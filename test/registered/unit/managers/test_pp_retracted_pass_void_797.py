@@ -1575,11 +1575,32 @@ class PPVoidOwnBatch797d(unittest.TestCase):
             "extend_range was already None and unrepairable -- carrying "
             "the request forward as self.chunked_req is the instr19 crash",
         )
-        self.assertNotIn(
+        # #968b UPDATED, AND THE OLD ASSERTION IS THE THING THAT WAS WRONG.
+        # This line used to read `assertNotIn(broken, h.waiting_queue)` with
+        # the rationale "it is dropped, not retracted". That rationale is the
+        # same sentence the twin site carried beside its own clear ("the
+        # request ... is re-admitted from the waiting queue by the ordinary
+        # path"), and it is false for a chunked continuation, which is never
+        # in the waiting queue by `_park_chunked_prefill_chunk` :798-802.
+        # Boot 4 of window-flip-0828 measured the cost: the clear dropped
+        # `4077b704`, and the refusals of the following passes reported that
+        # same rid MISSING. Clearing the FIELD (asserted above, unchanged,
+        # and still the instr19 fix) and DROPPING THE REQUEST are two acts;
+        # only the first was ever necessary.
+        self.assertIn(
             broken,
             h.waiting_queue,
-            "the chunked request must not be released/re-queued either -- "
-            "it is dropped, not retracted",
+            "a reset-shape carry that nothing else can reach must be queued, "
+            "not discarded: `add_chunked_req` re-admits only from "
+            "`self.chunked_req`, which has just been cleared, so a request "
+            "dropped here is in none of the four `pp_request_locations` "
+            "places for the rest of its life",
+        )
+        self.assertEqual(
+            h.waiting_queue.count(broken),
+            1,
+            "queued exactly once -- an unconditional append would duplicate "
+            "the request the disposal loop already re-queued",
         )
         # THE NEXT PASS'S OWN GUARD (scheduler.py get_next_batch_to_run),
         # run directly against this holder's post-gate state rather than

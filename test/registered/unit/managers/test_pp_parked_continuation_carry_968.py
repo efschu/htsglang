@@ -213,6 +213,29 @@ def _pp0_pass(pp0, *, queue_rids, cap=CAP):
     order, which is what the shipped loop does once
     `pp_parked_continuation_priority` has run. Both the reorder and the
     decision build are the shipped functions.
+
+    WHAT THIS FUNCTION DOES NOT PROVE, recorded after boot 4 rather than
+    left for the next reader to rediscover (#968 self-audit, #968b). The
+    line below builds `pp0.waiting_queue` WITH the parked rid already in it.
+    That was written as scene-setting and it is in fact the ONE precondition
+    the whole defect was about: PP0's copy of the continuation had been
+    displaced out of the single `chunked_req` field by the cross-slot void
+    restore and was in no queue at all, so the shipped reorder had nothing
+    to move and returned `()` for 400+ consecutive passes. This harness
+    supplied by hand the delivery it was measuring -- the #944 falsifier
+    trap, and the arms below are valid against carry links 1-3 (mint,
+    forward, absorb) and prove nothing about link 4 reaching a real
+    production queue.
+
+    THE QUEUE MEMBERSHIP IS NOW ESTABLISHED BY PRODUCTION CODE, and
+    `test_pp_continuation_cross_slot_rehome_968b.py` drives that for real
+    through the shipped `_pp_absorb_void_output` / `_pp_void_own_batch`:
+    `pp_rehome_displaced_chunked_req` queues a continuation displaced by
+    another slot's restore, and `pp_requeue_cleared_chunked_carry` queues
+    one whose reset-shape carry is cleared. This module keeps its
+    hand-built queue deliberately -- it is the unit test of the reorder and
+    the decision build, given the queue -- and the other module is the
+    integration proof that the queue is populated at all.
     """
     pp0.waiting_queue = [
         _req(rid, prefix_len=EXECUTED if rid == RID_PARKED else 0, extend_len=64)

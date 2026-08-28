@@ -865,6 +865,27 @@ def _park_chunked_prefill_chunk(scheduler, req, *, pass_allocated: bool = True) 
             req.inflight_middle_chunks -= 1
     except Exception as exc:  # noqa: BLE001 - cleanup must not raise
         logger.warning("#797b parked-chunk inflight accounting failed: %s", exc)
+    # #968b INSTRUMENT, standing order (a). This actuator was SILENT, and so
+    # was `pp_rehome_refused_chunked_req` beside it, so boot 4's zero hits on
+    # "rehome"/"park" were a blind probe and not evidence -- the route by
+    # which a continuation entered the `chunked_req` slot was undecidable
+    # from the log. `pass_allocated` is printed because it is exactly what
+    # separates the two routes: the #971 refusal path parks the GEOMETRY only
+    # (False), every void path also hands back KV rows and the inflight
+    # increment (True).
+    _rid = getattr(req, "rid", None)
+    _emit, _seen = pp_968_log_gate(f"park:{_rid}:{bool(pass_allocated)}")
+    if _emit:
+        logger.info(
+            "#968 PARK rid=%s executed=%s pass_allocated=%s route=%s "
+            "(extend_range restored to the parked shape end==len(prefix); "
+            "zero cached tokens discarded; seen=%d)",
+            _rid,
+            start,
+            bool(pass_allocated),
+            "void-give-backs" if pass_allocated else "refusal-geometry-only",
+            _seen,
+        )
     return True
 
 
@@ -1584,6 +1605,67 @@ def pp_void_forward_payload(
     return dict(message)
 
 
+#: #968b: how often a repeating chain line is re-printed after its first
+#: occurrence. The four carry links run on EVERY pass of every rank, so an
+#: unconditional line would be a per-pass firehose; a line that printed ONCE
+#: would answer "did this ever run" and not "is it still running", which is
+#: the question boot 4 actually needed. First occurrence plus every Nth
+#: answers both at a bounded cost.
+_PP_968_LOG_EVERY = 64
+
+#: Keyed by (link, rank, rid) so a NEW rid always announces itself on its
+#: first pass rather than inheriting another rid's counter. Bounded by the
+#: clear below: this is a diagnostic counter, and a diagnostic that grows
+#: without limit on a long boot is itself a defect (#606 family).
+_PP_968_LOG_COUNTS: Dict[str, int] = {}
+_PP_968_LOG_COUNTS_CAP = 4096
+
+
+def pp_968_log_gate(key: str, every: int = _PP_968_LOG_EVERY):
+    """#968b: (emit, occurrence) for a rate-limited chain line.
+
+    STANDING ORDER (a), and it exists because boot 4 could not be read. That
+    boot logged ZERO lines containing `#968`, and the zero was read as "the
+    chain did not run" when it meant "the chain has no instrument" -- the
+    #962a blind-probe class. Seven helpers and both park actuators were
+    silent, so the route a continuation took into the `chunked_req` slot was
+    undecidable from a 4919-line log.
+
+    Never raises. An instrument that can raise on the void path turns one
+    defect into two, which is the argument `_park_chunked_prefill_chunk`
+    makes for itself.
+    """
+    try:
+        count = _PP_968_LOG_COUNTS.get(key, 0) + 1
+        if count == 1 and len(_PP_968_LOG_COUNTS) >= _PP_968_LOG_COUNTS_CAP:
+            _PP_968_LOG_COUNTS.clear()
+            count = 1
+        _PP_968_LOG_COUNTS[key] = count
+        return (count == 1 or count % int(every) == 0), count
+    except Exception:  # noqa: BLE001 - an instrument may never break the path
+        return False, 0
+
+
+def pp_rid_digest(rids, cap: int = 4) -> str:
+    """#968b: a capped, joinable rid list for a log line on a hot path.
+
+    A COUNT IS NOT JOINABLE. Boot 4's 514 void lines printed how many
+    requests each void released and never which, so no void could be paired
+    with the refusal it caused and the pairing had to be reconstructed from
+    a 4919-line trawl. Capped rather than complete because this sits on the
+    void path, where an unbounded line is its own defect; the total is kept
+    beside the sample so a truncation is never mistaken for the whole set.
+    """
+    try:
+        items = [str(r) for r in (rids or ()) if r is not None]
+    except Exception:  # noqa: BLE001 - a log helper may never break the path
+        return "?"
+    if not items:
+        return "-"
+    head = ",".join(items[:cap])
+    return head if len(items) <= cap else f"{head},+{len(items) - cap}"
+
+
 def pp_parked_continuation_fact(holder):
     """#968: this rank's parked chunked continuation, or None.
 
@@ -1623,11 +1705,38 @@ def pp_parked_continuation_fact(holder):
     # never reach a boolean context; `len()` reads the shape only and does
     # not synchronise, which is what #790 requires on this path.
     prefix_len = 0 if prefix_indices is None else len(prefix_indices)
-    if int(end) != int(prefix_len):
-        return None
     rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
-    if rank is None:
+    if int(end) != int(prefix_len) or rank is None:
+        # #968 MINT, THE ZERO CASE, and it is printed for a reason boot 4
+        # paid for. A chunked request that EXISTS but does not qualify is a
+        # different world from no chunked request at all, and nothing in the
+        # log told them apart -- so "0 facts minted" could not be read as
+        # either "nothing is parked" or "the predicate is wrong". Silent
+        # above this line on purpose: `req is None` is the ordinary
+        # no-chunked-prefill pass, where there is no observation to report.
+        emit, seen = pp_968_log_gate(f"mint-none:{rank}:{rid}")
+        if emit:
+            logger.info(
+                "#968 MINT none rank=%s rid=%s end=%s prefix=%s (a chunked "
+                "request is held but is not in the parked shape "
+                "`extend_range.end == len(prefix_indices)`, so no fact rides "
+                "the lap for it; seen=%d)",
+                rank,
+                rid,
+                end,
+                prefix_len,
+                seen,
+            )
         return None
+    emit, seen = pp_968_log_gate(f"mint:{rank}:{rid}")
+    if emit:
+        logger.info(
+            "#968 MINT rank=%d rid=%s executed=%d (seen=%d)",
+            int(rank),
+            str(rid),
+            int(prefix_len),
+            seen,
+        )
     return (str(rid), int(prefix_len), int(rank))
 
 
@@ -1687,6 +1796,16 @@ def pp_parked_continuation_stamp(holder, incoming, out: Dict[str, object]) -> No
     if not merged:
         return
     out[_PP_PARKED_CONTINUATION_KEY] = tuple(merged[rank] for rank in sorted(merged))
+    own_rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
+    emit, seen = pp_968_log_gate(f"forward:{own_rank}:{len(merged)}")
+    if emit:
+        logger.info(
+            "#968 FORWARD rank=%s out=%d rids=%s (seen=%d)",
+            own_rank,
+            len(merged),
+            ",".join(str(merged[r][0])[:8] for r in sorted(merged)),
+            seen,
+        )
 
 
 def pp_note_parked_continuation(holder, message) -> int:
@@ -1723,6 +1842,21 @@ def pp_note_parked_continuation(holder, message) -> int:
     holder._pp_parked_continuations = {
         rid: (int(executed), int(rank)) for rid, executed, rank in facts
     }
+    # #968 ABSORB. Printed INCLUDING the empty-set case: a message that
+    # carries the key with nothing in it is every holder's withdrawal of its
+    # own claim, and that is a positive statement about the ring, not
+    # silence. `:1692`'s return already counts; this names the rids.
+    own_rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
+    emit, seen = pp_968_log_gate(f"absorb:{own_rank}:{len(facts)}")
+    if emit:
+        logger.info(
+            "#968 ABSORB rank=%s in=%d rids=%s (seen=%d)",
+            own_rank,
+            len(facts),
+            ",".join(f"{rid}@{executed}/r{rank}" for rid, executed, rank in facts)
+            or "-",
+            seen,
+        )
     return len(facts)
 
 
@@ -1754,12 +1888,49 @@ def pp_parked_continuation_priority(scheduler) -> Tuple[str, ...]:
     """#968: the rids PP0 must NAME on this pass, in queue order.
 
     THE ACTING HALF, and it is deliberately the smallest possible act:
-    reorder, never admit. The rids named here are requests already in PP0's
-    own `waiting_queue` -- the void's requeue put them there (mixin
-    :6791-6793/:8104-8106) and the tail rotation is exactly what kept them
-    from ever reaching a seat. Moving them to the FRONT lets the ordinary
-    admission loop admit them, which is what puts them in `can_run_list`,
-    which is what makes `build_pp_admission_decision` name them.
+    reorder, never admit. Moving a rid to the FRONT lets the ordinary
+    admission loop admit it, which is what puts it in `can_run_list`, which
+    is what makes `build_pp_admission_decision` name it.
+
+    WHAT PUTS THE RID IN THE QUEUE THIS PERMUTES -- corrected, #968b, and
+    the correction is the whole reason boot 4 died with the carry in place.
+    The premise stated here originally was that "the void's requeue put them
+    there (mixin :6791-6793/:8104-8106)". BOTH CITATIONS WERE DEAD: :6791 is
+    inside `_pp_reconcile_incoming_admission`'s local-match loop and :8104 is
+    a #951/#978 comment block, and neither contains a requeue. The real
+    requeues are `_pp_void_own_batch`'s :7099 and `_pp_absorb_void_output`'s
+    :8411 -- and `pp_void_keeps_request` deliberately SKIPS both for a
+    chunked continuation (:7088/:8402), because while a request IS the
+    scheduler's `chunked_req`, `add_chunked_req` re-admits it from that field
+    directly and queueing it would put it in the batch twice (:798-802). So
+    the premise was false in exactly the case this function exists for, and
+    the function returned the empty tuple for 400+ consecutive passes while
+    the carry table named a rid the whole time. Written, cited, never
+    checked.
+
+    THE PREMISE IS NOW TRUE BY CONSTRUCTION, and it is true for the only
+    case that matters: a continuation that has LEFT the `chunked_req` field.
+    While it is still in the field, this function must NOT act on it and
+    correctly does not -- the holder re-admits it itself. It leaves the field
+    at exactly four unguarded writers, and each now re-homes into the queue
+    instead of dropping:
+
+      * `pp_rehome_displaced_chunked_req`, called by both per-slot restores
+        (`_pp_absorb_void_output`, `_pp_void_own_batch`) before they
+        overwrite the ONE `chunked_req` field with their own slot's
+        snapshot. Back-to-back restores mean last-slot-wins, and any other
+        slot's continuation was previously dropped out of the only place it
+        lived.
+      * `pp_requeue_cleared_chunked_carry`, called by the reset-shape clears
+        beside them, whose comment used to justify the drop with "the
+        request is re-admitted from the waiting queue by the ordinary path"
+        -- false for a continuation by :798-802, and the boot-4 slice's line
+        408 is the witness (it cleared `4077b704`, which the next refusal
+        reported MISSING).
+
+    `pp_rehome_refused_chunked_req` (#971) is the same class at a fifth
+    exit and is unchanged: it re-homes INTO the field rather than out of it,
+    because a refused pass built no batch and the field is free.
 
     NOT A SECOND ADMISSION AUTHORITY (DESIGN_679 §4, rule 1): this changes
     what there is to decide from; the adder still decides. Nothing here
@@ -1781,13 +1952,40 @@ def pp_parked_continuation_priority(scheduler) -> Tuple[str, ...]:
     """
     carry = pp_parked_continuation_carry(scheduler)
     if not carry:
+        # No observation: nothing is parked anywhere in the ring. Silent by
+        # design -- this is every pass of every boot that never parks one,
+        # and a line here would be the firehose that gets the whole
+        # instrument turned off.
         return ()
-    queue = getattr(scheduler, "waiting_queue", None)
-    if not queue:
-        return ()
+    queue = getattr(scheduler, "waiting_queue", None) or ()
     front, rest = [], []
     for req in queue:
         (front if getattr(req, "rid", None) in carry else rest).append(req)
+    # #968 ACT, AND THE ZERO CASE IS THE POINT. `carry>0` with `front=0` is
+    # the state that spent boot 4: PP0 knows a rid is parked, and cannot
+    # reach it, so it names two other rids and the follower's occupant is an
+    # unnamed extra for ever. This ONE line would have named that in a single
+    # pass instead of a slice trawl. Printed BEFORE the early return, because
+    # a return that logs nothing is what made the previous three exits
+    # (`return ()` at the carry, queue and front tests) indistinguishable
+    # from "the function was never called".
+    emit, seen = pp_968_log_gate(f"act:{len(carry)}:{len(front)}")
+    if emit:
+        logger.info(
+            "#968 ACT carry=%d queue=%d front=%d rids=%s (seen=%d)%s",
+            len(carry),
+            len(queue),
+            len(front),
+            ",".join(sorted(carry)) or "-",
+            seen,
+            (
+                ""
+                if front
+                else " -- NOT REACHABLE: every carried rid is absent from "
+                "this rank's waiting queue, so the reorder is a no-op and "
+                "the follower's occupant stays unnamed (the boot-4 state)"
+            ),
+        )
     if not front:
         return ()
     scheduler.waiting_queue = front + rest
@@ -2587,8 +2785,206 @@ def pp_rehome_refused_chunked_req(scheduler, mb_id) -> bool:
     # freeing `req_to_token[.., start:end]` here would return another
     # request's pages and decrementing would report a chunk finished that is
     # still owed. See `_park_chunked_prefill_chunk`'s own parameter note.
-    return _park_chunked_prefill_chunk(
+    parked = _park_chunked_prefill_chunk(
         scheduler, chunked_before, pass_allocated=False
+    )
+    # #968b INSTRUMENT. Boot 4 could not decide WHICH route put the
+    # continuation into the slot -- this actuator and the #797b retraction
+    # restore are the two candidates, and both were silent, so 0 hits on
+    # "rehome" was a blind probe rather than evidence. The route is named
+    # here so the next boot answers it by grep.
+    _rid = getattr(chunked_before, "rid", None)
+    if _rid is not None:
+        _emit, _seen = pp_968_log_gate(f"rehome-refusal:{_rid}")
+        if _emit:
+            logger.info(
+                "#971 REHOME-ON-REFUSAL rid=%s slot=%s parked=%s route="
+                "refused-forwarded-schedule (the pass built no batch, so "
+                "self.chunked_req is free and the continuation goes back "
+                "INTO it; seen=%d)",
+                _rid,
+                mb_id,
+                parked,
+                _seen,
+            )
+    return parked
+
+
+def pp_chunked_req_is_reachable(scheduler, req) -> bool:
+    """#968b: can the ordinary admission loop still get to `req`?
+
+    THE QUESTION THE DROP SITES ASSUMED THE ANSWER TO. Both reset-shape
+    clears justified discarding a request with "it is re-admitted from the
+    waiting queue by the ordinary path" -- an assertion, never a test, and
+    false for a chunked continuation by `_park_chunked_prefill_chunk`
+    :798-802. Asking it instead of asserting it is what makes the claim
+    true, and it is also what keeps the fix from creating the OPPOSITE
+    defect: a blind append would duplicate a request the disposal loop at
+    :8411 has already re-queued, putting it in the batch twice.
+
+    TWO PLACES, NOT FOUR, and the difference is deliberate.
+    `pp_request_locations` enumerates all four, but two of them are exactly
+    what the caller is about to empty (`chunked_req`) or a per-pass snapshot
+    the next pass overwrites (the slot ring, written every pass by
+    `_pp_note_chunked_req_before_admission`). Neither is a home a request
+    can survive in, so counting them here would answer "reachable" about a
+    reference with at most `pp_size` passes to live -- which is precisely
+    what let the boot-4 loss look benign.
+
+    Never raises: this runs while cleaning up after a divergence.
+    """
+    rid = getattr(req, "rid", None)
+    if rid is None:
+        return True  # nothing identifiable to re-home; leave it alone
+    for other in getattr(scheduler, "waiting_queue", None) or ():
+        if other is req or getattr(other, "rid", None) == rid:
+            return True
+    running = getattr(scheduler, "running_batch", None)
+    for other in getattr(running, "reqs", None) or ():
+        if other is req or getattr(other, "rid", None) == rid:
+            return True
+    return False
+
+
+def pp_queue_orphaned_chunked_req(scheduler, req, *, tag, mb_id, route) -> bool:
+    """#968b: the shared act -- queue a continuation that has no home left.
+
+    THE LEGALITY, and it is the one line a future reader will want. The
+    prohibition at `_park_chunked_prefill_chunk` :798-802 ("NOT re-queued:
+    the chunked request is not in `waiting_queue`, so appending it would put
+    it in the batch twice") covers a request that REMAINS `self.chunked_req`
+    -- `add_chunked_req` re-admits it from that field, so the field and the
+    queue are two doors into one batch. A request DISPLACED out of that
+    field is by definition no longer one: no door leads to it at all, and
+    the queue is the only one left. The prohibition and this append are the
+    same rule read on the two sides of one condition.
+
+    NOTHING IS RESET, TRUNCATED OR RELEASED (Kein-Doppel-Prefill). The
+    request is appended exactly as it stands: parked geometry, full
+    `prefix_indices`, `last_node` and every stashed-chunk handle intact.
+    Zero tokens are discarded -- the executed prefix must ADVANCE, and a
+    re-home that reset it would recompute work the holder already ran.
+
+    NOTHING IN FLIGHT IS REWRITTEN (instr20). A resident request is already
+    reachable in `running_batch` and is refused by the check above, so this
+    never queues a request that is decoding from its pages -- the double
+    admission `pp_void_keeps_request` exists to prevent must not come back
+    through this door.
+
+    A module-level function looked up through this module's globals at call
+    time, like `pp_void_keeps_request` and `pp_chunked_req_for_slot` beside
+    it, so a can-fail proof can neuter this ONE step and show the
+    assertions that depend on it go red. Never raises.
+
+    True iff the request was queued.
+    """
+    rid = getattr(req, "rid", None)
+    if rid is None:
+        return False
+    if getattr(req, "finished_reason", None) is not None:
+        # Nothing left to run. Queueing it would hand the admission loop a
+        # member it must immediately drop, and clearing the field is the
+        # whole disposal such a request needs.
+        return False
+    if pp_chunked_req_is_reachable(scheduler, req):
+        return False
+    queue = getattr(scheduler, "waiting_queue", None)
+    if queue is None:
+        return False
+    try:
+        queue.append(req)
+    except Exception:  # noqa: BLE001 - a stand-in with an immutable queue
+        return False
+    emit, seen = pp_968_log_gate(f"{tag}:{rid}")
+    if emit:
+        logger.warning(
+            "#968b %s rid=%s from-slot=%s route=%s: this chunked "
+            "continuation had left the ONE self.chunked_req field and was in "
+            "none of the four pp_request_locations places -- it is queued "
+            "UNRESET, with its full executed prefix, so the ordinary "
+            "admission loop and pp_parked_continuation_priority can reach it "
+            "again. Dropping it here was boot 4's 407 unnamed extras "
+            "(seen=%d).",
+            tag,
+            rid,
+            mb_id,
+            route,
+            seen,
+        )
+    return True
+
+
+def pp_rehome_displaced_chunked_req(scheduler, incoming, *, mb_id, route):
+    """#968b: the request about to be DISPLACED from `chunked_req` is queued.
+
+    THE DEFECT, in the shipped code's own words. `_pp_absorb_void_output`
+    states at its own instr19 guard that void-output "fires ONCE PER SLOT,
+    several times in a row, with no `get_next_batch_to_run` in between" and
+    that "each call restores ITS OWN slot's `chunked_before`".
+    `self.chunked_req` is ONE field. Slot A's restore puts A's continuation
+    in it; slot B's restore overwrites it with B's, back to back. LAST SLOT
+    WINS, and A's continuation is dropped out of the only place it lived --
+    the file reasoned carefully about the request that ARRIVES in the field
+    and never about the one that leaves it.
+
+    THE HANDOVER THAT MAKES THE SNAPSHOT THE ONLY HANDLE is scheduler.py
+    :9018, `self.chunked_req = adder.add_chunked_req(self.chunked_req)`: on
+    a FINAL extend the adder appends the continuation to `can_run_list` and
+    returns None, so the field is emptied and the top-of-pass snapshot is
+    the sole remaining reference. That is the #971 specimen shape, on the
+    decider's side of the ring.
+
+    ONLY A HEALTHY PARKED CONTINUATION IS RE-HOMED. A displaced value in the
+    reset shape is either already re-queued by the disposal loop that reset
+    it (:7099/:8411 release AND queue in one act) or genuinely torn down
+    with its prefix gone -- `pp_chunked_req_is_reachable` settles which, so
+    this does not have to guess. The narrow predicate is deliberately the
+    same one `pp_parked_continuation_fact` mints on: a request worth
+    carrying home is a request worth keeping.
+
+    Returns the rid iff one was re-homed, else None. Never raises.
+    """
+    current = getattr(scheduler, "chunked_req", None)
+    if current is None or current is incoming:
+        return None
+    extend_range = getattr(current, "extend_range", None)
+    end = getattr(extend_range, "end", None)
+    if end is None or getattr(current, "is_retracted", False):
+        return None
+    prefix_indices = getattr(current, "prefix_indices", None)
+    # #796: a TENSOR of KV-pool slot pointers -- `len()` reads the shape and
+    # does not synchronise; it must never reach a boolean context.
+    prefix_len = 0 if prefix_indices is None else len(prefix_indices)
+    if int(end) != int(prefix_len):
+        return None
+    if not pp_queue_orphaned_chunked_req(
+        scheduler, current, tag="REHOME-ON-DISPLACE", mb_id=mb_id, route=route
+    ):
+        return None
+    return getattr(current, "rid", None)
+
+
+def pp_requeue_cleared_chunked_carry(scheduler, req, *, mb_id, route) -> bool:
+    """#968b: make the reset-shape clear's own justification TRUE.
+
+    The clear is RIGHT and stays: whatever is left in `self.chunked_req` is
+    what the next pass dereferences with no guard of its own (boot instr19,
+    `'NoneType' object has no attribute 'end'`). What was wrong is the
+    sentence beside it -- "the request keeps its pages, is re-admitted from
+    the waiting queue by the ordinary path". A chunked continuation is not
+    in the waiting queue (:798-802), so for the one shape this site actually
+    handles, the justification named a path that does not exist.
+
+    LIVE WITNESS, boot 4 slice line 408: this clear dropped `4077b704`, and
+    `4077b704` is one of the 107 rids the following passes' refusals
+    reported as MISSING. The comment was not merely imprecise; it described
+    the loss it was licensing.
+
+    Clearing the FIELD and dropping the REQUEST are two acts, and only the
+    first was ever necessary.
+    """
+    return pp_queue_orphaned_chunked_req(
+        scheduler, req, tag="REQUEUE-ON-CLEAR", mb_id=mb_id, route=route
     )
 
 
@@ -7041,6 +7437,18 @@ class SchedulerPPMixin:
             if carried_slots and 0 <= mb_id < len(carried_slots)
             else None
         )
+        # #968b: THE TWIN OF `_pp_absorb_void_output`'s cross-slot re-home,
+        # and the sibling sweep is part of the fix rather than a follow-up --
+        # a class closed at one of its two exits is a class that returns
+        # through the other. This site carries the identical eight lines and
+        # therefore the identical displacement: `self.chunked_req` is ONE
+        # field, and a slot restoring its own snapshot overwrites whatever
+        # another slot's restore put there. Reached whenever consecutive
+        # slots are voided by this rank's own decision rather than by an
+        # incoming retraction.
+        displaced = pp_rehome_displaced_chunked_req(
+            self, chunked_before, mb_id=mb_id, route="own-void-cross-slot"
+        )
         if getattr(self, "chunked_req", None) is not chunked_before:
             self.chunked_req = chunked_before
         parked = _park_chunked_prefill_chunk(self, chunked_before)
@@ -7065,17 +7473,29 @@ class SchedulerPPMixin:
         # happen" into an explicit, coherent "no carried chunk" rather than
         # a silent bet that the argument keeps holding across every future
         # edit to the functions on this path.
+        #
+        # #968b: the clear stays, the DROP does not -- same correction as the
+        # twin site. Clearing the field is required (the next pass reads
+        # `extend_range.end` unguarded); discarding the request was never
+        # required and, for a chunked continuation, strands it in no place at
+        # all because `add_chunked_req` re-admits only from this field.
         if (
             self.chunked_req is not None
             and getattr(self.chunked_req, "extend_range", None) is None
         ):
+            requeued = pp_requeue_cleared_chunked_carry(
+                self, self.chunked_req, mb_id=mb_id, route="own-void-reset-shape"
+            )
             logger.warning(
-                "#797d own-void: the chunked request for slot %d already had "
-                "extend_range=None (the reset_for_retract shape "
+                "#797d own-void: the chunked request for slot %d (rid=%s) "
+                "already had extend_range=None (the reset_for_retract shape "
                 "_park_chunked_prefill_chunk cannot repair) -- clearing "
                 "self.chunked_req instead of carrying a request the next "
-                "pass's get_next_batch_to_run cannot read.",
+                "pass's get_next_batch_to_run cannot read (#968b: re-queued "
+                "so the ordinary path can actually reach it = %s).",
                 mb_id,
+                getattr(self.chunked_req, "rid", None),
+                requeued,
             )
             self.chunked_req = None
 
@@ -7084,8 +7504,10 @@ class SchedulerPPMixin:
         resident = {r.rid for r in (getattr(running, "reqs", None) or ())}
         reqs = list(getattr(batch, "reqs", None) or ())
         released = 0
+        released_rids, kept_rids = [], []
         for req in reqs:
             if pp_void_keeps_request(req, resident, chunked_before):
+                kept_rids.append(getattr(req, "rid", None))
                 continue
             # #969: THE RETRACTION PATH, NOT THE PROBE PATH. These are
             # admitted requests -- they were matched against the prefix tree
@@ -7097,6 +7519,7 @@ class SchedulerPPMixin:
             # resets the request as its last act, so this site does not.
             _release_voided_request(self, req, len(reqs) - released)
             self.waiting_queue.append(req)
+            released_rids.append(getattr(req, "rid", None))
             released += 1
 
         # #801-spin: CONSUMED, never merely read -- read and cleared at the top
@@ -7111,11 +7534,14 @@ class SchedulerPPMixin:
                 "it is being cleared here instead of launched. %d of %d request(s) "
                 "released and re-queued (the rest are resident in the running batch, "
                 "or are the chunked request, and keep their pages -- #797/#797b; "
-                "chunk parked=%s).",
+                "chunk parked=%s). released=%s kept=%s displaced=%s.",
                 mb_id,
                 released,
                 len(reqs),
                 parked,
+                pp_rid_digest(released_rids),
+                pp_rid_digest(kept_rids),
+                displaced,
             )
         return True
 
@@ -8289,6 +8715,20 @@ class SchedulerPPMixin:
             if carried_slots and 0 <= mb_id < len(carried_slots)
             else None
         )
+        # #968b: WHAT LEAVES THE FIELD, not only what arrives in it. The
+        # eight lines above were reasoned through for the request being
+        # restored and never for the one being overwritten -- and this
+        # method's own guard comment below says why that matters: it "fires
+        # ONCE PER SLOT, several times in a row, with no
+        # `get_next_batch_to_run` in between", so slot B's restore displaces
+        # slot A's continuation out of the single `chunked_req` field. Last
+        # slot wins; the displaced request was in NONE of the four
+        # `pp_request_locations` places from here on, which is boot 4's 407
+        # unnamed extras. Re-homed BEFORE the overwrite -- after it, the
+        # reference is already gone.
+        displaced = pp_rehome_displaced_chunked_req(
+            self, chunked_before, mb_id=mb_id, route="void-output-cross-slot"
+        )
         if getattr(self, "chunked_req", None) is not chunked_before:
             self.chunked_req = chunked_before
         parked = _park_chunked_prefill_chunk(self, chunked_before)
@@ -8361,11 +8801,28 @@ class SchedulerPPMixin:
         # a holder that never had the attribute and carries None still does not
         # have it by this line. `test_ring_survives_the_retraction_with_the_fix`
         # is the case that proves it, and a plain read raised there.
+        #
+        # #968b CORRECTION TO THE PARAGRAPH ABOVE. "Clearing it is the correct
+        # disposal and not a loss: the request ... is re-admitted from the
+        # waiting queue by the ordinary path" -- the first half is true and
+        # the second was never checked. A chunked continuation is NOT in the
+        # waiting queue (`_park_chunked_prefill_chunk` :798-802 says so and
+        # `pp_request_locations` names it as the structural fact behind three
+        # tickets), so for that shape the sentence licensed exactly the loss
+        # it was denying. Boot 4 slice line 408 is the witness: this clear
+        # dropped `4077b704`, which the very next refusals reported MISSING.
+        # The field is still cleared -- the next pass dereferences it with no
+        # guard of its own -- but the REQUEST is now queued when nothing else
+        # can reach it, which is what makes the claim true rather than
+        # asserted.
         chunked_carry = getattr(self, "chunked_req", None)
         if chunked_carry is not None and (
             getattr(chunked_carry, "is_retracted", False)
             or getattr(chunked_carry, "extend_range", None) is None
         ):
+            requeued = pp_requeue_cleared_chunked_carry(
+                self, chunked_carry, mb_id=mb_id, route="void-output-reset-shape"
+            )
             logger.warning(
                 "#791b void-output: the chunked request for slot %d (rid=%s) "
                 "is in the reset_for_retract shape that "
@@ -8373,11 +8830,13 @@ class SchedulerPPMixin:
                 "(is_retracted=%s, extend_range=%s), produced by an earlier "
                 "slot's disposal loop in this same retraction -- clearing "
                 "self.chunked_req instead of carrying a request the next "
-                "pass's get_next_batch_to_run cannot read.",
+                "pass's get_next_batch_to_run cannot read (#968b: re-queued "
+                "so the ordinary path can actually reach it = %s).",
                 mb_id,
                 getattr(chunked_carry, "rid", None),
                 getattr(chunked_carry, "is_retracted", False),
                 getattr(chunked_carry, "extend_range", None),
+                requeued,
             )
             self.chunked_req = None
 
@@ -8398,8 +8857,10 @@ class SchedulerPPMixin:
         running = running_mbs[mb_id] if 0 <= mb_id < len(running_mbs) else None
         resident = {r.rid for r in (getattr(running, "reqs", None) or ())}
         released = 0
+        released_rids, kept_rids = [], []
         for req in reqs:
             if pp_void_keeps_request(req, resident, chunked_before):
+                kept_rids.append(getattr(req, "rid", None))
                 continue
             # #969: THE RETRACTION PATH, NOT THE PROBE PATH -- same reason as
             # the twin site in `_pp_void_own_batch`. The probe helper never
@@ -8409,21 +8870,32 @@ class SchedulerPPMixin:
             # act, so this site does not.
             _release_voided_request(self, req, len(reqs) - released)
             self.waiting_queue.append(req)
+            released_rids.append(getattr(req, "rid", None))
             released += 1
 
+        # #968b: RIDS, NOT ONLY COUNTS. All 514 of boot 4's void lines were
+        # rid-free, so no void could be joined to the refusal that followed
+        # it and the whole chain had to be re-derived from a slice trawl. A
+        # count answers "how many"; the refusal on the other side of the ring
+        # asks "which one". Capped, because a batch can be large and this
+        # line is on the void path.
         logger.warning(
             "#791b PP-ADMISSION void output on slot %d: the pipeline retracted "
             "this microbatch downstream, so the last rank produced nothing for "
             "it, and %d of rank 0's %d request(s) have been released and "
             "re-queued (the rest are resident in the running batch, or are the "
             "chunked request, and keep their pages -- #797/#797b; chunk "
-            "parked=%s). The message itself is what keeps the output ring "
-            "matched -- without it rank 0 blocks for ever in a receive no rank "
-            "is required to satisfy (boot instr11, 2026-08-21).",
+            "parked=%s). released=%s kept=%s displaced=%s. The message itself "
+            "is what keeps the output ring matched -- without it rank 0 blocks "
+            "for ever in a receive no rank is required to satisfy (boot "
+            "instr11, 2026-08-21).",
             mb_id,
             released,
             len(reqs),
             parked,
+            pp_rid_digest(released_rids),
+            pp_rid_digest(kept_rids),
+            displaced,
         )
         return True
 
