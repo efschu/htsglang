@@ -426,3 +426,55 @@ der `#996` den toten Ratchet und `#997` den falschen Guard-Hinweis gefunden hat 
 ein Indikator wird zum Befund erklaert, bevor geprueft ist, DASS er misst, was er
 behauptet. Die billige Gegenprobe ist in allen drei Faellen dieselbe und kostet
 Sekunden: **die Zeile darueber lesen.**
+
+### 8.5 Vierte Instanz derselben Form — und sie steht in DIESEM Specimen
+
+Von der Arithmetik-Achse gefilt, von mir am Baum nachgeprueft. Kein Defekt im
+Verhalten; ein Defekt in der MELDUNG — also exakt §8.4.
+
+`note_second_continuation_refused` (`schedule_policy.py:59-75`) schreibt in jede
+seiner Zeilen:
+
+> "…is left for a later pass rather than minted as a second continuation (#959).
+> **Nothing of it has run, so no progress is lost** and no double prefill is
+> incurred…"
+
+Fuer zwei der drei Aufrufer stimmt das. `add_one_req` (`:2192-2194`) meldet und
+**kehrt sofort zurueck**:
+
+```python
+2192   if self.chunked_req_outstanding:
+2193       note_second_continuation_refused(req, "add_one_req")
+2194       return AddReqResult.OTHER
+2197   req.set_extend_range(...)          # erst DANACH
+```
+
+Fuer den dritten, `_add_scheduled_req` (`:1611-1614`), stimmt es **nicht**: es
+gibt kein `return`. Die Methode laeuft weiter durch
+
+```python
+1611   if self.chunked_req_outstanding:
+1612       note_second_continuation_refused(req, "_add_scheduled_req")
+1613   else:
+1614       self._mint_chunked(req, "_add_scheduled_req")
+1615   if not carried_chunk:
+1616       self._req_inc_lock_ref(req)     # <- nimmt eine Tree-Lock-Ref
+1617   self._update_prefill_budget(...)    # <- belastet das Prefill-Budget
+```
+
+Der Request **wird ausgefuehrt**, er wird nur nicht als Continuation
+angekuendigt. Das Verhalten ist gewollt und `#995b` begruendet es an
+`:1599-1610` schluessig; falsch ist allein der Satz "Nothing of it has run".
+
+**Warum das hier und nicht nur in der Nachbar-Achse steht:** Boot 16s beide
+Refusals sind `site=_add_scheduled_req` (`:2034`, `:2045`). Wer diese zwei Zeilen
+im Specimen liest, entnimmt ihnen woertlich, dass nichts gelaufen sei und nichts
+gekostet habe — waehrend beide Requests eine Lock-Ref genommen und Budget
+belastet haben. Das ist kein hypothetisches Risiko: es ist eine Fehlleitung, die
+in genau dem Log wartet, das diese Analyse auswertet.
+
+Damit steht die Form viermal in einer Kampagne: der tote Ratchet (`#996`), der
+Guard-Hinweis auf die Drains (`#997` §3), der "uncalled"-Docstring eines
+aufgerufenen Drains (`:5521-5530`), und diese Meldung. Vier Instrumente, deren
+Text nicht beschreibt, was sie tun. **Gefilt, nicht gebaut** — die Korrektur ist
+ein Satz im Log-Text und gehoert nicht in einen Boot-Zyklus.
