@@ -596,8 +596,32 @@ def _release_voided_request(scheduler, req, remaining_req_count: int = 0) -> Non
             logger.warning("#969 voided-request retract failed: %s", exc)
 
 
-def _park_chunked_prefill_chunk(scheduler, req) -> bool:
+def _park_chunked_prefill_chunk(scheduler, req, *, pass_allocated: bool = True) -> bool:
     """#797b: un-do ONE prepared-but-never-run chunk. True iff it parked one.
+
+    #971 `pass_allocated`: DID THIS PASS GET FAR ENOUGH TO OWE THE GIVE-BACKS?
+
+    Every caller before #971 undoes a pass whose batch was BUILT -- the void
+    sites run after `get_next_batch_to_run` returned a batch, so
+    `prepare_for_extend` allocated the chunk's KV rows and scheduler.py's
+    `self.chunked_req.inflight_middle_chunks += 1` ran. Both give-backs below
+    are then exactly right.
+
+    A pass REFUSED at the forwarded-schedule membership check is the first
+    caller for which neither is. The raise happens above both sites:
+    `add_chunked_req` has written `extend_range` and appended to
+    `can_run_list`, and nothing after that ran. So on that path
+    `req_to_token[req_pool_idx, start:end]` holds STALE pointers from whatever
+    request last occupied those columns -- handing them to the allocator is
+    the "double free, not a leak" this function's own first bullet warns
+    about -- and the inflight decrement would hand back an increment that was
+    never taken, which the third bullet names as "a request that reports
+    finished while a chunk is still owed".
+
+    `False` therefore keeps the GEOMETRY park -- the one thing that path does
+    owe, because `add_chunked_req` really did write a range for a chunk that
+    will never run -- and skips both give-backs. Default `True` leaves every
+    pre-#971 caller byte-identical.
 
     THE CRASH THIS CLOSES, boot instr19 08:47:27, all three ranks within one
     second of each other:
@@ -689,6 +713,10 @@ def _park_chunked_prefill_chunk(scheduler, req) -> bool:
         prepared = int(end) > int(start)
     except Exception:  # noqa: BLE001 - cleanup must not raise
         prepared = False
+    # #971: "this round prepared a chunk" is necessary for both give-backs and
+    # no longer sufficient. A refused pass prepared one and then allocated
+    # nothing, so it owes the geometry park below and neither give-back.
+    prepared = prepared and bool(pass_allocated)
     try:
         if (
             pool is not None
@@ -1462,11 +1490,26 @@ def pp_request_locations(holder) -> Dict[str, object]:
     rid = getattr(chunked, "rid", None)
     if rid is not None:
         out.setdefault(rid, chunked)
-    by_slot = getattr(holder, "_pp_chunked_req_before_by_slot", None) or {}
-    try:
-        slot_reqs = list(by_slot.values())
-    except AttributeError:  # a stand-in that is not a mapping
-        slot_reqs = []
+    by_slot = getattr(holder, "_pp_chunked_req_before_by_slot", None) or ()
+    # #971: THE SLOT PLACE WAS SILENTLY EMPTY FOR EVERY CONSUMER. Production
+    # builds this ring as a LIST -- `[None] * pp_loop_size` in
+    # `init_pp_loop_state`, and the grow path in
+    # `_pp_note_chunked_req_before_admission` keeps it one -- so
+    # `.values()` raised `AttributeError` on the real object and the except
+    # below swallowed it as "a stand-in that is not a mapping". Three
+    # consumers therefore saw three places instead of four:
+    # `pp_apply_dead_premise_anywhere`, the ring probe, and scheduler.py's
+    # #943b re-issue candidate set. The shape is ANSWERED here rather than
+    # excepted away: a mapping is read by value, any other sequence by
+    # iteration, and only a genuinely non-iterable stand-in yields nothing.
+    values = getattr(by_slot, "values", None)
+    if callable(values):
+        slot_reqs = list(values())
+    else:
+        try:
+            slot_reqs = list(by_slot)
+        except TypeError:  # a stand-in that is neither mapping nor sequence
+            slot_reqs = []
     for req in slot_reqs:
         rid = getattr(req, "rid", None)
         if rid is not None:
@@ -1871,6 +1914,77 @@ def pp_chunked_req_for_slot(holder, mb_id) -> Optional[object]:
     if slot < 0 or slot >= len(ring):
         return None
     return ring[slot]
+
+
+def pp_rehome_refused_chunked_req(scheduler, mb_id) -> bool:
+    """#971: give a REFUSED pass's chunked continuation back to the scheduler.
+
+    THE CLASS, stated once so the next exit inherits it: ownership of a
+    chunked continuation may pass from `self.chunked_req` into the pass-owned
+    `adder.can_run_list` (scheduler.py, `adder.add_chunked_req`) only if EVERY
+    exit of that pass re-homes it. The successful exit re-homes it into the
+    batch. Every `PPScheduleRefused` exit after that line dropped it, and the
+    adder -- the only remaining reference -- was garbage-collected with the
+    pass.
+
+    THE SPECIMEN, boot 1 of window-flip-0828. A FINAL-extend continuation
+    (prefix 8192 of 8422, remaining 230 < the 4096 chunk, so
+    `PrefillAdder.add_chunked_req` appends it to `can_run_list` and returns
+    None) was handed over, the forwarded-schedule membership check then
+    refused the pass, and `_pp_refuse_forwarded_schedule` voided it and
+    returned without a restore. The request was then in NONE of the four
+    places `pp_request_locations` enumerates: 507 rounds of `#944 UNRESOLVED
+    told=8192 local=UNKNOWN` until the #801-spin guard killed the boot. The
+    two existing restores cannot reach this path: `_pp_void_own_batch`
+    early-returns on `batch is None` ABOVE its own restore, and
+    `_pp_absorb_void_output`'s restore needs an output expectation a pass that
+    built nothing never made (`#797d own pass voided` = 0 across the boot).
+
+    WHY THE PARK, and it is not optional. `add_chunked_req` has already
+    written `extend_range=(8192, 8422)` for a chunk that no rank will ever
+    run. Restoring the request without parking that range would leave the
+    next round's UNCONDITIONAL stash (scheduler.py, `if
+    self.chunked_req.extend_range.end > len(self.chunked_req.prefix_indices):
+    self.stash_chunked_request(...)`) caching a chunk that never executed.
+    `_park_chunked_prefill_chunk` restores `extend_range.end ==
+    len(prefix_indices)`, which that stash site already documents as the
+    parked shape it no-ops on. Zero tokens are discarded: the 8192 cached
+    prefix is untouched and only the never-computed tail is given back.
+
+    NOTHING IN FLIGHT IS REWRITTEN (instr20). This runs on a pass that built
+    no batch and sent no proxy -- the refusal is raised before
+    `_get_new_batch_prefill_raw` prunes `self.waiting_queue`, so every OTHER
+    request the loop admitted is still queued and needs nothing from here.
+    The chunked continuation is the one request that is never in the waiting
+    queue, which is exactly why it is the one that goes missing.
+
+    READS ONLY THE NAMED SLOT (#798) through `pp_chunked_req_for_slot`, and
+    RESTORES rather than blind-clears (#797b): a holder with no ring at all
+    cannot distinguish "the slot held None" from "there is no slot", so it is
+    left alone rather than having its continuation cleared on a guess.
+
+    A module-level function, looked up through this module's globals at call
+    time like `pp_void_keeps_request` and `pp_chunked_req_for_slot` beside it,
+    so a can-fail proof can neuter THIS restore alone and show the assertions
+    that depend on it go red.
+
+    Never raises. True iff a prepared chunk was parked.
+    """
+    ring = getattr(scheduler, "_pp_chunked_req_before_by_slot", None)
+    if ring is None:
+        return False
+    chunked_before = pp_chunked_req_for_slot(scheduler, mb_id)
+    if getattr(scheduler, "chunked_req", None) is not chunked_before:
+        scheduler.chunked_req = chunked_before
+    # `pass_allocated=False`: THE GEOMETRY ONLY. This pass was refused above
+    # both give-back sites -- `prepare_for_extend` never allocated the chunk's
+    # KV rows and scheduler.py's `inflight_middle_chunks += 1` never ran -- so
+    # freeing `req_to_token[.., start:end]` here would return another
+    # request's pages and decrementing would report a chunk finished that is
+    # still owed. See `_park_chunked_prefill_chunk`'s own parameter note.
+    return _park_chunked_prefill_chunk(
+        scheduler, chunked_before, pass_allocated=False
+    )
 
 
 def pp_void_keeps_request(req, resident_rids, chunked_before) -> bool:

@@ -8097,6 +8097,55 @@ class Scheduler(
                     bool(getattr(self, "_pp_output_expected_incoming", False)),
                     amended,
                 )
+
+        # #971 THE JUNCTION. Every exit of this pass must re-home the chunked
+        # continuation, and this is the exit that did not.
+        #
+        # `_get_new_batch_prefill_raw` hands `self.chunked_req` -- scheduler-
+        # owned, alive across rounds, and never a member of `waiting_queue` --
+        # into the pass-owned adder at `self.chunked_req =
+        # adder.add_chunked_req(self.chunked_req)`. On a FINAL extend the
+        # adder appends it to `can_run_list` and returns None, so after that
+        # line the adder holds the only reference. Refusing the pass here
+        # discards the adder, and with it the request: boot 1's 512-void
+        # livelock, 507 rounds of `#944 UNRESOLVED told=8192 local=UNKNOWN`.
+        #
+        # Neither existing restore is reachable from here.
+        # `_pp_void_own_batch` early-returns on `batch is None` above its
+        # restore -- and this pass built no batch, which is why `#797d own
+        # pass voided` is 0 in the whole boot log -- and
+        # `_pp_absorb_void_output`'s restore is keyed on an output
+        # expectation this pass never made.
+        #
+        # THE SLOT is `amended.mb_id`: the forwarded decision is stamped with
+        # the loop's own `mb_id` (`replace(raw, mb_id=mb_id)` in
+        # `_pp_reconcile_incoming_admission`), which is the same number
+        # `_pp_note_chunked_req_before_admission` wrote the snapshot under and
+        # the same one the `note(amended.mb_id, ...)` call directly above
+        # already relies on. `_pp_live_mb_id` is the fallback for a pass that
+        # carries no amended decision.
+        #
+        # THE PARK is part of the restore, not an extra -- and it is the
+        # GEOMETRY ONLY: this pass was refused above both the KV allocation
+        # and the `inflight_middle_chunks` increment, so it has nothing to
+        # give back and giving anyway would free another request's pages. See
+        # `pp_rehome_refused_chunked_req` and `_park_chunked_prefill_chunk`'s
+        # `pass_allocated`. Nothing is discarded here -- the
+        # refusal is raised before this function's `self.waiting_queue`
+        # prune, so every other admitted request is still queued, and the
+        # parked continuation keeps its full cached prefix. This junction
+        # costs zero tokens; the status quo cost 8192.
+        from sglang.srt.managers.scheduler_pp_mixin import (
+            pp_rehome_refused_chunked_req as _pp_rehome_refused_chunked_req,
+        )
+
+        slot = (
+            amended.mb_id
+            if amended is not None
+            else getattr(self, "_pp_live_mb_id", None)
+        )
+        if slot is not None:
+            _pp_rehome_refused_chunked_req(self, slot)
         return None
 
     def _trace_pp_admission_verdict(self, ret: Optional[ScheduleBatch]) -> None:
@@ -8955,6 +9004,30 @@ class Scheduler(
             _skips[kind] = _skips.get(kind, 0) + 1
             _skip_first_rid.setdefault(kind, str(rid))
 
+        def _write_skip_census() -> None:
+            """#971: publish this pass's skip census to `_admission_decline_note`.
+
+            THE READER IS THE REASON THIS MOVED. The census was written only
+            in the `len(can_run_list) == 0` branch far below, which every
+            `PPScheduleRefused` exit jumps over -- so the #788 verdict trace
+            printed `reason=-` for exactly the passes whose narrowing caused
+            the refusal, and the instrument was blind on the one path it was
+            built to explain. Written here as a closure so the refusal sites
+            and the empty-loop branch emit a byte-identical string; the
+            non-refusal path is unchanged, since nothing calls this on it.
+            """
+            if _skips:
+                self._admission_decline_note = (
+                    "loop_skips("
+                    + ",".join(
+                        f"{k}={v}(first={_skip_first_rid[k][:16]})"
+                        for k, v in sorted(_skips.items())
+                    )
+                    + ")"
+                )
+            else:
+                self._admission_decline_note = "loop=clean"
+
         # W30: AN EXEMPT BATCH CARRIES TRANSPORT ONLY.
         #
         # `seam_transport_exempt` opened the purity gate for this round
@@ -9177,6 +9250,8 @@ class Scheduler(
             mamba_allocator.alloc_group_end()
 
         if schedule_refusal is not None:
+            # #971: the refusal path must leave the skip census readable.
+            _write_skip_census()
             raise schedule_refusal
 
         # Update waiting queue
@@ -9202,6 +9277,8 @@ class Scheduler(
             admitted_rids = {req.rid for req in can_run_list}
             missing = [rid for rid in scheduled_extents if rid not in admitted_rids]
             if missing:
+                # #971: the refusal path must leave the skip census readable.
+                _write_skip_census()
                 raise PPScheduleRefused(
                     f"#791 FORWARDED SCHEDULE UNEXECUTABLE: the decision names "
                     f"{len(scheduled_extents)} request(s) and this rank's "
@@ -9213,6 +9290,8 @@ class Scheduler(
                 )
             extra = [rid for rid in admitted_rids if rid not in scheduled_extents]
             if extra:
+                # #971: the refusal path must leave the skip census readable.
+                _write_skip_census()
                 raise PPScheduleRefused(
                     f"#791 FORWARDED SCHEDULE UNEXECUTABLE: this rank admitted "
                     f"rid(s)={','.join(sorted(extra))}, which the decision does "

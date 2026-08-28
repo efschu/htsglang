@@ -132,7 +132,15 @@ class TheReissueCandidateSetMustSeeAChunkedContinuation(unittest.TestCase):
             chunked_req=chunked,
             running_batch=types.SimpleNamespace(reqs=[running]),
         )
-        holder._pp_chunked_req_before_by_slot = {0: slot}
+        # #971 THE MASKING FIXTURE, corrected. This was `{0: slot}` -- a dict,
+        # the one container `pp_request_locations`' `.values()` lookup could
+        # read. Production builds this ring as a LIST (`init_pp_loop_state`:
+        # `[None] * pp_loop_size`), on which that lookup raised AttributeError
+        # and was swallowed as "a stand-in that is not a mapping". So the
+        # fourth place this test claims to cover was, in production, empty for
+        # every consumer -- and the fixture was the reason nobody could see
+        # it. The test now drives the shape the product has.
+        holder._pp_chunked_req_before_by_slot = [slot]
         got = self._locations(holder)
         for rid in (RID_WAITING, RID_CHUNKED, RID_SLOT, RID_RUNNING):
             self.assertIn(rid, got, f"{rid} is one of the four places")
