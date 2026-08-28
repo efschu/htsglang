@@ -1590,7 +1590,7 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self, req: Req, truncation_align_size: Optional[int]
     ):
         # PS2 batch separation (see budget_state): a born-spilled-deep prompt
         # owns its extend batch exclusively.

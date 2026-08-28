@@ -285,7 +285,10 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_pp_mixin import (
+    SchedulerPPMixin,
+    pp_upstream_void_pending,
+)
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
@@ -7493,7 +7496,52 @@ class Scheduler(
         # event loop, and a phase flip into the TP layout must not be able to
         # inherit a void decided in the PP window. `init_pp_loop_state` clears
         # it at every cutover for the same reason.
-        if self.ps.pp_size > 1 and getattr(self, "_pp_admission_pass_voided", False):
+        # #951: AND THE MIRROR OF IT, WHICH THIS GUARD NEVER RECEIVED.
+        #
+        # `_event_loop_pp_body` runs two voids and calls the second "the mirror
+        # of" the first. They were not mirrored here. #797 (this rank
+        # retracted) sets `_pp_admission_pass_voided` in `_pp_void_retracted_
+        # pass`, which runs BEFORE `get_next_batch_to_run`, so its pass is
+        # refused above and builds nothing. #798 (this rank's UPSTREAM did not
+        # launch) sets the same flag in `_pp_void_pass_without_upstream_
+        # launch`, which runs AFTER this method returns -- so its pass ran the
+        # whole of `_get_new_batch_prefill_raw` and was unwound retroactively
+        # by `_pp_void_own_batch`.
+        #
+        # THE UNWIND CANNOT BE COMPLETED, WHICH IS WHY THIS IS A GUARD.
+        # `_get_new_batch_prefill_raw` reaches `_retract_decode_and_requeue`
+        # (via the #679 relief ladder and the #888b seat yield), and that
+        # method sends `AbortReq` to the tokenizer over `ipc_channels`. A
+        # message already on the wire to another process is not scheduler
+        # state and no handler can put it back. Every other unrestored item is
+        # a matter of writing more restore code; this one is a matter of
+        # physics, so the pass must not run rather than be undone. The same
+        # reasoning the #797 branch above states in one line: "The retraction
+        # voids the pass, so the pass must build nothing at all."
+        #
+        # Specimens: boot_943bx_dc4895e1dc_0828_000240.log and _001113.log,
+        # both dead at exactly 7 batches on `assert self.chunked_req is None`
+        # (this file, `_get_new_batch_prefill_raw`), immediately after a
+        # `#798 PP-ADMISSION pass voided` / `#797d own pass voided` pair.
+        #
+        # Rank-uniformity is unchanged, and it is per-hop rather than
+        # group-wide by construction: `pp_upstream_void_pending` reads only
+        # `_pp_upstream_launched_incoming`, which the upstream STATED on this
+        # pass's admission message, and the void is still forwarded downstream
+        # by `_pp_void_pass_without_upstream_launch` after this method returns
+        # -- so the ranks below take the same decision off the same fact, one
+        # hop later, exactly as they did before.
+        _pp_void_pending = pp_upstream_void_pending(self)
+        if self.ps.pp_size > 1 and (
+            getattr(self, "_pp_admission_pass_voided", False) or _pp_void_pending
+        ):
+            if _pp_void_pending:
+                # #951 / #801-spin: hand the void site the one thing it can no
+                # longer read for itself. See its own comment for why an empty
+                # slot stops being evidence once this guard exists.
+                self._pp_upstream_void_withheld_work = bool(self.waiting_queue) or (
+                    running_batch is not None and not running_batch.is_empty()
+                )
             self._round_built_nothing = False
             return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
@@ -9053,7 +9101,6 @@ class Scheduler(
             try:
                 res = adder.add_one_req(
                     req,
-                    has_chunked_req=(self.chunked_req is not None),
                     truncation_align_size=self.truncation_align_size,
                 )
             except PPScheduleRefused as exc:
@@ -9283,6 +9330,40 @@ class Scheduler(
 
         if adder.new_chunked_req is not None:
             # Update chunked prefill
+            #
+            # #951: WHAT ACTUALLY UPHOLDS THIS ASSERT, recorded because a dead
+            # parameter used to imply something else. `add_one_req` carried a
+            # `has_chunked_req` argument that its body never read -- it only
+            # ever forwarded to `add_one_req_ignore_eos`, and upstream deleted
+            # that last consumer in 8cc77261ec ("Super tiny remove unused
+            # argument"). It was never a guard, and reading it as one cost a
+            # boot window: it is removed rather than left to mislead again.
+            #
+            # The invariant is held by ARITHMETIC, not by a check. When the
+            # carried continuation survives `add_chunked_req` above, it has
+            # normally spent all of `rem_chunk_tokens`, so the fresh-request
+            # chunk branch in `add_one_req` computes `trunc_len <= 0` and
+            # never reaches `new_chunked_req`. That is emergent, not stated.
+            #
+            # AND IT IS BREAKABLE -- measured, not reasoned. Witnesses under
+            # /spinning/evidence-665-f1/witness_951/ drive the real
+            # `PrefillAdder` into three states where `add_chunked_req` returns
+            # the request while leaving `rem_chunk_tokens` positive (a
+            # `rem_total_tokens`-bound truncation, the hybrid-SWA early exit,
+            # and the #679 park), and a mid-pass replenishment of
+            # `rem_total_tokens` -- priority preemption there, request
+            # retraction on this rig -- then lets the loop mint a SECOND
+            # chunked request and trip this line. The replenishment is a hard
+            # requirement: witness_941_d2 is the negative control and does not
+            # reproduce without it.
+            #
+            # #951 closes the PP instance of that (a #798-voided pass no
+            # longer runs this function at all; see the void guard in
+            # `get_next_batch_to_run`). It does NOT close the general case,
+            # which needs its own posten and its own danger-direction analysis
+            # -- refusing a fresh chunked admission can wedge a request
+            # mid-prefill, the #858 shape. The assert stays: it is the honest
+            # watcher, and it has now named its own reachability.
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 

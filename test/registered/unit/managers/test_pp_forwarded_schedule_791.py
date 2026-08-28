@@ -177,7 +177,7 @@ def _pp0_builds_its_own_decision(reqs):
 
     adder = _adder(None)  # PP0 owns its own admission truth: no schedule.
     for req in reqs:
-        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        adder.add_one_req(req, truncation_align_size=None)
     return (
         build_pp_admission_decision(
             LIVE_MB,
@@ -391,9 +391,7 @@ def _victim_pass(h, decision, res):
 
     adder = _adder(schedule or None)
     try:
-        outcome = adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
+        outcome = adder.add_one_req(req, truncation_align_size=None)
         res["add_result"] = str(outcome)
         res["refused"] = None
     except PPScheduleRefused as exc:
@@ -484,7 +482,6 @@ def _order_pass(h, decision, res):
     for rid in local_queue_order:
         adder.add_one_req(
             _Req(prefix_len=0, host_resident=0, rid=rid, total=ORDER_EXTEND),
-            has_chunked_req=False,
             truncation_align_size=None,
         )
     res["local_order"] = [r.rid for r in adder.can_run_list]
@@ -539,7 +536,7 @@ def _producer_pass(h, decision, res):
 
     req = _Req(prefix_len=LONG_PROMPT_PREFIX, host_resident=0, total=LONG_PROMPT_TOKENS)
     adder = _adder(schedule or None)
-    adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+    adder.add_one_req(req, truncation_align_size=None)
     res["batch_tokens"] = int(req.extend_range.length)
 
     got = h._pp_recv_proxy_tensors(LIVE_MB)
@@ -1087,7 +1084,6 @@ class PPOrderBatchBySchedule791(unittest.TestCase):
         before = adder.rem_chunk_tokens
         adder.add_one_req(
             _Req(prefix_len=TOLD_PREFIX, host_resident=0),
-            has_chunked_req=False,
             truncation_align_size=None,
         )
         self.assertEqual(adder.rem_chunk_tokens, before - TOLD_EXTEND)
@@ -1096,20 +1092,20 @@ class PPOrderBatchBySchedule791(unittest.TestCase):
     def test_a_non_last_chunk_is_announced_as_the_new_chunked_request(self):
         adder = _adder({RID: (TOLD_PREFIX, TOLD_EXTEND)})
         req = _Req(prefix_len=TOLD_PREFIX, host_resident=0)
-        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        adder.add_one_req(req, truncation_align_size=None)
         self.assertIs(adder.new_chunked_req, req)
 
     def test_a_last_chunk_is_not(self):
         adder = _adder({RID: (0, PROMPT_TOKENS)})
         req = _Req(prefix_len=0, host_resident=0)
-        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        adder.add_one_req(req, truncation_align_size=None)
         self.assertIsNone(adder.new_chunked_req)
 
     def test_an_impossible_geometry_raises_rather_than_narrowing(self):
         adder = _adder({RID: (TOLD_PREFIX, TOLD_EXTEND)})
         req = _Req(prefix_len=PREFETCHED_PREFIX, host_resident=PREFETCHED_PREFIX)
         with self.assertRaises(PPScheduleRefused) as ctx:
-            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+            adder.add_one_req(req, truncation_align_size=None)
         self.assertIn(RID, str(ctx.exception))
         self.assertEqual(adder.can_run_list, [], "no partial batch may survive")
 

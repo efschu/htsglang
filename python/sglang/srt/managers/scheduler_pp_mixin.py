@@ -957,6 +957,53 @@ def pp_void_relay_stop_rank(
     return max(int(pp_size) - 1, 0)
 
 
+def pp_upstream_void_pending(scheduler) -> bool:
+    """#951: is this pass ALREADY void because the upstream did not launch?
+
+    THE ONE PREDICATE, READ AT TWO MOMENTS. `_pp_void_pass_without_upstream_
+    launch` asks this question AFTER `get_next_batch_to_run`, which is where
+    the void must be FORWARDED from -- that placement is #798's and it is
+    correct. scheduler.py's void guard asks it BEFORE, which is where the pass
+    must be REFUSED. Two moments, one fact; a second copy of these four
+    conditions is how the two would drift.
+
+    WHY IT IS ANSWERABLE THIS EARLY, which is the whole reason #951 is a guard
+    and not a bigger unwind. `_pp_upstream_launched_incoming` is written by
+    `_pp_recv_admission_decision`, and that method's own docstring records its
+    placement: "Positioned in `_event_loop_pp_body` strictly BEFORE
+    `get_next_batch_to_run`". So by the time the guard runs, this rank has
+    already been told, by the sender itself, whether its upstream launched.
+    Nothing here is derived from local state and nothing here is a new
+    collective -- it is a per-hop fact that already crossed the wire.
+
+    WHAT IT DELIBERATELY DOES NOT ASK: whether this rank derived a batch.
+    #798's own site adds that term (`self.mbs[mb_id] is not None`) because it
+    runs after the plan and uses it to scope the #801-spin streak. It is not
+    part of the decision to REFUSE the pass -- a pass whose upstream posted no
+    hidden states may not run whether or not this rank could have filled it.
+
+    NO-OP ON EVERY PATH THAT CANNOT HAVE THE PROBLEM, and this list is the
+    dangerous half. The first rank never receives an admission decision, so
+    `_pp_upstream_launched_incoming` is False on EVERY pass it takes; a guard
+    that skipped the `is_first_rank` term would void every pass on PP0 and
+    serve nothing at all. `pp_size <= 1` has no upstream hop, and a gapped set
+    has no stage-boundary proxy for the void to protect.
+
+    Tolerant of a stand-in that never ran `init_pp_loop_state`, as this file's
+    convention requires (#787): every read is defaulted rather than asserted,
+    and every default is the INERT answer.
+    """
+    ps = getattr(scheduler, "ps", None)
+    if ps is None or int(getattr(ps, "pp_size", 1) or 1) <= 1:
+        return False
+    pp_group = getattr(scheduler, "pp_group", None)
+    if pp_group is None or getattr(pp_group, "is_first_rank", True):
+        return False
+    if getattr(scheduler, "_pp_gapped_wire", False):
+        return False
+    return not getattr(scheduler, "_pp_upstream_launched_incoming", False)
+
+
 def pp_idle_void_should_report(streak: int) -> bool:
     """#801-spin: report a no-progress void streak on powers of two only.
 
@@ -1954,6 +2001,13 @@ class SchedulerPPMixin:
                 self._pp_pass_voided_incoming = False
                 self._pp_upstream_launched_incoming = False
                 self._pp_admission_pass_voided = False
+                # #951: reset in the same breath and for the same reason. This
+                # one is written by scheduler.py's void guard DURING the pass
+                # and read by `_pp_void_pass_without_upstream_launch` after it,
+                # so its whole life is one pass; a stale True would let a rank
+                # that is now idle keep incrementing the #801-spin streak it is
+                # no longer earning.
+                self._pp_upstream_void_withheld_work = False
                 if self.ps.pp_size > 1 and not self.pp_group.is_first_rank:
                     with torch.profiler.record_function("pp_admission_decision_recv"):
                         incoming_decision = self._pp_recv_admission_decision()
@@ -4493,6 +4547,10 @@ class SchedulerPPMixin:
         self._pp_admission_pass_voided: bool = False
         self._pp_pass_voided_incoming: bool = False
         self._pp_upstream_launched_incoming: bool = False
+        # #951: pass-scoped like the three above -- scheduler.py's void guard
+        # writes it, `_pp_void_pass_without_upstream_launch` reads it once, and
+        # a cutover must not carry either across.
+        self._pp_upstream_void_withheld_work: bool = False
         # #801-spin: consecutive no-progress voids. Cleared here for the same
         # reason as the flags above -- a cutover rebuilds the slot ring, so a
         # streak counted against the old one names nothing in the new one.
@@ -5916,6 +5974,21 @@ class SchedulerPPMixin:
         safe defense-in-depth rather than a second, competing source of
         truth.
         """
+        # #801-spin: CONSUMED FIRST, and #951 is why the position matters.
+        #
+        # The #798 site sets this for the single pass it is suppressing and
+        # this method is documented as consuming it, "so it can never outlive
+        # this pass". That held only while the #798 path always arrived here
+        # with a batch to void. Since #951 refuses that pass before it builds
+        # anything, this method now takes the empty-slot return below on
+        # exactly those passes -- and a consume that sits after the return is
+        # not a consume. The flag would then survive into the NEXT void, which
+        # is an ordinary #797 retraction, and silence a record that nothing
+        # asked to be silenced. Read and cleared before any early exit; the
+        # local is what the log below reads.
+        suppress = getattr(self, "_pp_idle_void_suppress_log", False)
+        self._pp_idle_void_suppress_log = False
+
         batch = self.mbs[mb_id] if mb_id < len(self.mbs) else None
         if batch is None:
             return False
@@ -5983,13 +6056,11 @@ class SchedulerPPMixin:
             self.waiting_queue.append(req)
             released += 1
 
-        # #801-spin: CONSUMED, never merely read. The #798 site sets this for
-        # the single pass it is suppressing; clearing it here means every other
-        # caller of this method -- the #797 retraction path above all -- logs
+        # #801-spin: CONSUMED, never merely read -- read and cleared at the top
+        # of this method (see there for why the position is load-bearing), so
+        # every other caller -- the #797 retraction path above all -- logs
         # exactly as it always did, and a stale True can never survive into a
         # pass that did not ask for it.
-        suppress = getattr(self, "_pp_idle_void_suppress_log", False)
-        self._pp_idle_void_suppress_log = False
         if not suppress:
             logger.warning(
                 "#797d PP-ADMISSION own pass voided on slot %d: get_next_batch_to_run "
@@ -6090,25 +6161,39 @@ class SchedulerPPMixin:
         there, so the receive this prevents is not made in the first place),
         an upstream that did launch, and a slot that is already empty.
         """
-        if self.ps.pp_size <= 1 or self.pp_group.is_first_rank:
-            return False
-        if getattr(self, "_pp_gapped_wire", False):
-            return False
-        if getattr(self, "_pp_upstream_launched_incoming", False):
+        if not pp_upstream_void_pending(self):
             # #801-spin: THE RESET, and it is the whole definition of progress
             # here. The upstream launched, so this pass can run and this rank's
-            # resident state can change. Every other early return above is a
-            # shape in which the spin cannot occur at all (no upstream, no
-            # wire), and the empty-slot return below is the shape in which this
-            # rank has nothing to re-derive -- all of them clear the streak, so
-            # a streak counts consecutive passes of exactly one state: THIS
-            # RANK HAD WORK AND ITS UPSTREAM HAD NOTHING TO GIVE IT.
+            # resident state can change. Every other shape the predicate
+            # excludes is one in which the spin cannot occur at all (no
+            # upstream, no wire), and the empty-slot return below is the shape
+            # in which this rank has nothing to re-derive -- all of them clear
+            # the streak, so a streak counts consecutive passes of exactly one
+            # state: THIS RANK HAD WORK AND ITS UPSTREAM HAD NOTHING TO GIVE
+            # IT.
             self._pp_upstream_idle_void_streak = 0
             return False
         batch = self.mbs[mb_id] if mb_id < len(self.mbs) else None
-        if batch is None:
+        if batch is None and not getattr(
+            self, "_pp_upstream_void_withheld_work", False
+        ):
             self._pp_upstream_idle_void_streak = 0
             return False
+        # #951: AND THE SLOT IS EMPTY BECAUSE THE GUARD EMPTIED IT. Once the
+        # void is decided before the plan, `self.mbs[mb_id]` is None on exactly
+        # the passes this method used to find non-empty, so reading emptiness
+        # alone would retire the #801-spin detector at the moment it started
+        # mattering -- a livelock that no longer counts is a livelock that no
+        # longer raises. scheduler.py's guard therefore records what it
+        # withheld: True only when this rank HELD WORK (a non-empty waiting
+        # queue, or a running batch) and was refused anyway, which is the same
+        # "this rank had work and its upstream had nothing to give it" the
+        # streak has always counted. It is a pre-plan superset of "derived a
+        # batch" -- work the pass could not have fitted also counts now -- and
+        # that is the safe direction here: it can only make a genuine
+        # no-progress streak visible sooner, never hide one, and an idle rank
+        # (empty queue, empty running batch) still clears the streak exactly as
+        # before.
 
         self._pp_upstream_idle_voids = getattr(self, "_pp_upstream_idle_voids", 0) + 1
         streak = getattr(self, "_pp_upstream_idle_void_streak", 0) + 1

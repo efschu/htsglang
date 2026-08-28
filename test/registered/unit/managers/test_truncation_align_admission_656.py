@@ -123,9 +123,7 @@ def test_a_chunk_budget_below_the_alignment_refuses_every_long_request():
         None`), so that is what this measures.
         """
         adder = _adder(rem_chunk_tokens=256)
-        adder.add_one_req(
-            _req(2000), has_chunked_req=False, truncation_align_size=align
-        )
+        adder.add_one_req(_req(2000), truncation_align_size=align)
         return len(adder.can_run_list) > 0
 
     # 256-token chunk budget against a 4096-token alignment: the exact shape

@@ -136,7 +136,7 @@ class _FakeAdder:
         self.preempt_list: List[_FakeReq] = []
         self.new_chunked_req = None
 
-    def add_one_req(self, req, has_chunked_req=False, truncation_align_size=None):
+    def add_one_req(self, req, truncation_align_size=None):
         if not self._verdicts:
             return AddReqResult.CONTINUE
         return self._verdicts.pop(0)
