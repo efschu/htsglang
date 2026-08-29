@@ -4055,7 +4055,31 @@ class SchedulerPPMixin:
                 # every channel is now deferred by a full slot cycle, so there
                 # is no privileged edge left to special-case.
                 self._pp_send_lap = int(getattr(self, "_pp_send_lap", 0)) + 1
-                self._pp_drain_due_sends()
+                # #969 CUT S: NO DRAIN ON THE PASS PATH. Upstream has no such
+                # call at all -- `main:scheduler_pp_mixin.py:93-174` joins each
+                # send kind at exactly the point it is about to be reposted
+                # (`send_req_work` at :104, `send_proxy_work` at :132, the
+                # output work inside
+                # `_pp_commit_send_output_work_and_preprocess_output_tensors`),
+                # and those three points all survive here.
+                #
+                # #1015e added a lap-lagged drain on the premise that "a peer
+                # making any progress at all has taken it", so a timeout here
+                # means a dead peer. The premise is false on a pipeline that is
+                # still FILLING: on the first lap nobody has taken anything yet,
+                # every rank blocks in its own drain joining a send whose
+                # receiver is blocked in the same drain, and the cycle #1015e
+                # says "stops being constructible" is exactly what forms.
+                #
+                # MEASURED, and this is the first boot in the campaign that
+                # could measure it (the handover records #1015e as COMMITTED,
+                # STILL UNTESTED, because death had always preceded the 120s
+                # bound): boot_969cut_c7970a4d2d_0829_132658.log with the idle
+                # census disarmed -- 3 LAUNCH-JUNCTION lines total, one per
+                # rank, `#1009 occurrence 1` on all three and never rising,
+                # then `#973 RING COMMIT TIMEOUT` after 120s in
+                # `_pp_drain_due_sends -> _pp_join_comm_work -> bounded_wait`.
+                # One lap each, then the ring stops.
                 self._pp_forward_and_process_input_requests(recv_reqs)
                 # #791 PP ADMISSION UNIFORMITY. Consume THIS pass's inbound
                 # admission decision before this rank derives its own batch,
