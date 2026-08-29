@@ -221,6 +221,36 @@ class SchedulerBatchResultProcessor:
     ):
         skip_stream_req = None
 
+        # #1003: A VOIDED SLOT HAS NO RESULT, AND MUST NOT BE PROCESSED AS IF
+        # IT HAD ONE. Boot 54 died here -- `result.copy_done` on `result=None`
+        # -- immediately after PP1 logged "#968b REHOME-ON-DISPLACE ...
+        # route=void-output-cross-slot". The void consumes the slot, and the
+        # (batch, result) pair still travelled on with result unset.
+        #
+        # Same class as boot 52's `d2h_event` deref: a void is a statement
+        # that the pass did not run, and every consumer downstream of it has
+        # to be told by the ABSENCE, not by a half-built object. Dropping the
+        # pair here is what "did not run" means; fabricating a result is what
+        # `_pp_make_skip_output_result` exists for and is deliberately NOT
+        # reused, because its zero placeholder is legitimate only for a chunk
+        # that really ran and produced no token.
+        #
+        # Named, never silent: a drop that stops being visible becomes the
+        # quiet token loss this whole window has been chasing.
+        if result is None:
+            logger.warning(
+                "#1003 VOIDED PREFILL RESULT DROPPED: bs=%d rids=%s. The slot "
+                "was voided (the pass ran nowhere) but the batch still "
+                "reached process_batch_result_prefill with no result. "
+                "Dropping the pair instead of dereferencing None; the "
+                "requests keep their state and are re-admitted by the "
+                "ordinary path. A non-zero count here is a void whose "
+                "consumers were not all told.",
+                len(getattr(batch, "reqs", None) or []),
+                ",".join(str(getattr(r, "rid", "?"))[:8] for r in (getattr(batch, "reqs", None) or [])[:4]) or "-",
+            )
+            return
+
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
