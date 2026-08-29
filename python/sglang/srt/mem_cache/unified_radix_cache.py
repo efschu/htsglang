@@ -3136,7 +3136,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             [1 - int(can_terminate), int(operation_terminated)],
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(
+        # #1026: TP **AND** PP. `_all_reduce_attn_groups` reduces over the
+        # attn_cp / attn_tp / tp groups only, so under `--tp-size 1
+        # --pp-size 3` every one of them has world size 1 and this reduce is
+        # a NO-OP: each PP rank then decides for itself whether the prefetch
+        # may terminate. `_all_reduce` is the same call plus `_pp_sync` --
+        # PP0 reduces and every following rank RECEIVES the answer, which is
+        # the follower semantics `raenge-nie-uneins-crash-stop` prescribes
+        # ("alles folgt rang0"). Paired with the value reduce below: entry
+        # and length must be agreed together, or a rank that returns early
+        # here leaves its peer waiting for a sync that never comes.
+        self._all_reduce(
             states,
             torch.distributed.ReduceOp.MAX,
             label="can_terminate_prefetch",
@@ -3167,7 +3177,46 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         min_completed_tokens = completed_tokens
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
-        if self.tp_world_size > 1:
+        # #1026: THE PUBLISHED PREFETCH LENGTH IS THE ADMISSION PREFIX, SO IT
+        # MUST NOT BE A RANK-LOCAL I/O OUTCOME.
+        #
+        # This reduce exists precisely to make the published length identical
+        # on every rank -- :2918 says so in as many words ("stays identical
+        # across ranks"). It was gated on `self.tp_world_size > 1` and routed
+        # through the TP-axis groups, so under `--tp-size 1 --pp-size 3` it
+        # never ran and `min_completed_tokens` stayed whatever THIS rank's
+        # transfer happened to deliver.
+        #
+        # MEASURED, boot 02192f18d4 (§AF5), one rid, same pass:
+        #   PP0  #969B prefix_len=8192 host_hit=327   <- the match AGREES
+        #   PP1  #969B prefix_len=8192 host_hit=327   <- byte for byte
+        #   PP0  prefetch success completed_local=0     min_synced=0
+        #   PP1  prefetch success completed_local=8518  min_synced=8518
+        #   PP0  #788 prefix_lens=0     -> #969N extend=4096
+        #   PP1  #788 prefix_lens=8519  -> #969N extend=1
+        #   ValueError: #631 PP proxy/batch mismatch: 4096 row(s) for a batch
+        #     of 1 token(s), sender_geom=(51e7b97d, 0, 4096) against
+        #     receiver_geom=(51e7b97d, 8519, 8520)
+        # Zero-completions are not a rank-0 property (11/14/9 on that boot):
+        # it is a per-request race, and whichever rank loses it drops its
+        # prefix while its peers keep theirs. That is the divergence the
+        # campaign has been chasing since §W3, one axis below every site it
+        # has cut so far.
+        #
+        # `_all_reduce` is the SAME reduce with `_pp_sync` after it: PP0
+        # reduces across its TP axis and hands the answer down the PP ring by
+        # bounded isend/irecv on the group and tag built for it
+        # (P2PTag.HIRADIX_PP_SYNC). It was written for exactly this, with
+        # exactly the user's follower semantics, and had ZERO callers -- the
+        # PRESENT-BUT-UNWIRED state, not an absent mechanism. Nothing new is
+        # introduced on this path and no new collective is created; the
+        # bounded recv is the "wait for the one decider, crash on expiry"
+        # shape `raenge-nie-uneins-crash-stop` names, never a local guess.
+        #
+        # The `tp_world_size > 1` gate is REPLACED, not widened: the question
+        # is no longer "is there a TP axis" but "is there any peer that must
+        # agree", which under PP there is.
+        if self.tp_world_size > 1 or (self.pp_size > 1 and self.pp_group is not None):
             # Reduce full completed tokens together with the sidecar pools that
             # this prefetch actually transferred, in one all_reduce. The vector
             # spans the fixed PoolName universe, not the rank-local comp_xfers
@@ -3180,7 +3229,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for p in sidecar_pools:
                 packed_list[_pool_slot(p, 1)] = int(hit_pages.get(p, 0))
             packed = torch.tensor(packed_list, dtype=torch.int)
-            self._all_reduce_attn_groups(
+            self._all_reduce(
                 packed,
                 torch.distributed.ReduceOp.MIN,
                 label="check_prefetch_progress",
