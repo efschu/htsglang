@@ -593,29 +593,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         are gated on this predicate. Stock even-TP HiCache (uniform host pools)
         never trips it -> that path is byte-identical. Uses the same attn/TP
         groups the existing prefetch collectives run on."""
-        #1027 GATE 1 OF THE CLASS: THE QUESTION IS "IS THERE A PEER THAT MUST
-        # AGREE", NOT "IS THERE A TP AXIS".
-        #
-        # `tp_world_size > 1` switched this entire family off under
-        # `--tp-size 1 --pp-size 3`, so the two symmetrization mechanisms this
-        # predicate gates -- participation consensus and the capacity floor --
-        # never ran, registration was never made symmetric, and the deadlock
-        # the docstring above describes stayed live on the PP axis. It is the
-        # same wrong-axis defect as #1026's completion agreement, one layer up,
-        # and it is why #1026 alone produced `#789 PROXY READINESS TIMEOUT`
-        # (§AG4): the value sync spanned PP before the ENTRY did.
-        #
-        # ORDER IS LOAD-BEARING and is the reason both live in one commit:
-        # entry symmetry (here) must hold before the completion agreement
-        # (#1026) spans, or a rank that never registered leaves its peer
-        # waiting on a sync that is never posted.
-        peers_must_agree = self.tp_world_size > 1 or (
-            self.pp_size > 1 and self.pp_group is not None
-        )
         return (
             getattr(self, "enable_storage", False)
             and self.cache_controller is not None
-            and peers_must_agree
+            and self.tp_world_size > 1
             and uneven_dcp_active()
         )
 
@@ -2983,24 +2964,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             vote = torch.tensor(
                 [_PREFETCH_VOTE_TAG, -_PREFETCH_VOTE_TAG, local_ok], dtype=torch.int
             )
-            # #1027: PP0 DECIDES PARTICIPATION, THE FOLLOWERS EXECUTE IT.
-            #
-            # `_all_reduce` is the TP reduce on PP0 followed by `_pp_sync`, so
-            # across the PP axis this is not an AND-vote but the follower rule
-            # the user set: "alles folgt rang0 ... ein Einigungsprotokoll
-            # existiert dort gar nicht, weil ausser Rang 0 niemand je
-            # entscheidet". A one-directional ring cannot compute an AND at
-            # PP0 anyway, and building the return leg would be the new
-            # collective this path may not have (recorded fatal).
-            #
-            # THE CONSEQUENCE IS DELIBERATE: a follower whose own allocation
-            # failed no longer holds a private veto. It is told to participate
-            # and must, and if it provably cannot it raises by name below --
-            # the crash/stop backstop of `raenge-nie-uneins-crash-stop`, never
-            # a local opt-out. A rank that silently skipped is exactly the
-            # divergence that cost this campaign twenty boots; a named death
-            # is bounded and readable, a silent skip is neither.
-            self._all_reduce(
+            self._all_reduce_attn_groups(
                 vote,
                 torch.distributed.ReduceOp.MIN,
                 label="prefetch_participation_vote",
@@ -3024,22 +2988,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if anchor_lock_params is not None:
                     self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 return
-            # Positive consensus: PP0 says participate -> all fall through to
-            # register. #1027: a follower that was TOLD to participate and
-            # cannot is the crash/stop backstop, not a silent skip -- the one
-            # legal reaction to detected rank divergence.
-            if alloc_failed or host_indices is None:
-                raise HiCacheCollectiveDesyncError(
-                    "#1027 PREFETCH PARTICIPATION UNHONOURABLE on this rank: "
-                    "the decider admitted this prefetch for the group and this "
-                    "rank could not allocate its host span "
-                    f"(alloc_failed={alloc_failed}, host_indices="
-                    f"{'None' if host_indices is None else 'present'}). "
-                    "Skipping locally would leave this rank out of every "
-                    "downstream prefetch collective and give it a different "
-                    "admission prefix from its peers, which is the divergence "
-                    "this path exists to make impossible. Stopping instead."
-                )
+            # Positive consensus: every rank allocated -> all fall through to register.
         elif alloc_failed:
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices,
@@ -3187,17 +3136,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             [1 - int(can_terminate), int(operation_terminated)],
             dtype=torch.int,
         )
-        # #1026: TP **AND** PP. `_all_reduce_attn_groups` reduces over the
-        # attn_cp / attn_tp / tp groups only, so under `--tp-size 1
-        # --pp-size 3` every one of them has world size 1 and this reduce is
-        # a NO-OP: each PP rank then decides for itself whether the prefetch
-        # may terminate. `_all_reduce` is the same call plus `_pp_sync` --
-        # PP0 reduces and every following rank RECEIVES the answer, which is
-        # the follower semantics `raenge-nie-uneins-crash-stop` prescribes
-        # ("alles folgt rang0"). Paired with the value reduce below: entry
-        # and length must be agreed together, or a rank that returns early
-        # here leaves its peer waiting for a sync that never comes.
-        self._all_reduce(
+        self._all_reduce_attn_groups(
             states,
             torch.distributed.ReduceOp.MAX,
             label="can_terminate_prefetch",
@@ -3228,46 +3167,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         min_completed_tokens = completed_tokens
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
-        # #1026: THE PUBLISHED PREFETCH LENGTH IS THE ADMISSION PREFIX, SO IT
-        # MUST NOT BE A RANK-LOCAL I/O OUTCOME.
-        #
-        # This reduce exists precisely to make the published length identical
-        # on every rank -- :2918 says so in as many words ("stays identical
-        # across ranks"). It was gated on `self.tp_world_size > 1` and routed
-        # through the TP-axis groups, so under `--tp-size 1 --pp-size 3` it
-        # never ran and `min_completed_tokens` stayed whatever THIS rank's
-        # transfer happened to deliver.
-        #
-        # MEASURED, boot 02192f18d4 (§AF5), one rid, same pass:
-        #   PP0  #969B prefix_len=8192 host_hit=327   <- the match AGREES
-        #   PP1  #969B prefix_len=8192 host_hit=327   <- byte for byte
-        #   PP0  prefetch success completed_local=0     min_synced=0
-        #   PP1  prefetch success completed_local=8518  min_synced=8518
-        #   PP0  #788 prefix_lens=0     -> #969N extend=4096
-        #   PP1  #788 prefix_lens=8519  -> #969N extend=1
-        #   ValueError: #631 PP proxy/batch mismatch: 4096 row(s) for a batch
-        #     of 1 token(s), sender_geom=(51e7b97d, 0, 4096) against
-        #     receiver_geom=(51e7b97d, 8519, 8520)
-        # Zero-completions are not a rank-0 property (11/14/9 on that boot):
-        # it is a per-request race, and whichever rank loses it drops its
-        # prefix while its peers keep theirs. That is the divergence the
-        # campaign has been chasing since §W3, one axis below every site it
-        # has cut so far.
-        #
-        # `_all_reduce` is the SAME reduce with `_pp_sync` after it: PP0
-        # reduces across its TP axis and hands the answer down the PP ring by
-        # bounded isend/irecv on the group and tag built for it
-        # (P2PTag.HIRADIX_PP_SYNC). It was written for exactly this, with
-        # exactly the user's follower semantics, and had ZERO callers -- the
-        # PRESENT-BUT-UNWIRED state, not an absent mechanism. Nothing new is
-        # introduced on this path and no new collective is created; the
-        # bounded recv is the "wait for the one decider, crash on expiry"
-        # shape `raenge-nie-uneins-crash-stop` names, never a local guess.
-        #
-        # The `tp_world_size > 1` gate is REPLACED, not widened: the question
-        # is no longer "is there a TP axis" but "is there any peer that must
-        # agree", which under PP there is.
-        if self.tp_world_size > 1 or (self.pp_size > 1 and self.pp_group is not None):
+        if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
             # this prefetch actually transferred, in one all_reduce. The vector
             # spans the fixed PoolName universe, not the rank-local comp_xfers
@@ -3280,7 +3180,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for p in sidecar_pools:
                 packed_list[_pool_slot(p, 1)] = int(hit_pages.get(p, 0))
             packed = torch.tensor(packed_list, dtype=torch.int)
-            self._all_reduce(
+            self._all_reduce_attn_groups(
                 packed,
                 torch.distributed.ReduceOp.MIN,
                 label="check_prefetch_progress",
