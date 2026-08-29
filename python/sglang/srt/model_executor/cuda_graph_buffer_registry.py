@@ -467,6 +467,8 @@ class CudaGraphBufferRegistry:
         gpu_srcs: List[torch.Tensor] = []
         cpu_dsts: List[torch.Tensor] = []
         cpu_srcs: List[torch.Tensor] = []
+        cpu_names: List[str] = []
+        gpu_names: List[str] = []
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None or not slot.copy_from_fb:
                 continue
@@ -498,11 +500,38 @@ class CudaGraphBufferRegistry:
             if dst.device.type == "cpu":
                 cpu_dsts.append(dst)
                 cpu_srcs.append(src)
+                cpu_names.append(slot.name)
             else:
                 gpu_dsts.append(dst)
                 gpu_srcs.append(src)
+                gpu_names.append(slot.name)
         if gpu_dsts:
-            _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
+            try:
+                _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
+            except RuntimeError as exc:
+                # #1006: NAME THE SLOT. `_grouped_foreach_copy_` batches every
+                # enabled slot into ONE `torch._foreach_copy_`, so a single bad
+                # pair fails the whole call with a shape pair and no name --
+                # boot 65 died as "output with shape [1] doesn't match the
+                # broadcast shape [3]" and that sentence does not say WHICH
+                # field, which is the difference between a fix and a guess.
+                #
+                # Costs nothing on the happy path: the walk runs only after the
+                # grouped call has already raised. `axis == "none"` slots take
+                # the whole buffer unsliced (:492), so a per-rank field under
+                # PP>1 is the shape this is most likely to catch.
+                bad = [
+                    f"{n}: dst{tuple(d.shape)} <- src{tuple(x.shape)}"
+                    for n, d, x in zip(gpu_names, gpu_dsts, gpu_srcs)
+                    if d.shape != x.shape
+                ]
+                raise RuntimeError(
+                    f"#1006 CUDA-GRAPH SLOT SHAPE MISMATCH (raw_bs={raw_bs} "
+                    f"padded_bs={padded_bs} raw_num_tokens={raw_num_tokens} "
+                    f"padded_num_tokens={padded_num_tokens}): "
+                    + ("; ".join(bad) if bad else "no pairwise mismatch found")
+                    + f". Original: {exc}"
+                ) from exc
         for dst, src in zip(cpu_dsts, cpu_srcs):
             dst.copy_(src)
 
