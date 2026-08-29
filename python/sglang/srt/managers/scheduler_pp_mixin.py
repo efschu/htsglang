@@ -1664,6 +1664,41 @@ def pp_void_relay_stop_rank(
     return max(int(pp_size) - 1, 0)
 
 
+class PPOutputExpectation:
+    """#1024: PP0's per-slot output-ring verdict, told to the ranks below.
+
+    Rides the REQUEST-CHAIN forward -- the one arc that is unconditional per
+    pass (`_pp_send_pyobj_to_next_stage(recv_reqs, ...)`, guarded only by rank
+    position) and that already carries control objects inline, the way a
+    `PhaseFlipReqInput` arm does. No new collective, no new arc.
+
+    WHY IT HAD TO COME BACK. This fact used to ride `_PP_OUTPUT_EXPECTED_KEY`
+    on the admission wire, which #1015 deleted with that arc. Its consumer did
+    not go away: `_pp_send_output_to_next_stage` asks
+    `_pp_output_expected_for_slot` whether to send a VOID output when it has no
+    real one, and that reads `_pp_output_expected_by_slot`, whose only writer
+    is PP0's own `_pp_note_output_expectation`. On every other rank the table
+    therefore stayed all-False, so the last rank sent NOTHING and the consuming
+    rank's `next_batch_result` stayed None for ever.
+
+    MEASURED, boot_pp3solo_7559e7418e_0829_123725, all three slots:
+        #1023 NO REAL OUTPUT SENT: slot=N target=None
+              expected_for_slot=False -> SILENCE
+    with #1009 stuck at the same count since boot 15, through every
+    slot-lifecycle change, because the producer was never going to send.
+
+    Per-slot, not per-pass: the chain forward is posted BEFORE this rank's own
+    admission, so the value it carries is one lap old. Slot keying absorbs
+    that -- at pp_loop_size 3 a slot's verdict is consumed two laps before the
+    same slot comes round again.
+    """
+
+    __slots__ = ("flags",)
+
+    def __init__(self, flags):
+        self.flags = tuple(bool(f) for f in flags)
+
+
 def pp_upstream_void_pending(scheduler) -> bool:
     """#951: is this pass ALREADY void because the upstream did not launch?
 
@@ -5122,6 +5157,35 @@ class SchedulerPPMixin:
         # strictly safer, and it removes manual's latent at-idle deadlock:
         # manual has only ever been exercised UNDER TRAFFIC, where the loop
         # keeps cycling and the commit happens naturally.
+        # #1024: take PP0's told output-ring verdict off the chain before
+        # anything else looks at the list. Stripped in place so
+        # `process_input_requests` and the flip-arm scan below see only real
+        # requests; applied only on ranks that RECEIVE a chain (PP0 builds the
+        # verdict itself from its own admission and must not overwrite it with
+        # a relayed copy of its own previous lap).
+        _told = [r for r in recv_reqs if isinstance(r, PPOutputExpectation)]
+        if _told:
+            recv_reqs[:] = [
+                r for r in recv_reqs if not isinstance(r, PPOutputExpectation)
+            ]
+            if not self.pp_group.is_first_rank:
+                _flags = _told[-1].flags
+                for _slot, _exp in enumerate(_flags):
+                    if _slot < self.pp_loop_size:
+                        self._pp_note_output_expectation(_slot, bool(_exp), None)
+                self._1024_told = getattr(self, "_1024_told", 0) + 1
+                if self._1024_told <= 3 or self._1024_told % 512 == 0:
+                    logger.warning(
+                        "#1024 OUTPUT EXPECTATION TOLD: applied %s from the "
+                        "request chain (occurrence=%d). This is the fact whose "
+                        "absence made the last rank send SILENCE for every "
+                        "slot (#1023); it rides the chain forward, which is "
+                        "unconditional per pass, so no arc and no collective "
+                        "is added.",
+                        list(_flags),
+                        self._1024_told,
+                    )
+
         carries_flip_arm = bool(recv_reqs) and any(
             isinstance(r, PhaseFlipReqInput) for r in recv_reqs
         )
@@ -5191,8 +5255,12 @@ class SchedulerPPMixin:
                 # the gapped layout: the hazard is not gapped-specific.
                 self._pp_commit_comm_work(self.send_req_work)
                 with torch.profiler.record_function("send_reqs_to_next_stage"):
+                    # #1024: PP0's output-ring verdict travels with the chain.
+                    # Appended to the OUTGOING copy only, so
+                    # `process_input_requests` below never sees a control
+                    # object it does not know.
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs,
+                        recv_reqs + [PPOutputExpectation(self._pp_output_expected_by_slot)],
                         async_send=True,
                     )
             # NOTE: no blocking commit here, deliberately. Committing the
