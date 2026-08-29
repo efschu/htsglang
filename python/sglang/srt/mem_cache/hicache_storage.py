@@ -696,39 +696,22 @@ class HiCacheFile(HiCacheStorage):
         # keys (written without the hash) simply no longer match: clean miss
         # instead of a silent wrong-format hit.
         identity_hash = storage_config.model_identity_hash or ""
-        self.config_suffix = f"_{model_name}"
-        # Weighted uneven-DCP owner mode: KV pages carry FULL replicated
-        # kv-heads and are token-sharded, so a page's bytes are complete on its
-        # backup-time owner rank and identical from every rank's perspective.
-        # KV keys therefore drop the rank suffix (single shared file per page,
-        # written by its owner only); component pools (mamba/SWA, genuinely
-        # per-rank shards) keep the rank-suffixed keys below.
-        self.kv_config_suffix = f"_{model_name}"
-        if identity_hash:
-            self.config_suffix += f"_{identity_hash}"
-            self.kv_config_suffix += f"_{identity_hash}"
-        if not is_mla_model:
-            self.config_suffix += f"_{tp_rank}_{tp_size}"
-            if not self.dcp_owner_mode and self.canonical_kv_page is None:
-                self.kv_config_suffix += f"_{tp_rank}_{tp_size}"
-        if enable_pp:
-            self.config_suffix += f"_{pp_size}_{pp_rank}"
-            # #706: the pp suffix is honest ONLY while a stage's page holds just
-            # that stage's layers. Under the canonical page the stages deposit
-            # their slots into one full-width page, so the bytes stop depending
-            # on the cut and the suffix has nothing left to name. The rule is
-            # not "keys always carry geometry" but "the key carries exactly the
-            # geometry the bytes still depend on" -- dropping it is legitimate
-            # here for the same reason dcp_owner_mode may drop the tp suffix,
-            # and for no other reason, which is why it is gated on the format
-            # being active rather than applied to every PP run.
-            if self.canonical_kv_page is None:
-                self.kv_config_suffix += f"_{pp_size}_{pp_rank}"
-        # Under NSA context parallel each CP rank holds a disjoint slice of every
-        # page, so give each rank its own file key to avoid a cross-rank write race.
-        if attn_cp_size > 1:
-            self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
-            self.kv_config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        # #969F: ONE DERIVATION MOMENT. These inputs are kept so the suffixes
+        # can be RE-DERIVED when `install_canonical_windows` later changes the
+        # one fact they depend on. See `_derive_key_suffixes`.
+        self._key_geom = dict(
+            model_name=model_name,
+            identity_hash=identity_hash,
+            is_mla_model=is_mla_model,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            enable_pp=enable_pp,
+            pp_size=pp_size,
+            pp_rank=pp_rank,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
+        )
+        self._derive_key_suffixes()
 
         # Shard directories created so far (see page_shard): keeps the write path
         # to one makedirs per shard instead of one per page.
@@ -1097,6 +1080,55 @@ class HiCacheFile(HiCacheStorage):
             f".{PoolName.MAMBA}"
         )
 
+    def _derive_key_suffixes(self) -> None:
+        """Build the two key suffixes from the geometry the BYTES still depend on.
+
+        #969F: THIS USED TO RUN ONCE, IN `__init__`, AND THE FACT IT READS
+        CHANGES AFTERWARDS. `install_canonical_windows` assigns
+        `self.canonical_kv_page` (:1347 pre-fix) and re-derived nothing, so a
+        store whose canonical page is installed AFTER construction -- which is
+        the live path, `cache_controller.py:1278` -- kept keys carrying
+        `_{tp_rank}_{tp_size}` and `_{pp_size}_{pp_rank}` even though the
+        canonical format had made that geometry irrelevant to the bytes.
+
+        The consequence is the whole read-side miss of this campaign: those
+        terms CHANGE AT EVERY FLIP (PP phase tp_size=1/pp_size=3, TP phase
+        tp_size=3/pp_size=1), so a page written in one phase is asked for under
+        a key the other phase never wrote. Measured: 132 `#937 STALE PREFETCH
+        INSERT REFUSED ... 0 token(s) fetched`, `#cached-token > 0` on 0 of 355
+        prefill lines, 315 of 324 re-admissions matching an empty tree.
+
+        The #706 rule the exemption states is unchanged and is the reason this
+        is a re-derivation and not a new rule: "the key carries exactly the
+        geometry the bytes still depend on". Under the canonical page the bytes
+        stop depending on the cut -- whenever that becomes true, including
+        later than construction.
+
+        The constructor already refuses a canonical mamba blob configured
+        WITHOUT the canonical KV page (":679", "a neutral GDN blob beside
+        pp-suffixed KV pages still misses across the flip") -- the author saw
+        this interaction; the guard simply could not fire for windows installed
+        after construction.
+        """
+        g = self._key_geom
+        self.config_suffix = f"_{g['model_name']}"
+        self.kv_config_suffix = f"_{g['model_name']}"
+        if g["identity_hash"]:
+            self.config_suffix += f"_{g['identity_hash']}"
+            self.kv_config_suffix += f"_{g['identity_hash']}"
+        if not g["is_mla_model"]:
+            self.config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
+            if not self.dcp_owner_mode and self.canonical_kv_page is None:
+                self.kv_config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
+        if g["enable_pp"]:
+            self.config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
+            if self.canonical_kv_page is None:
+                self.kv_config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
+        if g["attn_cp_size"] > 1:
+            self.config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
+            self.kv_config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
+
+
     def _get_suffixed_key(self, key: str) -> str:
         if self._is_draft_key(key):
             return key + self.config_suffix
@@ -1347,6 +1379,12 @@ class HiCacheFile(HiCacheStorage):
         self.canonical_kv_page = kv_page
         self._canonical_kv_extents = kv_page.as_extents()
         self.canonical_mamba_blob = mamba_blob
+        # #969F: THE FACT THE KEY SUFFIX DEPENDS ON JUST CHANGED. Re-derive it
+        # here, at the one place that changes it, so there is a single
+        # derivation function and no second moment. Without this the store
+        # keeps the pre-canonical, geometry-bearing key and every page written
+        # before a flip is unreachable after it.
+        self._derive_key_suffixes()
 
     def get(
         self,
