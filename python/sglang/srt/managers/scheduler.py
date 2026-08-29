@@ -9252,24 +9252,15 @@ class Scheduler(
             # ladder that admitted work itself would be a second admission
             # authority, and the park guard would no longer be final.
             self._maybe_spend_admission_relief(running_batch)
-            # #906 / #890 hole 2: THE CONTINUATION NEVER PASSED THE GATE.
-            # `add_chunked_req` runs here, ~50 lines BEFORE the transport_only
-            # filter, so a chunked request advanced chunk after chunk without
-            # the seam exemption ever being consulted again -- "the next chunk
-            # on a consumed permission" (#858's shape). That is the mechanism
-            # behind the live 20k-token TP wave: one grant, unbounded chunks,
-            # every one `#cached-token: 0`.
-            #
-            # Refusing here is safe in the one way that matters: the request
-            # stays `self.chunked_req` and is NOT dropped, and because its
-            # grant is spent it has left `seam_readmit_candidates`, so its
-            # remaining tokens count as ordinary pending prefill and the policy
-            # arms `tp_to_pp`. It resumes in PP, in the right layout, mid-chunk
-            # and unharmed -- never a wedge.
-            from sglang.srt.managers.phase_purity import (
-                SEAM_TRANSPORT_ROUND_ATTR as _STR_ATTR,
-                seam_grant_is_open as _grant_open,
-            )
+            # #906 / #890 hole 2, AND ITS RETRACTION (#969AB, see the block at
+            # the branch below). The gate this import served refused the next
+            # chunk of an already-resident continuation whenever the seam grant
+            # was spent, on the argument that "its remaining tokens count as
+            # ordinary pending prefill and the policy arms `tp_to_pp`". That
+            # escape was measured FALSE: the policy holds in tp while any other
+            # stamped candidate is queued, so the refusal never converted into
+            # a layout change -- it converted into a continuation slot that was
+            # never released. The import goes with the gate.
             from sglang.srt.managers.scheduler_pp_mixin import (
                 pp_apply_dead_premise_at_chunk_boundary as _pp_apply_dead_premise,
             )
@@ -9367,10 +9358,49 @@ class Scheduler(
                         ",".join(sorted(incoming.keys())) or "-",
                         count,
                     )
-            elif bool(getattr(self, _STR_ATTR, False)) and not _grant_open(
-                self.chunked_req
-            ):
-                self._note_seam_chunk_refused(self.chunked_req)
+            # #969AB THE #906 SPENT-GRANT REFUSAL IS DELETED. It was
+            #
+            #     elif transport_only and not seam_grant_is_open(chunked_req):
+            #         self._note_seam_chunk_refused(self.chunked_req)
+            #
+            # i.e. a resident request that is ALREADY MID-PREFILL and already
+            # holds the continuation slot had its NEXT CHUNK refused, and --
+            # per the #959 comment forty lines below -- the refusal "KEEPS the
+            # continuation without calling the adder at all", so
+            # `adder.chunked_req_outstanding` stayed True and the adder then
+            # refused to mint any other continuation.
+            #
+            # MEASURED, `boot_969nogrid_de3857b1f4_0829_192029.log` (§AA):
+            #     #906 SEAM CHUNK REFUSED           333, on exactly ONE rid
+            #     #967 SECOND CONTINUATION REFUSED  333, on exactly ONE rid
+            #     verdict=DECLINE queue=11 running=0 chunked=1
+            #       reason=loop_skips(add_result_OTHER=1, seam_transport_only=3)
+            # A three-layer cycle in which each layer's documented escape is
+            # falsified by another: #906 promises the policy will arm tp_to_pp
+            # (it logs `holding in tp ... served in THIS layout by
+            # read-through` instead, because other stamped candidates are
+            # still queued); #967 promises "left for a later pass" (no later
+            # pass can differ); W30 assumes its exemption is transient (it is
+            # self-holding, because its members cannot be admitted).
+            #
+            # WHY THIS LINK AND NOT THE OTHER TWO: a continuation is NOT a new
+            # arrival. The tokens were prefilled in the PP window, their KV is
+            # in the canonical store and the re-admission recomputes nothing --
+            # which is the seam exemption's OWN argument for why this is
+            # transport and not work. So the refusal prevented no wrong-layout
+            # work; it only guaranteed that the continuation slot was never
+            # released. It also stands against the standing no-double-prefill
+            # order (#939), under which this interception was legitimate only
+            # as a debugging catch.
+            #
+            # W30 and #959 are deliberately LEFT STANDING for this boot. The
+            # ladder decides whether one deletion breaks the cycle -- the same
+            # discipline that made §Z's asymmetric first cut readable as a
+            # shift rather than a cure. If the cycle falls apart, they are
+            # deletion candidates with overtaken premises (two of their three
+            # are already gone: membership is uniform by construction (§Z2) and
+            # the flip verdict is PP0's (§W3)); they are not pre-emptively cut
+            # here.
             else:
                 # #994 THE SECOND HALF OF THE SAME EXEMPTION.
                 #
