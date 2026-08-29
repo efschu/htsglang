@@ -3201,7 +3201,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # sentinel; 0 is a legitimate break value, so it cannot be the
         # default.
         try:
-            for _r in reqs[:4]:
+            # #998c ALL rids, not the first four: two closing statements of
+            # this window rested on a sample that excluded the dying request.
+            for _r in reqs:
                 _er = getattr(_r, "extend_range", None)
                 # #796 AGAIN, AND THIS TIME I WROTE IT. `prefix_indices` is a
                 # TENSOR; `x or ()` asks `bool(x)`, which torch refuses for a
@@ -3219,8 +3221,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     _st, _en = int(_er.start), int(_er.end)
                     _rec = (_st, _en, _pl, _en - _pl, _st - _pl)
                 _998_SEEN[0] += 1
-                if len(_998_LAST) < 32 or _r.rid in _998_LAST:
-                    _998_LAST[_r.rid] = _rec
+                # #998c HISTORY, not last-writer-wins. Every measurement in
+                # this window compared RANKS AT ONE INSTANT and every one came
+                # out uniform -- because the sender read its number one
+                # forward EARLIER than the receiver (fwd_ct 2107/2106). The
+                # two numbers the guard compares are two TIMESTAMPS, and the
+                # axis "same rank, consecutive passes" was never measured.
+                # `extend_range` is written from 24 sites -- (told,told) by the
+                # truncation, (prefix, prefix+new_len) by add_one_req,
+                # (len(prefix),len(prefix)) by the park -- so a request that
+                # passes through admission, truncation and a park across
+                # several passes MUST see different values. The question is
+                # whether the change falls between the two passes the guard
+                # compares.
+                if len(_998_LAST) < 64 or _r.rid in _998_LAST:
+                    _h = _998_LAST.setdefault(_r.rid, [])
+                    if not _h or _h[-1][1:] != _rec:
+                        _h.append((_998_SEEN[0],) + _rec)
+                        del _h[:-4]
                 if _rec[4] not in (0, -1):
                     _998_BREAKS[0] += 1
         except Exception:  # noqa: BLE001 - a probe may never break prepare_for_extend
