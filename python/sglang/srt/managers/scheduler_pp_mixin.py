@@ -1717,7 +1717,37 @@ def pp_upstream_void_pending(scheduler) -> bool:
         return False
     if getattr(scheduler, "_pp_gapped_wire", False):
         return False
-    return not getattr(scheduler, "_pp_upstream_launched_incoming", False)
+    # #1015c: THE HAZARD THIS REFUSED IS NOW STRUCTURALLY IMPOSSIBLE, so the
+    # refusal is retired rather than re-fed.
+    #
+    # #798 refused a pass whose upstream posted no hidden states, because the
+    # proxy receive would then block on a message nobody sent. Since #1015 the
+    # proxy channel is UNCONDITIONAL on both ends: a rank with no batch, or a
+    # prebuilt one, posts a void frame, so every pass has exactly one frame to
+    # take and the receive cannot block. The premise is gone, and with it the
+    # reason to refuse.
+    #
+    # AND THE ALTERNATIVE WAS MEASURED TO BE WORSE. #1015 deleted this
+    # predicate's only real writer, leaving it `not False` -- always True --
+    # so every downstream rank refused every pass. Boot
+    # boot_pp3solo_01a391fa03_0829_112833.log: 0 prefill batches, 0 served,
+    # the single request stranded in #1008 hold while #798 voids ran, and the
+    # census then reported its 10 rows as a leak because nothing owned them.
+    # The leak was the symptom; this refusal was the cause.
+    #
+    # RESTORING THE OLD TRUTH WAS THE OTHER OPTION AND IT DOES NOT FIT THE
+    # PASS ORDER. The frame that now carries the sender's statement is taken
+    # at the proxy receive, which runs AFTER `get_next_batch_to_run` -- and
+    # scheduler.py's consumer asks this predicate from inside that call. A
+    # value read from the frame would be one pass stale at the only site that
+    # matters, which is a quieter defect than the one it replaces.
+    #
+    # Downstream ranks are also being taken out of the admission-verdict
+    # business entirely (PP0-authoritative direction): a rank refusing a pass
+    # on its own reading of an upstream fact is precisely the rank-local
+    # verdict that model removes. This returns False -- "no void pending" --
+    # and the void decision stays with the rank that owns it.
+    return False
 
 
 def pp_idle_void_should_report(streak: int) -> bool:
