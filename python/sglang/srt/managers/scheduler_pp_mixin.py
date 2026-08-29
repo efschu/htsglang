@@ -4511,7 +4511,35 @@ class SchedulerPPMixin:
                             _occ,
                             self._1019_n,
                         )
-                if cur_batch:
+                # #1022: LAUNCH ONCE PER PASS, NOT ONCE PER LAP.
+                # Before #1021 the slot was wiped on the next empty lap, so
+                # this guard could only ever fire once per batch. #1021 keeps
+                # the slot -- correctly, that is what stopped the rows going
+                # unowned -- and thereby exposed that the guard is `if
+                # cur_batch:` with no notion of "already running". A kept slot
+                # was therefore re-launched on every lap, and boot
+                # 85a1ddc513 died with the batch arriving at the decode graph
+                # carrying its 11 EXTEND tokens (#1006: positions dst(1,) <-
+                # src(11,), mrope_positions dst(3,1) <- src(3,11)) -- a
+                # re-launch of a batch another path had meanwhile re-shaped.
+                #
+                # The in-flight mark #1020 already maintains is the exact
+                # predicate: launch a slot whose pass is outstanding again and
+                # you are running the same pass twice.
+                if cur_batch and mb_id in getattr(self, "_pp_launched_pending", ()):
+                    self._1022_inflight = getattr(self, "_1022_inflight", 0) + 1
+                    if self._1022_inflight <= 3 or self._1022_inflight % 512 == 0:
+                        logger.warning(
+                            "#1022 LAUNCH SKIPPED, PASS ALREADY IN FLIGHT: "
+                            "mb_id=%s (occurrence=%d). The slot is held by "
+                            "#1021 until its result is consumed; re-launching "
+                            "it would run the same pass twice. A count that "
+                            "grows without bound means the result never "
+                            "arrives -- a delivery defect, not a launch one.",
+                            mb_id,
+                            self._1022_inflight,
+                        )
+                elif cur_batch:
                     # #1020: this slot now has an IN-FLIGHT pass. Recorded
                     # before the call so the mark exists even if the launch
                     # blocks or raises; cleared where the slot's result is
