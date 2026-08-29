@@ -9572,7 +9572,75 @@ class Scheduler(
                     _note_skip("batch_full_break", req.rid)
                     break
 
-            if self.enable_hicache_storage:
+            # #969 §Z: THE PREFETCH-READINESS VERDICT IS PP0's, AND ONLY PP0's.
+            #
+            # MEASURED (§Y, `#969N ADMIT` keyed on (forward_ct, slot)): at
+            # fwd_ct=3 PP0 and PP1 admitted `71ee6713` (bs=1, extend=254) while
+            # PP2 admitted `f4b78f22,63667fa6` (bs=2, extend=508) -- which is
+            # verbatim what PP0 admits one pass LATER, at fwd_ct=4. PP2 never
+            # admitted 71ee6713 at all. Three lines above that in PP2's log:
+            # it admitted exactly the two requests whose HiCache prefetch had
+            # just completed ON PP2, and 71ee6713 has no completion line there.
+            #
+            # So the admission ORDER was being driven by per-rank prefetch
+            # completion, which is asynchronous and rank-local BY CONSTRUCTION
+            # -- two ranks reading the same store reach "ready to admit" in
+            # different orders. PP0's hidden states then met a downstream batch
+            # built from a different request set and `#631 PP proxy/batch
+            # mismatch` fired. That is the #631 width member this campaign has
+            # been chasing since §R2.
+            #
+            # THE CUT IS THE SOURCE, NOT A CARRIER (operator decision on §Y4,
+            # option (c); `pp0-autoritativer-umbau-order` verbatim: "Admission
+            # UND HiCache-Read/Match/Prefetch-Verdikt fallen bei PP0"). Below
+            # PP0 this term is DELETED, not relocated and not repaired: a
+            # follower forms no opinion about whether a request is ready, so it
+            # cannot reorder its own admission against PP0's. Repairing the
+            # timing, or wiring a carrier for a verdict that may not exist
+            # rank-locally in the first place, is the compensation-layer shape
+            # the standing upstream-minimal law sends to deletion.
+            #
+            # WHAT IS NOT DELETED, deliberately: the local prefetch itself.
+            # `_drain_prefetch_progress` still runs every pass on every rank,
+            # the load still completes, and `pop_prefetch_loaded_tokens` below
+            # still credits the store hit when it is there. Local completion
+            # stays relevant for the LOADING; it just no longer decides
+            # ADMISSION. (Operator, same order: "lokale Completion bleibt
+            # natuerlich fuer das eigentliche Laden relevant -- nur der
+            # ENTSCHEID faellt nicht mehr daraus.")
+            #
+            # RESIDUAL, NAMED RATHER THAN HIDDEN: this closes the direction the
+            # probe measured (a follower SKIPPING what PP0 admitted). The
+            # opposite direction -- PP0 skipping for its own pending prefetch
+            # while a follower, now without the term, admits that request --
+            # is not closed by a deletion alone and needs PP0's membership on
+            # the wire. `#969N` is still armed and names it on sight, so the
+            # next boot measures whether it occurs at all instead of a
+            # thirteenth structure hypothesis being shipped against it.
+            _pp_follower = self.ps.pp_size > 1 and self.ps.pp_rank != 0
+            if self.enable_hicache_storage and _pp_follower:
+                # Credit a completed store hit if there is one; decide nothing.
+                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                if loaded_tokens > 0:
+                    req.storage_hit_length = loaded_tokens
+                # Counted, never a skip: this rank ADMITS here. The census key
+                # records that the term ran and declined to decide, which is
+                # what makes the deletion visible in the #788 verdict trace
+                # instead of being an absence nobody can see.
+                self._969z_followed = getattr(self, "_969z_followed", 0) + 1
+                if self._969z_followed == 1 or self._969z_followed % 512 == 0:
+                    logger.warning(
+                        "#969Z PREFETCH VERDICT NOT TAKEN HERE (rank %d, n=%d): "
+                        "this rank admits on PP0's membership and forms no "
+                        "prefetch-readiness opinion. rid=%s storage_hit=%s. The "
+                        "local prefetch still runs and still credits its hit; "
+                        "only the DECISION moved to PP0 (#969 §Z).",
+                        self.ps.pp_rank,
+                        self._969z_followed,
+                        req.rid,
+                        getattr(req, "storage_hit_length", 0),
+                    )
+            elif self.enable_hicache_storage:
                 # #580: READ the verdict drained before the rank-local
                 # predicates above; do NOT call into the tree cache here. The
                 # call carries collectives and this point is only reachable on
