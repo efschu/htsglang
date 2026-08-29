@@ -8950,6 +8950,30 @@ class Scheduler(
         # Prefill policy
         from sglang.srt.mem_cache.common import published_fundable_floor
 
+        # #996 IS THE GROUP CEILING PUBLISHED ON THIS CONFIG?
+        #
+        # `extend_len = min(fill - prefix, _rem_tokens)` and `_rem_tokens`
+        # bottoms out in `rem_total_tokens`, a property over THIS RANK's own
+        # allocator and tree (schedule_policy.py:948-968). That term is
+        # rank-local, so two ranks can compute different extend lengths for
+        # the SAME request with an ALIGNED prefix and an ALIGNED fill -- which
+        # is exactly the 254-vs-301 shape, with no leftover and no fill
+        # divergence required.
+        #
+        # `#681` caps it with a published GROUP floor, but only when one was
+        # published: `published_fundable_floor` returns None unless
+        # `tree_cache.uniform_avail_floor` is set, and its docstring assumes
+        # that no floor means "pools that agree". THIS CONFIG RUNS
+        # --rank-gpu-memory-mib 28000,17000,12000 and its derived pools differ
+        # by a factor of 35 (767780 vs 21725 tokens, measured). The assumption
+        # is violated by construction, so whether the floor is actually there
+        # decides whether the cap is group-uniform or rank-local.
+        #
+        # Captured here, printed OFF-PATH in `pp_ring_note` -- zero log calls
+        # added on this path, per the rule this window proved for both log
+        # lines and wire payloads.
+        _996_floor = published_fundable_floor(self.tree_cache)
+        self._996_floor = _996_floor
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -8985,7 +9009,7 @@ class Scheduler(
             # so the cap is applied only where a group floor was actually
             # published. See that helper for why the two gates read the same
             # number through different doors.
-            fundable_extend_floor=published_fundable_floor(self.tree_cache),
+            fundable_extend_floor=_996_floor,
             # #701 defect (b): pass the SCHEDULER-owned ledger into the adder
             # this pass builds. Constructing it here instead would reset the
             # outstanding commitments every pass, which is the hole the

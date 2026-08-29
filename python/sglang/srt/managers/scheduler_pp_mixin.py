@@ -2302,6 +2302,22 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
         # Three numbers plus the skip reason, always, so `disagree=0` never
         # again arrives without its denominator.
         try:
+            # #996 the group-ceiling question, printed where the census already
+            # prints -- a site measured neutral across boots 33 and 34.
+            _f = getattr(holder, "_996_floor", "unset")
+            _pol = getattr(holder, "_last_adder_rem_total", None)
+            logger.warning(
+                "#996 GROUP CEILING: published_fundable_floor=%s | this rank's "
+                "rem_total_tokens=%s. None means the #681 cap is NOT applied "
+                "and `extend_len` is bounded by a RANK-LOCAL budget -- with "
+                "unequal per-rank pools that is enough to make two ranks "
+                "compute different extend lengths for the same request.",
+                _f,
+                _pol,
+            )
+        except Exception:  # noqa: BLE001 - a census may never break admission
+            pass
+        try:
             _seen = getattr(holder, "_995c_seen", 0)
             if _seen:
                 logger.warning(
