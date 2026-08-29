@@ -4502,10 +4502,37 @@ class SchedulerPPMixin:
                         getattr(self, "_pp_launched_pending", set()).discard(
                             next_mb_id
                         )
-                # #631 defect R: OUTSIDE the block above, deliberately. See
-                # _pp_record_slot_last_batch -- nesting this under "did the
-                # slot run something" is the resident-carry leak.
-                self._pp_record_slot_last_batch(next_mb_id)
+                        # #969 CUT L: PUBLISH THE SLOT'S last_batch ONLY WHEN
+                        # ITS RESULT WAS ACTUALLY APPLIED -- upstream's rule,
+                        # `main:scheduler_pp_mixin.py:148-155`, where
+                        # `last_mbs[next_mb_id] = mbs[next_mb_id]` sits inside
+                        # the same guard as `_pp_process_batch_result`.
+                        #
+                        # INVARIANT THAT READS THIS STATE: `get_next_batch_to_run`
+                        # merges `last_batch` into `running_batch`. Its
+                        # precondition is "this batch's result has been
+                        # applied". Publishing on the #1009 lap -- the lap where
+                        # the result has NOT arrived -- broke exactly that: the
+                        # un-run prefill batch was merged into running, so the
+                        # next visit to the slot decoded requests that had never
+                        # been prefilled. Measured on this branch:
+                        # `causal_conv1d_update: conv_state_indices has 1
+                        # entr(ies) for a batch of 22` and `#1007 DECODE GRAPH
+                        # REFUSED: input_ids=22 but batch_size=1`
+                        # (boot_969cut_ba2efeb6a7_0829_132233.log). That is the
+                        # root the #1008 hold was built on top of.
+                        #
+                        # WHY THE OLD PLACEMENT EXISTED, and why it goes: the
+                        # comment it replaces says nesting this "is the
+                        # resident-carry leak" (#631 defect R). That leak is in
+                        # `phase_flip_resident_carry`, which the #969 cut
+                        # deletes as the literal negation of "no state
+                        # transported across the cutover". A leak in a
+                        # compensation layer is not a reason to break an
+                        # upstream invariant. Resident carry runs only at a
+                        # flip, so this is safe for the no-flip rungs; it MUST
+                        # be deleted before the flip rung.
+                        self._pp_record_slot_last_batch(next_mb_id)
                 if not self.pp_group.is_last_rank:
                     # #1015: SEND IS UNCONDITIONAL NOW. No sender-side
                     # predicate may decide WHETHER a frame goes out any more --
