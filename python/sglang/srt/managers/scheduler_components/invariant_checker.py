@@ -287,20 +287,18 @@ class SchedulerInvariantChecker:
                 // allocator.page_size
                 * allocator.page_size
             )
-        # #912 REST: the correction term, from LIVE state when the published
+        leak, msg = self._check_pool_invariant(
+            "full",
+            full_available_size,
+            full_evictable_size,
+            protected,
+            session_held,
+            total,
             uncached,
             # Slots the residency controller holds out of the free list because
             # the pages under them are unmapped (#656 item 12). Published by
             # KvRowCap in the same unit available_size() reports.
             int(getattr(allocator, "residency_withheld_slots", 0) or 0),
-            # #912: rows the #822 authority's EXCLUSIVITY law found claimed by
-            # more than one owner (free list + tree, free list + a resident
-            # request, ...) at the last phase-flip census. Published by
-            # phase_flip_runtime.py's `_census_ownership_audit`
-            # (kv_row_ownership.py's own detection, not re-derived here), or --
-            # when that snapshot is absent or empty -- enumerated live just
-            # above. Zero whenever neither reading finds a doubly claimed row,
-            # so this is a no-op on every path that does not exercise #822.
         )
         # WHICH READING PAID, in the line that raises. A surplus explained by a
         # snapshot and one explained by a live intersection are different
@@ -416,7 +414,7 @@ class SchedulerInvariantChecker:
         ckpt_pool = getattr(self.req_to_token_pool, "mamba_ckpt_pool", None)
         if ckpt_pool is not None:
             return self._check_mamba_pool_with_int8(ps, ckpt_pool)
-        double_owned, double_owned_src, duplicates, detail = (
+        _diag_double, double_owned_src, duplicates, detail = (
             self._mamba_double_owned_terms()
         )
         leak, msg = self._check_pool_invariant(
@@ -428,7 +426,6 @@ class SchedulerInvariantChecker:
             self.req_to_token_pool.mamba_pool.size,
             0,
             0,
-            double_owned,
         )
         msg = f"{msg}, double_owned_src={double_owned_src}{detail}"
         if duplicates:
@@ -484,7 +481,7 @@ class SchedulerInvariantChecker:
         # #924 sibling: the int8 lane's ACTIVE pool is the same
         # ``mamba_allocator`` free list, so it inherits the same double-free
         # blindness. Same term, same fatality rule.
-        double_owned, double_owned_src, duplicates, detail = (
+        _diag_double, double_owned_src, duplicates, detail = (
             self._mamba_double_owned_terms()
         )
         active_leak, active_msg = self._check_pool_invariant(
@@ -496,7 +493,6 @@ class SchedulerInvariantChecker:
             self.req_to_token_pool.mamba_pool.size,
             0,
             0,
-            double_owned,
         )
         active_msg = f"{active_msg}, double_owned_src={double_owned_src}{detail}"
         if duplicates:
