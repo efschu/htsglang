@@ -10274,6 +10274,61 @@ class Scheduler(
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
+
+        # #1008: DECODE NEEDS A LAST TOKEN, AND A REQUEST THAT HAS NEVER
+        # PRODUCED ONE HAS NOTHING TO DECODE FROM.
+        #
+        # `get_next_batch_to_run` makes a freshly built PREFILL batch the
+        # running batch in the same breath (`running_batch = new_batch` /
+        # `merge_batch`). Upstream that holds, because without PP the prefill
+        # runs in the same round, so by the time this function sees the
+        # request its `output_ids` is non-empty. That seam is stock -- every
+        # commit touching it is an upstream PR (#29408, #22131, #20343,
+        # #14320, #17484, #14883), none of ours -- so this is not a
+        # regression to revert but a gap PP widens.
+        #
+        # Under PP=3 the prefill result comes back several passes later while
+        # membership was granted immediately. With one short request and no
+        # other traffic the next round has nothing else to do and decodes it
+        # first. `prepare_for_decode` then leaves the PREFILL input_ids in
+        # place, because there is no last output token to embed, and the
+        # batch travels on labelled DECODE while carrying extend tokens.
+        #
+        # MEASURED, boot 67: rid e463acc5 / 6f9d8c6e, prefix_lens=0
+        # fill_lens=3 out_lens=0, one ADMIT, no retraction, and NO void
+        # (797_void=0, 798_void=0 -- the void explanation is excluded). It
+        # surfaced as forward_mode=2 (DECODE) with batch_size=1 and
+        # input_ids=3, then as `causal_conv1d_update: conv_state_indices has
+        # 1 entr(ies) for a batch of 3`. Every short prompt does this, health
+        # checks included; long chunked prompts under continuous load never
+        # reach the state, which is why it stayed latent.
+        #
+        # This is the invariant, not a guard on a consumer: decode requires a
+        # last token. The request is not dropped and not reset -- it stays in
+        # the running batch and becomes eligible the moment its prefill
+        # result lands.
+        _held = [i for i, r in enumerate(batch.reqs) if not r.output_ids]
+        if _held:
+            self._1008_held = getattr(self, "_1008_held", 0) + len(_held)
+            logger.warning(
+                "#1008 DECODE HELD (no prefill result yet): %d of %d req(s) "
+                "-- rids=%s, held_total=%d. Their prefill has not come back, "
+                "so they carry extend input_ids and no last token; decoding "
+                "them now is what produced forward_mode=DECODE with "
+                "input_ids != batch_size. They stay in the running batch and "
+                "become eligible when the result lands. A held_total that "
+                "never grows means this class no longer occurs; one that "
+                "grows without bound means results are not landing at all.",
+                len(_held),
+                len(batch.reqs),
+                ",".join(str(batch.reqs[i].rid)[:8] for i in _held[:4]) or "-",
+                self._1008_held,
+            )
+            batch.filter_batch(
+                keep_indices=[
+                    i for i in range(len(batch.reqs)) if i not in set(_held)
+                ]
+            )
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
