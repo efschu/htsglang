@@ -3236,7 +3236,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             str(getattr(r, "rid", "?"))[:8],
                             None if r.extend_range is None else int(r.extend_range.start),
                             None if r.extend_range is None else int(r.extend_range.end),
-                            len(r.prefix_indices or []),
+                            0 if r.prefix_indices is None else len(r.prefix_indices),
                             len(_i),
                         )
                         for r, _i in zip(reqs, input_ids)
