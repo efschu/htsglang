@@ -3330,13 +3330,41 @@ def _decide_from_load(
                 # defect only when NO re-admission is in flight. While these
                 # tokens are outstanding the right action is to WAIT for them,
                 # not to flip away from them.
-                return _no(
-                    f"decode phase entered empty, which is normal under "
-                    f"no-carry: {inp.seam_transport_tokens} tok of seam "
-                    f"re-admission are in flight and are served in THIS "
-                    f"layout by read-through. Waiting for the bundle the "
-                    f"cutover just retracted, not flipping away from it"
-                )
+                # #1033 FIX 2: THIS WAIT HAD NO BOUND, AND THAT IS THE 244 s
+                # LIVELOCK.
+                #
+                # "While these tokens are outstanding the right action is to
+                # WAIT for them" is correct -- and it was written without a
+                # deadline, so a re-admission that never completes holds the
+                # TP layout for ever. Measured on boot 8808103f43: one request
+                # stuck at `cohort=1 tok=326`, this branch returning `_no` 25
+                # times, `LAYOUT-ECONOMY ANOMALY held=tp held_s=244.7
+                # window_s=10.0 pending_tok=43594`, ADMISSION-WEDGE 4 -> 101,
+                # and the instance serving nothing while its scheduler loop
+                # kept spinning (round 97900). Two real agent workloads
+                # launched against it got no answer at all.
+                #
+                # ONE PREDICATE, ONE CLOCK: bounded by the same
+                # `seam_cohort_dwell_active()` the #1032 dwell uses, so the two
+                # waits for the same cohort cannot disagree about when waiting
+                # stops -- the discipline #1032c had to apply after #906's
+                # grant and this term drifted apart. When the bound lapses the
+                # wait ends, the ordinary decode-empty verdict below takes
+                # over, and the flip leaves honestly.
+                #
+                # It stays a WAIT and not a flip while the bound holds: the
+                # W32 argument is untouched for the honest case (26 flips'
+                # worth of premature arming is exactly what it prevents).
+                if inp.seam_cohort_dwell_active():
+                    return _no(
+                        f"decode phase entered empty, which is normal under "
+                        f"no-carry: {inp.seam_transport_tokens} tok of seam "
+                        f"re-admission are in flight and are served in THIS "
+                        f"layout by read-through. Waiting for the bundle the "
+                        f"cutover just retracted, not flipping away from it "
+                        f"(bounded: round {inp.seam_cohort_stall_rounds}/"
+                        f"{SEAM_COHORT_DWELL_ROUNDS})"
+                    )
             if bundle == 0:
                 # #730: ZERO WORK MUST NOT READ AS ALL WORK.
                 #
