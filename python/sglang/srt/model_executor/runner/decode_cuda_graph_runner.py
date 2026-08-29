@@ -780,6 +780,52 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return default
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # #1007: THE TOKEN AXIS, WHICH THIS PREDICATE NEVER CHECKED. Every
+        # verdict below reasons about BATCH SIZE (`cuda_graph_bs =
+        # forward_batch.batch_size`, `cuda_graph_bs <= self.max_bs`); none of
+        # them asks how many tokens each sequence carries. The captured graph
+        # fixes that separately as `num_tokens_per_bs`, and `load_batch`
+        # derives every buffer width from it (`raw_num_token = raw_bs *
+        # self.num_tokens_per_bs`). So a batch with the right bs and the wrong
+        # tokens-per-sequence passes here and dies one frame later in the
+        # copy.
+        #
+        # MEASURED, boot 66: a 3-token first-pass prefill (rid 6f9d8c6e,
+        # prefix_lens=0 fill_lens=3 out_lens=0, no retraction, no chunk --
+        # literally a "Say OK." probe) reached this runner with raw_bs=1 and
+        # was accepted, then failed as
+        # `input_ids: dst(1,) <- src(3,)`. Every short prompt does this,
+        # health checks included, which is why every boot of this window died
+        # on its first real request.
+        #
+        # THE LINE IS NOT OPTIONAL (#967): a silent `return False` here would
+        # make it unmeasurable whether this ever fires, and the mode it prints
+        # is the half of the root that is still unread -- `is_cuda_graph()`
+        # admits DECODE, TARGET_VERIFY, IDLE and DLLM_EXTEND, and which of
+        # those this batch claims to be cannot be settled from the boot-66 log.
+        # So the guard reports it, and the next boot names it instead of me
+        # guessing it.
+        _ids = getattr(forward_batch, "input_ids", None)
+        if _ids is not None and self.num_tokens_per_bs:
+            _have = int(_ids.shape[0])
+            _want = int(forward_batch.batch_size) * int(self.num_tokens_per_bs)
+            if _have != _want:
+                logger.warning(
+                    "#1007 DECODE GRAPH REFUSED (token geometry): "
+                    "input_ids=%d but batch_size=%d x num_tokens_per_bs=%d=%d "
+                    "-- forward_mode=%s. The captured graph fixes tokens per "
+                    "sequence; this batch does not match it, so it runs eager "
+                    "instead of failing in the buffer copy. A non-zero count "
+                    "with forward_mode=DECODE means the classification is "
+                    "wrong upstream; with an EXTEND mode it means "
+                    "is_cuda_graph() admits a mode this runner cannot serve.",
+                    _have,
+                    int(forward_batch.batch_size),
+                    int(self.num_tokens_per_bs),
+                    _want,
+                    getattr(forward_batch, "forward_mode", "?"),
+                )
+                return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
