@@ -263,51 +263,101 @@ class TestEraAdmissionRingPredicate(CustomTestCase):
 
         self.assertTrue(self._predicate()(types.SimpleNamespace()))
 
-    def test_the_era_ring_is_gated_on_both_sides(self):
-        """#1013. THE ASSERTION THIS REPLACES WAS THE SAME DEFECT IT MISSED.
+    def test_the_hop_is_unconditional_on_both_ends(self):
+        """#1014. THE CONTRACT INVERTED, AND WITH IT WHAT THIS TEST PINS.
 
-        It counted one SPELLING -- `if not _pp_era_ring_live(self):` -- and
-        called the answer congruence. Both era gates I shipped were on the
-        SENDER (`_pp_send_admission_decision`,
-        `_pp_commit_admission_send_work`); the RECEIVER,
-        `_pp_recv_admission_decision`, ran unconditionally, and its own
-        docstring said why that looked safe ("always issued, never gated") --
-        true of a ring whose sender always sends, false the moment the sender
-        is switched off. Boot boot_pp3solo_6b28c34436_0829_094236.log, three
-        py-spy stacks at one instant: PP0 parked sending REQ WORK, PP1 and PP2
-        parked waiting for an ADMISSION DECISION that would never come. Ring
-        closed on the first request, 0 prefill batches, 0 http=200.
+        #1013 asserted the opposite of this: that the era predicate GUARDS the
+        admission-decision receive, so sender and receiver are gated in step.
+        That shape was congruent and served nothing. The reason is a fact
+        neither #1013 nor the strip-B gates it copied had measured -- the hop
+        is not the era's ring, it is a MULTIPLEX CARRIER. Six facts from five
+        tickets ride the one message (OUTPUT_EXPECTED #791b, PASS_VOIDED and
+        UPSTREAM_LAUNCHED #797, SLOT_OCCUPANT #1000b, LAUNCHED_CHAIN #978,
+        PARKED_CONTINUATION #968); six of the module's seven ``_PP_*_KEY`` are
+        on it, only ``_PP_VOID_OUTPUT_KEY`` rides the output wrap. Switching
+        the hop off retires five foreign wires along with the era's own.
 
-        A count of one spelling could not see that, and -- stated plainly --
-        no static count can. The gate that caught it was the boot. What a
-        static check CAN do is stop the fix from silently rotting, so this
-        pins the shape instead of the tally:
+        Measured, boot boot_pp3solo_0d81aab8db_0829_095245.log: the first of
+        the six to be missed, ``_pp_upstream_launched_incoming`` (one writer,
+        behind the skipped read), left ``_pp_drain_voided_proxy`` declining
+        every drain -- "voided proxy drained" 0 times in the whole log -- and
+        PP0 parked for ever on ``pp-ring-commit/dict/send_proxy_work[0]``.
+        0 prefill batches, 0 http=200.
 
-          * the reader is gated (the thing that was missing), and
-          * the predicate has exactly the three call sites that make the ring
-            congruent -- one reader, two writers -- in EITHER spelling, so a
-            fourth call site added in the `and _pp_era_ring_live(self)` form
-            cannot slip past a `if not ...` count the way #1013 did.
+        So the era payload is emptied and the MESSAGE keeps flying. Congruence
+        stops being a property two gates must maintain and becomes one of the
+        construction: both ends unconditional, nothing to keep in step. This
+        pins that shape, and it is the direct inverse of what #1013 pinned --
+        which is the point, and why the old assertion is replaced rather than
+        extended.
         """
         import inspect
 
         from sglang.srt.managers import scheduler_pp_mixin as mod
 
-        src = inspect.getsource(mod)
-        # Call sites only: the definition line and the docstring mention of
-        # `self._pp_era_ring_live` are not calls.
-        call_sites = src.count("_pp_era_ring_live(self)")
-        self.assertEqual(call_sites, 3, f"expected 3 call sites, got {call_sites}")
+        # COUNTED FROM THE AST, NOT FROM THE TEXT, and that is the whole
+        # lesson of this test's two previous versions. #1013's tally counted
+        # one SPELLING and missed a gate written in another. The first draft
+        # of THIS assertion counted both spellings as substrings and promptly
+        # matched a PROSE mention of `_pp_era_ring_live(self)` inside a
+        # comment at :4131, reporting two call sites where the module has one.
+        # A substring count cannot tell a call from a sentence about a call;
+        # the parser can, so the parser does the counting.
+        import ast
 
-        body = inspect.getsource(mod.SchedulerPPMixin._event_loop_pp_body)
-        self.assertIn("_pp_era_ring_live(self)", body)
-        self.assertLess(
-            body.index("_pp_era_ring_live(self)"),
-            body.index("_pp_recv_admission_decision("),
-            "the era predicate must guard the admission-decision receive, not "
-            "trail it: a switched-off sender with a live receiver is the "
-            "#1013 wedge.",
+        tree = ast.parse(inspect.getsource(mod))
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "_pp_era_ring_live"
+        ]
+        enclosing = []
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for n in ast.walk(fn):
+                    if n in calls:
+                        enclosing.append(fn.name)
+        self.assertEqual(
+            len(calls),
+            1,
+            "the era predicate must survive at exactly ONE call site -- the "
+            "payload choice in `_pp_send_admission_decision`. A second site "
+            "means something is being switched off again rather than "
+            f"emptied; found {len(calls)} in {sorted(set(enclosing))}",
         )
+        self.assertEqual(sorted(set(enclosing)), ["_pp_send_admission_decision"])
+
+        # The receive still happens, and it runs every pass. "No era
+        # predicate in the body" needs no separate text assertion -- the AST
+        # count above already proves the module's only call lives in
+        # `_pp_send_admission_decision`, so any gate here would have failed
+        # it. A substring check here would only re-run the same prose trap:
+        # the #1014 comment in this very body QUOTES the removed gate.
+        body = inspect.getsource(mod.SchedulerPPMixin._event_loop_pp_body)
+        self.assertIn("_pp_recv_admission_decision(", body)
+
+        # The send runs every pass too, and the surviving predicate chooses
+        # the PAYLOAD rather than whether to send.
+        send = inspect.getsource(mod.SchedulerPPMixin._pp_send_admission_decision)
+        self.assertIn("_pp_era_ring_live(self)", send)
+        self.assertIn(
+            "entries=()",
+            send,
+            "with the era off the decision must be sent EMPTY, not skipped.",
+        )
+        gate_line = send[send.index("_pp_era_ring_live(self)") :].splitlines()[1]
+        self.assertNotIn(
+            "return",
+            gate_line,
+            "the era predicate must select an empty payload, never return "
+            f"early: {gate_line.strip()!r}",
+        )
+
+        # The reap is unconditional, or every pass leaks an un-waited isend.
+        reap = inspect.getsource(mod.SchedulerPPMixin._pp_commit_admission_send_work)
+        self.assertNotIn("_pp_era_ring_live(self)", reap)
 
     def test_the_output_return_path_keeps_its_deadline(self):
         """The bound on `_pp_commit_comm_work` is an INSTRUMENT on a core PP

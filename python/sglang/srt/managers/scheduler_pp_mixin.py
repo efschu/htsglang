@@ -4127,11 +4127,16 @@ class SchedulerPPMixin:
                 # that is now idle keep incrementing the #801-spin streak it is
                 # no longer earning.
                 self._pp_upstream_void_withheld_work = False
-                if (
-                    self.ps.pp_size > 1
-                    and not self.pp_group.is_first_rank
-                    and _pp_era_ring_live(self)
-                ):
+                # #1014 WITHDRAWS #1013's GATE HERE. #1013 added
+                # `and _pp_era_ring_live(self)` to match the two sender gates,
+                # which made the hop congruent and served nothing: the six
+                # facts this receive unpacks stopped arriving, and the first of
+                # them to be missed (`_pp_upstream_launched_incoming`) wedged
+                # the proxy channel on the first request. Congruence is now
+                # restored the other way -- both ends unconditional, era
+                # payload empty -- so this condition is back to what it was
+                # before #1013 and there is no pair of gates to keep in step.
+                if self.ps.pp_size > 1 and not self.pp_group.is_first_rank:
                     with torch.profiler.record_function("pp_admission_decision_recv"):
                         incoming_decision = self._pp_recv_admission_decision()
                         effective, amended = self._pp_reconcile_incoming_admission(
@@ -7818,8 +7823,39 @@ class SchedulerPPMixin:
         # Ten boots died of this family (53, 55-59, 68-71), flip-free included
         # (#990), so it is left out rather than repaired -- an eleventh fix to
         # a mechanism with no remaining purpose.
+        # #1014 DEMULTIPLEX, DO NOT UNPLUG. The paragraph above is right that
+        # the era's DECISION has no remaining purpose and wrong that the
+        # MESSAGE is the era's. Measured on 0d81aab8db: six facts from five
+        # tickets ride this one wire -- _PP_OUTPUT_EXPECTED_KEY (#791b,
+        # :7837), _PP_PASS_VOIDED_KEY and _PP_UPSTREAM_LAUNCHED_KEY (#797,
+        # :7841/:7842), _PP_SLOT_OCCUPANT_KEY (#1000b, :7850),
+        # _PP_LAUNCHED_CHAIN_KEY (#978, :7854) and _PP_PARKED_CONTINUATION_KEY
+        # (#968, read :2060). Six of the module's seven _PP_*_KEY are on this
+        # message; only _PP_VOID_OUTPUT_KEY rides the output wrap. Returning
+        # here retires five foreign wires along with the era's own, silently.
+        #
+        # That is not a hypothesis. #1013 gated the READER off to match this
+        # return, and the very first consequence was a boot that served
+        # nothing: `_pp_upstream_launched_incoming` (single writer :7975,
+        # behind the skipped read) stayed at its getattr default False, so
+        # `_pp_drain_voided_proxy:8349` declined every drain, the wire kept
+        # owing a message, and PP0 blocked for ever in the next pass's
+        # `_pp_commit_comm_work(self.send_proxy_work)` at :4479 -- measured,
+        # boot_pp3solo_0d81aab8db_0829_095245.log, `voided proxy drained` 0 in
+        # the whole log. That was the FIRST of the six facts to surface, not
+        # the only one.
+        #
+        # So the era payload is emptied and the message keeps flying. An empty
+        # decision is a first-class value here, not a special case: this
+        # function's own docstring says it is "SENT EVERY PASS, EVEN WHEN
+        # EMPTY (`entries=()`)" and the normal path builds exactly that at
+        # :4351 and :4432. The congruence guard therefore learns nothing from
+        # the era while the six passengers keep their carrier, and
+        # sender/receiver stay unconditional on both ends -- which is what
+        # makes an asymmetry like #1013's impossible by construction rather
+        # than by a matching pair of gates that has to be kept in step.
         if not _pp_era_ring_live(self):
-            return
+            decision = PPAdmissionDecision(mb_id=decision.mb_id, entries=())
         if self.ps.pp_size <= 1:
             return
         # #978: recorded BEFORE the last-rank return below -- the last rank
@@ -7913,8 +7949,15 @@ class SchedulerPPMixin:
         # Ten boots died of this family (53, 55-59, 68-71), flip-free included
         # (#990), so it is left out rather than repaired -- an eleventh fix to
         # a mechanism with no remaining purpose.
-        if not _pp_era_ring_live(self):
-            return
+        #
+        # #1014: the gate is REMOVED here, not narrowed. `_pp_send_admission_
+        # decision` now always sends (with an empty era payload when the era
+        # is off -- see its #1014 block), so this reap must always run too:
+        # skipping it would leave every pass's isend handle un-waited and grow
+        # exactly the unbounded handle list #796 added this method to prevent.
+        # There is nothing left to gate on -- on a pass that posted nothing
+        # this is already a wait on an empty list, which is the property the
+        # docstring above states.
         pending = getattr(self, "_pp_admission_send_work", None)
         if pending:
             self._pp_commit_comm_work(pending)
@@ -7922,34 +7965,35 @@ class SchedulerPPMixin:
     def _pp_recv_admission_decision(self: Scheduler) -> Optional[PPAdmissionDecision]:
         """#791: this pass's inbound admission decision (blocking receive).
 
-        #1013 THE READER IS THE THIRD GATE, AND IT WAS THE MISSING ONE.
-        The two gates above switch the era's admission-decision SENDER off
-        when the flip is off. A switched-off producer is only half the change:
-        direction is a property of the READER, so every consumer has to be
-        enumerated in the same breath. This one was not, and the docstring
-        below says why it looked safe to leave -- "always issued, never
-        gated". That sentence is true of a ring where the sender always
-        sends.
+        #1014 THIS RECEIVE IS UNCONDITIONAL, AND THAT IS THE CONTRACT.
+        "Always issued, never gated" below is load-bearing, not incidental.
+        #1013 briefly gated it to match the two era gates on the sender, on
+        the reasoning that a switched-off producer obliges switching off its
+        consumers. That reasoning is right about direction and wrong about
+        WHAT the sender had been switched off: not a ring, a MULTIPLEX
+        CARRIER. Six facts from five tickets are unpacked below --
+        _PP_OUTPUT_EXPECTED_KEY (#791b), _PP_PASS_VOIDED_KEY and
+        _PP_UPSTREAM_LAUNCHED_KEY (#797), _PP_SLOT_OCCUPANT_KEY (#1000b),
+        _PP_LAUNCHED_CHAIN_KEY (#978), _PP_PARKED_CONTINUATION_KEY (#968) --
+        and skipping the read starved all six at once.
 
-        MEASURED, three py-spy stacks at one instant, boot
-        boot_pp3solo_6b28c34436_0829_094236.log (pp_size=3, tp_size=1, no
-        flip, first request):
-          PP0  _pp_commit_pending_req_work -> _pp_commit_comm_work:7261,
-               parked on `pp-ring-commit/req/send_req_work[0]`
-          PP1  _pp_recv_admission_decision:7934 -> _pp_recv_typed_dict:7604,
-               parked on `pp:0/recv_object[src=0,tag=0]/size`
-          PP2  _pp_recv_admission_decision:7934, parked on
-               `pp:0/recv_object[src=1,tag=0]/size`
-        PP0 is sending REQ WORK; PP1 is waiting for an ADMISSION DECISION.
-        Two different message kinds on the same hop, so PP1 never takes PP0's
-        work off the wire and the ring closes on the first request. Nothing is
-        served: 0 prefill batches, 0 http=200.
+        MEASURED, the first of the six to surface, boot
+        boot_pp3solo_0d81aab8db_0829_095245.log (pp_size=3, tp_size=1, no
+        flip, first request), PP0 pid 1893490 parked on
+        `pp-ring-commit/dict/send_proxy_work[0]` at
+        `_event_loop_pp_body:4479 -> _pp_commit_comm_work:7265`, with
+        "#797 PP-ADMISSION voided proxy drained" appearing 0 times in the
+        whole log. `_pp_upstream_launched_incoming` has exactly one real
+        writer (:7975, here) and one reset (:4117), so behind the skip it
+        stayed False and `_pp_drain_voided_proxy:8349` declined every drain.
+        The wire kept owing a message, PP0 blocked in the next pass, and
+        PP1/PP2 sat at the loop head in `recv_requests`. 0 prefill batches,
+        0 http=200. The other five facts had not yet had their turn.
 
-        The gate is placed at the CALL SITE in `_event_loop_pp_body` rather
-        than here, so the whole recv-and-reconcile block is skipped as one
-        unit: returning None from here would still run
-        `_pp_reconcile_incoming_admission(None)` and the #797 narrowing that
-        follows it, which is a second contract, not this one.
+        Congruence is therefore kept by CONSTRUCTION and not by a matching
+        pair of gates: the sender always sends (empty era payload when the
+        era is off) and this receive always runs. There is no state in which
+        one end is on and the other off.
 
         Positioned in `_event_loop_pp_body`
         strictly BEFORE `get_next_batch_to_run`, so this rank's own
