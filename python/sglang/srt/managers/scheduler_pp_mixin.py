@@ -4080,6 +4080,19 @@ class SchedulerPPMixin:
                         continue
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
+                # #1015d: reap the last rank's deferred wrap send HERE, after
+                # this rank has taken its upstream's chain off the wire. See
+                # the deferral site in
+                # `_pp_commit_send_output_work_and_preprocess_output_tensors`
+                # for the measured cycle this ordering opens. Blocking is
+                # correct at this point and only at this point: the upstream
+                # is no longer waiting on this rank, so the wait can only be
+                # on a peer that has had its chance to take the message --
+                # the same property `_pp_commit_pending_req_work` relies on.
+                _deferred_wrap = getattr(self, "_pp_deferred_output_work", None)
+                if _deferred_wrap:
+                    self._pp_deferred_output_work = None
+                    self._pp_commit_comm_work(work=_deferred_wrap)
                 self._pp_forward_and_process_input_requests(recv_reqs)
                 # #791 PP ADMISSION UNIFORMITY. Consume THIS pass's inbound
                 # admission decision before this rank derives its own batch,
@@ -7304,7 +7317,42 @@ class SchedulerPPMixin:
         pending_output_work = self.send_output_work
         gapped = getattr(self, "_pp_gapped_wire", False)
         if not gapped:
-            self._pp_commit_comm_work(work=pending_output_work)
+            if self.pp_group.is_last_rank and self.ps.pp_size > 1:
+                # #1015d: THE WRAP MAY NOT BE A BLOCKING OBLIGATION ON THE
+                # PATH. This edge -- last rank -> rank 0 -- is OUR arc, not
+                # upstream's: upstream sglang closes no ring (input at rank 0,
+                # output from the last rank to the detokenizer), and this wrap
+                # exists so PP0 gets its facts home on the ring lap. Being
+                # ours, it is also the one edge we may re-time freely.
+                #
+                # MEASURED, boot_pp3solo_206661a28b_0829_113554.log, all three
+                # ranks blocked at the same instant on consecutive matched
+                # edges: PP0 on req/send_req_work 0->1, PP1 on req 1->2, PP2
+                # here on dict/send_output_work 2->0. A closed 3-cycle. Same
+                # shape as the earlier admission-arc cycle, which is why
+                # deleting that arc did not end the class -- the cycle re-forms
+                # on whichever three edges exist.
+                #
+                # WHY NOT FIRE-AND-FORGET: `pp_pump_send_req_work` records the
+                # measurement that settles it -- `is_completed()` NEVER fires
+                # for an isend on this transport, so a polled reap cannot work
+                # and an unreaped send is corpse A. Both extremes are corpses;
+                # a blocking commit here is corpse B'. So the wait is MOVED,
+                # not removed.
+                #
+                # WHY THE EXISTING ONE-ITERATION LAG WAS NOT ENOUGH: this
+                # commit already waits on the PREVIOUS iteration's work. It
+                # still deadlocks, because it sits AHEAD of this rank's own
+                # `recv_requests` for the next lap -- so the rank that must
+                # take PP1's chain to free the cycle is itself parked on PP0
+                # taking the wrap. Deferring it past that receive is what
+                # opens the ring: PP2 takes the chain, PP1 unblocks, PP1 takes
+                # PP0's chain, PP0 unblocks and reaches the receive that frees
+                # PP2. The fact still travels home on the ring lap, one lap
+                # later, which is what "consumed on the next lap" means.
+                self._pp_deferred_output_work = pending_output_work
+            else:
+                self._pp_commit_comm_work(work=pending_output_work)
         (
             next_pp_outputs,
             next_batch_result,
