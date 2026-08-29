@@ -1254,6 +1254,106 @@ def _999_geom(scheduler, mb_id: int):
         return (-1, -1, -1)
 
 
+#: #1000: THE DECISION IS GROUP-AGREED, ITS CONSEQUENCE IS NOT.
+#: `_pp_void_pass_without_upstream_launch` calls itself "RANK-AGREED BY
+#: CONSTRUCTION" and it is -- for the DECISION. What the void does AFTERWARDS
+#: is not: `_pp_void_own_batch` deliberately does not touch `running_mbs`,
+#: "because the pass simply did not run, and it decodes again next pass from
+#: the state it still holds". That retention is taken rank-locally and changes
+#: what the SLOT MEANS for the group, and nobody tells the upstream.
+#:
+#: WHAT BOOT 46 READ. Sender and receiver were both on slot 1 and named two
+#: DIFFERENT requests -- sender ('054d07eb', 8192, 8470) = 278 rows, receiver
+#: ('d72fbd70', 8192, 8494) = 302 tokens. Each side internally consistent, both
+#: identity checks passed, because `mb_id` is the SLOT and not the OCCUPANT.
+#: The surplus-receive reading of the same shape is excluded: it requires the
+#: receiver BEHIND in slot index, and acceptance at :9017 proves the indices
+#: were equal (`pp_proxy_stamp_names_pass` compares them first, before every
+#: epoch branch).
+#:
+#: THE CONDITIONAL RETENTION. Unconditional retention keeps a corpse: once the
+#: upstream has moved this slot on to another request, the one held here will
+#: never be computed above again, so nothing will ever arrive for it and the
+#: retention protects no live work -- only itself. Unconditional RELEASE is
+#: equally wrong and is the reason this is not simply reverted: while the
+#: upstream still names the held request, its resident decode work is exactly
+#: what the void was written to preserve. The condition is the whole fix.
+#:
+#: THE SIGNAL IS ALREADY ON THE WIRE, which is why this reads and adds nothing.
+#: `_pp_admission_incoming_effective` is the upstream's rid set for this pass
+#: (`Dict[rid -> told]`), reset to None unconditionally at the top of every
+#: pass -- "a pass that receives nothing must inherit neither half" -- so a
+#: stale read is impossible by construction and no freshness stamp is needed.
+#: On PP0 it stays None ("PP0 has nothing to consume here"), so the first rank
+#: leaves through the same door as a pass that heard nothing.
+#:
+#: WHY NOTHING IS RELEASED YET, and it is not caution in general. The existing
+#: mover `pp_queue_orphaned_chunked_req` carries an explicit legality argument
+#: (:3082-3090) for a request DISPLACED out of `self.chunked_req` -- "no door
+#: leads to it at all, and the queue is the only one left". A RESIDENT DECODE
+#: request is not that animal: it is reachable through `running_mbs`, and
+#: appending it to `waiting_queue` would be the double-admission the same
+#: docstring prohibits. Dropping wedged (corpse R) and refusing wedged (#995);
+#: a third form that double-admits would be the third bill. Which of the two
+#: kinds actually sits in the slot at the moment of divergence cannot be read
+#: from the desk -- so the probe reports it, and that field decides the shape
+#: of the release. One boot, and the mechanism stops being DESK.
+_1000_SEEN = [0]
+_1000_REASONS: Dict[str, int] = {}
+_1000_SPECIMENS: List[tuple] = []
+
+
+def _1000_upstream_moved_on(scheduler, mb_id: int) -> str:
+    """Has the upstream moved this slot on past the occupant held here?
+
+    Called UNCONDITIONALLY, and the denominator is incremented before anything
+    can return, so it does not share the fate of the event it counts -- the
+    error made three times in this window. Every exit is a named reason and
+    every reason is counted, so "it did not fire" is always separable from
+    "it was never asked". Read-only: it releases nothing, and it may not raise
+    on the admission path.
+    """
+    _1000_SEEN[0] += 1
+    reason = "?"
+    try:
+        eff = getattr(scheduler, "_pp_admission_incoming_effective", None)
+        if eff is None:
+            reason = "no-decision"  # PP0, or a pass that received nothing
+        elif not eff:
+            reason = "empty-decision"  # upstream voided: retention is correct
+        else:
+            rmbs = getattr(scheduler, "running_mbs", None)
+            b = rmbs[mb_id] if rmbs and 0 <= mb_id < len(rmbs) else None
+            _rq = getattr(b, "reqs", None) if b is not None else None
+            reqs = list(_rq) if _rq is not None else []
+            if not reqs:
+                reason = "no-occupant"
+            else:
+                held = {str(getattr(r, "rid", "")) for r in reqs}
+                if held & {str(k) for k in eff}:
+                    reason = "still-named"  # live work -- retention is correct
+                else:
+                    reason = "MOVED-ON"
+                    if len(_1000_SPECIMENS) < 8:
+                        _chunked = getattr(scheduler, "chunked_req", None)
+                        _1000_SPECIMENS.append(
+                            (
+                                int(mb_id),
+                                tuple(sorted(h[:8] for h in held))[:3],
+                                tuple(sorted(str(k)[:8] for k in eff))[:3],
+                                # THE FIELD THAT DECIDES THE RELEASE: is the
+                                # held occupant a chunked continuation (the
+                                # mover's legality argument covers it) or a
+                                # resident decode request (it does not)?
+                                tuple(r is _chunked for r in reqs[:3]),
+                            )
+                        )
+    except Exception:  # noqa: BLE001 - a probe may never break admission
+        reason = "probe-error"
+    _1000_REASONS[reason] = _1000_REASONS.get(reason, 0) + 1
+    return reason
+
+
 def pp_proxy_stamp_epoch(stamp) -> Optional[int]:
     """The phase-flip epoch a proxy stamp names, or None if it names none.
 
@@ -2337,6 +2437,31 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
                 _998_BREAKS[0],
                 len(_998_LAST),
                 dict(list(_998_LAST.items())[:3]) or "-",
+            )
+        except Exception:  # noqa: BLE001 - a census may never break admission
+            pass
+        try:
+            # #1000 EMISSION, on the SAME off-path site as #998/#997d and for
+            # the same reason: the admission path already logs on a cadence, so
+            # nothing here shifts the timing of the receive being measured.
+            # Denominator first and unconditional, then EVERY reason -- a
+            # MOVED-ON of 0 is only a statement if the reasons beside it show
+            # the probe was actually asked.
+            logger.warning(
+                "#1000 SLOT-OCCUPANT rank=%s seen=%d reasons=%s specimens=%s. "
+                "MOVED-ON = this rank holds an occupant its upstream no longer "
+                "names for the slot, i.e. work that can never receive a proxy "
+                "again. still-named = the upstream still has it and the #798 "
+                "retention is protecting live work. no-decision = PP0 or a "
+                "pass that heard nothing; empty-decision = the upstream itself "
+                "voided. Specimen is (mb_id, held_rids, upstream_rids, "
+                "is_chunked_req) -- the last field decides whether the release "
+                "may use pp_queue_orphaned_chunked_req or needs its own "
+                "legality argument for resident decode work.",
+                getattr(getattr(holder, "ps", None), "pp_rank", "?"),
+                _1000_SEEN[0],
+                dict(sorted(_1000_REASONS.items())) or "-",
+                _1000_SPECIMENS[:3] or "-",
             )
         except Exception:  # noqa: BLE001 - a census may never break admission
             pass
@@ -4075,6 +4200,12 @@ class SchedulerPPMixin:
                 # sends is already the voided value and the ranks below take
                 # the same decision off the same per-hop fact. See
                 # `_pp_void_pass_without_upstream_launch`.
+                # #1000: read the upstream's rid set for THIS slot before the
+                # void below can empty it (`_pp_admission_incoming_effective =
+                # {}`), so the probe sees what the upstream actually said and
+                # not the consequence of this rank's own decision. Placed
+                # before #798 for that reason alone; it acts on nothing.
+                _1000_upstream_moved_on(self, mb_id)
                 self._pp_void_pass_without_upstream_launch(mb_id)
 
                 # #795 PP ADMISSION UNIFORMITY, RELOCATED: emit/forward this
