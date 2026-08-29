@@ -2309,6 +2309,15 @@ def release_req(
 # indistinguishable from a same-layout restore, and the one thing an operator
 # needs to read off these numbers is which flips keep their prefixes and by
 # which route. `carried + refused_layout` is every flip that crossed a geometry.
+#: #998 reader-side invariant probe: rid -> (start, end, len_prefix,
+#: len_input, break). `break` is `start - len(prefix_indices)`; 0 means the
+#: invariant holds, -1 means unreadable (a DISTINCT sentinel, because 0 is a
+#: legitimate value). Emitted from `pp_ring_note`, which runs independently
+#: of this probe.
+_998_LAST: dict = {}
+_998_SEEN = [0]
+_998_BREAKS = [0]
+
 _SEAM_STATE_COUNTS = {
     "copied": 0,
     "declined": 0,
@@ -3173,6 +3182,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Init tensors
         reqs = self.reqs
         input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
+        # #998 THE INVARIANT, CHECKED AT THE READER.
+        #
+        # `set_extend_range(prefix, prefix + new_len)` means
+        # `extend_range.start == len(prefix_indices)`, and the line above
+        # slices `fill[len(prefix) : extend_range.end]`. So
+        #     len(input_ids) = end - len(prefix) = end - start = new_len
+        # HOLDS ONLY WHILE start == len(prefix_indices). This is the one
+        # place that reads both, so ONE condition here covers all 24
+        # `extend_range` writers and all 27 `prefix_indices` writers -- and,
+        # unlike reading them one by one, it also catches the case where
+        # every writer is individually correct and their ORDER breaks the
+        # pair. Two of the 24 were read (truncate_prefix_to, the #797b park)
+        # and both carry the group; that is 2/24 and not a basis.
+        #
+        # Counter here, emission in `pp_ring_note` (independent of this
+        # probe, and its execution on this config is established). -1 is the
+        # sentinel; 0 is a legitimate break value, so it cannot be the
+        # default.
+        try:
+            for _r in reqs[:4]:
+                _er = getattr(_r, "extend_range", None)
+                _pl = len(getattr(_r, "prefix_indices", ()) or ())
+                if _er is None:
+                    _rec = (-1, -1, _pl, -1, -1)
+                else:
+                    _st, _en = int(_er.start), int(_er.end)
+                    _rec = (_st, _en, _pl, _en - _pl, _st - _pl)
+                _998_SEEN[0] += 1
+                if len(_998_LAST) < 32 or _r.rid in _998_LAST:
+                    _998_LAST[_r.rid] = _rec
+                if _rec[4] not in (0, -1):
+                    _998_BREAKS[0] += 1
+        except Exception:  # noqa: BLE001 - a probe may never break prepare_for_extend
+            pass
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.extend_range.end for r in reqs]
         orig_seq_lens = [max(r.extend_range.end, len(r.origin_input_ids)) for r in reqs]

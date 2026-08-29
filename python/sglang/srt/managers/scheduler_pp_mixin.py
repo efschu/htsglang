@@ -2302,6 +2302,29 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
         # Three numbers plus the skip reason, always, so `disagree=0` never
         # again arrives without its denominator.
         try:
+            from sglang.srt.managers.schedule_batch import (
+                _998_BREAKS,
+                _998_LAST,
+                _998_SEEN,
+            )
+
+            logger.warning(
+                "#998 EXTEND-INVARIANT rank=%s seen=%d breaks=%d tracked=%d "
+                "sample=%s. Tuple is (start, end, len_prefix, len_input, "
+                "BREAK); BREAK = start - len(prefix_indices) and MUST be 0 "
+                "while `len(input_ids) == new_len` holds. -1 is unreadable, "
+                "0 is a real value. breaks=0 with seen>0 means the invariant "
+                "held on every read; seen=0 means prepare_for_extend never "
+                "ran, which is not the same thing.",
+                getattr(getattr(holder, "ps", None), "pp_rank", "?"),
+                _998_SEEN[0],
+                _998_BREAKS[0],
+                len(_998_LAST),
+                dict(list(_998_LAST.items())[:3]) or "-",
+            )
+        except Exception:  # noqa: BLE001 - a census may never break admission
+            pass
+        try:
             # #997d EMISSION, at a site whose execution does not depend on the
             # probe -- verified to run on this config before the boot, which
             # is the check that cost boot 40. Denominator always, no hit
