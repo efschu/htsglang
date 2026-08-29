@@ -274,6 +274,68 @@ class SchedulerBatchResultProcessor:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    # #997b THE LAST UNMEASURED TERM, read here because there
+                    # is nowhere else to read it.
+                    #
+                    # extend = min(fill - prefix, cap). cap is group-uniform
+                    # (#610 pins every rank to the group minimum; measured
+                    # identical at 12977) and never bound (4096 against
+                    # extends of 253-278). prefix is equalised by the #791
+                    # truncation, both branches. So the only term that can
+                    # differ between ranks is fill, and `_refresh_fill_ids`
+                    # defines it as `origin_input_ids + output_ids` with a
+                    # rank-identical prompt -- leaving `output_ids` as the
+                    # single rank-local component of the whole equation.
+                    #
+                    # THIS append is the only place it grows, and it sits in
+                    # the RESULT path, which a VOIDED pass never reaches. That
+                    # is the chain, and it is code-read but UNMEASURED. Three
+                    # carriers were checked for an enrichment and all three
+                    # fail: no rid-precise log exists after this line, #968
+                    # MINT sits in the parked-continuation fact ring rather
+                    # than the result path, and #788 fires at ADMISSION where
+                    # out_len is structurally 0. A new emission is therefore
+                    # the only option, and it is a STATE reading, not a timing
+                    # signal.
+                    #
+                    # FIXED CADENCE, NOT A HIT FILTER: "log only when
+                    # interesting" cannot tell a zero from a never-evaluated.
+                    # DENOMINATOR ALWAYS: seen/emitted/unreadable ride on the
+                    # line whatever they are. SENTINEL -1: len(output_ids) can
+                    # legitimately be 0, so 0 and None are both unusable as
+                    # "not read".
+                    try:
+                        self._997_seen = getattr(self, "_997_seen", 0) + 1
+                        if self._997_seen % 40 == 0:
+                            try:
+                                _ol = len(req.output_ids)
+                                _fl = len(
+                                    getattr(req, "full_untruncated_fill_ids", ())
+                                    or ()
+                                )
+                            except Exception:  # noqa: BLE001
+                                _ol = _fl = -1
+                                self._997_unreadable = (
+                                    getattr(self, "_997_unreadable", 0) + 1
+                                )
+                            self._997_emitted = getattr(self, "_997_emitted", 0) + 1
+                            logger.warning(
+                                "#997b OUTPUT-FILL rid=%s out_len=%s fill_len=%s "
+                                "| seen=%d emitted=%d unreadable=%d. Compare the "
+                                "SAME rid across ranks: if out_len differs, the "
+                                "void path skipped this append on the lagging "
+                                "rank and the fill divergence is read rather "
+                                "than argued. -1 is a sentinel for unreadable "
+                                "and never a real length; 0 IS a real length.",
+                                req.rid,
+                                _ol,
+                                _fl,
+                                self._997_seen,
+                                self._997_emitted,
+                                getattr(self, "_997_unreadable", 0),
+                            )
+                    except Exception:  # noqa: BLE001 - a probe may never break the result path
+                        pass
                     # #699: this IS the first output token for req, never a
                     # forward-pass event -- stamp the admission-wedge clock
                     # here, not at forward_entry_time.
