@@ -8317,6 +8317,39 @@ class Scheduler(
                     )
                     for r in ret.reqs[:4]
                 )
+                # #997 THE LAST TERM OF THE EQUATION, on the line that already
+                # names the rids and already prints on every rank.
+                #
+                # extend = min(fill - prefix, cap). The cap is group-uniform
+                # (#610 pins it to the group minimum, measured identical at
+                # 12977 on all three ranks) and never bound for these requests
+                # (4096 against extends of 253/254/277/278). The prefix is
+                # equalised by the #791 truncation, both branches. So the only
+                # term left that can differ between ranks is the FILL -- and
+                # `_refresh_fill_ids` defines it as
+                # `origin_input_ids + output_ids`, where the prompt is
+                # rank-identical. `output_ids` is therefore the single
+                # rank-local component of the whole equation.
+                #
+                # `req.output_ids.append` lives in the RESULT path
+                # (batch_result_processor.py:276), which a VOIDED pass never
+                # reaches -- so a rank that voids falls behind on this list
+                # while a rank that ran does not. These boots are
+                # void-dominated. Printing both lengths per rid, on the same
+                # line, on every rank, is what turns that chain from
+                # code-argued into read.
+                #
+                # ENRICHMENT, not a new emission: same logger call, more
+                # fields. The event is what perturbs this path (measured four
+                # times); the bytes are not (measured twice).
+                fill_lens = ",".join(
+                    str(len(getattr(r, "full_untruncated_fill_ids", ()) or ()))
+                    for r in ret.reqs[:4]
+                )
+                out_lens = ",".join(
+                    str(len(getattr(r, "output_ids", ()) or ()))
+                    for r in ret.reqs[:4]
+                )
 
             # #788 (boot instr14): drop passes that REPEAT A CYCLE already
             # printed in full. The vacuous predicate above only fires on an
@@ -8383,11 +8416,14 @@ class Scheduler(
 
             logger.info(
                 "#788 PP-ADMISSION verdict=%s n_reqs=%d rids=%s prefix_lens=%s "
+                "#997 fill_lens=%s out_lens=%s "
                 "avail=%d evictable=%d queue=%d running=%d chunked=%d reason=%s",
                 verdict,
                 n_reqs,
                 rids,
                 prefix_lens,
+                fill_lens,
+                out_lens,
                 int(alloc.available_size()),
                 int(self.tree_cache.evictable_size()),
                 queue,
