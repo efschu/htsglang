@@ -4467,6 +4467,14 @@ class SchedulerPPMixin:
                             self._1019_n,
                         )
                 if cur_batch:
+                    # #1020: this slot now has an IN-FLIGHT pass. Recorded
+                    # before the call so the mark exists even if the launch
+                    # blocks or raises; cleared where the slot's result is
+                    # consumed below.
+                    self._pp_launched_pending = getattr(
+                        self, "_pp_launched_pending", set()
+                    )
+                    self._pp_launched_pending.add(mb_id)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,
@@ -4534,6 +4542,11 @@ class SchedulerPPMixin:
                                 self.mbs[next_mb_id],
                                 next_batch_result,
                             )
+                        # #1020: the pass for this slot has delivered; the
+                        # slot is ordinary again and may be voided.
+                        getattr(self, "_pp_launched_pending", set()).discard(
+                            next_mb_id
+                        )
                 # #631 defect R: OUTSIDE the block above, deliberately. See
                 # _pp_record_slot_last_batch -- nesting this under "did the
                 # slot run something" is the resident-carry leak.
@@ -7941,6 +7954,44 @@ class SchedulerPPMixin:
 
         batch = self.mbs[mb_id] if mb_id < len(self.mbs) else None
         if batch is None:
+            return False
+        # #1020 AN IDLE VOID MAY NOT VACATE A SLOT THAT IS NOT IDLE.
+        #
+        # This is the only site that clears a microbatch slot, and its two
+        # callers both fire on `_pp_admission_pass_voided`. That flag has
+        # LOCAL writers which survived the admission-arc removal -- notably
+        # the idle-void streak handler a few lines above, which sets it and
+        # then calls this. So a ring that is merely WAITING for a launched
+        # pass's result declares itself idle and destroys the live work.
+        #
+        # MEASURED end to end, boot_pp3solo_c58a7e0383_0829_121736: the smoke
+        # request c317394e is admitted, batched into mb_id=1, and LAUNCHED --
+        # `LAUNCH-JUNCTION mb_id=1 cur_batch=set occupied=[1] n=1` on all three
+        # ranks (#1019). The junction never fires again, because the slot is
+        # vacated here before the result lands. From then on the slot is empty,
+        # #1009 reports a resultless slot, #1008 holds the request, and its 11
+        # KV rows plus mamba slot {2} belong to no census term -- which is the
+        # deficit that killed boots 7 and 10-15, and which scales with the
+        # prompt (129 rows for a ~129-token smoke).
+        #
+        # The refusal is on the ACTUATOR, not on the messengers: #1008 and
+        # #1009 keep reporting exactly what they see, and the leak checker is
+        # untouched. What changes is that "void" stops meaning "discard a pass
+        # I myself launched and am still owed a result for".
+        if mb_id in getattr(self, "_pp_launched_pending", ()):
+            self._1020_refused = getattr(self, "_1020_refused", 0) + 1
+            if self._1020_refused <= 3 or self._1020_refused % 512 == 0:
+                logger.warning(
+                    "#1020 VOID REFUSED ON A LAUNCHED SLOT: mb_id=%s holds a "
+                    "pass this rank launched whose result has not been "
+                    "consumed yet, so it is not idle and must not be vacated "
+                    "(occurrence=%d). A count that keeps growing for one slot "
+                    "means the result never arrives -- that is a delivery "
+                    "defect, and this refusal keeps it visible instead of "
+                    "erasing the evidence with the batch.",
+                    mb_id,
+                    self._1020_refused,
+                )
             return False
         self.mbs[mb_id] = None
         if mb_id < len(self.mb_metadata):
