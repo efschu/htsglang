@@ -1252,6 +1252,31 @@ class MambaComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
+            # #969H BACKUP DECISION PROBE (temporary). §N1 established that this
+            # writer is PRESENT AND WIRED and declines only on an empty node.
+            # The open question is which of two things the retention path does:
+            #   "inserts a node WITHOUT mamba state"  -> we are called, value None
+            #   "inserts no node at all"              -> we are never called
+            # Reaching this line at all answers half of it; the flag answers the
+            # rest. Grep: "#969H BACKUP".
+            try:
+                _n = getattr(type(self), "_969h_n", 0) + 1
+                type(self)._969h_n = _n
+                _has = cd.value is not None
+                _k = "has_value" if _has else "EMPTY"
+                _c = getattr(type(self), "_969h_counts", None)
+                if _c is None:
+                    _c = type(self)._969h_counts = {}
+                _c[_k] = _c.get(_k, 0) + 1
+                if _n <= 40 or _n % 256 == 0:
+                    logger.warning(
+                        "#969H BACKUP n=%d mamba_value=%s counts=%s",
+                        _n,
+                        _k,
+                        _c,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("#969H BACKUP PROBE RAISED", exc_info=True)
             if cd.value is None:
                 return None
             return [
