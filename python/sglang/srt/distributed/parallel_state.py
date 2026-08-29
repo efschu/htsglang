@@ -2409,6 +2409,74 @@ class GroupCoordinator:
                 p2p_works.append(P2PWork(work, tensor))
         return p2p_works
 
+    def warmup_p2p_pairs(self) -> None:
+        """Establish this ring's p2p pairs BEFORE anyone needs them.
+
+        MEASURED, boot 59 of window-flip-0828, all three ranks in one window:
+        PP2 sat in ``torch.distributed.isend`` under ``send_tensor_dict`` --
+        the last rank's output wrap, which addresses ``self.ranks[dst]`` with
+        ``dst = (rank_in_group + 1) % world_size`` and so wraps 2 -> 0. That
+        pair had never been used, and a torch p2p pair is built lazily and
+        needs BOTH ends. PP0 was by then already parked in the admission
+        ring-commit (``_pp_commit_admission_send_work``) and PP1 with it, so
+        nobody joined the build. Closed three-arc cycle, and the ranks were at
+        two different lines of ONE loop body -- PP2 at :4454, PP0/PP1 at :4514.
+
+        So the first use of a pair must not be the one that has to succeed
+        while the peers are elsewhere. This walks the same neighbours over the
+        same groups the real send uses -- ``device_group`` for device tensors,
+        ``cpu_group`` for the metadata half -- so the pair the loop later needs
+        is the pair this warmed.
+
+        Both directions in one shot: every rank sends to its successor and
+        receives from its predecessor, which is exactly the ring the loop
+        drives, and no rank waits on a peer that is not simultaneously here.
+        Cheap (one byte per direction per group) and idempotent.
+
+        NOT gated on the flip. The cycle reproduces with enable_phase_flip
+        off (#990), so gating it would leave the plain PP path holding the
+        defect. Same channel-asymmetry family as #801.
+        """
+        if self.world_size < 2:
+            return
+        import time as _time
+
+        t0 = _time.perf_counter()
+        nxt = self.ranks[(self.rank_in_group + 1) % self.world_size]
+        prv = self.ranks[(self.rank_in_group - 1) % self.world_size]
+        pairs = []
+        for name, grp, dev in (
+            ("device", self.device_group, self.device),
+            ("cpu", self.cpu_group, torch.device("cpu")),
+        ):
+            if grp is None:
+                continue
+            try:
+                out = torch.zeros(1, dtype=torch.uint8, device=dev)
+                inp = torch.zeros(1, dtype=torch.uint8, device=dev)
+                works = [
+                    torch.distributed.isend(out, nxt, group=grp),
+                    torch.distributed.irecv(inp, prv, group=grp),
+                ]
+                for w in works:
+                    w.wait()
+                pairs.append(f"{name}:{self.rank}->{nxt},{prv}->{self.rank}")
+            except Exception as exc:  # noqa: BLE001
+                # A warmup may not be the thing that stops a boot; a pair that
+                # refuses here would have refused later, and the named line is
+                # what a reader needs either way.
+                pairs.append(f"{name}:FAILED({type(exc).__name__})")
+        logger.warning(
+            "PP-P2P-WARMUP pairs=%s done in %.1fms (group=%s world=%d). "
+            "Lazy pair construction needs both ends; boot 59 deadlocked "
+            "because the first use of 2->0 fell after the peers had entered "
+            "the admission ring-commit.",
+            ";".join(pairs) or "-",
+            (_time.perf_counter() - t0) * 1e3,
+            getattr(self, "group_name", "?"),
+            self.world_size,
+        )
+
     def recv_tensor_dict(
         self,
         src: Optional[int] = None,

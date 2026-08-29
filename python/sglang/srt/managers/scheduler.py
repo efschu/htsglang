@@ -13382,6 +13382,21 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
 
 
 def dispatch_event_loop(scheduler: Scheduler):
+    # #1005: WARM THE RING'S p2p PAIRS BEFORE ANY LOOP RUNS. Boot 59's stacks
+    # showed the last rank blocked in the lazy construction of pair 2->0 while
+    # both peers were already parked in the admission ring-commit -- the first
+    # use of that pair was also the one that had to succeed with nobody
+    # available to join it. Done HERE because it is the single entry to every
+    # loop (flip and non-flip alike), once, before the first send.
+    #
+    # UNGATED on purpose: the cycle reproduces with the flip off (#990), so
+    # gating this would leave plain PP holding the defect.
+    _pp = getattr(scheduler, "pp_group", None)
+    if _pp is not None and getattr(_pp, "world_size", 1) > 1:
+        if not getattr(scheduler, "_pp_p2p_warmed", False):
+            scheduler._pp_p2p_warmed = True
+            _pp.warmup_p2p_pairs()
+
     # Dispatch to the appropriate event loop based on the disaggregation mode
     # #631: a phase-flip boot re-dispatches per phase; wrapper, not patch.
     if getattr(scheduler.server_args, "enable_phase_flip", False):
