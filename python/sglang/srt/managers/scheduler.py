@@ -8145,13 +8145,9 @@ class Scheduler(
         if amended is not None:
             amended = void_pp_admission_decision(amended)
             self._pp_admission_amended_to_forward = amended
-            note = getattr(self, "_pp_note_output_expectation", None)
+            note = getattr(self, "_pp_note_admission_amendment", None)
             if note is not None:
-                note(
-                    amended.mb_id,
-                    bool(getattr(self, "_pp_output_expected_incoming", False)),
-                    amended,
-                )
+                note(amended.mb_id, amended)
 
         # #971 THE JUNCTION. Every exit of this pass must re-home the chunked
         # continuation, and this is the exit that did not.
