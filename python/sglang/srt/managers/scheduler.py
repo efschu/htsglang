@@ -894,6 +894,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self._pool_phase_probe("tree_cache")
 
         # #847 (W33): the WRITER for the phase-matched host pools. HERE, AND
         # NOT INSIDE init_model_worker -- W33 arm 1 measured why. It needs
@@ -914,6 +915,7 @@ class Scheduler(
             )
 
             self.phase_flip_host_pools = build_phase_flip_host_pools(self)
+        self._pool_phase_probe("flip_host_pools")
 
         # #677 PHASE 1: HERE, AND NOT BESIDE init_admission_limiter.
         # It reads the GDN slot pool off req_to_token_pool.mamba_allocator,
@@ -930,11 +932,13 @@ class Scheduler(
         # not have caught this: the ordering bug lives in the constructor, and
         # the tests bind the methods to an object that already has the fields.
         self.init_parked_decode_set()
+        self._pool_phase_probe("parked_decode")
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
         self.init_hisparse_coordinator()
+        self._pool_phase_probe("hisparse")
 
         if (
             self.server_args.disaggregation_mode == "decode"
@@ -966,9 +970,11 @@ class Scheduler(
 
         # Init running status
         self.init_running_status()
+        self._pool_phase_probe("running_status")
 
         # Init chunked prefill
         self.init_chunked_prefill()
+        self._pool_phase_probe("chunked_prefill")
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -11331,6 +11337,59 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+
+    def _pool_phase_probe(self, phase: str) -> None:
+        """#1017: read both pools at a named init phase, and name the rows.
+
+        Boots 7/10/11 and the graphs-off arm all died on the FIRST idle with
+        pool rows that belong to no census term -- 10, 6 and 11 full rows
+        respectively, and invariably mamba slot {2}. Tree-cache construction
+        already reports both pools FULL (21725/21725, 9/9), and turning cuda
+        graphs off made the full-row deficit BIGGER, so neither capture nor
+        anything before the tree is the owner. That leaves "somewhere between
+        tree-cache construction and the first idle", which is too coarse to
+        act on -- and four boots of inferring a candidate from a nearby log
+        line produced two attributions I had to withdraw.
+
+        So this stops inferring and measures: the same two numbers at every
+        init phase, with the concrete missing row ids the moment a phase shows
+        a deficit. One grepable anchor, POOL-PHASE, so the first phase whose
+        reading drops below full IS the owner's phase.
+
+        Diagnostics only. It allocates nothing, frees nothing, and adds no
+        ownership term -- the leak checker is untouched, which is the whole
+        point: this finds who took the rows, it does not excuse them.
+        """
+        try:
+            alloc = getattr(self, "token_to_kv_pool_allocator", None)
+            rtp = getattr(self, "req_to_token_pool", None)
+            mamba = getattr(rtp, "mamba_allocator", None) if rtp else None
+            if alloc is None:
+                return
+            full_avail, full_size = alloc.available_size(), alloc.size
+            parts = [f"full={full_avail}/{full_size}"]
+            if mamba is not None:
+                parts.append(f"mamba={mamba.available_size()}/{mamba.size}")
+            # Name the rows only when something is missing: on a healthy phase
+            # this stays a two-number line, and on the first unhealthy one it
+            # is already the evidence, without a second boot to collect it.
+            if full_avail < full_size:
+                try:
+                    free = {int(x) for x in alloc.free_pages.tolist()}
+                    missing = [r for r in range(1, full_size + 1) if r not in free]
+                    parts.append(f"missing_full={sorted(missing)[:24]}")
+                except Exception:  # noqa: BLE001
+                    parts.append("missing_full=<unreadable>")
+            if mamba is not None and mamba.available_size() < mamba.size:
+                try:
+                    mfree = {int(x) for x in mamba.free_slots.tolist()}
+                    mmiss = [s for s in range(1, mamba.size + 1) if s not in mfree]
+                    parts.append(f"missing_mamba={sorted(mmiss)[:16]}")
+                except Exception:  # noqa: BLE001
+                    parts.append("missing_mamba=<unreadable>")
+            logger.info("POOL-PHASE %s %s", phase, " ".join(parts))
+        except Exception as exc:  # noqa: BLE001 - a probe must never break a boot
+            logger.info("POOL-PHASE %s unreadable: %r", phase, exc)
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
