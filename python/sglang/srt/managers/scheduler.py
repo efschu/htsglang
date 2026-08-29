@@ -10307,7 +10307,55 @@ class Scheduler(
         # last token. The request is not dropped and not reset -- it stays in
         # the running batch and becomes eligible the moment its prefill
         # result lands.
-        _held = [i for i, r in enumerate(batch.reqs) if not r.output_ids]
+        # #1012: A RESULT STILL IN `result_queue` IS NOT A MISSING RESULT.
+        #
+        # `not r.output_ids` is TRUE for every freshly prefilled request under
+        # the overlap scheduler, PP or no PP. `event_loop_overlap` launches
+        # batch P in iteration N and pops the PREVIOUS batch's result in the
+        # same iteration, so P's result is processed at the END of iteration
+        # N+1 -- after `get_next_batch_to_run`, i.e. after this function has
+        # already looked at P's requests. Upstream is fine with that: decode
+        # embeds a FUTURE token (`prepare_for_decode`: "input_ids is set at end
+        # of previous run_batch (placeholder for overlap)"), not
+        # `req.output_ids`.
+        #
+        # So the #1008 premise -- "their prefill has not come back" -- was
+        # tested with a predicate that cannot distinguish "in flight, one
+        # iteration out" from "lost". MEASURED, boot
+        # boot_stage0tp3_531fba3ecf_0829_090840.log, pp_size=1: all three
+        # probes held and re-queued (`requeued_total=3`), each re-prefilled
+        # from scratch (`#new-token: 2` then `#new-token: 3`, `#cached-token:
+        # 0` both times). Two costs, both real:
+        #   - a DOUBLE PREFILL of every request, which the standing
+        #     no-double-prefill order forbids outright;
+        #   - a KV LEAK of exactly the first prefill's rows. `alloc` REUSES
+        #     `req.req_pool_idx` for a request that already holds one
+        #     (memory_pool.py:386-411), the re-prefill matches nothing and so
+        #     writes `req_to_token[idx, 0:n]` again from zero, and the rows the
+        #     first prefill put there are then referenced by nobody. Two boots,
+        #     two exact matches: 3 probes x 3 prompt tokens = 9 missing rows
+        #     (`total=221120, available=221111`), and 3 x 2 = 6 after the
+        #     prompt got shorter (`available=221114`). The same boot's TREE
+        #     CENSUS read `nodes=1 ... recomputed_evictable=0`, which rules out
+        #     the competing reading that the tree held them uncounted.
+        #
+        # THE DOOR #1010 LOOKED FOR EXISTS. Its argument for re-queueing is
+        # that no path leads to the request any more -- it checks the
+        # microbatch slots and the chunked carry. `result_queue` is a third
+        # door and the one that actually delivers: the request is in a batch
+        # whose forward has been launched and whose result is popped later this
+        # iteration. Excluding those requests leaves #1008/#1010 for the case
+        # they were built on (a PP result that genuinely never lands) and takes
+        # them off the overlap fast path they were never meant to see.
+        _pending_result = set()
+        for _pb, _ in getattr(self, "result_queue", None) or ():
+            for _pr in getattr(_pb, "reqs", None) or ():
+                _pending_result.add(id(_pr))
+        _held = [
+            i
+            for i, r in enumerate(batch.reqs)
+            if not r.output_ids and id(r) not in _pending_result
+        ]
         if _held:
             self._1008_held = getattr(self, "_1008_held", 0) + len(_held)
             logger.warning(

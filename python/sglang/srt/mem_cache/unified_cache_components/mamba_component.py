@@ -1022,7 +1022,48 @@ class MambaComponent(TreeComponent):
 
         if is_finished:
             if cache_len is None:
-                cache_len = 0
+                # #1012: NO TRACKED POSITION IS THE SAME ANSWER AS AN OFF-GRID
+                # ONE, AND IT WAS THE ONLY ONE STILL RETURNING 0.
+                #
+                # `cache_len = req.mamba_last_track_seqlen` is None whenever the
+                # request never reached a checkpoint boundary -- with
+                # `--mamba-checkpoint-interval 4096` that is every request
+                # shorter than 4096 tokens, i.e. all of them on a probe or a
+                # chat turn. The off-grid branch above cannot catch it (`cache_len
+                # is not None and not is_on_interval(...)`), so control fell here
+                # and `cache_len = 0` collapsed the shared `effective_cache_len`
+                # in `UnifiedRadixCache.cache_finished_req` to 0: the key is
+                # truncated to nothing, no node is inserted, and every row is
+                # freed.
+                #
+                # That is precisely the veto #783 removed from the two branches
+                # above, still standing on the third. It is the same "dark cache"
+                # signature that ticket names -- the tree retains nothing and
+                # every prefill reads `#cached-token: 0` -- and it was measured
+                # here: after three finished requests the TREE CENSUS read
+                # `nodes=1 ... recomputed_evictable=0`, an empty tree.
+                #
+                # The answer is the one `_decline_retention` already gives for a
+                # FINISHED caller: decline the ANCHOR (`mamba_value=None`, the
+                # tombstone `commit_insert_component_data` documents and
+                # accepts), impose NO constraint on the length. The
+                # full-attention KV does not depend on the mamba grid, so it
+                # stays cached at full length while the match walk keeps
+                # refusing the node as a resume point -- exactly the split #783
+                # established.
+                self._off_grid_retention_declines += 1
+                count = self._off_grid_retention_declines
+                if count <= 3 or count % 1000 == 0:
+                    logger.warning(
+                        "mamba checkpoint interval: no tracked position at "
+                        "finish (interval %s), caching KV without a mamba "
+                        "anchor, occurrence=%d, rid=%s",
+                        self.mamba_checkpoint_interval,
+                        count,
+                        getattr(req, "rid", None),
+                    )
+                insert_params.mamba_value = None
+                return _decline_retention(is_finished)
             if self.enable_mamba_extra_buffer:
                 keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
                     req
