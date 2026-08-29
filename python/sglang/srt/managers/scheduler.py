@@ -10269,6 +10269,25 @@ class Scheduler(
             self._add_request_to_queue(req, is_retracted=True)
         return new_token_gained
 
+    def _1008_held_indices(self, batch: ScheduleBatch) -> List[int]:
+        """Indices of requests in `batch` whose prefill result is genuinely absent.
+
+        A request with no `output_ids` whose batch is still sitting in
+        `result_queue` is one iteration out, not lost; see the #1012 block in
+        `update_running_batch` for why the bare `not r.output_ids` predicate
+        could not tell the two apart and what that cost. Split out from that
+        method so the predicate can be driven directly, without a scheduler.
+        """
+        pending: set[int] = set()
+        for pending_batch, _ in getattr(self, "result_queue", None) or ():
+            for pending_req in getattr(pending_batch, "reqs", None) or ():
+                pending.add(id(pending_req))
+        return [
+            i
+            for i, r in enumerate(batch.reqs)
+            if not r.output_ids and id(r) not in pending
+        ]
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -10347,15 +10366,7 @@ class Scheduler(
         # iteration. Excluding those requests leaves #1008/#1010 for the case
         # they were built on (a PP result that genuinely never lands) and takes
         # them off the overlap fast path they were never meant to see.
-        _pending_result = set()
-        for _pb, _ in getattr(self, "result_queue", None) or ():
-            for _pr in getattr(_pb, "reqs", None) or ():
-                _pending_result.add(id(_pr))
-        _held = [
-            i
-            for i, r in enumerate(batch.reqs)
-            if not r.output_ids and id(r) not in _pending_result
-        ]
+        _held = self._1008_held_indices(batch)
         if _held:
             self._1008_held = getattr(self, "_1008_held", 0) + len(_held)
             logger.warning(
