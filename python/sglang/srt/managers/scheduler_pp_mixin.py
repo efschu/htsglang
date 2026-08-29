@@ -4457,7 +4457,11 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    # #1002d: a declined output leaves this unset by design.
+                    if d2h_event is not None:
+                        # #1002d: a declined output leaves this unset.
+                        if d2h_event is not None:
+                            d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
@@ -4706,7 +4710,11 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    # #1002d: a declined output leaves this unset by design.
+                    if d2h_event is not None:
+                        # #1002d: a declined output leaves this unset.
+                        if d2h_event is not None:
+                            d2h_event.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -4889,7 +4897,9 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
-                        d2h_event.synchronize()
+                        # #1002d: a declined output leaves this unset.
+                        if d2h_event is not None:
+                            d2h_event.synchronize()
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
