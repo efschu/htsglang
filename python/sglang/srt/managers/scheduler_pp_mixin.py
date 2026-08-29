@@ -8999,6 +8999,28 @@ class SchedulerPPMixin:
                 # refusals, which is the mistake #995's first version made and
                 # boot 15 punished. The one correct comparison already exists
                 # downstream; this only lets it name its counterparty.
+                # #969I: WHAT ARRIVES WHEN 'hidden_states' IS MISSING. The
+                # KeyError that kills every #969D boot is raised three frames
+                # later, in the model
+                # (`qwen3_5.py:1573  pp_proxy_tensors["hidden_states"]`), where
+                # the payload's provenance is already gone. This names the
+                # payload AT ARRIVAL: which keys it does carry, which slot, and
+                # the sender's stamp. Silent on every healthy receive.
+                # Grep: "#969I PROXY-NO-HS".
+                try:
+                    if "hidden_states" not in raw:
+                        _n = getattr(self, "_969i_n", 0) + 1
+                        self._969i_n = _n
+                        logger.warning(
+                            "#969I PROXY-NO-HS n=%d mb_id=%s keys=%s stamp=%s",
+                            _n,
+                            mb_id,
+                            sorted(raw.keys()),
+                            stamp,
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.warning("#969I PROXY-NO-HS PROBE RAISED", exc_info=True)
+
                 _proxy = PPProxyTensors(raw)
                 try:
                     _proxy._pp_sender_stamp = stamp
