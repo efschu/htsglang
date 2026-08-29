@@ -4459,14 +4459,56 @@ class SchedulerPPMixin:
                 if self.mbs[next_mb_id] is not None:
                     # #1002d: a declined output leaves this unset by design.
                     if d2h_event is not None:
-                        # #1002d: a declined output leaves this unset.
-                        if d2h_event is not None:
-                            d2h_event.synchronize()
-                    with torch.profiler.record_function("process_batch_result"):
-                        self._pp_process_batch_result(
-                            self.mbs[next_mb_id],
-                            next_batch_result,
-                        )
+                        d2h_event.synchronize()
+                    # #1009: THE OTHER HALF OF THE PRECONDITION. `self.mbs[
+                    # next_mb_id] is not None` asks whether the slot HOLDS a
+                    # batch; it does not ask whether that batch has RUN. On a
+                    # PP=3 box with a single short request those two come
+                    # apart in one iteration: the slot is filled by this
+                    # round's admission and the result-processing step for the
+                    # same slot runs before any forward has happened, so
+                    # `next_batch_result` is still None.
+                    #
+                    # MEASURED, boot 68, all inside one second at 07:50:17:
+                    # ADMIT on all three ranks (rid 43452758, prefix_lens=0
+                    # fill_lens=3 out_lens=0) -> #1003 on PP0 AND PP1 -> #1008
+                    # holds the request. No forward in between, and no void
+                    # anywhere (797/798/951/984 all zero), so the batch was
+                    # never executed and there was nothing to process.
+                    #
+                    # The consequence was the whole ladder: the prefill result
+                    # is consumed as absent, so out_lens stays 0, so #1008
+                    # holds the request for ever, so the instance goes idle
+                    # and dies on the 120s ring budget. Before #1008 the same
+                    # state was decoded instead, which is where the DECODE-
+                    # labelled 3-token extend came from.
+                    #
+                    # Not a consumer guard: a slot's result exists only after
+                    # its pass ran, and this is that precondition written down
+                    # where it is used. Nothing is dropped -- the batch stays
+                    # in the slot and is processed when its result lands.
+                    if next_batch_result is None:
+                        self._1009_skipped = getattr(self, "_1009_skipped", 0) + 1
+                        if self._1009_skipped <= 8 or self._1009_skipped % 256 == 0:
+                            logger.warning(
+                                "#1009 SLOT HAS NO RESULT YET: mb_id=%s holds "
+                                "a batch whose pass has not run (occurrence "
+                                "%d). Skipping result processing rather than "
+                                "consuming absence as a result. A count that "
+                                "settles after the first rounds is the "
+                                "pipeline filling; one that grows with traffic "
+                                "means passes are not completing.",
+                                next_mb_id,
+                                self._1009_skipped,
+                            )
+                    else:
+                        with torch.profiler.record_function(
+                            "process_batch_result"
+                        ):
+                            self._pp_process_batch_result(
+                                self.mbs[next_mb_id],
+                                next_batch_result,
+                            )
                 # #631 defect R: OUTSIDE the block above, deliberately. See
                 # _pp_record_slot_last_batch -- nesting this under "did the
                 # slot run something" is the resident-carry leak.
@@ -4712,9 +4754,7 @@ class SchedulerPPMixin:
                 if self.mbs[next_mb_id] is not None:
                     # #1002d: a declined output leaves this unset by design.
                     if d2h_event is not None:
-                        # #1002d: a declined output leaves this unset.
-                        if d2h_event is not None:
-                            d2h_event.synchronize()
+                        d2h_event.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,

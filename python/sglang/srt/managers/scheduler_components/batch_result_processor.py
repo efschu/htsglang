@@ -239,9 +239,11 @@ class SchedulerBatchResultProcessor:
         # quiet token loss this whole window has been chasing.
         if result is None:
             logger.warning(
-                "#1003 VOIDED PREFILL RESULT DROPPED: bs=%d rids=%s. The slot "
-                "was voided (the pass ran nowhere) but the batch still "
-                "reached process_batch_result_prefill with no result. "
+                "#1003 PREFILL RESULT ABSENT: bs=%d rids=%s. The batch reached "
+                "process_batch_result_prefill with no result. The earlier "
+                "wording here blamed a void; boot 68 measured 797/798/951/984 "
+                "all at zero, so that attribution was wrong and is retracted "
+                "-- the pass had simply not run yet (#1009). "
                 "Dropping the pair instead of dereferencing None; the "
                 "requests keep their state and are re-admitted by the "
                 "ordinary path. A non-zero count here is a void whose "
