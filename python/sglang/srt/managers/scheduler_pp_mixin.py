@@ -2312,7 +2312,9 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
                 "Compare the SAME rid across ranks: a differing out_len means "
                 "the void path skipped this append on the lagging rank, which "
                 "is the fill divergence read rather than argued. Tuple is "
-                "(out_len, fill_len); -1 would be unreadable, 0 is a real "
+                "(out_len, fill_len, LAG); lag is the appends the fill has "
+                "not seen yet (#997e) -- a rank-local refresh trigger makes "
+                "it differ, and -1 there means unreadable, 0 is real; "
                 "length; an EMPTY sample with seen=0 means the decode append "
                 "never ran, not that nothing diverged.",
                 getattr(getattr(holder, "ps", None), "pp_rank", "?"),

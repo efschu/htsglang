@@ -897,10 +897,26 @@ class SchedulerBatchResultProcessor:
                 # last-writer-wins per rid, bounded: the reader compares the
                 # SAME rid across ranks, so one live value per rid suffices.
                 if len(_m) < 32 or req.rid in _m:
-                    _m[req.rid] = (
-                        len(req.output_ids),
-                        len(getattr(req, "full_untruncated_fill_ids", ()) or ()),
+                    # #997e THE SECOND TERM: how many appends the fill has not
+                    # seen yet. `fill = origin_input_ids + output_ids` holds
+                    # only at the moment `_refresh_fill_ids` runs, and that
+                    # runs from `init_next_round_input` -- i.e. gated on THIS
+                    # rank admitting this request. A rank that breaks out at
+                    # `batch_full_break` or `prefetch_pending`
+                    # (scheduler.py:9452/9476-9480, both BEFORE the refresh at
+                    # :9487) keeps appending while its fill stands still.
+                    # So fill-divergence = output-divergence + refresh-timing
+                    # divergence, and only the first was measured (boot 41:
+                    # max 1). This is the second, and it is exactly the
+                    # `n_have_output` that `_refresh_fill_ids` computes at
+                    # schedule_batch.py:1313.
+                    _out = len(req.output_ids)
+                    _fill = len(
+                        getattr(req, "full_untruncated_fill_ids", ()) or ()
                     )
+                    _orig = len(getattr(req, "origin_input_ids", ()) or ())
+                    _lag = _out - (_fill - _orig) if _fill and _orig else -1
+                    _m[req.rid] = (_out, _fill, _lag)
             except Exception:  # noqa: BLE001 - a probe may never break the result path
                 pass
             new_accept_len = len(next_token_id)
