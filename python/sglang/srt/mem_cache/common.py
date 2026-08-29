@@ -1747,6 +1747,29 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    # #969K RELEASE-EXIT PROBE (temporary). §O/§Q left one question: the
+    # retention path's prefixes never reach the mamba backup writer, the writer
+    # never declines (EMPTY=0), and #991 -- the decline inside
+    # prepare_for_caching_req -- is 0 on every boot. So the retracted request
+    # is not being declined anywhere; it must be leaving through an EARLIER
+    # exit than the insert. This function has exactly three, and nothing says
+    # which one is taken. Grep: "#969K RELEASE-EXIT".
+    try:
+        _e = (
+            "no_req_pool_idx"
+            if req.req_pool_idx is None
+            else ("spilled_host" if req.kv_spill_state == "host" else "insert_path")
+        )
+        _skip = bool(getattr(req, "skip_radix_cache_insert", False))
+        _c = globals().setdefault("_969k_counts", {})
+        _k = f"{_e}|is_insert={bool(is_insert)}|skip={_skip}"
+        _c[_k] = _c.get(_k, 0) + 1
+        _n = sum(_c.values())
+        if _n <= 40 or _n % 256 == 0:
+            logger.warning("#969K RELEASE-EXIT n=%d counts=%s", _n, _c)
+    except Exception:  # noqa: BLE001
+        logger.warning("#969K RELEASE-EXIT PROBE RAISED", exc_info=True)
+
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
