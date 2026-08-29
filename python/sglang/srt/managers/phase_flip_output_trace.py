@@ -65,6 +65,10 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "[#631 OUTTRACE]"
 TRACE_ENV = "SGLANG_PHASE_FLIP_OUTPUT_TRACE"
+#: #997c: arm the post-cutover reporting for N rounds WITHOUT a cutover, so
+#: the trace is usable on a flip-free build. 0 (default) keeps the trace
+#: armed only by `cutover()`, i.e. exactly today's behaviour.
+OFFFLIP_ENV = "SGLANG_631_TRACE_OFFFLIP"
 STATE_ATTR = "_phase_flip_output_trace"
 
 # How many passes to keep before the cutover, and to report after it. The
@@ -152,7 +156,32 @@ class OutputTrace:
     def __init__(self, pre: int = PRE_PASSES, post: int = POST_PASSES):
         self.ring: Deque[Tuple[str, List[Row]]] = deque(maxlen=pre)
         self.post = post
-        self.after_left = 0
+        # #997c A SECOND GATE BESIDE THE CUTOVER WINDOW, NEVER INSTEAD OF IT.
+        #
+        # `armed_after` is `after_left > 0`, and `after_left` was set in
+        # exactly one place: `cutover()`. On a build with the flip OFF there
+        # is no cutover, so this trace -- the ONLY rid-precise instrument that
+        # separates "this round appended nothing" from "this round produced
+        # nothing" (see `trace_round`'s docstring, and the #631 comment above
+        # the decode append at batch_result_processor.py:853) -- can never
+        # arm. The question it was built for is therefore structurally
+        # unanswerable off-flip, and that is why nobody has measured it there.
+        #
+        # This window found the same shape twice in ROOTS (#994's "bigger pool
+        # serves worse" and #987's "across tp_to_pp", both framed flip-bound
+        # while the mechanism occurs flip-free). A flip-bound root costs a
+        # wrong search; a flip-bound INSTRUMENT costs the possibility of
+        # searching at all.
+        #
+        # `cutover()` still sets `after_left = self.post` untouched, so the
+        # flip path keeps its window exactly as before -- taking it away would
+        # be the next regression. This only adds an off-flip arming, default 0
+        # = today's behaviour byte for byte.
+        try:
+            _off = int(os.environ.get(OFFFLIP_ENV, "") or 0)
+        except ValueError:
+            _off = 0
+        self.after_left = max(0, _off)
         self.pass_no = 0
         self.direction: Optional[str] = None
         self.epoch: Optional[int] = None
