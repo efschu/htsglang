@@ -1449,6 +1449,109 @@ class SeamOrderError(RuntimeError):
     """A seam step ran before the step it depends on (#856)."""
 
 
+def reissue_seam_prefetch(scheduler) -> int:
+    """#1025b: re-issue the cutover's own re-admission prefetches ON THE
+    BINDING THAT WILL ACTUALLY SERVE THEM.
+
+    THE SEQUENCING IS THE DEFECT, and it makes the seam's read-through
+    unreachable by construction. Inside one cutover:
+
+      1. `readmit_seam_residents` puts every retracted resident back on the
+         queue through `_add_request_to_queue`, which issues
+         `_prefetch_kvcache` -- registering the operation at binding
+         generation N, because that is the binding installed at that instant.
+      2. `rebind_for_cutover` then moves the pools and the generation to N+1.
+      3. The operation completes and is offered to the tree, where
+         `#937 STALE PREFETCH INSERT REFUSED` correctly refuses it: the span
+         sits in generation N's host pool and publishing it into an N+1 tree
+         would name rows nothing owns.
+
+    So the prefetch is FETCHED, PAID FOR, AND THROWN AWAY -- every time, for
+    every re-admitted resident. The seam's promise ("their KV is in the
+    canonical store from the fence; the new layout re-admits them and serves
+    the prefix by read-through") cannot be kept by this ordering no matter how
+    healthy the store is.
+
+    MEASURED on boot d70f38320e (2026-08-29, no-grid, agent load):
+        HiCache prefetch success                 35
+        ...of those refused as stale (#937)      30   (86%)
+        Prefill batches 82   Decode batches 0   cutovers 12
+    and the downstream refusals name the missing span by hand: `#928 anchor
+    REFUSING resume: node carries no recurrent state on device or host, so its
+    KV prefix cannot be reused; re-prefilling`. The request re-prefills 8470
+    tokens it had already fetched, cannot finish inside the TP phase's chunk
+    budget, is flipped away, and comes back -- the treadmill that reads from
+    outside as "the instance does nothing".
+
+    WHY RE-ISSUE RATHER THAN PUBLISH EARLY. Publishing the in-flight span
+    before the swap would need the tree to accept a generation-N span it is
+    about to drop anyway (the cutover resets the tree by law), i.e. a second
+    ownership scheme beside the binding generation -- the compensation class
+    this campaign is deleting. Re-issuing needs no new mechanism at all: the
+    same `_prefetch_kvcache` authority, one call later, when the answer to
+    "which pool does this land in" is finally the pool that will read it.
+
+    Paired with #1025's quiesce, which is what makes the re-issue meaningful:
+    without it the transfer thread was being KILLED by the swap instead of
+    completing, so there was no pipeline left to re-issue into.
+
+    Reaps first, deliberately: `check_prefetch_progress` retires the doomed
+    generation-N operation (logging its #937 refusal as it always has) so the
+    rid is out of `ongoing_prefetch` and the re-issue is not refused as a
+    duplicate of the very operation it replaces.
+
+    Returns how many requests were re-issued, so the seam can count rather
+    than hope.
+    """
+    if not getattr(scheduler, "enable_hicache_storage", False):
+        return 0
+    tree = getattr(scheduler, "tree_cache", None)
+    check = getattr(tree, "check_prefetch_progress", None)
+    issue = getattr(scheduler, "_prefetch_kvcache", None)
+    if check is None or issue is None:
+        return 0
+    try:
+        from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
+    except Exception:  # noqa: BLE001
+        return 0
+    reissued = 0
+    verdicts: dict = {}
+    for req in list(getattr(scheduler, "waiting_queue", []) or []):
+        if getattr(req, SEAM_READMIT_ATTR, None) is None:
+            continue
+        rid = getattr(req, "rid", None)
+        if rid is None:
+            continue
+        try:
+            check(rid)
+        except Exception:  # noqa: BLE001 - a reap that cannot run is not a reason to skip the re-issue
+            pass
+        try:
+            verdict = issue(req)
+        except Exception as exc:  # noqa: BLE001 - never strand a flip on a prefetch
+            logger.error(
+                "%s #1025b re-issue RAISED for %s (%s); this request serves no "
+                "read-through in the incoming layout and re-prefills in full.",
+                LOG_PREFIX,
+                str(rid)[:8],
+                exc,
+            )
+            continue
+        reissued += 1
+        verdicts[str(verdict)] = verdicts.get(str(verdict), 0) + 1
+    if reissued:
+        logger.info(
+            "%s #1025b SEAM PREFETCH RE-ISSUED on the incoming binding: %d "
+            "re-admitted resident(s), verdicts %s. Without this every one of "
+            "them was fetched at the outgoing generation and refused by #937 "
+            "on arrival (30 of 35 completions on boot d70f38320e).",
+            LOG_PREFIX,
+            reissued,
+            verdicts,
+        )
+    return reissued
+
+
 def release_residents_for_cutover(reqs, *, retract, reset_tree):
     """RETRACT STRICTLY BEFORE RESET. The order is the law (#856).
 
@@ -3562,6 +3665,10 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 LOG_PREFIX,
                 e,
             )
+        # #1025b: THE SEAM'S OWN PREFETCHES ARE ISSUED AT THE WRONG GENERATION
+        # AND ARE DOOMED BY CONSTRUCTION. Re-issue them here, where the binding
+        # is finally current. See `reissue_seam_prefetch` for the measurement.
+        reissue_seam_prefetch(scheduler)
         trace_cutover(scheduler, direction)
         _mark("verify+publish+trace")
         # #690 capture A: one line, sorted by cost, so the 24x spread can be
