@@ -4489,6 +4489,43 @@ class SchedulerPPMixin:
                             _occ,
                             self._1019_n,
                         )
+                # #969N PROBE -- NAME THE MEMBERSHIP, ON EVERY RANK, AT THE
+                # LAUNCH JUNCTION. §X3: the surviving killer is
+                # `#631 PP proxy/batch mismatch` with SAME geometry, SAME
+                # epoch, SAME slot and DIFFERENT batches (254 rows sent
+                # against a 507-token bs=2 receiver batch, sender fwd_ct 3 vs
+                # receiver 2). Two readings fit that and they need opposite
+                # cuts: (a) the ranks admitted DIFFERENT REQUEST SETS for the
+                # same slot, or (b) they admitted the same set and one rank
+                # SPLIT it across two forwards (507 = 254 + 253 is suspicious
+                # enough to be worth excluding rather than assuming).
+                #
+                # Instrument, not patch: eleven structure hypotheses have died
+                # on this chain and the twelfth was killed at the desk. This
+                # line costs one formatted string per launched pass and prints
+                # the one thing the guard's own message cannot -- WHICH
+                # requests each rank put in the slot.
+                if cur_batch:
+                    try:
+                        _reqs = getattr(cur_batch, "reqs", None) or []
+                        _rids = ",".join(str(getattr(r, "rid", "?"))[:8] for r in _reqs)
+                        _ext = getattr(cur_batch, "extend_num_tokens", None)
+                        logger.warning(
+                            "#969N ADMIT slot=%s fwd_ct=%s bs=%d extend=%s "
+                            "input_ids=%s rids=[%s]",
+                            mb_id,
+                            int(getattr(self, "forward_ct", -1)),
+                            len(_reqs),
+                            _ext,
+                            (
+                                None
+                                if getattr(cur_batch, "input_ids", None) is None
+                                else int(cur_batch.input_ids.numel())
+                            ),
+                            _rids,
+                        )
+                    except Exception as _exc:  # noqa: BLE001 - probe only
+                        logger.warning("#969N ADMIT probe failed: %s", _exc)
                 if cur_batch:
                     # #1020: this slot now has an IN-FLIGHT pass. Recorded
                     # before the call so the mark exists even if the launch
