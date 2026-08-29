@@ -5050,6 +5050,21 @@ class PhaseFlipRuntime:
         every_n = envs.SGLANG_PP_ARM_CENSUS_EVERY_N.get()
         min_interval = envs.SGLANG_PP_ARM_CENSUS_MIN_INTERVAL_S.get()
 
+        # [strip-B] The hard off-spelling the #926 cadence gate never had:
+        # a NEGATIVE EVERY_N disables the at-arm census entirely. 0/0 means
+        # "census every arm" (pre-#926) and every positive pair still fires
+        # at least once (first arm), so "never" was unspellable by env. The
+        # skip is still counted, so a later boot with the gate open reports
+        # the gap instead of reading silence as "clean". Guarded FIRST:
+        # `n % -1 == 0` in Python, so a -1 falling through to the modulo
+        # admission below would census EVERY arm -- the exact spin #926
+        # exists to prevent. Non-negative values: byte-identical behaviour.
+        if every_n is not None and int(every_n) < 0:
+            self._at_arm_census_skipped = (
+                int(getattr(self, "_at_arm_census_skipped", 0)) + 1
+            )
+            return False
+
         if not every_n and not min_interval:
             return True  # both admissions disabled: pre-#926 behaviour
 
