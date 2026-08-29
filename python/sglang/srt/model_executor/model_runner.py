@@ -4194,10 +4194,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 _st = getattr(pp_proxy_tensors, "_pp_sender_stamp", None)
                 _prov = (
                     f"sender stamp (mb_id={_st[0]} seq={_st[1]} rows={_st[2]} "
-                    f"epoch={_st[3]})"
+                    f"epoch={_st[3]}"
+                    + (f" fwd_ct={_st[4]}" if len(_st) >= 5 else "")
+                    + ")"
                     if isinstance(_st, (tuple, list)) and len(_st) >= 4
                     else "sender unstamped"
                 )
+                # #995g BOTH SIDES OF THE SAME COUNTER, side by side. The
+                # sender's `forward_ct` rides in the stamp and the receiver's
+                # was captured at acceptance; comparing them is legitimate
+                # where comparing `seq` to an iteration was not.
+                _rc = getattr(pp_proxy_tensors, "_pp_recv_fwd_ct", None)
+                _prov += f", receiver fwd_ct={_rc if _rc is not None else '?'}"
                 raise ValueError(
                     f"#631 PP proxy/batch mismatch: received hidden_states with "
                     f"{_hs.shape[0]} row(s) for a {forward_batch.forward_mode} "

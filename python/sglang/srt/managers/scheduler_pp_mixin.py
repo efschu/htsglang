@@ -8427,11 +8427,26 @@ class SchedulerPPMixin:
         except Exception:  # noqa: BLE001 - a stamp may never break a send
             pass
         epoch = pp_flip_epoch_of(self)
+        # #995g THE SENDER'S FORWARD COUNTER, APPENDED.
+        #
+        # `seq` counts SENDS and `forward_ct` counts FORWARDS -- two different
+        # counters that happen to run in the same order of magnitude, which is
+        # exactly why comparing them told us nothing (seq=2107 against a
+        # receiver's iter 2089 is not "18 behind", it is not a difference at
+        # all). Carrying the SENDER's `forward_ct` puts the SAME counter on
+        # both sides of the wire, so the receiver can finally ask "is this
+        # message from my iteration or an older one" and get an answer instead
+        # of a coincidence.
+        #
+        # APPENDED, not inserted: every consumer indexes positionally and
+        # guards with `>= N` (`len(stamp) >= 2/3/4`, `PP_PROXY_STAMP_EPOCH_
+        # INDEX = 3`); none checks an exact length, so index 4 is free.
         return (
             int(mb_id),
             int(self._pp_proxy_seq),
             rows,
             -1 if epoch is None else int(epoch),
+            int(getattr(self, "forward_ct", -1)),
         )
 
     def _pp_wait_for_dict_readiness(
@@ -8962,6 +8977,11 @@ class SchedulerPPMixin:
                 _proxy = PPProxyTensors(raw)
                 try:
                     _proxy._pp_sender_stamp = stamp
+                    # #995g the RECEIVER's own forward counter, captured at the
+                    # moment of acceptance and carried as an attribute (never a
+                    # dict entry -- see the pop note above). The guard then
+                    # prints BOTH sides of the SAME counter.
+                    _proxy._pp_recv_fwd_ct = int(getattr(self, "forward_ct", -1))
                 except Exception:  # noqa: BLE001 - provenance may never break a recv
                     pass
                 # #995c THE FALSE-REFUSAL SIDE, MEASURED BEFORE ANYTHING IS
