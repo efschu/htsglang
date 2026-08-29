@@ -4423,6 +4423,10 @@ class SchedulerPPMixin:
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
+                    # #1002c: re-read -- a declined proxy voids the slot in
+                    # the call above, and every guard below keys on the slot.
+                    cur_batch = self.mbs[mb_id]
+                    self.cur_batch_for_debug = cur_batch
                 else:
                     # #797: a voided pass has no batch, so the branch above
                     # never runs -- and the upstream, which voided nothing,
@@ -9229,7 +9233,23 @@ class SchedulerPPMixin:
         # blocking receive below. See _pp_wait_for_proxy_readiness's
         # docstring for the full contract; it is a no-op when
         # pp_flip_counters is None (unchanged behaviour on such boots).
-        self._pp_wait_for_proxy_readiness(mb_id)
+        # #1002c: THE PROXY HALF OF THE SAME CONTRACT. Measured 2/2: boot
+        # 050655 died on dict|proxy posted 11/consumed 11, boot 053102 on
+        # dict|output posted 9/consumed 9 -- same mb_id=2, same rank-1
+        # upstream, both after six clean flips. One asymmetry, two channels,
+        # so covering only `output` moves the death rather than removing it.
+        #
+        # The proxy answer cannot be "carry on without hidden states": they
+        # are the input to this rank's forward. It is VOIDING -- the pass ran
+        # nowhere, which is what the upstream's silence states -- the same
+        # rank-agreed act #798 performs on the same fact discovered one step
+        # earlier. Done HERE and not signalled to the caller, because two
+        # legitimate `return None` exits already sit above and the value alone
+        # cannot carry a third meaning: a sentinel may not share a value with
+        # a real result.
+        if not self._pp_wait_for_dict_readiness(mb_id, kind="proxy", soft=True):
+            self._pp_void_own_batch(mb_id)
+            return None
         raw = self._pp_recv_typed_dict(
             expected_kind="proxy",
             all_gather_group=(
@@ -10193,7 +10213,20 @@ class SchedulerPPMixin:
                     next_mb_id, soft=True
                 )
                 if raw_output is None:
-                    # #1002: the same exit `target is None` takes above.
+                    # #1002b: VOID THE SLOT, do not merely return. The
+                    # `target is None` exit above is safe only because the
+                    # caller guards `d2h_event.synchronize()` with
+                    # `self.mbs[next_mb_id] is not None`; returning with the
+                    # slot still occupied leaves `d2h_event` unassigned and
+                    # the caller dereferences None (measured: boot 52,
+                    # "AttributeError: 'NoneType' object has no attribute
+                    # 'synchronize'" -- introduced by the first cut of #1002
+                    # and fixed here). Voiding makes this rank's state agree
+                    # with the upstream's: it forwarded nothing for the slot,
+                    # so the slot did not run. That is the same rank-agreed
+                    # act `_pp_void_pass_without_upstream_launch` performs on
+                    # the same fact discovered one step earlier.
+                    self._pp_void_own_batch(next_mb_id)
                     return
             # #791b: a void carries no tokens and must not be turned into one.
             # `_pp_absorb_void_output` empties the slot, so the loop's "slot
