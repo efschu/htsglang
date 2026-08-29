@@ -302,6 +302,30 @@ def _hicache_impl_fields(cache) -> "dict[str, str]":
 
     kvhost = getattr(controller, "mem_pool_host", None) if controller else None
     fields["kvhost"] = "none" if kvhost is None else type(kvhost).__name__
+
+    # #1016 BRACKET THE BOOT-TIME POOL SHORTFALL. Boots 7 and 10 both died on
+    # the first idle with EXACTLY leaked_full_pages={1..10} and
+    # leaked_mamba_pages={2} -- boot 7 with a request in flight, boot 10 with
+    # zero /generate ever received, so the request was a bystander and the
+    # deficit is the same ten rows both times. Both free lists are built as
+    # `arange(1, size + 1)` with slot 0 reserved, so available == total at
+    # construction and those ten rows were HANDED OUT during boot by an owner
+    # the census cannot name. Reading both pools here, at tree-cache
+    # construction, brackets it: a shortfall already visible on this line was
+    # taken before the tree existed; a full pool here moves the owner later in
+    # the boot sequence. Two numbers, no behaviour.
+    try:
+        alloc = getattr(unwrapped, "token_to_kv_pool_allocator", None)
+        if alloc is not None:
+            fields["full_pool"] = f"{alloc.available_size()}/{alloc.size}"
+        rtp = getattr(unwrapped, "req_to_token_pool", None)
+        mamba_alloc = getattr(rtp, "mamba_allocator", None) if rtp else None
+        if mamba_alloc is not None:
+            fields["mamba_pool"] = (
+                f"{mamba_alloc.available_size()}/{mamba_alloc.size}"
+            )
+    except Exception as exc:  # noqa: BLE001 - a banner must never break a boot
+        fields["full_pool"] = f"unreadable({exc!r})"
     return fields
 
 
@@ -314,7 +338,7 @@ def _log_hicache_impl_banner(cache, ctx: TreeCacheBuildContext) -> None:
         return
     logger.info(
         "HICACHE-IMPL tree=%s write=%s read=%s mamba=%s store=%s "
-        "mambahost=%s kvhost=%s hierarchical=%s",
+        "mambahost=%s kvhost=%s hierarchical=%s full_pool=%s mamba_pool=%s",
         fields["tree"],
         fields["write"],
         fields["read"],
@@ -323,4 +347,6 @@ def _log_hicache_impl_banner(cache, ctx: TreeCacheBuildContext) -> None:
         fields["mambahost"],
         fields["kvhost"],
         ctx.enable_hierarchical_cache,
+        fields.get("full_pool", "n/a"),
+        fields.get("mamba_pool", "n/a"),
     )
