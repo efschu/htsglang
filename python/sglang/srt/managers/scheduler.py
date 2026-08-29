@@ -10270,181 +10270,50 @@ class Scheduler(
         for req in retracted_reqs:
             self._add_request_to_queue(req, is_retracted=True)
         return new_token_gained
-
-    def _1008_held_indices(self, batch: ScheduleBatch) -> List[int]:
-        """Indices of requests in `batch` whose prefill result is genuinely absent.
-
-        A request with no `output_ids` whose batch is still sitting in
-        `result_queue` is one iteration out, not lost; see the #1012 block in
-        `update_running_batch` for why the bare `not r.output_ids` predicate
-        could not tell the two apart and what that cost. Split out from that
-        method so the predicate can be driven directly, without a scheduler.
-        """
-        pending: set[int] = set()
-        for pending_batch, _ in getattr(self, "result_queue", None) or ():
-            for pending_req in getattr(pending_batch, "reqs", None) or ():
-                pending.add(id(pending_req))
-        return [
-            i
-            for i, r in enumerate(batch.reqs)
-            if not r.output_ids and id(r) not in pending
-        ]
-
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
 
-        # #1008: DECODE NEEDS A LAST TOKEN, AND A REQUEST THAT HAS NEVER
-        # PRODUCED ONE HAS NOTHING TO DECODE FROM.
+        # #969 CUT R: THE HOLD AND THE RE-QUEUE ARE DELETED, NOT NARROWED.
         #
-        # `get_next_batch_to_run` makes a freshly built PREFILL batch the
-        # running batch in the same breath (`running_batch = new_batch` /
-        # `merge_batch`). Upstream that holds, because without PP the prefill
-        # runs in the same round, so by the time this function sees the
-        # request its `output_ids` is non-empty. That seam is stock -- every
-        # commit touching it is an upstream PR (#29408, #22131, #20343,
-        # #14320, #17484, #14883), none of ours -- so this is not a
-        # regression to revert but a gap PP widens.
+        # #1008 filtered a request whose prefill result had not landed OUT of
+        # the running batch, and #1010 then pushed it back onto the waiting
+        # queue. Both were written for a PP result that never lands -- which is
+        # precisely the delivery failure CUT V removed, not a state upstream
+        # can reach.
         #
-        # Under PP=3 the prefill result comes back several passes later while
-        # membership was granted immediately. With one short request and no
-        # other traffic the next round has nothing else to do and decodes it
-        # first. `prepare_for_decode` then leaves the PREFILL input_ids in
-        # place, because there is no last output token to embed, and the
-        # batch travels on labelled DECODE while carrying extend tokens.
+        # THREE COSTS, ALL MEASURED, TWO OF THEM BY #1012 ITSELF (the comment
+        # this replaces): a DOUBLE PREFILL of the requeued request, which the
+        # standing no-double-prefill order forbids outright; a KV LEAK of
+        # exactly the first prefill's rows, because `alloc` reuses
+        # `req_pool_idx` and the re-prefill rewrites `req_to_token[idx, 0:n]`
+        # from zero; and -- the one #1012 did not name -- an EMPTIED BATCH, so
+        # `mbs[mb_id]` no longer holds the in-flight request, `server_is_idle`
+        # stays True, `on_idle()` runs while a request is legitimately in
+        # flight, and the idle census reads those same rows as a leak and
+        # RAISES.
         #
-        # MEASURED, boot 67: rid e463acc5 / 6f9d8c6e, prefix_lens=0
-        # fill_lens=3 out_lens=0, one ADMIT, no retraction, and NO void
-        # (797_void=0, 798_void=0 -- the void explanation is excluded). It
-        # surfaced as forward_mode=2 (DECODE) with batch_size=1 and
-        # input_ids=3, then as `causal_conv1d_update: conv_state_indices has
-        # 1 entr(ies) for a batch of 3`. Every short prompt does this, health
-        # checks included; long chunked prompts under continuous load never
-        # reach the state, which is why it stayed latent.
+        # That is the whole boot killer of this campaign, and the fingerprint
+        # matches to the row: deficit == prompt length (22 rows for a 22-token
+        # smoke; 11 -> 129 when the prompt was lengthened ~10x, measured
+        # 2026-08-29, HANDOVER §"Deficit fingerprint"). Measured again on this
+        # branch after CUT V: `#788 verdict=ADMIT ... fill_lens=22` on all three
+        # ranks, then `#1008 DECODE HELD 1 of 1`, then
+        # `leaked_full_pages={1..22}`.
         #
-        # This is the invariant, not a guard on a consumer: decode requires a
-        # last token. The request is not dropped and not reset -- it stays in
-        # the running batch and becomes eligible the moment its prefill
-        # result lands.
-        # #1012: A RESULT STILL IN `result_queue` IS NOT A MISSING RESULT.
+        # #1012 narrowed these two to the PP case instead of deleting them.
+        # Narrowing a compensation layer is not the answer to a defect inside
+        # it (user law 2026-08-29, upstream-minimal statt Eigenbau, §3).
         #
-        # `not r.output_ids` is TRUE for every freshly prefilled request under
-        # the overlap scheduler, PP or no PP. `event_loop_overlap` launches
-        # batch P in iteration N and pops the PREVIOUS batch's result in the
-        # same iteration, so P's result is processed at the END of iteration
-        # N+1 -- after `get_next_batch_to_run`, i.e. after this function has
-        # already looked at P's requests. Upstream is fine with that: decode
-        # embeds a FUTURE token (`prepare_for_decode`: "input_ids is set at end
-        # of previous run_batch (placeholder for overlap)"), not
-        # `req.output_ids`.
-        #
-        # So the #1008 premise -- "their prefill has not come back" -- was
-        # tested with a predicate that cannot distinguish "in flight, one
-        # iteration out" from "lost". MEASURED, boot
-        # boot_stage0tp3_531fba3ecf_0829_090840.log, pp_size=1: all three
-        # probes held and re-queued (`requeued_total=3`), each re-prefilled
-        # from scratch (`#new-token: 2` then `#new-token: 3`, `#cached-token:
-        # 0` both times). Two costs, both real:
-        #   - a DOUBLE PREFILL of every request, which the standing
-        #     no-double-prefill order forbids outright;
-        #   - a KV LEAK of exactly the first prefill's rows. `alloc` REUSES
-        #     `req.req_pool_idx` for a request that already holds one
-        #     (memory_pool.py:386-411), the re-prefill matches nothing and so
-        #     writes `req_to_token[idx, 0:n]` again from zero, and the rows the
-        #     first prefill put there are then referenced by nobody. Two boots,
-        #     two exact matches: 3 probes x 3 prompt tokens = 9 missing rows
-        #     (`total=221120, available=221111`), and 3 x 2 = 6 after the
-        #     prompt got shorter (`available=221114`). The same boot's TREE
-        #     CENSUS read `nodes=1 ... recomputed_evictable=0`, which rules out
-        #     the competing reading that the tree held them uncounted.
-        #
-        # THE DOOR #1010 LOOKED FOR EXISTS. Its argument for re-queueing is
-        # that no path leads to the request any more -- it checks the
-        # microbatch slots and the chunked carry. `result_queue` is a third
-        # door and the one that actually delivers: the request is in a batch
-        # whose forward has been launched and whose result is popped later this
-        # iteration. Excluding those requests leaves #1008/#1010 for the case
-        # they were built on (a PP result that genuinely never lands) and takes
-        # them off the overlap fast path they were never meant to see.
-        _held = self._1008_held_indices(batch)
-        if _held:
-            self._1008_held = getattr(self, "_1008_held", 0) + len(_held)
-            logger.warning(
-                "#1008 DECODE HELD (no prefill result yet): %d of %d req(s) "
-                "-- rids=%s, held_total=%d. Their prefill has not come back, "
-                "so they carry extend input_ids and no last token; decoding "
-                "them now is what produced forward_mode=DECODE with "
-                "input_ids != batch_size. They stay in the running batch and "
-                "become eligible when the result lands. A held_total that "
-                "never grows means this class no longer occurs; one that "
-                "grows without bound means results are not landing at all.",
-                len(_held),
-                len(batch.reqs),
-                ",".join(str(batch.reqs[i].rid)[:8] for i in _held[:4]) or "-",
-                self._1008_held,
-            )
-            # #1010: HOLDING IS NOT ENOUGH -- GIVE THE REQUEST BACK TO THE
-            # PATH THAT CAN ACTUALLY RUN IT.
-            #
-            # Boots 68 and 69 both held correctly and then starved: the
-            # request sits in the running batch, #1008 keeps it out of decode,
-            # and `_get_new_batch_prefill_raw` declines at its first gate
-            # (:8774, `len(self.waiting_queue) == 0 and self.chunked_req is
-            # None`) because the request has already left the waiting queue.
-            # Held by one path, invisible to the other, and the instance dies
-            # idle on the 120s ring budget with a request it never ran.
-            #
-            # DELIBERATE DEVIATION from the convention that a request in the
-            # running batch is no longer a prefill candidate (standing order
-            # 2026-08-29: soft design rules, deviate with a named reason).
-            # That convention encodes "running means its prefill has run",
-            # which is true upstream, where prefill and decode share a round.
-            # It is false for a PP request whose result is still in flight,
-            # and following it here produces a request nobody owns.
-            #
-            # THE DOUBLE-ADMISSION ARGUMENT, which is the one line that makes
-            # this legal (the prohibition #968b states): a request is
-            # re-queued only when NO microbatch slot still holds it and it is
-            # not the chunked carry. It has just been filtered out of the
-            # running batch, it is not in the waiting queue (that is why the
-            # gate fired), and no slot references it -- so no door leads to it
-            # at all, and the queue is the only one left. Nothing is reset or
-            # truncated: the request goes back exactly as it stands.
-            _slotted = set()
-            for _b in list(getattr(self, "mbs", None) or []):
-                for _r in list(getattr(_b, "reqs", None) or []):
-                    _slotted.add(id(_r))
-            _requeue = [
-                batch.reqs[i]
-                for i in _held
-                if id(batch.reqs[i]) not in _slotted
-                and batch.reqs[i] is not getattr(self, "chunked_req", None)
-            ]
-            batch.filter_batch(
-                keep_indices=[
-                    i for i in range(len(batch.reqs)) if i not in set(_held)
-                ]
-            )
-            if _requeue:
-                self._1010_requeued = getattr(self, "_1010_requeued", 0) + len(
-                    _requeue
-                )
-                logger.warning(
-                    "#1010 HELD REQUEST RE-QUEUED FOR PREFILL: %d req(s) "
-                    "rids=%s, requeued_total=%d. They were held out of decode "
-                    "with no prefill result and no slot holding them, so the "
-                    "prefill planner could not see them either (its first "
-                    "gate declines on an empty waiting queue). Returned to "
-                    "the queue unchanged. A total that keeps growing for the "
-                    "same rid means the prefill still never completes.",
-                    len(_requeue),
-                    ",".join(str(r.rid)[:8] for r in _requeue[:4]),
-                    self._1010_requeued,
-                )
-                for _r in _requeue:
-                    self.waiting_queue.append(_r)
+        # INVARIANT THIS RESTORES, and the one that made the hold look
+        # necessary: "a request in the running batch has had its prefill result
+        # applied." Upstream holds it by construction -- the result always
+        # arrives, `pp_size` laps later, and `running_mbs[mb_id]` keeps the
+        # request until it does. CUT V restores the arrival, so the premise of
+        # the hold is gone. If results ever stop landing again, the symptom to
+        # chase is the delivery, never the hold.
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
