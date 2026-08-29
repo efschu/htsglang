@@ -9502,6 +9502,22 @@ class SchedulerPPMixin:
             )
 
         self._pp_proxy_drops = getattr(self, "_pp_proxy_drops", 0) + 1
+        # #997/#1004: the IDENTITY half of the same layer, gated on the same
+        # switch and for the same reason. `mb_id` is a slot in the ring this
+        # guard polices ACROSS a cutover; with one layout the ring is never
+        # rebuilt and the cross-epoch case it names cannot arise. Boots 46-48
+        # died once each on this family with the flip off.
+        if not getattr(self.server_args, "enable_phase_flip", False):
+            logger.warning(
+                "#1004 #631 IDENTITY REFUSAL BYPASSED (flip off): stamp "
+                "mb_id=%s seq=%s rows=%s while on mb_id=%s. Flip machinery is "
+                "gated on enable_phase_flip; counted, never silent.",
+                stamp[0],
+                stamp[1],
+                stamp[2],
+                mb_id,
+            )
+            return None
         raise RuntimeError(
             f"#631 PROXY LEFTOVER REFUSED: a proxy stamped mb_id={stamp[0]} "
             f"seq={stamp[1]} rows={stamp[2]} epoch={pp_proxy_stamp_epoch(stamp)} "

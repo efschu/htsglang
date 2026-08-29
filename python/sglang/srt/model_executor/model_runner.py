@@ -4218,17 +4218,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     _prov += f", receiver_geom={_rg if _rg is not None else '?'}"
                 except Exception:  # noqa: BLE001
                     pass
-                raise ValueError(
-                    f"#631 PP proxy/batch mismatch: received hidden_states with "
-                    f"{_hs.shape[0]} row(s) for a {forward_batch.forward_mode} "
-                    f"batch of {_want} token(s) "
-                    f"(bs={forward_batch.batch_size}); {_prov}. The hidden "
-                    f"states of one "
-                    f"microbatch have been paired with another microbatch's "
-                    f"metadata -- the PP stages are out of step. Computing on "
-                    f"this pair corrupts memory rather than merely failing: the "
-                    f"cache-index tensors are sized for THIS batch."
-                )
+                # #997/#1004: THIS WHOLE LAYER IS FLIP MACHINERY, SO IT IS GATED
+                # ON THE FLIP. The proxy/readiness/expectation bookkeeping this
+                # guard polices was built for the HiCache reimplementation era
+                # (18.-23.08.) to police cross-slot expectations across a cutover.
+                # With one layout there is no cutover, no second geometry, and no
+                # cross-slot expectation for it to be about -- and the user's
+                # decision of 29.08. is that the layer itself goes: after a
+                # cutover the mb ring starts EMPTY, so the guard has no object.
+                #
+                # Falsifier, and it is why this is a gate and not a deletion:
+                # flip-free PP3 must now survive. Boots 46, 47 and 48 each died
+                # here exactly once (WIDTH twice, IDENTITY once) with
+                # enable_phase_flip off, on a path where the thing being guarded
+                # cannot occur. If those boots still die after this, the
+                # mispairing is upstream PP's and not ours, and that is decidable
+                # from one boot instead of a bisect.
+                if not getattr(
+                    self.server_args, "enable_phase_flip", False
+                ):
+                    logger.warning(
+                        "#1004 #631 WIDTH GUARD BYPASSED (flip off): %d row(s) "
+                        "for %d token(s). The layer this guard belongs to is "
+                        "gated on enable_phase_flip; with one layout there is "
+                        "no cutover for it to police. Counted, never silent.",
+                        _hs.shape[0],
+                        _want,
+                    )
+                else:
+                    raise ValueError(
+                        f"#631 PP proxy/batch mismatch: received hidden_states with "
+                        f"{_hs.shape[0]} row(s) for a {forward_batch.forward_mode} "
+                        f"batch of {_want} token(s) "
+                        f"(bs={forward_batch.batch_size}); {_prov}. The hidden "
+                        f"states of one "
+                        f"microbatch have been paired with another microbatch's "
+                        f"metadata -- the PP stages are out of step. Computing on "
+                        f"this pair corrupts memory rather than merely failing: the "
+                        f"cache-index tensors are sized for THIS batch."
+                    )
 
         self.forward_pass_id += 1
 
