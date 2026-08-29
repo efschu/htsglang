@@ -364,7 +364,12 @@ class HostKVCache(abc.ABC):
         if not bool(self.slot_used[indices_cpu].all()):
             _stale = indices_cpu[~self.slot_used[indices_cpu]]
             logger.error(
-                "#905 HOST-POOL DOUBLE-FREE about to raise: pool %r id=%d "
+                # #1034: this line said "about to raise" and no longer does --
+                # the raise became the named refusal below. Left in place for
+                # its pool/epoch/free_slots detail, corrected so the log does
+                # not promise a crash that will not come.
+                "#905 HOST-POOL DOUBLE-FREE detected (REFUSED by #1034, not "
+                "raised): pool %r id=%d "
                 "size=%d clear_epoch=%d | %d of %d index(es) are in range but "
                 "not allocated, span [%d, %d] | free_slots=%d",
                 getattr(self, "pool_name", "?"),
@@ -377,10 +382,102 @@ class HostKVCache(abc.ABC):
                 int(_stale.max()) if _stale.numel() else -1,
                 int(len(self.free_slots)),
             )
-        assert self.slot_used[indices_cpu].all(), (
-            f"Double-free detected: slots not currently allocated: "
-            f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
-        )
+        # #1034: IDEMPOTENT-REFUSE THE ALREADY-FREE SUBSET, LOUDLY.
+        #
+        # THE CENSUS THAT FORCED THIS (§AQ1). Two give-back routes reach this
+        # pool and they cannot see each other:
+        #   A  append_host_mem_release -> host_mem_release_queue ->
+        #      _drain_release, SEVEN on-path producers, and #989 already keys
+        #      it by first-slot -> "module:lineno" precisely because it is
+        #      many-producers-one-give-back.
+        #   B  DIRECT free out of a tree node's `host_value`
+        #      (full_component.py:180 via evict_component, and
+        #      unified_radix_cache.py:3995) -- NO provenance at all.
+        # A span returned through A whose node still carries `host_value` is
+        # freeable a second time through B. That is the measured crash
+        # (boot 0d3ea263c6, §AP7): a contiguous slot run from 0, reached via
+        # _drain_prefetch_progress -> _prefetch_kvcache -> prefetch_from_storage
+        # -> evict_host -> ... -> free.
+        #
+        # WHY REFUSE AND NOT RAISE. Returning a slot that is already free is a
+        # NO-OP on this pool's state: the second giver-back has nothing to
+        # give. Killing the instance for a no-op costs every in-flight request
+        # and, as measured, takes the whole PP group down behind it with gloo
+        # peer-closed cascades. The allocated remainder is still freed, so no
+        # slot leaks.
+        #
+        # AND IT IS NOT A SWALLOW. The refusal is counted and named on every
+        # occurrence, with the provenance table #989 already maintains, so the
+        # OTHER producer is identified instead of guessed at -- which is the
+        # one thing the static census could not answer. A silent
+        # `try/except` here would convert a loud stop into exactly the
+        # wrong-answer-with-no-crash class this campaign exists to remove;
+        # this keeps the stop's information and drops only the kill.
+        _live_mask = self.slot_used[indices_cpu]
+        if not bool(_live_mask.all()):
+            _stale = indices_cpu[~_live_mask]
+            self._double_free_refused = getattr(self, "_double_free_refused", 0) + 1
+            _prov = getattr(self, "_free_provenance", None)
+            _who = "no earlier free recorded for that slot"
+            if isinstance(_prov, dict) and _stale.numel():
+                _hit = _prov.get(int(_stale[0].item()))
+                if _hit:
+                    _who = f"slot {int(_stale[0].item())} was ALREADY freed by {_hit}"
+            logger.error(
+                "#1034 HOST-POOL DOUBLE-FREE REFUSED (%d so far): pool %r "
+                "id=%d clear_epoch=%d | %d of %d index(es) are in range but "
+                "ALREADY FREE, span [%d, %d] | %s | the allocated remainder "
+                "IS freed and no slot leaks; this give-back had nothing to "
+                "give. Two routes reach this pool (queue with provenance, "
+                "direct evict without) -- see ANALYSE-969 §AQ1.",
+                self._double_free_refused,
+                getattr(self, "pool_name", "?"),
+                id(self),
+                int(getattr(self, "_clear_epoch", 0)),
+                int(_stale.numel()),
+                int(indices_cpu.numel()),
+                int(_stale.min()),
+                int(_stale.max()),
+                _who,
+            )
+            indices_cpu = indices_cpu[_live_mask]
+            if indices_cpu.numel() == 0:
+                return 0
         self.slot_used[indices_cpu] = False
         self.free_slots = torch.cat([self.free_slots, indices_cpu])
-        return len(indices)
+        # #1034: PROVENANCE FOR *EVERY* ROUTE, RECORDED HERE RATHER THAN AT
+        # THE CALL SITES. #989 stamps only the queue route, which is why the
+        # census could not name route B's freer. Taken inside `free` itself,
+        # so a route added later is covered without being taught to -- the
+        # failure mode #989's own note describes ("a future fourth kind").
+        # First slot only and capped: this is a breadcrumb for the refusal
+        # above, not a ledger.
+        try:
+            _p = getattr(self, "_free_provenance", None)
+            if _p is None:
+                _p = self._free_provenance = {}
+            if len(_p) < 65536 and indices_cpu.numel():
+                import sys as _sys
+
+                # Walk PAST this module's own frames: `free` is wrapped by
+                # `@synchronized`, so frame 1 is the wrapper and naming it
+                # would make every breadcrumb read "base.py:101" -- caught in
+                # the desk smoke, and exactly the useless-provenance shape
+                # this is meant to end.
+                _f = _sys._getframe(1)
+                _here = __name__
+                _hops = 0
+                while (
+                    _f is not None
+                    and _f.f_globals.get("__name__") == _here
+                    and _hops < 8
+                ):
+                    _f = _f.f_back
+                    _hops += 1
+                if _f is not None:
+                    _p[int(indices_cpu[0].item())] = (
+                        f"{_f.f_globals.get('__name__', '?')}:{_f.f_lineno}"
+                    )
+        except Exception:  # noqa: BLE001 - a breadcrumb may never break a free
+            pass
+        return int(indices_cpu.numel())
