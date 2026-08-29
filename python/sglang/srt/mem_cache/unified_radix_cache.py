@@ -557,6 +557,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             collective_rank_desc(self),
         )
 
+    def _attn_reduce_world(self) -> int:
+        """#1028: how many ranks `_all_reduce_attn_groups` ACTUALLY reduces over.
+
+        A REDUCE THAT COVERS ONE RANK IS NOT AN AGREEMENT, AND TWO MARKERS
+        PRINTED IT AS ONE FOR THE WHOLE CAMPAIGN. `drain_retired_prefetch` and
+        `take_agreed_reissue` pack `[digest, -digest]` so that one MIN reduce
+        yields both min and max, and then read `min == max` as "every rank
+        agrees". Under `--tp-size 1 --pp-size 3` every group this helper
+        touches has world size 1, the reduce is a no-op, and `min == max`
+        holds BY ARITHMETIC on every round. So
+
+            #943 STALE-REFUSAL VERDICT AGREES ACROSS RANKS
+            #943b PREFETCH RE-ISSUED: req=... agreed by every rank
+
+        were affirmative rank-agreement claims covering nobody, on every boot
+        of this strand -- and §AG quoted the first of them as evidence. That is
+        the indicator law exactly: a counter is a finding only once you have
+        checked THAT it measures what it claims.
+
+        Returned rather than asserted, so the two call sites can say which
+        world they agreed in instead of implying one.
+        """
+        world = 1
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None:
+                try:
+                    world = max(world, torch.distributed.get_world_size(group=group))
+                except Exception:  # noqa: BLE001 - a census may abstain
+                    pass
+        if world == 1:
+            world = max(world, int(getattr(self, "tp_world_size", 1) or 1))
+        return world
+
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op, label: str = "hicache"):
         reduced = False
         for name, group in (
@@ -3527,12 +3560,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         elif stale_refusals > 0 and not getattr(self, "_stale_refusal_agreed_once", 0):
             self._stale_refusal_agreed_once = 1
+            _world = self._attn_reduce_world()
             logger.info(
-                "#943 STALE-REFUSAL VERDICT AGREES ACROSS RANKS at %d refusal(s) "
-                "-- the first affirmative reading that the #937 verdict is "
-                "rank-uniform. One agreeing round is not the property; the "
-                "absence of a DIVERGES line over a whole boot is.",
+                "#943 STALE-REFUSAL VERDICT %s at %d refusal(s) -- %s",
+                (
+                    "AGREES ACROSS RANKS"
+                    if _world > 1
+                    else "SINGLE-RANK (NO PEERS REDUCED)"
+                ),
                 stale_refusals,
+                (
+                    "the first affirmative reading that the #937 verdict is "
+                    "rank-uniform. One agreeing round is not the property; the "
+                    "absence of a DIVERGES line over a whole boot is."
+                    if _world > 1
+                    else "#1028: the reduce behind this comparison covered ONE "
+                    "rank, so min == max holds by arithmetic and says NOTHING "
+                    "about the peers. Not an agreement -- read it as unmeasured."
+                ),
             )
         if agreed_min == 0 or agreed_min != agreed_max:
             # No agreement this round (or nothing anywhere to drain). The
@@ -3723,12 +3768,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._reissue_pending.pop(local, None)
         self._reissue_taken += 1
         logger.info(
-            "#943b PREFETCH RE-ISSUED: req=%s agreed by every rank; fetching "
+            "#943b PREFETCH RE-ISSUED: req=%s %s; fetching "
             "again under the CURRENT binding generation (a new operation, new "
             "host slots, fresh bytes from the content-keyed store -- the "
             "refused span was released to its minting generation and is not "
             "revived). (%d re-issued, %d still owed.)",
             local,
+            (
+                "agreed by every rank"
+                if self._attn_reduce_world() > 1
+                else "chosen rank-locally (#1028: the agreement reduce covered "
+                "ONE rank, so this is NOT a cross-rank agreement)"
+            ),
             self._reissue_taken,
             len(self._reissue_pending),
         )
@@ -4710,6 +4761,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        # #1028 ROUND CENSUS -- the instrument that decides whether a per-ROUND
+        # carrier is viable at all, taken BEFORE any such carrier is built.
+        #
+        # §AH established that `_pp_sync` cannot carry the prefetch agreement
+        # because it is a rendezvous per OPERATION and entry is not rank-
+        # uniform. The proposed replacement is a rendezvous per ROUND here,
+        # on the premise that every rank reaches this point exactly once per
+        # scheduler step. THAT PREMISE IS UNTESTED, and the operator's own
+        # reading of the last boot is evidence against it: PP0 ran a fifth
+        # prefill batch its peers never ran, so the ranks did not execute the
+        # same amount of work in the same window.
+        #
+        # If the round counts diverge across ranks, a per-round ring send
+        # inherits the identical unmatched-entry wedge one level up, and the
+        # carrier has to be the existing per-pass proxy message instead. This
+        # counter answers that with data. Purely local, no collective; the
+        # comparison is made across the three ranks' logs afterwards.
+        try:
+            self._1028_round = int(getattr(self, "_1028_round", 0)) + 1
+            _every = 25
+            if self._1028_round % _every == 0:
+                logger.info(
+                    "#1028 HICACHE-ROUND n=%d pp_rank=%s pp_size=%s "
+                    "attn_reduce_world=%d ongoing_prefetch=%d",
+                    self._1028_round,
+                    getattr(self, "pp_rank", -1),
+                    getattr(self, "pp_size", -1),
+                    self._attn_reduce_world(),
+                    len(getattr(self, "ongoing_prefetch", {}) or {}),
+                )
+        except Exception:  # noqa: BLE001 - a probe may never break the round
+            pass
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         self.writing_check()
