@@ -9030,6 +9030,14 @@ class Scheduler(
             # same rid set as the two above.
             scheduled_last_chunk=self._pp_scheduled_last_chunk(),
         )
+        # #996 THIS RANK'S OWN CAP, captured beside the floor. Printed by
+        # APPENDING to the existing census line -- the previous revision put a
+        # SECOND emission next to it and flipped the death form, which is the
+        # same class again: the event perturbs, the bytes do not.
+        try:
+            self._996_budget = int(adder.rem_total_tokens)
+        except Exception:  # noqa: BLE001 - a probe may never break admission
+            self._996_budget = "err"
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()

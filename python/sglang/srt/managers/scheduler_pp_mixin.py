@@ -2302,34 +2302,28 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
         # Three numbers plus the skip reason, always, so `disagree=0` never
         # again arrives without its denominator.
         try:
-            # #996 the group-ceiling question, printed where the census already
-            # prints -- a site measured neutral across boots 33 and 34.
-            _f = getattr(holder, "_996_floor", "unset")
-            _pol = getattr(holder, "_last_adder_rem_total", None)
-            logger.warning(
-                "#996 GROUP CEILING: published_fundable_floor=%s | this rank's "
-                "rem_total_tokens=%s. None means the #681 cap is NOT applied "
-                "and `extend_len` is bounded by a RANK-LOCAL budget -- with "
-                "unequal per-rank pools that is enough to make two ranks "
-                "compute different extend lengths for the same request.",
-                _f,
-                _pol,
-            )
-        except Exception:  # noqa: BLE001 - a census may never break admission
-            pass
-        try:
             _seen = getattr(holder, "_995c_seen", 0)
             if _seen:
                 logger.warning(
                     "#995e WIDTH-AGREEMENT CENSUS (emitted off the measured "
                     "path): evaluated=%d agree=%d disagree=%d skipped=%d "
                     "(last skip reason: %s). A zero in `disagree` counts ONLY "
-                    "if `evaluated` is non-zero.",
+                    "if `evaluated` is non-zero. #996 group_floor=%s "
+                    "rank_budget=%s -- a floor of None means the #681 ceiling "
+                    "is NOT applied, so rank_budget is what caps extend_len on "
+                    "THIS rank alone; two ranks printing different "
+                    "rank_budget for the same pass is the divergence itself, "
+                    "read rather than inferred. 'unset' is a DISTINCT "
+                    "sentinel, never a legitimate return -- if it appears, "
+                    "the value was never captured (no traffic yet), which is "
+                    "not the same as a floor of None.",
                     _seen,
                     getattr(holder, "_995c_agree", 0),
                     getattr(holder, "_995c_disagree", 0),
                     getattr(holder, "_995c_skip", 0),
                     getattr(holder, "_995c_skip_why", "-"),
+                    getattr(holder, "_996_floor", "unset"),
+                    getattr(holder, "_996_budget", "unset"),
                 )
                 _sk = getattr(holder, "_995c_skip_ids", None)
                 if _sk:
