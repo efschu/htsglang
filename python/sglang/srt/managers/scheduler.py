@@ -8407,6 +8407,31 @@ class Scheduler(
             if vacuous:
                 return
 
+            # #969AA THE MIRROR OF #796, AND IT BLINDED THE DECLINE PASS.
+            #
+            # `fill_lens` and `out_lens` were bound ONLY inside the ADMIT
+            # branch below, while the `logger.info` at the end of this method
+            # reads them UNCONDITIONALLY. So every DECLINING pass raised
+            # `UnboundLocalError: cannot access local variable 'fill_lens'`
+            # and was swallowed by the except into
+            # "#788 PP-ADMISSION trace unavailable".
+            #
+            # That is precisely the #796 defect documented twenty lines below
+            # this one, with the branches swapped: #796 lost every ADMIT trace
+            # and left the DECLINE traces printing, and this one loses every
+            # DECLINE trace and leaves the ADMIT traces printing. The field
+            # that only ever carries information on a DECLINE is `reason=`
+            # (`_admission_decline_note`, the #971 skip census) -- so the one
+            # instrument built to say WHY a pass declined has been structurally
+            # invisible on exactly the passes it exists for. Measured on
+            # `boot_969nogrid_3f6c1b0799_0829_190424.log`: 27 emitted lines,
+            # all `reason=-` (i.e. all ADMITs), and the livelock's 1024-pass
+            # DECLINE cycle carrying no reason at all.
+            #
+            # Bound here, before the branch, so the trace can never again be
+            # lost to a name that one branch happens not to set.
+            fill_lens = ""
+            out_lens = ""
             if ret is None:
                 verdict = "DECLINE"
                 rids = ""
