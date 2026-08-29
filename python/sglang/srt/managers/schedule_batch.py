@@ -2285,7 +2285,6 @@ def release_req(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
     copy_state: bool = False,
-    retain: bool = False,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
@@ -2322,42 +2321,10 @@ def release_req(
     if server_args.disaggregation_mode == "decode" and offload_kv:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     # TODO (csy): for preempted requests, we may want to insert into the tree
-    # #969D RETAIN AT THE CUTOVER. `is_insert=False` is CORRECT for upstream's
-    # retraction, which is a deliberate discard under memory pressure: the
-    # request will be re-prefilled and throwing the span away is the point.
-    #
-    # Our cutover uses the same call for the OPPOSITE purpose. The user design
-    # is drain -> zero everything -> re-admit by HiCache prefix READ, and that
-    # read can only hit what reached the store. With `is_insert=False` the
-    # computed prefix is freed without ever entering the tree, so it is never
-    # hashed, never staged by the fence, never in the store -- and the
-    # re-admitted request's prefetch fetches 0 tokens and re-prefills in full.
-    #
-    # MEASURED, boot_969cutflip_92beb67982_0829_145759.log: across 102
-    # post-retract fences (34 cutovers x 3 ranks) `staged>0` NEVER ONCE -- 51
-    # found `eligible=0` (nothing in the tree at all) and 51 found only
-    # already-staged nodes. The fence was never the defect; it had nothing to
-    # write, because this line had already thrown it away. Downstream:
-    # 132 `#937 STALE PREFETCH INSERT REFUSED ... 0 token(s) fetched`,
-    # `#cached-token > 0` on 0 of 335 prefill lines, and 141 of 148
-    # re-admissions matching an empty tree (#969B).
-    #
-    # The cutover ALREADY stamps `FORCE_HOST_WRITE_THROUGH_ATTR` on every
-    # retracted request (phase_flip_runtime.py:1934) -- an intent that had
-    # nothing to act on, because nothing was inserted for write-through to
-    # carry.
-    #
-    # `retain` is threaded from the cutover only; every other caller keeps
-    # upstream's discard semantics unchanged.
-    release_kv_cache(req, tree_cache, is_insert=bool(retain))
-
-    if not retain:
-        # Evicting is right when the retraction is a discard under pressure. At
-        # the cutover it would free exactly the span we just retained, before
-        # the fence that has to stage it -- and the pools are reset wholesale
-        # moments later anyway.
-        num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-        evict_from_tree_cache(tree_cache, num_tokens)
+    release_kv_cache(req, tree_cache, is_insert=False)
+    # NOTE(lsyin): we should use the newly evictable memory instantly.
+    num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+    evict_from_tree_cache(tree_cache, num_tokens)
 
     req.reset_for_retract()
 
@@ -2839,7 +2806,6 @@ def retract_all(
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
     copy_state: bool = False,
-    retain: bool = False,
 ) -> List[Req]:
     retracted_reqs = reqs
     for idx in range(len(reqs)):
@@ -2853,7 +2819,6 @@ def retract_all(
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
             copy_state=copy_state,
-            retain=retain,
         )
     return retracted_reqs
 
