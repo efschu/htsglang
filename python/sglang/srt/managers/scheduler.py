@@ -5125,6 +5125,49 @@ class Scheduler(
             return "declined:already_in_flight"
         return f"declined:{_gate_reason_since(_gate_before)}"
 
+    def _969ad_note_retract(self, req, site: str) -> None:
+        """#969AD: name the RETRACT call site, per rid, bounded.
+
+        §AD measured the surviving divergence: PP0 runs 36 `retract-intake`
+        stamps against 24 on each follower, and a retraction clears
+        `prefix_indices`, so a request PP0 retracted re-enters at prefix 0
+        while a follower that did not retract it keeps 8472 -- which is
+        exactly the `#631` specimen (`sender_geom=(rid, 0, 4096)` against
+        `receiver_geom=(rid, 8472, 8473)`, same rid, same lap, same pass).
+        The stamps said `retract-intake` fired; they did not say WHO called it.
+
+        Three call sites exist, and the upstream check separates them:
+          * `readmit_seam_residents`   -- FORK-OWN. The #856 cutover's
+            no-carry retraction. No upstream equivalent.
+          * `_retract_decode_and_requeue` (x2) -- upstream HAS this one
+            (`main:scheduler.py:3151`, inside `update_running_batch`), so it
+            is decode pressure, not fork compensation.
+        Which of them produces PP0's excess decides whether the cut is a
+        DELETION (fork compensation) or a verdict placement (a real
+        mechanism taken rank-locally) -- and this chain has paid seventeen
+        times for skipping that step.
+
+        Instrument only: one warning per retraction, nothing branches on it.
+        """
+        try:
+            n = getattr(self, "_969ad_n", 0) + 1
+            self._969ad_n = n
+            logger.warning(
+                "#969AD RETRACT site=%s rank=%s rid=%s fwd_ct=%s prefix_len=%s n=%d",
+                site,
+                getattr(self.ps, "pp_rank", -1),
+                str(getattr(req, "rid", "?"))[:8],
+                getattr(self, "forward_ct", -1),
+                (
+                    0
+                    if getattr(req, "prefix_indices", None) is None
+                    else len(req.prefix_indices)
+                ),
+                n,
+            )
+        except Exception:  # noqa: BLE001 - a probe may never break a retract
+            pass
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
@@ -5258,6 +5301,7 @@ class Scheduler(
                 # A request whose client gave up between retraction and here
                 # must not be re-admitted into a queue nobody is waiting on.
                 continue
+            self._969ad_note_retract(req, "readmit_seam_residents")
             self._add_request_to_queue(req, is_retracted=True)
             block.append(req)
         if not block:
@@ -10472,6 +10516,7 @@ class Scheduler(
         could not be kept, and above all
 
             for req in retracted_reqs:
+                self._969ad_note_retract(req, "_retract_decode_and_requeue")
                 self._add_request_to_queue(req, is_retracted=True)
 
         A second implementation that forgot that line would LEAK every victim
@@ -10553,6 +10598,7 @@ class Scheduler(
         logger.warning(msg_prefix + msg_details)
 
         for req in retracted_reqs:
+            self._969ad_note_retract(req, "_retract_decode_and_requeue")
             self._add_request_to_queue(req, is_retracted=True)
         return new_token_gained
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
