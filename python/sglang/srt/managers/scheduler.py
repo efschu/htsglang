@@ -7341,6 +7341,55 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     running_batch.merge_batch(last_batch)
 
+        # #1031 MERGE-PATH PROBE, one line per chain link, before any cut.
+        #
+        # THE QUESTION IT SETTLES, and it has exactly two answers that look
+        # identical from outside: `#running-req: 0` on every prefill line
+        # either means the finished prefill NEVER MERGED, or means it merged
+        # and the #856 no-carry retracted it before a decode round formed a
+        # batch. The first is a merge-path defect; the second is the cutover
+        # cadence and the merge is innocent. Nothing measured so far separates
+        # them, and this chain has paid nineteen times for guessing the next
+        # level down.
+        #
+        # UPSTREAM-MINIMAL, checked BEFORE writing this and recorded here
+        # because the answer decides whether a cut is even admissible: the
+        # outer gate above is BYTE-IDENTICAL to upstream
+        # (`main:scheduler.py:2676-2679`: `not self.enable_hisparse and
+        # last_batch and last_batch.forward_mode.is_extend()`), and so is the
+        # merge itself. There is NO fork gate filtering this merge -- the
+        # purity / transport_only / batch_is_full / carry family is NOT on
+        # this path. So the deletion-candidate finding the order anticipated
+        # does not arise here, and any cut has to be justified somewhere else.
+        # Stated as a null result rather than left as a silence.
+        #
+        # Logged only when `last_batch` was an extend batch (the interesting
+        # transition) and rate-limited, so it cannot flood a boot.
+        try:
+            _lb = last_batch
+            if _lb is not None and getattr(_lb, "forward_mode", None) is not None:
+                if _lb.forward_mode.is_extend():
+                    _n = getattr(self, "_1031_n", 0) + 1
+                    self._1031_n = _n
+                    if _n <= 200:
+                        logger.info(
+                            "#1031 MERGE-PATH n=%d pp_rank=%s last_extend_bs=%d "
+                            "last_empty=%s running_bs_after=%d chunked=%s "
+                            "rids=%s",
+                            _n,
+                            getattr(getattr(self, "ps", None), "pp_rank", -1),
+                            int(_lb.batch_size()),
+                            bool(_lb.is_empty()),
+                            int(running_batch.batch_size()),
+                            getattr(self, "chunked_req", None) is not None,
+                            ",".join(
+                                str(getattr(r, "rid", "?"))[:8]
+                                for r in list(getattr(running_batch, "reqs", []) or [])[:4]
+                            ),
+                        )
+        except Exception:  # noqa: BLE001 - a probe may never break the merge
+            pass
+
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
         # for load reporting (num_running_reqs via /v1/loads).
