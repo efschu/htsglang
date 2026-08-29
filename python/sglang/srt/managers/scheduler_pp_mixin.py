@@ -4259,7 +4259,52 @@ class SchedulerPPMixin:
                         running_batch=self.running_batch, last_batch=self.last_batch
                     )
                     self.running_batch = plan.running_batch
-                    self.mbs[mb_id] = plan.batch_to_run
+                    # #1021 DO NOT OVERWRITE A SLOT WHOSE PASS IS STILL IN
+                    # FLIGHT. This assignment is unconditional, and on a lap
+                    # where the planner has nothing for this slot it writes
+                    # None -- wiping a batch this rank LAUNCHED and is still
+                    # owed a result for. That is the silent vacation, and it
+                    # is an ordinary assignment, not the vacater: #1020 marked
+                    # launched slots and guarded `_pp_void_own_batch`, and
+                    # boot a184a06208 showed that guard refusing exactly zero
+                    # times while the slot emptied anyway.
+                    #
+                    # MEASURED across boots c58a7e0383 / a184a06208: the smoke
+                    # is admitted, batched, and LAUNCHED
+                    # (`LAUNCH-JUNCTION ... cur_batch=set occupied=[0] n=1`),
+                    # the junction never reports an occupied slot again, and
+                    # there is no continue/return/break anywhere between
+                    # `ring:pre_plan` and the junction -- so the loop is not
+                    # short-circuiting, the slot is simply empty on every
+                    # later lap. Its 11 KV rows and mamba slot {2} then belong
+                    # to no census term, which is the deficit that killed
+                    # boots 7 and 10-16 and which scales with the prompt.
+                    #
+                    # Only the None case is withheld: a real new batch still
+                    # replaces the slot exactly as before, so a busy pipeline
+                    # is untouched. #1008/#1009 stay messengers and the leak
+                    # checker is untouched -- what changes is that a launched
+                    # pass keeps its slot until its result is consumed.
+                    if (
+                        plan.batch_to_run is None
+                        and mb_id in getattr(self, "_pp_launched_pending", ())
+                    ):
+                        self._1021_kept = getattr(self, "_1021_kept", 0) + 1
+                        if self._1021_kept <= 3 or self._1021_kept % 512 == 0:
+                            logger.warning(
+                                "#1021 SLOT KEPT: mb_id=%s holds a launched "
+                                "pass whose result is still outstanding, so "
+                                "the planner's empty result for this lap does "
+                                "NOT clear it (occurrence=%d). A count that "
+                                "grows without bound for one slot means the "
+                                "result never arrives -- a delivery defect, "
+                                "kept visible instead of erased with the "
+                                "batch.",
+                                mb_id,
+                                self._1021_kept,
+                            )
+                    else:
+                        self.mbs[mb_id] = plan.batch_to_run
                 self.running_mbs[mb_id] = self.running_batch
 
                 # #797d: THIS RANK'S OWN VOID MUST REACH THE BATCH, NOT ONLY
