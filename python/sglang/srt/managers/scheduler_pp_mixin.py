@@ -4259,52 +4259,7 @@ class SchedulerPPMixin:
                         running_batch=self.running_batch, last_batch=self.last_batch
                     )
                     self.running_batch = plan.running_batch
-                    # #1021 DO NOT OVERWRITE A SLOT WHOSE PASS IS STILL IN
-                    # FLIGHT. This assignment is unconditional, and on a lap
-                    # where the planner has nothing for this slot it writes
-                    # None -- wiping a batch this rank LAUNCHED and is still
-                    # owed a result for. That is the silent vacation, and it
-                    # is an ordinary assignment, not the vacater: #1020 marked
-                    # launched slots and guarded `_pp_void_own_batch`, and
-                    # boot a184a06208 showed that guard refusing exactly zero
-                    # times while the slot emptied anyway.
-                    #
-                    # MEASURED across boots c58a7e0383 / a184a06208: the smoke
-                    # is admitted, batched, and LAUNCHED
-                    # (`LAUNCH-JUNCTION ... cur_batch=set occupied=[0] n=1`),
-                    # the junction never reports an occupied slot again, and
-                    # there is no continue/return/break anywhere between
-                    # `ring:pre_plan` and the junction -- so the loop is not
-                    # short-circuiting, the slot is simply empty on every
-                    # later lap. Its 11 KV rows and mamba slot {2} then belong
-                    # to no census term, which is the deficit that killed
-                    # boots 7 and 10-16 and which scales with the prompt.
-                    #
-                    # Only the None case is withheld: a real new batch still
-                    # replaces the slot exactly as before, so a busy pipeline
-                    # is untouched. #1008/#1009 stay messengers and the leak
-                    # checker is untouched -- what changes is that a launched
-                    # pass keeps its slot until its result is consumed.
-                    if (
-                        plan.batch_to_run is None
-                        and mb_id in getattr(self, "_pp_launched_pending", ())
-                    ):
-                        self._1021_kept = getattr(self, "_1021_kept", 0) + 1
-                        if self._1021_kept <= 3 or self._1021_kept % 512 == 0:
-                            logger.warning(
-                                "#1021 SLOT KEPT: mb_id=%s holds a launched "
-                                "pass whose result is still outstanding, so "
-                                "the planner's empty result for this lap does "
-                                "NOT clear it (occurrence=%d). A count that "
-                                "grows without bound for one slot means the "
-                                "result never arrives -- a delivery defect, "
-                                "kept visible instead of erased with the "
-                                "batch.",
-                                mb_id,
-                                self._1021_kept,
-                            )
-                    else:
-                        self.mbs[mb_id] = plan.batch_to_run
+                    self.mbs[mb_id] = plan.batch_to_run
                 self.running_mbs[mb_id] = self.running_batch
 
                 # #797d: THIS RANK'S OWN VOID MUST REACH THE BATCH, NOT ONLY
@@ -4511,35 +4466,7 @@ class SchedulerPPMixin:
                             _occ,
                             self._1019_n,
                         )
-                # #1022: LAUNCH ONCE PER PASS, NOT ONCE PER LAP.
-                # Before #1021 the slot was wiped on the next empty lap, so
-                # this guard could only ever fire once per batch. #1021 keeps
-                # the slot -- correctly, that is what stopped the rows going
-                # unowned -- and thereby exposed that the guard is `if
-                # cur_batch:` with no notion of "already running". A kept slot
-                # was therefore re-launched on every lap, and boot
-                # 85a1ddc513 died with the batch arriving at the decode graph
-                # carrying its 11 EXTEND tokens (#1006: positions dst(1,) <-
-                # src(11,), mrope_positions dst(3,1) <- src(3,11)) -- a
-                # re-launch of a batch another path had meanwhile re-shaped.
-                #
-                # The in-flight mark #1020 already maintains is the exact
-                # predicate: launch a slot whose pass is outstanding again and
-                # you are running the same pass twice.
-                if cur_batch and mb_id in getattr(self, "_pp_launched_pending", ()):
-                    self._1022_inflight = getattr(self, "_1022_inflight", 0) + 1
-                    if self._1022_inflight <= 3 or self._1022_inflight % 512 == 0:
-                        logger.warning(
-                            "#1022 LAUNCH SKIPPED, PASS ALREADY IN FLIGHT: "
-                            "mb_id=%s (occurrence=%d). The slot is held by "
-                            "#1021 until its result is consumed; re-launching "
-                            "it would run the same pass twice. A count that "
-                            "grows without bound means the result never "
-                            "arrives -- a delivery defect, not a launch one.",
-                            mb_id,
-                            self._1022_inflight,
-                        )
-                elif cur_batch:
+                if cur_batch:
                     # #1020: this slot now has an IN-FLIGHT pass. Recorded
                     # before the call so the mark exists even if the launch
                     # blocks or raises; cleared where the slot's result is
@@ -9465,6 +9392,37 @@ class SchedulerPPMixin:
             # This is NOT the bounded-recv corpse in reverse -- the message is
             # one PP0 is REQUIRED to take, by the same verdict that put it on
             # the wire.
+            # #1023 THE DELIVERY DECISION, READ RATHER THAN REASONED ABOUT.
+            # #1009 ("slot has no result yet") has fired exactly 6x in boots
+            # 15, 17 and 18 -- before, during and after the slot-lifecycle
+            # changes -- so the consuming rank never gets a result. This is the
+            # only place the last rank decides whether ANY output goes out:
+            # either a real one above, or the void fallback below, gated on
+            # `_pp_output_expected_for_slot`. That predicate reads
+            # `_pp_output_expected_by_slot`, whose only writer is PP0's own
+            # `_pp_note_output_expectation`; the LAST rank's copy used to be
+            # fed by _PP_OUTPUT_EXPECTED_KEY over the admission wire, and that
+            # wire is gone since #1015. If it now answers False here while no
+            # real output was sent, the rank sends nothing at all and #1009 is
+            # the downstream echo.
+            _1023_expected = self._pp_output_expected_for_slot(
+                next_first_rank_mb_id
+            )
+            if not sent_real_output:
+                self._1023_n = getattr(self, "_1023_n", 0) + 1
+                if self._1023_n <= 3 or self._1023_n % 256 == 0:
+                    logger.warning(
+                        "#1023 NO REAL OUTPUT SENT: slot=%s target=%s "
+                        "expected_for_slot=%s -> %s (occurrence=%d). "
+                        "expected_for_slot=False here means NOTHING leaves "
+                        "this rank for that slot, so the consumer's "
+                        "next_batch_result stays None and #1009 fires.",
+                        next_first_rank_mb_id,
+                        "None" if mbs[next_first_rank_mb_id] is None else "set",
+                        _1023_expected,
+                        "void output sent" if _1023_expected else "SILENCE",
+                        self._1023_n,
+                    )
             if not sent_real_output and self._pp_output_expected_for_slot(
                 next_first_rank_mb_id
             ):
