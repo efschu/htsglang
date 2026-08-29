@@ -1434,7 +1434,19 @@ class Req(ReqDllmMixin):
                         "#969B READMIT-MATCH n=%d rid=%s prefix_len=%d "
                         "host_hit=%s mamba_host_hit=%s protected=%s "
                         "prefetch_registered=%s prefetch_keys=%d "
-                        "readmit_epoch=%s input_len=%d",
+                        "readmit_epoch=%s input_len=%d "
+                        # #969AC LAP PROVENANCE, read where §AC measured the
+                        # divergence. `lap` is how many times THIS rank has
+                        # put this rid back on the admission path; `site` is
+                        # WHICH code site did it last -- "own-void" means this
+                        # rank decided the void for itself (self-initiated),
+                        # "void-output" means the void arrived on the stream
+                        # (told), "intake"/"retract-intake" is ordinary
+                        # queueing. `from_fwd` is the forward_ct of the pass
+                        # that started the lap. The question this answers:
+                        # WHO runs the extra lap the peers do not, and out of
+                        # which site does that lap originate.
+                        "#969AC lap=%s site=%s from_fwd=%s stamped_rank=%s",
                         _n,
                         _rid[:8],
                         0 if self.prefix_indices is None else len(self.prefix_indices),
@@ -1445,6 +1457,10 @@ class Req(ReqDllmMixin):
                         len(_og) if isinstance(_og, dict) else -1,
                         getattr(self, _SRA, None),
                         input_len,
+                        getattr(self, "_969ac_lap", None),
+                        getattr(self, "_969ac_site", None),
+                        getattr(self, "_969ac_fwd", None),
+                        getattr(self, "_969ac_rank", None),
                     )
             except Exception:  # noqa: BLE001
                 logger.warning("#969B READMIT-MATCH PROBE RAISED", exc_info=True)

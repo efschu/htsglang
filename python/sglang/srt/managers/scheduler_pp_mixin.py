@@ -3679,6 +3679,26 @@ def pp_park_voided_batch_member(scheduler, req, *, mb_id, route) -> str:
     """
     if req is None:
         return VOID_PARK_NOTHING
+    # #969AC LAP PROVENANCE. §AC narrowed the last divergence to a COUNT: the
+    # ranks agree on every prefix they both compute and disagree on HOW MANY
+    # re-admission laps they run for the same rid (measured: PP0 matched 8472
+    # four times, PP1 once, PP2 never). This is the one funnel every void
+    # requeue passes through, and it ALREADY carries the discriminator the
+    # question needs -- `route` is "own-void" when THIS rank decided to void
+    # its own batch, and "void-output" when the void arrived from upstream.
+    # Self-initiated versus told, at the site, for free.
+    #
+    # Stamped on the request rather than logged here: the interesting moment
+    # is the NEXT admission's match, where §AC read the count divergence off
+    # `#969B`, so the provenance has to survive until then. Instrument only --
+    # nothing branches on these fields.
+    try:
+        req._969ac_site = str(route)
+        req._969ac_lap = int(getattr(req, "_969ac_lap", 0)) + 1
+        req._969ac_fwd = int(getattr(scheduler, "forward_ct", -1))
+        req._969ac_rank = int(getattr(getattr(scheduler, "ps", None), "pp_rank", -1))
+    except Exception:  # noqa: BLE001 - a probe may never break a void
+        pass
     rid = getattr(req, "rid", None)
     if getattr(req, "finished_reason", None) is not None:
         # Nothing left to run. A park would leave its pages held by a request

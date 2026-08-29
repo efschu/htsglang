@@ -5175,6 +5175,18 @@ class Scheduler(
                     )
             except Exception:  # noqa: BLE001
                 logger.warning("#969C READMIT-PREFETCH PROBE RAISED", exc_info=True)
+            # #969AC LAP PROVENANCE, the OTHER entry into the queue: ordinary
+            # intake. A lap that starts here came off the request stream (or,
+            # on PP0, off the socket) rather than from a void this rank
+            # decided for itself -- which is the distinction §AC's count
+            # divergence has to be read against.
+            try:
+                req._969ac_site = "retract-intake" if is_retracted else "intake"
+                req._969ac_lap = int(getattr(req, "_969ac_lap", 0)) + 1
+                req._969ac_fwd = int(getattr(self, "forward_ct", -1))
+                req._969ac_rank = int(getattr(self.ps, "pp_rank", -1))
+            except Exception:  # noqa: BLE001 - a probe may never break intake
+                pass
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
