@@ -13147,17 +13147,42 @@ class Scheduler(
                     SEAM_COHORT_DWELL_ROUNDS as _DWELL,
                 )
 
-                if _r == 1 or _r % 100 == 0:
-                    logger.info(
-                        "#1032 DWELL-HOLD cohort=%d tok=%d round=%d/%d phase=%s "
-                        "-- the pp-ward demand is held while the cutover's own "
-                        "re-admission becomes resident; its tokens are not a "
-                        "backlog that may arm the flip against it.",
+                # #1032d: THE LINE MUST NOT CLAIM A HOLD THAT IS OVER.
+                # Operator caught this on the live log: `DWELL-HOLD ...
+                # round=29600/400` -- printed 29200 rounds AFTER the bound
+                # expired, still saying "the pp-ward demand is held" when
+                # `seam_cohort_dwell_active()` had returned False since round
+                # 400 and the demand was free. The predicate was right; only
+                # this line lied. Gated on the same predicate the policy uses,
+                # so the two can no longer disagree, and the post-bound state
+                # gets its own honest wording instead of the hold's.
+                if _r <= _DWELL:
+                    if _r == 1 or _r % 100 == 0:
+                        logger.info(
+                            "#1032 DWELL-HOLD cohort=%d tok=%d round=%d/%d "
+                            "phase=%s -- the pp-ward demand is held while the "
+                            "cutover's own re-admission becomes resident; its "
+                            "tokens are not a backlog that may arm the flip "
+                            "against it.",
+                            _cohort_n,
+                            _cohort_tok,
+                            _r,
+                            _DWELL,
+                            runtime.phase,
+                        )
+                elif _r % 1000 == 0:
+                    logger.warning(
+                        "#1032 DWELL-LAPSED cohort=%d tok=%d round=%d (bound "
+                        "%d passed) phase=%s -- the demand is NOT held any "
+                        "more; this cohort has simply never become resident. "
+                        "The stall itself is the finding: %d request(s) that "
+                        "the cutover re-admitted are still not running.",
                         _cohort_n,
                         _cohort_tok,
                         _r,
                         _DWELL,
                         runtime.phase,
+                        _cohort_n,
                     )
                 if _r == _DWELL:
                     logger.error(
