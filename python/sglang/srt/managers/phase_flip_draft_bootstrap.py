@@ -174,11 +174,12 @@ class DraftBootstrapError(RuntimeError):
 # functions that happened to agree. The guard belongs to the concept, not
 # to the file, so the consumer that ALLOCATES imports the same check as
 # the producer that harvests.
-from sglang.srt.managers.phase_flip_resident_carry import (  # noqa: E402
-    IN_FLIGHT_CHUNKED_ALLOWANCE,
-    ResidentCarryError,
-    _reqs_of,
-)
+def _reqs_of(batch) -> list:
+    """The request list of a batch, or empty. #969: five lines inlined from
+    `phase_flip_resident_carry`, which this cut deletes -- this file used that
+    module for this helper, for a resident-set count and for the DEFECT-M
+    ceiling, and the latter two are gone with the carry itself."""
+    return list(getattr(batch, "reqs", None) or [])
 
 
 def draft_kv_pool(draft_worker) -> Optional[Any]:
@@ -451,41 +452,11 @@ def arm_draft_bootstrap(scheduler, batch, draft_worker) -> dict:
     if not reqs or pool is None:
         return {"reqs": len(reqs), "rows": 0, "armed": False}
 
-    # DEFECT M's LETHAL HALF. ``committed_slots`` below allocates one
-    # tensor per resident request. That is correct and cheap for the 0-4
-    # requests a real carry holds, and it is unsurvivable for a corrupted
-    # resident set: on 2026-08-09 a claimed 10485760 requests kept this
-    # rank inside that loop until the kernel OOM-killed it.
-    #
-    # The carry guards its own harvest, but this function is reachable
-    # with a batch from elsewhere, and the allocation happens HERE. A
-    # consumer that can be ruined by an implausible input checks that
-    # input itself rather than trusting every present and future caller.
-    #
-    # #682: the bound is cap + IN_FLIGHT_CHUNKED_ALLOWANCE, not cap. The
-    # scheduler suspends the running-request cap while a chunked prefill is
-    # in flight (the allowance's definition quotes the comment that says so),
-    # and this leg runs on exactly the configuration that produced the
-    # 02:07:22 crash -- PP->TP with NEXTN -- so repairing only
-    # ``harvest_resident_batches`` would have moved that raise one function
-    # later. The allowance is IMPORTED rather than re-derived: two guards
-    # asserting two different bounds is the same defect with a longer fuse.
-    cap = getattr(scheduler, "max_running_requests", None)
-    try:
-        cap = int(cap) if cap else None
-    except (TypeError, ValueError):
-        cap = None
-    ceiling = None if cap is None else cap + IN_FLIGHT_CHUNKED_ALLOWANCE
-    if ceiling is not None and len(reqs) > ceiling:
-        raise ResidentCarryError(
-            f"{LOG_PREFIX} refusing to arm draft state for {len(reqs)} "
-            f"carried request(s), above the {ceiling} this scheduler can "
-            f"hold (max_running_requests={cap} plus "
-            f"{IN_FLIGHT_CHUNKED_ALLOWANCE} for an in-flight chunked "
-            f"prefill). committed_slots would allocate one tensor per "
-            f"request. This is defect M: the resident set is corrupted, "
-            f"not large."
-        )
+    # #969: THE DEFECT-M CEILING IS GONE with `phase_flip_resident_carry`.
+    # It refused to arm draft state for more "carried" requests than
+    # max_running_requests + an in-flight-chunked allowance. Nothing is carried
+    # over a cutover any more, so a count above the cap can no longer be the
+    # signature of a corrupted carried set -- it would just be the load.
 
     slot_rows = committed_slots(scheduler, batch)
     # THE SCRUB IS SEPARABLE ON PURPOSE, and this switch is a measuring
@@ -773,11 +744,7 @@ def arm_draft_bootstrap_all_reachable(scheduler, draft_worker) -> list:
 
 
 def _harvest(scheduler):
-    from sglang.srt.managers.phase_flip_resident_carry import (
-        harvest_resident_batches,
-    )
-
-    return harvest_resident_batches(scheduler)
+    return scheduler._resident_batches()
 
 
 #: Set once per request so the admission arming is idempotent: a chunked

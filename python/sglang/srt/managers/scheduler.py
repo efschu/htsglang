@@ -5227,6 +5227,36 @@ class Scheduler(
         )
         return n
 
+    def _resident_batches(self) -> List:
+        """The batches this rank actually holds: the PP slot array, plus the
+        non-PP resident handle, deduplicated by identity.
+
+        #969: eight lines replacing `harvest_resident_batches`, the entry point
+        of `phase_flip_resident_carry` (911 LOC). Everything that module added
+        on top of these eight lines -- the max_running_requests ceiling, the
+        `ResidentCarryError` refusal, `describe_resident_slots`,
+        `repair_duplicate_resident_reqs` -- existed to police a resident set
+        that the cutover CARRIED. Nothing is carried any more, so there is
+        nothing to police: the cutover retracts every resident and
+        `readmit_seam_residents` puts them back through the ordinary queue.
+
+        `running_batch` is normally an ALIAS of one of the slots, so the
+        identity dedupe is load-bearing and is the one thing kept verbatim.
+        """
+        out: List = []
+        seen = set()
+        for batch in list(getattr(self, "running_mbs", None) or []) + [
+            getattr(self, "running_batch", None)
+        ]:
+            if batch is None or not getattr(batch, "reqs", None):
+                continue
+            if id(batch) in seen:
+                continue
+            seen.add(id(batch))
+            out.append(batch)
+        return out
+
+
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
         if self.enable_priority_scheduling and req.priority is None:
@@ -12425,91 +12455,24 @@ class Scheduler(
             observe_idle,
         )
 
-        # THE RESIDENT SET, NOT self.running_batch (#631 J.1, THIRD
-        # occurrence -- found by the audit this feature's own handoff
-        # commissioned). This hook runs inside recv_requests(), i.e. once
-        # per MICROBATCH SLOT under event_loop_pp, immediately after that
-        # slot's rebind of running_batch/last_batch. Reading running_batch
-        # here therefore counts whichever slot happens to be bound, not
-        # the rank's resident decode set.
+        # THE RESIDENT SET, NOT self.running_batch (#631 J.1). This hook runs
+        # inside recv_requests(), i.e. once per MICROBATCH SLOT under
+        # event_loop_pp, immediately after that slot's rebind of
+        # running_batch/last_batch -- so reading running_batch here would count
+        # whichever slot happens to be bound, not the rank's resident set, and
+        # the PP->TP rule ("pending <= N AND running_bs > 0") would then depend
+        # on WHICH SLOT the hook sampled rather than on the load.
         #
-        # It is load-bearing for the decision, not decoration: the PP->TP
-        # rule is "pending <= N AND running_bs > 0", so a request decoding
-        # in slot 1 while the hook fires for an empty slot 0 reads
-        # running_bs=0 and the flip is not armed. That is the same
-        # arming-condition-cannot-hold shape as the quiescence defects,
-        # arriving from the other side, and it makes the flip depend on
-        # WHICH SLOT the hook samples rather than on the load.
-        from sglang.srt.managers.phase_flip_resident_carry import (
-            harvest_resident_batches,
-        )
+        # #969: the DEFECT-M containment that used to wrap this is gone with
+        # `phase_flip_resident_carry`. It refused a resident set above
+        # max_running_requests, then -- because refusing deadlocked the only
+        # action that drains the set (#631 defect R: 1115 flips before, zero
+        # after, forever) -- repaired duplicates and re-asked. Both halves
+        # policed a set the cutover CARRIED. The cutover carries nothing now;
+        # it retracts every resident and re-admits it through the queue, so a
+        # duplicate cannot outlive a flip and there is nothing to repair.
+        running_bs = sum(len(b.reqs) for b in self._resident_batches())
 
-        # DEFECT M containment. ``harvest_resident_batches`` now refuses a
-        # resident set it cannot identify (a ``reqs`` that is not a request
-        # list, or a length above max_running_requests) instead of
-        # returning a number the rest of this function would act on.
-        #
-        # It is caught HERE, and only here, because this call site is a
-        # POLICY OBSERVATION: its output decides whether to arm a flip, and
-        # declining to arm is always a safe answer. The instance keeps
-        # serving in its current layout. The same refusal raised on the
-        # CUTOVER path is deliberately not caught -- there, proceeding
-        # would allocate against the corrupted set, which is the thing
-        # that killed the 21:47Z run.
-        #
-        # Loud, once per occurrence, with the exception text carrying the
-        # offending object's type: defect M appeared once in one boot, so
-        # the log line is the only instrument that will catch it again.
-        from sglang.srt.managers.phase_flip_resident_carry import (
-            ResidentCarryError,
-            describe_resident_slots,
-            repair_duplicate_resident_reqs,
-        )
-
-        def _running_bs() -> int:
-            return sum(
-                len(getattr(b, "reqs", []) or [])
-                for b in harvest_resident_batches(self)
-            )
-
-        try:
-            running_bs = _running_bs()
-        except ResidentCarryError as exc:
-            # #631 DEFECT R. Refusing was NOT containment, it was the
-            # deadlock: under strict purity only a flip to TP drains the
-            # resident set, so declining to evaluate the flip policy
-            # blocked the one action that clears the condition being
-            # detected -- 1115 flips before, zero after, forever.
-            #
-            # So repair once, then re-ask. The repair only removes Req
-            # entries that are duplicated INSIDE one batch, which is
-            # unambiguously wrong at any count; if the set is corrupt some
-            # other way the retry raises again and we still decline, but
-            # now with the full slot row in the log instead of a bare
-            # count, because two boots were spent attributing that count.
-            logger.error(
-                "PHASE-POLICY resident set is corrupted (%s). Slots: %s",
-                exc,
-                describe_resident_slots(self),
-            )
-            try:
-                repaired = repair_duplicate_resident_reqs(self)
-                running_bs = _running_bs()
-            except ResidentCarryError as exc2:
-                logger.error(
-                    "PHASE-POLICY refusing to evaluate the flip policy this "
-                    "round: the resident set is still corrupted after repair "
-                    "(%s). Not arming; the instance keeps serving in its "
-                    "current phase.",
-                    exc2,
-                )
-                return
-            logger.error(
-                "PHASE-POLICY resident set repaired (%d duplicate entrie(s) "
-                "removed); evaluating the flip policy with running_bs=%d.",
-                repaired,
-                running_bs,
-            )
         # #713: ONE reading, used by the verdict AND by the message that
         # reports it. Calling the accessor twice inside one constructor is how
         # a refusal could name a number the simulation never saw.

@@ -703,15 +703,6 @@ def _flip_can_bootstrap_draft(scheduler) -> bool:
     return draft_kv_pool(draft) is not None
 
 
-def _harvest(scheduler):
-    from sglang.srt.managers.phase_flip_resident_carry import (
-        harvest_resident_batches,
-    )
-
-    try:
-        return harvest_resident_batches(scheduler)
-    except Exception:  # noqa: BLE001 - a readiness probe never breaks a flip
-        return []
 
 
 def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
@@ -901,7 +892,7 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         pending = getattr(runtime, "pending", None) if runtime is not None else None
         if pending == PP_TO_TP and not _flip_spec_algo(scheduler).is_none():
             n_resident = sum(
-                len(getattr(b, "reqs", []) or []) for b in _harvest(scheduler)
+                len(getattr(b, "reqs", []) or []) for b in scheduler._resident_batches()
             )
             if n_resident and not _flip_can_bootstrap_draft(scheduler):
                 return (
@@ -3100,27 +3091,13 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         )
 
         _mark("census+microbatch")
-        # 6. PP loop arrays: re-initialized for the new topology (reads the
-        # NEW ps.pp_size).
-        #
-        # #631 J.3: this step USED TO DESTROY THE RESIDENT DECODE SET, and
-        # that is the whole reason a flip under load was impossible. The
-        # carry now lives inside init_pp_loop_state (it has three callers,
-        # and the TP->PP leg re-enters event_loop_pp, which calls it again);
-        # here we only bracket it with the evidence.
-        #
-        # The orphan check runs BEFORE the swap on purpose: a request
-        # reachable only through last_mbs would mean the quiescence
-        # predicate admitted a boundary that is not quiescent, and that is
-        # a predicate bug to be raised, not a carry to be widened.
-        from sglang.srt.managers.phase_flip_resident_carry import (
-            assert_no_orphan_resident_reqs,
-            promote_slot_zero_to_running_batch,
-            resident_req_identity,
-        )
-
-        assert_no_orphan_resident_reqs(scheduler)
-        resident_before = resident_req_identity(scheduler)
+        # #969: NO ORPHAN ASSERT, NO IDENTITY SNAPSHOT. Both policed the
+        # CARRY -- "every request resident at a cutover must survive it as the
+        # same object". Under the user design a resident does not survive the
+        # cutover at all: it is retracted, everything is zeroed, and it comes
+        # back through the ordinary queue with its prefix served by a HiCache
+        # read. Asserting object survival across a re-entry asserts the very
+        # thing the design removes.
         # WHAT init_pp_loop_state IS ABOUT TO DESTROY, on the record.
         # It clears pp_outputs, last_rank_comm_queue and send_output_work
         # with no drain and no carry. The request side has a carry and a
@@ -3229,29 +3206,6 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                     "%s #800 cutover stash retirement failed: %s", LOG_PREFIX, exc
                 )
         scheduler.init_pp_loop_state()
-        # 6b. The TP loops read ``running_batch``, not the slot array, so
-        # the TP leg moves the re-seeded set over (and empties the slots,
-        # or the next flip's harvest would resurrect a stale view of it).
-        if tp_phase:
-            promote_slot_zero_to_running_batch(scheduler)
-        # 6c. MEMBERSHIP PIN, before the deferred aborts of step 8 are
-        # allowed to change the set legitimately. Identity is (rid,
-        # req_pool_idx): the slot ARRANGEMENT changes at a flip by design,
-        # the MEMBERSHIP may not. A dropped request must fail here, loudly,
-        # not surface a pass later as a stranded page and a stranded mamba
-        # lock with the evidence already stale.
-        resident_after = resident_req_identity(scheduler)
-        if resident_after != resident_before:
-            lost = [r for r in resident_before if r not in resident_after]
-            gained = [r for r in resident_after if r not in resident_before]
-            raise KvReshardError(
-                f"{LOG_PREFIX} CUTOVER DROPPED THE RESIDENT DECODE SET "
-                f"({direction}): {len(resident_before)} request(s) before, "
-                f"{len(resident_after)} after; lost {lost[:8]}, gained "
-                f"{gained[:8]}. Every request resident at a cutover must "
-                f"survive it -- a dropped one strands its KV rows and its "
-                f"mamba slot lock and its answer is simply never finished."
-            )
 
         _mark("pp_loop_arrays")
         # 7. Active stack swap: the forward path follows model_worker.
@@ -3544,24 +3498,6 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 )
 
             _mark("spec_clear")
-            # THE TP->PP LEG'S OWN HANDOVER. The PP phase's first decode
-            # gathers its input token out of the future-map relay, and the
-            # speculative phase it is leaving never wrote that relay (the
-            # non-overlap V2 path installs next_draft_input directly and
-            # skips _relay_forward_payload). Re-derive it from the requests
-            # themselves, here, where the truth is present -- see
-            # reseed_decode_input_relay for the rule and the falsifier.
-            from sglang.srt.managers.phase_flip_resident_carry import (
-                reseed_decode_input_relay,
-            )
-
-            reseeded = reseed_decode_input_relay(scheduler)
-            if reseeded:
-                logger.info(
-                    "%s re-seeded the decode-input relay for %d carried request(s)",
-                    LOG_PREFIX,
-                    reseeded,
-                )
 
             _mark("relay_reseed")
 
