@@ -3362,6 +3362,28 @@ def _decide_from_load(
                 # non-empty backlog is a symptom of work that cannot be
                 # admitted, and it now says so where the operator is already
                 # looking.
+                # #1032 FIX 1, SECOND DOOR. "No bundle was ever resident" is
+                # exactly the state the dwell exists for while the cutover's
+                # own cohort is still being re-admitted: the bundle is not
+                # absent, it is on its way. Boot 564aa7aea7 proved this door
+                # matters -- with the demand term closed, the tp_to_pp arm
+                # simply moved here and cited `decode phase ran EMPTY` instead
+                # of `pending prefill`. Same arm, same round, other reason.
+                #
+                # Bounded by the same round count as the demand door, so a
+                # cohort that can never become resident still releases (and
+                # DWELL-BROKEN names it).
+                if inp.seam_cohort_dwell_active():
+                    return _no(
+                        f"#1032 decode phase not yet empty by right: "
+                        f"{inp.seam_cohort_pending_bs} request(s) of the "
+                        f"cutover's own cohort are still being re-admitted "
+                        f"({inp.seam_cohort_pending_tokens} tok, round "
+                        f"{inp.seam_cohort_stall_rounds}/"
+                        f"{SEAM_COHORT_DWELL_ROUNDS}). Calling this window "
+                        f"empty and flipping away would retract the bundle it "
+                        f"was opened to serve -- the decode-empty cycle"
+                    )
                 return PhasePolicyDecision(
                     TP_TO_PP,
                     f"decode phase ran EMPTY: no bundle was ever resident "

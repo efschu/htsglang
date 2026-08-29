@@ -13093,6 +13093,24 @@ class Scheduler(
         _cohort_n, _cohort_tok = 0, 0
         try:
             _cohort_n, _cohort_tok = self._seam_cohort_pending()
+            # SMOKE, unconditional and rate-limited: boot 564aa7aea7 emitted
+            # ZERO dwell lines and there was no way to tell "the reader ran and
+            # found no cohort" from "the reader never ran" -- the
+            # desk-written-never-executed trap, on my own instrument. This line
+            # separates them, and it prints the queue size beside the count so
+            # a zero can be attributed rather than guessed at.
+            _sn = int(getattr(self, "_1032_smoke_n", 0) or 0) + 1
+            self._1032_smoke_n = _sn
+            if _sn == 1 or _sn % 200 == 0:
+                logger.info(
+                    "#1032 COHORT-READ n=%d cohort=%d tok=%d waiting_queue=%d "
+                    "phase=%s",
+                    _sn,
+                    _cohort_n,
+                    _cohort_tok,
+                    len(getattr(self, "waiting_queue", ()) or ()),
+                    runtime.phase,
+                )
             _prev = int(getattr(self, "_1032_stall_rounds", 0) or 0)
             if _cohort_n > 0:
                 self._1032_stall_rounds = _prev + 1
