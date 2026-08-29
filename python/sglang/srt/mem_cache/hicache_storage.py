@@ -1141,9 +1141,33 @@ class HiCacheFile(HiCacheStorage):
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
+        # #969G KEY INSTRUMENT (temporary). The ONE funnel every store key goes
+        # through, read and write alike (6 call sites). The open question is
+        # whether the re-admission asks for the SAME key the retention wrote:
+        # equal keys with an empty answer is a store/lookup defect, different
+        # keys is a derivation defect and the difference names the field.
+        # The caller's name distinguishes read from write with no plumbing.
+        # Grep: "#969G KEY".
         if component_name is None or component_name in ("__default__", PoolName.KV):
-            return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+            out = self._get_suffixed_key(key)
+        else:
+            out = self._get_suffixed_key(f"{key}.{component_name}")
+        try:
+            import sys as _sys
+
+            _n = getattr(HiCacheFile, "_969g_n", 0) + 1
+            HiCacheFile._969g_n = _n
+            if _n <= 60 or _n % 1024 == 0:
+                logger.warning(
+                    "#969G KEY n=%d caller=%s component=%s key=%s",
+                    _n,
+                    _sys._getframe(1).f_code.co_name,
+                    component_name,
+                    out,
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning("#969G KEY PROBE RAISED", exc_info=True)
+        return out
 
     def _sharded_path(self, stem: str) -> str:
         """Path a NEW file for ``stem`` is written to."""
