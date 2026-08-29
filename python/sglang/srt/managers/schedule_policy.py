@@ -36,6 +36,76 @@ def _note_988_loadback(req, new_prefix_len: int) -> None:
         )
 
 
+#: #1035: rank-local host load-backs refused by the PP congruence rule.
+_1035_LOADBACK_REFUSED = {"n": 0}
+
+
+def _pp_forbids_rank_local_load_back(req) -> bool:
+    """#1035: under PP a host load-back is a rank-local prefix mutation.
+
+    THE BOOT THIS CLOSES. window-flip-0828 boot `1815081d46` died at 23:40:52
+    with `Bar1CollectiveAborted` on all three ranks. Ninety-four consecutive
+    `#969 EXTENT` events were rank-uniform; the ninety-fifth was not, and it
+    was the boot's ONLY host load-back:
+
+        PP0  rid=5373b3a7  prefix 8541  extend   1   (host_hit=349, mamba=1)
+        PP1  rid=5373b3a7  prefix 8192  extend 350   (host_hit=0)
+        PP2  rid=5373b3a7  prefix 8192  extend 350   (host_hit=0)
+
+    PP0 then ran a 1-row forward while its peers ran 350-row ones, the
+    attention-TP `all_reduce` never matched, and every rank's spin kernel sat
+    on its cycle deadline until the abort check raised. The message says "a
+    peer did not arrive"; the peer did arrive, at a different shape.
+
+    WHY THIS IS CONSTRUCTION AND NOT DETECTION. Under PP each stage holds a
+    different LAYER slice, so the host tier is layer-partitioned and
+    `host_hit_length` is non-uniform BY CONSTRUCTION -- there is no value of
+    it that all ranks can be relied on to share, and no amount of checking
+    afterwards makes one. A mechanism that can put two ranks into different
+    admission shapes may not exist; it is not something to detect and
+    compensate on the next pass.
+
+    THE RULE ALREADY EXISTS ONE PATH OVER, AND THIS IS ITS SIBLING. The
+    forwarded-schedule path refuses the identical load-back for the identical
+    reason -- "a load-back is a rank-local improvement to a quantity this rank
+    no longer owns, so on this path it does not run" (the instr20 line,
+    `_add_one_req_from_schedule`). Instr20 was the MIRROR of this death (PP1
+    and PP2 grew, PP0 did not), and the rule was fixed only on the path that
+    death happened to be found on. The self-building path kept the defect and
+    spent a boot proving it.
+
+    THE COST, STATED RATHER THAN ASSUMED. The revived tokens are recomputed
+    instead. Measured on the dead boot: 349 tokens, once across 57 cutovers,
+    against a HiCache chunk of 8192 -- an order of magnitude inside the
+    standing "at most one chunk of recompute" bound, and paid per re-admission
+    rather than per token. The counter below is what re-opens this trade if
+    the frequency ever stops being negligible.
+
+    NOT A DELETION OF HOST LOAD-BACK. `pp_size == 1` -- plain TP, and every
+    upstream configuration -- is untouched: there the host tier is sharded by
+    HEAD, holds the same tokens on every rank, and the hit is uniform.
+    """
+    if int(getattr(get_server_args(), "pp_size", 1) or 1) <= 1:
+        return False
+    _1035_LOADBACK_REFUSED["n"] += 1
+    n = _1035_LOADBACK_REFUSED["n"]
+    if n <= 5 or n % 64 == 0:
+        logger.warning(
+            "#1035 RANK-LOCAL LOAD-BACK REFUSED rid=%s: this rank has a host "
+            "hit (kv=%s swa=%s mamba=%s) that its peers need not have, and "
+            "applying it would grow this rank's prefix alone -- the shape "
+            "divergence that killed boot 1815081d46 in the attention-TP "
+            "all_reduce. The prefix stays at the rank-uniform match and these "
+            "tokens are recomputed. occurrence=%d",
+            getattr(req, "rid", None),
+            getattr(req, "host_hit_length", None),
+            getattr(req, "swa_host_hit_length", None),
+            getattr(req, "mamba_host_hit_length", None),
+            n,
+        )
+    return True
+
+
 #: #967: how many times the #959 "one continuation at a time" guard has
 #: refused a FRESH request in this process, per mint site.
 #:
@@ -2085,7 +2155,15 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
-            if req.needs_host_load_back():
+            # #1035: the load-back runs only where its result can be
+            # rank-uniform. Under PP the host tier is layer-partitioned, so
+            # this rank's hit is its own and growing the prefix on it alone
+            # is the shape divergence boot 1815081d46 died of. The refusal
+            # and its instrument live behind the same predicate, so the line
+            # can never report a state the branch did not take.
+            if req.needs_host_load_back() and not _pp_forbids_rank_local_load_back(
+                req
+            ):
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
