@@ -4237,6 +4237,38 @@ class SchedulerPPMixin:
                     # written over `can_run_list`; reading only `chunked_req`
                     # is why the armed actuator never fired on metal.
                     pp_apply_dead_premise_anywhere(self)
+                # #969M ARM DISCRIMINATOR (temporary). §V showed the flip
+                # drain's own docstring describing CUT J's guard as the defect:
+                # "A flip abandon is rank-local: each rank times out on its own
+                # clock ... the proxy recv was guarded by THIS rank's batch,
+                # never by whether the upstream sent ... every later receive on
+                # that rank was off by one."
+                #
+                # If that is what the epoch-2 `#631 PROXY LEFTOVER REFUSED` is,
+                # the ranks must DISAGREE about being armed at that moment. If
+                # they agree, the reframing is wrong and the membership carrier
+                # was the right cut after all. One line per pass per rank; the
+                # comparison is across ranks at the refusal's timestamp.
+                # Grep: "#969M ARM".
+                try:
+                    _n = getattr(self, "_969m_n", 0) + 1
+                    self._969m_n = _n
+                    if _n <= 3000 or _n % 64 == 0:
+                        logger.warning(
+                            "#969M ARM n=%d mb_id=%s armed=%s epoch=%s pending=%s",
+                            _n,
+                            mb_id,
+                            self.pp_phase_flip_armed(),
+                            self._pp_flip_epoch(),
+                            getattr(
+                                getattr(self, "phase_flip_runtime", None),
+                                "pending",
+                                None,
+                            ),
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.warning("#969M ARM PROBE RAISED", exc_info=True)
+
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
