@@ -7144,6 +7144,17 @@ class SchedulerPPMixin:
         addressable marker instead of wedging.
         """
         budget = _pp_ring_commit_budget_s()
+        # STRIP-B (user order 2026-08-29): no HiCacheCollectiveTimeout wrapper
+        # on plain PP. The named bound belongs to the retired era machinery;
+        # on this path it never bought correctness, only a named death -- ten
+        # boots of this window ended as 'pp-ring-commit/... did not complete
+        # within 120s'. `bounded_wait` is not a collective either (it takes one
+        # torch Work handle; the label only names the parked thread), so
+        # dropping it removes a deadline, not a guarantee. The raw wait below
+        # is the documented escape hatch of SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S
+        # and is what upstream PP does.
+        if not getattr(self.server_args, "enable_phase_flip", False):
+            budget = 0.0
         if budget <= 0:
             # Documented escape hatch (ENV_RING_COMMIT_BUDGET): byte-for-byte
             # the pre-#973 behaviour, including the unbounded park.
@@ -7698,6 +7709,21 @@ class SchedulerPPMixin:
         NO COLLECTIVE note -- the 2026-08-17 deadlock family this must not
         repeat). Retaining a handle is not blocking on one.
         """
+        # STRIP-B (user order 2026-08-29): this exists only for the retired
+        # second HiCache implementation. With the flip off there is no era to
+        # keep congruent, and the machinery is not merely idle here -- it is
+        # what deadlocks the ring. Measured, boot 71, three py-spy stacks at
+        # one instant: PP0 and PP1 both blocked in
+        # `_pp_commit_admission_send_work` waiting for their admission-decision
+        # send to be taken, PP2 blocked in its output-send wrap 2->0 that PP0
+        # would have taken next. A closed three-arc send cycle, and every arc
+        # of it belongs to this apparatus. Plain upstream PP has no
+        # admission-decision ring at all.
+        # Ten boots died of this family (53, 55-59, 68-71), flip-free included
+        # (#990), so it is left out rather than repaired -- an eleventh fix to
+        # a mechanism with no remaining purpose.
+        if not getattr(self.server_args, "enable_phase_flip", False):
+            return
         if self.ps.pp_size <= 1:
             return
         # #978: recorded BEFORE the last-rank return below -- the last rank
@@ -7778,6 +7804,21 @@ class SchedulerPPMixin:
         `_pp_commit_pending_req_work` relies on -- or, on a pass that sent
         nothing, a wait on an empty list.
         """
+        # STRIP-B (user order 2026-08-29): this exists only for the retired
+        # second HiCache implementation. With the flip off there is no era to
+        # keep congruent, and the machinery is not merely idle here -- it is
+        # what deadlocks the ring. Measured, boot 71, three py-spy stacks at
+        # one instant: PP0 and PP1 both blocked in
+        # `_pp_commit_admission_send_work` waiting for their admission-decision
+        # send to be taken, PP2 blocked in its output-send wrap 2->0 that PP0
+        # would have taken next. A closed three-arc send cycle, and every arc
+        # of it belongs to this apparatus. Plain upstream PP has no
+        # admission-decision ring at all.
+        # Ten boots died of this family (53, 55-59, 68-71), flip-free included
+        # (#990), so it is left out rather than repaired -- an eleventh fix to
+        # a mechanism with no remaining purpose.
+        if not getattr(self.server_args, "enable_phase_flip", False):
+            return
         pending = getattr(self, "_pp_admission_send_work", None)
         if pending:
             self._pp_commit_comm_work(pending)
