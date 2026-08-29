@@ -10324,11 +10324,66 @@ class Scheduler(
                 ",".join(str(batch.reqs[i].rid)[:8] for i in _held[:4]) or "-",
                 self._1008_held,
             )
+            # #1010: HOLDING IS NOT ENOUGH -- GIVE THE REQUEST BACK TO THE
+            # PATH THAT CAN ACTUALLY RUN IT.
+            #
+            # Boots 68 and 69 both held correctly and then starved: the
+            # request sits in the running batch, #1008 keeps it out of decode,
+            # and `_get_new_batch_prefill_raw` declines at its first gate
+            # (:8774, `len(self.waiting_queue) == 0 and self.chunked_req is
+            # None`) because the request has already left the waiting queue.
+            # Held by one path, invisible to the other, and the instance dies
+            # idle on the 120s ring budget with a request it never ran.
+            #
+            # DELIBERATE DEVIATION from the convention that a request in the
+            # running batch is no longer a prefill candidate (standing order
+            # 2026-08-29: soft design rules, deviate with a named reason).
+            # That convention encodes "running means its prefill has run",
+            # which is true upstream, where prefill and decode share a round.
+            # It is false for a PP request whose result is still in flight,
+            # and following it here produces a request nobody owns.
+            #
+            # THE DOUBLE-ADMISSION ARGUMENT, which is the one line that makes
+            # this legal (the prohibition #968b states): a request is
+            # re-queued only when NO microbatch slot still holds it and it is
+            # not the chunked carry. It has just been filtered out of the
+            # running batch, it is not in the waiting queue (that is why the
+            # gate fired), and no slot references it -- so no door leads to it
+            # at all, and the queue is the only one left. Nothing is reset or
+            # truncated: the request goes back exactly as it stands.
+            _slotted = set()
+            for _b in list(getattr(self, "mbs", None) or []):
+                for _r in list(getattr(_b, "reqs", None) or []):
+                    _slotted.add(id(_r))
+            _requeue = [
+                batch.reqs[i]
+                for i in _held
+                if id(batch.reqs[i]) not in _slotted
+                and batch.reqs[i] is not getattr(self, "chunked_req", None)
+            ]
             batch.filter_batch(
                 keep_indices=[
                     i for i in range(len(batch.reqs)) if i not in set(_held)
                 ]
             )
+            if _requeue:
+                self._1010_requeued = getattr(self, "_1010_requeued", 0) + len(
+                    _requeue
+                )
+                logger.warning(
+                    "#1010 HELD REQUEST RE-QUEUED FOR PREFILL: %d req(s) "
+                    "rids=%s, requeued_total=%d. They were held out of decode "
+                    "with no prefill result and no slot holding them, so the "
+                    "prefill planner could not see them either (its first "
+                    "gate declines on an empty waiting queue). Returned to "
+                    "the queue unchanged. A total that keeps growing for the "
+                    "same rid means the prefill still never completes.",
+                    len(_requeue),
+                    ",".join(str(r.rid)[:8] for r in _requeue[:4]),
+                    self._1010_requeued,
+                )
+                for _r in _requeue:
+                    self.waiting_queue.append(_r)
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
