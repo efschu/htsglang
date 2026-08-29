@@ -245,6 +245,43 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
+        # #1018: A ZEROED MATCH PROTECTS NOTHING, AND THIS FIELD HAD TO SAY SO.
+        # Of MatchResult's nine fields this function replaced seven. It left
+        # `mamba_branching_seqlen` deliberately -- the #928 refusals re-attach
+        # it on purpose, so the re-prefill re-establishes the anchor at that
+        # grid position -- and it left `cache_protected_len` by omission.
+        #
+        # That omission is a contradiction inside one object: `device_indices`
+        # is emptied here, so `prefix_indices` is empty downstream, while
+        # `cache_protected_len` still carries the PRE-refusal claim that the
+        # tree owns N tokens. Its consumer takes the claim at face value
+        # (`schedule_policy.py:231-234`, mirrored `schedule_batch.py:1410`):
+        #     if match_result.cache_protected_len is not None:
+        #         req.cache_protected_len = match_result.cache_protected_len
+        #     else:
+        #         req.cache_protected_len = len(req.prefix_indices)
+        # so the request is re-admitted asserting a protected prefix it just
+        # been told it does not have.
+        #
+        # MEASURED, boot_pp3solo_871178b77e_0829_121138: one second before the
+        # first idle, all three ranks log the #928 refusal for rid bbeeeae6
+        # ("re-prefilling", occurrence=1, rank-UNIFORM so not a told/local
+        # divergence), and the announced re-prefill never produces a prefill
+        # batch. The request's rows stay allocated and the census reports them:
+        # 129 rows for a ~129-token prompt, and 11 / 10 / 6 for the shorter
+        # smokes -- the deficit is the prompt, i.e. an ordinary admission whose
+        # launch never happens.
+        #
+        # `None`, not 0, and the difference matters: None means "this match
+        # makes no protection claim", which routes the consumer into the same
+        # else-branch an ordinary miss uses and lets it derive the length from
+        # the (now empty) prefix. Hardcoding 0 would state a second fact here
+        # instead of deferring to the one derivation both paths already share.
+        #
+        # This is the zeroing CONTRACT, not a patch at the refusal: every
+        # caller of this function -- strict-resume, both #928 arms, the
+        # slot-starvation zeroing -- gets the same repair from one line.
+        cache_protected_len=None,
     )
 
 
