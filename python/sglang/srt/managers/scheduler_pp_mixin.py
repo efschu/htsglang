@@ -1165,6 +1165,38 @@ def _pp_ring_commit_budget_s() -> float:
 # without adding anything to what a holder must bind.
 
 
+def _pp_era_ring_live(holder) -> bool:
+    """Is the retired era's admission-decision ring live on this holder?
+
+    THE ONE PLACE THE STRIP-B PREDICATE IS SPELLED, so the three gates that
+    ask it cannot drift apart, and module-level for the reason stated
+    immediately above: a stand-in binds methods one at a time and would raise
+    AttributeError on `self._pp_era_ring_live`.
+
+    AN UNKNOWN HOLDER IS NOT "FLIP OFF". Measured 2026-08-29: strip-B
+    (d4478a053a) spelled this predicate `getattr(self.server_args, ...)`,
+    which dereferences an attribute roughly a dozen stand-ins in the
+    #787/#791/#795/#796 family never set. Cherry-picked onto the #1010 pin it
+    turned 15 green tests into 13 failures across
+    test_pp_admission_wiring_791, test_pp_admission_send_handle_dropped_796,
+    test_pp_admission_chain_flush_deadlock_795 and
+    test_pp_admission_wraparound_never_blocks -- every one of them
+    `'types.SimpleNamespace' object has no attribute 'server_args'`, the exact
+    sibling of the #973 defect the comment above this function records.
+    strip-B's own evidence line says "py_compile", so no suite ever saw it.
+
+    A holder with no `server_args` therefore keeps the PRE-GATE behaviour --
+    byte-identical to what shipped before strip-B -- which is this file's
+    stand-in convention (#787) and costs production nothing: a real Scheduler
+    always has `server_args`, so the fallback is reachable only from test
+    harnesses.
+    """
+    server_args = getattr(holder, "server_args", None)
+    if server_args is None:
+        return True
+    return bool(getattr(server_args, "enable_phase_flip", False))
+
+
 def _pp_commit_channel_of(holder, work: List[P2PWork]) -> str:
     """Name the wire ``work`` rides, for the #973 message.
 
@@ -7193,7 +7225,7 @@ class SchedulerPPMixin:
         # dropping it removes a deadline, not a guarantee. The raw wait below
         # is the documented escape hatch of SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S
         # and is what upstream PP does.
-        if not getattr(self.server_args, "enable_phase_flip", False):
+        if not _pp_era_ring_live(self):
             budget = 0.0
         if budget <= 0:
             # Documented escape hatch (ENV_RING_COMMIT_BUDGET): byte-for-byte
@@ -7762,7 +7794,7 @@ class SchedulerPPMixin:
         # Ten boots died of this family (53, 55-59, 68-71), flip-free included
         # (#990), so it is left out rather than repaired -- an eleventh fix to
         # a mechanism with no remaining purpose.
-        if not getattr(self.server_args, "enable_phase_flip", False):
+        if not _pp_era_ring_live(self):
             return
         if self.ps.pp_size <= 1:
             return
@@ -7857,7 +7889,7 @@ class SchedulerPPMixin:
         # Ten boots died of this family (53, 55-59, 68-71), flip-free included
         # (#990), so it is left out rather than repaired -- an eleventh fix to
         # a mechanism with no remaining purpose.
-        if not getattr(self.server_args, "enable_phase_flip", False):
+        if not _pp_era_ring_live(self):
             return
         pending = getattr(self, "_pp_admission_send_work", None)
         if pending:
