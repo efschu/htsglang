@@ -8918,6 +8918,81 @@ class SchedulerPPMixin:
                     _proxy._pp_sender_stamp = stamp
                 except Exception:  # noqa: BLE001 - provenance may never break a recv
                     pass
+                # #995c THE FALSE-REFUSAL SIDE, MEASURED BEFORE ANYTHING IS
+                # ARMED. This is the can-fail on the DANGEROUS direction.
+                #
+                # The evidence says the enforcement belongs here: boot 26
+                # showed sender rows == received rows (payload intact,
+                # PAIRING wrong), with mb_id and epoch matching, so
+                # `pp_proxy_stamp_names_pass` cannot separate the two
+                # messages. The seqno can -- it exists for exactly this
+                # ("distinguishes two messages for the SAME slot, which is
+                # exactly the pair a stranded leftover creates") and no
+                # consumer reads it.
+                #
+                # BUT REFUSING HERE IS THE BOOT-KILLING DIRECTION, and #995's
+                # first version proved it: a refusal on the live path with no
+                # way onward cost 175 refusals on ONE rid and a dead window.
+                # So NOTHING IS REFUSED YET. This only asks whether the width
+                # available here agrees with the width the downstream guard
+                # will use -- because if it does not, an armed check would
+                # reject VALID messages, which is worse than the leftover it
+                # would catch.
+                #
+                # THE COMPARISON IS NOT A SECOND DERIVATION, which is what
+                # makes it trustworthy: `ForwardBatch` is built with
+                # `input_ids=batch.input_ids` (forward_batch_info.py:709), so
+                # `self.mbs[mb_id].input_ids` IS the tensor
+                # `model_runner.forward` measures. Same object, not a parallel
+                # computation of the same idea -- the distinction that made
+                # #994's truncation dangerous.
+                try:
+                    _srows = (
+                        int(stamp[2])
+                        if isinstance(stamp, (tuple, list)) and len(stamp) >= 3
+                        else -1
+                    )
+                    _cb = (
+                        self.mbs[mb_id]
+                        if 0 <= mb_id < len(getattr(self, "mbs", ()) or ())
+                        else None
+                    )
+                    _ii = getattr(_cb, "input_ids", None) if _cb is not None else None
+                    _local = int(_ii.shape[0]) if _ii is not None else -1
+                    if _srows >= 0 and _local >= 0:
+                        if _srows == _local:
+                            self._995c_agree = getattr(self, "_995c_agree", 0) + 1
+                        else:
+                            self._995c_disagree = (
+                                getattr(self, "_995c_disagree", 0) + 1
+                            )
+                            _n = self._995c_disagree
+                            if _n <= 8 or _n % 256 == 0:
+                                logger.warning(
+                                    "#995c PROXY WIDTH DISAGREES AT RECV "
+                                    "occurrence=%d: sender stamp says %d row(s) "
+                                    "(mb_id=%s seq=%s epoch=%s), this rank's "
+                                    "batch for slot %d holds %d token(s). "
+                                    "NOT REFUSED -- this pass still runs and "
+                                    "the downstream width check in "
+                                    "model_runner.forward remains the only "
+                                    "gate. Agreements so far: %d. An armed "
+                                    "check here is safe only once this line "
+                                    "fires ONLY on genuine leftovers; a hit "
+                                    "on a VALID message means the local width "
+                                    "is not the downstream width and arming "
+                                    "would kill good passes.",
+                                    _n,
+                                    _srows,
+                                    stamp[0],
+                                    stamp[1],
+                                    stamp[3] if len(stamp) >= 4 else "?",
+                                    mb_id,
+                                    _local,
+                                    getattr(self, "_995c_agree", 0),
+                                )
+                except Exception:  # noqa: BLE001 - a probe may never break a recv
+                    pass
                 return _proxy
             self._pp_proxy_batch_divergences = (
                 getattr(self, "_pp_proxy_batch_divergences", 0) + 1
