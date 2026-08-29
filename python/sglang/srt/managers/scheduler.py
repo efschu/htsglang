@@ -5126,7 +5126,44 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            self._prefetch_kvcache(req)
+            _pf_verdict = self._prefetch_kvcache(req)
+            # #969C: THE VERDICT WAS COMPUTED AND THROWN AWAY (success-value-
+            # without-action, this tree's own catalogued class). #969B measured
+            # that 141 of 148 seam re-admissions reach the match with
+            # `prefetch_registered=False` -- the prefetch was ATTEMPTED here and
+            # DECLINED, and because `check_prefetch_progress` reports "done" for
+            # a rid it never registered, the admission gate then waits for
+            # nothing and the request is matched against an empty tree and
+            # re-prefilled from token 0. `_prefetch_kvcache` names its exit in
+            # this string; nothing read it. Logged for re-admitted requests only.
+            # Grep: "#969C READMIT-PREFETCH".
+            try:
+                from sglang.srt.managers.phase_purity import (
+                    SEAM_READMIT_ATTR as _SRA,
+                )
+
+                if getattr(req, _SRA, None) is not None:
+                    _n = getattr(self, "_969c_n", 0) + 1
+                    self._969c_n = _n
+                    logger.warning(
+                        "#969C READMIT-PREFETCH n=%d rid=%s verdict=%s "
+                        "last_host_node=%s host_hit=%s prefix_len=%s "
+                        "storage_hit=%s readmit_epoch=%s",
+                        _n,
+                        str(getattr(req, "rid", "?"))[:8],
+                        _pf_verdict,
+                        type(getattr(req, "last_host_node", None)).__name__,
+                        getattr(req, "host_hit_length", None),
+                        (
+                            None
+                            if getattr(req, "prefix_indices", None) is None
+                            else len(req.prefix_indices)
+                        ),
+                        getattr(req, "storage_hit_length", None),
+                        getattr(req, _SRA, None),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("#969C READMIT-PREFETCH PROBE RAISED", exc_info=True)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
