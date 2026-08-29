@@ -516,6 +516,100 @@ class MixedLayoutError(RuntimeError):
     """The same page stem exists in BOTH the flat and the sharded layout."""
 
 
+class MixedGenerationError(MixedLayoutError):
+    """One store holds component blobs written by TWO key GENERATIONS.
+
+    Subclasses ``MixedLayoutError`` on purpose (#558's mechanic, extended one
+    axis) rather than introducing a parallel refusal: both say the same thing
+    -- one content-addressed key resolves to more than one candidate file, and
+    the read path would silently prefer one of them. #558 is the FILE-LAYOUT
+    axis (flat vs sharded, same key). This is the KEY-FORMAT axis (the retired
+    per-stage suffix vs the #706 geometry-neutral suffix, same pool).
+
+    Anything already catching MixedLayoutError therefore keeps working.
+    """
+
+
+def audit_blob_generations(
+    root_dir: str,
+    *,
+    stage_marker: str,
+    canonical_marker: str,
+    limit: int = 4,
+    max_files: int = 200_000,
+) -> tuple:
+    """Sample the store for component blobs of BOTH key generations.
+
+    THE HAZARD THIS NAMES (user order 2026-08-29, the retired second HiCache
+    implementation): the per-stage component writer of that era keys a GDN blob
+    ``{hash}.mamba{model}_{identity}_{tp_rank}_{tp_size}_{pp_size}_{pp_rank}``
+    -- the ``_0_1_3_r`` tail -- while the #706 canonical writer keys the SAME
+    pool ``{hash}.mamba{model}_{identity}``, geometry-neutral. Both writers ran
+    against the same directory for weeks. Measured 2026-08-29 in the specimen
+    store ``/tmp/hicache_783``: 328 canonical ``.mamba`` blobs beside 1091
+    per-stage ones (``_0_1_3_0`` / ``_0_1_3_1`` / ``_0_1_3_2``). Those bytes
+    describe different cuts of the state under one content-addressed hash.
+
+    DRAFT BLOBS ARE NOT A SECOND GENERATION and must never be counted here:
+    ``_is_shared_kv_key``'s docstring states the rule -- draft KV is
+    head-SHARDED and token-COMPLETE, so it keeps the geometry suffix BY
+    DESIGN, in every generation. Only the pool whose key MOVED between
+    generations can be ambiguous, and that is the one the caller names.
+
+    Returns ``(stage_samples, canonical_samples, files_seen, exhausted)``.
+    This is a bounded DETECTOR, not a proof of coherence: it stops at
+    ``max_files`` and ``exhausted`` reports whether the whole store was seen,
+    so a caller never reads a clean result as more than it is (indicator law).
+    """
+    stage: list = []
+    canonical: list = []
+    seen = 0
+    exhausted = True
+
+    def _consider(name: str) -> bool:
+        """False when the budget is spent."""
+        nonlocal seen
+        if not name.endswith(".bin"):
+            return True
+        seen += 1
+        stem = name[:-4]
+        # The stage marker EXTENDS the canonical one (same pool + model +
+        # identity, plus the geometry tail), so it is the more specific of the
+        # two and is tested first. On today's suffixes the two cannot both
+        # match one stem; the order costs nothing and holds if a future suffix
+        # rule ever makes them overlap.
+        if stem.endswith(stage_marker):
+            if len(stage) < limit:
+                stage.append(stem)
+        elif stem.endswith(canonical_marker):
+            if len(canonical) < limit:
+                canonical.append(stem)
+        if stage and canonical:
+            # Both generations found: the refusal is already decided.
+            return False
+        return seen < max_files
+
+    try:
+        with os.scandir(root_dir) as it:
+            top = list(it)
+    except (FileNotFoundError, NotADirectoryError):
+        return ((), (), 0, True)
+    for entry in top:
+        if entry.is_dir():
+            try:
+                with os.scandir(entry.path) as shard_it:
+                    for sub in shard_it:
+                        if not _consider(sub.name):
+                            # Early exit: either decided, or out of budget.
+                            # Either way the whole store was NOT examined.
+                            return (tuple(stage), tuple(canonical), seen, False)
+            except OSError:
+                continue
+        elif not _consider(entry.name):
+            return (tuple(stage), tuple(canonical), seen, False)
+    return (tuple(stage), tuple(canonical), seen, exhausted)
+
+
 def audit_layout(root_dir: str, *, limit: int = 8) -> list:
     """Stems present in BOTH layouts. Empty list when the store is coherent.
 
@@ -667,6 +761,72 @@ class HiCacheFile(HiCacheStorage):
                 "content-addressed key resolve to whichever file the lookup "
                 "order happens to find first."
             )
+
+        # THE RETIRED SECOND HiCACHE IMPLEMENTATION MUST NOT SHARE A STORE WITH
+        # THE ONE THAT REPLACED IT (user order 2026-08-29). Same law as #558
+        # directly above, one axis over: there the same key lived in two
+        # LAYOUTS, here the same pool is keyed by two FORMATS. The per-stage
+        # component writer of the retired era appends this rank's geometry
+        # (`_{tp_rank}_{tp_size}_{pp_size}_{pp_rank}`, the `_0_1_3_r` tail);
+        # the #706 writer that replaced it keys the same pool geometry-neutral.
+        # Bytes under those two keys are different CUTS of the same state, and
+        # the store cannot tell a reader which cut it just handed over.
+        #
+        # Checked once, at attach, and only where it can actually be ambiguous:
+        # the pool must have MOVED between generations, which is exactly the
+        # condition `config_suffix != kv_config_suffix`. Draft blobs keep the
+        # geometry suffix in BOTH generations by design (see
+        # `_is_shared_kv_key`) and are therefore never a generation signal.
+        if self.config_suffix != self.kv_config_suffix:
+            stage_blobs, canonical_blobs, files_seen, exhausted = (
+                audit_blob_generations(
+                    self.file_path,
+                    stage_marker=f".{PoolName.MAMBA}{self.config_suffix}",
+                    canonical_marker=f".{PoolName.MAMBA}{self.kv_config_suffix}",
+                )
+            )
+            if stage_blobs and canonical_blobs:
+                raise MixedGenerationError(
+                    f"HiCacheFile store {self.file_path!r} holds "
+                    f"{PoolName.MAMBA} blobs written by TWO key generations: "
+                    f"the retired second HiCache implementation's per-stage "
+                    f"form (e.g. {stage_blobs[0]!r}) beside the #706 "
+                    f"geometry-neutral form (e.g. {canonical_blobs[0]!r}). "
+                    "The two name different cuts of the same state under one "
+                    "content-addressed hash, so a hit can return bytes that do "
+                    "not describe this rank's layers. The retired writer is "
+                    "gone; its deposits are not. Migrate or drop them "
+                    "deliberately -- see #975 for the offline cut "
+                    "(hicache_migrate.MambaBlobSpec.for_layers / layer_extents) "
+                    "-- rather than letting the read path pick whichever file "
+                    "the lookup order happens to find first."
+                )
+            if stage_blobs:
+                # Single-generation, but the RETIRED one, and this process
+                # writes the new format. Not ambiguous yet, so not a refusal --
+                # it becomes one the moment this boot deposits its first
+                # canonical blob into the same directory.
+                logger.warning(
+                    "HiCacheFile store %s holds %d+ %s blob(s) in the retired "
+                    "second HiCache implementation's per-stage key format "
+                    "(e.g. %s). This process writes the #706 geometry-neutral "
+                    "format, so the store becomes two-generation -- and this "
+                    "attach a hard MixedGenerationError -- as soon as the "
+                    "first canonical blob lands. Clear them or migrate them "
+                    "now (#975).",
+                    self.file_path,
+                    len(stage_blobs),
+                    PoolName.MAMBA,
+                    stage_blobs[0],
+                )
+            elif not exhausted:
+                logger.info(
+                    "HiCacheFile generation audit stopped after %d files in "
+                    "%s without seeing the whole store; a clean result here "
+                    "bounds the check, it does not prove coherence.",
+                    files_seen,
+                    self.file_path,
+                )
 
         # #706: orphaned partials are invisible to readers AND untracked by the
         # LRU evictor (it walks .bin only), so nothing else would ever reap a
