@@ -3211,6 +3211,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Init tensors
         reqs = self.reqs
         input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
+        # #969 DECISION PROBE (temporary): what did THIS rank decide the extend
+        # range is, for each request, at the one place the forward width is
+        # actually built. The #998 invariant below checks the pair WITHIN a
+        # rank; this line is for comparing the SAME rid ACROSS ranks, which is
+        # the open question -- the #631 width mismatch showed a sender at
+        # extend_range=(0,4096) against a receiver batch of 1302 tokens, and
+        # nothing in the tree says whether that is a rank-local match verdict
+        # or a temporal lag. Grep: "#969 EXTENT".
+        try:
+            _rk = getattr(getattr(self, "model_config", None), "pp_rank", None)
+            if _rk is None:
+                import os as _os
+                _rk = _os.environ.get("SGLANG_DP_RANK", "?")
+            _n = getattr(ScheduleBatch, "_969_extent_n", 0) + 1
+            ScheduleBatch._969_extent_n = _n
+            if _n <= 400 or _n % 64 == 0:
+                logger.warning(
+                    "#969 EXTENT n=%d fwd=%s reqs=%s",
+                    _n,
+                    getattr(self, "forward_mode", "?"),
+                    [
+                        (
+                            str(getattr(r, "rid", "?"))[:8],
+                            None if r.extend_range is None else int(r.extend_range.start),
+                            None if r.extend_range is None else int(r.extend_range.end),
+                            len(r.prefix_indices or []),
+                            len(_i),
+                        )
+                        for r, _i in zip(reqs, input_ids)
+                    ],
+                )
+        except Exception:  # noqa: BLE001 - a probe may never break a forward
+            pass
+
         # #998 THE INVARIANT, CHECKED AT THE READER.
         #
         # `set_extend_range(prefix, prefix + new_len)` means
