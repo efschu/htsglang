@@ -2315,6 +2315,24 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
                     getattr(holder, "_995c_skip", 0),
                     getattr(holder, "_995c_skip_why", "-"),
                 )
+                _sk = getattr(holder, "_995c_skip_ids", None)
+                if _sk:
+                    # EXTRACTION COUNT PROBE beside the list: if the number of
+                    # recorded identities does not equal the skip counter, the
+                    # list is measuring something other than the counter and
+                    # neither may be quoted.
+                    logger.warning(
+                        "#995f SKIPPED RECEIVES, identified: %s (listed=%d "
+                        "counter=%d%s). A skip is a receive whose width was "
+                        "NEVER COMPARED -- if the dying receive is in this "
+                        "list, `disagree=0` says nothing about it.",
+                        _sk[:16],
+                        len(_sk),
+                        getattr(holder, "_995c_skip", 0),
+                        ""
+                        if len(_sk) == getattr(holder, "_995c_skip", 0)
+                        else " MISMATCH: list is capped or counts differently",
+                    )
         except Exception:  # noqa: BLE001 - a census may never break admission
             pass
         runs = list(hist)
@@ -9013,9 +9031,27 @@ class SchedulerPPMixin:
                         # reason the comparison could not be made, so a quiet
                         # log is a measured quiet and not an unread one.
                         self._995c_skip = getattr(self, "_995c_skip", 0) + 1
-                        self._995c_skip_why = (
-                            "no_stamp_rows" if _srows < 0 else "no_local_input_ids"
-                        )
+                        _why = "no_stamp_rows" if _srows < 0 else "no_local_input_ids"
+                        self._995c_skip_why = _why
+                        # #995f IDENTITY OF THE SKIP, not just its count.
+                        # Appending to a list is not I/O -- the EMISSION is
+                        # off-path in `pp_ring_note`, per the rule this window
+                        # produced. Bounded so a long boot cannot grow it.
+                        _sk = getattr(self, "_995c_skip_ids", None)
+                        if _sk is None:
+                            _sk = []
+                            self._995c_skip_ids = _sk
+                        if len(_sk) < 64:
+                            _sk.append(
+                                (
+                                    int(mb_id),
+                                    stamp[1]
+                                    if isinstance(stamp, (tuple, list))
+                                    and len(stamp) >= 2
+                                    else None,
+                                    _why,
+                                )
+                            )
                     elif _srows == _local:
                         self._995c_agree = getattr(self, "_995c_agree", 0) + 1
                     else:
