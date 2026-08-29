@@ -9816,62 +9816,38 @@ class SchedulerPPMixin:
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                # #802-ring: the slot is passed so the readiness gate can name
-                # it. It is the slot this rank's own gate above just proved
-                # non-empty -- exactly the expectation no upstream is told.
-                raw_output = self._pp_recv_dict_from_prev_stage(
-                    next_mb_id, soft=True
-                )
-                if raw_output is None:
-                    # #1002b: VOID THE SLOT, do not merely return. The
-                    # `target is None` exit above is safe only because the
-                    # caller guards `d2h_event.synchronize()` with
-                    # `self.mbs[next_mb_id] is not None`; returning with the
-                    # slot still occupied leaves `d2h_event` unassigned and
-                    # the caller dereferences None (measured: boot 52,
-                    # "AttributeError: 'NoneType' object has no attribute
-                    # 'synchronize'" -- introduced by the first cut of #1002
-                    # and fixed here). Voiding makes this rank's state agree
-                    # with the upstream's: it forwarded nothing for the slot,
-                    # so the slot did not run. That is the same rank-agreed
-                    # act `_pp_void_pass_without_upstream_launch` performs on
-                    # the same fact discovered one step earlier.
-                    # #1002d: NO rank-local void here. Boot 53 died with 0
-                    # flips because one rank voided, ran ahead into the
-                    # cutover, and left the others in the ring -- PP0 in
-                    # HiCache send_req_work, PP1 in p2p[0], PP2 in the lazy
-                    # NCCL build. That is the exact rule 59830ce72d states:
-                    # the decision may be group-agreed, its CONSEQUENCE is
-                    # not, and a void taken at this point is a consequence
-                    # only this rank knows. Declining the receive is local and
-                    # harmless; changing the slot is not.
-                    return
-            # #791b: a void carries no tokens and must not be turned into one.
-            # `_pp_absorb_void_output` empties the slot, so the loop's "slot
-            # non-empty => a result was received for it" invariant (the guard
-            # at `_event_loop_pp_body`'s `if self.mbs[next_mb_id] is not None`)
-            # holds with all three of `next_pp_outputs`, `batch_result` and
-            # `d2h_event` left as None.
-            if self._pp_absorb_void_output(next_mb_id, raw_output, mbs, mb_metadata):
-                # #797: PASS THE VOID ON when a rank between this one and the
-                # retraction still holds a launched batch for this slot. It
-                # rides the ordinary one-iteration output lag -- this is the
-                # same `pp_outputs` a real output would have been forwarded
-                # by, and `_do_send`'s `if pp_outputs:` is the same gate.
-                # `pp_void_forward_payload` returns None on every ordinary
-                # pass and at the last rank that needs it, so nothing is put
-                # on the wire that no peer must take.
-                forward = getattr(self, "_pp_void_forward_payload", None)
-                if forward is not None:
-                    next_pp_outputs = PPProxyTensors(forward)
-                    self._pp_void_forward_payload = None
-                return
-            # #797: a SUCCESSFUL pass carries its chain-reconciled decision
-            # home too, not only a voided one, and it is popped here for the
-            # same reason `__stamp__` is popped in `_pp_recv_proxy_tensors` --
-            # what is left becomes a PPProxyTensors and is forwarded on.
-            # Learning only from voids leaves `record_return_trip` with no way
-            # to CLEAR a floor, which is #796's named residual cost.
+                # #969 CUT B: THE RECEIVE BLOCKS AGAIN, as upstream's does
+                # (`main:scheduler_pp_mixin.py:1239-1240`, a bare
+                # `self._pp_recv_dict_from_prev_stage()`).
+                #
+                # `soft=True` made it a PEEK. On the lap that reads slot
+                # `next_mb_id`, the producing rank is DOWNSTREAM in the same
+                # lap and cannot have sent yet -- that is what the pipeline
+                # stagger means -- so the peek found nothing, returned None,
+                # and the result was never consumed. `#1009 SLOT HAS NO RESULT
+                # YET` is that peek, and every compensation above it (#1008's
+                # hold, #1010's re-queue, the void contracts) was built on the
+                # absence the peek manufactured.
+                #
+                # MEASURED across five boots on this branch, 2026-08-29: three
+                # LAUNCH-JUNCTION lines per boot, one per rank, `#1009
+                # occurrence 1` on all three, never rising -- one lap each and
+                # then the ring idles. The batch is admitted (`#788
+                # verdict=ADMIT ... fill_lens=22` on all three ranks) and never
+                # collected.
+                #
+                # Blocking is correct and cannot wedge on a healthy group: the
+                # gate above has already proved this rank's slot non-empty, so
+                # a message for it is owed, and CUT V made the last rank's send
+                # unconditional on exactly the same fact (`mbs[slot] is not
+                # None`). Sender and receiver ask one question of one batch --
+                # #753's own stated rule, now with upstream's answer on both
+                # ends.
+                raw_output = self._pp_recv_dict_from_prev_stage(next_mb_id)
+            # #797: a successful pass carries its chain-reconciled decision
+            # home; popped here for the same reason `__stamp__` is popped in
+            # `_pp_recv_proxy_tensors`. Kept until the admission-decision
+            # cluster is cut, last.
             pp_absorb_admission_return(self, raw_output)
             next_pp_outputs = PPProxyTensors(raw_output)
             with self.copy_stream_ctx:
