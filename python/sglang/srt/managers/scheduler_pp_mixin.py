@@ -4443,6 +4443,29 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                # #1019: WHY IS THE PASS NOT LAUNCHED. The batch is provably in
+                # a slot (#1009 names mb_id=0 holding a batch whose pass has
+                # not run) and this guard is the only thing between it and
+                # `_pp_launch_batch`. Two boots of inferring the reason from
+                # neighbouring log lines cost two withdrawn hypotheses, so this
+                # reads the junction itself. Low cadence: only while at least
+                # one slot is occupied, and only every 64th such pass, so a
+                # healthy server prints nothing and a stranded one prints
+                # within a second.
+                _occ = [i for i, b in enumerate(self.mbs) if b is not None]
+                if _occ:
+                    self._1019_n = getattr(self, "_1019_n", 0) + 1
+                    if self._1019_n == 1 or self._1019_n % 64 == 0:
+                        logger.warning(
+                            "LAUNCH-JUNCTION mb_id=%s cur_batch=%s occupied=%s "
+                            "n=%d -- a slot is occupied at the launch guard; "
+                            "cur_batch=None here means the guard sees no batch "
+                            "for THIS slot while another slot holds one.",
+                            mb_id,
+                            "None" if cur_batch is None else "set",
+                            _occ,
+                            self._1019_n,
+                        )
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
