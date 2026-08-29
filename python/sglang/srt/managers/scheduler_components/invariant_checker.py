@@ -146,70 +146,6 @@ class SchedulerInvariantChecker:
         return self.token_to_kv_pool_allocator
 
     @staticmethod
-    def _live_double_claimed_rows(free_reading, tree_cache) -> Optional[int]:
-        """Rows claimed RIGHT NOW by both the free enumeration and the tree.
-
-        #912 REST, and the reason this exists is that the term it re-derives is
-        a SNAPSHOT while everything it is subtracted from is LIVE.
-
-        ``double_owned`` reaches ``_check_full_pool`` as
-        ``allocator.double_owned_slots``, published by the phase-flip census's
-        ownership audit and, at every cutover, cleared to ``None`` by
-        ``_retire_row_id_space`` (phase_flip_runtime.py:6255-6264, whose own
-        comment says the cleared state makes the on-idle check "fall back to
-        the pre-#912 raw comparison for the short window before the
-        post-cutover census runs"). ``available`` and ``evictable``, meanwhile,
-        are read at the instant of the check. So a row that becomes doubly
-        claimed AFTER the last census is invisible to the correction and the
-        ledger raises with ``double_owned=0`` -- a surplus with no named
-        holder, which sends the reader to the wrong place.
-
-        MEASURED, boot 2 of the 2c acceptance
-        (/spinning/evidence-665-f1/boot_accept2c0827_0827_0049.log:21372, all
-        three ranks, 00:57:49Z, three minutes into a deliberate idle)::
-
-            pool memory leak detected! [full] total=432089, available=133120,
-              evictable=1, protected=0, session_held=0, uncached=0,
-              withheld=298969, double_owned=0
-
-        ``available + evictable + withheld = 432090``, one over ``total``. The
-        SAME boot's post-cutover census one second earlier (:21367) partitions
-        the id space with nothing left over::
-
-            size=432089 free=133120 cached=0 withheld=298969 unaccounted=0
-
-        ``free + withheld == size`` exactly, so every id already has an owner;
-        the ``evictable=1`` the checker then reads is a row the tree took on in
-        the round between the two readings (the boot's own OUTTRACE names it:
-        ``HEALTH_C n=1 (new) off=1 tail=[49276]``, :21340, and 49276 is below
-        the 133120 cap, i.e. inside the free range). One row, two owners, and
-        the census that could have named it had already been taken.
-
-        NOT A TOLERANCE AND NOT AN EPSILON. This returns the SIZE OF AN
-        ENUMERATED INTERSECTION -- the ids are known, not estimated -- and the
-        caller subtracts exactly that and still raises on any residue. It is
-        the same population ``double_owned`` already names, read from live
-        state instead of from a snapshot a cutover invalidated.
-
-        ``None`` when the intersection cannot be taken (a non-enumerable
-        allocator, a tree that cannot flatten its values). ``None`` is not
-        zero: zero would assert that nothing is doubly claimed, which is
-        exactly the false statement the stale snapshot was already making.
-        """
-        if free_reading is None or not getattr(free_reading, "is_enumerable", False):
-            return None
-        flatten = getattr(tree_cache, "all_values_flatten", None)
-        if not callable(flatten):
-            return None
-        try:
-            cached = flatten()
-            cached_rows = frozenset(int(v) for v in cached.tolist())
-            free_rows = frozenset(int(v) for v in free_reading.rows)
-        except Exception:  # noqa: BLE001 -- an unreadable set is not an empty one
-            return None
-        return len(free_rows & cached_rows)
-
-    @staticmethod
     def _check_pool_invariant(
         pool_name: str,
         available: int,
@@ -219,7 +155,6 @@ class SchedulerInvariantChecker:
         total: int,
         uncached: int = 0,
         withheld: int = 0,
-        double_owned: int = 0,
     ) -> Tuple[bool, str]:
         """Check: available + evictable + protected + session_held + uncached
         + withheld - double_owned == total.
@@ -265,13 +200,11 @@ class SchedulerInvariantChecker:
             + session_held
             + uncached
             + withheld
-            - double_owned
         )
         leak = total_accounted != total
         msg = (
             f"[{pool_name}] {total=}, {available=}, {evictable=}, "
-            f"{protected=}, {session_held=}, {uncached=}, {withheld=}, "
-            f"{double_owned=}"
+            f"{withheld=}"
         )
         return leak, msg
 
@@ -355,108 +288,6 @@ class SchedulerInvariantChecker:
                 * allocator.page_size
             )
         # #912 REST: the correction term, from LIVE state when the published
-        # snapshot has nothing to say. `double_owned_slots` is `None` for the
-        # whole window between a cutover's id-space retirement and the next
-        # census (phase_flip_runtime.py:6255-6264) and 0 whenever the last
-        # census found nothing -- and in both readings a row that became doubly
-        # claimed since then is missing from the ledger. `_live_double_claimed_
-        # rows` enumerates the intersection at the instant of the check.
-        #
-        # ONLY WHEN THE SNAPSHOT IS ABSENT OR EMPTY. A census reading that DID
-        # find rows is a measurement over the whole authority (free list, tree,
-        # residents, cap) and is strictly wider than the two sets available
-        # here, so it keeps precedence and is never overwritten by this
-        # narrower reading.
-        published_double_owned = getattr(allocator, "double_owned_slots", None)
-        double_owned = int(published_double_owned or 0)
-        double_owned_src = "census"
-        if not double_owned:
-            live_double_owned = self._live_double_claimed_rows(
-                free_reading, self.tree_cache
-            )
-            if live_double_owned:
-                double_owned = int(live_double_owned)
-                double_owned_src = "live"
-                # #927 CORRECTED. THE FIRST VERSION OF THIS WAS A TAUTOLOGY
-                # AND ITS SILENCE WAS READ AS EVIDENCE, which is worse than
-                # having no instrument at all.
-                #
-                # It compared `len(free_reading.rows)` against
-                # `free_reading.count`. Those are the SAME NUMBER by
-                # construction: `read_free_rows` builds the enumerated reading
-                # as `rows=rows, count=len(rows)` (kv_row_ownership.py:1007-
-                # 1009). The line could therefore never print, and "it printed
-                # zero times" says nothing whatever about the two readings
-                # agreeing.
-                #
-                # Worse, the ledger's `available` is ALSO that same reading --
-                # `full_available_size = free_reading.count if
-                # free_reading.is_enumerable else ps.full_available_size`, ~30
-                # lines up. So enumeration and ledger cannot disagree here at
-                # all, and the "enumeration over-reports" branch was
-                # unreachable from the start.
-                #
-                # WHAT THAT LEAVES, and it is derivable without any new
-                # instrument: `available` counts the enumerated free set and
-                # `protected`/`evictable` count the tree, so a NON-ZERO
-                # intersection means those rows are counted twice in the raw
-                # sum. Specimen 2's raw sum equalled `total` exactly, which
-                # means the double-count is masked by an equal number of rows
-                # that have NO owner. Subtracting `double_owned` is what
-                # exposes them. The rows are genuinely doubly claimed AND
-                # there is a real 8192-row hole; the exact balance was two
-                # errors cancelling.
-                #
-                # THE COMPARISON WORTH MAKING is against the allocator's OWN
-                # `available_size()`, which `ps.full_available_size` carries
-                # and which is an INDEPENDENT source from the enumeration.
-                # That one can genuinely disagree, and if it does the
-                # difference names which side moved.
-                try:
-                    enumerated = len(free_reading.rows)
-                    alloc_says = getattr(ps, "full_available_size", None)
-                    if alloc_says is not None and int(alloc_says) != enumerated:
-                        logger.warning(
-                            "#927 FREE ENUMERATION vs ALLOCATOR COUNT: the "
-                            "enumeration holds %d row(s) while available_size() "
-                            "says %d (delta %d). double_owned=%d is the "
-                            "intersection of that enumeration with the tree; "
-                            "the ledger's available is the ENUMERATION, so a "
-                            "delta here means the allocator and its own free "
-                            "list disagree. evictable=%s protected=%s",
-                            enumerated,
-                            int(alloc_says),
-                            enumerated - int(alloc_says),
-                            double_owned,
-                            full_evictable_size,
-                            protected,
-                        )
-                    else:
-                        # The two INDEPENDENT sources agree, so the
-                        # intersection is not an enumeration artefact: those
-                        # rows are in the free list and in the tree at once.
-                        logger.warning(
-                            "#927 GENUINE DOUBLE CLAIM: %d row(s) are in the "
-                            "free list AND in the prefix tree; the allocator "
-                            "and its free enumeration agree at %d, so this is "
-                            "not a reading artefact. An equal number of rows "
-                            "must therefore have no owner at all -- that is "
-                            "the hole the subtraction exposes. evictable=%s "
-                            "protected=%s",
-                            double_owned,
-                            enumerated,
-                            full_evictable_size,
-                            protected,
-                        )
-                except Exception:  # noqa: BLE001 - a diagnostic may never raise
-                    pass
-        leak, msg = self._check_pool_invariant(
-            "full",
-            full_available_size,
-            full_evictable_size,
-            protected,
-            session_held,
-            total,
             uncached,
             # Slots the residency controller holds out of the free list because
             # the pages under them are unmapped (#656 item 12). Published by
@@ -470,13 +301,11 @@ class SchedulerInvariantChecker:
             # when that snapshot is absent or empty -- enumerated live just
             # above. Zero whenever neither reading finds a doubly claimed row,
             # so this is a no-op on every path that does not exercise #822.
-            double_owned,
         )
         # WHICH READING PAID, in the line that raises. A surplus explained by a
         # snapshot and one explained by a live intersection are different
         # findings, and the boot log has to be able to tell them apart without
         # re-deriving anything (#912 rest).
-        msg = f"{msg}, double_owned_src={double_owned_src}"
         if (
             leak
             and getattr(self.server_args, "dcp_size", 1) > 1
