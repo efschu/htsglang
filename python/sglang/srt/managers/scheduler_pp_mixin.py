@@ -204,6 +204,16 @@ _ADMISSION_DECISION_PAYLOAD_KEY = "__admission_decision__"
 # #753 ("send and receive must be the SAME QUESTION asked of the SAME batch"),
 # applied to the one gate pair those two left rank-local.
 #
+# #1015: the constant and this comment block are retained ONLY as a
+# historical pointer for the two docstrings that still name it (:1511,
+# :2286 as of this edit) and for `test_pp_output_ring_retraction_wedge_
+# 791b.py:46`'s comment mention -- the key itself has no live writer or
+# reader left. Its sole carrier was `_pp_send_admission_decision` /
+# `_pp_recv_admission_decision`, deleted whole with the arc (see the
+# EDIT-E block at the top of `_event_loop_pp_body`); relocating it onto
+# the output-wrap message (EDIT-B) was investigated and DECLINED -- see
+# that same block for the two independent reasons (wire-direction
+# mismatch, and a pre-existing told/local divergence in the consumer).
 # Absent key means False, so a message from a stand-in or from a path that
 # never sets it produces exactly today's behaviour.
 _PP_OUTPUT_EXPECTED_KEY = "__pp_output_expected__"
@@ -215,42 +225,25 @@ _PP_OUTPUT_EXPECTED_KEY = "__pp_output_expected__"
 # result.
 _PP_VOID_OUTPUT_KEY = "__pp_void_output__"
 
-# #797: THIS PASS IS OFF, ON EVERY RANK FROM HERE DOWN. Set by the rank that
-# performs a #791 retraction and then FORWARDED (OR-ed, never cleared) by
-# every rank after it, on the decision message that already travels
-# 0 -> 1 -> ... -> last within the pass.
+# #1015: `_PP_PASS_VOIDED_KEY` and `_PP_UPSTREAM_LAUNCHED_KEY` (the two
+# per-hop facts this block used to define) are DELETED, not merely retired --
+# unlike `_PP_OUTPUT_EXPECTED_KEY` above, each had exactly the one consumer
+# this arc fed and no second carrier anywhere else, so nothing survives them.
+# `_PP_PASS_VOIDED_KEY` was "this pass is off, on every rank from here down",
+# forwarded on the deleted decision message; `_PP_UPSTREAM_LAUNCHED_KEY` was
+# "I have a runnable batch for this slot", per-hop on the same message. Both
+# died with `_pp_send_admission_decision` / `_pp_recv_admission_decision`
+# (see the EDIT-E block at the top of `_event_loop_pp_body`).
 #
-# The membership half of a void travels on the entries themselves
-# (`void_pp_admission_decision` marks them `admitted=False`, which
-# scheduler.py's admission loop already reads as "not named this pass"). This
-# key carries the half the entries cannot express: a rank whose prefill
-# admission is emptied does not therefore run NOTHING -- `get_next_batch_to_
-# run` falls through to its running decode batch, and a downstream decode
-# batch paired with the upstream's prefill batch is the same mispairing one
-# forward further on. So the fact that the ROUND is withheld has to be a fact
-# about the pass, not an inference each rank makes from its own emptiness.
+# `_PP_LAUNCHED_CHAIN_KEY` below is NOT part of this deletion, despite being
+# named alongside these two in the original scope: its docstring's own text
+# ("The chain rides ... the output/void payload that already rides back")
+# is correct and current -- `pp_output_payload_with_return_trip` (:2322)
+# still writes it and `pp_void_forward_payload` (:1853) / `pp_absorb_
+# admission_return` (:2364) still read it, entirely independent of the
+# deleted forward arc. Deleting it would break that live mechanism; kept
+# in full, unedited except for this note.
 #
-# Absent key means False: a stand-in, a sender that predates this key, or
-# `pp_size <= 1` all behave exactly as they did before it existed.
-_PP_PASS_VOIDED_KEY = "__pp_pass_voided__"
-
-# #797: "I have a runnable batch for this slot, so a proxy from me is coming."
-# PER-HOP, not forwarded: every sender OVERWRITES it with its own slot's
-# state, because the only rank a receiver needs this about is its IMMEDIATE
-# upstream. (`_PP_OUTPUT_EXPECTED_KEY` above is the opposite -- PP0's verdict,
-# carried verbatim to the last rank -- and the two must not be confused.)
-#
-# WHY A RECEIVER NEEDS IT. A rank that voids its pass has no `cur_batch`, so
-# `_event_loop_pp_body` never calls `_pp_recv_proxy_tensors` -- while its
-# upstream, which voided nothing, has already launched and posted its proxy
-# isend. That is the bounded-recv corpse: one unmatched message per voided
-# pass, and the upstream blocks for ever in the NEXT pass's
-# `_pp_commit_comm_work(self.send_proxy_work)`. The voiding rank therefore
-# drains exactly one proxy and discards it -- but only when a proxy really is
-# coming, which is a fact only the sender has (its batch can be empty for
-# capacity reasons that never reach the decision). So the sender states it.
-_PP_UPSTREAM_LAUNCHED_KEY = "__pp_upstream_launched__"
-
 # #978: THE SAME STATEMENT, KEPT PER GENERATION INSTEAD OF PER HOP. One bool
 # per rank, index = pp_rank, accumulated as the admission decision travels
 # 0 -> 1 -> ... -> last: PP0 starts the tuple with its own `launched`, every
@@ -319,28 +312,20 @@ _PP_LAUNCHED_CHAIN_KEY = "__pp_launched_chain__"
 _PP_PARKED_CONTINUATION_KEY = "__pp_parked_continuation__"
 
 # 2026-08-20, fourth deadlock of the "a rank blocked on a peer for something
-# not required for this iteration's forward progress" family. PP0's ring
-# wraparound receive for the admission decision (feeding
-# `PPAdmissionCongruenceGuard.record_return_trip`, a pure learning step) was
-# a plain blocking p2p recv inside the per-iteration loop: once PP0 had
-# `pp_size` sends outstanding it stopped sending entirely until a full ring
-# lap returned, and the downstream ranks that would have had to complete
-# that lap were themselves blocked at the top of their own pass waiting for
-# PP0's NEXT forward send. Closed ring, zero GPU utilisation, no
-# ADMISSION-WEDGE marker (the detector did not know this shape). See
-# `_pp_try_recv_admission_decision`'s docstring for the fix and
-# `_PP_ADMISSION_PENDING_SENDS_CAP` below for the one bookkeeping
-# consequence of making the receive opportunistic instead of blocking.
+# not required for this iteration's forward progress" family -- historical
+# context for the constant below, describing a mechanism #1015 removed.
 #
-# PURE MEMORY/STALENESS BOUND, NEVER A CORRECTNESS ONE. The PP0-only
-# `self._pp_admission_pending_sends` deque (see its docstring in
-# `init_pp_loop_state`) exists only to gate WHEN `_event_loop_pp_body`
-# opportunistically peeks for an already-arrived wraparound lap -- it holds
-# no data that is read back out, so forgetting its oldest entry loses no
-# information about what is actually in flight on the wire (which is
-# unbounded and always was). Without a cap, a run where wraparounds stay
-# unavailable for a long stretch would grow this deque by one entry every
-# pass forever; this caps it instead.
+# #1015 REMOVES THE ARC: `_pp_try_recv_admission_decision`,
+# `_pp_send_admission_decision` and `self._pp_admission_pending_sends` (the
+# deque this cap bounded) are gone -- the wraparound receive and the ring
+# wedge it existed to fix no longer exist, because the arc that carried both
+# is deleted (see the EDIT-E block at the top of `_event_loop_pp_body`).
+# `_PP_ADMISSION_PENDING_SENDS_CAP` itself is NOT deleted: it is imported
+# directly by two out-of-scope tests (`test_pp_admission_chain_flush_
+# deadlock_795.py`, `test_pp_admission_wraparound_never_blocks.py`) that
+# mirror its value in their own bookkeeping. Deleting it would break those
+# tests' collection for no benefit to this change; it is dead in production
+# code from here on, kept only as a stable constant those tests still read.
 _PP_ADMISSION_PENDING_SENDS_CAP = 64
 
 
@@ -1165,38 +1150,6 @@ def _pp_ring_commit_budget_s() -> float:
 # without adding anything to what a holder must bind.
 
 
-def _pp_era_ring_live(holder) -> bool:
-    """Is the retired era's admission-decision ring live on this holder?
-
-    THE ONE PLACE THE STRIP-B PREDICATE IS SPELLED, so the three gates that
-    ask it cannot drift apart, and module-level for the reason stated
-    immediately above: a stand-in binds methods one at a time and would raise
-    AttributeError on `self._pp_era_ring_live`.
-
-    AN UNKNOWN HOLDER IS NOT "FLIP OFF". Measured 2026-08-29: strip-B
-    (d4478a053a) spelled this predicate `getattr(self.server_args, ...)`,
-    which dereferences an attribute roughly a dozen stand-ins in the
-    #787/#791/#795/#796 family never set. Cherry-picked onto the #1010 pin it
-    turned 15 green tests into 13 failures across
-    test_pp_admission_wiring_791, test_pp_admission_send_handle_dropped_796,
-    test_pp_admission_chain_flush_deadlock_795 and
-    test_pp_admission_wraparound_never_blocks -- every one of them
-    `'types.SimpleNamespace' object has no attribute 'server_args'`, the exact
-    sibling of the #973 defect the comment above this function records.
-    strip-B's own evidence line says "py_compile", so no suite ever saw it.
-
-    A holder with no `server_args` therefore keeps the PRE-GATE behaviour --
-    byte-identical to what shipped before strip-B -- which is this file's
-    stand-in convention (#787) and costs production nothing: a real Scheduler
-    always has `server_args`, so the fallback is reachable only from test
-    harnesses.
-    """
-    server_args = getattr(holder, "server_args", None)
-    if server_args is None:
-        return True
-    return bool(getattr(server_args, "enable_phase_flip", False))
-
-
 def _pp_commit_channel_of(holder, work: List[P2PWork]) -> str:
     """Name the wire ``work`` rides, for the #973 message.
 
@@ -1286,6 +1239,15 @@ def _999_geom(scheduler, mb_id: int):
         return (-1, -1, -1)
 
 
+#: #1015: the `_PP_SLOT_OCCUPANT_KEY` constant and `_1000_slot_occupant`, the
+#: helper below that used to build fact 6's payload for the deleted forward
+#: arc, are DELETED together with it -- `_1000_slot_occupant` had exactly one
+#: caller (inside `_pp_send_admission_decision`) and none remain. This
+#: leaves `_1000_upstream_moved_on`'s reader permanently on the
+#: "no-statement" branch, since `_pp_upstream_slot_occupant_incoming` (its
+#: sole carrier) is now fed by nothing but its own per-pass reset to None --
+#: see EDIT-F at that function for the comment update this implies.
+#:
 #: #1000: THE DECISION IS GROUP-AGREED, ITS CONSEQUENCE IS NOT.
 #: `_pp_void_pass_without_upstream_launch` calls itself "RANK-AGREED BY
 #: CONSTRUCTION" and it is -- for the DECISION. What the void does AFTERWARDS
@@ -1348,35 +1310,9 @@ def _999_geom(scheduler, mb_id: int):
 #: 47 measured it independently at 4361 of 4372 arrivals, which is the check
 #: that was missing last time and is now done BEFORE the build.
 #:
-#: SENTINEL: absent key means "the sender said nothing" (PP0, a legacy sender,
-#: a pass that heard nothing) and reads as None. An empty TUPLE means "I hold
-#: nothing", which is a legitimate answer and must not collide with it -- so
-#: the key is written on every send from a capable sender, `()` included.
-_PP_SLOT_OCCUPANT_KEY = "__pp_slot_occupant__"
-
 _1000_SEEN = [0]
 _1000_REASONS: Dict[str, int] = {}
 _1000_SPECIMENS: List[tuple] = []
-
-
-def _1000_slot_occupant(scheduler, mb_id: int) -> Tuple[str, ...]:
-    """The rids this rank has in slot ``mb_id`` for THIS pass, bounded.
-
-    Read-only and never raises: this runs on the admission send path, and a
-    provenance field may not break a send. Empty tuple is a real answer ("I
-    hold nothing"), never a failure code -- a failure returns empty too, which
-    is the one ambiguity here and is why the probe treats an empty upstream as
-    its own named reason rather than as evidence of anything.
-    """
-    try:
-        mbs = getattr(scheduler, "mbs", None)
-        b = mbs[mb_id] if mbs and 0 <= mb_id < len(mbs) else None
-        _rq = getattr(b, "reqs", None) if b is not None else None
-        if _rq is None:
-            return ()
-        return tuple(str(getattr(r, "rid", "")) for r in list(_rq)[:8])
-    except Exception:  # noqa: BLE001 - provenance may never break a send
-        return ()
 
 
 def _1000_upstream_moved_on(scheduler, mb_id: int) -> str:
@@ -1388,6 +1324,17 @@ def _1000_upstream_moved_on(scheduler, mb_id: int) -> str:
     every reason is counted, so "it did not fire" is always separable from
     "it was never asked". Read-only: it releases nothing, and it may not raise
     on the admission path.
+
+    #1015 EDIT-F: `_pp_upstream_slot_occupant_incoming` (the `up` local
+    below) is now permanently None on every rank -- its sole carrier was
+    `_PP_SLOT_OCCUPANT_KEY` on the deleted forward admission-decision arc
+    (see the EDIT-E block at the top of `_event_loop_pp_body`), and nothing
+    else ever wrote it besides its own per-pass reset. This function's
+    "no-statement" branch, below, is therefore the only branch reachable
+    from here on; the four branches after it are unreachable dead code
+    kept in place rather than pruned, since the read is inert (a getattr
+    default) and pruning them would be a design change this task does not
+    make. NAMED, NOT FIXED, per the #1015 task's own scope.
     """
     _1000_SEEN[0] += 1
     reason = "?"
@@ -1728,13 +1675,22 @@ def pp_upstream_void_pending(scheduler) -> bool:
     conditions is how the two would drift.
 
     WHY IT IS ANSWERABLE THIS EARLY, which is the whole reason #951 is a guard
-    and not a bigger unwind. `_pp_upstream_launched_incoming` is written by
-    `_pp_recv_admission_decision`, and that method's own docstring records its
-    placement: "Positioned in `_event_loop_pp_body` strictly BEFORE
-    `get_next_batch_to_run`". So by the time the guard runs, this rank has
-    already been told, by the sender itself, whether its upstream launched.
-    Nothing here is derived from local state and nothing here is a new
-    collective -- it is a per-hop fact that already crossed the wire.
+    and not a bigger unwind. `_pp_upstream_launched_incoming` was written by
+    `_pp_recv_admission_decision` (deleted by #1015 -- see the EDIT-E block
+    at the top of `_event_loop_pp_body`; that method's own docstring, which
+    used to record its placement here, is gone with it). Historically, by
+    the time the guard ran, this rank had already been told, by the sender
+    itself, whether its upstream launched. Nothing here was derived from
+    local state and nothing here was a new collective -- it was a per-hop
+    fact that crossed the wire.
+
+    #1015 TOLD/LOCAL DIVERGENCE, NAMED NOT FIXED: with the writer gone,
+    `_pp_upstream_launched_incoming` is fed only by its own per-pass reset
+    to False (top of `_event_loop_pp_body`), so the final `return` below is
+    now `not False` on every pass this predicate is even reached for --
+    always True. This predicate's behavior changed as a structural
+    consequence of the arc removal; per this task's scope, that consequence
+    is reported here, not compensated for.
 
     WHAT IT DELIBERATELY DOES NOT ASK: whether this rank derived a batch.
     #798's own site adds that term (`self.mbs[mb_id] is not None`) because it
@@ -3883,12 +3839,26 @@ def pp_pass_should_void(
 ) -> bool:
     """#797: must this rank run NOTHING for this pass?
 
-    TWO WAYS IN, AND THEY ARE DIFFERENT FACTS. Either this rank performed a
+    #1015: this function has zero live callers left in this module -- its
+    caller inside the deleted forward admission-decision arc is gone (see
+    the EDIT-E block at the top of `_event_loop_pp_body`), and nothing else
+    in this file ever called it. Not deleted: it is a pure function of its
+    three arguments, does not itself read `_PP_PASS_VOIDED_KEY` or any other
+    wire state, and is exercised directly by four out-of-scope tests
+    (test_pp_unresolved_defer_cap_944.py, test_pp_retracted_pass_void_797.py,
+    test_chunked_continuation_clamp_946.py,
+    test_pp_reverse_wire_reachability_801.py) that hand-build
+    `incoming_voided`. Deleting it would break those tests' collection for
+    no requirement in this task's edit list.
+
+    TWO WAYS IN, AND THEY ARE DIFFERENT FACTS (historical -- describes the
+    production feed that no longer exists; `incoming_voided` is now supplied
+    only by test callers). Either this rank performed a
     #791 retraction against the decision it received -- in which case its own
     batch would be a strict subset of the one its upstream already launched,
     which is the mispair -- or a rank BEFORE it did, and said so on the wire
-    (`_PP_PASS_VOIDED_KEY`), in which case the pass is already off and this
-    rank must not restart it with a decode batch of its own.
+    (`_PP_PASS_VOIDED_KEY`, deleted), in which case the pass is already off
+    and this rank must not restart it with a decode batch of its own.
 
     ORed, NEVER CLEARED. A rank downstream of a retraction retracts nothing
     itself (`reconcile_pp_admission_decision` passes an already-retracted
@@ -4127,53 +4097,39 @@ class SchedulerPPMixin:
                 # that is now idle keep incrementing the #801-spin streak it is
                 # no longer earning.
                 self._pp_upstream_void_withheld_work = False
-                # #1014 WITHDRAWS #1013's GATE HERE. #1013 added
-                # `and _pp_era_ring_live(self)` to match the two sender gates,
-                # which made the hop congruent and served nothing: the six
-                # facts this receive unpacks stopped arriving, and the first of
-                # them to be missed (`_pp_upstream_launched_incoming`) wedged
-                # the proxy channel on the first request. Congruence is now
-                # restored the other way -- both ends unconditional, era
-                # payload empty -- so this condition is back to what it was
-                # before #1013 and there is no pair of gates to keep in step.
-                if self.ps.pp_size > 1 and not self.pp_group.is_first_rank:
-                    with torch.profiler.record_function("pp_admission_decision_recv"):
-                        incoming_decision = self._pp_recv_admission_decision()
-                        effective, amended = self._pp_reconcile_incoming_admission(
-                            incoming_decision
-                        )
-                        # #797 PREVENTION, and this is the line the whole
-                        # change turns on. `effective` above is the pass
-                        # NARROWED by this rank's own retraction, and a
-                        # narrowed pass is precisely what may not be run: the
-                        # upstream built and launched its batch from the
-                        # decision as it stood BEFORE the retraction, so this
-                        # rank's batch would be a strict subset of the one
-                        # whose hidden states are already on the wire. #791c
-                        # detects that pairing at the proxy boundary; this
-                        # stops it being created. See
-                        # `_pp_void_retracted_pass`.
-                        effective, amended = self._pp_void_retracted_pass(
-                            effective, amended
-                        )
-                        self._pp_admission_incoming_effective = effective
-                        # #791 CORE: the SECOND number off the same decision.
-                        # Taken from `amended` and not from the raw incoming
-                        # decision, so a void empties it exactly when it
-                        # empties `effective` -- the two can never name
-                        # different rid sets.
-                        self._pp_admission_incoming_schedule = (
-                            self._pp_forwarded_schedule_from(amended)
-                        )
-                        self._pp_admission_amended_to_forward = amended
-                        # #791b: record what PP0 said it will expect back for
-                        # this slot, and what this rank is forwarding, BEFORE
-                        # anything below can raise or return early. The last
-                        # rank reads both again in
-                        # `_pp_send_output_to_next_stage`.
-                        self._pp_note_output_expectation(
-                            mb_id, self._pp_output_expected_incoming, amended
-                        )
+                # #1015 REMOVES THE ARC. The admission-decision hop (this
+                # block, plus its sender at `_pp_send_admission_decision`) was
+                # one of three arcs in a closed send cycle that deadlocked
+                # PP3-solo on its first request (0 prefill batches, boot
+                # boot_pp3solo_0d81aab8db_0829_095245.log) -- refuting #1013's
+                # "gate both ends" attempt, which left the cycle closed and
+                # added 6 ring timeouts. Of the six side-channel facts this
+                # receive used to unpack: `_PP_UPSTREAM_LAUNCHED_KEY`,
+                # `_PP_PASS_VOIDED_KEY`, `_PP_LAUNCHED_CHAIN_KEY` and
+                # `_PP_SLOT_OCCUPANT_KEY` are dropped outright (each had
+                # exactly the one consumer this arc fed, now gone with it).
+                # `_PP_OUTPUT_EXPECTED_KEY` and `_PP_PARKED_CONTINUATION_KEY`
+                # were assessed for relocation and DECLINED -- see the
+                # EDIT-B/EDIT-C comment beside `_pp_note_output_expectation`'s
+                # call site below for the measured reason each one does not
+                # fit its named replacement wire.
+                #
+                # NAMED, NOT FIXED (PP0-authoritative-rebuild order,
+                # 2026-08-29): `self._pp_admission_incoming_effective` was this
+                # arc's PRIMARY payload, not a side-channel fact -- it drove
+                # the #791 PP-ADMISSION-UNIFORMITY truncation at
+                # scheduler.py:9513-9540 (`elif self._pp_admission_incoming_
+                # effective is not None: told = ...`). With this receive gone,
+                # that memo stays permanently None (see the reset above), so
+                # that `elif` branch never fires again and downstream ranks
+                # revert to independently re-deriving their own admission
+                # verdict from local radix state -- the exact per-rank
+                # disagreement #791 existed to prevent. This is the
+                # rank-local-verdict family the standing PP0-authoritative
+                # rebuild order (2026-08-29) names as its own target, and
+                # boot_pp3solo.sh's own header already carries the matching
+                # suspicion ("#863: a no-flip PP3 boot previously admitted
+                # nothing beyond the smoke"). Not patched here.
                 # #797b: the chunked request as it stands BEFORE this round's
                 # admission can touch it. `get_next_batch_to_run` below is
                 # where `add_chunked_req` advances it (a finished chunk clears
@@ -4346,131 +4302,89 @@ class SchedulerPPMixin:
                 # proxy send) is read by this block or writes anything this
                 # block reads, so moving it here changes WHEN the message
                 # goes out, never WHAT it contains.
-                if self.ps.pp_size > 1:
-                    if self.pp_group.is_first_rank:
-                        raw = getattr(self, "_pp_admission_last_built_decision", None)
-                        self._pp_admission_last_built_decision = None
-                        fresh_decision = (
-                            replace(raw, mb_id=mb_id)
-                            if raw is not None
-                            else PPAdmissionDecision(mb_id=mb_id, entries=())
-                        )
-                        # #791b: PP0's own output-ring verdict for this slot,
-                        # taken from the batch `get_next_batch_to_run` just
-                        # installed and published on the decision so the last
-                        # rank applies the SAME fact rather than re-deriving
-                        # it from a slot a retraction may have emptied. It is
-                        # the identical expression, on the identical object,
-                        # that PP0's own `_do_recv` will apply to this slot
-                        # `pp_size - 1` passes from now -- `self.mbs[mb_id]`
-                        # is not rewritten again until this slot comes round.
-                        expects_output = _pp_output_exchange_due(self.mbs[mb_id])
-                        self._pp_note_output_expectation(mb_id, expects_output, None)
-                        self._pp_send_admission_decision(
-                            fresh_decision,
-                            expects_output=expects_output,
-                            # #797: PP0 builds the decision, so it can never
-                            # be the rank that retracts against it -- the void
-                            # can only ever start downstream of here.
-                            pass_voided=False,
-                            launched=self.mbs[mb_id] is not None,
-                            slot_occupant=_1000_slot_occupant(self, mb_id),
-                            # #978: the chain starts here -- one entry, PP0's
-                            # own statement; every hop appends its own.
-                            launched_chain=(self.mbs[mb_id] is not None,),
-                        )
-                        self._pp_admission_pending_sends.append(mb_id)
-                        # Capped, not unbounded -- see
-                        # _PP_ADMISSION_PENDING_SENDS_CAP's docstring. What
-                        # falls off here is only a bookkeeping marker for
-                        # WHEN to opportunistically peek below; nothing on
-                        # the wire is touched or forgotten by dropping it.
-                        while (
-                            len(self._pp_admission_pending_sends)
-                            > _PP_ADMISSION_PENDING_SENDS_CAP
-                        ):
-                            self._pp_admission_pending_sends.popleft()
-                        # Attempt the wraparound only once at least one full
-                        # ring lap could plausibly have completed -- see the
-                        # field's docstring in init_pp_loop_state -- and,
-                        # critically, ONLY OPPORTUNISTICALLY: this used to be
-                        # an unconditional BLOCKING receive here, which is
-                        # the fourth deadlock of the "a rank must never block
-                        # on a peer for something not required for this
-                        # iteration's forward progress" family (see
-                        # `_PP_ADMISSION_PENDING_SENDS_CAP`'s docstring
-                        # above for the measured specimen).
-                        # `record_return_trip` is a pure learning step
-                        # (teaches `PPAdmissionCongruenceGuard` the coverage
-                        # a lap observed; never required for this iteration
-                        # to make progress), so the receive that feeds it
-                        # must never be allowed to block this iteration on a
-                        # peer. `_pp_try_recv_admission_decision` only
-                        # consumes a lap that is ALREADY in hand and returns
-                        # None immediately otherwise -- see its docstring.
-                        if len(self._pp_admission_pending_sends) >= self.ps.pp_size:
-                            with torch.profiler.record_function(
-                                "pp_admission_decision_return_trip"
-                            ):
-                                returned = self._pp_try_recv_admission_decision()
-                            if returned is not None:
-                                self._pp_admission_pending_sends.popleft()
-                                self._pp_admission_guard.record_return_trip(returned)
-                            # else: no lap already in hand this pass -- skip
-                            # it. `_pp_admission_pending_sends` is left at
-                            # its current (capped) length, still >= pp_size,
-                            # so every following pass retries this same
-                            # cheap opportunistic check (one inbox peek, no
-                            # wire touch) until a lap does show up. The
-                            # skipped lap itself is never lost: see
-                            # `_pp_try_recv_admission_decision`'s docstring
-                            # for why it stays consumable later. The one
-                            # user-visible consequence is that the learned
-                            # floor `record_return_trip` clears LATER --
-                            # whenever a lap next happens to already be in
-                            # hand -- instead of at a fixed
-                            # pass; this only delays reuse recovery for a
-                            # retracted rid, nothing else.
-                    else:
-                        amended = self._pp_admission_amended_to_forward
-                        if amended is None:
-                            amended = PPAdmissionDecision(mb_id=mb_id, entries=())
-                        # #791b: forwarded VERBATIM. This rank is not entitled
-                        # to an opinion about the ring -- PP0 owns the verdict,
-                        # every rank in between only carries it.
-                        self._pp_send_admission_decision(
-                            amended,
-                            expects_output=self._pp_output_expected_incoming,
-                            # #797: the void is OR-ed, never cleared -- a rank
-                            # downstream of a retraction must not be able to
-                            # un-void a pass by having retracted nothing of its
-                            # own. `launched` is the opposite: it is THIS
-                            # rank's own slot, overwritten for the next hop.
-                            pass_voided=self._pp_admission_pass_voided,
-                            launched=self.mbs[mb_id] is not None,
-                            slot_occupant=_1000_slot_occupant(self, mb_id),
-                            # #978: append this rank's own statement to the
-                            # chain received above -- per generation, never
-                            # overwritten, so the void relay can still read
-                            # it when the slot's output comes due.
-                            launched_chain=(
-                                *getattr(self, "_pp_launched_chain_incoming", ()),
-                                self.mbs[mb_id] is not None,
-                            ),
-                        )
+                # #1015 REMOVES THE ARC (see the block above, top of this
+                # iteration, for the full measurement). This used to be the
+                # SEND half: PP0 built and posted `fresh_decision`, every
+                # downstream rank forwarded `amended` verbatim, and
+                # `_pp_admission_pending_sends` / `_pp_try_recv_admission_
+                # decision` opportunistically drained the wraparound below.
+                # All of that apparatus, and the wire it posted to, is gone.
+                #
+                # What is KEPT: PP0's own local record of this slot's
+                # output-ring verdict, because `_pp_note_output_expectation`
+                # has a second reader besides the deleted wire --
+                # `_pp_admission_amended_by_slot`, which `_pp_pass_retraction_
+                # reason` (#791c) still consults on every rank. Recording it
+                # here, unconditionally on PP0 every pass, costs nothing and
+                # keeps that reader fed on the one rank that was always its
+                # producer.
+                #
+                # EDIT-B (investigated, DECLINED, not relocated): the spec
+                # asked to move `_PP_OUTPUT_EXPECTED_KEY` onto the output-wrap
+                # message (`pp_output_payload_with_return_trip`). That wire
+                # flows LAST RANK -> PP0 (`_pp_send_output_to_next_stage`,
+                # :9816); this fact is needed at the LAST rank BEFORE it
+                # decides whether to send a void output (:9873), i.e. it must
+                # travel PP0 -> ... -> last rank, the opposite direction. No
+                # relocation closes that gap without a new forward-flowing
+                # wire, which is out of this edit's scope. Separately and
+                # independently of my edit: `_pp_output_expected_for_slot`
+                # (:7730), the last rank's reader at :9873, reads
+                # `_pp_output_expected_by_slot`, a per-rank local table whose
+                # only normal-path writer is this PP0 call; the value the
+                # last rank actually received over the (now-deleted) wire
+                # landed in the scalar `_pp_output_expected_incoming`
+                # (`_pp_recv_admission_decision`, old :8042-8044) and was
+                # never copied into the per-slot table on that rank. That is
+                # a pre-existing told/local divergence (two ranks' notion of
+                # "does this slot expect output" can differ) and is NAMED
+                # here, not fixed, per this task's scope.
+                #
+                # EDIT-C (investigated, DECLINED, not relocated): the spec
+                # asked to move `_PP_PARKED_CONTINUATION_KEY` onto "the
+                # request-chain forward". That wire (`self.send_req_work =
+                # self._pp_send_pyobj_to_next_stage(recv_reqs, ...)`, :5189)
+                # carries a plain pickled `List[BaseReq]`, not a dict -- there
+                # is no keyed slot to attach a fact to without changing that
+                # wire's payload shape and its other consumers (`PpChainReceiver`,
+                # both disagg loops). The proxy tensor dict (now unconditional
+                # every hop per EDIT A) is dict-shaped and has precedent for a
+                # side-channel key (`__stamp__`, popped at :9464), but
+                # attaching a new key there touches the hot compute-tensor
+                # send/receive construction, which this edit does not touch
+                # and cannot verify safe. `_PP_PARKED_CONTINUATION_KEY` itself
+                # is NOT deleted -- it has an independent, unaffected carrier
+                # already: `pp_output_payload_with_return_trip` /
+                # `pp_absorb_admission_return` (:2302-2422) snapshot and
+                # absorb the LAST rank's own parked-continuation table on
+                # every output/void-output send. What is lost is only the
+                # FORWARD, hop-by-hop relay of a fact parked by a MIDDLE rank
+                # (neither first nor last) on its way to the last rank's
+                # snapshot -- that relay lived solely on the deleted wire
+                # (`pp_note_parked_continuation` at old :8070 inside
+                # `_pp_recv_admission_decision`, unioned back in at old
+                # :7931-7935 inside `_pp_send_admission_decision`).
+                if self.ps.pp_size > 1 and self.pp_group.is_first_rank:
+                    expects_output = _pp_output_exchange_due(self.mbs[mb_id])
+                    self._pp_note_output_expectation(mb_id, expects_output, None)
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
-                else:
-                    # #797: a voided pass has no batch, so the branch above
-                    # never runs -- and the upstream, which voided nothing,
-                    # has already posted its proxy isend. Take it and drop it,
-                    # or the upstream blocks for ever on next pass's
-                    # `_pp_commit_comm_work(self.send_proxy_work)`.
-                    self._pp_drain_voided_proxy(mb_id)
+                # #1015: RECEIVE IS UNCONDITIONAL NOW, matching the send below.
+                # The prior `if cur_batch: recv ... else: drain` split was the
+                # admission-decision arc's asymmetry one hop downstream: this
+                # rank could not know without that arc whether the upstream
+                # had a batch, so it needed two different actions depending on
+                # a fact it no longer receives at all once that arc is
+                # removed. The proxy wire itself now owes exactly one frame
+                # per pass unconditionally (real or void), so one unconditional
+                # take-it-off-the-wire replaces both branches.
+                # `_pp_recv_proxy_tensors` still declines on its own for the
+                # first rank and a gapped wire -- those are receiver-local
+                # facts, unaffected by this cut.
+                pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -4555,6 +4469,14 @@ class SchedulerPPMixin:
                 # slot run something" is the resident-carry leak.
                 self._pp_record_slot_last_batch(next_mb_id)
                 if not self.pp_group.is_last_rank:
+                    # #1015: SEND IS UNCONDITIONAL NOW. No sender-side
+                    # predicate may decide WHETHER a frame goes out any more --
+                    # only what it contains -- because a skipped send here is
+                    # exactly the debt the downstream receive above can no
+                    # longer tell apart from "no message was ever coming"
+                    # (that used to be the admission-decision arc's job, and
+                    # that arc is gone). A pass with no batch posts a void
+                    # frame instead of nothing.
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -4567,6 +4489,16 @@ class SchedulerPPMixin:
                                 async_send=True,
                                 msg_type="proxy",
                                 stamp=self._pp_proxy_stamp(mb_id, result),
+                            )
+                    else:
+                        with torch.profiler.record_function(
+                            "send_proxy_dict_to_next_stage"
+                        ):
+                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                                {},
+                                async_send=True,
+                                msg_type="proxy",
+                                stamp=self._pp_proxy_stamp(mb_id, None),
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -4586,15 +4518,9 @@ class SchedulerPPMixin:
                 # top-of-pass position closed a cycle. Guarded the same way
                 # the send site is: the last rank never posts a chain send,
                 # so it has nothing to flush here either.
-                # #796: reap this pass's admission-decision send BEFORE the
-                # chain flush. Retaining the handle is what makes the
-                # decision actually reach the peer at all (see
-                # _pp_send_admission_decision); reaping it here, rather than
-                # never, is what keeps the channel from growing an
-                # ever-longer list of un-waited isends. Ordered before the
-                # chain flush because it is the strictly weaker wait -- see
-                # _pp_commit_admission_send_work's docstring.
-                self._pp_commit_admission_send_work()
+                # #1015: the admission-decision send this used to reap
+                # (`_pp_commit_admission_send_work`) is gone with the arc --
+                # see the EDIT-E block at the top of this loop.
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_pending_req_work()
 
@@ -4741,7 +4667,11 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
+                # #1015: unconditional receive -- see _event_loop_pp_body's
+                # comment on the same cut. This loop never called the
+                # admission-decision arc at all, so the only change here is
+                # the proxy wire's own contract becoming batch-independent.
+                pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -4811,6 +4741,8 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    # #1015: unconditional send -- a void frame instead of no
+                    # frame when there is no batch this pass.
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -4820,6 +4752,13 @@ class SchedulerPPMixin:
                             async_send=True,
                             msg_type="proxy",
                             stamp=self._pp_proxy_stamp(mb_id, result),
+                        )
+                    else:
+                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                            {},
+                            async_send=True,
+                            msg_type="proxy",
+                            stamp=self._pp_proxy_stamp(mb_id, None),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -4894,9 +4833,12 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = None
-                    if not cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
+                # #1015: unconditional receive. Neither `cur_batch` nor
+                # `is_prebuilt()` may gate taking the frame off the wire any
+                # more -- the send below now posts a frame on both counts, so
+                # gating the receive on either term would rebuild the same
+                # send/receive mismatch one level deeper.
+                pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
 
                 # early send output if possible
                 if self.server_args.pp_async_batch_depth > 0:
@@ -4997,6 +4939,8 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    # #1015: unconditional send -- no batch, or a prebuilt
+                    # one, both get a void frame instead of no frame.
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -5006,6 +4950,13 @@ class SchedulerPPMixin:
                             async_send=True,
                             msg_type="proxy",
                             stamp=self._pp_proxy_stamp(mb_id, result),
+                        )
+                    else:
+                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                            {},
+                            async_send=True,
+                            msg_type="proxy",
+                            stamp=self._pp_proxy_stamp(mb_id, None),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -6710,17 +6661,16 @@ class SchedulerPPMixin:
         # carry above, since a request excluded on the pass this loop is
         # (re-)entered on simply reappears on the next pass's admission loop
         # (self.waiting_queue is never mutated for a skipped req).
-        # `_pp_admission_pending_sends` is PP0-only: a rolling count of
-        # decisions PP0 has sent but not yet opportunistically consumed the
-        # ring's wraparound for. It exists so the wraparound CHECK is
-        # deferred until at least one full lap could plausibly have
-        # completed, rather than PP0 checking for THIS pass's own wraparound
-        # immediately -- see _event_loop_pp_body's #791 block for why the
-        # latter would re-serialize the pipeline one pass at a time. Capped
-        # at `_PP_ADMISSION_PENDING_SENDS_CAP` (see that constant's
-        # docstring) so it cannot grow unboundedly on a run where
-        # wraparounds stay unavailable for a long stretch -- a memory bound
-        # only, never a correctness one.
+        # #1015: `_pp_admission_pending_sends` (the PP0-only wraparound-lap
+        # counter) and `_pp_admission_send_work` (the decision send's isend
+        # handle) are removed here -- both were scratch for the deleted
+        # admission-decision arc (`_pp_send_admission_decision` /
+        # `_pp_recv_admission_decision` / `_pp_commit_admission_send_work`,
+        # see the EDIT-E block at the top of `_event_loop_pp_body`). The
+        # three memos below survive: `scheduler.py`'s admission consumer
+        # (:9521) still reads `_pp_admission_incoming_effective`, now
+        # permanently None post-#1015 -- NAMED, NOT FIXED, see that same
+        # EDIT-E block.
         self._pp_admission_incoming_effective: Optional[Dict[str, int]] = None
         # #791 CORE: the forwarded pass geometry this rank EXECUTES --
         # `rid -> (prefix_len, extend_len)`, filled from the same amended
@@ -6730,14 +6680,6 @@ class SchedulerPPMixin:
             None
         )
         self._pp_admission_amended_to_forward: Optional[PPAdmissionDecision] = None
-        self._pp_admission_pending_sends: deque = deque()
-        # #796: the admission decision's outstanding async send, held here
-        # for the same reason `send_req_work` / `send_proxy_work` /
-        # `send_output_work` are held on the scheduler -- a gloo isend whose
-        # handle and buffers are local temporaries is dropped when they go
-        # out of scope, and the message never reaches the peer. Drained
-        # every iteration by `_pp_commit_admission_send_work`.
-        self._pp_admission_send_work: List[P2PWork] = []
         # #797: PASS-SCOPED, rewritten at the top of every pass by
         # `_event_loop_pp_body` before `get_next_batch_to_run` reads them.
         # Cleared here too, because a cutover re-enters the loop and a void
@@ -7251,11 +7193,15 @@ class SchedulerPPMixin:
         # to characterise. `ENV_RING_COMMIT_BUDGET` <= 0 remains the deliberate,
         # documented way to drop the deadline for one run.
         #
-        # The two gates strip-B placed on the ADMISSION ring
-        # (`_pp_send_admission_decision`, `_pp_commit_admission_send_work`) are
-        # kept: those remove two arcs of a closed send cycle that only the
-        # retired era needs. An instrument on a shared channel is a different
-        # thing from the machinery it observes.
+        # #1015 UPDATE: the two functions strip-B gated on the ADMISSION ring
+        # (`_pp_send_admission_decision`, `_pp_commit_admission_send_work`)
+        # are no longer merely gated -- #1015 deletes them and the arc they
+        # sent on outright (see the EDIT-E block at the top of
+        # `_event_loop_pp_body`), because that arc closed a three-way send
+        # cycle on its own, independent of strip-B's era gate. This
+        # function's bound is unaffected either way: it instruments a
+        # different, surviving channel (the output return path / proxy
+        # commits), never the deleted arc.
         if budget <= 0:
             # Documented escape hatch (ENV_RING_COMMIT_BUDGET): byte-for-byte
             # the pre-#973 behaviour, including the unbounded park.
@@ -7728,532 +7674,6 @@ class SchedulerPPMixin:
         rank = getattr(getattr(self, "ps", None), "pp_rank", None)
         return pp_proxy_pass_retraction_reason(carried[int(mb_id)], rank)
 
-    def _pp_send_admission_decision(
-        self: Scheduler,
-        decision: PPAdmissionDecision,
-        *,
-        expects_output: bool = False,
-        pass_voided: bool = False,
-        launched: bool = False,
-        launched_chain: Tuple[bool, ...] = (),
-        slot_occupant: Optional[Tuple[str, ...]] = None,
-    ) -> None:
-        """#791: forward this pass's admission decision to the next stage.
-
-        UNLIKE the proxy send (`_pp_send_dict_to_next_stage(..., msg_type=
-        "proxy")` above, gated on `not self.pp_group.is_last_rank`), this is
-        never gated on rank position. The whole point of this wire is that
-        it keeps travelling past the last stage and wraps back to PP0 --
-        `pp_group.send_tensor_dict`'s default `dst=None` already resolves to
-        "next rank in the ring", which lands on PP0 from the last rank the
-        same way the output ring wraps -- so PP0 can close the #630 learning
-        loop via `PPAdmissionCongruenceGuard.record_return_trip`.
-
-        SENT EVERY PASS, EVEN WHEN EMPTY (`entries=()`). Withholding it
-        whenever a rank's own verdict is empty would recreate exactly the
-        defect this module exists to close: a downstream rank's receive
-        gated on ITS OWN cur_batch rather than on what upstream actually
-        decided (`_event_loop_pp_body`'s `if cur_batch: ... _pp_recv_proxy_
-        tensors(mb_id)`, the root defect this whole feature targets).
-
-        NOT SENT BY THE LAST RANK -- #796, and this is a CORRECTION to the
-        ring described above. The wraparound edge (last rank -> PP0) has no
-        matching receive on PP0 by construction: PP0 never issues a blocking
-        receive for it (that closed a ring, the fourth specimen -- see
-        `_pp_try_recv_admission_decision`), it only PEEKS an inbox that is
-        filled solely as a side effect of the per-iteration OUTPUT receive
-        -- and that receive early-returns whenever the slot is empty
-        (`_pp_send_recv_and_preprocess_output_tensors`'s `_do_recv`: `if
-        target is None ... return`), which is every idle pass. So the
-        wraparound was one unmatched message per pass on the channel: the
-        exact corpse `_pp_send_dict_to_next_stage` already refuses for the
-        proxy under a gapped wire ("Sending anyway would leave one unmatched
-        message per pass on the channel -- the bounded-recv corpse, from the
-        sender's side"). The same law is now applied here: A RANK MUST NOT
-        POST A SEND NO PEER IS REQUIRED TO TAKE.
-
-        WHAT THAT COSTS, STATED PLAINLY: `PPAdmissionCongruenceGuard.
-        record_return_trip` no longer runs, because no lap can arrive. It
-        was never load-bearing for TERMINATION -- #630's retry livelock
-        terminates on the floor the guard learns from the RETRACTION
-        (`prefix_len_for`, strictly decreasing and non-negative), and
-        `record_return_trip` only CLEARED that floor early. The floors are
-        keyed by rid and a rid dies with its request, so the residual cost
-        is that one request's reuse stays suppressed for the rest of ITS
-        life instead of recovering mid-flight. A bounded, per-request
-        performance effect -- traded for a channel with no unmatched sends
-        on it.
-
-        THE WORK HANDLE IS RETAINED, NOT DISCARDED -- #796, the defect that
-        wedged six boots. This used to call `_pp_send_dict_to_next_stage`
-        and throw the returned `P2PWork` list away, which made it the ONLY
-        async channel in `_event_loop_pp_body` that did not keep its handle
-        alive on the scheduler (`send_req_work`, `send_proxy_work` and
-        `send_output_work` all do, and all are committed later). A gloo
-        isend whose handle and backing buffers are local temporaries is
-        dropped when they go out of scope: the message never reaches the
-        peer, and every downstream rank then blocks for ever at
-        `_event_loop_pp_body`'s decision receive waiting for something that
-        was never actually on the wire. That is why three successive
-        re-orderings of this send (#791, #795, and the wraparound fix) each
-        corrected a real defect and none of them saved a boot -- the
-        ordering of a message that does not exist cannot matter.
-        Reproduced hermetically in
-        test_pp_admission_send_handle_dropped_796.py, whose dropped-handle
-        arm reproduces the six-boot py-spy signature exactly (PP0 in the
-        chain flush one iteration ahead, PP1 and PP2 both in this channel's
-        receive). Committed at the end of the iteration by
-        `_pp_commit_admission_send_work`.
-
-        Still fire-and-forget WITHIN the pass: nothing on the admission path
-        may block on a peer here (scheduler.py's `_get_new_batch_prefill_raw`
-        NO COLLECTIVE note -- the 2026-08-17 deadlock family this must not
-        repeat). Retaining a handle is not blocking on one.
-        """
-        # STRIP-B (user order 2026-08-29): this exists only for the retired
-        # second HiCache implementation. With the flip off there is no era to
-        # keep congruent, and the machinery is not merely idle here -- it is
-        # what deadlocks the ring. Measured, boot 71, three py-spy stacks at
-        # one instant: PP0 and PP1 both blocked in
-        # `_pp_commit_admission_send_work` waiting for their admission-decision
-        # send to be taken, PP2 blocked in its output-send wrap 2->0 that PP0
-        # would have taken next. A closed three-arc send cycle, and every arc
-        # of it belongs to this apparatus. Plain upstream PP has no
-        # admission-decision ring at all.
-        # Ten boots died of this family (53, 55-59, 68-71), flip-free included
-        # (#990), so it is left out rather than repaired -- an eleventh fix to
-        # a mechanism with no remaining purpose.
-        # #1014 DEMULTIPLEX, DO NOT UNPLUG. The paragraph above is right that
-        # the era's DECISION has no remaining purpose and wrong that the
-        # MESSAGE is the era's. Measured on 0d81aab8db: six facts from five
-        # tickets ride this one wire -- _PP_OUTPUT_EXPECTED_KEY (#791b,
-        # :7837), _PP_PASS_VOIDED_KEY and _PP_UPSTREAM_LAUNCHED_KEY (#797,
-        # :7841/:7842), _PP_SLOT_OCCUPANT_KEY (#1000b, :7850),
-        # _PP_LAUNCHED_CHAIN_KEY (#978, :7854) and _PP_PARKED_CONTINUATION_KEY
-        # (#968, read :2060). Six of the module's seven _PP_*_KEY are on this
-        # message; only _PP_VOID_OUTPUT_KEY rides the output wrap. Returning
-        # here retires five foreign wires along with the era's own, silently.
-        #
-        # That is not a hypothesis. #1013 gated the READER off to match this
-        # return, and the very first consequence was a boot that served
-        # nothing: `_pp_upstream_launched_incoming` (single writer :7975,
-        # behind the skipped read) stayed at its getattr default False, so
-        # `_pp_drain_voided_proxy:8349` declined every drain, the wire kept
-        # owing a message, and PP0 blocked for ever in the next pass's
-        # `_pp_commit_comm_work(self.send_proxy_work)` at :4479 -- measured,
-        # boot_pp3solo_0d81aab8db_0829_095245.log, `voided proxy drained` 0 in
-        # the whole log. That was the FIRST of the six facts to surface, not
-        # the only one.
-        #
-        # So the era payload is emptied and the message keeps flying. An empty
-        # decision is a first-class value here, not a special case: this
-        # function's own docstring says it is "SENT EVERY PASS, EVEN WHEN
-        # EMPTY (`entries=()`)" and the normal path builds exactly that at
-        # :4351 and :4432. The congruence guard therefore learns nothing from
-        # the era while the six passengers keep their carrier, and
-        # sender/receiver stay unconditional on both ends -- which is what
-        # makes an asymmetry like #1013's impossible by construction rather
-        # than by a matching pair of gates that has to be kept in step.
-        if not _pp_era_ring_live(self):
-            decision = PPAdmissionDecision(mb_id=decision.mb_id, entries=())
-        if self.ps.pp_size <= 1:
-            return
-        # #978: recorded BEFORE the last-rank return below -- the last rank
-        # sends no decision (#796) but is the rank that BUILDS the slot's
-        # void, so it is the one that needs the chain per slot most.
-        if launched_chain:
-            self._pp_note_launched_chain(decision.mb_id, launched_chain)
-        if self.pp_group.is_last_rank:
-            return
-        tensor_dict = pp_admission_decision_to_wire(decision)
-        # #791b: PP0's output-ring verdict for this slot rides along. See
-        # `_PP_OUTPUT_EXPECTED_KEY` for why the fact has to travel instead of
-        # being re-derived per rank, and `_pp_send_output_to_next_stage` for
-        # what the last rank does with it.
-        tensor_dict[_PP_OUTPUT_EXPECTED_KEY] = bool(expects_output)
-        # #797: the two facts a #791 retraction makes the next rank need. See
-        # each key's own comment; `pass_voided` is OR-ed along the chain and
-        # `launched` is overwritten by every hop.
-        tensor_dict[_PP_PASS_VOIDED_KEY] = bool(pass_voided)
-        tensor_dict[_PP_UPSTREAM_LAUNCHED_KEY] = bool(launched)
-        # #1000b THE IDENTITY BESIDE THE BOOL. `launched` above is
-        # `self.mbs[mb_id] is not None` evaluated at the call site; this is WHO
-        # that batch holds, read from the same object at the same moment.
-        # Written whenever the caller supplied it -- `()` is the sender saying
-        # "I hold nothing" and must stay distinct from the ABSENT key, which
-        # means "this sender said nothing at all".
-        if slot_occupant is not None:
-            tensor_dict[_PP_SLOT_OCCUPANT_KEY] = tuple(str(x) for x in slot_occupant)
-        # #978: the same statement, accumulated per generation instead of
-        # overwritten per hop -- see `_PP_LAUNCHED_CHAIN_KEY`.
-        if launched_chain:
-            tensor_dict[_PP_LAUNCHED_CHAIN_KEY] = tuple(
-                bool(x) for x in launched_chain
-            )
-        # #968: THE DOWNSTREAM LEG OF THE RETURN LAP, and it is needed because
-        # the ring is not symmetric. The output goes home in ONE hop -- the
-        # last rank sends straight to PP0 -- so a middle rank never relays an
-        # output and has no other way onto the lap. It puts its parked fact on
-        # the decision message that already travels to its successor every
-        # pass (#791b, "SENT EVERY PASS, EVEN WHEN EMPTY"); the successor
-        # absorbs it into the same table, and the last rank forwards that
-        # table home with `pp_output_payload_with_return_trip`. Two existing
-        # messages, no new wire, no collective on the admission path.
-        pp_parked_continuation_stamp(
-            self,
-            {_PP_PARKED_CONTINUATION_KEY: _pp_parked_carry_wire(self)},
-            tensor_dict,
-        )
-        works = self._pp_send_dict_to_next_stage(
-            tensor_dict, async_send=True, msg_type=ADMISSION_DECISION_KIND
-        )
-        # Tolerant of a stand-in that never ran `init_pp_loop_state`, as this
-        # file's own convention requires (#787): a holder without the field
-        # simply grows one here.
-        pending = getattr(self, "_pp_admission_send_work", None)
-        if pending is None:
-            pending = []
-            self._pp_admission_send_work = pending
-        pending.extend(works or [])
-
-    def _pp_commit_admission_send_work(self: Scheduler) -> None:
-        """#796: reap this pass's admission-decision send.
-
-        Called once per iteration from `_event_loop_pp_body`, immediately
-        BEFORE `_pp_commit_pending_req_work`. That order is deliberate and
-        the weaker of the two waits comes first: this one is satisfied as
-        soon as the next rank reaches its decision receive at the TOP of the
-        same pass, whereas the chain flush is not satisfied until that rank
-        reaches the top of the NEXT pass. A wait that is already implied by
-        one placed after it can never be the wait that closes a cycle.
-
-        Safe to wait on unconditionally. Every remaining send on this
-        channel is matched by construction: rank r sends to rank r+1 exactly
-        once per pass, rank r+1 issues exactly one blocking receive for it
-        at the top of that same pass, and the last rank now posts nothing
-        (see `_pp_send_admission_decision`). So this is a wait on a message
-        the peer is REQUIRED to take -- the same property
-        `_pp_commit_pending_req_work` relies on -- or, on a pass that sent
-        nothing, a wait on an empty list.
-        """
-        # STRIP-B (user order 2026-08-29): this exists only for the retired
-        # second HiCache implementation. With the flip off there is no era to
-        # keep congruent, and the machinery is not merely idle here -- it is
-        # what deadlocks the ring. Measured, boot 71, three py-spy stacks at
-        # one instant: PP0 and PP1 both blocked in
-        # `_pp_commit_admission_send_work` waiting for their admission-decision
-        # send to be taken, PP2 blocked in its output-send wrap 2->0 that PP0
-        # would have taken next. A closed three-arc send cycle, and every arc
-        # of it belongs to this apparatus. Plain upstream PP has no
-        # admission-decision ring at all.
-        # Ten boots died of this family (53, 55-59, 68-71), flip-free included
-        # (#990), so it is left out rather than repaired -- an eleventh fix to
-        # a mechanism with no remaining purpose.
-        #
-        # #1014: the gate is REMOVED here, not narrowed. `_pp_send_admission_
-        # decision` now always sends (with an empty era payload when the era
-        # is off -- see its #1014 block), so this reap must always run too:
-        # skipping it would leave every pass's isend handle un-waited and grow
-        # exactly the unbounded handle list #796 added this method to prevent.
-        # There is nothing left to gate on -- on a pass that posted nothing
-        # this is already a wait on an empty list, which is the property the
-        # docstring above states.
-        pending = getattr(self, "_pp_admission_send_work", None)
-        if pending:
-            self._pp_commit_comm_work(pending)
-
-    def _pp_recv_admission_decision(self: Scheduler) -> Optional[PPAdmissionDecision]:
-        """#791: this pass's inbound admission decision (blocking receive).
-
-        #1014 THIS RECEIVE IS UNCONDITIONAL, AND THAT IS THE CONTRACT.
-        "Always issued, never gated" below is load-bearing, not incidental.
-        #1013 briefly gated it to match the two era gates on the sender, on
-        the reasoning that a switched-off producer obliges switching off its
-        consumers. That reasoning is right about direction and wrong about
-        WHAT the sender had been switched off: not a ring, a MULTIPLEX
-        CARRIER. Six facts from five tickets are unpacked below --
-        _PP_OUTPUT_EXPECTED_KEY (#791b), _PP_PASS_VOIDED_KEY and
-        _PP_UPSTREAM_LAUNCHED_KEY (#797), _PP_SLOT_OCCUPANT_KEY (#1000b),
-        _PP_LAUNCHED_CHAIN_KEY (#978), _PP_PARKED_CONTINUATION_KEY (#968) --
-        and skipping the read starved all six at once.
-
-        MEASURED, the first of the six to surface, boot
-        boot_pp3solo_0d81aab8db_0829_095245.log (pp_size=3, tp_size=1, no
-        flip, first request), PP0 pid 1893490 parked on
-        `pp-ring-commit/dict/send_proxy_work[0]` at
-        `_event_loop_pp_body:4479 -> _pp_commit_comm_work:7265`, with
-        "#797 PP-ADMISSION voided proxy drained" appearing 0 times in the
-        whole log. `_pp_upstream_launched_incoming` has exactly one real
-        writer (:7975, here) and one reset (:4117), so behind the skip it
-        stayed False and `_pp_drain_voided_proxy:8349` declined every drain.
-        The wire kept owing a message, PP0 blocked in the next pass, and
-        PP1/PP2 sat at the loop head in `recv_requests`. 0 prefill batches,
-        0 http=200. The other five facts had not yet had their turn.
-
-        Congruence is therefore kept by CONSTRUCTION and not by a matching
-        pair of gates: the sender always sends (empty era payload when the
-        era is off) and this receive always runs. There is no state in which
-        one end is on and the other off.
-
-        Positioned in `_event_loop_pp_body`
-        strictly BEFORE `get_next_batch_to_run`, so this rank's own
-        admission loop can be DRIVEN by the decision instead of
-        independently re-deriving one that might disagree with it -- and
-        strictly before `_pp_recv_proxy_tensors` / `_pp_wait_for_proxy_
-        readiness` (#789), so an ordinary prefix-length divergence is
-        degraded here and never has to reach that contract's raise path
-        (the #791 task's ordering requirement).
-        """
-        if self.ps.pp_size <= 1:
-            return None
-        message = self._pp_recv_typed_dict(expected_kind=ADMISSION_DECISION_KIND)
-        # #791b: PP0's output-ring verdict for this slot, published on the
-        # same message. Absent means False -- an older sender, or a stand-in,
-        # then behaves exactly as it did before this key existed.
-        self._pp_output_expected_incoming = bool(
-            message.get(_PP_OUTPUT_EXPECTED_KEY, False)
-        )
-        # #797: the two facts a retraction upstream of this rank makes it
-        # need. Absent means False on both, for the same reason.
-        self._pp_pass_voided_incoming = bool(message.get(_PP_PASS_VOIDED_KEY, False))
-        self._pp_upstream_launched_incoming = bool(
-            message.get(_PP_UPSTREAM_LAUNCHED_KEY, False)
-        )
-        # #978: the accumulated launched chain, appended to and forwarded by
-        # this rank's own decision send. Absent means empty, and an empty
-        # chain keeps every consumer on the legacy relay rule.
-        self._pp_launched_chain_incoming = tuple(
-            bool(x) for x in message.get(_PP_LAUNCHED_CHAIN_KEY, ())
-        )
-        # #1000b: None (absent) and () (empty) are two different statements
-        # and are kept apart deliberately -- see `_PP_SLOT_OCCUPANT_KEY`.
-        _occ = message.get(_PP_SLOT_OCCUPANT_KEY, None)
-        self._pp_upstream_slot_occupant_incoming = (
-            None if _occ is None else tuple(str(x) for x in _occ)
-        )
-        # #968: the upstream leg's parked facts land in the SAME table PP0
-        # reads, on every rank. A middle rank is a relay here, not a
-        # consumer: it absorbs so that its own decision send can forward the
-        # union onward (`_pp_parked_carry_wire`), and only PP0 ever acts on
-        # the table (`pp_parked_continuation_priority` is called from PP0's
-        # admission alone). Absent key is a no-op, so a pre-#968 sender or a
-        # stand-in leaves this rank exactly where it was.
-        pp_note_parked_continuation(self, message)
-        return pp_admission_decision_from_wire(message)
-
-    def _pp_try_recv_admission_decision(
-        self: Scheduler,
-    ) -> Optional[PPAdmissionDecision]:
-        """PP0's OPPORTUNISTIC counterpart to `_pp_recv_admission_decision`,
-        used ONLY for the ring wraparound check in `_event_loop_pp_body`
-        (never for the ordinary forward receive non-first ranks issue at
-        the top of the loop -- those genuinely need to block to make
-        progress, and are unaffected by this method).
-
-        THE DEADLOCK THIS CLOSES -- the fourth of the "a rank must never
-        block on a peer for something not required for this iteration's
-        forward progress" family, measured live 2026-08-20: boot reached
-        health, froze on the first request, zero GPU utilisation on all
-        ranks. py-spy on all three: PP0 blocked in exactly the wraparound
-        receive this method replaces; PP1 and PP2 both blocked at the
-        forward receive (`_event_loop_pp_body`'s #791 block, non-first-rank
-        branch) waiting for PP0's NEXT decision. Closed ring: PP0 would not
-        send again until its wraparound receive returned, and the only
-        ranks that could complete that lap were the ones waiting on PP0's
-        next send.
-
-        `record_return_trip` (`PPAdmissionCongruenceGuard`) is a pure
-        LEARNING step -- it teaches the guard the downstream coverage a lap
-        actually observed and clears a rid's learned floor early. Nothing
-        about THIS iteration's forward progress depends on it, so the
-        receive that feeds it must never be allowed to block this
-        iteration on a peer.
-
-        NON-BLOCKING BY CONSTRUCTION, NOT BY TIMEOUT. This never calls the
-        underlying blocking gloo receive itself. It only PEEKS
-        `pp_typed_channel.typed_inbox` for an already-stashed
-        `(src, ADMISSION_DECISION_KIND)` message -- the exact precedent
-        `_pp_wait_for_proxy_readiness` set (see its docstring: "AN
-        ALREADY-STASHED MESSAGE IS ALSO A POSITIVE SIGNAL") for gating a
-        blocking receive on inbox presence rather than trusting silence --
-        and only when one is already there does it call
-        `_pp_recv_admission_decision`, whose own fast path
-        (`recv_typed_tensor_dict`'s `take_typed` at the top, in
-        pp_typed_channel.py) then pops it with no further wire activity.
-        The peek and the pop use the identical `(src, kind)` key, computed
-        the same way (`resolve_src`), so there is no window between them
-        for a second message to arrive and be mistaken for this one.
-
-        WHY A LAP CAN ALREADY BE PRESENT WITHOUT THIS RANK EVER HAVING
-        ISSUED A DEDICATED BLOCKING RECEIVE FOR IT. PP0's mandatory
-        per-iteration "output" receive (`_pp_recv_dict_from_prev_stage`)
-        reads from the SAME directed pair -- the last rank, ring-wrapped to
-        PP0 -- that the amended admission decision also travels on.
-        `recv_typed_tensor_dict` drains messages off that wire until it
-        finds the kind it asked for ("output"), stashing every other kind
-        it passes over -- including ADMISSION_DECISION_KIND -- into the
-        inbox along the way. So a lap that arrived interleaved with an
-        "output" message is typically already sitting here by the time
-        this runs, discovered as a side effect of a receive the loop was
-        going to issue anyway, at no extra wire cost. If it is not there
-        yet, this iteration simply carries on without it -- see the call
-        site in `_event_loop_pp_body` for what that costs.
-
-        #796 UPDATE, AND IT MAKES THIS METHOD DORMANT RATHER THAN WRONG:
-        the last rank no longer EMITS the wraparound at all, because PP0 was
-        never required to take it and one unmatched message per pass is the
-        bounded-recv corpse (see `_pp_send_admission_decision` for the full
-        argument and for what the lost `record_return_trip` learning costs).
-        No lap can therefore arrive any more, and this returns None every
-        time. It is kept, not deleted, for the same reason
-        `pp_pump_send_req_work` is kept: it is exactly where a working
-        wraparound would be consumed if PP0 ever gains a receive it is
-        genuinely required to issue, and deleting it would erase the record
-        of what the ring was for. It is NOT a mechanism anything may rely
-        on, and nothing does -- the call site treats a None as an ordinary
-        "not this pass".
-
-        Returns None immediately, touching nothing, when `pp_size <= 1`
-        (matching `_pp_recv_admission_decision`'s own no-op contract) or
-        when no lap is already in hand.
-        """
-        if self.ps.pp_size <= 1:
-            return None
-        src = resolve_src(self.pp_group, None)
-        if not typed_inbox(self.pp_group).get((src, ADMISSION_DECISION_KIND)):
-            return None
-        return self._pp_recv_admission_decision()
-
-    def _pp_reconcile_incoming_admission(
-        self: Scheduler, decision: PPAdmissionDecision
-    ) -> Tuple[Dict[str, int], PPAdmissionDecision]:
-        """#791: this (downstream) rank's reconciliation of a received
-        decision against its OWN local radix-cache state.
-
-        For every named, still-admitted rid, freshly matches it against
-        THIS rank's own tree_cache (`req.init_next_round_input` -- safe to
-        call again here even though the admission loop below calls it again
-        too, per the idempotency already relied on for this exact call by
-        schedule_policy.py's pre-admission priority pass) to get a real
-        local candidate length, then hands everything to the pure
-        `reconcile_pp_admission_decision` (#791/#630) for the actual
-        safe-truncate / unsafe-retract verdict and the exactly-once warning.
-
-        FOUR PLACES A REQUEST CAN LIVE, and a rid found in NONE of them is
-        `UNKNOWN_MATCH`, never 0.
-
-        The sentence that stood here said a rid missing from `waiting_queue`
-        "is treated as a local match of 0 -- physically indistinguishable from
-        'this rank's cache has nothing for it' ... it needs no special case".
-        That was wrong three times over, and each time it cost a boot: #797c
-        (the rid is in `chunked_req`), #798 (it is in ANOTHER slot's chunked
-        req), #944 (it is in the RUNNING BATCH). The two facts are not
-        indistinguishable at all -- one is a statement about this rank's cache,
-        the other about this lookup -- and spelling them the same way is what
-        made three instances of one class read as three separate defects. The
-        lookup chain below is exhaustive as far as it is known to be; what has
-        changed is that running out of places to look now says so.
-
-        #797c, THE FIRST OF THE THREE, IN FULL -- kept because it is the
-        clearest specimen of the false negative and the reason the second and
-        third lookups exist at all.
-
-        The CHUNKED request is dropped from `waiting_queue` the moment
-        it is first admitted (scheduler.py's `self.waiting_queue = [x for x in
-        self.waiting_queue if x not in can_run_set]`) and lives in
-        `self.chunked_req` from then on -- so the lookup above misses it by
-        construction on every round but its first, and the miss defaults to a
-        local match of 0 for a request this rank is DEMONSTRABLY mid-prefill
-        on. That false negative retracted the same rid three times in one
-        second on boot instr19 while `told` grew by one chunk each time. It is
-        answered from the request's own progress instead; see
-        `pp_chunked_local_match` for why `extend_range.end` is the right
-        quantity and a radix re-match is not.
-        """
-        pp_size = self.ps.pp_size
-        if pp_size <= 1:
-            return {}, decision
-        by_rid = {req.rid: req for req in self.waiting_queue}
-        chunked = getattr(self, "chunked_req", None)
-        chunked_rid = getattr(chunked, "rid", None)
-        slot_chunked = pp_chunked_req_for_slot(self, decision.mb_id)
-        slot_chunked_rid = getattr(slot_chunked, "rid", None)
-        local_match_lens: Dict[str, int] = {}
-        for entry in decision.entries:
-            if not entry.admitted or entry.retracted:
-                continue
-            req = by_rid.get(entry.rid)
-            if req is None:
-                if chunked_rid is not None and entry.rid == chunked_rid:
-                    computed = pp_chunked_local_match(chunked)
-                    if computed is not None:
-                        local_match_lens[entry.rid] = computed
-                        continue
-                # #798: AND THE SLOT THE DECISION NAMES, which is the lookup
-                # whose absence livelocked boot_798_0822_0829 for 13 minutes
-                # without serving one request. `self.chunked_req` is a single
-                # scheduler-wide field, but `_pp_void_own_batch` restores it
-                # PER SLOT out of `_pp_chunked_req_before_by_slot[mb_id]`, so
-                # with more than one microbatch slot in flight the value
-                # standing there belongs to whichever slot wrote it last --
-                # not to the slot this decision is about. The miss then
-                # defaulted to 0 and was consumed as a MEASUREMENT: 2212
-                # consecutive `told=98304 local=0` retractions for a rank
-                # holding all 98304 tokens, voids alternating slot 2, 0, 2, 0
-                # with no exception, each void restoring the other slot's
-                # snapshot and so re-arming the next one.
-                #
-                # ONLY THE NAMED SLOT MAY ANSWER. Scanning the whole ring for
-                # a rid would be the same defect with a wider blast radius --
-                # answering a question about slot 2 with slot 0's progress.
-                # `PPAdmissionDecision.mb_id` is documented as "one PP
-                # microbatch slot" and has been on the wire since #791; this
-                # is an unread field, not a missing one.
-                if slot_chunked_rid is not None and entry.rid == slot_chunked_rid:
-                    computed = pp_chunked_local_match(slot_chunked)
-                    if computed is not None:
-                        local_match_lens[entry.rid] = computed
-                        continue
-                # #944 THE FOURTH PLACE A REQUEST CAN LIVE, and the one that
-                # wedged the instance. Once a request finishes its chunked
-                # prefill it is in NEITHER the waiting queue NOR `chunked_req`
-                # NOR the slot's chunked req -- it is in the RUNNING BATCH.
-                # `self.running_batch` is on this object and is read elsewhere
-                # in this file; this resolution chain never consulted it, so a
-                # rank holding the whole prefix answered 0.
-                #
-                # Measured under real agent-shaped load (long SHARED prefixes,
-                # which is what puts requests into the running batch while new
-                # admissions for the same prefix keep arriving): 2106
-                # unhonourable-prefix events, 2107 voided passes, and a
-                # three-rank hang 35 s after health.
-                running = getattr(self, "running_batch", None)
-                running_reqs = getattr(running, "reqs", None) or ()
-                for r in running_reqs:
-                    if getattr(r, "rid", None) == entry.rid:
-                        local_match_lens[entry.rid] = int(
-                            getattr(r, "kv_committed_len", 0) or 0
-                        )
-                        break
-                else:
-                    # #944 A MISS IS NOT A ZERO. Writing 0 here is what made
-                    # #797c and #798 look like two unrelated defects instead of
-                    # one class seen twice: the consumer cannot tell "no prefix"
-                    # from "not found", and it voids the pass on both. The
-                    # sentinel makes the two separable at the reader; the reader
-                    # decides what to do about it.
-                    local_match_lens[entry.rid] = UNKNOWN_MATCH
-                continue
-            req.init_next_round_input(self.tree_cache)
-            local_match_lens[entry.rid] = len(req.prefix_indices)
-        return reconcile_pp_admission_decision(
-            decision,
-            local_match_lens,
-            rank=self.ps.pp_rank,
-            pp_size=pp_size,
-            log=logger,
-        )
-
     def _pp_forwarded_schedule_from(
         self: Scheduler, amended: Optional[PPAdmissionDecision]
     ) -> Dict[str, Tuple[int, int]]:
@@ -8284,142 +7704,17 @@ class SchedulerPPMixin:
         """
         return order_batch_by_schedule(reqs, schedule)
 
-    def _pp_void_retracted_pass(
-        self: Scheduler,
-        effective: Dict[str, int],
-        amended: PPAdmissionDecision,
-    ) -> Tuple[Dict[str, int], PPAdmissionDecision]:
-        """#797: a retraction drops the PASS, not just the rid.
-
-        THE NUMBERS THAT DECIDED THIS. Boots instr15/16/17 logged 661, 1651
-        and 1718 `#791 unhonourable prefix` retractions and died on ONE width
-        mismatch each. Every other narrowing computed: `reconcile_pp_
-        admission_decision` dropped the unhonourable rid, this rank built a
-        batch from what was left, and the upstream's hidden states -- for a
-        batch containing that rid -- were paired with it. Chunked prefill caps
-        every chunk at the same size, so two ranks running DIFFERENT request
-        sets routinely present EQUAL widths; `model_runner.forward`'s
-        `_hs.shape[0] != _want` sees nothing at all in that case. So the
-        ~4000 survivals in that series are not survivals, they are silent
-        wrong output, and every uptime number measured on them is void.
-
-        WHY THE PASS AND NOT THE RID. There are only three membership
-        outcomes and two of them are unavailable. The rank cannot ADMIT the
-        rid -- it has no KV for the prefix its upstream reused, and the
-        upstream sent hidden states only for the extend tokens, so there is
-        nothing to reconstruct the missing prefix from. The upstream cannot be
-        AMENDED -- it sent its decision and launched its batch earlier in this
-        same pass, and a batch in flight cannot be recalled. What is left is
-        to run the pass NOWHERE, which restores uniform membership in the one
-        direction that is physically available.
-
-        THE COST, NAMED: the upstream's forward for this pass is wasted, once
-        per prefix first offered that a downstream cannot honour. It is not
-        once per pass: the void rides back to PP0 inside #791b's void output,
-        `PPAdmissionCongruenceGuard.record_return_trip` learns the observed
-        local match as a floor, and `prefix_len_for` clamps the next offer for
-        that rid to it -- a strictly decreasing, non-negative sequence, so the
-        rid stops being re-offered an unhonourable prefix. The requests are
-        not lost either: `_pp_absorb_void_output` releases and re-queues them
-        on PP0, which is the same requeue-for-free path a capacity rejection
-        already uses.
-
-        WHAT IT REPLACES, STATED PLAINLY: #791c's boundary raise. That
-        converted the mispair into a named refusal thirty layers earlier and
-        killed the boot anyway; it stays in place as a tripwire, and a boot
-        carrying this change should count zero of it.
-
-        Returns `(effective, amended)` UNCHANGED when this rank retracted
-        nothing of its own and nothing upstream voided -- the default path is
-        not merely equivalent, it is the same objects.
-        """
-        rank = getattr(getattr(self, "ps", None), "pp_rank", None)
-        voided = pp_pass_should_void(
-            amended, rank, getattr(self, "_pp_pass_voided_incoming", False)
-        )
-        self._pp_admission_pass_voided = voided
-        if not voided:
-            return effective, amended
-        mine = entries_retracted_by_rank(amended, rank) if rank is not None else ()
-        if mine:
-            self._pp_pass_voids = getattr(self, "_pp_pass_voids", 0) + 1
-            first = mine[0]
-            logger.warning(
-                "#797 PP-ADMISSION pass voided on rank %s: this rank retracted "
-                "%d request(s) (first: rid=%s told=%d local=%s), so its batch "
-                "would have been a strict SUBSET of the one the upstream "
-                "already launched. Running the whole pass nowhere instead: "
-                "rank 0's requests are released and re-queued by the void "
-                "output, and the observed local match is fed back as a prefix "
-                "floor so the next offer for this rid is honourable.",
-                rank,
-                len(mine),
-                first.rid,
-                first.prefix_len,
-                first.observed_local,
-            )
-        # Both halves of the void. The dict is what scheduler.py's admission
-        # loop reads (a rid it does not name is simply not admitted, the
-        # existing requeue-for-free path); the decision is what the next rank
-        # and the return trip read.
-        return {}, void_pp_admission_decision(amended)
-
-    def _pp_drain_voided_proxy(self: Scheduler, mb_id: int) -> bool:
-        """#797: take the proxy a voided pass will never pair, and drop it.
-
-        True iff a message was taken. THE WIRE OWES EXACTLY ONE MESSAGE PER
-        PASS and that debt does not disappear because this rank decided not to
-        run: the upstream posted its proxy isend before anything downstream
-        could tell it otherwise, and `_pp_commit_comm_work(self.send_proxy_
-        work)` on its NEXT pass is a blocking wait on that message being
-        taken. Leaving it is the bounded-recv corpse (see `_pp_send_dict_to_
-        next_stage`), and it wedges the upstream, not this rank.
-
-        GATED ON THE SENDER'S OWN STATEMENT, never on an inference from this
-        rank's state. `_PP_UPSTREAM_LAUNCHED_KEY` is written per hop by the
-        rank that will or will not send, because "did my upstream launch" is
-        not derivable here: its batch can be empty for capacity reasons that
-        never appear in the decision, and a blocking receive for a message
-        nobody sent is the deadlock family this whole feature is a list of.
-
-        Not the #631 guard's business: this is a deliberate discard of a
-        message whose pairing has already been refused, so it reads no stamp
-        and raises nothing. Under a gapped set there is no proxy on this
-        channel at all (`_pp_recv_proxy_tensors`' own early return), so this
-        is a no-op there for the same reason.
-        """
-        if not getattr(self, "_pp_admission_pass_voided", False):
-            return False
-        if not getattr(self, "_pp_upstream_launched_incoming", False):
-            return False
-        if self.ps.pp_size <= 1 or self.pp_group.is_first_rank:
-            return False
-        if getattr(self, "_pp_gapped_wire", False):
-            return False
-        self._pp_recv_typed_dict(
-            expected_kind="proxy",
-            all_gather_group=(
-                self.attn_tp_group if self.require_attn_tp_allgather else None
-            ),
-        )
-        self._pp_voided_proxy_drains = getattr(self, "_pp_voided_proxy_drains", 0) + 1
-        logger.warning(
-            "#797 PP-ADMISSION voided proxy drained on slot %d: the upstream "
-            "had already launched when this pass was voided, so its hidden "
-            "states are on the wire with no batch to pair them with. Taken "
-            "and discarded -- an unmatched message here blocks the UPSTREAM "
-            "in its next pass's proxy commit, not this rank.",
-            mb_id,
-        )
-        return True
-
     def _pp_void_own_batch(self: Scheduler, mb_id: int) -> bool:
         """#797d: THIS rank's own voided pass must build nothing for `mb_id`,
         even when `get_next_batch_to_run` still handed back a batch.
 
-        `_pp_void_retracted_pass` (above) empties the ADMISSION DICT
-        (`effective`) and the forwarded DECISION (`amended`), but neither of
-        those is what `get_next_batch_to_run` schedules from: it also runs
+        #1015: `_pp_void_retracted_pass`, which this docstring used to cite
+        as emptying the ADMISSION DICT (`effective`) and the forwarded
+        DECISION (`amended`) on the deleted forward arc, is deleted (zero
+        callers remained once `_pp_send_admission_decision` /
+        `_pp_recv_admission_decision` were removed -- see the EDIT-E block
+        at the top of `_event_loop_pp_body`). Neither of those two structures
+        is what `get_next_batch_to_run` schedules from anyway: it also runs
         its own local continuation logic -- `self.chunked_req` (the #797b
         stash at scheduler.py's `if self.chunked_req.extend_range.end >
         len(prefix_indices): self.stash_chunked_request(...)`, unconditional

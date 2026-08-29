@@ -226,157 +226,142 @@ class TestRetiredReadPathRefusesConstruction(CustomTestCase):
 
 
 class TestEraAdmissionRingPredicate(CustomTestCase):
-    """strip-B (d4478a053a) gates the era's admission-decision ring off on
-    plain PP. Its own evidence line reads "py_compile" -- no suite ever saw
-    it, and cherry-picked onto the #1010 pin it turned 15 green tests into 13
-    failures (`'types.SimpleNamespace' object has no attribute 'server_args'`)
-    across the #787/#791/#795/#796 stand-in family. This is the can-fail proof
-    that predicate never had."""
+    """strip-B (d4478a053a) gated the era's admission-decision ring off on
+    plain PP; #1014 made the hop unconditional and emptied its payload
+    instead. #1015 goes one step further and REMOVES THE ARC ENTIRELY --
+    PP3-solo still deadlocked on the closed three-arc send cycle with #1014's
+    congruent-but-still-present hop in place (boot
+    boot_pp3solo_0d81aab8db_0829_095245.log, 0 prefill batches, 0 http=200).
+    `_pp_era_ring_live`, `_pp_send_admission_decision`,
+    `_pp_recv_admission_decision`, `_pp_try_recv_admission_decision` and
+    `_pp_commit_admission_send_work` no longer exist. This class is now a
+    regression lock against any of them coming back, not a test of their
+    behaviour."""
 
-    def _predicate(self):
-        from sglang.srt.managers.scheduler_pp_mixin import _pp_era_ring_live
+    def test_the_arc_is_gone(self):
+        """#1015 v3. THE REPLACEMENT FOR test_the_hop_is_unconditional_on_
+        both_ends, whose every assertion named a function this edit deletes
+        (`_pp_era_ring_live`, `_pp_send_admission_decision`,
+        `_pp_recv_admission_decision`, `_pp_commit_admission_send_work`) --
+        asserting shapes of the message those functions built is no longer
+        answerable once the functions themselves are gone, so the contract
+        this test pins is narrower and different in kind: the deleted names
+        must never resurface, and the event loop must call none of them.
 
-        return _pp_era_ring_live
-
-    def test_flip_off_strips_the_era_ring(self):
-        import types
-
-        holder = types.SimpleNamespace(
-            server_args=types.SimpleNamespace(enable_phase_flip=False)
-        )
-        self.assertFalse(self._predicate()(holder))
-
-    def test_flip_on_keeps_the_era_ring(self):
-        """Briefing constraint: the flip mechanism itself is NOT retired and
-        must keep working. The discriminator boot flip-ON depends on this arm."""
-        import types
-
-        holder = types.SimpleNamespace(
-            server_args=types.SimpleNamespace(enable_phase_flip=True)
-        )
-        self.assertTrue(self._predicate()(holder))
-
-    def test_a_stand_in_without_server_args_keeps_the_pre_gate_behaviour(self):
-        """THE REGRESSION strip-B shipped. A holder that never set server_args
-        must neither raise nor be read as 'flip off'."""
-        import types
-
-        self.assertTrue(self._predicate()(types.SimpleNamespace()))
-
-    def test_the_hop_is_unconditional_on_both_ends(self):
-        """#1014. THE CONTRACT INVERTED, AND WITH IT WHAT THIS TEST PINS.
-
-        #1013 asserted the opposite of this: that the era predicate GUARDS the
-        admission-decision receive, so sender and receiver are gated in step.
-        That shape was congruent and served nothing. The reason is a fact
-        neither #1013 nor the strip-B gates it copied had measured -- the hop
-        is not the era's ring, it is a MULTIPLEX CARRIER. Six facts from five
-        tickets ride the one message (OUTPUT_EXPECTED #791b, PASS_VOIDED and
-        UPSTREAM_LAUNCHED #797, SLOT_OCCUPANT #1000b, LAUNCHED_CHAIN #978,
-        PARKED_CONTINUATION #968); six of the module's seven ``_PP_*_KEY`` are
-        on it, only ``_PP_VOID_OUTPUT_KEY`` rides the output wrap. Switching
-        the hop off retires five foreign wires along with the era's own.
-
-        Measured, boot boot_pp3solo_0d81aab8db_0829_095245.log: the first of
-        the six to be missed, ``_pp_upstream_launched_incoming`` (one writer,
-        behind the skipped read), left ``_pp_drain_voided_proxy`` declining
-        every drain -- "voided proxy drained" 0 times in the whole log -- and
-        PP0 parked for ever on ``pp-ring-commit/dict/send_proxy_work[0]``.
-        0 prefill batches, 0 http=200.
-
-        So the era payload is emptied and the MESSAGE keeps flying. Congruence
-        stops being a property two gates must maintain and becomes one of the
-        construction: both ends unconditional, nothing to keep in step. This
-        pins that shape, and it is the direct inverse of what #1013 pinned --
-        which is the point, and why the old assertion is replaced rather than
-        extended.
+        AST-based, not substring-based, for the reason the #1014 version of
+        this test already learned the hard way (its own docstring: a
+        substring count cannot tell a call from a sentence about a call; the
+        first draft of that assertion matched a PROSE mention inside a
+        comment). The names below DO still appear in prose throughout this
+        module (explaining what was removed and why) -- that is expected and
+        is exactly what this test must not trip over.
         """
+        import ast
         import inspect
 
         from sglang.srt.managers import scheduler_pp_mixin as mod
 
-        # COUNTED FROM THE AST, NOT FROM THE TEXT, and that is the whole
-        # lesson of this test's two previous versions. #1013's tally counted
-        # one SPELLING and missed a gate written in another. The first draft
-        # of THIS assertion counted both spellings as substrings and promptly
-        # matched a PROSE mention of `_pp_era_ring_live(self)` inside a
-        # comment at :4131, reporting two call sites where the module has one.
-        # A substring count cannot tell a call from a sentence about a call;
-        # the parser can, so the parser does the counting.
-        import ast
+        removed_names = {
+            "_pp_era_ring_live",
+            "_pp_send_admission_decision",
+            "_pp_recv_admission_decision",
+            "_pp_try_recv_admission_decision",
+            "_pp_commit_admission_send_work",
+            "_pp_reconcile_incoming_admission",
+            "_pp_void_retracted_pass",
+        }
 
-        tree = ast.parse(inspect.getsource(mod))
-        calls = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "_pp_era_ring_live"
-        ]
-        enclosing = []
-        for fn in ast.walk(tree):
-            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for n in ast.walk(fn):
-                    if n in calls:
-                        enclosing.append(fn.name)
+        # (1) None of the names exist as module or class attributes any more.
+        still_present = sorted(
+            name
+            for name in removed_names
+            if hasattr(mod, name) or hasattr(mod.SchedulerPPMixin, name)
+        )
         self.assertEqual(
-            len(calls),
-            1,
-            "the era predicate must survive at exactly ONE call site -- the "
-            "payload choice in `_pp_send_admission_decision`. A second site "
-            "means something is being switched off again rather than "
-            f"emptied; found {len(calls)} in {sorted(set(enclosing))}",
+            still_present,
+            [],
+            f"#1015 deleted these; found still defined: {still_present}",
         )
-        self.assertEqual(sorted(set(enclosing)), ["_pp_send_admission_decision"])
 
-        # The receive still happens, and it runs every pass. "No era
-        # predicate in the body" needs no separate text assertion -- the AST
-        # count above already proves the module's only call lives in
-        # `_pp_send_admission_decision`, so any gate here would have failed
-        # it. A substring check here would only re-run the same prose trap:
-        # the #1014 comment in this very body QUOTES the removed gate.
+        # (2) Nothing in the module CALLS any of them either -- catches a
+        # reintroduction under the same name from a different definition
+        # site (e.g. reattached via monkeypatch or a helper module), which
+        # (1) alone would miss.
+        tree = ast.parse(inspect.getsource(mod))
+        called = sorted(
+            {
+                n.func.id
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id in removed_names
+            }
+            | {
+                n.func.attr
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr in removed_names
+            }
+        )
+        self.assertEqual(
+            called,
+            [],
+            f"#1015 removed the arc; found calls to: {called}",
+        )
+
+        # (3) The event loop body no longer names the two deleted hop
+        # functions in its source at all (belt-and-braces on top of (2),
+        # cheap and specific to the one function every ring hop lived in).
         body = inspect.getsource(mod.SchedulerPPMixin._event_loop_pp_body)
-        self.assertIn("_pp_recv_admission_decision(", body)
-
-        # The send runs every pass too, and the surviving predicate chooses
-        # the PAYLOAD rather than whether to send.
-        send = inspect.getsource(mod.SchedulerPPMixin._pp_send_admission_decision)
-        self.assertIn("_pp_era_ring_live(self)", send)
-        self.assertIn(
-            "entries=()",
-            send,
-            "with the era off the decision must be sent EMPTY, not skipped.",
-        )
-        gate_line = send[send.index("_pp_era_ring_live(self)") :].splitlines()[1]
-        self.assertNotIn(
-            "return",
-            gate_line,
-            "the era predicate must select an empty payload, never return "
-            f"early: {gate_line.strip()!r}",
-        )
-
-        # The reap is unconditional, or every pass leaks an un-waited isend.
-        reap = inspect.getsource(mod.SchedulerPPMixin._pp_commit_admission_send_work)
-        self.assertNotIn("_pp_era_ring_live(self)", reap)
+        self.assertNotIn("_pp_send_admission_decision(", body)
+        self.assertNotIn("_pp_recv_admission_decision(", body)
 
     def test_the_output_return_path_keeps_its_deadline(self):
         """The bound on `_pp_commit_comm_work` is an INSTRUMENT on a core PP
-        channel, not retired machinery, and must not be gated off with the era.
+        channel, not retired machinery, and must not be silenced by any
+        era/flip gate -- present, deleted, or reintroduced.
 
         Operator boot boot_pp3solo_769f88efea_0829_092829.log, PP3 solo with NO
         flip: all three ranks wedged on the first request at this commit, on
         'pp-ring-commit/dict/send_output_work[0]' and 'pp-ring-commit/p2p[0]'.
         The channel is the output return path (last stage -> PP0), which plain
         upstream PP has. Silencing the deadline there turns a named 120 s death
-        into a park against gloo's two-hour timeout."""
+        into a park against gloo's two-hour timeout.
+
+        #1015: the previous version of this test asserted the literal absence
+        of `"if not _pp_era_ring_live(self):"` -- a string naming a function
+        #1015 now deletes outright, so the assertion would pass vacuously
+        forever regardless of whether a NEW gate replaced it. AST-based
+        instead: walk the function body for any assignment of a literal
+        ``0`` / ``0.0`` to the ``budget`` name, which is the shape every
+        version of this gate (strip-B's included) has taken.
+        """
+        import ast
         import inspect
+        import textwrap
 
         from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
         src = inspect.getsource(SchedulerPPMixin._pp_commit_comm_work)
-        # The predicate itself, not the words about it: the comment above the
-        # code deliberately quotes strip-B's `budget = 0.0` line.
-        self.assertNotIn("if not _pp_era_ring_live(self):", src)
+        tree = ast.parse(textwrap.dedent(src))
+        zero_budget_assignments = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "budget" for t in node.targets
+            )
+            and isinstance(node.value, ast.Constant)
+            and node.value.value in (0, 0.0)
+        ]
+        self.assertEqual(
+            zero_budget_assignments,
+            [],
+            "found an unconditional-looking `budget = 0` assignment -- the "
+            "shape strip-B used to silence this deadline for the retired "
+            "era; the bound on this channel must not be gated off.",
+        )
         self.assertIn("bounded_wait(", src)
 
 
