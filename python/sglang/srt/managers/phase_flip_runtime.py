@@ -1949,6 +1949,10 @@ def build_cutover_release(scheduler):
             # nowhere else, so the host cost stays priced at the flip cadence.
             # #920 made it a decision instead of a constant; see above.
             copy_state=copy_state,
+            # #969D: the cutover RETAINS. This is the one caller whose
+            # retraction is a park-and-re-read, not a discard -- see
+            # schedule_batch.release_req.
+            retain=True,
         )
         # W30 SEAM STAMP. `Req.reset_for_retract` sets `is_retracted` /
         # `retracted_stain`, but those are NOT seam-specific: ordinary
