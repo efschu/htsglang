@@ -2289,6 +2289,34 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
     holder._pp_ring_admissions = getattr(holder, "_pp_ring_admissions", 0) + 1
     every = int(os.environ.get("SGLANG_947_RING_EVERY", "25") or 25)
     if every > 0 and holder._pp_ring_admissions % every == 0:
+        # #995e THE WIDTH-AGREEMENT CENSUS, EMITTED OFF THE PATH IT MEASURES.
+        #
+        # The counters are incremented in `_pp_recv_proxy_tensors`; printing
+        # them from there cost this window two boots, because the log call
+        # perturbed the receive timing and moved the leftover to a slot where
+        # an EARLIER guard caught it (see the note at the increment site).
+        # This site is the ADMISSION path -- it already logs on a cadence, it
+        # is not the proxy receive, and it therefore cannot shift the timing
+        # of the thing being measured.
+        #
+        # Three numbers plus the skip reason, always, so `disagree=0` never
+        # again arrives without its denominator.
+        try:
+            _seen = getattr(holder, "_995c_seen", 0)
+            if _seen:
+                logger.warning(
+                    "#995e WIDTH-AGREEMENT CENSUS (emitted off the measured "
+                    "path): evaluated=%d agree=%d disagree=%d skipped=%d "
+                    "(last skip reason: %s). A zero in `disagree` counts ONLY "
+                    "if `evaluated` is non-zero.",
+                    _seen,
+                    getattr(holder, "_995c_agree", 0),
+                    getattr(holder, "_995c_disagree", 0),
+                    getattr(holder, "_995c_skip", 0),
+                    getattr(holder, "_995c_skip_why", "-"),
+                )
+        except Exception:  # noqa: BLE001 - a census may never break admission
+            pass
         runs = list(hist)
         logger.warning(
             "#947 VOID-RING CENSUS: %d admission-path entries so far; void "
@@ -9015,26 +9043,30 @@ class SchedulerPPMixin:
                                 mb_id,
                                 _local,
                             )
-                    # THE CENSUS, EMITTED ON A CADENCE AND NOT ON AN EVENT.
-                    # This is the line whose absence made boot 27 unreadable.
-                    # It prints all three numbers every N receives whatever
-                    # they are, so "no disagreements" always arrives with its
-                    # denominator and its skip count beside it, and a silent
-                    # probe is distinguishable from a clean one.
+                    # #995e COUNT HERE, PRINT ELSEWHERE.
+                    #
+                    # The counters stay on this path -- they are integer
+                    # increments and cost nothing measurable. The EMISSION
+                    # moved to `pp_ring_note` (admission path), and that move
+                    # is the whole point of this revision.
+                    #
+                    # MEASURED, and it is the sharpest methodological result
+                    # of this window: the previous revision printed the census
+                    # from right here, every 50 receives. Across five boots the
+                    # death form tracked the pin EXACTLY -- 2001952378,
+                    # ddb582bc91 and 04e511c35e all died at the WIDTH guard;
+                    # f752270171, which added that `logger.info`, died at the
+                    # IDENTITY guard twice out of two. One I/O call on a
+                    # latency-sensitive receive path shifted the timing enough
+                    # to land the leftover on a different slot, where the
+                    # identity check caught it FIRST -- and the identity check
+                    # sits UPSTREAM of this probe. The instrument perturbed
+                    # away the very condition it was built to observe.
+                    #
+                    # A COUNTER MAY NOT PRINT ITS DENOMINATOR ON THE PATH IT
+                    # MEASURES. The denominator rule from the previous revision
+                    # is right and stays; only the LOCATION was wrong.
                     self._995c_seen = getattr(self, "_995c_seen", 0) + 1
-                    if self._995c_seen % 50 == 0:
-                        logger.info(
-                            "#995c WIDTH-AGREEMENT CENSUS: evaluated=%d "
-                            "agree=%d disagree=%d skipped=%d (last skip "
-                            "reason: %s). A zero in `disagree` counts ONLY if "
-                            "`evaluated` is non-zero -- that is the whole "
-                            "point of printing three numbers instead of one.",
-                            self._995c_seen,
-                            getattr(self, "_995c_agree", 0),
-                            getattr(self, "_995c_disagree", 0),
-                            getattr(self, "_995c_skip", 0),
-                            getattr(self, "_995c_skip_why", "-"),
-                        )
                 except Exception:  # noqa: BLE001 - a probe may never break a recv
                     pass
                 return _proxy
