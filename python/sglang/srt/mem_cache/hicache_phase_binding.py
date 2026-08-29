@@ -487,6 +487,122 @@ def settle_pending_releases(scheduler: Any) -> int:
     return settled
 
 
+def _quiesce_storage_io(cc: Any) -> bool:
+    """#1025: STOP THE STORAGE IO THREADS ACROSS THE POOL SWAP.
+
+    THE SAME LAW AS ``settle_pending_releases``, ONE QUEUE OVER. W35 settled
+    the RELEASE queue before the swap because "every queued release belongs to
+    the binding still installed at this instant". The prefetch TRANSFER queue
+    has exactly that property and was never settled: ``prefetch_io_aux_func``
+    pulls an operation out of ``prefetch_buffer`` and runs ``_page_transfer``
+    on it, and that operation names host indices and a page geometry minted
+    under the binding that was installed when it was OPENED. The swap moves
+    the pools underneath it mid-transfer.
+
+    MEASURED, on every recent no-grid boot of this strand (2026-08-29), and
+    invisible to twenty sections of analysis because it lands on a WORKER
+    THREAD's stderr rather than in a counted marker:
+
+        boot 3e06c24514  2 thread deaths   boot be4647950f  7
+        boot 73b66f4a4a  8                 boot de3857b1f4  6
+        boot 3f6c1b0799  5                 boot 0922e207ec  0
+
+    in two flavours, both at a cutover second, both the same root:
+      * ``StrayHostIndexError: HICACHE-INDEX REFUSED (#718 class, index axis):
+        set_from_flat_data_page ... handed index range [42315, 42315] outside
+        [0, 30518)`` -- indices minted against the wider outgoing host tier.
+      * ``RuntimeError: shape '[2, 16, 1, 4, 256]' is invalid for input of
+        size 8192`` -- a page shaped for the outgoing layer count reshaped
+        under the incoming one.
+
+    AND THE DEATH IS PERMANENT AND RANK-LOCAL, which is what makes it a root
+    rather than noise. ``prefetch_io_aux_func`` catches ``Empty`` and nothing
+    else, so the first stale operation kills the thread for the life of the
+    process: from that instant this rank completes NO prefetch, every
+    read-through misses, and its prefix match diverges from the peers that
+    still have a live pipeline -- the shape ``raenge-nie-uneins-crash-stop``
+    forbids, arriving through a queue instead of through a verdict.
+
+    WHY QUIESCE RATHER THAN ROUTE. The release side was fixed by stamping the
+    generation onto the operation and routing the free to the pool that
+    generation names (``host_pool_for_generation``). Doing the same for
+    transfers would need a THIRD consumer taught to read a stamp -- second
+    bookkeeping beside the pool binding, which is the defect class this
+    campaign is deleting. The user's own cutover law says the opposite and is
+    simpler: at the flip everything is nulled and re-entered
+    (``cutover-full-reset-reentry``). An operation that cannot be in flight
+    while the geometry moves needs no stamp at all.
+
+    NO NEW MECHANISM: ``_stop_storage_threads`` / ``_start_storage_threads``
+    already exist for exactly this (runtime detach/attach), and the stop half
+    already joins ``prefetch_io_aux_thread`` -- the half ``reset()`` hand-rolls
+    and omits. This uses them and adds nothing.
+
+    Returns True only when the caller MUST resume. A stop that did not
+    complete returns False deliberately: threads are still alive on the old
+    buffer, and starting a second set on top of them would double the very
+    hazard being removed. That state is logged loudly and left as the honest
+    pre-#1025 behaviour.
+    """
+    if cc is None or not getattr(cc, "enable_storage", False):
+        return False
+    stop = getattr(cc, "_stop_storage_threads", None)
+    if stop is None or getattr(cc, "_start_storage_threads", None) is None:
+        return False
+    try:
+        stop()
+    except Exception as exc:  # noqa: BLE001 - a refused quiesce is reported, not raised
+        logger.error(
+            "%s #1025 STORAGE IO NOT QUIESCED for the cutover (%s). The "
+            "prefetch transfer thread is still alive on the OUTGOING binding "
+            "while the pools swap, which is the state that kills it with a "
+            "StrayHostIndexError or a page-shape RuntimeError and leaves this "
+            "rank with no prefetch pipeline at all. Not restarted here: a "
+            "second set of threads on the same buffer would double the "
+            "hazard.",
+            LOG_PREFIX,
+            exc,
+        )
+        return False
+    return True
+
+
+def _resume_storage_io(cc: Any, quiesced: bool) -> None:
+    """#1025: bring the storage IO pipeline back on the INCOMING binding.
+
+    Always paired with ``_quiesce_storage_io`` through a ``finally``, because
+    the one outcome worse than a stale transfer is a rank that silently stops
+    prefetching for the rest of the boot -- which is precisely the state the
+    thread deaths produced, and precisely what nobody counted.
+
+    Restarting also RESURRECTS a pipeline an earlier stale operation already
+    killed: ``_start_storage_threads`` builds fresh threads and fresh queues,
+    so a rank that lost its aux thread at cutover N is whole again at cutover
+    N+1 instead of staying blind for the rest of the process.
+    """
+    if not quiesced:
+        return
+    try:
+        cc.storage_stop_event.clear()
+        cc._start_storage_threads()
+        logger.info(
+            "%s #1025 storage IO resumed on the incoming binding: fresh "
+            "prefetch/backup threads and queues, nothing in flight from the "
+            "outgoing one.",
+            LOG_PREFIX,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "%s #1025 STORAGE IO DID NOT RESUME after the cutover (%s). This "
+            "rank now completes NO prefetch for the rest of the process: "
+            "every read-through misses, every re-admitted prefix is "
+            "recomputed in full, and its match diverges from the peers whose "
+            "pipeline is alive.",
+            LOG_PREFIX,
+            exc,
+        )
+
+
 def rebind_for_cutover(scheduler: Any, incoming_phase: str) -> Optional[int]:
     """Flag-gated rebind at the cutover. Returns the generation, or None.
 
@@ -501,6 +617,25 @@ def rebind_for_cutover(scheduler: Any, incoming_phase: str) -> Optional[int]:
         return None
     readers = readers_of(scheduler)
     incoming = phase_pools_for(scheduler, incoming_phase)
+    # #1025: NOTHING MAY BE IN FLIGHT WHILE THE POOLS MOVE. The stop joins the
+    # prefetch transfer thread; the resume in the `finally` below rebuilds the
+    # pipeline on the incoming binding whatever happens in between. See
+    # `_quiesce_storage_io` for the measurement and for why this is a quiesce
+    # rather than a third generation-routing scheme.
+    _cc = readers.get("cache_controller")
+    _quiesced = _quiesce_storage_io(_cc)
+    try:
+        return _rebind_for_cutover_inner(
+            scheduler, incoming_phase, readers, incoming
+        )
+    finally:
+        _resume_storage_io(_cc, _quiesced)
+
+
+def _rebind_for_cutover_inner(
+    scheduler: Any, incoming_phase: str, readers: Any, incoming: Any
+) -> Optional[int]:
+    """The rebind proper, bracketed by the #1025 storage-IO quiesce."""
     # W35: settle BEFORE the swap. Every queued release belongs to the binding
     # still installed at this instant; after `rebind` it would be freed against
     # a pool that never allocated it.

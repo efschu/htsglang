@@ -1446,7 +1446,16 @@ class Req(ReqDllmMixin):
                         # that started the lap. The question this answers:
                         # WHO runs the extra lap the peers do not, and out of
                         # which site does that lap originate.
-                        "#969AC lap=%s site=%s from_fwd=%s stamped_rank=%s",
+                        # #969AF: the field is a STICKY LABEL on the Req, not
+                        # an event. It says how this request was LAST put on
+                        # the queue and is re-printed on every consult, so
+                        # COUNTING THESE LINES IS NOT A SITE CENSUS -- §AD and
+                        # §AE both read it as one and drew a 36/24/24 and a
+                        # 24/6/6 "retraction asymmetry" out of a print count.
+                        # The retraction census is `#969AD RETRACT`, which is
+                        # one line per actual retraction (12/12/12, symmetric).
+                        "#969AC lap=%s last_queued_as=%s from_fwd=%s "
+                        "stamped_rank=%s",
                         _n,
                         _rid[:8],
                         0 if self.prefix_indices is None else len(self.prefix_indices),
