@@ -2655,8 +2655,36 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
     if kv_drifted or mamba_drifted:
         _SEAM_STATE_COUNTS["refused_layout"] += 1
         n = _SEAM_STATE_COUNTS["refused_layout"]
+        # #941: THE EXTENT IS PRINTED HERE BECAUSE IT IS THE ONE NUMBER THAT
+        # CAN REOPEN #875's DO-NOT-BUILD, AND NOTHING EMITS IT ON THIS PATH.
+        # `ec1717491f` refused the PP->TP completion (an all-to-all in the
+        # cutover's no-return region) on an explicitly FALSIFIABLE ground: it
+        # priced the collective against a 13-row specimen and said so --
+        # "payload is linear in extent while the collective is latency-
+        # dominated, so a break-even exists somewhere in the hundreds-to-
+        # thousands of tokens. What would settle it is the DISTRIBUTION of
+        # `extent` over requests actually retracted at a flip. I do not have it
+        # and am not entitled to infer it."
+        #
+        # That distribution was not harvestable: this line named the missing
+        # LAYERS (via `carry_refusal`) but never the ROWS, and the extent-
+        # mismatch refusal above -- the only other emitter of `covered` on a
+        # refusal -- by construction never fires for a request that reaches
+        # here. So the gate that governs whether the carry may ever be built
+        # could not be measured from a boot log, only re-argued from the same
+        # single specimen. One value per refusal closes that: 57 refusals is 57
+        # samples, and `#941 extent=` greps the distribution straight out.
+        #
+        # AN INSTRUMENT, NOT A GATE. Nothing below reads it and no behaviour
+        # depends on it; the refusal is unchanged in every branch. The payload
+        # this prices is (missing_layers x extent x row_bytes) -- `carry_refusal`
+        # already carries the layer count, this supplies the extent, and the
+        # row width is a property of the checkpoint. The DO-NOT-BUILD stands
+        # until that product is measured against the #656 PHB numbers; this
+        # only makes measuring it possible without a new boot instrument.
         logger.warning(
-            "%s SEAM RESTORE REFUSED (LAYOUT) rid=%s: the copy was taken from "
+            "%s SEAM RESTORE REFUSED (LAYOUT) rid=%s #941 extent=%s row(s): the "
+            "copy was taken from "
             "%s and this pool is %s (mamba: %s -> %s). Applying it would index "
             "past the saved per-layer list (the W40 IndexError) or write the "
             "copy's layers into the wrong global layers -- a wrong answer with "
@@ -2664,6 +2692,7 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
             "these tokens are recomputed. occurrence=%d",
             SEAM_STATE_PREFIX,
             getattr(req, "rid", None),
+            covered,
             saved_layout,
             live_layout,
             saved_mamba_layout,
