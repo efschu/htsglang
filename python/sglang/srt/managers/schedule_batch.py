@@ -3203,7 +3203,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         try:
             for _r in reqs[:4]:
                 _er = getattr(_r, "extend_range", None)
-                _pl = len(getattr(_r, "prefix_indices", ()) or ())
+                # #796 AGAIN, AND THIS TIME I WROTE IT. `prefix_indices` is a
+                # TENSOR; `x or ()` asks `bool(x)`, which torch refuses for a
+                # multi-element tensor. scheduler.py:8300 documents this exact
+                # idiom costing every admitting pass its trace line -- "the
+                # docstring above already said len() is the right spelling;
+                # the `or []` slipped in anyway" -- and I read that comment in
+                # this same session before reproducing the bug. len() with an
+                # explicit None test is the only correct spelling here.
+                _pi = getattr(_r, "prefix_indices", None)
+                _pl = 0 if _pi is None else len(_pi)
                 if _er is None:
                     _rec = (-1, -1, _pl, -1, -1)
                 else:
