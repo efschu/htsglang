@@ -8946,6 +8946,27 @@ class SchedulerPPMixin:
                 # `model_runner.forward` measures. Same object, not a parallel
                 # computation of the same idea -- the distinction that made
                 # #994's truncation dangerous.
+                # #995d THREE NUMBERS, NOT ONE -- AND THE DENOMINATOR IS
+                # EMITTED WHETHER OR NOT THE EVENT HAPPENS.
+                #
+                # The first version of this probe counted agreements only
+                # INSIDE the disagreement line. Boot 27 then reported zero
+                # disagreements while `#631` fired on the very pass it was
+                # built to see -- and with no denominator printed, that zero
+                # could not be told apart from "the probe never evaluated"
+                # (`_local` is -1 whenever `self.mbs[mb_id]` is None or its
+                # `input_ids` is not yet set, which is reachable here). A
+                # counter visible only on the error path cannot separate
+                # ABSENCE from NON-EXECUTION.
+                #
+                # That is the same class this window caught four times in
+                # other people's instruments on the same evening -- and it was
+                # built into this fresh one anyway. Vigilance does not defend
+                # against it; a structural rule does. Hence: agreements,
+                # disagreements and SKIPS are three separate counters, and the
+                # census below prints all three on a fixed cadence, so the
+                # log always states the denominator and the skip count even
+                # when nothing is wrong.
                 try:
                     _srows = (
                         int(stamp[2])
@@ -8959,38 +8980,61 @@ class SchedulerPPMixin:
                     )
                     _ii = getattr(_cb, "input_ids", None) if _cb is not None else None
                     _local = int(_ii.shape[0]) if _ii is not None else -1
-                    if _srows >= 0 and _local >= 0:
-                        if _srows == _local:
-                            self._995c_agree = getattr(self, "_995c_agree", 0) + 1
-                        else:
-                            self._995c_disagree = (
-                                getattr(self, "_995c_disagree", 0) + 1
+                    if _srows < 0 or _local < 0:
+                        # THE THIRD NUMBER. Not "nothing happened" -- a named
+                        # reason the comparison could not be made, so a quiet
+                        # log is a measured quiet and not an unread one.
+                        self._995c_skip = getattr(self, "_995c_skip", 0) + 1
+                        self._995c_skip_why = (
+                            "no_stamp_rows" if _srows < 0 else "no_local_input_ids"
+                        )
+                    elif _srows == _local:
+                        self._995c_agree = getattr(self, "_995c_agree", 0) + 1
+                    else:
+                        self._995c_disagree = getattr(self, "_995c_disagree", 0) + 1
+                        _n = self._995c_disagree
+                        if _n <= 8 or _n % 256 == 0:
+                            logger.warning(
+                                "#995c PROXY WIDTH DISAGREES AT RECV "
+                                "occurrence=%d: sender stamp says %d row(s) "
+                                "(mb_id=%s seq=%s epoch=%s), this rank's "
+                                "batch for slot %d holds %d token(s). "
+                                "NOT REFUSED -- this pass still runs and the "
+                                "downstream width check in "
+                                "model_runner.forward remains the only gate. "
+                                "An armed check here is safe only once this "
+                                "line fires ONLY on genuine leftovers; a hit "
+                                "on a VALID message means the local width is "
+                                "not the downstream width and arming would "
+                                "kill good passes.",
+                                _n,
+                                _srows,
+                                stamp[0],
+                                stamp[1],
+                                stamp[3] if len(stamp) >= 4 else "?",
+                                mb_id,
+                                _local,
                             )
-                            _n = self._995c_disagree
-                            if _n <= 8 or _n % 256 == 0:
-                                logger.warning(
-                                    "#995c PROXY WIDTH DISAGREES AT RECV "
-                                    "occurrence=%d: sender stamp says %d row(s) "
-                                    "(mb_id=%s seq=%s epoch=%s), this rank's "
-                                    "batch for slot %d holds %d token(s). "
-                                    "NOT REFUSED -- this pass still runs and "
-                                    "the downstream width check in "
-                                    "model_runner.forward remains the only "
-                                    "gate. Agreements so far: %d. An armed "
-                                    "check here is safe only once this line "
-                                    "fires ONLY on genuine leftovers; a hit "
-                                    "on a VALID message means the local width "
-                                    "is not the downstream width and arming "
-                                    "would kill good passes.",
-                                    _n,
-                                    _srows,
-                                    stamp[0],
-                                    stamp[1],
-                                    stamp[3] if len(stamp) >= 4 else "?",
-                                    mb_id,
-                                    _local,
-                                    getattr(self, "_995c_agree", 0),
-                                )
+                    # THE CENSUS, EMITTED ON A CADENCE AND NOT ON AN EVENT.
+                    # This is the line whose absence made boot 27 unreadable.
+                    # It prints all three numbers every N receives whatever
+                    # they are, so "no disagreements" always arrives with its
+                    # denominator and its skip count beside it, and a silent
+                    # probe is distinguishable from a clean one.
+                    self._995c_seen = getattr(self, "_995c_seen", 0) + 1
+                    if self._995c_seen % 50 == 0:
+                        logger.info(
+                            "#995c WIDTH-AGREEMENT CENSUS: evaluated=%d "
+                            "agree=%d disagree=%d skipped=%d (last skip "
+                            "reason: %s). A zero in `disagree` counts ONLY if "
+                            "`evaluated` is non-zero -- that is the whole "
+                            "point of printing three numbers instead of one.",
+                            self._995c_seen,
+                            getattr(self, "_995c_agree", 0),
+                            getattr(self, "_995c_disagree", 0),
+                            getattr(self, "_995c_skip", 0),
+                            getattr(self, "_995c_skip_why", "-"),
+                        )
                 except Exception:  # noqa: BLE001 - a probe may never break a recv
                     pass
                 return _proxy
