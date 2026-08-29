@@ -593,10 +593,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         are gated on this predicate. Stock even-TP HiCache (uniform host pools)
         never trips it -> that path is byte-identical. Uses the same attn/TP
         groups the existing prefetch collectives run on."""
+        #1027 GATE 1 OF THE CLASS: THE QUESTION IS "IS THERE A PEER THAT MUST
+        # AGREE", NOT "IS THERE A TP AXIS".
+        #
+        # `tp_world_size > 1` switched this entire family off under
+        # `--tp-size 1 --pp-size 3`, so the two symmetrization mechanisms this
+        # predicate gates -- participation consensus and the capacity floor --
+        # never ran, registration was never made symmetric, and the deadlock
+        # the docstring above describes stayed live on the PP axis. It is the
+        # same wrong-axis defect as #1026's completion agreement, one layer up,
+        # and it is why #1026 alone produced `#789 PROXY READINESS TIMEOUT`
+        # (§AG4): the value sync spanned PP before the ENTRY did.
+        #
+        # ORDER IS LOAD-BEARING and is the reason both live in one commit:
+        # entry symmetry (here) must hold before the completion agreement
+        # (#1026) spans, or a rank that never registered leaves its peer
+        # waiting on a sync that is never posted.
+        peers_must_agree = self.tp_world_size > 1 or (
+            self.pp_size > 1 and self.pp_group is not None
+        )
         return (
             getattr(self, "enable_storage", False)
             and self.cache_controller is not None
-            and self.tp_world_size > 1
+            and peers_must_agree
             and uneven_dcp_active()
         )
 
@@ -2964,7 +2983,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             vote = torch.tensor(
                 [_PREFETCH_VOTE_TAG, -_PREFETCH_VOTE_TAG, local_ok], dtype=torch.int
             )
-            self._all_reduce_attn_groups(
+            # #1027: PP0 DECIDES PARTICIPATION, THE FOLLOWERS EXECUTE IT.
+            #
+            # `_all_reduce` is the TP reduce on PP0 followed by `_pp_sync`, so
+            # across the PP axis this is not an AND-vote but the follower rule
+            # the user set: "alles folgt rang0 ... ein Einigungsprotokoll
+            # existiert dort gar nicht, weil ausser Rang 0 niemand je
+            # entscheidet". A one-directional ring cannot compute an AND at
+            # PP0 anyway, and building the return leg would be the new
+            # collective this path may not have (recorded fatal).
+            #
+            # THE CONSEQUENCE IS DELIBERATE: a follower whose own allocation
+            # failed no longer holds a private veto. It is told to participate
+            # and must, and if it provably cannot it raises by name below --
+            # the crash/stop backstop of `raenge-nie-uneins-crash-stop`, never
+            # a local opt-out. A rank that silently skipped is exactly the
+            # divergence that cost this campaign twenty boots; a named death
+            # is bounded and readable, a silent skip is neither.
+            self._all_reduce(
                 vote,
                 torch.distributed.ReduceOp.MIN,
                 label="prefetch_participation_vote",
@@ -2988,7 +3024,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if anchor_lock_params is not None:
                     self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 return
-            # Positive consensus: every rank allocated -> all fall through to register.
+            # Positive consensus: PP0 says participate -> all fall through to
+            # register. #1027: a follower that was TOLD to participate and
+            # cannot is the crash/stop backstop, not a silent skip -- the one
+            # legal reaction to detected rank divergence.
+            if alloc_failed or host_indices is None:
+                raise HiCacheCollectiveDesyncError(
+                    "#1027 PREFETCH PARTICIPATION UNHONOURABLE on this rank: "
+                    "the decider admitted this prefetch for the group and this "
+                    "rank could not allocate its host span "
+                    f"(alloc_failed={alloc_failed}, host_indices="
+                    f"{'None' if host_indices is None else 'present'}). "
+                    "Skipping locally would leave this rank out of every "
+                    "downstream prefetch collective and give it a different "
+                    "admission prefix from its peers, which is the divergence "
+                    "this path exists to make impossible. Stopping instead."
+                )
         elif alloc_failed:
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices,
