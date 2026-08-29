@@ -9035,9 +9035,26 @@ class Scheduler(
         # SECOND emission next to it and flipped the death form, which is the
         # same class again: the event perturbs, the bytes do not.
         try:
-            self._996_budget = int(adder.rem_total_tokens)
+            _tot = int(adder.rem_total_tokens)
+            _chunk = adder.rem_chunk_tokens
+            self._996_budget = _tot
+            # WHICH TERM BINDS, not just the number. `_rem_tokens` is
+            # min(rem_chunk_tokens, rem_total_tokens); two ranks printing the
+            # same value from DIFFERENT terms would be a coincidence, and two
+            # different values from the SAME term a different story. Naming
+            # the binding term is what keeps the next reading out of the
+            # numbers-fit trap this window produced four times.
+            if _chunk is None:
+                self._996_bind = f"total({_tot})"
+            else:
+                self._996_bind = (
+                    f"chunk({int(_chunk)})"
+                    if int(_chunk) <= _tot
+                    else f"total({_tot})"
+                )
         except Exception:  # noqa: BLE001 - a probe may never break admission
             self._996_budget = "err"
+            self._996_bind = "err"
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()

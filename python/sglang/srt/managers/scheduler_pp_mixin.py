@@ -2308,22 +2308,12 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
                     "#995e WIDTH-AGREEMENT CENSUS (emitted off the measured "
                     "path): evaluated=%d agree=%d disagree=%d skipped=%d "
                     "(last skip reason: %s). A zero in `disagree` counts ONLY "
-                    "if `evaluated` is non-zero. #996 group_floor=%s "
-                    "rank_budget=%s -- a floor of None means the #681 ceiling "
-                    "is NOT applied, so rank_budget is what caps extend_len on "
-                    "THIS rank alone; two ranks printing different "
-                    "rank_budget for the same pass is the divergence itself, "
-                    "read rather than inferred. 'unset' is a DISTINCT "
-                    "sentinel, never a legitimate return -- if it appears, "
-                    "the value was never captured (no traffic yet), which is "
-                    "not the same as a floor of None.",
+                    "if `evaluated` is non-zero.",
                     _seen,
                     getattr(holder, "_995c_agree", 0),
                     getattr(holder, "_995c_disagree", 0),
                     getattr(holder, "_995c_skip", 0),
                     getattr(holder, "_995c_skip_why", "-"),
-                    getattr(holder, "_996_floor", "unset"),
-                    getattr(holder, "_996_budget", "unset"),
                 )
                 _sk = getattr(holder, "_995c_skip_ids", None)
                 if _sk:
@@ -2347,11 +2337,21 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
             pass
         runs = list(hist)
         logger.warning(
+            "#996 group_floor=%s rank_budget=%s bound_by=%s. A floor of "
+            "None means the #681 ceiling is NOT applied, so rank_budget caps "
+            "extend_len on THIS rank alone; `bound_by` names WHICH term is "
+            "the binding one, because two equal numbers from different terms "
+            "are a coincidence and two different numbers from the same term "
+            "are a different story. 'unset' is a DISTINCT sentinel and never "
+            "a legitimate value -- it means never captured, not None. "
             "#947 VOID-RING CENSUS: %d admission-path entries so far; void "
             "runs between them (most recent last, up to 20): %s; max=%s "
             "mean=%.1f; sites reached this boot: %s. A site absent from that "
             "map does NOT run under this failure and no actuator may be "
             "placed on it.",
+            getattr(holder, "_996_floor", "unset"),
+            getattr(holder, "_996_budget", "unset"),
+            getattr(holder, "_996_bind", "unset"),
             holder._pp_ring_admissions,
             runs[-20:],
             max(runs) if runs else 0,
