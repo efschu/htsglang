@@ -80,11 +80,12 @@ class SchedulerRequestReceiver:
     # must not take on new work and must not block on the chain -- see
     # _pull_raw_reqs.
     phase_flip_armed_hook: Optional[Callable[[], bool]] = None
-    # #631 G: one turn of the ARMED SERVICE LOOP -- consume every inbound
-    # message the upstream's counter accounts for, then reap the sends the
-    # downstream's counter proves consumed. Replaces the poll-based drain,
-    # which absorbed nothing (corpse F).
-    phase_flip_service_hook: Optional[Callable[[], None]] = None
+    # #969 §W3: returns PP0's pending flip decision exactly once, or None.
+    # Called only on the request ORIGIN, right beside the policy arm hook, so
+    # the decision travels on the same stream the arm does -- the chain
+    # forward in the PP phase, the TP broadcast in the TP phase. No new arc,
+    # no new collective (which is recorded fatal on this path).
+    phase_flip_decision_hook: Optional[Callable[[], Any]] = None
     # #824 W5(b): called as on_blocked_recv(arm, since) around the DIRECT
     # chain receive below, and with (None, None) when it returns. Without
     # it that call is a blocking PP receive that records nothing, so the
@@ -187,6 +188,21 @@ class SchedulerRequestReceiver:
             if policy_req is not None:
                 recv_reqs.append(policy_req)
 
+        # #969 §W3: PP0's flip decision rides the SAME stream as the arm, one
+        # position behind it, on the same origin test. In the PP phase this
+        # list is chain-forwarded to every stage; in the TP phase the cutover
+        # has rewritten `ps` to tp_size=n and the broadcast below carries it.
+        # Appended AFTER the arm so a decision can never overtake the arm it
+        # belongs to on the wire.
+        if (
+            is_request_origin
+            and recv_reqs is not None
+            and self.phase_flip_decision_hook is not None
+        ):
+            decision = self.phase_flip_decision_hook()
+            if decision is not None:
+                recv_reqs.append(decision)
+
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
@@ -239,10 +255,29 @@ class SchedulerRequestReceiver:
         # Both halves return an EMPTY list rather than None: empty means
         # "no new work this pass", which every downstream step already
         # handles, whereas None means "not the intake rank".
-        if self._phase_flip_armed():
+        # #969 §W3: THE ARMED INTAKE RULE, REDUCED TO ITS ONE REAL TERM.
+        #
+        # Only the ZMQ INTAKE is suspended while armed, and only on the rank
+        # that has one: not reading the socket is what buffers new work, and
+        # there is no queue to manage and nothing to lose. Everything else
+        # about the pass is unchanged -- ranks below PP0 take their ordinary
+        # chain receive, and every non-last rank forwards, because THAT ARC IS
+        # WHAT CARRIES PP0's DECISION (io_struct.PhaseFlipDecision).
+        #
+        # WHAT WAS HERE BEFORE, and why it went: an armed rank returned []
+        # WITHOUT receiving, and ran a "service turn" instead. That closed the
+        # request chain for the whole armed window, which is exactly why the
+        # flip then needed a presence channel, a quorum spin and two drains to
+        # find out what its peers were doing -- a private protocol invented to
+        # replace the arc the same code had just switched off. With the arc
+        # left running there is nothing to reinvent: PP0 forwards its decision
+        # and the ranks below execute it (#969 §W3, follower semantics).
+        #
+        # In the TP phase `ps.pp_size` is 1 on every rank, so this branch is
+        # taken by all of them: rank 0 buffers its socket and the others fall
+        # through to `recv_reqs = None` and are served by the TP broadcast.
+        if self._phase_flip_armed() and self.ps.pp_rank == 0:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                if self.phase_flip_service_hook is not None:
-                    self.phase_flip_service_hook()
                 return []
             return None
 

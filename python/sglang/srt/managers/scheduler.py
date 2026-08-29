@@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     KvReshardReqInput,
     KvReshardReqOutput,
+    PhaseFlipDecision,
     PhaseFlipReqInput,
     PhaseFlipReqOutput,
     SessionHandoverReqInput,
@@ -2857,6 +2858,15 @@ class Scheduler(
         # managers/wedge_recovery.py for why the actuator must not run on the
         # watchdog thread (it silenced PP0's detector on 2026-08-22).
         drain_recovery_request(self)
+        # #969 §W3: take PP0's flip decision off the stream before anything
+        # else looks at the list. THIS site is the one place every loop family
+        # reaches once per iteration -- which is exactly the property the
+        # comment above claims for the recovery drain -- so the follower half
+        # of the cut needs no second hook per loop. Applied only below PP0:
+        # rank 0 built the decision and must not be handed a relayed copy of
+        # its own.
+        if recv_reqs:
+            self._apply_phase_flip_decisions(recv_reqs)
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
@@ -3187,11 +3197,12 @@ class Scheduler(
             phase_flip_armed_hook=(
                 self.phase_flip_is_armed if self.server_args.enable_phase_flip else None
             ),
-            # #631 G: one service turn -- consume every inbound message
-            # the upstream's counter accounts for, then reap this rank's
-            # own sends that the downstream's counter proves consumed.
-            phase_flip_service_hook=(
-                self.pp_flip_service if self.server_args.enable_phase_flip else None
+            # #969 §W3: PP0's flip decision, taken exactly once per decision
+            # and put on the request stream beside the arm.
+            phase_flip_decision_hook=(
+                self._take_phase_flip_decision
+                if self.server_args.enable_phase_flip
+                else None
             ),
             # #824 W5(b): mark the DIRECT chain receive too. That branch
             # runs on every boot without the flip, and it was the last
@@ -6946,6 +6957,46 @@ class Scheduler(
                 "decode-mem decision escaped that ordering."
             )
         return int(self.token_to_kv_pool_allocator.available_size())
+
+    def _take_phase_flip_decision(self):
+        """#969 §W3: PP0's pending flip decision, for the request stream.
+
+        Returns it exactly ONCE (the runtime marks it taken), which is what
+        lets the decider know the followers have been told and that it may
+        execute on its next round. Never builds the runtime: a decision can
+        only exist once a flip is armed, and arming builds it.
+        """
+        rt = self.phase_flip_runtime
+        if rt is None:
+            return None
+        return rt.take_flip_decision()
+
+    def _apply_phase_flip_decisions(self, recv_reqs: List) -> None:
+        """#969 §W3: strip PP0's decision off the stream and hand it over.
+
+        Stripped IN PLACE on every rank -- `process_input_requests` below must
+        never meet a control object it does not know -- and applied only below
+        PP0 (`apply_flip_decision` no-ops on rank 0, so the rule lives in one
+        place rather than being restated at each call site).
+        """
+        if not any(isinstance(r, PhaseFlipDecision) for r in recv_reqs):
+            return
+        told = [r for r in recv_reqs if isinstance(r, PhaseFlipDecision)]
+        recv_reqs[:] = [r for r in recv_reqs if not isinstance(r, PhaseFlipDecision)]
+        rt = self.phase_flip_runtime
+        if rt is None:
+            # A decision for a rank whose runtime does not exist cannot be
+            # executed, and inventing a local answer is the thing this cut
+            # removes. The runtime is built on the first round of every
+            # flip-enabled rank, so this is unreachable in a live group.
+            raise RuntimeError(
+                f"#969 rank was handed PP0's flip decision {told[-1]!r} with "
+                f"no phase-flip runtime built. A follower that cannot execute "
+                f"its order must stop, not improvise."
+            )
+        # LAST WINS, deliberately: the stream is ordered and a later decision
+        # supersedes an earlier one for the same reason a later arm does.
+        rt.apply_flip_decision(told[-1])
 
     def _phase_flip_on_round(self, require_armed_and_parked: bool = False):
         """One phase-flip runtime round (#631): lazy-build, bounded

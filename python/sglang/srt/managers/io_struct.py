@@ -1481,6 +1481,57 @@ class PhaseFlipReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class PhaseFlipDecision:
+    """#969 §W3: PP0's flip verdict, told to the ranks below it.
+
+    FOLLOWER SEMANTICS, exactly the TP3 model the user named ("alles folgt
+    rang0, so wie bei tp3 ja auch"). Rank 0 decides proceed/abort; every
+    other rank EXECUTES what it is handed and forms no opinion. There is no
+    consensus, no vote, no reduction of per-rank readiness -- disagreement is
+    excluded by construction because nobody except rank 0 ever decides.
+
+    IT RIDES THE REQUEST STREAM, which is the arc that already exists in BOTH
+    loop families and needs no new collective (a new collective on this path
+    is recorded fatal):
+      * PP phase   -- appended on the request origin (rank 0) and carried by
+        the per-pass chain forward `_pp_send_pyobj_to_next_stage(recv_reqs)`,
+        the same arc a `PhaseFlipReqInput` arm already travels on.
+      * TP phase   -- the cutover rewrites `scheduler.ps` to tp_size=n
+        (phase_flip_runtime.py, step 3), so the SAME list is broadcast from
+        rank 0 over the flip TP group in `_broadcast_reqs_across_ranks`.
+    One append site, one strip site, two phases.
+
+    THE NON-VERDICT FIELDS ARE A CHECKSUM, NOT A NEGOTIATION. `epoch`,
+    `dir_id`, `config_fp` and `vector` are rank 0's, and a follower that finds
+    its own differing has detected the one thing that may never happen
+    (memory `raenge-nie-uneins-crash-stop`): it raises, group-fatally, rather
+    than repairing locally or continuing. `tree_digest` is carried for the
+    #825 divergence COUNTER only -- PP-phase tree divergence is a designed,
+    measured consequence of per-rank admission in PP and is not a decision
+    disagreement, so it counts and never kills (see on_round).
+    """
+
+    __slots__ = ("verdict", "epoch", "dir_id", "config_fp", "vector", "tree_digest")
+
+    PROCEED = "proceed"
+    ABORT = "abort"
+
+    def __init__(self, *, verdict, epoch, dir_id, config_fp, vector, tree_digest):
+        self.verdict = str(verdict)
+        self.epoch = int(epoch)
+        self.dir_id = int(dir_id)
+        self.config_fp = int(config_fp)
+        self.vector = tuple(int(v) for v in vector)
+        self.tree_digest = int(tree_digest)
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return (
+            f"PhaseFlipDecision(verdict={self.verdict!r}, epoch={self.epoch}, "
+            f"dir_id={self.dir_id}, config_fp={self.config_fp}, "
+            f"vector={self.vector}, tree_digest={self.tree_digest})"
+        )
+
+
 class SessionHandoverReqInput(BaseReq, kw_only=True):
     """#261: live session handover without server stop.
 

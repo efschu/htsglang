@@ -5168,74 +5168,62 @@ class SchedulerPPMixin:
         )
 
         if not self.pp_group.is_last_rank:
-            if self.pp_phase_flip_armed():
-                # #631 THE BOOT-18 FIX, downstream half. This commit is
-                # the ORDINARY top-of-pass flush of the previous pass's
-                # forward, and it is where rank 1 was found blocked while
-                # rank 0 sat in the consensus reduction. It blocks
-                # whenever the downstream stage has stopped consuming --
-                # which is exactly what that stage does once IT is armed
-                # and waiting at the gate. Because this point PRECEDES
-                # the gate, no gate could ever have covered it.
-                #
-                # An armed rank issues no new forward -- it is admitting no
-                # new work, so it has nothing to forward -- and reaps the
-                # outstanding one through the SERVICE TURN instead: consume
-                # whatever the upstream posted, then flush this rank's own
-                # send once the downstream's counter proves it is consumed.
-                #
-                # This line used to call pp_pump_send_req_work, which
-                # reaped NOTHING on this build (corpse F): is_completed()
-                # never fires for an isend here, so send_req_work stayed
-                # non-empty, presence was withheld for ever, and every flip
-                # abandoned at the presence deadline. The service turn is
-                # the same intent with a predicate the transport can
-                # actually honour. Presence is still withheld until the
-                # handle is reaped, so the flag still means "my chain is
-                # flushed" (clause (i), PhaseFlipRuntime) -- it is now a
-                # condition that can be REACHED.
-                self.pp_flip_service()
-            else:
-                # #788: THIS LINE IS UNCHANGED, AND THAT IS THE POINT.
-                #
-                # The wedge was this commit blocking BEFORE the rank had
-                # posted anything else it owed its peers for the iteration:
-                # the proxy tensor-dict send and the output-ring send both
-                # come later in _event_loop_pp_body, so a downstream whose
-                # progress needs one of them was waiting on a rank that was
-                # itself waiting on that downstream. Specimen WEDGE_788: two
-                # ranks parked in this exact commit while the last rank
-                # waited on a proxy neither had sent yet.
-                #
-                # The fix is NOT to move this call. It is to make it a
-                # no-op in the loop where the hazard lives, by flushing the
-                # handle at the END of the iteration instead -- see
-                # _pp_commit_pending_req_work and its call site in
-                # _event_loop_pp_body. By the time that loop returns here,
-                # send_req_work has already been waited on and cleared, so
-                # this commit finds an empty list.
-                #
-                # Leaving the call in place is what keeps the other two
-                # callers -- event_loop_pp_disagg_prefill (:618) and
-                # event_loop_pp_disagg_decode (:765), neither of which runs
-                # the end-of-iteration commit -- on exactly their previous
-                # behaviour, and it is what keeps the #633 ordering contract
-                # this function's docstring documents literally intact:
-                # commit, then forward, then process, with send_req_work
-                # holding THIS pass's handle on return. Staging the send
-                # into a second slot instead broke that contract and the
-                # test that pins it (test_scheduler_pp_request_order_633).
-                #
-                # #753's a7ff250dc8 made the same "flush after the exchange,
-                # not before it" move for the OUTPUT channel. This is that
-                # fix for the REQUEST-CHAIN channel, and it is not gated to
-                # the gapped layout: the hazard is not gapped-specific.
-                self._pp_commit_comm_work(self.send_req_work)
-                with torch.profiler.record_function("send_reqs_to_next_stage"):
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs,
-                        async_send=True,
-                    )
+            # #969 §W3: THE FORWARD IS UNCONDITIONAL AGAIN, ARMED OR NOT.
+            #
+            # The armed branch that used to sit here (`pp_flip_service()`
+            # instead of a forward) is deleted. Its premise -- "an armed rank
+            # issues no new forward, it is admitting no new work, so it has
+            # nothing to forward" -- stopped being true the moment PP0's flip
+            # decision started riding this arc: while armed it is the ONLY
+            # thing on the wire, and it is the one message the group cannot
+            # do without.
+            #
+            # Its hazard goes with it. The blocking commit below was dangerous
+            # only because the DOWNSTREAM stopped consuming (it was armed and
+            # spinning at the presence gate); with the gate deleted no rank
+            # ever stops consuming, so this is an ordinary flush of the
+            # previous pass's forward against a peer that is cycling. That is
+            # upstream's shape, and upstream has no wedge here.
+            # #788: THIS LINE IS UNCHANGED, AND THAT IS THE POINT.
+            #
+            # The wedge was this commit blocking BEFORE the rank had
+            # posted anything else it owed its peers for the iteration:
+            # the proxy tensor-dict send and the output-ring send both
+            # come later in _event_loop_pp_body, so a downstream whose
+            # progress needs one of them was waiting on a rank that was
+            # itself waiting on that downstream. Specimen WEDGE_788: two
+            # ranks parked in this exact commit while the last rank
+            # waited on a proxy neither had sent yet.
+            #
+            # The fix is NOT to move this call. It is to make it a
+            # no-op in the loop where the hazard lives, by flushing the
+            # handle at the END of the iteration instead -- see
+            # _pp_commit_pending_req_work and its call site in
+            # _event_loop_pp_body. By the time that loop returns here,
+            # send_req_work has already been waited on and cleared, so
+            # this commit finds an empty list.
+            #
+            # Leaving the call in place is what keeps the other two
+            # callers -- event_loop_pp_disagg_prefill (:618) and
+            # event_loop_pp_disagg_decode (:765), neither of which runs
+            # the end-of-iteration commit -- on exactly their previous
+            # behaviour, and it is what keeps the #633 ordering contract
+            # this function's docstring documents literally intact:
+            # commit, then forward, then process, with send_req_work
+            # holding THIS pass's handle on return. Staging the send
+            # into a second slot instead broke that contract and the
+            # test that pins it (test_scheduler_pp_request_order_633).
+            #
+            # #753's a7ff250dc8 made the same "flush after the exchange,
+            # not before it" move for the OUTPUT channel. This is that
+            # fix for the REQUEST-CHAIN channel, and it is not gated to
+            # the gapped layout: the hazard is not gapped-specific.
+            self._pp_commit_comm_work(self.send_req_work)
+            with torch.profiler.record_function("send_reqs_to_next_stage"):
+                self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                    recv_reqs,
+                    async_send=True,
+                )
             # NOTE: no blocking commit here, deliberately. Committing the
             # arm-carrying send in-pass is corpse B' (boot 13): this rank
             # blocked in _pp_commit_comm_work while its peers sat in the
@@ -5659,11 +5647,18 @@ class SchedulerPPMixin:
         # emptiness proof that was supposed to prevent it is a SAMPLE taken
         # earlier, not a barrier. Draining here catches the in-flight
         # leftover on the way back to the pass loop, on every route out.
-        try:
-            self.pp_flip_drain_leftover_dicts(mb_id)
-        except Exception as exc:  # noqa: BLE001 - a drain may never break the loop
-            logger.error("%s #757 leftover drain failed: %s", "PHASE-FLIP", exc)
-
+        # #969 §W3: THE DISARM-EDGE LEFTOVER DRAIN IS DELETED WITH THE CLOCKS
+        # IT COMPENSATED FOR. Its own docstring named the defect exactly --
+        # "a flip abandon is rank-local: each rank times out on its own
+        # clock. The first rank to disarm resumes launching and sends its
+        # proxy hidden states" -- and that is no longer a state this system
+        # can be in: PP0 is the only timeout carrier, its abort decision
+        # travels on the request stream, and every rank disarms because it
+        # was told to, in stream order. A drain that exists to tidy up after
+        # ranks that disagreed is second bookkeeping the moment they cannot.
+        # If a leftover ever DOES arrive, `_pp_recv_proxy_tensors` refuses it
+        # fatally, which is now the correct answer rather than a symptom of
+        # a drain that did not run.
         if counters is None:
             return
         try:
@@ -5947,123 +5942,6 @@ class SchedulerPPMixin:
                 "%s #787 pre-abandon send flush failed: %s", "PHASE-FLIP", exc
             )
 
-    def pp_flip_drain_tensor_dicts(self: Scheduler) -> int:
-        """Consume the tensor-dict wire while ARMED, and discard what comes.
-
-        THIS IS THE PREVENTION HALF OF THE MISPAIRING FIX, and it is where
-        the strand is actually killed.
-
-        THE STRAND. A flip abandon is rank-local: each rank times out on
-        its own clock. The first rank to disarm resumes launching and sends
-        its proxy hidden states. Its downstream is still armed, so it has
-        no ``cur_batch`` -- and the proxy recv was guarded by THIS rank's
-        batch, never by whether the upstream sent. The message was left on
-        the wire, and every later receive on that rank was off by one,
-        silently, for the rest of the loop's life.
-
-        WHY DISCARDING IS RIGHT HERE, AND ONLY HERE. The open question in
-        the design note was "discarding loses a microbatch". Metal answered
-        it: at THIS point there is no microbatch to lose. An armed rank is
-        withholding admissions and launching nothing, so the message names
-        a pass this rank never ran and there is no batch it could ever pair
-        with -- now or later. That is precisely NOT true at the receive
-        site, where discarding a message you do have a batch for wedged the
-        instance (corpse R).
-
-        WHY THE BLOCKING RECV IS SAFE -- the whole safety argument. It is
-        made ONLY when the upstream's published counter exceeds this rank's
-        consumed count, so the message provably exists and the call is
-        bounded by transfer time rather than by peer scheduling. The
-        publish-after-post ordering makes the only possible skew
-        counter-lags-send, which under-reports and can never invent a
-        message that was not sent. Corpse F rules out polling here; this
-        counter is what replaces it.
-
-        WHY IT MOVES NO LAUNCH TIMING -- the refined design law. It adds
-        consumption during the armed window only, when this rank launches
-        nothing anyway. No rank's decision about WHEN to proceed changes,
-        which is what the resume gate got wrong by holding ranks out of
-        launching (HANDOFF §7).
-
-        DISABLED -- CORPSE S. The paragraph that stood here said the
-        demultiplexer was bypassed deliberately because "both kinds are
-        equally void while armed". METAL FALSIFIED THAT SENTENCE within one
-        arm: the upstream wire MULTIPLEXES the proxy forward and the output
-        return, and an output belongs to work launched BEFORE the arm. This
-        function ate one (kind=output, PP1, 07:33:30Z) and PP1 then blocked
-        for ever waiting for it, with PP2 behind it. See the call site in
-        ``pp_flip_service`` for the full specimen and for what a correct
-        version would have to do instead. It is left here, uncalled, so the
-        next reader inherits the measurement rather than the idea.
-        """
-        counters = getattr(self, "pp_flip_counters", None)
-        if counters is None:
-            return 0
-        drained = 0
-        # Bounded so a counter that runs away cannot pin the rank here.
-        for _ in range(64):
-            posted = counters.sent(CHAN_DICT, self._pp_flip_upstream())
-            if counters.local_consumed(CHAN_DICT) >= posted:
-                break
-            raw = self.pp_group.recv_tensor_dict(
-                all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
-                )
-            )
-            _pp_flip_bump_kind(self, "bump_consumed", CHAN_DICT, _msg_kind_of(raw))
-            self._pp_flip_bump_consumed(CHAN_DICT)
-            drained += 1
-            stamp = raw.get("__stamp__") if isinstance(raw, dict) else None
-            # #757: DEMULTIPLEX, then decide. Kind-blind discarding is corpse
-            # S -- it ate an `output` owed to a real consumer and blocked PP1
-            # for ever. The message stays off the wire either way (the
-            # upstream's blocking commit waits on exactly that), but only a
-            # provably void proxy is dropped; everything else is handed to the
-            # inbox its consumer already reads.
-            # getattr: this method is bound UNBOUND against stubs by
-            # test_pp_proxy_stamp_631, which carries only what the old drain
-            # touched. A missing accessor means "no slots known", which is the
-            # conservative reading anyway.
-            ran_fn = getattr(self, "_pp_ran_mb_ids", None)
-            # #795: same getattr convention for the epoch -- a stand-in with
-            # no accessor yields None, which turns the epoch test off and
-            # leaves the slot-only classification that shipped before.
-            action, kind, why = classify_armed_drain_message(
-                raw,
-                ran_fn() if ran_fn is not None else set(),
-                pp_flip_epoch_of(self),
-            )
-            if action == DRAIN_STASH:
-                # Never discard for want of somewhere to put it -- that is
-                # corpse S. The inbox is created on demand by stash_typed.
-                stash_typed(self.pp_group, None, kind, raw)
-                logger.info(
-                    "%s armed drain took a tensor dict off the wire and "
-                    "STASHED it: kind=%s stamp=%s -- %s. (%d this window)",
-                    "#757",
-                    kind,
-                    stamp,
-                    why,
-                    drained,
-                )
-            else:
-                logger.info(
-                    "%s armed drain took a tensor dict off the wire and "
-                    "discarded it: kind=%s stamp=%s -- %s. Leaving it on the "
-                    "wire is what used to strand it and put every later "
-                    "receive off by one. (%d this window)",
-                    "#757",
-                    kind,
-                    stamp,
-                    why,
-                    drained,
-                )
-        if drained:
-            self._pp_flip_drained_total = (
-                getattr(self, "_pp_flip_drained_total", 0) + drained
-            )
-        return drained
-
     def pp_flip_drain_leftover_dicts(self: Scheduler, live_mb_id: int) -> int:
         """#757: clear pre-arm leftovers at DISARM, without eating an output.
 
@@ -6242,77 +6120,6 @@ class SchedulerPPMixin:
             return {i for i, b in enumerate(mbs) if b is not None}
         except Exception:  # noqa: BLE001 - an unreadable slot set proves nothing
             return set()
-
-    def pp_flip_service(self: Scheduler) -> None:
-        """One turn of the armed service loop: consume, then flush.
-
-        CONSUME FIRST, and the order is load-bearing. Taking the upstream's
-        message off the wire is what lets the UPSTREAM flush its own send
-        on its next turn; flushing first would leave every rank waiting on
-        a peer that is waiting on it. Consuming is also the half that can
-        never block for peer reasons -- the counter proved the message
-        exists -- so doing it first means a rank always makes the group's
-        progress possible before asking anything of it.
-        """
-        try:
-            self.pp_flip_consume_inbound()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("%s armed consume failed: %s", "#631", exc)
-        # CORPSE S -- THE ARMED DRAIN IS DISABLED, and must not be re-enabled
-        # in this shape. Metal, 2026-08-09 07:33:30Z, specimen
-        # /spinning/evidence-631/wedge_20260809T073423Z_armed_drain_ate_output_20260809T0733Z:
-        #
-        #     PP1] #631 armed drain took a tensor dict off the wire and
-        #          discarded it: kind=OUTPUT stamp=None
-        #
-        # and 20 s later PP1 AND PP2 were both blocked in
-        # _pp_recv_dict_from_prev_stage while PP0 spun at the flip gate.
-        # PP1 was waiting for the output its own drain had eaten.
-        #
-        # THE FALSE SENTENCE, verbatim from the docstring below: "both kinds
-        # are equally void while armed". They are NOT. The upstream wire
-        # MULTIPLEXES two streams -- the proxy forward and the output return,
-        # relayed stage by stage and demultiplexed by __msg_type__ AFTER
-        # coming off the wire. A proxy for a pass an armed rank never ran is
-        # void. An OUTPUT belongs to work that was launched BEFORE the arm
-        # and is still owed to a real consumer. Discarding it destroys a
-        # microbatch's results and strands every rank waiting behind it.
-        #
-        # The repair is not a bigger hammer: a drain that wants to be
-        # kind-blind cannot be, and one that discards must demultiplex first
-        # (stash 'output' in the inbox, where its consumer already looks) and
-        # then decide about 'proxy' alone -- for which in-flight microbatches
-        # launched before the arm raise the same question a second time.
-        # #757: RE-ENABLED. Corpse S killed the KIND-BLIND drain, and the note
-        # above states the repair exactly -- "one that discards must
-        # demultiplex first (stash 'output' in the inbox, where its consumer
-        # already looks) and then decide about 'proxy' alone". That is now
-        # `classify_armed_drain_message`, and the in-flight-proxy question the
-        # note raised a second time is answered by the stamp: a proxy for a
-        # microbatch this rank DID run is stashed, not dropped.
-        #
-        # The guard at `_pp_recv_proxy_tensors` STAYS. It refused correctly on
-        # comp4 and it is the only thing standing between this race and silent
-        # cross-microbatch corruption; this drain is the prevention half that
-        # should keep it from ever firing.
-        try:
-            self.pp_flip_drain_tensor_dicts()
-        except Exception as exc:  # noqa: BLE001 - a drain may never kill a flip
-            logger.error("%s armed drain failed: %s", "#757", exc)
-        try:
-            self.pp_flip_flush_drained_sends()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("%s armed flush failed: %s", "#631", exc)
-        # #800: THE ESCAPE HATCH, and it belongs HERE rather than in the
-        # presence probe. `pp_flip_channels_empty` is consulted twice per round
-        # and is documented as reporting rather than acting; retiring from
-        # inside it would make a probe mutate the thing it measures. This is
-        # the armed loop's one service turn, it already acts, and it runs
-        # immediately BEFORE the probe in the same round.
-        try:
-            self.pp_flip_retire_undeclared_stash()
-        except Exception as exc:  # noqa: BLE001 - an escape may never kill a flip
-            logger.error("%s undeclared-stash escape failed: %s", "#800", exc)
 
     def pp_flip_retire_undeclared_stash(self: Scheduler) -> int:
         """#800: bound how long an UNDECLARED kind may hold the flip gate.
@@ -9264,11 +9071,19 @@ class SchedulerPPMixin:
             f"would pair one microbatch's hidden states with another's "
             f"metadata and corrupt memory rather than merely fail; taking "
             f"another message instead wedges the pipeline (corpse R), because "
-            f"the wire owes exactly one message per pass. The drains "
+            f"the wire owes exactly one message per pass. "
+            f"#969 §W3: THIS IS A GROUP-FATAL DIVERGENCE AND NOTHING ELSE. "
+            f"The drains that used to be named here as the prevention "
             f"(pp_flip_drain_tensor_dicts while armed, "
-            f"pp_flip_drain_leftover_dicts at disarm) are what is supposed to "
-            f"prevent this from ever being reached -- if you are reading this, "
-            f"they did not, and THAT is the defect to chase."
+            f"pp_flip_drain_leftover_dicts at disarm) are deleted: they "
+            f"compensated for ranks disarming on their own clocks, and no "
+            f"rank has a clock any more -- PP0 decides, the decision travels "
+            f"on the request stream, and every rank disarms in stream order. "
+            f"So reaching this line means the ranks are out of step about a "
+            f"decision only one of them makes, which is a broken premise, not "
+            f"a race to tidy up. The group stops (user law 2026-08-29: "
+            f"'raenge duerfen sich niemals uneins sein. wenn uneins crash "
+            f"stop')."
         )
 
     def _pp_recv_dict_from_prev_stage(

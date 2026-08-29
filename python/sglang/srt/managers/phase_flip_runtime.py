@@ -64,17 +64,20 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers import phase_flip_seam_census as seam_census
 from sglang.srt.managers import tree_congruence
+from sglang.srt.managers.io_struct import PhaseFlipDecision
 from sglang.srt.managers.kv_reshard import (
     _CHECKSUM_BYTES,
     KvPoolView,
     _checksum,
-    _encode,
+    # #969 §W3: `_encode` packed the per-rank consensus proposal
+    # [armed, ready, expired, ...] for the reduce that has been deleted.
     _gather_block_rows,
 )
-from sglang.srt.managers.pp_presence_disposition import (
-    ALARM_PRESENCE_FUTILE,
-    census_withhold_reason,
-)
+# #969 §W3: the presence-disposition catalogue went with the presence gate
+# (`_await_group_presence`, `_spin_for_group_presence`, `_abandon_no_quorum`).
+# It was the taxonomy of "why did a rank withhold its announcement" -- a
+# question that cannot be asked any more, because no rank announces anything:
+# PP0 decides and the ranks below execute.
 from sglang.srt.managers.warmup_latency import WarmupLatencyLedger
 from sglang.srt.model_executor.weights_arena import (
     checksum_is_representable,
@@ -3852,7 +3855,11 @@ def build_phase_flip_runtime(scheduler) -> PhaseFlipRuntime:
         # It is wired on EVERY rank, unlike the pair it replaces, which
         # were gated on the chain receiver and were therefore off on rank
         # 0 -- the intake rank, the one whose starvation defined corpse G.
-        service_fn=getattr(scheduler, "pp_flip_service", None),
+        # #969 §W3: `pp_flip_service` is deleted. The armed window no longer
+        # has a private service loop, because it no longer switches the
+        # request chain off -- the chain keeps running and carries PP0's
+        # decision, which is the only thing an armed rank ever needed from it.
+        service_fn=None,
         channels_empty_fn=getattr(scheduler, "pp_flip_channels_empty", None),
         # (i) withhold presence until this rank's own forward is flushed,
         # so the flag means "I owe no send" rather than merely "I am
@@ -4557,6 +4564,15 @@ class PhaseFlipRuntime:
         self._park_deadline_s = float(park_deadline_s)
         #: Clock reading of the moment this rank armed, or None when idle.
         self._armed_at: Optional[float] = None
+        #: #969 §W3 follower cut. Rank 0 side: the decision it has taken and
+        #: published, and whether the request stream has actually carried it
+        #: yet (`take_flip_decision`). Rank k>0 side: the decision it was
+        #: handed and must execute this round (`apply_flip_decision`). Two
+        #: fields, one direction each -- there is no state here that both
+        #: sides write, because that is what a second bookkeeping looks like.
+        self._decision_out: Optional[PhaseFlipDecision] = None
+        self._decision_taken: bool = False
+        self._told: Optional[PhaseFlipDecision] = None
         #: #746: ``(req_rows, req_max)`` measured by ``arm()`` at the arm
         #: instant -- the exact extent this flip will pack -- or None when no
         #: flip is armed or the arm-time measurement failed. Cleared at EVERY
@@ -5026,8 +5042,22 @@ class PhaseFlipRuntime:
         return True
 
     def arm(self, direction: str, source: str) -> Tuple[bool, str]:
-        """Arm a flip. Replicated call; the consensus round commits it once
-        every rank is armed AND ready. Returns (ok, msg)."""
+        """Arm a flip. Replicated call; PP0's decision round commits it.
+        Returns (ok, msg).
+
+        #969 §W3: EVERY REFUSAL IN THIS FUNCTION IS RANK 0's ALONE. The arm
+        originates at the request origin (request_receiver.py: the policy hook
+        runs only there) and travels to the ranks below on the request stream;
+        below rank 0 this call is an ORDER, not a proposal. A follower that
+        consulted its own guards, its own storm limiter or its own pre-arm
+        drain verdict could refuse an arm rank 0 accepted, and then rank 0
+        would decide a flip for a rank that is not armed -- the exact
+        disagreement `raenge-nie-uneins-crash-stop` forbids, manufactured by
+        the defensive check that was meant to prevent it. So the follower
+        takes the branch below and runs the side-effecting part only.
+        """
+        if self._rank != 0:
+            return self._arm_as_follower(direction, source)
         # THE BACKOFF CLOCK TICKS ON EVERY ARM REQUEST, including the ones
         # this function goes on to refuse. It has to: the sequence is only
         # group-uniform if every rank advances it for the same events, and a
@@ -5194,12 +5224,69 @@ class PhaseFlipRuntime:
                 prearm_drain_ms,
                 prearm_detail,
             )
+        self._enter_armed_state(direction)
+        msg = (
+            f"phase flip armed: {direction} (source {source}); PP0 decides "
+            f"when it commits and tells every rank below, or abandons it "
+            f"after {self._park_deadline_s:g}s parked -- PP0 is the only "
+            f"timeout carrier (#969 §W3)"
+        )
+        logger.warning("%s %s", LOG_PREFIX, msg)
+        return True, msg
+
+    def _arm_as_follower(self, direction: str, source: str) -> Tuple[bool, str]:
+        """#969 §W3: below PP0 an arm is an ORDER. Execute it, judge nothing.
+
+        The side-effecting half of ``arm`` runs here -- the pre-arm device-tier
+        quiesce, the state entry, the at-arm census, the exposure enforcement.
+        What does NOT run is every verdict: guards, storm/backoff limiters, the
+        legal-transition check and the pre-arm drain's own ok/not-ok. Each of
+        those is a rank-local opinion, and a rank-local opinion that can refuse
+        an arm PP0 accepted is precisely how the ranks end up uneins.
+
+        The one thing that IS checked is identity: a direction this build does
+        not know cannot be executed, and it means the stream carried something
+        this rank cannot be following. That stops the group.
+        """
+        if direction not in _DIR_ID:
+            raise KvReshardError(
+                f"{LOG_PREFIX} #969 rank {self._rank} was told to arm an "
+                f"unknown flip direction {direction!r} (source {source}). A "
+                f"follower cannot execute what it cannot name, and it may "
+                f"not invent a local substitute -- the group stops here."
+            )
+        # Side effect only: the verdict is discarded on purpose (see above).
+        try:
+            self._prearm_quiesce(direction)
+        except Exception as exc:  # noqa: BLE001 - never refuse PP0's order
+            logger.warning(
+                "%s [#834] pre-arm quiesce raised on follower rank %d: %s. "
+                "The arm proceeds: the seam's own quiesce still runs at the "
+                "no-return point, and refusing here would split the arm.",
+                LOG_PREFIX,
+                self._rank,
+                exc,
+            )
+        self._enter_armed_state(direction)
+        msg = f"phase flip armed (told by PP0): {direction} (source {source})"
+        logger.warning("%s %s", LOG_PREFIX, msg)
+        return True, msg
+
+    def _enter_armed_state(self, direction: str) -> None:
+        """The state entry every arm performs, decider and follower alike."""
+        if self._pending is not None and self._pending != direction:
+            logger.warning(
+                "%s re-arming %s -> %s", LOG_PREFIX, self._pending, direction
+            )
         self._pending = direction
         # A fresh arm starts a fresh round sequence. The epoch already
-        # distinguishes this arm from any earlier one, so the round
-        # simply restarts at 0 rather than having to be globally unique.
+        # distinguishes this arm from any earlier one, so the round simply
+        # restarts at 0 rather than having to be globally unique.
         self._entry_round = 0
-        self._presence_wait_stamp = None
+        # #969 §W3: a fresh arm can carry no stale told/published decision.
+        self._decision_out = None
+        self._decision_taken = False
+        self._told = None
         # The park clock starts at ARMING, not at the first unparked round:
         # the deadline bounds how long the requests are held, and they are
         # held from the moment this rank starts withholding work.
@@ -5244,258 +5331,98 @@ class PhaseFlipRuntime:
         # arms while its peers do not and parks at the entry for ever. This
         # corrects the id space and reports; it does not vote.
         self._enforce_exposure_at_seam(f"{direction} arm")
-        msg = (
-            f"phase flip armed: {direction} (source {source}); commits at "
-            f"the next consensus boundary where every rank is quiescent, or "
-            f"is abandoned after {self._park_deadline_s:g}s parked"
-        )
-        logger.warning("%s %s", LOG_PREFIX, msg)
-        return True, msg
 
     # -- the per-round hook ---------------------------------------------------
     def on_round(self, require_armed_and_parked: bool = False) -> Optional[dict]:
-        """One scheduler round; see KvReshardRuntime.on_round. Returns move
-        stats when a flip executed this round, else ``None``.
+        """One scheduler round; returns move stats when a flip executed this
+        round, else ``None``.
 
-        ``require_armed_and_parked`` is the PP-phase entry gate (measured
-        wedges 2026-08-08, boots 9 and 10): under event_loop_pp the local
-        round counters of the ranks diverge in ABSOLUTE value (pipeline
-        fill, conditional per-slot ops), so ANY blocking reduction entered
-        at a local cadence can pair with a peer blocked in a pipeline recv
-        whose satisfying send sits behind this rank's reduction -- moving
-        the hook inside the iteration only moved the wedge. With the gate,
-        an UNARMED rank performs NO collective at all (there is nothing to
-        agree on; arming state arrives via the broadcast RPC on every
-        rank), and an armed rank enters only once it is locally PARKED
-        (ready_fn: drained microbatches, no partial chunk) -- a parked
-        rank owes no pipeline send, so no recv/reduction cycle can close.
-        Peers converge on their own arm+drain, MIN-skew is legal, and the
-        liveness bound turns a lost peer into a loud error. A flip under
-        continuous load needs the posted-async two-phase consensus -- a
-        named follow-up, not this gate.
+        #969 §W3 -- THE FOLLOWER CUT. RANK 0 DECIDES; EVERY OTHER RANK
+        EXECUTES AND FORMS NO OPINION.
 
-        The wait is BOUNDED (see DEFAULT_PARK_DEADLINE_S): a rank armed
-        past the deadline without parking joins the reduction anyway
-        carrying ``expired``, and every participating rank abandons the
-        flip on the reduced maximum. Abandoning the flip is the whole
-        point -- the parked requests are never abandoned."""
-        armed = 1 if self._pending is not None else 0
-        # #631 DEFECT Q, SECOND INSTANCE -- and this one is fatal in the TP
-        # phase. ``_round`` is a RANK-LOCAL counter, and ``_round %
-        # _interval`` below gates ENTRY TO A BLOCKING COLLECTIVE. That is
-        # only safe while the ranks' counts stay congruent, and nothing
-        # makes them congruent except the loop being paced in lockstep.
-        #
-        # AN ARMED WINDOW IS EXACTLY WHERE THAT PACING STOPS. An armed rank
-        # admits nothing and launches nothing, so its pass loop free-runs at
-        # about 8 kHz and calls this hook every iteration: measured
-        # 2026-08-09, 37371 / 28677 / 32344 calls in ONE 5 s window. The
-        # ranks come out incongruent mod _interval, their periodic entries
-        # never coincide again, and the FIRST periodic consensus after the
-        # cutover deadlocks -- rank 0 inside the reduction, its peers inside
-        # the broadcast recv that rank 0 owes them. Measured 08:09:39Z:
-        # "barlink collective 'phase_flip.consensus' made no progress for
-        # 120s", PP0 in event_loop_normal -> get_next_batch_to_run ->
-        # _phase_flip_on_round, peers never arriving, then SIGQUIT.
-        #
-        # SO THE CADENCE COUNTS ONLY THE ROUNDS THE CADENCE GATES. The
-        # per-pass hook of event_loop_pp is exactly the caller that passes
-        # require_armed_and_parked=True, and its entry is decided by the
-        # parked predicate and the presence gate -- never by this counter.
-        # Its increments therefore buy nothing and cost the congruence of
-        # every periodic round after them. The periodic caller
-        # (event_loop_normal, require_armed_and_parked=False) is the one
-        # this counter exists for, and that loop IS paced: rank 0 broadcasts
-        # the request list every iteration, so those rounds stay in step.
-        #
-        # NOT "count unarmed rounds only", which was the first cut and is
-        # wrong: an ARMED rank on the periodic path must still reach the
-        # reduction, or a flip armed in the TP phase can never commit.
-        # Freezing the counter while armed left ranks whose residue was not
-        # already zero unable to enter at all, and
-        # TestMoveCorrectness caught it -- the move never ran and the
-        # destination pool kept its old bytes.
-        #
-        # This is the same warning the ``_entry_round`` comment below already
-        # makes ("incrementing anywhere else -- a local loop counter, a clock
-        # -- would reintroduce the absolute divergence between ranks"),
-        # applied to the variable it was actually true of.
+        User law, verbatim (2026-08-29): "raenge duerfen sich niemals uneins
+        sein. wenn uneins crash stop." and "nein, alles folgt rang0, so wie
+        bei tp3 ja auch." The design form is FOLLOWER SEMANTICS, not agreement
+        machinery -- exactly what TP3 already does, where rank 0 samples and
+        broadcasts and no consensus protocol exists because nobody else ever
+        decides. Disagreement is excluded by CONSTRUCTION here for the same
+        reason; the checksum below is only a backstop.
+
+        WHAT THIS REPLACED, and why it is a deletion rather than a repair.
+        Until #969 §W3 this hook packed a per-rank proposal
+        ``[armed, ready, expired, epoch, dir, fp, *vec, tree_digest]`` into a
+        blocking element-wise MIN reduction and reconciled the ranks'
+        opinions from ``lo``/``hi``. Every term of that payload except the
+        identity fields was a VOTE, and the reduce was the machinery that
+        settled the votes -- the shape the standing user order names for
+        deletion (`upstream-minimal-statt-eigenbau`: a second bookkeeping
+        beside an upstream truth is deleted, not repaired). Upstream has no
+        such reduction: PP0 admits, the batch travels, and every rank simply
+        does what arrives. Deleted with it: ``_park_expired`` (the per-rank
+        park clock -- rank 0 is now the ONLY timeout carrier), the presence
+        announce/quorum spin that had to exist because the reduce was a
+        blocking collective entered at a rank-local cadence, and both flip
+        drains, whose whole job was to clean up after ranks that had disarmed
+        on their own clocks.
+
+        HOW THE DECISION TRAVELS: on the request stream, which already runs
+        in both loop families, so no arc and no collective is added (a new
+        collective on this path is RECORDED FATAL, and that stands). See
+        ``PhaseFlipDecision`` in io_struct for both carriers.
+
+        WHY A FOLLOWER MAY CUT OVER ON RANK 0's READINESS ALONE, which is the
+        one property this whole design rests on: rank 0 holds ``mbs[slot]``
+        for a microbatch until that microbatch's OUTPUT has come back around
+        the ring, so "rank 0 has no in-flight microbatch" is a statement
+        about the WHOLE RING, not about rank 0. Combined with rank 0 having
+        stopped admitting at arm time, a decided flip is a flip whose
+        pipeline is provably empty on every rank. That is the same fact
+        upstream relies on and the reason it needs no readiness exchange.
+
+        The bounded wait a follower does is the request-stream receive it was
+        doing anyway. If it expires the receive raises and the group dies --
+        which is the required behaviour (`raenge-nie-uneins-crash-stop`), not
+        a fallback into a local decision."""
         if not require_armed_and_parked:
             self._round += 1
-        # #834 B: PAY THE DEFERRED GROW HERE, and pay the debt guard's
-        # attention with it. Rank-local work only -- no collective is reached
-        # on this path, which is what makes a local cadence legal for it and
-        # illegal for the levelling it was split from.
+        # #834 B: PAY THE DEFERRED GROW HERE. Rank-local work only -- no
+        # collective is reached on this path, which is what makes a local
+        # cadence legal for it and illegal for the levelling it was split
+        # from. Unchanged by the follower cut.
         pay_deferred_grow(self)
-        ready = 1 if (armed and self._ready_fn()) else 0
-        expired = 1 if self._park_expired(armed, ready) else 0
-        # #631 QUIESCENT-ANNOUNCE. An armed rank that is NOT yet quiescent
-        # must go back around the pass loop -- that is how it drains -- and
-        # must NOT announce on the way. Announcing before quiescence is
-        # what made the flag mean "I was at the entry once": the rank
-        # published presence, returned to the loop, and met its top-of-pass
-        # commit before it could come back and ENTER. The last announcer
-        # then entered the reduction and every earlier one blocked behind
-        # it (measured 23:39Z, three stacks).
-        #
-        # An EXPIRED rank is exempt: it has been armed past the park
-        # deadline without ever draining, and it must be allowed to reach
-        # the reduction to carry that fact into a group-agreed
-        # abandonment. It owes no fresh work by then, having withheld
-        # admissions for the whole deadline.
-        # Scoped to a wired presence channel ON PURPOSE. This early
-        # return exists solely to stop a rank ANNOUNCING before it is
-        # quiescent; with no presence channel there is no announce, so
-        # applying it would change the readiness-skew behaviour of the
-        # plain consensus path (which holds uniformly inside the
-        # reduction) for no gain. Caught by
-        # TestConsensusDiscipline::test_readiness_skew_holds_uniformly.
-        if armed and self._presence is not None and not ready and not expired:
-            # SAY WHAT IS HOLDING THIS RANK, periodically. Without it the
-            # only evidence is "ready=0" in an abandonment 30 s later, and
-            # defect I had to be read off three py-spy stacks instead.
-            self._log_not_ready()
-            return None
-        # #631 THE ENTRY GATE, evaluated AFTER park expiry now that
-        # announcing requires quiescence. It SPINS: once this rank has
-        # announced it does not return to the pass loop at all, because
-        # that interval is exactly what kills it. The spin blocks on no
-        # channel -- it reads flags and sleeps -- and is bounded per round,
-        # so a group that never assembles abandons loudly instead of
-        # hanging.
-        if armed:
-            gate = self._spin_for_group_presence()
-            if gate is not True:
-                return gate  # a pre-entry abandonment, or None if disarmed
-        # The PP-phase entry gate, widened by the deadline: an armed rank
-        # enters once it is PARKED, or -- if it has been armed past the
-        # deadline without ever parking -- to carry that fact into the
-        # consensus. Entering unparked is what makes the abandonment
-        # GROUP-AGREED: the peers are already blocked in this reduction
-        # waiting for exactly this rank, so the flag reaches them, every
-        # rank abandons the same flip in the same round, and nobody is left
-        # armed against a disarmed peer. It is safe here because an armed
-        # rank has been withholding new work for the whole deadline, so it
-        # owes no fresh pipeline send.
-        if require_armed_and_parked and not (armed and (ready or expired)):
-            return None
-        if not require_armed_and_parked and self._round % self._interval != 0:
-            return None
-        dir_id = _DIR_ID[self._pending] if self._pending is not None else 0
-        # #825: THE PREFIX-TREE DIGEST RIDES THIS REDUCE.
-        #
-        # NOT a new collective. `_update_uniform_pool_budget` names this as
-        # the right close for its own gaps ("ONE MORE INT ON A REDUCE THAT
-        # ALREADY RUNS, which is what the gap note itself named as the right
-        # close"), and here it matters more than economy: a second collective
-        # at the seam would need its own proof of group-atomicity, its own
-        # timeout behaviour and its own place in the group FIFO -- the three
-        # things that killed the census all_gather_object (step 4c, "mispairs
-        # with the request broadcasts on the same group FIFO") and the
-        # HiCache ack-count reduction (scheduler.py:7121, 2026-08-17). As a
-        # field of THIS payload it inherits all three from a reduction that
-        # is already proven, and it is reached only after the early returns
-        # above -- never on the ~8 kHz free-running loop body.
-        #
-        # Computed here, one line above the reduce it rides, so a future
-        # reader cannot mistake it for an independent synchronisation point.
-        local_tree_digest = tree_congruence.tree_digest_of(
+        if self._rank == 0:
+            return self._round_as_decider()
+        return self._round_as_follower()
+
+    def _local_tree_digest(self) -> int:
+        """#825: this rank's prefix-tree digest, or 0 when there is no tree."""
+        return tree_congruence.tree_digest_of(
             getattr(getattr(self, "_census_scheduler", None), "tree_cache", None)
         )
-        payload = _encode(
-            [
-                armed,
-                ready,
-                expired,
-                self._epoch,
-                dir_id,
-                self._fp,
-                *self._vec,
-                local_tree_digest,
-            ]
-        )
-        self.desync_checks += 1
-        # #631(c) WITHDRAWN -- measured fatal, kept as a warning.
-        #
-        # Bounding this join and abandoning from inside CANNOT work on a
-        # gloo collective. Measured 2026-08-08: the 45 s bound fired
-        # (CollectiveTimeoutError), and the moment this rank walked away
-        # its peers saw "gloo/transport/tcp/pair.cc:547 Connection closed
-        # by peer" and every rank died with "Fatal Python error: Aborted".
-        # A rank that has ENTERED an all_reduce owes that all_reduce; the
-        # group has no way to un-enter it. So a wedge here cannot be
-        # broken from inside the collective -- any bound has to be
-        # applied BEFORE entry (do not enter unless the peers are known
-        # to be joining), or the reduction has to become a non-blocking
-        # poll that a rank re-enters, which is a different design.
-        reduced = self._collective_min(payload)
-        # THE ROUND ADVANCES HERE, and only here. Reaching this line
-        # means every participant completed the SAME reduction, so this
-        # is the one instant at which the ranks provably agree -- which
-        # is exactly what makes the count usable as a shared stamp
-        # without ever being exchanged. Incrementing anywhere else (a
-        # local loop counter, a clock) would reintroduce the absolute
-        # divergence between ranks that the gate exists to tolerate.
-        self._entry_round += 1
-        if len(reduced) != len(payload):
-            raise KvReshardError(
-                f"consensus channel returned {len(reduced)} values for a "
-                f"{len(payload)}-value payload; the channel contract is "
-                f"element-wise MIN of the packed proposal."
-            )
-        fields = [
-            "armed",
-            "ready",
-            "expired",
-            "epoch",
-            "direction",
-            "config_fp",
-        ] + [f"vector[{i}]" for i in range(self._n)]
-        # #825: appended LAST, matching the payload order above. The vector is
-        # variable-length, so anything added must go after it or every index
-        # below shifts.
-        fields = fields + ["tree_digest"]
-        lo = {f: reduced[2 * i] for i, f in enumerate(fields)}
-        hi = {f: -reduced[2 * i + 1] for i, f in enumerate(fields)}
 
-        # Equality family: epoch + config fingerprint + vector ALWAYS
-        # (boot config); direction once every rank is armed.
-        eq_checked = ["epoch", "config_fp"] + [f"vector[{i}]" for i in range(self._n)]
-        if lo["armed"] == 1:
-            eq_checked.append("direction")
-        mismatches = [
-            f"{f}: min={lo[f]} max={hi[f]}" for f in eq_checked if lo[f] != hi[f]
-        ]
-        if mismatches:
-            raise KvReshardError(
-                f"{LOG_PREFIX} DESYNC at round {self._round}: the ranks "
-                f"disagree on the flip state ({'; '.join(mismatches)}; this "
-                f"rank: armed={armed} pending={self._pending} "
-                f"epoch={self._epoch} phase={self._phase}). A flip that "
-                f"disagrees across ranks must fail loudly HERE, before any "
-                f"rank moves a byte under the wrong layout."
-            )
-        # #825: THE TREE DIGEST IS DELIBERATELY NOT IN `eq_checked`.
-        #
-        # That family RAISES ("must fail loudly HERE, before any rank moves a
-        # byte under the wrong layout"), which is right for epoch, config
-        # fingerprint and vector: those disagreeing is a bug in the flip
-        # itself. A tree digest disagreeing is NOT a bug in the flip -- it is
-        # the expected, measured consequence of the PP phase running with the
-        # uniformity floors switched off (scheduler.py:4770), and it is what
-        # this field exists to observe. Putting it in `eq_checked` would take
-        # the instance down at the first cutover of every boot.
-        #
-        # So it gets a verdict instead of an exception: group-decided (both
-        # ranks read the same lo/hi, so both take the same branch), counted,
-        # and carried to the cutover, which is the only place that can act on
-        # it. Losing prefix cache is a capacity cost; entering the TP phase
-        # with divergent trees is a correctness one -- the same trade #824
-        # makes in this family.
+    def _note_tree_congruence(self, local_digest: int, peer_digest: int) -> None:
+        """#825 divergence detector -- KEPT, and deliberately NOT fatal.
+
+        §W3 keeps the detectors and turns their action arms group-fatal
+        "where they are refuse-and-continue today". This one is neither: it
+        has only ever counted (its ACTION, the tree reset, was withdrawn on
+        metal in 2026-08-23 and is off by default), and a divergent tree is
+        not the ranks disagreeing about a DECISION. It is the designed,
+        measured consequence of the PP phase running with the uniformity
+        floors switched off (scheduler.py:4770) -- #825's own note says
+        putting it in the fatal family "would take the instance down at the
+        first cutover of every boot". So it stays a counter, and the
+        deviation from the letter of §W3 is stated here rather than
+        performed silently.
+
+        The fatal family is ``_verify_told_identity``: epoch, direction,
+        config fingerprint and vector. Those disagreeing IS the ranks being
+        out of step about the flip itself, and that stops the group.
+        """
         self._tree_congruence = tree_congruence.congruence_verdict(
-            local_digest=local_tree_digest,
-            group_min=lo["tree_digest"],
-            group_neg_min=-hi["tree_digest"],
+            local_digest=local_digest,
+            group_min=min(local_digest, peer_digest),
+            group_neg_min=max(local_digest, peer_digest),
         )
         if not self._tree_congruence.congruent:
             self.tree_divergence_rounds += 1
@@ -5509,9 +5436,9 @@ class PhaseFlipRuntime:
                     self._tree_congruence.reason,
                 )
         elif self._tree_divergence_open:
-            # Recovery edge. #823's lesson, applied at build time rather than
-            # after the fact: a divergence that is only ever reported at onset
-            # can say THAT the trees parted and never that they healed.
+            # Recovery edge. #823's lesson: a divergence that is only ever
+            # reported at onset can say THAT the trees parted and never that
+            # they healed.
             self._tree_divergence_open = False
             self.tree_congruence_recoveries += 1
             logger.warning(
@@ -5523,44 +5450,173 @@ class PhaseFlipRuntime:
                 self.tree_divergence_onsets,
             )
 
-        # Park deadline, decided on the MAX: one rank out of time is enough
-        # to abandon the flip, and every rank in this reduction reads the
-        # same max, so the abandonment is unanimous by construction.
-        # Checked before the armed/ready holds -- those are the states the
-        # deadline exists to stop waiting in.
-        if hi["expired"] == 1:
-            return self._abandon_parked_flip(ready)
+    def _round_as_decider(self) -> Optional[dict]:
+        """Rank 0. The ONLY rank that decides, and the only timeout carrier.
 
-        if lo["armed"] == 0:
-            if hi["armed"] == 1:
-                self._hold("waiting for every rank to arm (delivery skew)")
+        Two passes, deliberately: the verdict is published on the round it is
+        taken and EXECUTED on the round after the request stream has actually
+        carried it. Executing in the same round would cut over before the
+        followers had been told, and rank 0 leaves the PP loop on a committed
+        flip (PhaseFlipLoopExit), so a decision not yet on the wire when it
+        leaves would never be sent at all. The PP loop commits its chain
+        forward (`_pp_commit_pending_req_work`) immediately BEFORE this hook,
+        so by the round that executes, the message is gone from this rank;
+        in the TP phase the carrier is a broadcast and is complete on return.
+        """
+        if self._pending is None:
+            self._decision_out = None
+            self._decision_taken = False
             return None
-        if lo["ready"] == 0:
+
+        if self._decision_out is not None:
+            if not self._decision_taken:
+                # Published, not yet carried. Nothing to do but let the next
+                # request-stream turn pick it up.
+                return None
+            dec = self._decision_out
+            self._decision_out = None
+            self._decision_taken = False
+            self.desync_checks += 1
+            self._entry_round += 1
+            # Trivially congruent with itself: rank 0 is the reference the
+            # followers compare against, so the pair it reports is its own.
+            self._note_tree_congruence(dec.tree_digest, dec.tree_digest)
+            if dec.verdict == PhaseFlipDecision.ABORT:
+                return self._abandon_parked_flip(0)
+            self._last_hold_reason = None
+            try:
+                return self._execute()
+            finally:
+                # #760/#834 A insurance, unchanged: a raise anywhere in the
+                # seam must not leave the guard reporting a seam for ever,
+                # except while a pre-arm hold is deliberately down.
+                if not prearm_quiesce_held(self):
+                    self.hicache_seam_active = False
+
+        if self._ready_fn():
+            verdict = PhaseFlipDecision.PROCEED
+        elif (
+            self._park_deadline_s > 0
+            and self._armed_at is not None
+            and (self._clock() - self._armed_at) >= self._park_deadline_s
+        ):
+            # THE ONE TIMEOUT IN THE SYSTEM. It lives here and nowhere else:
+            # a rank-local clock that can put one rank in a different state
+            # from its peers is exactly what the flip campaign died of
+            # twenty times, and _park_expired was that clock on every rank.
+            verdict = PhaseFlipDecision.ABORT
+        else:
+            self._log_not_ready()
             self._hold(
-                f"armed ({self._pending}), waiting for a group-wide "
-                f"quiescent boundary (this rank ready={ready})"
+                f"armed ({self._pending}), waiting for the ring to drain on "
+                f"this rank -- rank 0's drained state IS the ring's"
             )
             return None
+
+        self._decision_out = PhaseFlipDecision(
+            verdict=verdict,
+            epoch=self._epoch,
+            dir_id=_DIR_ID[self._pending],
+            config_fp=self._fp,
+            vector=self._vec,
+            tree_digest=self._local_tree_digest(),
+        )
+        self._decision_taken = False
+        logger.warning(
+            "%s #969 PP0 DECIDES %s for %s at epoch %d: it rides the request "
+            "stream to every rank below, which executes it and decides "
+            "nothing. No consensus round, no votes, no reduction.",
+            LOG_PREFIX,
+            verdict,
+            self._pending,
+            self._epoch,
+        )
+        return None
+
+    def _round_as_follower(self) -> Optional[dict]:
+        """Every rank below PP0. Executes what it is told; decides nothing."""
+        dec = self._told
+        if dec is None:
+            return None
+        self._told = None
+        if self._pending is None:
+            raise KvReshardError(
+                f"{LOG_PREFIX} #969 TOLD A FLIP THIS RANK NEVER ARMED: rank "
+                f"{self._rank} was handed PP0's {dec.verdict!r} decision for "
+                f"epoch {dec.epoch} while nothing is armed here. The arm and "
+                f"the decision ride the SAME request stream, in that order, "
+                f"so this can only mean the ranks are out of step -- and an "
+                f"out-of-step group STOPS. It does not repair itself locally."
+            )
+        self._verify_told_identity(dec)
+        self.desync_checks += 1
+        self._entry_round += 1
+        self._note_tree_congruence(self._local_tree_digest(), dec.tree_digest)
+        if dec.verdict == PhaseFlipDecision.ABORT:
+            # ready is reported, not consulted: this rank is abandoning
+            # because PP0 said so, never because of its own reading.
+            return self._abandon_parked_flip(1 if self._ready_fn() else 0)
         self._last_hold_reason = None
         try:
             return self._execute()
         finally:
-            # #760 insurance: a raise anywhere in the seam must not leave the
-            # guard reporting a seam forever -- that would silently kill the
-            # device tier for the life of the process, the #742 inert-state
-            # class. On the ordinary path the cutover already cleared it.
-            #
-            # #834 A: EXCEPT WHILE A PRE-ARM HOLD IS DELIBERATELY DOWN. This
-            # `finally` runs after EVERY `_execute`, and the great majority
-            # return without flipping because the group is not yet quiescent --
-            # so an unconditional clear here drops a pre-arm guard on the very
-            # next round and leaves its drain covering nothing. The insurance
-            # is not weakened: the hold is only honoured while `_pending` is
-            # set (`_prearm_quiesce_held`), which the park deadline already
-            # bounds and which every abandon path clears, so a raise in the
-            # seam still ends with the guard down.
             if not prearm_quiesce_held(self):
                 self.hicache_seam_active = False
+
+    def _verify_told_identity(self, dec) -> None:
+        """The backstop: detected divergence STOPS THE GROUP.
+
+        Construction already excludes disagreement (only rank 0 decides), so
+        reaching a mismatch here means a premise of the design is false. The
+        only legal response is to die loudly before any rank moves a byte
+        under the wrong layout -- never refuse-and-continue, never a local
+        repair (`raenge-nie-uneins-crash-stop`, detection half).
+        """
+        local_dir = _DIR_ID[self._pending] if self._pending is not None else 0
+        mismatches = []
+        if int(dec.epoch) != int(self._epoch):
+            mismatches.append(f"epoch: pp0={dec.epoch} here={self._epoch}")
+        if int(dec.dir_id) != int(local_dir):
+            mismatches.append(f"direction: pp0={dec.dir_id} here={local_dir}")
+        if int(dec.config_fp) != int(self._fp):
+            mismatches.append(f"config_fp: pp0={dec.config_fp} here={self._fp}")
+        if tuple(dec.vector) != tuple(self._vec):
+            mismatches.append(f"vector: pp0={tuple(dec.vector)} here={self._vec}")
+        if not mismatches:
+            return
+        raise KvReshardError(
+            f"{LOG_PREFIX} DESYNC at round {self._round}: rank {self._rank} "
+            f"disagrees with PP0 about the flip it was told to execute "
+            f"({'; '.join(mismatches)}; this rank: pending={self._pending} "
+            f"epoch={self._epoch} phase={self._phase}). Under follower "
+            f"semantics this is unreachable by construction, so reaching it "
+            f"means a premise is false -- the group stops HERE, before any "
+            f"rank moves a byte under the wrong layout."
+        )
+
+    def take_flip_decision(self):
+        """Rank 0 only: hand the pending decision to the request stream.
+
+        Called by the request origin once per intake turn. Returns the
+        decision exactly once; after that the decider knows the followers
+        have been told and may execute on its next round.
+        """
+        if self._rank != 0:
+            return None
+        dec = self._decision_out
+        if dec is None or self._decision_taken:
+            return None
+        self._decision_taken = True
+        return dec
+
+    def apply_flip_decision(self, dec) -> None:
+        """Every rank below PP0: record what PP0 decided, to execute this
+        round. No verdict is formed here and none is checked -- the checks
+        that exist are identity checks, and they kill the group rather than
+        adjust anything (see ``_verify_told_identity``)."""
+        if self._rank == 0:
+            return
+        self._told = dec
 
     def _reconcile_trees_if_diverged(self, direction: str) -> None:
         """#825: repair the prefix trees before the TP phase demands identity.
@@ -6966,52 +7022,6 @@ class PhaseFlipRuntime:
             why,
         )
 
-    def _spin_for_group_presence(self):
-        """#631: announce, then SPIN here until the group assembles.
-
-        THE POINT, and the whole reason this is a loop rather than one poll
-        per pass: a rank that announces and then returns to the pass loop
-        meets its top-of-pass commit before it can come back and ENTER, and
-        that commit blocks behind whichever rank has already entered. The
-        announce-to-entry interval must contain NO blocking channel
-        operation, so the rank simply does not leave.
-
-        WHY LEAVING THE LOOP IS SAFE HERE, and only here: this is reached
-        only once ready_fn holds (or the park deadline has expired), i.e.
-        the rank is drained -- no in-flight microbatches, no admissions, no
-        owed payload. It therefore owes its peers neither hidden states nor
-        chain data, and the only per-pass message it stops producing is the
-        empty keep-alive forward. Peers that need nothing are either
-        quiescent and spinning here too, or not yet quiescent -- and that
-        second case is a BOUNDED RETRY, not a wedge: a mid-drain rank that
-        stalls on its recv is released when the spinners' per-round bound
-        expires, they abandon loudly, return to the loop and resume
-        forwarding, it drains, and a later epoch retries with everyone
-        genuinely quiescent. At true idle every rank is quiescent at once,
-        so the gate opens on live evidence and the flip commits in the
-        first epoch.
-
-        Delegates each iteration to _await_group_presence, which stays the
-        single-shot primitive: same announce, same round-scoped read, same
-        pre-entry bound, same abandonment. Nothing new is invented here --
-        this only stops the rank from going away between iterations.
-        """
-        while True:
-            gate = self._await_group_presence()
-            if gate is not True:
-                if gate is not None:
-                    return gate  # pre-entry abandonment: loud, nothing entered
-                if self._pending is None:
-                    # Disarmed underneath us (abandonment elsewhere).
-                    return None
-                # Not assembled yet. Sleep briefly and ask again WITHOUT
-                # touching any channel. The pre-entry deadline inside
-                # _await_group_presence is what ends this loop if the group
-                # never arrives.
-                self._sleep(self._presence_poll_interval_s)
-                continue
-            return True
-
     def _snapshot_parked_extent(self) -> Optional[Tuple[int, int]]:
         """#746: ``(req_rows, req_max)`` of the resident set, measured NOW.
 
@@ -7071,664 +7081,6 @@ class PhaseFlipRuntime:
         sync.
         """
         return self._pending is not None
-
-    def _park_expired(self, armed: int, ready: int) -> bool:
-        """Has this rank been armed-but-unparked past the deadline?
-
-        Wall clock, not a round count: rounds are what the PP loop makes
-        incomparable across ranks in the first place, and the quantity the
-        operator cares about is how long a request may be held. The reading
-        is rank-local and does NOT need to be replicated -- one rank
-        raising the flag is enough, because the DECISION to abandon is
-        taken from the reduced maximum in on_round, which every
-        participating rank reads identically.
-        """
-        if not armed or ready or self._park_deadline_s <= 0:
-            return False
-        if self._armed_at is None:
-            return False
-        return (self._clock() - self._armed_at) >= self._park_deadline_s
-
-    def _await_group_presence(self):
-        """#631 option 2(b): the non-blocking armed wait, and the gate.
-
-        Returns True when every rank is at the entry and the caller may
-        safely enter the blocking reduction; None to keep polling on later
-        rounds; or the result of an abandonment when the pre-entry bound
-        expires.
-
-        NOTHING IN THIS LOOP BLOCKS, which is the whole point -- it is the
-        construction that satisfies the design law (no rank blocks on any
-        channel while a peer may be in a different one). Concretely, per
-        iteration this rank only:
-          * PUMPS its outstanding arm-forward -- progresses it
-            non-blockingly, never a blocking commit. A blocking commit
-            here is corpse B' (boot 13): rank 0 blocked in
-            _pp_commit_comm_work while its peers sat in the hidden-states
-            exchange, because "the peer is waiting for the arm" is simply
-            not true -- it may be in another channel entirely,
-          * DRAINS its incoming chain non-blockingly (clause (ii)),
-            buffering what arrives. An armed rank that stops consuming
-            makes its UPSTREAM block on the ordinary top-of-pass commit,
-            upstream of the gate, where no gate can help it (boot 18),
-          * announces its own presence for this epoch (a file create) --
-            but ONLY once it owes no send (clause (i)), so the flag means
-            "my chain is flushed", not merely "I am armed",
-          * polls peers' flags (file existence).
-
-        Once all flags are up, entering is safe by CONSTRUCTION rather
-        than by argument: every rank that will participate is in this
-        same loop -- not blocked elsewhere -- flags are monotone so every
-        rank observes the same all-ready fact, and each rank's own chain
-        send was pumped to completion before it announced.
-
-        THE THREE CLAUSES ARE ONE MECHANISM, not three precautions. (i)
-        alone is unsatisfiable: a rank cannot flush a forward to a peer
-        that has stopped reading. (ii) alone leaves the flag a lie, which
-        is what let the peers enter on a rank that was still blocked.
-        Together they close boot 18: every announced rank owes nothing,
-        and no rank can be prevented from announcing.
-
-        The bound is PRE-ENTRY and therefore legal, unlike the withdrawn
-        (c): abandoning a poll costs nothing, because nothing has been
-        entered and no peer is owed anything. Abandoning an ENTERED
-        all_reduce aborts the whole group, which is why that bound was
-        withdrawn and pinned.
-        """
-        if self._presence is None:
-            # No presence channel wired (unit tests, or a builder that
-            # predates the gate): fall through to the old behaviour rather
-            # than silently never flipping.
-            return True
-
-        epoch = self._epoch
-        entry_round = self._entry_round
-        # PER-ROUND PRE-ENTRY BOUND. A new round is a new question, so it
-        # gets its own budget; carrying the previous round's elapsed time
-        # forward would abandon a perfectly healthy later round for time
-        # spent waiting on an earlier one.
-        stamp = (epoch, entry_round)
-        if self._presence_wait_stamp != stamp:
-            self._presence_wait_stamp = stamp
-            self._presence_wait_started = self._clock()
-        if self._presence_wait_started is None:
-            self._presence_wait_started = self._clock()
-
-        # #631 G: THE SERVICE TURN, and the reason this loop is no longer a
-        # starvation source. A spinning rank used to stop issuing its
-        # per-pass chain forward, and its downstream reached the hook ONLY
-        # by returning from the blocking recv that forward satisfied -- so
-        # the first rank to quiesce blocked every rank behind it, every
-        # epoch, identically. The answer is not to keep sending (an armed
-        # rank has nothing to forward) but to make the downstream not NEED
-        # the send: it services its channels here and reaches the hook by
-        # its own poll. Blocking inside this call is bounded by transfer
-        # time, never by peer scheduling, because a counter proved the
-        # message exists before the receive was made.
-        if self._service_fn is not None:
-            try:
-                self._service_fn()
-            except Exception as exc:  # noqa: BLE001 - servicing is best effort
-                logger.warning("%s service turn failed: %s", LOG_PREFIX, exc)
-
-        if self._pump_fn is not None:
-            # Progress our own arm forward WITHOUT blocking on it. This is
-            # what actually delivers the arm to the next stage while we
-            # wait, and it is the difference between this design and
-            # corpse B'.
-            try:
-                self._pump_fn()
-            except Exception as exc:  # noqa: BLE001 - pumping is best effort
-                logger.warning("%s pump failed: %s", LOG_PREFIX, exc)
-
-        # #631 CLAUSE (ii), and the boot-18 fix. An armed rank must keep
-        # servicing EVERY channel obligation it has, or a peer blocks on
-        # it. Pumping alone covers only what this rank SENDS; the other
-        # half of the obligation is what it RECEIVES. Boot 18: rank 2
-        # armed and stopped consuming the chain, so rank 1's ordinary
-        # top-of-pass commit of the previous pass's forward blocked in
-        # work.wait() -- a blocking point that PRECEDES the gate, which is
-        # why the gate could never cover it. Rank 1 therefore never
-        # announced, the gate never assembled, and rank 0 waited in the
-        # reduction. Draining here is what keeps the upstream free to
-        # reach its own announce.
-        if self._drain_fn is not None:
-            try:
-                self._drain_fn()
-            except Exception as exc:  # noqa: BLE001 - draining is best effort
-                logger.warning("%s drain failed: %s", LOG_PREFIX, exc)
-
-        # #631 CLAUSE (i). ANNOUNCE ONLY ONCE THIS RANK OWES NO SEND, so a
-        # raised flag means "my chain is flushed", not merely "I am armed".
-        # Announcing while a forward is still outstanding is what made the
-        # boot-18 flag a lie: the rank announced, went back around the
-        # pass, and blocked on the top-of-pass commit of that very send
-        # before it could reach the reduction its flag had promised. The
-        # peers, seeing a full quorum, entered and waited for a rank that
-        # was blocked elsewhere.
-        #
-        # Withholding is safe: presence is monotone, so a later announce is
-        # simply a later fact, and the pre-entry deadline still bounds the
-        # wait. A rank that can never flush abandons LOUDLY instead of
-        # dragging the group into a reduction it cannot join.
-        #
-        # WITHHOLDING MUST FALL THROUGH TO THE DEADLINE, never return
-        # early. Returning from here skips the pre-entry bound below and
-        # turns "wait until flushed" into a NEW unbounded wait -- the same
-        # shape as the wedge this clause exists to remove. Caught by
-        # test_can_fail_a_rank_that_never_flushes_abandons_instead_of_wedging
-        # while building it.
-        owes = False
-        if self._owes_send_fn is not None:
-            try:
-                owes = bool(self._owes_send_fn())
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("%s owes-send probe failed: %s", LOG_PREFIX, exc)
-                owes = False
-
-        # #631 G, FLIP-COMMIT HYGIENE. Quiescent AND fully serviced implies
-        # every channel is empty; a rank that is not there yet withholds
-        # presence exactly as a rank that owes a send does. Withholding
-        # rather than abandoning is what keeps this CONVERGENT: a message
-        # still in flight is normally reaped by the next service turn, and
-        # the pre-entry deadline below still bounds the wait, so a rank
-        # that can never empty its channels abandons loudly instead of
-        # dragging the group into a reduction it cannot join.
-        unclean = None
-        if not owes and self._channels_empty_fn is not None:
-            try:
-                unclean = self._channels_empty_fn()
-            except Exception as exc:  # noqa: BLE001
-                # #800: A BROKEN PROBE IS NOT A CLEAN ONE. This used to set
-                # `unclean = None`, which is the value that means "channels
-                # empty" -- so a probe that raised made the rank announce and
-                # enter the reduction with whatever live state the probe had
-                # been about to report. One return value carrying both "nothing
-                # to report" and "I could not tell" is the error shape this
-                # change exists to remove.
-                #
-                # Treated as unclean, which is bounded: the rank withholds and
-                # the pre-entry deadline below turns it into a LOUD abandonment
-                # within `presence_deadline_s`. A loud abandon is strictly
-                # better than a silent entry across a live channel, which
-                # misframes the post-flip stream long after the flip.
-                logger.warning("%s channel probe failed: %s", LOG_PREFIX, exc)
-                unclean = (
-                    f"the channel probe RAISED ({exc!r}), so this rank cannot "
-                    "prove its channels are empty. Withholding rather than "
-                    "assuming clean (#800)"
-                )
-        if unclean:
-            self.presence_withheld_channels += 1
-
-        if owes or unclean:
-            self.presence_withheld_rounds += 1
-            # #800: hold the reason, not just the count, so the abandonment
-            # that follows can say WHICH of the two missing-rank states this
-            # was instead of naming only the other one.
-            self._last_presence_withhold_reason = (
-                "still owes a chain send" if owes else str(unclean)
-            )
-            # #850: IS THIS WAIT AGAINST ANYTHING? A withhold is a wait, and a
-            # wait is only meaningful against something that can happen. The
-            # armed loop holds exactly four actuators (pp_flip_service); a
-            # reason outside all four cannot change while this rank sits in the
-            # gate, so every further round is spent losing. `owes` is excluded
-            # deliberately -- an owed chain send IS reaped by the service turn,
-            # and it is the single most common healthy withhold there is.
-            # Read through `getattr` with old-behaviour defaults, the
-            # convention this module already uses for `pp_flip_counters` and
-            # `_pp_stash_first_seen`: a duck-typed rank that never ran
-            # `__init__` (every gate test in this tree builds one) must keep
-            # working, and must keep the PRE-#850 behaviour while doing so.
-            futile_now = False
-            if unclean and not owes:
-                census = census_withhold_reason(str(unclean))
-                if census.is_futile:
-                    futile_now = True
-                    self.presence_futile_rounds = (
-                        getattr(self, "presence_futile_rounds", 0) + 1
-                    )
-                    # THE CLOCK IS PER EPISODE, never inherited. #800 states
-                    # the same rule for its escape clock ("reset when the key
-                    # empties, so a kind that is consumed and stashed again
-                    # starts fresh rather than inheriting a stranger's age").
-                    # Without this, a futile withhold that ended in an abandon
-                    # leaves `_presence_futile_since` set, and the NEXT arm
-                    # measures its bound from the previous episode -- expiring
-                    # in its first round, before the service turn has had one
-                    # chance to work.
-                    episode = (epoch, entry_round)
-                    if (
-                        getattr(self, "_presence_futile_key", None) != episode
-                        or getattr(self, "_presence_futile_since", None) is None
-                    ):
-                        self._presence_futile_key = episode
-                        self._presence_futile_since = self._clock()
-                    # ONCE PER OCCURRENCE, not once per round. #800's specimen
-                    # was 57922 silent rounds; the answer to silence is one
-                    # loud line, not 57922 of them.
-                    if getattr(self, "_presence_futile_alarmed", None) != (
-                        epoch,
-                        entry_round,
-                    ):
-                        self._presence_futile_alarmed = (epoch, entry_round)
-                        self.presence_futile_detected = (
-                            getattr(self, "presence_futile_detected", 0) + 1
-                        )
-                        logger.error(
-                            "%s %s epoch %d round %d: "
-                            "this rank is withholding presence on a reason no "
-                            "armed service turn can clear -- %s. Waiting cannot "
-                            "change it, so the flip is abandoned after %.1fs "
-                            "instead of holding the group for the full %.1fs "
-                            "presence deadline (#850).",
-                            LOG_PREFIX,
-                            ALARM_PRESENCE_FUTILE,
-                            epoch,
-                            entry_round,
-                            census.futile_reason(),
-                            getattr(self, "_presence_futile_s", 0.0),
-                            self._presence_deadline_s,
-                        )
-            if not futile_now:
-                self._presence_futile_since = None
-                self._presence_futile_alarmed = None
-            # SAY WHY, PERIODICALLY. A withholding rank is invisible in the
-            # log -- it simply does not announce -- and the only symptom is
-            # an abandonment 60 s later naming it as "never reached the
-            # entry", which points at the wrong place: it DID reach the
-            # entry and chose not to announce. The first metal run of this
-            # design cost a log-dig for exactly that reason. Throttled by
-            # the presence deadline so a healthy withhold of a few rounds
-            # stays silent and a stuck one is on the record before the
-            # abandonment that follows it.
-            now = self._clock()
-            if (
-                self._last_withhold_log is None
-                or (now - self._last_withhold_log) >= self._presence_deadline_s / 4.0
-            ):
-                self._last_withhold_log = now
-                logger.warning(
-                    "%s epoch %d round %d: WITHHOLDING presence (%d rounds so "
-                    "far) -- %s. This rank is AT the entry and declining to "
-                    "announce; it is not blocked upstream of it.",
-                    LOG_PREFIX,
-                    epoch,
-                    entry_round,
-                    self.presence_withheld_rounds,
-                    "still owes a chain send" if owes else unclean,
-                )
-        else:
-            self._last_withhold_log = None
-            self._last_presence_withhold_reason = None
-            # #850: this rank announced, so whatever it was waiting for is
-            # gone. Clear the futility clock so a later withhold is timed from
-            # its own arrival rather than inheriting a predecessor's age.
-            self._presence_futile_since = None
-            self._presence_futile_alarmed = None
-            self._presence.announce(
-                epoch, note=f"pending={self._pending}", round_=entry_round
-            )
-
-        # A rank that is withholding cannot be part of a full quorum (its
-        # own flag is down), so this is skipped rather than merely false.
-        # #631 H: the predicate is now "everyone present AND nobody
-        # withdrawn". A stale presence flag from a rank that has since
-        # abandoned must not form a quorum -- that is corpse H.
-        if (
-            not owes
-            and not unclean
-            and self._presence.quorum(epoch, round_=entry_round)
-        ):
-            # #631 G, THE ASSERT. Re-checked HERE, at the instant of entry,
-            # because the withholding check above proves nothing about the
-            # moment a quorum forms: a peer's message can land in between.
-            # This is the cheap catch for the nastiest silent failure this
-            # change can introduce -- a half-consumed two-step
-            # point_to_point_pyobj message, or an unreaped isend, crossing
-            # the re-formation and misframing the post-flip stream long
-            # after the flip is forgotten. It also catches a sender that
-            # died between posting its message and publishing its counter.
-            #
-            # Loud, and pre-entry: nothing has been entered, so abandoning
-            # costs nothing and no peer is owed a collective. Crossing the
-            # re-formation with a live channel would cost everything.
-            late = None
-            if self._channels_empty_fn is not None:
-                try:
-                    late = self._channels_empty_fn()
-                except Exception as exc:  # noqa: BLE001
-                    # #800: same separation as the withhold probe above. A
-                    # raising probe left `late` as None, which reads as "empty",
-                    # and this rank entered the re-formation on the strength of
-                    # a check that never ran. Abandoning here is free -- nothing
-                    # has been entered and no request has been touched.
-                    logger.warning("%s entry channel probe failed: %s", LOG_PREFIX, exc)
-                    late = (
-                        f"the entry channel probe RAISED ({exc!r}), so this "
-                        "rank cannot prove its channels are empty at the "
-                        "instant of entry (#800)"
-                    )
-            if late:
-                self.entry_channel_violations += 1
-                logger.error(
-                    "%s CHANNELS NOT EMPTY AT ENTRY for epoch %d round %d: "
-                    "%s. A quiescent, fully serviced rank owes nothing on "
-                    "any channel, so this is a framing or quiescence bug, "
-                    "not a slow peer. Abandoning BEFORE entry -- nothing "
-                    "was entered and no request was touched.",
-                    LOG_PREFIX,
-                    epoch,
-                    entry_round,
-                    late,
-                )
-                waited = self._clock() - self._presence_wait_started
-                self._presence_wait_started = None
-                return self._abandon_no_quorum(epoch, [], waited)
-            self._commit_to_entering(epoch, entry_round)
-            waited = self._clock() - self._presence_wait_started
-            self._presence_wait_started = None
-            # RE-BASE THE PARK CLOCK ON GROUP ASSEMBLY. The park deadline
-            # measures "armed but never reached quiescence" -- a question
-            # that is only meaningful once the group is actually
-            # assembled. Left measuring from the arm, it races this gate:
-            # a rank whose peers took longer than park_deadline_s to
-            # arrive would abandon on the park deadline while those peers
-            # were still polling, and the ranks would then disagree
-            # around a gloo collective -- which is fatal, not merely
-            # wrong ("Connection closed by peer" -> every rank aborts).
-            # Measured 2026-08-08, boot 14: all three ranks announced
-            # presence correctly, then abandoned at exactly 30.0s and the
-            # group died.
-            #
-            # Re-basing keeps the two bounds from overlapping at all: the
-            # presence bound governs assembly, the park bound governs
-            # quiescence, and they now run in sequence rather than
-            # concurrently.
-            # ONCE PER ARM, never per round. Re-basing on every gate
-            # opening makes the park deadline unreachable: the gate opens
-            # each round, the clock resets each round, and a flip that can
-            # never reach quiescence holds FOR EVER with its requests
-            # parked -- measured 2026-08-08 (boot 17): repeated "group
-            # present after 0.00s" on every rank, cutovers=0,
-            # abandoned=0, and the server answering nothing.
-            if self._gate_open_epoch != epoch:
-                self._gate_open_epoch = epoch
-                self._armed_at = self._clock()
-                logger.warning(
-                    "%s group present for epoch %d after %.2fs; park clock "
-                    "re-based once, entering the consensus round",
-                    LOG_PREFIX,
-                    epoch,
-                    waited,
-                )
-            return True
-
-        waited = self._clock() - self._presence_wait_started
-        # #850: THE ONLY BEHAVIOUR CHANGE, and it is a clock, not a new exit.
-        # A futile withhold takes the SAME withdrawal path as any other
-        # expiry -- may_withdraw, the race re-check, _abandon_no_quorum -- so
-        # nothing about how a flip is abandoned changes here. It just stops
-        # waiting 60 s for a consumer this rank is itself excluding. The bound
-        # is measured from when the futility STARTED, not from the arm, so a
-        # withhold that only turns futile late still gets its own full bound.
-        expired = waited >= self._presence_deadline_s
-        futile_since = getattr(self, "_presence_futile_since", None)
-        futile_bound = getattr(self, "_presence_futile_s", 0.0)
-        if not expired and futile_since is not None and futile_bound > 0:
-            expired = (self._clock() - futile_since) >= futile_bound
-            if expired:
-                # Counted HERE, where the shortened bound is what ends the
-                # wait -- not where the defect was merely detected.
-                self.presence_futile_abandons = (
-                    getattr(self, "presence_futile_abandons", 0) + 1
-                )
-        if expired:
-            # #631 H, THE WITHDRAWAL SIDE. Leaving is only permitted while
-            # no peer has committed on this rank's presence. If one has,
-            # this rank is still at the hook and owes it the reduction --
-            # so it follows through instead of stranding it. That is the
-            # invariant: any commit converts a withdrawing rank into an
-            # enterer, and there is no interleaving where one enters and
-            # another stays out.
-            if not self._presence.may_withdraw(epoch, round_=entry_round):
-                logger.warning(
-                    "%s pre-entry bound expired for epoch %d round %d, but a "
-                    "peer is already ENTERING on this rank's presence -- "
-                    "following through into the reduction rather than "
-                    "stranding it",
-                    LOG_PREFIX,
-                    epoch,
-                    entry_round,
-                )
-                self._commit_to_entering(epoch, entry_round)
-                self._presence_wait_started = None
-                return True
-            self._presence.declare_withdrawn(epoch, round_=entry_round)
-            # Re-check AFTER publishing: a peer may have committed in the
-            # window between the check and the write.
-            if not self._presence.may_withdraw(epoch, round_=entry_round):
-                logger.warning(
-                    "%s withdrawal raced a peer's entry for epoch %d round "
-                    "%d -- following through into the reduction",
-                    LOG_PREFIX,
-                    epoch,
-                    entry_round,
-                )
-                self._commit_to_entering(epoch, entry_round)
-                self._presence_wait_started = None
-                return True
-            missing = self._presence.missing(epoch, round_=entry_round)
-            self._presence_wait_started = None
-            return self._abandon_no_quorum(epoch, missing, waited)
-        return None
-
-    def _commit_to_entering(self, epoch: int, entry_round: int) -> None:
-        """#631 H phase one: publish the intent to enter, then settle.
-
-        Written BEFORE this rank actually enters, so a peer at its own
-        pre-entry bound can see that someone has committed on its presence
-        and is therefore forbidden from withdrawing. If a withdrawal is
-        already visible, waiting is SAFE and terminates by construction:
-        this rank's ENTERING marker forces that withdrawer to follow
-        through, at which point it stops counting as withdrawn.
-        """
-        self._presence.declare_entering(epoch, round_=entry_round)
-        if not self._presence.withdrawn(epoch, round_=entry_round):
-            return
-        deadline = self._clock() + self._presence_deadline_s
-        while self._presence.withdrawn(epoch, round_=entry_round):
-            if self._clock() >= deadline:
-                logger.error(
-                    "%s epoch %d round %d: a peer stayed WITHDRAWN despite "
-                    "this rank ENTERING. The tie-break should have forced "
-                    "it in; entering anyway would strand this rank.",
-                    LOG_PREFIX,
-                    epoch,
-                    entry_round,
-                )
-                return
-            self._sleep(self._presence_poll_interval_s)
-
-    def _abandon_no_quorum(self, epoch: int, missing, waited: float):
-        """Pre-entry abandonment: loud, safe, and retryable.
-
-        Safe precisely because nothing was entered -- no peer is waiting
-        on a collective this rank owes. Disarms and returns to normal
-        cycling; the policy may re-arm, which mints a NEW epoch, so the
-        stale flags of this one are never consulted again.
-
-        #787 SENDER-SIDE HALF: before local state clears, give this rank
-        one last chance to reap/count anything it already posted on the
-        CHAN_DICT wire. Without this, a send that completed moments ago
-        can still be un-bumped when a downstream peer's disarm-time
-        settle window (pp_flip_drain_leftover_dicts) already gave up and
-        closed -- the exact race #787 exploits. This does not delay the
-        abandon on anything unfinished; it only catches up bookkeeping
-        for work that is already done.
-        """
-        # #787 REGRESSION REPAIR: getattr, and for the reason this codebase
-        # already documents at scheduler.py:9286 -- these paths are driven in
-        # tests by STAND-INS that carry only the fields the logic reads. A
-        # stand-in without this hook must behave exactly as before rather than
-        # raise AttributeError from inside the abandon path. Direct attribute
-        # access here broke 6 phase-policy cases the moment the hook was added.
-        flush_fn = getattr(self, "_flush_pending_sends_fn", None)
-        if flush_fn is not None:
-            try:
-                flush_fn()
-            except Exception as exc:  # noqa: BLE001 - flush is best effort
-                logger.warning(
-                    "%s #787 pre-abandon send flush failed (no quorum): %s",
-                    LOG_PREFIX,
-                    exc,
-                )
-        direction = self._pending
-        self._pending = None
-        self._armed_at = None
-        # #834 A: nothing is pending any more, so nothing may keep the
-        # device tier disarmed. Released HERE rather than left to the
-        # round hook's insurance so the tier comes back in the same
-        # step the flip ends in, not one round later.
-        release_prearm_quiesce(self, "nothing pending")
-        self._parked_extent = None  # #746: a snapshot never outlives its flip
-        self._last_hold_reason = None
-        self.presence_timeouts += 1
-        # #800: NAME BOTH CAUSES, and say which one this rank was in.
-        #
-        # A rank lands in `missing` when it did not announce, and there are
-        # exactly TWO ways to not announce: never having reached the gate at
-        # all (blocked upstream of it), or having reached it and WITHHELD. The
-        # sentence here used to assert the first as though it were the only
-        # one, and both 2026-08-22 wedges were the second -- so every reader
-        # this line reached was sent upstream, away from the rank that was
-        # sitting at the entry with a stashed message it could not place.
-        # One indicator that reads the same in two different states is not a
-        # finding; this one now separates them for the rank it can speak for.
-        # getattr for the reason #787 documents twenty lines above: these paths
-        # are driven in tests by stand-ins that carry only the fields the logic
-        # reads, and a stand-in without this one must abandon exactly as before.
-        withheld = getattr(self, "_last_presence_withhold_reason", None)
-        self._last_presence_withhold_reason = None
-        if withheld is not None:
-            local = (
-                f"THIS rank withheld its own presence for "
-                f"{self.presence_withheld_rounds} round(s): {withheld}. It "
-                f"reached the entry and declined to announce -- do not look "
-                f"upstream of the entry for it."
-            )
-        else:
-            local = (
-                "THIS rank announced. A peer named above either never reached "
-                "the entry (look upstream of it) or reached it and withheld "
-                "-- its own WITHHOLDING presence line for this epoch and round "
-                "says which, and its absence from the log means the former."
-            )
-        logger.error(
-            "%s FLIP ABANDONED (no quorum): %s waited %.1fs for epoch %d "
-            "and rank(s) %s did not announce presence (deadline %gs). "
-            "NOTHING was entered and no request was touched -- serving "
-            "continues on the %s stack and the policy may re-arm, which "
-            "mints a new epoch. %s",
-            LOG_PREFIX,
-            direction,
-            waited,
-            epoch,
-            missing,
-            self._presence_deadline_s,
-            self._phase,
-            local,
-        )
-        return None
-
-    def _join_bounded(self, payload):
-        """#631(c): the consensus reduction under a deadline.
-
-        Raises ``PhaseFlipJoinTimeout`` when peers do not join in time,
-        instead of blocking for ever. The bound is deliberately generous
-        (``DEFAULT_JOIN_DEADLINE_S``): a slow peer draining a long
-        prefill is normal and must NOT trip it -- this is a wedge
-        breaker, not a latency control.
-        """
-        from sglang.srt.distributed.device_communicators.barlink_liveness import (
-            CollectiveTimeoutError,
-            PeerLostError,
-        )
-
-        try:
-            return self._collective_min(payload, timeout_s=self._join_deadline_s)
-        except TypeError:
-            # An injected channel from a test/older builder that does not
-            # take a deadline. Do not silently drop the bound: the whole
-            # point is that this wait cannot be unbounded.
-            logger.warning(
-                "%s consensus channel takes no timeout; joining unbounded "
-                "(a wedge here cannot be broken from inside)",
-                LOG_PREFIX,
-            )
-            return self._collective_min(payload)
-        except (CollectiveTimeoutError, PeerLostError) as exc:
-            # BOTH, because the channel raises CollectiveTimeoutError and
-            # catching only PeerLostError let it escape as a bare
-            # "Fatal Python error: Aborted" (measured 2026-08-08).
-            raise PhaseFlipJoinTimeout(
-                f"no group-wide join within {self._join_deadline_s:g}s ({exc})"
-            ) from exc
-
-    def _abandon_unjoined_flip(self, why: str) -> None:
-        """Give up on a flip whose consensus round never assembled.
-
-        Same contract as ``_abandon_parked_flip``: disarm, log loudly,
-        return to serving, and NEVER raise -- the flip is optional, the
-        requests are not. The policy may re-arm at its next evaluation,
-        so a transient skew costs one logged retry.
-
-        #787 SENDER-SIDE HALF: same reasoning as in ``_abandon_no_quorum``
-        -- flush/count anything already posted on CHAN_DICT before this
-        rank's local state clears, so a peer's disarm-time settle window
-        is not racing against bookkeeping this rank could have closed out
-        itself.
-        """
-        # #787 REGRESSION REPAIR: getattr, and for the reason this codebase
-        # already documents at scheduler.py:9286 -- these paths are driven in
-        # tests by STAND-INS that carry only the fields the logic reads. A
-        # stand-in without this hook must behave exactly as before rather than
-        # raise AttributeError from inside the abandon path. Direct attribute
-        # access here broke 6 phase-policy cases the moment the hook was added.
-        flush_fn = getattr(self, "_flush_pending_sends_fn", None)
-        if flush_fn is not None:
-            try:
-                flush_fn()
-            except Exception as exc:  # noqa: BLE001 - flush is best effort
-                logger.warning(
-                    "%s #787 pre-abandon send flush failed (unjoined): %s",
-                    LOG_PREFIX,
-                    exc,
-                )
-        direction = self._pending
-        self._pending = None
-        self._armed_at = None
-        # #834 A: nothing is pending any more, so nothing may keep the
-        # device tier disarmed. Released HERE rather than left to the
-        # round hook's insurance so the tier comes back in the same
-        # step the flip ends in, not one round later.
-        release_prearm_quiesce(self, "nothing pending")
-        self._parked_extent = None  # #746: a snapshot never outlives its flip
-        self._last_hold_reason = None
-        self.join_deadline_aborts += 1
-        logger.error(
-            "%s FLIP ABANDONED (join): %s never assembled a consensus "
-            "round -- %s. Serving continues on the %s stack and no request "
-            "was touched; the arm is dropped and may be retried. A peer "
-            "that never joins is a peer that never reached its round hook: "
-            "look for a rank blocked upstream of it, not for a slow flip.",
-            LOG_PREFIX,
-            direction,
-            why,
-            self._phase,
-        )
-        return None
 
     def _abandon_parked_flip(self, ready: int) -> None:
         """Give up on an armed flip that never reached quiescence.
