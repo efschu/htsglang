@@ -1165,6 +1165,38 @@ def _pp_ring_commit_budget_s() -> float:
 # without adding anything to what a holder must bind.
 
 
+def _pp_era_ring_live(holder) -> bool:
+    """Is the retired era's admission-decision ring live on this holder?
+
+    THE ONE PLACE THE STRIP-B PREDICATE IS SPELLED, so the three gates that
+    ask it cannot drift apart, and module-level for the reason stated
+    immediately above: a stand-in binds methods one at a time and would raise
+    AttributeError on `self._pp_era_ring_live`.
+
+    AN UNKNOWN HOLDER IS NOT "FLIP OFF". Measured 2026-08-29: strip-B
+    (d4478a053a) spelled this predicate `getattr(self.server_args, ...)`,
+    which dereferences an attribute roughly a dozen stand-ins in the
+    #787/#791/#795/#796 family never set. Cherry-picked onto the #1010 pin it
+    turned 15 green tests into 13 failures across
+    test_pp_admission_wiring_791, test_pp_admission_send_handle_dropped_796,
+    test_pp_admission_chain_flush_deadlock_795 and
+    test_pp_admission_wraparound_never_blocks -- every one of them
+    `'types.SimpleNamespace' object has no attribute 'server_args'`, the exact
+    sibling of the #973 defect the comment above this function records.
+    strip-B's own evidence line says "py_compile", so no suite ever saw it.
+
+    A holder with no `server_args` therefore keeps the PRE-GATE behaviour --
+    byte-identical to what shipped before strip-B -- which is this file's
+    stand-in convention (#787) and costs production nothing: a real Scheduler
+    always has `server_args`, so the fallback is reachable only from test
+    harnesses.
+    """
+    server_args = getattr(holder, "server_args", None)
+    if server_args is None:
+        return True
+    return bool(getattr(server_args, "enable_phase_flip", False))
+
+
 def _pp_commit_channel_of(holder, work: List[P2PWork]) -> str:
     """Name the wire ``work`` rides, for the #973 message.
 
@@ -7184,6 +7216,37 @@ class SchedulerPPMixin:
         addressable marker instead of wedging.
         """
         budget = _pp_ring_commit_budget_s()
+        # THE BOUND STAYS ON THIS CHANNEL, AND STRIP-B's THIRD GATE IS REVERTED
+        # HERE (2026-08-29). strip-B (d4478a053a) set `budget = 0.0` whenever
+        # the flip is off, on the premise that the named bound "belongs to the
+        # retired era machinery" -- ten boots of the window had ended as
+        # 'pp-ring-commit/... did not complete within 120s'.
+        #
+        # THE BOUND IS THE MESSENGER, NOT THE WEDGE, and the measurement that
+        # settles it arrived after strip-B was written. Operator boot
+        # boot_pp3solo_769f88efea_0829_092829.log, PP3 solo with NO flip: all
+        # three ranks wedged on the FIRST request, here, on
+        # 'pp-ring-commit/dict/send_output_work[0]' and 'pp-ring-commit/p2p[0]'
+        # -- the prefill result never reached PP0 ("DECODE HELD (no prefill
+        # result yet)"), zero batches served. Two things follow. The wedge is
+        # flip-independent (#990 confirmed from the other side), so silencing
+        # the deadline would not have prevented it. And the channel it wedges
+        # on is the OUTPUT RETURN PATH, last stage -> PP0, which plain upstream
+        # PP has and which is therefore NOT the retired second implementation.
+        #
+        # So removing the bound here does not retire era machinery; it converts
+        # a named 120 s death on a core PP channel into a silent park against
+        # gloo's two-hour group timeout. That is the opposite of what the purge
+        # is for -- "kein stilles Warn-und-Weiter auf Korrektheitspfaden" --
+        # and it would blind the next PP3 proof boot to the one fault it exists
+        # to characterise. `ENV_RING_COMMIT_BUDGET` <= 0 remains the deliberate,
+        # documented way to drop the deadline for one run.
+        #
+        # The two gates strip-B placed on the ADMISSION ring
+        # (`_pp_send_admission_decision`, `_pp_commit_admission_send_work`) are
+        # kept: those remove two arcs of a closed send cycle that only the
+        # retired era needs. An instrument on a shared channel is a different
+        # thing from the machinery it observes.
         if budget <= 0:
             # Documented escape hatch (ENV_RING_COMMIT_BUDGET): byte-for-byte
             # the pre-#973 behaviour, including the unbounded park.
@@ -7738,6 +7801,21 @@ class SchedulerPPMixin:
         NO COLLECTIVE note -- the 2026-08-17 deadlock family this must not
         repeat). Retaining a handle is not blocking on one.
         """
+        # STRIP-B (user order 2026-08-29): this exists only for the retired
+        # second HiCache implementation. With the flip off there is no era to
+        # keep congruent, and the machinery is not merely idle here -- it is
+        # what deadlocks the ring. Measured, boot 71, three py-spy stacks at
+        # one instant: PP0 and PP1 both blocked in
+        # `_pp_commit_admission_send_work` waiting for their admission-decision
+        # send to be taken, PP2 blocked in its output-send wrap 2->0 that PP0
+        # would have taken next. A closed three-arc send cycle, and every arc
+        # of it belongs to this apparatus. Plain upstream PP has no
+        # admission-decision ring at all.
+        # Ten boots died of this family (53, 55-59, 68-71), flip-free included
+        # (#990), so it is left out rather than repaired -- an eleventh fix to
+        # a mechanism with no remaining purpose.
+        if not _pp_era_ring_live(self):
+            return
         if self.ps.pp_size <= 1:
             return
         # #978: recorded BEFORE the last-rank return below -- the last rank
@@ -7818,6 +7896,21 @@ class SchedulerPPMixin:
         `_pp_commit_pending_req_work` relies on -- or, on a pass that sent
         nothing, a wait on an empty list.
         """
+        # STRIP-B (user order 2026-08-29): this exists only for the retired
+        # second HiCache implementation. With the flip off there is no era to
+        # keep congruent, and the machinery is not merely idle here -- it is
+        # what deadlocks the ring. Measured, boot 71, three py-spy stacks at
+        # one instant: PP0 and PP1 both blocked in
+        # `_pp_commit_admission_send_work` waiting for their admission-decision
+        # send to be taken, PP2 blocked in its output-send wrap 2->0 that PP0
+        # would have taken next. A closed three-arc send cycle, and every arc
+        # of it belongs to this apparatus. Plain upstream PP has no
+        # admission-decision ring at all.
+        # Ten boots died of this family (53, 55-59, 68-71), flip-free included
+        # (#990), so it is left out rather than repaired -- an eleventh fix to
+        # a mechanism with no remaining purpose.
+        if not _pp_era_ring_live(self):
+            return
         pending = getattr(self, "_pp_admission_send_work", None)
         if pending:
             self._pp_commit_comm_work(pending)

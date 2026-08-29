@@ -1,11 +1,21 @@
 """Hierarchical Mamba Radix Cache -- extends MambaRadixCache with HiCache storage pooling.
 
-UNREACHABLE IN THE DEFAULT FACTORY: no code path constructs this class --
-registry.py routes hierarchical + hybrid-SSM configs to UnifiedRadixCache.
-Fixes for production behavior belong in unified_radix_cache.py. This class is
-retained as tested latent code for a potential future construction site; three
-hardening commits (2915f6de4f, 1d379c56ee, 8bca9d3db1) landed here before the
-reachability gap was discovered (#581).
+RETIRED SECOND HiCache IMPLEMENTATION -- REFUSED, NOT MERELY UNREACHABLE
+(user order 2026-08-29, "das muss sofort allem ausgetrieben werden").
+
+No code path constructs this class -- registry.py routes hierarchical +
+hybrid-SSM configs to UnifiedRadixCache -- and since 2026-08-29 none may:
+``HiMambaRadixCache.__init__`` raises, and importing this module logs a
+warning. Fixes for production behavior belong in unified_radix_cache.py.
+
+The class body is retained as tested latent code, but "latent" is now
+enforced rather than documented. Three hardening commits (2915f6de4f,
+1d379c56ee, 8bca9d3db1) landed here AFTER it was already unreachable and
+before the gap was discovered (#581) -- fixes to a second implementation
+nobody ran. The wider cost of running two implementations against one store
+is on record: a store carrying two blob generations at once (see
+``hicache_storage.MixedGenerationError``) and an era validator refusing
+beside the replacement's read path (#873).
 """
 
 from __future__ import annotations
@@ -72,6 +82,22 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# Warned at IMPORT, refused at CONSTRUCTION (user order 2026-08-29). The two
+# are not redundant: an import is how this module gets back into a process at
+# all -- a stray `from ... import HiMambaRadixCache` in a new call site, a
+# helper reaching for `HostLRUList`, a test harness pulling the class in to
+# introspect it -- and the import happens long before anyone tries to build
+# the class. Naming it at the earlier seam is what makes the later refusal
+# predictable instead of a surprise at boot. Nothing on the live path imports
+# this module: `hybrid_pool_assembler` names it under TYPE_CHECKING only, so
+# this line does not fire in a serving process.
+logger.warning(
+    "IMPORTED RETIRED MODULE mem_cache/hi_mamba_radix_cache.py -- the retired "
+    "second HiCache implementation. It has no construction site (#581) and "
+    "HiMambaRadixCache.__init__ refuses. The live hierarchical + hybrid-SSM "
+    "path is UnifiedRadixCache (mem_cache/unified_radix_cache.py)."
+)
 
 
 class HostLRUList(LRUList):
@@ -151,6 +177,35 @@ class HiMambaRadixCache(MambaRadixCache):
             )
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
+        # RETIRED SECOND HiCache IMPLEMENTATION -- REFUSED AT ITS ENTRY POINT
+        # (user order 2026-08-29). This class is the era's own storage read
+        # path: its own `prefetch_from_storage`, `check_prefetch_progress`,
+        # `terminate_prefetch`, `mamba_prefetch_alloc` and its own host-pool
+        # attach, all duplicating what UnifiedRadixCache now owns. It has had
+        # no construction site since #581 (see this module's docstring and
+        # `registry.py`'s selection chain, which routes hierarchical +
+        # hybrid-SSM to UnifiedRadixCache), and three hardening commits landed
+        # in it while it was already unreachable -- fixes to a second
+        # implementation nobody ran.
+        #
+        # THE HAZARD THIS REFUSAL NAMES is not "dead code costs nothing". It
+        # is that a construction site added here, by anyone, at any later
+        # date, silently restores TWO live HiCache implementations against one
+        # store -- the exact state that produced a store carrying two blob
+        # generations at once (see `hicache_storage.MixedGenerationError`) and
+        # an era validator refusing beside the replacement's read path (#873).
+        # The class body is kept as tested latent code, and the door is shut.
+        raise NotImplementedError(
+            "sglang.srt.mem_cache.hi_mamba_radix_cache: retired second HiCache "
+            "implementation. HiMambaRadixCache has had no construction site "
+            "since #581 and must not gain one: hierarchical + hybrid-SSM is "
+            "served by UnifiedRadixCache (mem_cache/unified_radix_cache.py, "
+            "built in mem_cache/registry.py::_create_unified_radix_cache), "
+            "which owns the live storage read path. Port the behaviour you "
+            "need to UnifiedRadixCache instead of reviving this class -- two "
+            "HiCache implementations against one store is the defect this "
+            "refusal exists to prevent, not a configuration."
+        )
         self._enable_metrics_flag = params.enable_metrics
         self.normalize_hicache_args(server_args)
 
