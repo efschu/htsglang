@@ -263,14 +263,38 @@ class TestEraAdmissionRingPredicate(CustomTestCase):
 
         self.assertTrue(self._predicate()(types.SimpleNamespace()))
 
-    def test_all_three_gates_ask_the_one_predicate(self):
-        """No second spelling of the predicate may reappear beside it."""
+    def test_both_admission_gates_ask_the_one_predicate(self):
+        """No second spelling of the predicate may reappear beside it.
+
+        TWO, not strip-B's three. Its third gate dropped the #973 deadline in
+        `_pp_commit_comm_work` whenever the flip is off, and that gate is
+        reverted -- see `test_the_output_return_path_keeps_its_deadline`."""
         import inspect
 
         from sglang.srt.managers import scheduler_pp_mixin as mod
 
         src = inspect.getsource(mod)
-        self.assertEqual(src.count("if not _pp_era_ring_live(self):"), 3, src.count)
+        self.assertEqual(src.count("if not _pp_era_ring_live(self):"), 2)
+
+    def test_the_output_return_path_keeps_its_deadline(self):
+        """The bound on `_pp_commit_comm_work` is an INSTRUMENT on a core PP
+        channel, not retired machinery, and must not be gated off with the era.
+
+        Operator boot boot_pp3solo_769f88efea_0829_092829.log, PP3 solo with NO
+        flip: all three ranks wedged on the first request at this commit, on
+        'pp-ring-commit/dict/send_output_work[0]' and 'pp-ring-commit/p2p[0]'.
+        The channel is the output return path (last stage -> PP0), which plain
+        upstream PP has. Silencing the deadline there turns a named 120 s death
+        into a park against gloo's two-hour timeout."""
+        import inspect
+
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        src = inspect.getsource(SchedulerPPMixin._pp_commit_comm_work)
+        # The predicate itself, not the words about it: the comment above the
+        # code deliberately quotes strip-B's `budget = 0.0` line.
+        self.assertNotIn("if not _pp_era_ring_live(self):", src)
+        self.assertIn("bounded_wait(", src)
 
 
 if __name__ == "__main__":

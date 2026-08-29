@@ -7216,17 +7216,37 @@ class SchedulerPPMixin:
         addressable marker instead of wedging.
         """
         budget = _pp_ring_commit_budget_s()
-        # STRIP-B (user order 2026-08-29): no HiCacheCollectiveTimeout wrapper
-        # on plain PP. The named bound belongs to the retired era machinery;
-        # on this path it never bought correctness, only a named death -- ten
-        # boots of this window ended as 'pp-ring-commit/... did not complete
-        # within 120s'. `bounded_wait` is not a collective either (it takes one
-        # torch Work handle; the label only names the parked thread), so
-        # dropping it removes a deadline, not a guarantee. The raw wait below
-        # is the documented escape hatch of SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S
-        # and is what upstream PP does.
-        if not _pp_era_ring_live(self):
-            budget = 0.0
+        # THE BOUND STAYS ON THIS CHANNEL, AND STRIP-B's THIRD GATE IS REVERTED
+        # HERE (2026-08-29). strip-B (d4478a053a) set `budget = 0.0` whenever
+        # the flip is off, on the premise that the named bound "belongs to the
+        # retired era machinery" -- ten boots of the window had ended as
+        # 'pp-ring-commit/... did not complete within 120s'.
+        #
+        # THE BOUND IS THE MESSENGER, NOT THE WEDGE, and the measurement that
+        # settles it arrived after strip-B was written. Operator boot
+        # boot_pp3solo_769f88efea_0829_092829.log, PP3 solo with NO flip: all
+        # three ranks wedged on the FIRST request, here, on
+        # 'pp-ring-commit/dict/send_output_work[0]' and 'pp-ring-commit/p2p[0]'
+        # -- the prefill result never reached PP0 ("DECODE HELD (no prefill
+        # result yet)"), zero batches served. Two things follow. The wedge is
+        # flip-independent (#990 confirmed from the other side), so silencing
+        # the deadline would not have prevented it. And the channel it wedges
+        # on is the OUTPUT RETURN PATH, last stage -> PP0, which plain upstream
+        # PP has and which is therefore NOT the retired second implementation.
+        #
+        # So removing the bound here does not retire era machinery; it converts
+        # a named 120 s death on a core PP channel into a silent park against
+        # gloo's two-hour group timeout. That is the opposite of what the purge
+        # is for -- "kein stilles Warn-und-Weiter auf Korrektheitspfaden" --
+        # and it would blind the next PP3 proof boot to the one fault it exists
+        # to characterise. `ENV_RING_COMMIT_BUDGET` <= 0 remains the deliberate,
+        # documented way to drop the deadline for one run.
+        #
+        # The two gates strip-B placed on the ADMISSION ring
+        # (`_pp_send_admission_decision`, `_pp_commit_admission_send_work`) are
+        # kept: those remove two arcs of a closed send cycle that only the
+        # retired era needs. An instrument on a shared channel is a different
+        # thing from the machinery it observes.
         if budget <= 0:
             # Documented escape hatch (ENV_RING_COMMIT_BUDGET): byte-for-byte
             # the pre-#973 behaviour, including the unbounded park.
