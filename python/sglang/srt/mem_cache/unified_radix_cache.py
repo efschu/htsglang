@@ -870,26 +870,51 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
                 )
             if self.pp_rank == 0:
-                # The home hop: the last rank's fully-reduced vector.
-                home = torch.full((width,), -1, dtype=torch.int64)
-                bounded_recv(
-                    home,
-                    group=self.pp_group,
-                    group_src=last,
-                    tag=P2PTag.HIRADIX_PP_SYNC,
-                    label=f"1029_lap/home<-pp{last}",
-                    timeout_s=self.collective_timeout_s,
-                    rank_desc=collective_rank_desc(self),
-                )
-                for s in range(_1029_SLOTS):
-                    h = int(home[3 * s].item())
-                    val = int(home[3 * s + 1].item())
-                    flag = int(home[3 * s + 2].item())
-                    if h == -1 or flag != 0 or val < 0:
-                        continue
-                    rid = self._1029_by_hash.get(h)
-                    if rid is not None:
-                        self._1029_final[rid] = val
+                # THE HOME HOP IS NON-BLOCKING, AND THAT IS THE WHOLE FIX OF
+                # THE FIRST #1029 BOOT.
+                #
+                # `679ff10406` blocked here on `bounded_recv` from the last
+                # rank and wedged the instance in four minutes. The lap is NOT
+                # free-standing: it runs inside `check_hicache_events`, inside
+                # a scheduler round whose progress depends on the PP pipeline.
+                # PP0 blocking for PP2's home vector meant PP2 could not reach
+                # its own lap, because PP2 was waiting on PP1's proxy, which
+                # was waiting on PP0's proxy, which PP0 could not send while
+                # blocked here. Measured with py-spy on the wedge:
+                #   PP1 MainThread -> _pp_recv_dict_from_prev_stage ->
+                #       recv_object, parked on "pp:0/recv_object[src=0]/size"
+                # A pipeline nested inside a pipeline is a CYCLE, and the
+                # earlier claim that it was not is retracted.
+                #
+                # So the home vector is harvested a round LATE, off a standing
+                # irecv, and nothing waits for it. A lap whose answer has not
+                # landed yet simply proposes again -- deferral, which is the
+                # property this design already relies on everywhere else.
+                # Counts stay matched because the rounds are in lockstep
+                # (#1028), so exactly one home send meets one posted irecv.
+                work = getattr(self, "_1029_home_work", None)
+                if work is not None and work.is_completed():
+                    home = self._1029_home_buf
+                    for s in range(_1029_SLOTS):
+                        h = int(home[3 * s].item())
+                        val = int(home[3 * s + 1].item())
+                        flag = int(home[3 * s + 2].item())
+                        if h == -1 or flag != 0 or val < 0:
+                            continue
+                        rid = self._1029_by_hash.get(h)
+                        if rid is not None:
+                            self._1029_final[rid] = val
+                    self._1029_home_work = None
+                if getattr(self, "_1029_home_work", None) is None:
+                    self._1029_home_buf = torch.full(
+                        (width,), -1, dtype=torch.int64
+                    )
+                    self._1029_home_work = torch.distributed.irecv(
+                        self._1029_home_buf,
+                        group_src=last,
+                        group=self.pp_group,
+                        tag=P2PTag.HIRADIX_PP_SYNC,
+                    )
         except Exception as exc:  # noqa: BLE001 - a lap may fail, never wedge
             self._1029_lap_failures = getattr(self, "_1029_lap_failures", 0) + 1
             logger.warning(
@@ -1029,6 +1054,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._1029_pending: set = set()
         self._1029_defer: dict[str, int] = {}
         self._1029_by_hash: dict[int, str] = {}
+        # The standing home-hop irecv on PP0. Never waited on: harvested a
+        # round late when it completes. See `_1029_lap`.
+        self._1029_home_buf = None
+        self._1029_home_work = None
         # #810: built in `init_hicache`, once the controller and the
         # symmetrized prefetch reservation exist. None here and for the whole
         # of `--hicache-host-role retention`, which is the default.
