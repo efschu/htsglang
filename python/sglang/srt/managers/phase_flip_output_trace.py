@@ -69,6 +69,30 @@ TRACE_ENV = "SGLANG_PHASE_FLIP_OUTPUT_TRACE"
 #: the trace is usable on a flip-free build. 0 (default) keeps the trace
 #: armed only by `cutover()`, i.e. exactly today's behaviour.
 OFFFLIP_ENV = "SGLANG_631_TRACE_OFFFLIP"
+#: #997f THE HOST GATE, which is the one that made #997c inert.
+#:
+#: `OFFFLIP_ENV` above arms an OutputTrace that a flip-free build never
+#: CONSTRUCTS: every path to `_trace_of` runs from `trace_tick` or
+#: `trace_cutover`, and both are reached only through
+#: `Scheduler._phase_flip_on_round`, whose call sites sit behind
+#: `if server_args.enable_phase_flip`. With the flag off, `_ACTIVE_TRACE`
+#: stays None for the life of the process and `trace_round`/`trace_emit`
+#: return on their first line -- so the arming knob had nothing to arm.
+#: Checking the ARMING and not the HOST is the check this costs a cycle to
+#: skip; see `trace_tick_offflip`.
+#:
+#: Cadence in scheduler rounds. 0 (default, unset) = no off-flip host at
+#: all = today's behaviour byte for byte.
+OFFFLIP_EVERY_ENV = "SGLANG_631_TRACE_OFFFLIP_EVERY"
+#: Length in rounds of each off-flip burst. Consecutive rounds, because the
+#: measurement is the per-round DELTA and a single isolated round has none.
+OFFFLIP_WINDOW_ENV = "SGLANG_631_TRACE_OFFFLIP_WINDOW"
+OFFFLIP_WINDOW_DEFAULT = 4
+#: Round counter for the off-flip host. Lives on the scheduler and is
+#: advanced on EVERY round the host sees, so the cadence is a property of
+#: the loop and not of whether anything was found -- a hit-filtered cadence
+#: cannot produce a trustworthy zero.
+OFFFLIP_ROUND_ATTR = "_phase_flip_output_trace_offflip_round"
 STATE_ATTR = "_phase_flip_output_trace"
 
 # How many passes to keep before the cutover, and to report after it. The
@@ -139,6 +163,13 @@ def _fmt_delta(prev: Optional[List[Row]], rows: List[Row]) -> str:
     previous traced pass. The DELTA is the measurement: a pass that
     appends one token everywhere and two (or zero) on one rank is the
     whole answer, and it is invisible in absolute lengths alone."""
+    # #997f DENOMINATOR, NOT AN EMPTY TAIL. With `prev` set and `rows`
+    # empty this returned "" and the caller printed a line ending in
+    # "-- " with nothing behind it. An armed round that held no requests
+    # and an armed round whose formatting failed then read identically,
+    # which is the same false-zero the host gate below exists to remove.
+    if not rows:
+        return "(no resident requests)"
     if prev is None:
         return _fmt(rows)
     by_rid = {rid: n for rid, n, _off, _t in prev}
@@ -316,6 +347,108 @@ def trace_tick(scheduler, site: str) -> None:
     if runtime is None or getattr(runtime, "pending", None) is None:
         return
     trace.observe(site, snapshot_rows(_resident_reqs(scheduler)))
+
+
+def _offflip_every() -> int:
+    try:
+        return max(0, int(os.environ.get(OFFFLIP_EVERY_ENV, "") or 0))
+    except ValueError:
+        return 0
+
+
+def _offflip_window() -> int:
+    try:
+        return max(
+            1, int(os.environ.get(OFFFLIP_WINDOW_ENV, "") or OFFFLIP_WINDOW_DEFAULT)
+        )
+    except ValueError:
+        return OFFFLIP_WINDOW_DEFAULT
+
+
+def trace_tick_offflip(scheduler, site: str) -> None:
+    """#997f: A SECOND HOST BESIDE THE FLIP HOST, NEVER INSTEAD OF IT.
+
+    `trace_tick` above answers a question about ORDINARY serving -- whether
+    a round appended to `req.output_ids` on every rank, and if not, which
+    rank differed -- and it is the only rid-precise instrument that
+    separates "this round appended nothing" from "this round produced
+    nothing". Its only caller is `Scheduler._phase_flip_on_round`, and both
+    of THAT function's call sites are behind `enable_phase_flip`. So on a
+    flip-free build the OutputTrace object is never constructed, the module
+    global `_ACTIVE_TRACE` stays None, and `trace_round`/`trace_emit`
+    return on their first line -- silently, exactly as if they had run and
+    found nothing.
+
+    That is the cost this window has now paid twice over. #994 and #996
+    were both framed flip-bound and both measured occurring flip-free; a
+    flip-bound ROOT costs one wrong search, a flip-bound INSTRUMENT costs
+    the possibility of searching at all.
+
+    THIS DOES NOT TOUCH THE FLIP PATH. When `enable_phase_flip` is set this
+    function returns immediately and `_phase_flip_on_round` keeps its tick,
+    its ring and its post-cutover window exactly as before -- taking the
+    flip's window away to give the off-flip build one would only build the
+    next regression. Two hosts, never one moved.
+
+    CADENCE, NOT A HIT FILTER. The round counter advances on every round the
+    host sees and the burst opens on the counter alone; nothing about what
+    the previous burst found can lengthen or shorten the next one, so a
+    silent burst is evidence and not an artefact. The burst is
+    `OFFFLIP_WINDOW_DEFAULT` CONSECUTIVE rounds because the measurement is a
+    per-round delta, and one isolated round has no delta to report.
+
+    Default: `OFFFLIP_EVERY_ENV` unset -> returns on its second line, no
+    object built, no attribute written. Byte-identical.
+    """
+    every = _offflip_every()
+    if every <= 0:
+        return
+    if getattr(getattr(scheduler, "server_args", None), "enable_phase_flip", False):
+        # The flip host owns the trace on this build. Ticking here as well
+        # would double-count `pass_no`, double-fill the pre-cutover ring and
+        # consume the post-cutover countdown at twice the rate -- i.e. it
+        # would corrupt the flip path's reading in order to serve a build
+        # that is not this one.
+        return
+    if not trace_enabled():
+        return
+    try:
+        n = int(getattr(scheduler, OFFFLIP_ROUND_ATTR, 0) or 0) + 1
+        setattr(scheduler, OFFFLIP_ROUND_ATTR, n)
+        trace = _trace_of(scheduler)
+        if trace is None:
+            return
+        if not trace.armed_after and n % every == 0:
+            window = _offflip_window()
+            trace.direction = "offflip"
+            trace.epoch = n
+            trace.post = window
+            trace.after_left = window
+            # THE DENOMINATOR, EMITTED WHERE THE WINDOW OPENS AND NOT WHERE
+            # A FINDING WOULD BE. Without this line an off-flip build that
+            # printed no `post[+k]` lines is indistinguishable from one on
+            # which the host never ran -- which is the entire defect being
+            # repaired here, reintroduced one level down. `resident` is a
+            # count, so 0 is a legitimate reading and means the burst ran
+            # against an idle instance; the ABSENCE of this line means the
+            # host did not run.
+            logger.info(
+                "%s offflip window OPEN round=%d every=%d window=%d "
+                "resident=%d -- the flip is off, so this window was armed "
+                "by cadence and not by a cutover; %d consecutive rounds "
+                "follow as post[+k]. No line at all after this one means "
+                "the round hook stopped, not that nothing diverged.",
+                LOG_PREFIX,
+                n,
+                every,
+                window,
+                len(_resident_reqs(scheduler)),
+                window,
+            )
+    except Exception as e:  # noqa: BLE001 - an instrument may never break the loop
+        logger.warning("%s offflip host failed: %s", LOG_PREFIX, e)
+        return
+    trace_tick(scheduler, site)
 
 
 def trace_cutover(scheduler, direction: str) -> None:

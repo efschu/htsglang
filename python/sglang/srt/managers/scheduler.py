@@ -7218,6 +7218,23 @@ class Scheduler(
         ):
             self._phase_flip_on_round()
 
+        # #997f THE OUTPUT TRACE'S SECOND HOST, BESIDE THE BLOCK ABOVE AND
+        # NOT INSIDE IT. The block above is the ONLY thing that reaches
+        # `trace_tick`, so the #631 output trace -- the only rid-precise
+        # instrument that tells "this round appended nothing" apart from
+        # "this round produced nothing" -- cannot even be CONSTRUCTED on a
+        # build without `--enable-phase-flip`. Its question is about
+        # ordinary serving and its arming knob (#997c) was inert for
+        # exactly this reason: the arming was fixed, the host was not.
+        #
+        # `trace_tick_offflip` returns on its second line unless
+        # SGLANG_631_TRACE_OFFFLIP_EVERY is set, and returns immediately
+        # whenever `enable_phase_flip` is on -- the flip path keeps its own
+        # tick, ring and post-cutover window untouched.
+        from sglang.srt.managers.phase_flip_output_trace import trace_tick_offflip
+
+        trace_tick_offflip(self, "tp_top")
+
         # #330 VRAM dial / KV capacity runtime: same lazy-build and cadence
         # discipline. Runs AFTER the reshard block so a #297 cutover in this
         # round is already visible to the capacity math (the C re-raise arms
