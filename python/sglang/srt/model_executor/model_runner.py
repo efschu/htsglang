@@ -4179,11 +4179,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             _hs = pp_proxy_tensors.tensors.get("hidden_states")
             _want = forward_batch.input_ids.shape[0]
             if _hs is not None and _hs.shape[0] != _want:
+                # #995b: NAME THE COUNTERPARTY. The sender's `__stamp__` is
+                # (mb_id, seqno, rows, epoch) and its `rows` element is what
+                # the SENDER believed it was sending. `_pp_recv_proxy_tensors`
+                # pops the stamp before the payload gets here, so it is
+                # re-attached as an attribute purely so this message can print
+                # it. Reading it splits two failures the old text could not:
+                #   sender_rows == received rows -> the payload is intact and
+                #     the PAIRING is wrong (a leftover from another pass).
+                #   sender_rows != received rows -> the payload itself was
+                #     altered in transit or assembled from the wrong result.
+                # Absent stamp prints as "unstamped", which is itself a fact
+                # (a sender that could not name its pass).
+                _st = getattr(pp_proxy_tensors, "_pp_sender_stamp", None)
+                _prov = (
+                    f"sender stamp (mb_id={_st[0]} seq={_st[1]} rows={_st[2]} "
+                    f"epoch={_st[3]})"
+                    if isinstance(_st, (tuple, list)) and len(_st) >= 4
+                    else "sender unstamped"
+                )
                 raise ValueError(
                     f"#631 PP proxy/batch mismatch: received hidden_states with "
                     f"{_hs.shape[0]} row(s) for a {forward_batch.forward_mode} "
                     f"batch of {_want} token(s) "
-                    f"(bs={forward_batch.batch_size}). The hidden states of one "
+                    f"(bs={forward_batch.batch_size}); {_prov}. The hidden "
+                    f"states of one "
                     f"microbatch have been paired with another microbatch's "
                     f"metadata -- the PP stages are out of step. Computing on "
                     f"this pair corrupts memory rather than merely failing: the "

@@ -8880,7 +8880,45 @@ class SchedulerPPMixin:
             # requests. See `pp_proxy_pass_retraction_reason`.
             diverged = pp_pass_retraction_reason_of(self, mb_id)
             if diverged is None:
-                return PPProxyTensors(raw)
+                # #995b THE SENDER ALREADY DECLARED ITS WIDTH; NOBODY READ IT.
+                #
+                # `_pp_proxy_stamp` builds (mb_id, seqno, ROWS, epoch) -- the
+                # row count of the hidden-state tensor is element 2 and has
+                # been there since #631 Variant B. Every consumer of the stamp
+                # compares only the PASS identity, which is exactly what the
+                # #791c note twelve lines above says is not enough: "Every
+                # identity above answers 'which PASS is this from'; none
+                # answers 'which BATCH is it of'."
+                #
+                # The shipped width check in `model_runner.forward`
+                # (model_runner.py:4178-4191) DOES answer the batch question
+                # and is the guard that fired in boot 22 -- but the stamp is
+                # popped here, so by the time it raises, the sender is
+                # anonymous: "received 253 row(s) for a batch of 302 token(s)"
+                # names neither which pass sent the 253 nor whether the sender
+                # itself thought it was sending 253.
+                #
+                # Carried as an ATTRIBUTE, never as a dict entry. The comment
+                # at the pop above is explicit about why: PPProxyTensors' slice
+                # path maps `v[key]` over EVERY dict entry and cuda-graph
+                # buffer copies iterate the dict, so a tuple left in there
+                # "would slice to nonsense rather than raise -- the worst
+                # available outcome". An attribute is invisible to both.
+                #
+                # PURELY ADDITIVE: no comparison is made here and no message is
+                # refused that was not refused before. Deriving this rank's
+                # expected width at this point would be a second, independent
+                # derivation of the very quantity whose disagreement is the
+                # defect -- and a wrong derivation would manufacture false
+                # refusals, which is the mistake #995's first version made and
+                # boot 15 punished. The one correct comparison already exists
+                # downstream; this only lets it name its counterparty.
+                _proxy = PPProxyTensors(raw)
+                try:
+                    _proxy._pp_sender_stamp = stamp
+                except Exception:  # noqa: BLE001 - provenance may never break a recv
+                    pass
+                return _proxy
             self._pp_proxy_batch_divergences = (
                 getattr(self, "_pp_proxy_batch_divergences", 0) + 1
             )
