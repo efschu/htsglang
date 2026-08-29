@@ -3808,6 +3808,78 @@ class Scheduler(
             return self._layout_admits_decode(rows, running_bs)
         return False
 
+    def _prefilled_awaiting_merge_bs(self) -> int:
+        """#1030: requests whose prefill is DONE but which are not yet resident.
+
+        The window this counts is one round wide and the whole decode-empty
+        cycle lives in it. `get_next_batch_to_run` merges a finished extend
+        batch into the running batch on the round AFTER it ran, so between the
+        prefill forward and that merge a decode-ready request appears in no
+        running structure at all. The phase policy samples in exactly that gap
+        (boot 7ac2c93e55: six requests prefilled at 21:20:07, `tp_to_pp` armed
+        at 21:20:08, `#running-req` 0 on all 52 prefill lines of the boot).
+
+        DERIVED, NOT LATCHED. Read from live state on every call rather than
+        remembered by a flag, so it cannot go stale and cannot hold a phase
+        open after the fact: the moment the merge happens the request is
+        resident, the exclusion below drops it, and the term returns to 0. A
+        latch would be a second bookkeeping of residency beside the batch
+        structures, which is the class this campaign is deleting.
+
+        EXCLUDES ANYTHING ALREADY RESIDENT, by identity, so the caller can add
+        this to `running_bs` without double counting -- the same discipline
+        `readmit_seam_residents` states for its own ordering against the live
+        universe (#731).
+
+        A request counts when it is in a batch that has just run, is not
+        finished, and has no prefill left to do. The last term is what keeps a
+        CHUNKED prefill out: a request still owing chunks is prefill work and
+        belongs to the demand side, which is the category error #861e made in
+        the other direction and paid for with the W37-E deadlock.
+        """
+        try:
+            resident = set()
+            for mb in getattr(self, "running_mbs", []) or []:
+                for req in list(getattr(mb, "reqs", []) or []):
+                    resident.add(id(req))
+            for req in list(getattr(getattr(self, "running_batch", None), "reqs", []) or []):
+                resident.add(id(req))
+            chunked = getattr(self, "chunked_req", None)
+            if chunked is not None:
+                resident.add(id(chunked))
+
+            seen = set()
+            n = 0
+            batches = list(getattr(self, "last_mbs", []) or [])
+            batches.append(getattr(self, "last_batch", None))
+            for batch in batches:
+                if batch is None:
+                    continue
+                mode = getattr(batch, "forward_mode", None)
+                is_extend = bool(
+                    getattr(mode, "is_extend", lambda: False)()
+                ) if mode is not None else False
+                if not is_extend:
+                    continue
+                for req in list(getattr(batch, "reqs", []) or []):
+                    rid_key = id(req)
+                    if rid_key in resident or rid_key in seen:
+                        continue
+                    seen.add(rid_key)
+                    fin = getattr(req, "finished", None)
+                    if callable(fin) and fin():
+                        continue
+                    # Prefill complete = nothing left to extend.
+                    fill_ids = getattr(req, "fill_ids", None)
+                    origin = getattr(req, "origin_input_ids", None)
+                    if fill_ids is not None and origin is not None:
+                        if len(fill_ids) < len(origin):
+                            continue
+                    n += 1
+            return n
+        except Exception:  # noqa: BLE001 - a policy input may abstain, never raise
+            return 0
+
     def _retracted_unfinished_bs(self) -> int:
         """Requests the seam retracted that have ALREADY produced output. #861e.
 
@@ -12967,6 +13039,13 @@ class Scheduler(
             decode_runs_in_this_phase=_decode_runs_here,
             retracted_unfinished_bs=int(
                 (getattr(self, "_retracted_unfinished_bs", None) or (lambda: 0))() or 0
+            ),
+            # #1030: the cohort whose prefill finished but which the merge has
+            # not yet made resident. Same getattr discipline as its two
+            # neighbours and for the same stand-in reason.
+            prefilled_awaiting_merge_bs=int(
+                (getattr(self, "_prefilled_awaiting_merge_bs", None) or (lambda: 0))()
+                or 0
             ),
             seam_transport_tokens=_seam_transport_now,
             # #861j: the serviceable-here subset computed above; 0 outside TP

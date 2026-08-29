@@ -2144,6 +2144,20 @@ class PhasePolicyInputs:
     #: work that genuinely exists.
     retracted_unfinished_bs: int = 0
 
+    #: #1030: requests whose PREFILL COMPLETED THIS ROUND and that have not yet
+    #: been merged into the running batch. The third state the #861e/f
+    #: discriminator never had, and the one this rig lives in.
+    #:
+    #: `decode_work_bs` separated exactly two populations by "has it produced
+    #: output": a mid-flight bundle (d4, output tokens n=2..13) from queued
+    #: prefill that never started (d2, 0 output tokens). A request that has
+    #: just FINISHED its prefill has 0 output tokens and so reads as d2 -- but
+    #: it is not queued and it is not idle: decode simply has not had its first
+    #: round yet. Supplied by the build site, 0 on every stand-in and every
+    #: non-flip deployment, so like its neighbour it can only ADD decode work
+    #: that genuinely exists.
+    prefilled_awaiting_merge_bs: int = 0
+
     #: #861f: decode steps COMPLETED since this TP phase began. The d4-thrash
     #: protection, measured in work actually done rather than in wall seconds
     #: (a seconds floor cannot tell a fast bundle from a stalled one) and
@@ -2282,7 +2296,34 @@ class PhasePolicyInputs:
         # is `decode_steps_this_phase` below -- a floor measured in COMPLETED
         # DECODE STEPS rather than in "requests that exist somewhere", which is
         # what d4 actually needed and what this field was standing in for.
-        return int(self.running_bs or 0)
+        #
+        # #1030: PLUS THE COHORT WHOSE PREFILL JUST FINISHED. Measured on boot
+        # 7ac2c93e55, with a one-second log anchor:
+        #
+        #   21:20:07  Prefill batch phase=tp, #new-seq: 6, #new-token: 1672,
+        #             #cached-token: 40960, #running-req: 0
+        #   21:20:08  PHASE-FLIP-SPILL KV shrink verdict (tp_to_pp)
+        #
+        # Six requests completed their prefill in the TP phase -- the read
+        # through working exactly as designed, 40960 cached against 1672 new
+        # -- and the instance armed the flip AWAY from them one second later,
+        # before decode had a single round. The #856 no-carry then retracted
+        # all six. `#running-req` is 0 on all 52 prefill lines of that boot,
+        # and `decode phase ran EMPTY: no bundle was ever resident` is the
+        # policy saying so in its own words.
+        #
+        # The reason is here: this authority returned bare `running_bs`, and a
+        # request that has finished prefill is not in the running batch until
+        # the NEXT round merges it. So the one instant the policy sampled was
+        # the one instant in which six decode-ready requests were invisible.
+        # That is the manufactured-zero class this function's own docstring
+        # exists for -- a zero produced by a transition rather than by absence
+        # -- one transition further along than the seam it was written for.
+        #
+        # Bounded and self-clearing: the build site excludes anything already
+        # resident, so the term drops to 0 the moment the merge happens, and
+        # it cannot hold a phase open on requests that are already counted.
+        return int(self.running_bs or 0) + int(self.prefilled_awaiting_merge_bs or 0)
 
     def demand_prefill_tokens(self) -> int:
         """Tokens of UNSTARTED queued prefill that justify DEMANDING a flip.
