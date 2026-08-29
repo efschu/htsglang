@@ -845,16 +845,46 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     vec[3 * slot + 2] = 0
                     slot += 1
             else:
-                bounded_recv(
-                    vec,
-                    group=self.pp_group,
+                # #1029c: THE DOWN-LEG IS POLL-ONLY TOO. Third wedge, same
+                # root: ANY blocking receive on this arc inside a scheduler
+                # round closes a cycle, because the sender's `isend` is only
+                # progressed by the NEXT round's `_drain_async_work`, and the
+                # sender cannot reach that round while the receiver holds the
+                # pipeline. Boot 34cef199cb measured it at its sharpest: 0
+                # `#1028 HICACHE-ROUND` samples in four minutes (the loop ran
+                # under 25 rounds where the previous boot ran 250), a single
+                # direct request timing out at 20 s with no response, and the
+                # policy reporting `pending prefill 0 tok, running bs 0` --
+                # requests never even reached the scheduler.
+                #
+                # So nothing on this arc may ever WAIT. A lap whose vector has
+                # not arrived proposes again next round; the agreement is a
+                # mailbox, not a rendezvous, on both legs.
+                work = getattr(self, "_1029_down_work", None)
+                if work is not None and work.is_completed():
+                    vec = self._1029_down_buf
+                    self._1029_apply(vec)
+                    self._1029_down_work = None
+                else:
+                    # Nothing landed: do not forward a vector we did not get.
+                    if work is None:
+                        self._1029_down_buf = torch.full(
+                            (width,), -1, dtype=torch.int64
+                        )
+                        self._1029_down_work = torch.distributed.irecv(
+                            self._1029_down_buf,
+                            group_src=self.pp_rank - 1,
+                            group=self.pp_group,
+                            tag=P2PTag.HIRADIX_PP_SYNC,
+                        )
+                    return
+                self._1029_down_buf = torch.full((width,), -1, dtype=torch.int64)
+                self._1029_down_work = torch.distributed.irecv(
+                    self._1029_down_buf,
                     group_src=self.pp_rank - 1,
+                    group=self.pp_group,
                     tag=P2PTag.HIRADIX_PP_SYNC,
-                    label=f"1029_lap/recv<-pp{self.pp_rank - 1}",
-                    timeout_s=self.collective_timeout_s,
-                    rank_desc=collective_rank_desc(self),
                 )
-                self._1029_apply(vec)
             # Install AGREED on rank 0 too, on the lap that carries them, so
             # every rank installs in the same round.
             if self.pp_rank == 0:
@@ -1058,6 +1088,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # round late when it completes. See `_1029_lap`.
         self._1029_home_buf = None
         self._1029_home_work = None
+        self._1029_down_buf = None
+        self._1029_down_work = None
         # #810: built in `init_hicache`, once the controller and the
         # symmetrized prefetch reservation exist. None here and for the whole
         # of `--hicache-host-role retention`, which is the default.
