@@ -263,18 +263,51 @@ class TestEraAdmissionRingPredicate(CustomTestCase):
 
         self.assertTrue(self._predicate()(types.SimpleNamespace()))
 
-    def test_both_admission_gates_ask_the_one_predicate(self):
-        """No second spelling of the predicate may reappear beside it.
+    def test_the_era_ring_is_gated_on_both_sides(self):
+        """#1013. THE ASSERTION THIS REPLACES WAS THE SAME DEFECT IT MISSED.
 
-        TWO, not strip-B's three. Its third gate dropped the #973 deadline in
-        `_pp_commit_comm_work` whenever the flip is off, and that gate is
-        reverted -- see `test_the_output_return_path_keeps_its_deadline`."""
+        It counted one SPELLING -- `if not _pp_era_ring_live(self):` -- and
+        called the answer congruence. Both era gates I shipped were on the
+        SENDER (`_pp_send_admission_decision`,
+        `_pp_commit_admission_send_work`); the RECEIVER,
+        `_pp_recv_admission_decision`, ran unconditionally, and its own
+        docstring said why that looked safe ("always issued, never gated") --
+        true of a ring whose sender always sends, false the moment the sender
+        is switched off. Boot boot_pp3solo_6b28c34436_0829_094236.log, three
+        py-spy stacks at one instant: PP0 parked sending REQ WORK, PP1 and PP2
+        parked waiting for an ADMISSION DECISION that would never come. Ring
+        closed on the first request, 0 prefill batches, 0 http=200.
+
+        A count of one spelling could not see that, and -- stated plainly --
+        no static count can. The gate that caught it was the boot. What a
+        static check CAN do is stop the fix from silently rotting, so this
+        pins the shape instead of the tally:
+
+          * the reader is gated (the thing that was missing), and
+          * the predicate has exactly the three call sites that make the ring
+            congruent -- one reader, two writers -- in EITHER spelling, so a
+            fourth call site added in the `and _pp_era_ring_live(self)` form
+            cannot slip past a `if not ...` count the way #1013 did.
+        """
         import inspect
 
         from sglang.srt.managers import scheduler_pp_mixin as mod
 
         src = inspect.getsource(mod)
-        self.assertEqual(src.count("if not _pp_era_ring_live(self):"), 2)
+        # Call sites only: the definition line and the docstring mention of
+        # `self._pp_era_ring_live` are not calls.
+        call_sites = src.count("_pp_era_ring_live(self)")
+        self.assertEqual(call_sites, 3, f"expected 3 call sites, got {call_sites}")
+
+        body = inspect.getsource(mod.SchedulerPPMixin._event_loop_pp_body)
+        self.assertIn("_pp_era_ring_live(self)", body)
+        self.assertLess(
+            body.index("_pp_era_ring_live(self)"),
+            body.index("_pp_recv_admission_decision("),
+            "the era predicate must guard the admission-decision receive, not "
+            "trail it: a switched-off sender with a live receiver is the "
+            "#1013 wedge.",
+        )
 
     def test_the_output_return_path_keeps_its_deadline(self):
         """The bound on `_pp_commit_comm_work` is an INSTRUMENT on a core PP
