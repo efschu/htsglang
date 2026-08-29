@@ -2302,6 +2302,27 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
         # Three numbers plus the skip reason, always, so `disagree=0` never
         # again arrives without its denominator.
         try:
+            # #997d EMISSION, at a site whose execution does not depend on the
+            # probe -- verified to run on this config before the boot, which
+            # is the check that cost boot 40. Denominator always, no hit
+            # filter, sentinel -1 (0 is a legitimate output length).
+            _m = getattr(holder, "_997d_last", None) or {}
+            logger.warning(
+                "#997d OUTPUT-FILL rank=%s seen=%d tracked_rids=%d sample=%s. "
+                "Compare the SAME rid across ranks: a differing out_len means "
+                "the void path skipped this append on the lagging rank, which "
+                "is the fill divergence read rather than argued. Tuple is "
+                "(out_len, fill_len); -1 would be unreadable, 0 is a real "
+                "length; an EMPTY sample with seen=0 means the decode append "
+                "never ran, not that nothing diverged.",
+                getattr(getattr(holder, "ps", None), "pp_rank", "?"),
+                getattr(holder, "_997d_seen", 0),
+                len(_m),
+                dict(list(_m.items())[:4]) or "-",
+            )
+        except Exception:  # noqa: BLE001 - a census may never break admission
+            pass
+        try:
             _seen = getattr(holder, "_995c_seen", 0)
             if _seen:
                 logger.warning(

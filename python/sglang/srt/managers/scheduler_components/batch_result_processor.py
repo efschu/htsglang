@@ -871,6 +871,38 @@ class SchedulerBatchResultProcessor:
             is_spec = not batch.spec_algorithm.is_none()
 
             req.output_ids.extend(next_token_id)
+            # #997d THE MINIMAL PROBE: two integers, counted where they grow.
+            #
+            # This is the DECODE append -- the one that actually feeds the
+            # divergent term. `fill = origin_input_ids + output_ids` with a
+            # rank-identical prompt, so `output_ids` is the only rank-local
+            # part of `extend = min(fill - prefix, cap)`; prefix is equalised
+            # by the #791 truncation and cap is group-uniform (#610) and never
+            # bound. This append lives in the RESULT path, which a VOIDED pass
+            # never reaches -- that is the chain, code-read and unmeasured.
+            #
+            # COUNT HERE, EMIT ELSEWHERE. The emission sits in `pp_ring_note`,
+            # whose execution is independent of this probe and is PROVEN to
+            # run on this config (241 lines across all three ranks, boot 36).
+            # A denominator that lives in the same call as the event is not a
+            # denominator -- it shares the event's fate, which is what made
+            # #997b emit nothing at all.
+            try:
+                _sched = self.metrics_reporter.scheduler
+                _sched._997d_seen = getattr(_sched, "_997d_seen", 0) + 1
+                _m = getattr(_sched, "_997d_last", None)
+                if _m is None:
+                    _m = {}
+                    _sched._997d_last = _m
+                # last-writer-wins per rid, bounded: the reader compares the
+                # SAME rid across ranks, so one live value per rid suffices.
+                if len(_m) < 32 or req.rid in _m:
+                    _m[req.rid] = (
+                        len(req.output_ids),
+                        len(getattr(req, "full_untruncated_fill_ids", ()) or ()),
+                    )
+            except Exception:  # noqa: BLE001 - a probe may never break the result path
+                pass
             new_accept_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
