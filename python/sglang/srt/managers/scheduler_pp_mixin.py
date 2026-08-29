@@ -4398,19 +4398,31 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                # #1015: RECEIVE IS UNCONDITIONAL NOW, matching the send below.
-                # The prior `if cur_batch: recv ... else: drain` split was the
-                # admission-decision arc's asymmetry one hop downstream: this
-                # rank could not know without that arc whether the upstream
-                # had a batch, so it needed two different actions depending on
-                # a fact it no longer receives at all once that arc is
-                # removed. The proxy wire itself now owes exactly one frame
-                # per pass unconditionally (real or void), so one unconditional
-                # take-it-off-the-wire replaces both branches.
-                # `_pp_recv_proxy_tensors` still declines on its own for the
-                # first rank and a gapped wire -- those are receiver-local
-                # facts, unaffected by this cut.
-                pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
+                # #969J: THE RECEIVE IS GUARDED AGAIN, and the void proxy is
+                # gone with it. Upstream guards BOTH ends with `cur_batch`
+                # (`main:scheduler_pp_mixin.py:119-121` receive, `:156-168`
+                # send), so a rank with no batch neither sends nor expects a
+                # frame and the wire carries only real hidden states.
+                #
+                # #1015 made both ends UNCONDITIONAL instead, on the contract
+                # that "the proxy wire owes exactly one frame per pass (real or
+                # void)". That contract is what put empty frames on the wire:
+                # measured 540 arrivals of `keys=['__msg_type__']` with the
+                # sender's own stamp reading `rows=-1, geom=(-1,-1,-1)`
+                # (#969I, boot_969nogrid_3df64c89b3_0829_170947.log) -- a rank
+                # that had nothing, posting anyway, because the contract said
+                # it owed a frame.
+                #
+                # Two deaths hang off that contract and both go with it: an
+                # empty frame reaching the model is
+                # `KeyError: 'hidden_states'` (qwen3_5.py:1573), and a frame
+                # that is owed but not yet posted is what `#789 PROXY READINESS
+                # TIMEOUT` was built to bound. Under upstream's symmetry
+                # neither state is constructible: nothing is owed unless the
+                # sender has a batch, and then it always sends.
+                pp_proxy_tensors = None
+                if cur_batch:
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -4578,16 +4590,6 @@ class SchedulerPPMixin:
                                 async_send=True,
                                 msg_type="proxy",
                                 stamp=self._pp_proxy_stamp(mb_id, result),
-                            )
-                    else:
-                        with torch.profiler.record_function(
-                            "send_proxy_dict_to_next_stage"
-                        ):
-                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                {},
-                                async_send=True,
-                                msg_type="proxy",
-                                stamp=self._pp_proxy_stamp(mb_id, None),
                             )
 
                 self.pp_outputs = next_pp_outputs
