@@ -4196,6 +4196,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"sender stamp (mb_id={_st[0]} seq={_st[1]} rows={_st[2]} "
                     f"epoch={_st[3]}"
                     + (f" fwd_ct={_st[4]}" if len(_st) >= 5 else "")
+                    + (f" sender_geom={_st[5]}" if len(_st) >= 6 else "")
                     + ")"
                     if isinstance(_st, (tuple, list)) and len(_st) >= 4
                     else "sender unstamped"
@@ -4206,6 +4207,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # where comparing `seq` to an iteration was not.
                 _rc = getattr(pp_proxy_tensors, "_pp_recv_fwd_ct", None)
                 _prov += f", receiver fwd_ct={_rc if _rc is not None else '?'}"
+                # #999 the receiving batch's OWN chunk position, beside the
+                # sender's. Equal -> same pass, the divergence is elsewhere.
+                # Different -> the guard is comparing two passes of the same
+                # request, which is what the measured 4096->4096->254 walk
+                # predicts and what the unstable sign requires.
+                try:
+                    _rr = getattr(forward_batch, "req_pool_indices", None)
+                    _rg = getattr(pp_proxy_tensors, "_pp_recv_geom", None)
+                    _prov += f", receiver_geom={_rg if _rg is not None else '?'}"
+                except Exception:  # noqa: BLE001
+                    pass
                 raise ValueError(
                     f"#631 PP proxy/batch mismatch: received hidden_states with "
                     f"{_hs.shape[0]} row(s) for a {forward_batch.forward_mode} "

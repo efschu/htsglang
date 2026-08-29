@@ -1238,6 +1238,22 @@ def _pp_ring_commit_peer_statement(holder, chan: str) -> str:
 PP_PROXY_STAMP_EPOCH_INDEX = 3
 
 
+def _999_geom(scheduler, mb_id: int):
+    """#999: (rid8, extend_start, extend_end) of the batch this proxy is built
+    from, or (-1,-1,-1). Read-only, never raises -- a stamp may not break a
+    send."""
+    try:
+        mbs = getattr(scheduler, "mbs", None)
+        b = mbs[mb_id] if mbs and 0 <= mb_id < len(mbs) else None
+        r = b.reqs[0] if b is not None and getattr(b, "reqs", None) else None
+        er = getattr(r, "extend_range", None) if r is not None else None
+        if er is None:
+            return (-1, -1, -1)
+        return (str(r.rid)[:8], int(er.start), int(er.end))
+    except Exception:  # noqa: BLE001
+        return (-1, -1, -1)
+
+
 def pp_proxy_stamp_epoch(stamp) -> Optional[int]:
     """The phase-flip epoch a proxy stamp names, or None if it names none.
 
@@ -8503,6 +8519,17 @@ class SchedulerPPMixin:
             rows,
             -1 if epoch is None else int(epoch),
             int(getattr(self, "forward_ct", -1)),
+            # #999 THE GRANULARITY THAT ACTUALLY VARIES. `mb_id` and
+            # `forward_ct` were both checked and both too coarse: a chunked
+            # request occupies the SAME mb slot across SEVERAL passes, and one
+            # forward of offset is the normal pipeline state. Measured on this
+            # config, one request walked len_input 4096 -> 4096 -> 254 over
+            # three passes while both of those identities stayed valid. So the
+            # stamp carries the sender's CHUNK POSITION -- the extend_range it
+            # built this proxy from -- and the guard prints it beside the
+            # receiving batch's own. Same request, two passes, read instead of
+            # inferred. -1 when unavailable, never a real value.
+            _999_geom(self, mb_id),
         )
 
     def _pp_wait_for_dict_readiness(
@@ -9038,6 +9065,9 @@ class SchedulerPPMixin:
                     # dict entry -- see the pop note above). The guard then
                     # prints BOTH sides of the SAME counter.
                     _proxy._pp_recv_fwd_ct = int(getattr(self, "forward_ct", -1))
+                    # #999 the RECEIVER's own chunk position, same helper, so
+                    # the guard compares like with like.
+                    _proxy._pp_recv_geom = _999_geom(self, mb_id)
                 except Exception:  # noqa: BLE001 - provenance may never break a recv
                     pass
                 # #995c THE FALSE-REFUSAL SIDE, MEASURED BEFORE ANYTHING IS
