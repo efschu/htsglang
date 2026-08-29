@@ -4423,10 +4423,6 @@ class SchedulerPPMixin:
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
-                    # #1002c: re-read -- a declined proxy voids the slot in
-                    # the call above, and every guard below keys on the slot.
-                    cur_batch = self.mbs[mb_id]
-                    self.cur_batch_for_debug = cur_batch
                 else:
                     # #797: a voided pass has no batch, so the branch above
                     # never runs -- and the upstream, which voided nothing,
@@ -4461,7 +4457,11 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    # #1002d: a declined output leaves this unset by design.
+                    if d2h_event is not None:
+                        # #1002d: a declined output leaves this unset.
+                        if d2h_event is not None:
+                            d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
@@ -4710,7 +4710,11 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    # #1002d: a declined output leaves this unset by design.
+                    if d2h_event is not None:
+                        # #1002d: a declined output leaves this unset.
+                        if d2h_event is not None:
+                            d2h_event.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -4893,7 +4897,9 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
-                        d2h_event.synchronize()
+                        # #1002d: a declined output leaves this unset.
+                        if d2h_event is not None:
+                            d2h_event.synchronize()
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
@@ -9247,9 +9253,12 @@ class SchedulerPPMixin:
         # legitimate `return None` exits already sit above and the value alone
         # cannot carry a third meaning: a sentinel may not share a value with
         # a real result.
-        if not self._pp_wait_for_dict_readiness(mb_id, kind="proxy", soft=True):
-            self._pp_void_own_batch(mb_id)
-            return None
+        # #1002d: the proxy half stays a RAISE. Declining here would have to
+        # void (no hidden states, nothing to compute), and a void taken by one
+        # rank inside the cutover window is what killed boot 53. Softening
+        # this needs the verdict on the #791 ring first -- one send, not a
+        # rank-local act -- and that is a separate cut.
+        self._pp_wait_for_proxy_readiness(mb_id)
         raw = self._pp_recv_typed_dict(
             expected_kind="proxy",
             all_gather_group=(
@@ -10226,7 +10235,15 @@ class SchedulerPPMixin:
                     # so the slot did not run. That is the same rank-agreed
                     # act `_pp_void_pass_without_upstream_launch` performs on
                     # the same fact discovered one step earlier.
-                    self._pp_void_own_batch(next_mb_id)
+                    # #1002d: NO rank-local void here. Boot 53 died with 0
+                    # flips because one rank voided, ran ahead into the
+                    # cutover, and left the others in the ring -- PP0 in
+                    # HiCache send_req_work, PP1 in p2p[0], PP2 in the lazy
+                    # NCCL build. That is the exact rule 59830ce72d states:
+                    # the decision may be group-agreed, its CONSEQUENCE is
+                    # not, and a void taken at this point is a consequence
+                    # only this rank knows. Declining the receive is local and
+                    # harmless; changing the slot is not.
                     return
             # #791b: a void carries no tokens and must not be turned into one.
             # `_pp_absorb_void_output` empties the slot, so the loop's "slot
