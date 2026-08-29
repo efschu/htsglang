@@ -1298,9 +1298,53 @@ def _999_geom(scheduler, mb_id: int):
 #: kinds actually sits in the slot at the moment of divergence cannot be read
 #: from the desk -- so the probe reports it, and that field decides the shape
 #: of the release. One boot, and the mechanism stops being DESK.
+#: #1000b: THE OCCUPANT, ON A CARRIER WHOSE POPULATION WAS MEASURED FIRST.
+#: The first cut asked `_pp_admission_incoming_effective`, which carries rids
+#: and is provably fresh -- and is EMPTY on every pass that is not an
+#: admission. Boot 47 counted it: 4361 empty against 8 voids, and the branch
+#: "occupant held AND decision non-empty" never occurred once in 4372 passes.
+#: A field that carries the right quantity and is empty on the path in
+#: question does not answer the question. Freshness was checked, POPULATION
+#: was not.
+#:
+#: THIS CARRIER IS THE ONE THE SEND SITE ALREADY READS. `_pp_send_admission_
+#: decision` is handed `launched=self.mbs[mb_id] is not None` -- evaluated
+#: AFTER `self.mbs[mb_id] = plan.batch_to_run`, so the occupant of this pass
+#: is in scope at exactly that point, boiled down to a bool. This adds the
+#: identity beside the bool and nothing else. Its docstring states the
+#: population as a contract -- "SENT EVERY PASS, EVEN WHEN EMPTY" -- and boot
+#: 47 measured it independently at 4361 of 4372 arrivals, which is the check
+#: that was missing last time and is now done BEFORE the build.
+#:
+#: SENTINEL: absent key means "the sender said nothing" (PP0, a legacy sender,
+#: a pass that heard nothing) and reads as None. An empty TUPLE means "I hold
+#: nothing", which is a legitimate answer and must not collide with it -- so
+#: the key is written on every send from a capable sender, `()` included.
+_PP_SLOT_OCCUPANT_KEY = "__pp_slot_occupant__"
+
 _1000_SEEN = [0]
 _1000_REASONS: Dict[str, int] = {}
 _1000_SPECIMENS: List[tuple] = []
+
+
+def _1000_slot_occupant(scheduler, mb_id: int) -> Tuple[str, ...]:
+    """The rids this rank has in slot ``mb_id`` for THIS pass, bounded.
+
+    Read-only and never raises: this runs on the admission send path, and a
+    provenance field may not break a send. Empty tuple is a real answer ("I
+    hold nothing"), never a failure code -- a failure returns empty too, which
+    is the one ambiguity here and is why the probe treats an empty upstream as
+    its own named reason rather than as evidence of anything.
+    """
+    try:
+        mbs = getattr(scheduler, "mbs", None)
+        b = mbs[mb_id] if mbs and 0 <= mb_id < len(mbs) else None
+        _rq = getattr(b, "reqs", None) if b is not None else None
+        if _rq is None:
+            return ()
+        return tuple(str(getattr(r, "rid", "")) for r in list(_rq)[:8])
+    except Exception:  # noqa: BLE001 - provenance may never break a send
+        return ()
 
 
 def _1000_upstream_moved_on(scheduler, mb_id: int) -> str:
@@ -1316,11 +1360,12 @@ def _1000_upstream_moved_on(scheduler, mb_id: int) -> str:
     _1000_SEEN[0] += 1
     reason = "?"
     try:
-        eff = getattr(scheduler, "_pp_admission_incoming_effective", None)
-        if eff is None:
-            reason = "no-decision"  # PP0, or a pass that received nothing
-        elif not eff:
-            reason = "empty-decision"  # upstream voided: retention is correct
+        # #1000b: the upstream's OCCUPANT for this slot on THIS pass, not its
+        # admission set. None means the sender said nothing; () means it says
+        # it holds nothing -- two different facts, two different reasons.
+        up = getattr(scheduler, "_pp_upstream_slot_occupant_incoming", None)
+        if up is None:
+            reason = "no-statement"  # PP0, legacy sender, or heard nothing
         else:
             rmbs = getattr(scheduler, "running_mbs", None)
             b = rmbs[mb_id] if rmbs and 0 <= mb_id < len(rmbs) else None
@@ -1328,9 +1373,11 @@ def _1000_upstream_moved_on(scheduler, mb_id: int) -> str:
             reqs = list(_rq) if _rq is not None else []
             if not reqs:
                 reason = "no-occupant"
+            elif not up:
+                reason = "upstream-empty"  # upstream ran nothing: retain
             else:
                 held = {str(getattr(r, "rid", "")) for r in reqs}
-                if held & {str(k) for k in eff}:
+                if held & {str(k) for k in up}:
                     reason = "still-named"  # live work -- retention is correct
                 else:
                     reason = "MOVED-ON"
@@ -1340,7 +1387,7 @@ def _1000_upstream_moved_on(scheduler, mb_id: int) -> str:
                             (
                                 int(mb_id),
                                 tuple(sorted(h[:8] for h in held))[:3],
-                                tuple(sorted(str(k)[:8] for k in eff))[:3],
+                                tuple(sorted(str(k)[:8] for k in up))[:3],
                                 # THE FIELD THAT DECIDES THE RELEASE: is the
                                 # held occupant a chunked continuation (the
                                 # mover's legality argument covers it) or a
@@ -4018,6 +4065,9 @@ class SchedulerPPMixin:
                 # requirement). PP0 has nothing to consume here -- it is the
                 # one BUILDING the decision, inside the call below.
                 self._pp_admission_incoming_effective = None
+                # #1000b: reset on the same argument -- a pass that receives
+                # nothing must inherit no statement about the upstream's slot.
+                self._pp_upstream_slot_occupant_incoming = None
                 # #791 CORE: reset on the same argument and in the same
                 # breath as `effective` -- the two are one fact split in two,
                 # and a pass that receives nothing must inherit neither half.
@@ -4283,6 +4333,7 @@ class SchedulerPPMixin:
                             # can only ever start downstream of here.
                             pass_voided=False,
                             launched=self.mbs[mb_id] is not None,
+                            slot_occupant=_1000_slot_occupant(self, mb_id),
                             # #978: the chain starts here -- one entry, PP0's
                             # own statement; every hop appends its own.
                             launched_chain=(self.mbs[mb_id] is not None,),
@@ -4356,6 +4407,7 @@ class SchedulerPPMixin:
                             # rank's own slot, overwritten for the next hop.
                             pass_voided=self._pp_admission_pass_voided,
                             launched=self.mbs[mb_id] is not None,
+                            slot_occupant=_1000_slot_occupant(self, mb_id),
                             # #978: append this rank's own statement to the
                             # chain received above -- per generation, never
                             # overwritten, so the void relay can still read
@@ -7562,6 +7614,7 @@ class SchedulerPPMixin:
         pass_voided: bool = False,
         launched: bool = False,
         launched_chain: Tuple[bool, ...] = (),
+        slot_occupant: Optional[Tuple[str, ...]] = None,
     ) -> None:
         """#791: forward this pass's admission decision to the next stage.
 
@@ -7655,6 +7708,14 @@ class SchedulerPPMixin:
         # `launched` is overwritten by every hop.
         tensor_dict[_PP_PASS_VOIDED_KEY] = bool(pass_voided)
         tensor_dict[_PP_UPSTREAM_LAUNCHED_KEY] = bool(launched)
+        # #1000b THE IDENTITY BESIDE THE BOOL. `launched` above is
+        # `self.mbs[mb_id] is not None` evaluated at the call site; this is WHO
+        # that batch holds, read from the same object at the same moment.
+        # Written whenever the caller supplied it -- `()` is the sender saying
+        # "I hold nothing" and must stay distinct from the ABSENT key, which
+        # means "this sender said nothing at all".
+        if slot_occupant is not None:
+            tensor_dict[_PP_SLOT_OCCUPANT_KEY] = tuple(str(x) for x in slot_occupant)
         # #978: the same statement, accumulated per generation instead of
         # overwritten per hop -- see `_PP_LAUNCHED_CHAIN_KEY`.
         if launched_chain:
@@ -7745,6 +7806,12 @@ class SchedulerPPMixin:
         # chain keeps every consumer on the legacy relay rule.
         self._pp_launched_chain_incoming = tuple(
             bool(x) for x in message.get(_PP_LAUNCHED_CHAIN_KEY, ())
+        )
+        # #1000b: None (absent) and () (empty) are two different statements
+        # and are kept apart deliberately -- see `_PP_SLOT_OCCUPANT_KEY`.
+        _occ = message.get(_PP_SLOT_OCCUPANT_KEY, None)
+        self._pp_upstream_slot_occupant_incoming = (
+            None if _occ is None else tuple(str(x) for x in _occ)
         )
         # #968: the upstream leg's parked facts land in the SAME table PP0
         # reads, on every rank. A middle rank is a relay here, not a
