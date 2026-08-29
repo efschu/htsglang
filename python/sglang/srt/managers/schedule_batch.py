@@ -1982,6 +1982,7 @@ class Req(ReqDllmMixin):
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
+        self._kvc_src = "reset_for_retract"  # #969L writer stamp
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
         self.swa_evicted_seqlen = 0
@@ -3491,6 +3492,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # update req-level memory management fields
             req.kv_committed_len = seq_len
+            req._kvc_src = "extend"  # #969L writer stamp
             req.kv_allocated_len = seq_len
 
             # If input_embeds are available, store them

@@ -1147,6 +1147,37 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         kv_committed_len = req.pop_committed_kv_cache()
+        # #969L: THE VALUE AT THE PARK INSERT. §S proved this insert IS reached
+        # for a retracted request (is_insert=True, skip=False) and that nothing
+        # declines it (#991=0, #969H EMPTY=0), which leaves only a ZERO-LENGTH
+        # span. This reads the number and names which of the two park-path
+        # writers wrote it last (#969L stamps in schedule_batch: "extend" sets
+        # it to seq_len, "reset_for_retract" zeroes it). A missing stamp means
+        # one of the OTHER 16 writers (§T: streaming_session 7, dual_group_lane
+        # 3, disagg 1) owns it, which would be its own finding.
+        # Grep: "#969L COMMIT-AT-INSERT".
+        try:
+            from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR as _SRA
+
+            if getattr(req, _SRA, None) is not None or kv_committed_len == 0:
+                _n = getattr(UnifiedRadixCache, "_969l_n", 0) + 1
+                UnifiedRadixCache._969l_n = _n
+                if _n <= 40 or _n % 256 == 0:
+                    logger.warning(
+                        "#969L COMMIT-AT-INSERT n=%d rid=%s committed=%s src=%s "
+                        "is_insert=%s origin=%d out=%d readmit=%s",
+                        _n,
+                        str(getattr(req, "rid", "?"))[:8],
+                        kv_committed_len,
+                        getattr(req, "_kvc_src", "UNSTAMPED"),
+                        is_insert,
+                        len(getattr(req, "origin_input_ids", ()) or ()),
+                        len(getattr(req, "output_ids", ()) or ()),
+                        getattr(req, _SRA, None),
+                    )
+        except Exception:  # noqa: BLE001
+            logger.warning("#969L COMMIT-AT-INSERT PROBE RAISED", exc_info=True)
+
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
