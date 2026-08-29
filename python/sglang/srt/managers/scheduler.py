@@ -3808,6 +3808,59 @@ class Scheduler(
             return self._layout_admits_decode(rows, running_bs)
         return False
 
+    def _seam_cohort_pending(self):
+        """#1032 FIX 1: the flip cohort that is not yet resident, (count, tokens).
+
+        THE COHORT ALREADY HAS AN IDENTITY and this adds none: it is the set
+        the last cutover retracted and `readmit_seam_residents` put back on
+        the queue, marked with `SEAM_READMIT_ATTR`. Read here, never stored --
+        a register would be the second bookkeeping this campaign is deleting,
+        and it would go stale exactly when the cohort changes.
+
+        RESIDENT MEANS RESIDENT: anything already in a running structure is
+        excluded by identity, so the count falls to 0 by itself as the cohort
+        is admitted, and the dwell ends because the work arrived rather than
+        because a timer said so.
+
+        REPLICATED, which is what makes the dwell rank-uniform with no clock:
+        the waiting queue is replicated and the seam stamp is group-unanimous,
+        so every rank computes the same pair in the same round -- the same
+        argument `seam_serviceable_tokens` states for itself, and the reason
+        no rank-local timer appears anywhere in this fix
+        (`raenge-nie-uneins-crash-stop`).
+        """
+        try:
+            from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
+        except Exception:  # noqa: BLE001
+            return (0, 0)
+        try:
+            resident = set()
+            for mb in getattr(self, "running_mbs", []) or []:
+                for req in list(getattr(mb, "reqs", []) or []):
+                    resident.add(id(req))
+            for req in list(
+                getattr(getattr(self, "running_batch", None), "reqs", []) or []
+            ):
+                resident.add(id(req))
+            n = 0
+            toks = 0
+            for req in list(getattr(self, "waiting_queue", ()) or ()):
+                if getattr(req, SEAM_READMIT_ATTR, None) is None:
+                    continue
+                if id(req) in resident:
+                    continue
+                fin = getattr(req, "finished", None)
+                if callable(fin) and fin():
+                    continue
+                n += 1
+                origin = getattr(req, "origin_input_ids", None) or ()
+                prefix = getattr(req, "prefix_indices", None)
+                owed = len(origin) - (0 if prefix is None else len(prefix))
+                toks += max(0, int(owed))
+            return (n, toks)
+        except Exception:  # noqa: BLE001 - a policy input may abstain, never raise
+            return (0, 0)
+
     def _prefilled_awaiting_merge_bs(self) -> int:
         """#1030: requests whose prefill is DONE but which are not yet resident.
 
@@ -13033,6 +13086,60 @@ class Scheduler(
                 )
         except Exception:  # noqa: BLE001 - an input probe never breaks arming
             _decode_runs_here = True
+        # #1032 FIX 1: read the cohort, advance the replicated stall count, and
+        # emit ONE line per chain link -- the execution proof this fix is
+        # judged by. HOLD names the cohort size, RELEASE fires the round it
+        # becomes resident, BROKEN fires if the bound expires first.
+        _cohort_n, _cohort_tok = 0, 0
+        try:
+            _cohort_n, _cohort_tok = self._seam_cohort_pending()
+            _prev = int(getattr(self, "_1032_stall_rounds", 0) or 0)
+            if _cohort_n > 0:
+                self._1032_stall_rounds = _prev + 1
+                _r = self._1032_stall_rounds
+                from sglang.srt.managers.phase_policy import (
+                    SEAM_COHORT_DWELL_ROUNDS as _DWELL,
+                )
+
+                if _r == 1 or _r % 100 == 0:
+                    logger.info(
+                        "#1032 DWELL-HOLD cohort=%d tok=%d round=%d/%d phase=%s "
+                        "-- the pp-ward demand is held while the cutover's own "
+                        "re-admission becomes resident; its tokens are not a "
+                        "backlog that may arm the flip against it.",
+                        _cohort_n,
+                        _cohort_tok,
+                        _r,
+                        _DWELL,
+                        runtime.phase,
+                    )
+                if _r == _DWELL:
+                    logger.error(
+                        "#1032 DWELL-BROKEN cohort=%d tok=%d after %d rounds in "
+                        "phase=%s: the flip cohort NEVER became resident, so the "
+                        "bound has lapsed and the pp-ward demand is released. "
+                        "This is the anomaly path, not the normal end of the "
+                        "dwell -- the re-admission itself is being refused "
+                        "somewhere and that refusal is the defect to chase, not "
+                        "this release.",
+                        _cohort_n,
+                        _cohort_tok,
+                        _r,
+                        runtime.phase,
+                    )
+            else:
+                if _prev > 0:
+                    logger.info(
+                        "#1032 DWELL-RELEASE after %d round(s) in phase=%s: the "
+                        "flip cohort is resident; the pp-ward demand is free "
+                        "again. This is the normal end of the dwell.",
+                        _prev,
+                        runtime.phase,
+                    )
+                self._1032_stall_rounds = 0
+        except Exception:  # noqa: BLE001 - a probe may never break the policy
+            _cohort_n, _cohort_tok = 0, 0
+
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the
@@ -13095,6 +13202,14 @@ class Scheduler(
             prefilled_awaiting_merge_bs=int(
                 (getattr(self, "_prefilled_awaiting_merge_bs", None) or (lambda: 0))()
                 or 0
+            ),
+            # #1032 FIX 1: the flip cohort still becoming resident, and the
+            # replicated round count that bounds the dwell. Same getattr
+            # discipline as every neighbour here.
+            seam_cohort_pending_bs=_cohort_n,
+            seam_cohort_pending_tokens=_cohort_tok,
+            seam_cohort_stall_rounds=int(
+                getattr(self, "_1032_stall_rounds", 0) or 0
             ),
             seam_transport_tokens=_seam_transport_now,
             # #861j: the serviceable-here subset computed above; 0 outside TP

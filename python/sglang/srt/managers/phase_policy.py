@@ -2063,6 +2063,16 @@ class PhasePolicyState:
 #: Small on purpose -- this is an anti-chop floor, not a scheduling quantum.
 MIN_DECODE_STEPS_PER_PHASE = 8
 
+#: #1032: how many consecutive rounds the pp-ward demand may be held while the
+#: flip cohort becomes resident. Sized against the measurement rather than
+#: guessed: the cohort's re-admission took 2 TP prefills over ~4 s on the AN
+#: timeline, and the round census (#1028) put a TP phase at a few hundred
+#: rounds, so this is generous for the honest case and still expires long
+#: before the 180 s decode-stall cap. It is a BOUND, not a schedule -- the
+#: dwell normally ends because the cohort became resident, not because this
+#: expired, and an expiry is logged as the anomaly it is.
+SEAM_COHORT_DWELL_ROUNDS = 400
+
 
 @dataclass(frozen=True)
 class PhasePolicyInputs:
@@ -2102,6 +2112,44 @@ class PhasePolicyInputs:
     #: Replicated: derived from the replicated queue and the group-unanimous
     #: stamp, same argument as ``seam_transport_tokens``.
     seam_serviceable_tokens: int = 0
+
+    #: #1032 FIX 1: the flip cohort that is NOT YET RESIDENT, as a count and as
+    #: tokens. The cohort is the set the last cutover retracted and
+    #: `readmit_seam_residents` put back on the queue -- identity that already
+    #: exists (`SEAM_READMIT_ATTR`), so this is no new register and no new
+    #: state carrier, only a reading of it.
+    #:
+    #: WHY THE DEMAND MUST NOT SEE IT. AN measured the preemption on the
+    #: timeline the operator asked for (PP0, clean load, last TP phase):
+    #:     22:28:19 ENTER-TP · 22:28:19 SEAM-TRANSPORT-ADMIT
+    #:     22:28:21 TP-PREFILL x2
+    #:     22:28:24 ARM-TP_TO_PP      <-- 3 s in, before any merge
+    #:     22:28:27 RESIDENTS-RELEASED · 22:28:34 ENTER-PP
+    #: with no merge and no decode batch anywhere in the phase. The arm's
+    #: stated reason is `pending prefill N tok > 0`, and those tokens ARE the
+    #: cohort's own re-admission -- so the flip is armed BY the work it just
+    #: created, and then destroys it. #861j already subtracts
+    #: `seam_serviceable_tokens` from the ADMISSIBLE term, but
+    #: `demand_prefill_tokens` takes a `max()` with `pending_prefill_tokens`,
+    #: and the cohort sits in that first term untouched. This closes the same
+    #: door on the side #861j left open.
+    #:
+    #: REPLICATED, and that is what makes the dwell rank-uniform without a
+    #: clock: both numbers are derived from the replicated waiting queue and
+    #: the group-unanimous seam stamp, the same argument
+    #: `seam_serviceable_tokens` above states for itself. No rank-local timer
+    #: exists here, which `raenge-nie-uneins-crash-stop` forbids by
+    #: construction.
+    seam_cohort_pending_bs: int = 0
+    seam_cohort_pending_tokens: int = 0
+
+    #: #1032: consecutive rounds the cohort has stayed non-resident. The
+    #: BOUNDED ESCAPE, and it is a ROUND COUNT rather than a wall clock on
+    #: purpose: #1028 measured the rounds rank-identical (163 of 163 sampled
+    #: rounds present on all three ranks, max round 250/250/250), so a count
+    #: derived from them expires on every rank in the same round. A seconds
+    #: timer would be exactly the rank-local clock the law forbids.
+    seam_cohort_stall_rounds: int = 0
 
     #: #861c: PROMPT TOKENS OWED A PREFILL PASS, CACHED OR NOT.
     #:
@@ -2371,13 +2419,49 @@ class PhasePolicyInputs:
         # economics number was already corrected at the input boundary (W32)
         # -- and floored at 0, so fresh unstamped work keeps demanding
         # undiminished.
+        # #1032 FIX 1: THE COHORT MAY NOT DEMAND THE FLIP THAT DESTROYS IT.
+        #
+        # While the last cutover's cohort is still becoming resident in this
+        # layout, its own re-admission tokens are subtracted from BOTH terms.
+        # #861j did this for the admissible term only, and the `max()` below
+        # let `pending_prefill_tokens` carry the same population back in --
+        # which is the arm AN caught three seconds into the TP phase.
+        #
+        # BOUNDED, because a dwell that cannot expire is the livelock this
+        # campaign has paid for repeatedly: if the cohort cannot become
+        # resident at all (its re-admission is itself refused), the
+        # suppression lapses after `SEAM_COHORT_DWELL_ROUNDS` and the demand
+        # fires again with the reason logged by name at the caller. The
+        # expiry is a ROUND count, rank-identical by #1028, so every rank
+        # lapses in the same round and no rank decides alone.
+        _cohort = 0
+        if (
+            int(self.seam_cohort_pending_bs or 0) > 0
+            and int(self.seam_cohort_stall_rounds or 0) < SEAM_COHORT_DWELL_ROUNDS
+        ):
+            _cohort = max(0, int(self.seam_cohort_pending_tokens or 0))
         return max(
-            int(self.pending_prefill_tokens or 0),
+            max(0, int(self.pending_prefill_tokens or 0) - _cohort),
             max(
                 0,
                 int(self.admissible_prefill_tokens or 0)
-                - int(self.seam_serviceable_tokens or 0),
+                - int(self.seam_serviceable_tokens or 0)
+                - _cohort,
             ),
+        )
+
+    def seam_cohort_dwell_active(self) -> bool:
+        """#1032: is the pp-ward demand currently held for the flip cohort?"""
+        return (
+            int(self.seam_cohort_pending_bs or 0) > 0
+            and int(self.seam_cohort_stall_rounds or 0) < SEAM_COHORT_DWELL_ROUNDS
+        )
+
+    def seam_cohort_dwell_broken(self) -> bool:
+        """#1032: the cohort never became resident and the bound expired."""
+        return (
+            int(self.seam_cohort_pending_bs or 0) > 0
+            and int(self.seam_cohort_stall_rounds or 0) >= SEAM_COHORT_DWELL_ROUNDS
         )
 
     def work_exists(self) -> bool:
