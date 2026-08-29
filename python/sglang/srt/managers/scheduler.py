@@ -3829,8 +3829,32 @@ class Scheduler(
         no rank-local timer appears anywhere in this fix
         (`raenge-nie-uneins-crash-stop`).
         """
+        # #1032c: KEYED ON THE OPEN GRANT, NOT ON THE RETRACT STAMP.
+        #
+        # #906's debit carries an explicit anti-wedge argument, and this fix
+        # would have broken it. `phase_purity.py:1161-1168`, verbatim: "refusing
+        # the next chunk while still excluding its tokens would leave the
+        # request with no layout willing to run it and no policy input able to
+        # say so -- a mid-prefill wedge, which is the one outcome this posten
+        # may not produce."
+        #
+        # Keyed on the retract stamp, the dwell hid the cohort's tokens for as
+        # long as the cohort existed. But the TP grant is ONE chunk and the
+        # re-admission is three (8471 tokens at 4096): after chunk 1 the
+        # exemption re-derives False, strict purity refuses further TP prefill,
+        # and with the tokens still hidden NOTHING arms pp-ward -- precisely
+        # the wedge the contract forbids.
+        #
+        # Keyed on `seam_grant_is_open` the two halves stay welded: while the
+        # grant is open this layout IS serving the request, so its tokens are
+        # not a backlog and the flip may not be armed by them; the moment the
+        # grant is spent they become ordinary pending prefill and arm pp-ward,
+        # which is exactly what #906 requires. One predicate, one clock.
         try:
-            from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
+            from sglang.srt.managers.phase_purity import (
+                SEAM_READMIT_ATTR,
+                seam_grant_is_open,
+            )
         except Exception:  # noqa: BLE001
             return (0, 0)
         try:
@@ -3851,6 +3875,10 @@ class Scheduler(
                     continue
                 fin = getattr(req, "finished", None)
                 if callable(fin) and fin():
+                    continue
+                # The welded half: a spent grant hands the remainder back to
+                # PP as honest work, and it must be visible there.
+                if not seam_grant_is_open(req):
                     continue
                 n += 1
                 origin = getattr(req, "origin_input_ids", None) or ()
