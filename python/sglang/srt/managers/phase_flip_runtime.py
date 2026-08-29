@@ -46,9 +46,14 @@ import json
 import logging
 import os
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    # #1030: type-only. scheduler.py imports this module at runtime
+    # (build_phase_flip_runtime), so a real import here would be circular.
+    from sglang.srt.managers.scheduler import Scheduler
 
 from sglang.srt.layers.dcp.phase_flip_plan import (
     PP_TO_TP,
@@ -2475,7 +2480,9 @@ def seam_kv_recover(scheduler, reduce_fn, direction: str) -> None:
     runtime.book_deferred_grow(direction, level)
 
 
-def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], None]:
+def build_production_flip_cutover(
+    scheduler: "Scheduler", reduce_fn=None
+) -> Callable[[str], None]:
     """The cutover leg (DESIGN_631 3.6 step 5): everything the scheduler
     snapshotted from the boot topology is rebuilt for the target phase.
     Runs inside PhaseFlipRuntime._execute after KV/GDN/arena moves; the
