@@ -1411,6 +1411,44 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+            # #969B RE-ADMISSION DECISION PROBE (temporary). The open question
+            # from §H3: when PP0 rebuilt a re-admitted request FROM ZERO while
+            # its peers continued at (4096, N), was PP0 EARLY (it consulted the
+            # match before its own prefetch landed) or was its tree dropped and
+            # never re-read? Both look identical downstream -- an empty
+            # prefix_indices -- so the answer has to be taken HERE, at the
+            # consult, with the prefetch registry read in the same breath.
+            # Logs only re-admitted requests, so the ordinary path is silent.
+            # Grep: "#969B READMIT-MATCH".
+            try:
+                from sglang.srt.managers.phase_purity import (
+                    SEAM_READMIT_ATTR as _SRA,
+                )
+
+                if getattr(self, _SRA, None) is not None:
+                    _og = getattr(tree_cache, "ongoing_prefetch", None)
+                    _rid = str(getattr(self, "rid", "?"))
+                    _n = getattr(Req, "_969b_n", 0) + 1
+                    Req._969b_n = _n
+                    logger.warning(
+                        "#969B READMIT-MATCH n=%d rid=%s prefix_len=%d "
+                        "host_hit=%s mamba_host_hit=%s protected=%s "
+                        "prefetch_registered=%s prefetch_keys=%d "
+                        "readmit_epoch=%s input_len=%d",
+                        _n,
+                        _rid[:8],
+                        0 if self.prefix_indices is None else len(self.prefix_indices),
+                        getattr(self, "host_hit_length", None),
+                        getattr(self, "mamba_host_hit_length", None),
+                        getattr(self, "cache_protected_len", None),
+                        (_rid in _og) if isinstance(_og, dict) else "n/a",
+                        len(_og) if isinstance(_og, dict) else -1,
+                        getattr(self, _SRA, None),
+                        input_len,
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("#969B READMIT-MATCH PROBE RAISED", exc_info=True)
+
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
