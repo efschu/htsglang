@@ -8731,7 +8731,7 @@ class SchedulerPPMixin:
         )
 
     def _pp_wait_for_dict_readiness(
-        self: Scheduler, mb_id: int, kind: str = "proxy"
+        self: Scheduler, mb_id: int, kind: str = "proxy", soft: bool = False
     ) -> None:
         """#789: refuse to enter a blocking CHAN_DICT receive until there is
         POSITIVE evidence a message is actually coming.
@@ -9007,7 +9007,7 @@ class SchedulerPPMixin:
                 # already read "caught up" (see the docstring section
                 # above) and would otherwise wait out the whole budget for
                 # something already delivered.
-                return
+                return True
             if not per_kind:
                 per_kind = kind_axis_covers(counters, CHAN_DICT, upstream)
             if per_kind:
@@ -9025,7 +9025,7 @@ class SchedulerPPMixin:
                 # immediately -- the caller's ordinary receive is next, and
                 # from here it is bounded by transfer time, not by whether
                 # the upstream ever schedules anything.
-                return
+                return True
             attempted = (
                 counters.attempted_of_kind(CHAN_DICT, kind, upstream)
                 if per_kind
@@ -9097,6 +9097,44 @@ class SchedulerPPMixin:
                 if kind == "output"
                 else ""
             )
+            # #1002: NOTHING WAS POSTED, SO THERE IS NOTHING TO WAIT FOR.
+            # `consumed == posted == attempted` is not a lost message: it is
+            # the upstream stating, in-band, that it forwarded nothing for
+            # this slot. The receive predicate is `mbs[next_mb_id] is not
+            # None` -- this rank's OWN slot state -- while the send predicate
+            # is the upstream's `if pp_outputs:`. Two predicates on one
+            # stream, which is what the hint above already says in prose.
+            #
+            # A caller that can decline is told so and takes its EXISTING
+            # no-output exit, rather than the instance being killed for a
+            # message nobody owed. Nothing is dropped (nothing was sent) and
+            # nothing is refused (there is nothing to refuse) -- the two forms
+            # already metal-falsified on this path, corpse R and #995. No
+            # token is fabricated either: `_pp_make_skip_output_result` is
+            # deliberately NOT used, its zero placeholder being legitimate
+            # only for a chunk that really ran and produced no token.
+            #
+            # Opt-in, and the default still raises: a missing PROXY is a
+            # different fact, because those hidden states are the input to
+            # this rank's own forward and declining them computes on nothing.
+            if soft:
+                logger.warning(
+                    "%s #1002 %s READINESS DECLINED (not fatal): mb_id=%s "
+                    "upstream=%s posted=%d entered=%d consumed=%d on %s. The "
+                    "upstream forwarded nothing for this slot, so this rank "
+                    "declines the blocking receive and takes its no-output "
+                    "exit instead of dying. Waiting longer cannot help -- the "
+                    "counters are the upstream's own in-band statement.",
+                    "PHASE-FLIP",
+                    label,
+                    mb_id,
+                    upstream,
+                    posted,
+                    attempted,
+                    consumed,
+                    axis,
+                )
+                return False
             raise RuntimeError(
                 f"#789 {label} READINESS TIMEOUT: mb_id={mb_id}: this rank's "
                 f"upstream (rank {upstream}) posted {posted} dict message(s) "
@@ -9458,7 +9496,8 @@ class SchedulerPPMixin:
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
         mb_id: int = -1,
-    ) -> Dict[str, torch.Tensor]:
+        soft: bool = False,
+    ) -> Optional[Dict[str, torch.Tensor]]:
         # #802-ring: the OUTPUT wire gets the gate the PROXY wire has had
         # since #789. This receive is where PP1 sat, for ever, in specimen
         # wedge_802f_1712 while PP0 held a request-chain flush PP1 could only
@@ -9466,7 +9505,10 @@ class SchedulerPPMixin:
         # send -- a closed ring whose only cuttable arc is this one. A no-op
         # when `pp_flip_counters` is None, and on every pass where the
         # upstream has posted; see `_pp_wait_for_dict_readiness`.
-        self._pp_wait_for_dict_readiness(mb_id, kind="output")
+        # #1002: None means "the upstream posted nothing for this slot", and
+        # it is reachable only with soft=True; every other path is unchanged.
+        if not self._pp_wait_for_dict_readiness(mb_id, kind="output", soft=soft):
+            return None
         return self._pp_recv_typed_dict(
             expected_kind="output",
             all_gather_group=(
@@ -10147,7 +10189,12 @@ class SchedulerPPMixin:
                 # #802-ring: the slot is passed so the readiness gate can name
                 # it. It is the slot this rank's own gate above just proved
                 # non-empty -- exactly the expectation no upstream is told.
-                raw_output = self._pp_recv_dict_from_prev_stage(next_mb_id)
+                raw_output = self._pp_recv_dict_from_prev_stage(
+                    next_mb_id, soft=True
+                )
+                if raw_output is None:
+                    # #1002: the same exit `target is None` takes above.
+                    return
             # #791b: a void carries no tokens and must not be turned into one.
             # `_pp_absorb_void_output` empties the slot, so the loop's "slot
             # non-empty => a result was received for it" invariant (the guard
