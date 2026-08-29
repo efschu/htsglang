@@ -4127,7 +4127,11 @@ class SchedulerPPMixin:
                 # that is now idle keep incrementing the #801-spin streak it is
                 # no longer earning.
                 self._pp_upstream_void_withheld_work = False
-                if self.ps.pp_size > 1 and not self.pp_group.is_first_rank:
+                if (
+                    self.ps.pp_size > 1
+                    and not self.pp_group.is_first_rank
+                    and _pp_era_ring_live(self)
+                ):
                     with torch.profiler.record_function("pp_admission_decision_recv"):
                         incoming_decision = self._pp_recv_admission_decision()
                         effective, amended = self._pp_reconcile_incoming_admission(
@@ -7918,9 +7922,36 @@ class SchedulerPPMixin:
     def _pp_recv_admission_decision(self: Scheduler) -> Optional[PPAdmissionDecision]:
         """#791: this pass's inbound admission decision (blocking receive).
 
-        Always issued, never gated on this rank's own local state -- see
-        `_pp_send_admission_decision`'s docstring for why that gating would
-        be the defect, not the fix. Positioned in `_event_loop_pp_body`
+        #1013 THE READER IS THE THIRD GATE, AND IT WAS THE MISSING ONE.
+        The two gates above switch the era's admission-decision SENDER off
+        when the flip is off. A switched-off producer is only half the change:
+        direction is a property of the READER, so every consumer has to be
+        enumerated in the same breath. This one was not, and the docstring
+        below says why it looked safe to leave -- "always issued, never
+        gated". That sentence is true of a ring where the sender always
+        sends.
+
+        MEASURED, three py-spy stacks at one instant, boot
+        boot_pp3solo_6b28c34436_0829_094236.log (pp_size=3, tp_size=1, no
+        flip, first request):
+          PP0  _pp_commit_pending_req_work -> _pp_commit_comm_work:7261,
+               parked on `pp-ring-commit/req/send_req_work[0]`
+          PP1  _pp_recv_admission_decision:7934 -> _pp_recv_typed_dict:7604,
+               parked on `pp:0/recv_object[src=0,tag=0]/size`
+          PP2  _pp_recv_admission_decision:7934, parked on
+               `pp:0/recv_object[src=1,tag=0]/size`
+        PP0 is sending REQ WORK; PP1 is waiting for an ADMISSION DECISION.
+        Two different message kinds on the same hop, so PP1 never takes PP0's
+        work off the wire and the ring closes on the first request. Nothing is
+        served: 0 prefill batches, 0 http=200.
+
+        The gate is placed at the CALL SITE in `_event_loop_pp_body` rather
+        than here, so the whole recv-and-reconcile block is skipped as one
+        unit: returning None from here would still run
+        `_pp_reconcile_incoming_admission(None)` and the #797 narrowing that
+        follows it, which is a second contract, not this one.
+
+        Positioned in `_event_loop_pp_body`
         strictly BEFORE `get_next_batch_to_run`, so this rank's own
         admission loop can be DRIVEN by the decision instead of
         independently re-deriving one that might disagree with it -- and
