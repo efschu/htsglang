@@ -150,6 +150,33 @@ _MAX_PREFETCH_REISSUES: int = 3
 #: value; it is reduced as a (tag, -tag) pair so one MIN yields min and max.
 _PREFETCH_VOTE_TAG = 580
 
+#: #1029: slots carried per agreement lap. Sized to `max_running_requests`
+#: (8 on this rig); the remainder rides the next lap, which is cheap because
+#: #1028 measured the rounds in lockstep (163/163 on all three ranks).
+_1029_SLOTS: int = 8
+
+#: How many laps a completion may wait for its agreement before this rank
+#: publishes its own value and says so by name. NOT a silent fallback and NOT
+#: a crash: the first metal run of this protocol needs to COUNT how often the
+#: lap fails to deliver, and a boot that dies on a timing artifact measures
+#: nothing. `raenge-nie-uneins` promotes this to a stop once the count is
+#: known to be zero -- stated here so the temporary is not mistaken for the
+#: design.
+_1029_MAX_DEFER: int = 8
+
+
+def _1029_hash(req_id: str) -> int:
+    """A stable, process-independent int64 slot key for a request id.
+
+    `hash()` is salted per process and would name a different slot on every
+    rank -- the exact defect `offered_prefix_key` documents one module over.
+    """
+    import hashlib
+
+    return int.from_bytes(
+        hashlib.blake2b(str(req_id).encode(), digest_size=7).digest(), "big"
+    )
+
 _COLLECTIVE_POLL_SPINS = COLLECTIVE_POLL_SPINS
 _COLLECTIVE_POLL_MIN_S = COLLECTIVE_POLL_MIN_S
 _COLLECTIVE_POLL_MAX_S = COLLECTIVE_POLL_MAX_S
@@ -742,6 +769,169 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._all_reduce_attn_groups(data, tp_reduce_op, label=label)
         self._pp_sync(data)
 
+    def _1029_lap(self) -> None:
+        """#1029: ONE ROUND-LEVEL LAP OF THE PREFETCH AGREEMENT (§AJ3).
+
+        WHY A LAP AND NOT A RENDEZVOUS PER OPERATION. §AH measured that
+        `_pp_sync` per prefetch wedges, because entry is rank-local: a rank
+        that never registered a rid never posts the sync its peer waits for
+        (6 PARTIAL occurrences in 16 triples, §AI2). #1028 then measured that
+        entry HERE is symmetric -- 163 of 163 sampled rounds present on all
+        three ranks, max round 250/250/250 -- so a lap driven once per round
+        is matched by construction. Unmatched per-operation events change the
+        lap's CONTENT and force no entry, which is the whole property.
+
+        WHY A MIN AND NOT A BROADCAST. PP0-propagate alone is not honourable:
+        a follower told 8470 that holds 0 cannot publish bytes it does not
+        have (#791's unhonourable shape), and one capping down to its own
+        value restores the divergence §AF5 measured. The agreed value must be
+        the group MINIMUM, which is what makes PP0's decision executable on
+        every rank and keeps the `raenge-nie-uneins` crash a backstop rather
+        than something that fires on a 1-in-16 race.
+
+        THE ARC. `_pp_sync` is strictly one-directional (`group_src=rank-1`,
+        `group_dst=rank+1`, no wraparound), so the MIN that accumulates at the
+        last rank has no way home. The token-carrying output ring DOES lap
+        home (`PPBoundaryStats`: "the `next_token_ids` feedback from the last
+        stage back to rank 0") and was rejected on blast radius: a mistake in
+        that dict loses tokens, and this chain has wedged twice already. What
+        is used instead is the HiCache PP-sync arc's own missing wrap hop --
+        same group, same `P2PTag.HIRADIX_PP_SYNC`, same bounded receive,
+        entirely off the token wire. Not a new collective and not a new
+        channel: one more hop on the arc that is already there.
+
+        ORDER IS A PIPELINE, NOT A CYCLE, so it cannot deadlock: PP0 SENDS
+        before it receives, so PP1 is released, then PP2, then PP0's home
+        receive. Every receive is `bounded_recv` with the collective timeout.
+
+        SCHEMA, bounded and fixed (`_1029_SLOTS` entries x 3 int64):
+        `(rid_hash, value, flag)`.
+          flag=0 PROPOSAL -- each rank mins its own value in. A rank with no
+                 value yet contributes -1, and since -1 is below every real
+                 length a plain elementwise min carries "somebody is not
+                 ready" all the way round with no extra bookkeeping.
+          flag=1 AGREED   -- the final MIN from the previous lap. Every rank,
+                 PP0 included, installs on the lap that CARRIES it, so all
+                 three install in the same round.
+        Overflow is not an error: the remainder rides the next lap, which is
+        cheap precisely because #1028 measured the rounds in lockstep.
+        """
+        if (
+            self.pp_size <= 1
+            or self.pp_group is None
+            or not getattr(self, "enable_storage", False)
+        ):
+            return
+        width = 3 * _1029_SLOTS
+        vec = torch.full((width,), -1, dtype=torch.int64)
+        last = self.pp_size - 1
+        try:
+            if self.pp_rank == 0:
+                # Publish last lap's finals as AGREED, then propose the rest.
+                slot = 0
+                for rid, val in list(self._1029_final.items()):
+                    if slot >= _1029_SLOTS:
+                        break
+                    vec[3 * slot] = _1029_hash(rid)
+                    vec[3 * slot + 1] = int(val)
+                    vec[3 * slot + 2] = 1
+                    slot += 1
+                self._1029_final.clear()
+                for rid in list(self._1029_pending):
+                    if slot >= _1029_SLOTS:
+                        break
+                    vec[3 * slot] = _1029_hash(rid)
+                    vec[3 * slot + 1] = int(self._1029_local.get(rid, -1))
+                    vec[3 * slot + 2] = 0
+                    slot += 1
+            else:
+                bounded_recv(
+                    vec,
+                    group=self.pp_group,
+                    group_src=self.pp_rank - 1,
+                    tag=P2PTag.HIRADIX_PP_SYNC,
+                    label=f"1029_lap/recv<-pp{self.pp_rank - 1}",
+                    timeout_s=self.collective_timeout_s,
+                    rank_desc=collective_rank_desc(self),
+                )
+                self._1029_apply(vec)
+            # Install AGREED on rank 0 too, on the lap that carries them, so
+            # every rank installs in the same round.
+            if self.pp_rank == 0:
+                self._1029_apply(vec)
+            dst = self.pp_rank + 1 if self.pp_rank < last else 0
+            if not (self.pp_rank == 0 and last == 0):
+                self.work_list.append(
+                    torch.distributed.isend(
+                        vec.clone(),
+                        group_dst=dst,
+                        group=self.pp_group,
+                        tag=P2PTag.HIRADIX_PP_SYNC,
+                    )
+                )
+            if self.pp_rank == 0:
+                # The home hop: the last rank's fully-reduced vector.
+                home = torch.full((width,), -1, dtype=torch.int64)
+                bounded_recv(
+                    home,
+                    group=self.pp_group,
+                    group_src=last,
+                    tag=P2PTag.HIRADIX_PP_SYNC,
+                    label=f"1029_lap/home<-pp{last}",
+                    timeout_s=self.collective_timeout_s,
+                    rank_desc=collective_rank_desc(self),
+                )
+                for s in range(_1029_SLOTS):
+                    h = int(home[3 * s].item())
+                    val = int(home[3 * s + 1].item())
+                    flag = int(home[3 * s + 2].item())
+                    if h == -1 or flag != 0 or val < 0:
+                        continue
+                    rid = self._1029_by_hash.get(h)
+                    if rid is not None:
+                        self._1029_final[rid] = val
+        except Exception as exc:  # noqa: BLE001 - a lap may fail, never wedge
+            self._1029_lap_failures = getattr(self, "_1029_lap_failures", 0) + 1
+            logger.warning(
+                "#1029 LAP FAILED on pp_rank=%s (%s). %d failure(s) so far; "
+                "the pending agreements ride the next lap. A lap that cannot "
+                "run is a deferral, never a rank deciding for itself.",
+                getattr(self, "pp_rank", -1),
+                exc,
+                self._1029_lap_failures,
+            )
+
+    def _1029_apply(self, vec: torch.Tensor) -> None:
+        """Install AGREED slots and min this rank's own value into PROPOSALs."""
+        for s in range(_1029_SLOTS):
+            h = int(vec[3 * s].item())
+            if h == -1:
+                continue
+            flag = int(vec[3 * s + 2].item())
+            rid = self._1029_by_hash.get(h)
+            if flag == 1:
+                if rid is not None:
+                    self._1029_agreed[rid] = int(vec[3 * s + 1].item())
+                continue
+            own = -1 if rid is None else int(self._1029_local.get(rid, -1))
+            vec[3 * s + 1] = min(int(vec[3 * s + 1].item()), own)
+
+    def _1029_note_pending(self, req_id: str, own_completed: int) -> None:
+        """This rank's proposal for `req_id`, recorded for the next lap."""
+        self._1029_by_hash[_1029_hash(req_id)] = req_id
+        self._1029_local[req_id] = int(own_completed)
+        self._1029_pending.add(req_id)
+
+    def _1029_take_agreed(self, req_id: str):
+        """The agreed MIN for `req_id`, or None while the lap is still out."""
+        val = self._1029_agreed.pop(req_id, None)
+        if val is not None:
+            self._1029_pending.discard(req_id)
+            self._1029_local.pop(req_id, None)
+            self._1029_defer.pop(req_id, None)
+            self._1029_by_hash.pop(_1029_hash(req_id), None)
+        return val
+
     def _pp_sync(self, data: torch.Tensor) -> None:
         """
         Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
@@ -831,6 +1021,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._reissue_disagreements = 0
         self._retired_prefetch_recompute = 0
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        # #1029 round-level prefetch agreement (§AJ3). All rank-local state;
+        # the only thing that crosses is the fixed vector in `_1029_lap`.
+        self._1029_local: dict[str, int] = {}
+        self._1029_agreed: dict[str, int] = {}
+        self._1029_final: dict[str, int] = {}
+        self._1029_pending: set = set()
+        self._1029_defer: dict[str, int] = {}
+        self._1029_by_hash: dict[int, str] = {}
         # #810: built in `init_hicache`, once the controller and the
         # symmetrized prefetch reservation exist. None here and for the whole
         # of `--hicache-host-role retention`, which is the default.
@@ -3195,10 +3393,58 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not self.can_terminate_prefetch(operation):
             return False
 
+        # #1029: THE PUBLISHED LENGTH IS THE ADMISSION PREFIX, SO IT WAITS FOR
+        # THE GROUP. Taken BEFORE `terminate_prefetch`, which mutates the
+        # operation: a deferral must leave the operation exactly as it found
+        # it so the next round can ask again. `operation.completed_tokens` is
+        # readable without terminating (`_page_transfer` reads it too).
+        _1029_agreed = None
+        if self.pp_size > 1 and self.pp_group is not None:
+            _1029_agreed = self._1029_take_agreed(req_id)
+            if _1029_agreed is None:
+                own = int(getattr(operation, "completed_tokens", 0) or 0)
+                self._1029_note_pending(req_id, own)
+                n = self._1029_defer.get(req_id, 0) + 1
+                self._1029_defer[req_id] = n
+                if n <= _1029_MAX_DEFER:
+                    # Not done: the lap is still out. Deferral, not divergence.
+                    return False
+                logger.warning(
+                    "#1029 AGREEMENT DID NOT ARRIVE for req=%s after %d lap(s) "
+                    "on pp_rank=%s; publishing this rank's own %d token(s). "
+                    "This is the counted fallback, not the design: a rank that "
+                    "publishes unagreed is exactly the divergence #1029 exists "
+                    "to remove, and the count is here so it can be driven to "
+                    "zero before the crash/stop replaces it.",
+                    str(req_id)[:8],
+                    n,
+                    getattr(self, "pp_rank", -1),
+                    own,
+                )
+                self._1029_pending.discard(req_id)
+                self._1029_local.pop(req_id, None)
+                self._1029_defer.pop(req_id, None)
+                self._1029_by_hash.pop(_1029_hash(req_id), None)
+
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
         min_completed_tokens = completed_tokens
+        if _1029_agreed is not None and _1029_agreed >= 0:
+            # The group MIN. `min` and not assignment: the agreed value can
+            # never exceed what this rank holds (it IS a minimum over the
+            # ranks), and clamping states that invariant instead of trusting
+            # it. Equal on every rank by construction, which is the point.
+            min_completed_tokens = min(int(completed_tokens), int(_1029_agreed))
+            logger.info(
+                "#1029 AGREED LENGTH req=%s pp_rank=%s own=%d agreed=%d "
+                "published=%d",
+                str(req_id)[:8],
+                getattr(self, "pp_rank", -1),
+                int(completed_tokens),
+                int(_1029_agreed),
+                int(min_completed_tokens),
+            )
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
         if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
@@ -4795,6 +5041,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pass
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        # #1029: ONE agreement lap per round, at the one point #1028 measured
+        # every rank reaching exactly once per scheduler step. Driven here and
+        # nowhere else -- a second driver would break the matching that makes
+        # this safe where the per-operation rendezvous was not (§AH/§AI).
+        self._1029_lap()
         self.writing_check()
         self.loading_check()
         if self._pin_trace_every:
