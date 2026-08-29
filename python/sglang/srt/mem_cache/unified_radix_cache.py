@@ -4864,6 +4864,67 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return "\n".join(lines) + "\n"
 
+    def leak_census_str(self) -> str:
+        """What the TREE holds, recomputed from the nodes, for a pool leak.
+
+        The pool ledger only ever says how big the ``evictable`` TERM is. When
+        rows go missing that leaves two indistinguishable worlds, and they have
+        opposite fixes:
+
+          (a) the tree HOLDS the rows and the term does not follow -- a
+              bookkeeping defect at the handover point;
+          (b) the tree holds NOTHING and the rows were orphaned outside it --
+              a missing free / a lost owner.
+
+        ``sanity_check`` PART 4 already recomputes the per-component sizes from
+        a full node walk, but it runs after the pool check, which raises first,
+        so its answer never reached a log. This is the same recomputation,
+        callable at the moment the leak is found and cheap enough to run once
+        on a fatal path: node count, the recomputed evictable/protected sums
+        per component against the tracked terms, and the first few nodes with
+        their row counts, so "steht der Knoten im Baum?" is answered by the
+        error itself rather than by the next boot.
+        """
+        try:
+            all_nodes = self._collect_all_nodes()
+        except Exception as exc:  # noqa: BLE001 - diagnostics must not mask the leak
+            return f"tree census unavailable: {exc!r}"
+
+        parts = [f"nodes={len(all_nodes)}"]
+        for ct in self.tree_components:
+            evictable = 0
+            protected = 0
+            for n in all_nodes:
+                if n is self.root_node:
+                    continue
+                cd = n.component_data[ct]
+                if cd.value is not None:
+                    if cd.lock_ref > 0:
+                        protected += len(cd.value)
+                    else:
+                        evictable += len(cd.value)
+            parts.append(
+                f"{ct.name}: tracked_evictable={self.component_evictable_size_[ct]} "
+                f"recomputed_evictable={evictable} "
+                f"tracked_protected={self.component_protected_size_[ct]} "
+                f"recomputed_protected={protected}"
+            )
+        held = []
+        for n in all_nodes:
+            if n is self.root_node:
+                continue
+            cd = n.component_data[BASE_COMPONENT_TYPE]
+            held.append(
+                f"id={n.id} keylen={len(n.key) if n.key is not None else '-'} "
+                f"full_dev={0 if cd.value is None else len(cd.value)} "
+                f"full_host={0 if cd.host_value is None else len(cd.host_value)} "
+                f"lock={cd.lock_ref}"
+            )
+            if len(held) >= 8:
+                break
+        parts.append("held=[" + "; ".join(held) + "]")
+        return "TREE CENSUS " + " | ".join(parts)
+
     def _collect_all_nodes(self) -> list[UnifiedTreeNode]:
         nodes = []
         stack = [self.root_node]

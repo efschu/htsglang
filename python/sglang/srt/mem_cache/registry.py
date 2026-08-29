@@ -234,4 +234,93 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         ctx.enable_hierarchical_cache,
         streaming_wrapped,
     )
+    _log_hicache_impl_banner(cache, ctx)
     return cache
+
+
+def _hicache_impl_fields(cache) -> "dict[str, str]":
+    """Name the HiCache implementation ACTUALLY bound, half by half.
+
+    One-path discipline (user order 2026-08-29): this fork carries two
+    lineages of the hierarchical cache -- the ``MambaRadixCache``/
+    ``HiRadixCache`` line and the ``UnifiedRadixCache`` + component line --
+    and the selection chain in ``default_radix_cache_factory`` is long enough
+    that reading the launch flags does NOT tell you which one a boot got. The
+    concrete miss this closes: ``mamba_radix_cache.py`` line numbers were
+    carried through a whole handover as the defect site while the boot that
+    produced the defect ran ``UnifiedRadixCache``, whose ``MambaComponent``
+    is a different file. Without a line naming the bound classes there is no
+    cache verdict, only a guess about which file the evidence belongs to.
+
+    Reports CLASSES, never flags: a flag says what was asked for, a class
+    says what answered. ``none`` means that half is genuinely absent (no
+    controller, no storage backend, no mamba lineage), which is itself a
+    verdict and not a gap in the instrument.
+    """
+    unwrapped = getattr(cache, "tree_cache", cache)  # StreamingSession wrapper
+    controller = getattr(unwrapped, "cache_controller", None)
+    fields = {"tree": type(unwrapped).__name__}
+
+    if controller is None:
+        fields["write"] = "none"
+        fields["read"] = "none"
+        fields["store"] = "none"
+    else:
+        cname = type(controller).__name__
+        fields["write"] = f"{cname}:{getattr(controller, 'write_policy', '?')}"
+        fields["read"] = f"{cname}:{getattr(controller, 'io_backend', '?')}"
+        backend = getattr(controller, "storage_backend", None)
+        if backend is None or not getattr(controller, "enable_storage", False):
+            fields["store"] = "none"
+        else:
+            fields["store"] = type(backend).__name__
+
+    # Mamba half: the component in the unified line, the class itself in the
+    # MambaRadixCache line, `none` when the tree carries no mamba lineage.
+    mamba = "none"
+    components = getattr(unwrapped, "components", None)
+    if isinstance(components, dict):
+        for comp in components.values():
+            ct = getattr(comp, "component_type", None)
+            if ct is not None and getattr(ct, "is_mamba", False):
+                mamba = type(comp).__name__
+                break
+    if mamba == "none" and getattr(unwrapped, "supports_mamba", lambda: False)():
+        mamba = type(unwrapped).__name__
+    fields["mamba"] = mamba
+
+    host = None
+    if isinstance(components, dict):
+        for comp in components.values():
+            ct = getattr(comp, "component_type", None)
+            if ct is not None and getattr(ct, "is_mamba", False):
+                host = getattr(comp, "_mamba_pool_host", None)
+                break
+    if host is None:
+        host = getattr(unwrapped, "mamba_pool_host", None)
+    fields["mambahost"] = "none" if host is None else type(host).__name__
+
+    kvhost = getattr(controller, "mem_pool_host", None) if controller else None
+    fields["kvhost"] = "none" if kvhost is None else type(kvhost).__name__
+    return fields
+
+
+def _log_hicache_impl_banner(cache, ctx: TreeCacheBuildContext) -> None:
+    """Emit the single grepable HICACHE-IMPL line for this boot."""
+    try:
+        fields = _hicache_impl_fields(cache)
+    except Exception as exc:  # noqa: BLE001 - a banner must never break a boot
+        logger.warning("HICACHE-IMPL banner unavailable: %r", exc)
+        return
+    logger.info(
+        "HICACHE-IMPL tree=%s write=%s read=%s mamba=%s store=%s "
+        "mambahost=%s kvhost=%s hierarchical=%s",
+        fields["tree"],
+        fields["write"],
+        fields["read"],
+        fields["mamba"],
+        fields["store"],
+        fields["mambahost"],
+        fields["kvhost"],
+        ctx.enable_hierarchical_cache,
+    )

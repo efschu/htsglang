@@ -11237,6 +11237,18 @@ class Scheduler(
                 self.pool_stats_observer.get_pool_stats(),
             )
             if has_leak:
+                # The ledger names the SIZE of the evictable term, never who
+                # holds the rows. Recompute what the tree actually holds first,
+                # so the fatal message says whether the missing rows are IN the
+                # tree and uncounted or outside it and orphaned -- the two
+                # worlds have opposite fixes and the term alone cannot tell
+                # them apart. Diagnostics only; the raise below is unchanged.
+                census = getattr(self.tree_cache, "leak_census_str", None)
+                if callable(census):
+                    try:
+                        logger.error("%s", census())
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("tree leak census raised: %r", exc)
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
             self.invariant_checker._check_req_pool()
 
