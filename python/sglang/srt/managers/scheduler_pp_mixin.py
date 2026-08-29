@@ -9248,7 +9248,21 @@ class SchedulerPPMixin:
         # upstream has posted; see `_pp_wait_for_dict_readiness`.
         # #1002: None means "the upstream posted nothing for this slot", and
         # it is reachable only with soft=True; every other path is unchanged.
-        if not self._pp_wait_for_dict_readiness(mb_id, kind="output", soft=soft):
+        # #969 CUT B2: the readiness gate is a SOFT-PATH device only. Upstream
+        # calls the typed receive directly (`main:scheduler_pp_mixin.py:1240`)
+        # and that receive blocks on its own -- measured in the py-spy of
+        # boot_969cut_55fdfa5e7a: PP2 parked in
+        # `_pp_recv_typed_dict -> recv_typed_tensor_dict -> recv_object ->
+        # join`. So on the blocking path the gate adds nothing but a way to
+        # RETURN ABSENCE: a declined gate returned None, the caller wrapped it
+        # as `PPProxyTensors(None)`, and `_pp_prep_batch_result` died on
+        # `pp_outputs["next_token_ids"]` with `'NoneType' object is not
+        # subscriptable` (boot_969cut_4214455631_0829_134216.log:738). Absence
+        # returned as a value is the defect class this whole cut exists to
+        # remove, so the gate now runs only where a caller asked for a peek.
+        if soft and not self._pp_wait_for_dict_readiness(
+            mb_id, kind="output", soft=True
+        ):
             return None
         return self._pp_recv_typed_dict(
             expected_kind="output",
