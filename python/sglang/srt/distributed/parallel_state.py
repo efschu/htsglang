@@ -2454,21 +2454,34 @@ class GroupCoordinator:
             try:
                 out = torch.zeros(1, dtype=torch.uint8, device=dev)
                 inp = torch.zeros(1, dtype=torch.uint8, device=dev)
-                # RECEIVE IS POSTED FIRST, AND THAT ORDER IS THE WHOLE
-                # POINT. Measured: with isend first, all three ranks blocked
-                # in isend (boot 60, PP2 at parallel_state.py:2458 with both
-                # peers simultaneously in the same call) -- `isend` here does
-                # not return before a matching receive is posted, so a ring in
-                # which everyone sends before anyone receives closes on
-                # itself. Posting the receive first costs nothing, cannot
-                # block, and leaves a buffer waiting for the predecessor
-                # before this rank asks anything of its successor.
-                works = [
-                    torch.distributed.irecv(inp, prv, group=grp),
-                    torch.distributed.isend(out, nxt, group=grp),
-                ]
-                for w in works:
-                    w.wait()
+                # ONE PAIR AT A TIME, AND THAT IS FORCED BY MEASUREMENT.
+                # Both symmetric orderings deadlock on this group: with isend
+                # first all three ranks blocked in isend (boot 60, PP2 at
+                # :2458), with irecv first all three blocked in irecv (boot
+                # 64, PP2 at :2467). So these calls do not return before they
+                # are matched -- they are synchronous here whatever their
+                # names suggest, and ANY ring warmup in which every rank
+                # issues the same operation first closes on itself.
+                #
+                # Sequencing removes the symmetry instead of guessing a third
+                # order: at step k exactly one rank sends and exactly one
+                # receives, so every operation is matched the moment it is
+                # issued and no rank ever waits on a peer that is not already
+                # in the matching call. world_size steps, a barrier between
+                # them so no rank runs ahead into the next pair.
+                ok = True
+                for k in range(self.world_size):
+                    try:
+                        if self.rank_in_group == k:
+                            torch.distributed.send(out, nxt, group=grp)
+                        elif self.rank_in_group == (k + 1) % self.world_size:
+                            torch.distributed.recv(inp, prv, group=grp)
+                        torch.distributed.barrier(group=grp)
+                    except Exception:  # noqa: BLE001
+                        ok = False
+                        break
+                if not ok:
+                    raise RuntimeError("pairwise warmup step failed")
                 pairs.append(f"{name}:{self.rank}->{nxt},{prv}->{self.rank}")
             except Exception as exc:  # noqa: BLE001
                 # A warmup may not be the thing that stops a boot; a pair that
