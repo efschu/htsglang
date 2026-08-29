@@ -4089,10 +4089,14 @@ class SchedulerPPMixin:
                 # is no longer waiting on this rank, so the wait can only be
                 # on a peer that has had its chance to take the message --
                 # the same property `_pp_commit_pending_req_work` relies on.
-                _deferred_wrap = getattr(self, "_pp_deferred_output_work", None)
-                if _deferred_wrap:
-                    self._pp_deferred_output_work = None
-                    self._pp_commit_comm_work(work=_deferred_wrap)
+                # #1015e: one lap tick per pass, and the due-send drain that
+                # rides on it. #1015d's special-cased wrap deferral is gone --
+                # it deferred ONE edge by ONE lap and boot a922f3b6b4 simply
+                # re-formed the cycle on the proxy edge instead. Every send on
+                # every channel is now deferred by a full slot cycle, so there
+                # is no privileged edge left to special-case.
+                self._pp_send_lap = int(getattr(self, "_pp_send_lap", 0)) + 1
+                self._pp_drain_due_sends()
                 self._pp_forward_and_process_input_requests(recv_reqs)
                 # #791 PP ADMISSION UNIFORMITY. Consume THIS pass's inbound
                 # admission decision before this rank derives its own batch,
@@ -7183,7 +7187,93 @@ class SchedulerPPMixin:
                 )
         return send_release_work, release_rids
 
+    def _pp_send_join_lag(self: Scheduler) -> int:
+        """How many laps a posted send waits before this rank joins it.
+
+        One full slot cycle. By the time a lap-N send is joined at lap
+        N+`pp_loop_size`, the peer's loop has come round to its own
+        unconditional receive for that slot at least once, so the join
+        finds the message already taken and returns without parking.
+        """
+        return max(1, int(getattr(self.ps, "pp_size", 1) or 1))
+
+    def _pp_post_send(self: Scheduler, work: List[P2PWork]) -> None:
+        """Post-and-forget: take the send off the pass path entirely.
+
+        #1015e. THE JOIN IS THE CYCLE, NOT THE ARC. Three boots removed or
+        re-timed one arc each and the closed 3-cycle re-formed on whichever
+        three edges were left:
+          admission 0->1 / admission 1->2 / output-wrap 2->0   (6bf9fb7bac)
+          req 0->1       / req 1->2       / output-wrap 2->0   (206661a28b)
+          req 0->1       / proxy 1->2     / wrap deferred 2->0 (a922f3b6b4)
+        Matched edges, same instant, every time -- so it is not a verdict or
+        slot divergence. The invariant behind all three: every rank holds
+        exactly one BLOCKING forward obligation per pass, and the wrap closes
+        the loop. Which arc carries it is free, so no arc edit reaches it.
+
+        The sends stay -- hidden states and results must flow. What leaves is
+        the JOIN. A rank never waits on a send while on the pass path, so no
+        rank can be the blocking member of a cycle, and a cycle stops being
+        constructible rather than merely being avoided at three sites.
+
+        WHY A DEFERRED JOIN AND NOT A DROPPED ONE. `pp_pump_send_req_work`
+        pins the measurement that rules out polling: `is_completed()` NEVER
+        fires for an isend on this transport, so nothing can reap a handle by
+        asking. Dropping the handle instead is corpse A -- the `Work` owns the
+        tensor, and releasing it unjoined frees memory the transport is still
+        reading. So the join still happens; it happens LATE, one full slot
+        cycle after the post, where the peer has provably cycled past its
+        receive and the join returns immediately.
+
+        MEMORY IS BOUNDED BY CONSTRUCTION, and here is the bound: each rank
+        posts at most one send per channel per pass, and at most
+        `_pp_send_join_lag()` laps are outstanding, so the retained set is
+        (channels x pp_size) handles -- single digits on this rig -- not a
+        list that grows with uptime. The tensors behind them live exactly
+        that long.
+        """
+        if not work:
+            return
+        lap = int(getattr(self, "_pp_send_lap", 0))
+        pending = getattr(self, "_pp_pending_sends", None)
+        if pending is None:
+            pending = self._pp_pending_sends = {}
+        pending.setdefault(lap, []).append(list(work))
+        # The caller owns an empty list afterwards exactly as it did when this
+        # joined inline; the handles now live in `pending`, not in the caller.
+        work.clear()
+        self._pp_drain_due_sends()
+
+    def _pp_drain_due_sends(self: Scheduler) -> None:
+        """Join sends posted at least one full slot cycle ago.
+
+        Off the critical path by construction: the message being joined here
+        was posted `_pp_send_join_lag()` laps back, so a peer that is making
+        any progress at all has taken it and this returns at once. A timeout
+        HERE therefore means a genuinely dead or wedged peer -- which is what
+        the #973 bound was always for -- and it keeps the same named abort
+        with the channel name. No new collective is introduced on the path.
+        """
+        pending = getattr(self, "_pp_pending_sends", None)
+        if not pending:
+            return
+        due_before = int(getattr(self, "_pp_send_lap", 0)) - self._pp_send_join_lag()
+        for lap in sorted(l for l in pending if l <= due_before):
+            for work in pending.pop(lap):
+                self._pp_join_comm_work(work)
+
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
+        """Post this rank's sends without joining them on the pass path.
+
+        #1015e: the name is kept because nineteen call sites use it and its
+        contract to the caller is unchanged -- hand over a work list, get an
+        empty list back. What changed is that the handover no longer WAITS.
+        See `_pp_post_send` for the three boots that forced this and for why
+        the join is deferred rather than dropped.
+        """
+        self._pp_post_send(work)
+
+    def _pp_join_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
         """Flush this rank's outstanding p2p sends, with a #973 deadline.
 
         THE WAIT USED TO BE NAKED, and that is what boot 2 of window-flip-0828
@@ -7317,42 +7407,7 @@ class SchedulerPPMixin:
         pending_output_work = self.send_output_work
         gapped = getattr(self, "_pp_gapped_wire", False)
         if not gapped:
-            if self.pp_group.is_last_rank and self.ps.pp_size > 1:
-                # #1015d: THE WRAP MAY NOT BE A BLOCKING OBLIGATION ON THE
-                # PATH. This edge -- last rank -> rank 0 -- is OUR arc, not
-                # upstream's: upstream sglang closes no ring (input at rank 0,
-                # output from the last rank to the detokenizer), and this wrap
-                # exists so PP0 gets its facts home on the ring lap. Being
-                # ours, it is also the one edge we may re-time freely.
-                #
-                # MEASURED, boot_pp3solo_206661a28b_0829_113554.log, all three
-                # ranks blocked at the same instant on consecutive matched
-                # edges: PP0 on req/send_req_work 0->1, PP1 on req 1->2, PP2
-                # here on dict/send_output_work 2->0. A closed 3-cycle. Same
-                # shape as the earlier admission-arc cycle, which is why
-                # deleting that arc did not end the class -- the cycle re-forms
-                # on whichever three edges exist.
-                #
-                # WHY NOT FIRE-AND-FORGET: `pp_pump_send_req_work` records the
-                # measurement that settles it -- `is_completed()` NEVER fires
-                # for an isend on this transport, so a polled reap cannot work
-                # and an unreaped send is corpse A. Both extremes are corpses;
-                # a blocking commit here is corpse B'. So the wait is MOVED,
-                # not removed.
-                #
-                # WHY THE EXISTING ONE-ITERATION LAG WAS NOT ENOUGH: this
-                # commit already waits on the PREVIOUS iteration's work. It
-                # still deadlocks, because it sits AHEAD of this rank's own
-                # `recv_requests` for the next lap -- so the rank that must
-                # take PP1's chain to free the cycle is itself parked on PP0
-                # taking the wrap. Deferring it past that receive is what
-                # opens the ring: PP2 takes the chain, PP1 unblocks, PP1 takes
-                # PP0's chain, PP0 unblocks and reaches the receive that frees
-                # PP2. The fact still travels home on the ring lap, one lap
-                # later, which is what "consumed on the next lap" means.
-                self._pp_deferred_output_work = pending_output_work
-            else:
-                self._pp_commit_comm_work(work=pending_output_work)
+            self._pp_commit_comm_work(work=pending_output_work)
         (
             next_pp_outputs,
             next_batch_result,
