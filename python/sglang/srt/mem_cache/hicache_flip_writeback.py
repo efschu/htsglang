@@ -217,6 +217,41 @@ def require_canonical_store(tree_cache: Any) -> None:
         )
 
 
+def _total_nodes(tree_cache: Any) -> int:
+    """EVERY node under the root, hashed or not. #969E discriminator.
+
+    `_hashed_nodes` is the eligibility predicate: a node counts only once it
+    carries a `hash_value`. So `eligible=0` has two very different causes and
+    the fence cannot tell them apart:
+
+      (a) nothing was INSERTED into the tree at all, or
+      (b) it was inserted and is not HASHED YET, because hashing happens on the
+          write-through path asynchronously and this fence runs immediately
+          after the retraction.
+
+    Rising total with eligible=0 is (b) -- an ordering problem, fixable under
+    this fence's existing deadline. Flat total is (a) -- the insert never
+    happened. One number decides it; nothing else in the tree reports it.
+    """
+    root = getattr(tree_cache, "root_node", None)
+    if root is None:
+        return -1
+    n = 0
+
+    def _walk(node) -> None:
+        nonlocal n
+        for child in list(getattr(node, "children", {}).values()):
+            n += 1
+            _walk(child)
+
+    try:
+        _walk(root)
+    except Exception:  # noqa: BLE001 - a probe may never break a fence
+        return -1
+    return n
+
+
+
 def _hashed_nodes(tree_cache: Any) -> list:
     """Persistable nodes, PARENT FIRST.
 
@@ -287,6 +322,11 @@ def flip_writeback(
     deadline = started + float(deadline_s)
 
     nodes = _hashed_nodes(tree_cache)
+    # #969E: the discriminator, logged beside eligible. See _total_nodes.
+    _969e_total = _total_nodes(tree_cache)
+    logger.warning(
+        "#969E FENCE-NODES total=%d eligible=%d", _969e_total, len(nodes)
+    )
     root = getattr(tree_cache, "root_node", None)
     staged = 0
     already = 0
