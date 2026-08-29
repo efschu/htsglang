@@ -9609,16 +9609,46 @@ class Scheduler(
             # natuerlich fuer das eigentliche Laden relevant -- nur der
             # ENTSCHEID faellt nicht mehr daraus.")
             #
-            # RESIDUAL, NAMED RATHER THAN HIDDEN: this closes the direction the
-            # probe measured (a follower SKIPPING what PP0 admitted). The
-            # opposite direction -- PP0 skipping for its own pending prefetch
-            # while a follower, now without the term, admits that request --
-            # is not closed by a deletion alone and needs PP0's membership on
-            # the wire. `#969N` is still armed and names it on sight, so the
-            # next boot measures whether it occurs at all instead of a
-            # thirteenth structure hypothesis being shipped against it.
-            _pp_follower = self.ps.pp_size > 1 and self.ps.pp_rank != 0
-            if self.enable_hicache_storage and _pp_follower:
+            # THE RESIDUAL WAS MEASURED, AND IT CLOSED THE ARGUMENT (boot
+            # `boot_969nogrid_0922e207ec_0829_185657.log`). Deleting the term
+            # BELOW PP0 only removed the width member -- `#631 PP proxy/batch
+            # mismatch` 0, and the ladder moved 2 -> 4 cutovers -- and then the
+            # named opposite direction arrived as the OTHER #631 member:
+            #
+            #   #631 PROXY LEFTOVER REFUSED: a proxy stamped mb_id=1 seq=2
+            #   rows=4096 epoch=4 arrived while this rank is on mb_id=0 in
+            #   flip epoch 4
+            #
+            # Same epoch, different SLOT: PP0 withheld a pass for its own
+            # pending prefetch while a follower, no longer holding that
+            # opinion, launched -- so the slot cursors parted. An asymmetric
+            # deletion just moves which rank is out of step.
+            #
+            # SO THE TERM GOES ON EVERY RANK OF A PP GROUP, and PP0's verdict
+            # is the constant one: TAKE WITHOUT WAITING. That is a decision,
+            # it is PP0's, and it is uniform -- which is exactly why it needs
+            # no wire and no collective. The alternative (PP0 waits and TELLS
+            # the others) cannot be built on the §W3 carrier: the request
+            # stream is posted at the TOP of a pass, before that rank's own
+            # admission, so it can only ever carry the PREVIOUS pass's
+            # membership, and a one-pass-late membership is precisely the
+            # skew this line is removing.
+            #
+            # THE COST, priced rather than waved past: a request whose storage
+            # prefetch has not finished is admitted now instead of next pass,
+            # so its L3 hit is not credited and those tokens are recomputed.
+            # It is bounded -- the DEVICE-tier radix prefix is untouched, and
+            # `pop_prefetch_loaded_tokens` below still credits every prefetch
+            # that HAS completed -- and it is the cheaper side of the trade
+            # against a group that dies at cutover 4.
+            #
+            # NOT deleted: `_drain_prefetch_progress` still runs every pass on
+            # every rank, so the loads still complete and still land in the
+            # tree for the NEXT request that matches them. Local completion
+            # stays relevant for the loading; it no longer decides admission
+            # anywhere in a PP group.
+            _pp_group = self.ps.pp_size > 1
+            if self.enable_hicache_storage and _pp_group:
                 # Credit a completed store hit if there is one; decide nothing.
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
@@ -9631,10 +9661,12 @@ class Scheduler(
                 if self._969z_followed == 1 or self._969z_followed % 512 == 0:
                     logger.warning(
                         "#969Z PREFETCH VERDICT NOT TAKEN HERE (rank %d, n=%d): "
-                        "this rank admits on PP0's membership and forms no "
-                        "prefetch-readiness opinion. rid=%s storage_hit=%s. The "
-                        "local prefetch still runs and still credits its hit; "
-                        "only the DECISION moved to PP0 (#969 §Z).",
+                        "no rank of a PP group withholds admission for its own "
+                        "prefetch; PP0's standing verdict is TAKE WITHOUT "
+                        "WAITING, uniform and therefore wireless. rid=%s "
+                        "storage_hit=%s. The local prefetch still runs and "
+                        "still credits every completed hit; only the DECISION "
+                        "is gone (#969 §Z2).",
                         self.ps.pp_rank,
                         self._969z_followed,
                         req.rid,
