@@ -892,8 +892,9 @@ def check_cpu_copy_layers(found: int, expected: int, direction: str, what: str) 
     WHY THIS STILL REFUSES rather than carrying: a carry needs a collective, and
     it needs TWO of them -- the layer axis (this one) and the TOKEN axis, where
     PP holds every token at allocator slots while TP holds an owner-rule SUBSET
-    at compacted rows (layers/dcp/owner.py:159). The layer half is built and
-    proven in `seam_layer_carry.py`; the token half is not, and a layer-correct
+    at compacted rows (layers/dcp/owner.py:159). The layer half was built in
+    `seam_layer_carry.py` and DELETED (#1043: 162 refusals / 0 successes);
+    the token half was never built, and a layer-correct
     token-wrong carry is the "matching row ids, mismatched widths" corruption
     #719 already walked into. Until then a refusal costs one recompute, which is
     the cheaper of the two wrong answers.
