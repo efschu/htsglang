@@ -767,34 +767,40 @@ class PrefillAdmissionGate:
         # #968 answer (the budget verdict belongs at PP0 and is distributed,
         # not recomputed locally by every rank before a barrier). Recorded here
         # so the next reader does not mistake this for the destination.
-        import time
-
-        now = time.monotonic()
-        last = getattr(self, "_takeable_at", None)
-        if last is not None and (now - last) < self._TRAPPED_REFRESH_S:
-            cached = getattr(self, "_takeable_cached", None)
-            if cached is not None:
-                return cached
-
+        # #1028b REVERTED TO #1027 SCOPE -- I had cadenced the WHOLE value and
+        # justified it with a staleness argument that is FALSE for this half.
+        #
+        # THE SIGN, read off the consumer instead of remembered: `takeable` is
+        # ADDED in `spendable_bytes` (:620, `free + takeable - delta`), and
+        # `takeable_cache_bytes`' own docstring says so ("a negative budget
+        # that would then be ADDED to a free column"). So a stale-LARGER
+        # `cache` WIDENS the granted chunk -- the exact case the #856 F6 note
+        # at :606-619 calls unsurvivable. My #1028 commit claimed the value was
+        # "subtracted, so a stale reading narrows and never widens": that is
+        # true of `trapped` (subtracted INSIDE takeable, #1027) and false of
+        # `cache`. Cadencing the sum inherited the wrong half's direction.
+        #
+        # So only the provably-safe half stays cadenced. `_allocator_cache_bytes`
+        # returns to the per-round path, which REINSTATES the #1028a straggler
+        # (memory_stats via memory_reserved). That is a deliberate trade and it
+        # is the one the law prescribes: an intermittent liveness stall is
+        # detected (dead-man, and it crashes nothing silently), while an
+        # over-granted corridor is silent over-commit. Crash over corruption.
+        #
+        # The real fix belongs to the measurement axis (#968 piece 3) and it
+        # cannot be "sample it less often": an off-thread sample is stale too.
+        # For an ADDED term the options are (a) make it cheap enough to read
+        # synchronously, (b) restructure so it is not needed per round, or
+        # (c) carry a MEASURED LOWER BOUND (e.g. the minimum over the sampling
+        # window), which is stale in the SAFE direction rather than an
+        # arbitrary margin. Named here so the next pass starts from the
+        # direction table rather than from the cost.
         cache = int(self._allocator_cache_bytes())
         try:
             trapped = self._trapped_bytes_cadenced()
         except Exception:  # noqa: BLE001 - precision, never a gate
-            value = cache
-        else:
-            value = takeable_cache_bytes(cache, trapped)
-        self._takeable_cached = value
-        self._takeable_at = now
-        if not getattr(self, "_takeable_logged", False):
-            self._takeable_logged = True
-            logger.info(
-                "#1028 takeable-cache probe: WHOLE value cadenced at %.0fs "
-                "(was: only the memory_snapshot half, #1027). allocator "
-                "stats + graph-pool snapshot are now both off the per-round "
-                "admission path.",
-                self._TRAPPED_REFRESH_S,
-            )
-        return value
+            return cache
+        return takeable_cache_bytes(cache, trapped)
 
     #: #1027 cadence for the graph-pool-free probe, in seconds. NOT a tuning
     #: knob -- it is bounded above by how fast the term can CHANGE (only a
