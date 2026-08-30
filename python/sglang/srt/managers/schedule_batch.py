@@ -141,6 +141,84 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
 
+#: #1036: per-callsite census of admitted-prefix demotions. site -> count.
+_1036_PREFIX_DEMOTIONS: Dict[str, int] = {}
+
+
+def _note_1036_prefix_demotion(req, start: int) -> None:
+    """#1036 INSTRUMENT: name whoever admits a prefix below `protected`.
+
+    THE TWO-LINE GAP THIS EXISTS TO FILL. Boot `f178a94c51` died on a rank
+    disagreement whose mutation site is not instrumented anywhere. PP0's own
+    consult and its admitted geometry are ADJACENT log lines -- 951701 and
+    951702 -- with nothing between them:
+
+        #969B READMIT-MATCH n=61 rid=6da98e29 prefix_len=8192 protected=8192
+        #969 EXTENT        n=28          reqs=[('6da98e29', 0, 4096, 0, 4096)]
+
+    while PP1 and PP2 admitted the same rid in the same pass at
+    `(8192, 8868, 8192, 676)`. Something dropped 8192 to 0 on PP0 alone and
+    left no trace, so the writer cannot be named from any boot log we have.
+    `set_extend_range` is the chokepoint every admitting path goes through
+    (`schedule_policy.py` :1202, :1287, :1428, :1719, :1743, :1762, :2115),
+    which makes it the one place that sees every candidate writer.
+
+    AN INSTRUMENT, NOT A GATE -- deliberately, and this is the whole design.
+    The refusal that belongs here cannot be written yet: gating a mechanism
+    nobody has identified is the symptom-patching the standing order forbids,
+    and a boot could not validate it (silence would not distinguish "gated the
+    right path" from "gated nothing"). This names the path first; the #1035
+    refusal template then applies to whatever it names.
+
+    PER-SITE COUNTERS, NOT PER-EVENT LINES, and that is a lesson paid for
+    once already: #1035's single rate-limited counter went quiet after five
+    occurrences, so ABSENCE OF THE LINE IS NOT ABSENCE OF THE EVENT. Here every
+    distinct callsite carries its own counter and its own first-three budget,
+    so a writer that appears for the first time on occurrence 900 still prints,
+    and the census below is the number to read rather than the line count.
+
+    CHEAP ON THE HOT PATH: the caller compares two ints and only calls this on
+    a demotion; the frame walk happens exclusively inside a real event.
+    """
+    try:
+        protected = int(getattr(req, "cache_protected_len", 0) or 0)
+        # The frame walk skips this module so the site named is the ADMITTING
+        # caller, not `set_extend_range` itself -- the same correction the
+        # #1034 provenance walk needed when it first printed `base.py:101`.
+        site = "?"
+        frame = sys._getframe(2) if hasattr(sys, "_getframe") else None
+        hops = 0
+        while frame is not None and hops < 12:
+            name = frame.f_code.co_filename.rsplit("/", 1)[-1]
+            if name != "schedule_batch.py":
+                site = f"{name}:{frame.f_lineno} in {frame.f_code.co_name}"
+                break
+            frame = frame.f_back
+            hops += 1
+        n = _1036_PREFIX_DEMOTIONS.get(site, 0) + 1
+        _1036_PREFIX_DEMOTIONS[site] = n
+        if n <= 3 or n % 64 == 0:
+            logger.warning(
+                "#1036 PREFIX DEMOTED BELOW PROTECTED rid=%s site=%s "
+                "protected=%d admitted_start=%d lost=%d prefix_indices=%d "
+                "host_hit=%s mamba_host_hit=%s seam_readmit=%s "
+                "site_occurrence=%d census=%s",
+                str(getattr(req, "rid", "?"))[:8],
+                site,
+                protected,
+                start,
+                protected - start,
+                0 if req.prefix_indices is None else len(req.prefix_indices),
+                getattr(req, "host_hit_length", None),
+                getattr(req, "mamba_host_hit_length", None),
+                getattr(req, "seam_readmit_epoch", None),
+                n,
+                dict(sorted(_1036_PREFIX_DEMOTIONS.items())),
+            )
+    except Exception:  # noqa: BLE001
+        # An instrument may never be the thing that kills a boot.
+        logger.warning("#1036 PREFIX-DEMOTION PROBE RAISED", exc_info=True)
+
 #: #783 seam state transfer log prefix, so the acceptance lines are greppable.
 SEAM_STATE_PREFIX = "[#783 seam-state]"
 
@@ -1268,6 +1346,10 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def set_extend_range(self, start: int, end: int) -> None:
+        # #1036 INSTRUMENT ONLY -- no behaviour change, no refusal, nothing
+        # below reads its result. See `_note_1036_prefix_demotion`.
+        if start < getattr(self, "cache_protected_len", 0):
+            _note_1036_prefix_demotion(self, start)
         self.extend_range = Range(start, end)
 
     def get_fill_ids(self) -> array:
