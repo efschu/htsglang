@@ -1300,6 +1300,49 @@ def make_admission_wedge_poller(scheduler: Scheduler):
         except Exception as e:  # noqa: BLE001 - a watchdog must not die
             logger.error(f"admission-wedge watchdog check failed: {e}")
             return None
+        # #1028i: THE BOTH-SIDES DIAGNOSIS, hung on the alarm that ALREADY
+        # fires correctly rather than on a threshold of my own.
+        #
+        # WHY HERE AND NOT ON A NEW DETECTOR. The 2026-08-30 stalls are a
+        # LIVELOCK, not a blocked collective: one rank sampled 4 s apart went
+        # all_reduce -> all_reduce -> broadcast, i.e. the ranks keep entering
+        # and completing collectives while the system makes no progress. Two
+        # instruments I built on WAIT DURATION were therefore correctly silent
+        # (#1028g/#1028h, deleted in this same commit). This watchdog's clock
+        # is FIRST-TOKEN PROGRESS, which is the quantity a livelock actually
+        # moves, and it had the right diagnosis all along -- 9 alarms in the
+        # same log, "1 queued, 0 running, and NO first token for 22.6s ... Work
+        # is admissible and nothing is serving it."
+        #
+        # WHAT THIS ADDS is the half that alarm cannot have on its own: each
+        # rank's OWN collective family history, so the three logs diff into
+        # "who was in which collective" instead of needing py-spy. Taken from
+        # `format_local_history`, which is COLLECTIVE-FREE by construction --
+        # the census's cross-rank comparator cannot speak here, because it
+        # needs an all_gather_object on the very group whose disagreement it
+        # would have to report.
+        #
+        # EDGE-TRIGGERED: the alarm re-fires every poll while the wedge lasts
+        # (9 times in the specimen), and the history is a deque of bounded
+        # length -- repeating it per poll would bury the first, most
+        # informative copy. Re-armed when the alarm clears.
+        if alarm and not getattr(scheduler, "_wedge_census_dumped", False):
+            scheduler._wedge_census_dumped = True
+            try:
+                from sglang.srt.distributed import collective_census
+
+                logger.warning(
+                    "%s #1028i COLLECTIVE HISTORY (collective-free) at the "
+                    "first alarm of this wedge: %s",
+                    ADMISSION_WEDGE,
+                    collective_census.format_local_history(
+                        int(getattr(getattr(scheduler, "ps", None), "pp_rank", -1))
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001 - a watchdog must not die
+                logger.warning("%s #1028i history unavailable: %s", ADMISSION_WEDGE, e)
+        elif not alarm:
+            scheduler._wedge_census_dumped = False
         try:
             driver.step(alarm)
         except Exception as e:  # noqa: BLE001 - a watchdog must not die
@@ -1372,72 +1415,6 @@ def create_admission_wedge_watchdog(
     # and leave a stale verdict in the real /run path, and #800 observed the
     # same thread flood every later test in the suite with ERROR lines at a
     # 10 ms cadence. Two tickets, two symptoms, one unstoppable loop.
-    def _read_collective_waits() -> None:
-        """#1028h: report-only reader for the two published collective stamps.
-
-        THE SIGNATURE THIS EXISTS TO MAKE READABLE. Three caught stalls
-        (2026-08-30) all showed the same shape: the ranks are not slow, they
-        are in DIFFERENT collectives at the same instant and none can finish
-        -- e.g. one rank in `broadcast_pyobj` while another sits in the
-        `_update_uniform_pool_budget` all_reduce. Main-thread profiles put
-        30-35 % of stall time in all_reduce and 4-27 % in broadcast, while a
-        healthy window under the same load has NO collective in its top 7.
-        Until now that had to be reconstructed with py-spy across two logs;
-        this prints BOTH stamps on ONE line so the signature is read, not
-        correlated.
-        : reduce stamp from scheduler.py (#1028g), receive stamp from the
-        request/chain funnel (#824 W5(b), extended to the broadcasts in
-        #1028d).
-        THRESHOLDS, from measurement rather than taste. Healthy sequence:
-        ZERO reduce waits above 30 s over six passed questions. Caught
-        stalls: 81.6 s and 95.6 s for the enclosing question. 60 s therefore
-        sits above every healthy sample and below every observed stall -- it
-        fires in a hang and never in health. The 120 s census dump is the
-        same reasoning one step out.
-        REPORT-ONLY, and it must stay so until phase 2's criteria are met:
-        (i) zero firings across a healthy sequence, (ii) one caught stall in
-        which this path demonstrably fired. Promotion to CRASH/STOP is
-        #1028's phase 2 and is NOT authorised by this function existing.
-        TAKES NO COLLECTIVE, and that is load-bearing rather than incidental:
-        the census's own cross-rank comparator needs an all_gather_object on
-        the very group whose disagreement it would have to report, which is
-        exactly why it cannot speak here. Everything below is a getattr, a
-        subtraction and a log call; `format_local_history` is the
-        collective-free half by construction.
-        """
-        now = time.monotonic()
-        red_since = getattr(scheduler, "_uniform_reduce_since", None)
-        recv_since = getattr(scheduler, "_pp_blocked_recv_since", None)
-        red_w = None if red_since is None else now - red_since
-        recv_w = None if recv_since is None else now - recv_since
-        worst = max(red_w or 0.0, recv_w or 0.0)
-        if worst < 60.0:
-            scheduler._collective_wait_dumped = False
-            return
-        arm = getattr(scheduler, "_pp_blocked_recv_arm", None) or "none"
-        logger.warning(
-            "#1028h COLLECTIVE-WAIT: reduce=%s receive=%s arm=%s. Two ranks "
-            "waiting in DIFFERENT collectives is the wedge signature; a "
-            "single rank waiting alone is normal idle.",
-            "-" if red_w is None else f"{red_w:.1f}s",
-            "-" if recv_w is None else f"{recv_w:.1f}s",
-            arm,
-        )
-        if worst >= 120.0 and not getattr(scheduler, "_collective_wait_dumped", False):
-            scheduler._collective_wait_dumped = True
-            try:
-                from sglang.srt.distributed import collective_census
-
-                logger.warning(
-                    "#1028h CENSUS (collective-free) after %.0fs: %s",
-                    worst,
-                    collective_census.format_local_history(
-                        int(getattr(getattr(scheduler, "ps", None), "pp_rank", -1))
-                    ),
-                )
-            except Exception as e:  # noqa: BLE001 - a watchdog must not die
-                logger.warning("#1028h census dump unavailable: %s", e)
-
     def _loop() -> None:
         while True:
             time.sleep(poll_interval)
@@ -1447,13 +1424,6 @@ def create_admission_wedge_watchdog(
             if stop is not None and stop.is_set():
                 return
             poll()
-            # #1028h: separate from `poll()` on purpose -- that poller owns the
-            # admission-wedge verdict and drives a recovery actuator; this one
-            # only reads two timestamps and must never be able to affect it.
-            try:
-                _read_collective_waits()
-            except Exception as e:  # noqa: BLE001 - a watchdog must not die
-                logger.error("%s #1028h reader failed: %s", ADMISSION_WEDGE, e)
 
     t = threading.Thread(target=_loop, daemon=True, name="admission-wedge-watchdog")
     t.start()
