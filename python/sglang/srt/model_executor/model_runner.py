@@ -2003,6 +2003,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         pp_size=1,
                         dcp_size=len(flip_vec),
                     )
+            # #704b step (a): BUILD the decoupled-KV group. Until this call
+            # existed, initialize_decoupled_kv_group had ZERO callers anywhere
+            # in the tree -- present-but-unwired, while SGLANG_DECOUPLED_KV
+            # already gated the POOL half. That asymmetry IS the #1007 booby
+            # trap: arming the pool half sized a plan for a group that had
+            # never been built.
+            #
+            # Placed here for the same reason the phase-flip block above sits
+            # here: the create is a COLLECTIVE, so reaching it must be
+            # rank-uniform. A server arg is rank-uniform by construction. The
+            # verify-then-create manifest inside dies loudly on any divergence
+            # before creating anything.
+            #
+            # This builds the group and NOTHING else. Routing stays disarmed --
+            # set_decoupled_kv_active(True) is deliberately NOT called, so
+            # get_dcp_group's B1 branch (_DECOUPLED_KV_ACTIVE) stays False and
+            # every existing route is unchanged. Report-only precursor by
+            # design: the pool half still reads dcp_size/attn_dcp_rank and is
+            # NOT touched by this cut.
+            if self.server_args.enable_decoupled_kv:
+                from sglang.srt.distributed.parallel_state import (
+                    get_decoupled_kv_group_no_assert,
+                    initialize_decoupled_kv_group,
+                )
+
+                if get_decoupled_kv_group_no_assert() is None:
+                    initialize_decoupled_kv_group(
+                        world_size=self.tp_size * self.pp_size,
+                        tp_size=self.tp_size,
+                        pp_size=self.pp_size,
+                    )
             # #605: placed AFTER the phase-flip secondary groups, not after
             # initialize_model_parallel. Those groups are communicators too,
             # and a boundary drawn before them would price a launch's NCCL

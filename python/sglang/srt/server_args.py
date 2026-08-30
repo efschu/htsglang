@@ -2538,6 +2538,31 @@ class ServerArgs:
             "--enable-vram-ledger false to size from the heuristic alone.",
         ),
     ] = True
+    enable_decoupled_kv: A[
+        bool,
+        Arg(
+            help="Build the #704b decoupled-KV process group (one group per TP "
+            "position, spanning that pipeline's PP stages). This is the group "
+            "that refuse_pp_dcp_combination names as the DESIGNATED vehicle for "
+            "token-sharded KV under pipeline parallelism -- dcp_size was "
+            "deliberately NOT overloaded for it, because dcp_enabled would then "
+            "report True on PP prefill ranks and contradict the invariant "
+            "dcp_group_guard.py documents, WITHOUT the guard failing (silently "
+            "wrong, not a crash). "
+            "DEFAULT OFF, and off is byte-identical: nothing is created and no "
+            "route changes. ON, this flag creates the group and NOTHING ELSE -- "
+            "routing through it stays disarmed (set_decoupled_kv_active is not "
+            "called) and the KV pool is not resized. That separation is "
+            "deliberate: before this flag existed the group builder had ZERO "
+            "callers while SGLANG_DECOUPLED_KV already gated the POOL half, so "
+            "enabling the pool half armed a sizing path whose group had never "
+            "been built (the #1007 booby trap). Building the group first, "
+            "observably and on its own, is the precondition for ever wiring the "
+            "pool half -- do not enable SGLANG_DECOUPLED_KV under PP expecting "
+            "this flag to make it correct; the pool half still reads dcp_size "
+            "and attn_dcp_rank, which are 1 and 0 under PP.",
+        ),
+    ] = False
     rank_perf_loose_ctx_percent: A[
         float,
         Arg(
