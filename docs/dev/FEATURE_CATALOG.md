@@ -3941,7 +3941,7 @@ breaks a test instead of rotting quietly here.
 - **IdentityMap** — the live UUID <-> NVML index <-> CUDA ordinal <-> PCI BDF
   resolver; the single source of truth for card identity, and the reason
   torch's enumeration order is never trusted (#331).
-  ENTRY `registry/nvml.py:867` (`identity_map()`), class at `:611`,
+  ENTRY `registry/nvml.py:939` (`identity_map()`), class at `:611`,
   `require()` at `:648` raises rather than returning a nearest match.
   GATE: NVML present (`registry/nvml.py:131`). `allow_cuda_init=True` is
   needed for the CUDA-ordinal side and **creates a CUDA context worth a few
@@ -3960,7 +3960,7 @@ breaks a test instead of rotting quietly here.
 - **card_probe** — self-calibrating per-card capability profile (FP8 support,
   measured GEMM TFLOPs, pairwise link) with a UUID+driver-keyed cache, so a
   hardware-dependent term is measured once instead of hardcoded per rig.
-  ENTRY `rigmon/card_probe.py:495` (`load_card_probe()`), write side
+  ENTRY `rigmon/card_probe.py:550` (`load_card_probe()`), write side
   `:483`, cache key `:370`, staleness match `:394`.
   GATE: cache path resolution `:382` — a miss means a probe run, not a
   fabricated number.
@@ -3974,7 +3974,7 @@ breaks a test instead of rotting quietly here.
   **lane-keyed** stream and buffer pool. This is the module with the widest
   fan-in in the fork (~400 import sites) and the one most often rebuilt
   locally as "a module-level global".
-  ENTRY `runtime_context.py:914` (`get_parallel`), `:918`
+  ENTRY `runtime_context.py:919` (`get_parallel`), `:918`
   (`get_server_args`), `:935` (`get_flags`), `:947`/`:951` (stream
   get/set), `:955` (`get_buffer(name, factory)`), `:930` (`lane_scope`).
   GATE: none for reads. The buffer pool is keyed by LANE since #274
@@ -4031,10 +4031,10 @@ taxonomy and the global importance ladder.
   it rather than restate it.
 - **mem_ledger engine (#593/#596)** — per-card VRAM ledgers: card facts,
   demand terms, communicator-group classification, itemized refusal.
-  ENTRY `mem_ledger/engine.py:808` (`build_card_ledgers`), `:189`
+  ENTRY `mem_ledger/engine.py:917` (`build_card_ledgers`), `:189`
   (`CardFacts`), `:213` (`DemandInputs`), `:692`
   (`communicator_groups_from_server_args`).
-  GATE: construct through the ONE call site `server_args.py:11182`
+  GATE: construct through the ONE call site `server_args.py:13299`
   (`_build_card_ledgers`) — #593's whole point is that the gated ledger path
   and the full-demand reserve read the same ledger, because two
   constructions are two answers. #596 is the same defect fixed on one caller
@@ -4043,7 +4043,7 @@ taxonomy and the global importance ladder.
   UNCAPPED ring (deliberately — #602 proved a capped ring turns "no event
   here" into an untrue statement), phase marks, per-site resident and churn
   attribution, and `allocator_transient_bytes` per mark.
-  ENTRY `mem_ledger/flight_recorder.py:177` (`arm_process_trace`, must run
+  ENTRY `mem_ledger/flight_recorder.py:214` (`arm_process_trace`, must run
   before the process's first CUDA allocation), `:471` (`mark`), `:539`
   (`read_marks`), `:637` (`phase_deltas`), `:780` (`resident_attribution`),
   `:854` (`churn_attribution`); the transient term at `:523`.
@@ -4053,7 +4053,7 @@ taxonomy and the global importance ladder.
 - **vram_dial (#330)** — runtime per-card VRAM budget dial with KV capacity
   re-raise over the VMM-backed pool. Reusable as a *participant registry*:
   anything holding VMM-backed capacity can join the dial.
-  ENTRY `managers/vram_dial.py:134` (`register_dial_participant`), `:1090`
+  ENTRY `managers/vram_dial.py:155` (`register_dial_participant`), `:1090`
   (`build_kv_capacity_runtime`), `:1041` (`validate_vram_dial_compat`),
   `:993` (`verify_pool_reached_capacity`), boot plan `:115`/`:130`.
   GATE `--enable-vram-dial` (`server_args.py:5229`, `:7133`); chunk size
@@ -4086,7 +4086,7 @@ taxonomy and the global importance ladder.
   GATE: none — data and protocol. A reservation without a name is refused.
 - **KV resharding mover (#297)** — moves KV pool contents across a changed
   rank/shard geometry, with staged guards and a cutover callback.
-  ENTRY `managers/kv_reshard.py:697` (`build_kv_reshard_runtime`), runtime
+  ENTRY `managers/kv_reshard.py:1245` (`build_kv_reshard_runtime`), runtime
   `:176`, pool view `:84`, stage-A guards `:644`, cutover `:675`,
   checksum `:170`.
   GATE: stage-A guards at `:644` return the refusal list; the #330 dial
@@ -4124,14 +4124,14 @@ taxonomy and the global importance ladder.
   latch `:358`, ref `:89`, expert-major ref derivation `:176`, gate helper
   `:72`.
   REFUSES the capturable spill pool (`SGLANG_MOE_OFFLOAD_CUDA_GRAPH`) by name
-  at `layers/moe/expert_offload.py:2440` (`device_view_of_pinned`): a captured
+  at `layers/moe/expert_offload.py:2432` (`device_view_of_pinned`): a captured
   graph reads the pool by ADDRESS and would bypass the accessor, so the pool
   deliberately exposes no `data_ptr` / `is_contiguous` either.
   GATE `SGLANG_EXPERT_LAZY_STAGING`, `environ.py:1251`, **default off**. The
   staging door additionally requires a caller-supplied ref provider
   (`layers/moe/expert_offload.py:1553`), so a door that cannot describe its
   bytes on disk stages eagerly no matter what the flag says.
-  CONSUMERS `layers/moe/expert_offload.py:1469` (`_stage_spill_lazily`). NOTE
+  CONSUMERS `layers/moe/expert_offload.py:1461` (`_stage_spill_lazily`). NOTE
   the standing scope limit before wiring a new door: both production doors
   today run AFTER the loader has already read the experts (§3), so they have
   nothing left to defer — see the #396 scope verdict there.
@@ -4171,7 +4171,7 @@ taxonomy and the global importance ladder.
   returning EVERY violation rather than the first, because #814 and #816 were
   the same rows under two laws and a short-circuiting checker is how they
   became two tickets. Narrative entry in §3.
-  ENTRY `mem_cache/kv_row_ownership.py:224` (`RowOwnershipAuthority`),
+  ENTRY `mem_cache/kv_row_ownership.py:349` (`RowOwnershipAuthority`),
   `:267` (`declare`), `:308` (`retire`), `:357` (`audit`), `:514`
   (`observe_census`). Production goes through the two call-site adapters, not
   the constructor: `:553` (`authority_for`), `:571` (`audit_pool_census`).
@@ -4191,7 +4191,7 @@ taxonomy and the global importance ladder.
   funded, and from where", against posts that are each declared BY NAME, so a
   refusal names what held the money instead of only reporting a shortfall.
   Narrative entry, the three priced losses and the arming-floor solve, in §2.
-  ENTRY `managers/funding_authority.py:334` (`FundingAuthority`), `:350`
+  ENTRY `managers/funding_authority.py:356` (`FundingAuthority`), `:350`
   (`declare_post`), `:378` (`can_fund` — this is the solve). Production builds
   it through `:503` (`authority_from_seam_snapshot`). Solvers alongside it:
   `:694` (`solve_arming_floor`), `:620` (`diagnose_floor_band`), `:470`
@@ -4213,7 +4213,7 @@ taxonomy and the global importance ladder.
 - **session_handover (#261)** — export/import a session's KV state across
   processes as a manifest + verified roundtrip, with a conflict rule on
   overlapping prefixes.
-  ENTRY `managers/session_handover.py:309` (`SessionHandoverRuntime`),
+  ENTRY `managers/session_handover.py:513` (`SessionHandoverRuntime`),
   `:176` (`build_manifest`), `:209` (`validate_manifest_completeness`),
   `:253` (`verify_import`), `:101` (`HandoverLedger`), `:87`
   (`handover_id_for`), `:77` (`prefixes_conflict`).
@@ -4281,14 +4281,14 @@ taxonomy and the global importance ladder.
   pinned-plan staleness guard, and the wedge detector that supervises a lane
   once it is up. One systemd target plus template units; the watchdog is a
   DETECTOR that asks systemd to restart and never spawns serving itself.
-  ENTRY config `turnkey/config.py:215` (`StackConfig`), `:306` (`load`);
-  refusals `turnkey/refusal.py:111` (`Refusal`), `:146` (`RefusalError`);
-  preflight `turnkey/preflight.py:322` (`run_all`), `:66` (`Probes`, the
+  ENTRY config `turnkey/config.py:232` (`StackConfig`), `:306` (`load`);
+  refusals `turnkey/refusal.py:133` (`Refusal`), `:146` (`RefusalError`);
+  preflight `turnkey/preflight.py:535` (`run_all`), `:66` (`Probes`, the
   injection seam every check is reachable through); plan pin
   `turnkey/plan.py:115` (`fingerprint_of`), `:190` (`check_staleness`);
   boot `turnkey/orchestrator.py:179` (`boot`), `:120` (`assemble`);
-  watchdog policy `turnkey/watchdog.py:202` (`step`, pure), `:83` (`Policy`),
-  `:149` (`initial`); runner `turnkey/runner.py:95` (`WatchdogRunner`),
+  watchdog policy `turnkey/watchdog.py:243` (`step`, pure), `:83` (`Policy`),
+  `:149` (`initial`); runner `turnkey/runner.py:241` (`WatchdogRunner`),
   `:188` (`orphan_pids`), `:226` (`reap_orphans`);
   probes `turnkey/probe.py:99` (`generation_ok`), `:75` (`LIVENESS_PATH`).
   Units in `deploy/turnkey/`, installer `scripts/turnkey_539_install.sh`.
@@ -4300,7 +4300,7 @@ taxonomy and the global importance ladder.
   The
   replacement is the #699/#739 admission-wedge verdict, published passively by
   the scheduler that already computes it and read as a file:
-  publish `managers/wedge_status.py:126` (`publish_verdict`), read `:172`
+  publish `managers/wedge_status.py:153` (`publish_verdict`), read `:172`
   (`read_wedge_signal`), tri-state `:98` (`WedgeSignal`); the detector's own
   publish edge `invariant_checker.py` (`make_admission_wedge_poller`, the
   callable the live thread runs); consumed at `turnkey/runner.py`
@@ -4350,7 +4350,7 @@ taxonomy and the global importance ladder.
   events, with caller-supplied labels that beat the dispatch site's derived
   ones, and an honest `graph_capture_skipped` flag making a slot's total a
   lower bound when a capture swallowed a collective.
-  ENTRY `utils/collective_clock.py:102`, `arm` `:114`, `disarm` `:117`,
+  ENTRY `utils/collective_clock.py:114`, `arm` `:114`, `disarm` `:117`,
   `label_scope` `:124`.
   GATE: reported for **plain-prefill forwards on the target runner only**,
   cuda, `pp_size == 1`
@@ -4359,7 +4359,7 @@ taxonomy and the global importance ladder.
 - **CollectiveCensus** — per-rank collective ring history plus divergence
   detection; the instrument that turns "rank 2 is stuck" into "rank 2 is
   three collectives behind and here they are".
-  ENTRY `distributed/collective_census.py:384` (`census()`), class `:168`,
+  ENTRY `distributed/collective_census.py:480` (`census()`), class `:168`,
   `format_local_census` `:388`, `format_local_history` `:401`,
   `Divergence` `:146`, ring capacity `:108`.
   GATE `census_enabled()` `:123`; heartbeat/interval `:127`/`:136`.
@@ -4396,11 +4396,16 @@ taxonomy and the global importance ladder.
   `:119` (`digest_pair`), `:131` (`reduce_pair_result`), `:143`
   (`agreement`), verdict type `:153` (`CongruenceVerdict`).
   GATE: the DETECTION is ungated and always runs. The RECOVERY is gated —
-  `SGLANG_TREE_RECONCILE` at `managers/phase_flip_runtime.py:3777`, unset
+  `SGLANG_TREE_RECONCILE` at `managers/phase_flip_runtime.py:5877`, unset
   meaning OFF, because the reset it performs is what crashed on resident lock
   references (#827) and it was withdrawn rather than repaired in place.
-  CONSUMERS `managers/phase_flip_runtime.py:3562` (`tree_digest_of`), `:3655`
-  (`congruence_verdict`), `:3748` (the verdict read). The verdict is decided
+  CONSUMERS `managers/phase_flip_runtime.py:5592` calls `tree_digest_of`,
+  `:5615` calls `congruence_verdict`, `:5848` reads the verdict. A CONSUMERS
+  citation names a CALL SITE, so the symbol is named in prose and not in
+  backticks directly after the pointer — that adjacency is the catalog's
+  syntax for "defined here", and using it on a caller made the anchor check
+  read this entry as a claim that `tree_digest_of` lives in
+  `phase_flip_runtime.py` (#1034b). The verdict is decided
   FROM THE GROUP, never locally — a rank that decided on its own digest would
   be the divergence it is trying to detect.
 
@@ -4512,10 +4517,10 @@ taxonomy and the global importance ladder.
   ENTRY `planner/stage_measure_store.py:339` (`StageMeasurementLibrary`),
   lookup `:369` (returns `(record, reason)`; the reason is filled on all four
   misses), path `:95`, rig key `:153`, record `:177`, save `:416`, load `:446`.
-  The pass that fills it: `planner/stage_measure_pass.py:353`
+  The pass that fills it: `planner/stage_measure_pass.py:391`
   (`build_measurement`), trace reader `:164`, band rule `:327`, flip-cost
   parser `:339`, CLI `:466`.
-  GATE: the FILE. `managers/regime_runtime.py:1106` (`_stage_measurements`)
+  GATE: the FILE. `managers/regime_runtime.py:1191` (`_stage_measurements`)
   consults the canon only when it exists at the resolved path
   (`SGLANG_STAGE_MEASUREMENTS`, else beside `card_library.json`); with no file
   the boot takes the pre-#584 path and `StageTable` refuses an unmeasured
