@@ -76,6 +76,11 @@ class ServerFrame(str, Enum):
     TRACK_STATE = "track.state"
     TRANSCRIPT_DELTA = "transcript.delta"
     TRANSCRIPT_LINE = "transcript.line"
+    HINT_PENDING = "hint.pending"
+    """A decode has been started for a named transcript source. The read pane
+    must be able to distinguish thinking from broken, so the app says which of
+    the two it is instead of leaving the pane still."""
+
     HINT = "hint"
     BRIEFING_UPDATE = "briefing.update"
     TOPIC_STATE = "topic.state"

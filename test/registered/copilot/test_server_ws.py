@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from sglang.srt.copilot.config import CopilotConfig
-from sglang.srt.copilot.hints import DeskFakeHints
+from sglang.srt.copilot.deskfakes import desk_fake_backend_set
 from sglang.srt.copilot.protocol import Track, encode_audio_frame
 from sglang.srt.copilot.server import CopilotService, build_app
 
@@ -31,7 +31,7 @@ Ends in March.
 @pytest.fixture
 def client():
     config = CopilotConfig()
-    service = CopilotService(config=config, hint_backend=DeskFakeHints(config=config))
+    service = CopilotService(config=config, backends=desk_fake_backend_set(config))
     with TestClient(build_app(service)) as test_client:
         yield test_client
 

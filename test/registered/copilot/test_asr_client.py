@@ -10,6 +10,7 @@ base64-PCM-in-JSON only (``:249-253``), no server-side VAD (``:315-321``),
 If any of those move upstream, these tests are what notices.
 """
 
+import asyncio
 import base64
 
 import pytest
@@ -21,12 +22,26 @@ from sglang.srt.copilot.asr_client import (
     EV_COMPLETED,
     EV_DELTA,
     EV_SESSION_UPDATE,
-    AsrError,
     AsrPhase,
-    DeskFakeAsr,
     RealtimeAsrProtocol,
 )
+from sglang.srt.copilot.backends import AsrError, TranscriptDelta
+from sglang.srt.copilot.deskfakes import DeskFakeAsrBackend, DeskFakeAsrStream
 from sglang.srt.copilot.protocol import Track
+
+
+class Collector:
+    """An :class:`AsrEvents` sink that records what a stream produced."""
+
+    def __init__(self) -> None:
+        self.deltas: list[TranscriptDelta] = []
+        self.errors: list[AsrError] = []
+
+    async def on_delta(self, delta: TranscriptDelta) -> None:
+        self.deltas.append(delta)
+
+    async def on_error(self, track: Track, error: AsrError) -> None:
+        self.errors.append(error)
 
 
 def configured(track: Track = Track.SELF) -> RealtimeAsrProtocol:
@@ -137,31 +152,50 @@ class TestServerEvents:
 
 
 class TestDeskFakeNamedDifference:
-    """The fake's declared difference, executed rather than only documented.
+    """The double's declared difference, executed rather than only documented.
 
-    ``DeskFakeAsr`` emits NO partials -- only one final line per commit. A
-    component that silently depends on partials passes here and starves against
-    the real endpoint, so the difference is asserted where a reader meets it.
+    ``DeskFakeAsrStream`` emits NO partials -- only one final line per commit.
+    A component that silently depends on partials passes here and starves
+    against the real endpoint, so the difference is asserted where a reader
+    meets it.
     """
 
     def test_fake_emits_no_partials(self):
-        fake = DeskFakeAsr(Track.SELF)
-        assert fake.append(b"\x00\x00" * 320) == []
-        assert fake.append(b"\x00\x00" * 320) == []
+        sink = Collector()
+
+        async def run():
+            backend = DeskFakeAsrBackend()
+            stream = await backend.open(Track.SELF, sink)
+            await stream.append(b"\x00\x00" * 320)
+            await stream.append(b"\x00\x00" * 320)
+
+        asyncio.run(run())
+        assert sink.deltas == []
 
     def test_real_protocol_does_emit_partials_on_the_same_input(self):
         proto = configured()
         assert proto.on_event({"type": EV_DELTA, "delta": "partial"}) != []
 
     def test_fake_commit_yields_one_marked_final_line(self):
-        fake = DeskFakeAsr(Track.OTHER)
-        fake.append(b"\x00\x00" * 320)
-        out = fake.commit()
-        assert len(out) == 1
-        assert out[0].final is True
-        assert out[0].text.startswith(DeskFakeAsr.MARKER)
-        assert out[0].track is Track.OTHER
+        sink = Collector()
+
+        async def run():
+            backend = DeskFakeAsrBackend()
+            stream = await backend.open(Track.OTHER, sink)
+            await stream.append(b"\x00\x00" * 320)
+            await stream.commit()
+
+        asyncio.run(run())
+        assert len(sink.deltas) == 1
+        assert sink.deltas[0].final is True
+        assert sink.deltas[0].text.startswith(DeskFakeAsrStream.MARKER)
+        assert sink.deltas[0].track is Track.OTHER
 
     def test_fake_refuses_an_empty_commit_like_the_real_endpoint(self):
+        async def run():
+            backend = DeskFakeAsrBackend()
+            stream = await backend.open(Track.SELF, Collector())
+            await stream.commit()
+
         with pytest.raises(AsrError, match="empty audio buffer"):
-            DeskFakeAsr(Track.SELF).commit()
+            asyncio.run(run())

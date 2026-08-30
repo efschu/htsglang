@@ -19,7 +19,8 @@ import pytest
 
 from sglang.srt.copilot.briefing import parse_briefing
 from sglang.srt.copilot.config import CopilotConfig
-from sglang.srt.copilot.hints import DeskFakeHints, prime_chat_request
+from sglang.srt.copilot.deskfakes import DeskFakeHints
+from sglang.srt.copilot.hints import prime_chat_request
 from sglang.srt.copilot.topics import (
     TopicRegistry,
     Warmth,
@@ -180,3 +181,45 @@ class TestDeskFakeDifference:
         assert "prompt_tokens_details" not in result.usage
         assert reg.observe_usage("contract-renewal", result.usage) is Warmth.COLD
         assert reg.get("contract-renewal").misses == 1
+
+
+class TestPreparePolicy:
+    """Which topics get prepared, and in what order.
+
+    Both rules came out of a real browser run against a bounded backend, where
+    preparing every section churned the whole prepared set every cadence tick
+    and reported every topic cold.
+    """
+
+    def test_the_focused_topic_is_prepared_last_so_it_survives_eviction(self):
+        reg = registry()
+        reg.set_focus("contract-renewal")
+        ids = [p.topic_id for p in reg.due_for_prime()]
+        assert ids[-1] == "contract-renewal"
+
+    def test_no_more_topics_are_prepared_than_the_backend_holds(self):
+        reg = registry()
+        reg.set_focus("migration-timeline")
+        ids = [p.topic_id for p in reg.due_for_prime(limit=1)]
+        # Exactly the focused one: asking for a second guarantees that the
+        # backend evicts the topic the conversation is about.
+        assert ids == ["migration-timeline"]
+
+    def test_an_unstated_capacity_holds_nothing_back(self):
+        """The rig cannot state a capacity, and must not be second-guessed."""
+        reg = registry()
+        assert len(reg.due_for_prime(limit=None)) == len(reg.order)
+
+    def test_a_reprepare_clears_the_previous_verdict_instead_of_keeping_it(self):
+        """A COLD verdict about an evicted prefix is not about the new one."""
+        reg = registry()
+        reg.record_prime("contract-renewal", 40)
+        reg.record_eviction("contract-renewal")
+        assert reg.get("contract-renewal").warmth is Warmth.COLD
+        reg.record_prime("contract-renewal", 40)
+        topic = reg.get("contract-renewal")
+        assert topic.warmth is Warmth.UNKNOWN
+        assert topic.last_cached_tokens is None
+        # The miss is history and stays counted.
+        assert topic.misses == 1
+        assert reg.miss_report()["misses"] == 1

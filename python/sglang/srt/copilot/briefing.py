@@ -70,7 +70,6 @@ class Briefing:
     preamble: str = ""
     sections: List[BriefingSection] = field(default_factory=list)
     source: str = ""
-    _appended: List[BriefingSection] = field(default_factory=list, repr=False)
 
     @property
     def briefing_id(self) -> str:
@@ -97,16 +96,28 @@ class Briefing:
             parts.append(sec.text())
         return "\n\n".join(p for p in parts if p).strip() + "\n"
 
-    def append_generated(
+    def extend_generated(
         self, title: str, body: str, provenance: str
     ) -> BriefingSection:
-        """Append a model-written section.
+        """Append model-written material, ONE section per title.
 
         Appending only: a generated section never replaces or edits a
-        user-written one. The anchor is uniquified so a second expansion of the
-        same topic does not collide with the first.
+        user-written one. A second expansion of the same topic EXTENDS the
+        section the first one created instead of adding another -- a browser run
+        showed a twenty-minute conversation turning the topic bar into a list of
+        four identical "live addendum" chips, one per expander round.
+
+        The extended section's own token path moves as it grows. That costs only
+        its own residency, which was never measured and never focused; the
+        SOURCE topic's prefix is not touched, which is the thing that must not
+        move.
         """
         base = slugify(title)
+        existing = self.section(base)
+        if existing is not None and existing.generated and existing.title == title:
+            existing.body = f"{existing.body}\n\n{body.strip()}".strip()
+            existing.provenance = provenance
+            return existing
         anchor = base
         n = 2
         while self.section(anchor) is not None:
@@ -121,7 +132,6 @@ class Briefing:
             provenance=provenance,
         )
         self.sections.append(sec)
-        self._appended.append(sec)
         return sec
 
     @property

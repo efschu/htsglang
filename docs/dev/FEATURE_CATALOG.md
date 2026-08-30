@@ -1480,20 +1480,27 @@ anything.
   (`video_enhance/mux.py:subprocess_failure`) — reflected into a 422 it was a
   filesystem existence oracle for a caller who also chose the input path.
 
-Live interview copilot (#502, `srt/copilot/`, **P1 skeleton — desk fakes, never
-booted against a model**): a browser app that captures the user's microphone
-AND the far side via tab capture, streams both to the runtime's own ASR surface
-as TWO `/v1/realtime` connections (one per track, since that endpoint is one
-stream per socket, `realtime/session.py:143-164`), and shows hints to read.
-Own FastAPI process (`python -m sglang.srt.copilot.launch`) that owns no model,
-no VRAM and no CUDA context — it reaches the runtime only through
-`/v1/realtime` and `/v1/chat/completions`. Live hints carry `lane="fast"`
-(`entrypoints/openai/protocol.py:869`), background briefing expansion carries
-the heavy-tier default. Warm topic contexts are prefill-only primed
-(`max_new_tokens=0`) and ranked by request priority, NOT pinned — no pin API
-exists (`mem_cache/radix_cache.py:598-625`; `session_radix_cache.py:23-27`
-"no pinning, no open") — and their warmth is MEASURED from
-`prompt_tokens_details.cached_tokens` per request rather than assumed. Design
+Live interview copilot (#502, `srt/copilot/`, **P1.5 — runs end to end against
+the stub backend set in a real browser; never booted against a model**): a
+browser app that captures the user's microphone AND the far side via tab
+capture and shows hints to read. Own FastAPI process
+(`python -m sglang.srt.copilot.launch`) that owns no model, no VRAM and no CUDA
+context. Everything below the app is reached through three protocols in
+`copilot/backends.py` (`AsrBackend`, `HintBackend`, `SessionPrep`), so
+`--backend stub` and `--backend rig` differ by CONFIG only; `--backend rig`
+currently REFUSES at launch and names the missing piece (the `/v1/realtime`
+WebSocket transport — `asr_client.RealtimeAsrProtocol` is the conformance state
+machine, nothing moves its frames over a socket yet). The rig shape it is built
+for: TWO `/v1/realtime` connections, one per track, since that endpoint is one
+stream per socket (`realtime/session.py:143-164`). Live hints carry
+`lane="fast"` (`entrypoints/openai/protocol.py:869`), background briefing
+expansion carries the heavy-tier default. Warm topic contexts are prefill-only
+primed (`max_new_tokens=0`) and ranked by request priority, NOT pinned — no pin
+API exists (`mem_cache/radix_cache.py:598-625`;
+`session_radix_cache.py:23-27` "no pinning, no open") — and their warmth is
+MEASURED from `prompt_tokens_details.cached_tokens` per request rather than
+assumed. The app also never prepares more contexts than the backend states it
+holds, and prepares the FOCUSED topic last so it is the last evicted. Design
 and phase falsifiers: `docs/dev/DESIGN_502_interview_copilot.md`. Note the
 input-side ASR surface it builds on is upstream, not fork-added:
 `POST /v1/audio/transcriptions` (`http_server.py:2316`) and

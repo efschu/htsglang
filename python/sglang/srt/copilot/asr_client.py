@@ -2,10 +2,11 @@
 
 The risky part of talking to that endpoint is protocol conformance, not
 transport, so the protocol is a transport-free state machine here: it produces
-the frames to send and consumes the frames received, and a thin transport shell
-(P2) moves them over a WebSocket. That way the conformance can be pinned by
-hermetic tests today, against the event names read out of
-``entrypoints/openai/realtime/session.py``.
+the frames to send and consumes the frames received. Moving them over a
+WebSocket is P2 and is deliberately not built (see
+``backends.build_backend_set``, which refuses ``--backend rig`` and names this
+gap). That way the conformance can be pinned by hermetic tests today, against
+the event names read out of ``entrypoints/openai/realtime/session.py``.
 
 Three properties of the endpoint are load-bearing and are enforced by this
 client rather than discovered at runtime:
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from sglang.srt.copilot.backends import AsrError, TranscriptDelta
 from sglang.srt.copilot.config import PIPELINE_SAMPLE_RATE
 from sglang.srt.copilot.protocol import Track
 
@@ -49,22 +51,6 @@ EV_COMPLETED = "conversation.item.input_audio_transcription.completed"
 EV_ERROR = "error"
 
 
-class AsrError(RuntimeError):
-    """An error frame from the transcription endpoint, surfaced as-is.
-
-    Notably includes ``too_many_sessions`` (``--asr-max-concurrent-sessions``,
-    ``server_args.py:2718``) and ``buffer_overflow``
-    (``--asr-max-buffer-seconds``, ``server_args.py:2714``): both are
-    conditions the copilot can hit by design, since it opens two connections
-    per conversation and streams continuously.
-    """
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.message = message
-
-
 class AsrPhase(str, Enum):
     NEW = "new"
     CONFIGURED = "configured"
@@ -74,21 +60,13 @@ class AsrPhase(str, Enum):
 
 
 @dataclass
-class TranscriptDelta:
-    """A partial transcription result."""
-
-    track: Track
-    text: str
-    item_id: Optional[str] = None
-    final: bool = False
-
-
-@dataclass
 class RealtimeAsrProtocol:
     """One track's conversation with ``/v1/realtime``.
 
     Send-side methods return the JSON payload to transmit; ``on_event``
-    consumes a received payload and returns the deltas it produced.
+    consumes a received payload and returns the deltas it produced. A transport
+    implementing :class:`~sglang.srt.copilot.backends.AsrBackend` forwards those
+    deltas to the session's event sink.
     """
 
     track: Track
@@ -197,53 +175,3 @@ class RealtimeAsrProtocol:
         # Unknown event types are ignored rather than fatal: the endpoint is
         # OpenAI-compatible and may grow events this client does not need.
         return []
-
-
-class DeskFakeAsr:
-    """Desk fake for the transcription stream.
-
-    NAMED DIFFERENCE FROM THE REAL ENDPOINT -- read before relying on this:
-    the real ``/v1/realtime`` emits a stream of PARTIAL deltas
-    (``conversation.item.input_audio_transcription.delta``) while audio is
-    still arriving, and only then a completed event. This fake emits NOTHING
-    until ``commit`` and then exactly one final line. Any component that works
-    against this fake because partials arrive early is untested; any component
-    that depends on partials will look correct here and starve in production.
-    The dependency is therefore visible at the seam instead of being buried.
-
-    A second, smaller difference: transcripts are derived from the appended
-    byte count, so they are deterministic and carry the ``[desk-fake-asr]``
-    marker. Nothing this fake returns can be mistaken for a real transcript.
-    """
-
-    MARKER = "[desk-fake-asr]"
-
-    def __init__(self, track: Track, phrases: Optional[List[str]] = None) -> None:
-        self.track = track
-        self.phrases = phrases or [
-            "the quarterly figures came in above plan",
-            "we should talk about the migration timeline",
-            "what does that mean for the support contract",
-        ]
-        self.appended_bytes = 0
-        self.commits = 0
-
-    def append(self, pcm: bytes) -> List[TranscriptDelta]:
-        self.appended_bytes += len(pcm)
-        # No partials. See NAMED DIFFERENCE above.
-        return []
-
-    def commit(self) -> List[TranscriptDelta]:
-        if self.appended_bytes == 0:
-            raise AsrError("invalid_state", "cannot commit an empty audio buffer")
-        phrase = self.phrases[self.commits % len(self.phrases)]
-        self.commits += 1
-        self.appended_bytes = 0
-        return [
-            TranscriptDelta(
-                track=self.track,
-                text=f"{self.MARKER} {phrase}",
-                item_id=f"fake-{self.track.value}-{self.commits}",
-                final=True,
-            )
-        ]

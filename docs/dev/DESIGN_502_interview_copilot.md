@@ -398,13 +398,23 @@ waiting for a clean sentence.
 Every phase names the observation that would prove it wrong. A phase whose
 falsifier fires is reported, not repaired silently.
 
-**P1 — protocol, app skeleton, topic state machine, client (this change).**
+**P1 — protocol, app skeleton, topic state machine, client.**
 No GPU, no model, no exposure. Backends are desk fakes that differ from their
 real counterparts at named places.
 *Falsifier:* the hermetic suite cannot drive a full round trip
 (two tracks in → transcript lines out → hint frames out → briefing update) over
 the real ASGI stack, or a gate cannot be shown to fail when its condition is
 violated.
+
+**P1.5 — the stub backend set, and the app running on it (this change).**
+Still no GPU, no model, no exposure. The difference from P1 is that the app is
+now USABLE: one narrow seam (`backends.py`), a stub set behind it that speaks a
+scripted conversation with human timing and partials, server-initiated events,
+and a browser client that renders a continuously updating read pane with the
+line→suggestion latency measured on two independent clocks. See §6.
+*Falsifier:* the six acceptance items cannot be executed end to end against the
+stub set — in the hermetic suite AND in a real browser — or the app's own
+latency figure cannot be reproduced by an independent clock.
 
 **P2 — real backends, measured.** Wire the realtime ASR client and the chat
 client to a booted runtime; measure warm vs cold hint TTFT with an A-vs-A floor
@@ -430,39 +440,148 @@ because the resident prefix is never the one used.
 
 ---
 
-## 4. P1 module map
+## 4. Module map
 
 ```
 python/sglang/srt/copilot/
-  config.py     CopilotConfig — ports, cadences, limits
+  config.py     CopilotConfig — the backend switch, ports, cadences, limits
   protocol.py   frame kinds, event envelope, journal, audio frame codec
   briefing.py   markdown briefing loader (STATUS.md-shaped anchors)
-  topics.py     TopicRegistry: prime / touch / probe, WARM|PARTIAL|COLD
-  backends.py   AsrBackend + HintBackend protocols, desk fakes, real clients
-  session.py    CopilotSession: two tracks, transcript, hints, expander
-  service.py    session manager, idle collection
-  server.py     FastAPI app: REST + WS + PWA
+  topics.py     TopicRegistry: prepare / touch / probe, WARM|PARTIAL|COLD
+  backends.py   THE SEAM: AsrBackend + HintBackend + SessionPrep protocols,
+                and build_backend_set(config) -> the stub set or the rig set
+  stubs.py      the STUB set: scripted ASR with partials, canned hints with a
+                configured latency, a capacity-bounded prepared-context store
+  deskfakes.py  the adversarial UNIT doubles, deliberately degenerate
+  asr_client.py /v1/realtime protocol conformance state machine (no transport)
+  hints.py      prompt discipline, request builders, ChatHintBackend
+  session.py    CopilotSession: two tracks, transcript, hints, expander, and
+                the event stream every connection subscribes to
+  server.py     FastAPI app: REST + WS (reader + writer) + PWA
   launch.py     python -m sglang.srt.copilot.launch
-  client/index.html   PWA: two capture chains, reading panel
-test/registered/copilot/    hermetic suite
+  client/index.html   PWA: two capture chains, read pane, latency instrument
+test/registered/copilot/    hermetic suite, incl. test_acceptance_stub.py
 ```
 
-## 5. Desk fakes and how they are marked
+## 5. Doubles, and how they are marked
 
-Per the desk-fake law, a fake that is indistinguishable from the real thing is
-a trap. Both P1 fakes differ from their real counterparts at a **named** place,
-declared in the class docstring and asserted by a test:
+Per the desk-fake law, a fake indistinguishable from the real thing is a trap.
+There are two KINDS of double here and conflating them is the trap:
 
-* `DeskFakeAsr` — emits deterministic transcripts derived from frame counts,
-  and every line it produces is prefixed with a marker. **Named difference:**
-  it never produces a `partial` delta stream; it emits one final line per
-  commit. A component that only works because partials arrive will pass against
-  the fake and fail against `/v1/realtime`, so the difference is stated where a
-  reader meets it.
-* `DeskFakeHints` — returns hints assembled from the briefing text with
-  `desk_fake=True` on every frame. **Named difference:** it reports
-  `cached_tokens` equal to the full primed prefix on *every* call, i.e. it
-  always claims a perfect cache hit. The residency probe must therefore be
-  tested against a *second* fake that reports misses; a probe validated only
-  against the optimistic fake is untested. That second fake exists
-  (`DeskFakeHints(always_warm=False)`) and the can-fail proof uses it.
+**`deskfakes.py` — adversarial unit doubles.** Deliberately degenerate, so a
+component quietly depending on the good case fails a unit test.
+
+* `DeskFakeAsrBackend` — instant, deterministic transcripts. **Named
+  difference:** it never produces a `partial` delta stream; one final line per
+  commit, the instant `commit` is called, with no relation to how much audio
+  arrived. A component that only works because partials arrive passes here and
+  starves against `/v1/realtime`.
+* `DeskFakeHints` — **Named difference:** it reports `cached_tokens` equal to
+  the full primed prefix on *every* call, i.e. always claims a perfect cache
+  hit. The residency probe is therefore also tested against
+  `DeskFakeHints(always_warm=False)`, which reports the miss in the runtime's
+  own absent-details shape.
+* `DeskFakePrep` — **Named difference:** `report()` omits the `held` key, which
+  models the RIG: a radix prefix is not addressable by topic from outside, so
+  there an eviction is only ever discovered by the warmth probe. The session's
+  "the backend cannot tell me what it holds" path is exercised by this double,
+  the other path by the stub.
+
+**`stubs.py` — the app's stand-in for the rig.** Realistic, which is what makes
+it dangerous.
+
+* `StubAsrBackend` — **Named difference:** it speaks a FIXED SCRIPT, gated on
+  audio (no audio, no words), and it never REVISES a partial; a real adapter can
+  replace the whole partial text of an item.
+* `StubHints` — **Named difference:** latency is a configured constant plus
+  jitter, so any latency measured against it measures the harness, not a model.
+  A cold topic additionally pays `stub_cold_penalty_ms`, and the request that
+  paid it leaves the prefix behind, exactly as ordinary traffic populates a
+  radix tree.
+* `StubSessionPrep` — **Named difference:** it evicts deterministically by LRU
+  within its own stated capacity, while the real tree also loses a prefix to
+  OTHER tenants at unpredictable times. "Prepared" is stickier here than it will
+  ever be on a rig.
+
+Everything either kind produces carries a flag that reaches the browser, which
+paints a permanent STUB banner and marks every synthetic transcript line.
+
+---
+
+## 6. P1.5: the seam, the stub set, and server-initiated events
+
+### 6.1 One seam, two implementations, config-only switch
+
+`backends.py` declares three protocols and one factory. The app never imports a
+concrete backend; `CopilotConfig.backend` selects the set. A stub reached
+through a different code path than the real thing proves nothing about the real
+thing, so there is exactly one path.
+
+`AsrStream` is **push-shaped**: deltas and errors leave through an `AsrEvents`
+sink rather than being returned from `append`. That is the shape of the real
+endpoint — a WebSocket that emits transcription deltas and `error` frames with
+no relation to the arrival of any particular audio frame. A request/response
+seam would have fit the desk fake and misfit the endpoint, and the mismatch
+would only have surfaced on a booted rig.
+
+`--backend rig` REFUSES at launch and names the missing piece rather than
+booting an app whose transcript pane can never fill. The chat side of the rig
+set is complete; the `/v1/realtime` transport is P2 and deliberately unbuilt.
+
+### 6.2 The session owns an event stream
+
+Everything a reader sees arrives unasked: partials while someone is still
+talking, a suggestion when a decode finishes, a briefing addendum on a
+background cadence. So `CopilotSession.emit` journals an event and fans it out
+to every subscribed connection, and a connection is a reader task plus a writer
+task over ONE outbound queue — never two tasks calling `send_text`.
+
+Two consequences are load-bearing:
+
+* A hint decode never blocks the audio path: it runs as its own task, and while
+  it is in flight the client has already been told (`hint.pending`). A read pane
+  that stops moving must always be able to say whether it is thinking or broken.
+* An outbound queue that overflows drops the CONNECTION, loudly, instead of
+  falling behind silently. The journal retains more events than the queue holds,
+  so the reconnect replays exactly what the dropped connection missed.
+
+### 6.3 The latency instrument, and its two clocks
+
+§2.5 left links 5 and 6 UNMEASURED. P1.5 does not measure them — no model is
+involved — but it does close the instrument around them, so that when a model
+is wired in, the number has a denominator:
+
+* the SERVER reports `pipeline_ms`, from the moment the app first had the text
+  (a final line or a partial, named per hint by `source_kind` and
+  `source_line_id`/`source_item_id`) to the moment the suggestion was emitted;
+* the CLIENT independently measures from the moment it RENDERED that source to
+  the moment it rendered the suggestion, and displays both with their sample
+  counts.
+
+Two independent clocks over the same interval is the whole point: they agreed to
+about 1 ms in the browser run, which is what makes either of them worth
+quoting. A replayed suggestion is excluded from both samples — its source was
+rendered milliseconds earlier during the same replay, so sampling it would
+report the speed of the recovery and flatter the pipeline after every
+reconnect.
+
+### 6.4 Preparing no more than the backend holds
+
+Learned from a browser run against a bounded backend. With five briefing
+sections and a capacity of three, preparing every section means each cadence
+tick evicts what the previous tick prepared: steady churn, every topic measured
+cold, and the prepared-context mechanism reduced to noise. So:
+
+* when a backend STATES a capacity, the app prepares at most that many contexts
+  and leaves the surplus honestly unprepared — a switch to one of those costs
+  exactly one slow suggestion, which is then measured and displayed;
+* the FOCUSED topic is prepared LAST, so it is the most recently used and the
+  last to be evicted. Preparing in briefing order systematically evicted the one
+  topic the conversation was about;
+* a completed prepare clears the previous warmth verdict to UNKNOWN. It still
+  never CLAIMS warmth — but leaving a stale COLD in place made the UI report a
+  topic as cold immediately after preparing it, which is a claim about a state
+  that no longer existed. The cumulative miss count is what carries the history.
+
+A backend that cannot state a capacity (the rig) is treated as UNKNOWABLE, not
+as unlimited: nothing is held back, and eviction is discovered by the probe.

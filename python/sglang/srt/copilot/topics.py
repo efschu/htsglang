@@ -190,8 +190,37 @@ class TopicRegistry:
             lane=None,
         )
 
-    def due_for_prime(self, now: Optional[float] = None) -> List[PrimeRequest]:
-        """Topics whose prime has never run or is older than the touch cadence.
+    def prime_candidates(self, limit: Optional[int] = None) -> List[str]:
+        """Which topics are worth preparing, in the order to prepare them.
+
+        Two rules, both learned from watching this run against a bounded
+        backend:
+
+        1. NEVER ASK FOR MORE THAN THE BACKEND HOLDS. With five sections and a
+           capacity of three, preparing all five means every round evicts what
+           the previous round prepared -- steady churn, and every topic
+           measured cold. When the backend states a capacity, the app respects
+           it and leaves the surplus topics honestly unprepared; a switch to one
+           of those costs exactly one slow suggestion. ``limit=None`` means the
+           backend cannot state a capacity (the rig case), and then nothing is
+           held back.
+        2. THE FOCUSED TOPIC IS PREPARED LAST, so it is the most recently used
+           and therefore the last to be evicted. Preparing in briefing order
+           would systematically evict the one topic the conversation is about.
+
+        Beyond the focused topic, briefing order decides -- it is the user's own
+        ordering and this module has no better one.
+        """
+        others = [t for t in self.order if t != self.focus]
+        focused = [self.focus] if self.focus in self.topics else []
+        if limit is not None and limit > 0:
+            others = others[: max(0, limit - len(focused))]
+        return others + focused
+
+    def due_for_prime(
+        self, now: Optional[float] = None, limit: Optional[int] = None
+    ) -> List[PrimeRequest]:
+        """Candidates whose prepare has never run or is older than the cadence.
 
         The cadence exists to refresh ``last_access_time``, which is the second
         key of the priority eviction strategy (``evict_policy.py:41-47``); it
@@ -199,7 +228,7 @@ class TopicRegistry:
         """
         now = self._now() if now is None else now
         due: List[PrimeRequest] = []
-        for topic_id in self.order:
+        for topic_id in self.prime_candidates(limit):
             topic = self.topics[topic_id]
             if (
                 topic.prime_count == 0
@@ -211,17 +240,26 @@ class TopicRegistry:
     def record_prime(
         self, topic_id: str, prompt_tokens: int, now: Optional[float] = None
     ) -> TopicState:
-        """Record that a priming request completed.
+        """Record that a preparation completed.
 
-        Deliberately does NOT set warmth. A completed prime says the tokens
+        Deliberately does NOT claim warmth. A completed prepare says the tokens
         were prefilled once; it says nothing about whether they are still
         resident when the next request arrives, and that difference is exactly
         what the probe measures.
+
+        It DOES clear the previous verdict back to UNKNOWN, because that verdict
+        was about a prefix that has since been re-prepared. Leaving a stale COLD
+        in place made the UI report a topic as cold immediately after preparing
+        it -- a claim about a state that no longer existed. The cumulative
+        ``misses`` count is kept: that is the history, and it is what
+        ``miss_report`` reports.
         """
         topic = self.topics[topic_id]
         topic.primed_tokens = int(prompt_tokens)
         topic.last_primed_at = self._now() if now is None else now
         topic.prime_count += 1
+        topic.warmth = Warmth.UNKNOWN
+        topic.last_cached_tokens = None
         return topic
 
     # --- probing ----------------------------------------------------------
@@ -252,10 +290,35 @@ class TopicRegistry:
             topic.misses += 1
         return topic.warmth
 
+    def record_eviction(self, topic_id: str) -> Optional[TopicState]:
+        """A backend reported that it no longer holds this topic's context.
+
+        Counted as an OBSERVED miss, not as a return to UNKNOWN: the backend
+        said the prefix is gone, and that is a measurement. ``primed_tokens``
+        is deliberately kept -- it records the size of the prefix this app
+        primed, which is still the right denominator when the next request
+        repopulates it.
+        """
+        topic = self.topics.get(topic_id)
+        if topic is None:
+            return None
+        topic.last_cached_tokens = 0
+        topic.observations += 1
+        topic.misses += 1
+        topic.warmth = Warmth.COLD
+        return topic
+
     # --- reporting --------------------------------------------------------
 
     def states(self) -> List[Dict[str, Any]]:
-        return [self.topics[t].to_json() for t in self.order]
+        """Every topic in briefing order, with which one is focused.
+
+        Focus belongs to the registry, not to a topic: exactly one is live at a
+        time and a per-topic flag could contradict itself.
+        """
+        return [
+            {**self.topics[t].to_json(), "focus": t == self.focus} for t in self.order
+        ]
 
     def warm_topics(self) -> Iterable[TopicState]:
         return (t for t in self.topics.values() if t.warmth is Warmth.WARM)

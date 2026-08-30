@@ -77,7 +77,7 @@ class TestGeneratedSections:
     def test_append_is_additive_and_attributed(self):
         briefing = parse_briefing(HEADING_DOC)
         before = [s.anchor for s in briefing.sections]
-        section = briefing.append_generated(
+        section = briefing.extend_generated(
             "Contract renewal — live addendum",
             "They mentioned a 90-day notice, not 60.",
             provenance="copilot expansion, session abc",
@@ -90,7 +90,7 @@ class TestGeneratedSections:
 
     def test_generated_marker_survives_a_render_parse_round_trip(self):
         briefing = parse_briefing(HEADING_DOC)
-        briefing.append_generated("Addendum", "New fact.", provenance="copilot")
+        briefing.extend_generated("Addendum", "New fact.", provenance="copilot")
         rendered = briefing.render()
         assert GENERATED_MARKER in rendered
         reparsed = parse_briefing(rendered)
@@ -99,16 +99,29 @@ class TestGeneratedSections:
         assert addendum.generated is True
         assert len(reparsed.generated_sections) == 1
 
-    def test_repeated_expansion_does_not_collide(self):
+    def test_repeated_expansion_extends_one_section(self):
+        """A twenty-minute call must not produce twenty addendum sections."""
         briefing = parse_briefing(HEADING_DOC)
-        first = briefing.append_generated("Addendum", "a", provenance="copilot")
-        second = briefing.append_generated("Addendum", "b", provenance="copilot")
-        assert first.anchor != second.anchor
+        first = briefing.extend_generated("Addendum", "a", provenance="copilot")
+        second = briefing.extend_generated("Addendum", "b", provenance="copilot")
+        assert first is second
+        assert second.body == "a\n\nb"
+        assert len(briefing.generated_sections) == 1
+
+    def test_a_generated_section_never_absorbs_a_user_section(self):
+        """Same slug, different origin: the user's text is not extended."""
+        briefing = parse_briefing(HEADING_DOC)
+        user_body = briefing.section("contract-renewal").body
+        section = briefing.extend_generated(
+            "Contract renewal", "model text", provenance="copilot"
+        )
+        assert section.anchor == "contract-renewal-2"
+        assert briefing.section("contract-renewal").body == user_body
 
     def test_briefing_id_changes_with_content(self):
         briefing = parse_briefing(HEADING_DOC)
         before = briefing.briefing_id
-        briefing.append_generated("Addendum", "New fact.", provenance="copilot")
+        briefing.extend_generated("Addendum", "New fact.", provenance="copilot")
         assert briefing.briefing_id != before
 
 

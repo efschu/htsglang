@@ -27,7 +27,7 @@ mechanism into a no-op. The prefix is concatenated, never rebuilt.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -139,7 +139,9 @@ def expansion_request(
     )
 
 
-def prime_chat_request(config: CopilotConfig, topic_id: str, prefix_text: str):
+def prime_chat_request(
+    config: CopilotConfig, topic_id: str, prefix_text: str
+) -> HintRequest:
     """A prefill-only request that populates the radix prefix without output.
 
     ``max_tokens=0`` is permitted (``sampling_params.py:207-211``). Note the
@@ -202,69 +204,3 @@ class ChatHintBackend:
         if self._client is not None and self._owned:
             await self._client.aclose()
             self._client = None
-
-
-@dataclass
-class DeskFakeHints:
-    """Desk fake for the hint/expansion backend.
-
-    NAMED DIFFERENCE FROM THE REAL BACKEND -- read before relying on this:
-    with ``always_warm=True`` (the default) this fake reports
-    ``prompt_tokens_details.cached_tokens`` equal to the FULL prompt on every
-    call, i.e. it claims a perfect cache hit unconditionally. The real runtime
-    reports whatever the radix tree actually held, and reports a zero hit by
-    OMITTING the details object entirely
-    (``entrypoints/openai/usage_processor.py:15``).
-
-    Consequence, and the reason the difference is named here: a residency probe
-    validated only against this fake is UNTESTED, because it never sees a miss.
-    Construct ``DeskFakeHints(always_warm=False)`` to get the miss behaviour --
-    including the omitted-details shape -- and test the probe against both.
-
-    Second difference: every result carries ``desk_fake=True`` and the text is
-    assembled from the prompt, so no output of this fake can be mistaken for a
-    model's.
-    """
-
-    config: CopilotConfig
-    always_warm: bool = True
-    cached_fraction: float = 0.0
-    """Used only when ``always_warm`` is False."""
-
-    latency_ms: float = 3.0
-    calls: List[HintRequest] = field(default_factory=list)
-
-    MARKER = "[desk-fake-hint]"
-
-    async def complete(self, req: HintRequest) -> HintResult:
-        self.calls.append(req)
-        prompt_tokens = max(1, len(req.prompt.split()))
-        if self.always_warm:
-            cached = prompt_tokens
-        else:
-            cached = int(prompt_tokens * self.cached_fraction)
-        usage: Dict[str, Any] = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": 8,
-            "total_tokens": prompt_tokens + 8,
-        }
-        if cached > 0:
-            # Mirrors usage_processor.py:15 -- details exist only for a hit.
-            usage["prompt_tokens_details"] = {"cached_tokens": cached}
-        if req.kind is RequestKind.PRIME:
-            text = ""
-        elif req.kind is RequestKind.EXPANSION:
-            text = f"{self.MARKER} expansion for {req.topic_id}"
-        else:
-            head = req.topic_id.replace("-", " ")
-            text = f"- {self.MARKER} {head}\n- keyword from the briefing"
-        return HintResult(
-            text=text,
-            usage=usage,
-            latency_ms=self.latency_ms,
-            desk_fake=True,
-            prompt_tokens=prompt_tokens,
-        )
-
-    async def aclose(self) -> None:
-        return None
