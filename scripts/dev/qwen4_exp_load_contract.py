@@ -115,9 +115,21 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    import os.path as _osp
+
+    # --config accepts either the checkpoint DIRECTORY or config.json itself. The
+    # directory form matters because ServerArgs wants a model path it can also find
+    # the tokeniser and generation config beside.
+    if _osp.isdir(args.config):
+        model_dir = args.config
+        config_path = _osp.join(args.config, "config.json")
+    else:
+        config_path = args.config
+        model_dir = _osp.dirname(_osp.abspath(args.config))
+
     with open(args.index) as fh:
         weight_map = json.load(fh)["weight_map"]
-    with open(args.config) as fh:
+    with open(config_path) as fh:
         raw_config = json.load(fh)
 
     patterns = Counter(collapse(k) for k in weight_map)
@@ -185,7 +197,16 @@ def main() -> int:
         # slot -- the fork's own idiom, documented as the replacement for the legacy
         # set_server_args swap and as the path tests use. Nothing a concurrent
         # serving group could observe.
-        server_args = ServerArgs(model_path=args.config)
+        server_args = ServerArgs(model_path=model_dir)
+
+        # Some layers read the DP-attention globals while building, so initialise
+        # them too. Defaults only (dp_size 1, dp attention off) -- this is a shape
+        # contract check, not a parallelism test.
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.layers.dp_attention import initialize_dp_attention
+
+        initialize_dp_attention(server_args, ModelConfig.from_server_args(server_args))
+
         with lane_scope(None, server_args):
             with torch.device("meta"):
                 model = Qwen4ExpForConditionalGeneration(config)

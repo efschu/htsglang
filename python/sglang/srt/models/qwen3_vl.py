@@ -1237,6 +1237,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
 
+        # [#1036] Grafted from upstream sgl-project/sglang PR #36497
+        # (models/qwen3_vl.py:1243 at 99c9362e66). Subclasses read
+        # self.language_model_only -- Qwen4ExpForConditionalGeneration does, at three
+        # sites -- so the attribute has to exist on this base. ONLY the assignment is
+        # grafted, not upstream's four `if self.language_model_only:` vision-skip
+        # guards: for every checkpoint this fork serves today the value is False, so
+        # those branches are no-ops and grafting them would change vision behaviour
+        # for no gain here. Add them when a language_model_only checkpoint is served.
+        self.language_model_only = bool(getattr(config, "language_model_only", False))
+
         self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
         self.visual = Qwen3VLMoeVisionModel(

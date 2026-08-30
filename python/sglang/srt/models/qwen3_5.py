@@ -728,9 +728,15 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             config, layer_id, linear_attn_quant_config, alt_stream, prefix
         )
 
-        # NOTE: Determine the MLP type based on the model type
-        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type == "qwen3_5_moe_text":
+        # NOTE: Determine the MLP type from the number of ROUTED EXPERTS, not from
+        # model_type. Dense Qwen3.5 has none; Qwen3.5-MoE and every derived backbone
+        # (qwen4_exp_text among them) do. [#1036] Grafted from upstream
+        # sgl-project/sglang PR #36497: the previous two-way dispatch on
+        # "qwen3_5_moe_text" / "qwen3_5_text" raised `Invalid model type` for any
+        # derived config, which is exactly how qwen4_exp_text failed here.
+        # `getattr` rather than upstream's bare attribute read, because a dense
+        # config need not carry the field at all.
+        if getattr(config, "num_experts", 0):
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -750,7 +756,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_layer_sparse = True
             is_previous_layer_sparse = True
             is_next_layer_sparse = True
-        elif config.model_type == "qwen3_5_text":
+        else:
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -761,8 +767,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
-        else:
-            raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -1034,8 +1038,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # Dense MLP for non-MoE variant
-        if config.model_type == "qwen3_5_text":
+        # Dense MLP for non-MoE variant. [#1036] Dispatch on routed-expert COUNT
+        # rather than model_type, same graft as the linear-attention layer above:
+        # the model_type form raised `Invalid model type` for every derived
+        # backbone, qwen4_exp_text included.
+        if not getattr(config, "num_experts", 0):
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -1046,7 +1053,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
-        elif config.model_type == "qwen3_5_moe_text":
+        else:
             self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
@@ -1070,8 +1077,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_layer_sparse = True
             is_previous_layer_sparse = True
             is_next_layer_sparse = True
-        else:
-            raise ValueError(f"Invalid model type: {config.model_type}")
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
