@@ -3693,7 +3693,38 @@ def _decide_from_load(
                 f"pending prefill {inp.pending_prefill_tokens} tok <= "
                 f"N={n_live}, running it in tp (seam {seam_s:.2f}s {priced})"
             )
-        return _no("decoding in tp")
+        # #1028: SAY WHAT IS KNOWN, NOT WHAT IS ASSUMED.
+        #
+        # This is the fall-through of the tp branch: it is reached when no
+        # prefill is owed anywhere (`work_exists()` asks ONLY about prefill --
+        # `pending_prefill_tokens` / `admissible_prefill_tokens`) and the idle
+        # arm above did not apply. NOTHING here has checked that a decode is
+        # in flight, yet the reason string asserted one.
+        #
+        # Measured cost of that assertion (2026-08-30, acceptance suite pack 5,
+        # RM-13): the group sat in tp for 6.5 minutes emitting "decoding in tp"
+        # while the LAST DECODE BATCH HAD BEEN AT 11:57:45 and zero decode
+        # batches followed. The line sent the investigation looking for a
+        # stuck decode; there was none, and the real loss is upstream of this
+        # policy (the scheduler saw no work at all -- PP0 in `is_fully_idle`,
+        # detokenizer idle on its socket, client still waiting). Specimen:
+        # /spinning/gpu-arb/W855-STRANDED-REQ-SPECIMEN.md, ticket #1028.
+        #
+        # Same class as the three other instrument-text findings of that day:
+        # a guard whose DETECTION is fine and whose EXPLANATION is invented.
+        # The fix is not to guess better -- it is to print the term the branch
+        # actually stands on, so "a decode is running" and "nothing is owed
+        # and nobody is asking" stop looking identical in a log.
+        return _no(
+            f"nothing owed in tp: no prefill pending or admissible, "
+            f"running_bs={inp.running_bs}"
+            + (
+                " -- decode is in flight, this is a normal hold"
+                if inp.running_bs > 0
+                else " -- NOTHING IS DECODING EITHER; if a client is waiting, "
+                "its request never reached this scheduler (#1028)"
+            )
+        )
 
     if inp.phase == PHASE_PP:
         # Prefill is done (or what is left is not worth staying for) and
