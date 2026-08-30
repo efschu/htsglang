@@ -1751,15 +1751,45 @@ class HiCacheFile(HiCacheStorage):
                 # zeroes the claim -- leaves NO entry behind. Empty caps next
                 # to final=0 therefore means "a component found no anchor in
                 # this span at all", the opposite of "nothing capped it".
+                # #1035b WHERE IS THE NEAREST ANCHOR? `claimed=0 caps={}` is
+                # produced by two different worlds and the line above cannot
+                # tell them apart:
+                #   (i)  anchors ARE inside the queried range but not at a
+                #        reachable trailing position -- a GRANULARITY problem,
+                #        fixed by publishing anchors more often; or
+                #   (ii) the queried range was cut SHORT of the nearest anchor
+                #        -- a SPAN problem (the prefetch span is truncated, or
+                #        the node boundary simply lies past the last queried
+                #        key), where denser publication inside the span would
+                #        change nothing.
+                # Building the density step without separating these is exactly
+                # the "fix an unverified root" move that has already cost this
+                # strand two roots, so the discriminator is printed at the
+                # failure point rather than argued: for each capped component,
+                # how many of its blobs exist among the queried keys and the
+                # DEEPEST index carrying one (-1 = none at all). Computed only
+                # on the rate-limited logging path.
+                _anchor_probe = {}
+                for _t in pool_transfers or []:
+                    if _t.name == PoolName.KV:
+                        continue
+                    _present = [
+                        i for i in range(len(keys)) if has_component(i, _t.name)
+                    ]
+                    _anchor_probe[_t.name] = (
+                        len(_present),
+                        _present[-1] if _present else -1,
+                    )
                 logger.warning(
                     "#1028B FETCH CAP n=%d: kv=%d claimed=%d lost=%d caps=%s "
-                    "keys=%d",
+                    "keys=%d #1035b anchors_in_range(count,deepest_idx)=%s",
                     self._1028b_n,
                     kv_pages,
                     final_pages,
                     kv_pages - final_pages,
                     {k: v for k, v in hit_count.items() if k != PoolName.KV},
                     len(keys),
+                    _anchor_probe,
                 )
 
         return PoolTransferResult(final_pages, hit_count)

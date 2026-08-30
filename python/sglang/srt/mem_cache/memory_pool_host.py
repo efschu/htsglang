@@ -287,16 +287,26 @@ from sglang.srt.mem_cache.pinned_host_budget import (  # noqa: E402
 
 
 # #1035: how many times the KV tier's host/device ratio the MAMBA ANCHOR pool
-# gets when nothing explicit is configured. Deliberately a small whole multiple
-# rather than a share of free RAM (see the sizing block in
-# `MambaPoolHost.__init__` for why free-RAM sizing is rank-divergent): 2.0 keeps
-# every rank identical, doubles the anchor ceiling that the density step will
-# spend, and leaves the freed RAM to the flip/serving machinery, which the
-# standing host-RAM priority puts ahead of cache. Raise it (or set
-# `--hicache-mamba-host-mib`) once a boot reports a non-zero
-# "#1035 PREFETCH DROPPED" count -- that counter, not this constant, is the
-# evidence that the ceiling binds.
-MAMBA_ANCHOR_HOST_AUTO_MULT: float = 2.0
+# gets when nothing explicit is configured. Deliberately a multiple rather than
+# a share of free RAM (see the sizing block in `MambaPoolHost.__init__` for why
+# free-RAM sizing is rank-divergent), so every rank resolves identically.
+#
+# BACK TO 1.0 ON MEASUREMENT, 2026-08-30. It shipped at 2.0 for exactly one
+# boot (boot_855_1035anchor, 31 -> 61 slots) on the inherited premise that an
+# exhausted anchor pool was starving read-through. That boot measured the
+# premise false: "#1035 PREFETCH DROPPED" fired 0 times with the path provably
+# exercised (39 prefetch successes, 12 batch_exists_v2 events), and the
+# realised-loss distribution was BIT-IDENTICAL to the previous boot at half the
+# pool (3x kv=343, 3x kv=349, 6x kv=521, all claimed=0). The pool was never the
+# binding constraint, so the doubling bought nothing and cost ~2.2 GiB
+# node-wide on a box whose cgroup memory.peak sits at 104.8 GiB of 118 GiB.
+# A default that costs memory and pays nothing does not ship.
+#
+# The lever survives where the evidence can reach it: set
+# `--hicache-mamba-host-mib` if "#1035 PREFETCH DROPPED" ever reports a
+# non-zero count. That counter, not this constant, is what says the ceiling
+# binds.
+MAMBA_ANCHOR_HOST_AUTO_MULT: float = 1.0
 
 
 class MambaBlobGeometryError(RuntimeError):
