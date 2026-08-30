@@ -26,6 +26,34 @@ What it reports, per rank, in one line
 * the allocator's own posts at the two checkpoints the boot already records:
   post-weights, post-pools, and now. Their differences are the POOL bytes
   (KV, mamba/GDN, draft) and the GRAPH/workspace bytes.
+
+  ``graphs_mib`` IS NOT ALWAYS PHYSICAL, AND THE ARTIFACT SAYS SO (#1009a).
+  It is ``memory_allocated(now) - memory_allocated(post_pools)``, so it
+  inherits whatever torch's allocator accounting does. Measured on the #855
+  gdncov census boot (2026-08-30, ``boot_855_census2``): pp0 reported
+  ``alloc=38688.5`` and ``reserved=39124.0`` MiB on a card whose
+  ``nvml_total`` is 32088.5 and ``nvml_used`` 30464.8 -- torch claimed ~8 GiB
+  more live than the card physically holds, and ``graphs=13105.1`` against an
+  NVML-anchored ceiling of 4925.6 (``nvml_used - params - pools``). Same
+  shape on both 3080s: graphs 7868.8 and 7871.1 against ceilings of 3449.6
+  and 3452.9.
+
+  WHERE IT ENTERS, bounded by what the artifact can show: NOT
+  ``expandable_segments`` -- that config makes ``reserved`` a virtual extent
+  (``phase_flip_spill``: 36910 MiB measured on a 32607 MiB card) and would
+  explain exactly this shape, but ``PYTORCH_CUDA_ALLOC_CONF`` is UNSET on
+  this boot and the string appears nowhere in its log. The inflation is
+  bounded to the window BETWEEN the post-pools checkpoint and the census,
+  because ``params + pools`` reconciles against the driver on all three ranks
+  while ``graphs`` does not; the only thing in that window is CUDA-graph
+  capture. The per-rank figures fit that: the two 3080s capture the same
+  batch-size set and report graph terms within 2.3 MiB of each other despite
+  owning different layer counts.
+
+  So the census REFUSES TO OFFER the number rather than explaining it away:
+  ``reconciliation.graphs_mib_physical`` carries the verdict and
+  ``reconciliation.graphs_ceiling_mib`` carries the honest alternative, which
+  is the same NVML-anchored residual the cut gate already prices from.
 * fragmentation (reserved - allocated) and this boot's transient peak.
 * the driver's free/total for the card, i.e. the axis the corridor law is
   written on, plus the CUDA-context residue (used - reserved) that no torch
@@ -215,6 +243,13 @@ def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[st
         # refused. Silent continuation is what is forbidden, not the boot.
         breaches = []
         partition_b = params_total + pools_b + graphs_b
+        # #1009a(3): the NVML-anchored CEILING on the graph/workspace term.
+        # Whatever the driver reports used, minus what the parameter walk and
+        # the pool posts account for, is all the room graphs can possibly
+        # occupy. This is the honest alternative to `graphs_b` and the number
+        # the cut gate already prices as its per-rank residual.
+        graphs_ceiling_b = used_b - params_total - pools_b
+        graphs_physical = graphs_b <= max(0, graphs_ceiling_b)
         if alloc_now > reserved_now:
             breaches.append(
                 f"alloc {alloc_now / _MIB:.1f} > reserved {reserved_now / _MIB:.1f}"
@@ -235,6 +270,12 @@ def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[st
             breaches.append(
                 f"params+pools {(params_total + pools_b) / _MIB:.1f} > "
                 f"nvml_used {used_b / _MIB:.1f} (residual would be negative)"
+            )
+        if not graphs_physical:
+            breaches.append(
+                f"graphs {graphs_b / _MIB:.1f} > NVML-anchored ceiling "
+                f"{graphs_ceiling_b / _MIB:.1f} "
+                f"(= nvml_used - params - pools): graphs_mib is NOT PHYSICAL"
             )
         if breaches:
             logger.warning(
@@ -363,6 +404,13 @@ def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[st
                     "breaches": list(breaches),
                     "params_plus_pools_mib": (params_total + pools_b) / _MIB,
                     "partition_sum_mib": partition_b / _MIB,
+                    # #1009a(3): the verdict ON THE GRAPH TERM specifically,
+                    # beside the number itself, so no consumer can price
+                    # `graphs_mib` without seeing whether it is physical --
+                    # and so a reader who wants the graph/workspace mass has
+                    # the NVML-anchored ceiling to use instead.
+                    "graphs_mib_physical": bool(graphs_physical),
+                    "graphs_ceiling_mib": graphs_ceiling_b / _MIB,
                 },
             }
             os.makedirs(out_dir, exist_ok=True)
