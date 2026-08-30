@@ -6214,7 +6214,14 @@ class Scheduler(
         # -- NOT a guessed constant. Measured so far: a healthy DE-06 took
         # 95.6 s end-to-end, so anything below that order is russian roulette
         # with the group.
-        _cw_t0 = time.perf_counter()
+        # time.monotonic(), NOT perf_counter(): the watchdog reader that
+        # consumes this stamp computes `time.monotonic() - since`, and the two
+        # clocks have DIFFERENT EPOCHS -- mixing them yields a garbage age, not
+        # a slightly wrong one. `_pp_blocked_recv_since` (the stamp this one
+        # sits beside in the same report line) is monotonic for the same
+        # reason. Caught before the reader was written; the units bridge is
+        # cheaper to get right than to debug.
+        _cw_t0 = time.monotonic()
         self._uniform_reduce_since = _cw_t0
         try:
             torch.distributed.all_reduce(
@@ -6222,7 +6229,7 @@ class Scheduler(
             )
         finally:
             self._uniform_reduce_since = None
-        _cw_waited = time.perf_counter() - _cw_t0
+        _cw_waited = time.monotonic() - _cw_t0
         if _cw_waited > 30.0:
             # Every long-but-COMPLETED wait is one sample of the distribution
             # phase 2's deadline is derived from. Rare by construction, so it
