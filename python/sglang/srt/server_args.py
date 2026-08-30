@@ -426,6 +426,41 @@ def add_mxfp8_moe_runner_backend_choices(choices):
     MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
+def asymmetric_wna16_moe_group(hf_config) -> Optional[Tuple[str, dict]]:
+    """The first compressed-tensors WNA16 config group with ``symmetric: false``.
+
+    Returns ``(group_name, weights_dict)``, or ``None`` when the checkpoint is
+    not of that class. WNA16 means weight-only integer quantisation -- the
+    group declares no ``input_activations`` -- which is the condition under
+    which ``CompressedTensorsConfig.get_moe_scheme`` selects one of the
+    ``CompressedTensorsWNA16*`` schemes.
+
+    ``symmetric: false`` is what makes the zero points load-bearing: with them
+    a dequantised output channel is centred on zero, without them every
+    channel is shifted by roughly ``7.5 * scale``. That separation is what the
+    refusal below keys on.
+    """
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return None
+    if quantization_config.get("quant_method") != "compressed-tensors":
+        return None
+    config_groups = quantization_config.get("config_groups")
+    if not isinstance(config_groups, dict):
+        return None
+    for name, group in config_groups.items():
+        if not isinstance(group, dict) or group.get("input_activations") is not None:
+            continue
+        weights = group.get("weights")
+        if not isinstance(weights, dict):
+            continue
+        if weights.get("type") != "int" or weights.get("num_bits") not in (4, 8):
+            continue
+        if weights.get("symmetric") is False:
+            return name, weights
+    return None
+
+
 def add_fp8_gemm_runner_backend_choices(choices):
     FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
 
@@ -16290,6 +16325,51 @@ class ServerArgs:
             ], (
                 f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'nvfp4_online', or bfloat16 (None)."
             )
+
+        # #1036: the compressed-tensors WNA16 *Triton* MoE scheme drops the
+        # zero points. CompressedTensorsWNA16TritonMoE.get_triton_quant_info
+        # builds its TritonMoeQuantInfo with use_int4_w4a16=True and no
+        # w13_zp/w2_zp argument at all, while moe_wna16.py passes w13_zp
+        # whenever has_zp. On a `symmetric: false` checkpoint the zero points
+        # are load-bearing, so every dequantised output channel is shifted by
+        # roughly 7.5 * scale instead of being centred on zero. Measured on
+        # this checkpoint's real tensors: gate_proj goes from 45.1 % positive
+        # (correct) to 95.7 % positive, a 46x per-channel mean shift. That
+        # produces plausible logits rather than an error, which is why this
+        # is a refusal and not a warning.
+        #
+        # Scope, deliberately narrow: only the "triton" member routes there
+        # (MoeRunnerBackend.TRITON; is_triton() matches that member alone), so
+        # "triton_kernel" is a different backend and is untouched, and the
+        # CUDA default "auto" already resolves to the Marlin scheme. This
+        # guard does NOT cover ROCm: get_moe_scheme routes HIP to the Triton
+        # scheme unconditionally, so there is no flag value to refuse there
+        # and the load-time sign-balance invariant is what covers it.
+        if view.moe_runner_backend == "triton":
+            asymmetric_group = asymmetric_wna16_moe_group(
+                self.get_model_config().hf_config
+            )
+            if asymmetric_group is not None:
+                group_name, weights = asymmetric_group
+                raise ValueError(
+                    "--moe-runner-backend triton is refused for this "
+                    "checkpoint: quantization_config group "
+                    f"'{group_name}' is compressed-tensors weight-only int"
+                    f"{weights.get('num_bits')} with symmetric=false "
+                    f"(group_size={weights.get('group_size')}), so its zero "
+                    "points are load-bearing. "
+                    "CompressedTensorsWNA16TritonMoE.get_triton_quant_info "
+                    "passes no w13_zp/w2_zp to the int4_w4a16 kernel, which "
+                    "shifts every dequantised output channel by about "
+                    "7.5 * scale instead of centring it on zero -- measured "
+                    "on these tensors, gate_proj goes from 45.1 % positive "
+                    "(correct) to 95.7 %, a 46x per-channel mean shift. The "
+                    "output stays plausible, so this cannot be left to a "
+                    "warning. Use --moe-runner-backend auto (the default, "
+                    "which selects the Marlin scheme and applies the zero "
+                    "points); 'triton_kernel' is a different backend and is "
+                    "not affected by this refusal."
+                )
 
         # The runner-driven shared-experts fusion disables moved to the
         # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),

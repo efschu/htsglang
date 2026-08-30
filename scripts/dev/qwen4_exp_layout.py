@@ -121,21 +121,32 @@ ANCHOR_COLD_FRACTION = 0.34
 ANCHOR_CEILING_ACHIEVED_TOK_S = 13.5
 ANCHOR_CEILING_LINK_TOK_S = 49.6
 
-#: The Marlin grouped-MoE tile rule, read in sgl-kernel source by
-#: W4A4Scout.BlackwellFp4Moe and independently re-verified at the literal SHA by
-#: PlannerCensus (marlin.cuh min_thread_n/k = 64, max_thread_n = 256;
+#: The Marlin grouped-MoE tile rule: N % 128 == 0 and K % 64 == 0. Read in
+#: sgl-kernel source by W4A4Scout.BlackwellFp4Moe and re-verified at the literal
+#: SHA by PlannerCensus (marlin.cuh min_thread_n/k = 64, max_thread_n = 256;
 #: moe_wna16_marlin.cuh candidate tiles {128,128,256} / {64,128,128} /
-#: {64,256,256}, so thread_n is ONLY EVER 128 or 256; the hard N check and the
-#: tile gate). Effective constraint: N % 128 == 0 and K % 64 == 0. For a MoE
-#: expert that is w13 (fused gate_up, N = 2 * I_r, K = hidden) and w2
-#: (N = hidden, K = I_r), which reduces to I_r % 64 == 0 on every rank.
-#: This is why the MoE intermediate is split in 64-wide UNITS below and not
-#: proportionally: a proportional split lands on I_r = 160 at [32,16,16], which
-#: is upstream issue #37089's "Invalid thread config ... MKN = [64, 2560, 320]"
-#: and CRASHES rather than degrading.
+#: {64,256,256}, so thread_n is ONLY EVER 128 or 256). For a MoE expert that is
+#: w13 (fused gate_up, N = 2 * I_r, K = hidden) and w2 (N = hidden, K = I_r),
+#: which reduces to I_r % 64 == 0 on every rank.
+#:
+#: THE FORK ALREADY GUARANTEES THIS AND THE SCRIPT DOES NOT RE-IMPOSE IT. The
+#: expert intermediate is partitioned in INDIVISIBLE UNITS by
+#: `fused_moe_triton.layer.moe_uneven_tp_units` +
+#: `distributed.utils.partition_units`, and for a compressed-tensors config the
+#: unit is lcm(group_size, GPTQ_MARLIN_MIN_THREAD_K) -- 128 on this checkpoint,
+#: EXECUTED not read (see fork_moe_units). Every emittable shard is therefore a
+#: multiple of 128, so w13 N is a multiple of 256 and w2 K of 128: both rules
+#: hold with margin, and upstream #37089's I_r = 160 is arithmetically
+#: unemittable through --rank-tp-ratio. The tile check below is kept as an
+#: INVARIANT, not a filter, because it is the only thing that would catch a lane
+#: handing a width down outside that machinery (units=None), which is the one
+#: live hazard on this axis.
 MARLIN_N_MULTIPLE = 128
 MARLIN_K_MULTIPLE = 64
-MOE_UNIT_WIDTH = 64
+
+#: Fallback unit width, used ONLY when the fork is not importable. Labelled as
+#: such in the output, never silently substituted.
+FALLBACK_MOE_UNIT_WIDTH = 128
 
 #: ASSUMPTION 1 -- the miss model between the two measured points. A power law
 #: through ONE measured point per policy: miss = (1 - resident) ** k, with k
@@ -245,6 +256,9 @@ class Geometry:
     ple_embed_dim: int
     ple_conv_kernel_size: int
     n_ple_layers: int
+    #: The checkpoint's own ``quantization_config``, carried verbatim so the
+    #: fork's ``moe_uneven_tp_units`` can be CALLED on the real thing.
+    quant_config: Optional[dict] = None
 
     @classmethod
     def from_config(cls, path: str) -> "Geometry":
@@ -278,6 +292,7 @@ class Geometry:
             ple_embed_dim=int(text["ple_embed_dim"]),
             ple_conv_kernel_size=int(text["ple_conv_kernel_size"]),
             n_ple_layers=len(list(text.get("ple_layer_ids") or ())),
+            quant_config=cfg.get("quantization_config"),
         )
 
     @property
@@ -437,25 +452,106 @@ def offload_floor_slots(override: Optional[int] = None) -> int:
     return 1 + scratch_slot_count(1, override)
 
 
-def unit_vector(weights: Sequence[float], units: int) -> List[int]:
-    """Split `units` indivisible units proportionally to `weights`, >= 1 each.
+def _ensure_fork_importable() -> None:
+    """Put this checkout's ``python/`` on sys.path, once.
 
-    Largest-remainder, then a floor pass. This is the only place an indivisible
-    resource is split, and it is deliberate: a proportional split of the MoE
-    intermediate lands on a width Marlin cannot tile (see MARLIN_N_MULTIPLE).
+    The script lives at ``scripts/dev/`` inside the tree it reports on, so the
+    fork it must agree with is two directories up. Resolving it from ``__file__``
+    rather than from the caller's PYTHONPATH is what stops the script from
+    silently falling back to its own UNVERIFIED arithmetic when it is run from
+    the repo root -- which is how it is run.
     """
+    import os
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    pkg = os.path.join(root, "python")
+    if os.path.isdir(os.path.join(pkg, "sglang")) and pkg not in sys.path:
+        sys.path.insert(0, pkg)
+
+
+def fork_moe_units(intermediate: int, quant_config: Optional[dict]) -> Tuple[int, str]:
+    """Units the FORK will actually partition the expert intermediate into.
+
+    CALLS the fork's own `moe_uneven_tp_units` against a real
+    `CompressedTensorsConfig` built from the checkpoint's own
+    `quantization_config`, rather than re-deriving which branch fires. That
+    matters: eleven agent-hours went into READING that branch table and six
+    independent readings got it wrong, because `weight_block_size` is a
+    @property and a grep for `self.weight_block_size =` is structurally blind to
+    it. Executing the function is the only sound instrument, and a second copy of
+    the branch logic here would be exactly the duplication this script exists to
+    avoid.
+    """
+    _ensure_fork_importable()
+    if quant_config:
+        try:
+            from sglang.srt.layers.moe.fused_moe_triton.layer import (
+                moe_uneven_tp_units,
+            )
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+                CompressedTensorsConfig,
+            )
+
+            qc = CompressedTensorsConfig.from_config(quant_config)
+            units = int(moe_uneven_tp_units(intermediate, qc))
+            if units > 0 and intermediate % units == 0:
+                return units, (
+                    "EXECUTED fused_moe_triton.layer.moe_uneven_tp_units() "
+                    "against a real CompressedTensorsConfig built from this "
+                    "checkpoint's quantization_config"
+                )
+        except Exception as e:  # pragma: no cover - import/config shape
+            note = f"fork call failed ({type(e).__name__}: {e})"
+        else:
+            note = "fork call returned an unusable unit count"
+    else:
+        note = "no quantization_config in the checkpoint config"
+    width = FALLBACK_MOE_UNIT_WIDTH
+    while width > 1 and intermediate % width:
+        width //= 2
+    return intermediate // max(width, 1), (
+        f"FALLBACK, UNVERIFIED: {note}; assuming a {width}-element unit"
+    )
+
+
+def fork_partition_units(units: int, weights: Sequence[int]) -> Tuple[List[int], str]:
+    """The unit vector the FORK will actually serve for these ratio weights.
+
+    CALLS `distributed.utils.partition_units`. This is the read-back that stops
+    the provenance line from recording a split that never happened: the
+    partition is largest-remainder rounding with every rank >= 1 unit and ties
+    broken toward the lower rank index, and at a 5-unit grain it distorts the
+    requested ratio badly and silently -- a requested 50/25/25 is served as
+    60/20/20. Nothing in the runtime warns about that.
+    """
+    try:
+        _ensure_fork_importable()
+        from sglang.srt.distributed.utils import partition_units
+
+        served = [int(x) for x in partition_units(units, list(weights), None)]
+        if sum(served) == units and all(s >= 1 for s in served):
+            return served, "EXECUTED distributed.utils.partition_units()"
+    except Exception:  # pragma: no cover - import shape
+        pass
+    return _largest_remainder(units, weights), (
+        "FALLBACK, UNVERIFIED: largest-remainder, >= 1 unit per rank, ties to "
+        "the lower rank index (the documented contract of partition_units)"
+    )
+
+
+def _largest_remainder(units: int, weights: Sequence[int]) -> List[int]:
     n = len(weights)
     units = max(units, n)
-    total = sum(weights) or 1.0
-    base = [max(int(units * w / total), 1) for w in weights]
-    # Repair the sum: give or take from the largest/smallest, never below 1.
+    total = float(sum(weights)) or 1.0
+    exact = [units * w / total for w in weights]
+    base = [max(int(x), 1) for x in exact]
     while sum(base) > units:
-        i = int(max(range(n), key=lambda j: base[j]))
+        i = int(max(range(n), key=lambda j: (base[j] - exact[j], -j)))
         if base[i] <= 1:
             break
         base[i] -= 1
     while sum(base) < units:
-        i = int(max(range(n), key=lambda j: weights[j] / base[j]))
+        i = int(max(range(n), key=lambda j: (exact[j] - base[j], -j)))
         base[i] += 1
     return base
 
@@ -665,15 +761,28 @@ class Solver:
         rsum = sum(self.weight_ratio) or 1
         self.weight_share = [r / rsum for r in self.weight_ratio]
 
-        # MoE intermediate: split in INDIVISIBLE 64-wide units, so every rank's
-        # I_r clears the Marlin tile rule. This is the constraint a proportional
-        # split violates.
-        self.moe_unit_width = args.moe_unit_width
-        self.moe_units_total = geom.moe_intermediate // max(self.moe_unit_width, 1)
-        self.moe_unit_vector = unit_vector(self.weight_share, self.moe_units_total)
-        self.intermediate = [u * self.moe_unit_width for u in self.moe_unit_vector]
-        itotal = sum(self.intermediate) or 1
-        self.slice_frac = [i / itotal for i in self.intermediate]
+        # MoE intermediate: split in INDIVISIBLE units, so every rank's I_r
+        # clears the Marlin tile rule. The GRAIN is not assumed: it is obtained
+        # by executing the fork's own function, and the SERVED vector is read
+        # back from the fork's own partitioner, so the provenance line records
+        # the split that will actually happen rather than the one requested.
+        self.moe_units_total, self.moe_units_source = fork_moe_units(
+            geom.moe_intermediate,
+            geom.quant_config if args.derive_moe_units else None,
+        )
+        if args.moe_units:
+            self.moe_units_total = int(args.moe_units)
+            self.moe_units_source = f"OVERRIDDEN by --moe-units {args.moe_units}"
+        self.moe_unit_width = geom.moe_intermediate // max(self.moe_units_total, 1)
+        #: What a plain capacity-driven `--rank-tp-ratio auto` would serve. It is
+        #: the REFERENCE, not the answer: capacity says nothing about which card
+        #: sits on the crippled x4 link, and the expert slice width decides how
+        #: many cold-expert bytes cross that link per token.
+        self.capacity_unit_vector, self.moe_partition_source = fork_partition_units(
+            self.moe_units_total, self.weight_ratio
+        )
+        self.requested_share = list(self.weight_share)
+        self._apply_moe_vector(self.capacity_unit_vector)
 
         # Cold-expert split under ep_shard: the fork already resolves this BY
         # CARD UUID from the measured pinned H2D per rank
@@ -807,8 +916,8 @@ class Solver:
             # ep_shard: what residency could not fund is cold, split by link.
             total_hot = sum(p.hot_per_layer for p in ranks)
             if total_hot >= g.num_experts:
-                scaled = unit_vector(
-                    [max(p.hot_per_layer, 1) for p in ranks], g.num_experts
+                scaled = _largest_remainder(
+                    g.num_experts, [max(p.hot_per_layer, 1) for p in ranks]
                 )
                 for r, p in enumerate(ranks):
                     p.hot_per_layer = scaled[r]
@@ -849,6 +958,32 @@ class Solver:
         host_need_gib = (cold_host_bytes + ple_host) / _GIB
 
         binding = ""
+        # The tile rule enters the SOLVER, not a post-hoc check. Every reviewer
+        # of this axis converged on that: a search that optimises VRAM and
+        # scores throughput will happily SELECT a geometry the kernel cannot
+        # tile, and the failure is a hard "Invalid thread config" abort rather
+        # than a slow layout. At the fork's served grain no such vector is
+        # reachable, so this constraint is normally inert -- it is here for the
+        # case where it is not (an overridden grain, or a lane handing a width
+        # down outside the units machinery).
+        tiles_ok, _ = self.marlin_verdict()
+        if not tiles_ok:
+            return Layout(
+                tokens_global=tokens_global,
+                ranks=ranks,
+                host_need_gib=0.0,
+                cold_host_bytes=0.0,
+                feasible=False,
+                binding=(
+                    f"MoE intermediate vector {self.intermediate} has no valid "
+                    f"Marlin tile (needs N % {MARLIN_N_MULTIPLE} == 0 and K % "
+                    f"{MARLIN_K_MULTIPLE} == 0); this is upstream #37089's abort"
+                ),
+                fully_resident=fully_resident,
+                hot_mass=hot_mass,
+                cold_mass=cold_mass,
+            )
+
         feasible = True
         for r, p in enumerate(ranks):
             if p.corridor_mib < p.reserve_mib - 1e-9:
@@ -899,14 +1034,57 @@ class Solver:
 
     # -- the search -------------------------------------------------------
 
-    def solve(self) -> Tuple[Layout, Layout, str]:
-        """(chosen, reference, note).
+    def _apply_moe_vector(self, units_vec: Sequence[int]) -> None:
+        """Install one candidate expert-intermediate unit vector.
 
-        The reference is the same solve at ZERO KV tokens -- the layout that
-        spends everything on residency. It is what the chosen layout's decode
-        delta is measured AGAINST, the same way `uneven_perf` compares a chosen
-        vector to the VRAM-auto split. A number is not a result without a floor.
+        `served_share` vs `requested_share` is the read-back that keeps the
+        provenance line honest: the units layer rounds and never warns, and at
+        five units over three ranks a requested 50/25/25 is served as 60/20/20.
         """
+        self.moe_unit_vector = list(units_vec)
+        self.intermediate = [u * self.moe_unit_width for u in self.moe_unit_vector]
+        itotal = sum(self.intermediate) or 1
+        self.slice_frac = [i / itotal for i in self.intermediate]
+        self.served_share = list(self.slice_frac)
+        self.ratio_distortion = max(
+            abs(x - y) for x, y in zip(self.requested_share, self.served_share)
+        )
+
+    def moe_candidates(self) -> List[List[int]]:
+        """Every ORDERED unit vector the fork can serve, >= 1 unit per rank.
+
+        Ordered, not "up to permutation", because the three links are not equal
+        (14.42 / 6.47 / 13.33 GB/s in RANK order, and rank 1 is the x4 card).
+        The same multiset permuted differently changes the cold-expert bytes that
+        must cross the slowest link, so rank ORDER is a decision variable and not
+        a presentation detail -- measured by MoEPrefetchScout at up to 2x on the
+        transfer bill for one shape.
+        """
+        n, total = self.n, self.moe_units_total
+
+        def comps(k: int, left: int) -> List[List[int]]:
+            if k == 1:
+                return [[left]] if left >= 1 else []
+            out: List[List[int]] = []
+            for first in range(1, left - k + 2):
+                for rest in comps(k - 1, left - first):
+                    out.append([first] + rest)
+            return out
+
+        return comps(n, total) or [[max(total // n, 1)] * n]
+
+    def round_trip(self, units_vec: Sequence[int]) -> Tuple[List[int], bool]:
+        """The ratio that produces `units_vec`, verified through the fork.
+
+        A unit vector is its own ratio, but that is a claim about
+        `partition_units`, so it is CHECKED rather than asserted -- the whole
+        point of this section is that requested and served vectors differ.
+        """
+        served, _ = fork_partition_units(self.moe_units_total, list(units_vec))
+        return served, list(served) == list(units_vec)
+
+    def _solve_kv(self) -> Tuple[Layout, Layout, str]:
+        """Largest reachable KV target for the CURRENTLY INSTALLED MoE vector."""
         target = int(self.a.kv_target_tokens)
         reference = self.evaluate(0)
         at_target = self.evaluate(target)
@@ -924,6 +1102,75 @@ class Solver:
                 hi = mid - 1
         best.binding = best.binding or at_target.binding
         return best, reference, "target NOT reachable"
+
+    def solve(self) -> Tuple[Layout, Layout, str]:
+        """(chosen, reference, note).
+
+        TWO nested solves, in objective order:
+          OUTER -- every ORDERED expert-intermediate unit vector the fork can
+            serve. Scored on (KV tokens reached, then decode ceiling at the
+            ACHIEVED H2D). The outer loop exists because capacity and throughput
+            disagree: the widest expert slice wants the biggest card, the
+            SMALLEST slice wants the x4-linked card, and on this rig those are
+            different ranks. A capacity-only split therefore loads the crippled
+            link with cold-expert traffic and binds the whole rig there.
+          INNER -- the largest reachable KV target for that vector.
+
+        The reference is the same solve at ZERO KV tokens -- the layout that
+        spends everything on residency. It is what the chosen layout's decode
+        delta is measured AGAINST, the same way `uneven_perf` compares a chosen
+        vector to the VRAM-auto split. A number is not a result without a floor.
+
+        Scoring on ACHIEVED rather than LINK bandwidth is a deliberate, stated
+        choice: the two orderings disagree (MoEPrefetchScout measured the
+        link-proportional vector winning at the ceiling and losing at today's
+        rates, because the measured per-rank H2D is NOT proportional to link
+        width -- rank 2 is the slowest achieved despite an x8 link). The
+        link-ceiling winner is reported alongside, so the choice is visible and
+        re-measurable rather than baked in. --score-at link flips it.
+        """
+        self.candidates: List[dict] = []
+        best_key = None
+        best: Optional[Tuple[Layout, Layout, str]] = None
+        best_vec: List[int] = list(self.moe_unit_vector)
+        for vec in self.moe_candidates():
+            self._apply_moe_vector(vec)
+            chosen, reference, note = self._solve_kv()
+            ach = decode_ceiling(
+                chosen,
+                self,
+                link=False,
+                policy=self.a.residency_policy,
+                model=self.a.miss_model,
+            )
+            lnk = decode_ceiling(
+                chosen,
+                self,
+                link=True,
+                policy=self.a.residency_policy,
+                model=self.a.miss_model,
+            )
+            self.candidates.append(
+                {
+                    "units": list(vec),
+                    "intermediate": list(self.intermediate),
+                    "feasible": chosen.feasible,
+                    "tokens": chosen.tokens_global,
+                    "cold_fraction": chosen.cold_fraction,
+                    "tok_s_achieved": ach.tok_s,
+                    "tok_s_link": lnk.tok_s,
+                    "bound_rank_achieved": ach.bound_rank,
+                    "distortion": self.ratio_distortion,
+                    "binding": chosen.binding,
+                }
+            )
+            score = ach.tok_s if self.a.score_at == "achieved" else lnk.tok_s
+            key = (bool(chosen.feasible), chosen.tokens_global, score)
+            if best_key is None or key > best_key:
+                best_key, best, best_vec = key, (chosen, reference, note), list(vec)
+        self._apply_moe_vector(best_vec)
+        assert best is not None
+        return best
 
 
 # ---------------------------------------------------------------------------
@@ -1170,9 +1417,27 @@ def report(solver: Solver, chosen: Layout, reference: Layout, note: str) -> int:
         f"{solver.intermediate} from {solver.moe_units_total} indivisible "
         f"{solver.moe_unit_width}-wide units; Marlin tile floor N % "
         f"{MARLIN_N_MULTIPLE} == 0 and K % {MARLIN_K_MULTIPLE} == 0 -- "
-        f"{'OK' if marlin_ok else 'REFUSED'}; a PROPORTIONAL split would give "
-        f"{[int(g.moe_intermediate * s) for s in solver.weight_share]}, which is "
-        "upstream #37089's crash when it is not a multiple of 64)"
+        f"{'OK' if marlin_ok else 'REFUSED'}; requested share "
+        f"{[round(x, 3) for x in solver.requested_share]} vs SERVED share "
+        f"{[round(x, 3) for x in solver.served_share]}, worst-case distortion "
+        f"{solver.ratio_distortion:.1%} -- the units layer rounds and never "
+        "warns, so this is the split that happens)"
+    )
+    w(f"  units grain: {solver.moe_units_source}")
+    w(f"  units split: {solver.moe_partition_source}")
+    rt_served, rt_ok = solver.round_trip(solver.moe_unit_vector)
+    w(
+        f"  paste-ready : --rank-moe-ratio "
+        f"{','.join(map(str, solver.moe_unit_vector))}  (round-trip through the "
+        f"fork's partition_units -> {rt_served} -- "
+        f"{'VERIFIED' if rt_ok else 'DOES NOT REPRODUCE, do not use'})"
+    )
+    w(
+        f"  vs capacity : --rank-tp-ratio auto would serve MoE units "
+        f"{solver.capacity_unit_vector} (I_r "
+        f"{[u * solver.moe_unit_width for u in solver.capacity_unit_vector]}), "
+        "which is the VRAM-proportional answer and ignores which card sits on "
+        "the x4 link"
     )
     for line in marlin_notes:
         w(f"  tile check: {line}")
@@ -1297,6 +1562,46 @@ def report(solver: Solver, chosen: Layout, reference: Layout, note: str) -> int:
         "45.6% residency, i.e. the lever is WHICH experts are resident, not "
         "prefetch)"
     )
+    cands = getattr(solver, "candidates", [])
+    if cands:
+        w("")
+        w(
+            "candidate expert-slice ORDERINGS (rank order matters: rank 1 is the "
+            f"x4 card; scored at --score-at {a.score_at}):"
+        )
+        w(
+            f"  {'units':<10} {'I_r':<20} {'KV tok':>9} {'cold%':>7} "
+            f"{'tok/s ach':>10} {'tok/s link':>11}  note"
+        )
+        best_link = max(cands, key=lambda c: (c["feasible"], c["tok_s_link"]))
+        best_ach = max(cands, key=lambda c: (c["feasible"], c["tok_s_achieved"]))
+        for c in cands:
+            tags = []
+            if c["units"] == list(solver.moe_unit_vector):
+                tags.append("CHOSEN")
+            if c is best_ach:
+                tags.append("best@achieved")
+            if c is best_link:
+                tags.append("best@link")
+            if c["units"] == list(solver.capacity_unit_vector):
+                tags.append("VRAM-auto")
+            if not c["feasible"]:
+                tags.append(f"INFEASIBLE: {c['binding'][:60]}")
+            w(
+                f"  {','.join(map(str, c['units'])):<10} "
+                f"{str(c['intermediate']):<20} {c['tokens']:>9} "
+                f"{c['cold_fraction'] * 100:>6.1f}% {c['tok_s_achieved']:>10.1f} "
+                f"{c['tok_s_link']:>11.1f}  {' | '.join(tags)}"
+            )
+        if best_ach["units"] != best_link["units"]:
+            w(
+                "  CONDITIONAL: the two H2D regimes pick DIFFERENT orderings "
+                f"({','.join(map(str, best_ach['units']))} at today's achieved "
+                f"rates vs {','.join(map(str, best_link['units']))} at the link "
+                "ceiling), because the measured per-rank rates are not "
+                "proportional to link width. Re-measure after any H2D overlap "
+                "change instead of pinning this vector."
+            )
     w(f"anchor cross-check at {ANCHOR_COLD_FRACTION:.0%} cold:")
     out.extend(anchor_cross_check(solver))
     w("")
@@ -1328,11 +1633,16 @@ def report(solver: Solver, chosen: Layout, reference: Layout, note: str) -> int:
     # -- notes -----------------------------------------------------------
     w("=== NOTES ===")
     w(
-        f"  The MoE intermediate is split in {solver.moe_unit_width}-wide units, "
-        "not proportionally, because Marlin has no thread_n=64 tile: N % 128 == 0 "
-        "and K % 64 == 0, which reduces to I_r % 64 == 0. At TP1 this checkpoint "
-        f"is clean (w13 N={2 * g.moe_intermediate}, w2 K={g.moe_intermediate}); "
-        "the constraint is a property of the SPLIT, not of the model."
+        f"  The MoE intermediate is served in {solver.moe_unit_width}-wide units "
+        f"({solver.moe_units_total} of them), so every I_r is a multiple of "
+        f"{solver.moe_unit_width} and both Marlin rules (N % "
+        f"{MARLIN_N_MULTIPLE}, K % {MARLIN_K_MULTIPLE}) hold BY CONSTRUCTION -- "
+        "upstream #37089's I_r = 160 is arithmetically unemittable through "
+        f"--rank-tp-ratio. At TP1 this checkpoint is clean anyway (w13 "
+        f"N={2 * g.moe_intermediate}, w2 K={g.moe_intermediate}). The tile check "
+        "is ALSO a feasibility constraint inside the solve, so a tile-invalid "
+        "ordering can never be selected even at an overridden grain; the "
+        "invariant below is the belt-and-braces restatement."
     )
     w(
         "  The expert-offload spill scratch is now a ledger term "
@@ -1371,6 +1681,27 @@ def report(solver: Solver, chosen: Layout, reference: Layout, note: str) -> int:
             f"{chosen.cold_mass} = {got_mass}, expected {g.num_experts} x "
             f"{g.moe_intermediate} x {g.n_layers} = {expected_mass}"
         )
+    # The same identity in RAW COUNTS, which is how the acceptance criterion is
+    # worded ("hot + cold == 512 x 48"). Under tp_slice every rank holds all
+    # num_experts experts at a slice width, so the per-rank count is the one
+    # that must be exact; under ep_shard the ranks partition the set and the
+    # SUM is. Both are checked, so neither placement can hide a lost expert.
+    per_layer = [p.hot_per_layer + p.cold_per_layer for p in chosen.ranks]
+    if a.expert_placement == "tp_slice":
+        bad = [r for r, v in enumerate(per_layer) if v != g.num_experts]
+        if bad:
+            failures.append(
+                f"INVARIANT 2 BROKEN (raw counts): rank(s) {bad} do not hold all "
+                f"{g.num_experts} experts per layer -- got {per_layer}; "
+                f"x {g.n_layers} layers should be {g.expert_slots} slots on "
+                "every rank"
+            )
+    elif sum(per_layer) != g.num_experts:
+        failures.append(
+            f"INVARIANT 2 BROKEN (raw counts): the ranks partition "
+            f"{sum(per_layer)} experts per layer, expected {g.num_experts} "
+            f"({g.expert_slots} slots over {g.n_layers} layers)"
+        )
     if not marlin_ok:
         failures.append(
             "INVARIANT 3 BROKEN: the emitted MoE intermediate vector has no "
@@ -1399,7 +1730,9 @@ def report(solver: Solver, chosen: Layout, reference: Layout, note: str) -> int:
         )
         w(
             f"  INVARIANT 3 OK: every rank's I_r clears N % {MARLIN_N_MULTIPLE} "
-            f"== 0 and K % {MARLIN_K_MULTIPLE} == 0"
+            f"== 0 and K % {MARLIN_K_MULTIPLE} == 0 (enforced as a feasibility "
+            "constraint in the solve, so a tile-invalid candidate is REFUSED "
+            "before it can be scored -- see the candidate table)"
         )
         w(f"  VERDICT: {'ACCEPTED' if ok else 'ACCEPTED BELOW TARGET'} ({note})")
 
@@ -1472,7 +1805,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--expert-placement", choices=EXPERT_PLACEMENTS, default="tp_slice"
     )
-    ap.add_argument("--moe-unit-width", type=int, default=MOE_UNIT_WIDTH)
+    ap.add_argument(
+        "--moe-units",
+        type=int,
+        default=None,
+        help="override the expert-intermediate unit COUNT. Default: whatever "
+        "the fork's own moe_uneven_tp_units() returns for this checkpoint.",
+    )
+    ap.add_argument(
+        "--no-derive-moe-units",
+        dest="derive_moe_units",
+        action="store_false",
+        default=True,
+        help="do not import the fork to derive the unit grain (uses the "
+        "labelled UNVERIFIED fallback instead).",
+    )
     ap.add_argument(
         "--moe-scratch-slots",
         type=int,
@@ -1499,6 +1846,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "policy=equal (81.7%%).",
     )
     ap.add_argument("--max-cold-fraction", type=float, default=None)
+    ap.add_argument(
+        "--score-at",
+        choices=("achieved", "link"),
+        default="achieved",
+        help="which H2D figure the OUTER solve scores expert-slice orderings "
+        "on. 'achieved' is today's measured 3.04/1.92/1.74 GB/s; 'link' is the "
+        "14.42/6.47/13.33 ceiling. The two disagree about the best ordering, so "
+        "the choice is explicit and both are always reported.",
+    )
     ap.add_argument("--mtp", action="store_true", default=True)
     ap.add_argument("--no-mtp", dest="mtp", action="store_false")
     ap.add_argument("--vision", action="store_true", default=True)
@@ -1539,10 +1895,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if geom.moe_intermediate % a.moe_unit_width:
+    if a.moe_units and geom.moe_intermediate % a.moe_units:
         print(
-            f"--moe-unit-width {a.moe_unit_width} does not divide the "
-            f"intermediate {geom.moe_intermediate}",
+            f"--moe-units {a.moe_units} does not divide the intermediate "
+            f"{geom.moe_intermediate}",
             file=sys.stderr,
         )
         return 2

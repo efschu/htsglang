@@ -124,7 +124,151 @@ def _tier_experts_for_offload(layer: torch.nn.Module, scheme: str) -> None:
     )
 
 
+#: Trigger for the sign-balance invariant below, in units of the mean group
+#: scale. DERIVED, not tuned: asymmetric pack-quantized int4 stores q in [0,15]
+#: with W = s*(q - z), and for a roughly zero-centred trained weight z sits near
+#: the midpoint, so dropping z biases EVERY output channel by ~7.5 scale units
+#: while a correct dequant leaves ~0. Two independent measurements bracket it:
+#:   * real tensors (this checkpoint, layer 0 / expert 0 / gate_proj, read from
+#:     the safetensors): correct 0.778 scale units, zero-points-dropped 9.732.
+#:   * synthetic asymmetric int4, uniform codes with per-group zp in [6,10]
+#:     (credit QSAImpl, independent route): correct 0.491, dropped 7.504 --
+#:     i.e. the predicted (2^3 - 0.5) to three digits, so this has a closed
+#:     form rather than an empirical fit.
+#: 2.5 is the max-margin point on a log scale across BOTH routes: 3.2x above
+#: the worst correct case (0.778) and 3.0x below the best dropped case (7.504).
+#: The trigger is deliberately |mean|-in-scales and NOT percent-positive --
+#: |mean| separates by ~15x, percent-positive only ~2.1x (43.9/95.7 vs
+#: 93.7/95.7), so the latter is reported as corroboration, never as the test.
+#: DO NOT tighten this toward the idealised 7.5. On the real FUSED w13 (1280
+#: output channels, the shape the check actually samples) the measured pair is
+#: correct 0.827 / dropped 12.267 -- a 14.8x separation against the 15.3x the
+#: closed form predicts. The dropped case reads HIGHER than 7.5 because real
+#: code distributions are not uniform, which is the SAFE direction; "correcting"
+#: 12.267 down to 7.5 on the strength of the derivation would shrink the
+#: false-alarm margin that protects a correct boot. Credit QSAImpl for catching
+#: that this footgun needed writing down next to the constant.
+_ASYM_ZP_MEAN_TOLERANCE_SCALES = 2.5
+
+
+def _unpack_int4(packed: torch.Tensor, dim: int) -> torch.Tensor:
+    """Unpack 8 unsigned int4 nibbles per int32 word along ``dim``.
+
+    Nibble ``i`` occupies bits ``4i..4i+3`` (compressed-tensors pack order).
+    """
+    shifts = torch.arange(8, dtype=torch.int64, device=packed.device) * 4
+    words = packed.to(torch.int64).movedim(dim, -1).unsqueeze(-1)
+    return ((words >> shifts) & 0xF).flatten(-2).movedim(-1, dim)
+
+
+def _assert_asymmetric_zero_points_usable(scheme, layer: torch.nn.Module) -> None:
+    """#1036 load-time invariants for an ASYMMETRIC (``symmetric: false``)
+    compressed-tensors WNA16 MoE checkpoint. No-op for a symmetric one.
+
+    TWO invariants that catch DIFFERENT failures. Neither subsumes the other,
+    and neither subsumes the parse-time ``--moe-runner-backend`` refusal (which
+    fails earliest and with the clearest operator message):
+
+    1. CONSUMPTION (structural, free, and the ONLY one that covers ROCm).
+       The concrete scheme class must DECLARE that its apply path reads the
+       per-expert zero points. Read from the class's OWN ``__dict__``, so a new
+       subclass that declares nothing is REFUSED BY DEFAULT instead of
+       inheriting a permissive answer -- the same polarity as the expert-offload
+       admission gate, and for the same reason: silent admission is the defect
+       class. ``CompressedTensorsWNA16TritonMoE`` declares ``False`` because
+       ``get_triton_quant_info`` builds ``TritonMoeQuantInfo`` with no zero
+       point argument at all, so an asymmetric checkpoint on that lane computes
+       ``W = s*q``. A flag refusal cannot reach that case on ROCm, where
+       ``get_moe_scheme`` routes to the Triton scheme unconditionally and there
+       is no flag value to refuse.
+
+    2. SIGN BALANCE (numerical, sampled). Proves the zero points actually
+       LOADED and carry real per-group values; a failed round-trip yields
+       plausible weights and no crash. Samples ONE expert and MUST run BEFORE
+       the marlin repack: pre-repack the layout is the plain
+       ``[E, K/pack, N]`` / ``[E, K/group, N]`` / ``[E, K/group, N/pack]``
+       triple, whereas inverting the marlin permutation afterwards would mean
+       reimplementing marlin dequant -- and a wrong inverse would raise false
+       alarms on a CORRECT build, which is worse than no check at all. The
+       check carries its own proof of correct unpacking: only the right nibble
+       and transpose convention yields a per-channel mean near zero.
+    """
+    if getattr(scheme, "sym", True):
+        return
+
+    declared = type(scheme).__dict__.get("CONSUMES_WEIGHT_ZERO_POINTS")
+    if declared is not True:
+        raise ValueError(
+            f"{type(scheme).__name__} is being used for a compressed-tensors "
+            f"checkpoint with symmetric=false, but it does not declare "
+            f"CONSUMES_WEIGHT_ZERO_POINTS = True. Its apply path therefore "
+            f"either ignores the per-expert zero points -- computing W = s*q "
+            f"instead of W = s*(q - z), which is silently wrong output rather "
+            f"than a crash -- or has never been checked. Declare that "
+            f"attribute on the class ONLY after confirming its quant-info "
+            f"builder passes the zero points to the kernel; naming it without "
+            f"that is how a corrupt lane gets admitted. Otherwise select a "
+            f"lane that does read them (--moe-runner-backend auto selects the "
+            f"Marlin path, which reads w13/w2_weight_zero_point)."
+        )
+
+    packed = getattr(layer, "w13_weight_packed", None)
+    scales = getattr(layer, "w13_weight_scale", None)
+    zeros = getattr(layer, "w13_weight_zero_point", None)
+    if packed is None or scales is None or zeros is None or scheme.num_bits != 4:
+        return  # nothing to sample, or not the int4 layout this check knows
+    q = _unpack_int4(packed[0].data, 0).float()  # [K, N], codes 0..15
+    z = _unpack_int4(zeros[0].data, 1).float()  # [K/group, N]
+    s = scales[0].data.float()  # [K/group, N]
+    if q.shape[0] % s.shape[0] or z.shape != s.shape or q.shape[1] != s.shape[1]:
+        return  # unexpected geometry: not this check's business to guess
+    reps = q.shape[0] // s.shape[0]
+    dequant = s.repeat_interleave(reps, 0) * (q - z.repeat_interleave(reps, 0))
+    scale_unit = s.mean().abs().item()
+    if scale_unit <= 0:
+        return
+    worst = (dequant.mean(0).abs().max() / scale_unit).item()
+    positive = (dequant > 0).float().mean().item()
+    # EXECUTION-PROOF INSTRUMENT (#1036). counter = worst per-output-channel
+    # mean bias in units of the mean group scale; denominator = the tolerance
+    # it is judged against. A boot log without this line ran no invariant.
+    logger.info(
+        "[moe-asym-zp] %s layer=%s sign-balance %.3f/%.1f scale units over %d "
+        "output channels (%.1f%% positive; int%d group=%s)",
+        type(scheme).__name__,
+        getattr(layer, "layer_id", None),
+        worst,
+        _ASYM_ZP_MEAN_TOLERANCE_SCALES,
+        dequant.shape[1],
+        100.0 * positive,
+        scheme.num_bits,
+        scheme.group_size,
+    )
+    if worst > _ASYM_ZP_MEAN_TOLERANCE_SCALES:
+        raise ValueError(
+            f"Asymmetric int{scheme.num_bits} MoE weights on layer "
+            f"{getattr(layer, 'layer_id', None)} are not sign-balanced: the "
+            f"worst per-output-channel mean is {worst:.3f} group-scale units "
+            f"(tolerance {_ASYM_ZP_MEAN_TOLERANCE_SCALES}), with "
+            f"{100.0 * positive:.1f}% of weights positive. A trained weight "
+            f"matrix dequantizes to a near-zero per-channel mean and roughly "
+            f"balanced signs; a bias near half the int{scheme.num_bits} range "
+            f"with almost every weight positive means the zero points were not "
+            f"applied -- either they failed to load into "
+            f"w13_weight_zero_point, or this checkpoint is not actually "
+            f"asymmetric. Computing W = s*q instead of W = s*(q - z) yields "
+            f"plausible-looking but wrong logits, not a crash."
+        )
+
+
 class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
+
+    #: #1036: does this scheme's apply path READ the per-expert zero points?
+    #: True here because ``get_marlin_quant_info`` passes
+    #: ``w13_qzeros=layer.w13_weight_zero_point if not self.sym`` (and the w2
+    #: equivalent) into ``fused_marlin_moe``. Declared per-class rather than
+    #: inherited -- see _assert_asymmetric_zero_points_usable invariant 1.
+    CONSUMES_WEIGHT_ZERO_POINTS = True
 
     def __init__(
         self,
@@ -347,6 +491,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # Skip if the layer is already converted to Marlin format to prevent double-packing.
         if getattr(layer, "is_marlin_converted", False):
             return
+
+        # #1036: asymmetric checkpoints must reach a lane that reads the zero
+        # points, and the zero points must have loaded. BEFORE the repack --
+        # the sign-balance check needs the pre-marlin layout.
+        _assert_asymmetric_zero_points_usable(self, layer)
 
         if not hasattr(layer, "_original_shapes"):
             layer._original_shapes = {}
@@ -576,9 +725,27 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     instead of the Marlin-specific format.
     """
 
+    #: #1036: FALSE, and this is a real defect rather than an omission --
+    #: ``get_triton_quant_info`` below builds ``TritonMoeQuantInfo`` with
+    #: ``use_int4_w4a16=True`` and w13/w2 scales but NO zero-point argument at
+    #: all, so on a ``symmetric: false`` checkpoint this lane computes
+    #: W = s*q rather than W = s*(q - z). Measured on real tensors (this
+    #: checkpoint, layer 0 / expert 0 / gate_proj): that moves the
+    #: per-output-channel mean from ~0 to ~7.5 group-scale units and makes
+    #: 95.7% of weights positive instead of 45.1%, i.e. plausible-looking but
+    #: wrong logits with no crash. Overriding this to True without first
+    #: threading zero points into TritonMoeQuantInfo would ADMIT that lane, not
+    #: fix it. Symmetric checkpoints are unaffected and still work here.
+    CONSUMES_WEIGHT_ZERO_POINTS = False
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "is_triton_converted", False):
             return
+
+        # #1036: refuses an asymmetric checkpoint on this lane (it drops the
+        # zero points) -- including on ROCm, where get_moe_scheme routes here
+        # unconditionally and there is no flag value to refuse.
+        _assert_asymmetric_zero_points_usable(self, layer)
 
         num_experts = layer.w13_weight_packed.shape[0]
 

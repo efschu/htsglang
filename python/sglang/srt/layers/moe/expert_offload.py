@@ -2422,7 +2422,11 @@ def assert_expert_offload_quant_supported(
             f"load-time half (call presplit_expert_offload_after_repack at the "
             f"end of its process_weights_after_loading, as awq_moe.py, "
             f"gptq_moe.py and fp8.py do) and add its per-expert tensor names "
-            f"to MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS, or leave "
+            f"to MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS -- but ONLY if this "
+            f"scheme's KERNEL actually reads every tensor you add (see the "
+            f"note on EXPERT_TENSOR_ATTRS): naming a tensor the apply path "
+            f"ignores makes this gate ADMIT a lane that is already "
+            f"numerically wrong. Otherwise leave "
             f"--moe-resident-expert-fraction at 1.0 for this checkpoint."
         )
     # EXECUTION-PROOF INSTRUMENT (#1036), one line per admitted MoE layer.
@@ -2802,6 +2806,31 @@ class MoEExpertOffloadCache:
         "w2_weight_packed",
         "w13_weight_zero_point",
         "w2_weight_zero_point",
+        # NECESSARY CONDITION FOR ADDING A NAME HERE, because the refusal
+        # message in assert_expert_offload_quant_supported points a future
+        # reader at this tuple and the naive edit is a trap (#1036):
+        # a name belongs here only if the scheme's APPLY path actually READS
+        # that tensor. This tuple is what the admission gate's coverage check
+        # counts, so adding a name the kernel ignores does not make a lane
+        # correct -- it makes the gate ADMIT a lane that was already wrong.
+        # Two live examples, both verified at pin 2e92024a4d:
+        #   * ``w13/w2_weight_offset`` (compressed_tensors_wNa16_moe.py:672,
+        #     :684) belongs to NPUCompressedTensorsW4A16Int4DynamicMoE:571,
+        #     reachable only through the ``_is_npu`` branch of get_moe_scheme
+        #     (compressed_tensors.py:909-915). Deliberately NOT listed: on
+        #     CUDA the name never appears, and on NPU nothing tiers it, so
+        #     the coverage check refuses that layer loudly and names the
+        #     tensor -- which is the correct outcome, not a gap to paper over.
+        #   * ``CompressedTensorsWNA16TritonMoE.get_triton_quant_info``
+        #     (:545-555) passes NO zero points to the int4_w4a16 triton
+        #     kernel. On a ``symmetric: false`` checkpoint that lane is
+        #     numerically wrong BEFORE any offload (measured: dequantizing one
+        #     expert both ways moves the per-output-channel mean from ~0 to
+        #     ~7.5x scale and makes every channel positive). Staging its zero
+        #     points is still right -- they are expert-major payload and the
+        #     Marlin sibling does read them -- but it does NOT fix that lane.
+        #     Use the Marlin lane: ``--moe-runner-backend`` must not be
+        #     ``triton`` for this checkpoint (default ``auto`` selects Marlin).
     )
 
     #: #1036: does ``_fetch`` join the copy stream back into the compute stream

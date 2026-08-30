@@ -148,16 +148,48 @@ def main() -> int:
     constructed = False
     missing: list[tuple[str, str]] = []
     try:
+        import os
+        import tempfile
+
         import torch
 
         sys.path.insert(0, "python")
+
+        # sglang's layers read the parallel state at construction time, so a
+        # 1-rank group must exist before the model is built. gloo over a file://
+        # rendezvous keeps this CPU-only and PORTLESS: no CUDA context, no
+        # sockets, nothing that could disturb a running serving boot.
+        from sglang.srt.distributed import (
+            init_distributed_environment,
+            initialize_model_parallel,
+        )
+
+        rdzv = os.path.join(tempfile.mkdtemp(prefix="qwen4_contract_"), "rdzv")
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"file://{rdzv}",
+            local_rank=0,
+            backend="gloo",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=1)
+
         from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
         from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+        from sglang.srt.runtime_context import lane_scope
+        from sglang.srt.server_args import ServerArgs
 
         config = Qwen4ExpConfig(**raw_config)
-        with torch.device("meta"):
-            model = Qwen4ExpForConditionalGeneration(config)
-        param_names = set(dict(model.named_parameters()))
+        # The model reads get_server_args() while building. `lane_scope` installs
+        # an OVERLAY in a context variable rather than overwriting the process-wide
+        # slot -- the fork's own idiom, documented as the replacement for the legacy
+        # set_server_args swap and as the path tests use. Nothing a concurrent
+        # serving group could observe.
+        server_args = ServerArgs(model_path=args.config)
+        with lane_scope(None, server_args):
+            with torch.device("meta"):
+                model = Qwen4ExpForConditionalGeneration(config)
+            param_names = set(dict(model.named_parameters()))
         constructed = True
         print(f"\nCONSTRUCTED on meta: {len(param_names)} parameters")
 
