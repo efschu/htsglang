@@ -1738,11 +1738,26 @@ class HiCacheFile(HiCacheStorage):
         if final_pages != kv_pages:
             self._1028b_n = getattr(self, "_1028b_n", 0) + 1
             if self._1028b_n <= 40 or self._1028b_n % 256 == 0:
+                # `lost` is the REALISED loss of this claim: pages that exist
+                # in storage and were given up. It is the quantity the
+                # no-double-prefill law (#939) bounds at ONE chunk, so it is
+                # printed as a number rather than left to be subtracted by
+                # whoever reads the line.
+                #
+                # NOTE FOR THE READER OF `caps`: an empty dict does NOT mean
+                # "no component cap applied". `hit_count[name]` is only
+                # assigned `if boundary`, so a component whose boundary came
+                # out 0 -- the total-miss case, which is exactly the one that
+                # zeroes the claim -- leaves NO entry behind. Empty caps next
+                # to final=0 therefore means "a component found no anchor in
+                # this span at all", the opposite of "nothing capped it".
                 logger.warning(
-                    "#1028B FETCH CAP n=%d: kv=%d final=%d caps=%s keys=%d",
+                    "#1028B FETCH CAP n=%d: kv=%d claimed=%d lost=%d caps=%s "
+                    "keys=%d",
                     self._1028b_n,
                     kv_pages,
                     final_pages,
+                    kv_pages - final_pages,
                     {k: v for k, v in hit_count.items() if k != PoolName.KV},
                     len(keys),
                 )

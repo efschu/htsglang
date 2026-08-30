@@ -4829,8 +4829,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         instrument, and a nonzero count there next to a divergent `n` here is
         the divergence, named in advance.
         """
+        # PER-RANK, NOT PER-INSTANCE. The first version of this counter was
+        # `self._chunk_publish_n`, and that made it useless for the one job it
+        # was built for: a rank runs SEVERAL UnifiedRadixCache instances (the
+        # PP stack, the TP stack, the flip stacks), so the counter reset per
+        # instance and the log filled with `n=1` lines. Boot 1 printed 4/4/4
+        # across the ranks and that LOOKED like the unanimity proof; it was a
+        # line-count coincidence, and boot 2 printed 7/6/6 from the same
+        # healthy state. A class attribute is per PROCESS, and one process is
+        # one rank, which is the population the `raenge-nie-uneins` check
+        # actually asks about. Same shape as the `#969H` probe, which is why
+        # that one could carry its claim and this one could not.
+        n = getattr(type(self), "_chunk_publish_n_rank", 0) + 1
+        type(self)._chunk_publish_n_rank = n
         self._chunk_publish_n += 1
-        n = self._chunk_publish_n
         if n <= 40 or n % 256 == 0:
             logger.warning(
                 "#1028P CHUNK-PUBLISH n=%d: publishing a chunked-prefill node "
