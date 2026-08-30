@@ -298,6 +298,43 @@
     t.ok(!shared.isEnhanceUrl(url, "http://other:8100"), "different server is not ours");
   });
 
+  test("sr_only upscales without asking for interpolation", function (t) {
+    // The mode a viewer picks as "upscale": geometry changes, the frame rate
+    // does not. fps_multiplier=1 is what the chain builder reads as "no RIFE
+    // stage", so the request costs no interpolation memory.
+    var url = shared.buildEnhanceUrl(
+      { serverUrl: "http://127.0.0.1:8100", preset: "sr_only", target: "3840x2160" },
+      { sourceUrl: "https://cdn.test/a.mp4", width: 1920, height: 1080 },
+      "ext-abc"
+    );
+    var q = params(url);
+    t.equal(q.target, "3840x2160");
+    t.equal(q.enable_sr, "true");
+    t.equal(q.sr_scale, "4");
+    t.equal(q.fps_multiplier, "1");
+  });
+
+  test("the three presets are the three modes, and they differ", function (t) {
+    // upscale / interpolate / both, as three distinct requests. A preset that
+    // silently produced the same URL as another would be a menu entry that
+    // lies about what it does.
+    var source = { sourceUrl: "https://cdn.test/a.mp4", width: 1920, height: 1080 };
+    var seen = {};
+    ["sr_only", "rife_only", "full_chain"].forEach(function (preset) {
+      var q = params(
+        shared.buildEnhanceUrl(
+          { serverUrl: "http://s", preset: preset, target: "3840x2160" },
+          source,
+          null
+        )
+      );
+      seen[preset] = q.target + "|" + q.enable_sr + "|" + q.fps_multiplier;
+    });
+    t.equal(seen.sr_only, "3840x2160|true|1");
+    t.equal(seen.rife_only, "1920x1080|false|2");
+    t.equal(seen.full_chain, "3840x2160|true|2");
+  });
+
   test("a generated job id is within the server's accepted alphabet", function (t) {
     for (var i = 0; i < 50; i++) {
       var id = shared.makeJobId();

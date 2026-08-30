@@ -78,15 +78,36 @@ There is no `content_scripts` block and no standing `host_permissions`.
 Nothing runs on any page until you click the action, and the extension can
 reach exactly one server: the one you granted.
 
+## The three modes
+
+A viewer can ask for three things, and the chain preset is how they ask:
+
+| Mode | Preset | What the server runs | Geometry | Frame rate |
+|---|---|---|---|---|
+| Upscale | `sr_only` | x4 super-resolution, then resize to target | changed | unchanged |
+| Interpolate | `rife_only` | RIFE only | unchanged | doubled |
+| Both | `full_chain` | SR, resize, then RIFE | changed | doubled |
+
+The names are the server's own `CHAIN_PRESETS`, not a client-side vocabulary,
+so the string a viewer picks here is the string a measurement row is filed
+under. `sr_only` carries `fps_multiplier: 1`, which the chain builder reads as
+"no RIFE stage" — the preset costs no interpolation memory and needs no RIFE
+engine, which is why it is its own name rather than `full_chain` with the
+multiplier turned down.
+
+The mode is chosen in the options page, not per click: the action is a toggle,
+and a toggle that also had to ask "which mode?" would need a popup, and a
+popup would replace the single click that is the whole point of the component.
+
 ## Settings
 
 | Setting | Meaning |
 |---|---|
 | Server URL | Base URL of the video-enhance server, e.g. `http://127.0.0.1:8100`. |
-| Chain preset | `rife_only` (interpolation only, source resolution kept) or `full_chain` (x4 SR, resize to target, then interpolation). |
+| Chain preset | One of the three modes above. |
 | Target resolution | Only used by presets that change geometry. `rife_only` ignores it. |
 | Interpolation flow scale | RIFE's optical-flow scale. `0.5` is the 4K headroom arm, `1.0` full quality. |
-| Start / Duration | Optional time range in seconds, passed as `start_s` / `duration_s`. |
+| Start / Duration | Optional time range in seconds, passed as `start_s` / `duration_s`. This is the only seek there is; see below. |
 
 **Test server** in the options page calls `GET /v1/video/capabilities` and
 prints what that deployment reports: its presets, its budget, and its
@@ -143,15 +164,54 @@ plausible-looking `src` is present.
 4. The element's `src` is replaced with the enhance URL, child `<source>`
    elements are removed (they would win over the attribute on `load()`), and
    playback starts.
-5. A second click restores the original source, seeks back to where you were,
+5. The swap is watched, not assumed — see below. On the first decoded frame a
+   notice appears over the video saying enhancement is on and that seeking is
+   not available.
+6. A second click restores the original source, seeks back to where you were,
    and sends `DELETE /v1/video/enhance/{job_id}`.
-6. Closing the tab or navigating away sends the same `DELETE`.
+7. Closing the tab or navigating away sends the same `DELETE`.
 
 The `DELETE` is the polite path, not the safety net. The server's client
 liveness layer reclaims a stream whose consumer went quiet, but its
 `video_stream` timeout is 300 s, because a paused player is a normal thing. A
 client that *knows* the viewer is gone should say so, and then the card is
 free in milliseconds.
+
+## When the engine is not there
+
+Step 4 above points a `<video>` element at a URL that may produce nothing:
+the server can be down, refuse the job, or die mid-stream. The page's own
+player has no idea why, and a black frame with no explanation is worse than
+not enhancing at all — so the swap is provisional until a frame arrives.
+
+`watchStream` in `src/content.js` arms two failure signals, because a dead
+engine produces one or the other depending on how it is dead:
+
+* an `error` event on the element — a refused connection, a 503, or a body
+  that is not a decodable stream; and
+* silence — a socket that accepts and then never writes, caught by a
+  12-second first-frame timer.
+
+`loadeddata`, the first decoded frame, is the success signal and disarms both.
+On either failure the original source is put back, the position and play state
+are restored, a notice naming the reason is shown over the video, and the
+background is told so the badge stops claiming `ON` and the job is cancelled.
+
+## Seeking
+
+There is none, and the extension says so rather than letting you find out.
+
+The enhanced response is a chunked live body with no byte index, so the
+element cannot honour the scrub bar; browsers differ in whether they fire
+`seeking` for an unreachable position or silently clamp it. The notice shown
+on the first frame therefore states the limitation unconditionally, and a
+`seeking` handler snaps the position back and repeats it where the event does
+fire.
+
+What the endpoint *does* have is a time range: `start_s` and `duration_s`,
+the #338 API extension, surfaced as **Start / Duration** in the options page.
+Enhancing a different stretch of the source is a new request, not a seek
+within an existing stream.
 
 ## Server requirements
 
@@ -183,14 +243,52 @@ cd clients/browser-extension
 node test/run.js
 ```
 
-Everything else is **manual**. There is no browser CI harness in this repo.
-
 `test/registered/video_enhance/test_browser_extension.py` runs in the normal
 Python suite and covers what can rot silently across the language boundary:
 the manifests parse and agree, the permission set has not widened, every
 referenced file exists, the chain presets in `src/shared.js` match the
-server's `CHAIN_PRESETS` exactly, the query-parameter names are ones the
-endpoint accepts, and the generated job ids pass the server's validator.
+server's `CHAIN_PRESETS` exactly, the three presets are three distinguishable
+modes, the query-parameter names are ones the endpoint accepts, the generated
+job ids pass the server's validator, and the fallback path's two halves — the
+message `content.js` sends and the handler `background.js` registers — still
+name the same string.
+
+### End-to-end, in a real browser
+
+There is an end-to-end acceptance run, and it lives outside this repository
+because it needs a browser binary and an engine that CI has neither of:
+
+```bash
+cd /spinning/video-extension/acceptance
+python3 run.py            # ~20 s, writes evidence/run-<stamp>/report.json
+```
+
+It loads *this* extension unpacked into Chrome, serves a generated clip over
+HTTP, points the extension at the shared pseudo-engine, and asserts through
+CDP: the action is present, each of the three modes posts the request its
+label promises, the enhanced stream decodes at the promised geometry and
+plays, a saved sample's ffprobe numbers match, a second click and a tab close
+tear a running engine job down (read back out of the engine's request log),
+the time range is honoured, and an unreachable or refusing engine leaves the
+original video playing with a notice.
+
+Two things it does not prove, stated because they are easy to imply:
+
+* **The toolbar click itself.** The toolbar is browser chrome and no
+  automation protocol can click it. The harness calls the function the click
+  listener is registered with (`self.enhanceToggleTab`), inside the real
+  service worker, against a real tab. Everything downstream of that call is
+  the production path; Chrome's delivery of the click event to the listener is
+  not exercised.
+* **The permission gestures.** `activeTab` comes from that click and the
+  server origin from the options page's permission prompt; neither gesture
+  exists under CDP, so the harness loads a copy of the extension with
+  `host_permissions` for `127.0.0.1` added, and records the difference in its
+  report. The shipped manifest is unchanged, and the registered Python test
+  fails if it ever grows a standing host permission.
+
+Firefox is not covered by the harness. The manual steps below are the Firefox
+story.
 
 ### Manual test steps (Chrome and Firefox)
 
@@ -224,8 +322,12 @@ manifests. None of it is automated.
 
 ### Known gaps
 
-* No end-to-end browser proof is recorded in this repo. Steps 1-10 above have
-  not been run by CI and are not claimed as passing.
+* Firefox has no automated end-to-end proof; the harness drives Chrome only.
+  The manual steps above are the Firefox coverage.
+* The manual steps have not been run by CI and are not claimed as passing;
+  what *is* claimed as passing is the acceptance run above, against the
+  pseudo-engine. The real engine on the rig is a change of the server URL and
+  nothing else, and has not been exercised from this harness.
 * mpv and VLC integrations are a separate task. They need nothing from this
   extension — they open the same URL.
 * MSE re-encapsulation, which is the only route to YouTube-class sources, is

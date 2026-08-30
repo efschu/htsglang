@@ -77,11 +77,20 @@ if (typeof importScripts === "function" && !self.EnhanceShared) {
     return record;
   }
 
-  api.action.onClicked.addListener(function (tab) {
+  /**
+   * What a click on the toolbar button does.
+   *
+   * A named function rather than an inline listener, and published on the
+   * worker's global below, because the toolbar button is browser chrome: no
+   * automation protocol can click it, so an end-to-end acceptance run has no
+   * other way to exercise the real path through the real service worker. The
+   * listener and the acceptance run call the same function with the same tab.
+   */
+  function toggleTab(tab) {
     if (!tab || tab.id === undefined) {
-      return;
+      return Promise.resolve();
     }
-    loadSettings().then(function (settings) {
+    return loadSettings().then(function (settings) {
       return api.scripting
         .executeScript({
           target: { tabId: tab.id },
@@ -95,7 +104,7 @@ if (typeof importScripts === "function" && !self.EnhanceShared) {
         })
         .then(function (result) {
           if (!result) {
-            return;
+            return null;
           }
           if (result.action === "enhanced") {
             active[tab.id] = {
@@ -113,13 +122,18 @@ if (typeof importScripts === "function" && !self.EnhanceShared) {
             // permission; the title text is where the reason lands.
             console.warn("[video-enhance] not eligible:", result.reason);
           }
+          return result;
         })
         .catch(function (err) {
           setBadge(tab.id, "!", String(err && err.message ? err.message : err));
           console.warn("[video-enhance] toggle failed:", err);
+          return null;
         });
     });
-  });
+  }
+
+  api.action.onClicked.addListener(toggleTab);
+  self.enhanceToggleTab = toggleTab;
 
   api.tabs.onRemoved.addListener(function (tabId) {
     cancelJob(forget(tabId));
@@ -136,9 +150,27 @@ if (typeof importScripts === "function" && !self.EnhanceShared) {
   });
 
   api.runtime.onMessage.addListener(function (message, sender, sendResponse) {
+    if (!message) {
+      return false;
+    }
+    // The content script reports a swap that never produced a frame. It has
+    // already put the original source back and told the viewer; what is left
+    // is this side's bookkeeping -- the badge stops claiming ON, and the job
+    // is cancelled so a server that did accept it stops working on a stream
+    // nobody is reading.
+    if (message.type === "enhance-failed") {
+      var tabId = sender && sender.tab ? sender.tab.id : undefined;
+      if (tabId !== undefined) {
+        forget(tabId);
+        setBadge(tabId, "!", "Enhancement failed: " + message.reason);
+      }
+      cancelJob({ jobId: message.jobId, serverUrl: message.serverUrl });
+      console.warn("[video-enhance] fell back to the original:", message.reason);
+      return false;
+    }
     // The options page asks the background to probe a server, because the
     // optional host permission is granted to the extension, not to a page.
-    if (!message || message.type !== "probe-capabilities") {
+    if (message.type !== "probe-capabilities") {
       return false;
     }
     fetch(shared.buildCapabilitiesUrl(message.serverUrl, message.query || {}))

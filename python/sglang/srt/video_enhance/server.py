@@ -137,14 +137,29 @@ _PREVIEW_MEDIA_TYPE: dict[str, str] = {
 
 
 #: The chain configurations a client picks between by name. The browser
-#: extension (``clients/browser-extension``) offers exactly these two, and the
-#: capability endpoint reports both, so the name a user selects in a settings
-#: page and the name a measurement row is filed under are the same string.
+#: extension (``clients/browser-extension``) offers exactly these three, and
+#: the capability endpoint reports all of them, so the name a user selects in
+#: a settings page and the name a measurement row is filed under are the same
+#: string.
 #:
-#: ``full_chain`` is super-resolution followed by interpolation;
-#: ``rife_only`` is interpolation alone, which is the cheap arm and the one
-#: that sustains 4K (see docs/dev/TASK_333_M2_MEASUREMENTS.md).
+#: The three are the three things a viewer can ask for, and each one names
+#: exactly the stages it runs: ``sr_only`` is super-resolution and resize with
+#: the source frame rate kept; ``rife_only`` is interpolation alone, which is
+#: the cheap arm and the one that sustains 4K (see
+#: docs/dev/TASK_333_M2_MEASUREMENTS.md); ``full_chain`` is both.
+#:
+#: ``sr_only`` carries ``fps_multiplier: 1``, which the chain builder reads as
+#: "no RIFE stage" (``chain.py``), so the preset costs no interpolation memory
+#: and no RIFE engine -- the reason it is worth having as its own name rather
+#: than as ``full_chain`` with the multiplier turned down.
 CHAIN_PRESETS: dict[str, dict] = {
+    "sr_only": {
+        "enable_sr": True,
+        "sr_scale": 4,
+        "enable_resize": True,
+        "fps_multiplier": 1,
+        "description": "x4 super-resolution and resize to target; source frame rate preserved",
+    },
     "rife_only": {
         "enable_sr": False,
         "enable_resize": False,

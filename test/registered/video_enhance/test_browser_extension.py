@@ -157,6 +157,78 @@ class PresetContractTest(CustomTestCase):
         options = (ROOT / "src" / "options.js").read_text()
         self.assertIn("shared.CHAIN_PRESETS", options)
 
+    def test_the_presets_cover_upscale_interpolate_and_both(self):
+        """Three modes, each one distinguishable from the other two.
+
+        Asserted on the flags rather than on the names, so a preset that was
+        renamed still counts and a preset whose flags were quietly changed
+        into a duplicate of another does not. A menu entry that produces the
+        same request as its neighbour is a menu entry that lies.
+        """
+        shapes = {
+            name: (
+                bool(preset.get("enable_sr") or preset.get("enable_resize")),
+                int(preset.get("fps_multiplier", 1)) > 1,
+            )
+            for name, preset in CHAIN_PRESETS.items()
+        }
+        self.assertEqual(
+            sorted(shapes.values()),
+            sorted([(True, False), (False, True), (True, True)]),
+            f"expected upscale / interpolate / both, got {shapes}",
+        )
+
+
+class FallbackContractTest(CustomTestCase):
+    """The engine-unreachable path spans two files and one message name.
+
+    The content script puts the original source back and posts a message; the
+    background clears the badge and cancels the job. Nothing in either file
+    fails to load if the two names drift apart -- the swap simply stops being
+    undone, and the viewer is left with a black player. That is the failure
+    this test exists to make loud.
+    """
+
+    MESSAGE = "enhance-failed"
+
+    def _read(self, name: str) -> str:
+        return (ROOT / "src" / name).read_text()
+
+    def test_the_content_script_reports_a_swap_that_produced_no_frame(self):
+        content = self._read("content.js")
+        self.assertIn(f'type: "{self.MESSAGE}"', content)
+        # The report is worth nothing if the element was not put back first.
+        self.assertIn("restore(el)", content)
+
+    def test_the_background_handles_the_report_the_content_script_sends(self):
+        background = self._read("background.js")
+        self.assertIn(f'message.type === "{self.MESSAGE}"', background)
+        self.assertIn("cancelJob(", background)
+
+    def test_the_swap_is_watched_for_both_kinds_of_dead_engine(self):
+        """An error event covers a refusal; a timer covers a socket that hangs."""
+        content = self._read("content.js")
+        self.assertIn('addEventListener("error"', content)
+        self.assertIn("FIRST_FRAME_TIMEOUT_MS", content)
+        # loadeddata is the success signal that disarms both.
+        self.assertIn('addEventListener("loadeddata"', content)
+
+    def test_a_seek_on_a_live_stream_is_answered_rather_than_ignored(self):
+        content = self._read("content.js")
+        self.assertIn('addEventListener("seeking"', content)
+        self.assertIn("seek-unavailable", content)
+
+    def test_the_click_handler_is_reachable_for_an_acceptance_run(self):
+        """The toolbar button is browser chrome and cannot be clicked by CDP.
+
+        The acceptance harness calls the function the listener is registered
+        with, in the real service worker. If that name stops being published
+        the harness stops testing the real path, so it is pinned here.
+        """
+        background = self._read("background.js")
+        self.assertIn("api.action.onClicked.addListener(toggleTab)", background)
+        self.assertIn("self.enhanceToggleTab = toggleTab", background)
+
 
 class EndpointContractTest(CustomTestCase):
     def _constant(self, name: str) -> str:

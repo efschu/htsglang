@@ -31,6 +31,14 @@
   // files -- a rename on one side fails that test rather than silently
   // producing requests the server plans differently than the label promised.
   var CHAIN_PRESETS = {
+    sr_only: {
+      enable_sr: true,
+      sr_scale: 4,
+      enable_resize: true,
+      fps_multiplier: 1,
+      description:
+        "x4 super-resolution and resize to target; source frame rate preserved",
+    },
     rife_only: {
       enable_sr: false,
       enable_resize: false,
