@@ -737,20 +737,91 @@ class PrefillAdmissionGate:
             if hook is not None:
                 trapped = hook()
             else:
-                import torch
-
-                from sglang.srt.managers.phase_flip_runtime import (
-                    graph_pool_free_bytes_from_segments,
-                )
-
-                if not torch.cuda.is_available():
-                    return cache
-                trapped = graph_pool_free_bytes_from_segments(
-                    torch.cuda.memory_snapshot()
-                )
+                trapped = self._trapped_bytes_cadenced()
         except Exception:  # noqa: BLE001 - precision, never a gate
             return cache
         return takeable_cache_bytes(cache, trapped)
+
+    #: #1027 cadence for the graph-pool-free probe, in seconds. NOT a tuning
+    #: knob -- it is bounded above by how fast the term can CHANGE (only a
+    #: graph capture or a flip creates/destroys a private pool, and both are
+    #: minutes apart) and below by the cost it exists to avoid.
+    _TRAPPED_REFRESH_S = 30.0
+
+    def _trapped_bytes_cadenced(self) -> Optional[int]:
+        """``graph_pool_free_bytes_from_segments`` behind a time cadence.
+
+        #1027. The uncached form called ``torch.cuda.memory_snapshot()`` -- a
+        walk of the ENTIRE allocator segment list -- on the PER-ROUND admission
+        path (``_update_uniform_pool_budget`` runs inside
+        ``get_next_batch_to_run``). Its cost grows with segment count, and
+        measured on 2026-08-30 it grew until a rank could no longer reach the
+        all_reduce its peers were already blocked in: PP0 idle in
+        ``all_reduce`` (scheduler.py:6186) while PP2 burned CPU here
+        (scheduler.py:6121), GPUs at 0 %, group declared dead by the dead-man.
+        Specimen: /spinning/gpu-arb/W855-SUITE-WEDGE-SPECIMEN/.
+
+        WHY A CADENCE AND NOT A CHEAPER SOURCE. ``torch.cuda.memory_stats()``
+        cannot carry this term, and that is not an oversight -- it is the
+        premise of ``graph_pool_free_bytes_from_segments`` itself, whose
+        docstring argues that ``reserved``/``allocated`` are device-global
+        ``.all`` counters that COUNT the private-pool bytes instead of
+        separating them. Telling them apart needs the per-segment pool id
+        (``_segment_pool_id``), which only the snapshot exposes. So the choice
+        is cadence, not source.
+
+        THE TRADE, NAMED: the returned figure may be up to
+        ``_TRAPPED_REFRESH_S`` seconds stale. That cost is small BY THIS
+        TERM'S OWN EVIDENCE -- #852 R3 measured it "stable to the MiB" across
+        five passes (88 MiB) while the general cache drifted 310 -> 305 MiB in
+        the same window, and concluded "a term that does not move while its
+        neighbours do is not fragmentation; it is a fixed structure". It moves
+        only when a graph pool is created or released, i.e. at capture and at
+        flip -- both far rarer than 30 s. A stale read is also SAFE in the one
+        direction that matters: this value is SUBTRACTED from the spendable
+        budget (:620), so carrying yesterday's slightly larger trapped figure
+        narrows a cut rather than widening one.
+
+        Returns ``None`` the same way the uncached form does -- "no verdict"
+        and "no trapped bytes" stay distinguishable.
+        """
+        import time
+
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        now = time.monotonic()
+        last = getattr(self, "_trapped_at", None)
+        if last is not None and (now - last) < self._TRAPPED_REFRESH_S:
+            return getattr(self, "_trapped_cached", None)
+
+        from sglang.srt.managers.phase_flip_runtime import (
+            graph_pool_free_bytes_from_segments,
+        )
+
+        t0 = time.monotonic()
+        trapped = graph_pool_free_bytes_from_segments(torch.cuda.memory_snapshot())
+        cost_ms = (time.monotonic() - t0) * 1000.0
+        self._trapped_cached = trapped
+        self._trapped_at = now
+        # EXECUTION PROOF, once per process: name the source and the cadence,
+        # and print the measured cost of the call this ticket exists to take
+        # off the per-round path -- so the next reader can see the size of the
+        # thing rather than trust this docstring about it.
+        if not getattr(self, "_trapped_logged", False):
+            self._trapped_logged = True
+            logger.info(
+                "#1027 graph-pool-free probe: source=torch.cuda.memory_snapshot "
+                "(memory_stats cannot separate private pools), cadence=%.0fs, "
+                "first call %.1f ms, trapped=%s. Previously this ran EVERY "
+                "scheduler round on the admission path and wedged the group "
+                "under suite load.",
+                self._TRAPPED_REFRESH_S,
+                cost_ms,
+                trapped,
+            )
+        return trapped
 
     def before_admission(self, tokens: int) -> Optional[Any]:
         """Make room for a ``tokens``-wide prefill chunk BEFORE it is built.
