@@ -36,6 +36,9 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 logger = logging.getLogger(__name__)
 
+#: #1028d one-shot for the broadcast-stamp banner (see _stamped_broadcast).
+_BCAST_STAMP_LOGGED = False
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -342,6 +345,54 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         return recv_reqs
 
+    def _stamped_broadcast(self, site: str, *args, **kwargs):
+        """``broadcast_pyobj`` under the #824 W5(b) blocked-recv stamp.
+
+        #1028d COVERAGE, not a new mechanism. The stamp already exists and is
+        already applied around the DIRECT chain receive (:323-340). It was
+        never applied around the broadcasts below, and the omission has a
+        measured cost: on 2026-08-30 PP1 and PP2 sat in ``broadcast_pyobj``
+        from this function for minutes while the group was dead, and the
+        watchdog could not name the site -- the wedge was only locatable with
+        py-spy. That is word for word what the hook's own comment
+        (:89-95) predicts of an unstamped blocking receive: "a blocking PP
+        receive that records nothing, so the watchdog cannot name it -- the
+        same blind spot #821 left on the chain_receiver path".
+
+        Deliberately NOT in this cut: any deadline, timeout or actuator. This
+        only makes the wait NAMEABLE. Turning a named wait into CRASH/STOP is
+        the rank-law half and needs the other side's diagnosis (what rank 0 is
+        doing), which is a separate, reported piece.
+
+        The ``finally`` mirrors the chain-receive site exactly, and for the
+        same reason recorded there: cleared even when the call RAISES, so a
+        dead peer cannot leave a stale timestamp that later reads as a wedge.
+        """
+        global _BCAST_STAMP_LOGGED
+        if self.on_blocked_recv is not None:
+            # MODULE-level one-shot, NOT an attribute: this class is
+            # `@dataclass(kw_only=True, slots=True, frozen=True)` (:49), so
+            # `self.<new attr> = ...` raises inside the frozen __setattr__.
+            # I wrote it as an instance flag first and it killed boot
+            # stamp1028d at request_receiver.py:370 -- the constraint is
+            # declared at the top of this same file. Per-process is also the
+            # correct scope for a "say it once" line.
+            if not _BCAST_STAMP_LOGGED:
+                _BCAST_STAMP_LOGGED = True
+                logger.info(
+                    "#1028d request-broadcast stamping ACTIVE: blocking "
+                    "broadcasts in _broadcast_reqs_across_ranks now record "
+                    "their site for the watchdog (first site: %s). Coverage "
+                    "only -- no deadline is armed by this change.",
+                    site,
+                )
+            self.on_blocked_recv(site, time.monotonic())
+        try:
+            return broadcast_pyobj(*args, **kwargs)
+        finally:
+            if self.on_blocked_recv is not None:
+                self.on_blocked_recv(None, None)
+
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
         if self.server_args.enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
@@ -351,7 +402,8 @@ class SchedulerRequestReceiver:
                 control_reqs = None
 
             if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
+                work_reqs = self._stamped_broadcast(
+                    "request-broadcast/attn_tp<-work",
                     work_reqs,
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
@@ -359,7 +411,8 @@ class SchedulerRequestReceiver:
                 )
 
             if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
+                work_reqs = self._stamped_broadcast(
+                    "request-broadcast/attn_cp<-work",
                     work_reqs,
                     self.attn_cp_group.rank,
                     self.attn_cp_cpu_group,
@@ -374,21 +427,24 @@ class SchedulerRequestReceiver:
             _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
+                    control_reqs = self._stamped_broadcast(
+                        "request-broadcast/attn_tp<-control",
                         control_reqs,
                         self.attn_tp_group.rank,
                         self.attn_tp_cpu_group,
                         src=self.attn_tp_group.ranks[0],
                     )
                 if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
+                    control_reqs = self._stamped_broadcast(
+                        "request-broadcast/attn_cp<-control",
                         control_reqs,
                         self.attn_cp_group.rank,
                         self.attn_cp_cpu_group,
                         src=self.attn_cp_group.ranks[0],
                     )
             elif self.ps.tp_size != 1:
-                control_reqs = broadcast_pyobj(
+                control_reqs = self._stamped_broadcast(
+                    "request-broadcast/tp<-control",
                     control_reqs,
                     self.tp_group.rank,
                     self.tp_cpu_group,
@@ -396,7 +452,8 @@ class SchedulerRequestReceiver:
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.ps.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
+            recv_reqs = self._stamped_broadcast(
+                "request-broadcast/tp<-reqs",
                 recv_reqs,
                 self.tp_group.rank,
                 self.tp_cpu_group,
