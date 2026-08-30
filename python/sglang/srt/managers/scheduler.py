@@ -13195,6 +13195,37 @@ class Scheduler(
         else:
             self._seam_transport_debt_since = None
             self._seam_debt_lapse_announced = False
+        # #942: THE #887 ONE-CHUNK GRANT, READ AT THE INPUT BOUNDARY.
+        #
+        # Asked of the #887 authority itself, never re-derived: the budget
+        # still owed in this TP phase (`tp_compute_budget_remaining`, epoch-
+        # keyed) AND the fit term the gate uses (`tp_compute_fits_in_one_chunk`,
+        # #870's strict `<` against `chunked_prefill_size`). Both are PURE
+        # READS -- `_spend_tp_compute_chunk` is called only from
+        # `prefill_blocked_here`, so this probe cannot empty the valve without
+        # a batch ever being built (the W33 divergence class, which the #887
+        # docstring names and reserves this exact probe path against).
+        #
+        # In TOKENS rather than chunks, because that is the currency the arm
+        # compares in. `tp_compute_fits_in_one_chunk` has already established
+        # 0 < pending < chunk, so the pending count IS the servable quantity.
+        #
+        # 0 outside TP, 0 on every stand-in and on every non-flip deployment,
+        # 0 the moment the gate spends the allowance -- so an unsupplied or
+        # unreadable field reproduces the pre-#942 behaviour exactly. An input
+        # probe never breaks arming (same discipline as its neighbours above).
+        _tp_subchunk_grant_now = 0
+        if _in_tp_now:
+            try:
+                from sglang.srt.managers.phase_purity import (
+                    tp_compute_budget_remaining as _tp_budget_left,
+                    tp_compute_fits_in_one_chunk as _tp_fits_one_chunk,
+                )
+
+                if _tp_budget_left(self) > 0 and _tp_fits_one_chunk(self) is True:
+                    _tp_subchunk_grant_now = int(self._pending_prefill_tokens() or 0)
+            except Exception:  # noqa: BLE001 - an input probe never breaks arming
+                _tp_subchunk_grant_now = 0
         # #869: may a decode step execute in the layout that is up right now?
         # Computed before the snapshot so the probe's failure mode is a plain
         # fallback rather than a half-built dataclass.
@@ -13382,6 +13413,10 @@ class Scheduler(
             # and on every stand-in, so an unsupplied field reproduces the
             # pre-#861j behaviour exactly.
             seam_serviceable_tokens=_seam_serviceable_now,
+            # #942: the #887 one-chunk allowance, in tokens, as computed above.
+            # 0 outside TP and once the gate has spent it, so the tp-ward arm
+            # is unchanged everywhere the grant is not actually open.
+            tp_subchunk_grant_tokens=_tp_subchunk_grant_now,
             running_bs=int(running_bs or 0),
             now=time.perf_counter(),
             # getattr, because this gate is driven in tests by scheduler

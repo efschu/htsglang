@@ -2113,6 +2113,44 @@ class PhasePolicyInputs:
     #: stamp, same argument as ``seam_transport_tokens``.
     seam_serviceable_tokens: int = 0
 
+    #: #942: COMPUTED prefill the #887 one-chunk grant will serve in THIS (TP)
+    #: layout, in THIS TP phase, expressed in tokens. 0 everywhere the grant is
+    #: not open, so an unsupplied field reproduces the pre-#942 behaviour
+    #: exactly.
+    #:
+    #: THE GRANT THE ARM COULD NOT SEE. ``prefill_runs_in_tp`` is a BOOLEAN,
+    #: baked at boot from ``purity.prefill_allowed_in_tp()`` -- the mode NAME.
+    #: #887 turned that rule into a QUANTITY (``strict:<n>``: n chunks of
+    #: computed prefill per TP phase are permitted in the TP layout), and the
+    #: boolean was never re-derived, so the policy still believes prefill in TP
+    #: is impossible while the scheduler gate is granting it. Measured on
+    #: boot_855_gdncov_0840f82601_0830_042735.log: 12 x ``arming tp_to_pp:
+    #: pending prefill 1 tok > 0 (purity: prefill cannot run in tp)`` -- a full
+    #: ~4 s cutover armed for ONE token -- beside 132 x ``LAYOUT-ALLOWED
+    #: tp_compute_one_chunk (#887)``, i.e. the very path that was serving that
+    #: size of work in TP the whole time. Same class as #797/#820: a mechanism
+    #: built, proven and left unwired at the one site whose decision it changes.
+    #:
+    #: NOT A SECOND COPY OF THE GRANT. The value is read from the #887
+    #: authority itself (``phase_purity.tp_compute_budget_remaining`` +
+    #: ``tp_compute_fits_in_one_chunk``) and books nothing -- the probe path
+    #: the #887 docstring already reserves for exactly this ("the hypothetical
+    #: ``target_can_admit`` probe asks ``prefill_allowed_in_tp_now`` directly
+    #: and books nothing"). One predicate, two consumers (#1040): the batch
+    #: gate spends the chunk, this arm declines to flip away from it.
+    #:
+    #: BOUNDED BY THE LEDGER, not by an argument. The grant is epoch-keyed
+    #: (``TP_COMPUTE_LEDGER_ATTR``): once the gate spends the chunk this field
+    #: is 0 and the arm fires exactly as it does today, and a cutover resets
+    #: the allowance. There is no new clock and no new latch -- which is what
+    #: ``raenge-nie-uneins-crash-stop`` forbids by construction.
+    #:
+    #: REPLICATED on the same contract as its neighbours: static purity config,
+    #: a static chunk size, the replicated waiting queue / ``chunked_req``, and
+    #: a group-unanimous flip epoch. It adds no rank-local input that the #887
+    #: gate does not already read on every rank.
+    tp_subchunk_grant_tokens: int = 0
+
     #: #1032 FIX 1: the flip cohort that is NOT YET RESIDENT, as a count and as
     #: tokens. The cohort is the set the last cutover retracted and
     #: `readmit_seam_residents` put back on the queue -- identity that already
@@ -3509,6 +3547,59 @@ def _decide_from_load(
                 f"away from it. Bounded: the transport-debt clock lapses "
                 f"this credit after the drain-stall deadline, and the "
                 f"demand then fires (#861j)"
+            )
+        # #942: DO NOT ARM A ~4 s CUTOVER FOR WORK THIS LAYOUT IS ALREADY
+        # ALLOWED TO FINISH. The #887 grant lets the TP phase COMPUTE up to one
+        # chunk of prefill; the arm above cannot see it, because
+        # `prefill_runs_in_tp` is a boot-time boolean taken from the purity
+        # MODE NAME while #887 made the rule a quantity. So the policy armed
+        # tp_to_pp for a ONE-TOKEN /health_generate probe -- 12 times on
+        # boot_855_gdncov_0840f82601_0830_042735.log -- on the same boot whose
+        # gate logged `LAYOUT-ALLOWED tp_compute_one_chunk (#887)` 132 times.
+        # Exactly the `decode_forbidden_in_pp` lesson, mirrored: a consumer
+        # that re-derives a purity property from the mode name refuses a mode
+        # that provides the opposite by a different route.
+        #
+        # THE CAP STAYS EXACTLY ONE CHUNK, and it is the #887 authority that
+        # says so, not a second reading of it. `tp_subchunk_grant_tokens` is 0
+        # unless the phase's chunk allowance is still UNSPENT and the pending
+        # compute fits STRICTLY below the chunk cap -- #870's `<`
+        # discriminator, whose whole argument is that a batch REACHING the cap
+        # was truncated by it, so more prefill stands behind it and the flip is
+        # coming anyway. Above one chunk this branch is dead and the arm below
+        # behaves byte-for-byte as it does today.
+        #
+        # `pending <= grant` IS A REAL COMPARISON, not a tautology. The grant
+        # is measured off `_pending_prefill_tokens()`; the policy's own
+        # `pending_prefill_tokens` additionally carries the #713 INFLIGHT term
+        # (requests received but not yet queued). If an arrival has pushed the
+        # backlog past what the grant will serve, the suppression does not
+        # apply and the cutover is armed -- the conservative direction.
+        #
+        # DELIBERATELY NOT KEYED ON `demand_tokens`. Demand counts prompt
+        # tokens owed a PASS, cached ones included; the grant is a COMPUTE
+        # allowance and a HiCache restore riding in the same batch is
+        # explicitly unbounded by the user's own precisification ("wenn das
+        # hicache reinladen als prefill gilt, dann darf es das natuerlich
+        # ueber einen chunk hinaus tun"). Gating on demand would re-cap the
+        # restore that order exempts.
+        #
+        # BOUNDED, and by the ledger rather than by this comment: the gate
+        # spends the chunk on its next round, the field collapses to 0, and
+        # the arm fires. Nothing here can hold the layout for a second phase.
+        _subchunk_grant = int(getattr(inp, "tp_subchunk_grant_tokens", 0) or 0)
+        if (
+            not cfg.prefill_runs_in_tp
+            and _subchunk_grant > 0
+            and int(inp.pending_prefill_tokens or 0) <= _subchunk_grant
+        ):
+            return _no(
+                f"SUBCHUNK-SERVED-IN-TP (#942): "
+                f"pending={inp.pending_prefill_tokens} <= grant, arming "
+                f"suppressed -- the #887 one-chunk allowance ({_subchunk_grant} "
+                f"tok, unspent this TP phase) serves this here instead of "
+                f"paying a full cutover for it. Bounded by the #887 ledger: "
+                f"the gate spends the chunk and the arm returns"
             )
         if inp.pending_prefill_tokens > tp_threshold or strict_demands_flip:
             # THE DECODE FLOOR. Under purity every token of prefill has to
