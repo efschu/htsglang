@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DSAIndexerPoolHost,
     HostPoolGroup,
     LogicalHostPool,
+    MAMBA_ANCHOR_HOST_AUTO_MULT,
     MambaPoolHost,
     PoolEntry,
 )
@@ -555,9 +556,17 @@ def build_hybrid_mamba_stack(
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
         # #1035: the anchor pool gets its own budget. Sharing --hicache-size
-        # with the KV host tier would price a 74.8 MiB anchor slot as though it
-        # were a KV page.
+        # with the KV host tier would price an anchor slot as though it were a
+        # KV page. One anchor costs ~74.8 MiB NODE-WIDE, split unevenly across
+        # the PP stages by their mamba-layer counts (measured 2026-08-30:
+        # 37.41 / 21.82 / 15.59 MiB on PP0 / PP1 / PP2 under stage ratio
+        # 32,18,14) -- the per-rank provenance line prints each rank's own.
         anchor_host_mib=getattr(server_args, "hicache_mamba_host_mib", 0),
+        # The auto multiple is applied HERE, at the L2 tier that is sized from
+        # --hicache-ratio -- not inside the pool, so the post-flip rebind in
+        # phase_flip_boot.py keeps mirroring the device pool exactly as its
+        # ratio=1.0 says it does.
+        anchor_auto_mult=MAMBA_ANCHOR_HOST_AUTO_MULT,
     )
     entries = [
         build_pool_entry(

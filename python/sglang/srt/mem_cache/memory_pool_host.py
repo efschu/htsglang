@@ -322,6 +322,7 @@ class MambaPoolHost(HostKVCache):
         allocator_type: str = "default",
         layout: str = "layer_first",
         anchor_host_mib: int = 0,
+        anchor_auto_mult: float = 1.0,
     ):
         self.device_pool = device_pool
         self.page_size = 1
@@ -414,13 +415,19 @@ class MambaPoolHost(HostKVCache):
             # The multiple, not the product, is the policy: it stays correct if
             # the device pool or the ratio changes, and it can never size the
             # pool BELOW what this boot form already had (mult >= 1).
+            # The multiple is the CALLER'S, not this class's. Measured
+            # 2026-08-30, boot_855_1035anchor: baking the constant in here
+            # applied it to BOTH construction sites, and the second one --
+            # `phase_flip_boot.py`'s post-flip rebind -- passes ratio=1.0 with
+            # the stated intent "mirror the device pool". Doubling it there
+            # silently overrode a deliberate, documented choice at a site that
+            # never asked for the policy. That is the same defect class this
+            # commit exists to close, so the policy travels as an ARGUMENT and
+            # the default (1.0) changes nothing.
             _size_source = (
-                f"auto(ratio={host_to_device_ratio} x "
-                f"mult={MAMBA_ANCHOR_HOST_AUTO_MULT})"
+                f"auto(ratio={host_to_device_ratio} x mult={anchor_auto_mult})"
             )
-            self.size = int(
-                device_pool.size * host_to_device_ratio * MAMBA_ANCHOR_HOST_AUTO_MULT
-            )
+            self.size = int(device_pool.size * host_to_device_ratio * anchor_auto_mult)
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
@@ -438,7 +445,7 @@ class MambaPoolHost(HostKVCache):
             self.size,
             device_pool.size,
             host_to_device_ratio,
-            MAMBA_ANCHOR_HOST_AUTO_MULT,
+            anchor_auto_mult,
             self.size_per_token / (1024**2),
             self.size * self.size_per_token / (1024**3),
             layout,
