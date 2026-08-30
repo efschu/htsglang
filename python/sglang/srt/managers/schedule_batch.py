@@ -149,6 +149,72 @@ _1036_PREFIX_DEMOTIONS: Dict[str, int] = {}
 _1036_HWM_BY_RID: Dict[str, int] = {}
 _1036_HWM_CAP = 4096
 
+#: #1037: how many `Req` objects this process has constructed per rid.
+_1037_INSTANCES_BY_RID: Dict[str, int] = {}
+_1037_INSTANCE_CAP = 4096
+
+
+def _note_1037_instance(rid: str) -> None:
+    """#1037 INSTRUMENT: count `Req` CONSTRUCTIONS per rid, and name re-builds.
+
+    THE DISCRIMINATOR THE PREFIX INSTRUMENTS COULD NOT PROVIDE. Four boots, one
+    signature, measured by `census_extent_uniformity.py` with zero lines
+    skipped: PP0 admits a rid at `(0, 4096)` while PP1 holds `(8192, N)` for
+    the SAME rid at the SAME `n` in ring slot 0, and in three of the four PP0's
+    batch also carries one rid where PP1 carries two.
+
+    `#1036` in all three of its reference forms (live field, mark on the
+    object, mark keyed by rid) stayed silent for every one of those killing
+    rids while naming only benign, rank-symmetric ones. The rid-keyed form
+    settles what that silence means: PP0 never held a positive protected prefix
+    for that rid at all. It is not demoting a prefix -- it is admitting a
+    request with no protected history on that rank.
+
+    Two shapes explain that and they need opposite fixes:
+
+      * DUPLICATE -- PP0 constructed a SECOND `Req` for the rid while its peers
+        kept the first. Prefix 0 is then correct for PP0's instance and 8192 is
+        correct for PP1's; they are different objects wearing one rid. This is
+        the #731 double-existence family from the other side.
+      * DROP-AND-REACQUIRE -- PP0 lost the request (`readmit_seam_residents`
+        skips any `req.finished()`, a RANK-LOCAL filter) and the client's retry
+        arrived as fresh work.
+
+    A per-rid construction count separates them in one line: instance>=2 on PP0
+    while peers stay at 1 is DUPLICATE; all ranks at 1 is DROP.
+
+    WHY THIS SITE IS SUSPECT AT ALL (prior art, checked before building):
+    `repair_duplicate_resident_reqs` and the rest of the #731 policing were
+    DELETED, on the recorded argument that "nothing is carried any more, so
+    there is nothing to police: the cutover retracts every resident and
+    `readmit_seam_residents` puts them back through the ordinary queue"
+    (`scheduler.py`:5496-5499). The census falsifies that premise -- the
+    retract-and-re-admit is NOT rank-uniform -- so the policing was removed
+    against a condition that does not hold.
+    """
+    try:
+        if not rid:
+            return
+        n = _1037_INSTANCES_BY_RID.get(rid, 0) + 1
+        if len(_1037_INSTANCES_BY_RID) >= _1037_INSTANCE_CAP and n == 1:
+            for stale in list(_1037_INSTANCES_BY_RID)[: _1037_INSTANCE_CAP // 4]:
+                _1037_INSTANCES_BY_RID.pop(stale, None)
+        _1037_INSTANCES_BY_RID[rid] = n
+        if n > 1:
+            logger.warning(
+                "#1037 REQ RE-CONSTRUCTED rid=%s instance=%d: this rank has "
+                "built %d separate Req objects for one rid. If a peer is still "
+                "running instance %d, the two ranks hold different objects "
+                "under one identity -- the prefix-0-versus-8192 split the "
+                "extent census names.",
+                str(rid)[:8],
+                n,
+                n,
+                n - 1,
+            )
+    except Exception:  # noqa: BLE001 - an instrument may never kill a boot
+        pass
+
 
 def _1036_stamp_protected(req) -> int:
     """#1036: sticky high-water mark of `cache_protected_len`; returns it.
@@ -870,6 +936,10 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
+        # #1037 INSTRUMENT ONLY: count Req constructions per rid, so a rank
+        # that REBUILDS a request its peers still hold is named at the moment
+        # it does so. No behaviour change; see `_note_1037_instance`.
+        _note_1037_instance(rid)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
