@@ -1721,6 +1721,32 @@ class HiCacheFile(HiCacheStorage):
                 hit_count[name] = boundary
             final_pages = min(final_pages, boundary)
 
+        # #1028B THE CAP, NAMED. This `min` is the only place that decides how
+        # much of an existing KV prefix a prefetch may actually claim, and it
+        # printed NOTHING: measured 2026-08-30 on boot `boot_855_1028fence`,
+        # the strings `final_pages`, `kv_pages`, `boundary=` and `hit_pages`
+        # each occur 0 times in the whole 5.87 MB log. The consequence was
+        # that a completion of 3072 against a 13179-token prompt could not be
+        # attributed -- "the mamba anchors are too sparse" and "the KV prefix
+        # in storage is short" produce the SAME number here and were not
+        # separable from that boot at all.
+        #
+        # Both terms on one line, so the next boot answers it directly:
+        # `kv` is the longest contiguous KV prefix present in storage and
+        # `final` is what survives the component caps; when they differ, the
+        # component named in `caps` is the binding constraint.
+        if final_pages != kv_pages:
+            self._1028b_n = getattr(self, "_1028b_n", 0) + 1
+            if self._1028b_n <= 40 or self._1028b_n % 256 == 0:
+                logger.warning(
+                    "#1028B FETCH CAP n=%d: kv=%d final=%d caps=%s keys=%d",
+                    self._1028b_n,
+                    kv_pages,
+                    final_pages,
+                    {k: v for k, v in hit_count.items() if k != PoolName.KV},
+                    len(keys),
+                )
+
         return PoolTransferResult(final_pages, hit_count)
 
     def _log_key(self, pool_name: str, key: str) -> str:

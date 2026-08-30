@@ -803,6 +803,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # place by the first backup, but not necessarily at construction.
         self._mamba_pin_budget_cached: Optional[int] = None
         self._mamba_pin_skipped = 0
+        # #1028 chunk publish (see `_inc_hit_count`).
+        self._chunk_publish_n = 0
         # #841: host-only inserts declined for breaking the contiguous-backup
         # law. Counted rather than silent, so a collapsing storage hit rate is
         # attributable to the law and not to the backend.
@@ -2733,14 +2735,60 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         if node.evicted:
             return
-        if chunked or (
+        write_back_policy = (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
-        ):
+        )
+        # #1028 CHUNK PUBLISH -- A DELIBERATE DEVIATION FROM UPSTREAM'S
+        # "skip the hit count update for chunked requests", NAMED AS SUCH.
+        #
+        # Upstream (`hiradix_cache.py:_inc_hit_count`) skips the host backup of
+        # every chunked-prefill node and publishes at `cache_finished_req`
+        # instead. On pure attention that loses nothing: the finished request's
+        # node covers every chunk it was split into.
+        #
+        # It loses EVERYTHING here, and it was measured losing it (boot
+        # `boot_855_1028fence`, 2026-08-30). Two fork properties break the
+        # upstream premise:
+        #   1. Drain-and-flip: a chunked prefill interrupted by a phase flip
+        #      never reaches `cache_finished_req` at all (#856 removed the
+        #      carry, so the flip DISCARDS it). Nothing is ever published, so
+        #      the re-admission recomputes the whole prompt.
+        #   2. GDN hybrid: a mamba/recurrent state is only valid AT one token
+        #      position. The per-chunk node created here already carries a
+        #      donated state (`MambaComponent.prepare_for_caching_req`, the
+        #      `is_finished=False` branch) -- the anchor EXISTS on the device
+        #      and this early return is the only reason it never reaches the
+        #      host or the storage tier.
+        # Measured consequence of the upstream form on that boot: exactly 11
+        # host backups per rank in the whole run (`#969H BACKUP` n=1..11 on
+        # PP0/PP1/PP2 at identical timestamps), all 11 with a mamba value, so
+        # storage held 11 `.mamba` anchors -- one per FINISHED request -- and
+        # a 13179-token prompt found its deepest anchor at 3072 and recomputed
+        # the remaining 10107 tokens.
+        #
+        # Publishing the chunk restores the standing no-double-prefill bound
+        # (`kein-doppel-prefill`, verbatim user order: at most ONE HiCache
+        # chunk of loss) and is what `mamba-per-knoten-nicht-gitter` asks for
+        # in its own words -- "states per radix node/chunk like KV pages" --
+        # at the one link where the per-chunk state was being dropped. That
+        # law also waives write volume as a counter-argument explicitly.
+        #
+        # Gated structurally, not by a flag: without a mamba tier or without a
+        # storage tier there is no anchor to publish and the path stays
+        # byte-identical to upstream.
+        chunk_publish = (
+            chunked
+            and not write_back_policy
+            and self._chunk_anchor_publish_enabled()
+        )
+        if (chunked and not chunk_publish) or write_back_policy:
             if not force_host_write_through:
                 return
         else:
             node.hit_count += 1
+            if chunk_publish:
+                self._note_chunk_publish()
         if (
             self.cache_controller is not None
             and not node.backuped
@@ -4725,6 +4773,70 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._mamba_pins_held(),
                 self._mamba_pin_budget,
                 "?" if mamba_pool is None else mamba_pool.size,
+                self._mamba_pin_skipped,
+            )
+
+    def _chunk_anchor_publish_enabled(self) -> bool:
+        """May a chunked-prefill node reach the host tier? (#1028)
+
+        Structural, not a flag: the deviation from upstream's chunked skip is
+        only meaningful where there is a per-chunk recurrent anchor to publish
+        AND a storage tier to publish it to. Without either, this returns
+        False and `_inc_hit_count` behaves byte-identically to upstream.
+        """
+        # DELIBERATELY NOT CACHED. `self.enable_storage` is False at
+        # `__init__` time and only becomes True inside `init_hicache`
+        # (:813 vs :846). A value memoised by an early caller would pin this
+        # to False for the process and leave a WIRED-BUT-INERT write path --
+        # the #742/#745 failure class this exact area has produced before
+        # (prior art: "silent-inert write path on the composite"), and the
+        # most expensive kind of bug here because it looks like a clean boot
+        # that simply does not help. Three attribute reads against a host
+        # backup is not a cost worth that risk.
+        return bool(
+            self.cache_controller is not None
+            and getattr(self, "enable_storage", False)
+            and ComponentType.MAMBA in self.tree_components
+        )
+
+    def _note_chunk_publish(self) -> None:
+        """Count and (rate-limited) announce a chunk publish. (#1028)
+
+        THIS COUNTER IS THE RANK-UNANIMITY PROOF, and that is why it prints
+        `n` rather than only a total. The publish decision is taken at the
+        scheduler's chunk boundary (`scheduler.py`'s
+        `maybe_cache_unfinished_req(..., chunked=True)`), which every rank
+        runs for the same request at the same split -- so it is unanimous BY
+        CONSTRUCTION, not by agreement, and this path holds no reduce (the
+        one at `check_prefetch_progress` is TP-scoped and this boot runs
+        tp_size=1, pp_size=3, so it is structurally skipped).
+
+        `raenge-nie-uneins` is therefore satisfied by construction and this
+        line is how the claim gets CHECKED instead of asserted: identical `n`
+        at identical timestamps across PP0/PP1/PP2 is the same evidence shape
+        that `#969H BACKUP` gave for the 11 finish-time backups of boot
+        `boot_855_1028fence` (n=1..11 on all three ranks, same seconds).
+        Divergent `n` between ranks means a rank-local input entered this
+        path and is a STOP-class finding, not a tuning observation.
+
+        The one rank-local input reachable from here is the #581/#773
+        write-through pin budget (`_mamba_write_through_pin_admissible`,
+        rank-local by its own comment at the `write_backup` head). It fired
+        ZERO times in that boot (trap-safe count of "write-through pin budget"
+        = bare 0, genuine 0, whole file) because 11 backups never approached
+        it. Publishing per chunk raises pin pressure, so it becomes REACHABLE
+        here for the first time -- `_note_mamba_pin_skipped` is the paired
+        instrument, and a nonzero count there next to a divergent `n` here is
+        the divergence, named in advance.
+        """
+        self._chunk_publish_n += 1
+        n = self._chunk_publish_n
+        if n <= 40 or n % 256 == 0:
+            logger.warning(
+                "#1028P CHUNK-PUBLISH n=%d: publishing a chunked-prefill node "
+                "to the host tier (upstream skips this; see _inc_hit_count). "
+                "pin_skipped=%d",
+                n,
                 self._mamba_pin_skipped,
             )
 
