@@ -2950,6 +2950,71 @@ def build_gdn_flip_guard(scheduler) -> Callable[[str], None]:
     return _guard
 
 
+def _apply_phase_release(scheduler, direction: str) -> None:
+    """#778 Posten 2: lend the prefill activation reserve to TP, take it back for PP.
+
+    RANK-LOCAL AND COLLECTIVE-FREE, deliberately. Every rank books the same
+    1024 MiB reserve at boot and reaches this point in the same cutover, so the
+    loan is uniform by construction and needs no reduction to agree on. It also
+    changes no EXPOSED id here -- it moves a target that the recovery converges
+    to, and exposure is still raised only by the collective levelling that
+    follows. So this cannot be the "one rank exposes an id a peer cannot map"
+    fault, which is the failure this seam is most afraid of.
+
+    Never fatal. A loan that cannot be priced or applied is simply not taken:
+    the pool keeps exactly today's behaviour, which is the shipped path.
+    """
+    try:
+        from sglang.srt.managers.kv_backing_relief import (
+            PHASE_RELEASABLE_ACTIVATION_RESERVE_MIB,
+        )
+        from sglang.srt.managers.phase_flip_spill import KV_BACKING_RELIEF_ATTR
+
+        rung = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
+        if rung is None or not hasattr(rung, "set_phase_release_rows"):
+            return
+        if direction == PP_TO_TP:
+            rows = int(rung.default_phase_release_rows())
+            if rows <= 0:
+                return
+            prev = rung.set_phase_release_rows(rows)
+            if prev != rows:
+                logger.info(
+                    "%s phase-release LEND %s: %d rows (~%d MiB) of prefill "
+                    "activation reserve offered to the KV pool for the TP "
+                    "phase; the recovery below converges to it under the "
+                    "corridor law and the arena ceiling. Returned on tp_to_pp.",
+                    LOG_PREFIX,
+                    direction,
+                    rows,
+                    int(PHASE_RELEASABLE_ACTIVATION_RESERVE_MIB),
+                )
+        else:
+            prev = rung.set_phase_release_rows(0)
+            # REPAY FIRST, then let the recovery run. See converge_phase_release:
+            # recovery only grows, so the rows come back only because this call
+            # shrinks them back -- lowering the number alone would silently
+            # leave the prefill hazard unfunded.
+            freed = rung.converge_phase_release()
+            if prev or freed:
+                logger.info(
+                    "%s phase-release REPAY %s: loan %d -> 0 rows, %d MiB "
+                    "returned to the prefill activation reserve before the "
+                    "prefill leg resumes",
+                    LOG_PREFIX,
+                    direction,
+                    int(prev),
+                    int(freed) // (1024 * 1024),
+                )
+    except Exception as e:  # noqa: BLE001 - a loan is never worth a seam
+        logger.warning(
+            "%s phase-release step skipped (%s); the pool keeps its boot "
+            "activation reserve, which is today's shipped behaviour",
+            LOG_PREFIX,
+            e,
+        )
+
+
 def seam_kv_recover(scheduler, reduce_fn, direction: str) -> None:
     """#834 B: the recovery, with the expensive half optionally out of the seam.
 
@@ -2994,6 +3059,23 @@ def seam_kv_recover(scheduler, reduce_fn, direction: str) -> None:
         level_kv_backing_to_group,
         recover_kv_backing,
     )
+
+    # #778 Posten 2: SET THE LOAN BEFORE THE RECOVERY, ON BOTH LEGS.
+    #
+    # The prefill activation reserve (1024 MiB/rank, model_runner_kv_cache_mixin
+    # .py:2171-2176) covers a hazard that only exists in prefill -- the
+    # DCP-extend prefix-gather scratch. Under strict purity there is no prefill
+    # in the TP phase, so on pp->tp those rows are lent to the KV pool and on
+    # tp->pp they are returned BEFORE the leg that re-enters prefill completes.
+    #
+    # ORDER IS THE SAFETY ARGUMENT, and it is why both calls sit here rather
+    # than at the two direction arms: the lend must be visible to the recovery
+    # that follows (which is the only thing that grows the backing), and the
+    # repayment must happen BEFORE that same recovery, so the grow converges to
+    # the repaid level instead of re-granting a loan that was just cancelled.
+    # One function, both legs, one order -- the same reason this function
+    # exists at all ("ONE CALL SITE SHAPE FOR BOTH LEGS").
+    _apply_phase_release(scheduler, direction)
 
     runtime = getattr(scheduler, "phase_flip_runtime", None)
     if not seam_shrink_defer_grow_enabled() or runtime is None:

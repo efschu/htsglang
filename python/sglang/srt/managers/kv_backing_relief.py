@@ -660,6 +660,66 @@ FLOOR_NEED_RESERVATION_CAPPED = "RESERVATION-CAPPED"
 #: configured, with room above it.
 CONSERVATIVE_ADMISSION_RESERVE_ROWS = 16384
 
+#: #778 Posten 2: the prefill activation reserve, in MiB per rank, that the
+#: TP phase may lend to the KV pool.
+#:
+#: WHY THIS IS LENDABLE AT ALL, and why only on the TP leg. The reserve is
+#: booked once at boot (``MAMBA_AUTO_ACTIVATION_RESERVE_MIB``,
+#: model_runner_kv_cache_mixin.py:145, subtracted at :2171-2176) and its own
+#: comment names the hazard it exists for: the transient DCP-extend
+#: prefix-gather scratch, "which OOMs a large prefill". That is a PREFILL
+#: hazard by construction -- there is no prefill in the TP decode phase under
+#: strict purity (#631), so between pp->tp and the next tp->pp the reserve is
+#: holding memory against an event that cannot occur. Measured on
+#: boot_855_solveRR_0840f82601_0830_070404: 1.000 GiB booked on all three
+#: ranks ("KV budget posts (GiB): ... prefill activation reserve=1.000"),
+#: while decode ran at #running-req max 5 over 306 samples.
+#:
+#: IT IS A LOAN, NOT A GIFT. The rows go back before the tp->pp leg completes,
+#: which is the leg that re-enters prefill, so the hazard is never unfunded
+#: when it can actually fire. That ordering is the whole safety argument and
+#: it lives in ``seam_kv_recover``.
+PHASE_RELEASABLE_ACTIVATION_RESERVE_MIB = 1024
+
+
+def phase_release_rows_for(bytes_per_row: int, mib: int = -1) -> int:
+    """Rows worth ``mib`` MiB of KV backing, rounded DOWN, or 0 if unknown.
+
+    Rounds down because this is memory being LENT to the pool: a row too few
+    costs a little admission capacity, a row too many would have the pool hand
+    out ids backed by memory the prefill hazard still needs. The two errors are
+    not symmetric, so the rounding goes toward the reserve.
+
+    Pure, so the loan arithmetic is testable without a pool or a driver.
+    """
+    if mib < 0:
+        mib = PHASE_RELEASABLE_ACTIVATION_RESERVE_MIB
+    if bytes_per_row <= 0 or mib <= 0:
+        return 0
+    return int((int(mib) * 1024 * 1024) // int(bytes_per_row))
+
+
+def phase_release_loan_rows(buffer_descs, mib: int = -1) -> int:
+    """Rows of VA headroom the TP leg's loan needs, from the descs themselves.
+
+    THE ROW SIZE IS ASKED, NEVER RECONSTRUCTED. ``_bytes_per_row`` refuses to
+    rebuild this number from head counts because it decides how much memory
+    gets unmapped; the same applies to deciding how much gets RESERVED, so this
+    sums the descriptors' own ``row_bytes`` -- K and V, every layer, whatever
+    the layout's rows-per-token is. A descriptor set that cannot be read yields
+    0, which reserves no extra VA and leaves the loan ungrantable: inert rather
+    than wrong, the same failure direction the rest of this module takes.
+
+    Called before the arena exists (the descs are pure layout objects), which
+    is the only moment a VA reservation can still be widened -- it is immutable
+    afterwards, and that immutability is the #848 wall.
+    """
+    try:
+        total = sum(int(getattr(d, "row_bytes", 0) or 0) for d in (buffer_descs or []))
+    except TypeError:
+        return 0
+    return phase_release_rows_for(total, mib)
+
 
 def lawful_reservation_rows(
     size_rows: int, admission_reserve_rows: int = 0, margin_rows: int = 0
@@ -1246,6 +1306,13 @@ class KvBackingRelief:
         #: overwritten by a second one, so a two-step relief still recovers to
         #: the boot reservation rather than to the intermediate step.
         self._rows_at_boot: Optional[int] = None
+        #: #778 Posten 2: rows the CURRENT phase has lent the pool on top of
+        #: ``_rows_at_boot``. Non-zero only between a pp->tp cutover and the
+        #: next tp->pp one. Deliberately a separate number rather than an
+        #: adjustment to ``_rows_at_boot``: that field is the boot truth every
+        #: other bound is derived from, and #684 already had to repair it once
+        #: after a stale value made every recovery re-clamp in silence.
+        self._phase_release_rows: int = 0
         #: THE BACKING LEVEL AT WHICH A SHRINK RETURNED NO DRIVER BYTES, or
         #: None while this rank is willing to be asked. Read through the
         #: :attr:`_exhausted` property, which compares it against the CURRENT
@@ -3038,6 +3105,106 @@ class KvBackingRelief:
         self.clamp_exposure_to_backing("after a successful shrink")
         return measured
 
+    def set_phase_release_rows(self, rows: int) -> int:
+        """#778 Posten 2: set the rows the CURRENT phase lends the pool.
+
+        Returns the previous value, so a caller can log the delta it caused.
+
+        THIS ONLY MOVES A NUMBER. It commits and decommits nothing: the next
+        ``recover`` converges the backing to it under every bound that already
+        applies -- the corridor law, the arena's immutable reservation, page
+        alignment. That is the entire reason the loan is expressed as a target
+        and not as a mover: a second actuator against the same arena would be
+        exactly the second bookkeeping this rung was built to replace, and it
+        would fight the dial that is already driving it (measured 147
+        BACKING-DIAL calls, 75 shrink / 72 grow, in one boot).
+
+        Lowering it back to 0 is therefore SAFE BUT NOT YET PAID: the rows are
+        owed until a recover runs at the lower target. ``seam_kv_recover``
+        lowers it BEFORE the tp->pp recovery for that reason.
+        """
+        prev = int(self._phase_release_rows)
+        self._phase_release_rows = max(0, int(rows))
+        return prev
+
+    def phase_release_rows(self) -> int:
+        """The rows the current phase has lent. 0 outside the TP leg."""
+        return int(self._phase_release_rows)
+
+    def default_phase_release_rows(self) -> int:
+        """The loan this rank can offer, priced off the rung's OWN row size.
+
+        Asked here rather than re-derived by the caller: ``_bytes_per_row`` is
+        already the geometry every shrink and grow on this pool is priced
+        against, so a caller reaching for the pool to recompute it would be a
+        second source of truth for the number that decides how much memory
+        moves -- the thing ``_bytes_per_row``'s own docstring refuses to do.
+        """
+        return phase_release_rows_for(int(self._bytes_per_row))
+
+    def converge_phase_release(self) -> int:
+        """Shrink the backing down to the current loan level. Returns bytes freed.
+
+        THE REPAYMENT HALF, AND IT CANNOT RIDE ON ``recover``. ``recover`` only
+        ever grows (``if ... was < boot_rows``), so lowering the loan to 0 on
+        its own would leave the rows OUT during the prefill leg -- the exact
+        state the reserve exists to prevent, reached by a mechanism that
+        believed it had repaid. A loan that only has a lend path is not a loan.
+
+        Safe when there is nothing to repay: at or below the target this
+        returns 0 without touching the actuator, so the shipped path (loan
+        permanently 0) can call it on every leg and never move a byte.
+
+        Bounded by the same live-row floor as every other shrink: the rows
+        being returned are UNOCCUPIED by construction (they were lent from a
+        reserve nothing was admitted against), but the floor is asked rather
+        than assumed, because #684's lesson is that a target derived from a
+        remembered number is the one that goes stale.
+        """
+        self._rebind()
+        if not self._supported() or self._rows_at_boot is None:
+            return 0
+        target = int(self._rows_at_boot) + max(0, int(self._phase_release_rows))
+        current = self._current_rows()
+        if current <= target:
+            return 0
+        floor = self._floor_rows(self._max_live_row())
+        if floor is not None and target < int(floor):
+            logger.info(
+                "%s phase-release repayment clamped by the live floor: "
+                "target %d rows is below the floor of %d, repaying to the "
+                "floor instead. The remainder is owed until the live set "
+                "drains -- a capacity loss on the prefill leg, never a breach.",
+                LOG_PREFIX,
+                target,
+                int(floor),
+            )
+            target = int(floor)
+        if current <= target:
+            return 0
+        try:
+            released = int(self._pool.runtime_set_backing_rows(target))
+        except Exception as e:  # noqa: BLE001 - repayment must not kill the seam
+            logger.error(
+                "%s phase-release repayment to %d rows failed: %s. The rows "
+                "stay lent, so the prefill activation reserve is UNFUNDED on "
+                "this leg -- the DCP-extend prefix-gather scratch is the "
+                "hazard it covers (#778).",
+                LOG_PREFIX,
+                target,
+                e,
+            )
+            return 0
+        logger.info(
+            "%s phase-release repaid: %d -> %d rows, %d MiB returned to the "
+            "prefill activation reserve",
+            LOG_PREFIX,
+            current,
+            target,
+            released // (1024 * 1024),
+        )
+        return released
+
     def recover(self) -> int:
         """Re-back the pool toward its boot reservation, as far as the
         corridor law allows, and lift the cap to whatever it reached.
@@ -3064,7 +3231,11 @@ class KvBackingRelief:
         self._rebind()
         if self._rows_at_boot is None:
             return 0
-        boot_rows = int(self._rows_at_boot)
+        # #778 Posten 2: the target is the boot truth PLUS whatever the current
+        # phase has lent (0 outside the TP leg). Kept as a separate addend so
+        # the #684 correction below can never write a loan into the boot count.
+        loan = max(0, int(self._phase_release_rows))
+        boot_rows = int(self._rows_at_boot) + loan
         was = self._current_rows()
         rows = boot_rows
         if self._supported() and was < boot_rows:
@@ -3112,8 +3283,15 @@ class KvBackingRelief:
                 # the same place while believing it had further to go. The
                 # pool's ceiling is what it can hold, so that is what "fully
                 # recovered" means for this arena.
-                self._rows_at_boot = max(int(rows), int(was))
-                boot_rows = self._rows_at_boot
+                # #778: STRIP THE LOAN BEFORE CORRECTING THE BOOT COUNT. The
+                # clamp above is the #684 repair of a STALE BOOT VALUE, and the
+                # loan is not part of that value -- folding it in would make a
+                # TP-phase lend permanent, so the rows would never return to
+                # the prefill hazard on the tp->pp leg and #684's own failure
+                # mode (a remembered number nobody can justify) would come back
+                # wearing the opposite sign.
+                self._rows_at_boot = max(int(rows) - loan, int(was) - loan, 0)
+                boot_rows = int(self._rows_at_boot) + loan
             if rows <= was:
                 logger.warning(
                     "%s recovery deferred: %d MiB free leaves nothing above "
