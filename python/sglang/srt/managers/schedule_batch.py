@@ -79,6 +79,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.mem_cache import seam_layer_carry
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -1202,9 +1203,16 @@ class Req(ReqDllmMixin):
         # #890: DID THE LAST SEAM RESTORE ACTUALLY RESTORE?
         #
         # The exemption above is granted on the claim that a re-admission
-        # #1043: the `seam_restore_refused` field and the #890 revocation it
-        # drove are DELETED together with the rank-local carry whose failures
-        # they described. See `restore_seam_state`.
+        # "recomputes nothing -- it is a cache restore". `restore_seam_state`
+        # has two branches that refuse the copy and send the tokens back to be
+        # RECOMPUTED, which falsifies that claim for this request; W38 counted
+        # 90 and 21 of them in two boots. Set there and only there, and cleared
+        # there by a restore that actually happens, so this says what the LAST
+        # attempt did rather than passing a life sentence. Read by
+        # `phase_purity.seam_transport_premise_holds`
+        # (`SEAM_RESTORE_REFUSED_ATTR`), which is where the permission is
+        # issued and therefore where it has to be withdrawn.
+        self.seam_restore_refused = False
 
         # kv-session-offload Prefill-Spill (born-spilled, PS1-V1a): set at
         # admission when the prompt's lifetime KV would not fit VRAM but its
@@ -2847,6 +2855,7 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         # the comparison above are the LOGICAL extent (`kv_cache_cpu_extent` is
         # stamped in `offload_kv_cache` from `[: seqlen - 1]`), which is
         # replicated across the group.
+        req.seam_restore_refused = True
         return False
 
     # #875: THIS REFUSAL WAS A NON-ANSWER FOR BOTH DIRECTIONS AND IS NOW THE
@@ -2898,15 +2907,75 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         and live_mamba_layout is not None
         and saved_mamba_layout != live_mamba_layout
     )
-    # #1043: THE RANK-LOCAL CARRY IS DELETED. `seam_layer_carry` scored 162
-    # refusals to ZERO successes over 57 cutovers (135 LAYOUT + 27 extent, 0
-    # carried, 0 restored, 0 even attempted) while the HiCache store served
-    # the same prefix independently -- rid 12f312df was refused here while its
-    # own `HiCache prefetch success ... matched=8192` had already landed, and
-    # the re-admission batches read `new=1672 cached=40960`. Pure cost, and
-    # the one direction it could never answer (PP stage -> TP pool, layers on
-    # a peer) is forbidden by #875's DO-NOT-BUILD. Second bookkeeping beside
-    # the store: deleted, not repaired.
+    if kv_drifted or mamba_drifted:
+        # #875d: TRY THE CARRY BEFORE PAYING THE RECOMPUTE. Drift is not one
+        # situation, it is two, and only one of them is unanswerable here.
+        #
+        #   the copy is MISSING layers (PP stage -> TP pool). They are on a
+        #   peer. Completing this needs an all-to-all inside the cutover's
+        #   no-return region, measured and refused (#875, DO NOT BUILD). The
+        #   refusal below is the answer, and it now names the layers.
+        #
+        #   the copy has a SUPERSET (TP -> PP stage). Nothing is missing; the
+        #   destination's layers are all in hand and the answer is a rank-local
+        #   SLICE -- no group, no peer, no cutover cost. This was ALSO the
+        #   silent arm: the pool loop runs fewer iterations and writes global
+        #   0..7 into global 8..15 with no crash and no log. So the direction
+        #   nobody could see was the one that never needed a collective.
+        #
+        # The attempt is confined to `seam_layer_carry`, which acts only on
+        # layouts it can identify BY TYPE and payload shapes it can NAME.
+        # Anything else raises and lands on the refusal below, unchanged -- the
+        # opaque layouts #861c's contract test passes here on purpose included.
+        carry_refusal = None
+        try:
+            carried_kv = (
+                seam_layer_carry.carry_payload(
+                    saved_layout, live_layout, req.kv_cache_cpu
+                )
+                if kv_drifted
+                else None
+            )
+            carried_mamba = (
+                seam_layer_carry.carry_payload(
+                    saved_mamba_layout, live_mamba_layout, req.mamba_state_cpu
+                )
+                if mamba_drifted
+                else None
+            )
+        except seam_layer_carry.SeamCarryError as exc:
+            carry_refusal = str(exc)
+        else:
+            # BOTH HALVES OR NEITHER, and the assignment happens only after both
+            # have been built. A carry that wrote the KV half and then refused
+            # the mamba half would leave the request holding attention state
+            # from one geometry and GDN state from another -- the partial
+            # restore this whole path exists to forbid.
+            if kv_drifted:
+                req.kv_cache_cpu = carried_kv
+                req.kv_cache_cpu_layout = live_layout
+            if mamba_drifted:
+                req.mamba_state_cpu = carried_mamba
+                req.mamba_state_cpu_layout = live_mamba_layout
+            _SEAM_STATE_COUNTS["carried"] += 1
+            n = _SEAM_STATE_COUNTS["carried"]
+            if n <= 5 or n % 50 == 0:
+                logger.info(
+                    "%s SEAM RESTORE CARRIED rid=%s: the copy was taken from %s "
+                    "and this pool is %s (mamba: %s -> %s). The copy covers "
+                    "every global layer this pool holds, so it is re-selected "
+                    "onto them rank-locally -- no collective, no peer. These "
+                    "tokens are NOT recomputed. occurrence=%d",
+                    SEAM_STATE_PREFIX,
+                    getattr(req, "rid", None),
+                    saved_layout,
+                    live_layout,
+                    saved_mamba_layout,
+                    live_mamba_layout,
+                    n,
+                )
+            kv_drifted = mamba_drifted = False
+
     if kv_drifted or mamba_drifted:
         _SEAM_STATE_COUNTS["refused_layout"] += 1
         n = _SEAM_STATE_COUNTS["refused_layout"]
@@ -2952,7 +3021,7 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
             live_layout,
             saved_mamba_layout,
             live_mamba_layout,
-            "the rank-local carry is deleted (#1043) -- it never once succeeded and this prefix is served by the store",
+            carry_refusal,
             n,
         )
         req.kv_cache_cpu = None
@@ -2968,6 +3037,7 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         # of the rank; a flip that repartitions nothing leaves the two equal on
         # every rank. Whether a pool can state a layout at all is a property of
         # the pool CLASS, which is likewise the same on every rank.
+        req.seam_restore_refused = True
         return False
 
     # #783b: ANNOUNCE BEFORE THE DANGEROUS CALL. This emitter sat only
@@ -2993,6 +3063,7 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
     # clears here. Without this one flip whose geometry did not match would
     # exile the request from an exemption that exists to keep the instance out
     # of the W30 livelock, for the rest of its life.
+    req.seam_restore_refused = False
     _SEAM_STATE_COUNTS["restored"] += 1
     n = _SEAM_STATE_COUNTS["restored"]
     if n <= 5 or n % 50 == 0:

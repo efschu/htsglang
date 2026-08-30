@@ -195,12 +195,92 @@ def _note_work_layout(scheduler, batch, prefill_stats) -> None:
         )
         if detail:
             layout_conformance.note_conformance_violation(detail, now)
-            # #1043: the #906 credit revoke is deleted with the carry and
-            # the seam_restore_refused mark it wrote through.
+            # #906 slice 2: THE OUTCOME REVOKES THE CREDIT, not just reports it.
+            #
+            # This detector has had the right verdict since #861k -- "a batch
+            # claiming transport while recomputing tokens is a violation, and
+            # `cached_tokens == 0 and new_tokens > 0` is exactly that shape" --
+            # and it only ever LOGGED it. So the premise could be disproved on
+            # metal, loudly, once per batch, and the next round would issue the
+            # exemption again on the same claim. #501's shape: a grant checked
+            # at issue and never revoked at execution.
+            #
+            # It routes into the channel #890 built for exactly this and
+            # documented as "the one signal that says the claim was false for
+            # this request" -- no new channel, no second reading of the batch.
+            # The inputs are the ones the verdict above already used, so the
+            # revoke cannot reach a different answer than the violation that
+            # triggered it.
+            _revoke_seam_credit_on_recompute(batch, transport_verified)
         elif allowed and bool(purity.strict):
             layout_conformance.note_tp_compute_exception(allowed, now)
     except Exception:  # noqa: BLE001 - an instrument may never break the stats line
         pass
+
+
+def _revoke_seam_credit_on_recompute(batch, transport_verified: bool) -> int:
+    """#906: a transport batch that recomputed revokes its own credit.
+
+    Returns how many requests were revoked, so a test can assert on the act
+    rather than on a log line.
+
+    RANK-UNIFORMITY, which is the load-bearing question for anything that
+    feeds a group-wide branch. Two inputs decide this:
+
+    * ``batch.is_seam_transport`` is uniform by construction -- it is the
+      builder's own ``transport_only`` local, derived from the replicated
+      waiting queue and a group-unanimous cutover stamp (scheduler.py's note
+      at the filter).
+    * ``cached_tokens`` is a per-rank sum of prefix matches. In the fault this
+      posten exists for it is uniform anyway: the canonical store either
+      serves this prefix or it does not, and W37-D measured
+      ``#cached-token: 0`` on ALL 1441 occurrences of a whole boot, PP
+      included. A split would need one rank to hit while another misses, which
+      is the radix-replica disagreement #639b already has machinery for and is
+      a different defect from this one.
+
+    The residual is stated rather than hidden: this writes the SAME channel
+    ``restore_seam_state``'s refusal branches already write per rank, so it
+    introduces no new uniformity class -- and ``seam_transport_premise_holds``
+    consumes it by COUNTING over the candidate population rather than by
+    trusting any single request, which is what keeps a mixed reading from
+    flipping the group on one request's account.
+
+    ANTI-WEDGE, and it is not incidental: revoking does NOT strand anything.
+    By the time this runs, slice 1 has already spent the grant of every
+    request admitted in this round, so the revoke changes nothing about the
+    CURRENT chunk. What it changes is the NEXT grant -- and a request with no
+    open grant is out of ``seam_readmit_candidates``, which is precisely the
+    state that hands its remaining tokens back to the policy as ordinary
+    pending prefill and arms the flip to PP. Revocation therefore rides the
+    same path slice 1 proved, rather than adding a second way to stop a
+    request.
+    """
+    if not transport_verified:
+        return 0
+    try:
+        from sglang.srt.managers.phase_purity import SEAM_RESTORE_REFUSED_ATTR
+    except Exception:  # noqa: BLE001 - an instrument may never break the line
+        return 0
+    revoked = 0
+    for req in getattr(batch, "reqs", None) or ():
+        try:
+            if getattr(req, SEAM_RESTORE_REFUSED_ATTR, False):
+                continue
+            setattr(req, SEAM_RESTORE_REFUSED_ATTR, True)
+            revoked += 1
+        except Exception:  # noqa: BLE001
+            continue
+    if revoked:
+        logger.info(
+            "[#906] SEAM CREDIT REVOKED for %d request(s): this batch claimed "
+            "transport and recomputed its tokens, so the claim the exemption "
+            "rests on is false for them. Their next re-admission is refused "
+            "at the grant and their tokens return to the policy as ordinary "
+            "prefill, which arms the flip to PP.",
+            revoked,
+        )
+    return revoked
 
 
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:

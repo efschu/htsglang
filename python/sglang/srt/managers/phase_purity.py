@@ -1114,6 +1114,7 @@ SEAM_TRANSPORT_ROUND_ATTR = "_seam_transport_round"
 #: `seam_transport_premise_holds`, which is the whole point: the exemption is
 #: granted on the claim that a re-admission recomputes nothing, and this is the
 #: one signal that says the claim was false for this request.
+SEAM_RESTORE_REFUSED_ATTR = "seam_restore_refused"
 
 
 #: #906: the grant this request has already SPENT. The seam stamp
@@ -1348,14 +1349,9 @@ def seam_transport_premise_holds(scheduler) -> bool:
             # again on a claim this request has already falsified on metal --
             # the #501 shape (a grant checked at issue, never revoked at
             # execution).
-            # #1043: the #890 revocation is deleted WITH the carry it existed
-            # to describe. Its ground -- 'the copy was dropped and the tokens
-            # go back to be recomputed' -- was measured false: the store
-            # serves the prefix. With no carry there are no carry failures to
-            # revoke on, and the read-through re-admission is no longer forced
-            # under the #887 one-chunk cap by a false premise -- which is the
-            # user order quoted at the top of this module: the HiCache
-            # load-in, counting as prefill, MAY exceed one chunk.
+            if getattr(req, SEAM_RESTORE_REFUSED_ATTR, False):
+                revoked += 1
+                continue
             # #861j: EVIDENCE THAT SURVIVES THE RETRACTION. The seam's own
             # `reset_for_retract` zeroes `cache_protected_len` on every
             # request it stamps, so keying the premise on that field alone
