@@ -13248,8 +13248,38 @@ class Scheduler(
                     tp_compute_fits_in_one_chunk as _tp_fits_one_chunk,
                 )
 
-                if _tp_budget_left(self) > 0 and _tp_fits_one_chunk(self) is True:
-                    _tp_subchunk_grant_now = int(self._pending_prefill_tokens() or 0)
+                # #942c: BOTH READS TAKE THE #713 INFLIGHT BATCH, because this
+                # probe answers a POLICY question, not a batch-builder one.
+                #
+                # Without it this probe measured the WAITING QUEUE while the
+                # policy it feeds measured queue + inflight. On a fresh arrival
+                # -- the only arrival a bs1 stream makes, and precisely the case
+                # #887 exists for -- the queue is still empty at this instant
+                # (`recv_requests` evaluates the policy BEFORE queueing, which
+                # is why the `inflight` parameter exists at all), so the fit
+                # term read `0 < 0 < chunk` = False and the grant collapsed to
+                # 0. The #942 suppression then could not fire, and the tp-ward
+                # arm paid a full round trip for a prompt the TP layout was
+                # already allowed to finish.
+                #
+                # MEASURED, boot_855_1011idle: 11 `LAYOUT-ALLOWED
+                # tp_compute_one_chunk` grants, ZERO `SUBCHUNK-SERVED-IN-TP`,
+                # and 10 tp-ward arms reading `pending prefill 51 tok > 0`.
+                #
+                # STILL A PURE READ, so the #890/#906 grant-consumption hazard
+                # is untouched: `_spend_tp_compute_chunk` is called only from
+                # `prefill_blocked_here`, never here. Widening what this probe
+                # can SEE cannot spend the allowance, and the real gate keeps
+                # reading the queue alone (phase_purity.py:1093 passes no
+                # inflight) because a batch builder can only build what is
+                # actually queued.
+                if (
+                    _tp_budget_left(self) > 0
+                    and _tp_fits_one_chunk(self, inflight_reqs) is True
+                ):
+                    _tp_subchunk_grant_now = int(
+                        self._pending_prefill_tokens(inflight_reqs) or 0
+                    )
             except Exception:  # noqa: BLE001 - an input probe never breaks arming
                 _tp_subchunk_grant_now = 0
         # #869: may a decode step execute in the layout that is up right now?

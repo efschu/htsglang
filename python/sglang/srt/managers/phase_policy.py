@@ -3588,6 +3588,47 @@ def _decide_from_load(
         # spends the chunk on its next round, the field collapses to 0, and
         # the arm fires. Nothing here can hold the layout for a second phase.
         _subchunk_grant = int(getattr(inp, "tp_subchunk_grant_tokens", 0) or 0)
+        # #942-DIAG (C-diagnosis, 2026-08-30): SAY WHICH TERM REFUSED.
+        #
+        # Measured on boot_855_1011idle: the #887 gate GRANTED 11 times
+        # (`LAYOUT-ALLOWED tp_compute_one_chunk`, 33 lines / 3 ranks) and this
+        # suppression fired ZERO times, while the tp-ward arm below fired 10
+        # times on `pending prefill > 0`. Every static term reads satisfiable
+        # from the source -- `_in_tp_now` is a plain phase equality, the
+        # fits-in-one-chunk rule is `0 < 51 < 4096`, and strict:3 leaves budget
+        # after one spend -- so reading harder cannot settle it. Which of the
+        # three conjuncts is false at the DECISION instant is a runtime fact,
+        # and this is the one log line per chain link that turns it into one.
+        #
+        # Diagnostic only: it returns nothing and changes no verdict. Emitted
+        # only on the rounds that actually reach the tp-ward arm under purity,
+        # so it cannot flood a healthy boot.
+        # RATE-LIMITED: on boot_855_942c the unlimited form wrote 1457 DECLINE
+        # lines in one cell. A grant>0 round is always worth a line (it is the
+        # case the mechanism exists for); a plain DECLINE is sampled.
+        _diag_n = int(getattr(state, "_942_diag_n", 0) or 0) + 1
+        try:
+            state._942_diag_n = _diag_n
+        except Exception:  # noqa: BLE001 - an instrument may never break the arm
+            pass
+        if not cfg.prefill_runs_in_tp and (_subchunk_grant > 0 or _diag_n % 200 == 1):
+            logger.info(
+                "#942-DIAG suppression terms at the tp-ward decision: "
+                "grant=%d pending=%d pending<=grant=%s -> suppression %s "
+                "(grant is 0 when the scheduler probe found: not in tp, or "
+                "no #887 budget left this phase, or fits_in_one_chunk not True)",
+                _subchunk_grant,
+                int(inp.pending_prefill_tokens or 0),
+                int(inp.pending_prefill_tokens or 0) <= _subchunk_grant,
+                (
+                    "FIRES"
+                    if (
+                        _subchunk_grant > 0
+                        and int(inp.pending_prefill_tokens or 0) <= _subchunk_grant
+                    )
+                    else "DECLINED"
+                ),
+            )
         if (
             not cfg.prefill_runs_in_tp
             and _subchunk_grant > 0

@@ -863,7 +863,7 @@ def tp_compute_budget_remaining(scheduler, purity=None) -> int:
     return rule.tp_compute_budget_remaining(tp_compute_chunks_spent(scheduler))
 
 
-def tp_compute_fits_in_one_chunk(scheduler) -> Optional[bool]:
+def tp_compute_fits_in_one_chunk(scheduler, inflight=None) -> Optional[bool]:
     """#887: does ALL the pending prefill fit inside ONE chunk? None = unknown.
 
     THE GATE AND THE #838 DETECTOR MUST BE ONE RULE, and without this term they
@@ -903,7 +903,27 @@ def tp_compute_fits_in_one_chunk(scheduler) -> Optional[bool]:
     if not callable(fn):
         return None
     try:
-        pending = int(fn() or 0)
+        # #942c: ASK THE SAME QUANTITY THE FLIP POLICY COMPARES AGAINST.
+        #
+        # `_pending_prefill_tokens` takes the #713 `inflight` batch -- requests
+        # pulled off the wire that have NOT yet reached `waiting_queue` -- and
+        # its own docstring says "passing it is what the flip policy must do".
+        # This probe is read on the flip-policy path and did NOT pass it, so on
+        # a FRESH ARRIVAL it measured 0 while the policy measured the real
+        # prompt. `0 < 0 < chunk` is False, the grant collapsed to 0, and the
+        # #942 suppression could never fire for the one case #887 exists for.
+        # Measured on boot_855_1011idle: 11 grants, 0 suppressions, 10 tp-ward
+        # arms on `pending prefill 51 tok > 0`.
+        #
+        # Default None keeps every other caller byte-identical (the #363
+        # observer's quantity and the break-even denominator, which the
+        # docstring warns must not move). The fallback keeps stand-in
+        # schedulers whose accessor takes no argument working as before,
+        # rather than turning a signature mismatch into a silent refusal.
+        try:
+            pending = int(fn(inflight) or 0)
+        except TypeError:
+            pending = int(fn() or 0)
     except Exception:  # noqa: BLE001 - an unreadable queue is not a permission
         return None
     # Strictly LESS than the chunk, matching the detector's boundary exactly:
