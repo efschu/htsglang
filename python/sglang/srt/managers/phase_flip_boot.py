@@ -382,6 +382,23 @@ def derive_tp_stack_server_args(server_args, pp_id_space: int | None = None):
     # this only stops the TP side from overshooting it.
     if pp_id_space is not None:
         tp_args.max_total_tokens = int(pp_id_space)
+        # #1030: RECORD THE PROVENANCE, so the reader does not have to guess.
+        #
+        # The sizing log named this value "--max-total-tokens user limit"
+        # whenever it bound -- a label that was true only in the era the
+        # comment above describes, when an operator DID pass the flag. Since
+        # the derivation the field is populated here, and the log was
+        # attributing a machine-derived cap to an operator input nobody made.
+        # Measured 2026-08-30 (boot_855_704bgroup2): "projected 1309248 ->
+        # EFFECTIVE max_total_num_tokens 613722 (bound by --max-total-tokens
+        # user limit 613722)" on a launch whose command line contains no such
+        # flag.
+        #
+        # A stamp rather than an inference: the reader must DISTINGUISH the
+        # two provenances, not guess between them, because both are legitimate
+        # -- an operator may still pass --max-total-tokens, and that case must
+        # keep its own label.
+        tp_args.max_total_tokens_from_pp_id_space = int(pp_id_space)
     return tp_args
 
 

@@ -73,6 +73,44 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 
+def max_total_tokens_bound_label(user_limit, pp_derived) -> str:
+    """#1030: name WHERE a binding ``max_total_tokens`` came from.
+
+    The field has TWO legitimate writers and they mean different things:
+
+    * the operator's ``--max-total-tokens`` -- a policy the operator chose;
+    * ``phase_flip_boot.derive_tp_stack_server_args`` (``:384``), which DERIVES
+      it from the PP id space on purpose ("Deriving it removes the guess" --
+      the decision comment there), stamping
+      ``max_total_tokens_from_pp_id_space`` as it writes.
+
+    The sizing log used to call BOTH cases a "user limit". Measured 2026-08-30
+    on boot_855_704bgroup2: ``projected 1309248 -> EFFECTIVE
+    max_total_num_tokens 613722 (bound by --max-total-tokens user limit
+    613722)`` on a launch whose command line carries no such flag -- a
+    machine-derived cap reported as an operator input, which sends a reader
+    hunting for a flag that was never passed.
+
+    Split out as a pure function on purpose: it is a DECISION, and a decision
+    embedded in a 200-line sizing method cannot be exercised without a boot.
+    Here both provenance arms are provable by direct call.
+
+    The stamp is compared BY VALUE, not merely for presence: an operator who
+    passes ``--max-total-tokens`` explicitly must keep their own label even on
+    a flip boot where the derived stamp also exists, and the binding value is
+    the only thing that says which of the two actually bound.
+    """
+    if user_limit is None:
+        return "none (no max_total_tokens in force)"
+    if pp_derived is not None and int(pp_derived) == int(user_limit):
+        return (
+            f"max_total_tokens derived from PP id space "
+            f"(pp_id_space={int(pp_derived)}, phase_flip_boot.py) "
+            f"-- NOT an operator --max-total-tokens"
+        )
+    return f"--max-total-tokens user limit {int(user_limit)}"
+
+
 def _moe_offload_active() -> bool:
     """Is MoE expert offload on anywhere in the group?
 
@@ -5063,7 +5101,20 @@ class ModelRunnerKVCacheMixin:
             if int(token_capacity) >= projected_capacity:
                 bound_by = "none (projection was already within every cap)"
             elif user_limit is not None and int(token_capacity) == int(user_limit):
-                bound_by = f"--max-total-tokens user limit {int(user_limit)}"
+                # #1030: name the PROVENANCE of this cap, not a guess at it.
+                # `max_total_tokens` has two legitimate writers: the operator's
+                # --max-total-tokens, and phase_flip_boot.py:384, which DERIVES
+                # it from the PP id space (deliberately -- see the decision
+                # comment there: "Deriving it removes the guess"). Calling the
+                # derived case a "user limit" attributed a machine-derived cap
+                # to an operator input nobody made, and that is the misreading
+                # this line existed to prevent for the projection figure.
+                bound_by = max_total_tokens_bound_label(
+                    user_limit,
+                    getattr(
+                        self.server_args, "max_total_tokens_from_pp_id_space", None
+                    ),
+                )
             elif hybrid_cap is not None and int(token_capacity) == int(hybrid_cap):
                 bound_by = f"hybrid {hybrid_cap_kind} cap {int(hybrid_cap)}"
             else:
