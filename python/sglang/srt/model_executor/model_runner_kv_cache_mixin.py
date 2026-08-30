@@ -4881,13 +4881,33 @@ class ModelRunnerKVCacheMixin:
                 _caps = [int(u) * sum(v) for u, v in zip(_units.tolist(), _vecs)]
                 token_capacity = min(_caps)
                 _binding = _vecs[_caps.index(token_capacity)]
+                # #1015 sibling: this line had the SAME defect as the
+                # Uneven-DCP sizing log below -- it announced C before the
+                # user limit and the hybrid cap were applied, so the printed
+                # C was a projection wearing the name of the effective
+                # capacity. The dial block just below already caps its own
+                # copies (_cv), which is what made the mismatch invisible:
+                # the number that mattered was capped, the number that got
+                # READ was not. Emitted after the caps now, with both
+                # figures.
+                _projected_c = int(token_capacity)
+                _effective_c = _projected_c
+                if user_limit is not None:
+                    _effective_c = min(_effective_c, int(user_limit))
+                if hybrid_cap is not None:
+                    _effective_c = min(_effective_c, int(hybrid_cap))
                 logger.info(
                     "#297 fitted-ceiling token sizing: candidate capacities "
-                    "%s for vectors %s -> C = %d (binding vector %s)",
+                    "%s for vectors %s -> projected C = %d -> EFFECTIVE C = "
+                    "%d (binding vector %s; user limit %s, hybrid %s cap %s)",
                     _caps,
                     _vecs,
-                    token_capacity,
+                    _projected_c,
+                    _effective_c,
                     _binding,
+                    user_limit,
+                    hybrid_cap_kind,
+                    hybrid_cap,
                 )
                 if getattr(self.server_args, "enable_vram_dial", False):
                     # #330: record the PER-VECTOR achievable ceilings (each
@@ -4919,26 +4939,58 @@ class ModelRunnerKVCacheMixin:
                 group=get_world_group().cpu_group,
             )
             token_capacity = int(local_blocks.item()) * split_factor
-            # Sizing-chain evidence log (T156 VRAM underfill diagnosis): which
-            # rank binds the unit, and whether the hybrid cap clamps after it.
-            logger.info(
-                "Uneven-DCP token sizing: rank %d local capacity %d tokens / "
-                "ratio %d = unit %d; min-reduced unit %d -> global "
-                "max_total_num_tokens %d (vector %s, hybrid %s cap %s).",
-                self.tp_rank,
-                int(token_capacity) if False else local_unit * int(ratio_r),
-                int(ratio_r),
-                local_unit,
-                int(local_blocks.item()),
-                token_capacity,
-                ratios,
-                hybrid_cap_kind,
-                hybrid_cap,
-            )
+            # #1015: THE CAPS ARE APPLIED FIRST, AND THE LINE IS EMITTED
+            # AFTER THEM.
+            #
+            # This log used to run HERE, before the `user_limit` clamp and
+            # before `_apply_hybrid_kv_token_cap`, while announcing its
+            # pre-cap value as "global max_total_num_tokens". It therefore
+            # printed a BUDGET PROJECTION under the name of the number the
+            # scheduler would actually run with, and the two differ whenever
+            # any cap binds. Measured on boot_855_gdncovB3 (2026-08-30): the
+            # line reported 1274048 tokens, which was read as a real pool for
+            # as long as it stood.
+            #
+            # That is an indicator law instance: the counter was never
+            # checked for measuring what it claimed. So the projection is
+            # kept -- it is genuinely useful, it is what the ranks' units
+            # reduce to -- but it is now NAMED as a projection and printed
+            # BESIDE the effective figure, with the binding cap named. A
+            # reader can no longer quote the uncapped number by accident,
+            # because the uncapped number no longer appears alone.
+            projected_capacity = int(token_capacity)
             if user_limit is not None:
                 token_capacity = min(token_capacity, user_limit)
             token_capacity = self._apply_hybrid_kv_token_cap(
                 token_capacity, hybrid_cap, hybrid_cap_kind
+            )
+            if int(token_capacity) >= projected_capacity:
+                bound_by = "none (projection was already within every cap)"
+            elif user_limit is not None and int(token_capacity) == int(user_limit):
+                bound_by = f"--max-total-tokens user limit {int(user_limit)}"
+            elif hybrid_cap is not None and int(token_capacity) == int(hybrid_cap):
+                bound_by = f"hybrid {hybrid_cap_kind} cap {int(hybrid_cap)}"
+            else:
+                bound_by = "a downstream cap"
+            # Sizing-chain evidence log (T156 VRAM underfill diagnosis): which
+            # rank binds the unit, what the projection was, and what actually
+            # survived the caps.
+            logger.info(
+                "Uneven-DCP token sizing: rank %d local capacity %d tokens / "
+                "ratio %d = unit %d; min-reduced unit %d -> projected %d "
+                "-> EFFECTIVE max_total_num_tokens %d (bound by %s; vector "
+                "%s, hybrid %s cap %s).",
+                self.tp_rank,
+                local_unit * int(ratio_r),
+                int(ratio_r),
+                local_unit,
+                int(local_blocks.item()),
+                projected_capacity,
+                int(token_capacity),
+                bound_by,
+                ratios,
+                hybrid_cap_kind,
+                hybrid_cap,
             )
             if getattr(self.server_args, "enable_vram_dial", False):
                 # #330 without --kv-reshard-vectors: the plan holds only the
