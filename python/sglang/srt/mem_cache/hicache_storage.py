@@ -1699,6 +1699,26 @@ class HiCacheFile(HiCacheStorage):
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
 
+        # #1035 R13: THE MISS THAT LOOKS LIKE SILENCE.
+        # `#1028B` below only fires when a COMPONENT cap moved the number
+        # (`final_pages != kv_pages`). When the KV prefix itself is 0 the claim
+        # is already zero and nothing prints -- so "storage genuinely has
+        # nothing for this key" and "everything is fine" are the SAME log, which
+        # is how a dead read path can look healthy for a whole campaign. Say it
+        # once per occurrence, rate-limited, and say which of the two it is.
+        if kv_pages == 0 and keys:
+            self._1035r13_n = getattr(self, "_1035r13_n", 0) + 1
+            if self._1035r13_n <= 40 or self._1035r13_n % 256 == 0:
+                logger.warning(
+                    "#1035 R13 EMPTY KV PREFIX n=%d: storage holds NO leading "
+                    "page for this key set (keys=%d) -- an honest cold miss, "
+                    "not a component cap. Distinguishing this from a capped "
+                    "claim is the whole point: #1028B stays silent here "
+                    "because final==kv==0.",
+                    self._1035r13_n,
+                    len(keys),
+                )
+
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break

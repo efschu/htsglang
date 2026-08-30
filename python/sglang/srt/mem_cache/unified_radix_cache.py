@@ -1942,14 +1942,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         parent_backed = node is self.root_node or node.backuped
         if not parent_backed and not write_back_policy:
             self._host_insert_refused_unbacked_parent += 1
-            logger.debug(
-                "#841 host-only insert declined: parent node %s carries no host "
-                "copy, so a backed child under it could be orphaned by a "
-                "device eviction. matched=%d declined=%d",
-                node.id,
-                matched_length,
-                total_len - matched_length,
-            )
+            # #1035 R11: THIS WAS logger.debug AND THEREFORE INVISIBLE.
+            # The chain census found it as a BLIND row: this is the #841 law
+            # itself -- it silently zeroes a host insert and marks the whole
+            # fetched tail unclaimed -- and on an INFO boot it printed NOTHING,
+            # so a boot where this fired and a boot where storage was simply
+            # cold looked identical in every log of the campaign. A guard that
+            # can zero the read path must be audible at the level the boots
+            # actually run at. Rate-limited like the campaign's other
+            # instruments so a hot path cannot flood the log.
+            if (
+                self._host_insert_refused_unbacked_parent <= 40
+                or self._host_insert_refused_unbacked_parent % 256 == 0
+            ):
+                logger.warning(
+                    "#841 host-only insert declined (n=%d): parent node %s "
+                    "carries no host copy, so a backed child under it could be "
+                    "orphaned by a device eviction. matched=%d declined=%d "
+                    "-- the declined tail is released, NOT published.",
+                    self._host_insert_refused_unbacked_parent,
+                    node.id,
+                    matched_length,
+                    total_len - matched_length,
+                )
             # The caller reserved the tail for a node that will not exist.
             # Nothing in the tree can free it, so say so.
             result.host_span_unclaimed = True

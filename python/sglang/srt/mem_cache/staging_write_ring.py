@@ -129,6 +129,27 @@ class StagingWriteRing:
         if self._occupied_tokens + tokens > self.capacity_tokens:
             self.refused += 1
             self.refused_tokens += int(tokens)
+            # #1035 W12: THE COUNTER NOBODY READS.
+            # `refused`/`refused_tokens` have been maintained here all along,
+            # but `stats()` -- their only exposure -- has ZERO callers in the
+            # tree, so a write-through page refused for want of staging room
+            # left no trace anywhere. Nothing can be READ back that was never
+            # WRITTEN, which makes a silent write-side refusal indistinguishable
+            # from a read-side miss for whoever debugs the read path afterwards.
+            # Emit at the refusal itself rather than waiting for a reporting
+            # site to be invented; rate-limited so a full ring cannot flood.
+            if self.refused <= 40 or self.refused % 256 == 0:
+                logger.warning(
+                    "#1035 W12 STAGING RING REFUSED n=%d ring=%s: %d token(s) "
+                    "rejected, occupied=%d/%d, refused_tokens=%d. This page is "
+                    "NOT written through -- it can never be read back.",
+                    self.refused,
+                    self.name,
+                    int(tokens),
+                    self._occupied_tokens,
+                    self.capacity_tokens,
+                    self.refused_tokens,
+                )
             return False
         self._inflight[key] = int(tokens)
         self._occupied_tokens += int(tokens)
