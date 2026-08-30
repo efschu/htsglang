@@ -144,6 +144,11 @@ logger = logging.getLogger(__name__)
 #: #1036: per-callsite census of admitted-prefix demotions. site -> count.
 _1036_PREFIX_DEMOTIONS: Dict[str, int] = {}
 
+#: #1036c: protected-prefix high-water mark keyed by RID, so it outlives the
+#: `Req` object (see `_1036_stamp_protected`). Bounded; a census is not a leak.
+_1036_HWM_BY_RID: Dict[str, int] = {}
+_1036_HWM_CAP = 4096
+
 
 def _1036_stamp_protected(req) -> int:
     """#1036: sticky high-water mark of `cache_protected_len`; returns it.
@@ -158,18 +163,38 @@ def _1036_stamp_protected(req) -> int:
     said so) and the guard therefore evaluated `0 < 0`.
 
     A high-water mark cannot be cleared by the event it is watching, which is
-    the whole point. Deliberately never reset: for one `Req` the protected
-    prefix only ever grows within a life, so a later `start` below the mark is
-    exactly the event of interest, and the per-site counters bound the noise.
+    the whole point. Deliberately never reset: the protected prefix for a rid
+    only ever grows, so a later `start` below the mark is exactly the event of
+    interest, and the per-site counters bound the noise.
+
+    KEYED BY RID, NOT STORED ON THE `Req` -- v2 was still blind and the census
+    said why. `92f5d5bb` killed boot `07cabd1857` by being admitted at
+    `(0, 4096)` on PP0 while PP1 held `(8192, 599)` for the same rid at the
+    same `n` in the same ring slot, and #1036 did not fire for it, while the
+    three rids it DID name were symmetric across all ranks. A mark living on
+    the object cannot survive the object being destroyed and re-created --
+    which is precisely the "object surgery across the cutover" the user's own
+    cutover design names as the root class. Keyed by rid, a re-created request
+    is still measured against what that rid had already earned, so object
+    REPLACEMENT and field CLEARING become distinguishable instead of both
+    reading as silence.
     """
     try:
         live = int(getattr(req, "cache_protected_len", 0) or 0)
     except (TypeError, ValueError):
         live = 0
-    hwm = int(getattr(req, "_1036_protected_hwm", 0) or 0)
-    if live > hwm:
-        hwm = live
-        req._1036_protected_hwm = hwm
+    rid = str(getattr(req, "rid", "") or "")
+    if not rid:
+        return live
+    prev = _1036_HWM_BY_RID.get(rid, 0)
+    hwm = live if live > prev else prev
+    if hwm > prev:
+        if len(_1036_HWM_BY_RID) >= _1036_HWM_CAP:
+            # Bounded: drop the oldest quarter (dicts keep insertion order).
+            # A census may not become a leak.
+            for stale in list(_1036_HWM_BY_RID)[: _1036_HWM_CAP // 4]:
+                _1036_HWM_BY_RID.pop(stale, None)
+        _1036_HWM_BY_RID[rid] = hwm
     return hwm
 
 
