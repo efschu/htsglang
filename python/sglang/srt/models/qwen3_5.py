@@ -598,6 +598,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
+    def finalize_fused_in_proj(self) -> None:
+        """Post-load hook: settle how in_proj_qkvz and in_proj_ba are executed.
+
+        [#1036] Required because the adopted upstream loader calls this on every
+        Qwen3_5GatedDeltaNet after weight load (models/qwen4_exp.py:2114-2116,
+        isinstance-guarded and NOT hasattr-guarded, so its absence is an
+        AttributeError that aborts the load at the MTP tail).
+
+        This fork DECLINES the fusion, and that is a decision, not an omission.
+        Upstream (qwen3_5.py:560 at 99c9362e66) stacks the two weights into one
+        buffer and adds a fused-GEMM branch to _forward_input_proj to hide the
+        second projection's latency. This fork already hides it a different and
+        mutually exclusive way: _forward_input_proj below issues the two
+        projections on TWO CUDA STREAMS (:618-623) under capture. Stacking the
+        weights buys nothing for a forward that never reads a fused buffer, and
+        porting upstream's fused branch would replace a working overlap in the
+        decode path of all 36 linear-attention layers with an alternative that
+        cannot be A/B-measured without a GPU forward.
+
+        So: nothing to finalize. Re-point nothing, allocate nothing. If the fused
+        branch is ever ported, it belongs here together with its
+        _forward_input_proj counterpart and a same-boot A/B against the
+        dual-stream path -- not one half without the other.
+        """
+        return
+
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if (
             _is_cpu
@@ -1347,6 +1373,20 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    # [#1036] Grafted from upstream sgl-project/sglang PR #36497
+    # (models/qwen3_5.py:1333 at 99c9362e66). A CLASS-LEVEL hook, not a constant:
+    # models reusing this backbone override it to supply their own decoder layers.
+    # Before this, get_layer() read the module global directly, so
+    # Qwen4ExpModel.decoder_layer_types (models/qwen4_exp.py:1584) was accepted by
+    # Python and then silently ignored -- the Qwen4-Exp layers were never built and
+    # Qwen3.5's were built in their place. The checkpoint's 48 per-layer
+    # hyper-connection and PLE tensor groups then had nowhere to land, and NOTHING
+    # raised: the loader's warn-then-continue logged "Parameter ... not found" and
+    # a fully-formed model with the wrong architecture would have served garbage.
+    # Behaviour for every existing model is bit-identical: the attribute resolves
+    # to exactly the same dict this file already defined.
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
+
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1449,61 +1489,20 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
-        # Embedding layer
-        if self.pp_group.is_first_rank:
-            # GGUF only: build embed_tokens QUANTIZED-RESIDENT (packed
-            # `qweight` via GGUFEmbeddingMethod) instead of the dense bf16
-            # materialization -- saves ~1.1 GiB/rank on a 248k vocab. Every
-            # non-GGUF quantization keeps quant_config=None here, i.e. the
-            # default path is byte-identical. SGLANG_GGUF_DENSE_VOCAB=1
-            # restores the legacy dense embed for GGUF too.
-            from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
-                is_compressed_tensors_config,
-            )
-
-            embedding_quant_config = None
-            if quant_config is not None and quant_config.get_name() == "gguf":
-                from sglang.srt.model_loader.gguf_qwen35 import gguf_dense_vocab
-
-                if not gguf_dense_vocab():
-                    embedding_quant_config = quant_config
-            elif is_compressed_tensors_config(quant_config):
-                # #727: only when the checkpoint ACTUALLY quantized the vocab.
-                # Every checkpoint we serve today lists embed_tokens in
-                # quantization_config.ignore, so this stays None and the dense
-                # BF16 path runs byte-identically. A requantized checkpoint
-                # (tools/requant_vocab_int8.py) drops that entry, and then the
-                # int8 rows are dequantized on gather instead of materialized.
-                #
-                # #763: the family test used to be a bare == "compressed-tensors"
-                # here, but the config names itself "compressed_tensors", so it
-                # never matched and a requantized checkpoint silently took the
-                # dense path -- int8 rows into a BF16 embedding, scales orphaned
-                # ("weight_scale not found in params_dict"), output = token soup.
-                from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
-                    vocab_is_quantized,
-                )
-
-                if vocab_is_quantized(
-                    getattr(quant_config, "config", None) or {},
-                    add_prefix("embed_tokens", prefix),
-                ):
-                    embedding_quant_config = quant_config
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                enable_tp=not is_dp_attention_enabled(),
-                quant_config=embedding_quant_config,
-                prefix=add_prefix("embed_tokens", prefix),
-            )
-        else:
-            self.embed_tokens = PPMissingLayer()
+        # Embedding layer. [#1036] Now behind a hook (upstream :1416 calling :1451
+        # at 99c9362e66) so a model reusing this backbone can shard its embedding
+        # differently -- Qwen4-Exp does, at models/qwen4_exp.py:1586. The
+        # fork-local GGUF and #727/#763 compressed-tensors vocab logic is
+        # UNCHANGED and still runs for every existing model: it moved verbatim
+        # into _build_embed_tokens below, nothing else.
+        self._embed_quant_config = quant_config
+        self._embed_prefix = prefix
+        self.embed_tokens = self._build_embed_tokens(config)
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
-            layer_class = ALL_DECODER_LAYER_TYPES[layer_type]
+            layer_class = self.decoder_layer_types[layer_type]
             if layer_type == "attention":
                 prefix = add_prefix("self_attn", prefix)
             else:
@@ -1540,6 +1539,73 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
         self.layers_to_capture = []
+
+    def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
+        """How this architecture shards and quantizes its embedding.
+
+        [#1036] Extracted from __init__ as an override point, matching upstream
+        PR #36497 (models/qwen3_5.py:1451 at 99c9362e66) SIGNATURE-FOR-SIGNATURE so
+        that a subclass written against upstream -- Qwen4ExpModel at
+        models/qwen4_exp.py:1586 -- overrides it successfully instead of defining a
+        method nobody calls.
+
+        The body is this fork's, not upstream's: upstream has no GGUF vocab path
+        and no #727/#763 compressed-tensors vocab detection. Both are preserved
+        verbatim, so every model that reaches this default is byte-identical to
+        before the extraction.
+        """
+        if not self.pp_group.is_first_rank:
+            return PPMissingLayer()
+
+        quant_config = self._embed_quant_config
+        prefix = self._embed_prefix
+
+        # GGUF only: build embed_tokens QUANTIZED-RESIDENT (packed `qweight` via
+        # GGUFEmbeddingMethod) instead of the dense bf16 materialization -- saves
+        # ~1.1 GiB/rank on a 248k vocab. Every non-GGUF quantization keeps
+        # quant_config=None here, i.e. the default path is byte-identical.
+        # SGLANG_GGUF_DENSE_VOCAB=1 restores the legacy dense embed for GGUF too.
+        from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+            is_compressed_tensors_config,
+        )
+
+        embedding_quant_config = None
+        if quant_config is not None and quant_config.get_name() == "gguf":
+            from sglang.srt.model_loader.gguf_qwen35 import gguf_dense_vocab
+
+            if not gguf_dense_vocab():
+                embedding_quant_config = quant_config
+        elif is_compressed_tensors_config(quant_config):
+            # #727: only when the checkpoint ACTUALLY quantized the vocab. Every
+            # checkpoint we serve today lists embed_tokens in
+            # quantization_config.ignore, so this stays None and the dense BF16
+            # path runs byte-identically. A requantized checkpoint
+            # (tools/requant_vocab_int8.py) drops that entry, and then the int8
+            # rows are dequantized on gather instead of materialized.
+            #
+            # #763: the family test used to be a bare == "compressed-tensors"
+            # here, but the config names itself "compressed_tensors", so it never
+            # matched and a requantized checkpoint silently took the dense path --
+            # int8 rows into a BF16 embedding, scales orphaned ("weight_scale not
+            # found in params_dict"), output = token soup.
+            from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+                vocab_is_quantized,
+            )
+
+            if vocab_is_quantized(
+                getattr(quant_config, "config", None) or {},
+                add_prefix("embed_tokens", prefix),
+            ):
+                embedding_quant_config = quant_config
+
+        return VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            enable_tp=not is_dp_attention_enabled(),
+            quant_config=embedding_quant_config,
+            prefix=add_prefix("embed_tokens", prefix),
+        )
 
     def get_input_embeddings(self):
         return self.embed_tokens

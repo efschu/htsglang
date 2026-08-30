@@ -240,9 +240,19 @@ class VocabParallelEmbedding(torch.nn.Module):
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
+        # [#1036] Grafted from upstream sgl-project/sglang PR #36497
+        # (layers/vocab_parallel_embedding.py:237,248 at 99c9362e66). Cast the
+        # GATHERED rows, so a table stored narrower than the model's activation
+        # dtype still hands bf16 to its consumer. Qwen4-Exp's per-layer n-gram
+        # embedding is the caller (models/qwen4_exp.py:500): the PLE table is the
+        # one tensor class this checkpoint may keep in fp8, and without the cast
+        # its rows would reach a bf16 residual stream in fp8.
+        # None (the default) means no cast, so every existing caller is unchanged.
+        output_dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
         self.quant_config = quant_config
+        self.output_dtype = output_dtype
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
@@ -648,6 +658,12 @@ class VocabParallelEmbedding(torch.nn.Module):
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             output_parallel = self.quant_method.embedding(self, masked_input.long())
+
+        # [#1036] Cast BEFORE the mask and the all-reduce (upstream :543/:557/:571),
+        # so the collective moves the narrower payload and masked_fill_ writes zeros
+        # of the final dtype rather than of the storage dtype.
+        if self.output_dtype is not None:
+            output_parallel = output_parallel.to(self.output_dtype)
 
         if self.tp_size > 1:
             # Mask the output embedding.

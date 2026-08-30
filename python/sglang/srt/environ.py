@@ -2026,6 +2026,21 @@ class Envs:
     #   for, but it depends on kernels whose reachability is audited by
     #   resolve_qsa_route() and refused loudly when a stage is missing.
     SGLANG_QSA_MODE = EnvStr("dense")
+    # [#1036] The remaining Qwen4-Exp / JIT env entries the adopted upstream files
+    # read. Types and defaults are upstream's VERBATIM (qwen4-main-squashed
+    # environ.py:293,296,299,364,1001,1003,1007,1193) -- a guessed default here is
+    # a silent behaviour change, and PLE_FUSION in particular defaults ON, so
+    # inventing False would have quietly disabled a fused path the checkpoint was
+    # trained with. Each was found by CONSTRUCTING the model and reading the
+    # AttributeError, not by reading the upstream diff.
+    SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
+    SGLANG_JIT_KERNEL_RUN_FULL_TESTS = EnvBool(False)
+    SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
+    SGLANG_JIT_CACHE_KEEP = EnvInt(None)
+    SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
