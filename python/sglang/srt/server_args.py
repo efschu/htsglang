@@ -1566,6 +1566,27 @@ class ServerArgs:
             "byte-identical.",
         ),
     ] = None
+    pp_solve_objective: A[
+        str,
+        Arg(
+            help="What --pp-solve-cut optimizes. 'kv-floor' (default) "
+            "maximizes the world KV floor min_r(capacity_r) -- the token "
+            "count the pipeline can actually address -- which is the "
+            "capacity-first objective. 'makespan' minimizes the lockstep "
+            "prefill makespan instead. BOTH SOLVERS ALREADY EXISTED; this "
+            "flag chooses between them. "
+            "THE TWO TRADE AGAINST EACH OTHER AND THE TRADE IS NOW PRINTED: "
+            "whichever objective is chosen, the provenance line reports the "
+            "chosen cut's pool AND makespan plus the cut the other objective "
+            "would have picked, so the cost of the choice is a number in the "
+            "boot log rather than an inference. Measured 2026-08-30 on the "
+            "reference rig: the makespan solver moved a layer onto the "
+            "poorer stage and paid 3.9 % of the world pool (616670 -> 592677 "
+            "tokens) for it, which is exactly the trade this flag makes "
+            "visible and selectable.",
+            choices=["kv-floor", "makespan"],
+        ),
+    ] = "kv-floor"
     dp_size: A[
         int,
         Arg(
@@ -16698,12 +16719,127 @@ class ServerArgs:
             tp_token_shares=token_shares,
         )
 
-        solution = pp_cut.solve_pp_cut(inputs)
-        if not solution.feasible:
-            raise ValueError(
-                "--pp-solve-cut found no feasible layer split:\n  "
-                + "\n  ".join(solution.refusals)
+        # #1018: TWO OBJECTIVES, ONE DISPATCH, AND THE TRADE IS PRINTED.
+        #
+        # solve_pp_cut_for_kv_floor and world_kv_floor have existed in
+        # planner/pp_cut.py since #485 with NO caller outside that file --
+        # built, proven, and invisible to every boot. Meanwhile
+        # --pp-solve-cut hard-wired the MAKESPAN solver, so a rig whose
+        # operator is pushing capacity got a cut optimized for speed and no
+        # way to say otherwise.
+        #
+        # The two objectives genuinely trade. Measured on the reference rig
+        # 2026-08-30: the makespan solver returned [32,17,15] at
+        # makespan=3089.6 ms and moved the world pool from 616670 to 592677
+        # tokens (-3.9 %) by putting a layer on the poorer stage. That trade
+        # was not a defect -- it is what minimizing makespan MEANS -- but it
+        # was invisible, which is the part that was wrong.
+        #
+        # So: the objective is selectable, the default is kv-floor (the
+        # standing boot is a capacity push), and whichever is chosen the
+        # provenance line below prices BOTH cuts on BOTH axes. A trade that
+        # is printed per boot cannot be paid by accident.
+        objective = str(getattr(self, "pp_solve_objective", "kv-floor"))
+        if objective == "kv-floor":
+            kv_solution = pp_cut.solve_pp_cut_for_kv_floor(inputs)
+            if not kv_solution.feasible:
+                raise ValueError(
+                    "--pp-solve-cut (objective kv-floor) found no feasible "
+                    "layer split:\n  " + "\n  ".join(kv_solution.refusals)
+                )
+            counts = tuple(kv_solution.counts)
+            stages = kv_solution.stages
+            refusals = kv_solution.refusals
+            considered = kv_solution.candidates_considered
+        else:
+            solution = pp_cut.solve_pp_cut(inputs)
+            if not solution.feasible:
+                raise ValueError(
+                    "--pp-solve-cut found no feasible layer split:\n  "
+                    + "\n  ".join(solution.refusals)
+                )
+            counts = tuple(solution.counts)
+            stages = solution.stages
+            refusals = solution.refusals
+            considered = solution.candidates_considered
+
+        # Price BOTH objectives' answers on BOTH axes so the operator sees
+        # what the choice cost. The comparison solve is a pure desk
+        # computation over the same inputs; it changes nothing.
+        def _both_axes(cut):
+            """(pool_tokens, makespan_seconds) for a cut, either may be None."""
+            try:
+                pool = pp_cut.world_kv_floor(cut, inputs)
+            except Exception:  # noqa: BLE001 - a report must not break a boot
+                pool = None
+            try:
+                costs = pp_cut.stage_costs(tuple(cut), inputs)
+                span = max(c.total_seconds for c in costs) if costs else None
+            except Exception:  # noqa: BLE001
+                span = None
+            return pool, span
+
+        try:
+            if objective == "kv-floor":
+                other = pp_cut.solve_pp_cut(inputs)
+            else:
+                other = pp_cut.solve_pp_cut_for_kv_floor(inputs)
+            other_counts = tuple(other.counts) if other.feasible else None
+        except Exception:  # noqa: BLE001 - the comparison is a report, not a gate
+            other_counts = None
+
+        chosen_pool, chosen_span = _both_axes(counts)
+        other_name = "makespan" if objective == "kv-floor" else "kv-floor"
+        if other_counts is not None and other_counts != counts:
+            other_pool, other_span = _both_axes(other_counts)
+
+            def _fmt(pool, span):
+                p = f"{pool:.0f} tokens" if pool is not None else "no pool"
+                s = f"{span * 1e3:.1f} ms" if span is not None else "no makespan"
+                return f"pool {p}, makespan {s}"
+
+            logger.info(
+                "--pp-solve-cut objective=%s chose %s (%s). The %s objective "
+                "would have chosen %s (%s). That difference IS the trade "
+                "between capacity and prefill speed on this rig; it is "
+                "printed so it is never paid unnoticed.",
+                objective,
+                list(counts),
+                _fmt(chosen_pool, chosen_span),
+                other_name,
+                list(other_counts),
+                _fmt(other_pool, other_span),
             )
+        else:
+            logger.info(
+                "--pp-solve-cut objective=%s chose %s (pool %s, makespan %s); "
+                "the %s objective agrees on this cut, so there is no trade to "
+                "price on this rig at this operating point.",
+                objective,
+                list(counts),
+                f"{chosen_pool:.0f} tokens" if chosen_pool is not None else "n/a",
+                f"{chosen_span * 1e3:.1f} ms" if chosen_span is not None else "n/a",
+                other_name,
+            )
+
+        solution = pp_cut.PPCutSolution(
+            counts=counts,
+            bounds=pp_cut._bounds_from_counts(counts),
+            attention_counts=pp_cut.attention_counts(inputs.layer_families, counts),
+            stages=stages,
+            makespan_seconds=float(chosen_span or 0.0),
+            bottleneck_stage=max(
+                range(len(stages)), key=lambda i: stages[i].total_seconds
+            )
+            if stages
+            else 0,
+            min_headroom_mib=min(
+                (c.runnable_headroom_mib for c in stages), default=0.0
+            ),
+            feasible=True,
+            refusals=tuple(refusals),
+            candidates_considered=int(considered),
+        )
 
         # #1009a: disclose every stage whose measured worst transient dips
         # into the corridor band. Admissible -- the peak is governed by the
