@@ -19,7 +19,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,11 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            # [#1036] fork idiom: upstream carries this on ParallelContext, this
+            # fork on ServerArgs -- and it is ServerArgs in ~40 in-tree model files
+            # (`use_attn_tp_group=get_server_args().enable_dp_lm_head`), so the
+            # fork's placement is the convention here, not an omission.
+            use_attn_tp_group=get_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -126,7 +130,13 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         if (
             is_npu()
             and self.quant_config is None
-            and get_model().quantization is not None
+            # [#1036] fork idiom: upstream reads this from its `_ConfigBag`
+            # refactor (`runtime_context.get_model().quantization`), which this
+            # fork does not have -- it keeps the same field on ServerArgs. Adapting
+            # the one call site is the whole delta; importing upstream's config-bag
+            # layer for it would drag in get_exec/get_schedule/get_memory too.
+            # NPU-only branch, so it is unreachable on this rig either way.
+            and get_server_args().quantization is not None
         ):
             exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
             exit_stack.enter_context(

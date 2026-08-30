@@ -16,10 +16,24 @@ def _hc_param_device() -> Optional[int]:
     ``RuntimeError: No CUDA GPUs are available`` whenever CUDA is absent, so
     upstream's ``GatedResidual`` cannot be constructed at all off-GPU -- no
     meta-device init, and no CPU test of the shape algebra (which is how the
-    (10240,) vs (2560,) ``hc_norm`` trap gets caught before a boot). On a CUDA
-    box this returns exactly what upstream returned, so the GPU path is
-    unchanged.
+    (10240,) vs (2560,) ``hc_norm`` trap gets caught before a boot).
+
+    [#1036] Second half of the same problem, measured rather than reasoned:
+    returning a CUDA index whenever CUDA is merely AVAILABLE overrides an
+    enclosing ``torch.device("meta")``. Building this 48-layer model on meta then
+    still allocated **1.19 GiB of real VRAM** -- and every byte of it came from the
+    three ``nn.Linear`` calls below (:153, :160, :184; profiled with
+    ``scripts/dev/qwen4_exp_meta_leaks.py``). On a rig whose cards sit 85-95 %
+    occupied by a standing boot, that turned every desk construction into a race
+    against the serving job for memory it had no business wanting.
+
+    So: if the caller has already named an ambient device, DEFER to it. Only when
+    the ambient device is the plain CPU default does this pick the current CUDA
+    device, which is exactly what upstream returned and what a boot still gets.
     """
+    ambient = torch.get_default_device()
+    if ambient.type != "cpu":
+        return None
     return torch.cuda.current_device() if torch.cuda.is_available() else None
 
 

@@ -78,6 +78,49 @@ def build_mtp_fc(hidden_size: int, quant_config, prefix: str):
     )
 
 
+def _mtp_quant_config(quant_config):
+    """The quantization the MTP module itself is built with.
+
+    The MTP module often ships unquantized even though the target checkpoint is
+    quantized; anything that has to answer "how is the drafter built" must see the
+    same normalization the constructor applies, or it answers for the TARGET's
+    quantization instead.
+
+    [#1036] EXTRACTED, not written: this is the body that was inlined in
+    `Qwen3_5ForCausalLMMTP.__init__` verbatim. It is pulled out to module scope
+    because `models/qwen4_exp_mtp.py:20` -- adopted from upstream PR #36497 --
+    imports it by this name, and without it that module raises ImportError, which is
+    why the checkpoint's 31 `mtp.*` tensors could not be proven.
+
+    Deliberately NOT upstream's body. Upstream gates `modelopt_fp4` on
+    `is_checkpoint_nvfp4_serialized`; this fork disables it unconditionally (#332,
+    measured on ocicek/Qwen3.6-27B-NVFP4). Taking upstream's narrower test would
+    silently re-quantize a drafter this fork deliberately builds dense, so the
+    fork's semantics win and the divergence is named here.
+    """
+    # The MTP model is unquantized in the nvfp4 checkpoint.
+    if quant_config and quant_config.get_name() in (
+        "modelopt_fp4",
+        "modelopt_mixed",
+    ):
+        return None
+    if is_npu() and get_server_args().speculative_draft_model_quantization is None:
+        return None
+
+    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16; every
+    # `mtp.*` layer appears under the quantization exclude list. Detect that and
+    # skip quantization here so linear/MoE weight loaders allocate bf16 shapes
+    # (see sgl-project/sglang#23113).
+    if quant_config and quant_config.get_name() == "quark":
+        exclude_layers = getattr(quant_config, "exclude_layers", [])
+        if any(
+            isinstance(layer, str) and layer.startswith("mtp.")
+            for layer in exclude_layers
+        ):
+            return None
+    return quant_config
+
+
 class Qwen3_5ForCausalLMMTP(nn.Module):
 
     # The draft block is a Qwen3_5ForCausalLM, so it fuses exactly the same
@@ -106,26 +149,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() in (
-            "modelopt_fp4",
-            "modelopt_mixed",
-        ):
-            quant_config = None
-        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
-            quant_config = None
-
-        # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in
-        # bf16; every `mtp.*` layer appears under the quantization exclude
-        # list. Detect that and skip quantization here so linear/MoE weight
-        # loaders allocate bf16 shapes (see sgl-project/sglang#23113).
-        if quant_config and quant_config.get_name() == "quark":
-            exclude_layers = getattr(quant_config, "exclude_layers", [])
-            if any(
-                isinstance(layer, str) and layer.startswith("mtp.")
-                for layer in exclude_layers
-            ):
-                quant_config = None
+        # [#1036] Body moved to the module-level `_mtp_quant_config` above so a
+        # sibling MTP model can ask the same question. Same code, same order.
+        quant_config = _mtp_quant_config(quant_config)
 
         self.config = config
         self.tp_size = get_parallel().tp_size

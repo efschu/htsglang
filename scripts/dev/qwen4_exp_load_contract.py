@@ -101,10 +101,21 @@ ALLOWED_UNCONSUMED = [
         re.compile(r"^mtp\."),
         "The MTP/NEXTN draft head is a SEPARATE model (models/qwen4_exp_mtp.py) "
         "loaded only when speculative decoding is enabled, with its own "
-        "load_weights. The target model is right to leave these alone. NOTE: that "
-        "module does not import in this fork yet (_mtp_quant_config missing from "
-        "models/qwen3_5_mtp.py), so these names are unproven rather than proven "
-        "elsewhere -- tracked, not waved through.",
+        "load_weights, so the TARGET model is right to leave these alone. Pass "
+        "--mtp to build that head and drive it too, which proves these 31 names "
+        "instead of excusing them.",
+    ),
+]
+
+# The draft head's own direction. Its `lm_head` and `embed_tokens` are TIED to the
+# target's at runtime, never loaded from the checkpoint.
+ALLOWED_UNFED_MTP = [
+    (
+        re.compile(r"^(lm_head\.weight|model\.embed_tokens\.weight)$"),
+        "Shared with the target model, not loaded from the checkpoint: the runtime "
+        "calls set_embed_and_head / set_lm_head_from_target "
+        "(qwen3_5_mtp.py:176,207) to point the draft head at the target's tensors. "
+        "A checkpoint copy would be a second, silently divergent embedding.",
     ),
 ]
 
@@ -118,7 +129,7 @@ def excused(name, rules):
 
 
 
-def build_model(model_dir: str, raw_config: dict):
+def build_model(model_dir: str, raw_config: dict, with_mtp: bool = False):
     """Construct the real model on `meta`. Every prerequisite here was found by
     RUNNING this script, not by reading: each one is a construction-time global the
     layers read while building."""
@@ -179,13 +190,33 @@ def build_model(model_dir: str, raw_config: dict):
     # overwriting the process-wide server-args slot -- the fork's own documented
     # idiom and the path its tests use.
     load_config = LoadConfig()
+    mtp = None
     with lane_scope(None, server_args):
         quant_config = _get_quantization_config(model_config, load_config)
         with set_default_torch_dtype(model_config.dtype):
             with torch.device("meta"):
                 model = _initialize_model(model_config, load_config, quant_config)
+                if with_mtp:
+                    # The draft head is a SEPARATE model with its own load_weights;
+                    # it is built here, inside the same lane and the same meta
+                    # device, because the distributed and DP-attention globals are
+                    # process-wide and must not be initialised twice.
+                    from sglang.srt.models.qwen4_exp_mtp import (
+                        Qwen4ExpForCausalLMMTP,
+                    )
+                    mtp = Qwen4ExpForCausalLMMTP(
+                        model_config.hf_config, quant_config, prefix="mtp"
+                    )
     print(f"quantization: {type(quant_config).__name__ if quant_config else None}")
-    return model
+    # A meta construction should cost NO device memory. It used to cost 1.19 GiB,
+    # all of it from three nn.Linear calls in layers/hyperconnection.py whose device
+    # helper returned a CUDA index whenever CUDA was merely available, overriding
+    # the ambient meta device -- which made every desk run race the standing serving
+    # job for VRAM. Printed, not assumed, so a regression is visible here.
+    if torch.cuda.is_available():
+        peak = torch.cuda.max_memory_allocated() / 2**20
+        print(f"peak VRAM allocated during construction: {peak:.1f} MiB")
+    return model, mtp
 
 
 def drive_loader(model, weight_map, shapes, expert_cap):
@@ -338,6 +369,13 @@ def main() -> int:
         action="store_true",
         help="do not fail merely because the model modules are not importable yet",
     )
+    ap.add_argument(
+        "--mtp",
+        action="store_true",
+        help="also build the MTP draft head and drive it with the same stream, so "
+        "the checkpoint's `mtp.*` tensors are PROVEN rather than excused. Requires "
+        "models/qwen4_exp_mtp.py to import.",
+    )
     args = ap.parse_args()
 
     if osp.isdir(args.config):
@@ -369,7 +407,7 @@ def main() -> int:
         return 2
 
     try:
-        model = build_model(model_dir, raw_config)
+        model, mtp = build_model(model_dir, raw_config, with_mtp=args.mtp)
     except Exception as exc:  # noqa: BLE001
         print(f"\nCOULD NOT CONSTRUCT the model ({type(exc).__name__}: {exc})")
         print("  The parameter-existence half of this contract did NOT run.")
@@ -377,6 +415,11 @@ def main() -> int:
 
     params = dict(model.named_parameters())
     print(f"\nCONSTRUCTED on meta: {len(params)} parameters")
+    if mtp is not None:
+        print(
+            f"CONSTRUCTED MTP draft head: "
+            f"{len(dict(mtp.named_parameters()))} parameters"
+        )
 
     if args.dump:
         rx = re.compile(args.dump)
@@ -397,6 +440,40 @@ def main() -> int:
     consumed, fed, errors, skipped, all_params = drive_loader(
         model, weight_map, shapes, args.expert_cap
     )
+
+    # --- the draft head, as its own subject. Its loader takes the SAME full stream
+    # and filters `if "mtp" not in name: continue`, so it is driven with the whole
+    # weight map and judged only on the `mtp.*` slice. This is what turns those 31
+    # names from "excused" into "proven", and it matters because the MTP loader has
+    # its own silent skip (`if name_mapped not in params_dict: continue`,
+    # qwen3_5_mtp.py:413-414) that only the parameter direction can catch.
+    mtp_verdict = None
+    if mtp is not None:
+        m_consumed, m_fed, m_errors, m_skipped, m_params = drive_loader(
+            mtp, weight_map, shapes, args.expert_cap
+        )
+        mtp_names = {n for n in weight_map if n.startswith("mtp.")} - m_skipped
+        m_unconsumed = mtp_names - m_consumed
+        m_unfed_all = m_params - m_fed
+        m_unfed = {n for n in m_unfed_all if not excused(n, ALLOWED_UNFED_MTP)}
+        m_excused = m_unfed_all - m_unfed
+        print(
+            f"\nMTP draft head: {len(m_consumed & mtp_names)}/{len(mtp_names)} "
+            f"`mtp.*` tensors consumed, "
+            f"{len(m_fed) + len(m_excused)}/{len(m_params)} parameters accounted for"
+        )
+        for n in sorted(m_excused):
+            print(f"  declared-unfed: {n}\n      {excused(n, ALLOWED_UNFED_MTP)}")
+        if m_errors:
+            print(f"  MTP LOADER RAISED ({len(m_errors)}):")
+            for name, (kind, msg) in list(m_errors.items())[:5]:
+                print(f"    {collapse(name)}\n        {kind}: {msg}")
+        if m_unconsumed:
+            report("  MTP: `mtp.*` TENSORS NO PARAMETER CONSUMED", m_unconsumed, 10)
+        if m_unfed:
+            report("  MTP: PARAMETERS NO CHECKPOINT TENSOR FED", m_unfed, 10)
+        mtp_verdict = not (m_errors or m_unconsumed or m_unfed)
+        print(f"  MTP verdict: {'PROVEN' if mtp_verdict else 'FAILED'}")
 
     offered = set(weight_map) - skipped
     unconsumed_all = offered - consumed
@@ -444,13 +521,15 @@ def main() -> int:
     if unfed:
         report("PARAMETERS NO CHECKPOINT TENSOR FED -> silently random", unfed)
 
-    if errors or unconsumed or unfed:
+    if errors or unconsumed or unfed or mtp_verdict is False:
         print("\nCONTRACT FAILED.")
         return 1
 
     print("\nOK: every checkpoint tensor reached a parameter, and every parameter")
     print("    was fed, through the model's OWN load_weights.")
     print(f"    mode=DRIVEN  tensors={len(offered)}  params={len(all_params)}")
+    if mtp_verdict:
+        print("    the MTP draft head's `mtp.*` tensors are PROVEN, not excused.")
     if args.expert_cap:
         print("    NOTE: --expert-cap was set, so this is a subset proof.")
         return 1
