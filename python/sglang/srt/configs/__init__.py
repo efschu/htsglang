@@ -39,6 +39,11 @@ from sglang.srt.configs.qwen3_tts import (
     Qwen3TTSTalkerConfig,
 )
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+from sglang.srt.configs.qwen4_exp import (
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
+    Qwen4ExpVisionConfig,
+)
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,
@@ -96,4 +101,7 @@ __all__ = [
     "Qwen3TTSCodePredictorConfig",
     "UnlimitedVLConfig",
     "ZayaConfig",
+    "Qwen4ExpConfig",
+    "Qwen4ExpTextConfig",
+    "Qwen4ExpVisionConfig",
 ]

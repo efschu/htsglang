@@ -62,6 +62,68 @@ class GPTQMarlinState(Enum):
     READY = enum.auto()
 
 
+def _tier_experts_for_offload(layer: torch.nn.Module, scheme: str) -> None:
+    """#1036 LOAD-TIME OFFLOAD HALF for the compressed-tensors WNA16 MoE path.
+
+    Mirrors the working precedent exactly: ``awq_moe.py:171-186`` (pin
+    2e92024a4d) ends ``process_weights_after_loading`` with
+    ``presplit_expert_offload_after_repack(layer)``, so the full [E] expert
+    stack is split into a [R+C] GPU buffer plus a pinned host spill and is
+    never copied back to host by ``device_loading_context``. ``fp8.py`` and
+    ``gptq_moe.py`` do the same; those three files are the only production
+    callers of that entry point.
+
+    (The task brief named ``MoeWNA16Method`` as the precedent that works. It is
+    not: it sits in ``_OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES`` precisely
+    BECAUSE it has no such half. AWQ-marlin is the correct donor, and it is
+    also the closest layout -- packed int4 + group scales + asymmetric packed
+    zero points, repacked by the very same marlin helpers.)
+
+    Deliberately no ``cold_shard=``: the #394 link-proportional cold-expert
+    policy is REFUSED at this door for every scheme, and passing one raises.
+    See ``expert_offload.refuse_cold_shard_at_repack_door`` for the measured
+    reason.
+
+    No-op unless ``SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0`` -- the presplit
+    resolves the per-rank fraction itself and returns early at >= 1.0.
+    """
+    from sglang.srt.layers.moe.expert_offload import (
+        MoEExpertOffloadCache,
+        presplit_expert_offload_after_repack,
+    )
+
+    # Denominator, taken BEFORE the presplit so it counts what the staging path
+    # was offered rather than what it left behind (the presplit swaps every
+    # tensor it tiers for a 0-row placeholder).
+    exposed = sum(
+        1
+        for attr in MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS
+        if getattr(layer, attr, None) is not None
+    )
+    presplit_expert_offload_after_repack(layer)
+    tiered = len(getattr(layer, "_moe_offload_presplit", None) or {})
+    # EXECUTION-PROOF INSTRUMENT (#1036), one line per MoE layer that went
+    # through this half.
+    #   counter     = expert-major tensors tiered into VRAM + pinned host.
+    #   denominator = EXPERT_TENSOR_ATTRS names this layer actually carries.
+    # tiered == 0 means the offload lane was not requested (fraction >= 1.0),
+    # which is the uninteresting case, so it drops to DEBUG; the INFO line is
+    # the positive proof that the lane ran. A boot with
+    # --moe-resident-expert-fraction < 1.0 and NO INFO line here means this
+    # half did not run, and assert_expert_offload_quant_supported will then
+    # refuse the layer loudly rather than install a partially staged cache.
+    logger.log(
+        logging.INFO if tiered else logging.DEBUG,
+        "[moe-offload-presplit] %s layer=%s tiered %d/%d expert-major tensors "
+        "(experts=%s)",
+        scheme,
+        getattr(layer, "layer_id", None),
+        tiered,
+        exposed,
+        getattr(layer, "_moe_offload_full_experts", None),
+    )
+
+
 class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
     def __init__(
@@ -403,6 +465,12 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         layer.workspace = marlin_make_workspace(layer.w13_weight_packed.device, 4)
         layer.is_marlin_converted = True
+        # #1036: give this scheme the load-time offload half that the admission
+        # gate now demands. MUST be the last statement of this method -- it
+        # replaces the registered expert params with 0-row placeholders, so
+        # everything above that still reads them (marlin_make_workspace) has to
+        # have run already.
+        _tier_experts_for_offload(layer, "CompressedTensorsWNA16MoE")
 
     def restore_weights_before_loading(self, layer: torch.nn.Module):
         """Forcibly resize parameters back to their original shapes (e.g., GPTQ format) before loading weights."""
@@ -535,6 +603,11 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
 
         layer.is_triton_converted = True
+        # #1036: the same load-time half as the marlin path above. This
+        # override does not call ``super()``, so the presplit has to be
+        # repeated here or the triton lane stays un-tiered and the admission
+        # gate refuses it.
+        _tier_experts_for_offload(layer, "CompressedTensorsWNA16TritonMoE")
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig

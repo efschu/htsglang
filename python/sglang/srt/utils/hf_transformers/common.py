@@ -53,6 +53,7 @@ from sglang.srt.configs import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    Qwen4ExpConfig,
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
@@ -94,6 +95,10 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Olmo3Config,
         KimiLinearConfig,
         Qwen3NextConfig,
+        # Only the WRAPPER goes in: Qwen4ExpVisionConfig.model_type is also
+        # "qwen4_exp" upstream (it matches the checkpoint's vision_config), so
+        # adding it here would collide on the key of this dict comprehension.
+        Qwen4ExpConfig,
         FalconH1Config,
         GraniteMoeHybridConfig,
         DotsVLMConfig,

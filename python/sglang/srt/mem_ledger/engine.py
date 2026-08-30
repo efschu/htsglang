@@ -79,6 +79,7 @@ __all__ = [
     "BUDGET_FUNDED_TERMS",
     "TERM_NCCL_BUFFERS",
     "TERM_LOAD_TRANSIENT",
+    "TERM_MOE_OFFLOAD_SCRATCH",
     "LOAD_TRANSIENT_REFERENCE_MIB",
     "LOAD_TRANSIENT_REFERENCE_TAG",
     "RUNTIME_COMMUNICATOR_GROUPS",
@@ -99,6 +100,7 @@ TERM_NCCL_BUFFERS = "NCCL communicator buffers"
 TERM_ATTN_WORKSPACE = "attention workspaces (capped)"
 TERM_NVML_CARVE_OUT = "NVML driver carve-out (not allocatable)"
 TERM_LOAD_TRANSIENT = "load transient (allocator peak over resident)"
+TERM_MOE_OFFLOAD_SCRATCH = "MoE expert-offload spill scratch"
 
 #: The load transient, MiB per rank process, as the 2026-08-06 corridor window
 #: recorded it.
@@ -281,6 +283,13 @@ class DemandInputs:
     #: Per-rank DSV4 C4-indexer prefill scratch peak, MiB, or None when the
     #: checkpoint has no indexer.
     indexer_scratch_mib_per_rank: Optional[Sequence[float]] = None
+    #: Per-rank MoE expert-offload SPILL SCRATCH band, MiB, or None when this
+    #: launch has no expert-offload lane (which is "does not apply", not
+    #: "unknown"). It is the C extra GPU slots of the fixed-resident buffer,
+    #: NOT the resident experts -- those are already inside
+    #: ``weight_mib_per_rank``. See TERM_MOE_OFFLOAD_SCRATCH for why the
+    #: reclaim is deliberately not credited back against it here.
+    moe_scratch_mib_per_rank: Optional[Sequence[float]] = None
     #: ``{gpu_id: MiB}`` for the adaptive ladder, charged to the one GPU that
     #: hosts the solo draft rank.
     ladder_mib_per_gpu: Mapping[int, int] = dataclasses.field(default_factory=dict)
@@ -541,6 +550,8 @@ class DemandInputs:
         except Exception as e:  # pragma: no cover - cache/env differences
             logger.debug("NCCL buffer measurement unavailable: %s", e)
 
+        moe_scratch = _moe_offload_scratch_mib_per_rank(server_args, len(rank_gpu_id))
+
         return cls(
             weight_mib_per_rank=list(weight_mib_per_rank),
             activation_mib_per_rank=activation,
@@ -553,6 +564,7 @@ class DemandInputs:
             mamba_pool_mib_per_rank=list(mamba_pool_mib_per_rank or ()),
             gdn_scratch_mib_per_rank=gdn if gdn_applicable else None,
             indexer_scratch_mib_per_rank=indexer if indexer_applicable else None,
+            moe_scratch_mib_per_rank=moe_scratch,
             ladder_mib_per_gpu=ladder,
             chunked_prefill_size=int(server_args.chunked_prefill_size or 0),
             context_length=getattr(server_args, "context_length", None),
@@ -584,6 +596,75 @@ class DemandInputs:
             nccl_buffer_mib_per_gpu=_nccl_mib_per_gpu,
             nccl_signature=_nccl_sig,
         )
+
+
+def _moe_offload_scratch_mib_per_rank(
+    server_args, n_ranks: int
+) -> Optional[List[float]]:
+    """Per-rank MoE expert-offload SPILL SCRATCH band, MiB, or ``None``.
+
+    ``None`` means the launch has no expert-offload lane, i.e. the allocation
+    does not exist here -- not that it is unknown.
+
+    Every number below is READ from the existing derivation, never restated:
+    the routed-expert mass per rank from ``PerfCostModel.
+    per_rank_offloadable_weight_bytes`` (uneven_perf.py:4614-4637, the same
+    call planner/capacity.py:77 and planner/placement.py:1614 make), the
+    residency split from ``resident_slot_count`` and ``scratch_slot_count``
+    (layers/moe/expert_offload.py:589-612), the buffer cap from
+    ``ExpertResidencyPlanner.buffer_size`` (:496-498), and the per-rank
+    fraction from the sanctioned accessor ``resident_fraction_vector``
+    (layers/moe/resident_fraction.py:91), which takes an explicit
+    ``server_args`` precisely so it can be read before distributed init.
+
+    The cost model is built ONLY when a resident fraction is actually pinned.
+    Constructing it reads the checkpoint config, and no launch that never
+    offloads should pay for that -- the same stance planner/placement.py:1659
+    takes about resolving the identity map only when there is something to
+    resolve.
+    """
+    n = max(int(n_ranks), 1)
+    try:
+        from sglang.srt.layers.moe.expert_offload import (
+            resident_slot_count,
+            scratch_slot_count,
+        )
+        from sglang.srt.layers.moe.resident_fraction import resident_fraction_vector
+
+        fracs = resident_fraction_vector(n, server_args)
+        if not fracs or all(f >= 1.0 for f in fracs):
+            return None  # no spill pool exists: every expert is resident
+
+        from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+
+        plan_inputs = PlanInputs.from_server_args(server_args)
+        base_plan = list(plan_inputs.rank_tp_ratio or [1] * n)
+        model = PerfCostModel(
+            plan_inputs, base_plan, list(plan_inputs.effective_vram_mib or [1024] * n)
+        )
+        if int(model.num_experts) <= 0:
+            return None  # dense checkpoint: there is nothing to offload
+        mlp_vector = list(plan_inputs.rank_mlp_ratio or base_plan)
+        routed_bytes = model.per_rank_offloadable_weight_bytes(mlp_vector)
+        total = float(sum(routed_bytes))
+        if total <= 0:
+            return None
+
+        out: List[float] = []
+        for r in range(n):
+            # Expert COUNT per rank from the same mass split that priced the
+            # bytes, so the two can never disagree about where an expert is.
+            e_local = max(1, int(round(model.num_experts * routed_bytes[r] / total)))
+            per_expert_mib = routed_bytes[r] / e_local / (1 << 20)
+            resident = resident_slot_count(e_local, float(fracs[r]))
+            # buffer_size caps the band at E: a rank whose whole expert set
+            # fits has no spill pool to stage into.
+            scratch = min(scratch_slot_count(resident), e_local - resident)
+            out.append(max(0.0, scratch * per_expert_mib))
+        return out
+    except Exception as e:  # pragma: no cover - config/env shape differences
+        logger.debug("MoE offload scratch band unavailable for the ledger: %s", e)
+        return None
 
 
 def _model_architectures(server_args) -> Tuple[str, ...]:
@@ -1305,6 +1386,60 @@ def build_card_ledgers(
                         ),
                     )
                 )
+
+        # -- MoE expert-offload spill scratch (#1036) ------------------------
+        # The one device buffer the 13 inherited terms never named. It IS
+        # accounted today, but by MEASUREMENT, not by itemization: KV sizing
+        # reads live free VRAM after the offload has installed and released
+        # (model_runner_kv_cache_mixin.py:350-353), and that file says so
+        # outright at :371 -- "No new budget term is introduced". A measured
+        # post has no name, cannot be planned before a card is loaded, fails
+        # as an OOM instead of a parse-time refusal, and is lost entirely with
+        # SGLANG_MOE_OFFLOAD_KV_REGAIN=0, which switches the ordering off
+        # (environ.py:1507-1508). So it becomes a term.
+        #
+        # Charged for the SCRATCH slots only. The resident slots are already
+        # inside TERM_WEIGHTS, which prices the FULL routed stack; the
+        # (E - R) host-held experts are therefore over-charged there and this
+        # term deliberately does NOT credit that reclaim back. A credit would
+        # be a second bookkeeping of the release tally the boot log already
+        # states at :1060-1064, and it would make the ledger optimistic in
+        # exactly the direction that OOMs a 20 GiB card.
+        if inputs.moe_scratch_mib_per_rank is None:
+            pass  # no expert-offload lane: does not apply
+        elif inputs.moe_scratch_mib_per_rank:
+            moe_scratch = sum(
+                float(inputs.moe_scratch_mib_per_rank[r]) for r in ranks
+            )
+            terms.append(
+                LedgerTerm(
+                    name=TERM_MOE_OFFLOAD_SCRATCH,
+                    mib=int(math.ceil(moe_scratch)),
+                    provenance=Provenance.MODELED,
+                    derivation=(
+                        "scratch_slot_count(resident_slot_count(E, fraction)) "
+                        "slots of the fixed-resident GPU buffer, priced at the "
+                        "per-expert mass PerfCostModel."
+                        "per_rank_offloadable_weight_bytes() reports for this "
+                        f"rank, summed over {n_co} rank process(es). The "
+                        "resident slots are not charged here -- "
+                        "TERM_WEIGHTS already prices the whole routed stack"
+                    ),
+                    inputs=(
+                        "rank_moe_resident_fraction",
+                        "rank_moe_ratio",
+                        "rank_tp_ratio",
+                        "model_path",
+                    ),
+                    bounded_by=(
+                        "SGLANG_MOE_SCRATCH_SLOTS (the SLOT COUNT is the cap: "
+                        "the buffer is (R + C) slots and is allocated once at "
+                        "install, min(R + C, E) -- expert_offload.py:496-498, "
+                        "589-612; a wave that needs more spill slots is "
+                        "wave-split rather than allowed to grow the buffer)"
+                    ),
+                )
+            )
 
         # -- attention workspaces, charged AT THEIR CAP ----------------------
         # These are the "allocated lazily after KV sizing" pools that the old

@@ -2169,6 +2169,124 @@ _OFFLOAD_CONDITIONAL_QUANT_METHOD_NAMES = {
 }
 
 
+#: Expert-major tensors that are LOADER BOOKKEEPING, not kernel payload.
+#: The compressed-tensors MoE schemes register a ``[E, 2]`` ``*_weight_shape``
+#: parameter purely so the checkpoint's ``*.weight_shape`` keys have a
+#: destination during load. Re-derived at the literal pin 2e92024a4d
+#: (``git grep -n 'w13_weight_shape|w2_weight_shape' 2e92024a4d -- python/``):
+#: every occurrence is a ``register_parameter`` / ``set_weight_attrs`` line in
+#: compressed_tensors_wNa16_moe.py or compressed_tensors_w4a4_mxint4_moe.py --
+#: no kernel and no post-load path READS them, so leaving them un-tiered can
+#: never pair one expert's payload with another expert's.
+#:
+#: POLARITY, deliberately the opposite of the deny-list above: this is an
+#: exemption from a POSITIVE check, so forgetting to name a new bookkeeping
+#: tensor here produces a LOUD REFUSAL, never a silent admission. That
+#: asymmetry is the whole point of #1036.
+_OFFLOAD_NON_PAYLOAD_EXPERT_MAJOR_ATTRS = frozenset(
+    {
+        "w13_weight_shape",
+        "w2_weight_shape",
+    }
+)
+
+
+def _iter_layer_tensors(layer):
+    """Yield ``(name, tensor)`` for every tensor sitting DIRECTLY on a layer.
+
+    Registered parameters and buffers first, then plain tensor attributes, so a
+    scheme that does ``layer.foo = tensor`` instead of ``register_parameter``
+    is still seen. ``recurse=False``: sub-modules own their own weights and are
+    not expert-major.
+    """
+    import torch
+
+    seen = set()
+    for meth in ("named_parameters", "named_buffers"):
+        fn = getattr(layer, meth, None)
+        if not callable(fn):
+            continue
+        try:
+            items = list(fn(recurse=False))
+        except TypeError:  # not an nn.Module signature
+            continue
+        for name, t in items:
+            if isinstance(t, torch.Tensor) and name not in seen:
+                seen.add(name)
+                yield name, t.data if isinstance(t, torch.nn.Parameter) else t
+    for name, t in list(vars(layer).items()):
+        if name.startswith("_") or name in seen:
+            continue
+        if isinstance(t, torch.nn.Parameter):
+            t = t.data
+        if isinstance(t, torch.Tensor):
+            seen.add(name)
+            yield name, t
+
+
+def expert_offload_coverage(layer):
+    """POSITIVE capability check (#1036): does this layer's quant path actually
+    TIER every per-expert payload tensor the offload cache will address by SLOT?
+
+    Returns ``(covered, uncovered)``: how many expert-major payload tensors the
+    staging path will carry, and the sorted names of the ones it will NOT.
+    A non-empty ``uncovered`` means PARTIAL staging -- after ``install()`` the
+    kernel reads some tensors at a slot index into a ``[R+C]`` buffer and the
+    rest at that same index into a full ``[E]`` tensor, i.e. one expert's
+    weights paired against another expert's scales: silently wrong output, not
+    a crash. That is exactly what the #323b comment above predicted for NVFP4,
+    and exactly what CompressedTensorsWNA16MoE walked into (its post-repack
+    scales are called ``w13_weight_scale``/``w2_weight_scale`` and were staged,
+    while its packed weights and zero points are called ``w13_weight_packed``/
+    ``w13_weight_zero_point`` and were not).
+
+    A tensor counts as COVERED when it is either
+      * already in ``layer._moe_offload_presplit`` -- a load-time half tiered it
+        and left a 0-row placeholder behind -- or
+      * named in ``MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS``, which is the
+        one tuple both staging paths iterate (``install()``'s split-here branch
+        and ``presplit_expert_offload_after_repack``).
+
+    A tensor is EXPERT-MAJOR PAYLOAD when ``shape[0] == E`` and ``numel() > 0``
+    and its name is not in ``_OFFLOAD_NON_PAYLOAD_EXPERT_MAJOR_ATTRS``. The
+    ``numel() > 0`` term is load-bearing rather than defensive: the marlin
+    schemes park empty ``[E, 0]`` ``*_g_idx`` / ``*_g_idx_sort_indices``
+    tensors on the layer when act-order is off, and an empty tensor has no
+    per-expert data to mis-pair. With act-order ON those same names carry real
+    ``[E, K]`` data that nothing stages -- and are then correctly reported as
+    uncovered, which is the verdict we want.
+
+    ``E`` comes from ``_moe_offload_full_experts`` when a presplit already ran
+    (it stashes the real expert count there), else from ``num_local_experts``.
+    """
+    if layer is None:
+        return 0, []
+    full = getattr(layer, "_moe_offload_full_experts", None)
+    try:
+        experts = int(full) if full else int(getattr(layer, "num_local_experts", 0) or 0)
+    except (TypeError, ValueError):
+        experts = 0
+    if experts <= 0:
+        return 0, []
+    presplit = getattr(layer, "_moe_offload_presplit", None) or {}
+    stageable = frozenset(MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS)
+    covered = 0
+    uncovered = []
+    for name, t in _iter_layer_tensors(layer):
+        if name in presplit:
+            covered += 1
+            continue
+        if name in _OFFLOAD_NON_PAYLOAD_EXPERT_MAJOR_ATTRS:
+            continue
+        if t.dim() == 0 or int(t.shape[0]) != experts or t.numel() == 0:
+            continue
+        if name in stageable:
+            covered += 1
+        else:
+            uncovered.append(name)
+    return covered, sorted(uncovered)
+
+
 def assert_expert_offload_quant_supported(
     quant_method, layer_id=None, scheme=None, layer=None
 ) -> None:
@@ -2256,6 +2374,72 @@ def assert_expert_offload_quant_supported(
             "--moe-resident-expert-fraction at 1.0 (or unset) for this "
             "checkpoint's quant type, or use a supported quant path."
         )
+
+    # -------------------------------------------------------------------
+    # #1036 POSITIVE CAPABILITY CHECK.
+    #
+    # Everything above is the historical EXCLUSION list, and an exclusion list
+    # admits BY OMISSION: a scheme this file has never heard of passes, and
+    # then install() stages the strict subset of its tensors whose names happen
+    # to collide with EXPERT_TENSOR_ATTRS. That is precisely how
+    # CompressedTensorsWNA16MoE got in. So the verdict is now two-sided:
+    # not-denied AND demonstrably tiered. A future scheme is refused BY DEFAULT
+    # because its tensor names are not in EXPERT_TENSOR_ATTRS, rather than
+    # admitted because nobody remembered to add it above.
+    #
+    # It REFUSES, it does not warn-and-continue (#505a): the single production
+    # call site puts this guard OUTSIDE its try/except
+    # (fused_moe_triton/layer.py:2330 vs the try at :2341, pin 2e92024a4d), so
+    # the raise is a hard boot abort and not a silent per-layer degrade.
+    #
+    # SCOPE, stated rather than left implicit: the coverage half needs a layer.
+    # ``layer=None`` is the name-only question -- the #323b unit tests ask it
+    # that way -- and yields the deny-list verdict alone. The production caller
+    # always passes ``layer=self``, so the positive half always runs on a boot.
+    if layer is None:
+        return
+    covered, uncovered = expert_offload_coverage(layer)
+    named = scheme if scheme is not None else quant_method
+    name = type(named).__name__ if named is not None else "unquantized"
+    layer_tag = f" (layer_id={layer_id})" if layer_id is not None else ""
+    total = covered + len(uncovered)
+    if uncovered or covered == 0:
+        detail = (
+            f"; NOT tiered: {', '.join(uncovered)}."
+            if uncovered
+            else "; the staging path recognises none of this layer's "
+            "expert-major tensor names."
+        )
+        raise RuntimeError(
+            f"MoE expert-offload (SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0) "
+            f"is not supported for quant method {name!r}{layer_tag}: its "
+            f"load-time half tiered {covered}/{total} of this layer's "
+            f"expert-major payload tensors{detail} Installing the cache would "
+            f"address the tiered tensors by SLOT in a [R+C] buffer and the "
+            f"untiered ones by that same index into a full [E] tensor -- one "
+            f"expert's weights paired with another expert's scales, which is "
+            f"silently wrong output rather than a crash. Give this scheme a "
+            f"load-time half (call presplit_expert_offload_after_repack at the "
+            f"end of its process_weights_after_loading, as awq_moe.py, "
+            f"gptq_moe.py and fp8.py do) and add its per-expert tensor names "
+            f"to MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS, or leave "
+            f"--moe-resident-expert-fraction at 1.0 for this checkpoint."
+        )
+    # EXECUTION-PROOF INSTRUMENT (#1036), one line per admitted MoE layer.
+    # counter   = expert-major payload tensors this layer's load-time half
+    #             tiered (or that EXPERT_TENSOR_ATTRS will tier at install).
+    # denominator = expert-major payload tensors the layer exposes at all.
+    # A boot log without these lines means the positive half never ran.
+    import logging
+
+    logging.getLogger(__name__).info(
+        "[moe-offload-gate] admitted layer=%s scheme=%s coverage=%d/%d "
+        "expert-major payload tensors tiered",
+        layer_id,
+        name,
+        covered,
+        total,
+    )
 
 
 # ===========================================================================
@@ -2601,7 +2785,70 @@ class MoEExpertOffloadCache:
         # absent for a given quant method are skipped by the shape check below.
         "w13_qzeros",
         "w2_qzeros",
+        # compressed-tensors WNA16 (pack-quantized int4/int8) path -- #1036.
+        # The scheme marlin-repacks IN PLACE and keeps the compressed-tensors
+        # NAMES, so its scales already land on w13_weight_scale/w2_weight_scale
+        # above while the packed weights and the (asymmetric) zero points need
+        # these four entries. Staging is a dim-0 (whole-expert) slice and every
+        # one of these stays expert-major through the repack:
+        # marlin_moe_permute_scales and moe_awq_to_marlin_zero_points both loop
+        # ``for e in range(num_experts)`` into an [E, ...] output
+        # (marlin_utils.py:369-378 / :431-439 at pin 2e92024a4d) and
+        # gptq_marlin_moe_repack keeps dim 0 = experts. The int4 packing and
+        # the marlin permutation are therefore strictly WITHIN one expert: a
+        # dim-0 slice never cuts an int32 word, so packed zero points tier by
+        # whole-expert row exactly like the weights. No unpacking is needed.
+        "w13_weight_packed",
+        "w2_weight_packed",
+        "w13_weight_zero_point",
+        "w2_weight_zero_point",
     )
+
+    #: #1036: does ``_fetch`` join the copy stream back into the compute stream
+    #: before it returns? True today, and the reason is structural rather than
+    #: cautious: every caller issues wave w's fetch IMMEDIATELY BEFORE wave w's
+    #: own apply (run_waves:3404, _run_single_wave, _run_waves_expert_major:3553
+    #: at pin 2e92024a4d), so there is no other work in flight to overlap with.
+    #: Deferring the join today would buy zero overlap and lose the
+    #: read-after-write ordering.
+    #:
+    #: THE ALTERNATIVE THIS CONSTANT NAMES: move the ISSUE point one wave ahead
+    #: (fetch wave w+1 before apply(w)), flip this to False, and have the
+    #: consumer call ``wait_fetch()`` right before it reads the slots. The
+    #: ordering primitive for that is already built and live below
+    #: (``self._fetch_done``). What is missing is NOT the primitive but
+    #: (a) a lookahead issue point -- no fetch path has one -- and (b) DISJOINT
+    #: SCRATCH-SLOT OWNERSHIP between consecutive waves. Without (b) the
+    #: write-after-read guard in _fetch is not sufficient either: it orders the
+    #: copy behind work ALREADY ENQUEUED on the compute stream, so an issue
+    #: point running before apply(w) is enqueued would let the copy overwrite
+    #: slots apply(w) is about to read. That is the documented silent-corruption
+    #: bug in _fetch's own comment. Do not flip this without splitting the
+    #: C band into per-wave halves.
+    #:
+    #: THE DONOR, so the deferred mode extends an idiom rather than inventing
+    #: one: the qwen4_exp PLE lane already ships exactly this split-phase pair
+    #: upstream. ``start_prefetch`` issues the gather on a side stream
+    #: (``stream.wait_stream(current_stream())`` then the work inside
+    #: ``with torch.cuda.stream(stream)``) and parks ``_prefetch_state``, and a
+    #: separate ``_consume_prefetched_embeddings`` later takes the join with
+    #: ``current_stream().wait_stream(prefetch_stream)`` -- models/qwen4_exp.py
+    #: :1106 and :1144 at upstream ref 99c9362e66. ``_fetch`` + ``wait_fetch()``
+    #: below is the same factorisation, which is why no new stream layer is
+    #: needed here.
+    #: Two things to COPY from that donor when the issue point moves, both of
+    #: which this class does not need while the join is inline:
+    #:   * it RAISES if the previous state was never consumed ("PLE prefetch
+    #:     state was not consumed before reuse", :1114-1115) -- a split-phase
+    #:     pair needs that loud invariant, because a silently overwritten
+    #:     record is a dropped join, i.e. the corruption this constant guards;
+    #:   * it calls ``record_stream`` on the gather's INDEX tensor (:1139),
+    #:     because a transient tensor may be recycled by the caching allocator
+    #:     before an unjoined copy reads it. Our sources are the long-lived
+    #:     ``self._pinned`` pool and ``self._resident`` buffers, so nothing here
+    #:     is allocator-transient today -- but a deferred fetch that ever reads
+    #:     a temporary must record_stream it.
+    FETCH_JOIN_INLINE = True
 
     def __init__(self, layer, fraction: float):
         self.layer = layer
@@ -2624,6 +2871,13 @@ class MoEExpertOffloadCache:
         self._resident: Dict[str, "object"] = {}  # attr -> GPU buffer [R+C,...]
         self._stream = None
         self._installed = False
+        # #1036: the copy stream's completion as a named EVENT, not only as a
+        # stream-to-stream join, so the read-after-write ordering point becomes
+        # movable (see FETCH_JOIN_INLINE). Created with the stream in install().
+        self._fetch_done = None
+        self._fetch_calls = 0
+        self._fetch_joins = 0
+        self._fetch_join_logged = False
 
         # --- Stage-1 hot-expert residency ----------------------------------
         # When enabled, per-expert routing counts are accumulated over the first
@@ -2827,6 +3081,11 @@ class MoEExpertOffloadCache:
         # has a context, so the CUDA branch is unchanged.
         cuda = torch.cuda.is_available()
         self._stream = torch.cuda.Stream() if cuda else None
+        # #1036: recorded on _stream after each wave's copies. torch's
+        # ``wait_stream`` IS record-event-then-wait-event, so naming the event
+        # costs nothing and is this tree's own idiom for a deferrable join
+        # (flashinfer_backend.py:3701 records, :3879 waits, at pin 2e92024a4d).
+        self._fetch_done = torch.cuda.Event() if cuda else None
         dev = torch.cuda.current_device() if cuda else torch.device("cpu")
         R = self.resident_count
         buf_slots = self.planner.buffer_size  # R + C
@@ -2921,6 +3180,8 @@ class MoEExpertOffloadCache:
         resolved through ``self._cold_tier``. The copy itself is the same
         ``copy_`` over the same link; only the source address differs, which is
         the whole design (the storage moved, the transport did not)."""
+        import logging
+
         import torch
 
         if not fetch_plan:
@@ -2964,6 +3225,7 @@ class MoEExpertOffloadCache:
                     dst[slot].copy_(spill[row], non_blocking=True)
                     moved += per_expert
 
+        self._fetch_calls += 1
         if self._stream is None:
             # No CUDA context (desk test): same copies, same order, no streams.
             _copies()
@@ -2971,9 +3233,54 @@ class MoEExpertOffloadCache:
             self._stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._stream):
                 _copies()
-            torch.cuda.current_stream().wait_stream(self._stream)
+            if self._fetch_done is not None:
+                # Read-after-write ordering point, as a named event so it can
+                # be taken by the consumer instead (FETCH_JOIN_INLINE=False).
+                self._fetch_done.record(self._stream)
+                if self.FETCH_JOIN_INLINE:
+                    self.wait_fetch()
+            else:  # pragma: no cover - no event available
+                torch.cuda.current_stream().wait_stream(self._stream)
+                self._fetch_joins += 1
         self.planner.stats.h2d_bytes += moved
         self.planner.stats.remote_h2d_bytes += remote_moved
+        if not self._fetch_join_logged:
+            self._fetch_join_logged = True
+            # EXECUTION-PROOF INSTRUMENT (#1036), one line per cache the first
+            # time it actually moves bytes.
+            # counter     = fetches whose copy stream was joined back into the
+            #               compute stream.
+            # denominator = fetches issued by this cache so far.
+            # Under FETCH_JOIN_INLINE the two are equal BY CONSTRUCTION, and
+            # that equality is the claim being instrumented: any future overlap
+            # experiment shows up here as joined < issued.
+            logging.getLogger(__name__).info(
+                "[moe-offload-fetch] layer=%s join=%s joined=%d/%d fetches "
+                "issued (event=%s)",
+                getattr(self.layer, "layer_id", None),
+                "inline" if self.FETCH_JOIN_INLINE else "deferred",
+                self._fetch_joins,
+                self._fetch_calls,
+                self._fetch_done is not None,
+            )
+
+    def wait_fetch(self):
+        """Order the CURRENT stream behind the last ``_fetch``'s copies.
+
+        The read-after-write half of ``_fetch``'s ordering, factored out so the
+        CONSUMER can take it (deferred join) instead of ``_fetch`` taking it on
+        the consumer's behalf (``FETCH_JOIN_INLINE``). Identical primitive
+        either way -- ``Stream.wait_stream`` is record-event + wait-event -- so
+        this is not a second stream-management layer, it is the same one with
+        its join point named. Idempotent: waiting on a completed event is a
+        no-op, and waiting twice on one record is harmless.
+        """
+        import torch
+
+        if self._fetch_done is None:
+            return
+        torch.cuda.current_stream().wait_event(self._fetch_done)
+        self._fetch_joins += 1
 
     def _build_lut(self, slot_of_needed, dtype, device):
         """Global expert id -> slot LUT for one wave; -1 for every id the wave

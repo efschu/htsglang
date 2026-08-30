@@ -2003,6 +2003,29 @@ class Envs:
     SGLANG_DSV4_MHC_PREWARM = EnvBool(True)
     SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
+    # Qwen4-Exp Gated Residual (hyper-connections). Adopted from upstream
+    # qwen4-main-squashed environ.py:964,968 together with
+    # layers/hyperconnection.py, which reads both in GatedResidual.__init__
+    # and raises AttributeError without them.
+    # Route the low-rank HC mix through the CuTe split-K pair (sm_100 only;
+    # GatedResidual additionally gates on device capability) instead of the
+    # persistent Triton mix.
+    SGLANG_HC_MIX_CUDA = EnvBool(True)
+    # Split the HC combine gate dot across CTAs instead of one CTA per row.
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
+    # Qwen4-Exp QSA (Qwen Sparse Attention), read by
+    # layers/attention/qwen4_exp_qsa.resolve_qsa_mode().
+    # "dense": attend to the full causal context through the ordinary
+    #   attention backend and DISCARD the indexer's block selection. This is
+    #   a strict numerical SUPERSET of "sparse" (all blocks instead of the
+    #   selected 512), so it is the correctness reference; the indexer
+    #   projections still run, so weights and shapes stay exercised and a
+    #   mode flip is a pure A/B.
+    # "sparse": block-selected attention through upstream's
+    #   QwenSparseAttnBackend. Faster, and what the checkpoint was trained
+    #   for, but it depends on kernels whose reachability is audited by
+    #   resolve_qsa_route() and refused loudly when a stage is missing.
+    SGLANG_QSA_MODE = EnvStr("dense")
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
