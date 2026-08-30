@@ -10045,12 +10045,70 @@ class Scheduler(
             # throughout this method).
             if self.ps.pp_size > 1:
                 if self.ps.pp_rank == 0:
-                    told = self._pp_admission_guard.prefix_len_for(
-                        req.rid, len(req.prefix_indices)
-                    )
-                    # #930: prefix_indices and cache_protected_len move
-                    # TOGETHER. See Req.truncate_prefix_to.
-                    req.truncate_prefix_to(told)
+                    # #1039: A CLAMP NOBODY IS TOLD ABOUT MANUFACTURES THE
+                    # DISAGREEMENT IT EXISTS TO RESOLVE.
+                    #
+                    # This is PP0's half of a two-half mechanism. PP0 clamps
+                    # its own prefix to the learned floor -- and, after
+                    # UNRESOLVED_DEFER_CAP identical re-offers, the #944
+                    # escalation pins the rid to `told=0`
+                    # (`prefix_len_for` -> `return 0 if self.note_offer(...)`).
+                    # `truncate_prefix_to` then zeroes `prefix_indices` and
+                    # `cache_protected_len` TOGETHER (#930). The OTHER half --
+                    # every downstream rank adopting that same `told` -- is the
+                    # `elif self._pp_admission_incoming_effective is not None`
+                    # branch directly below, and #1015 deleted the receive that
+                    # populates it. Measured: that memo is now permanently
+                    # None, and a whole boot emits ZERO forwarded-schedule
+                    # markers of any kind.
+                    #
+                    # So the surviving half runs alone, on rank 0 only, and
+                    # produces exactly the signature six consecutive boots
+                    # died of (`devtools/census_extent_uniformity.py`, zero
+                    # lines skipped, one occurrence per boot, always slot 0):
+                    #
+                    #     PP0=(0, 4096)    PP1=(8192, N)    same rid, same n
+                    #
+                    # with `#1036` reporting `cleared_together=True` at
+                    # `add_one_req` -- the `truncate_prefix_to` fingerprint.
+                    #
+                    # UPSTREAM-MINIMAL: the surviving half of a deleted
+                    # mechanism is a DELETION candidate, not a repair
+                    # candidate, and the wire is explicitly not to be rebuilt
+                    # (#631 `d7618425a4` reverted it after two metal
+                    # deadlocks; #1015 removed it again). The clamp is
+                    # therefore skipped while it cannot be distributed, and
+                    # the condition is the same predicate the telling branch
+                    # uses -- so if that wire is ever restored, the clamp
+                    # resumes automatically and cannot silently diverge again.
+                    #
+                    # Without the clamp every rank derives its prefix from its
+                    # own fresh match, which is what the peers already do and
+                    # what 94 of 94 healthy extents in the specimen boot show
+                    # to be rank-uniform.
+                    if self._pp_admission_incoming_effective is not None:
+                        told = self._pp_admission_guard.prefix_len_for(
+                            req.rid, len(req.prefix_indices)
+                        )
+                        # #930: prefix_indices and cache_protected_len move
+                        # TOGETHER. See Req.truncate_prefix_to.
+                        req.truncate_prefix_to(told)
+                    else:
+                        told = len(req.prefix_indices)
+                        _n = getattr(self, "_1039_clamp_skipped", 0) + 1
+                        self._1039_clamp_skipped = _n
+                        if _n <= 5 or _n % 256 == 0:
+                            logger.info(
+                                "#1039 UNDISTRIBUTABLE CLAMP SKIPPED rid=%s "
+                                "prefix=%d: PP0's learned-floor clamp is one "
+                                "half of a mechanism whose telling half #1015 "
+                                "deleted. Applying it here would move this "
+                                "rank's prefix alone and manufacture the "
+                                "rank split. occurrence=%d",
+                                str(getattr(req, "rid", "?"))[:8],
+                                told,
+                                _n,
+                            )
                 elif self._pp_admission_incoming_effective is not None:
                     told = self._pp_admission_incoming_effective.get(req.rid)
                     if told is None:
