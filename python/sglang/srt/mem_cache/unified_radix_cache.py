@@ -3288,6 +3288,141 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
 
+    def _rehome_stale_prefetch_span(
+        self,
+        req_id: str,
+        stale_indices,
+        n_tokens: int,
+        stale_generation,
+    ):
+        """#939: re-home an already-fetched span into the CURRENT generation's pool.
+
+        WHY THIS EXISTS. A prefetch opened under binding generation N completes
+        after the request's own prefill flip, so it lands under N+1/N+2. That is
+        not a race that can be tuned away: BOOT-MEASURED 2026-08-30 on
+        boot_855_1039ingen, the request that triggers the prefetch also triggers
+        the flips, so under drain-and-flip EVERY request spans a flip pair
+        (generations 0,2,4,6,8 across five requests; a min_dwell of 60 s refused
+        117581 flips and changed the pattern not at all). #937 therefore refused
+        100 % of non-zero fetches, five of five, zero counterexamples.
+
+        WHAT IS ACTUALLY STALE, and what is not. The fetched BYTES are keyed by
+        content hash and are generation-independent -- they are as valid now as
+        when they were read. What is stale is only the HOST SLOTS they were
+        written into, which were minted by the pool of `stale_generation` and
+        will be freed against it. So the correct move is not to discard the
+        bytes and re-read them (#943b's re-issue, which loses the race with
+        admission anyway), but to mint fresh slots under the CURRENT binding and
+        copy the bytes across.
+
+        THIS IS NOT A BYPASS OF #937 -- IT IS A NEW LEGITIMATE EXIT FROM IT.
+        The form #937 was built against is measured and specific (0827 soak:
+        every prompt >= 256 tokens returned non-deterministic garbage at
+        temperature 0 because a span was adopted WHOLE out of a pool that had
+        already been replaced). That form stays structurally impossible here:
+        the caller adopts ONLY the tensor this function returns, and that tensor
+        can only ever come from `dst_pool.alloc` on the pool bound RIGHT NOW.
+        `stale_indices` is never returned, never adopted, and still travels the
+        generation-stamped release to the pool that minted it. Every failure
+        path below returns None, which leaves the #937 refusal exactly as it was.
+
+        Returns the freshly minted indices, or None to decline (caller refuses).
+        """
+        if n_tokens <= 0:
+            return None
+        cc = self.cache_controller
+        dst_pool = getattr(cc, "mem_pool_host", None)
+        if dst_pool is None:
+            return None
+        try:
+            from sglang.srt.mem_cache.hicache_phase_binding import (
+                current_generation,
+                host_pool_for_generation,
+            )
+
+            src_pool = host_pool_for_generation(stale_generation)
+        except Exception:  # noqa: BLE001
+            return None
+        if src_pool is None or src_pool is dst_pool:
+            # Same object means the stamp moved but the tier did not; there is
+            # nothing to re-home and copying onto itself would be a no-op at
+            # best. Let the refusal stand rather than invent a third outcome.
+            return None
+        page = int(getattr(dst_pool, "page_size", 1) or 1)
+        if int(getattr(src_pool, "page_size", page) or page) != page:
+            # Different page geometry between the two tiers: a page-wise copy
+            # would silently reinterpret bytes. Refuse; a wrong prefix is worse
+            # than a missing one, which is the whole lesson of #937.
+            return None
+
+        t0 = time.perf_counter()
+        new_indices = dst_pool.alloc(n_tokens)
+        if new_indices is None:
+            self.evict_host(n_tokens)
+            new_indices = dst_pool.alloc(n_tokens)
+        if new_indices is None:
+            self._rehome_declined_no_room = (
+                getattr(self, "_rehome_declined_no_room", 0) + 1
+            )
+            logger.warning(
+                "#939 RE-HOME DECLINED (no room) req=%s tokens=%d: the current "
+                "generation's host pool could not seat the span even after "
+                "evict_host. Falling through to the #937 refusal. (%d so far.)",
+                req_id,
+                int(n_tokens),
+                self._rehome_declined_no_room,
+            )
+            return None
+        try:
+            n_pages = 0
+            for off in range(0, n_tokens, page):
+                dst_pool.set_from_flat_data_page(
+                    int(new_indices[off]),
+                    src_pool.get_data_page(int(stale_indices[off]), flat=True),
+                )
+                n_pages += 1
+        except Exception:  # noqa: BLE001
+            # Hand the fresh slots straight back and decline. NEVER fall through
+            # to adopting `stale_indices` -- that is precisely the #937 form.
+            try:
+                dst_pool.free(new_indices)
+            except Exception:  # noqa: BLE001
+                pass
+            self._rehome_copy_failed = getattr(self, "_rehome_copy_failed", 0) + 1
+            logger.warning(
+                "#939 RE-HOME COPY FAILED req=%s tokens=%d from_generation=%s: "
+                "fresh slots returned, #937 refusal stands. (%d so far.)",
+                req_id,
+                int(n_tokens),
+                stale_generation,
+                self._rehome_copy_failed,
+                exc_info=True,
+            )
+            return None
+
+        self._prefetch_span_rehomed = getattr(self, "_prefetch_span_rehomed", 0) + 1
+        # THE RECONCILIATION INSTRUMENT (#939 guardrail 2): after this change,
+        # `refused_stale + re_homed` must equal what `refused_stale` alone used
+        # to be. If the two do not add up, a THIRD exit is running silently and
+        # that is the finding, not the ratio.
+        logger.warning(
+            "#939 PREFETCH SPAN RE-HOMED n=%d req=%s tokens=%d pages=%d "
+            "from_generation=%s to_generation=%s copy_ms=%.1f | reconcile: "
+            "refused_stale=%d re_homed=%d sum=%d",
+            self._prefetch_span_rehomed,
+            req_id,
+            int(n_tokens),
+            n_pages,
+            stale_generation,
+            current_generation(),
+            (time.perf_counter() - t0) * 1e3,
+            getattr(self, "_prefetch_insert_refused_stale", 0),
+            self._prefetch_span_rehomed,
+            getattr(self, "_prefetch_insert_refused_stale", 0)
+            + self._prefetch_span_rehomed,
+        )
+        return new_indices
+
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
@@ -3369,7 +3504,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         _stamp = getattr(operation, "binding_generation", None)
-        if not write_back_stamp_is_current(_stamp):
+        _stale = not write_back_stamp_is_current(_stamp)
+        # #939 RE-HOMING, tried BEFORE the refusal. The bytes are content-keyed
+        # and still valid; only the slots holding them belong to a superseded
+        # generation. `_rehome_stale_prefetch_span` mints fresh slots under the
+        # CURRENT binding and copies the bytes there, returning None to decline
+        # -- and on None the #937 refusal below runs exactly as it always did.
+        # The stale indices are never adopted on either branch.
+        _rehomed = (
+            self._rehome_stale_prefetch_span(
+                req_id, host_indices, int(min_completed_tokens), _stamp
+            )
+            if _stale
+            else None
+        )
+        if _stale and _rehomed is None:
             self._prefetch_insert_refused_stale = (
                 getattr(self, "_prefetch_insert_refused_stale", 0) + 1
             )
@@ -3413,12 +3562,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     _MAX_PREFETCH_REISSUES,
                 )
         else:
+            # `_rehomed` is None on the normal (current-stamp) path and carries
+            # freshly minted current-generation slots on the re-homed path. The
+            # tree therefore only ever adopts slots that belong to the binding
+            # that is live right now -- never `host_indices` when it is stale.
+            _adopt = _rehomed if _rehomed is not None else host_indices
             insert_result = self._insert_helper_host(
                 last_host_node,
                 fetched_key,
-                host_indices[:min_completed_tokens],
+                _adopt[:min_completed_tokens],
                 hash_value[: min_completed_tokens // self.page_size],
             )
+            if _rehomed is not None:
+                # Whatever the tree did NOT adopt out of the re-homed span
+                # belongs to the CURRENT generation's pool -- not to the stale
+                # one that `host_indices` is routed to further below. Sending
+                # these two spans down one route is exactly the head/tail drift
+                # #905 was written to stop.
+                from sglang.srt.mem_cache.hicache_phase_binding import (
+                    current_generation as _cur_gen,
+                )
+
+                _new_unclaimed_to = (
+                    min_completed_tokens
+                    if insert_result.host_span_unclaimed
+                    else insert_result.prefix_len
+                )
+                self.cache_controller.append_host_mem_release(
+                    host_indices=_rehomed[:_new_unclaimed_to],
+                    generation=_cur_gen(),
+                )
 
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
@@ -3433,9 +3606,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # and when the contiguous-backup law declined the insert the fetched
         # TAIL was not adopted either. Both are this rank's to release: no
         # tree node references them, so nothing else ever will.
+        # #939: when the span was RE-HOMED, the tree references the fresh slots
+        # and the ENTIRE stale span is unreferenced -- so all of it goes back to
+        # the generation that minted it, regardless of how much of the re-homed
+        # copy the tree adopted. Reading `insert_result` here (which now
+        # describes the FRESH span) would under-free the stale one and leak it.
         unclaimed_to = (
             min_completed_tokens
-            if insert_result.host_span_unclaimed
+            if (insert_result.host_span_unclaimed or _rehomed is not None)
             else insert_result.prefix_len
         )
         # DIAGNOSTIC ONLY (#905 window): the decisive datum. If the pool object
