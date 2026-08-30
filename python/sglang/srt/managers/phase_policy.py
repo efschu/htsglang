@@ -3722,7 +3722,8 @@ def _decide_from_load(
                 " -- decode is in flight, this is a normal hold"
                 if inp.running_bs > 0
                 else " -- NOTHING IS DECODING EITHER; if a client is waiting, "
-                "its request never reached this scheduler (#1028)"
+                "its request was admitted and then stopped progressing "
+                "somewhere DOWNSTREAM of admission (#1028)"
             )
         )
 
