@@ -3336,9 +3336,29 @@ class MHATokenToKVPool(KVCache):
             # carried: the reservation is immutable after construction, so a
             # loan the arena has no address space for is a loan no runtime
             # actuator can ever grant -- the #848 wall, in the lending
-            # direction. The admission reserve alone does not cover it (4096
-            # rows against the ~40k rows 1024 MiB buys at this rig's row size),
-            # so without this the grow would be refused as RESERVATION-CAPPED.
+            # direction. The admission reserve alone does not cover it: 4096
+            # rows against the ~40k rows 1024 MiB buys at this rig's row size.
+            #
+            # WHAT IS AND IS NOT MEASURED HERE, because the first version of
+            # this comment got it wrong. It asserted that "without this the
+            # grow would be refused as RESERVATION-CAPPED" -- inferred from the
+            # boot's 609062-vs-592677 ratio, never from an observed refusal.
+            # Measured 2026-08-30 at 5 sessions (dial requests 334-576k against
+            # a 616194 id space): RESERVATION-CAPPED 0, extent refusals 0. So
+            # the ceiling is NOT a binding constraint AT THAT LOAD, and the
+            # claim as written was an indicator-law violation -- a ratio read
+            # off a boot and turned into a statement about behaviour.
+            #
+            # It is UNPROVEN, not disproven, and the distinction is the whole
+            # point: that load never drove occupancy near 1.0, and at
+            # saturation the dial may well press against the ceiling, which is
+            # exactly when the loan needs the address space. Widening costs
+            # only virtual address space (see lawful_reservation_rows: "an
+            # over-sized reservation" is cheap, an under-sized one is a
+            # permanent wall no runtime actuator can lift), so it stays on the
+            # cheap side of an asymmetric bet. Do not re-describe it as either
+            # load-bearing or as mere precaution until a saturated boot has
+            # read the LEND/grow pair.
             return int(
                 lawful_reservation_rows(int(self.size), reserve, int(margin_rows))
             )
