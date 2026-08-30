@@ -5633,7 +5633,25 @@ class ServerArgs:
             "'30,17,17'). Mandatory with --enable-phase-flip, refused "
             "without it. Length must equal pp_size (the same ranks flip). "
             "Also the TP layout's KV owner rule -- both phase pools are "
-            "sized at boot from it (DESIGN_631 section 3.4a).",
+            "sized at boot from it (DESIGN_631 section 3.4a). This is a "
+            "VALIDATED OVERRIDE of --phase-flip-solve-vector: passing it "
+            "wins, but it wins by being the only one passed.",
+        ),
+    ] = None
+    phase_flip_solve_vector: A[
+        Optional[str],
+        Arg(
+            help="#1017: solve --phase-flip-tp-vector from a measured "
+            "census directory instead of hand-pinning it, closing the last "
+            "large hand-set performance axis (PROVENANCE_32_16_16_boot.md "
+            "gap G10: 'solve() from per-rank compute capability'). Takes "
+            "the SAME census directory as --pp-solve-cut. The solved "
+            "vector materializes into --phase-flip-tp-vector, so every "
+            "downstream check runs on it exactly as on a hand-written one. "
+            "BASIS IS CAPABILITY, NOT A TP-PHASE MEASUREMENT: no per-rank "
+            "compute instrument exists inside the TP phase today, and the "
+            "emitted provenance line says so every time. Refuses rather "
+            "than clamps when no vector fits the rank budgets.",
         ),
     ] = None
     phase_flip_spill_depth: A[
@@ -8666,11 +8684,17 @@ class ServerArgs:
         from sglang.srt.managers.phase_flip_spill import resolve_spill_depth
 
         resolve_spill_depth(self)
+        # #1017: solve the vector before the mandatory-flag check, so a
+        # solved vector satisfies it exactly as a hand-written one does. The
+        # solver is an input to this pipeline, not a bypass of it -- the same
+        # rule --pp-solve-cut follows for --pp-layer-ratio.
+        self._handle_phase_flip_solve_vector()
         if self.phase_flip_tp_vector is None:
             raise ValueError(
                 "--enable-phase-flip requires --phase-flip-tp-vector (the "
                 "TP decode layout's weighted DCP vector; there is no "
-                "default because pool sizing derives from it)."
+                "default because pool sizing derives from it), or "
+                "--phase-flip-solve-vector <census_dir> to solve it (#1017)."
             )
         try:
             vec = [int(x) for x in self.phase_flip_tp_vector.split(",")]
@@ -17269,6 +17293,171 @@ class ServerArgs:
                 )
             out.append((name, float(spec.gemm_tflops), float(spec.membw_gbs)))
         return out
+
+    def _handle_phase_flip_solve_vector(self):
+        """--phase-flip-solve-vector: solve the flip's TP weight vector (#1017).
+
+        Closes gap **G10** of ``PROVENANCE_32_16_16_boot.md``, the last large
+        hand-set axis on the performance surface: "``--phase-flip-tp-vector
+        32,16,16`` | Typed TP-phase weight shard | solve() from per-rank
+        compute capability."
+
+        Materializes ``phase_flip_tp_vector``, so the length check against
+        ``pp_size``, the pool sizing that derives from it and every other
+        downstream consumer run on the solved vector exactly as they run on a
+        hand-written one.
+
+        NOT a lane of ``apply_auto_performance`` (#1010, ``949bd6e305``). That
+        solver is refused under ``pp_size > 1`` and the refusal was upheld
+        rather than bridged, for reasons that bind here: it indexes budgets by
+        ``tp_size`` and scores by the WORLD-length ``--rank-gpu-id``, and it
+        would be a second authority over a split ``--phase-flip-tp-vector``
+        already declares. This path shares that flag's census and card-rate
+        readers and nothing else.
+        """
+        census_dir = self.phase_flip_solve_vector
+        if census_dir is None:
+            return
+
+        if self.phase_flip_tp_vector is not None:
+            raise ValueError(
+                "--phase-flip-solve-vector and --phase-flip-tp-vector both "
+                "decide the TP phase's weight split. --phase-flip-tp-vector "
+                "is a VALIDATED OVERRIDE and still wins when you want it -- "
+                "but it wins by being the only one passed, not by silently "
+                "overruling a solved vector. Drop one."
+            )
+
+        from sglang.srt.planner import flip_tp_vector as ftv
+        from sglang.srt.planner.pp_cut_calibration import load_census_calibration
+
+        cfg = self._read_declared_config() or {}
+        text = cfg.get("text_config") or cfg
+
+        def probe(key):
+            v = cfg.get(key)
+            return int((v if v is not None else text.get(key, 0)) or 0)
+
+        q_heads = probe("num_attention_heads")
+        kv_heads = probe("num_key_value_heads")
+        if not q_heads:
+            raise ValueError(
+                "--phase-flip-solve-vector cannot solve a width split: the "
+                f"model config at {self.model_path} does not declare "
+                "num_attention_heads. Pass --phase-flip-tp-vector explicitly."
+            )
+
+        # THE SUM IS A CONSTRAINT, NOT A CONVENTION. `partition_sizes` splits a
+        # dimension that carries no unit count by requiring
+        # `total % sum(weights) == 0`, and raises otherwise. So the vector's
+        # sum must divide every unitless sharded dimension. On the reference
+        # rig those are the MLP intermediate (17408) and the two GDN
+        # projections (48*128 = 6144 value, 16*128 = 2048 key); their gcd is
+        # 1024, which is why sum 64 is admissible and why HANDOVER_855 records
+        # `43,11,11` (sum 65) as "fails all three unitless dims" -- 65 divides
+        # none of them. Derived here rather than inherited.
+        unitless_dims = tuple(
+            d
+            for d in (
+                probe("intermediate_size"),
+                probe("linear_num_value_heads") * probe("linear_value_head_dim"),
+                probe("linear_num_key_heads") * probe("linear_key_head_dim"),
+            )
+            if d > 0
+        )
+        admissible = ftv.admissible_ratio_totals(unitless_dims, self.pp_size)
+        if not admissible:
+            raise ValueError(
+                "--phase-flip-solve-vector: no vector sum divides this "
+                f"model's unitless sharded dimensions {list(unitless_dims)} "
+                f"while giving each of {self.pp_size} ranks a share. Pass "
+                "--phase-flip-tp-vector explicitly."
+            )
+        # Prefer the incumbent sum when the geometry admits it, so a solved
+        # vector stays directly comparable to every measured arm on record
+        # (HANDOVER_855's candidates all carry sum 64). Otherwise take the
+        # largest admissible sum: a finer grid quantizes capability less.
+        ratio_total = (
+            ftv.INCUMBENT_RATIO_TOTAL
+            if ftv.INCUMBENT_RATIO_TOTAL in admissible
+            else admissible[-1]
+        )
+        depth = self.declared_num_hidden_layers()
+        kinds = self.declared_layer_kinds()
+        if depth is None or kinds is None:
+            raise ValueError(
+                "--phase-flip-solve-vector cannot price the shard: the "
+                f"model's depth or per-layer families are unreadable from "
+                f"{self.model_path}."
+            )
+
+        calibration = load_census_calibration(census_dir)
+        rates = self._pp_cut_card_rates(calibration.gpu_names)
+        budgets = self._pp_cut_budgets(calibration.total_visible_mib)
+
+        # The TP phase shards every layer across every rank, so the mass that
+        # scales with a rank's share is the WHOLE model's shardable weight --
+        # not one stage's, which is what the PP cut prices. Measured census
+        # numbers, never a formula: every formula-derived weight term on this
+        # rig has been wrong (the C38/C39 lesson).
+        n_attn = sum(1 for k in kinds if k)
+        shardable_mib = (
+            n_attn * calibration.attn_layer_mib
+            + (len(kinds) - n_attn) * calibration.linear_layer_mib
+            + calibration.lm_head_mib
+        )
+        ranks = tuple(
+            ftv.RankCapability(
+                label=f"rank{i}-{rates[i][0]}",
+                gemm_score=rates[i][1],
+                budget_mib=budgets[i],
+                fixed_overhead_mib=calibration.residual_mib[i],
+            )
+            for i in range(self.pp_size)
+        )
+        solution = ftv.solve_flip_tp_vector(
+            ftv.FlipTPVectorInputs(
+                ranks=ranks,
+                ratio_total=ratio_total,
+                unitless_dims=unitless_dims,
+                head_units=q_heads,
+                total_kv_heads=kv_heads,
+                shardable_bytes=shardable_mib * ftv.MIB,
+                replicated_bytes=(
+                    calibration.replicated_mib + calibration.embedding_mib
+                )
+                * ftv.MIB,
+            )
+        )
+
+        # The KV cell is expected to be INVARIANT across candidate vectors on
+        # this rig (HANDOVER_855 sec 4.4). If a solve moves it, every pool
+        # size derived from the old cell is stale -- say so rather than let
+        # the next reader discover it as a corridor breach.
+        incumbent_kv = ftv.partition_units_largest_remainder(
+            kv_heads, [ratio_total // self.pp_size] * self.pp_size
+        )
+        if kv_heads and solution.kv_heads != incumbent_kv:
+            logger.warning(
+                "--phase-flip-solve-vector: the solved vector moves the KV "
+                "head split from %s to %s. The KV cell is not invariant for "
+                "this solve, so any pool size calibrated on the old cell "
+                "carries that error bar.",
+                list(incumbent_kv),
+                list(solution.kv_heads),
+            )
+
+        self.phase_flip_tp_vector = solution.vector_string()
+        logger.info(
+            "--phase-flip-solve-vector %s: solved --phase-flip-tp-vector %s "
+            "(of %d query heads, kv heads %s) -- %s. %s",
+            census_dir,
+            solution.vector_string(),
+            q_heads,
+            list(solution.kv_heads),
+            solution.summary(),
+            solution.describe(),
+        )
 
     def _pp_cut_budgets(self, census_totals):
         """Per-stage memory budget: the explicit per-rank cap when given,
