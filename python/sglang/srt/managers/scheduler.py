@@ -9496,57 +9496,7 @@ class Scheduler(
             self._996_bind = "err"
 
         if self.chunked_req is not None:
-            # #1038: A PREFIX THAT NO STORE CONSULT PRODUCED IS RANK-LOCAL.
-            #
-            # This call deliberately omits `tree_cache` so a continuation
-            # mid-chunk cannot have its prefix moved under it (the #988/#965
-            # hazard). That argument holds only while there IS a prefix. When
-            # `prefix_indices` is empty the omission has the opposite effect:
-            # nothing is protected, and the request is admitted at prefix 0
-            # from stale local state while a peer holding the same rid in its
-            # waiting_queue reaches `init_next_round_input(self.tree_cache)`
-            # (:10020), consults the store, and admits it at 8192.
-            #
-            # That is the whole signature, measured in FIVE consecutive boots
-            # by `devtools/census_extent_uniformity.py` (zero lines skipped),
-            # always one occurrence per boot, always ring slot 0:
-            #
-            #     PP0=(0, 4096)   PP1=(8192, N)   same rid, same n
-            #
-            # and read directly off PP0's own lines in emission order --
-            # `#969 EXTENT n=74 (…, 0, 4096)` FIRST, its own
-            # `#969B READMIT-MATCH prefix=8192` SECOND. The rank admitted
-            # before it consulted. Whether a rid is this rank's `chunked_req`
-            # or in its waiting_queue is rank-local, so the two ranks derived
-            # the same request's shape from two different inputs -- the
-            # admission-input-uniformity rule this strand runs on.
-            #
-            # SURGICAL, AND THE NARROWEST FORM THAT CLOSES IT: consult the
-            # store only when there is no prefix to move. A genuine mid-chunk
-            # continuation (prefix non-empty) keeps the original behaviour
-            # byte-for-byte, so the #988/#965 hazard is untouched; an empty
-            # prefix has nothing that CAN move, and the consult is exactly
-            # what the peer already did.
-            _cr = self.chunked_req
-            _cr_prefix = getattr(_cr, "prefix_indices", None)
-            if _cr_prefix is not None and len(_cr_prefix) == 0:
-                self._1038_store_consulted = (
-                    getattr(self, "_1038_store_consulted", 0) + 1
-                )
-                _n = self._1038_store_consulted
-                if _n <= 5 or _n % 64 == 0:
-                    logger.info(
-                        "#1038 CHUNKED CONTINUATION CONSULTS THE STORE rid=%s: "
-                        "its prefix is empty, so there is nothing a re-match "
-                        "can move, and admitting without the consult is what "
-                        "let this rank start at 0 while a peer served the same "
-                        "rid at its cached prefix. occurrence=%d",
-                        str(getattr(_cr, "rid", "?"))[:8],
-                        _n,
-                    )
-                _cr.init_next_round_input(self.tree_cache)
-            else:
-                _cr.init_next_round_input()
+            self.chunked_req.init_next_round_input()
             # #679 rung 1-3: SPEND RELIEF BEFORE THE PARK, not instead of it.
             #
             # The ladder runs here and nowhere else: this is the last point at
