@@ -1569,24 +1569,35 @@ class ServerArgs:
     pp_solve_objective: A[
         str,
         Arg(
-            help="What --pp-solve-cut optimizes. 'kv-floor' (default) "
-            "maximizes the world KV floor min_r(capacity_r) -- the token "
-            "count the pipeline can actually address -- which is the "
-            "capacity-first objective. 'makespan' minimizes the lockstep "
-            "prefill makespan instead. BOTH SOLVERS ALREADY EXISTED; this "
-            "flag chooses between them. "
-            "THE TWO TRADE AGAINST EACH OTHER AND THE TRADE IS NOW PRINTED: "
-            "whichever objective is chosen, the provenance line reports the "
-            "chosen cut's pool AND makespan plus the cut the other objective "
-            "would have picked, so the cost of the choice is a number in the "
-            "boot log rather than an inference. Measured 2026-08-30 on the "
-            "reference rig: the makespan solver moved a layer onto the "
-            "poorer stage and paid 3.9 % of the world pool (616670 -> 592677 "
-            "tokens) for it, which is exactly the trade this flag makes "
-            "visible and selectable.",
+            help="What --pp-solve-cut optimizes. 'makespan' (DEFAULT) "
+            "minimizes the lockstep prefill makespan. 'kv-floor' maximizes "
+            "planner/pp_cut.world_kv_floor -- BUT THAT METRIC WAS FALSIFIED "
+            "ON METAL 2026-08-30 and the option is kept only for "
+            "experiments; it warns when selected. "
+            "WHAT WAS MEASURED, three cuts on the reference rig, PP world "
+            "tokens = min_r(available_r / (n_attn_r * 2048)): hand-pin "
+            "[32,18,14] 616670, makespan [32,17,15] 592677, kv-floor "
+            "[31,18,15] 567412. The solver had predicted kv-floor ABOVE "
+            "makespan, so the ranking INVERTED, and both solved cuts lost to "
+            "the hand pin. Root: world_kv_floor is a FEASIBILITY-scoped "
+            "proxy, not the boot's sizing formula -- it charges the "
+            "dual-phase arena max(PP attention share, TP token share) and its "
+            "spendable pot is the cut gate's, which lands 2.33x below the "
+            "boot's available bytes. It also cannot separate two cuts whose "
+            "binding stage is unchanged: it returned the identical "
+            "265213.33 for [32,18,14] and [32,17,15], which metal separates "
+            "by 23993 tokens. "
+            "The serving world is dominated by the ATTENTION split, and "
+            "ANALYSE_799 section 5.4 predicted this before the solver was "
+            "built: on the current budgets PP0 is the POOR stage, so moving "
+            "attention off it makes the min worse. kv-floor moved an "
+            "attention layer onto PP1 ([8,4,4] -> [7,5,4]) and PP1 fell "
+            "725191 -> 567412. "
+            "Whichever objective is chosen the provenance line reports both "
+            "cuts on both axes, so the trade is a number in the boot log.",
             choices=["kv-floor", "makespan"],
         ),
-    ] = "kv-floor"
+    ] = "makespan"
     dp_size: A[
         int,
         Arg(
@@ -16739,8 +16750,29 @@ class ServerArgs:
         # standing boot is a capacity push), and whichever is chosen the
         # provenance line below prices BOTH cuts on BOTH axes. A trade that
         # is printed per boot cannot be paid by accident.
-        objective = str(getattr(self, "pp_solve_objective", "kv-floor"))
+        objective = str(getattr(self, "pp_solve_objective", "makespan"))
         if objective == "kv-floor":
+            # #1019: kept for experiments, never silent. The metric this
+            # objective maximizes was falsified on metal 2026-08-30 -- it
+            # ranked three cuts in the exact reverse of the serving world,
+            # and both solved cuts lost to the hand pin. See
+            # pp_cut.world_kv_floor's docstring for the mechanism and
+            # docs/dev/ANALYSE_799_token_axis_x_pp.md section 5.4 for the
+            # prediction that preceded it.
+            logger.warning(
+                "--pp-solve-objective kv-floor maximizes "
+                "pp_cut.world_kv_floor, which was FALSIFIED ON METAL "
+                "2026-08-30: measured PP world tokens ranked hand-pin "
+                "[32,18,14] 616670 > makespan [32,17,15] 592677 > kv-floor "
+                "[31,18,15] 567412, the exact reverse of this metric's "
+                "ranking, and both solved cuts lost to the hand pin. The "
+                "metric is feasibility-scoped (it charges the dual-phase "
+                "arena and the cut gate's spendable pot, 2.33x below the "
+                "boot's available bytes) and cannot separate cuts that share "
+                "a binding stage. The serving world is dominated by the "
+                "ATTENTION split. Use --pp-solve-objective makespan unless "
+                "you are deliberately experimenting."
+            )
             kv_solution = pp_cut.solve_pp_cut_for_kv_floor(inputs)
             if not kv_solution.feasible:
                 raise ValueError(

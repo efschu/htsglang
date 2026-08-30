@@ -1570,6 +1570,48 @@ def world_kv_floor(
     ``None`` rather than 0.0 or -inf: a cut that cannot fund the corridor and
     the seam has no capacity to report, and returning a number would let a
     caller rank it against cuts that can.
+
+    DO NOT RANK CUTS BY THIS. FALSIFIED ON METAL 2026-08-30 (#1019).
+    ------------------------------------------------------------------
+    It IS a ``min`` -- the reduction below is ``min(floor, cap)``, and the
+    suspicion that it summed per-rank capacities is wrong. The defect is the
+    QUANTITY being reduced, not the reduction.
+
+    The boot sizes the serving world as
+    ``min_r(available_bytes_r / (n_attn_layers_r * kv_cell))``. This function
+    reduces :func:`stage_kv_capacity`, which differs from that in two ways:
+
+    * it charges the DUAL-PHASE arena, ``max(PP attention share, TP token
+      share)``, because one arena backs both flip layouts. On the reference
+      rig that bills stage1 for 4.75 attention-equivalents where the PP boot
+      bills 4;
+    * its ``spendable`` pot is the CUT GATE's -- what is left after the
+      corridor, transient, fixed overhead and seam are funded. That is the
+      right pot for "does this cut fit" and the wrong one for "how many
+      tokens will the boot address": measured 2.33x below the boot's
+      available bytes on the same cut and stage.
+
+    Consequence, measured: it returned the IDENTICAL 265213.33 for
+    ``[32,18,14]`` and ``[32,17,15]`` -- their binding stage is stage0, which
+    the two cuts share -- while metal separates them by 23993 tokens. Ranking
+    the three cuts by this metric inverted against metal:
+
+        metric : [31,18,15] > [32,18,14] = [32,17,15]
+        metal  : [32,18,14] 616670 > [32,17,15] 592677 > [31,18,15] 567412
+
+    WHY THE INVERSION WAS PREDICTABLE, and it was predicted. The serving
+    world is dominated by the ATTENTION split, and
+    ``docs/dev/ANALYSE_799_token_axis_x_pp.md`` section 5.4 measured that on
+    the CURRENT budgets PP0 is the POOR stage, so moving attention layers off
+    it makes the min WORSE (the historic "+33 % for [6,5,5]" projection
+    inverts to -16 %). The kv-floor solve moved an attention layer onto PP1
+    ([8,4,4] -> [7,5,4]) and PP1 fell 725191 -> 567412. That section also
+    puts a ceiling of 639800 tokens (+6.51 %) on the whole token axis at this
+    cut, so the capacity prize is smaller than the framing assumed.
+
+    This function remains correct for what it was built for -- a
+    feasibility-scoped capacity comparison inside the cut gate. Use the boot
+    sizing formula for anything the boot will then size.
     """
     pref_attn = _prefix_attention(inputs.layer_families)
     hybrid = 0 < inputs.n_full_attention < inputs.n_layers
