@@ -16563,7 +16563,25 @@ class ServerArgs:
             pp_cut.LAYER_FAMILY_ATTENTION if k else pp_cut.LAYER_FAMILY_LINEAR
             for k in kinds
         )
+        # #1009(b): the arena the cut gate prices must be the pool this boot
+        # will actually provision. `--max-total-tokens` states it outright when
+        # the operator passes it; when they do not, the operating point is
+        # `--context-length`, NOT a chunk-derived guess.
+        #
+        # THE DEFECT THIS REPLACES, measured 2026-08-30: `pool_tokens` was
+        # `max_total_tokens or 0`, and `arena_tokens` is
+        # `kv_pool_tokens or kv_depth_tokens`, so on every boot that does not
+        # pass --max-total-tokens the arena silently became
+        # `chunked_prefill_size * 64`. On the #855 boot that is 4096*64 =
+        # 262144 -- a number that LOOKS like the context length and tracks it
+        # not at all: the refusal text was byte-identical at
+        # --context-length 131072 and only moves when the CHUNK SIZE moves.
+        # A term that reads as the operating point and is actually a chunk
+        # heuristic is exactly the "looks complete and is wrong" failure this
+        # module refuses everywhere else.
         pool_tokens = int(self.max_total_tokens or 0)
+        if pool_tokens <= 0 and self.context_length:
+            pool_tokens = int(self.context_length)
         kv_bytes = self._pp_cut_kv_bytes_per_token_per_attn_layer()
         token_shares = self._pp_cut_token_shares()
 
