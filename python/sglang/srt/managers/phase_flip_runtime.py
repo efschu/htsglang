@@ -88,6 +88,10 @@ from sglang.srt.utils.common import ceil_align
 logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PHASE-FLIP"
+# #1028: how many consecutive flips may be deferred for an incomplete writeback
+# fence before the flip proceeds anyway and the recompute is accepted out loud.
+# Small on purpose: this is a bound against a wedge, not a retry budget.
+_WRITEBACK_DEFER_LIMIT = 3
 
 #: #871: consecutive work-retracting cutovers whose fence persisted nothing
 #: before the blind-fence alarm fires. FOUR, taken from #719's settled reading
@@ -8767,18 +8771,47 @@ class PhaseFlipRuntime:
         n = len(released or ())
         self.residents_released = int(getattr(self, "residents_released", 0)) + n
         self.tree_rows_returned = tree_rows["returned"]
+        # #1028: THE PROMISE IS NOW BOUND TO THE FENCE'S OWN NUMBERS.
+        #
+        # This line asserted "Their KV is in the canonical store from the
+        # fence" UNCONDITIONALLY. Measured on boot_855_wt1016 19:22:45-46, the
+        # post-retract fence had just logged `acked=1 outstanding=3` and this
+        # line still made the promise one second later; the re-admission then
+        # reported `host_hit=0 storage_hit=0` and recomputed 13180 tokens. Two
+        # instruments of the same cutover, same second, opposite claims -- the
+        # instrument-text class, where the text describes something the code
+        # never checked. It now reads the report it is speaking for.
+        _post = getattr(self, "_last_retract_writeback_report", None)
+        _outstanding = None if _post is None else int(getattr(_post, "outstanding", 0))
+        if _outstanding:
+            _kv_claim = (
+                f"WARNING: {_outstanding} backup(s) were STILL IN FLIGHT at the "
+                f"fence, so that many prefixes are NOT in the canonical store "
+                f"and their requests will recompute in full rather than serve "
+                f"by read-through (#1028)"
+            )
+        elif _post is None:
+            _kv_claim = (
+                "the fence reported nothing on this cutover, so whether their KV "
+                "reached the canonical store is UNMEASURED here (#1028)"
+            )
+        else:
+            _kv_claim = (
+                "their KV is in the canonical store from the fence (acked, "
+                "0 outstanding); the new layout re-admits them and serves the "
+                "prefix by read-through"
+            )
         logger.info(
             "%s RESIDENTS RELEASED for %s: %d request(s) retracted, %d live "
             "reference(s) retired, and the prefix tree dropped returning %s "
-            "row(s) to the allocator, in that order (#856). Their KV is in "
-            "the canonical store from the fence; the new layout re-admits "
-            "them and serves the prefix by read-through. Nothing is carried "
-            "across, and nothing retracted is still live.",
+            "row(s) to the allocator, in that order (#856). %s. Nothing is "
+            "carried across, and nothing retracted is still live.",
             LOG_PREFIX,
             direction,
             n,
             int(getattr(self, "_retracted_refs_retired", 0)),
             "UNKNOWN" if tree_rows["returned"] is None else tree_rows["returned"],
+            _kv_claim,
         )
         # W31: RE-ADMIT THEM. THIS IS THE HALF #856 NEVER SHIPPED.
         #
@@ -10726,6 +10759,13 @@ class PhaseFlipRuntime:
         # current phase, which is the lesson the bounds check below learned the
         # expensive way. A prefix that misses the store costs a later cache
         # miss; that is the cheaper failure, and it is logged, not thrown.
+        # #1028: set when the fence came back with backups still in flight. It
+        # becomes a TERM IN THE UNANIMOUS VERDICT below rather than a log line,
+        # for the reason the row-bounds paragraph gives two screens down:
+        # nothing has been mutated at this point, so the safe answer to "this
+        # flip cannot honour its own contract" is that every rank abandons it
+        # and keeps serving. See the objection's own comment for the measurement.
+        writeback_detail: Optional[str] = None
         try:
             from sglang.srt.mem_cache.hicache_flip_writeback import (
                 maybe_flip_writeback,
@@ -10734,6 +10774,15 @@ class PhaseFlipRuntime:
             report = maybe_flip_writeback(getattr(self, "_census_scheduler", None))
             if report:
                 seam_census.mark("flip_writeback")
+                if not report.complete:
+                    writeback_detail = (
+                        f"#1028 writeback fence incomplete: {report.outstanding} "
+                        f"backup(s) still in flight ({report.as_log()}). The "
+                        f"cutover would retract these residents and drop the "
+                        f"prefix tree while claiming their KV is in the "
+                        f"canonical store, and the re-admission would then find "
+                        f"host_hit=0 and RECOMPUTE the whole prompt"
+                    )
                 # #856: THE FENCE IS HALF THE NEW VALIDATION METRIC. Once the
                 # flip carries no KV, cutover-blocking time is fence + weights
                 # refill, and the fence's cost has until now been visible only
@@ -10849,6 +10898,56 @@ class PhaseFlipRuntime:
         affordable, staging_detail = self._staging_affordable(staging_bytes, direction)
         if not affordable:
             too_small.append(staging_detail)
+
+        # #1028: AN EXPIRED FENCE MAY NOT CONVERT INTO A FALSE PROMISE.
+        #
+        # MEASURED, boot_855_wt1016 19:22:45: the fence reported `acked=1
+        # outstanding=3 elapsed=2.000s/2.000s` and the cutover proceeded to log
+        # "RESIDENTS RELEASED ... Their KV is in the canonical store from the
+        # fence" one second later. It was not. `#969B READMIT-MATCH
+        # rid=a5517198 prefix_len=0 host_hit=0 storage_hit=0 input_len=13180`
+        # is the receipt: all 13180 tokens were recomputed, the recompute did
+        # not fit the one-chunk TP grant, and the decode phase armed away from
+        # it mid-recompute -- four flips and 157.7 s of wall for 16 tokens.
+        # This is the falsifier #856 named for itself in WINDOW-QUEUE.md: "a
+        # flip that completes but leaves requests re-prefilling uncached means
+        # the fence is not covering what read-through needs."
+        #
+        # It joins the existing unanimous abandon rather than becoming a check
+        # of its own -- same argument as the staging term above: the answer
+        # when the flip cannot be honoured is group-agreed and rank-uniform,
+        # and a rank-local abandon would half-flip the group.
+        #
+        # BOUNDED, because a permanently stuck storage backend must not mean
+        # "never flip again" -- that trades a recompute for a wedge, which is
+        # the worse of the two and the failure class this campaign keeps
+        # paying for. After `_WRITEBACK_DEFER_LIMIT` consecutive defers the
+        # flip proceeds and the recompute is ACCEPTED OUT LOUD, which is the
+        # honest version of what the code did silently before.
+        if writeback_detail is not None:
+            _wb_defers = int(getattr(self, "_writeback_defers", 0) or 0)
+            if _wb_defers < _WRITEBACK_DEFER_LIMIT:
+                self._writeback_defers = _wb_defers + 1
+                too_small.append(
+                    f"{writeback_detail} -- deferring this flip "
+                    f"({self._writeback_defers}/{_WRITEBACK_DEFER_LIMIT}); the "
+                    f"residents stay resident and decodable (#1011)"
+                )
+            else:
+                logger.error(
+                    "%s #1028 WRITEBACK DEFER LIMIT reached (%d consecutive): "
+                    "proceeding with the flip although the fence is incomplete. "
+                    "The affected prefixes WILL miss and their requests WILL "
+                    "recompute in full -- accepted here deliberately, because a "
+                    "flip deferred without end is a wedge and a wedge is worse "
+                    "than a recompute. %s",
+                    LOG_PREFIX,
+                    _wb_defers,
+                    writeback_detail,
+                )
+                self._writeback_defers = 0
+        else:
+            self._writeback_defers = 0
 
         # #721: HOST RAM, measured at the flip, every flip.
         #

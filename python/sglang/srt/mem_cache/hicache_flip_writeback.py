@@ -94,6 +94,9 @@ LOG_PREFIX = "[#703 flip-writeback]"
 
 # Poll interval while waiting for storage acknowledgements.
 _POLL_S = 0.005
+# #1028: hard total = this many times the no-progress bound. See
+# `maybe_flip_writeback` for why it is derived rather than separately settable.
+_CEILING_MULTIPLE = 12.0
 
 
 class FlipWritebackRefused(RuntimeError):
@@ -121,6 +124,10 @@ class FlipWritebackReport:
     # not carry that counter, which is NOT the same as zero and must not be
     # printed as zero.
     refused_mamba_pin: int = -1
+    # #1028: the HARD total bound, distinct from `deadline_s` which is now the
+    # NO-PROGRESS bound. Printed beside elapsed so a fence that ran long
+    # because acks kept landing is distinguishable from one that hung.
+    ceiling_s: float = 0.0
 
     @property
     def complete(self) -> bool:
@@ -181,6 +188,7 @@ class FlipWritebackReport:
             f"refused_silently={self.refused_silently} "
             f"refused_mamba_pin={mamba} "
             f"elapsed={self.elapsed_s:.3f}s/{self.deadline_s:.3f}s"
+            f" ceiling={self.ceiling_s:.3f}s"
         )
 
 
@@ -300,6 +308,7 @@ def flip_writeback(
     tree_cache: Any,
     *,
     deadline_s: float = 2.0,
+    ceiling_s: Optional[float] = None,
     now: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> FlipWritebackReport:
@@ -310,16 +319,43 @@ def flip_writeback(
     That ordering is the whole point: after the cutover the same copy would
     read a pool the model is no longer writing into.
 
-    The deadline is a hard bound, not a target. Whatever is not acknowledged in
-    time stays in flight; the report says so and the caller decides. Nothing
-    here aborts the flip -- a prefix that misses the store is a cache miss
-    later, which is a cost, while a flip that stalls behind an unbounded wait
-    is a wedge.
+    #1028: THE BOUND IS ON STALLING, NOT ON DURATION.
+
+    ``deadline_s`` was a flat wall-clock cut, and that is the wrong axis: it
+    cuts a fence that is making steady progress at exactly the same moment as
+    one that is wedged. MEASURED, boot_855_wt1016 19:22:42 and 19:22:45, the
+    same four nodes fenced twice three seconds apart: ``acked=0 outstanding=4``
+    then ``acked=1 outstanding=3``, both ``elapsed=2.000s/2.000s``. Acks were
+    landing at roughly one per three seconds -- the backups were not stuck,
+    they were slow -- so the flat bound threw away a 13179-token prompt's
+    persistence that another ~10 s would have completed. The consequence is
+    the #1028 churn: ``host_hit=0`` on re-admission, a full recompute of the
+    whole prompt, and the decode phase armed away from it mid-recompute.
+
+    So the bound that stays is the one that CONVERGES, the same argument
+    ``phase_policy`` makes for its drain stall: ``deadline_s`` is now the
+    NO-PROGRESS bound -- give up after this long with no acknowledgement --
+    and ``ceiling_s`` is a hard total so a backend that acks forever in small
+    increments still cannot hold the seam open without end.
+
+    Behaviour is UNCHANGED for the two cases that dominate: a fence with
+    nothing outstanding still returns in milliseconds, and a genuinely stuck
+    backend still gives up after ``deadline_s`` exactly as before. Only the
+    slow-but-progressing case, which is the defect, behaves differently.
+
+    Nothing here aborts the flip -- this function reports and the CALLER
+    decides. Under #1028 the caller does now act on ``outstanding > 0``
+    (phase_flip_runtime's unanimous abandon), which is where such a verdict
+    belongs: group-agreed, before anything is mutated.
     """
     require_canonical_store(tree_cache)
 
     started = now()
+    if ceiling_s is None:
+        ceiling_s = float(deadline_s)
+    ceiling_s = max(float(ceiling_s), float(deadline_s))
     deadline = started + float(deadline_s)
+    ceiling = started + float(ceiling_s)
 
     nodes = _hashed_nodes(tree_cache)
     # #969E: the discriminator, logged beside eligible. See _total_nodes.
@@ -437,7 +473,7 @@ def flip_writeback(
         logger.warning("%s writing_check failed: %s", LOG_PREFIX, e)
 
     acknowledged, outstanding = _await_storage_acks(
-        tree_cache, deadline=deadline, now=now, sleep=sleep
+        tree_cache, deadline=deadline, ceiling=ceiling, now=now, sleep=sleep
     )
 
     report = FlipWritebackReport(
@@ -450,6 +486,7 @@ def flip_writeback(
         deadline_s=float(deadline_s),
         refused_silently=refused_silently,
         refused_mamba_pin=refused_mamba_pin,
+        ceiling_s=float(ceiling_s),
     )
     if report.complete:
         logger.info("%s %s", LOG_PREFIX, report.as_log())
@@ -469,6 +506,7 @@ def _await_storage_acks(
     tree_cache: Any,
     *,
     deadline: float,
+    ceiling: Optional[float] = None,
     now: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> tuple[int, int]:
@@ -529,6 +567,19 @@ def _await_storage_acks(
             before,
         )
         return 0, before
+    # #1028: WAIT WHILE PROGRESS IS BEING MADE, not while a clock runs.
+    #
+    # `deadline` is the NO-PROGRESS bound and `ceiling` the hard total. The
+    # stall clock is RESET every time the in-flight set shrinks, so a backend
+    # acking one node every second keeps the fence open, while a backend that
+    # acks nothing gives up after exactly the same interval as before this
+    # change. `best` is monotone by construction (the set only shrinks as acks
+    # land), so the reset cannot be triggered by noise.
+    if ceiling is None:
+        ceiling = deadline
+    best = len(ongoing)
+    stall_window = max(0.0, deadline - now())
+    last_progress = now()
     while True:
         try:
             drain()
@@ -537,7 +588,22 @@ def _await_storage_acks(
             break
         if not ongoing:
             break
-        if now() >= deadline:
+        remaining = len(ongoing)
+        if remaining < best:
+            best = remaining
+            last_progress = now()
+        t = now()
+        if t - last_progress >= stall_window:
+            break
+        if t >= ceiling:
+            logger.warning(
+                "%s #1028 writeback fence hit its HARD CEILING with %d backup(s) "
+                "still in flight while acks were still landing -- this is the "
+                "bound that exists so a slow backend cannot hold the seam open "
+                "without end, not a stall. Those prefixes will miss.",
+                LOG_PREFIX,
+                len(ongoing),
+            )
             break
         sleep(_POLL_S)
     outstanding = len(ongoing)
@@ -567,4 +633,14 @@ def maybe_flip_writeback(
         deadline_s = float(
             getattr(server_args, "phase_flip_writeback_deadline_s", None) or 2.0
         )
-    return flip_writeback(tree_cache, deadline_s=deadline_s)
+    # #1028: the hard total. Deliberately NOT a second CLI knob for now -- it is
+    # derived from the one the operator already sets, so there is no new
+    # configuration surface and no way for the two to be set inconsistently.
+    # The multiple is sized from the measurement that opened #1028 (four nodes
+    # acking at ~1 per 3 s against a 2 s bound); 12x2 s = 24 s covers it with
+    # room, and costs nothing whenever the fence is already complete.
+    ceiling_s = float(
+        getattr(server_args, "phase_flip_writeback_ceiling_s", None)
+        or (deadline_s * _CEILING_MULTIPLE)
+    )
+    return flip_writeback(tree_cache, deadline_s=deadline_s, ceiling_s=ceiling_s)

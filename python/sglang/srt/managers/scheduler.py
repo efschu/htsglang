@@ -3809,7 +3809,13 @@ class Scheduler(
         return False
 
     def _seam_cohort_pending(self):
-        """#1032 FIX 1: the flip cohort that is not yet resident, (count, tokens).
+        """#1032 FIX 1: the flip cohort not yet resident, (count, tokens, spent).
+
+        #1028 added the third member: how many stamped re-admissions were
+        EXCLUDED because their one-chunk TP grant is spent while they are still
+        neither resident nor finished. It changes no decision -- the pair is
+        computed exactly as before -- it exists so the caller can report which
+        of the two reasons ended the dwell instead of guessing.
 
         THE COHORT ALREADY HAS AN IDENTITY and this adds none: it is the set
         the last cutover retracted and `readmit_seam_residents` put back on
@@ -3856,7 +3862,7 @@ class Scheduler(
                 seam_grant_is_open,
             )
         except Exception:  # noqa: BLE001
-            return (0, 0)
+            return (0, 0, 0)
         try:
             resident = set()
             for mb in getattr(self, "running_mbs", []) or []:
@@ -3868,6 +3874,7 @@ class Scheduler(
                 resident.add(id(req))
             n = 0
             toks = 0
+            spent = 0
             for req in list(getattr(self, "waiting_queue", ()) or ()):
                 if getattr(req, SEAM_READMIT_ATTR, None) is None:
                     continue
@@ -3879,15 +3886,26 @@ class Scheduler(
                 # The welded half: a spent grant hands the remainder back to
                 # PP as honest work, and it must be visible there.
                 if not seam_grant_is_open(req):
+                    # #1028: COUNTED, NOT JUST SKIPPED. This `continue` is why
+                    # the dwell can end while the cohort is still mid-recompute:
+                    # the TP grant is ONE chunk, a 13179-token re-admission is
+                    # four, and after chunk 1 the request drops out of the
+                    # cohort here although it is neither resident nor finished.
+                    # The count leaves with the pair so DWELL-RELEASE can say
+                    # WHICH of the two reasons ended the dwell instead of
+                    # asserting the flattering one (measured boot_855_wt1016
+                    # 19:23:33: "the flip cohort is resident" logged in the same
+                    # second as `recomputing=True` on a 4096-token TP batch).
+                    spent += 1
                     continue
                 n += 1
                 origin = getattr(req, "origin_input_ids", None) or ()
                 prefix = getattr(req, "prefix_indices", None)
                 owed = len(origin) - (0 if prefix is None else len(prefix))
                 toks += max(0, int(owed))
-            return (n, toks)
+            return (n, toks, spent)
         except Exception:  # noqa: BLE001 - a policy input may abstain, never raise
-            return (0, 0)
+            return (0, 0, 0)
 
     def _prefilled_awaiting_merge_bs(self) -> int:
         """#1030: requests whose prefill is DONE but which are not yet resident.
@@ -13300,9 +13318,9 @@ class Scheduler(
         # emit ONE line per chain link -- the execution proof this fix is
         # judged by. HOLD names the cohort size, RELEASE fires the round it
         # becomes resident, BROKEN fires if the bound expires first.
-        _cohort_n, _cohort_tok = 0, 0
+        _cohort_n, _cohort_tok, _cohort_spent = 0, 0, 0
         try:
-            _cohort_n, _cohort_tok = self._seam_cohort_pending()
+            _cohort_n, _cohort_tok, _cohort_spent = self._seam_cohort_pending()
             # SMOKE, unconditional and rate-limited: boot 564aa7aea7 emitted
             # ZERO dwell lines and there was no way to tell "the reader ran and
             # found no cohort" from "the reader never ran" -- the
@@ -13382,16 +13400,35 @@ class Scheduler(
                     )
             else:
                 if _prev > 0:
-                    logger.info(
-                        "#1032 DWELL-RELEASE after %d round(s) in phase=%s: the "
-                        "flip cohort is resident; the pp-ward demand is free "
-                        "again. This is the normal end of the dwell.",
-                        _prev,
-                        runtime.phase,
-                    )
+                    # #1028: SAY WHICH REASON ENDED THE DWELL. The cohort count
+                    # reaches zero on two different paths and only one of them
+                    # is "resident". When requests dropped out because their
+                    # one-chunk TP grant is spent, they are mid-recompute, and
+                    # calling that residency is the claim that let the
+                    # decode-empty verdict fire against work that was arriving.
+                    if _cohort_spent > 0:
+                        logger.warning(
+                            "#1032 DWELL-RELEASE after %d round(s) in phase=%s: "
+                            "the pp-ward demand is free again, but NOT because "
+                            "the cohort became resident -- %d re-admission(s) "
+                            "left the cohort with a SPENT one-chunk TP grant and "
+                            "are still recomputing. This is the #1028 path: the "
+                            "release is honest, the residency is not.",
+                            _prev,
+                            runtime.phase,
+                            _cohort_spent,
+                        )
+                    else:
+                        logger.info(
+                            "#1032 DWELL-RELEASE after %d round(s) in phase=%s: "
+                            "the flip cohort is resident; the pp-ward demand is "
+                            "free again. This is the normal end of the dwell.",
+                            _prev,
+                            runtime.phase,
+                        )
                 self._1032_stall_rounds = 0
         except Exception:  # noqa: BLE001 - a probe may never break the policy
-            _cohort_n, _cohort_tok = 0, 0
+            _cohort_n, _cohort_tok, _cohort_spent = 0, 0, 0
 
         inp = PhasePolicyInputs(
             phase=runtime.phase,
