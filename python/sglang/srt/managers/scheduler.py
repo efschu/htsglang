@@ -7489,12 +7489,38 @@ class Scheduler(
                 if _lb.forward_mode.is_extend():
                     _n = getattr(self, "_1031_n", 0) + 1
                     self._1031_n = _n
-                    if _n <= 200:
+                    # #1028 RE-ARM: the flat 200-line cap made this probe
+                    # ANSWER-BLIND for the case it was written to settle.
+                    # Measured on boot_855_fix1027_..._112900: the cap was
+                    # exhausted in 37 s (11:32:16 -> 11:32:53, 200 lines on
+                    # each of 3 ranks) and the strand happened at 11:58 --
+                    # 25 minutes after the probe had gone silent. The
+                    # stranded rid appears in ZERO probe lines. A head
+                    # sample alone cannot catch an intermittent late event.
+                    #
+                    # So: keep the head sample AND always emit on the one
+                    # state the probe exists to discriminate -- an extend
+                    # batch that CARRIED requests while the running batch is
+                    # empty afterwards. That is the "#running-req: 0"
+                    # signature, and it separates the two readings the
+                    # docstring above says nothing has separated yet:
+                    # never-merged (this fires, running_bs_after=0) vs
+                    # merged-then-retracted (this does NOT fire; the merge
+                    # happened and #856 no-carry removed it later).
+                    # Rare by construction, so it cannot flood the way a
+                    # raised flat cap would.
+                    _interesting = (
+                        int(_lb.batch_size()) > 0
+                        and int(running_batch.batch_size()) == 0
+                    )
+                    if _n <= 200 or _interesting:
                         logger.info(
-                            "#1031 MERGE-PATH n=%d pp_rank=%s last_extend_bs=%d "
+                            "#1031 MERGE-PATH n=%d why=%s pp_rank=%s "
+                            "last_extend_bs=%d "
                             "last_empty=%s running_bs_after=%d chunked=%s "
                             "rids=%s",
                             _n,
+                            "NEVER-MERGED-CANDIDATE" if _interesting else "head",
                             getattr(getattr(self, "ps", None), "pp_rank", -1),
                             int(_lb.batch_size()),
                             bool(_lb.is_empty()),

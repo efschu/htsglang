@@ -731,16 +731,70 @@ class PrefillAdmissionGate:
         read -- that is the pre-existing behaviour, so an unreadable snapshot
         costs precision and never a refusal.
         """
-        cache = int(self._allocator_cache_bytes())
         hook = getattr(self, "_graph_pool_free_probe", None)
-        try:
-            if hook is not None:
+        if hook is not None:
+            # Injected probe: never cadenced. Callers that inject it want a
+            # live reading, and caching here would make them untestable.
+            cache = int(self._allocator_cache_bytes())
+            try:
                 trapped = hook()
-            else:
-                trapped = self._trapped_bytes_cadenced()
+            except Exception:  # noqa: BLE001 - precision, never a gate
+                return cache
+            return takeable_cache_bytes(cache, trapped)
+
+        # #1028: THE WHOLE VALUE IS CADENCED, not just its snapshot half.
+        #
+        # #1027 put `torch.cuda.memory_snapshot()` behind a cadence and left
+        # `_allocator_cache_bytes()` -- called on the line above the snapshot --
+        # on the per-round path. That function calls `memory_reserved()` and
+        # `memory_allocated()`, and BOTH go through `torch.cuda.memory_stats()`,
+        # which materialises the full stats mapping. So the expensive work was
+        # halved, not removed, and the group wedged again in the same shape.
+        # Caught live 2026-08-30 12:53Z with all three stacks at one moment:
+        # PP0 and PP2 waiting in the all_reduce at scheduler.py:6186, PP1
+        # burning CPU HERE at :6121 (memory_stats <- memory_reserved <-
+        # _allocator_cache_bytes:715). Specimen:
+        # /spinning/gpu-arb/W1028-LIVE-CATCH/FINDING.md.
+        #
+        # Same staleness argument as #1027 and it covers this half too: the
+        # value is SUBTRACTED from the spendable budget (:620), so a slightly
+        # old (larger) reading narrows a cut and never widens one.
+        #
+        # THIS IS STILL A PER-CALL CADENCE, i.e. the same shape of answer that
+        # #1027 was. The durable fix is to make the whole pre-collective region
+        # cost-bounded by construction -- no allocator introspection between a
+        # round's start and the barrier every rank must reach -- which is the
+        # #968 answer (the budget verdict belongs at PP0 and is distributed,
+        # not recomputed locally by every rank before a barrier). Recorded here
+        # so the next reader does not mistake this for the destination.
+        import time
+
+        now = time.monotonic()
+        last = getattr(self, "_takeable_at", None)
+        if last is not None and (now - last) < self._TRAPPED_REFRESH_S:
+            cached = getattr(self, "_takeable_cached", None)
+            if cached is not None:
+                return cached
+
+        cache = int(self._allocator_cache_bytes())
+        try:
+            trapped = self._trapped_bytes_cadenced()
         except Exception:  # noqa: BLE001 - precision, never a gate
-            return cache
-        return takeable_cache_bytes(cache, trapped)
+            value = cache
+        else:
+            value = takeable_cache_bytes(cache, trapped)
+        self._takeable_cached = value
+        self._takeable_at = now
+        if not getattr(self, "_takeable_logged", False):
+            self._takeable_logged = True
+            logger.info(
+                "#1028 takeable-cache probe: WHOLE value cadenced at %.0fs "
+                "(was: only the memory_snapshot half, #1027). allocator "
+                "stats + graph-pool snapshot are now both off the per-round "
+                "admission path.",
+                self._TRAPPED_REFRESH_S,
+            )
+        return value
 
     #: #1027 cadence for the graph-pool-free probe, in seconds. NOT a tuning
     #: knob -- it is bounded above by how fast the term can CHANGE (only a
