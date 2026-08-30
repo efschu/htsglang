@@ -3282,7 +3282,7 @@ class MHATokenToKVPool(KVCache):
         self.k_buffer = tensors[: self.layer_num]
         self.v_buffer = tensors[self.layer_num :]
 
-    def _lawful_reserved_tokens(self) -> int:
+    def _lawful_reserved_tokens(self, margin_rows: int = 0) -> int:
         """#851 F2: rows to RESERVE, covering the floor's lawful headroom.
 
         `reserved_num_tokens=self.size` reserves for the size at THIS INSTANT,
@@ -3331,7 +3331,17 @@ class MHATokenToKVPool(KVCache):
             # the derivation, so a missing or zero server_arg cannot produce a
             # reservation smaller than the pre-#851 wall.
             reserve = max(reserve, int(CONSERVATIVE_ADMISSION_RESERVE_ROWS))
-            return int(lawful_reservation_rows(int(self.size), reserve, 0))
+            # #778 Posten 2: ``margin_rows`` now carries the TP leg's
+            # activation-reserve loan. This is the ONLY moment it can be
+            # carried: the reservation is immutable after construction, so a
+            # loan the arena has no address space for is a loan no runtime
+            # actuator can ever grant -- the #848 wall, in the lending
+            # direction. The admission reserve alone does not cover it (4096
+            # rows against the ~40k rows 1024 MiB buys at this rig's row size),
+            # so without this the grow would be refused as RESERVATION-CAPPED.
+            return int(
+                lawful_reservation_rows(int(self.size), reserve, int(margin_rows))
+            )
         except Exception:  # noqa: BLE001 - never fail construction on a knob
             return int(self.size)
 
@@ -3384,7 +3394,19 @@ class MHATokenToKVPool(KVCache):
         # Passing the same number to both makes the divergence unrepresentable
         # rather than merely currently-absent; `KvVmmBufferOwner.__init__`
         # refuses the pair if a future caller separates them again.
-        lawful_reserved = int(self._lawful_reserved_tokens())
+        # #778 Posten 2: price the TP leg's activation-reserve loan in VA rows
+        # BEFORE the reservation is fixed. The probe descs are pure layout
+        # objects at the pool's current size -- no allocation, no driver call --
+        # and they are the same derivation the arena will use, so the loan is
+        # sized from the geometry that will actually back it rather than from a
+        # second reconstruction of it.
+        try:
+            from sglang.srt.managers.kv_backing_relief import phase_release_loan_rows
+
+            loan_rows = int(phase_release_loan_rows(self._build_kv_buffer_descs()))
+        except Exception:  # noqa: BLE001 - a loan that cannot be priced is not taken
+            loan_rows = 0
+        lawful_reserved = int(self._lawful_reserved_tokens(margin_rows=loan_rows))
         buffer_descs = self._build_kv_buffer_descs(reserved_rows=lawful_reserved)
         self._post_capture_owner = KvVmmBufferOwner(
             device=self.device,
