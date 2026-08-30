@@ -956,6 +956,33 @@ class PrefillAdder:
         # assert deep inside `HybridReqToTokenPool.alloc` (#581).
         self._mamba_slots_per_req = 1
         if self._mamba_slot_cost:
+            # #1044 CALIBRATION: the unified branch charged 1 slot per request
+            # while the request actually holds `mamba_slots_per_running_req`
+            # of them -- ACTIVE + ping-pong + donation = 3 under this boot's
+            # flags (radix on, --mamba-slot-reorder on,
+            # --disable-overlap-schedule so ping-pong = 1). Measured at the
+            # exhaustion point of boot 575ae27f37: mamba usage 0.95 of
+            # mamba_total=20, i.e. 19 states held, at #running-req 3.
+            #
+            # The NON-unified branch below already calls this authority; only
+            # the unified path kept the flat 1, so `budget_state()` refused
+            # roughly three times too late and the pool drained into
+            # `alloc_req_slots runs out of memory ... mamba_schedulable=0`.
+            #
+            # SAME AUTHORITY, NOT A SECOND FORMULA (#1040 pattern): this is the
+            # #755/#773 derivation the allocator floor itself uses.
+            # Planner-derived rather than hand-pinned (#770), and rank-uniform
+            # by construction because `server_args` is replicated.
+            #
+            # The ceiling this makes explicit: 3 slots/req against 20 states is
+            # ~6 concurrent requests, BELOW --max-running-requests 8. That gap
+            # is what the #890 revocation had been masking as an implicit
+            # throttle; the gate now states it instead.
+            from sglang.srt.mem_cache.mamba_pool_floor import (
+                mamba_slots_per_running_req as _slots_per_req,
+            )
+
+            self._mamba_slots_per_req = _slots_per_req(get_server_args())
             self.rem_mamba_slots = (
                 self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             )
