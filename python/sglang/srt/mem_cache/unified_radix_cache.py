@@ -3355,6 +3355,47 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # than a missing one, which is the whole lesson of #937.
             return None
 
+        # PER-PAGE GEOMETRY, BOOT-MEASURED (boot_855_939rehome, 2026-08-30):
+        # equal `page_size` is NOT enough. All 15 copy attempts of that boot
+        # raised
+        #     RuntimeError: shape '[2, 16, 1, 4, 256]' is invalid for input of
+        #     size 16384   (and 8192)
+        # -- the source page carried HALF, or a QUARTER, of the destination's
+        # elements. The PP-phase and TP-phase host tiers shard differently under
+        # uneven DCP, so carrying a span across a flip is a RESHARD, not a
+        # relocation. Compare the geometry up front and decline cheaply, rather
+        # than allocating a span and then catching a reshape deep inside the
+        # pool. The exception handler below stays as the backstop; this makes
+        # the common case explicit and free.
+        try:
+            _src_page = src_pool.get_dummy_flat_data_page()
+            _dst_page = dst_pool.get_dummy_flat_data_page()
+            _geom_ok = (
+                _src_page.numel() == _dst_page.numel()
+                and _src_page.dtype == _dst_page.dtype
+            )
+        except Exception:  # noqa: BLE001
+            _geom_ok = False
+            _src_page = _dst_page = None
+        if not _geom_ok:
+            self._rehome_declined_geometry = (
+                getattr(self, "_rehome_declined_geometry", 0) + 1
+            )
+            if self._rehome_declined_geometry <= 5:
+                logger.warning(
+                    "#939 RE-HOME DECLINED (page geometry) req=%s tokens=%d "
+                    "from_generation=%s: source page %s elems, destination page "
+                    "%s elems -- the tiers shard differently, so this is a "
+                    "RESHARD and not a copy. #937 refusal stands. (%d so far.)",
+                    req_id,
+                    int(n_tokens),
+                    stale_generation,
+                    None if _src_page is None else _src_page.numel(),
+                    None if _dst_page is None else _dst_page.numel(),
+                    self._rehome_declined_geometry,
+                )
+            return None
+
         t0 = time.perf_counter()
         new_indices = dst_pool.alloc(n_tokens)
         if new_indices is None:
