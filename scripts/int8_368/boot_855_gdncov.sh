@@ -78,6 +78,20 @@ export SGLANG_UNEVEN_DCP=1
 export SGLANG_UNEVEN_DCP_WEIGHTED=1
 export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=1
+# Residency census (#485): armed only when CENSUS_DIR_ARG is passed. The census
+# must be measured ON THE CHECKPOINT THAT WILL BE SOLVED FOR -- it splits
+# parameter bytes by family from the parameter NAMES, so a census taken on the
+# incumbent would price the GDN layers at their BF16 size and solve a cut for a
+# model that no longer exists.
+if [ -n "${CENSUS_DIR_ARG:-}" ]; then
+  export SGLANG_RESIDENCY_CENSUS=1
+  # The cut gate funds the WORST load state each rank served, so the transient
+  # table must exist AND the census boot must serve REAL traffic -- an idle
+  # boot measures an idle transient and the solver refuses it by name.
+  export SGLANG_TRANSIENT_CENSUS=1
+  export SGLANG_RESIDENCY_CENSUS_DIR="$CENSUS_DIR_ARG"
+  mkdir -p "$CENSUS_DIR_ARG"
+fi
 # FRESH HiCache store: the model changed, and a store keyed on the previous
 # checkpoint's geometry would be a two-geometry key (HiCache-Phasen-Uniform).
 export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/tmp/hicache_855_${TAG}
@@ -92,6 +106,9 @@ mkdir -p /spinning/evidence-665-f1
   echo "tag         : $TAG"
   echo "rank_mib    : $RANK_MIB"
   echo "flip_policy : $FLIP_POLICY"
+  echo "chunk_size  : ${CHUNK_SIZE:-4096}"
+  echo "census_dir  : ${CENSUS_DIR_ARG:-<not armed>}"
+  echo "pp_cut_flags: ${PP_CUT_FLAGS:-<default hand pins 32,18,14 / 8,4,4>}"
   echo "model       : $MODEL"
   echo "footprint   : ${SGLANG_PHASE_FOOTPRINT_DUMP:-<not armed>}"
   echo "model bytes : $(du -sbL "$MODEL" | awk '{printf "%s (%.3f GiB)", $1, $1/1073741824}')"
@@ -115,8 +132,7 @@ setsid choom -n 1000 -- "$VENV/bin/python" -m sglang.launch_server \
   --trust-remote-code \
   --served-model-name Qwen3.8-27B \
   --tp-size 1 --pp-size 3 \
-  --pp-stage-ratio 32,18,14 \
-  --pp-attn-stage-ratio 8,4,4 \
+  ${PP_CUT_FLAGS:-  --pp-stage-ratio 32,18,14 --pp-attn-stage-ratio 8,4,4} \
   --rank-gpu-id 0,1,2 \
   --rank-gpu-memory-mib "$RANK_MIB" \
   --skip-server-warmup \
@@ -127,7 +143,7 @@ setsid choom -n 1000 -- "$VENV/bin/python" -m sglang.launch_server \
   --phase-flip-spill-depth arena \
   --disable-overlap-schedule \
   --kv-cache-dtype fp8_e4m3 \
-  --context-length 262144 \
+  --context-length ${CTX_LEN:-262144} \
   --max-running-requests 8 \
   --speculative-algorithm NEXTN \
   --speculative-num-steps 2 \
@@ -145,7 +161,7 @@ setsid choom -n 1000 -- "$VENV/bin/python" -m sglang.launch_server \
   --hicache-mem-layout layer_first \
   --hicache-io-backend direct \
   --host 127.0.0.1 --port 30030 \
-  --chunked-prefill-size 4096 \
+  --chunked-prefill-size ${CHUNK_SIZE:-4096} \
   --scheduler-distributed-teardown \
   --page-size 1 \
   --random-seed 785500001 \
