@@ -302,8 +302,12 @@ def main() -> int:
             note = (f"lane holds {len(mods)} module(s) but the log reports no "
                     f"test outcome at all -- collected nothing, or the summary "
                     f"was not understood")
+        # events, not names: the summary counts one failure per failing
+        # SUBTEST and one error per ERROR line, so a name count would be
+        # smaller by construction on any log carrying either (#1034a).
         print(f"  {name:7s}: {'OK' if ok else 'BROKEN'}  counts={r.counts} "
-              f"names={len(r.all_names)} {note}")
+              f"events=f{r.failed_events}/e{r.error_events} names={len(r.all_names)} "
+              f"{note}")
         broken = broken or not ok
     if broken:
         print("\nVERDICT: INCONCLUSIVE -- the extraction is broken, not the run.")
