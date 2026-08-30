@@ -106,6 +106,26 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TABLE = ROOT / "scripts" / "gate_partition.tsv"
 PY = os.environ.get("GATE_PY", "/spinning/htsglang-gpu/.venv/bin/python3")
 
+#: One table per gate path (DETERMINATION_898 §3.4). The pairing is DERIVED,
+#: never remembered: `--table` defaulted to the managers table whatever
+#: `--gate-path` said, so pointing the gate at another scope without also
+#: passing `--table` read every module there as "not in the partition table",
+#: demoted all of them to the serial lane, and still printed a verdict. A gate
+#: that silently measures the wrong scope is worse than one that refuses.
+SCOPE_TABLES = {
+    "test/registered/unit/managers": "gate_partition.tsv",
+    "test/registered/unit/distributed": "gate_partition_distributed.tsv",
+    "test/registered/unit/mem_cache": "gate_partition_mem_cache.tsv",
+    "test/registered/scheduler": "gate_partition_scheduler.tsv",
+    "test/registered/unit/unified_radix_tree": "gate_partition_unified_radix_tree.tsv",
+}
+
+
+def table_for(gate_path: str) -> Path | None:
+    """The table that belongs to this gate path, or None if none is registered."""
+    name = SCOPE_TABLES.get(gate_path.rstrip("/"))
+    return ROOT / "scripts" / name if name else None
+
 
 def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
@@ -146,7 +166,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-n", "--wide", type=int, default=8, help="workers for the wide lane")
     ap.add_argument("--narrow", type=int, default=4, help="workers for the rank-spawning lane")
-    ap.add_argument("--table", default=str(DEFAULT_TABLE))
+    ap.add_argument("--table", default=None,
+                    help="partition table; default is the one registered for "
+                         "--gate-path (see SCOPE_TABLES)")
     ap.add_argument("--gate-path", default="test/registered/unit/managers")
     ap.add_argument("--outdir", default=None)
     ap.add_argument("--serial-only", action="store_true",
@@ -158,6 +180,26 @@ def main() -> int:
                          "reference's failure set, in both directions")
     ap.add_argument("extra", nargs="*", default=[])
     args = ap.parse_args()
+
+    # Bind the table to the scope BEFORE anything runs. An unregistered scope
+    # is refused rather than silently gated against another scope's table: the
+    # old default paired every gate path with the managers table, and the
+    # failure was invisible -- every module reads as unclassified, the whole
+    # path goes to the serial lane, and a verdict is still printed.
+    if args.table is None:
+        derived = table_for(args.gate_path)
+        if derived is None:
+            print(f"REFUSED: no partition table is registered for gate path "
+                  f"{args.gate_path!r}. Build one with "
+                  f"scripts/gate_partition_build.py from a measured serial "
+                  f"reference plus solo probes, register it in SCOPE_TABLES, or "
+                  f"pass --table explicitly. Registered scopes: "
+                  f"{', '.join(sorted(SCOPE_TABLES))}.", file=sys.stderr)
+            return 2
+        args.table = str(derived)
+    if not Path(args.table).is_file():
+        print(f"REFUSED: partition table {args.table} does not exist.", file=sys.stderr)
+        return 2
 
     # The lane WIDTH is a knob; the distribution MODE is not. `loadscope` groups
     # test methods by CLASS, so it splits single files across workers and breaks
