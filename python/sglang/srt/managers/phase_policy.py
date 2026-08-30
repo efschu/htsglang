@@ -3545,10 +3545,47 @@ def _decide_from_load(
             in_phase = (
                 None if state.phase_since is None else inp.now - state.phase_since
             )
+            # #1041: THE FLOOR'S PRECONDITION EXCLUDED THE STATE IT PROTECTS.
+            #
+            # `running_bs > 0` asks "is something decoding right now". Right
+            # after a pp->tp cutover the answer is structurally NO: #856
+            # no-carry RETRACTS every resident, and the bundle that justified
+            # the flip is mid-re-admission. So the floor stood down in exactly
+            # the window it exists for -- its own comment calls it "minimum
+            # seconds in TP before a pending-prefill-driven flip".
+            #
+            # Measured, boot 10fc5c2b3f, the last empty TP phase:
+            #   02:09:00  cutover complete: active stack tp
+            #   02:09:00  holding in tp ... (running bs 0)
+            #   02:09:01  ARM-VERDICT-WRONG: armed (DRAINED, 5 req decoding),
+            #             cutover COMMITTED, no batch in 8 rounds
+            #   02:09:03  arming tp_to_pp: pending prefill 67950 tok > 0
+            #             (purity: prefill cannot run in tp, NOTHING DECODING)
+            #   02:09:09  cutover complete: active stack pp
+            # Three seconds in a 10 s floor, abandoned because the requests
+            # the flip was for had not landed back yet.
+            #
+            # Same family as #1036 v1: a guard whose trigger condition is
+            # destroyed by the very event it must survive.
+            #
+            # The replacement asks "does this phase have anything to serve",
+            # from inputs that survive the retraction: work already decoding,
+            # carriers waiting for a window, or a non-empty queue (the
+            # retracted bundle sits there mid-re-admission -- queue=7 in the
+            # specimen). A genuinely empty phase still escapes fast: all three
+            # terms are 0/False for the idle case, and the "decode phase ran
+            # EMPTY: no bundle was ever resident" arm remains the escape for a
+            # phase that stays empty past its own timer (it fired correctly at
+            # 02:00:47, 6.3 s in).
+            _floor_has_work = (
+                inp.running_bs > 0
+                or int(getattr(inp, "ready_carriers", 0) or 0) > 0
+                or bool(getattr(inp, "queue_nonempty", False))
+            )
             if (
                 cfg.tp_decode_floor_s > 0
                 and in_phase is not None
-                and inp.running_bs > 0
+                and _floor_has_work
                 and in_phase < cfg.tp_decode_floor_s
             ):
                 return _no(
