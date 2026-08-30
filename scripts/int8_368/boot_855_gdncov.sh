@@ -46,9 +46,22 @@ set -u
 
 TREE=/spinning/wt-855-int8
 VENV=/spinning/htsglang-gpu/.venv
-MODEL=/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed
+# MODEL / TAG / RANK_MIB are overridable so the SAME flag block serves every arm
+# of this strand -- the arm-A KLD-capture boot, the footprint-calibration boot,
+# and the retuned final boot differ ONLY in these, which is what makes the
+# comparisons attributable (Patchstand vor Last).
+MODEL=${MODEL_ARG:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed}
+TAG=${TAG_ARG:-gdncov}
+RANK_MIB=${RANK_MIB_ARG:-31800,18800,19800}
+# FLIP_POLICY: "auto" is the production shape. The MEASUREMENT arms use "manual"
+# so a long chunked prefill cannot race an auto-arm -- see the 05:05Z wedge
+# (W855-WEDGE-SPECIMEN.md): flip armed tp_to_pp while a chunked prefill was
+# incomplete, strict drain refused, and the group livelocked. That is the
+# flip strand's #856/#819 fault domain, not the checkpoint's; holding the
+# layout still is what makes the INT8 ladder attributable to the checkpoint.
+FLIP_POLICY=${FLIP_POLICY_ARG:-auto}
 STAMP=$(date -u +%m%d_%H%M%S)
-LOG=/spinning/evidence-665-f1/boot_855_gdncov_0840f82601_${STAMP}.log
+LOG=/spinning/evidence-665-f1/boot_855_${TAG}_0840f82601_${STAMP}.log
 
 NVRTC="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib"
 export LD_LIBRARY_PATH="$NVRTC:${LD_LIBRARY_PATH:-}"
@@ -67,8 +80,8 @@ export SGLANG_MAMBA_SSM_DTYPE=bfloat16
 export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=1
 # FRESH HiCache store: the model changed, and a store keyed on the previous
 # checkpoint's geometry would be a two-geometry key (HiCache-Phasen-Uniform).
-export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/tmp/hicache_855
-mkdir -p /tmp/hicache_855
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/tmp/hicache_855_${TAG}
+mkdir -p "/tmp/hicache_855_${TAG}"
 
 mkdir -p /spinning/evidence-665-f1
 
@@ -76,7 +89,11 @@ mkdir -p /spinning/evidence-665-f1
   echo "=== #855 BOOT (arm B, gdncov+vocabembed union) ==="
   echo "date        : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "tree        : $TREE @ $(git -C "$TREE" rev-parse --short=10 HEAD) ($(git -C "$TREE" rev-parse --abbrev-ref HEAD))"
+  echo "tag         : $TAG"
+  echo "rank_mib    : $RANK_MIB"
+  echo "flip_policy : $FLIP_POLICY"
   echo "model       : $MODEL"
+  echo "footprint   : ${SGLANG_PHASE_FOOTPRINT_DUMP:-<not armed>}"
   echo "model bytes : $(du -sbL "$MODEL" | awk '{printf "%s (%.3f GiB)", $1, $1/1073741824}')"
   echo "arm A ref   : /spinning/evidence-665-f1/boot_969nogrid_a51e5e8f28_0830_030705.log"
   echo "arm A model : /spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-vocabint8-embed"
@@ -101,11 +118,11 @@ setsid choom -n 1000 -- "$VENV/bin/python" -m sglang.launch_server \
   --pp-stage-ratio 32,18,14 \
   --pp-attn-stage-ratio 8,4,4 \
   --rank-gpu-id 0,1,2 \
-  --rank-gpu-memory-mib 31800,18800,19800 \
+  --rank-gpu-memory-mib "$RANK_MIB" \
   --skip-server-warmup \
   --enable-phase-flip \
   --phase-flip-tp-vector 32,16,16 \
-  --phase-flip-policy auto \
+  --phase-flip-policy "$FLIP_POLICY" \
   --phase-flip-purity strict:3 \
   --phase-flip-spill-depth arena \
   --disable-overlap-schedule \
@@ -158,6 +175,15 @@ setsid choom -n 1000 -- "$VENV/bin/python" -m sglang.launch_server \
   >> "$LOG" 2>&1 &
 
 echo $! > /spinning/gpu-arb/boot855.launchpid
+
+# DEAD-MAN ARMED BY THE LAUNCHER, not by the operator's memory (standing order
+# 2026-08-30, after an arming was missed). One-shot: it EXITS when it fires, so
+# an empty pgrep AFTER a verdict is correct behaviour, not a lost watcher.
+setsid /spinning/gpu-arb/devtools/boot_deadman.sh "$LOG" 30030 \
+  > "/spinning/gpu-arb/deadman_855_${TAG}.out" 2>&1 &
+echo "  deadman armed: pid $!, verdict -> /spinning/gpu-arb/deadman_855_${TAG}.out"
+sleep 1
+echo "  deadman pgrep proof: $(pgrep -c -f "[b]oot_deadman.sh" 2>/dev/null || echo 0) process(es)"
 ln -sfn "$LOG" /root/current_boot.log
 echo "$LOG" > /spinning/gpu-arb/boot855.logpath
 echo "launched, pid $(cat /spinning/gpu-arb/boot855.launchpid), log $LOG"
