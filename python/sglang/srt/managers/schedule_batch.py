@@ -145,7 +145,35 @@ logger = logging.getLogger(__name__)
 _1036_PREFIX_DEMOTIONS: Dict[str, int] = {}
 
 
-def _note_1036_prefix_demotion(req, start: int) -> None:
+def _1036_stamp_protected(req) -> int:
+    """#1036: sticky high-water mark of `cache_protected_len`; returns it.
+
+    THE REFERENCE MAY NOT BE READ FROM STATE THE DEFECT MUTATES. Version 1 of
+    this instrument compared the admitted start against the LIVE
+    `cache_protected_len` and was blind on boot `a4af6bd96e` at the exact
+    event it was built for: PP0 logged `protected=8192` at its consult and
+    admitted `start=0` on the next line, and the counter stayed at zero,
+    because the writer clears `cache_protected_len` in the same act as
+    `prefix_indices` (`reset_for_retract`, :1908 -- the #861j comment already
+    said so) and the guard therefore evaluated `0 < 0`.
+
+    A high-water mark cannot be cleared by the event it is watching, which is
+    the whole point. Deliberately never reset: for one `Req` the protected
+    prefix only ever grows within a life, so a later `start` below the mark is
+    exactly the event of interest, and the per-site counters bound the noise.
+    """
+    try:
+        live = int(getattr(req, "cache_protected_len", 0) or 0)
+    except (TypeError, ValueError):
+        live = 0
+    hwm = int(getattr(req, "_1036_protected_hwm", 0) or 0)
+    if live > hwm:
+        hwm = live
+        req._1036_protected_hwm = hwm
+    return hwm
+
+
+def _note_1036_prefix_demotion(req, start: int, hwm: int) -> None:
     """#1036 INSTRUMENT: name whoever admits a prefix below `protected`.
 
     THE TWO-LINE GAP THIS EXISTS TO FILL. Boot `f178a94c51` died on a rank
@@ -181,7 +209,14 @@ def _note_1036_prefix_demotion(req, start: int) -> None:
     a demotion; the frame walk happens exclusively inside a real event.
     """
     try:
-        protected = int(getattr(req, "cache_protected_len", 0) or 0)
+        live = int(getattr(req, "cache_protected_len", 0) or 0)
+        # `live` BESIDE `hwm` is the discriminator, not decoration: the
+        # blind-spot writer is precisely the one that has already zeroed the
+        # live field by the time it admits, so a line reading `protected_hwm=
+        # 8192 protected_live=0` names a writer that cleared protected and
+        # prefix TOGETHER (the `reset_for_retract` shape), while
+        # `protected_live=8192` names one that lowered the prefix alone. The
+        # two shapes have different fixes and the log must tell them apart.
         # The frame walk skips this module so the site named is the ADMITTING
         # caller, not `set_extend_range` itself -- the same correction the
         # #1034 provenance walk needed when it first printed `base.py:101`.
@@ -200,14 +235,17 @@ def _note_1036_prefix_demotion(req, start: int) -> None:
         if n <= 3 or n % 64 == 0:
             logger.warning(
                 "#1036 PREFIX DEMOTED BELOW PROTECTED rid=%s site=%s "
-                "protected=%d admitted_start=%d lost=%d prefix_indices=%d "
+                "protected_hwm=%d protected_live=%d cleared_together=%s "
+                "admitted_start=%d lost=%d prefix_indices=%d "
                 "host_hit=%s mamba_host_hit=%s seam_readmit=%s "
                 "site_occurrence=%d census=%s",
                 str(getattr(req, "rid", "?"))[:8],
                 site,
-                protected,
+                hwm,
+                live,
+                (live == 0 and hwm > 0),
                 start,
-                protected - start,
+                hwm - start,
                 0 if req.prefix_indices is None else len(req.prefix_indices),
                 getattr(req, "host_hit_length", None),
                 getattr(req, "mamba_host_hit_length", None),
@@ -1347,9 +1385,14 @@ class Req(ReqDllmMixin):
 
     def set_extend_range(self, start: int, end: int) -> None:
         # #1036 INSTRUMENT ONLY -- no behaviour change, no refusal, nothing
-        # below reads its result. See `_note_1036_prefix_demotion`.
-        if start < getattr(self, "cache_protected_len", 0):
-            _note_1036_prefix_demotion(self, start)
+        # below reads its result. The reference is the STICKY high-water mark,
+        # never the live field: the writer being hunted clears
+        # `cache_protected_len` in the same act as `prefix_indices`, so a
+        # comparison against the live value reads `0 < 0` and sees nothing
+        # (measured blind on boot a4af6bd96e -- see `_1036_stamp_protected`).
+        _1036_hwm = _1036_stamp_protected(self)
+        if start < _1036_hwm:
+            _note_1036_prefix_demotion(self, start, _1036_hwm)
         self.extend_range = Range(start, end)
 
     def get_fill_ids(self) -> array:
@@ -1508,6 +1551,13 @@ class Req(ReqDllmMixin):
                 )
 
                 if getattr(self, _SRA, None) is not None:
+                    # #1036: stamp the high-water mark HERE, at the consult
+                    # that reports `protected=` below. This is the last point
+                    # at which the value is known good before the writers that
+                    # clear it run, so it is where the instrument's reference
+                    # has to be taken (boot a4af6bd96e read protected=8192 on
+                    # this very line and 0 three frames later).
+                    _1036_stamp_protected(self)
                     _og = getattr(tree_cache, "ongoing_prefetch", None)
                     _rid = str(getattr(self, "rid", "?"))
                     _n = getattr(Req, "_969b_n", 0) + 1
