@@ -3294,6 +3294,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         stale_indices,
         n_tokens: int,
         stale_generation,
+        hash_values=None,
+        prefix_keys=None,
     ):
         """#939: re-home an already-fetched span into the CURRENT generation's pool.
 
@@ -3377,24 +3379,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001
             _geom_ok = False
             _src_page = _dst_page = None
+        # NOT a decline any more: when the geometry differs the span is RE-READ
+        # by content key into the fresh slots instead of copied. That is the
+        # #939 order's own form ("re-issue the read under the current
+        # generation"), and it keeps the layout-correct reader as the only
+        # writer of a host page -- a reshard mover beside it would be the
+        # bespoke second mover `ein-job-ein-mover` forbids.
         if not _geom_ok:
-            self._rehome_declined_geometry = (
-                getattr(self, "_rehome_declined_geometry", 0) + 1
+            self._rehome_geometry_reshard = (
+                getattr(self, "_rehome_geometry_reshard", 0) + 1
             )
-            if self._rehome_declined_geometry <= 5:
+            if self._rehome_geometry_reshard <= 5:
                 logger.warning(
-                    "#939 RE-HOME DECLINED (page geometry) req=%s tokens=%d "
-                    "from_generation=%s: source page %s elems, destination page "
-                    "%s elems -- the tiers shard differently, so this is a "
-                    "RESHARD and not a copy. #937 refusal stands. (%d so far.)",
+                    "#939 RE-HOME VIA RE-READ req=%s tokens=%d from_generation=%s: "
+                    "source page %s elems vs destination page %s elems -- the "
+                    "tiers shard differently, so this is a RESHARD, not a copy. "
+                    "Re-reading by content key into the current tier. (%d so far.)",
                     req_id,
                     int(n_tokens),
                     stale_generation,
                     None if _src_page is None else _src_page.numel(),
                     None if _dst_page is None else _dst_page.numel(),
-                    self._rehome_declined_geometry,
+                    self._rehome_geometry_reshard,
                 )
-            return None
+            if not hash_values:
+                # No content keys for this span -> nothing to re-read against.
+                self._rehome_declined_no_keys = (
+                    getattr(self, "_rehome_declined_no_keys", 0) + 1
+                )
+                return None
 
         t0 = time.perf_counter()
         new_indices = dst_pool.alloc(n_tokens)
@@ -3414,14 +3427,51 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._rehome_declined_no_room,
             )
             return None
-        try:
-            n_pages = 0
-            for off in range(0, n_tokens, page):
-                dst_pool.set_from_flat_data_page(
-                    int(new_indices[off]),
-                    src_pool.get_data_page(int(stale_indices[off]), flat=True),
+        if not _geom_ok:
+            # RESHARD PATH: the canonical reader writes the pages, in the
+            # destination tier's own layout, from the geometry-neutral store.
+            n_pages = (n_tokens + page - 1) // page
+            got = cc.reread_pages_into(
+                list(hash_values)[:n_pages],
+                new_indices,
+                prefix_keys=prefix_keys,
+                label=f"#939-reread:{req_id[:8]}",
+            )
+            if int(got) < int(n_tokens):
+                # A partial re-read cannot be published: the caller inserts
+                # `n_tokens` and a short span would advertise pages that were
+                # never written. Hand the slots back and let #937 stand.
+                try:
+                    dst_pool.free(new_indices)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._rehome_reread_short = (
+                    getattr(self, "_rehome_reread_short", 0) + 1
                 )
-                n_pages += 1
+                logger.warning(
+                    "#939 RE-READ SHORT req=%s wanted=%d got=%d from_generation=%s: "
+                    "slots returned, #937 refusal stands. (%d so far.)",
+                    req_id,
+                    int(n_tokens),
+                    int(got),
+                    stale_generation,
+                    self._rehome_reread_short,
+                )
+                return None
+            _via = "reread"
+        else:
+            _via = "copy"
+        try:
+            n_pages = 0 if not _geom_ok else 0
+            if _geom_ok:
+                for off in range(0, n_tokens, page):
+                    dst_pool.set_from_flat_data_page(
+                        int(new_indices[off]),
+                        src_pool.get_data_page(int(stale_indices[off]), flat=True),
+                    )
+                    n_pages += 1
+            else:
+                n_pages = (n_tokens + page - 1) // page
         except Exception:  # noqa: BLE001
             # Hand the fresh slots straight back and decline. NEVER fall through
             # to adopting `stale_indices` -- that is precisely the #937 form.
@@ -3447,10 +3497,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # to be. If the two do not add up, a THIRD exit is running silently and
         # that is the finding, not the ratio.
         logger.warning(
-            "#939 PREFETCH SPAN RE-HOMED n=%d req=%s tokens=%d pages=%d "
+            "#939 PREFETCH SPAN RE-HOMED n=%d via=%s req=%s tokens=%d pages=%d "
             "from_generation=%s to_generation=%s copy_ms=%.1f | reconcile: "
             "refused_stale=%d re_homed=%d sum=%d",
             self._prefetch_span_rehomed,
+            _via,
             req_id,
             int(n_tokens),
             n_pages,
@@ -3554,7 +3605,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # The stale indices are never adopted on either branch.
         _rehomed = (
             self._rehome_stale_prefetch_span(
-                req_id, host_indices, int(min_completed_tokens), _stamp
+                req_id,
+                host_indices,
+                int(min_completed_tokens),
+                _stamp,
+                hash_values=hash_value,
+                prefix_keys=getattr(operation, "prefix_keys", None),
             )
             if _stale
             else None

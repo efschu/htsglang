@@ -2221,6 +2221,75 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+    def reread_pages_into(
+        self, hash_values, host_indices, prefix_keys=None, label: str = "#939-reread"
+    ) -> int:
+        """#939: re-read pages BY CONTENT KEY into slots of the CURRENT tier.
+
+        The #939 order's own form: on a stale refusal, re-issue the read under
+        the binding that is current now instead of recomputing the prefix. This
+        is deliberately NOT a second mover for the same payload (`ein-job-ein-
+        mover`): it drives `page_get_func`, the exact dispatch `_page_transfer`
+        uses, so the layout-correct reader stays the only one that ever writes
+        a page into a host tier.
+
+        Why re-reading and not moving the bytes we already hold: BOOT-MEASURED
+        2026-08-30 (boot_855_939rehome), a host->host copy across a flip raised
+        `shape '[2,16,1,4,256]' is invalid for input of size 16384/8192` on all
+        15 attempts -- the PP-phase and TP-phase tiers shard differently, so
+        carrying a span across is a RESHARD, not a relocation. The store is
+        geometry-neutral (#706, "cut only at read time"), verified on that same
+        boot as a single key suffix across 666 KV + 171 mamba keys, so the
+        destination tier can simply read the same keys itself.
+
+        Returns the number of tokens successfully read (a multiple of
+        page_size), 0 on any failure. Never raises: the caller's contract is
+        that a 0 leaves the #937 refusal standing.
+        """
+
+        class _RereadOp:
+            """Minimal operation shim: `page_get_func` needs exactly these two."""
+
+            request_id = label
+
+            def __init__(self):
+                self.completed_tokens = 0
+
+            def increment(self, num_tokens: int) -> bool:
+                self.completed_tokens += num_tokens
+                return True
+
+        op = _RereadOp()
+        # Copy: `_page_transfer` appends to this list as it walks batches, and
+        # mutating the caller's list would be a side effect on the tree's state.
+        keys = list(prefix_keys) if prefix_keys else None
+        try:
+            for i in range(0, len(hash_values), STORAGE_BATCH_SIZE):
+                batch_hashes = hash_values[i : i + STORAGE_BATCH_SIZE]
+                batch_host_indices = host_indices[
+                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                ]
+                before = op.completed_tokens
+                self.page_get_func(
+                    op,
+                    batch_hashes,
+                    batch_host_indices,
+                    HiCacheStorageExtraInfo(prefix_keys=keys),
+                )
+                if op.completed_tokens != before + len(batch_hashes) * self.page_size:
+                    # Short read: stop at the contiguous prefix that landed.
+                    break
+                if keys is not None:
+                    keys += batch_hashes
+        except Exception:  # noqa: BLE001 - a failed re-read may never break the path
+            logger.warning(
+                "#939 RE-READ RAISED (%s): returning 0 so the #937 refusal stands.",
+                label,
+                exc_info=True,
+            )
+            return 0
+        return int(op.completed_tokens)
+
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
