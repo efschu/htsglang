@@ -3330,12 +3330,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         Returns the freshly minted indices, or None to decline (caller refuses).
         """
-        if n_tokens <= 0:
+        # EVERY DECLINE BELOW CARRIES A NAMED REASON. Measured 2026-08-30
+        # (boot_855_939reread): one refusal per rank (req=e1ad3aac, 4618 tokens)
+        # could not be attributed to ANY counter, because several of these
+        # branches used to `return None` in silence. A silent exit is the class
+        # this campaign has already paid for twice; the reason is now always on
+        # the record, even when the outcome is simply "nothing to do".
+        def _decline(reason: str, detail: str = "") -> None:
+            attr = f"_rehome_declined_{reason}"
+            n = getattr(self, attr, 0) + 1
+            setattr(self, attr, n)
+            if n <= 5 or n % 256 == 0:
+                logger.warning(
+                    "#939 RE-HOME DECLINED (%s) req=%s tokens=%s "
+                    "from_generation=%s%s -- #937 refusal stands. (%d so far.)",
+                    reason,
+                    req_id,
+                    n_tokens,
+                    stale_generation,
+                    f" {detail}" if detail else "",
+                    n,
+                )
             return None
+
+        if n_tokens <= 0:
+            return _decline("empty_span")
         cc = self.cache_controller
         dst_pool = getattr(cc, "mem_pool_host", None)
         if dst_pool is None:
-            return None
+            return _decline("no_destination_pool")
         try:
             from sglang.srt.mem_cache.hicache_phase_binding import (
                 current_generation,
@@ -3344,12 +3367,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             src_pool = host_pool_for_generation(stale_generation)
         except Exception:  # noqa: BLE001
-            return None
-        if src_pool is None or src_pool is dst_pool:
-            # Same object means the stamp moved but the tier did not; there is
-            # nothing to re-home and copying onto itself would be a no-op at
-            # best. Let the refusal stand rather than invent a third outcome.
-            return None
+            logger.warning(
+                "#939 RE-HOME DECLINED (binding_lookup_raised) req=%s: could not "
+                "resolve the pool for generation %s.",
+                req_id,
+                stale_generation,
+                exc_info=True,
+            )
+            return _decline("binding_lookup_raised")
+        if src_pool is None:
+            # The generation that minted the span no longer resolves to a pool.
+            return _decline("source_pool_gone")
+        if src_pool is dst_pool:
+            # The stamp moved but the tier did not: nothing to re-home, and a
+            # copy onto itself would be a no-op at best. Not an error -- but it
+            # must still be VISIBLE, or it looks exactly like a lost span.
+            return _decline("same_pool_object", "tier did not move")
         page = int(getattr(dst_pool, "page_size", 1) or 1)
         if int(getattr(src_pool, "page_size", page) or page) != page:
             # Different page geometry between the two tiers: a page-wise copy
