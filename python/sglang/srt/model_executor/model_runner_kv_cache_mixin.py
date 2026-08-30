@@ -787,66 +787,7 @@ class ModelRunnerKVCacheMixin:
                 mib if isinstance(mib, (int, float)) else mib[self._rank_vector_index()]
             )
             budget_gb = budget_mib / 1024.0
-            # #1015: the free-memory DELTA is not safe on its own, because it
-            # measures a WINDOW and anything freed inside that window is
-            # subtracted from this rank's own bill.
-            #
-            # MEASURED, phase-flip TP stack 2026-08-30. The delta booked
-            # "weights + runtime state" at 4.252 GiB on pp0 against a
-            # census-measured 13.50 GiB of resident parameters. The missing
-            # 9.320 GiB is the PP KV backing (9632 MiB = 9.406 GiB, residual
-            # 0.086) that phase_flip_boot releases FOR the TP stack's
-            # allocation and graph capture -- i.e. inside this very window.
-            # The two 3080s under-reported 4.689 and 4.680 GiB, near-identical
-            # despite different layer counts, which is the signature of one
-            # shared freed quantity rather than a per-rank weight difference.
-            #
-            # WHY THIS NEVER OOMed, and why the fix is therefore safe: the TP
-            # pool is separately capped to the PP id space
-            # (phase_flip_boot.py:1452-1460, "the surplus a self-sized TP pool
-            # would take is unaddressable"), so the slack this under-booking
-            # created was never spendable. Removing it takes away headroom
-            # that no allocation could reach.
-            #
-            # THE ALLOCATOR'S OWN VIEW is immune to the window: it reports what
-            # this process holds live right now, not how free memory moved. It
-            # is read here, post-weights and pre-pools, which is exactly where
-            # it is clean (the graph-capture inflation this tree found in
-            # #1009a enters later, during capture).
-            #
-            # BOOKED AS THE MAX OF THE TWO, never the new number alone. max()
-            # is the conservative operator here -- a larger weight post means a
-            # SMALLER `rest`, so this can only shrink the KV budget relative to
-            # today and can never grow it. It also keeps the delta authoritative
-            # wherever it is the larger figure, which covers device memory this
-            # rank holds outside the torch allocator (NCCL buffers, the CUDA
-            # context) that `memory_allocated` does not see.
-            delta_gb = pre_model_load_memory - available_gpu_memory
-            allocator_gb = None
-            try:
-                if self.device == "cuda":
-                    allocator_gb = torch.cuda.memory_allocated() / (1 << 30)
-            except Exception:  # noqa: BLE001 - an instrument must not break boot
-                allocator_gb = None
-            used_by_me_gb = delta_gb
-            if allocator_gb is not None and allocator_gb > delta_gb:
-                used_by_me_gb = allocator_gb
-                # Never silently corrected: a gap here means something was
-                # released inside the measurement window, and the operator
-                # should see which number won and by how much.
-                logger.warning(
-                    "[world_rank %d] #1015: the free-memory delta books "
-                    "%.3f GiB of 'weights + runtime state' while the "
-                    "allocator holds %.3f GiB live -- a %.3f GiB gap, which "
-                    "means memory was RELEASED inside the profiling window "
-                    "and was credited against this rank's own bill. Booking "
-                    "the allocator figure (the larger, conservative one); the "
-                    "KV budget shrinks by the gap.",
-                    self._rank_vector_index(),
-                    delta_gb,
-                    allocator_gb,
-                    allocator_gb - delta_gb,
-                )
+            used_by_me_gb = pre_model_load_memory - available_gpu_memory
             rest_memory = budget_gb - used_by_me_gb
             budget_posts.append(("weights + runtime state", used_by_me_gb))
             rest_memory, _reserve_post = self._gapped_corridor_holdback(rest_memory)
