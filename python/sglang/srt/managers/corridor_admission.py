@@ -599,7 +599,11 @@ class PrefillAdmissionGate:
         allocations of the rest of the round.
         """
         try:
-            free = float(guard.free_bytes())
+            # #1028c: the driver free column is ADDED below, so it takes the
+            # measured minimum over the window rather than a spot reading --
+            # same direction argument as the cache term. This is also the call
+            # (`mem_get_info`) the third straggler was caught inside.
+            free = float(self._bounded_min("driver_free", guard.free_bytes))
         except Exception:  # noqa: BLE001
             return None
         delta = float(getattr(guard, "delta_mib", 0) or 0) * (1024 * 1024)
@@ -696,6 +700,73 @@ class PrefillAdmissionGate:
             "NONE -- want is 0 and the gate enforces the floor without "
             "preempting (set SGLANG_FORWARD_PEAK_PATH for a measured price)"
         )
+
+    #: #1028c bounded-min sampler. REFRESH is how often the expensive driver
+    #: call runs; WINDOW is how far back the minimum reaches.
+    _BOUND_REFRESH_S = 1.0
+    _BOUND_WINDOW_S = 5.0
+
+    def _bounded_min(self, name: str, sample_fn) -> float:
+        """A MEASURED LOWER BOUND over a window, for the ADDED consumers.
+
+        #1028c. This exists because of a direction, not a cost. The two terms
+        that feed ``spendable_bytes`` -- the driver free column (:602) and the
+        allocator cache (:620) -- are ADDED to the budget, so an overstated
+        reading WIDENS the granted chunk (`#856 F6`, :606-619). Cadencing them
+        on the LAST value is therefore unsafe, which is exactly the defect my
+        own #1028 introduced and #1028b reverted.
+
+        Cadence answers the cost; the MINIMUM answers the direction. The
+        expensive call runs at most once per ``_BOUND_REFRESH_S``, and what the
+        caller receives is the smallest reading in the last
+        ``_BOUND_WINDOW_S`` -- strictly <= the newest reading, so this can only
+        narrow a grant relative to the uncached path, never widen one.
+
+        WHAT THIS IS NOT, stated because the distinction is the whole reason it
+        was allowed: it is a MEASUREMENT, not a safety margin. No constant is
+        invented; every value returned was read off the device at some point
+        inside the window.
+
+        WHAT IT DOES NOT GUARANTEE, equally explicit: min-over-window is not a
+        proof-carrying bound on the CURRENT value -- the true figure can fall
+        below every sample in the window. It is strictly more conservative than
+        the value the caller would otherwise use, and the residual is the same
+        class the guard's existing ``delta`` watermark already exists to cover
+        (:597-599, "the margin for what this estimate does not model"). Whether
+        it stays inside that watermark is an empirical question, which is what
+        the instrument below is for.
+        """
+        import time
+
+        now = time.monotonic()
+        hist = getattr(self, "_bound_hist", None)
+        if hist is None:
+            hist = {}
+            self._bound_hist = hist
+        samples = hist.setdefault(name, [])
+        last_t = samples[-1][0] if samples else None
+        if last_t is None or (now - last_t) >= self._BOUND_REFRESH_S:
+            samples.append((now, float(sample_fn())))
+            cutoff = now - self._BOUND_WINDOW_S
+            while len(samples) > 1 and samples[0][0] < cutoff:
+                samples.pop(0)
+            instant = samples[-1][1]
+            bound = min(v for _, v in samples)
+            # GUARDRAIL (a): the reader must be able to see that this is a
+            # BOUND and not a spot reading, and how far the two are apart.
+            # Rate-limited to one line per refresh per name, which is 1/s.
+            logger.info(
+                "#1028c BOUND %s: window=%.1fs n=%d bound=%.1f MiB "
+                "instant=%.1f MiB delta=%.1f MiB (bound is a MEASURED MINIMUM "
+                "over the window, not a spot value; it can only narrow)",
+                name,
+                (samples[-1][0] - samples[0][0]),
+                len(samples),
+                bound / (1024 * 1024),
+                instant / (1024 * 1024),
+                (instant - bound) / (1024 * 1024),
+            )
+        return min(v for _, v in samples)
 
     def _allocator_cache_bytes(self) -> int:
         """Bytes torch holds reserved but not allocated: the cheap tier.
@@ -795,7 +866,14 @@ class PrefillAdmissionGate:
         # window), which is stale in the SAFE direction rather than an
         # arbitrary margin. Named here so the next pass starts from the
         # direction table rather than from the cost.
-        cache = int(self._allocator_cache_bytes())
+        # #1028c: BOUNDED here and NOT inside `_allocator_cache_bytes`, which
+        # is deliberate. That method has two callers with OPPOSITE safe
+        # directions (its own docstring, :720-728): at :447 the value is
+        # SUBTRACTED from `want`, where overstating is safe and understating
+        # costs a late arm. Bounding it at the source would push that caller
+        # the wrong way. Only THIS path -- the one that feeds the ADDED term in
+        # `spendable_bytes` -- takes the minimum.
+        cache = int(self._bounded_min("alloc_cache", self._allocator_cache_bytes))
         try:
             trapped = self._trapped_bytes_cadenced()
         except Exception:  # noqa: BLE001 - precision, never a gate
