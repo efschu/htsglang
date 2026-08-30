@@ -813,6 +813,50 @@ class ModelRunnerKVCacheMixin:
                 )
                 rest_memory -= mamba_precapture_gb
                 budget_posts.append(("mamba pre-capture reserve", mamba_precapture_gb))
+            # #1025 CUDA-GRAPH CAPTURE POST -- PROVISIONAL, see the successor
+            # note below. This branch spends an ABSOLUTE budget, so unlike the
+            # else-branch it has no `mem_fraction_static` slack, and the ledger
+            # above had NO post for graph capture at all: every MiB the weights
+            # did not use flowed into the KV pool, and the capture allocation
+            # then had nowhere to land. Measured consequence (#855 lm_head
+            # ladder, four arms): the artifact could not boot on the shipping
+            # flip form, and handing reserve back via --rank-gpu-memory-mib was
+            # NOT a fix -- free-at-capture is not monotone in the budget,
+            # because the uneven token split redistributes whatever a rank
+            # gives up. A post is the only place this can be priced.
+            #
+            # Skipped when post-capture sizing is active: there the pool is
+            # sized from MEASURED free AFTER capture, so the bytes are already
+            # spent when the measurement is taken and booking them here would
+            # charge them twice.
+            #
+            # THIS IS THE TRANSITION, NOT THE DESTINATION. The destination is
+            # post-capture sizing on this path too (a measurement always beats
+            # a reserve), which is blocked by the #592 DCP gate -- see
+            # NOTE_1025_capture_post.md for the successor's three steps. Until
+            # then this post is a floor: exact where the rig is calibrated,
+            # provisional otherwise.
+            # MEASURED 2026-08-30 AND NOT ARMED -- the boot that tested it is
+            # named below. Booking the post here REDUCED THE PP-PHASE POOL BY
+            # EXACTLY THE POST (PP0 643,202 -> 591,362 tokens = -810 MiB at
+            # cell 16384, so the arithmetic works) AND THE BOOT STILL OOM'd AT
+            # CAPTURE, on PP0, with 123.75 MiB free
+            # (boot_855_lmhead1025_0840f82601_0830_095901.log).
+            #
+            # WHY A BUDGET-SIDE POST CANNOT FIX THIS RANK: PP0's budget is
+            # 31800 MiB on a 32607 MiB card. The budget is essentially the
+            # whole card, so the binding constraint is the PHYSICAL ceiling,
+            # not the budget -- subtracting from a budget that already exceeds
+            # what the card can give changes nothing physical. A post bites
+            # only on a rank whose budget is the binding term.
+            #
+            # Leaving it armed would therefore cost the shipping form ~810 MiB
+            # of KV pool per rank for no measured benefit, which is a capacity
+            # regression in exchange for accounting neatness. The accessor
+            # stays (it is correct, and the successor needs it); the
+            # subtraction waits for the mechanism that measures instead of
+            # reserves -- post-capture sizing on this path, NOTE_1025_capture_post.md.
+            _ = self.server_args.capture_reserve_mb  # successor's entry point
         else:
             slack_gb = pre_model_load_memory * (1 - self.mem_fraction_static)
             if self.mambaish_config is not None and self.post_capture_kv_active:

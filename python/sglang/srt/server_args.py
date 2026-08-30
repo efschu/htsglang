@@ -14387,6 +14387,7 @@ class ServerArgs:
     #: Set once the inherited activation heuristic has been used in anger, so
     #: the warning below fires per process rather than per call site.
     _activation_heuristic_warned = False
+    _capture_heuristic_warned = False
 
     def activation_reserve_mb(self, gpu_mem, card_uuid: Optional[str] = None) -> float:
         """Prefill activation reserve (MiB): CALIBRATED where the rig has a
@@ -14446,6 +14447,81 @@ class ServerArgs:
                 heuristic,
             )
         return heuristic
+
+    #: PROVISIONAL fallback for :meth:`capture_reserve_mb`, in MiB. Measured on
+    #: this rig 2026-08-30 (#1025): the decode-graph capture asked for exactly
+    #: 810.00 MiB on EVERY rank and every arm of the lm_head ladder
+    #: (boot_855_lmhead{2,3,4,5}). It is deliberately LARGER than every
+    #: calibrated ``capture_mib`` in the 2026-08-05 table (633-730 MiB) because
+    #: those points were taken WITHOUT speculative decoding, and a spec boot
+    #: captures a graph pool per runner -- target AND draft
+    #: (mem_ledger/flight_recorder.py:178). Rounded UP to the measured value
+    #: rather than interpolated: this is a floor that must not be optimistic.
+    _CAPTURE_RESERVE_FALLBACK_MIB = 810.0
+
+    def capture_reserve_mb(self, card_uuid: Optional[str] = None) -> float:
+        """CUDA-graph capture reserve (MiB), from the SAME measured record
+        :meth:`activation_reserve_mb` already resolves.
+
+        #1025. ``PhaseFootprint`` carries ``activation_mib`` AND ``capture_mib``
+        side by side (mem_ledger/activation.py:147-148), and ``capture_mib`` is
+        defined as "avail_mem at 'Capture ... begin' minus post-boot steady
+        free" (:202) -- a MEASUREMENT, not a formula. The ledger demand path
+        already consumes it (mem_ledger/engine.py:427-431). The
+        ``--rank-gpu-memory-mib`` sizing path did not, which is why the capture
+        allocation had no post in ``_profile_available_bytes``' budget ledger
+        and the KV pool was sized over it.
+
+        WHY A SEPARATE ACCESSOR RATHER THAN FOLDING IT INTO
+        ``activation_reserve_mb``: they are different phases with different
+        lifetimes, and the two are booked on different branches -- the
+        activation reserve is owed only when the KV pool is sized BEFORE the
+        pre-capture forwards, the capture reserve only when the pool is sized
+        before CAPTURE. Summing them behind one name is how a reader loses the
+        ability to tell which one a boot actually paid.
+
+        RESERVE-SEMANTIK (user law): internal demand is priced EXACTLY, per
+        ledger/measurement, never as a fraction. Hence no ``mem_fraction``-style
+        term here, and the fallback below is a measured MiB figure with its
+        provenance in the constant's own comment.
+        """
+        try:
+            from sglang.srt.mem_ledger.activation import (
+                profile_from_server_args,
+                resolve_phase_footprint,
+            )
+            from sglang.srt.mem_ledger.calibration import live_fingerprint
+            from sglang.srt.mem_ledger.engine import _model_architectures
+
+            uuid = card_uuid
+            if not uuid:
+                from sglang.srt.registry import nvml as registry_nvml
+
+                uuid = registry_nvml.current_device_uuid()
+            live = live_fingerprint()
+            footprint = resolve_phase_footprint(
+                uuid,
+                hw_fingerprint=live[0] if live else None,
+                profile=profile_from_server_args(self, _model_architectures(self)),
+            )
+            if footprint is not None:
+                return float(footprint.capture_mib)
+        except Exception as e:  # pragma: no cover - probe/NVML availability
+            logger.debug("capture footprint unavailable (%s)", e)
+
+        fallback = ServerArgs._CAPTURE_RESERVE_FALLBACK_MIB
+        if not ServerArgs._capture_heuristic_warned:
+            ServerArgs._capture_heuristic_warned = True
+            logger.warning(
+                "Using the PROVISIONAL capture reserve (%.0f MiB per rank): no "
+                "phase footprint is calibrated for this hardware fingerprint "
+                "and activation profile, so the graph-capture post falls back "
+                "to the figure measured on the #1025 ladder. Run "
+                "scripts/vram_ledger/probe_activation.py once for this config "
+                "to replace it with this rig's own measurement.",
+                fallback,
+            )
+        return fallback
 
     def reserve_for_graph_mb(self) -> float:
         decode_cuda_graph_config = self.cuda_graph_config.decode
