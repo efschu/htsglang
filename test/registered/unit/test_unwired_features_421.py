@@ -229,6 +229,129 @@ class TestDrafterParkHasNoCaller(CustomTestCase):
         )
 
 
+class TestRealMovementBackendIsNeverConstructed(CustomTestCase):
+    """#778/#286: the movement half has a real backend that nothing builds.
+
+    Added 2026-08-30 from the "solved, never shipped" inventory
+    (``/spinning/gpu-arb/GELOEST-NIE-GESHIPPT-INVENTAR-0830.md``, table B3).
+
+    THREE COMPOUNDING LAYERS, which is why fixing any one alone changes
+    nothing and why this is pinned rather than left to prose:
+
+    1. ``SGLANG_OFFLOAD_REGISTER`` is set by no launcher on this rig.
+    2. Even with the gate on, ``offload_register.py:572`` reads
+       ``self._backend = backend or CpuFakeMovementBackend()`` -- the register
+       falls back to the CPU FAKE whenever no backend is injected, and nothing
+       injects one.
+    3. ``RealMovementBackend`` is constructed in no production file at all.
+
+    THE PROSE ALREADY DISAGREES WITH ITSELF, which is the reason a
+    reachability assertion is the only trustworthy record here:
+    ``offload_register.py``'s ``MovementBackend`` docstring states "The real
+    backend is ``offload_movement.RealMovementBackend``", while
+    ``registry/tick.py`` states "It does not call ``#286``'s
+    ``RealMovementBackend``". Exactly one of those is true about production,
+    and this test is the one that cannot go stale.
+
+    RETIRE WHEN: a production file constructs ``RealMovementBackend``. Deleting
+    this pin is then correct ONLY together with checking layer 2 -- a
+    constructor that runs while the register still defaults to the fake leaves
+    the spill mover just as dark. Replace with a wiring test that pins the
+    injection SITE, the way #421 F2's replacement does.
+    """
+
+    _DEFINER = "python/sglang/srt/model_executor/offload_movement.py"
+
+    def test_no_production_file_constructs_the_real_backend(self):
+        callers = _production_callers_of(
+            "RealMovementBackend", defining_rel_paths=(self._DEFINER,)
+        )
+        self.assertEqual(
+            callers,
+            [],
+            "GOOD NEWS: the real movement backend is constructed in production "
+            f"({callers}). #778/#286 is no longer desk-only -- delete this pin, "
+            "and verify the register no longer defaults to "
+            "CpuFakeMovementBackend when that construction happens.",
+        )
+
+
+class TestMlpRebalanceAdvisoryIsEmitOnly(CustomTestCase):
+    """The uneven-TP self-calibration computes a better vector and can only
+    ask a human to restart with it.
+
+    Added 2026-08-30 from the "solved, never shipped" inventory (table B1).
+    MEASURED on the standing boot
+    (``/spinning/evidence-665-f1/boot_855_gdncovB2_0840f82601_0830_053228.log``
+    line 673)::
+
+        [PP0] uneven TP: restart with SGLANG_UNEVEN_MLP_VECTOR=1009,38,41
+              to raise the KV pool from 449314 to ~561293 tokens
+
+    That is +111,979 tokens (+24.9%) on the rank that BINDS the MIN-synced
+    pool, computed by the server about itself, and discarded when the process
+    exits. ``_maybe_suggest_mlp_rebalance`` says so in its own docstring:
+    "Purely advisory -- nothing is resized in-process; the hint asks for a
+    restart".
+
+    THIS IS THE #797 SHAPE ON A SECOND AXIS. #797 was the same defect on the
+    TOKEN vector -- an advisory printed and consumed by nobody -- and it was
+    closed by giving the measurement a consumer, which is why the same boot
+    shows the measured ownership vector [30,17,17] installed OVER the
+    pre-boot estimate. The MLP and MOE axes never got that second half.
+
+    WHAT IS PINNED, precisely: no production file writes either calibration
+    environment variable, so there is no in-process path from the advisory
+    back into the resolved configuration. The loop can only be closed by a
+    human reading a log line and editing a launcher -- and on this rig, for
+    the entire life of the flag, nobody has.
+
+    RETIRE WHEN: the in-flight solve-boot lands a consumer for the computed
+    vector. At that point this pin goes RED and must be DELETED, not widened;
+    replace it with a positive test that the suggested vector reaches the
+    resolver, mirroring #797's own replacement.
+    """
+
+    _FAMILY_ENVS = ("SGLANG_UNEVEN_MLP_VECTOR", "SGLANG_UNEVEN_MOE_VECTOR")
+
+    def _environ_writes(self, name):
+        """Production ``os.environ[name] = ...`` assignments."""
+        hits = []
+        for path in _production_py_files():
+            rel = path.relative_to(_REPO_ROOT).as_posix()
+            try:
+                tree = _parse(path)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign):
+                    continue
+                for target in node.targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Attribute)
+                        and target.value.attr == "environ"
+                        and isinstance(target.slice, ast.Constant)
+                        and target.slice.value == name
+                    ):
+                        hits.append(f"{rel}:{node.lineno}")
+        return hits
+
+    def test_nothing_feeds_the_suggested_vector_back_in_process(self):
+        for name in self._FAMILY_ENVS:
+            with self.subTest(env=name):
+                writes = self._environ_writes(name)
+                self.assertEqual(
+                    writes,
+                    [],
+                    f"GOOD NEWS: {name} is now written in production "
+                    f"({writes}) -- the self-calibration may have gained an "
+                    "in-process consumer. Delete this pin and replace it with "
+                    "a positive test that the suggested vector reaches the "
+                    "resolver, the way #797 was closed on the token axis.",
+                )
+
+
 # RETIRED PIN -- #421 F4 is FIXED (task #394 slice 2).
 #
 # ``TestColdTierShmIsUnreachable`` asserted that
