@@ -1062,11 +1062,63 @@ class ModelRunnerKVCacheMixin:
         # the first boot carrying this line emitted "[rank 0]" for PP0, PP1 and
         # PP2 alike. _rank_vector_index() is the existing accessor and falls
         # back to tp_rank when server_args is stubbed.
+        # #1026 DISPLAY HONESTY -- the posts alone cannot show a residue.
+        #
+        # Every post above is appended at the SAME place its value is
+        # subtracted, so `budget - sum(posts) == rest` holds BY CONSTRUCTION.
+        # That makes this line read like a full account of the card while it
+        # is only an account of the deductions this code chose to make: a
+        # consumer that is never booked as a post is structurally invisible
+        # here. Measured cost of exactly that (#1025): the cuda-graph capture
+        # had no post, the pool was sized over it, and four boots of the #855
+        # lm_head ladder died at capture while this line looked balanced.
+        #
+        # THE FIX IS THE SHAPE WE ALREADY USE ELSEWHERE, not a new idea: the
+        # flip decomposition measures its total INDEPENDENTLY and carries an
+        # explicit UNACCOUNTED term, and POOL CENSUS prints `unaccounted=`.
+        # So: read what the CARD says is free (mem_get_info -> real CUDA free,
+        # the same source kv_backing_relief._free_bytes trusts, never
+        # total-minus-used), and print the gap against the ledger's own answer.
+        #
+        # HOW TO READ `unaccounted`, because its sign carries the diagnosis:
+        #   ~0      the budget is the binding term and the ledger is complete.
+        #   < 0     the card has LESS free than the ledger intends to spend --
+        #           either the budget exceeds what this card can give (PP0 at
+        #           31800 MiB on a 32607 MiB card: the physical ceiling binds,
+        #           not the budget), or a real consumer is unbooked. This is
+        #           the sign that #1025 would have shown on the first boot.
+        #   > 0     the card has more free than the KV pool will claim. This is
+        #           NOT waste, and calling it that was my first misreading:
+        #           this surplus is the UNBUDGETED pool that later allocations
+        #           are actually served from -- the cuda-graph capture (810 MiB
+        #           measured, #1025) and the arena tails come out of exactly
+        #           here, and nothing books them. So the number is the honest
+        #           headroom, and it is also the whole #1025 story in one
+        #           figure: gdncov boots because this surplus is 2.5-3.6 GiB,
+        #           far above the 810 MiB capture needs; the lm_head artifact
+        #           dies because its freed weight bytes are converted into KV
+        #           pool, shrinking THIS surplus below what capture requires.
+        #           A shrinking residue across boots is the early warning that
+        #           four boots of the #855 ladder had to discover the hard way.
+        # It is NOT an error and nothing branches on it. This is the display
+        # half only; the planner-consumption half (see the comment above about
+        # the pool solve CONSUMING these posts) is deliberately untouched.
+        try:
+            _free_b, _total_b = torch.cuda.mem_get_info(self.gpu_id)
+            _measured_free_gb = float(_free_b) / (1 << 30)
+            _unaccounted_gb = _measured_free_gb - rest_memory
+            _residue = f" | measured free={_measured_free_gb:.3f} | unaccounted={_unaccounted_gb:+.3f}"
+        except Exception as e:  # pragma: no cover - driver availability
+            # Never let an instrument take the boot down, and never print a
+            # zero residue we did not measure -- an absent reading says so.
+            logger.debug("unaccounted residue unavailable (%s)", e)
+            _residue = " | measured free=UNAVAILABLE | unaccounted=UNKNOWN"
         logger.info(
-            "[world_rank %d] KV budget posts (GiB): %s | rest=%.3f",
+            "[world_rank %d] KV budget posts (GiB): %s | rest=%.3f%s",
             self._rank_vector_index(),
             ", ".join(f"{name}={gb:.3f}" for name, gb in budget_posts),
             rest_memory,
+            _residue,
         )
 
         return int(rest_memory * (1 << 30))  # return in bytes
