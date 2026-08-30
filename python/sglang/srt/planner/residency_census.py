@@ -174,6 +174,91 @@ def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[st
         # gets attributed to a named term is how the last ledger went wrong.
         unposted_b = used_b - reserved_now
 
+        # #1009(a): NVML RECONCILIATION. Every term above is checked against
+        # the driver BEFORE it is written, because a term that is not
+        # physically possible must never leave this function looking like a
+        # measurement.
+        #
+        # THE CHAIN, and why each link is a hard physical fact:
+        #   params_total + pools + graphs == alloc   -- a PARTITION identity,
+        #       not an assumption. `pools` is alloc(post_pools) -
+        #       alloc(post_weights) and `graphs` is alloc(now) -
+        #       alloc(post_pools), so the three telescope to alloc(now) up to
+        #       the non-parameter bytes already live at the post-weights mark.
+        #       Stated out loud because the ONE thing a reader must not do is
+        #       add these three and compare the sum to nvml_used as if they
+        #       were independent addends -- they are consecutive differences
+        #       of one running total, and reading them as independent is what
+        #       produced the "physically impossible census" misdiagnosis of
+        #       2026-08-30 (the sum is alloc BY CONSTRUCTION, so an excess
+        #       over nvml_used says something about alloc, never about
+        #       double-booking between pools and graphs).
+        #   alloc <= reserved      -- live bytes sit inside allocator segments
+        #   reserved <= nvml_used  -- the process cannot hold segments the
+        #       driver does not count against it
+        #   nvml_used <= nvml_total
+        #
+        # MEASURED VIOLATION, #855 gdncov boot 2026-08-30, pp0: alloc 38688.5
+        # and reserved 39124.0 MiB against nvml_used 30464.8 and nvml_total
+        # 32088.5 on a 32 GiB card. Torch reported ~7 GiB more resident than
+        # the card physically has. `graphs_mib` is derived from `alloc_now`,
+        # so on such a boot `graphs_mib` (13105.1) is NOT a physical quantity
+        # and no consumer may price from it. The verdict travels IN the
+        # artifact so a later reader cannot mistake it for one.
+        #
+        # This is an INSTRUMENT, so it does not raise: killing a serving boot
+        # because a probe disagreed with the driver is the wrong trade. It
+        # logs at WARNING with BOTH numbers and stamps the verdict into the
+        # JSON. The REFUSAL belongs to the consumer that prices from these
+        # bytes -- pp_cut_calibration.load_census_calibration -- which is
+        # where every other unpriceable term in this pipeline is already
+        # refused. Silent continuation is what is forbidden, not the boot.
+        breaches = []
+        partition_b = params_total + pools_b + graphs_b
+        if alloc_now > reserved_now:
+            breaches.append(
+                f"alloc {alloc_now / _MIB:.1f} > reserved {reserved_now / _MIB:.1f}"
+            )
+        if reserved_now > used_b:
+            breaches.append(
+                f"reserved {reserved_now / _MIB:.1f} > nvml_used {used_b / _MIB:.1f}"
+            )
+        if used_b > int(total_b):
+            breaches.append(
+                f"nvml_used {used_b / _MIB:.1f} > nvml_total {int(total_b) / _MIB:.1f}"
+            )
+        # The term the CUT GATE actually prices from: params + pools must fit
+        # inside what the driver reports, because the gate's per-rank residual
+        # is `nvml_used - params - pools` and a negative residual is an
+        # UNDER-charge -- the direction that OOMs.
+        if params_total + pools_b > used_b:
+            breaches.append(
+                f"params+pools {(params_total + pools_b) / _MIB:.1f} > "
+                f"nvml_used {used_b / _MIB:.1f} (residual would be negative)"
+            )
+        if breaches:
+            logger.warning(
+                "RESIDENCY CENSUS RECONCILIATION FAILED rank=%s pp_rank=%s: %s. "
+                "Terms: params_total=%.1f pools=%.1f graphs=%.1f "
+                "(params+pools+graphs=%.1f, which is alloc by construction) "
+                "alloc=%.1f reserved=%.1f nvml_used=%.1f nvml_total=%.1f MiB. "
+                "The torch posts disagree with the driver, so graphs_mib and "
+                "any residual derived from alloc are NOT physical on this "
+                "boot and must not be priced. The cut gate refuses a "
+                "calibration built on them.",
+                getattr(model_runner, "tp_rank", -1),
+                getattr(model_runner, "pp_rank", -1),
+                "; ".join(breaches),
+                params_total / _MIB,
+                pools_b / _MIB,
+                graphs_b / _MIB,
+                partition_b / _MIB,
+                alloc_now / _MIB,
+                reserved_now / _MIB,
+                used_b / _MIB,
+                int(total_b) / _MIB,
+            )
+
         owner_parts = " ".join(
             f"{k}={v / _MIB:.1f}"
             for k, v in sorted(groups.items())
@@ -193,6 +278,9 @@ def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[st
             f"| nvml_used={used_b / _MIB:.1f} nvml_free={int(free_b) / _MIB:.1f} "
             f"nvml_total={int(total_b) / _MIB:.1f} "
             f"unposted={unposted_b / _MIB:.1f} (MiB)"
+            # #1009(a): the verdict rides on the line itself, so a reader
+            # quoting this line cannot quote it without the caveat.
+            + ("" if not breaches else f" | RECONCILE=FAILED [{'; '.join(breaches)}]")
         )
         logger.info(line)
 
@@ -264,6 +352,18 @@ def log_residency_census(model_runner, tag: str = "post-capture") -> Optional[st
                 "nvml_used_mib": used_b / _MIB,
                 "nvml_free_mib": int(free_b) / _MIB,
                 "nvml_total_mib": int(total_b) / _MIB,
+                # #1009(a): the NVML reconciliation verdict travels WITH the
+                # bytes. A consumer that prices from this file can refuse on
+                # `ok: false` without re-deriving the check, and a reader
+                # cannot mistake a non-physical `graphs_mib` for a
+                # measurement. Absent on censuses written before #1009 --
+                # which the consumer treats as "unverified", not as "passed".
+                "reconciliation": {
+                    "ok": not breaches,
+                    "breaches": list(breaches),
+                    "params_plus_pools_mib": (params_total + pools_b) / _MIB,
+                    "partition_sum_mib": partition_b / _MIB,
+                },
             }
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"census_pp{pp_rank}.json")

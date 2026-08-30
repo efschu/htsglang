@@ -179,6 +179,58 @@ def load_census_calibration(census_dir: str) -> CensusCalibration:
         used = float(_require(blob.get("nvml_used_mib"), "nvml_used_mib", census_dir))
         pools = float(_require(blob.get("pools_mib"), "pools_mib", census_dir))
         params_total = sum(float(v) for v in params.values())
+        # #1009(a): NVML RECONCILIATION, ENFORCED WHERE THE BYTES ARE PRICED.
+        # The residual below is `nvml_used - params - pools`, so it is only a
+        # residual while that subtraction is non-negative. If the census
+        # reports more params+pools than the driver reported the card using,
+        # the "residual" is a NEGATIVE overhead -- the gate would then credit
+        # the stage with memory that does not exist and admit a cut that
+        # cannot run. That is the 2026-08-05 OOM direction exactly, so it is
+        # refused here rather than clamped: a clamp would keep the number
+        # looking calibrated while the arithmetic underneath it had already
+        # failed.
+        #
+        # THE CHECK IS ON THE TERMS THIS MODULE CONSUMES, deliberately, and
+        # NOT on params+pools+graphs. Those three are consecutive differences
+        # of one running allocator total (see residency_census.py), so their
+        # sum IS `alloc_mib` by construction and comparing that sum to
+        # nvml_used tests the torch posts, not this calibration. This module
+        # never reads `graphs_mib`; refusing a sound, NVML-anchored
+        # calibration because an unconsumed torch post was unphysical would
+        # block a boot for a term nothing here prices.
+        if params_total + pools > used:
+            raise PPCutCalibrationError(
+                f"{census_dir!r} rank {pp_rank}: the census does not "
+                f"reconcile against NVML. params_total {params_total:.1f} + "
+                f"pools {pools:.1f} = {params_total + pools:.1f} MiB exceeds "
+                f"nvml_used {used:.1f} MiB, so the per-rank residual this "
+                f"gate prices (nvml_used - params - pools) would be "
+                f"{used - params_total - pools:.1f} MiB. A negative overhead "
+                f"credits the stage with memory the driver says is not there "
+                f"and admits a cut that cannot run. Re-take the census on a "
+                f"boot whose RESIDENCY CENSUS line does not carry "
+                f"RECONCILE=FAILED."
+            )
+        # The emitter's own verdict, when the census is new enough to carry
+        # one. Only a breach that touches params/pools/nvml_used is fatal --
+        # a torch-post breach (alloc/reserved above the driver) makes
+        # `graphs_mib` unphysical, which this module does not price, so it is
+        # surfaced in the refusal path only when it also broke the consumed
+        # terms. An absent block means "written before #1009", i.e.
+        # UNVERIFIED, and is not read as a pass.
+        recon = blob.get("reconciliation")
+        if isinstance(recon, dict) and not recon.get("ok", True):
+            fatal = [
+                b for b in (recon.get("breaches") or []) if "params+pools" in str(b)
+            ]
+            if fatal:
+                raise PPCutCalibrationError(
+                    f"{census_dir!r} rank {pp_rank}: the census emitter "
+                    f"recorded a failed NVML reconciliation on a term this "
+                    f"gate prices: {'; '.join(str(b) for b in fatal)}. The "
+                    f"cut gate will not price from bytes the driver "
+                    f"contradicts."
+                )
         residual.append(used - params_total - pools)
         totals.append(
             float(_require(blob.get("nvml_total_mib"), "nvml_total_mib", census_dir))

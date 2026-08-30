@@ -216,6 +216,37 @@ class RankResources:
     #: Zero is reserved for "this deployment has no draft runner".
     draft_residency_mib: Optional[float] = None
 
+    #: #1009(a): what the DRIVER says this stage's card holds in total, as the
+    #: census recorded it. Supplied so the corridor reserve is charged ONCE.
+    #:
+    #: THE RESERVE WAS BOOKED TWICE. ``budget_mib`` is the operator's
+    #: ``--rank-gpu-memory-mib`` cap when they set one, and that cap is
+    #: ITSELF a reserve: on this rig it is 18800 MiB against a 20054.9 MiB
+    #: card, so the operator has already held 1254.9 MiB back. The gate then
+    #: subtracted ``corridor_mib`` from that cap as well, which targets
+    #: 2278.9 MiB free on the card. The corridor law is a BAND -- 819-1229
+    #: MiB NVML-free per card under load -- and 2278.9 is ABOVE it, which
+    #: that law scores as a FAILED acceptance in its own right. So the second
+    #: subtraction did not buy safety; it drove the card out of the band on
+    #: the other side and refused cuts for a reserve nothing asked for.
+    #:
+    #: With this set, the budget becomes ``min(cap, card_total - corridor)``:
+    #: never more than the operator allowed, and never so much that fewer
+    #: than ``corridor_mib`` MiB remain free on the card. Both constraints
+    #: are still enforced, in full -- what is dropped is only the double
+    #: charge where they overlap.
+    #:
+    #: ``None`` means the caller could not say, and the gate then keeps the
+    #: strictly more conservative ``cap - corridor``. The default is the safe
+    #: direction on purpose.
+    #:
+    #: ONE RANK PER CARD is assumed here, which is this dataclass's stated
+    #: model ("One pipeline stage's host card"). Were two stages ever to
+    #: share a card, ``card_total - corridor`` would have to be split between
+    #: them rather than offered to each, and this field would need the
+    #: co-tenant count.
+    card_total_mib: Optional[float] = None
+
     def __post_init__(self) -> None:
         if self.attn_bw_gbs <= 0.0:
             raise ValueError(
@@ -578,8 +609,40 @@ class StageCost:
 
         The quantity the verdict is actually about: a stage that fits at rest
         and cannot reach its seam is a stage that boots and then wedges.
+
+        #1009(a): THE PEAK IS CHARGED ONCE, NOT TWICE. ``resident_mib``
+        already contains ``transient_mib``, and on the wired path that is
+        ``RankResources.worst_transient_mib`` -- the max over EVERY load state
+        in the measured table. ``server_args._pp_cut_seam_staging`` builds
+        ``seam_staging_mib`` by FILTERING THAT SAME TABLE to its
+        ``SEAM_``-prefixed keys, so the seam states are a SUBSET of the states
+        the transient already maxed over and subtracting the seam again books
+        one measurement twice.
+
+        Measured on the #855 gdncov census (census-855-v2, stage1): the table
+        is ``{DECODE 1526.0, EXTEND 1390.1, SEAM_PP_TO_TP 1342.1,
+        SEAM_TP_TO_PP 1526.0}``. ``worst_transient_mib`` returns 1526.0 and
+        ``seam_staging_mib`` returns 1526.0 -- the SAME entry -- and the old
+        expression charged 3052.0 MiB for a peak the instrument measured at
+        1526.0. That is 1526 MiB of phantom demand on the binding rank.
+
+        A rank occupies ONE load state at a time, so the honest bound on
+        demand above at-rest residency is the MAX over states, never the sum
+        of two of them. This charges the max: the seam only adds what it
+        exceeds the already-charged transient by.
+
+        NOT A RELAXATION OF THE SEAM LAW. When a caller supplies
+        ``seam_staging_mib`` from an INDEPENDENT measurement that the
+        transient table does not contain -- the hand-fed path the field was
+        added for, where the census predates the seam feed -- that excess is
+        still charged in full. What is removed is only the portion already
+        funded once. The verdict can therefore never become more permissive
+        than "fund the worst state this rank actually served", which is the
+        predicate law 31 asks for.
         """
-        return self.headroom_mib - self.seam_staging_mib
+        return self.headroom_mib - max(
+            0.0, self.seam_staging_mib - self.transient_mib
+        )
 
     @property
     def feasible(self) -> bool:
@@ -831,7 +894,24 @@ def _price_stage(
         draft_mib=float(rank.draft_residency_mib or 0.0),
         # The corridor is subtracted here, once, so every downstream
         # comparison is against usable bytes.
-        budget_mib=rank.budget_mib - inputs.corridor_mib,
+        #
+        # #1009(a): ONCE means once. Both constraints bind -- the stage may
+        # not exceed the operator's cap, and the card may not be left with
+        # less than the corridor free -- so the budget is the tighter of the
+        # two, not the cap minus the corridor. See
+        # RankResources.card_total_mib for the measured case this fixes: a
+        # cap already 1254.9 MiB below the card total had the corridor
+        # subtracted a second time, targeting 2278.9 MiB free against a
+        # 819-1229 MiB band. Without a card total the old, strictly more
+        # conservative form is kept.
+        budget_mib=(
+            rank.budget_mib - inputs.corridor_mib
+            if rank.card_total_mib is None
+            else min(
+                rank.budget_mib,
+                float(rank.card_total_mib) - inputs.corridor_mib,
+            )
+        ),
         attn_bound_by=attn_bound_by,
     )
 

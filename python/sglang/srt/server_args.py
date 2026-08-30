@@ -16607,6 +16607,15 @@ class ServerArgs:
                 fixed_overhead_mib=calibration.residual_mib[i],
                 transient_by_load_state=transients[i],
                 seam_staging_mib=seam_staging[i],
+                # #1009(a): the driver's total for this stage's card, so the
+                # corridor reserve is charged once rather than on top of an
+                # operator cap that already holds memory back. See
+                # pp_cut.RankResources.card_total_mib.
+                card_total_mib=(
+                    float(calibration.total_visible_mib[i])
+                    if i < len(calibration.total_visible_mib)
+                    else None
+                ),
             )
             for i in range(self.pp_size)
         )
