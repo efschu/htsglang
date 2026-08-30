@@ -407,11 +407,21 @@ class Geometry:
             self.ngram_vocab_size_base + 2 * i + 1 for i in range(self.ple_n_grams)
         )
 
-    def ple_bytes(self, bits: float, group: int, scale_bytes: int) -> float:
+    def ple_bytes(
+        self, bits: float, group: int, scale_bytes: int, fp8: bool = False
+    ) -> float:
         """PLE table bytes at a given weight width, from the row geometry."""
         elements = float(self.ple_table_rows) * self.ple_row_width
         body = elements * bits / 8.0
-        scales = (elements / max(group, 1)) * scale_bytes if bits < 16 else 0.0
+        # fp8_e4m3 is a STORAGE DTYPE, not a group-quantized format: the module
+        # carries one scalar `weight_scale` for the whole table, so there is no
+        # per-group overhead to add. int8/int4 would need group scales, which is
+        # why they are priced differently -- and refused, see --ple-dtype.
+        scales = (
+            0.0
+            if bits >= 16 or fp8
+            else (elements / max(group, 1)) * scale_bytes
+        )
         return body + scales
 
     def ple_gather_bytes_per_token(self, dtype_bytes: float) -> float:
@@ -740,9 +750,14 @@ class Solver:
             geom.ple_side_state_bytes_per_request(ssm_bytes, args.draft_tokens) * bs
         )
 
-        self.ple_bits = {"bf16": 16.0, "int8": 8.0, "int4": 4.0}[args.ple_dtype]
+        self.ple_bits = {"bf16": 16.0, "fp8": 8.0, "int8": 8.0, "int4": 4.0}[
+            args.ple_dtype
+        ]
         self.ple_bytes = geom.ple_bytes(
-            self.ple_bits, args.ple_quant_group, args.ple_scale_bytes
+            self.ple_bits,
+            args.ple_quant_group,
+            args.ple_scale_bytes,
+            fp8=(args.ple_dtype == "fp8"),
         )
         self.ple_gather_bpt = geom.ple_gather_bytes_per_token(2.0)
         self.ple_staging_bytes = self.ple_gather_bpt * bs * PLE_STAGING_DOUBLE_BUFFER
@@ -1827,7 +1842,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="SGLANG_MOE_SCRATCH_SLOTS equivalent. Default: the derived "
         "max(8, R // 4).",
     )
-    ap.add_argument("--ple-dtype", choices=("bf16", "int8", "int4"), default="int4")
+    ap.add_argument(
+        "--ple-dtype",
+        choices=("bf16", "fp8", "int8", "int4"),
+        default="fp8",
+        help="PLE table storage. Only bf16 and fp8 are CONSTRUCTIBLE: "
+        "Qwen4ExpPinnedHostEmbedding.__init__ raises NotImplementedError unless the "
+        "quant method is UnquantizedEmbeddingMethod and TypeError unless the dtype "
+        "is bf16 or float8_e4m3fn. int8/int4 are priced for comparison only and are "
+        "REFUSED as a plan -- the default used to be int4, which no boot could have "
+        "built.",
+    )
     ap.add_argument("--ple-residency", choices=("host", "gpu"), default="host")
     ap.add_argument("--ple-quant-group", type=int, default=32)
     ap.add_argument("--ple-scale-bytes", type=int, default=2)
@@ -1872,6 +1897,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "constraint. Both are always reported.",
     )
     a = ap.parse_args(argv)
+
+    if a.ple_dtype in ("int8", "int4"):
+        print(
+            f"REFUSED: --ple-dtype {a.ple_dtype} is not CONSTRUCTIBLE.\n"
+            "  models/qwen4_exp.py Qwen4ExpPinnedHostEmbedding.__init__ raises\n"
+            "  NotImplementedError unless the quant method is\n"
+            "  UnquantizedEmbeddingMethod, and TypeError unless the dtype is\n"
+            "  bfloat16 or float8_e4m3fn. A layout priced at int8/int4 would size\n"
+            "  a table no boot can build -- and at 8 bits it sizes within 0.02 GiB\n"
+            "  of the fp8 plan, so the numbers look right and the boot still dies.\n"
+            "  Use --ple-dtype fp8 (47.68 GiB) or bf16 (95.37 GiB).",
+            file=sys.stderr,
+        )
+        return 2
 
     if not a.cards:
         a.cards = [Card(*c) for c in DEFAULT_CARDS]
