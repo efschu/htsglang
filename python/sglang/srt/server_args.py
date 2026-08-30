@@ -16679,6 +16679,14 @@ class ServerArgs:
             state_bytes_per_linear_layer=(
                 calibration.state_per_linear_mib * pp_cut.MIB
             ),
+            # #1009a: per-stage recurrent state where the census measured it
+            # per stage. The cross-rank mean mispriced the calibrated cut by
+            # +799.7 MiB on one stage and -541 MiB on another, and the second
+            # direction is an under-charge.
+            state_bytes_per_linear_layer_by_stage=tuple(
+                v * pp_cut.MIB
+                for v in calibration.state_per_linear_mib_by_rank
+            ),
             attn_layer_flops_per_token=flops["attn"],
             linear_layer_flops_per_token=flops["linear"],
             attn_core_flops_per_token_pair=flops["core"],
@@ -16696,6 +16704,17 @@ class ServerArgs:
                 "--pp-solve-cut found no feasible layer split:\n  "
                 + "\n  ".join(solution.refusals)
             )
+
+        # #1009a: disclose every stage whose measured worst transient dips
+        # into the corridor band. Admissible -- the peak is governed by the
+        # band's lower edge, not by the at-rest user reserve -- but never
+        # silent: this is the operator's signal that the card runs at the
+        # band's floor, and the line carries BOTH numbers so no reader has to
+        # reconstruct which floor applied.
+        for cost in solution.stages:
+            note = cost.corridor_dip_note
+            if note:
+                logger.warning("--pp-solve-cut corridor dip: %s", note)
 
         # C39: the census's per-rank residual is NOT cut-invariant -- it moved
         # ~1250 MiB between a 28-layer and a 40-layer stage 0 on the reference
