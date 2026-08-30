@@ -3826,15 +3826,39 @@ def _decide_from_load(
         in_pp = None if state.phase_since is None else inp.now - state.phase_since
         cap = pp_residency_cap_s(cfg)
         if cap > 0 and in_pp is not None and inp.running_bs > 0 and in_pp >= cap:
-            return PhasePolicyDecision(
-                PP_TO_TP,
-                f"decode stall cap: {inp.running_bs} req stalled "
-                f"{in_pp + 2 * cfg.flip_cost_s:.1f}s of the "
-                f"{cfg.decode_stall_slo_s:g}s budget (residency {in_pp:.1f}s "
-                f">= {cap:.1f}s solved as slo - 2x{cfg.flip_cost_s:g}s seam); "
-                f"{inp.pending_prefill_tokens} tok prefill still pending -- exit "
-                f"condition: decode starvation cap",
-            )
+            # #1011 (user order 2026-08-30, verbatim: the decode-stall SLO
+            # "widerspricht meiner anweisung erst alles fertig zu prefillen").
+            # A PREFILL BACKLOG OUTRANKS THE DECODE SLO. While prefill work is
+            # still pending this cap DEGRADES TO A DETECTOR: it says how long
+            # the carried decodes have waited and how much prefill is still
+            # owed, and it does NOT cut the drain short.
+            #
+            # THE ONE HONEST CONSEQUENCE, stated rather than softened: under a
+            # continuous prefill stream `pending_prefill_tokens` never reaches
+            # zero, so carried decodes wait UNBOUNDEDLY. That is the operator's
+            # decision -- prefill runs to exhaustion first -- and the warning
+            # below is the whole mechanism by which it stays visible.
+            if inp.pending_prefill_tokens > 0:
+                logger.warning(
+                    "#1011 DECODE-STALL DETECTOR (not actuated): %d req stalled "
+                    "%.1fs of the %gs budget, but %d tok of prefill is still "
+                    "pending and the prefill drain outranks the decode SLO. "
+                    "Holding in pp; decodes wait until the backlog is empty.",
+                    inp.running_bs,
+                    in_pp + 2 * cfg.flip_cost_s,
+                    cfg.decode_stall_slo_s,
+                    inp.pending_prefill_tokens,
+                )
+            else:
+                return PhasePolicyDecision(
+                    PP_TO_TP,
+                    f"decode stall cap: {inp.running_bs} req stalled "
+                    f"{in_pp + 2 * cfg.flip_cost_s:.1f}s of the "
+                    f"{cfg.decode_stall_slo_s:g}s budget (residency {in_pp:.1f}s "
+                    f">= {cap:.1f}s solved as slo - 2x{cfg.flip_cost_s:g}s seam); "
+                    f"prefill backlog empty -- exit condition: decode "
+                    f"starvation cap",
+                )
 
         # LEGACY STOPWATCH. Retained so a deployment that set pp_window_s keeps
         # its behaviour, but it now has to say what the drain-based policy
