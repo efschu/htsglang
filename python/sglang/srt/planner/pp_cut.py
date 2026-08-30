@@ -397,6 +397,20 @@ class PPCutInputs:
     #: Calibrate from the census; zero prices it away.
     state_bytes_per_linear_layer: float = 0.0
 
+    #: #1009a: the same term PER STAGE, where the census measured it per
+    #: stage. Indexed by stage; empty means "use the scalar for every stage",
+    #: which is the previous behaviour exactly.
+    #:
+    #: The scalar above is a cross-rank MEAN, and on the #855 gdncov census
+    #: the per-rank values spread 317.4 / 255.9 / 366.9 MiB per linear layer.
+    #: Applying the mean back to each rank mispriced the calibrated cut by
+    #: +799.7 MiB on stage1 and -541 MiB on stage2 -- and an under-charge is
+    #: the direction that OOMs. See
+    #: ``pp_cut_calibration.CensusCalibration.state_per_linear_mib_by_rank``
+    #: for the measurement and for the honest limit (exact on the calibrated
+    #: cut, an assumption off it, separable only with a second cut family).
+    state_bytes_per_linear_layer_by_stage: Tuple[float, ...] = ()
+
     #: Tokens the KV ARENA is sized for, i.e. ``--max-total-tokens``. This
     #: drives the memory term only, and it is a different quantity from
     #: ``kv_depth_tokens``: the arena is provisioned for the whole pool while
@@ -436,8 +450,36 @@ class PPCutInputs:
     #: is what falsifies it.
     kv_sweeps_per_chunk: float = 1.0
 
-    #: Free VRAM that must remain on every card. The rig's standing corridor.
+    #: Free VRAM that must remain on every card AT REST. The rig's standing
+    #: corridor, and specifically the USER-FREEDOM reserve of the reserve
+    #: semantics law: 1024 MiB per card that nothing resident may consume.
     corridor_mib: float = 1024.0
+
+    #: #1009a, operator decision 2026-08-30: how far the MEASURED WORST
+    #: TRANSIENT may dip into the corridor, in MiB of free VRAM.
+    #:
+    #: TWO LAWS, TWO FLOORS, AND THEY WERE BEING CONFLATED. ``corridor_mib``
+    #: is the at-rest user-freedom reserve (reserve semantics: 1024 MiB per
+    #: card, default). The CORRIDOR law is a different statement: it defines
+    #: 819-1229 MiB free per card as the acceptance BAND UNDER LOAD. Charging
+    #: the transient peak against the 1024 at-rest reserve applied the wrong
+    #: law to the peak and refused boots the corridor law passes.
+    #:
+    #: MEASURED, and this is the case that forced the decision: on the #855
+    #: gdncov boot stage 0 holds 909.7 MiB free at its measured worst
+    #: transient (30464.8 MiB at rest + 714.0 MiB EXTEND draw against a
+    #: 32088.5 MiB card). 909.7 is INSIDE the 819-1229 band -- the running
+    #: boot passes acceptance -- while the gate refused it for being below
+    #: 1024. The band is not softened here: 819 is its published lower edge.
+    #:
+    #: SO THE PREDICATE IS TWO-SIDED, not one budget. At-rest residency must
+    #: still leave ``corridor_mib`` free, because that reserve is the user's
+    #: and a peak is not permission to spend it permanently. The peak on top
+    #: of it may dip to ``corridor_dip_floor_mib`` and no further. A dip that
+    #: lands in [floor, corridor) is LOGGED with both numbers rather than
+    #: passed silently -- it is admissible, and it is also the operator's
+    #: signal that the card is running at the band's lower edge.
+    corridor_dip_floor_mib: float = 819.0
 
     #: #602: does this deployment run a NEXTN / draft runner? Declaring it
     #: makes ``RankResources.draft_residency_mib`` MANDATORY on every rank.
@@ -540,7 +582,15 @@ class StageCost:
     weight_mib: float
     kv_mib: float
     transient_mib: float
+    #: The AT-REST budget: what may be occupied with the user-freedom reserve
+    #: (``PPCutInputs.corridor_mib``) still free on the card.
     budget_mib: float
+    #: #1009a: the PEAK budget -- what may be occupied at the measured worst
+    #: transient, with only the corridor band's lower edge
+    #: (``PPCutInputs.corridor_dip_floor_mib``) still free. Always >=
+    #: ``budget_mib``. Defaults to ``budget_mib`` so a caller that builds a
+    #: StageCost by hand keeps the old, stricter single-budget behaviour.
+    peak_budget_mib: float = 0.0
     #: Non-layer weights this stage's ROLE owns (embedding on the first
     #: stage, lm_head on the last, replicated payloads everywhere). Kept as
     #: its own post rather than folded into ``weight_mib`` so a future
@@ -604,6 +654,40 @@ class StageCost:
         return self.budget_mib - self.resident_mib
 
     @property
+    def at_rest_mib(self) -> float:
+        """Occupancy with no load on the stage: everything but the transient.
+
+        The transient is a PEAK the stage reaches and gives back, so it is
+        not part of what the stage holds at rest -- and the user-freedom
+        reserve is a statement about rest.
+        """
+        return self.resident_mib - self.transient_mib
+
+    @property
+    def at_rest_headroom_mib(self) -> float:
+        """Room left under the AT-REST budget once the stage is resident."""
+        return self.budget_mib - self.at_rest_mib
+
+    @property
+    def effective_peak_budget_mib(self) -> float:
+        """The peak budget, falling back to the at-rest one when unset."""
+        return max(self.budget_mib, self.peak_budget_mib)
+
+    @property
+    def peak_headroom_mib(self) -> float:
+        """Room left at the measured peak, against the dip floor.
+
+        Charges the seam only where it exceeds the transient already funded
+        -- see :attr:`runnable_headroom_mib` for why that subtraction is a
+        max and not a sum.
+        """
+        return (
+            self.effective_peak_budget_mib
+            - self.resident_mib
+            - max(0.0, self.seam_staging_mib - self.transient_mib)
+        )
+
+    @property
     def runnable_headroom_mib(self) -> float:
         """Headroom left once the peak transient is also funded.
 
@@ -639,9 +723,53 @@ class StageCost:
         funded once. The verdict can therefore never become more permissive
         than "fund the worst state this rank actually served", which is the
         predicate law 31 asks for.
+
+        #1009a: TWO FLOORS, BOTH BINDING. The verdict is the tighter of two
+        separate laws, not one budget doing double duty:
+
+          at rest -- must leave ``corridor_mib`` (1024 MiB) free, the user's
+                     reserve, which a transient peak is not permission to
+                     spend permanently;
+          at peak -- must leave ``corridor_dip_floor_mib`` (819 MiB) free,
+                     the corridor band's published lower edge under load.
+
+        Neither is softened; the change is only that the PEAK is now measured
+        against the law that governs peaks. See
+        ``PPCutInputs.corridor_dip_floor_mib`` for the measured case
+        (909.7 MiB free at the worst transient -- inside the band, refused by
+        the at-rest reserve).
         """
-        return self.headroom_mib - max(
-            0.0, self.seam_staging_mib - self.transient_mib
+        return min(self.at_rest_headroom_mib, self.peak_headroom_mib)
+
+    @property
+    def corridor_dip_note(self) -> Optional[str]:
+        """One line when this stage's peak dips into the corridor band.
+
+        #1009a: a dip to between the band's lower edge and the at-rest
+        reserve is ADMISSIBLE and is not passed silently -- it is the
+        operator's signal that this card runs at the band's lower edge, and
+        it names BOTH numbers so the reader never has to reconstruct which
+        floor was applied. Returns None when the stage does not dip, or when
+        no card total was supplied (no dip allowance was granted, so there is
+        nothing to disclose).
+        """
+        if not self.peak_budget_mib or self.peak_budget_mib <= self.budget_mib:
+            return None
+        # Free VRAM at the peak, expressed against the at-rest floor. The
+        # dip allowance is (peak_budget - budget) = corridor - dip_floor.
+        overshoot = self.resident_mib - self.budget_mib
+        if overshoot <= 0.0:
+            return None
+        allowance = self.peak_budget_mib - self.budget_mib
+        return (
+            f"{self.rank}: measured worst transient dips into the corridor "
+            f"band -- peak occupancy is {overshoot:.1f} MiB above the at-rest "
+            f"reserve, leaving {allowance - overshoot:.1f} MiB of the "
+            f"{allowance:.0f} MiB dip allowance. Admissible: the peak is "
+            f"governed by the corridor band's lower edge, at rest the full "
+            f"reserve is still free ({self.at_rest_headroom_mib:.1f} MiB "
+            f"spare). transient={self.transient_mib:.1f} MiB "
+            f"(state {self.transient_load_state or 'unnamed'})."
         )
 
     @property
@@ -850,7 +978,16 @@ def _price_stage(
     nonlayer_weight_mib = nonlayer_bytes / MIB
 
     # Recurrent-state pool: cut-shaped, one share per linear layer owned.
-    state_mib = (n_linear * inputs.state_bytes_per_linear_layer) / MIB
+    # #1009a: per-stage where the census measured it per stage, otherwise the
+    # cross-rank scalar. The mean destroyed a 43 % per-rank spread the
+    # artifact already carried and under-charged one rank by 541 MiB.
+    by_stage = inputs.state_bytes_per_linear_layer_by_stage
+    state_bytes_per_linear = (
+        by_stage[stage]
+        if stage < len(by_stage)
+        else inputs.state_bytes_per_linear_layer
+    )
+    state_mib = (n_linear * state_bytes_per_linear) / MIB
 
     # KV ARENA, which is sized for the whole pool and not for one request.
     # When a TP layout shares this arena (the phase flip), the stage pays the
@@ -910,6 +1047,24 @@ def _price_stage(
             else min(
                 rank.budget_mib,
                 float(rank.card_total_mib) - inputs.corridor_mib,
+            )
+        ),
+        # #1009a: the peak budget uses the corridor band's lower edge instead
+        # of the at-rest reserve. Same two constraints as above -- never over
+        # the operator's cap, never below the floor of free VRAM -- only the
+        # floor differs, because a peak is governed by the corridor law and
+        # rest is governed by the reserve law.
+        # Without a card total the gate cannot say where the card's free
+        # VRAM actually sits, so the dip allowance is NOT granted: the peak
+        # budget collapses onto the at-rest budget and the old, stricter
+        # single-budget behaviour is kept. The permissive direction is never
+        # the default for an unmeasured term.
+        peak_budget_mib=(
+            rank.budget_mib - inputs.corridor_mib
+            if rank.card_total_mib is None
+            else min(
+                rank.budget_mib,
+                float(rank.card_total_mib) - inputs.corridor_dip_floor_mib,
             )
         ),
         attn_bound_by=attn_bound_by,

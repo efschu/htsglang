@@ -73,6 +73,29 @@ class CensusCalibration:
     #: NVML's. The IdentityMap travels in the artifact.
     gpu_names: Tuple[Optional[str], ...] = ()
     calibrated_on_pool: Optional[int] = None
+    #: #1009a: the recurrent-state cost PER RANK, per linear layer, as that
+    #: rank's own census measured it -- not the cross-rank mean.
+    #:
+    #: WHY THE MEAN WAS WRONG, MEASURED. ``with_arena_split_state`` derives
+    #: ``(pools_mib - arena_mib) / n_linear`` per rank and used to average the
+    #: three into one scalar. On the #855 gdncov census the per-rank values
+    #: are 317.4 / 255.9 / 366.9 MiB per linear layer -- a 43 % spread -- and
+    #: the mean 313.4 was applied back to every rank. On THE VERY CUT THE
+    #: CENSUS WAS TAKEN ON that misprices stage1 by +799.7 MiB and stage2 by
+    #: -541 MiB. The second sign is the dangerous one: an UNDER-charge reads
+    #: to the solver as free memory.
+    #:
+    #: NOT A FIT. These are the census's own per-rank measurements used where
+    #: they were measured; nothing is tuned to make a configuration pass.
+    #: What the mean did was destroy a measurement the artifact already held.
+    #:
+    #: THE HONEST LIMIT, stated because it is real: this term is indexed by
+    #: RANK, so it is exact on the calibrated cut and an ASSUMPTION off it --
+    #: it says the per-layer state cost follows the CARD rather than the
+    #: geometry. Those two readings only separate with a census from a second
+    #: cut family, which this rig does not yet have. Empty falls back to
+    #: :attr:`state_per_linear_mib` for every rank: the old behaviour exactly.
+    state_per_linear_mib_by_rank: Tuple[float, ...] = ()
     #: Per rank, the MEASURED transient draw for every load state that rank
     #: actually served, as ``planner/transient_census.py`` wrote it. Empty
     #: when the census boot did not run the transient instrument -- and the
@@ -323,6 +346,11 @@ def with_arena_split_state(
     """
     paths = sorted(glob.glob(os.path.join(census_dir, "census_pp*.json")))
     per_layer: List[float] = []
+    # #1009a: keep each rank's own value beside the mean. The mean stays as
+    # the fallback for ranks the split could not derive (no linear layers, or
+    # an arena that already exceeds the measured pool), so no rank is ever
+    # priced at zero for this term.
+    by_rank: Dict[int, float] = {}
     for p in paths:
         with open(p) as fh:
             blob = json.load(fh)
@@ -345,10 +373,19 @@ def with_arena_split_state(
         remainder = float(blob.get("pools_mib", 0.0)) - arena_mib
         if remainder > 0:
             per_layer.append(remainder / n_lin)
+            by_rank[stage] = remainder / n_lin
     if not per_layer:
         return calibration
+    mean = sum(per_layer) / len(per_layer)
+    n_ranks = len(calibration.residual_mib)
     return dataclasses.replace(
         calibration,
-        state_per_linear_mib=sum(per_layer) / len(per_layer),
+        state_per_linear_mib=mean,
+        # Per-rank where the census measured it, the mean only where it did
+        # not. A rank the split skipped keeps the previous behaviour rather
+        # than becoming a hole.
+        state_per_linear_mib_by_rank=tuple(
+            by_rank.get(i, mean) for i in range(n_ranks)
+        ),
         calibrated_on_pool=pool_tokens,
     )

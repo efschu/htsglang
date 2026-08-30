@@ -11765,10 +11765,59 @@ class ServerArgs:
             # derivation with an agreement gate); the measured-profile ladder
             # is still a single-group planner. Refusal by name, never a
             # silent fallback to plain auto.
+            #
+            # #1010, ANSWERED AND UPHELD 2026-08-30. The proposal was a
+            # symbolic --rank-tp-ratio value that would reach the MLP-vector
+            # solve alone and bypass this line for that path. It is refused,
+            # because the solve's MEANING does not survive the crossing --
+            # this is not a plumbing restriction that a narrower gate could
+            # step around:
+            #
+            # 1. THE TWO HALVES OF THE SOLVE DISAGREE ABOUT THE INDEX under
+            #    PP. `uneven_perf.apply_auto_performance` sizes its budget
+            #    list as `[budgets] * server_args.tp_size` (uneven_perf.py
+            #    :6633) but builds one rank score per entry of
+            #    `--rank-gpu-id` (:6668) -- and under pp_size > 1 that flag is
+            #    WORLD-length, `pp_size * tp_size` in world-rank order (see
+            #    the check at the top of this class's auto path). Under pure
+            #    TP the two lengths coincide, which is why the solve is
+            #    correct there and only there. On the reference rig
+            #    (pp_size=3, tp_size=1) it would emit a 3-entry vector into a
+            #    slot the layers read as 1 entry long: `rank_mlp_ratio` is
+            #    consumed as a TP-GROUP vector via
+            #    `distributed.utils.get_tp_partition_ratios("mlp")`, indexed
+            #    by tp_rank, never by pp_rank.
+            #
+            # 2. UNDER PP THERE IS NO MLP TO SPLIT. Each stage owns a
+            #    DISJOINT set of layers, so a layer's MLP is resident, whole,
+            #    on the one stage that owns it. How MLP mass is distributed
+            #    across pipeline stages IS the layer cut, and that already has
+            #    an authority: --pp-layer-ratio / --pp-solve-cut. A per-PP-rank
+            #    MLP vector would be a SECOND authority for one payload, which
+            #    is the failure this codebase has paid for repeatedly.
+            #
+            # 3. ON A PHASE-FLIP BOOT the TP phase's weight split is likewise
+            #    already declared, by --phase-flip-tp-vector. Solving a
+            #    competing vector for the same split is the same second
+            #    authority in the other phase.
+            #
+            # That an ADVISORY prints a plausible 3-vector on a PP boot is not
+            # evidence the solve transfers: the advisory reports, it does not
+            # index into the layer partition. And no env pin is offered as a
+            # bridge -- SGLANG_UNEVEN_MLP_VECTOR here would be exactly the
+            # #354/#424 pattern this file already names elsewhere (a vector
+            # read off one boot's log and hand-pinned, with the operating
+            # point it was solved for recorded nowhere the next boot can
+            # check).
             raise ValueError(
                 "--rank-tp-ratio auto-performance is not available under "
                 f"--pp-size > 1 (current: {self.pp_size}): the measured "
-                "hardware ladder plans one TP group, not per-stage groups. "
+                "hardware ladder plans one TP group, not per-stage groups, "
+                "and its MLP vector is indexed by tp_rank while --rank-gpu-id "
+                "is world-length under pipeline parallelism. Under PP the "
+                "distribution of MLP mass across stages IS the layer cut: use "
+                "--pp-solve-cut or --pp-layer-ratio for that, and "
+                "--phase-flip-tp-vector for the TP phase's weight split. "
                 "Use --rank-tp-ratio auto (per-stage VRAM derivation with "
                 "an agreement gate) or an explicit vector of length "
                 f"--tp-size ({self.tp_size})."
@@ -16630,6 +16679,14 @@ class ServerArgs:
             state_bytes_per_linear_layer=(
                 calibration.state_per_linear_mib * pp_cut.MIB
             ),
+            # #1009a: per-stage recurrent state where the census measured it
+            # per stage. The cross-rank mean mispriced the calibrated cut by
+            # +799.7 MiB on one stage and -541 MiB on another, and the second
+            # direction is an under-charge.
+            state_bytes_per_linear_layer_by_stage=tuple(
+                v * pp_cut.MIB
+                for v in calibration.state_per_linear_mib_by_rank
+            ),
             attn_layer_flops_per_token=flops["attn"],
             linear_layer_flops_per_token=flops["linear"],
             attn_core_flops_per_token_pair=flops["core"],
@@ -16647,6 +16704,17 @@ class ServerArgs:
                 "--pp-solve-cut found no feasible layer split:\n  "
                 + "\n  ".join(solution.refusals)
             )
+
+        # #1009a: disclose every stage whose measured worst transient dips
+        # into the corridor band. Admissible -- the peak is governed by the
+        # band's lower edge, not by the at-rest user reserve -- but never
+        # silent: this is the operator's signal that the card runs at the
+        # band's floor, and the line carries BOTH numbers so no reader has to
+        # reconstruct which floor applied.
+        for cost in solution.stages:
+            note = cost.corridor_dip_note
+            if note:
+                logger.warning("--pp-solve-cut corridor dip: %s", note)
 
         # C39: the census's per-rank residual is NOT cut-invariant -- it moved
         # ~1250 MiB between a 28-layer and a 40-layer stage 0 on the reference
