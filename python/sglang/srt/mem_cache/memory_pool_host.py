@@ -286,6 +286,19 @@ from sglang.srt.mem_cache.pinned_host_budget import (  # noqa: E402
 )
 
 
+# #1035: how many times the KV tier's host/device ratio the MAMBA ANCHOR pool
+# gets when nothing explicit is configured. Deliberately a small whole multiple
+# rather than a share of free RAM (see the sizing block in
+# `MambaPoolHost.__init__` for why free-RAM sizing is rank-divergent): 2.0 keeps
+# every rank identical, doubles the anchor ceiling that the density step will
+# spend, and leaves the freed RAM to the flip/serving machinery, which the
+# standing host-RAM priority puts ahead of cache. Raise it (or set
+# `--hicache-mamba-host-mib`) once a boot reports a non-zero
+# "#1035 PREFETCH DROPPED" count -- that counter, not this constant, is the
+# evidence that the ceiling binds.
+MAMBA_ANCHOR_HOST_AUTO_MULT: float = 2.0
+
+
 class MambaBlobGeometryError(RuntimeError):
     """#869b: a mamba blob whose byte length is not this pool's page geometry.
 
@@ -308,6 +321,7 @@ class MambaPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         layout: str = "layer_first",
+        anchor_host_mib: int = 0,
     ):
         self.device_pool = device_pool
         self.page_size = 1
@@ -358,15 +372,77 @@ class MambaPoolHost(HostKVCache):
         self.dtype = self.conv_dtype
         self.size_per_token = self.get_size_per_token()
 
-        if host_size > 0:
+        # #1035 ANCHOR-POOL SIZING. This pool holds MAMBA ANCHORS, and an
+        # anchor is what makes a cached KV prefix USABLE: the conjunctive match
+        # walk rejects a KV-only node, and a prefetch whose anchor slot cannot
+        # be acquired is dropped whole (see "#1035 PREFETCH DROPPED"). Its
+        # capacity is therefore not a cache-hit-rate dial like the KV tier's --
+        # it is the ceiling on how many resumable points the whole read path
+        # can hold at once.
+        #
+        # Sizing it off `--hicache-ratio` (1.5) tied it to the DEVICE slot count
+        # (20 here -> 30 host anchors, ~74.8 MiB each, ~2.2 GiB). Measured on
+        # boot_855_1028rerun: 22 host anchors were published per rank in a
+        # five-cell session, i.e. a handful of short prompts already reaches
+        # ~73 % of that ceiling. The anchor-density step that follows raises the
+        # publication rate by design, so it must not run against this ceiling.
+        #
+        # WHY THIS IS RANK-INVARIANT, AND WHY IT IS NOT SIZED FROM FREE RAM.
+        # The obvious form -- take a share of what is free right now -- is
+        # exactly what `pinned_host_budget`'s own docstring rules out: live
+        # availability SHRINKS as each rank pins its share, so the same policy
+        # yields different sizes (or passes on rank 0 and raises on rank 2) in
+        # different workers. A divergent anchor capacity is a divergent prefetch
+        # vote, which is the `raenge-nie-uneins` failure, and a divergent
+        # boot-time raise is an NCCL hang rather than an error. Every input
+        # below is therefore rank-invariant: the device pool size, the ratio,
+        # and a named constant. The MACHINE-level question ("does this fit
+        # beside every other pinned post?") stays where it belongs -- with
+        # `check_and_register_pinned_post` below, which sums and refuses by
+        # naming every post and the flag that shrinks it.
+        #
+        # Precedence: explicit MiB > absolute --hicache-size > auto multiple.
+        if anchor_host_mib and int(anchor_host_mib) > 0:
+            _size_source = f"--hicache-mamba-host-mib={int(anchor_host_mib)}"
+            self.size = int(anchor_host_mib) * (1024**2) // self.size_per_token
+        elif host_size > 0:
+            _size_source = f"--hicache-size={host_size}"
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            # The multiple, not the product, is the policy: it stays correct if
+            # the device pool or the ratio changes, and it can never size the
+            # pool BELOW what this boot form already had (mult >= 1).
+            _size_source = (
+                f"auto(ratio={host_to_device_ratio} x "
+                f"mult={MAMBA_ANCHOR_HOST_AUTO_MULT})"
+            )
+            self.size = int(
+                device_pool.size * host_to_device_ratio * MAMBA_ANCHOR_HOST_AUTO_MULT
+            )
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
+
+        # PROVENANCE LINE (one per rank per boot). Every term that produced the
+        # number, so a later reader can reconstruct the decision without the
+        # source: where the size came from, what one anchor costs, what the
+        # device pool holds, and the resulting host ceiling. The anchor-density
+        # step is dimensioned against THIS line.
+        logger.info(
+            "#1035 ANCHOR-POOL PROVENANCE: source=%s -> host_anchor_slots=%d "
+            "(device_slots=%d, ratio=%.2f, auto_mult=%.2f) "
+            "per_slot=%.2f MiB total=%.2f GiB layout=%s",
+            _size_source,
+            self.size,
+            device_pool.size,
+            host_to_device_ratio,
+            MAMBA_ANCHOR_HOST_AUTO_MULT,
+            self.size_per_token / (1024**2),
+            self.size * self.size_per_token / (1024**3),
+            layout,
+        )
 
         if self.size <= device_pool.size:
             logger.warning(
@@ -379,8 +455,8 @@ class MambaPoolHost(HostKVCache):
 
         requested_bytes = self.size * self.size_per_token
         check_and_register_pinned_post(
-            name="HiCache Mamba host pool",
-            flag="--hicache-size / --hicache-ratio",
+            name="HiCache Mamba anchor host pool",
+            flag="--hicache-mamba-host-mib (or --hicache-size / --hicache-ratio)",
             requested_bytes=requested_bytes,
             reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,
         )

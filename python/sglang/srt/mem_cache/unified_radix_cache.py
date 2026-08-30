@@ -3013,7 +3013,54 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         last_hash=last_hash,
                     )
                     if transfers == []:
+                        # #1035 -- THE PREFETCH THAT VANISHES WITHOUT A WORD.
+                        #
+                        # An empty (not None) list is a component saying "I could
+                        # not acquire my host resource" -- for MambaComponent,
+                        # `_mamba_pool_host.alloc(1)` returned None twice, once
+                        # before and once after an eviction pass, i.e. the host
+                        # ANCHOR pool is exhausted. `alloc_failed` then votes this
+                        # rank out of the prefetch entirely and the request is
+                        # recomputed from scratch.
+                        #
+                        # That is the right SEMANTIC (a KV span without its anchor
+                        # is unmatchable, so not prefetching beats publishing an
+                        # unmatchable node), but until now it was completely
+                        # SILENT: no counter, no line, indistinguishable in every
+                        # log from "there was nothing in storage". Read-through
+                        # measured 0 for the whole campaign while this branch,
+                        # if hot, was the reason -- and no instrument could say
+                        # so. Name it, count it, and print the pool occupancy
+                        # that caused it, so the anchor-DENSITY step that follows
+                        # is dimensioned against a measured exhaustion rate
+                        # instead of an assumed one.
                         alloc_failed = True
+                        self._1035_n = getattr(self, "_1035_n", 0) + 1
+                        if self._1035_n <= 40 or self._1035_n % 256 == 0:
+                            _hp = getattr(comp, "_mamba_pool_host", None)
+                            try:
+                                _avail = (
+                                    _hp.available_size() if _hp is not None else -1
+                                )
+                            except Exception:  # noqa: BLE001 - diagnostic only
+                                _avail = -1
+                            try:
+                                _size = int(getattr(_hp, "size", -1))
+                            except Exception:  # noqa: BLE001 - diagnostic only
+                                _size = -1
+                            logger.warning(
+                                "#1035 PREFETCH DROPPED (host anchor pool "
+                                "exhausted) n=%d comp=%s req=%s prefetch_tokens=%d "
+                                "host_anchor_avail=%s host_anchor_size=%s -- this "
+                                "rank votes the prefetch DOWN; the prompt is "
+                                "recomputed in full. Not a storage miss.",
+                                self._1035_n,
+                                comp.component_type,
+                                req_id,
+                                len(prefetch_key),
+                                _avail,
+                                _size,
+                            )
                         break
                     if transfers:
                         comp_xfers[comp.component_type] = transfers

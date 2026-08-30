@@ -4282,6 +4282,20 @@ class ServerArgs:
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
     ] = 0
+    hicache_mamba_host_mib: A[
+        int,
+        "#1035: size of the host MAMBA ANCHOR pool in MiB PER RANK, absolute. "
+        "Overrides --hicache-size/--hicache-ratio for this pool only. This "
+        "pool is not an L2 hit-rate dial: an anchor is what makes a cached KV "
+        "prefix matchable at all, and a prefetch whose anchor slot cannot be "
+        "acquired is dropped whole, so this value is the ceiling on how many "
+        "resumable points the read path can hold. 0 (the default) derives it "
+        "rank-invariantly from the device pool; it is deliberately NOT a share "
+        "of free RAM, because live availability differs per rank and a "
+        "divergent anchor capacity is a divergent prefetch vote. Whatever it "
+        "resolves to is registered as a named post in the pinned-host ledger, "
+        "which refuses a jointly impossible configuration by naming every post.",
+    ] = 0
     hicache_host_role: A[
         str,
         Arg(

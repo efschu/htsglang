@@ -554,6 +554,10 @@ def build_hybrid_mamba_stack(
         server_args.hicache_size,
         allocator_type=server_args.hicache_storage_backend,
         layout=server_args.hicache_mem_layout,
+        # #1035: the anchor pool gets its own budget. Sharing --hicache-size
+        # with the KV host tier would price a 74.8 MiB anchor slot as though it
+        # were a KV page.
+        anchor_host_mib=getattr(server_args, "hicache_mamba_host_mib", 0),
     )
     entries = [
         build_pool_entry(

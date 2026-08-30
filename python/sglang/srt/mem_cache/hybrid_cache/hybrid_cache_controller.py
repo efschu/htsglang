@@ -757,9 +757,51 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
         if operation.pool_transfers:
+            self._hitq_v2_n = getattr(self, "_hitq_v2_n", 0) + 1
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
             )
+        elif getattr(self, "extra_host_mem_release_entries", None):
+            # #1035 -- THE SILENT DEGRADATION, NAMED AND REFUSED.
+            #
+            # The `else` below is upstream's path for a controller that has NO
+            # non-KV pools at all: nothing to cap with, so an uncapped KV answer
+            # is the correct answer. On THIS controller non-KV pools ARE
+            # registered (`extra_host_mem_release_entries` is populated in
+            # __init__ from `mem_pool_host.entries`, one per non-anchor pool),
+            # so reaching it means a component DECLINED to build its transfer
+            # list -- e.g. `MambaComponent.build_hicache_transfers` returning an
+            # empty list on an exhausted host anchor pool.
+            #
+            # Answering that request through `batch_exists` returns the KV span
+            # WITHOUT the component boundary that makes it usable, and the node
+            # then published carries KV and no anchor. The conjunctive match walk
+            # (`unified_radix_cache.py`, mamba validator) rejects such a node for
+            # good, so the uncapped answer is not a generous answer -- it is an
+            # unmatchable one, bought at full host-memory price. Both counters
+            # ("success") stay green while read-through stays dead: the
+            # `instrument-text-luegt` shape.
+            #
+            # A refusal is the honest answer: report 0 pages, exactly as a real
+            # miss does, and SAY SO with a counter so a zero here is readable as
+            # "never happened" rather than as "not instrumented". Nothing is
+            # published, nothing leaks, and the cost shows up as a named number
+            # instead of as a mysteriously dead read path.
+            self._hitq_v1_refused_n = getattr(self, "_hitq_v1_refused_n", 0) + 1
+            if self._hitq_v1_refused_n <= 40 or self._hitq_v1_refused_n % 256 == 0:
+                logger.warning(
+                    "#1035 UNCAPPED-PUBLISH REFUSED n=%d: %d non-KV pool(s) are "
+                    "registered (%s) but this prefetch carries NO pool transfers "
+                    "-- a component could not build its list (exhausted host "
+                    "anchor pool is the known cause). Answering uncapped would "
+                    "publish a KV-only node the match walk can never match. "
+                    "Refusing with 0 pages. v2_queries=%d",
+                    self._hitq_v1_refused_n,
+                    len(self.extra_host_mem_release_entries),
+                    ",".join(str(n) for n in self.extra_host_mem_release_entries),
+                    getattr(self, "_hitq_v2_n", 0),
+                )
+            hit_result = PoolTransferResult(kv_hit_pages=0, extra_pool_hit_pages={})
         else:
             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
             hit_result = PoolTransferResult(
