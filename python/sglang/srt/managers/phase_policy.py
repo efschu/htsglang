@@ -3943,16 +3943,57 @@ def _decide_from_load(
                 f"declare {ENV_DECODE_STALL_SLO} to solve this instead",
             )
         if idle and cfg.rest_phase == PHASE_TP:
-            if state.idle_since is None:
-                return _no("idle, waiting for the idle dwell to start")
-            idle_for = inp.now - state.idle_since
-            if idle_for >= cfg.idle_dwell_s:
-                return PhasePolicyDecision(
-                    PP_TO_TP,
-                    f"idle {idle_for:.1f}s >= {cfg.idle_dwell_s:g}s, "
-                    f"returning to the {cfg.rest_state} resting layout",
-                )
-            return _no(f"idle {idle_for:.1f}s < {cfg.idle_dwell_s:g}s idle dwell")
+            # #1011 WORK EXHAUSTION: DO NOT PAY A ROUND TRIP TO PRE-POSITION
+            # FOR WORK THAT DOES NOT EXIST.
+            #
+            # `idle` here is the STRONG emptiness term computed above --
+            # `decode_work_bs() == 0 AND not work_exists()` -- so at this line
+            # it is PROVEN that there is neither a resident decoding bundle nor
+            # a prefill owed anywhere. This arm nevertheless flipped, to park
+            # in the resting layout. Its premise is pre-positioning: be where
+            # the next work will want to run, so the first request does not pay
+            # the seam.
+            #
+            # THE PREMISE IS BACKWARDS FOR A COLD ARRIVAL, and that is the only
+            # arrival an empty box can get. A new request needs a PREFILL pass
+            # first, and prefill cannot run in tp under strict purity -- so
+            # resting in TP means the next arrival pays a tp_to_pp to be
+            # prefilled and a pp_to_tp to be decoded, while resting in PP means
+            # it is prefilled where it lands. Resting in PP is strictly the
+            # better position for the arrival an idle box actually receives.
+            #
+            # MEASURED, boot_855_704bgroup2 (2026-08-30), a boot with 57
+            # prefill batches, ZERO decode batches and one 6-token probe:
+            #   21x  PHASE-POLICY arming pp_to_tp: idle Ns >= Ns, returning to
+            #        the decode resting layout
+            #   21x  PHASE-POLICY arming tp_to_pp: pending prefill N tok > 0
+            #        (purity: prefill cannot run in tp, nothing decoding)
+            # -- 21 round trips, 42 flips, on an IDLE box. The two rules
+            # certified each other: this one flipped to TP for nothing, the
+            # health probe's prefill then could not run there, and the tp-ward
+            # arm flipped straight back. At the measured 8.07 s per round trip
+            # (4.016 s pp_to_tp + 4.050 s tp_to_pp, reconciled `flips` table)
+            # that is ~169 s of seam spent serving nothing.
+            #
+            # DELIBERATELY NOT A DWELL INCREASE. A longer idle dwell makes the
+            # loop slower, not absent, and the #819 pricing question ("is this
+            # round trip worth the work behind it") cannot be answered by a
+            # timer at all -- at zero work no dwell is long enough to make the
+            # trade positive.
+            #
+            # THE LIVELOCK DIRECTION IS COVERED (#858/#1006): staying is safe
+            # only because this is the EMPTY case. The moment either work class
+            # appears, `idle` is False and control never reaches this branch --
+            # the pp-window arm above (requests waiting to decode) and the
+            # DRAINED arm still arm pp_to_tp on their own terms. Nothing here
+            # touches the drain-and-flip contract.
+            return _no(
+                f"idle {0.0 if state.idle_since is None else inp.now - state.idle_since:.1f}s "
+                f"with NO work of either class: staying in pp rather than "
+                f"paying a seam to rest in {cfg.rest_state} (#1011). A cold "
+                f"arrival needs prefill first, which pp already serves; the "
+                f"normal arms flip when work actually exists."
+            )
         if idle:
             return _no("idle at rest")
         return _no(f"prefilling in pp ({inp.pending_prefill_tokens} tok pending)")
