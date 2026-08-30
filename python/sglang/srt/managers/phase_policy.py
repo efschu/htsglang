@@ -2510,6 +2510,31 @@ class PhasePolicyInputs:
     #: diverged and a formation rule keyed on running_bs would read 0 exactly
     #: when the window is fullest.
     ready_carriers: int = 0
+
+    #: #1040: can the TP layout ACTUALLY re-admit the residents this cutover
+    #: would retract, RIGHT NOW? The tp-ward DRAINED arm already has a refusal
+    #: for "the target cannot re-admit them" -- but it reads
+    #: `cfg.seam_readmit_available`, which is BOOT-STATIC and hardcoded True
+    #: (`config_from_env`), so the refusal has never once been reachable.
+    #: Its own comment credits it with holding W30 to 3 flips instead of 150.
+    #:
+    #: The static True rests on "under strict/threshold the seam-transport
+    #: exemption covers exactly this population, so it is available too". #890
+    #: falsified that AFTER it was written: `seam_restore_refused` REVOKES the
+    #: exemption per request (`phase_purity.py`:1352), and the seam carry was
+    #: measured at 162 refusals to 0 successes across 57 cutovers. So the
+    #: population the arm counts on is routinely NOT re-admittable, and the
+    #: guard that should stand the arm down cannot see it.
+    #:
+    #: Live, and rank-uniform by the same contract as every other field here:
+    #: derived from `seam_readmit_candidates` + `seam_transport_premise_holds`,
+    #: which read the REPLICATED queue -- the same two functions the
+    #: `target_can_admit` probe uses (`scheduler.py`:4165), so the arm and the
+    #: post-cutover builder ask ONE predicate rather than two that can drift.
+    #: Defaults True so a stand-in that never observed it behaves exactly as
+    #: before this field existed.
+    seam_readmit_ready: bool = True
+
     #: Whether anything is still queued behind them. When the queue is empty
     #: there is nothing left to accumulate and the window opens at once.
     queue_nonempty: bool = False
@@ -3628,7 +3653,19 @@ def _decide_from_load(
             # ever. Refusing here is what keeps that at 3 flips instead of
             # 150, and it is a REFUSAL rather than a silent hold so the
             # operator sees which contract is missing.
-            if not getattr(cfg, "seam_readmit_available", True):
+            # #1040: ASK THE LIVE QUESTION TOO. `cfg.seam_readmit_available`
+            # is boot-static and hardcoded True, so this refusal has never
+            # been reachable; `inp.seam_readmit_ready` is the same question
+            # asked of the current queue, via the same authority the
+            # post-cutover builder uses. Either one saying "no" stands the arm
+            # down. Measured specimens this closes, both `ARM-VERDICT-WRONG`
+            # on boot 13633687a7: armed with `running_bs=4 ready_carriers=2`
+            # and with `running_bs=5`, cutover COMMITTED, then no batch in 8
+            # rounds -- the flip arriving with nothing to do, which is exactly
+            # what the refusal below was written for.
+            if not getattr(cfg, "seam_readmit_available", True) or not getattr(
+                inp, "seam_readmit_ready", True
+            ):
                 return _no(
                     f"NOT ARMING pp_to_tp despite {inp.running_bs} req "
                     f"decoding and {inp.pending_prefill_tokens} tok pending: "

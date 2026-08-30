@@ -5484,6 +5484,43 @@ class Scheduler(
         )
         return n
 
+    def _1040_seam_readmit_ready(self) -> bool:
+        """#1040: can the TP layout re-admit the residents a cutover retracts?
+
+        Answered from the SAME authority the post-cutover builder and the
+        `target_can_admit` probe use (`scheduler.py`:4165) --
+        `seam_readmit_candidates` plus `seam_transport_premise_holds` -- so
+        the tp-ward arm and the thing that has to build the batch cannot
+        disagree. One predicate, two consumers.
+
+        NO CANDIDATES MEANS READY. An empty candidate set is not a failure: it
+        is a flip with no seam population at all (an idle return to the resting
+        layout, or a decode bundle already resident), and those arms are
+        legitimate. Only a NON-EMPTY population whose premise does not hold
+        stands the arm down -- that is the measured case, where the cutover
+        retracts requests the target then refuses to re-admit and the flip
+        arrives with nothing to do.
+
+        Rank-uniform: both functions read the replicated waiting queue, which
+        is the contract every field of `PhasePolicyInputs` is held to.
+
+        Fail-open: any error returns True, i.e. exactly the behaviour before
+        this term existed. A buildability probe may not become a new way to
+        wedge the policy.
+        """
+        try:
+            from sglang.srt.managers.phase_purity import (
+                seam_readmit_candidates,
+                seam_transport_premise_holds,
+            )
+
+            candidates = seam_readmit_candidates(self)
+            if not candidates:
+                return True
+            return bool(seam_transport_premise_holds(self))
+        except Exception:  # noqa: BLE001 - never wedge the arming path
+            return True
+
     def _resident_batches(self) -> List:
         """The batches this rank actually holds: the PP slot array, plus the
         non-PP resident handle, deduplicated by identity.
@@ -13363,6 +13400,15 @@ class Scheduler(
                 getattr(getattr(self, "parked_decode_set", None), "resident_count", 0)
                 or 0
             ),
+            # #1040 ONE PREDICATE, TWO CONSUMERS. The tp-ward DRAINED arm and
+            # the post-cutover batch builder must ask the SAME buildability
+            # question, or they drift -- and they had: the arm's own refusal
+            # reads a boot-static flag hardcoded True, so it never fired,
+            # while the builder produced nothing. These are the two functions
+            # the `target_can_admit` probe already calls (:4165), and they
+            # read the REPLICATED queue, so the value is rank-uniform by the
+            # same contract as every other field on this object.
+            seam_readmit_ready=self._1040_seam_readmit_ready(),
             queue_nonempty=bool(len(getattr(self, "waiting_queue", ()) or ())),
             # #708: the RANK-UNIFORM availability, so the BOTH-BLOCKED decline
             # names its binding resource from a measurement. Group MIN via the
