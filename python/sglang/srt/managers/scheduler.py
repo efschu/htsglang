@@ -5189,6 +5189,32 @@ class Scheduler(
         # have asked about an empty span and answered about nothing.
         _last_hash = last_host_node.get_last_hash_value()
         _matched_len = len(req.prefix_indices) + req.host_hit_length
+        # #1039 WHY THIS SPAN ENDS ONE PAGE SHORT OF A NODE'S OWN ANCHOR, AND WHY
+        # THAT IS ACCEPTED RATHER THAN FIXED HERE.
+        # `_compute_max_prefix_len` is input_len - 1 (schedule_batch.py:1715, an
+        # UPSTREAM rule -- the match must leave at least one token to forward).
+        # The mamba anchor, by contrast, is published at the NODE END
+        # (mamba_component.py, BACKUP_STORAGE, keys=[node.hash_value[-1]]). The
+        # deepest key this span can ever ask for is therefore exactly one page
+        # below the anchor of a node that ends where the prompt ends. Measured
+        # 2026-08-30 by recomputing the real hash chain offline against the anchor
+        # blobs on disk: for a 350-token prompt the only anchor sits at prefix
+        # length 350 while this span ends at 349.
+        #
+        # THE LOSS IS BOUNDED BY ONE CHUNK, which is exactly the #939 bound ("at
+        # most one HiCache chunk size of loss"). With an anchor at every chunk end
+        # (chunk size C) the deepest REACHABLE anchor is the largest multiple of C
+        # that is <= L-1, so the realised loss is
+        #       L - floor((L-1)/C) * C   <=   C     for every prompt length L
+        # Worked: L=350 -> 350;  L=4618, C=4096 -> 522;  L=8192, C=4096 -> 4096
+        # (the bound is attained, never exceeded). A multi-chunk prompt keeps
+        # reaching its EARLIER chunk anchors -- for L=4618 the anchor at 4096 lies
+        # inside this span -- so a warm hit is available without touching the cap.
+        # HAZARD if someone raises the cap here to chase the last anchor: that
+        # trades an upstream invariant (a request must always have a token left to
+        # forward) for at most one chunk of prefix. Caveat:
+        # dynamic_chunked_prefill_size (scheduler.py:8268-8415) can vary C, which
+        # moves the number but not the "at most one chunk" bound.
         _match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
         _new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]
         _prefix_keys = (

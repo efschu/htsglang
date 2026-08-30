@@ -1343,6 +1343,29 @@ class MambaComponent(TreeComponent):
             cd = node.component_data[ct]
             if cd.host_value is None or not node.hash_value:
                 return None
+            # #1039: THE ANCHOR IS PUBLISHED AT THE NODE END, and a reader can
+            # never request past input_len-1 (upstream cap, consumed at
+            # scheduler.py -> Req._compute_max_prefix_len). A node whose end
+            # coincides with a prompt's own end is therefore UNREACHABLE for an
+            # identical repeat of that prompt -- at ANY anchor density, because
+            # density cannot rescue a span that stops one page short. Measured
+            # 2026-08-30 by recomputing the hash chain offline against the anchor
+            # blobs on disk: a 350-token prompt's only anchor sits at prefix
+            # length 350, the read span ends at 349.
+            #
+            # This is accepted, not repaired: the loss is bounded by one chunk
+            # (worked arithmetic at the _match_end comment in scheduler.py), which
+            # is the #939 bound. Earlier chunk-end anchors of a multi-chunk prompt
+            # stay reachable -- for a 4618-token prompt the anchor at 4096 lies
+            # inside the read span -- and that is where a warm hit comes from.
+            #
+            # HAZARD, if someone "fixes" the off-by-one by keying this at
+            # hash_value[-2]: the state in cd.host_value is the mamba state AFTER
+            # the node's LAST token. Filing it under the prefix-length-minus-one
+            # key would advertise a state that does not belong to that prefix, and
+            # the reader would continue from it -- a silently wrong continuation
+            # instead of a miss. Shifting the KEY requires capturing the STATE at
+            # that position too; the two are not separable.
             return [
                 PoolTransfer(
                     name=PoolName.MAMBA,
