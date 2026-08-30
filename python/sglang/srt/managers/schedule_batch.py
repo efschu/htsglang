@@ -3037,7 +3037,59 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
         # of the rank; a flip that repartitions nothing leaves the two equal on
         # every rank. Whether a pool can state a layout at all is a property of
         # the pool CLASS, which is likewise the same on every rank.
-        req.seam_restore_refused = True
+        # #1042: THIS REFUSAL DOES NOT MEAN THE TOKENS ARE RECOMPUTED, AND THE
+        # #890 REVOCATION IT USED TO TRIGGER RESTS ON EXACTLY THAT CLAIM.
+        #
+        # `seam_restore_refused` revokes the seam-transport exemption
+        # (`phase_purity.py`:1352). The revocation's stated ground is "the copy
+        # was dropped and the tokens go back to be recomputed", so re-admitting
+        # would be "a COLD PREFILL of real work, not a cache restore".
+        #
+        # MEASURED, AND FALSE FOR THIS BRANCH. Across 57 cutovers the seam copy
+        # scored 162 refusals to ZERO successes (135 LAYOUT + 27 extent, 0
+        # carried, 0 restored) -- and the refused requests lose nothing,
+        # because the HiCache store serves the same prefix independently:
+        # rid 12f312df was refused here at 23:30:43 while its own
+        # `HiCache prefetch success ... matched=8192` had landed seconds
+        # earlier, and the re-admission batches read
+        # `nseq=6 new=1672 cached=40960` -- ~279 new tokens per request against
+        # an 8192-token chunk. That is a cache restore, not a cold prefill.
+        #
+        # THE COST OF THE FALSE REVOCATION IS THE LAST EMPTY TP PHASE. With the
+        # premise revoked, `prefill_blocked_here` falls past the seam-transport
+        # exemption -- which returns "not blocked" WITHOUT spending a chunk --
+        # onto the #887 computed-prefill budget, which is `strict:1`: ONE chunk
+        # per TP phase. The re-admission then needs ~17 chunks for its 68718
+        # tok, gets one, and `#861j transport-debt clock LAPSED` fires at 10 s
+        # with no decode batch ever built. That is the measured 02:09:00 phase.
+        #
+        # It also contradicts a user order this file's own gate quotes
+        # verbatim (`phase_purity.py`:240): *"wenn das hicache reinladen als
+        # prefill gilt, dann darf es das natuerlich ueber einen chunk hinaus
+        # tun"* -- the read-through re-admission is explicitly allowed past one
+        # chunk, and the revocation is what forces it back under the cap.
+        #
+        # The DROP stands (the copy is unusable and is discarded, unchanged
+        # above). Only the claim that a recompute follows is withdrawn, because
+        # the store answers it. The extent-mismatch refusal keeps its mark: it
+        # fires on a request whose extent MOVED, where store coverage is not
+        # implied by anything measured here.
+        _SEAM_STATE_COUNTS["layout_refused_no_revoke"] = (
+            _SEAM_STATE_COUNTS.get("layout_refused_no_revoke", 0) + 1
+        )
+        _nr = _SEAM_STATE_COUNTS["layout_refused_no_revoke"]
+        if _nr <= 3 or _nr % 64 == 0:
+            logger.info(
+                "%s #1042 LAYOUT REFUSAL DOES NOT REVOKE THE EXEMPTION "
+                "rid=%s: the copy is dropped, but this request's prefix is "
+                "served by the store (read-through), not recomputed, so the "
+                "#890 premise still holds for it. Revoking here forced the "
+                "re-admission onto the one-chunk computed budget and cost the "
+                "TP phase its decode. occurrence=%d",
+                SEAM_STATE_PREFIX,
+                getattr(req, "rid", None),
+                _nr,
+            )
         return False
 
     # #783b: ANNOUNCE BEFORE THE DANGEROUS CALL. This emitter sat only
