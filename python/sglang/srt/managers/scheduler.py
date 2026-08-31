@@ -10643,7 +10643,17 @@ class Scheduler(
             _d = _seen_with_extent - _published
             _n = getattr(self, "_1041_pop_n", 0) + 1
             self._1041_pop_n = _n
-            if _d != 0 or _n <= 5 or _n % 64 == 0:
+            # #1043c: NEVER SUPPRESS A PASS THAT HAD HOLDERS. The boot-13
+            # overlay (PP0 `set` at 10:14:33/10:15:04 against `#1041` at
+            # 10:14:15/:21/:54 -- zero intersection) reads as a clean time
+            # disjunction, but it is BOUNDED BY THIS RATE LIMIT: only the first
+            # five publisher calls emit, so "no emission after 10:14:54" cannot
+            # distinguish "the publisher did not run" from "it ran and was not
+            # printed". An overlay drawn from a rate-limited sample is a
+            # denominator claim about the sample, not about the pass stream.
+            # Emitting unconditionally whenever holders exist makes the next
+            # overlay decisive; the volume is bounded by how rare holders are.
+            if _seen_with_extent > 0 or _d != 0 or _n <= 5 or _n % 64 == 0:
                 logger.info(
                     "#1041 EXTENT POPULATION seen=%d published=%d delta=%d "
                     "admitted=%d carriers=%d n=%d -- delta!=0 means a request "
