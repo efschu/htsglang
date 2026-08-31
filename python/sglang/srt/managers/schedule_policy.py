@@ -12,7 +12,7 @@ _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBU
 logger = logging.getLogger(__name__)
 
 #: #988: rate-limit state for the load-back instrument, module-level.
-_988_LOADBACK_SEEN = {"n": 0}
+_988_LOADBACK_SEEN = {"n": 0, "mamba": 0, "kv_only": 0}
 
 
 def _note_988_loadback(req, new_prefix_len: int) -> None:
@@ -26,13 +26,30 @@ def _note_988_loadback(req, new_prefix_len: int) -> None:
     """
     _988_LOADBACK_SEEN["n"] += 1
     n = _988_LOADBACK_SEEN["n"]
+    # #1040 KV/MAMBA SPLIT, COUNTED APART. A load-back that moved the KV prefix
+    # while the recurrent restore refused is a HALF SUCCESS with a named link --
+    # never a green one -- and the single `n` above cannot express that. The
+    # mamba half is `mamba_loadback_anchor_adopted`, written by the component
+    # during `init_load_back` and read here in the same straight-line stretch of
+    # the same `add_one_req`, so no pass, chunk, cutover or flip can land in
+    # between (the only lifecycle shape this fact is safe under).
+    if getattr(req, "mamba_loadback_anchor_adopted", False):
+        _988_LOADBACK_SEEN["mamba"] += 1
+    else:
+        _988_LOADBACK_SEEN["kv_only"] += 1
     if n == 1 or n % 64 == 0:
         logger.info(
             "#988 LOADBACK rid=%s prefix moved to %d, extend_range re-derived "
-            "to the parked shape at the mutation (seen=%d)",
+            "to the parked shape at the mutation (seen=%d) "
+            "kv_applied=%d mamba_restored=%d kv_only=%d anchor_depth=%s told=%s",
             getattr(req, "rid", None),
             new_prefix_len,
             n,
+            n,
+            _988_LOADBACK_SEEN["mamba"],
+            _988_LOADBACK_SEEN["kv_only"],
+            getattr(req, "state_anchor_depth", None),
+            getattr(req, "pp_load_back_told", None),
         )
 
 
@@ -326,6 +343,17 @@ def match_prefix_for_req(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
+    # #1040: the two depths travel with the match that produced them.
+    # `state_anchor_depth` is the deepest position at which EVERY component --
+    # `is_resume_candidate` included -- accepted an anchor, i.e. the deepest
+    # place a KV prefix may end without the recurrent state running ahead of it.
+    # `key_match_depth` is how far the KEY matched with no validator asked. They
+    # are written unconditionally, including the None the pure-KV caches
+    # produce, so a stale value from an earlier admission of the same resident
+    # request can never be read as this pass's answer -- the lifecycle defect
+    # (writer, reader, deleter separated by an event) that cost PP0 boot 1.
+    req.state_anchor_depth = match_result.state_anchor_depth
+    req.key_match_depth = match_result.key_match_depth
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len
@@ -2387,6 +2415,22 @@ class PrefillAdder:
                             PPScheduleRefused,
                         )
 
+                        # #1040: NAME BOTH NUMBERS, so the next verdict is a
+                        # MEASUREMENT and not another round of inference. The
+                        # question this refusal has never been able to answer is
+                        # whether the receiving rank holds a state at PP0's
+                        # depth at all: `_lb_extent` is PP0's state-aligned
+                        # choice IN PP0'S TREE, while `_anchor_here` is the
+                        # deepest state-bearing boundary in THIS rank's tree.
+                        # Their relation decides the next design step -- if they
+                        # usually agree, the residual is rare and the
+                        # all-or-nothing costs little; if they usually differ,
+                        # the row has to carry PP0's anchor depth as the clamp
+                        # value and this seam needs a rank-uniform state
+                        # lattice. Neither can be decided from the count alone.
+                        _anchor_here = getattr(req, "state_anchor_depth", None)
+                        _prefix_here = getattr(req, "prefix_indices", None)
+                        _dev_here = 0 if _prefix_here is None else len(_prefix_here)
                         raise PPScheduleRefused(
                             f"#968 LOAD-BACK GDN ANCHOR OFF-EXTENT for rid="
                             f"{getattr(req, 'rid', '?')}: PP0 published an "
@@ -2397,7 +2441,12 @@ class PrefillAdder:
                             f"would resume the scan from a recurrent state "
                             f"that has already consumed the tokens in "
                             f"between. Refusing the load-back instead; the "
-                            f"request re-prefills."
+                            f"request re-prefills. "
+                            f"#1040 local_anchor_depth={_anchor_here} "
+                            f"device_len={_dev_here} "
+                            f"local_anchor_room={None if _anchor_here is None else int(_anchor_here) - _dev_here} "
+                            f"told_vs_local_anchor="
+                            f"{'AGREE' if _anchor_here is not None and int(_anchor_here) - _dev_here == _lb_extent else 'DIFFER'}"
                         )
                     if _applied > _lb_extent:
                         new_indices = new_indices[:_lb_extent]

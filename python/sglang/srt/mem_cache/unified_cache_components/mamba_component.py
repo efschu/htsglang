@@ -394,12 +394,25 @@ class MambaComponent(TreeComponent):
                 self._stateless_resume_refusals += 1
                 count = self._stateless_resume_refusals
                 if count <= 3 or count % 1000 == 0:
+                    # #1040: NAME BOTH NUMBERS. "Refusing" alone cannot say
+                    # whether the KV extent overshot a state point that exists
+                    # further back, or whether the path carries no state at all
+                    # -- and those two have different fixes (round the extent
+                    # down vs. make the anchor survive its node, #1039). The
+                    # match depth reached and the extent the tree WOULD have
+                    # served are printed beside the verdict so the next reader
+                    # measures instead of infers.
                     logger.warning(
                         "[#928 anchor] REFUSING resume: node carries no "
                         "recurrent state on device or host, so its KV prefix "
-                        "cannot be reused; re-prefilling. occurrence=%d rid=%s",
+                        "cannot be reused; re-prefilling. occurrence=%d rid=%s "
+                        "#1040 match_tokens=%d best_value_len=%d "
+                        "kv_host_hit=%s next_state_point=NONE-ON-THIS-PATH",
                         count,
                         getattr(req, "rid", None),
+                        sum(len(v) for v in value_chunks),
+                        best_value_len,
+                        result.host_hit_length,
                     )
                 return zero_match_result(self.cache, result)._replace(
                     mamba_branching_seqlen=branching_seqlen

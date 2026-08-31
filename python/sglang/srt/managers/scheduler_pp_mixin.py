@@ -6719,6 +6719,15 @@ class SchedulerPPMixin:
             return 0
         local = self._local_reqs_by_rid()
         stamped = 0
+        # #1040 MAMBA COLUMN. A boot that stamps KV extents onto requests whose
+        # recurrent anchor this rank does not hold is a HALF SUCCESS with a
+        # named link, never a green one, and one counter cannot say which half
+        # ran. `anchors` counts the stamped requests that carry a state-bearing
+        # boundary at all; `retracted` counts those that have survived at least
+        # one cutover retraction, which is the free pre-measurement for the
+        # lifecycle half (#1039: does the anchor outlive the node it hangs on?).
+        anchors = 0
+        retracted_survivors = 0
         for rid, extent in wanted.items():
             req = local.get(rid)
             if req is None:
@@ -6728,17 +6737,27 @@ class SchedulerPPMixin:
                 continue
             req.pp_load_back_told = extent
             stamped += 1
+            _anchor = getattr(req, "state_anchor_depth", None)
+            if _anchor:
+                anchors += 1
+            if getattr(req, "_1040_seen_retract", False):
+                retracted_survivors += 1
         if stamped:
             _n = getattr(self, "_968_applied_n", 0) + 1
             self._968_applied_n = _n
             if _n <= 5 or _n % 64 == 0:
                 logger.info(
-                    "#968 LOAD-BACK ROW APPLIED n=%d stamped=%d/%d phase=%s "
-                    "extents=%s -- PP0 extents written onto this rank's own "
-                    "requests, honoured from their next chunk.",
+                    "#968 LOAD-BACK ROW APPLIED n=%d stamped=%d/%d anchors=%d/%d "
+                    "retract_survivors=%d phase=%s extents=%s -- PP0 extents "
+                    "written onto this rank's own requests, honoured from their "
+                    "next chunk. anchors < stamped means this rank holds the KV "
+                    "half of the fact without the recurrent half.",
                     _n,
                     stamped,
                     len(wanted),
+                    anchors,
+                    stamped,
+                    retracted_survivors,
                     getattr(getattr(self, "phase_flip_runtime", None), "phase", "?"),
                     sorted(wanted.values())[:5],
                 )

@@ -217,6 +217,22 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        state_anchor_depth: ABSOLUTE depth (same units as the match walk's `cum_tokens`)
+                            of `best_match_node` -- i.e. of the deepest position at which
+                            EVERY component accepted, the mamba resume predicate
+                            (`is_resume_candidate`) included. This is the deepest
+                            STATE-BEARING boundary on the matched path, and the only
+                            position at which a KV prefix may end without the recurrent
+                            state being ahead of it. ``None`` when no component makes a
+                            state-bearing claim (pure-KV caches): callers must then leave
+                            every length untouched, which keeps upstream's path
+                            byte-for-byte what it was.
+        key_match_depth:    How far the KEY matched, INDEPENDENT of any validator -- the
+                            walk's final `cum_tokens`. The pair (`key_match_depth`,
+                            `state_anchor_depth`) is the measurement #1039 needs: the KEY
+                            reached this far, a STATE survived only that far. Their gap is
+                            "the tree kept the shape and lost the anchor", which no single
+                            number can express. ``None`` when not measured.
     """
 
     device_indices: torch.Tensor
@@ -228,6 +244,8 @@ class MatchResult(NamedTuple):
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    state_anchor_depth: Optional[int] = None
+    key_match_depth: Optional[int] = None
 
 
 def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
@@ -282,6 +300,18 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         # caller of this function -- strict-resume, both #928 arms, the
         # slot-starvation zeroing -- gets the same repair from one line.
         cache_protected_len=None,
+        # #1040, same contract, same reason: a zeroed match reaches back to the
+        # ROOT, so there is no accepted anchor left to point at. Leaving the
+        # pre-refusal depth here would hand the extent chooser a state-bearing
+        # boundary that this very call has just declared unusable -- the exact
+        # shape the paragraph above describes for `cache_protected_len`. ZERO,
+        # not None: None means "this cache has no state to align to at all"
+        # (pure-KV), while the caller here HAS such a component and is saying
+        # its anchor is gone. Collapsing the two would make an honest refusal
+        # read as an upstream-shaped no-op.
+        state_anchor_depth=(
+            None if match_result.state_anchor_depth is None else 0
+        ),
     )
 
 

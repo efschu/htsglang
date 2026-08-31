@@ -1169,6 +1169,147 @@ def _last_chunk_verdict(
     return int(prefix_len) + int(extend_len) >= int(fill_len)
 
 
+#: #1040 counters. Kept apart on purpose: a shortfall whose anchor is simply
+#: deeper in the tree than the host tier reaches is an ordinary alignment, while
+#: a MATCH THAT FOUND NO ANCHOR AT ALL is the #1039 population -- the tree kept
+#: the node's shape and lost its recurrent payload. Summing them would produce
+#: one number that cannot answer either question.
+#:
+#: AND THE LOSS STATISTIC HAS ITS OWN DENOMINATOR, separate from the total
+#: refusals. A round-down with an anchor present gives back PART of the hit --
+#: that is the population the user's "at most one HiCache chunk" grant is about,
+#: and the number that has to be reported against it. An extent of 0 because
+#: there was NO anchor gives back the WHOLE hit, which is a different event with
+#: a different fix; pooling the two inflates the loss median and max with values
+#: that have nothing to do with rounding. Measured while building this: the
+#: pooled form reported loss_max=300 on a fixture whose only genuine round-down
+#: lost 200.
+_1040_ALIGN = {
+    "n": 0,  # extents chosen
+    "rounded": 0,  # extents an anchor actually moved (anchor > 0)
+    "loss_sum": 0,  # tokens given back BY ROUNDING (anchor > 0 only)
+    "loss_max": 0,
+    "anchor_absent": 0,  # anchor gone while the KEY still matched
+    "absent_forgone": 0,  # tokens given back because there was NO anchor
+    "below_first_anchor": 0,  # no anchor because the match is short: legitimate
+}
+
+
+def state_aligned_load_back_len(req) -> Optional[int]:
+    """#1040: PP0's load-back extent, rounded DOWN to a state-bearing boundary.
+
+    THE USER'S GRANT, IN ONE EXPRESSION: up to one HiCache chunk may be
+    re-prefilled, and it is re-prefilled FROM THE KV POSITION THAT MATCHES THE
+    MOST CURRENT RECURRENT STATE. KV is divisible -- any prefix length is a
+    legal place to stop -- while the mamba/GDN state is pointlike and cannot be
+    trimmed to a length it does not belong to. Where the two disagree the KV
+    yields, because giving back tokens costs recompute while keeping them costs
+    correctness (`schedule_policy.py`'s FIX-3 comment spells the same hazard out
+    at the receiving end).
+
+    The anchor is NOT recomputed here. `req.state_anchor_depth` is the depth of
+    the node the match walk's own validators accepted -- mamba's being
+    `is_resume_candidate` itself -- so this function only clamps against a
+    decision that was already made, once, in the one place that makes it. A
+    second anchor rule here would be the second bookkeeping the upstream-minimal
+    law rejects, and #747 records what two anchor lineages do to each other.
+
+    THREE ANSWERS, AND THEY ARE NOT THE SAME ANSWER:
+
+      ``None`` from `state_anchor_depth` -- this cache has NO state-bearing
+        component (pure KV). Nothing to align to, every length is valid, the
+        extent is returned untouched. That is what keeps `pp_size <= 1` and
+        every upstream configuration byte-for-byte what they were.
+      ``0`` extent -- the match reached no acceptable anchor. "Load back
+        nothing" is then the CORRECT verdict, not a failure: under leaf-only
+        mamba data a split nulls the parent's state, so the candidate set along
+        one path is typically one point or none. It is counted, because a zero
+        anchor under a LONG key match is the #1039 symptom (the anchor died with
+        an evicted node) and a zero anchor under a SHORT one is just a request
+        that has not reached the first checkpoint yet. The counter separates
+        them; the action is the same either way.
+      a SHORTENED extent -- the anchor sits below the host hit's end. The
+        difference is the loss, in tokens, and it is summed and maxed here so a
+        boot can state the user's "a few thousand tokens" expectation as a
+        MEASURED number instead of an assumption.
+
+    NOTE ON THE EXPECTED SIZE OF THE LOSS: with `--mamba-checkpoint-interval`
+    set, anchors sit on a grid and the loss is bounded by the interval. With the
+    interval OFF the anchor is wherever traffic last committed one, so there is
+    no bound to compare against and the distribution measured here IS the
+    finding. Do not read a large loss as a defect without first reading the
+    interval the boot ran with.
+    """
+    kv = int(getattr(req, "host_hit_length", 0) or 0)
+    if kv <= 0:
+        return None
+    anchor = getattr(req, "state_anchor_depth", None)
+    if anchor is None:
+        # Pure-KV cache: no state to align to. Upstream's number, unmodified.
+        return kv or None
+
+    # `state_anchor_depth` is ABSOLUTE (from the root) while the row carries a
+    # DELTA (how many host tokens to pull in beyond what the device already
+    # holds), so the anchor has to be expressed in the same coordinate before
+    # it can clamp anything. `prefix_indices` is the device-resident half; its
+    # length is read with `len()`, never a boolean context, because it is a
+    # tensor of pool pointers (#796).
+    prefix_indices = getattr(req, "prefix_indices", None)
+    device_len = 0 if prefix_indices is None else len(prefix_indices)
+    room = int(anchor) - int(device_len)
+    extent = kv if room >= kv else max(0, room)
+
+    _1040_ALIGN["n"] += 1
+    loss = kv - extent
+    key_depth = getattr(req, "key_match_depth", None)
+    absent_class = None
+    if int(anchor) <= 0:
+        # No anchor at all -- the WHOLE hit is given back. Which of the two
+        # worlds is it? A long key match with no surviving anchor is the #1039
+        # symptom (the tree kept the node's shape and lost its recurrent
+        # payload); a short one is simply a request that has not reached a
+        # checkpoint yet. Same action, different finding.
+        _1040_ALIGN["absent_forgone"] += loss
+        if key_depth is not None and int(key_depth) > 0:
+            _1040_ALIGN["anchor_absent"] += 1
+            absent_class = "ANCHOR-ABSENT-ON-MATCH"
+        else:
+            _1040_ALIGN["below_first_anchor"] += 1
+            absent_class = "below-first-anchor"
+    elif loss > 0:
+        # THE ROUNDING PROPER, and the only population the user's "at most one
+        # HiCache chunk" bound is a statement about.
+        _1040_ALIGN["rounded"] += 1
+        _1040_ALIGN["loss_sum"] += loss
+        if loss > _1040_ALIGN["loss_max"]:
+            _1040_ALIGN["loss_max"] = loss
+
+    n = _1040_ALIGN["n"]
+    if loss > 0 or absent_class == "ANCHOR-ABSENT-ON-MATCH" or n <= 5 or n % 64 == 0:
+        logger.info(
+            "#1040 EXTENT STATE-ALIGN rid=%s kv=%d extent=%d loss=%d "
+            "anchor_depth=%s device_len=%d key_match_depth=%s class=%s -- "
+            "n=%d rounded=%d loss_sum=%d loss_max=%d anchor_absent=%d "
+            "absent_forgone=%d below_first_anchor=%d",
+            getattr(req, "rid", None),
+            kv,
+            extent,
+            loss,
+            anchor,
+            device_len,
+            key_depth,
+            absent_class or "aligned",
+            n,
+            _1040_ALIGN["rounded"],
+            _1040_ALIGN["loss_sum"],
+            _1040_ALIGN["loss_max"],
+            _1040_ALIGN["anchor_absent"],
+            _1040_ALIGN["absent_forgone"],
+            _1040_ALIGN["below_first_anchor"],
+        )
+    return extent or None
+
+
 def forwarded_last_chunk(
     decision: Optional[PPAdmissionDecision],
 ) -> Dict[str, bool]:
@@ -1423,9 +1564,11 @@ def build_pp_admission_decision(
                     # the same number, set by `init_next_round_input` earlier
                     # in this same pass, and it is what the deferral line
                     # prints.
-                    load_back_len=(
-                        int(getattr(req, "host_hit_length", 0) or 0) or None
-                    ),
+                    # #1040: STATE-ALIGNED, not raw. The extent PP0 publishes is
+                    # rounded DOWN to the deepest boundary that carries a
+                    # recurrent state, because the KV half of a prefix can stop
+                    # anywhere and the GDN half cannot.
+                    load_back_len=state_aligned_load_back_len(req),
                 )
             )
             continue
@@ -1509,7 +1652,10 @@ def build_pp_admission_decision(
                 last_chunk=_last_chunk_verdict(told, extend_len, fallback_fill_len),
                 # #968/#1035: same offer, same reader, on the fallback branch.
                 # ROW-COLLAPSE: see the sibling constructor above.
-                load_back_len=(int(getattr(req, "host_hit_length", 0) or 0) or None),
+                # #1040: the SAME state-aligning call, not a second copy of the
+                # arithmetic -- one writer, so the two branches cannot publish
+                # extents chosen by different rules.
+                load_back_len=state_aligned_load_back_len(req),
             )
         )
     return PPAdmissionDecision(mb_id=mb_id, entries=tuple(entries))

@@ -2212,6 +2212,19 @@ class Req(ReqDllmMixin):
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
 
+        # #1040 RETRACT-SURVIVAL PRE-MEASUREMENT for the lifecycle half (#1039).
+        # The open question there is whether a recurrent anchor OUTLIVES the
+        # retraction of the request that hangs on it -- state is the payload of
+        # a radix node, and a cutover retracts requests wholesale. This stamp
+        # costs nothing and is the only way to tell, at the next admission,
+        # "this request has crossed a retraction" from "this request is fresh".
+        # It is deliberately NOT cleared anywhere: the question is whether the
+        # request has EVER been retracted, so the stamp is monotone, and the
+        # anchor depth it will be read against is re-derived by the next match
+        # rather than carried -- no stale state can hide behind it.
+        self._1040_seen_retract = True
+        self._1040_anchor_before_retract = getattr(self, "state_anchor_depth", None)
+
         # #856: RECORD WHAT WAS ALREADY COMPUTED, BEFORE THE FIELDS THAT SAY SO
         # ARE CLEARED THREE LINES DOWN.
         #

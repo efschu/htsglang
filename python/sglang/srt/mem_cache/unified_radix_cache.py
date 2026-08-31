@@ -967,6 +967,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            key_match_depth,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
             params,
@@ -974,6 +975,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            key_match_depth,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -1445,9 +1447,59 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- Internal Helpers ----
 
+    def _state_anchor_depth(self, best_match_node: UnifiedTreeNode) -> Optional[int]:
+        """Absolute depth of the deepest STATE-BEARING boundary on this match.
+
+        #1040 / the user's round-down grant. KV is DIVISIBLE -- every prefix
+        length is a legal place to stop -- while the recurrent (mamba/GDN) state
+        is POINTLIKE: it exists only at the exact positions a checkpoint was
+        committed to, and it cannot be trimmed or rewound to any other one. A
+        length chosen in the KV's coordinate system therefore lands, for mamba,
+        on a boundary with no state behind it, and reusing the KV prefix there
+        resumes a scan from a state that has consumed different tokens than the
+        prefix covers. That is silently wrong, not loudly wrong.
+
+        THE PREDICATE IS NOT RE-DERIVED HERE, AND THAT IS THE POINT.
+        `best_match_node` is set in `_match_prefix_helper` only where
+        `_all_valid` accepted, and mamba's validator IS `is_resume_candidate`
+        (mamba_component.py `create_match_validator`) -- the same call
+        `MambaRadixCache._match_prefix_helper` makes. Writing a second "is this
+        an anchor" rule here would be exactly the second bookkeeping beside an
+        existing truth that the upstream-minimal law forbids, and #747 already
+        records what happens when two anchor lineages drift apart. So this
+        function only READS OFF the depth of the node that predicate already
+        chose: the sum of key lengths from `best_match_node` back to the root,
+        which reproduces the walk's `cum_tokens` at the moment that node was
+        accepted (the same units the validators were handed, bigram view
+        included).
+
+        Returns ``None`` when no component in this cache makes a state-bearing
+        claim. A pure-KV cache has nothing to align to, every length is valid
+        for it, and every caller must then leave its lengths exactly as they
+        were -- that is what keeps the upstream path byte-for-byte unchanged.
+        ZERO is a different answer from ``None`` and means something real: the
+        walk found no acceptable anchor at all, so the honest extent is "load
+        back nothing". Under leaf-only mamba data (a node split NULLS the
+        parent's `host_value`, mamba_component.py's split path) the candidate
+        set along one path is typically ONE point or NONE, so zero is an
+        ordinary outcome and never an error.
+        """
+        if not any(
+            comp.component_type == ComponentType.MAMBA
+            for comp in self._components_tuple
+        ):
+            return None
+        depth = 0
+        node = best_match_node
+        root = self.root_node
+        while node is not None and node is not root:
+            depth += len(node.key)
+            node = node.parent
+        return depth
+
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int]:
+    ) -> tuple[list[torch.Tensor], UnifiedTreeNode, UnifiedTreeNode, int, int]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
@@ -1590,11 +1642,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # printed, because this call did not exist. See `prefetch_gate_due`.
         if _prefetch_gate_due():
             logger.info("%s", _format_prefetch_gate())
+        # #1040: THE KEY DEPTH IS RETURNED BESIDE THE ANCHOR, NOT INSTEAD OF IT.
+        # `cum_tokens` is how far the KEY matched, with no validator consulted;
+        # `best_match_node` is how far a node was accepted BY the validators,
+        # mamba's `is_resume_candidate` among them. The two are different
+        # questions and only their PAIR can say which of the two #1039 worlds a
+        # cold load-back is in: "the prefix was never stored" (key depth small)
+        # or "the prefix is here and its recurrent anchor died with an evicted
+        # node" (key depth large, anchor shallow or zero). A single hit number
+        # collapses them, which is the shape #904 already paid for once.
         return (
             value,
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+            cum_tokens,
         )
 
     def _match_post_processor(
@@ -1604,6 +1666,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         best_match_device_node: UnifiedTreeNode,
         best_match_device_value_len: int,
+        key_match_depth: int = 0,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self._components_tuple:
@@ -1637,6 +1700,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
+            state_anchor_depth=self._state_anchor_depth(best_match_node),
+            key_match_depth=int(key_match_depth),
         )
 
         for component in self._components_tuple:
