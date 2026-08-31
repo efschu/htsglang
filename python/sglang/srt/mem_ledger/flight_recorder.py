@@ -90,6 +90,7 @@ __all__ = [
     "arm_process_trace",
     "trace_requested_for_rank",
     "disarm_process_trace",
+    "hold_trace_through_serving",
     "trace_armed",
     "dump_trace",
     "is_recording_phases",
@@ -120,6 +121,26 @@ MIB = 1 << 20
 #: ``1``/``all`` arms every rank; a comma-separated rank list arms only those,
 #: which is how a first measurement boot keeps its host-RAM cost to one rank.
 TRACE_ENV = "SGLANG_VRAM_FLIGHT_TRACE"
+
+#: #1054: HOLD THE WINDOW OPEN PAST ``boot_complete``, for the one question
+#: the boot-bounded window cannot answer.
+#:
+#: ``disarm_process_trace`` closes the window at ``boot_complete`` because every
+#: post this instrument was built to attribute is resident by then, and serving
+#: would otherwise grow the ring for the life of the process. That reasoning is
+#: correct for the RESIDENT question and wrong for the TRANSIENT one: boot 24
+#: (2026-08-31) died of a CUDA OOM at ``fla/chunk_o.py:146
+#: torch.zeros_like(v)`` inside the GDN extend kernel, minutes into serving,
+#: with the corridor guard predicting a trough it did not reach. That allocation
+#: happens only under real prefill depth, i.e. only AFTER the window this
+#: instrument closes -- so the term stayed modeled while the ledger printed, in
+#: 80 of 82 boots, that six of its terms are "neither measured nor bounded".
+#:
+#: Set this to keep recording through serving. It is a MEASUREMENT-RUN setting
+#: and it says so in the log: the ring is uncapped by design (see
+#: :func:`arm_process_trace`), so host RAM grows with every allocation the
+#: process makes for as long as it runs. Never set it on an acceptance boot.
+HOLD_ENV = "SGLANG_VRAM_FLIGHT_HOLD"
 
 #: Carries the boot id from the launcher to every rank it spawns. Set by
 #: :func:`publish_boot_id` and inherited through the environment, which is the
@@ -275,6 +296,17 @@ def disarm_process_trace() -> bool:
         "is closed and serving runs at full speed again."
     )
     return True
+
+
+def hold_trace_through_serving() -> bool:
+    """#1054: is this a measurement run that keeps recording past the boot?
+
+    Read at the ONE disarm site rather than inside ``disarm_process_trace``,
+    deliberately: the disarm verb must keep meaning "stop recording" for every
+    other caller, including a future one that stops the trace on purpose. What
+    is conditional is the boot's DECISION to stop, not the ability to.
+    """
+    return bool(os.environ.get(HOLD_ENV))
 
 
 def dump_trace(

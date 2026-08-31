@@ -15137,7 +15137,23 @@ def run_scheduler_process(
         # taken at either runner's capture_end is missing the other's.
         flight_recorder.mark("boot_complete", rank=tp_rank)
         flight_recorder.dump_trace("boot_complete", rank=tp_rank)
-        flight_recorder.disarm_process_trace()
+        # #1054: a MEASUREMENT run keeps the window open past this point. The
+        # boot-bounded window is right for the resident posts and blind to the
+        # transient one that killed boot 24 -- the GDN extend allocation only
+        # happens under real prefill depth, minutes after this line. The log
+        # line names the cost so nobody reads a measurement boot's host-RAM
+        # growth as a regression.
+        if flight_recorder.hold_trace_through_serving():
+            logger.warning(
+                "#1054 VRAM flight recorder HELD OPEN through serving "
+                "(%s is set). This is a MEASUREMENT RUN: the allocation ring "
+                "is uncapped, so host RAM grows with every allocation this "
+                "process makes for as long as it runs, and per-allocation cost "
+                "rises. Never set this on an acceptance boot.",
+                flight_recorder.HOLD_ENV,
+            )
+        else:
+            flight_recorder.disarm_process_trace()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
@@ -15148,6 +15164,25 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        # #1054: THE DEATH IS THE ONE MOMENT THE ALLOCATOR STATE IS WORTH MOST,
+        # and it was the one moment nothing captured it. Boot 24 died at
+        # `torch.zeros_like(v)` in the GDN extend kernel with 21.69 MiB of its
+        # budget left; the traceback names the LINE and says nothing about WHO
+        # was holding the other 31 GiB. This dump answers that, with per-block
+        # stacks, for any exception -- an OOM is merely the case that needs it
+        # most. No-op unless the recorder was armed (`dump_trace` returns None),
+        # so an ordinary boot pays nothing, and wrapped because a diagnostic
+        # must never replace the exception it is diagnosing.
+        try:
+            # Imported HERE, not reused from the try block above: an exception
+            # raised before that import leaves the name unbound, and a NameError
+            # in a crash handler would report "could not dump" for a boot that
+            # never armed anything.
+            from sglang.srt.mem_ledger import flight_recorder as _fr
+
+            _fr.dump_trace("scheduler_exception", rank=tp_rank)
+        except Exception:  # noqa: BLE001 - diagnostics may not mask the death
+            logger.warning("#1054: could not dump the allocation snapshot")
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.

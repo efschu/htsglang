@@ -1422,14 +1422,42 @@ class CorridorGuard:
                 "%s CANNOT FULLY HOLD THE CORRIDOR FLOOR through this seam "
                 "entry on device %d: predicted trough %d MiB below the %d MiB "
                 "law. PROCEEDING -- the law is a fill-quality target, not a "
-                "gate (user decision 2026-08-16), and the allocation itself "
-                "fits, so this is a dip and not an OOM. %s",
+                "gate (user decision 2026-08-16), and THE ALLOCATION THIS GATE "
+                "WAS ASKED ABOUT fits. That is the whole of the claim: the "
+                "trough is PREDICTED from this pass's providers and does NOT "
+                "bound what a later kernel allocates on the same device. "
+                "REFUTED ONCE, and the sentence that used to stand here said "
+                "'this is a dip and not an OOM' -- boot 24 (2026-08-31) "
+                "emitted this line three times on PP0 and took a CUDA OOM in "
+                "the third one's own second, at fla/chunk_o.py:146 "
+                "torch.zeros_like(v) inside the GDN extend kernel, a "
+                "transient this predictor has no term for. Read this as a "
+                "WARNING WITH AN UNMEASURED RESIDUAL, never as an all-clear. "
+                "(dip %d of this process.) %s",
                 LOG_PREFIX,
                 self.device_index,
                 (self.law_floor_bytes - (free_now - want)) / _MIB,
                 self.law_floor_mib,
+                self.law_dip_count,
                 detail,
             )
+            # #1054: capture the allocator on the FIRST dip of the process.
+            # This line is the last honest warning before the class of death
+            # boot 24 died of, and until now nothing recorded who held the
+            # memory when it fired -- the log carried a predicted trough and no
+            # attribution for the 31 GiB behind it. `dump_trace` is a no-op
+            # unless the flight recorder was armed, so an ordinary boot pays
+            # one attribute lookup. First dip only: the interesting state is
+            # the onset, and a dump per dip would write gigabytes under load.
+            if self.law_dip_count == 1:
+                try:
+                    from sglang.srt.mem_ledger import flight_recorder
+
+                    flight_recorder.dump_trace(
+                        "corridor_first_dip", rank=self.device_index
+                    )
+                except Exception:  # noqa: BLE001 - a probe may never break a seam
+                    logger.debug("#1054: corridor-dip snapshot unavailable")
         elif ok:
             logger.info(
                 "%s cleared on device %d: %s", LOG_PREFIX, self.device_index, detail
