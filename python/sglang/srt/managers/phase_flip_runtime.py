@@ -63,6 +63,7 @@ from sglang.srt.layers.dcp.phase_flip_plan import (
 )
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers import phase_flip_seam_census as seam_census
+from sglang.srt.managers import seam_coverage
 from sglang.srt.managers import tree_congruence
 from sglang.srt.managers.io_struct import PhaseFlipDecision
 from sglang.srt.managers.kv_reshard import (
@@ -10977,6 +10978,20 @@ class PhaseFlipRuntime:
     def _execute(self) -> Optional[dict]:
         direction = self._pending
         assert direction is not None
+        # Seam execution-surface instrument (diagnostic, #855 diag boot):
+        # brackets the WHOLE cutover attempt -- including a collective abandon
+        # that returns before any bytes move -- in a `cutover:<direction>`
+        # coverage context, restored to `serving` in the `finally` on every
+        # exit path (return OR an exception this function does not itself
+        # catch). No-op end to end unless SGLANG_SEAM_COVERAGE_DIR is set; see
+        # sglang.srt.managers.seam_coverage.
+        seam_coverage.enter_cutover(direction, rank=self._rank)
+        try:
+            return self._execute_body(direction)
+        finally:
+            seam_coverage.exit_cutover(direction, rank=self._rank)
+
+    def _execute_body(self, direction: str) -> Optional[dict]:
         t0 = self._clock()
         # #631 seam census: per-STAGE memory attribution across this cutover.
         # The aggregate cost was measured from outside the process; which
