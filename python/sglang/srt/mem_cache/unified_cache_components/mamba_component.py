@@ -59,6 +59,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class MambaLoadBackUnservable(Exception):
+    """#968 FIX-4: the GDN half of a host load-back cannot be served.
+
+    HAZARD THIS NAMES: a KV prefix booked as WARM over a recurrent state that
+    was never loaded. `load_back` grows the request's device prefix to the
+    told extent; the mamba restore is a separate transfer in the same call.
+    If the slot acquisition for that transfer fails, skipping only the mamba
+    half leaves the scan resuming at the told position from a foreign or
+    zeroed GDN slot -- no assert can fire, because the KV geometry is
+    self-consistent at that length.
+
+    The sibling site on the ordinary prefix-resume COW already answers this
+    exact question correctly (`finalize_match_result`: "Reusing the KV prefix
+    without the matching mamba state would be silently wrong, so the whole
+    match is zeroed" -> `zero_match_result`). This exception is that same
+    answer for the host load-back path: KV extent and GDN state stand or fall
+    together, so the whole load-back falls. Caught in
+    `UnifiedRadixCache.load_back`, which unwinds its locks and returns False.
+    """
+
+
 def _decline_retention(is_finished: bool) -> Optional[int]:
     """Answer for "mamba has no on-grid state to file at this position".
 
@@ -1319,11 +1340,32 @@ class MambaComponent(TreeComponent):
                         # #991: host load-back sibling of the COW acquire.
                         req.mamba_slot_acquired_this_admission = True
                     else:
-                        # #581 sibling site: exhausted with nothing evictable.
-                        # Skip the host->device restore instead of asserting;
-                        # the request re-prefills the segment, which is a
-                        # slowdown, not a dead scheduler.
+                        # #968 FIX-4: FAIL THE WHOLE LOAD-BACK, NOT HALF OF IT.
+                        #
+                        # This branch used to log and fall through, on the
+                        # justification "the request re-prefills the segment,
+                        # which is a slowdown, not a dead scheduler". That
+                        # justification is the #581 sibling's, and it does not
+                        # hold HERE: on this path the KV prefix does NOT get
+                        # re-prefilled -- `add_one_req` grows
+                        # `req.prefix_indices` to the told extent immediately
+                        # after this call returns. The request would then carry
+                        # a prefix booked as warm over a GDN state that was
+                        # never loaded, and the scan would resume at the told
+                        # position from a foreign or zeroed slot. Silently
+                        # wrong tokens, no assert reachable.
+                        #
+                        # Same answer as the ordinary prefix-resume COW gives
+                        # (`finalize_match_result` -> `zero_match_result`):
+                        # KV extent and GDN state stand or fall together.
                         self._log_mamba_slot_starvation("mamba (host load-back)")
+                        raise MambaLoadBackUnservable(
+                            "mamba slot pool exhausted with nothing evictable "
+                            "during a host load-back for rid="
+                            f"{getattr(req, 'rid', '?')}: refusing the whole "
+                            "load-back rather than growing the KV prefix over "
+                            "an unloaded GDN state."
+                        )
             if (
                 req is not None
                 and cd.host_value is not None
@@ -1336,6 +1378,18 @@ class MambaComponent(TreeComponent):
                         device_indices=req.mamba_pool_idx.unsqueeze(0),
                     )
                 )
+                # #968 FIX-3 (writer): this load-back plants the node-END
+                # anchor -- the state AFTER `node`'s LAST token -- into the
+                # request's own slot. The caller needs to know that, because
+                # its S1 clamp may cut the KV indices SHORT of that position
+                # and cannot cut this transfer (it is already built, and by
+                # the time the caller sees the length it has already run).
+                # A state ahead of its prefix is the hazard spelled out at
+                # the BACKUP_STORAGE comment below: the reader continues from
+                # a state that does not belong to that prefix.
+                # Reset by the caller immediately before `init_load_back`, so
+                # writer, reader and deleter share one straight-line pass.
+                req.mamba_loadback_anchor_adopted = True
 
             return transfers if transfers else None
 

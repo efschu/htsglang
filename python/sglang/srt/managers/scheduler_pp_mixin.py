@@ -2479,7 +2479,22 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
                 _998_SEEN[0],
                 _998_BREAKS[0],
                 len(_998_LAST),
-                dict(list(_998_LAST.items())[:3]) or "-",
+                # THE SAMPLE MUST BE THE NEWEST ENTRIES, NOT THE OLDEST.
+                #
+                # This was `[:3]` over an insertion-ordered dict that is never
+                # pruned, so it printed the same three rids -- whichever
+                # happened to arrive first, in practice the boot's opening
+                # HEALTH_CHECK probe -- unchanged in every snapshot for the
+                # rest of the boot. Measured 2026-08-31 on
+                # boot_855_968offer_...073637: bare-counting that first rid
+                # returns 35k+ hits and still climbing, from ONE genuine
+                # extend event at 07:40:05 echoed by every later dump. A
+                # reader counting that rid concludes the health request stayed
+                # resident and serving for the whole boot. It did not.
+                # `[-3:]` samples what the instrument claims to sample: the
+                # most recent reads. (The unbounded growth of `_998_LAST`
+                # itself is a separate defect at its definition site.)
+                dict(list(_998_LAST.items())[-3:]) or "-",
             )
         except Exception:  # noqa: BLE001 - a census may never break admission
             pass
@@ -4176,33 +4191,26 @@ class SchedulerPPMixin:
                 # newer offer always overwrites an older one for the same rid.
                 # Spent on application (popped there), so the map does not grow
                 # without bound.
-                _lb_new = getattr(self, "_pp_load_back_pending", None)
-                if _lb_new:
-                    _lb_eff = dict(getattr(self, "_pp_load_back_effective", None) or {})
-                    _lb_eff.update(_lb_new)
-                    self._pp_load_back_effective = _lb_eff
-                    # #968 THE SUCCESS INSTRUMENT, and the reason it exists: up
-                    # to here the chain had only a FAILURE marker (LOAD-BACK
-                    # DEFERRED) and an APPLICATION marker (#988 LOADBACK), so
-                    # the middle -- did the fact ever arrive and get promoted --
-                    # was blind, and two boots of "0 applied" could not be
-                    # attributed to a missing publish, a missing hop or a
-                    # missing consume. This line is the difference between
-                    # "nobody sent it" and "it arrived and nobody used it".
-                    # Low cadence: first five promotions, then every 64th.
-                    _n = getattr(self, "_968_promote_n", 0) + 1
-                    self._968_promote_n = _n
-                    if _n <= 5 or _n % 64 == 0:
-                        logger.info(
-                            "#968 LOAD-BACK PROMOTED n=%d new=%d live=%d "
-                            "extents=%s -- PP0 extents this rank may now apply "
-                            "(keyed by prefix identity, not rid).",
-                            _n,
-                            len(_lb_new),
-                            len(_lb_eff),
-                            sorted(_lb_new.values())[:5],
-                        )
-                self._pp_load_back_pending = None
+                # FIX-2 (#968): THE PROMOTE NO LONGER LIVES HERE ALONE.
+                #
+                # This body is `_event_loop_pp_body`, and it was the ONLY
+                # place `pending -> effective` ever happened. The warm prefill
+                # on this rig runs BOOT-MEASURED in the TP phase (the instance
+                # flags it itself: `LAYOUT-CONFORMANCE VIOLATION (#838)
+                # kind=work_in_wrong_layout class=prefill phase=tp`), where
+                # this body does not run at all -- so PP0 published the fact
+                # into `pending` and nobody on any rank ever promoted it.
+                # Three boots of `#968 LOAD-BACK PROMOTED` read 0/0/0 over the
+                # whole file, and that is a REAL zero, not a cadence artifact:
+                # its `n` counts promotions, so the very first one would have
+                # printed.
+                #
+                # The promote is now a phase-neutral helper called from BOTH
+                # the loop bodies and the prefill builder that CONSUMES
+                # `effective`. Kept here as well so the PP path's ordering is
+                # unchanged; the helper is idempotent (an empty `pending` is a
+                # no-op), so calling it twice in a pass costs nothing.
+                self.promote_pp_load_back_pending()
                 # The forward payload is PASS-SCOPED, unlike the two above: a
                 # rank owes its downstream only what it learned THIS pass. Left
                 # standing it would re-send a decision the downstream already
@@ -6638,6 +6646,68 @@ class SchedulerPPMixin:
         """
         self.last_mbs[slot] = self.mbs[slot]
 
+    def promote_pp_load_back_pending(self: Scheduler) -> int:
+        """#968 FIX-2: promote `pending -> effective`, in ANY phase.
+
+        Returns the number of extents promoted (0 when there was nothing),
+        so a caller can instrument it without re-deriving the answer.
+
+        WHY THIS IS A METHOD AND NOT A LINE IN A LOOP BODY. It used to be a
+        line in `_event_loop_pp_body`, which made a statement about the HOST
+        TIER conditional on which LAYOUT happened to be up. Those two are
+        independent: PP0 builds the admission decision inside
+        `_get_new_batch_prefill_raw`, which runs in both phases, and the warm
+        prefill this fact exists for runs boot-measured in the TP phase. A
+        fact published in one phase and promoted only in another is not
+        transported -- it is dropped, silently, and it was: three boots with
+        `#968 LOAD-BACK PROMOTED` at a genuine zero.
+
+        IDEMPOTENT BY CONSTRUCTION -- an empty or absent `pending` is a no-op
+        and clears nothing that a later caller still needs. That is what lets
+        the PP loop body keep its original call while the prefill builder adds
+        one, without the two having to agree on an order.
+
+        The merge direction is UPDATE, not replace: `effective` is sticky
+        until spent (popped at application), `pending` is the newest word on
+        the rids it names, and a newer offer must win for the same key.
+        """
+        _lb_new = getattr(self, "_pp_load_back_pending", None)
+        if not _lb_new:
+            # Nothing to promote. Deliberately does NOT clear `effective`:
+            # sticky-until-spent is that field's contract.
+            return 0
+        _lb_eff = dict(getattr(self, "_pp_load_back_effective", None) or {})
+        _lb_eff.update(_lb_new)
+        self._pp_load_back_effective = _lb_eff
+        # #968 THE SUCCESS INSTRUMENT, and the reason it exists: up to here
+        # the chain had only a FAILURE marker (LOAD-BACK DEFERRED) and an
+        # APPLICATION marker (#988 LOADBACK), so the middle -- did the fact
+        # ever arrive and get promoted -- was blind, and two boots of
+        # "0 applied" could not be attributed to a missing publish, a missing
+        # hop or a missing consume. This line is the difference between
+        # "nobody sent it" and "it arrived and nobody used it".
+        # Cadence counts PROMOTIONS, not passes, so the first one always
+        # prints -- this instrument does not have the cold-head blindness
+        # FIX-7 had to repair on the publish probe.
+        _n = getattr(self, "_968_promote_n", 0) + 1
+        self._968_promote_n = _n
+        if _n <= 5 or _n % 64 == 0:
+            logger.info(
+                "#968 LOAD-BACK PROMOTED n=%d new=%d live=%d phase=%s "
+                "extents=%s -- PP0 extents this rank may now apply "
+                "(keyed by prefix identity, not rid).",
+                _n,
+                len(_lb_new),
+                len(_lb_eff),
+                getattr(getattr(self, "phase_flip_runtime", None), "phase", "?"),
+                sorted(_lb_new.values())[:5],
+            )
+        # Spent: the fact has moved to `effective`, which is the field the
+        # application site reads. Leaving it standing would re-promote the
+        # same extents every pass for the life of the request.
+        self._pp_load_back_pending = None
+        return len(_lb_new)
+
     def init_pp_loop_state(self: Scheduler):
         # #969: NOTHING IS HARVESTED HERE ANY MORE. `init_pp_loop_state` is
         # upstream's zeroing step (`main:scheduler_pp_mixin.py:558-579`), and
@@ -6809,7 +6879,32 @@ class SchedulerPPMixin:
         # is an epoch-independent check against the tier the number is about.
         # Only `pending` is a per-pass quantity; `effective` is sticky until
         # spent.
-        self._pp_load_back_pending: Optional[Dict[str, int]] = None
+        # FIX-1 (#968): `pending` GETS THE SAME PROTECTION `effective` HAS,
+        # and the two lines are deliberately identical now.
+        #
+        # The unconditional null that used to stand here was not a slip -- the
+        # comment above states the intent ("Only `pending` is a per-pass
+        # quantity"), and that intent is sound AS LONG AS a promote runs every
+        # pass. It does not: the promote lived only in the PP loop body while
+        # the warm prefill runs in the TP phase (see FIX-2 at that site). So
+        # the per-pass null was destroying a fact that nothing had yet had the
+        # chance to promote -- every re-entry into the PP phase, and every
+        # cutover, since `init_pp_loop_state` runs at both.
+        #
+        # FIX-2 is the ROOT (make the promote phase-neutral); this is the
+        # guard that additionally carries the fact ACROSS THE CUTOVER, which
+        # is exactly the boundary the warm read-through has to survive: the
+        # host tier is what persists a flip, and the same rid's host hit was
+        # measured going 1215 -> 1216 -> 2114 across these cutovers. Precedent
+        # for process-lifetime state on this seam: `_pp_admission_guard`,
+        # scheduler.py.
+        #
+        # Staleness is still caught where it is cheap, unchanged: a rank told
+        # an extent its host tier no longer covers raises `#968 LOAD-BACK
+        # EXTENT UNHONOURABLE` at the application site, against the tier the
+        # number is actually about.
+        if not hasattr(self, "_pp_load_back_pending"):
+            self._pp_load_back_pending: Optional[Dict[str, int]] = None
         if not hasattr(self, "_pp_load_back_effective"):
             self._pp_load_back_effective: Optional[Dict[str, int]] = None
         self._pp_pass_voided_incoming: bool = False

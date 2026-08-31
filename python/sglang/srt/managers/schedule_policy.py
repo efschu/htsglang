@@ -133,10 +133,29 @@ def _pp_load_back_extent(req) -> Optional[int]:
     if told > local:
         # LOUD, NOT QUIETLY LESS. Loading `local` here would put this rank at a
         # different prefix length from the peers that could honour `told` --
-        # the 1815081d46 shape divergence, arrived at by being helpful. The
-        # refusal voids the pass for the whole group, which is the uniform
-        # outcome; `add_one_req`'s caller already handles PPScheduleRefused
+        # the 1815081d46 shape divergence, arrived at by being helpful.
+        # `add_one_req`'s caller already handles PPScheduleRefused
         # (scheduler.py, the `except PPScheduleRefused` arm).
+        #
+        # WHAT THIS REFUSAL IS AND IS NOT (#968 FIX-6). The sentence that stood
+        # here claimed the raise voided the pass group-wide and was therefore
+        # the uniform outcome. It does neither, and a comment asserting a
+        # uniformity the code does not have is the defect class this file has
+        # already paid for twice.
+        #
+        # The raise breaks the admission loop on THIS
+        # rank only. Its TRIGGER is half rank-local by construction: `told` is
+        # the group fact, but `local` is this rank's own host tier, which the
+        # layer-partitioned host tier (`pp_layer_ratio`) makes non-uniform on
+        # purpose. So a peer may well continue while this rank stops.
+        #
+        # It is kept anyway, and the reason is asymmetric: refusing yields a
+        # rank that grows its prefix by NOTHING, which is a recompute; the
+        # alternative -- loading `local` -- yields a rank that grows its
+        # prefix by a DIFFERENT NUMBER than its peers, which is a collective
+        # entered with mismatched shapes. Recompute is recoverable, shape
+        # divergence is the wedge. This is a bounded-loss stop, not a group
+        # barrier, and nothing downstream may assume otherwise.
         #
         # IMPORTED HERE, not at module scope, for the reason every other raise
         # site in this file does the same (see :1566 and :2120):
@@ -2239,11 +2258,41 @@ class PrefillAdder:
             # fact, and None means NO load-back on any rank -- never a
             # rank-local substitute. See its docstring for why the absence is
             # answered with recompute instead of a local derivation.
-            if req.needs_host_load_back():
+            # #968 FIX-5: THE GROUP FACT IS READ FIRST, THE LOCAL COVERAGE
+            # SECOND. This gate used to ask `needs_host_load_back()` -- three
+            # rank-local hit counters -- BEFORE it would even look at the PP0
+            # extent, so a rank whose local counters were all zero never
+            # learned that the group had committed to a number, and skipped in
+            # silence while a peer loaded exactly `told`. Under a
+            # layer-partitioned host tier (`pp_layer_ratio=[32,18,14]`)
+            # `host_hit_length` is NOT rank-uniform by construction, so that
+            # local zero is the normal case, not a corner.
+            #
+            # `_pp_load_back_extent`'s docstring forbids adding an
+            # `or req.host_hit_length` fallback BELOW it. The defect was the
+            # equivalent fallback sitting ABOVE it, working in the opposite
+            # direction: a local zero vetoing a group decision.
+            #
+            # No new refusal is introduced here. A local zero with `told > 0`
+            # is exactly the `told > local` case that function already refuses
+            # loudly -- it simply never got asked. The `told is None` branch
+            # keeps its old precondition, because the deferred/offer arm inside
+            # that function documents itself as reachable only with a live
+            # local hit, and that must stay true.
+            _told_fact = getattr(req, "pp_load_back_told", None)
+            if _told_fact is not None or req.needs_host_load_back():
                 _lb_extent = _pp_load_back_extent(req)
             else:
                 _lb_extent = None
             if _lb_extent:
+                # #968 FIX-3 (deleter). Armed False for THIS attempt only. The
+                # mamba component sets it True if the load-back plants the
+                # node-END anchor into this request's slot; the clamp below
+                # reads it. Writer, reader and deleter therefore share one
+                # straight-line stretch of a single `add_one_req` call -- no
+                # pass, chunk, cutover or flip can land between them, which is
+                # the only lifecycle shape this fact is safe under.
+                req.mamba_loadback_anchor_adopted = False
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
@@ -2287,6 +2336,84 @@ class PrefillAdder:
                 # `pp_size <= 1` path, which stays byte-for-byte upstream.
                 if getattr(req, "pp_load_back_told", None) is not None:
                     _applied = int(new_indices.numel())
+                    if _applied != _lb_extent and getattr(
+                        req, "mamba_loadback_anchor_adopted", False
+                    ):
+                        # #968 FIX-3: THE CLAMP MAY NOT CUT UNDER AN ADOPTED
+                        # GDN ANCHOR.
+                        #
+                        # HAZARD: the state this load-back copied into
+                        # `req.mamba_pool_idx` is the mamba state AFTER the
+                        # matched node's LAST token, i.e. at position
+                        # `_applied`. The clamp below cuts the KV indices to
+                        # `_lb_extent` and CANNOT cut that transfer -- it has
+                        # already run inside `init_load_back`. Applying both
+                        # would leave `prefix_indices` covering `_lb_extent`
+                        # positions while the recurrent state has already
+                        # consumed tokens `_lb_extent.._applied-1`. The scan
+                        # resumes from a state that is AHEAD of its own
+                        # prefix: a silently wrong continuation, and no assert
+                        # can fire, because the KV geometry is self-consistent
+                        # at `_lb_extent`. The identical hazard is spelled out
+                        # verbatim at mamba_component.py's BACKUP_STORAGE
+                        # comment, for a different occasion.
+                        #
+                        # AND IT IS THE EXPECTED PATH, NOT A CORNER: the
+                        # extent is published one lap before it is applied, so
+                        # `told < local` is normal (a4c9a7ac6a, measured 1215
+                        # -> 1216 -> 2114). That is precisely when the clamp
+                        # fires.
+                        #
+                        # NEVER "trim" or "rewind" the state to `_lb_extent`.
+                        # A state filed under a length it does not belong to
+                        # is the same wrongness with a tidier shape; the two
+                        # are not separable (mamba_component.py, same
+                        # comment). So the whole load-back falls instead --
+                        # the same verdict `finalize_match_result` reaches
+                        # with `zero_match_result`, and the same one FIX-4
+                        # reaches for slot starvation. One rule: KV extent and
+                        # GDN state stand or fall together.
+                        #
+                        # GIVE THE SLOT BACK BEFORE RAISING. This raise leaves
+                        # `add_one_req` by exception, which bypasses
+                        # scheduler.py's #991 revert site (that site runs on a
+                        # returned AddReqResult, not on this path). Without
+                        # the give-back the request would keep a slot holding
+                        # exactly the ahead-of-prefix anchor this refusal
+                        # exists to reject, and carry it into its next
+                        # admission. Guarded exactly as the revert site is:
+                        # only a slot THIS admission acquired, never a
+                        # session-held one.
+                        if (
+                            req.mamba_pool_idx is not None
+                            and getattr(
+                                req, "mamba_slot_acquired_this_admission", False
+                            )
+                            and not getattr(req, "session", None)
+                        ):
+                            self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                                req.mamba_pool_idx.unsqueeze(-1)
+                            )
+                            req.mamba_pool_idx = None
+                            req.mamba_slot_acquired_this_admission = False
+                        req.mamba_loadback_anchor_adopted = False
+
+                        from sglang.srt.managers.pp_admission_congruence import (
+                            PPScheduleRefused,
+                        )
+
+                        raise PPScheduleRefused(
+                            f"#968 LOAD-BACK GDN ANCHOR OFF-EXTENT for rid="
+                            f"{getattr(req, 'rid', '?')}: PP0 published an "
+                            f"extent of {_lb_extent} token(s), this rank's "
+                            f"load-back yielded {_applied}, and the mamba "
+                            f"restore already adopted the anchor state at "
+                            f"{_applied}. Clamping the KV to {_lb_extent} "
+                            f"would resume the scan from a recurrent state "
+                            f"that has already consumed the tokens in "
+                            f"between. Refusing the load-back instead; the "
+                            f"request re-prefills."
+                        )
                     if _applied > _lb_extent:
                         new_indices = new_indices[:_lb_extent]
                     elif _applied < _lb_extent:

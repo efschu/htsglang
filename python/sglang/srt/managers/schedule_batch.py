@@ -215,6 +215,54 @@ def _note_1037_instance(rid: str) -> None:
         pass
 
 
+#: #968 FIX-8: how many times a RE-ADMITTED request has booked a non-zero
+#: cached prefix. Counts the EVENT, never the pass -- see the cadence note in
+#: `_note_968_readmit_cached`.
+_968_READMIT_CACHED_EVENTS = 0
+
+
+def _note_968_readmit_cached(req, pre_len: int, new_cached: int) -> None:
+    """#968 FIX-8 INSTRUMENT: a re-admitted request just booked cached tokens.
+
+    THE LINE THE ACCEPTANCE GREPS. The client-visible number
+    (`usage.prompt_tokens_details.cached_tokens`) travels a long way from here
+    -- `req.cached_tokens` -> `output_streamer` -> `meta_info["cached_tokens"]`
+    -> `PromptTokensDetails` -- and it only arrives if the request finishes and
+    the harness parses the response. This line says the same fact at the site
+    that produces it, so a warm hit is provable from the boot log alone even if
+    the request is later aborted, retracted again, or served through a path the
+    cell does not read.
+
+    CADENCE IS EVENT-BASED, DELIBERATELY. A probe whose `n` counts PASSES
+    spends its whole budget on the cold head of a boot and is structurally
+    blind to the warm case it exists to observe -- that shape has already cost
+    this strand three boots. `n` here counts only the events being reported:
+    a re-admitted request booking a NON-ZERO cached prefix, which is precisely
+    the occurrence that has read 0 for six boots. A boot in which this never
+    logs is a boot in which the event never happened, not a boot in which the
+    probe ran out of budget.
+    """
+    global _968_READMIT_CACHED_EVENTS
+    try:
+        _968_READMIT_CACHED_EVENTS += 1
+        n = _968_READMIT_CACHED_EVENTS
+        if n <= 20 or n % 100 == 0:
+            logger.info(
+                "#968 READMIT CACHED rid=%s cached=%d (prefix=%d, this "
+                "admission total=%d) -- a re-admitted request booked a "
+                "non-zero cached prefix; before FIX-8 the retraction stain "
+                "held this at 0 for the whole re-admitted population. "
+                "occurrence=%d",
+                str(getattr(req, "rid", None))[:8],
+                int(new_cached),
+                int(pre_len),
+                int(getattr(req, "readmit_cached_tokens", 0)),
+                n,
+            )
+    except Exception:  # noqa: BLE001 - an instrument may never kill a boot
+        pass
+
+
 def _1036_stamp_protected(req) -> int:
     """#1036: sticky high-water mark of `cache_protected_len`; returns it.
 
@@ -1312,6 +1360,28 @@ class Req(ReqDllmMixin):
         self.cached_tokens = 0
         self.already_computed = 0
 
+        # #968 FIX-8: THE RE-ADMISSION HALF OF THE CACHED-TOKEN ACCOUNTING.
+        #
+        # `cached_tokens` above is a LIFETIME accumulator and its `+=` in
+        # `prepare_for_extend` is suppressed for any request that has ever been
+        # retracted (`retracted_stain`). Under this system's cutover design --
+        # a phase flip retracts EVERYTHING and re-admits it through a HiCache
+        # read-through -- the re-admitted population IS the retracted one, so
+        # for exactly the requests a warm-hit acceptance lands on, the
+        # client-visible number was frozen at its pre-retraction value however
+        # large the prefix grew. The metric was structurally blind, not zero.
+        #
+        # These two fields carry the SAME telescoping arithmetic scoped to ONE
+        # admission, so a re-admitted request can report an honest number
+        # without the lifetime accumulator ever adding a prefix twice (see the
+        # else-branch in `prepare_for_extend`, which ASSIGNS this total rather
+        # than accumulating into `cached_tokens`).
+        #
+        # Both are reset by `reset_for_retract`, which is what makes them
+        # per-admission rather than per-lifetime.
+        self.readmit_cached_tokens = 0
+        self.readmit_already_computed = 0
+
         # Detailed breakdown of cached tokens by source (for HiCache)
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
@@ -2245,6 +2315,14 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
         self.already_computed = 0
+        # #968 FIX-8: the per-admission cached-token pair is scoped to ONE
+        # admission, so the retraction that ends this admission ends it too.
+        # Zeroed HERE and nowhere else: this is the separating event, and it is
+        # the same event that sets `retracted_stain` four lines up, so the
+        # branch that reads these fields and the branch that resets them can
+        # never disagree about which admission they are talking about.
+        self.readmit_cached_tokens = 0
+        self.readmit_already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
         self._kvc_src = "reset_for_retract"  # #969L writer stamp
@@ -2839,23 +2917,48 @@ def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bo
 
     covered = getattr(req, "kv_cache_cpu_extent", None)
     now = _seam_extent_of(req)
-    if (
-        covered is None
-        or int(covered) != int(now)
-        or not _seam_prefill_is_complete(req)
-    ):
+    # #968 FIX-10 / D2: the refusal is a THREE-TERM disjunction and the message
+    # used to be written for one of them. `_seam_prefill_is_complete` is pure
+    # (a getattr and a comparison), so evaluating it here rather than inside the
+    # `or` changes nothing but lets the message name the term that fired.
+    complete = _seam_prefill_is_complete(req)
+    if covered is None or int(covered) != int(now) or not complete:
         _SEAM_STATE_COUNTS["refused"] += 1
         n = _SEAM_STATE_COUNTS["refused"]
+        # NAME THE TERM THAT ACTUALLY FIRED, WITH NUMBERS THAT DIFFER.
+        # Boot-measured on the warm pass: "the copy covers 4618 row(s) but the
+        # request now needs 4618 (allocated=4096)" -- two IDENTICAL numbers,
+        # because the sentence described the extent-drift branch while the term
+        # that fired was the completeness one. `allocated` is not a chunk size:
+        # it is how far this request's row is actually filled, which is
+        # `rem_chunk_tokens` at admission (the same 4618-token prompt was
+        # measured at 4096 once and 2817 another time). A reader who took the
+        # old sentence at face value looked for a drift that was not there.
+        if covered is None:
+            reason = (
+                "NO RECORDED EXTENT: the copy carries no row count "
+                "(kv_cache_cpu_extent=None), so there is nothing to check it "
+                "against"
+            )
+        elif int(covered) != int(now):
+            reason = (
+                f"EXTENT DRIFT: the copy covers {covered} row(s) but the "
+                f"request now needs {now}"
+            )
+        else:
+            reason = (
+                f"PREFILL INCOMPLETE: the copy's {covered} row(s) match what "
+                f"the request needs, but its row is filled only to "
+                f"allocated={getattr(req, 'kv_allocated_len', None)}, so "
+                f"indexing at seqlen-1 is not yet sound"
+            )
         logger.warning(
-            "%s SEAM RESTORE REFUSED rid=%s: the copy covers %s row(s) but the "
-            "request now needs %d (allocated=%s). Applying it would index past "
+            "%s SEAM RESTORE REFUSED rid=%s: %s. Applying it would index past "
             "the saved chunks (the W38-A crash) or write a prefix into the "
             "wrong rows. Dropped; these tokens are recomputed. occurrence=%d",
             SEAM_STATE_PREFIX,
             getattr(req, "rid", None),
-            covered,
-            now,
-            getattr(req, "kv_allocated_len", None),
+            reason,
             n,
         )
         req.kv_cache_cpu = None
@@ -3759,6 +3862,43 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
+            else:
+                # #968 FIX-8: THE RE-ADMITTED POPULATION, ACCOUNTED PER
+                # ADMISSION INSTEAD OF NOT AT ALL.
+                #
+                # WHICH HAZARD THE STAIN STILL GUARDS AFTER THIS CHANGE: the
+                # branch above is untouched, so `cached_tokens` is still never
+                # ACCUMULATED across a retraction. That was the whole point of
+                # the stain -- a retracted request re-prefills its prompt with
+                # `already_computed` back at 0 (`reset_for_retract`), so a `+=`
+                # here would add the same prefix a second time on top of the
+                # value the pre-retraction pass already booked, and the client
+                # would be told its prompt was cached twice. That double count
+                # remains impossible: this branch ASSIGNS a single admission's
+                # total, so no number of retractions can compound it.
+                #
+                # What it stops doing is reporting 0. The stain is an EVER-flag
+                # ("has this request ever been retracted") and is deliberately
+                # never taken back -- `schedule_policy._update_prefill_budget`
+                # reads it to separate a REPROCESS from a first attempt in
+                # `reprocessed_log_hit_tokens`, and clearing it would silently
+                # corrupt that. So the flag stays; only the blindness goes.
+                #
+                # The arithmetic mirrors the branch above exactly, against a
+                # watermark scoped to this admission: chunk 1 books the prefix
+                # the read-through actually delivered, later chunks of the same
+                # admission book 0 because their "prefix" is what this
+                # admission just computed itself.
+                prior = getattr(req, "readmit_already_computed", 0)
+                new_cached = max(0, pre_len - prior)
+                req.readmit_cached_tokens = (
+                    getattr(req, "readmit_cached_tokens", 0) + new_cached
+                )
+                req.readmit_already_computed = seq_len
+                # ASSIGNMENT, never `+=`. See the double-count note above.
+                req.cached_tokens = req.readmit_cached_tokens
+                if new_cached > 0:
+                    _note_968_readmit_cached(req, pre_len, new_cached)
 
             # #783 half 2: restore instead of recomputing, for the cutover
             # population only. Here and not in `readmit_seam_residents`, which

@@ -504,7 +504,7 @@ def uncached_prompt_tokens(req) -> int:
     return max(0, int(total) - max(0, min(credit, int(total))))
 
 
-def _arriving_prefill_tokens(inflight, _already_queued=None) -> int:
+def _arriving_prefill_tokens(inflight, _already_queued=None, exclude=None) -> int:
     """#713: prompt tokens that have ARRIVED but are not yet on the queue.
 
     ``inflight`` is the raw ``recv_reqs`` list. It is heterogeneous -- abort
@@ -535,6 +535,13 @@ def _arriving_prefill_tokens(inflight, _already_queued=None) -> int:
         # rather than trusted. A request already queued is priced by the queue
         # term and must not be counted again here.
         if _already_queued is not None and id(item) in _already_queued:
+            continue
+        # Health-isolation: the ECONOMY reading passes a predicate here, the
+        # SERVICE reading passes None. Same argument as the control-message
+        # skip two lines up -- counting a liveness probe as work arms a flip
+        # on nothing, which is the defect this whole helper's docstring warns
+        # about, in its most expensive form (a ~4 s cutover per probe).
+        if exclude is not None and exclude(item):
             continue
         for field in ("input_ids", "origin_input_ids"):
             try:
@@ -3684,7 +3691,9 @@ class Scheduler(
             return
         resident = len(getattr(running_batch, "reqs", None) or [])
         try:
-            pending = int(self._pending_prefill_tokens() or 0)
+            # Economy/observation term -- health probes stay out of it, for
+            # the same reason they stay out of the arm this outcome feeds.
+            pending = int(self._pending_prefill_tokens(include_health=False) or 0)
         except Exception:  # noqa: BLE001 - an observation must not break a round
             pending = 0
         self._round_built_nothing = bool(resident > 0 or pending > 0)
@@ -4027,8 +4036,17 @@ class Scheduler(
                 continue
         return n
 
-    def _admissible_prefill_tokens(self) -> int:
+    def _admissible_prefill_tokens(self, *, include_health=True) -> int:
         """Prompt tokens still owed a PREFILL PASS -- cached or not (#861c).
+
+        ``include_health`` splits the same two questions ``_pending_prefill_
+        tokens`` splits, and for the same reason. The DEFAULT (True) is the
+        ADMISSION question and must stay inclusive: a health probe genuinely
+        does owe a prefill pass, and a simulation that pretended otherwise
+        would refuse to admit the very request it is asked about. Only the
+        FLIP POLICY passes False, because this number reaches ``starved`` and
+        ``work_exists`` -- and there a liveness probe must not read as work
+        that justifies a cutover or bypasses the thrash bound.
 
         THE SECOND QUESTION, and the whole reason this is a second function
         rather than a change to ``_pending_prefill_tokens``.
@@ -4073,6 +4091,12 @@ class Scheduler(
         """
         total = 0
         for req in list(getattr(self, "waiting_queue", None) or ()):
+            if not include_health:
+                try:
+                    if is_health_check_generate_req(req):
+                        continue
+                except Exception:  # noqa: BLE001 - an observation never breaks a round
+                    pass
             ids = getattr(req, "origin_input_ids", None)
             try:
                 n = len(ids) if ids is not None else 0
@@ -9189,6 +9213,28 @@ class Scheduler(
         # lines. Host-side strings only (#790).
         self._admission_decline_note = None
 
+        # #968 FIX-2: PROMOTE THE LOAD-BACK FACT WHERE IT IS CONSUMED, NOT
+        # WHERE ONE LAYOUT HAPPENS TO RUN.
+        #
+        # This function is the consumer: the stamp block below reads
+        # `_pp_load_back_effective` to set `pp_load_back_told`, and PP0 fills
+        # `_pp_load_back_pending` from its own decision at the end of this
+        # same function. Promoting here makes the hand-off phase-neutral --
+        # it happens on every pass that could USE the fact, in the TP phase as
+        # well as the PP one. The PP loop body keeps its own call; the helper
+        # is idempotent, so the order of the two never matters.
+        #
+        # ABOVE every early return in this function, deliberately: a pass that
+        # bails out before building a batch must still have promoted what the
+        # previous pass published, or the fact waits for a pass that does not
+        # bail -- reintroducing the same "arrives but is never adopted" shape
+        # in a narrower window.
+        try:
+            self.promote_pp_load_back_pending()
+        except AttributeError:
+            # Not a PP build (mixin absent) -- nothing to promote.
+            pass
+
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -10252,6 +10298,24 @@ class Scheduler(
                     # len(req.prefix_indices) >= told always holds here.
                     # #930: same helper as the PP0 branch above -- these two
                     # are siblings and drifted identically.
+                    #
+                    # FIX-9 ORDERING RIEGEL, and it names a hazard that is
+                    # DORMANT ONLY BY ACCIDENT. `truncate_prefix_to` zeroes
+                    # `host_hit_length` together with `prefix_indices` and
+                    # `cache_protected_len` (#930, they must move together).
+                    # The load-back site captures the OFFER from exactly that
+                    # `host_hit_length`. So if this line ever runs BEFORE the
+                    # load-back site on the same pass, the offer is captured
+                    # as 0 and the whole #968 chain goes silently dead -- no
+                    # crash, no refusal, just `with_offer=0` forever.
+                    #
+                    # Today it cannot: both truncate branches hang off
+                    # `_pp_admission_incoming_effective`, which #1039 measured
+                    # as permanently None because #1015 deleted the receiving
+                    # end (the log carries `#1039 UNDISTRIBUTABLE CLAMP
+                    # SKIPPED`). That is a broken mechanism protecting a
+                    # correct one, which is not a guarantee. WHOEVER
+                    # RESTORES THE #1015 WIRE MUST RE-CHECK THIS ORDER FIRST.
                     req.truncate_prefix_to(told)
 
                 # #968/#1035 THE LOAD-BACK EXTENT, DELIVERED TO THE SITE THAT
@@ -10315,6 +10379,32 @@ class Scheduler(
                     req.pp_load_back_applied = False
                     if _lb_map and req.pp_load_back_key is not None:
                         _lb_map.pop(req.pp_load_back_key, None)
+                    # REGRESSION FIX for e0bc96008e -- THE OFFER LOST ITS ONLY
+                    # DELETER, and monotone-sticky is the dangerous direction.
+                    #
+                    # Before that commit the offer was written unconditionally
+                    # in this loop as `_hit if _hit > 0 else None`, and the
+                    # comment above records the property that made it safe:
+                    # "the offer is read off THIS pass's fresh match, so once
+                    # the tokens are on device the hit shrinks and the offer
+                    # goes to None on its own -- nothing has to clear it."
+                    # e0bc96008e moved the write to the load-back site and
+                    # kept only the `_hit > 0` half, so nothing writes None
+                    # any more. The offer then survives its own truth: after
+                    # the prefix lands on device the host hit shrinks, but the
+                    # stale-HIGH extent keeps being re-published, a peer is
+                    # told an extent its host tier no longer covers, and
+                    # `#968 LOAD-BACK EXTENT UNHONOURABLE` raises
+                    # PPScheduleRefused -- which voids the pass for the WHOLE
+                    # GROUP, not just this rank.
+                    #
+                    # Cleared HERE, at the spend, on the same argument that
+                    # bounds `_lb_map` one line up: the extent has been
+                    # applied, so the number is spent and re-offering it is
+                    # re-offering a fact that is no longer true. The load-back
+                    # site re-writes it next pass from the live hit if one
+                    # still exists.
+                    req.pp_load_back_offer = None
 
             try:
                 res = adder.add_one_req(
@@ -10563,6 +10653,59 @@ class Scheduler(
         # second clamp (`prefix_len_for` on an already-clamped candidate
         # returns that same candidate).
         if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
+            # #968 FIX-0 (remaining half): THE STAMP POPULATION AND THE ENTRY
+            # POPULATION MUST BE THE SAME SET.
+            #
+            # The key/told stamp above runs inside the admission LOOP, behind
+            # eight `continue` branches (`already_in_batch` -- the #946 shape,
+            # where `add_chunked_req` appends the continuation to
+            # `can_run_list` BEFORE the loop and the loop then skips it --
+            # plus `seam_transport_only`, `lora`, `batch_full_break` and the
+            # four prefetch branches). The decision, however, is built from
+            # `can_run_list`. Two different sets, and the request holding the
+            # host hit is boot-measured in the gap: `loop_skips(prefetch_
+            # pending=1(first=bce57cf8...))`, three times, the same 4618-token
+            # rid that then defers at the load-back site.
+            #
+            # The consequence was silent and exact. `build_pp_admission_
+            # decision` reads BOTH `pp_load_back_offer` and
+            # `pp_load_back_key` off the request; since e0bc96008e the OFFER
+            # is captured at the load-back site and therefore survives, but
+            # the KEY is still only written in the loop -- and the publish
+            # filter below requires `load_back_len AND load_back_key is not
+            # None`. An entry with a live offer and no key is dropped, so
+            # `published=0` while `with_offer` is finally non-zero: the next
+            # defect in the same chain, one link further on.
+            #
+            # Stamping here makes the two populations identical by
+            # CONSTRUCTION rather than by the loop happening to visit
+            # everyone. Idempotent: it recomputes the same key the loop would
+            # have written, and never touches a request the loop already
+            # stamped with the same fill.
+            try:
+                from sglang.srt.managers.pp_admission_congruence import (
+                    offered_prefix_key as _lb_key_of,
+                )
+
+                _lb_eff_now = getattr(self, "_pp_load_back_effective", None)
+                for _r in can_run_list:
+                    _fill = getattr(_r, "full_untruncated_fill_ids", None)
+                    if _fill is None:
+                        continue
+                    if getattr(_r, "pp_load_back_key", None) is None:
+                        _r.pp_load_back_key = _lb_key_of(_fill, len(_fill))
+                    # `told` follows the key: a member that never reached the
+                    # loop has no told either, and the application site reads
+                    # it. Never OVERWRITE a told the loop already resolved --
+                    # that one was taken against this pass's map.
+                    if (
+                        getattr(_r, "pp_load_back_told", None) is None
+                        and _lb_eff_now
+                        and _r.pp_load_back_key is not None
+                    ):
+                        _r.pp_load_back_told = _lb_eff_now.get(_r.pp_load_back_key)
+            except Exception:  # noqa: BLE001 - never break the decision build
+                logger.warning("#968 ENTRY-STAMP RAISED", exc_info=True)
             self._pp_admission_last_built_decision = build_pp_admission_decision(
                 0,  # placeholder mb_id; stamped with the real one downstream
                 can_run_list,
@@ -10604,15 +10747,53 @@ class Scheduler(
             # key" rather than to the chain.
             try:
                 _es = self._pp_admission_last_built_decision.entries
+                _with_offer = sum(1 for _e in _es if _e.load_back_len)
+                # HEALTH AS ITS OWN COLUMN, never mixed into the denominator.
+                # This instrument is where the health confound was finally
+                # SEEN: e0bc96008e's own measurement records "the sole
+                # published entry was a health-check request". A probe that
+                # reports `entries=1` without saying WHAT that entry was sent
+                # three boots chasing a chain that was in fact never asked the
+                # question. Reported separately, never subtracted here -- the
+                # reader decides, the instrument does not.
+                # Same predicate the economy terms use -- it reads `.rid`
+                # through getattr, so it applies unchanged to a
+                # `PPAdmissionEntry`. One definition of "is a health probe"
+                # for the whole file.
+                _health = sum(1 for _e in _es if is_health_check_generate_req(_e))
+                # FIX-7: EVENT CADENCE, NOT PASS CADENCE.
+                #
+                # The old rule was `_n <= 5 or _n % 64 == 0` where `_n` counts
+                # PASSES. Measured on boot_855_968ratio1: the boot had fewer
+                # than 64 publishes, so the `% 64` arm never fired and the
+                # probe spent its entire budget on passes 1..5 -- the coldest
+                # head of the boot, 07:30:18-07:31:20. All five WARM
+                # opportunities came later and went unobserved. The probe was
+                # structurally blind to the one event it was built for, and
+                # `with_offer=0 in 6/6` had the denominator "the five coldest
+                # passes", not "the warm path".
+                #
+                # So the first five INTERESTING publishes (an offer actually
+                # present) are always printed, in addition to the first five
+                # passes and the periodic sample. `_968_pub_ev` counts the
+                # event, not the opportunity.
                 _n = getattr(self, "_968_pub_n", 0) + 1
                 self._968_pub_n = _n
-                if _n <= 5 or _n % 64 == 0:
+                _ev = getattr(self, "_968_pub_ev", 0)
+                _interesting = _with_offer > 0
+                if _interesting:
+                    _ev += 1
+                    self._968_pub_ev = _ev
+                if _n <= 5 or _n % 64 == 0 or (_interesting and _ev <= 5):
                     logger.info(
-                        "#968 LOAD-BACK PUBLISH n=%d entries=%d with_offer=%d "
-                        "with_key=%d published=%d | first=%s",
+                        "#968 LOAD-BACK PUBLISH n=%d ev=%d entries=%d "
+                        "health=%d with_offer=%d with_key=%d published=%d "
+                        "| first=%s",
                         _n,
+                        _ev,
                         len(_es),
-                        sum(1 for _e in _es if _e.load_back_len),
+                        _health,
+                        _with_offer,
                         sum(1 for _e in _es if _e.load_back_key is not None),
                         len(_lb_pending),
                         [
@@ -13101,8 +13282,47 @@ class Scheduler(
         barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
-    def _pending_prefill_tokens(self, inflight=None) -> int:
+    def _pending_prefill_tokens(self, inflight=None, *, include_health=True) -> int:
         """Prompt tokens ADMITTED BUT NOT YET COMPUTED (#631 defect N).
+
+        ``include_health`` (#942/health-isolation) selects WHICH QUESTION is
+        being asked of this number, because two consumers ask two different
+        ones and shared it silently until now:
+
+        * ``True`` (default) -- THE SERVICE QUESTION: "how much prefill is
+          owed here, whoever asked for it?" The #887 one-chunk grant and its
+          ``tp_compute_fits_in_one_chunk`` gate must read this, because the
+          grant is precisely the mechanism that SERVES a health probe in
+          place instead of paying a cutover for it. Every pre-existing caller
+          keeps this default and is byte-for-byte unchanged.
+        * ``False`` -- THE ECONOMY QUESTION: "how much work justifies paying
+          for a layout change?" A ``/health_generate`` probe is a liveness
+          instrument, not work; it must never arm a flip and never appear in
+          a backlog or break-even term.
+
+        WHY THE SPLIT IS AT THE CALL SITE AND NOT INSIDE. A blanket exclusion
+        was the obvious form and it is WRONG, in the silent direction. The
+        #887 gate grants only while ``0 < pending < chunk``
+        (``phase_purity.tp_compute_fits_in_one_chunk``). Subtract the probe
+        from that reading too and a lone health probe measures 0, ``0 < 0``
+        is False, the grant collapses -- and the very request the isolation
+        exists to serve in place is then served by nothing at all. The two
+        readings must differ, so the difference is named where it is chosen.
+
+        The health probe is identified by the rid prefix upstream already
+        stamps at the ``/health_generate`` source
+        (``constants.HEALTH_CHECK_RID_PREFIX``, ``http_server.py``), read
+        through upstream's own predicate. No second tag and no parallel
+        bookkeeping: the source-side prefix IS the structural tag, and a
+        fork-local ``is_health`` flag beside it would be exactly the second
+        accounting the upstream-minimal law forbids.
+
+        MEASURED BASIS (#942): 1-token health probes armed full ~4 s cutovers
+        because ``tp_threshold`` is 0 under purity, so ANY pending token
+        fires the tp-ward arm -- 12 arms on one boot for a one-token probe.
+        Upstream only dispatches a health check when the box ``is_fully_idle``
+        (``scheduler.py`` intake), so at idle the probe IS the entire backlog
+        and its single token decides the layout of the whole instance.
 
         ``inflight`` (#713) is the batch of requests that have just been pulled
         off the wire and have NOT yet reached ``waiting_queue``. Passing it is
@@ -13145,13 +13365,33 @@ class Scheduler(
         Evaluated on the request-origin rank only (see
         maybe_arm_phase_policy), so this needs no cross-rank replication.
         """
+        # ONE predicate, applied to every term below. `is_health_check_generate_req`
+        # reads `.rid` through getattr, so it works unchanged on BOTH shapes this
+        # function straddles: the `Req` the scheduler builds and the
+        # `TokenizedGenerateReqInput` that is still on the wire (`_arriving_...`
+        # documents that boundary). Excluding at only some terms would move the
+        # probe's token from one term to another instead of out of the sum.
+        def _excluded(_r) -> bool:
+            if include_health:
+                return False
+            try:
+                return bool(is_health_check_generate_req(_r))
+            except Exception:  # noqa: BLE001 - an observation never breaks a round
+                return False
+
+        # NOTE the exclusion is applied to the SUMS ONLY, never to `queued`
+        # itself: `_queued_ids` below is the #731 double-billing guard, and a
+        # request missing from that identity set would simply be re-billed by
+        # the resident term instead -- moving the token, not removing it.
         queued = list(self.waiting_queue)
         # #856: UNCACHED prompt tokens. A token whose KV already exists costs a
         # cache read in EITHER layout, so it cannot make one layout cheaper
         # than the other and must not enter the break-even comparison. See
         # `uncached_prompt_tokens`; for a request that was never retracted the
         # credit is zero and this is the pre-#856 sum, token for token.
-        pending = sum(uncached_prompt_tokens(req) for req in queued)
+        pending = sum(
+            uncached_prompt_tokens(req) for req in queued if not _excluded(req)
+        )
         # #731: THE TERMS BELOW MUST NOT RE-BILL WHAT THE QUEUE ALREADY DID.
         #
         # The resident term further down and this one are two different sets,
@@ -13174,11 +13414,13 @@ class Scheduler(
         # was. So exactly one overlap is excluded, and only this one.
         _queued_ids = {id(req) for req in queued}
         chunked = getattr(self, "chunked_req", None)
-        if chunked is not None:
+        if chunked is not None and not _excluded(chunked):
             rng = getattr(chunked, "extend_range", None)
             filled = int(rng.end) if rng is not None else 0
             pending += max(0, len(chunked.origin_input_ids) - filled)
-        pending += _arriving_prefill_tokens(inflight, _queued_ids)
+        pending += _arriving_prefill_tokens(
+            inflight, _queued_ids, exclude=None if include_health else _excluded
+        )
         # #713 (a): RESIDENT-BUT-UNPREFILLED. The three terms above see a
         # request in the waiting queue, in the chunked slot, or in the recv
         # batch -- and NOWHERE ELSE. A request that has been ADMITTED has left
@@ -13207,6 +13449,8 @@ class Scheduler(
                     continue  # already priced by the chunked term above
                 if id(req) in _queued_ids:
                     continue  # #731: the waiting-queue term already billed it
+                if _excluded(req):
+                    continue  # health probe: never an economy term
                 rng = getattr(req, "extend_range", None)
                 if rng is None:
                     continue
@@ -13299,7 +13543,16 @@ class Scheduler(
         # #713: ONE reading, used by the verdict AND by the message that
         # reports it. Calling the accessor twice inside one constructor is how
         # a refusal could name a number the simulation never saw.
-        _pending_now = self._pending_prefill_tokens(inflight_reqs)
+        # HEALTH-ISOLATION, THE ECONOMY READING. This is the number the flip
+        # policy compares against the break-even, and from which `starved` and
+        # the idle determination are derived -- so it is exactly the number a
+        # `/health_generate` probe must not appear in. The #887 GRANT reading
+        # at the `_tp_subchunk_grant_now` probe below deliberately keeps the
+        # default (health INCLUDED): that grant is what serves the probe in
+        # place. Two questions, named at the two call sites.
+        _pending_now = self._pending_prefill_tokens(
+            inflight_reqs, include_health=False
+        )
         # W32: SEAM TRANSPORT IS NOT PENDING PP WORK, AND THE POLICY MUST READ
         # THE SAME AUTHORITY THE PURITY GATE DOES.
         #
@@ -13634,9 +13887,16 @@ class Scheduler(
             # observed anything. "Not observed" must mean 0 -- the pre-change
             # behaviour, which `work_exists()` then reduces to the economics
             # number alone -- rather than an AttributeError in the arming path.
+            # HEALTH-ISOLATION: the POLICY reading. This field feeds
+            # `work_exists()` and the `starved` term -- and `starved` is what
+            # BYPASSES the min-dwell thrash bound. A one-token liveness probe
+            # reaching it would lift the only guarantee that survives an
+            # adversarial arrival pattern, which is the most expensive place
+            # in the policy for a non-work token to appear.
             admissible_prefill_tokens=int(
-                (getattr(self, "_admissible_prefill_tokens", None) or (lambda: 0))()
-                or 0
+                self._admissible_prefill_tokens(include_health=False)
+                if hasattr(self, "_admissible_prefill_tokens")
+                else 0
             ),
             # #861e: decode work the cutover retracted but did not finish.
             # Same getattr discipline as the field above, and 0 on every

@@ -72,6 +72,9 @@ from sglang.srt.mem_cache.match_refusal_census import (
     prefetch_gate_due as _prefetch_gate_due,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+    MambaLoadBackUnservable,
+)
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -2588,9 +2591,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            t = comp.build_hicache_transfers(
-                best_match_node, CacheTransferPhase.LOAD_BACK, req=req
-            )
+            try:
+                t = comp.build_hicache_transfers(
+                    best_match_node, CacheTransferPhase.LOAD_BACK, req=req
+                )
+            except MambaLoadBackUnservable:
+                # #968 FIX-4: a component that cannot serve its half of this
+                # load-back kills the WHOLE load-back. Nothing has been
+                # transferred yet at this point -- `cache_controller.load` is
+                # still below -- so unwinding the two lock refs taken above
+                # leaves the tree exactly as it was found, the same shape as
+                # every other `return False` in this function.
+                self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                self.dec_host_lock_ref(best_match_node, host_anchor_params)
+                return False
             if t:
                 comp_xfers[comp.component_type] = t
         sidecar_xfers = self._build_sidecar_transfers(
@@ -2631,6 +2645,30 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
                 return False
         else:
+            if req is not None and getattr(req, "pp_load_back_told", None) is not None:
+                # #968 FIX-6: UNDER A GROUP FACT, THIS DECISION MAY NOT BE
+                # TAKEN RANK-LOCALLY. The branch below decides whether the
+                # load-back happens from THIS rank's own free space. That is
+                # the very quantity `rank_gpu_memory_mib=[31800,18800,19800]`
+                # makes unequal, so the roomy rank would load the prefix back
+                # while the tight rank gave up -- the device trees stop being
+                # replicas and the next TP collective is entered with
+                # rank-dependent token counts (the 21:52:25 wedge).
+                #
+                # `pp_load_back_told is not None` means PP0 published an
+                # extent for this request, i.e. the group has committed to one
+                # number and every rank owes exactly that. If the uniform
+                # floor is not available to answer the admission question,
+                # there is no rank-uniform answer to give, so no rank attempts
+                # it. Refusing here yields an empty load-back on every rank;
+                # `add_one_req`'s clamp turns that into the loud, pass-voiding
+                # refusal rather than a silent per-rank divergence.
+                #
+                # Single rank / no PP0 fact keeps the local path exactly as it
+                # was -- `pp_load_back_told` is never stamped there.
+                self.dec_lock_ref(best_match_node, ancestor_lock_params)
+                self.dec_host_lock_ref(best_match_node, host_anchor_params)
+                return False
             if self.supports_swa():
                 avail = self.token_to_kv_pool_allocator.full_available_size()
             else:
