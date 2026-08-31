@@ -8554,6 +8554,31 @@ class SchedulerPPMixin:
                 "quiet": 0,
             }
         stats["calls"] += 1
+
+        def _trace(verdict: str) -> None:
+            # BOUNDED FULL TRACE (row11: the wedge reproduces on the second
+            # health check, within the first ~100 probe calls of a boot --
+            # 400 lines buys complete visibility of the fatal window and
+            # then goes silent for the life of the process).
+            if stats["calls"] <= 400:
+                try:
+                    _q0 = typed_inbox(self.pp_group).get(
+                        (resolve_src(self.pp_group, None), "proxy")
+                    )
+                    logger.info(
+                        "#631 ROW-PROBE t%d slot=%s -> %s inbox_head=%s depth=%d",
+                        stats["calls"],
+                        mb_id,
+                        verdict,
+                        (
+                            _q0[0].get("__stamp__")
+                            if _q0 and isinstance(_q0[0], dict)
+                            else None
+                        ),
+                        len(_q0 or ()),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         # BALANCE LINE (boot 631row6 forensics: PP0 posted 43, PP1's
         # consumed counter read 43, but only 41 passes ever launched -- two
         # frames vanished between consumption and launch with no drop, no
@@ -8618,6 +8643,7 @@ class SchedulerPPMixin:
                 # establishes with the upstream's first labeled send; until
                 # then this slot simply waits a loop iteration.
                 stats["quiet"] += 1
+                _trace("quiet_covers")
                 return False
             posted = counters.sent_of_kind(CHAN_DICT, "proxy", upstream)
             consumed = counters.local_consumed_of_kind(CHAN_DICT, "proxy")
@@ -8633,6 +8659,7 @@ class SchedulerPPMixin:
             attempted = counters.attempted_of_kind(CHAN_DICT, "proxy", upstream)
             if consumed >= posted and consumed >= attempted:
                 stats["quiet"] += 1
+                _trace(f"quiet p={posted} a={attempted} c={consumed}")
                 return False
             raw = self._pp_recv_typed_dict(
                 expected_kind="proxy",
@@ -8658,21 +8685,25 @@ class SchedulerPPMixin:
             )
             q = typed_inbox(self.pp_group).get((src, "proxy"))
             if not q:
+                _trace("drained_gone")
                 return False
         head = q[0]
         stamp = head.get("__stamp__") if isinstance(head, dict) else None
         if stamp is None:
             # Unstamped legacy frame: only the slot's own recv may judge it.
             stats["head_this"] += 1
+            _trace("head_unstamped")
             return True
         epoch = pp_flip_epoch_of(self)
         if pp_proxy_stamp_names_pass(stamp, mb_id, epoch):
             stats["head_this"] += 1
+            _trace("head_this")
             return True
         try:
             _stamp_slot = int(stamp[0])
         except Exception:  # noqa: BLE001 - unreadable stamp: let recv judge it
             stats["head_this"] += 1
+            _trace("head_unreadable")
             return True
         # MIRROR names_pass's epoch semantics exactly (boot 631row9b died on
         # the mismatch): an ABSENT epoch -- on the stamp or on this rank --
@@ -8687,6 +8718,7 @@ class SchedulerPPMixin:
             # Another CURRENT slot's frame: not this slot's business. It is
             # consumed when the loop reaches its named slot.
             stats["head_other"] += 1
+            _trace(f"head_other slot={_stamp_slot}")
             return False
         # Stale/foreign epoch at the head: hand it to the slot's own recv,
         # whose established refusal logic names it (detection untouched).
