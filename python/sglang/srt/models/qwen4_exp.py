@@ -1050,16 +1050,19 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     def _gather_host(self, flat_ids: torch.Tensor, output: torch.Tensor) -> None:
         """Gather on the HOST, then move only the result.
 
-        [#1036] The pinned path lets the GPU read this table directly over PCIe,
-        which is faster but requires every page to be resident forever. This path
-        exists so the table can be PAGEABLE -- page-cache resident, cold tail on
-        disk -- because a GPU kernel cannot take a page fault on host memory
-        (models/qwen4_exp.py:1891 says so about the fp8 auto-switch). The CPU can,
-        so the lookup moves to the CPU and only the gathered rows cross the bus.
+        [#1036] Two independent reasons this path exists, and only the second one is
+        about choice:
+          * On sm86 an fp8 table has NO alternative. Triton there cannot compile
+            fp8e4nv at all ("type fp8e4nv not supported in this architecture"), so
+            the pinned kernel is unavailable rather than slow.
+          * A PAGEABLE table -- page-cache resident, cold tail on disk -- cannot be
+            read by the pinned kernel either: a GPU kernel cannot take a page fault
+            on host memory (:1891 says so about the fp8 auto-switch). The CPU can.
 
-        The traffic is why this is cheap rather than a regression: one token's
-        entire gather is n_grams x embedding_dim x 2 B = 5 KiB at this geometry,
-        so the H2D is negligible next to the round trip it replaces.
+        SIZE of the traffic, which is arithmetic and not a benchmark: one token's
+        whole gather is n_grams x embedding_dim = 16 x 160 elements, so 2560 B at fp8
+        and 5120 B at bf16. Whether that is CHEAPER than the round trip it replaces
+        is UNMEASURED and deliberately not asserted here -- see the comment below.
 
         Semantics are the Triton kernel's, line for line: local row is
         ``global - tp_vocab_start`` when the id falls in this rank's slice, row 0
@@ -1073,9 +1076,32 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         ids = flat_ids.to("cpu")
         in_range = (ids >= start) & (ids < end)
         local = torch.where(in_range, ids - start, torch.zeros_like(ids))
-        rows = self.weight.data.index_select(0, local).to(torch.bfloat16)
-        rows.mul_(in_range.unsqueeze(1).to(torch.bfloat16))
-        output.view(-1, self.embedding_dim).copy_(rows.to(output.device))
+
+        # Gather in the STORAGE dtype and convert on the GPU, NOT the other way round.
+        # [#1036] The obvious order -- .index_select(...).to(bfloat16) on the CPU --
+        # is the one I shipped first, and it is wrong on two counts that need no
+        # stopwatch to establish:
+        #   1. BYTES. Converting before the copy sends bf16 over PCIe. At fp8 that is
+        #      2 B/element instead of 1: exactly DOUBLE the payload, by arithmetic.
+        #      Per token at this geometry, 5120 B instead of 2560 B.
+        #   2. WHERE THE INSTRUCTION IS. fp8_e4m3 is a storage dtype on the CPU with
+        #      no vectorised conversion; on the device it is one instruction.
+        # So the CPU does a pure 160 B row memcpy and the device does the widening.
+        # NOT a measured speedup: any wall-clock number from this desk would be taken
+        # on a shared, heavily loaded rig where the two paths contend for DIFFERENT
+        # resources (this one for CPU, the pinned one for SMs), so even the RATIO is
+        # confounded. What is claimed here is half the bus payload and correctness --
+        # both load-independent. The cost belongs to a quiet box.
+        rows = self.weight.data.index_select(0, local)
+        out2d = output.view(-1, self.embedding_dim)
+        out2d.copy_(rows.to(output.device))
+
+        # Out-of-range ids contribute ZEROS, not row 0's contents. Only pay for this
+        # when it can happen: under TP every rank sees ids outside its slice, but with
+        # tp_size 1 the mask is all-true and the check is a CPU-side any() on ids that
+        # are already on the host, so it costs no synchronisation.
+        if not bool(in_range.all()):
+            out2d[(~in_range).to(output.device)] = 0
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
