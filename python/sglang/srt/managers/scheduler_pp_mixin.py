@@ -8436,7 +8436,17 @@ class SchedulerPPMixin:
                 return False
             posted = counters.sent_of_kind(CHAN_DICT, "proxy", upstream)
             consumed = counters.local_consumed_of_kind(CHAN_DICT, "proxy")
-            if consumed >= posted:
+            # #789's attempted counter, and it is LOAD-BEARING here (boot
+            # 631row2 wedged 90 s after READY without it): the FIRST p2p op
+            # on a torch NCCL group creates its communicator lazily, so the
+            # sender's isend cannot return -- and `posted` cannot bump --
+            # until THIS rank enters the receive. `attempted` is bumped
+            # BEFORE the send call; consumed < attempted means the upstream
+            # is inside a send for this rank right now, and entering the
+            # recv is what completes the rendezvous (instr7/instr8's cycle,
+            # cut the same way `_pp_wait_for_dict_readiness` cuts it).
+            attempted = counters.attempted_of_kind(CHAN_DICT, "proxy", upstream)
+            if consumed >= posted and consumed >= attempted:
                 return False
             raw = self._pp_recv_typed_dict(
                 expected_kind="proxy",
