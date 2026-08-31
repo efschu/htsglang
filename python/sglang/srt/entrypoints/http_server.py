@@ -1013,9 +1013,22 @@ async def health_generate(request: Request) -> Response:
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
     )
     logger.error(
+        # UPSTREAM TEXT, KEPT VERBATIM so anyone grepping the known string still
+        # finds this site -- with a fork clause after it, because the upstream
+        # sentence names the WRONG PARTY and that cost a whole window.
         f"Health check failed. Server couldn't get a response from detokenizer for last "
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
         f"last_heartbeat time: {last_receive_time}"
+        f" -- #1033 READ THIS AS: NOBODY SENT, not 'the detokenizer is stuck'. "
+        f"The detokenizer is the LAST link; it goes quiet whenever any link "
+        f"upstream of it stops producing. Measured 2026-08-31 (boot 20 "
+        f"livelock): the detokenizer was idle in recv_pyobj with its last work "
+        f"finished, while the scheduler spun arm/abandon on a flip that could "
+        f"never reach quiescence. This line named the SILENT one instead of "
+        f"the NON-SPEAKER. Before suspecting the detokenizer, check the "
+        f"scheduler's own alarms -- `ADMISSION-WEDGE: N queued`, `PHASE-FLIP "
+        f"FLIP ABANDONED`, `PHASE-POLICY ARM-UNFUNDED` -- which name the link "
+        f"that actually stopped."
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
