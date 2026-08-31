@@ -1380,6 +1380,13 @@ class HiCacheFile(HiCacheStorage):
         from sglang.srt.mem_cache.canonical_page_store import write_extents
 
         suffixed = self._get_suffixed_key(key)
+        # #1065b: THE THIRD WRITE PATH, and the one that actually carries the KV
+        # bytes. Neither traced funnel saw it: `_log_key` covers the v2 page IO
+        # and `_get_component_key` covers lookups, while the canonical slice
+        # writes through `_get_suffixed_key` DIRECTLY. Boot 35 measured
+        # io_unique=1 / lookup_unique=19999 / intersection=0 -- a number that
+        # looked like a finding and was an artefact of this blind spot.
+        _969g_trace("write", "canonical", suffixed)
         if self.exists(key):
             # A complete blob is content-addressed: it already holds exactly
             # these bytes. Refresh recency, write nothing.
@@ -1531,6 +1538,8 @@ class HiCacheFile(HiCacheStorage):
         if window is not None:
             return self._set_canonical_slice(key, window, value)
         suffixed = self._get_suffixed_key(key)
+        # #1065b: the plain write path; `batch_set` funnels through here.
+        _969g_trace("write", "plain", suffixed)
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if self.exists(key):
