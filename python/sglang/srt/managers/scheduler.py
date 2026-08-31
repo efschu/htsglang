@@ -10300,9 +10300,12 @@ class Scheduler(
                 # the request. The offer is read off THIS pass's fresh match, so
                 # once the tokens are on device the hit shrinks and the offer
                 # goes to None on its own -- nothing has to clear it.
-                if self.ps.pp_rank == 0:
-                    _hit = int(getattr(req, "host_hit_length", 0) or 0)
-                    req.pp_load_back_offer = _hit if _hit > 0 else None
+                # The OFFER is no longer captured here. It is captured at the
+                # load-back site (`_pp_load_back_extent`), where the host hit
+                # is live by construction; reading it off a `can_run_list`
+                # member measured `with_offer=0` on every entry, because the
+                # request holding the hit is the one deferring at that site and
+                # not the one reaching the decision on that pass.
                 # SPEND WHAT THE LAST VISIT APPLIED. The load-back site sets
                 # this flag when it actually grew the prefix; dropping the rid
                 # here is what bounds the sticky map. Done BEFORE this pass's
