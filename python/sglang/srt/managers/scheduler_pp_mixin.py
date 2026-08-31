@@ -2268,6 +2268,44 @@ def pp_parked_continuation_priority(scheduler) -> Tuple[str, ...]:
     return tuple(str(getattr(req, "rid", "")) for req in front)
 
 
+def pp_stamp_observed_coverage(holder, decision):
+    """#1059 SITE 1: this rank's coverage promise, reported AND pinned.
+
+    REPORTING IS PINNING, and the two happen here or not at all. PP0 publishes
+    the MIN over these reports on the next lap; a report the reporter does not
+    hold to is what would reopen the eviction-between-laps gap, and a prefix
+    shortfall is NOT absorbable (DESIGN_968 5f -- prefix is a START POSITION,
+    not a read amount). So the same line that promises the span also raises
+    ``cache_protected_len`` to cover it, which `mem_cache/common.py:82` already
+    honours as an eviction floor (``evict_floor = max(req.cache_protected_len,
+    req.swa_evict_floor)``). No second protection mechanism is introduced.
+
+    NEVER LOWERS an existing protection: the pin is a floor, and another
+    mechanism's larger claim on the same request stays intact.
+
+    A rid this rank cannot locate is left with ``observed_local=None``, which
+    ``min_told`` SKIPS rather than counting as zero -- one rank that cannot see
+    a request must not collapse the group's prefix to 0 and recompute every
+    prompt.
+    """
+    from sglang.srt.managers.pp_uniform_width import report_local_coverage
+
+    locations = pp_request_locations(holder)
+    entries = []
+    for entry in decision.entries:
+        req = locations.get(entry.rid)
+        if req is None:
+            entries.append(entry)
+            continue
+        prefix = getattr(req, "prefix_indices", None)
+        promised = report_local_coverage(0 if prefix is None else len(prefix))
+        held = getattr(req, "cache_protected_len", None)
+        if held is None or held < promised:
+            req.cache_protected_len = promised
+        entries.append(replace(entry, observed_local=promised))
+    return replace(decision, entries=tuple(entries))
+
+
 def pp_output_payload_with_return_trip(
     holder, payload: Dict[str, object], mb_id: int
 ) -> Dict[str, object]:
@@ -2329,6 +2367,12 @@ def pp_output_payload_with_return_trip(
         return payload
     out = dict(payload)
     if decision is not None:
+        # #1059 SITE 1: report this rank's coverage UPWARD, and PIN it in the
+        # same breath. This is the only direction a per-rank observation may
+        # travel: the DOWNWARD relay is verbatim by design ("so the extent PP2
+        # applies is the one PP0 decided and not something a middle rank
+        # re-derived on the way"), and a report is not a decision.
+        decision = pp_stamp_observed_coverage(holder, decision)
         out.update(pp_admission_decision_to_wire(decision))
     if chain:
         out[_PP_LAUNCHED_CHAIN_KEY] = tuple(bool(x) for x in chain)
@@ -9297,6 +9341,28 @@ class SchedulerPPMixin:
                     except Exception:  # noqa: BLE001
                         continue
                 self._1058_told_prefix_observed = _told
+                # #1059 SITE 4: the told geometry rides the REQ from here.
+                #
+                # Stamped rather than threaded through a call chain, because
+                # the apply site (`Req.init_next_round_input`) has the request
+                # and the tree but not the scheduler -- and this is the tree's
+                # own established shape ("the fact now rides the row across
+                # ranks and the Req within a rank"). Applied on the NEXT pass,
+                # which is the decide-at-N / apply-at-N+1 form: the frame
+                # arrives AFTER this rank planned, so a same-pass stamp is
+                # structurally impossible and the blocking pre-planning receive
+                # that would fix that is the shape #1015 deleted after it
+                # deadlocked PP3-solo.
+                _locs = pp_request_locations(self)
+                for _e in getattr(_lb_decision, "entries", ()) or ():
+                    _req = _locs.get(_e.rid)
+                    if _req is None:
+                        continue
+                    try:
+                        _req._1059_told_prefix = int(_e.prefix_len)
+                        _req._1059_told_extend = int(_e.extend_len)
+                    except Exception:  # noqa: BLE001 - a stamp may never break a recv
+                        continue
             except Exception:  # noqa: BLE001
                 # A row this rank cannot read is a fact it does not have, which
                 # is a state the applying site already handles honestly (no

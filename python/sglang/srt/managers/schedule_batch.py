@@ -1617,6 +1617,48 @@ class Req(ReqDllmMixin):
         else:
             self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
+    def apply_uniform_pass_geometry_1059(self) -> bool:
+        """#1059 SITE 5: adopt the group's geometry over this rank's own.
+
+        A NAMED METHOD RATHER THAN AN INLINE BLOCK, and the reason is a false
+        green I produced myself: the first cut lived inline in
+        `init_next_round_input`, whose only reachable assertion was an AST check
+        that `uniform_pass_geometry` is CALLED there -- and a mutant that kept
+        the call but discarded its result (`None and uniform_pass_geometry(...)`)
+        passed every test. A site whose deadness cannot be detected is the
+        present-wired-never-populated shape this whole change exists to remove,
+        so the site is now behaviourally testable instead of proxied.
+
+        Returns True when the told geometry was adopted, so a caller and a test
+        can both tell adoption from "no fact this pass".
+        """
+        told_prefix = getattr(self, "_1059_told_prefix", None)
+        if told_prefix is None:
+            return False
+
+        from sglang.srt.managers.pp_uniform_width import uniform_pass_geometry
+
+        local = 0 if self.prefix_indices is None else len(self.prefix_indices)
+        # The pin is the promise this rank made on the previous lap and
+        # protected with `cache_protected_len`; passing it is what turns an
+        # eviction between laps into a LOUD broken promise instead of a silent
+        # told>local that resurfaces as #631 on a peer three hops away.
+        geom = uniform_pass_geometry(
+            told_prefix,
+            getattr(self, "_1059_told_extend", None),
+            local,
+            pinned_prefix=getattr(self, "cache_protected_len", None),
+        )
+        if geom.adopted and geom.prefix < local:
+            # Truncation is the ONLY direction available here (#930:
+            # prefix_indices and cache_protected_len move together). A told
+            # value ABOVE the local one is unreachable, because PP0 publishes
+            # the MIN over PINNED promises -- and if it ever were reached, the
+            # call above has already raised rather than let it pass silently.
+            self.truncate_prefix_to(geom.prefix)
+        self._1059_applied = geom
+        return bool(geom.adopted)
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -1724,6 +1766,17 @@ class Req(ReqDllmMixin):
             )
 
             _stamp_extent_1041(self)
+            # #1059 SITE 5: the group's geometry REPLACES this rank's own
+            # derivation. Placed beside #1041 deliberately -- its own comment
+            # calls these "the ONLY live writers of `host_hit_length` on a Req
+            # ... which is what makes this placement dominate every
+            # `can_run_list` filler instead of patching them one by one".
+            #
+            # SHIPS INERT (#947's precedent: "This one ships INERT ... the boot
+            # MEASURES the ring first"). Default OFF, so an unset env is
+            # byte-identical to the pre-#1059 tree; boot 29 turns it on.
+            if envs.SGLANG_PP_UNIFORM_WIDTH.get():
+                self.apply_uniform_pass_geometry_1059()
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:

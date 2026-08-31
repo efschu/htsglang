@@ -993,6 +993,38 @@ class PPAdmissionCongruenceGuard:
         # EXECUTED branch, which may count but must never be clamped.
         return 0 if self.note_offer(rid, told) else told
 
+    def note_observed_coverage(self, rid, observed) -> None:
+        """#1059 SITE 2 FEED: remember the SMALLEST coverage promised this lap.
+
+        Fed from `record_return_trip`, i.e. from the one upward channel that
+        survives #796's law. `None` is SKIPPED, never treated as zero: a rank
+        that could not locate the request must not collapse the group's prefix
+        to 0 and force every prompt to be recomputed (`min_told` holds the same
+        rule on the other side, and mutant 6 pins it).
+
+        Monotone-DOWN within a lap by construction (`min`), so the order the
+        entries arrive in cannot change the answer.
+        """
+        if observed is None:
+            return
+        if not hasattr(self, "_1059_observed"):
+            self._1059_observed = {}
+        prev = self._1059_observed.get(rid)
+        value = int(observed)
+        self._1059_observed[rid] = value if prev is None else min(prev, value)
+
+    def uniform_prefix_for(self, rid):
+        """#1059 SITE 2: the MIN over the promises that came home for this rid.
+
+        `None` means no promise arrived, which every consumer treats as "no
+        fact" -- no adoption, never a local substitute.
+        """
+        return getattr(self, "_1059_observed", {}).get(rid)
+
+    def forget_observed_coverage(self, rid) -> None:
+        """Drop a rid's promise once it has been spent or the lap expired."""
+        getattr(self, "_1059_observed", {}).pop(rid, None)
+
     def record_return_trip(self, decision: PPAdmissionDecision) -> None:
         """Consume a fully chain-reconciled decision on its way back to PP0.
 
@@ -1012,6 +1044,12 @@ class PPAdmissionCongruenceGuard:
         forwarding.
         """
         for entry in decision.entries:
+            # #1059: harvest the coverage promise from EVERY entry, before the
+            # retracted/admitted split below. The promise is about what a rank
+            # HOLDS, which is independent of whether that rank retracted -- and
+            # collecting it only on one branch would make the MIN depend on the
+            # pass's outcome instead of on the tiers.
+            self.note_observed_coverage(entry.rid, entry.observed_local)
             if entry.retracted:
                 if entry.unresolved:
                     # #944 THE OTHER POPULATION, COUNTED SEPARATELY. No rank
@@ -1779,6 +1817,27 @@ def build_pp_admission_decision(
             )
         else:
             told = raw_prefix_len
+
+        # #1059 SITE 2: clamp further DOWN to the MIN the group promised.
+        #
+        # This is what makes the published number REALIZABLE BY EVERY RANK
+        # rather than merely PP0's own. Boot 27 died because each rank derived
+        # its width from its own post-cutover HiCache hit (PP0 4094, PP1
+        # 13376) -- and option 2, "PP0 is minimal", had no mechanism behind it:
+        # `build_pp_admission_decision` runs ONLY on PP0, so PP0 never sees a
+        # follower's number unless one is reported upward. `uniform_prefix_for`
+        # is that report, harvested in `record_return_trip` from the promises
+        # each rank PINNED when it made them.
+        #
+        # SAME DIRECTION AS THE #630 CLAMP ABOVE, deliberately: it only ever
+        # moves tokens from "prefix" to "extend", so the `extend_len`
+        # arithmetic below and the invariant it rests on are untouched. `None`
+        # means no promise came home = no fact = PP0's own number stands, which
+        # is exactly the pre-#1059 behaviour.
+        if guard is not None and pp_size > 1:
+            _uniform = guard.uniform_prefix_for(req.rid)
+            if _uniform is not None and int(_uniform) < told:
+                told = int(_uniform)
 
         # told <= raw_prefix_len always (prefix_len_for only ever clamps
         # down): the shortfall moves from "prefix" to "extend", the total

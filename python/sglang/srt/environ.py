@@ -758,6 +758,12 @@ class Envs:
     # abandonment it exists to prevent is decoration, not an actuator. Kinds
     # with a declared disposition are unaffected -- see pp_stash_disposition.
     SGLANG_PP_STASH_ESCAPE_S = EnvFloat(20.0)
+    # #1059: apply PP0's uniform pass geometry instead of each rank's own
+    # HiCache-derived width. Ships OFF, per #947's precedent -- an unset env is
+    # byte-identical to the pre-#1059 tree, and the boot that turns it on is
+    # the one that proves it. The producer, the pin and the MIN run either way,
+    # so the reports are measurable before the apply is trusted.
+    SGLANG_PP_UNIFORM_WIDTH = EnvBool(False)
     # PP: how long the presence gate may keep waiting once EVERY clause of its
     # withhold reason is one no armed service turn can clear (#850). The gate
     # holds four actuators; a reason outside all four cannot change while the
