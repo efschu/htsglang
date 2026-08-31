@@ -2432,6 +2432,41 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req.mamba_ping_pong_track_buffer = None
             req.mamba_next_track_idx = None
 
+    def relinquish_mamba_cache(self, req: Req):
+        """Drop the request's claim on its mamba slot WITHOUT returning it.
+
+        #1051. The counterpart of ``free_mamba_cache`` for the one case where
+        the slot does not go back to the pool: the radix tree TOOK the
+        request's own active slot as a node anchor (the ``no_buffer``,
+        no-int8-checkpoint finish path donates
+        ``req.mamba_pool_idx.unsqueeze(-1).clone()`` -- the same slot, a
+        different tensor object). Ownership moves to the tree, which releases
+        it at eviction. Freeing it here as well is one slot with two owners:
+        the tree hands it out as a resume anchor while ``alloc()`` hands it to
+        a second request.
+
+        Only the RELEASE differs; every other postcondition of
+        ``free_mamba_cache`` is reproduced, so callers can treat the two as
+        interchangeable at the seam (``req.mamba_pool_idx`` is None afterwards,
+        and the #991 acquire stamp dies with the slot it described).
+
+        Refuses the extra-buffer configuration by construction: there the
+        donation is a ping-pong track slot, not the request's active one, and
+        the active slot must always go back (see ``free_mamba_cache``'s
+        ``mamba_ping_pong_track_buffer_to_keep`` handling). No caller reaches
+        this with that mode; the raise keeps it that way.
+        """
+        assert not self.enable_mamba_extra_buffer, (
+            "relinquish_mamba_cache is only defined for the plain donation "
+            "path, where the tree takes the request's OWN active slot. With "
+            "the extra buffer the donation is a ping-pong track slot and the "
+            "active slot must still be freed."
+        )
+        assert req.mamba_pool_idx is not None, "relinquish? mamba_index is None"
+        req.mamba_pool_idx = None
+        # #991: the stamp describes the slot, so it dies with it.
+        req.mamba_slot_acquired_this_admission = False
+
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()

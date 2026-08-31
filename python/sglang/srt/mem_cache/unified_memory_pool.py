@@ -681,7 +681,10 @@ class UnifiedMambaSlotAllocator:
 
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch that ``alloc(1)`` then draws from."""
-        self._alloc_iter = None
+        # #1051b sibling: return a still-open group's un-consumed slots instead
+        # of dropping the iterator on them (leak form). See
+        # `MambaSlotAllocator.alloc_group_begin`.
+        self.alloc_group_end()
         if num_reqs > 0:
             result = self._multi_ended_allocator.alloc(num_reqs)
             if result is not None:

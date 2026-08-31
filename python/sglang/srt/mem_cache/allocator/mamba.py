@@ -73,7 +73,16 @@ class MambaSlotAllocator:
 
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch of slots for match_prefix to amortize overhead."""
-        self._alloc_iter = None
+        # #1051b (side finding, own class -- a LEAK, not a double free):
+        # dropping a still-open group's iterator discards its un-consumed
+        # slots WITHOUT returning them. They stay `slot_used=True` and are on
+        # no free list, i.e. exactly the `leaked_mamba_pages` shape the on-idle
+        # ledger reports minutes later with nothing left to attribute it to.
+        # The single production caller (scheduler.py:10002) pairs begin/end
+        # under a carried refusal (#791), so this is unreachable today -- but
+        # an exception escaping between the two makes it reachable without any
+        # edit to this file, and the correct answer is not "assume the pair".
+        self.alloc_group_end()
         if num_reqs > 0:
             result = self._do_alloc(num_reqs)
             if result is not None:
@@ -290,6 +299,14 @@ class MambaSlotAllocator:
         )
 
     def clear(self):
+        # #1051b: a flush/reset invalidates every outstanding slot id, so an
+        # open group iterator must die with the generation that minted it.
+        # Surviving it would let `alloc()` hand out an id from the OLD
+        # free-list generation and `alloc_group_end` return it into the FRESH
+        # one -- a duplicate on a free list that is a bare `torch.cat` and
+        # cannot represent uniqueness. `UnifiedMambaSlotAllocator.clear`
+        # already does this; the static allocator only did it in `__init__`.
+        self._alloc_iter = None
         # Slot 0 is reserved as a dummy write target for padded tokens.
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device

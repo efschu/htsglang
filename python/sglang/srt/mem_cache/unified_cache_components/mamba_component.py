@@ -1263,6 +1263,46 @@ class MambaComponent(TreeComponent):
                 ):
                     self._free_mamba_value(donated)
                 pool.free_mamba_cache(req)
+                return
+
+            # #1051 THE OTHER HALF OF #929, AND IT IS THE ONE THAT KILLED SIX
+            # BOOTS. The block above reasons about the donation the tree did
+            # NOT take. When the tree DID take it, this path still ran
+            # `free_mamba_cache(req)` unconditionally -- and on THIS branch
+            # (`no_buffer`, no int8 checkpoint pool) the donation IS the
+            # request's own active slot: `prepare_for_caching_req` builds
+            # `active_value = req.mamba_pool_idx.unsqueeze(-1).clone()` (:1109)
+            # and hands THAT to the tree (:1118). So the node holds slot X and
+            # the allocator is told X is free, in the same call.
+            #
+            # The consequence is not a crash here; it is a crash three passes
+            # later, in a stranger's stack. Measured, boot 23
+            # (boot_855_1033c_0840f82601_0831_134138.log, 13:45:39Z, all three
+            # ranks, slot 1): `alloc_group_begin` legitimately re-drew the slot
+            # from the free list, nothing consumed it, `alloc_group_end`
+            # returned the remainder -- and the #1033b provenance named THAT as
+            # the FIRST RELEASER, with the node's eviction as the second. Both
+            # were innocent: the free list and the tree had held the same slot
+            # since this line ran.
+            #
+            # THE GUARD IS NOT NEW CODE, IT IS A PORT OMISSION. The sibling
+            # implementation this component replaced states the same rule
+            # explicitly (`mamba_radix_cache.py:781-792`):
+            #     free_mamba_cache = True if (extra_buffer or int8) else mamba_exist
+            # i.e. on the plain path the active slot goes back ONLY when the
+            # tree refused the donation. That term was lost in the move to the
+            # unified component; this restores it rather than inventing a
+            # second bookkeeping for ownership.
+            #
+            # Compared BY VALUE (`_same_mamba_slot`), because the donation is a
+            # clone: a distinct tensor carrying the same id. An unreadable
+            # handle answers False and takes the free path, which is the old
+            # behaviour -- narrower than the defect, never wider.
+            donated = insert_params.mamba_value if insert_params is not None else None
+            if _same_mamba_slot(donated, getattr(req, "mamba_pool_idx", None)):
+                pool.relinquish_mamba_cache(req)
+            else:
+                pool.free_mamba_cache(req)
         else:
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
