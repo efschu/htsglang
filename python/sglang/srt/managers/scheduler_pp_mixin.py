@@ -8487,8 +8487,16 @@ class SchedulerPPMixin:
             return None
         if getattr(receiver, "inbox", None):
             return True
+        # THE MATCHED PAIR, not the receiver's own counter (boot 631row7:
+        # `receiver.consumed` runs on a different baseline than the shm
+        # sent counter -- s0=528 vs receiver.consumed<528 read as a
+        # permanently posted message, and PP1 blocked forever in a chain
+        # receive of nothing). `local_consumed(CHAN_REQ)` is bumped by the
+        # same discipline that bumps `sent(CHAN_REQ)` on the other side
+        # (measured balanced at 528/528 while the gate wedged), so the
+        # comparison is counter-against-its-own-twin.
         posted = counters.sent(CHAN_REQ, self._pp_flip_upstream())
-        return int(getattr(receiver, "consumed", 0)) < int(posted)
+        return int(counters.local_consumed(CHAN_REQ)) < int(posted)
 
     def _pp_row_any_proxy_signal(self: Scheduler) -> bool:
         """#631 ROW AUTHORITY: any proxy frame stashed or provably in flight?
