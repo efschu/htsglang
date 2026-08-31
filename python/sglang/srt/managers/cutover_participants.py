@@ -121,6 +121,20 @@ REGISTRY: Tuple[Participant, ...] = (
     ),
     # ---------------------------------------------------------- allocator
     Participant(
+        name="tree_held_rows_at_drop",
+        what="every device row and mamba slot the prefix tree still holds when "
+        "the seam drops it -- LOCKED ones included. `evict` refuses a locked "
+        "node and `_reset_full` zeroes the protected book without freeing a "
+        "row, so a lock surviving the drop made its rows nobody's. This is the "
+        "#902-form declaration the release now carries: a state that outlives "
+        "the drop without a declared release site is a construction error, and "
+        "for two boots this one had none",
+        hook="sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.reclaim_rows_for_drop",
+        probe=LOG + "#1050 CUTOVER ROW RECLAIM",
+        ticket="#938/#1050",
+        found_by="boot",
+    ),
+    Participant(
         name="allocator_free_lists",
         what="an id may live in at most one free list; free_pages and "
         "release_pages overlapped and available_size double-counted",
