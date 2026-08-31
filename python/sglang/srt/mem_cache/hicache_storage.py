@@ -643,6 +643,52 @@ def audit_layout(root_dir: str, *, limit: int = 8) -> list:
     return duplicates
 
 
+
+def _969g_trace(direction: str, tag: str, stem: str) -> None:
+    """#1065: one key-trace for BOTH funnels, so the sets are comparable.
+
+    `direction` is `io` (the page write/read, via `_log_key`) or `lookup` (the
+    existence query, via `_get_component_key`). Boot 35's whole question is
+    whether the stems the WRITER produced are the stems the LOOKUP asks for, and
+    that comparison is only possible if both are printed with a direction label
+    and share one denominator.
+
+    The caller frame is printed too: it is what separates `_write_page` from
+    `_read_page` inside `io`, and names which existence path asked inside
+    `lookup`. Never raises, and past the cap it prints the suppressed count
+    rather than going silent.
+    """
+    try:
+        _n = getattr(HiCacheFile, "_969g_n", 0) + 1
+        HiCacheFile._969g_n = _n
+        _cap = int(envs.SGLANG_HICACHE_KEY_TRACE_CAP.get() or 0) or 20000
+        if _n <= _cap:
+            import sys as _sys
+
+            logger.warning(
+                "#969G KEY n=%d dir=%s caller=%s tag=%s stem=%s",
+                _n,
+                direction,
+                _sys._getframe(2).f_code.co_name,
+                tag,
+                stem,
+            )
+        else:
+            _s = getattr(HiCacheFile, "_969g_suppressed", 0) + 1
+            HiCacheFile._969g_suppressed = _s
+            if _s == 1 or _s % 100000 == 0:
+                logger.warning(
+                    "#969G KEY TRACE CAPPED at %d lines; %d further key "
+                    "derivations SUPPRESSED so far. A set difference read off "
+                    "the printed lines is bounded by this number, not by the "
+                    "population.",
+                    _cap,
+                    _s,
+                )
+    except Exception:  # noqa: BLE001 - a probe may never break an IO path
+        pass
+
+
 class HiCacheFile(HiCacheStorage):
 
     def __init__(
@@ -1164,8 +1210,20 @@ class HiCacheFile(HiCacheStorage):
         its arithmetic unchanged.
         """
         if component_name is None or component_name in ("__default__", PoolName.KV):
-            return self._get_suffixed_key(key)
-        return self._get_suffixed_key(f"{key}.{component_name}")
+            out = self._get_suffixed_key(key)
+        else:
+            out = self._get_suffixed_key(f"{key}.{component_name}")
+        # #1065: TRACED AGAIN, BUT LABELLED HONESTLY THIS TIME. The set
+        # comparison boot 35 exists for needs BOTH funnels: `_log_key` carries
+        # the page IO (`_write_page`/`_read_page`), while the EXISTENCE query
+        # that produces `storage_hit=0` -- `batch_exists` ->
+        # `_collect_existing_component_keys` / `batch_exists_v2` -- comes
+        # through HERE and never touches `_log_key`. Tracing only the first
+        # would have compared writes against writes.
+        # Same counter and same cap as `_log_key`, so the two directions share
+        # one denominator and one suppressed count.
+        _969g_trace("lookup", str(component_name), out)
+        return out
 
     def _sharded_path(self, stem: str) -> str:
         """Path a NEW file for ``stem`` is written to."""
@@ -1830,34 +1888,7 @@ class HiCacheFile(HiCacheStorage):
         how many keys were not shown.
         """
         out = key if pool_name == PoolName.KV else f"{key}.{pool_name}"
-        try:
-            _n = getattr(HiCacheFile, "_969g_n", 0) + 1
-            HiCacheFile._969g_n = _n
-            _cap = int(envs.SGLANG_HICACHE_KEY_TRACE_CAP.get() or 0) or 20000
-            if _n <= _cap:
-                import sys as _sys
-
-                logger.warning(
-                    "#969G KEY n=%d dir=%s pool=%s stem=%s",
-                    _n,
-                    _sys._getframe(1).f_code.co_name,
-                    pool_name,
-                    out,
-                )
-            else:
-                _s = getattr(HiCacheFile, "_969g_suppressed", 0) + 1
-                HiCacheFile._969g_suppressed = _s
-                if _s == 1 or _s % 100000 == 0:
-                    logger.warning(
-                        "#969G KEY TRACE CAPPED at %d lines; %d further key "
-                        "derivations SUPPRESSED so far. A zero difference read "
-                        "off the printed lines is bounded by this number, not "
-                        "by the population.",
-                        _cap,
-                        _s,
-                    )
-        except Exception:  # noqa: BLE001 - a probe may never break an IO path
-            pass
+        _969g_trace("io", pool_name, out)
         return out
 
     def _read_buffer_pool(self, pool_name: str, host_pool):
