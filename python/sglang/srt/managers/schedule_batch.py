@@ -42,6 +42,7 @@ import logging
 import os
 import re
 import sys
+import time
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -309,6 +310,212 @@ def _1036_stamp_protected(req) -> int:
                 _1036_HWM_BY_RID.pop(stale, None)
         _1036_HWM_BY_RID[rid] = hwm
     return hwm
+
+
+#: #1060: the re-admission recovery census. Class-free module state so the
+#: scheduler's teardown/exception hooks can emit it without owning a Req.
+_1060_STATE: Dict[str, int] = {}
+_1060_LAST_CENSUS_T: List[float] = []
+_1060_CENSUS_CADENCE_S = 20.0
+#: rid -> host-pool clear epoch observed at that rid's PREVIOUS consult.
+_1060_EPOCH_BY_RID: Dict[str, int] = {}
+_1060_EPOCH_CAP = 4096
+
+
+def _1060_bump(key: str, n: int = 1) -> None:
+    _1060_STATE[key] = _1060_STATE.get(key, 0) + n
+
+
+def _1060_note_readmit_recovery(req, tree_cache) -> None:
+    """#1060 MEASURE-ONLY: WHY a re-admission's read-through came back empty.
+
+    THE QUANTITY BOOT 30 EXISTS TO SIZE, and the reason it is a census rather
+    than a fix. Boot 29 re-admitted the same four requests nine to thirteen
+    times each (`#969L ... origin=33674 out=5 readmit=9`) and 714 of 771
+    `#969B READMIT-MATCH` lines carried ` host_hit=0`, so every lap re-prefilled
+    ~33k tokens to buy one output token. The standing user design
+    (`Cutover-Full-Reset-Re-Entry`, 2026-08-28) is "flip = zero everything,
+    re-admit by HiCache READ" -- which PRESUPPOSES that the host/storage copy
+    survives the flip. Something makes it not survive, and there are at least
+    three candidates that look identical downstream (an empty `prefix_indices`):
+
+    * the DEVICE TREE was dropped at the cutover and nothing was re-read;
+    * the HOST POOL was cleared, so every index handed out before that instant
+      reads as "not currently allocated" (`pool_host/base.py:309`, logged as
+      `#905 HOST-POOL CLEAR`, 63 times against 51 flips on boot 29);
+    * the STORAGE tier was never consulted at all.
+
+    THE DISCRIMINATOR IS THE CLEAR EPOCH ACROSS TWO CONSULTS OF THE SAME RID,
+    not the tier states at one instant. `clears_between > 0` on an empty match
+    says a host-pool clear happened between this request's previous consult and
+    this one; `clears_between == 0` on an empty match refutes the clear for that
+    observation and sends the hunt elsewhere. Boot 29 already carries the
+    counter-evidence that makes this necessary rather than confirmatory: 54
+    re-admissions DID recover (`host_hit=28297`), and `prefetch_registered` does
+    not correlate with recovery (HIT/False=40, HIT/True=17, MISS/False=666,
+    MISS/True=48).
+
+    DENOMINATOR LAW, built into the shape rather than remembered. Every
+    observation increments `seen` and exactly one `outcome_*` bucket, and the
+    tier flags are counted INDEPENDENTLY beside them rather than folded into a
+    decision tree -- overlapping causes stay visible instead of the first
+    matching branch eating the rest. A probe that cannot be read increments
+    `probe_unreadable` instead of silently scoring a tier as absent, so
+    "unknown" can never be reported as "empty".
+
+    NOTHING HERE CHANGES BEHAVIOUR: it reads, counts, and returns None.
+    """
+    try:
+        rid = str(getattr(req, "rid", "") or "")
+        host_hit = int(getattr(req, "host_hit_length", 0) or 0)
+        try:
+            device_hit = len(req.prefix_indices) if req.prefix_indices is not None else 0
+        except TypeError:
+            device_hit = 0
+
+        # --- tier probes, each independently guarded -------------------------
+        unreadable = 0
+        try:
+            root = getattr(tree_cache, "root_node", None)
+            children = getattr(root, "children", None)
+            tree_empty = (len(children) == 0) if children is not None else None
+        except Exception:  # noqa: BLE001 - a probe may never break admission
+            tree_empty = None
+        if tree_empty is None:
+            unreadable += 1
+
+        pool = getattr(getattr(tree_cache, "cache_controller", None), "mem_pool_host", None)
+        try:
+            avail = int(pool.available_size()) if pool is not None else None
+            size = int(getattr(pool, "size", 0)) if pool is not None else None
+            host_all_free = (
+                (avail is not None and size is not None and size > 0 and avail >= size)
+            )
+        except Exception:  # noqa: BLE001
+            avail = size = None
+            host_all_free = None
+        if host_all_free is None:
+            unreadable += 1
+
+        try:
+            epoch_now = int(getattr(pool, "_clear_epoch", 0)) if pool is not None else None
+        except (TypeError, ValueError):
+            epoch_now = None
+        epoch_prev = _1060_EPOCH_BY_RID.get(rid) if rid else None
+        if epoch_now is not None and rid:
+            if len(_1060_EPOCH_BY_RID) >= _1060_EPOCH_CAP:
+                # Bounded, for the same reason as the #1036 high-water map: a
+                # census may never become a leak.
+                for stale in list(_1060_EPOCH_BY_RID)[: _1060_EPOCH_CAP // 4]:
+                    _1060_EPOCH_BY_RID.pop(stale, None)
+            _1060_EPOCH_BY_RID[rid] = epoch_now
+        clears_between = (
+            (epoch_now - epoch_prev)
+            if (epoch_now is not None and epoch_prev is not None)
+            else None
+        )
+
+        storage_on = bool(getattr(tree_cache, "enable_storage", False))
+        try:
+            og = getattr(tree_cache, "ongoing_prefetch", None)
+            prefetch_registered = (rid in og) if isinstance(og, dict) else None
+        except Exception:  # noqa: BLE001
+            prefetch_registered = None
+
+        # --- one observation, exactly one outcome bucket ---------------------
+        _1060_bump("seen")
+        if unreadable:
+            _1060_bump("probe_unreadable", unreadable)
+        if host_hit > 0:
+            _1060_bump("outcome_recovered_host")
+        elif device_hit > 0:
+            _1060_bump("outcome_recovered_device")
+        else:
+            _1060_bump("outcome_empty")
+            # The discriminator, on the empty population only -- that is the
+            # population the design promise is broken for.
+            if clears_between is None:
+                _1060_bump("empty_clear_unknown")
+            elif clears_between > 0:
+                _1060_bump("empty_clear_between")
+            else:
+                _1060_bump("empty_no_clear_between")
+
+        # --- independent tier flags, whole population ------------------------
+        if tree_empty is True:
+            _1060_bump("tier_tree_empty")
+        if host_all_free is True:
+            _1060_bump("tier_host_pool_all_free")
+        if storage_on:
+            _1060_bump("tier_storage_enabled")
+        if prefetch_registered is True:
+            _1060_bump("tier_prefetch_registered")
+
+        # #1058b's lesson, inherited rather than re-learned: a WALL-CLOCK
+        # cadence, never an observation count. Boot 28 starved below the count
+        # gate and printed nothing, and a missing line reads exactly like a
+        # measured zero.
+        now = time.monotonic()
+        if not _1060_LAST_CENSUS_T:
+            _1060_LAST_CENSUS_T.append(now)
+        if (
+            _1060_STATE.get("seen", 0) % 128 == 0
+            or (now - _1060_LAST_CENSUS_T[0]) >= _1060_CENSUS_CADENCE_S
+        ):
+            _1060_LAST_CENSUS_T[0] = now
+            _1060_emit_census("cadence")
+    except Exception:  # noqa: BLE001 - a measurement may never break admission
+        pass
+
+
+def _1060_emit_census(reason: str) -> None:
+    """#1060: print the re-admission recovery census UNCONDITIONALLY.
+
+    Called on a wall-clock cadence, at teardown, and on the scheduler's death
+    path -- the three call sites #1058b needed after boot 28 died below its
+    emitter's count gate. `seen=0` is then a printed measurement ("the
+    re-admission consult was never reached on this rank") rather than a missing
+    line indistinguishable from "nothing was ever lost".
+
+    Never raises: it is called from the crash handler, where a diagnostic that
+    can raise would replace the death it reports.
+    """
+    try:
+        s = _1060_STATE
+        seen = s.get("seen", 0)
+        empty = s.get("outcome_empty", 0)
+        logger.warning(
+            "#1060 READMIT-RECOVERY CENSUS (%s): seen=%d "
+            "recovered_host=%d recovered_device=%d empty=%d | "
+            "WHY-EMPTY (denominator=empty=%d): clear_between=%d "
+            "no_clear_between=%d clear_unknown=%d | "
+            "TIERS (denominator=seen=%d, counted independently and may "
+            "overlap): tree_empty=%d host_pool_all_free=%d "
+            "storage_enabled=%d prefetch_registered=%d | "
+            "probe_unreadable=%d. `clear_between` counts EMPTY matches for "
+            "which the host pool's clear epoch advanced since that same rid's "
+            "previous consult -- the #905 signature. `no_clear_between` "
+            "REFUTES the clear for that observation. seen=0 means the "
+            "re-admission consult was never reached on this rank, which is "
+            "not the same as nothing being lost.",
+            reason,
+            seen,
+            s.get("outcome_recovered_host", 0),
+            s.get("outcome_recovered_device", 0),
+            empty,
+            empty,
+            s.get("empty_clear_between", 0),
+            s.get("empty_no_clear_between", 0),
+            s.get("empty_clear_unknown", 0),
+            seen,
+            s.get("tier_tree_empty", 0),
+            s.get("tier_host_pool_all_free", 0),
+            s.get("tier_storage_enabled", 0),
+            s.get("tier_prefetch_registered", 0),
+            s.get("probe_unreadable", 0),
+        )
+    except Exception:  # noqa: BLE001 - a diagnostic may never mask a death
+        pass
 
 
 def _note_1036_prefix_demotion(req, start: int, hwm: int) -> None:
@@ -1868,6 +2075,22 @@ class Req(ReqDllmMixin):
             except Exception:  # noqa: BLE001
                 logger.warning("#969B READMIT-MATCH PROBE RAISED", exc_info=True)
 
+            # #1060: the same population #969B prints per line, counted with a
+            # denominator. #969B answers "what did THIS consult see"; the
+            # census answers "over the boot, how often did the read-through
+            # come back empty, and did a host-pool clear fall between that
+            # rid's previous consult and this one". Placed here, after the
+            # match and inside the re-admission guard, because that is the only
+            # point at which the match result and every tier are both in hand.
+            try:
+                from sglang.srt.managers.phase_purity import (
+                    SEAM_READMIT_ATTR as _SRA_1060,
+                )
+
+                if getattr(self, _SRA_1060, None) is not None:
+                    _1060_note_readmit_recovery(self, tree_cache)
+            except Exception:  # noqa: BLE001 - a measurement may never break admission
+                pass
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()

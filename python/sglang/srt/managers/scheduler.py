@@ -15334,6 +15334,18 @@ def run_scheduler_process(
                 scheduler._1058_emit_census("scheduler-exception")
         except Exception:  # noqa: BLE001 - diagnostics may not mask the death
             pass
+        # #1060: same law, same path. The re-admission recovery census is
+        # module state, not scheduler state, so it emits even when `scheduler`
+        # is None -- which is exactly the case an exception before the
+        # scheduler is built produces.
+        try:
+            from sglang.srt.managers.schedule_batch import (
+                _1060_emit_census as _emit_1060,
+            )
+
+            _emit_1060("scheduler-exception")
+        except Exception:  # noqa: BLE001 - diagnostics may not mask the death
+            pass
         # #1054: THE DEATH IS THE ONE MOMENT THE ALLOCATOR STATE IS WORTH MOST,
         # and it was the one moment nothing captured it. Boot 24 died at
         # `torch.zeros_like(v)` in the GDN extend kernel with 21.69 MiB of its
@@ -15405,6 +15417,17 @@ def run_scheduler_process(
             # a diagnostic may never mask a death.
             try:
                 scheduler._1058_emit_census("teardown")
+            except Exception:  # noqa: BLE001 - diagnostics may not mask a death
+                pass
+            # #1060: the re-admission recovery census, on the same stop paths
+            # and for the same reason. Module state, so it prints even if the
+            # scheduler object is a stand-in without the method.
+            try:
+                from sglang.srt.managers.schedule_batch import (
+                    _1060_emit_census as _emit_1060,
+                )
+
+                _emit_1060("teardown")
             except Exception:  # noqa: BLE001 - diagnostics may not mask a death
                 pass
             # FPM has a background ZMQ publisher thread that needs explicit
