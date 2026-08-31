@@ -5999,12 +5999,112 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         mamba_comp = self.components.get(ComponentType.MAMBA)
         if mamba_vals and mamba_comp is not None:
-            for mval in mamba_vals:
-                try:
-                    mamba_comp._free_mamba_value(mval)
-                    out["mamba_slots"] += int(len(mval))
-                except Exception:  # noqa: BLE001 - one slot may not break a flip
-                    continue
+            # #1055: THE MAMBA HALF FREED BLIND WHILE THE KV HALF DIFFERENCED.
+            #
+            # Twenty lines above, the full/KV half reads the allocator's
+            # enumerated free set and frees only rows that are NOT already on
+            # it -- "NEVER FREES BLIND", because "a row that is already on the
+            # free list must not be freed twice: that is silent corruption, the
+            # one outcome worse than the leak". Every word of that applies to a
+            # mamba slot and none of it was implemented here.
+            #
+            # MEASURED, boot 25 (boot_855_1054diag..., 9 events, all three
+            # ranks): both releasers sit inside THIS function. The eviction at
+            # :1924 frees a node's `cd.value` and nulls it; this loop then
+            # walks the tree again and frees the same slot a second time. The
+            # #1033b provenance named the pair and neither party was at fault
+            # -- the asymmetry was.
+            #
+            # THE AUTHORITY IS THE ALLOCATOR'S OWN LEDGER. `slot_used` is the
+            # #924 bool ledger and answers "is this slot already free?" without
+            # an O(n) scan, which is exactly what `read_free_rows` gives the KV
+            # side. Same question, cheaper answer, same refusal to guess.
+            #
+            # AND IT ASKS THE ALLOCATOR THE FREE ACTUALLY REACHES (#941 class,
+            # the lesson the KV half spells out): `_free_mamba_value` routes to
+            # `int8_ckpt_pool` when one exists, and differencing against the
+            # SLOT allocator's ledger would then check membership in one pool
+            # while freeing into another -- the guard passing while doing the
+            # double free it exists to prevent. With a checkpoint pool in play
+            # there is no enumerable ledger to difference against, so this
+            # REFUSES rather than freeing blind, and says so.
+            ledger = None
+            reason = ""
+            if getattr(mamba_comp, "int8_ckpt_pool", None) is not None:
+                reason = (
+                    "mamba reclaim skipped: the free routes to the int8 "
+                    "checkpoint pool, whose free set this cannot enumerate; "
+                    "refusing to free against an unknown ledger"
+                )
+            else:
+                alloc = getattr(
+                    getattr(self, "req_to_token_pool", None), "mamba_allocator", None
+                )
+                ledger = getattr(alloc, "slot_used", None)
+                if ledger is None:
+                    reason = (
+                        "mamba reclaim skipped: allocator exposes no slot_used "
+                        "ledger, so 'already free?' is unanswerable here"
+                    )
+            if ledger is None:
+                out["reason"] = (out["reason"] + "; " + reason).lstrip("; ")
+            else:
+                dup = 0
+                failed = 0
+                for mval in mamba_vals:
+                    try:
+                        sel = (
+                            [int(x) for x in mval.reshape(-1).tolist()]
+                            if hasattr(mval, "reshape")
+                            else [int(mval)]
+                        )
+                        n = int(ledger.numel())
+                        fresh = [s for s in sel if 0 <= s < n and bool(ledger[s])]
+                        dup += len(sel) - len(fresh)
+                        if not fresh:
+                            continue
+                        mamba_comp._free_mamba_value(
+                            torch.tensor(
+                                fresh,
+                                dtype=getattr(mval, "dtype", torch.int64),
+                                device=getattr(mval, "device", None),
+                            )
+                        )
+                        out["mamba_slots"] += len(fresh)
+                    except Exception as exc:  # noqa: BLE001 - may not break a flip
+                        # NO SILENT `continue` ON THIS PATH. The version this
+                        # replaces swallowed every per-slot failure without a
+                        # word, which is the C1 swallow instance in miniature:
+                        # it is what let nine MambaSlotDoubleFree raises die
+                        # unheard in boot 25 while the ledger corrupted
+                        # underneath. Counted and named; the flip still
+                        # proceeds, because a reclaim may not abort a seam.
+                        failed += 1
+                        if not out["reason"]:
+                            out["reason"] = (
+                                f"mamba reclaim: {type(exc).__name__}: {exc}"
+                            )
+                out["mamba_already_free"] = int(dup)
+                out["mamba_failed"] = int(failed)
+                if failed:
+                    logger.error(
+                        "#1055 MAMBA RECLAIM: %d of %d slot vector(s) failed to "
+                        "release and %d slot(s) were ALREADY FREE and skipped. "
+                        "An already-free slot here is not noise: it means this "
+                        "drop's own eviction pass and this reclaim both hold a "
+                        "reference to it (#924/#1055).",
+                        failed,
+                        len(mamba_vals),
+                        dup,
+                    )
+                elif dup:
+                    logger.warning(
+                        "#1055 MAMBA RECLAIM: %d slot(s) were already free and "
+                        "were NOT returned a second time. Before this guard "
+                        "that was a double free -- boot 25 raised "
+                        "MambaSlotDoubleFree 9 times on exactly this path.",
+                        dup,
+                    )
 
         out["reclaimed"] = True
         return out
