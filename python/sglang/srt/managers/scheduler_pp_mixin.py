@@ -9270,7 +9270,33 @@ class SchedulerPPMixin:
                 # has no work. The decision object is still received and
                 # forwarded for the #791 batch geometry -- that is a different
                 # axis and is untouched.
-                pass
+                #
+                # #1058 OBSERVATION ONLY -- NOT A CONSUMER, AND THE DISTINCTION
+                # IS THE WHOLE SAFETY ARGUMENT.
+                #
+                # Boot 27 showed two ranks admitting the same pass at different
+                # widths (PP0 extend=4096, PP1 extend=2596, same slot, same
+                # fwd_ct, same rids). The fix form is under debate and BOTH
+                # candidate arms have a dead boot behind them, so this boot
+                # changes NOTHING and only measures the open quantity: how
+                # often does PP0's published prefix exceed what a peer can
+                # actually cover?
+                #
+                # THIS MUST NEVER WRITE `_pp_admission_incoming_effective`.
+                # That field is the armed predicate of the clamp in
+                # `_get_new_batch_prefill_raw`; populating it here would arm
+                # PP0-published widths plus the per-rank refusal that killed
+                # BOOT 15 (#1048: "PP0 published an extent of 4618 token(s)
+                # and this rank's load-back yielded only 0", 1448 refusals on
+                # one rid until the ring wedged). A separate dict, read by
+                # nothing but the census, cannot do that.
+                _told = {}
+                for _e in getattr(_lb_decision, "entries", ()) or ():
+                    try:
+                        _told[_e.rid] = int(_e.prefix_len)
+                    except Exception:  # noqa: BLE001
+                        continue
+                self._1058_told_prefix_observed = _told
             except Exception:  # noqa: BLE001
                 # A row this rank cannot read is a fact it does not have, which
                 # is a state the applying site already handles honestly (no

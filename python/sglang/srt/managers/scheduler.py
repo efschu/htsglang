@@ -9290,6 +9290,80 @@ class Scheduler(
             self._chunked_commitment_ledger = ledger
         return ledger
 
+    def _1058_note_told_vs_local(self, req, local_prefix: int) -> None:
+        """#1058 MEASURE-ONLY: PP0's published prefix beside this rank's own.
+
+        THE OPEN QUANTITY THIS BOOT EXISTS TO SIZE. Boot 27 died because two
+        ranks admitted the same pass at different widths, and the fix is a
+        value fork whose two arms each already killed a boot (per-rank refusal
+        -- #1048 boot 15, 1448 refusals; rank-local derivation -- boot 27).
+        The number that decides it is: HOW OFTEN does PP0's prefix exceed what
+        a peer can cover, and is it concentrated at flip boundaries?
+
+        NOTHING HERE CHANGES BEHAVIOUR. It reads a dict that only the receive
+        point writes and only this function reads, and it returns the caller's
+        value untouched -- the caller does not even take a return value.
+
+        DENOMINATOR LAW, built in rather than remembered. Five counters, and
+        the ABSENT case is one of them: a census that counted only comparisons
+        would report "0 overshoots" identically whether PP0 never overshot or
+        no told value ever arrived. The census line prints all five and its
+        own suppressed count, on a fixed cadence, so a quiet log is a measured
+        quiet.
+        """
+        try:
+            rid = getattr(req, "rid", None)
+            told_map = getattr(self, "_1058_told_prefix_observed", None)
+            told = told_map.get(rid) if isinstance(told_map, dict) else None
+
+            if told is None:
+                self._1058_absent = getattr(self, "_1058_absent", 0) + 1
+            else:
+                told = int(told)
+                if told == local_prefix:
+                    self._1058_agree = getattr(self, "_1058_agree", 0) + 1
+                elif told > local_prefix:
+                    # THE CASE THE FORK TURNS ON: PP0 published more than this
+                    # rank holds. Under an armed clamp with a per-rank refusal
+                    # this is precisely the boot-15 shape.
+                    _o = getattr(self, "_1058_told_over", 0) + 1
+                    self._1058_told_over = _o
+                    if _o <= 16 or _o % 128 == 0:
+                        logger.warning(
+                            "#1058 TOLD OVER LOCAL occurrence=%d rid=%s "
+                            "told=%d local=%d gap=%d flip_epoch=%s. PP0 "
+                            "published a prefix this rank does not hold. "
+                            "MEASURE ONLY -- nothing is clamped and nothing "
+                            "is refused on this boot; this is the quantity "
+                            "the #968 fix-form fork turns on.",
+                            _o,
+                            str(rid)[:8],
+                            told,
+                            local_prefix,
+                            told - local_prefix,
+                            getattr(self, "_pp_flip_arm_epoch", "?"),
+                        )
+                else:
+                    self._1058_told_under = getattr(self, "_1058_told_under", 0) + 1
+
+            _seen = getattr(self, "_1058_seen", 0) + 1
+            self._1058_seen = _seen
+            if _seen % 128 == 0:
+                logger.warning(
+                    "#1058 TOLD-VS-LOCAL CENSUS: evaluated=%d absent=%d "
+                    "agree=%d told_over=%d told_under=%d. `absent` counts "
+                    "requests for which NO told prefix arrived at all -- a "
+                    "zero in told_over means nothing unless evaluated minus "
+                    "absent is non-zero.",
+                    _seen,
+                    getattr(self, "_1058_absent", 0),
+                    getattr(self, "_1058_agree", 0),
+                    getattr(self, "_1058_told_over", 0),
+                    getattr(self, "_1058_told_under", 0),
+                )
+        except Exception:  # noqa: BLE001 - a measurement may never break admission
+            pass
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -10351,6 +10425,7 @@ class Scheduler(
                         req.truncate_prefix_to(told)
                     else:
                         told = len(req.prefix_indices)
+                        self._1058_note_told_vs_local(req, told)
                         _n = getattr(self, "_1039_clamp_skipped", 0) + 1
                         self._1039_clamp_skipped = _n
                         if _n <= 5 or _n % 256 == 0:
