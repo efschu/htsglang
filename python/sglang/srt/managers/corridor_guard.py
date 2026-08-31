@@ -1078,6 +1078,21 @@ class CorridorGuard:
 
     # -- the gate --------------------------------------------------------
 
+    # #1054e: `device_index` IS PROCESS-LOCAL, and the log lines that print it
+    # read as if it were physical. Verified on the live boot 25 (2026-08-31):
+    # every rank process carries CUDA_VISIBLE_DEVICES set to a single GPU UUID
+    # (PP0 -> GPU-31d7ef41 = the 5090, PP1 -> GPU-5c648f96, PP2 -> GPU-62dbbae1,
+    # cross-checked against nvidia-smi's per-PID compute-apps list), so torch
+    # sees exactly one device per process and index 0 is that process's own
+    # card. "cleared on device 0" therefore appears on PP0 AND PP2 and is
+    # correct in both -- they are different physical cards.
+    #
+    # RULED OUT BY THIS, explicitly, because it was a live hypothesis: the
+    # guard is NOT reading a foreign card for a rank. The #392/#406/#589
+    # device-order family does not apply here; isolation is at the process
+    # level, which is the canonical form, not an in-process index map. The
+    # 774 MiB -> 21.69 MiB gap in boot 24 is therefore a REAL transient spike
+    # between the two readings, not a wrong-card artifact.
     def free_bytes(self) -> int:
         if self._probe is not None:
             return int(self._probe())
