@@ -8400,35 +8400,74 @@ class SchedulerPPMixin:
         return {}, void_pp_admission_decision(amended)
 
     def _pp_proxy_frame_pending(self: Scheduler, mb_id: int) -> Optional[bool]:
-        """#631 ROW AUTHORITY: one-shot, non-blocking frame-presence probe.
+        """#631 ROW AUTHORITY: slot-aware, non-blocking frame-presence probe.
 
-        Exactly the first three exits of `_pp_wait_for_dict_readiness`,
-        taken ONCE and without the budgeted wait: an already-stashed inbox
-        message, a posted-but-unconsumed counter, or an entered send
-        (rendezvous) each prove a proxy frame is coming for this rank; a
-        clean "nothing new" proves the upstream has posted nothing.
+        BOOT 631row's 3-second death is the reason this is SLOT-AWARE and not
+        a bare wire probe: PP0's first frame was for slot 0 while PP1's loop
+        stood on slot 1; a slot-blind "something is pending" consumed it at
+        the wrong slot and the stamp validation refused it as a leftover
+        (corpse-R family, correctly). The frame must be ROUTED by its own
+        stamp, so the probe (a) moves a provably-posted proxy off the wire
+        INTO the per-(src,kind) inbox -- bounded by transfer time, since the
+        counters prove it is posted -- and (b) answers per SLOT by peeking
+        the head's stamp non-destructively. A head that names another
+        same-epoch slot answers False here and True when the loop reaches
+        that slot (FIFO order is send order, so the head is always the
+        oldest undelivered pass).
 
-        Returns True (frame provably pending), False (provably nothing
-        posted), or None (no signal channel -- `pp_flip_counters` absent --
-        presence is UNDECIDABLE without blocking, and the caller must fall
-        back to the legacy plan-first path rather than guess).
+        Returns True (THIS slot's frame is in the inbox; the ordinary recv
+        will find it without wire activity), False (nothing for this slot
+        right now), or None (no signal channel -- `pp_flip_counters` absent
+        -- presence is UNDECIDABLE without blocking, and the caller must
+        fall back to the legacy plan-first path rather than guess).
         """
         src = resolve_src(self.pp_group, None)
-        if typed_inbox(self.pp_group).get((src, "proxy")):
-            return True
-        counters = getattr(self, "pp_flip_counters", None)
-        if counters is None:
-            return None
-        upstream = self._pp_flip_upstream()
-        if kind_axis_covers(counters, CHAN_DICT, upstream):
+        q = typed_inbox(self.pp_group).get((src, "proxy"))
+        if not q:
+            counters = getattr(self, "pp_flip_counters", None)
+            if counters is None:
+                return None
+            upstream = self._pp_flip_upstream()
+            if not kind_axis_covers(counters, CHAN_DICT, upstream):
+                # The wire counter cannot tell a proxy from an output, and
+                # draining on it could block on the wrong kind. Coverage
+                # establishes with the upstream's first labeled send; until
+                # then this slot simply waits a loop iteration.
+                return False
             posted = counters.sent_of_kind(CHAN_DICT, "proxy", upstream)
             consumed = counters.local_consumed_of_kind(CHAN_DICT, "proxy")
-            attempted = counters.attempted_of_kind(CHAN_DICT, "proxy", upstream)
-        else:
-            posted = counters.sent(CHAN_DICT, upstream)
-            consumed = counters.local_consumed(CHAN_DICT)
-            attempted = counters.attempted(CHAN_DICT, upstream)
-        return consumed < posted or consumed < attempted
+            if consumed >= posted:
+                return False
+            raw = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
+            )
+            stash_typed(self.pp_group, None, "proxy", raw)
+            q = typed_inbox(self.pp_group).get((src, "proxy"))
+            if not q:
+                return False
+        head = q[0]
+        stamp = head.get("__stamp__") if isinstance(head, dict) else None
+        if stamp is None:
+            # Unstamped legacy frame: only the slot's own recv may judge it.
+            return True
+        epoch = pp_flip_epoch_of(self)
+        if pp_proxy_stamp_names_pass(stamp, mb_id, epoch):
+            return True
+        try:
+            _stamp_slot = int(stamp[0])
+            _stamp_epoch = int(stamp[3]) if len(stamp) > 3 else epoch
+        except Exception:  # noqa: BLE001 - malformed stamp: let recv judge it
+            return True
+        if _stamp_epoch == epoch and _stamp_slot != int(mb_id):
+            # Another CURRENT slot's frame: not this slot's business. It is
+            # consumed when the loop reaches its named slot.
+            return False
+        # Stale/foreign epoch at the head: hand it to the slot's own recv,
+        # whose established refusal logic names it (detection untouched).
+        return True
 
     def _pp_forwarded_schedule_from(
         self: Scheduler, amended: Optional[PPAdmissionDecision]
