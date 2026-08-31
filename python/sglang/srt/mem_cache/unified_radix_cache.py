@@ -5970,14 +5970,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     fresh = [x for x in sel if x not in already]
                     dup += len(sel) - len(fresh)
                     if fresh:
-                        keep.append(torch.tensor(fresh, dtype=torch.int64))
+                        # DTYPE AND DEVICE COME FROM THE SOURCE ROW VECTOR, not
+                        # from a default. Measured on boot 19 (2026-08-31
+                        # 11:56:03): rebuilding the filtered ids as a plain CPU
+                        # int64 tensor made `_free_full` raise -- the allocator
+                        # indexes DEVICE memory with these ids and a host
+                        # tensor is not an address space it can use. The
+                        # instrument caught it on the first real drop
+                        # (`reclaimed=False ... full_held=213 already_free=168`)
+                        # instead of the leak coming back silently, which is
+                        # the whole reason the refusal prints its numbers.
+                        keep.append(
+                            torch.tensor(fresh, dtype=v.dtype, device=v.device)
+                            if hasattr(v, "dtype")
+                            else torch.tensor(fresh, dtype=torch.int64)
+                        )
                 out["already_free"] = int(dup)
                 if keep:
                     merged = torch.cat(keep)
                     full_comp._free_full(merged)
                     out["full_rows"] = int(merged.numel())
             except Exception as exc:  # noqa: BLE001 - never abort a flip
-                out["reason"] = f"full reclaim failed: {type(exc).__name__}"
+                # THE MESSAGE, NOT JUST THE TYPE. The first version printed
+                # `RuntimeError` and nothing else, which named the failure and
+                # not the cause -- one boot's worth of guessing for one f-string.
+                out["reason"] = f"full reclaim failed: {type(exc).__name__}: {exc}"
                 return out
 
         mamba_comp = self.components.get(ComponentType.MAMBA)
