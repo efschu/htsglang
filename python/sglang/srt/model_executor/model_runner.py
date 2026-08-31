@@ -4191,9 +4191,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # It can strand: the recv is guarded by THIS rank's ``cur_batch`` while
         # the upstream's send is guarded by the UPSTREAM's, and nothing
         # enforces that the two agree -- only the unasserted "every rank builds
-        # the same batches" property. A commit hides any strand because the
-        # cutover re-enters event_loop_pp and init_pp_loop_state resets every
-        # buffer including _pp_tensor_dict_inbox; an ABANDON resets nothing.
+        # the same batches" property.
+        #
+        # #1057: THE SENTENCE THAT USED TO STAND HERE WAS FALSE, AND IT COST A
+        # DRAFT OF THE #968 ANALYSIS. It read: "A commit hides any strand
+        # because the cutover re-enters event_loop_pp and init_pp_loop_state
+        # resets every buffer including _pp_tensor_dict_inbox; an ABANDON
+        # resets nothing." That stopped being true at #753, which moved the
+        # inbox off the scheduler and onto the ``pp_group`` so the crossing
+        # wire could share it -- ``init_pp_loop_state`` has not touched it
+        # since. The claim survived here, in the funnel EVERY PP forward
+        # passes through, and reading it leads to the conclusion that a
+        # committed cutover is safe.
+        #
+        # What actually clears the stash is ``pp_flip_retire_pp_loop_stash``
+        # (#800, scheduler_pp_mixin.py:6402), called from the cutover at
+        # phase_flip_runtime.py:3615 -- by DISPOSITION: PP_LOOP_ONLY and
+        # UNDECLARED are retired, BLOCKS_FLIP is deliberately left. So a
+        # commit does not "hide" a strand; a named sweep removes two of three
+        # dispositions of it, and the third rests on the presence gate.
+        #
+        # A COMMIT IS ALSO NOT THE ONLY WAY TO STRAND. Measured boot
+        # boot_855_1056acc_..._0831_150350: all 24 cutovers logged an EMPTY
+        # PP-loop stash, 0 blocking and 0 undeclared -- and this guard still
+        # fired, three seconds after a cutover. The mispair arose INSIDE the
+        # new epoch, because the pairing identity ``(epoch, slot)`` repeats
+        # every ``pp_loop_size`` passes (3 on that boot form), so a pass three
+        # laps older satisfies it exactly. See TICKET_1057 and DESIGN_968.
         #
         # MEASURED COST (2026-08-09 05:21:16Z, specimen
         # /spinning/evidence-631/oom_and_abandon_20260809T0521Z): a decode
