@@ -1200,6 +1200,85 @@ _1040_ALIGN = {
 LOAD_BACK_EXTENT_ATTR = "pp_load_back_extent"
 
 
+#: #1042 LIFECYCLE LEDGER for the extent field. The table is the CONTRACT, not a
+#: comment beside it: these are the ONLY four things that may happen to
+#: `pp_load_back_extent`, and every one of them is counted.
+#:
+#:   set            a match WITH a host hit chooses an extent          (writer)
+#:   hitless_noop   a match WITHOUT a hit -- NO-OP, never a clear      (was the bug)
+#:   spend          the row carried it; the fact is delivered          (consumer)
+#:   retract        the request was retracted; the fact is void        (deleter)
+#:
+#: BOOT 10 MEASURED WHY `hitless_noop` MUST NOT BE A CLEAR. The stamp nulled the
+#: field on every hitless match, so a request stamped 4618 on one pass reached
+#: the publisher with None on the next: `#1041 EXTENT POPULATION seen=0
+#: published=0 delta=0 admitted=1`, beside `#1040 ... extent=4618` for the same
+#: rid. Writer, eraser and reader separated by an ordinary intervening match --
+#: the lifecycle shape the pre-boot table exists to catch, reproduced inside the
+#: mechanism that was supposed to fix it.
+_1042_LIFECYCLE = {"set": 0, "hitless_noop": 0, "spend": 0, "retract": 0}
+
+
+def _1042_note(kind: str, req, extent=None) -> None:
+    _1042_LIFECYCLE[kind] += 1
+    n = _1042_LIFECYCLE[kind]
+    if n <= 3 or n % 256 == 0:
+        logger.info(
+            "#1042 EXTENT LIFECYCLE %s rid=%s extent=%s held=%s -- set=%d "
+            "hitless_noop=%d spend=%d retract=%d",
+            kind,
+            getattr(req, "rid", None),
+            extent,
+            getattr(req, LOAD_BACK_EXTENT_ATTR, None),
+            _1042_LIFECYCLE["set"],
+            _1042_LIFECYCLE["hitless_noop"],
+            _1042_LIFECYCLE["spend"],
+            _1042_LIFECYCLE["retract"],
+        )
+
+
+def spend_state_aligned_extent(req) -> None:
+    """#1042 transition SPEND: the row carried the fact, so the field is done.
+
+    Cleared at the ROW BUILD, which is where the value is consumed into an
+    entry. Clearing later (at apply) would need the field to survive a rank
+    hop it does not travel on; clearing never would let one hit republish
+    forever, which is the stale-HIGH republish e0bc96008e already paid for.
+    """
+    if getattr(req, LOAD_BACK_EXTENT_ATTR, None) is None:
+        return
+    _1042_note("spend", req)
+    try:
+        setattr(req, LOAD_BACK_EXTENT_ATTR, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def clear_state_aligned_extent_on_retract(req) -> None:
+    """#1042 transition RETRACT: a retracted request's extent names a prefix
+    this rank is about to stop holding. The next match re-derives it."""
+    if getattr(req, LOAD_BACK_EXTENT_ATTR, None) is None:
+        return
+    _1042_note("retract", req)
+    try:
+        setattr(req, LOAD_BACK_EXTENT_ATTR, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _spend_for_entry(req) -> Optional[int]:
+    """#1042: read the stamped extent INTO an entry and mark it spent.
+
+    One expression for "the row carried it", so no branch can publish without
+    spending and none can spend without publishing -- the two-populations defect
+    this whole slice exists to remove, kept out of its own fix.
+    """
+    extent = getattr(req, LOAD_BACK_EXTENT_ATTR, None)
+    if extent:
+        spend_state_aligned_extent(req)
+    return extent
+
+
 def stamp_state_aligned_extent(req) -> Optional[int]:
     """#1041: CHOOSE THE EXTENT WHERE THE FACT IS BORN, not where a batch is.
 
@@ -1235,9 +1314,20 @@ def stamp_state_aligned_extent(req) -> Optional[int]:
     rank reads the told value off the row. Uniformity still comes from ONE rank
     choosing, exactly as before -- what changes is only WHEN it chooses.
     """
+    # #1042 TRANSITION GUARD. A hitless match is a NO-OP WITH A COUNTER, never
+    # a clear -- only `spend_state_aligned_extent` and
+    # `clear_state_aligned_extent_on_retract` may empty this field. The counter
+    # is also the discriminator for boot 10's unstamped rid (364e5b59: DEFERRED
+    # x3 with kv=4618, zero stamps): if it appears here, the stamp ran with a
+    # zero hit; if it appears nowhere, a third path sets `host_hit_length`
+    # without passing either writer, and that is a finding of its own.
+    if int(getattr(req, "host_hit_length", 0) or 0) <= 0:
+        _1042_note("hitless_noop", req)
+        return getattr(req, LOAD_BACK_EXTENT_ATTR, None)
     extent = state_aligned_load_back_len(req)
     try:
         setattr(req, LOAD_BACK_EXTENT_ATTR, extent)
+        _1042_note("set", req, extent)
     except Exception:  # noqa: BLE001 - never break a match walk
         pass
     return extent
@@ -1588,7 +1678,7 @@ def build_pp_admission_decision(
     # A carrier with no extent would be pure noise on the wire, so it is not
     # emitted at all.
     for req in fact_only_reqs or ():
-        _extent = getattr(req, LOAD_BACK_EXTENT_ATTR, None)
+        _extent = _spend_for_entry(req)
         if not _extent:
             continue
         entries.append(
@@ -1661,7 +1751,7 @@ def build_pp_admission_decision(
                     # site every executable request must pass. Deriving it here
                     # made the fact depend on this pass admitting the request,
                     # and boot 8 measured what that costs.
-                    load_back_len=getattr(req, LOAD_BACK_EXTENT_ATTR, None),
+                    load_back_len=_spend_for_entry(req),
                 )
             )
             continue
@@ -1748,7 +1838,7 @@ def build_pp_admission_decision(
                 # #1040/#1041: the SAME stamped field, not a second copy of the
                 # arithmetic -- one chooser at the writer, so the two branches
                 # cannot publish extents chosen by different rules.
-                load_back_len=getattr(req, LOAD_BACK_EXTENT_ATTR, None),
+                load_back_len=_spend_for_entry(req),
             )
         )
     return PPAdmissionDecision(mb_id=mb_id, entries=tuple(entries))

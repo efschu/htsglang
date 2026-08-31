@@ -2238,6 +2238,14 @@ class Req(ReqDllmMixin):
         # rather than carried -- no stale state can hide behind it.
         self._1040_seen_retract = True
         self._1040_anchor_before_retract = getattr(self, "state_anchor_depth", None)
+        # #1042 transition RETRACT: one of the only two paths allowed to empty
+        # the extent field. A retracted request's extent names a prefix this
+        # rank is about to stop holding; the next match re-derives it.
+        from sglang.srt.managers.pp_admission_congruence import (
+            clear_state_aligned_extent_on_retract as _clear_extent_1042,
+        )
+
+        _clear_extent_1042(self)
 
         # #856: RECORD WHAT WAS ALREADY COMPUTED, BEFORE THE FIELDS THAT SAY SO
         # ARE CLEARED THREE LINES DOWN.
