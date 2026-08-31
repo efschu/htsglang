@@ -379,6 +379,13 @@ _POLICY_REASON_DIGITS = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 # Runtime HiCache resize requests are expressed in GiB.
 _GIB = 1024**3
 
+#: #1058b: seconds between told-vs-local census lines. A WALL-CLOCK cadence
+#: on purpose: boot 28 emitted zero census lines because the emitter was
+#: gated on 128 observations and the boot starved at fewer than that, so the
+#: measurement it existed for came back empty. Time is the denominator that
+#: does not depend on the thing being measured.
+_1058_CENSUS_CADENCE_S = 20.0
+
 # #583 collective census: resolved once at import so the per-iteration
 # tick is a bool read, not an environment lookup.
 _CENSUS = census()
@@ -9329,6 +9336,9 @@ class Scheduler(
                     _o = getattr(self, "_1058_told_over", 0) + 1
                     self._1058_told_over = _o
                     if _o <= 16 or _o % 128 == 0:
+                        self._1058_told_over_emitted = (
+                            getattr(self, "_1058_told_over_emitted", 0) + 1
+                        )
                         logger.warning(
                             "#1058 TOLD OVER LOCAL occurrence=%d rid=%s "
                             "told=%d local=%d gap=%d flip_epoch=%s. PP0 "
@@ -9348,20 +9358,63 @@ class Scheduler(
 
             _seen = getattr(self, "_1058_seen", 0) + 1
             self._1058_seen = _seen
-            if _seen % 128 == 0:
-                logger.warning(
-                    "#1058 TOLD-VS-LOCAL CENSUS: evaluated=%d absent=%d "
-                    "agree=%d told_over=%d told_under=%d. `absent` counts "
-                    "requests for which NO told prefix arrived at all -- a "
-                    "zero in told_over means nothing unless evaluated minus "
-                    "absent is non-zero.",
-                    _seen,
-                    getattr(self, "_1058_absent", 0),
-                    getattr(self, "_1058_agree", 0),
-                    getattr(self, "_1058_told_over", 0),
-                    getattr(self, "_1058_told_under", 0),
-                )
+            # #1058b: WALL-CLOCK CADENCE, not an observation count. The
+            # observation-count gate is what lost boot 28's measurement --
+            # see _1058_emit_census. The count gate is kept beside it so a
+            # busy boot still gets a line every 128 observations even if
+            # 128 of them land inside one cadence window.
+            _now = time.monotonic()
+            _last = getattr(self, "_1058_last_census_t", None)
+            if _last is None:
+                self._1058_last_census_t = _now
+                _last = _now
+            if _seen % 128 == 0 or (_now - _last) >= _1058_CENSUS_CADENCE_S:
+                self._1058_last_census_t = _now
+                self._1058_emit_census("cadence")
         except Exception:  # noqa: BLE001 - a measurement may never break admission
+            pass
+
+    def _1058_emit_census(self, reason: str) -> None:
+        """#1058b: print the told-vs-local census UNCONDITIONALLY.
+
+        THE DEFECT THIS CLOSES, measured on boot 28 (2026-08-31): the census
+        was emitted only on ``_seen % 128 == 0``. That boot starved, made
+        fewer than 128 admissions, and printed ZERO census lines -- so the
+        one quantity the boot existed to size came back empty and the
+        coordinator's prediction was neither confirmed nor refuted. The
+        DENOMINATOR LAW had been built into the five counters and then
+        defeated by the EMITTER, which is structurally `#995e`'s `if _seen:`
+        one layer out.
+
+        So the census now fires on a wall-clock cadence AND unconditionally
+        at teardown and on the scheduler's death path. ``evaluated=0`` is
+        then a printed measurement -- "the admission path never reached the
+        observation point" -- instead of a missing line that reads
+        identically to "PP0 never overshot".
+
+        Never raises: it is called from the crash handler, where a
+        diagnostic that can raise would replace the death it reports.
+        """
+        try:
+            _over = getattr(self, "_1058_told_over", 0)
+            logger.warning(
+                "#1058 TOLD-VS-LOCAL CENSUS (%s): evaluated=%d absent=%d "
+                "agree=%d told_over=%d told_under=%d "
+                "told_over_lines_emitted=%d told_over_lines_suppressed=%d. "
+                "`absent` counts requests for which NO told prefix arrived "
+                "at all -- a zero in told_over means nothing unless "
+                "evaluated minus absent is non-zero. evaluated=0 means the "
+                "observation point was never reached on this rank.",
+                reason,
+                getattr(self, "_1058_seen", 0),
+                getattr(self, "_1058_absent", 0),
+                getattr(self, "_1058_agree", 0),
+                _over,
+                getattr(self, "_1058_told_under", 0),
+                getattr(self, "_1058_told_over_emitted", 0),
+                max(0, _over - getattr(self, "_1058_told_over_emitted", 0)),
+            )
+        except Exception:  # noqa: BLE001 - a diagnostic may never mask a death
             pass
 
     def _get_new_batch_prefill_raw(
@@ -15249,6 +15302,18 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        # #1058b: the census goes out HERE, ahead of every signal, not only in
+        # the `finally` below. `parent_process.send_signal(SIGQUIT)` and the
+        # opt-in `os.killpg(..., SIGKILL)` a few lines down can both end this
+        # process before an unwind reaches `finally` -- and this boot form dies
+        # by exception, not by ShutdownReq. A measurement whose last line is
+        # only written on the path the boot does not take is the boot-28 defect
+        # one layer out. Never raises (see _1058_emit_census).
+        try:
+            if scheduler is not None:
+                scheduler._1058_emit_census("scheduler-exception")
+        except Exception:  # noqa: BLE001 - diagnostics may not mask the death
+            pass
         # #1054: THE DEATH IS THE ONE MOMENT THE ALLOCATOR STATE IS WORTH MOST,
         # and it was the one moment nothing captured it. Boot 24 died at
         # `torch.zeros_like(v)` in the GDN extend kernel with 21.69 MiB of its
@@ -15307,6 +15372,21 @@ def run_scheduler_process(
             from sglang.srt.managers.regime_runtime import close_regime_trace
 
             close_regime_trace(scheduler)
+            # #1058b: the told-vs-local census, unconditionally, on whichever
+            # stop path unwinds. Prints even when evaluated=0 -- that zero is
+            # the measurement "this rank never reached the observation point",
+            # which is exactly what boot 28 could not distinguish from "PP0
+            # never overshot" because the emitter never ran at all.
+            #
+            # Wrapped for the same reason the exception-path call is, and by
+            # this block's own rule ("Idempotent, never raises"): `scheduler`
+            # here may be a stand-in without the method, and an AttributeError
+            # raised in a `finally` would REPLACE the death being reported --
+            # a diagnostic may never mask a death.
+            try:
+                scheduler._1058_emit_census("teardown")
+            except Exception:  # noqa: BLE001 - diagnostics may not mask a death
+                pass
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
