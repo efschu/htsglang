@@ -51,7 +51,55 @@ nothing keeps exactly its pre-#1059 behaviour, so an older sender, a stand-in,
 or a pass PP0 did not name is byte-identical to before.
 """
 
-from typing import NamedTuple, Optional
+from typing import Iterable, NamedTuple, Optional
+
+
+class UniformWidthPromiseBroken(RuntimeError):
+    """A rank was told a prefix its PINNED span does not cover.
+
+    THIS IS AN INVARIANT VIOLATION, NOT FLOW CONTROL, and the distinction is the
+    whole reason it may raise at all. `report_local_coverage` pins the span it
+    reports (`cache_protected_len`, which `mem_cache/common.py:82` already
+    honours as an eviction floor: `evict_floor = max(req.cache_protected_len,
+    req.swa_evict_floor)`), and PP0 publishes the MIN over those promises. So
+    `told <= pinned` holds BY CONSTRUCTION and this exception is unreachable
+    unless the pin itself failed.
+
+    Raising here is `raenge-nie-uneins` applied literally: a detected broken
+    promise is a group crash, never a per-rank compensation. It is NOT the
+    boot-15 shape -- that was a per-pass refusal on a reachable condition, which
+    re-fired 1448 times and wedged the ring. This condition is unreachable while
+    the pin holds, fires once, and names both numbers.
+    """
+
+
+def report_local_coverage(local_prefix: int) -> int:
+    """What this rank promises for the NEXT lap: reporting IS pinning.
+
+    The eviction-between-laps gap, closed by construction. `observed_local` is
+    reported on lap N and applied on lap N+1; if the tier evicted the span in
+    between, `told > local` would hold despite the MIN -- and a prefix
+    shortfall is NOT absorbable (see DESIGN_968 5f: prefix is a START POSITION,
+    not a read amount). So a rank that reports a span also pins it, and the
+    caller must set `cache_protected_len >= ` this value until the apply
+    releases it or the lap expires.
+
+    Reuses the existing eviction floor rather than adding a second protection
+    mechanism -- upstream-minimal at this seam.
+    """
+    return max(0, int(local_prefix))
+
+
+def min_told(reported: Iterable[Optional[int]]) -> Optional[int]:
+    """PP0's published value: the MIN over the promises that came home.
+
+    A rank that reported nothing (None) is NOT counted as zero -- that would let
+    one silent rank collapse the group's prefix to 0 and recompute everything.
+    It is skipped, and if NOBODY reported, the answer is None = no fact = no
+    adoption, never a local substitute.
+    """
+    vals = [int(v) for v in reported if v is not None]
+    return min(vals) if vals else None
 
 
 class PassGeometry(NamedTuple):
@@ -74,6 +122,7 @@ def uniform_pass_geometry(
     told_prefix: Optional[int],
     told_extend: Optional[int],
     local_prefix: int,
+    pinned_prefix: Optional[int] = None,
 ) -> PassGeometry:
     """The pass geometry every rank of the group runs, told-first.
 
@@ -97,9 +146,28 @@ def uniform_pass_geometry(
         )
 
     told_prefix = int(told_prefix)
-    # EXECUTION, not decision: a rank holding fewer leading tokens than it was
-    # told recomputes the gap. Negative differences are surplus cache the rank
-    # simply does not use this pass -- also execution, also invisible here.
+
+    # THE EVICTION-BETWEEN-LAPS CASE, given its defined answer instead of a
+    # silent one. `told` was MINned over promises made on the previous lap; the
+    # pin (`cache_protected_len`) is what makes those promises still true now.
+    # A silent `told > local` must not be constructible here -- that is exactly
+    # the shape that cannot be absorbed (5f) and would surface as #631 three
+    # ranks later instead of at its cause.
+    effective_pin = local_prefix if pinned_prefix is None else int(pinned_prefix)
+    if told_prefix > effective_pin:
+        raise UniformWidthPromiseBroken(
+            f"told prefix {told_prefix} exceeds this rank's pinned span "
+            f"{effective_pin} (live local {int(local_prefix)}). The pin is what "
+            "makes the MIN realizable, so this is a broken promise, not a "
+            "capacity event: either the span was released before its lap "
+            "expired or it was evicted despite cache_protected_len. Crashing "
+            "the group is raenge-nie-uneins; compensating locally here would "
+            "move the batch and reappear as #631 on a peer."
+        )
+
+    # EXECUTION, not decision: the pin guarantees the tokens are still there, so
+    # a rank whose LIVE match came back short simply re-reads the pinned span.
+    # Surplus cache is likewise execution -- it is not used this pass.
     shortfall = told_prefix - int(local_prefix)
     if shortfall < 0:
         shortfall = 0
