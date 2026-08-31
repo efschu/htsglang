@@ -821,24 +821,44 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._mmap_path = None
         self._mmap_flushed = False
 
+        table_bytes = source_weight.numel() * source_weight.element_size()
+
         if self._pageable and not mmap_dir:
-            swap_kb = 0
+            # Unpinned without a file spills NOTHING when there is no swap. Whether
+            # that is a mistake depends entirely on whether the table FITS: at bf16
+            # (95.368 GiB) the caller must have meant disk and gets a refusal; at
+            # fp8 (47.684 GiB) RAM residency is a legitimate plan and gets a log
+            # line. Refusing the fp8 case is what my first version did, and it made
+            # the operator's actual configuration unreachable.
+            swap_kb = avail_kb = 0
             try:
                 with open("/proc/meminfo") as fh:
                     for line in fh:
                         if line.startswith("SwapTotal:"):
                             swap_kb = int(line.split()[1])
-                            break
+                        elif line.startswith("MemAvailable:"):
+                            avail_kb = int(line.split()[1])
             except OSError:
                 pass
-            if swap_kb == 0:
+            fits = avail_kb * 1024 >= table_bytes
+            if swap_kb == 0 and not fits:
                 raise ValueError(
                     "SGLANG_PLE_HOST_PAGEABLE=1 without SGLANG_PLE_HOST_MMAP_DIR "
-                    "does not spill anything: anonymous pages need swap, and "
-                    "SwapTotal is 0. The table would stay fully resident "
-                    f"({source_weight.numel() * source_weight.element_size() / 2**30:.3f}"
-                    " GiB) while looking offloaded. Set "
-                    "SGLANG_PLE_HOST_MMAP_DIR to a directory on fast storage."
+                    "spills nothing: anonymous pages need swap and SwapTotal is 0. "
+                    f"The table is {table_bytes / 2**30:.3f} GiB against "
+                    f"{avail_kb / 2**20:.1f} GiB MemAvailable, so it does NOT fit "
+                    "and would fail during load while looking offloaded. Either set "
+                    "SGLANG_PLE_HOST_MMAP_DIR (file-backed, spills to disk) or use "
+                    "an 8-bit table."
+                )
+            if swap_kb == 0:
+                logger.info(
+                    "PLE table is unpinned but RAM-RESIDENT: %.3f GiB against "
+                    "%.1f GiB MemAvailable, SwapTotal 0, so nothing spills. That is "
+                    "a valid plan for an 8-bit table; set "
+                    "SGLANG_PLE_HOST_MMAP_DIR if disk residency was intended.",
+                    table_bytes / 2**30,
+                    avail_kb / 2**20,
                 )
 
         if self._pageable and mmap_dir:
@@ -895,6 +915,50 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
+        # WHICH GATHER, decided here and per RANK, because on a heterogeneous rig
+        # the answer differs by card from one boot command. The zero-copy Triton
+        # kernel needs fp8e4nv for an fp8 table, whose floor is compute capability
+        # 8.9 -- measured: 8.6 refuses to compile it, 12.0 compiles it natively. A
+        # boot that discovers that at the first gather has already wasted a window,
+        # and it fails on 2 of 3 ranks here, so "auto" resolves it up front.
+        mode = (envs.SGLANG_PLE_GATHER.get() or "auto").strip().lower()
+        is_fp8_table = cpu_weight.dtype == torch.float8_e4m3fn
+        cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+        kernel_can_fp8 = cap >= (8, 9)
+
+        if mode == "host":
+            self._use_host_gather = True
+            why = "forced by SGLANG_PLE_GATHER=host"
+        elif mode == "pinned":
+            self._use_host_gather = False
+            why = "forced by SGLANG_PLE_GATHER=pinned"
+            if is_fp8_table and not kernel_can_fp8:
+                raise ValueError(
+                    f"SGLANG_PLE_GATHER=pinned with an fp8 PLE table on sm{cap[0]}"
+                    f"{cap[1]}: the zero-copy kernel needs fp8e4nv, whose floor is "
+                    "8.9, and it fails at COMPILE time rather than degrading. Use "
+                    "auto (or host) on this card."
+                )
+        elif mode == "auto":
+            # Not pinned -> the kernel cannot read it at all (a GPU kernel cannot
+            # page-fault on host memory). fp8 on a pre-8.9 card -> it cannot compile.
+            self._use_host_gather = (
+                self._pageable or (is_fp8_table and not kernel_can_fp8)
+            )
+            why = (
+                f"auto: dtype={'fp8' if is_fp8_table else 'bf16'}, sm{cap[0]}{cap[1]}, "
+                f"{'unpinned' if self._pageable else 'pinned'}"
+            )
+        else:
+            raise ValueError(
+                f"SGLANG_PLE_GATHER={mode!r} is not one of auto, host, pinned."
+            )
+        logger.info(
+            "PLE gather: %s (%s)",
+            "host-side" if self._use_host_gather else "pinned zero-copy kernel",
+            why,
+        )
+
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
     ) -> torch.Tensor:
@@ -927,7 +991,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
-            if self._pageable:
+            if self._use_host_gather:
                 self._maybe_flush_backing()
                 self._gather_host(flat_ids, output)
             else:

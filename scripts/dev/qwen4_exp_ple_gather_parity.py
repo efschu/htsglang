@@ -97,15 +97,41 @@ def run_allocation_modes(tmpdir) -> bool:
     print(f"  {'OK ' if good else 'BAD'} default            -> pinned="
           f"{m.weight.is_pinned()} mmap={m._mmap_path is not None}")
     ok &= good
-
-    # (2) pageable with no directory: must REFUSE when there is no swap
+    # (2) pageable with no directory. The refusal is CONDITIONAL ON FIT, which is
+    # the correction the operator's 8-bit plan forced: at bf16 (95.368 GiB) the
+    # caller must have meant disk, at fp8 (47.684 GiB) RAM residency is the plan.
+    # My first version refused both and made the second unreachable.
     os.environ["SGLANG_PLE_HOST_PAGEABLE"] = "1"
+
+    #   (2a) a table that FITS -> accepted, RAM-resident, no refusal
     try:
-        Qwen4ExpPinnedHostEmbedding(fake())
-        print("  BAD pageable, no dir   -> accepted (should refuse: nothing spills)")
+        m = Qwen4ExpPinnedHostEmbedding(fake())
+        good = not m.weight.is_pinned() and m._mmap_path is None
+        print(f"  {'OK ' if good else 'BAD'} pageable, fits     -> accepted, "
+              f"RAM-resident (pinned={m.weight.is_pinned()}, mmap=False)")
+        ok &= good
+    except ValueError as exc:
+        print(f"  BAD pageable, fits     -> refused, but it fits: {str(exc)[:50]}")
+        ok = False
+
+    #   (2b) a table that CANNOT fit -> must refuse. The weight is a META tensor, so
+    #   the size is real but nothing is allocated: the refusal is computed from
+    #   numel*element_size and fires before any allocation.
+    huge = fake()
+    huge.weight = torch.nn.Parameter(
+        torch.empty(400_000_000, dim, dtype=torch.bfloat16, device="meta"),
+        requires_grad=False,
+    )
+    try:
+        Qwen4ExpPinnedHostEmbedding(huge)
+        print("  BAD pageable, oversized-> accepted (119 GiB cannot be RAM-resident)")
         ok = False
     except ValueError as exc:
-        print(f"  OK  pageable, no dir   -> REFUSED: {str(exc)[:58]}...")
+        print(f"  OK  pageable, oversized-> REFUSED: {str(exc)[:52]}...")
+    except Exception as exc:
+        print(f"  BAD pageable, oversized-> {type(exc).__name__} instead of a "
+              f"refusal: {str(exc)[:40]}")
+        ok = False
 
     # (3) pageable with a directory: file-backed, and the file really appears
     os.environ["SGLANG_PLE_HOST_MMAP_DIR"] = tmpdir
@@ -118,6 +144,54 @@ def run_allocation_modes(tmpdir) -> bool:
     ok &= good
     for k in ("SGLANG_PLE_HOST_PAGEABLE", "SGLANG_PLE_HOST_MMAP_DIR"):
         os.environ.pop(k, None)
+
+    # ---- the OTHER axis: which gather, independent of residency. This is the
+    # combination my first design made unreachable: pinned + host gather, which is
+    # what an fp8 table on sm86 needs.
+    cap = torch.cuda.get_device_capability()
+    print(f"\n  gather axis on sm{cap[0]}{cap[1]} (fp8e4nv floor is 8.9):")
+
+    def gmode(env, dtype):
+        for k in ("SGLANG_PLE_GATHER", "SGLANG_PLE_HOST_PAGEABLE",
+                  "SGLANG_PLE_HOST_MMAP_DIR"):
+            os.environ.pop(k, None)
+        if env:
+            os.environ["SGLANG_PLE_GATHER"] = env
+        e = fake()
+        e.weight = torch.nn.Parameter(
+            torch.zeros(rows, dim, dtype=dtype), requires_grad=False
+        )
+        try:
+            mm = Qwen4ExpPinnedHostEmbedding(e)
+            return ("host" if mm._use_host_gather else "pinned"), mm.weight.is_pinned()
+        except ValueError as exc:
+            return f"REFUSED({str(exc)[:34]}...)", None
+        finally:
+            os.environ.pop("SGLANG_PLE_GATHER", None)
+
+    want_fp8 = "host" if cap < (8, 9) else "pinned"
+    cases = [
+        (None, torch.bfloat16, "pinned", "auto, bf16 table"),
+        (None, torch.float8_e4m3fn, want_fp8, "auto, fp8 table"),
+        ("host", torch.bfloat16, "host", "forced host, bf16"),
+    ]
+    for env, dtype, expect, label in cases:
+        got, pinned = gmode(env, dtype)
+        good = got == expect
+        print(f"  {'OK ' if good else 'BAD'} {label:22s} -> {got:8s} "
+              f"(want {expect}, residency pinned={pinned})")
+        ok &= good
+
+    # forced pinned + fp8 on a pre-8.9 card must REFUSE, not die later at compile
+    got, _ = gmode("pinned", torch.float8_e4m3fn)
+    if cap < (8, 9):
+        good = got.startswith("REFUSED")
+        print(f"  {'OK ' if good else 'BAD'} forced pinned, fp8    -> {got[:46]}")
+    else:
+        good = got == "pinned"
+        print(f"  {'OK ' if good else 'BAD'} forced pinned, fp8    -> {got} "
+              f"(this card supports fp8e4nv)")
+    ok &= good
     return ok
 
 

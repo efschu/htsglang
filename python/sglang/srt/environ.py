@@ -2049,6 +2049,25 @@ class Envs:
     #
     # Default False keeps the pinned zero-copy path byte-identical.
     SGLANG_PLE_HOST_PAGEABLE = EnvBool(False)
+    # HOW the PLE rows are fetched -- an axis INDEPENDENT of where the table lives.
+    # I first conflated the two into SGLANG_PLE_HOST_PAGEABLE and that made the
+    # operator's actual configuration unreachable: "fp8 table fully RAM-resident,
+    # gathered host-side" needs a host gather with PINNED residency, which one
+    # switch could not express.
+    #
+    #   "auto"   (default) decide PER RANK, which is what a heterogeneous rig needs:
+    #            the host gather when the table is fp8 and this card's Triton cannot
+    #            compile fp8e4nv, or when the table is not pinned. Otherwise the
+    #            pinned zero-copy kernel. On this rig that resolves to the kernel on
+    #            the 5090 and the host gather on both 3080s, from one boot command.
+    #   "host"   always the host-side gather.
+    #   "pinned" always the zero-copy kernel -- which RAISES at compile time for an
+    #            fp8 table on sm86 rather than degrading, so it is only for forcing
+    #            the comparison arm on a card that supports it.
+    #
+    # The fp8e4nv floor is compute capability 8.9. Measured here: 8.6 fails to
+    # compile, 12.0 works.
+    SGLANG_PLE_GATHER = EnvStr("auto")
     # WHERE the pageable table lives, and the reason this is a separate entry:
     # unpinned is NOT the same as spillable. Anonymous pageable memory can only be
     # evicted to swap, and this rig has SwapTotal 0 -- so `PAGEABLE=1` alone drops
