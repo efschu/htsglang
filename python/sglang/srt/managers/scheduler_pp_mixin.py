@@ -8097,11 +8097,21 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
+        mark_consumed: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
         If a message of the wrong kind is received, it's stashed in the queue
         and we continue receiving until we get the expected kind.
+
+        ``mark_consumed=False`` is the ROW-AUTHORITY DRAIN's spelling (#631,
+        boot 631row4): the probe takes a posted proxy off the wire only to
+        ROUTE it -- it stashes the message back for its named slot's own
+        receive. Advancing the #1057 seq high-water on that drain condemned
+        the stashed message as its own stale duplicate (measured: occurrence
+        1 dropped the health check's frame and wedged the ring), so a caller
+        that re-stashes must leave the mark to the receive that actually
+        DELIVERS the message to a consumer.
         """
         # #753: the inbox lives on the GROUP, not on this scheduler, because
         # the crossing wire is a SECOND consumer of the same channel. Two
@@ -8209,7 +8219,7 @@ class SchedulerPPMixin:
         # arrive here identically. Feeding the mark from the inbox alone would
         # leave it standing still on the common path, and the guard would have
         # nothing to compare against on the pass that matters.
-        if expected_kind == "proxy":
+        if expected_kind == "proxy" and mark_consumed:
             self._pp_note_proxy_consumed(tensor_dict)
         if expected_kind == "default":
             logger.warning_once(
@@ -8482,6 +8492,12 @@ class SchedulerPPMixin:
                 all_gather_group=(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
+                # The drain ROUTES, it does not deliver: leaving the #1057
+                # seq high-water untouched here is what keeps the stashed
+                # message alive for its named slot's own receive (boot
+                # 631row4: marking it here condemned it as its own stale
+                # duplicate and the ring wedged on the dropped frame).
+                mark_consumed=False,
             )
             stash_typed(self.pp_group, None, "proxy", raw)
             q = typed_inbox(self.pp_group).get((src, "proxy"))
