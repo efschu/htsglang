@@ -49,6 +49,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     entries_retracted_by_rank,
     forwarded_schedule,
     order_batch_by_schedule,
+    pp_row_authority_enabled,
     reconcile_pp_admission_decision,
     void_pp_admission_decision,
 )
@@ -4448,17 +4449,93 @@ class SchedulerPPMixin:
                 except Exception:  # noqa: BLE001
                     logger.warning("#969M ARM PROBE RAISED", exc_info=True)
 
-                # #631 PP0 GEOMETRY AUTHORITY (pp_admission_bulletin.py, the
-                # DESIGN_631 cut). Downstream reads PP0's published geometry
-                # for THIS slot before planning it, so the match writer in
-                # `init_next_round_input` can cap async adoption at PP0's
-                # ceiling instead of at whatever this rank's prefetch happens
-                # to have completed -- the rank-divergent batch build that
-                # killed boots 26-35. Non-blocking (bounded /dev/shm poll,
-                # single node), planted for exactly one plan call and cleared
-                # right after, so no other path can read a stale bulletin.
-                if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
-                    pp_bulletin.load_for_plan(self, mb_id)
+                # #631 ROW AUTHORITY (DESIGN_631, second cut -- the #968 end
+                # state). A downstream rank RECEIVES BEFORE IT PLANS: the
+                # admission row already rides the proxy frame, so the frame
+                # itself is the synchronizer, and the one-pass lag that made
+                # the row unable to cover the intake pass (#1059 SITE 4) is
+                # removed by ORDER, not by a side channel. The /dev/shm
+                # bulletin of the first cut is retired -- boot 631cut measured
+                # its stale-epoch laps leaving DEVICE prefixes rank-local,
+                # which is the divergence that killed that boot at lap 15.
+                #
+                # NON-BLOCKING BY CONSTRUCTION (#1015's deadlock shape cannot
+                # recur): the frame-presence probe reads the same counters
+                # `_pp_wait_for_dict_readiness` polls, exactly once. Frame
+                # provably pending -> take it NOW, reconcile its row
+                # (#791/#630) and let the plan below EXECUTE that geometry.
+                # Provably nothing posted -> this rank plans NOTHING for the
+                # slot (empty membership, the receiving side of the #969J
+                # symmetry). No signal channel -> legacy plan-first, loudly.
+                _row_auth = pp_row_authority_enabled(self)
+                _pre_proxy = None
+                if _row_auth and self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+                    _pending = self._pp_proxy_frame_pending(mb_id)
+                    if _pending is None:
+                        _row_auth = False
+                        if not getattr(self, "_pp_row_auth_no_signal_warned", False):
+                            self._pp_row_auth_no_signal_warned = True
+                            logger.warning(
+                                "#631 ROW AUTHORITY DISABLED: no "
+                                "pp_flip_counters side channel on this boot "
+                                "form, so frame presence cannot be probed "
+                                "without blocking. Downstream geometry stays "
+                                "rank-local (pre-row behaviour, #631 width "
+                                "guard remains the detector)."
+                            )
+                    elif _pending:
+                        # The slot's amendment record is about to be re-made
+                        # from THIS pass's row; a stale retraction left there
+                        # would make the receive refuse its own frame.
+                        self._pp_note_admission_amendment(mb_id, None)
+                        _pre_proxy = self._pp_recv_proxy_tensors(mb_id)
+                        _decision = getattr(
+                            self, "_pp_last_recv_admission_decision", None
+                        )
+                        if _decision is None:
+                            # PP0 only omits the row when it planned nothing,
+                            # and then it sends no frame (#969J). A frame
+                            # without a row is a protocol violation, and
+                            # running it would mean re-deriving rank-local
+                            # geometry -- the class this cut ends. Loud stop
+                            # (RAENGE-NIE-UNEINS), never a silent substitute.
+                            raise RuntimeError(
+                                "#631 ROW AUTHORITY: a proxy frame for slot "
+                                f"{mb_id} arrived with no admission row; it "
+                                "cannot be executed without re-deriving "
+                                "rank-local geometry."
+                            )
+                        effective, amended = self._pp_reconcile_incoming_admission(
+                            _decision
+                        )
+                        effective, amended = self._pp_void_retracted_pass(
+                            effective, amended
+                        )
+                        self._pp_admission_incoming_effective = effective
+                        self._pp_admission_incoming_schedule = (
+                            self._pp_forwarded_schedule_from(amended)
+                        )
+                        self._pp_admission_amended_to_forward = amended
+                        self._pp_note_admission_amendment(mb_id, amended)
+                        # Relay the AMENDED decision, never the verbatim row:
+                        # a later rank and the return trip must see an earlier
+                        # rank's retraction (#797), or PP0's floor never
+                        # learns and the unhonourable offer repeats (#1048).
+                        self._pp_load_back_wire = pp_admission_decision_to_wire(
+                            amended
+                        )
+                        # The match writer's ceiling map (old #1059 SITE 5),
+                        # fed from the row instead of /dev/shm: same
+                        # enforcement (truncate down, cap async adoption),
+                        # one mover for one payload.
+                        pp_bulletin.plant_from_row(self, effective)
+                    else:
+                        # Upstream provably posted nothing for this slot yet.
+                        # {} is the "admit nothing" spelling -- None would
+                        # re-open the rank-local derivation this cut ends.
+                        self._pp_admission_incoming_effective = {}
+                        self._pp_admission_incoming_schedule = {}
+                        pp_bulletin.plant_from_row(self, {})
                 try:
                     with torch.profiler.record_function("get_next_batch_to_run"):
                         plan = self.get_next_batch_to_run(
@@ -4469,13 +4546,35 @@ class SchedulerPPMixin:
                 finally:
                     if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
                         pp_bulletin.clear_after_plan(self)
-                # PP0's half: publish the geometry just decided, at the
-                # earliest point it exists and strictly before any downstream
-                # rank can plan the same slot (it still waits on this pass's
-                # frame). An empty plan publishes an empty entry list -- that
-                # too is a decision.
-                if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
-                    pp_bulletin.publish(self, mb_id, self.mbs[mb_id])
+                # #631 ROW AUTHORITY: a downstream batch may only exist when a
+                # frame is in hand. `get_next_batch_to_run`'s local
+                # continuation logic (chunked_req, the resident running batch)
+                # can still hand back a batch on a frameless pass (#797d's own
+                # finding); running it would recreate the rank-local pass this
+                # cut ends -- and would then block in a proxy receive nothing
+                # feeds. Voided via the same helper the #797d path uses; the
+                # chunked continuation is restored, not lost, and the pass
+                # runs when its frame arrives.
+                if (
+                    _row_auth
+                    and self.ps.pp_size > 1
+                    and self.ps.pp_rank != 0
+                    and _pre_proxy is None
+                    and self.mbs[mb_id] is not None
+                ):
+                    self._pp_row_frameless_voids = (
+                        getattr(self, "_pp_row_frameless_voids", 0) + 1
+                    )
+                    _n = self._pp_row_frameless_voids
+                    if _n <= 5 or _n % 256 == 0:
+                        logger.info(
+                            "#631 ROW AUTHORITY: voiding a locally-derived "
+                            "batch for slot %s built on a pass with no "
+                            "upstream frame (occurrence=%d).",
+                            mb_id,
+                            _n,
+                        )
+                    self._pp_void_own_batch(mb_id)
                 self.running_mbs[mb_id] = self.running_batch
 
                 # #797d: THIS RANK'S OWN VOID MUST REACH THE BATCH, NOT ONLY
@@ -4662,7 +4761,16 @@ class SchedulerPPMixin:
                 # sender has a batch, and then it always sends.
                 pp_proxy_tensors = None
                 if cur_batch:
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors(mb_id)
+                    # #631 ROW AUTHORITY: on a row-driven pass the frame was
+                    # already taken BEFORE the plan (it is what the plan was
+                    # built from); receiving again here would consume the NEXT
+                    # pass's frame -- the corpse-R dual (two consumes against
+                    # a debt of one).
+                    pp_proxy_tensors = (
+                        _pre_proxy
+                        if _pre_proxy is not None
+                        else self._pp_recv_proxy_tensors(mb_id)
+                    )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -8171,6 +8279,157 @@ class SchedulerPPMixin:
         rank = getattr(getattr(self, "ps", None), "pp_rank", None)
         return pp_proxy_pass_retraction_reason(carried[int(mb_id)], rank)
 
+    def _pp_reconcile_incoming_admission(
+        self: Scheduler, decision: PPAdmissionDecision
+    ) -> Tuple[Dict[str, int], PPAdmissionDecision]:
+        """#791: this (downstream) rank's reconciliation of a received
+        decision against its OWN local radix-cache state.
+
+        RESTORED VERBATIM from the pre-#1015 tree (01a391fa03^) for the #631
+        ROW AUTHORITY cut: #1015 deleted this together with the dedicated
+        admission-decision wire that deadlocked PP3-solo; the row now arrives
+        on the PROXY FRAME, before planning, so the receive that feeds this
+        is non-blocking by construction and the deadlock shape cannot recur.
+
+        For every named, still-admitted rid, freshly matches it against
+        THIS rank's own tree_cache (`req.init_next_round_input` -- safe to
+        call again here even though the admission loop below calls it again
+        too, per the idempotency already relied on for this exact call by
+        schedule_policy.py's pre-admission priority pass) to get a real
+        local candidate length, then hands everything to the pure
+        `reconcile_pp_admission_decision` (#791/#630) for the actual
+        safe-truncate / unsafe-retract verdict and the exactly-once warning.
+
+        FOUR PLACES A REQUEST CAN LIVE, and a rid found in NONE of them is
+        `UNKNOWN_MATCH`, never 0 (#797c: chunked_req; #798: the slot's
+        chunked req; #944: the running batch; else the waiting queue).
+        """
+        pp_size = self.ps.pp_size
+        if pp_size <= 1:
+            return {}, decision
+        by_rid = {req.rid: req for req in self.waiting_queue}
+        chunked = getattr(self, "chunked_req", None)
+        chunked_rid = getattr(chunked, "rid", None)
+        slot_chunked = pp_chunked_req_for_slot(self, decision.mb_id)
+        slot_chunked_rid = getattr(slot_chunked, "rid", None)
+        local_match_lens: Dict[str, int] = {}
+        for entry in decision.entries:
+            if not entry.admitted or entry.retracted:
+                continue
+            req = by_rid.get(entry.rid)
+            if req is None:
+                if chunked_rid is not None and entry.rid == chunked_rid:
+                    computed = pp_chunked_local_match(chunked)
+                    if computed is not None:
+                        local_match_lens[entry.rid] = computed
+                        continue
+                # #798: only the NAMED slot may answer for a slot-chunked req.
+                if slot_chunked_rid is not None and entry.rid == slot_chunked_rid:
+                    computed = pp_chunked_local_match(slot_chunked)
+                    if computed is not None:
+                        local_match_lens[entry.rid] = computed
+                        continue
+                # #944: the running batch is the fourth place.
+                running = getattr(self, "running_batch", None)
+                running_reqs = getattr(running, "reqs", None) or ()
+                for r in running_reqs:
+                    if getattr(r, "rid", None) == entry.rid:
+                        local_match_lens[entry.rid] = int(
+                            getattr(r, "kv_committed_len", 0) or 0
+                        )
+                        break
+                else:
+                    # #944 A MISS IS NOT A ZERO.
+                    local_match_lens[entry.rid] = UNKNOWN_MATCH
+                continue
+            req.init_next_round_input(self.tree_cache)
+            local_match_lens[entry.rid] = len(req.prefix_indices)
+        return reconcile_pp_admission_decision(
+            decision,
+            local_match_lens,
+            rank=self.ps.pp_rank,
+            pp_size=pp_size,
+            log=logger,
+        )
+
+    def _pp_void_retracted_pass(
+        self: Scheduler,
+        effective: Dict[str, int],
+        amended: PPAdmissionDecision,
+    ) -> Tuple[Dict[str, int], PPAdmissionDecision]:
+        """#797: a retraction drops the PASS, not just the rid.
+
+        RESTORED VERBATIM from the pre-#1015 tree (01a391fa03^), for the same
+        reason `_pp_reconcile_incoming_admission` above is: the mechanism was
+        deleted with the wire that fed it, and the row on the proxy frame is
+        the new feed. A rank that cannot honour a told prefix has no third
+        membership option -- it cannot ADMIT the rid (no KV for the reused
+        prefix) and the upstream cannot be AMENDED (its batch is in flight) --
+        so the pass runs NOWHERE on this rank, the void relays group-uniformly
+        (#797), the void output carries the observed local match home, and
+        PP0's `PPAdmissionCongruenceGuard` learns it as a floor so the next
+        offer for that rid is honourable ("PP0 defers its raise to the group
+        floor" -- the exact next-slice the boot-631cut under-coverage counter
+        ordered).
+        """
+        rank = getattr(getattr(self, "ps", None), "pp_rank", None)
+        voided = pp_pass_should_void(
+            amended, rank, getattr(self, "_pp_pass_voided_incoming", False)
+        )
+        self._pp_admission_pass_voided = voided
+        if not voided:
+            return effective, amended
+        mine = entries_retracted_by_rank(amended, rank) if rank is not None else ()
+        if mine:
+            self._pp_pass_voids = getattr(self, "_pp_pass_voids", 0) + 1
+            first = mine[0]
+            logger.warning(
+                "#797 PP-ADMISSION pass voided on rank %s: this rank retracted "
+                "%d request(s) (first: rid=%s told=%d local=%s), so its batch "
+                "would have been a strict SUBSET of the one the upstream "
+                "already launched. Running the whole pass nowhere instead: "
+                "rank 0's requests are released and re-queued by the void "
+                "output, and the observed local match is fed back as a prefix "
+                "floor so the next offer for this rid is honourable.",
+                rank,
+                len(mine),
+                first.rid,
+                first.prefix_len,
+                first.observed_local,
+            )
+        return {}, void_pp_admission_decision(amended)
+
+    def _pp_proxy_frame_pending(self: Scheduler, mb_id: int) -> Optional[bool]:
+        """#631 ROW AUTHORITY: one-shot, non-blocking frame-presence probe.
+
+        Exactly the first three exits of `_pp_wait_for_dict_readiness`,
+        taken ONCE and without the budgeted wait: an already-stashed inbox
+        message, a posted-but-unconsumed counter, or an entered send
+        (rendezvous) each prove a proxy frame is coming for this rank; a
+        clean "nothing new" proves the upstream has posted nothing.
+
+        Returns True (frame provably pending), False (provably nothing
+        posted), or None (no signal channel -- `pp_flip_counters` absent --
+        presence is UNDECIDABLE without blocking, and the caller must fall
+        back to the legacy plan-first path rather than guess).
+        """
+        src = resolve_src(self.pp_group, None)
+        if typed_inbox(self.pp_group).get((src, "proxy")):
+            return True
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is None:
+            return None
+        upstream = self._pp_flip_upstream()
+        if kind_axis_covers(counters, CHAN_DICT, upstream):
+            posted = counters.sent_of_kind(CHAN_DICT, "proxy", upstream)
+            consumed = counters.local_consumed_of_kind(CHAN_DICT, "proxy")
+            attempted = counters.attempted_of_kind(CHAN_DICT, "proxy", upstream)
+        else:
+            posted = counters.sent(CHAN_DICT, upstream)
+            consumed = counters.local_consumed(CHAN_DICT)
+            attempted = counters.attempted(CHAN_DICT, upstream)
+        return consumed < posted or consumed < attempted
+
     def _pp_forwarded_schedule_from(
         self: Scheduler, amended: Optional[PPAdmissionDecision]
     ) -> Dict[str, Tuple[int, int]]:
@@ -9323,6 +9582,10 @@ class SchedulerPPMixin:
             if isinstance(raw, dict)
             else None
         )
+        # #631 ROW AUTHORITY: reset before the parse, so a frame without a
+        # row can never hand the pre-plan consumer a previous pass's
+        # decision (a pass that receives nothing must inherit nothing).
+        self._pp_last_recv_admission_decision = None
         if _lb_row is not None:
             # RELAY VERBATIM. This rank forwards the row it received, byte for
             # byte, so the extent PP2 applies is the one PP0 decided and not
@@ -9335,6 +9598,12 @@ class SchedulerPPMixin:
                 _lb_decision = pp_admission_decision_from_wire(
                     self._pp_load_back_wire
                 )
+                # #631 ROW AUTHORITY: hand THIS pass's decision to the
+                # pre-plan consumer in `_event_loop_pp_body`. With the
+                # receive now running BEFORE the plan, this is the channel
+                # that ends the decide-at-N / apply-at-N+1 lag the #1059
+                # SITE 4 comment below describes.
+                self._pp_last_recv_admission_decision = _lb_decision
                 # #1046: NOTHING IS CONSUMED FROM THE ROW HERE ANY MORE.
                 # This read the `load_back_len` column and stamped it onto this
                 # rank's requests. The extent is now derived at this rank's own

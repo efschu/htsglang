@@ -226,6 +226,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     forwarded_fill_carry,
     forwarded_last_chunk,
     pp_admission_verdict_is_vacuous,
+    pp_row_authority_enabled,
     void_pp_admission_decision,
 )
 from sglang.srt.managers.prefill_delayer import (
@@ -10504,7 +10505,24 @@ class Scheduler(
                     # own fresh match, which is what the peers already do and
                     # what 94 of 94 healthy extents in the specimen boot show
                     # to be rank-uniform.
-                    if self._pp_admission_incoming_effective is not None:
+                    if pp_row_authority_enabled(self):
+                        # #631 ROW AUTHORITY: the telling half is alive again
+                        # (downstream builds from the row it receives BEFORE
+                        # planning), so PP0's learned-floor clamp is
+                        # distributable and re-arms -- exactly the automatic
+                        # resumption the #1039 comment below promises. The
+                        # floor is fed by retractions riding home on the
+                        # return trip (`pp_absorb_admission_return` ->
+                        # `PPAdmissionCongruenceGuard.record_return_trip`), so
+                        # an offer a peer could not honour is lowered on the
+                        # next pass instead of repeating (#1048's loop).
+                        told = self._pp_admission_guard.prefix_len_for(
+                            req.rid, len(req.prefix_indices)
+                        )
+                        # #930: prefix_indices and cache_protected_len move
+                        # TOGETHER. See Req.truncate_prefix_to.
+                        req.truncate_prefix_to(told)
+                    elif self._pp_admission_incoming_effective is not None:
                         told = self._pp_admission_guard.prefix_len_for(
                             req.rid, len(req.prefix_indices)
                         )

@@ -219,6 +219,26 @@ logger = logging.getLogger(__name__)
 #: `observed_local` has readers that treat it as a length -- see that field.
 UNKNOWN_MATCH = -1
 
+
+def pp_row_authority_enabled(scheduler) -> bool:
+    """#631 ROW AUTHORITY (DESIGN_631, second cut): is the row the geometry law?
+
+    True on every multi-stage PP form unless explicitly killed via
+    ``SGLANG_PP_ROW_AUTHORITY=0`` (the discriminator switch). BOTH halves of
+    the mechanism read this one predicate -- PP0's learned-floor clamp
+    (scheduler.py, the #1039 site) and the downstream receive-before-plan
+    consumption (scheduler_pp_mixin._event_loop_pp_body) -- so they can never
+    be armed apart, which is the exact failure #1039 measured when the two
+    halves hung off a memo only one side wrote.
+    """
+    import os as _os
+
+    if _os.environ.get("SGLANG_PP_ROW_AUTHORITY", "1") in ("0", "false", "False"):
+        return False
+    ps = getattr(scheduler, "ps", None)
+    return ps is not None and getattr(ps, "pp_size", 1) > 1
+
+
 #: #944: how many consecutive rounds a rid may be DEFERRED for being
 #: unresolvable before PP0 stops asking, refuses loudly, and pins the next
 #: offer to `told=0`.
