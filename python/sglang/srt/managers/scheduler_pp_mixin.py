@@ -288,6 +288,67 @@ _PP_PARKED_CONTINUATION_KEY = "__pp_parked_continuation__"
 _PP_ADMISSION_PENDING_SENDS_CAP = 64
 
 
+#: #1044: BOTH HALVES OF THE ROW'S TRIP, counted. The campaign has paid three
+#: times for instrumenting ONE branch and leaving its neighbour silent, so these
+#: two ledgers cover every exit of the ship site and every exit of the apply
+#: function -- not just the branch currently under suspicion.
+_1044_SHIP = {
+    "posted_with_row": 0,
+    "posted_no_row": 0,
+    "posted_no_decision": 0,
+    "skipped_with_row": 0,
+    "skipped_no_row": 0,
+    "entries_shipped": 0,
+}
+_1044_APPLY = {
+    "calls": 0,
+    "no_entries": 0,
+    "entry_no_extent": 0,
+    "entry_no_rid": 0,
+    "no_wanted": 0,
+    "unknown_rid": 0,
+    "stamped": 0,
+}
+
+
+def _1044_note_apply(sched, wanted: int, stamped: int, entries) -> None:
+    """#1044: the receiver's line. UNCONDITIONAL whenever the row wanted
+    anything -- the whole point is that a decline must never be a silence."""
+    n = _1044_APPLY["calls"]
+    if wanted or n <= 3 or n % 512 == 0:
+        logger.info(
+            "#1044 ROW RECV wanted=%d stamped=%d entries=%d -- calls=%d "
+            "no_entries=%d entry_no_extent=%d entry_no_rid=%d no_wanted=%d "
+            "unknown_rid=%d stamped_total=%d "
+            "(sampled every 512 after the third when wanted=0)",
+            wanted, stamped, len(entries or ()),
+            _1044_APPLY["calls"], _1044_APPLY["no_entries"],
+            _1044_APPLY["entry_no_extent"], _1044_APPLY["entry_no_rid"],
+            _1044_APPLY["no_wanted"], _1044_APPLY["unknown_rid"],
+            _1044_APPLY["stamped"],
+        )
+
+
+def _1044_note_ship(kind: str, mb_id, entries: int) -> None:
+    _1044_SHIP[kind] += 1
+    _1044_SHIP["entries_shipped"] += int(entries or 0)
+    # UNCONDITIONAL whenever a row is actually involved; otherwise sampled AND
+    # the suppression count is printed, because a zero from a rate-limited
+    # emitter is not a zero.
+    n = _1044_SHIP[kind]
+    if entries or n <= 3 or n % 512 == 0:
+        logger.info(
+            "#1044 ROW SHIP %s mb=%s entries=%d -- posted_with_row=%d "
+            "posted_no_row=%d posted_no_decision=%d skipped_with_row=%d "
+            "skipped_no_row=%d entries_shipped=%d (this kind seen %d times, "
+            "sampled every 512 after the third)",
+            kind, mb_id, int(entries or 0),
+            _1044_SHIP["posted_with_row"], _1044_SHIP["posted_no_row"],
+            _1044_SHIP["posted_no_decision"], _1044_SHIP["skipped_with_row"],
+            _1044_SHIP["skipped_no_row"], _1044_SHIP["entries_shipped"], n,
+        )
+
+
 def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, object]:
     """#791: serialize a PPAdmissionDecision for the typed tensor-dict wire.
 
@@ -2316,11 +2377,34 @@ def pp_output_payload_with_return_trip(
     pp_parked_continuation_stamp(
         holder, {_PP_PARKED_CONTINUATION_KEY: _pp_parked_carry_wire(holder)}, parked_out
     )
+    # #1044 SENDER HALF. Boot 14 published a row (`#1041 ... published=1`) and
+    # NO rank ever stamped one (`ROW APPLIED` 0 in the whole boot). Two shapes
+    # cannot be told apart from the receiver alone: the frame was never posted
+    # (delivery), or it was posted and the receiver could not use it (lap). This
+    # line is the sender's half of that partition and it counts the SKIPPED
+    # passes too -- a frame that is never posted is exactly the case a
+    # posted-only counter cannot see.
+    _lb_entries = 0
+    if decision is not None:
+        _lb_entries = sum(
+            1 for _e in (getattr(decision, "entries", ()) or ())
+            if getattr(_e, "load_back_len", None)
+        )
     if decision is None and not chain and not parked_out:
+        if _lb_entries:
+            # Unreachable by construction (decision is None here), kept as a
+            # can-fail tell rather than an assumption.
+            _1044_note_ship("skipped_with_row", mb_id, _lb_entries)
+        else:
+            _1044_note_ship("skipped_no_row", mb_id, 0)
         return payload
     out = dict(payload)
     if decision is not None:
         out.update(pp_admission_decision_to_wire(decision))
+        _1044_note_ship("posted_with_row" if _lb_entries else "posted_no_row",
+                        mb_id, _lb_entries)
+    else:
+        _1044_note_ship("posted_no_decision", mb_id, 0)
     if chain:
         out[_PP_LAUNCHED_CHAIN_KEY] = tuple(bool(x) for x in chain)
     if parked_out:
@@ -6708,14 +6792,30 @@ class SchedulerPPMixin:
         learns it would run at a prefix its peers cannot reach, which is the
         divergence boot 1815081d46 died in.
         """
+        # #1044 RECEIVER HALF -- EVERY EXIT OF THIS FUNCTION IS NAMED.
+        # `ROW APPLIED` only ever emitted on `stamped > 0`, so all four ways
+        # this function can decline were one indistinguishable silence. That is
+        # the shape the campaign has paid for three times: one branch
+        # instrumented, its neighbour left mute. Swept in one go rather than one
+        # branch per boot.
+        _1044_APPLY["calls"] += 1
         entries = getattr(decision, "entries", None) or ()
         wanted = {}
         for e in entries:
             n = getattr(e, "load_back_len", None)
             rid = getattr(e, "rid", None)
-            if n and rid is not None:
-                wanted[str(rid)] = int(n)
+            if not n:
+                _1044_APPLY["entry_no_extent"] += 1
+                continue
+            if rid is None:
+                _1044_APPLY["entry_no_rid"] += 1
+                continue
+            wanted[str(rid)] = int(n)
+        if not entries:
+            _1044_APPLY["no_entries"] += 1
         if not wanted:
+            _1044_APPLY["no_wanted"] += 1
+            _1044_note_apply(self, 0, 0, entries)
             return 0
         local = self._local_reqs_by_rid()
         stamped = 0
@@ -6734,6 +6834,11 @@ class SchedulerPPMixin:
                 # The row names a request this rank does not hold. Not an
                 # error: PP0 admits against its own queue and a peer may have
                 # completed or retracted that rid. No fact is invented.
+                # #1044: NOT AN ERROR IS NOT THE SAME AS NOT WORTH COUNTING.
+                # This is candidate (D) -- the row arrived a lap after the rid
+                # left this rank -- and it was the one silent branch that could
+                # absorb the entire chain without a single line of evidence.
+                _1044_APPLY["unknown_rid"] += 1
                 continue
             req.pp_load_back_told = extent
             stamped += 1
@@ -6742,6 +6847,8 @@ class SchedulerPPMixin:
                 anchors += 1
             if getattr(req, "_1040_seen_retract", False):
                 retracted_survivors += 1
+        _1044_APPLY["stamped"] += stamped
+        _1044_note_apply(self, len(wanted), stamped, entries)
         if stamped:
             _n = getattr(self, "_968_applied_n", 0) + 1
             self._968_applied_n = _n
