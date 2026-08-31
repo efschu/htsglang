@@ -4764,6 +4764,10 @@ class HybridLinearKVPool(KVCache):
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
+        # [#1036] Upstream PR #36497's position for it, kept identical so a
+        # positional call from either tree lands the same. QwenDSATokenToKVPool
+        # forwards it (qsa_kv_pool.py:287).
+        quant_method=None,
         # When provided (shared-KV-pool path), use this pool for the
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
@@ -4802,20 +4806,56 @@ class HybridLinearKVPool(KVCache):
             self.full_kv_pool = full_kv_pool
         elif not use_mla:
             TokenToKVPoolClass = MHATokenToKVPool
+            # [#1036] Grafted from upstream PR #36497 (memory_pool.py:3742-3778 at
+            # 99c9362e66). QwenDSATokenToKVPool passes `quant_method=` up to this
+            # constructor (mem_cache/qsa_kv_pool.py:287, an adopted file), so
+            # without it the QSA KV pool cannot be built at all -- a TypeError,
+            # found by running the PR's own test_qsa.py. Threaded the way upstream
+            # threads it: only the in-tree MHA classes take the kwarg, so the
+            # out-of-tree and NPU pools clear it rather than being handed an
+            # argument they do not accept.
+            quant_method_kwarg = {"quant_method": quant_method}
 
             if current_platform.is_out_of_tree():
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
+                quant_method_kwarg = {}
             elif _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
 
                 TokenToKVPoolClass = NPUMHATokenToKVPool
+                quant_method_kwarg = {}
             elif full_kv_pool_class is not None:
                 # Caller-selected MHA layout variant (e.g. the page-major
                 # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
                 # priority since they don't understand alternate layouts.
                 TokenToKVPoolClass = full_kv_pool_class
+
+            # [#1036] This fork has NO KV-cache quant-method subsystem: upstream
+            # threads `quant_method` through 21 sites of MHATokenToKVPool
+            # (UnquantizedKVCacheMethod, create_buffers, quantize_and_store,
+            # scale buffers); this tree has zero. Importing that is a subsystem,
+            # not a graft, and #1036 does not need it -- the checkpoint's KV runs
+            # through the existing `--kv-cache-dtype fp8_e4m3` path.
+            #
+            # So drop the kwarg when the target cannot take it, exactly as the
+            # out-of-tree and NPU branches above do -- but REFUSE rather than drop
+            # if a caller actually asked for a method, because silently discarding
+            # a KV quantization request is the silent-wrong-answer class.
+            import inspect as _inspect
+
+            if "quant_method" not in _inspect.signature(
+                TokenToKVPoolClass.__init__
+            ).parameters:
+                if quant_method is not None:
+                    raise ValueError(
+                        f"{TokenToKVPoolClass.__name__} does not accept a KV-cache "
+                        f"quant_method, and one was supplied "
+                        f"({type(quant_method).__name__}). This fork has no "
+                        f"KV-cache quant-method subsystem; use --kv-cache-dtype."
+                    )
+                quant_method_kwarg = {}
 
             post_capture_kwargs = (
                 {
@@ -4840,6 +4880,7 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 enable_kv_cache_copy=enable_kv_cache_copy,
+                **quant_method_kwarg,
                 **post_capture_kwargs,
             )
         else:

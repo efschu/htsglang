@@ -126,6 +126,22 @@ def _create_nsa_compat(runner):
     return create_dsa_backend(runner)
 
 
+@register_attention_backend("qsa")
+def create_qsa_backend(runner):
+    # [#1036] Grafted from upstream PR #36497. Without this entry
+    # ATTENTION_BACKENDS has no "qsa" key at all, so `--attention-backend qsa`
+    # cannot resolve and the adopted Qwen4-Exp sparse-attention backend is
+    # unreachable however correct it is. Found by running the PR's own
+    # test_qsa.py, which fails on `ATTENTION_BACKENDS["qsa"]` with a KeyError --
+    # the load contract never sees this because it builds the model, not the
+    # attention backend.
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+
+    return QwenSparseAttnBackend(runner)
+
+
 @register_attention_backend("dsv4")
 def create_dsv4_backend(runner):
     if _is_npu:

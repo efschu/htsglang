@@ -643,6 +643,27 @@ is_sm80_supported = _device_version_gate("is_sm80_supported", [8], (11, 0))
 is_sm90_supported = _device_version_gate("is_sm90_supported", [9], (12, 3))
 
 
+# [#1036] Grafted from upstream PR #36497 (utils/common.py:313-323 at
+# 99c9362e66). The gates above match on the MAJOR only, so
+# `is_sm120_supported()` is also true on SM121/GB10 -- which is exactly the
+# distinction the QSA path turns on: upstream #36558 is "QSA decode has no
+# working kernel path on SM121", and the fast path is gated on sm100-or-EXACTLY
+# sm120. Without these two the adopted QSA backend cannot express that, and
+# `test_qsa.py` fails at `sglang.srt.utils.is_sm120` before it tests anything.
+#
+# RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
+@lru_cache(maxsize=1)
+def is_sm120() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 0)
+
+
+# GB10 (DGX Spark and OEM equivalents). Not expressible via
+# _check_cuda_device_version, which only matches on the major.
+@lru_cache(maxsize=1)
+def is_sm121() -> bool:
+    return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
+
+
 @lru_cache(maxsize=1)
 def _intel_amx_backend_available() -> bool:
     """Deferred from module scope: `import sgl_kernel` initializes CUDA in
