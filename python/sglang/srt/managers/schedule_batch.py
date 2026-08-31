@@ -2006,6 +2006,26 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
+            # #631 PP0 GEOMETRY AUTHORITY (pp_admission_bulletin.cap_req_geometry):
+            # the successor of the deleted #1059 SITE 5, at the same position
+            # and for the same reason -- this is the match writer every
+            # admissible request passes, after `cache_protected_len` is fresh
+            # (so the #930-paired truncate operates on consistent state) and
+            # before `add_one_req` derives `extend_range` from the current
+            # prefix. On a downstream PP rank during its own plan call, the
+            # planted bulletin caps device prefix and async host adoption at
+            # PP0's published ceiling; everywhere else the map is absent and
+            # this is one getattr and a return. Never raises: a geometry cap
+            # that kills the admission would be worse than the divergence it
+            # prevents.
+            try:
+                from sglang.srt.managers.pp_admission_bulletin import (
+                    cap_req_geometry as _cap_631,
+                )
+
+                _cap_631(self, tree_cache)
+            except Exception:  # noqa: BLE001 - the cap may never break admission
+                logger.warning("#631 BULLETIN CAP RAISED", exc_info=True)
             # #969B RE-ADMISSION DECISION PROBE (temporary). The open question
             # from §H3: when PP0 rebuilt a re-admitted request FROM ZERO while
             # its peers continued at (4096, N), was PP0 EARLY (it consulted the

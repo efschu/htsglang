@@ -31,6 +31,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers import pp_admission_bulletin as pp_bulletin
 from sglang.srt.managers.io_struct import PhaseFlipReqInput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.phase_flip_counters import (
@@ -4447,12 +4448,34 @@ class SchedulerPPMixin:
                 except Exception:  # noqa: BLE001
                     logger.warning("#969M ARM PROBE RAISED", exc_info=True)
 
-                with torch.profiler.record_function("get_next_batch_to_run"):
-                    plan = self.get_next_batch_to_run(
-                        running_batch=self.running_batch, last_batch=self.last_batch
-                    )
-                    self.running_batch = plan.running_batch
-                    self.mbs[mb_id] = plan.batch_to_run
+                # #631 PP0 GEOMETRY AUTHORITY (pp_admission_bulletin.py, the
+                # DESIGN_631 cut). Downstream reads PP0's published geometry
+                # for THIS slot before planning it, so the match writer in
+                # `init_next_round_input` can cap async adoption at PP0's
+                # ceiling instead of at whatever this rank's prefetch happens
+                # to have completed -- the rank-divergent batch build that
+                # killed boots 26-35. Non-blocking (bounded /dev/shm poll,
+                # single node), planted for exactly one plan call and cleared
+                # right after, so no other path can read a stale bulletin.
+                if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+                    pp_bulletin.load_for_plan(self, mb_id)
+                try:
+                    with torch.profiler.record_function("get_next_batch_to_run"):
+                        plan = self.get_next_batch_to_run(
+                            running_batch=self.running_batch, last_batch=self.last_batch
+                        )
+                        self.running_batch = plan.running_batch
+                        self.mbs[mb_id] = plan.batch_to_run
+                finally:
+                    if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+                        pp_bulletin.clear_after_plan(self)
+                # PP0's half: publish the geometry just decided, at the
+                # earliest point it exists and strictly before any downstream
+                # rank can plan the same slot (it still waits on this pass's
+                # frame). An empty plan publishes an empty entry list -- that
+                # too is a decision.
+                if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
+                    pp_bulletin.publish(self, mb_id, self.mbs[mb_id])
                 self.running_mbs[mb_id] = self.running_batch
 
                 # #797d: THIS RANK'S OWN VOID MUST REACH THE BATCH, NOT ONLY
