@@ -41,6 +41,25 @@ process-local, and the rank that aborts is the one NOT building -- its
 multiplier is closed. Raising the deadline only pads the race. Moving the
 build to a point where NO rank can be in a collective is what removes it.
 
+  STALE AS OF 2026-08-07 -- READ THE PARAGRAPH ABOVE WITH ITS DATE (#1033c).
+  The "process-local" premise was true when this was written (8bddb93d16,
+  2026-08-06) and #615 falsified it ONE DAY LATER (38ec4fb348, 2026-08-07):
+  ``cold_build_window`` now PUBLISHES a marker that peers read without any
+  cooperation from the builder, and they extend their deadlines under a 900 s
+  cap -- "every existing call site therefore becomes group-visible without
+  moving". Both commits are ancestors of today's pin; checked with
+  ``git log -S``, not assumed.
+
+  This correction is written here rather than by deleting the paragraph
+  because the paragraph is still RIGHT about this module: warming at boot
+  plus a barrier REMOVES the race, while a window only EXTENDS it under a cap
+  -- so #603b's own placement stands unchanged. What is no longer true is the
+  general claim that wrapping a lazy build "does NOT work", and that claim,
+  read at face value in 2026-08-31, nearly refuted the correct fix for the
+  boot-22 wedge (#1033c, ``Scheduler.run_batch``) before it was built.
+  A determination carries its date into its verdict; this one did not, and
+  the cost was one near-miss.
+
 So: build here, at boot, on every rank, inside the cold-build window, and then
 BARRIER. The barrier is the load-bearing half -- it is what guarantees no rank
 leaves for the serving loop while a peer is still in nvcc. It runs on the CPU

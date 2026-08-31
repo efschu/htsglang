@@ -11573,7 +11573,115 @@ class Scheduler(
         except Exception:  # noqa: BLE001 - a detector may never break serving
             pass
 
+    #: #1033c: how many forwards after a cutover run inside a published JIT
+    #: build window. Not "the first one": the first PREFILL and the first
+    #: DECODE of the new layout are different shapes, spec-decode adds a draft
+    #: forward, and the #887 one-chunk grant can put a TP prefill several
+    #: batches in. A small count covers the whole first-touch set without
+    #: anyone having to enumerate which kernels those are -- which is the
+    #: property that matters, because an enumeration that misses one lets the
+    #: next first-loader reproduce the identical wedge.
+    POST_CUTOVER_BUILD_BATCHES = 8
+
     def run_batch(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """Run a batch, inside a PUBLISHED build window right after a cutover.
+
+        #1033c -- THE DEFECT, measured on boot 22
+        (boot_855_1033b_0840f82601_0831_131955, 13:24-13:26).
+
+        The first TP forward after a pp_to_tp cutover touches a Triton shape
+        specialisation that has never been loaded in this process. Rank 0's
+        crash-time stack (log line 53248 ff.):
+
+            _dcp_write_scatter (flashinfer_backend.py:2574)
+              run (triton/runtime/jit.py:743)
+                _init_handles (triton/compiler/compiler.py:466)
+                  loadBinary -> cuModuleLoadData (libcuda.so) + 11 libcuda frames
+
+        NOT the compiler -- ``cuModuleLoadData``. The module is built; LOADING
+        it into the CUDA context is what blocks, because the load needs the
+        device and the device is saturated by the peers' barlink BAR1 spin
+        kernels, which are waiting in ``all_gather`` for this very rank. The
+        cycle closes and the spin deadline fires:
+        ``Bar1CollectiveAborted: rank 1/3 group flip_dcp:0, a spin kernel took
+        its abort path, observed at all_gather`` -> SIGQUIT, all three ranks.
+
+        WHY THE EXISTING MECHANISM DID NOT COVER IT. ``cold_build_window``
+        publishes a marker the peers read without cooperation (#615), and they
+        extend their deadlines under a 900 s cap. It fired 352 times in that
+        boot -- and ZERO times in 13:24-13:26. All 352 carry the reason
+        ``full cuda-graph capture warmup``. Its three production callers are
+        barlink's own BAR1 build, the flashinfer sampling warmup (#603b) and
+        the capture warmup; none of them is on the path a cutover re-dispatches
+        into. This is #640 on a path #615 never saw, and the fix is to make
+        that path a caller -- not to build a second mechanism beside it.
+
+        A STALE COMMENT NEARLY SENT THIS THE WRONG WAY, and it is worth naming
+        because the same trap is one file away. ``layers/sampler_warmup.py``
+        states that wrapping a lazy build in ``cold_build_window`` "does NOT
+        work ... the window is PROCESS-LOCAL, and the rank that aborts is the
+        one NOT building". That was true when it was written -- 8bddb93d16,
+        2026-08-06 -- and #615 falsified it ONE DAY LATER (38ec4fb348,
+        2026-08-07), by hooking publication into ``cold_build_window`` itself
+        so that "every existing call site therefore becomes group-visible
+        without moving". The comment was never revised. Both commits are
+        ancestors of this pin. Checked, not assumed.
+
+        WHY A COUNT AND NOT A WARMUP-PLUS-BARRIER. An explicit warmup has to
+        name the kernels it warms, and the set is not knowable by inspection:
+        it varies with direction, with spec-decode, with the #887 one-chunk
+        grant, and with every backend swap. Missing one member reproduces the
+        wedge exactly, at the next first-loader. Running the real forwards
+        inside a published window needs no such list -- whatever loads, loads
+        under the window. The residual honesty: this EXTENDS deadlines rather
+        than removing the race, and the extension is capped at 900 s. Boot 22's
+        stall was ~150 s, so the cap is not the binding term here; if a future
+        stall ever approaches it, the answer is the rendezvous warmup, and that
+        is a bigger change than this one.
+        """
+        n = getattr(self, "_post_cutover_build_batches", 0)
+        if n <= 0:
+            return self._run_batch_forward(batch, pp_proxy_tensors)
+        self._post_cutover_build_batches = n - 1
+        from sglang.srt.utils.jit_cold_build import cold_build_window
+
+        idx = int(self.POST_CUTOVER_BUILD_BATCHES) - n + 1
+        reason = (
+            f"post-cutover first forwards, {self.phase_flip_active_stack} layout "
+            f"({idx}/{self.POST_CUTOVER_BUILD_BATCHES})"
+        )
+        # #1033c LOUD ON PURPOSE (the #640 lesson, built in on the new path
+        # rather than learned again): a multi-minute module load must read as a
+        # BUILD, not as a fresh hang. `cold_build_window` logs its own open and
+        # close; this pair adds the per-rank duration so a long cold load is
+        # attributable to this window and to nothing else.
+        _t0 = time.monotonic()
+        logger.warning(
+            "%s #1033c CUTOVER FORWARD WARMUP begin: %s. Shapes first touched "
+            "in this layout load their Triton modules now; the window is "
+            "PUBLISHED so peers stretch their collective deadlines instead of "
+            "aborting the group (#615). A minutes-long pause here is a cold "
+            "module load, not a wedge.",
+            f"[rank {self.attn_tp_rank if hasattr(self, 'attn_tp_rank') else '?'}]",
+            reason,
+        )
+        try:
+            with cold_build_window(reason):
+                return self._run_batch_forward(batch, pp_proxy_tensors)
+        finally:
+            logger.warning(
+                "#1033c CUTOVER FORWARD WARMUP done: %s in %.1f ms. "
+                "%d warmed forward(s) left in this window budget.",
+                reason,
+                (time.monotonic() - _t0) * 1e3,
+                self._post_cutover_build_batches,
+            )
+
+    def _run_batch_forward(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -14661,10 +14769,27 @@ def run_phase_flip_event_loops(scheduler: Scheduler):
                 scheduler.event_loop_pp()
             return
         except PhaseFlipLoopExit as e:
+            # #1033c: ARM THE PUBLISHED BUILD WINDOW FOR THE NEW LAYOUT'S FIRST
+            # FORWARDS. This is the one place that knows a layout change just
+            # committed, and the forwards that follow it are the ones that touch
+            # shapes never loaded in this process. See `Scheduler.run_batch` for
+            # the measured defect (boot 22: cuModuleLoadData blocked behind the
+            # peers' spin kernels -> Bar1CollectiveAborted).
+            #
+            # Set on EVERY re-dispatch, in both directions: pp_to_tp is where it
+            # was caught, but tp_to_pp re-enters the PP loop on shapes that are
+            # equally cold after a long TP phase, and nothing about the defect
+            # is direction-specific.
+            scheduler._post_cutover_build_batches = int(
+                getattr(scheduler, "POST_CUTOVER_BUILD_BATCHES", 8)
+            )
             logger.warning(
-                "PHASE-FLIP event loop re-dispatch after %s (active stack now %s)",
+                "PHASE-FLIP event loop re-dispatch after %s (active stack now "
+                "%s); #1033c armed a published JIT build window for the next "
+                "%d forward(s) of the new layout",
                 e.direction,
                 scheduler.phase_flip_active_stack,
+                scheduler._post_cutover_build_batches,
             )
             continue
 

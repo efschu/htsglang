@@ -2293,8 +2293,46 @@ class HiCacheController:
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
+
+        #1033d: ONE FAILED OPERATION MUST NOT END THE THREAD.
+        Measured, boot 22 (`boot_855_1033b_0840f82601_0831_131955`, 13:23:57,
+        three seconds before the cutover re-dispatch): a page whose geometry
+        did not match the incoming binding raised out of `_page_transfer` --
+
+            pool_host/mha.py:556  data_page.reshape(...)
+            RuntimeError: shape '[2, 16, 1, 4, 256]' is invalid for input of
+            size 16384          (2*16*1*4*256 = 32768 against a 16384 page)
+
+        -- and because only `Empty` was caught, the exception left the `while`
+        and the thread was GONE for the rest of the boot. Nothing noticed: a
+        worker thread's death kills no process, sets no exit code and appears
+        in no health probe. Storage prefetch was simply dead from then on.
+
+        THE UNDERLYING DEFECT IS NOT FIXED HERE and this guard must not be
+        mistaken for its fix. Two lines above that traceback the log carries
+        the fork's own diagnosis of the same mismatch --
+        `#939 RE-HOME VIA RE-READ ... source page 16384 elems vs destination
+        page 32768 elems` -- alongside `[#719 hicache-rebind] rebound 3
+        reader(s) to the 'tp' pools (generation 3)`. The host pool carries TWO
+        page geometries across a flip; the #939 re-home path knows both and
+        re-reads, this path does not. That is the #718/#719/#875 family and a
+        violation of the standing phase-uniformity law (two geometries for one
+        key is a bug). It is its own posten.
+
+        WHY A BROAD `except` IS DEFENSIBLE HERE, given that warn-then-continue
+        is a catalogued defect class in this tree: the comparison is not
+        "swallow vs. propagate", it is "swallow vs. SILENT THREAD DEATH",
+        because there is no supervisor above this loop to receive the raise.
+        The three properties that keep it from becoming the anti-pattern:
+        the operation is FAILED rather than silently skipped (its host memory
+        is released, so the requester gets a refusal instead of waiting for a
+        completion that can never come); the line is loud and names the
+        consequence; and it CARRIES A COUNTER, so a path that fails constantly
+        cannot read like a path that failed once.
         """
+        n_failed = 0
         while not self.storage_stop_event.is_set():
+            operation = None
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
@@ -2308,6 +2346,36 @@ class HiCacheController:
                     generation=getattr(operation, "binding_generation", None),
                 )
             except Empty:
+                continue
+            except Exception:  # noqa: BLE001 - see the docstring: the only
+                # alternative is a dead thread nobody is told about.
+                n_failed += 1
+                logger.error(
+                    "#1033d PREFETCH IO REFUSED: page transfer raised; this "
+                    "operation is FAILED and its host slots are released, and "
+                    "the aux thread STAYS ALIVE (before #1033d this raise ended "
+                    "the thread and storage prefetch died silently for the rest "
+                    "of the boot). Failures on this thread so far: %d. A "
+                    "reshape/geometry error here is the two-geometry host pool "
+                    "across a flip -- see the '#939 RE-HOME VIA RE-READ ... "
+                    "source page N elems vs destination page M elems' line, "
+                    "which is the same mismatch handled correctly elsewhere.",
+                    n_failed,
+                    exc_info=True,
+                )
+                if operation is not None:
+                    try:
+                        self.append_host_mem_release(
+                            operation.host_indices[operation.completed_tokens :],
+                            generation=getattr(operation, "binding_generation", None),
+                        )
+                    except Exception:  # noqa: BLE001 - a release may not re-kill
+                        logger.error(
+                            "#1033d and the release of the failed operation's "
+                            "host slots ALSO raised; those slots leak until the "
+                            "binding is torn down. Named, not hidden.",
+                            exc_info=True,
+                        )
                 continue
 
     def prefetch_rate_limited(self) -> bool:
