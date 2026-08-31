@@ -9282,6 +9282,16 @@ class Scheduler(
 
         if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
             self.tree_cache.check_hicache_events()
+            # #811: release anchor pins whose write-through ack just drained,
+            # BEFORE this tick's admissions allocate -- so an acked-but-still
+            # -pinned checkpoint can never crowd out an admission in the same
+            # tick. Only requests in the RUNNING batch are swept: their first
+            # extend result has been processed, so the deferred mamba COW
+            # read of the matched anchor has provably executed. No-op unless
+            # --mamba-anchor-ack-release armed the mechanism.
+            release_pins = getattr(self.tree_cache, "release_acked_anchor_pins", None)
+            if release_pins is not None and self.running_batch is not None:
+                release_pins(self.running_batch.reqs)
 
         # #580: rank-uniform entry into the prefetch-progress collectives.
         # MUST stay above every early return and every loop exit below -- all

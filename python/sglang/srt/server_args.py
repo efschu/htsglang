@@ -6038,6 +6038,21 @@ class ServerArgs:
             "SGLANG_MAMBA_SLOT_REORDER (#781)."
         ),
     ] = None
+    mamba_anchor_ack_release: A[
+        Optional[bool],
+        Arg(
+            help="#811: release a running request's mamba anchor pin as soon "
+            "as the anchor's write-through backup is ACKNOWLEDGED, instead of "
+            "holding it until the request finishes. Requires the #755/#773 "
+            "slot reorder to be active (--mamba-slot-reorder plus a "
+            "write-through hierarchical cache); refused together with "
+            "kv-session-offload, streaming sessions, session radix cache, "
+            "and PD disaggregation, whose lock-release sites do not carry "
+            "the release marker. Arms the reduced mamba pool floor "
+            "(per-request pinned-checkpoint term becomes retention-budget "
+            "funded). Planner-emitted; no environment variable form."
+        ),
+    ] = None
     uneven_dcp: A[
         Optional[bool],
         Arg(

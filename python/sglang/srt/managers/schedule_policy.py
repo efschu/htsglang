@@ -1415,6 +1415,12 @@ class PrefillAdder:
         result = self.tree_cache.inc_lock_ref(req.last_node)
         if self.is_hybrid_swa:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
+        # #811: record (never settle) the admission anchor pin. The matched
+        # anchor is the request's deferred-COW source until the first extend
+        # forward has run, so only the running-batch sweep may release it.
+        note_anchor_pin = getattr(self.tree_cache, "note_anchor_pin", None)
+        if note_anchor_pin is not None:
+            note_anchor_pin(req, result, settle=False)
 
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None

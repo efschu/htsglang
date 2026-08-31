@@ -1232,6 +1232,15 @@ class Req(ReqDllmMixin):
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
         self.swa_prefix_lock_released: bool = False
+        # #811 (mamba anchor ack release; both maintained only while the
+        # feature is armed, see mamba_anchor_ack_release_active):
+        # whether this request currently holds a MAMBA component ref on
+        # req.last_node ...
+        self.mamba_anchor_pin_held: bool = False
+        # ... and whether that ref was released early (at/after the
+        # write-through ack), so the next dec_lock_ref of req.last_node must
+        # skip the MAMBA component. Mirrors swa_prefix_lock_released.
+        self.mamba_anchor_pin_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
@@ -2312,6 +2321,11 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
+        # #811: the retraction's dec_lock_ref (release_kv_cache ->
+        # cache_finished_req) has already consumed these, in the same order
+        # the SWA pair above relies on.
+        self.mamba_anchor_pin_held = False
+        self.mamba_anchor_pin_released = False
         self.extend_range = None
         # #987: the carried fill tail is a statement about ONE pass's seam
         # divergence, and a retraction ends that pass. Left standing it would

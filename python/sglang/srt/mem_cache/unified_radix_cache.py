@@ -808,6 +808,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._mamba_pin_skipped = 0
         # #1028 chunk publish (see `_inc_hit_count`).
         self._chunk_publish_n = 0
+        # #811: lazily resolved for the same reason as the pin budget above.
+        self._anchor_ack_release_armed_cached: Optional[bool] = None
         # #841: host-only inserts declined for breaking the contiguous-backup
         # law. Counted rather than silent, so a collapsing storage hit rate is
         # attributable to the law and not to the backend.
@@ -1159,6 +1161,163 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
         return self.dec_mamba_lock_only(req.last_node)
 
+    # ---- #811: release the admission anchor pin at the write-through ack ----
+
+    @property
+    def _anchor_ack_release_armed(self) -> bool:
+        """Config-level gate for the #811 mechanism, resolved once.
+
+        The per-node question -- may THIS pin be released NOW -- is always
+        `MambaComponent.anchor_release_admissible` (host copy present AND the
+        ack landed); this property never substitutes for it.
+        """
+        if self._anchor_ack_release_armed_cached is None:
+            from sglang.srt.mem_cache.mamba_pool_floor import (
+                mamba_anchor_ack_release_active,
+            )
+            from sglang.srt.runtime_context import get_server_args
+
+            self._anchor_ack_release_armed_cached = mamba_anchor_ack_release_active(
+                get_server_args()
+            ) and (ComponentType.MAMBA in self.tree_components)
+        return self._anchor_ack_release_armed_cached
+
+    @staticmethod
+    def _mamba_ref_taken(result: IncLockRefResult, node: Any) -> bool:
+        """Did the inc_lock_ref that produced `result` take a MAMBA ref on
+        `node`? False for a tombstone (the component recorded the skip)."""
+        skipped = result.skip_lock_node_ids.get(ComponentType.MAMBA)
+        return not (skipped and node.id in skipped)
+
+    def note_anchor_pin(
+        self, req, lock_result: IncLockRefResult, settle: bool = True
+    ) -> None:
+        """#811: record (and optionally settle) the anchor pin just taken on
+        `req.last_node` by an inc_lock_ref whose result is `lock_result`.
+
+        Armed only. `settle=False` is the ADMISSION site: the matched
+        anchor's state is the request's deferred-COW SOURCE
+        (`req.mamba_cow_src_index`, copied only at the start of the first
+        extend forward pass -- model_runner's
+        `_maybe_execute_deferred_mamba_cow_and_clear`), so the pin MUST
+        survive until that copy has provably executed. Only the sweep, which
+        runs over the running (decode) batch -- i.e. over requests whose
+        extend result has been processed -- may release it.
+
+        `settle=True` is the CHUNK-BOUNDARY site: the freshly pinned node
+        holds a donated COPY of the request's own state, which the request
+        never reads back. Three outcomes for a pin that was actually taken:
+
+        * backup ACKED (`anchor_release_admissible`) -- the persistent copy
+          exists; release here, exactly as the sweep would later;
+        * backup IN FLIGHT -- keep the pin; the sweep releases it after
+          `_finish_write_through_ack` retires the ack;
+        * NO backup and none in flight (pin budget refused it, or the
+          write-through threshold has not admitted it) -- the pin is not
+          allowed to persist: it is given back in the same step, before
+          anything could rely on it. This is the #581 half of the floor
+          argument: with the per-request pinned-checkpoint term dropped, a
+          persistent pin may only exist while the retention budget bounds
+          it. The state itself stays cached on the device and stays
+          evictable -- the same soft degradation the pin budget already
+          chose in `write_backup` -- and it has no host copy a resume could
+          half-read, so the #767 failure shape is structurally absent here.
+        """
+        if not self._anchor_ack_release_armed:
+            return
+        node = req.last_node
+        req.mamba_anchor_pin_released = False
+        req.mamba_anchor_pin_held = (
+            node is not None
+            and node is not self.root_node
+            and len(node.component_data) > int(ComponentType.MAMBA)
+            and node.component_data[ComponentType.MAMBA].value is not None
+            and self._mamba_ref_taken(lock_result, node)
+        )
+        if not req.mamba_anchor_pin_held or not settle:
+            return
+        comp = self.components.get(ComponentType.MAMBA)
+        if comp is None:
+            return
+        if comp.anchor_release_admissible(node):
+            # Acked backup: release now rather than waiting for the sweep.
+            if self.dec_mamba_lock_only(node):
+                req.mamba_anchor_pin_held = False
+                req.mamba_anchor_pin_released = True
+        elif node.id not in self.ongoing_write_through:
+            # No backup and none in flight: the pin must not persist.
+            if self.dec_mamba_lock_only(node):
+                req.mamba_anchor_pin_held = False
+                req.mamba_anchor_pin_released = True
+
+    def release_acked_anchor_pin(self, req) -> bool:
+        """#811 sweep primitive: release `req`'s anchor pin iff its backup is
+        acked. Returns True when a ref was actually given back.
+
+        Safe to call every scheduler tick: unarmed, pin-less, and
+        already-released requests fall through on attribute checks. The
+        admissibility gate is `anchor_release_admissible` -- an in-flight
+        backup (node still in `ongoing_write_through`) is refused, which is
+        the #767 invariant: no release before the persistent copy exists.
+        """
+        if not self._anchor_ack_release_armed:
+            return False
+        if not getattr(req, "mamba_anchor_pin_held", False):
+            return False
+        if req.mamba_anchor_pin_released:
+            return False
+        node = req.last_node
+        comp = self.components.get(ComponentType.MAMBA)
+        if node is None or comp is None:
+            return False
+        if not comp.anchor_release_admissible(node):
+            # A held pin whose node has no host copy and no backup in flight
+            # would otherwise stay pinned until the request finishes -- the
+            # per-request term the armed floor no longer reserves. Re-issue
+            # the backup (still bounded by the write-through pin budget; a
+            # refusal is retried at the next sweep), so the ack that permits
+            # this release eventually arrives.
+            cd = (
+                node.component_data[ComponentType.MAMBA]
+                if len(node.component_data) > int(ComponentType.MAMBA)
+                else None
+            )
+            if (
+                cd is not None
+                and cd.value is not None
+                and cd.host_value is None
+                and node.id not in self.ongoing_write_through
+            ):
+                self.write_backup(node)
+            return False
+        if not self.dec_mamba_lock_only(node):
+            return False
+        req.mamba_anchor_pin_held = False
+        req.mamba_anchor_pin_released = True
+        return True
+
+    def release_acked_anchor_pins(self, reqs) -> int:
+        """Sweep `release_acked_anchor_pin` over `reqs`; returns releases."""
+        if not self._anchor_ack_release_armed:
+            return 0
+        released = 0
+        for req in reqs:
+            if self.release_acked_anchor_pin(req):
+                released += 1
+        return released
+
+    def _anchor_dec_skip(self, req, dec_params: DecLockRefParams) -> None:
+        """#811: make `dec_params` skip the MAMBA ref of `req.last_node` when
+        that ref was already given back early, and consume the marker."""
+        if not self._anchor_ack_release_armed:
+            return
+        if req.mamba_anchor_pin_released and req.last_node is not None:
+            dec_params.skip_lock_node_ids.setdefault(ComponentType.MAMBA, set()).add(
+                req.last_node.id
+            )
+        req.mamba_anchor_pin_held = False
+        req.mamba_anchor_pin_released = False
+
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult()
@@ -1304,9 +1463,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
+        finish_dec_params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        # #811: an anchor pin already released at the write-through ack must
+        # not be decremented a second time here. Covers retraction too --
+        # release_kv_cache funnels into this method.
+        self._anchor_dec_skip(req, finish_dec_params)
         self.dec_lock_ref(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+            finish_dec_params,
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
@@ -1344,7 +1508,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # coexist and the request holds `active + donated` rather than
         # `active + donated + old pin`. Only admissible for a node whose host
         # copy has actually landed -- see MambaComponent.anchor_release_admissible.
-        mamba_anchor_released = self._mamba_anchor_early_release(req)
+        #
+        # #811 (armed only): the pin may ALREADY be gone -- released at the
+        # write-through ack by the sweep, or never persisted (note_anchor_pin).
+        # Then the reorder must not release a ref this request no longer
+        # holds; the dec below still needs the skip either way.
+        if self._anchor_ack_release_armed:
+            released_this_call = (
+                not req.mamba_anchor_pin_released
+                and req.mamba_anchor_pin_held
+                and self._mamba_anchor_early_release(req)
+            )
+            if released_this_call:
+                req.mamba_anchor_pin_held = False
+                req.mamba_anchor_pin_released = True
+            mamba_anchor_released = req.mamba_anchor_pin_released
+        else:
+            released_this_call = mamba_anchor_released = (
+                self._mamba_anchor_early_release(req)
+            )
 
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1364,7 +1546,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
 
         if effective_cache_len <= 0:
-            if mamba_anchor_released:
+            if released_this_call:
                 # #773: nothing was inserted, so no new anchor will take over
                 # the pin we dropped -- and `req.last_node` is unchanged, so
                 # the NEXT dec_lock_ref for it would decrement a mamba ref
@@ -1373,9 +1555,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # imbalance forward. Re-acquiring a node whose state was
                 # evicted inside the window is still correct: the component
                 # records the skip and the paired release honours it.
+                #
+                # #811: only for a release performed IN THIS CALL. A pin the
+                # ack already released stays released -- `req.last_node` is
+                # unchanged and the request's release marker keeps steering
+                # every later dec around it.
                 self.components[ComponentType.MAMBA].acquire_component_lock(
                     node=req.last_node, result=IncLockRefResult()
                 )
+                if self._anchor_ack_release_armed:
+                    req.mamba_anchor_pin_held = True
+                    req.mamba_anchor_pin_released = False
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
@@ -1435,6 +1625,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        # #811: the request now anchors at `new_last_node`, a donated COPY of
+        # its own state it never reads back -- settle the fresh pin (release
+        # if acked, keep only while a backup is in flight).
+        self.note_anchor_pin(req, lock_result, settle=True)
 
         # cleanup
         for comp in self._components_tuple:
