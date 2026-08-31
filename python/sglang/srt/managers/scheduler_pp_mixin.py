@@ -331,6 +331,10 @@ def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, ob
                     # load-back", i.e. exactly the behaviour before this field
                     # existed.
                     e.load_back_len,
+                    # #968: the prefix identity that extent is ABOUT. Travels
+                    # with it or not at all -- an extent whose key a receiver
+                    # cannot read names a cache state it cannot identify.
+                    e.load_back_key,
                 )
                 for e in decision.entries
             ),
@@ -374,6 +378,9 @@ def _pp_admission_entry_from_row(row: Sequence) -> PPAdmissionEntry:
         # #968/#1035: same index-and-width discipline as the #987 pair above.
         load_back_len=(
             row[10] if n > _ADMISSION_ROW_WIDTH_PRE_987 + 2 else None
+        ),
+        load_back_key=(
+            row[11] if n > _ADMISSION_ROW_WIDTH_PRE_987 + 3 else None
         ),
     )
 
@@ -4174,6 +4181,27 @@ class SchedulerPPMixin:
                     _lb_eff = dict(getattr(self, "_pp_load_back_effective", None) or {})
                     _lb_eff.update(_lb_new)
                     self._pp_load_back_effective = _lb_eff
+                    # #968 THE SUCCESS INSTRUMENT, and the reason it exists: up
+                    # to here the chain had only a FAILURE marker (LOAD-BACK
+                    # DEFERRED) and an APPLICATION marker (#988 LOADBACK), so
+                    # the middle -- did the fact ever arrive and get promoted --
+                    # was blind, and two boots of "0 applied" could not be
+                    # attributed to a missing publish, a missing hop or a
+                    # missing consume. This line is the difference between
+                    # "nobody sent it" and "it arrived and nobody used it".
+                    # Low cadence: first five promotions, then every 64th.
+                    _n = getattr(self, "_968_promote_n", 0) + 1
+                    self._968_promote_n = _n
+                    if _n <= 5 or _n % 64 == 0:
+                        logger.info(
+                            "#968 LOAD-BACK PROMOTED n=%d new=%d live=%d "
+                            "extents=%s -- PP0 extents this rank may now apply "
+                            "(keyed by prefix identity, not rid).",
+                            _n,
+                            len(_lb_new),
+                            len(_lb_eff),
+                            sorted(_lb_new.values())[:5],
+                        )
                 self._pp_load_back_pending = None
                 # The forward payload is PASS-SCOPED, unlike the two above: a
                 # rank owes its downstream only what it learned THIS pass. Left
@@ -9010,9 +9038,9 @@ class SchedulerPPMixin:
                     self._pp_load_back_wire
                 )
                 _lb_map = {
-                    _e.rid: int(_e.load_back_len)
+                    _e.load_back_key: int(_e.load_back_len)
                     for _e in _lb_decision.entries
-                    if _e.load_back_len
+                    if _e.load_back_len and _e.load_back_key is not None
                 }
                 # ONE FIELD OF THE ROW, DELIBERATELY. The row carries PP0's
                 # whole admission decision; this slice consumes `load_back_len`

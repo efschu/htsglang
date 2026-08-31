@@ -2235,6 +2235,53 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                # #968 S1: THE TOLD EXTENT DECIDES *HOW MUCH*, NOT MERELY
+                # *WHETHER* -- enforced HERE because the callee cannot.
+                #
+                # `init_load_back` consumes `host_hit_length` ONLY as a boolean
+                # trigger (unified_radix_cache.py:4981-4988); the amount it
+                # actually returns is this rank's LOCAL node run,
+                # `_collect_new_prefix_indices()` at :4990, and `load_back()`
+                # never sees the number at all. Without the clamp below, "every
+                # rank applies the same number" is unbacked: the told value only
+                # gates the call, and each rank then grows its prefix by its own
+                # local amount -- which is exactly the 1815081d46 divergence
+                # this slice exists to make impossible, reintroduced one layer
+                # down.
+                #
+                # AND THE SKEW IS NOT HYPOTHETICAL, IT IS THE NORMAL CASE: the
+                # extent is published one lap before it is applied and is keyed
+                # by content, so it is STALE-LOW by construction -- the same
+                # rid's host hit was measured growing 1215 -> 1216 -> 2114
+                # across cutovers. told < local is therefore the expected
+                # relation, not the exception.
+                #
+                # CLAMP DOWN rather than refuse: stale-low is the SAFE
+                # direction (fewer revived tokens = more recompute, never more
+                # memory), it keeps the hit instead of throwing the pass away,
+                # and it makes the applied length identical on every rank by
+                # construction. A rank that cannot even reach `told` has a
+                # genuinely different host tier and refuses loudly instead.
+                # Only under a PP0 fact: `pp_load_back_told is None` is the
+                # `pp_size <= 1` path, which stays byte-for-byte upstream.
+                if getattr(req, "pp_load_back_told", None) is not None:
+                    _applied = int(new_indices.numel())
+                    if _applied > _lb_extent:
+                        new_indices = new_indices[:_lb_extent]
+                    elif _applied < _lb_extent:
+                        from sglang.srt.managers.pp_admission_congruence import (
+                            PPScheduleRefused,
+                        )
+
+                        raise PPScheduleRefused(
+                            f"#968 LOAD-BACK EXTENT UNREACHABLE for rid="
+                            f"{getattr(req, 'rid', '?')}: PP0 published an "
+                            f"extent of {_lb_extent} token(s) and this rank's "
+                            f"load-back yielded only {_applied}. Growing by the "
+                            f"smaller amount would leave this rank at a "
+                            f"different prefix length than its peers -- the "
+                            f"shape divergence boot 1815081d46 died in."
+                        )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len

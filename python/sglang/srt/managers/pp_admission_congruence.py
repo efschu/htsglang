@@ -431,12 +431,27 @@ class PPAdmissionEntry:
     holds it. Uniformity is then CONSTRUCTIVE -- the number comes from one
     rank -- rather than a bet that two ranks measured the same thing.
 
-    THE COST, STATED. One pass of latency per rid, which lands exactly on a
-    chunk boundary: the first chunk of a cold-warm request computes without
-    the prefix (that is the batch whose frame carries this fact), and every
-    later chunk honours it. The loss is therefore bounded by ONE HiCache
-    chunk by construction -- the standing #939 bound -- and not by the
-    prompt.
+    THE COST, STATED HONESTLY -- AND AN EARLIER VERSION OF THIS PARAGRAPH WAS
+    WRONG. It claimed "the first chunk computes without the prefix and every
+    later chunk honours it". THAT IS NOT WHAT THE CODE DOES: the only consumer
+    of this fact is in `PrefillAdder.add_one_req`; `add_chunked_req` has NO
+    load-back site, so the later chunks of an already-admitted request do not
+    consume it. The claim described an intention, not a mechanism, and it is
+    corrected here rather than left to be read as a guarantee.
+
+    WHAT IS ACTUALLY PAID: the request that DISCOVERS an extent never benefits
+    from it -- it defers, publishes, and runs its whole prefill uncached. The
+    benefit lands on the next request over the same content, which is a FRESH
+    admission through `add_one_req` and therefore does consume it. Since a warm
+    hit is by definition a different request carrying the same prompt, that is
+    exactly the case this exists for; what is genuinely lost is the remaining
+    chunks of the FIRST request to see a given prefix.
+
+    NOT MIRRORED INTO `add_chunked_req` DELIBERATELY. That would put a second
+    prefix mutation on the chunked path, which is the seam #965/#988 record as
+    having already cost a boot (`extend_range.start == len(prefix_indices)`
+    re-derived at the mutation, not at the exits). One consumer, one mutation
+    site.
 
     MEASURED, boot_855_939reread_0840f82601_0830_232150: 15/15 `#1035
     RANK-LOCAL LOAD-BACK REFUSED` lines, 5 rids x 3 ranks, host hit
@@ -444,6 +459,34 @@ class PPAdmissionEntry:
     uniformity is a HAZARD READING, never a licence: it says the offered
     extent will normally be honourable, NOT that a rank may derive one
     locally when the fact is absent."""
+
+    load_back_key: Optional[int] = None
+    """#968: the PREFIX IDENTITY `load_back_len` is about (`offered_prefix_key`).
+
+    THE FACT IS KEYED BY CONTENT, NOT BY RID, and that correction is what makes
+    the mechanism reach the case it exists for. Measured,
+    boot_855_968sticky_0840f82601_0831_063048: five rids, three ranks, every rid
+    deferring EXACTLY ONCE (`occurrence=1..5` on each rank). A request reaches
+    the load-back site once, and the extent is only learned DURING that visit --
+    so a rid-keyed fact is always one visit too late for the rid it names, and
+    the sticky map never had anything to hand back.
+
+    Worse, the warm hit is by definition a DIFFERENT request: the acceptance
+    cell's `mid_cold`, `mid_warm` and `mid_warm2` carry identical content under
+    three distinct rids, so a rid-keyed extent can never travel from the request
+    that discovered it to the request that needs it. Keyed by prefix identity it
+    travels across rids, across cutovers, and across the one-lap delivery lag at
+    once.
+
+    KEYED ON THE FULL FILL, not on the device match. `offered_prefix_key`
+    returns None for `prefix_len <= 0`, and the device match at the moment of
+    the offer is measured as 0 on exactly the warm path this serves (`#969
+    EXTENT` tuples read `(rid, 0, 350, 0, 350)`), so a device-match key would be
+    None precisely when it is needed. The full fill is stable between two
+    requests carrying the same prompt, which is the identity the hit is about.
+
+    `None` means "no identity available", and a receiver treats that exactly as
+    `load_back_len=None`: no load-back, recompute, never a local substitute."""
 
 
 @dataclass(frozen=True)
@@ -1401,6 +1444,7 @@ def build_pp_admission_decision(
                     # the defect is how #995's first version manufactured false
                     # refusals.
                     load_back_len=getattr(req, "pp_load_back_offer", None),
+                    load_back_key=getattr(req, "pp_load_back_key", None),
                 )
             )
             continue
@@ -1484,6 +1528,7 @@ def build_pp_admission_decision(
                 last_chunk=_last_chunk_verdict(told, extend_len, fallback_fill_len),
                 # #968/#1035: same offer, same reader, on the fallback branch.
                 load_back_len=getattr(req, "pp_load_back_offer", None),
+                load_back_key=getattr(req, "pp_load_back_key", None),
             )
         )
     return PPAdmissionDecision(mb_id=mb_id, entries=tuple(entries))

@@ -10272,9 +10272,26 @@ class Scheduler(
                 # from the pass before it. Same discipline as the reset block at
                 # the top of the loop body: a pass that receives nothing must
                 # inherit no statement.
+                # KEYED BY CONTENT, NOT BY RID. A request reaches the load-back
+                # site exactly once and only learns the extent DURING that
+                # visit, so a rid-keyed fact is always one visit too late for
+                # the rid that named it; and the warm hit this serves is by
+                # definition a DIFFERENT request carrying the same prompt.
+                # Measured both ways in boot_855_968sticky (5 rids, 3 ranks,
+                # every rid deferring exactly once).
+                from sglang.srt.managers.pp_admission_congruence import (
+                    offered_prefix_key as _lb_key_of,
+                )
+
+                _fill = getattr(req, "full_untruncated_fill_ids", None)
+                req.pp_load_back_key = (
+                    None if _fill is None else _lb_key_of(_fill, len(_fill))
+                )
                 _lb_map = getattr(self, "_pp_load_back_effective", None)
                 req.pp_load_back_told = (
-                    None if _lb_map is None else _lb_map.get(req.rid)
+                    None
+                    if (_lb_map is None or req.pp_load_back_key is None)
+                    else _lb_map.get(req.pp_load_back_key)
                 )
                 # PP0 RE-OFFERS EVERY PASS, and that is what makes the mechanism
                 # self-correcting rather than authoritative: if the extent does
@@ -10293,8 +10310,8 @@ class Scheduler(
                 # the same pass keeps the newer offer.
                 if getattr(req, "pp_load_back_applied", False):
                     req.pp_load_back_applied = False
-                    if _lb_map:
-                        _lb_map.pop(req.rid, None)
+                    if _lb_map and req.pp_load_back_key is not None:
+                        _lb_map.pop(req.pp_load_back_key, None)
 
             try:
                 res = adder.add_one_req(
@@ -10569,9 +10586,9 @@ class Scheduler(
             # one pass at a prefix its peers cannot reach, which is precisely
             # the divergence boot 1815081d46 died in.
             _lb_pending = {
-                _e.rid: int(_e.load_back_len)
+                _e.load_back_key: int(_e.load_back_len)
                 for _e in self._pp_admission_last_built_decision.entries
-                if _e.load_back_len
+                if _e.load_back_len and _e.load_back_key is not None
             }
             self._pp_load_back_pending = _lb_pending or None
             # THE ROW ITSELF IS WHAT TRAVELS, not the extracted number. The
