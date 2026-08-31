@@ -356,7 +356,8 @@ def _1061_emit_census(reason: str) -> None:
         logger.warning(
             "#1060b/#1061 TOLD-APPLY CENSUS (%s): apply_reached=%d "
             "no_fact=%d refused_epoch=%d epoch_ok=%d adopted=%d "
-            "not_adopted=%d | refused_epoch_lines_emitted=%d "
+            "not_adopted=%d | retract_seen=%d told_cleared_at_retract=%d "
+            "| refused_epoch_lines_emitted=%d "
             "refused_epoch_lines_suppressed=%d. `apply_reached` is the "
             "denominator: how often the apply site ran at all. adopted>0 is "
             "the ONLY positive proof that a told row travelled AND took "
@@ -371,6 +372,8 @@ def _1061_emit_census(reason: str) -> None:
             s.get("epoch_ok", 0),
             s.get("adopted", 0),
             s.get("not_adopted", 0),
+            s.get("retract_seen", 0),
+            s.get("told_cleared_at_retract", 0),
             s.get("refused_epoch_lines", 0),
             max(0, refused - s.get("refused_epoch_lines", 0)),
         )

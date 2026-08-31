@@ -5405,7 +5405,50 @@ class Scheduler(
         times for skipping that step.
 
         Instrument only: one warning per retraction, nothing branches on it.
+
+        #1061b: IT IS NO LONGER ONLY AN INSTRUMENT -- it is also where a told
+        row about this request's PRE-RETRACTION state is dropped, and this is
+        the chokepoint every retraction passes.
+
+        WHY THE EPOCH WAS THE WRONG CLOCK, measured on boot 31. #1061 keyed the
+        told row to the cutover epoch; the boot died anyway, with
+        `refused_epoch=0` and `epoch_ok=1` on the raising rank -- the gate was
+        consulted, agreed, and the raise came after it. The reason is that
+        `PhaseFlipRuntime._epoch` advances at cutover COMPLETION, while the
+        destructive act -- `_release_residents_for_cutover` dropping the tree
+        and re-admitting the residents -- runs BEFORE completion, inside the
+        SAME epoch. The staleness window is not between epochs; it is inside
+        one. An epoch test cannot see it, by construction.
+
+        THE RETRACTION IS THE EVENT, and it is a GROUP event, not a rank-local
+        one: boot 31 shows `#969AD RETRACT site=readmit_seam_residents` exactly
+        once on PP0, PP1 and PP2 -- one per rank, same cutover, same rid. So
+        clearing here is uniform for the same reason the epoch test was meant to
+        be, and it is strictly finer: it fires at the destructive act itself
+        rather than at the counter that trails it. Same shape as #946's mark,
+        which "invalidates ITSELF on a retract or cutover".
+
+        A told row describes a prefix this request HELD. A retraction is
+        precisely the statement that it no longer holds it, so the row is not
+        stale-by-suspicion here, it is stale by definition. Dropping it routes
+        into the contract's own no-adopt path: the rank runs its own geometry
+        and the request proceeds.
         """
+        try:
+            from sglang.srt.managers.schedule_batch import _1061_bump as _bump_1061
+
+            _bump_1061("retract_seen")
+            if getattr(req, "_1059_told_prefix", None) is not None:
+                _bump_1061("told_cleared_at_retract")
+            for _attr in (
+                "_1059_told_prefix",
+                "_1059_told_extend",
+                "_1059_told_epoch",
+            ):
+                if hasattr(req, _attr):
+                    setattr(req, _attr, None)
+        except Exception:  # noqa: BLE001 - a clear may never break a retract
+            pass
         try:
             n = getattr(self, "_969ad_n", 0) + 1
             self._969ad_n = n

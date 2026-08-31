@@ -202,3 +202,51 @@ def test_apply_site_actually_consults_the_gate():
     finally:
         puw.set_epoch_source(None)
         sb._1061_STATE.clear()
+
+
+def test_retract_clears_the_told_row_before_readmission():
+    """#1061b: the RETRACT drops the told row — the epoch alone could not.
+
+    RED-FIRST AT BOOT 31, which is the boot that refuted the epoch gate. There
+    `refused_epoch=0` and `epoch_ok=1` on the raising rank: the gate ran, agreed,
+    and the raise came after it, because `PhaseFlipRuntime._epoch` advances at
+    cutover COMPLETION while `_release_residents_for_cutover` drops the tree and
+    re-admits BEFORE completion — inside the SAME epoch. An epoch test cannot see
+    a staleness window that lives inside one epoch.
+
+    The retract is the destructive act itself, it is a GROUP event (boot 31:
+    `#969AD RETRACT site=readmit_seam_residents` exactly once on each of PP0,
+    PP1, PP2), and `_969ad_note_retract` is the chokepoint every retraction
+    passes — called immediately before `_add_request_to_queue`, i.e. before the
+    apply that raised.
+    """
+    from sglang.srt.managers import schedule_batch as sb
+    from sglang.srt.managers.scheduler import Scheduler
+
+    class _Req:
+        rid = "a3fe52c0"
+        prefix_indices = ()
+        _1059_told_prefix = TOLD_PREFIX
+        _1059_told_extend = TOLD_EXTEND
+        _1059_told_epoch = 1
+
+    class _Sched:
+        class ps:
+            pp_rank = 1
+
+        forward_ct = 12
+        _969ad_note_retract = Scheduler._969ad_note_retract
+
+    req = _Req()
+    sb._1061_STATE.clear()
+    try:
+        _Sched._969ad_note_retract(_Sched(), req, "readmit_seam_residents")
+        assert req._1059_told_prefix is None
+        assert req._1059_told_epoch is None
+        assert sb._1061_STATE.get("told_cleared_at_retract") == 1, sb._1061_STATE
+        assert sb._1061_STATE.get("retract_seen") == 1, sb._1061_STATE
+        # And the apply is now a no-fact pass rather than a raise.
+        assert sb.Req.apply_uniform_pass_geometry_1059(req) is False
+        assert sb._1061_STATE.get("no_fact") == 1, sb._1061_STATE
+    finally:
+        sb._1061_STATE.clear()
