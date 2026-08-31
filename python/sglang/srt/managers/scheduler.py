@@ -1760,8 +1760,6 @@ class Scheduler(
         # Initialised on EVERY configuration, `pp_size == 1` included: the
         # admission loop reads `effective` through a plain attribute access,
         # and a non-PP boot must find None there rather than raise.
-        self._pp_load_back_pending = None
-        self._pp_load_back_effective = None
         # The serialized decision row this rank owes its downstream this pass,
         # or None. PP0 sets it from the decision it built; a middle rank sets
         # it to the payload it received, which is the whole of the relay.
@@ -9213,27 +9211,16 @@ class Scheduler(
         # lines. Host-side strings only (#790).
         self._admission_decline_note = None
 
-        # #968 FIX-2: PROMOTE THE LOAD-BACK FACT WHERE IT IS CONSUMED, NOT
-        # WHERE ONE LAYOUT HAPPENS TO RUN.
-        #
-        # This function is the consumer: the stamp block below reads
-        # `_pp_load_back_effective` to set `pp_load_back_told`, and PP0 fills
-        # `_pp_load_back_pending` from its own decision at the end of this
-        # same function. Promoting here makes the hand-off phase-neutral --
-        # it happens on every pass that could USE the fact, in the TP phase as
-        # well as the PP one. The PP loop body keeps its own call; the helper
-        # is idempotent, so the order of the two never matters.
-        #
-        # ABOVE every early return in this function, deliberately: a pass that
-        # bails out before building a batch must still have promoted what the
-        # previous pass published, or the fact waits for a pass that does not
-        # bail -- reintroducing the same "arrives but is never adopted" shape
-        # in a narrower window.
-        try:
-            self.promote_pp_load_back_pending()
-        except AttributeError:
-            # Not a PP build (mixin absent) -- nothing to promote.
-            pass
+        # ROW-COLLAPSE: PP0 applies the row it built LAST pass, here, before
+        # this pass plans anything. That makes PP0's timing identical to a
+        # follower's (which applies at its proxy-receive point, after its own
+        # planning) without PP0 having to receive its own frame. Above every
+        # early return, so a pass that bails out still adopts what the last
+        # one decided.
+        _own_row = getattr(self, "_pp_load_back_row_self", None)
+        if _own_row is not None:
+            self._pp_load_back_row_self = None
+            self.apply_pp_load_back_row(_own_row)
 
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -10325,8 +10312,8 @@ class Scheduler(
                 # may grow by. They move in opposite directions, which is why
                 # they are different fields (see PPAdmissionEntry.load_back_len).
                 #
-                # `_pp_load_back_effective` is what PP0 published one pass ago
-                # and this rank has since promoted (top of the PP loop body).
+                # `pp_load_back_told` is what PP0's row put on this request
+                # one lap ago (`apply_pp_load_back_row`).
                 # `None` here means "no fact for this rid yet", and
                 # `_pp_load_back_extent` answers that with recompute rather than
                 # a local measurement -- deliberately, see its docstring.
@@ -10343,68 +10330,18 @@ class Scheduler(
                 # definition a DIFFERENT request carrying the same prompt.
                 # Measured both ways in boot_855_968sticky (5 rids, 3 ranks,
                 # every rid deferring exactly once).
-                from sglang.srt.managers.pp_admission_congruence import (
-                    offered_prefix_key as _lb_key_of,
-                )
-
-                _fill = getattr(req, "full_untruncated_fill_ids", None)
-                req.pp_load_back_key = (
-                    None if _fill is None else _lb_key_of(_fill, len(_fill))
-                )
-                _lb_map = getattr(self, "_pp_load_back_effective", None)
-                req.pp_load_back_told = (
-                    None
-                    if (_lb_map is None or req.pp_load_back_key is None)
-                    else _lb_map.get(req.pp_load_back_key)
-                )
-                # PP0 RE-OFFERS EVERY PASS, and that is what makes the mechanism
-                # self-correcting rather than authoritative: if the extent does
-                # not make its lap, the next pass simply stamps it again, so a
-                # dropped frame costs one pass of recompute and can never strand
-                # the request. The offer is read off THIS pass's fresh match, so
-                # once the tokens are on device the hit shrinks and the offer
-                # goes to None on its own -- nothing has to clear it.
-                # The OFFER is no longer captured here. It is captured at the
-                # load-back site (`_pp_load_back_extent`), where the host hit
-                # is live by construction; reading it off a `can_run_list`
-                # member measured `with_offer=0` on every entry, because the
-                # request holding the hit is the one deferring at that site and
-                # not the one reaching the decision on that pass.
-                # SPEND WHAT THE LAST VISIT APPLIED. The load-back site sets
-                # this flag when it actually grew the prefix; dropping the rid
-                # here is what bounds the sticky map. Done BEFORE this pass's
-                # `add_one_req` so a rid that is applied and then re-offered in
-                # the same pass keeps the newer offer.
-                if getattr(req, "pp_load_back_applied", False):
-                    req.pp_load_back_applied = False
-                    if _lb_map and req.pp_load_back_key is not None:
-                        _lb_map.pop(req.pp_load_back_key, None)
-                    # REGRESSION FIX for e0bc96008e -- THE OFFER LOST ITS ONLY
-                    # DELETER, and monotone-sticky is the dangerous direction.
-                    #
-                    # Before that commit the offer was written unconditionally
-                    # in this loop as `_hit if _hit > 0 else None`, and the
-                    # comment above records the property that made it safe:
-                    # "the offer is read off THIS pass's fresh match, so once
-                    # the tokens are on device the hit shrinks and the offer
-                    # goes to None on its own -- nothing has to clear it."
-                    # e0bc96008e moved the write to the load-back site and
-                    # kept only the `_hit > 0` half, so nothing writes None
-                    # any more. The offer then survives its own truth: after
-                    # the prefix lands on device the host hit shrinks, but the
-                    # stale-HIGH extent keeps being re-published, a peer is
-                    # told an extent its host tier no longer covers, and
-                    # `#968 LOAD-BACK EXTENT UNHONOURABLE` raises
-                    # PPScheduleRefused -- which voids the pass for the WHOLE
-                    # GROUP, not just this rank.
-                    #
-                    # Cleared HERE, at the spend, on the same argument that
-                    # bounds `_lb_map` one line up: the extent has been
-                    # applied, so the number is spent and re-offering it is
-                    # re-offering a fact that is no longer true. The load-back
-                    # site re-writes it next pass from the live hit if one
-                    # still exists.
-                    req.pp_load_back_offer = None
+                # ROW-COLLAPSE: NOTHING IS STAMPED HERE ANY MORE.
+                #
+                # This block used to compute a content key, look `told` up in
+                # a promoted side-map, and spend an `applied` flag against
+                # that map. All three are gone: `pp_load_back_told` is now
+                # written directly onto this request when PP0's row arrives
+                # (`apply_pp_load_back_row`), and it stays there because the
+                # Req is rank-locally resident across the cutover. The
+                # side-map's whole job was to emulate that lifetime in a
+                # second place -- which is where both binding terms of this
+                # slice lived, and where the offer's only deleter was lost in
+                # e0bc96008e.
 
             try:
                 res = adder.add_one_req(
@@ -10653,59 +10590,12 @@ class Scheduler(
         # second clamp (`prefix_len_for` on an already-clamped candidate
         # returns that same candidate).
         if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
-            # #968 FIX-0 (remaining half): THE STAMP POPULATION AND THE ENTRY
-            # POPULATION MUST BE THE SAME SET.
-            #
-            # The key/told stamp above runs inside the admission LOOP, behind
-            # eight `continue` branches (`already_in_batch` -- the #946 shape,
-            # where `add_chunked_req` appends the continuation to
-            # `can_run_list` BEFORE the loop and the loop then skips it --
-            # plus `seam_transport_only`, `lora`, `batch_full_break` and the
-            # four prefetch branches). The decision, however, is built from
-            # `can_run_list`. Two different sets, and the request holding the
-            # host hit is boot-measured in the gap: `loop_skips(prefetch_
-            # pending=1(first=bce57cf8...))`, three times, the same 4618-token
-            # rid that then defers at the load-back site.
-            #
-            # The consequence was silent and exact. `build_pp_admission_
-            # decision` reads BOTH `pp_load_back_offer` and
-            # `pp_load_back_key` off the request; since e0bc96008e the OFFER
-            # is captured at the load-back site and therefore survives, but
-            # the KEY is still only written in the loop -- and the publish
-            # filter below requires `load_back_len AND load_back_key is not
-            # None`. An entry with a live offer and no key is dropped, so
-            # `published=0` while `with_offer` is finally non-zero: the next
-            # defect in the same chain, one link further on.
-            #
-            # Stamping here makes the two populations identical by
-            # CONSTRUCTION rather than by the loop happening to visit
-            # everyone. Idempotent: it recomputes the same key the loop would
-            # have written, and never touches a request the loop already
-            # stamped with the same fill.
-            try:
-                from sglang.srt.managers.pp_admission_congruence import (
-                    offered_prefix_key as _lb_key_of,
-                )
-
-                _lb_eff_now = getattr(self, "_pp_load_back_effective", None)
-                for _r in can_run_list:
-                    _fill = getattr(_r, "full_untruncated_fill_ids", None)
-                    if _fill is None:
-                        continue
-                    if getattr(_r, "pp_load_back_key", None) is None:
-                        _r.pp_load_back_key = _lb_key_of(_fill, len(_fill))
-                    # `told` follows the key: a member that never reached the
-                    # loop has no told either, and the application site reads
-                    # it. Never OVERWRITE a told the loop already resolved --
-                    # that one was taken against this pass's map.
-                    if (
-                        getattr(_r, "pp_load_back_told", None) is None
-                        and _lb_eff_now
-                        and _r.pp_load_back_key is not None
-                    ):
-                        _r.pp_load_back_told = _lb_eff_now.get(_r.pp_load_back_key)
-            except Exception:  # noqa: BLE001 - never break the decision build
-                logger.warning("#968 ENTRY-STAMP RAISED", exc_info=True)
+            # ROW-COLLAPSE: the entry-stamp that stood here is gone with
+            # the content key it existed to write. The two populations it was
+            # reconciling (the loop's stamp set vs `can_run_list`) collapse to
+            # one, because the row is now built straight from each member's
+            # live `host_hit_length` at this site -- there is no earlier stamp
+            # for a member to have missed.
             self._pp_admission_last_built_decision = build_pp_admission_decision(
                 0,  # placeholder mb_id; stamped with the real one downstream
                 can_run_list,
@@ -10731,82 +10621,18 @@ class Scheduler(
             # its batch at :4292 -- so a PP0 that applied immediately would run
             # one pass at a prefix its peers cannot reach, which is precisely
             # the divergence boot 1815081d46 died in.
-            _lb_pending = {
-                _e.load_back_key: int(_e.load_back_len)
-                for _e in self._pp_admission_last_built_decision.entries
-                if _e.load_back_len and _e.load_back_key is not None
-            }
-            self._pp_load_back_pending = _lb_pending or None
-            # #968 PUBLISH INSTRUMENT. The promote marker proved the fact is
-            # never promoted, which narrows the break to THIS side -- PP0 fills
-            # `pending` straight from its own decision, with no wire in
-            # between. Three boots of static reasoning about which half is
-            # empty were wrong three times; this prints the halves instead.
-            # Names the DENOMINATOR (entries) beside the two numerators, so a
-            # zero can be attributed to "no entries at all", "no offer" or "no
-            # key" rather than to the chain.
-            try:
-                _es = self._pp_admission_last_built_decision.entries
-                _with_offer = sum(1 for _e in _es if _e.load_back_len)
-                # HEALTH AS ITS OWN COLUMN, never mixed into the denominator.
-                # This instrument is where the health confound was finally
-                # SEEN: e0bc96008e's own measurement records "the sole
-                # published entry was a health-check request". A probe that
-                # reports `entries=1` without saying WHAT that entry was sent
-                # three boots chasing a chain that was in fact never asked the
-                # question. Reported separately, never subtracted here -- the
-                # reader decides, the instrument does not.
-                # Same predicate the economy terms use -- it reads `.rid`
-                # through getattr, so it applies unchanged to a
-                # `PPAdmissionEntry`. One definition of "is a health probe"
-                # for the whole file.
-                _health = sum(1 for _e in _es if is_health_check_generate_req(_e))
-                # FIX-7: EVENT CADENCE, NOT PASS CADENCE.
-                #
-                # The old rule was `_n <= 5 or _n % 64 == 0` where `_n` counts
-                # PASSES. Measured on boot_855_968ratio1: the boot had fewer
-                # than 64 publishes, so the `% 64` arm never fired and the
-                # probe spent its entire budget on passes 1..5 -- the coldest
-                # head of the boot, 07:30:18-07:31:20. All five WARM
-                # opportunities came later and went unobserved. The probe was
-                # structurally blind to the one event it was built for, and
-                # `with_offer=0 in 6/6` had the denominator "the five coldest
-                # passes", not "the warm path".
-                #
-                # So the first five INTERESTING publishes (an offer actually
-                # present) are always printed, in addition to the first five
-                # passes and the periodic sample. `_968_pub_ev` counts the
-                # event, not the opportunity.
-                _n = getattr(self, "_968_pub_n", 0) + 1
-                self._968_pub_n = _n
-                _ev = getattr(self, "_968_pub_ev", 0)
-                _interesting = _with_offer > 0
-                if _interesting:
-                    _ev += 1
-                    self._968_pub_ev = _ev
-                if _n <= 5 or _n % 64 == 0 or (_interesting and _ev <= 5):
-                    logger.info(
-                        "#968 LOAD-BACK PUBLISH n=%d ev=%d entries=%d "
-                        "health=%d with_offer=%d with_key=%d published=%d "
-                        "| first=%s",
-                        _n,
-                        _ev,
-                        len(_es),
-                        _health,
-                        _with_offer,
-                        sum(1 for _e in _es if _e.load_back_key is not None),
-                        len(_lb_pending),
-                        [
-                            (
-                                str(_e.rid)[:8],
-                                _e.load_back_len,
-                                None if _e.load_back_key is None else "key",
-                            )
-                            for _e in _es[:3]
-                        ],
-                    )
-            except Exception:  # noqa: BLE001
-                logger.warning("#968 PUBLISH PROBE RAISED", exc_info=True)
+            # ROW-COLLAPSE: PP0 APPLIES ITS OWN DECISION THE SAME WAY ITS
+            # PEERS DO -- through the row, one lap later.
+            #
+            # It cannot simply write its extents now: the peers receive this
+            # row only at their proxy-receive point, which is measured to sit
+            # AFTER their planning in the same loop body. A PP0 that applied
+            # immediately would spend one pass at a prefix its peers cannot
+            # reach -- the divergence boot 1815081d46 died in. So PP0 stamps
+            # its own requests from its own row on the NEXT pass, exactly as
+            # a follower does, and the one-lap delay is uniform across ranks
+            # by construction rather than by a matching pair of side-maps.
+            self._pp_load_back_row_self = self._pp_admission_last_built_decision
             # THE ROW ITSELF IS WHAT TRAVELS, not the extracted number. The
             # decision goes onto the wire through its own established codec
             # (`pp_admission_decision_to_wire`), so the fact rides as
@@ -10821,7 +10647,14 @@ class Scheduler(
             # (`reconcile_pp_admission_decision`, still 0 call sites) stays
             # dark until a slice needs it -- re-lighting it here would be a
             # second, untested mechanism riding in on the back of this one.
-            if _lb_pending:
+            # ROW-COLLAPSE: send the row whenever it carries an extent for
+            # anyone. The gate is read off the decision itself now, not off a
+            # side-map built beside it -- one source, so the thing sent and
+            # the thing tested can never be two different objects.
+            if any(
+                getattr(_e, "load_back_len", None)
+                for _e in self._pp_admission_last_built_decision.entries
+            ):
                 from sglang.srt.managers.scheduler_pp_mixin import (
                     pp_admission_decision_to_wire as _lb_to_wire,
                 )

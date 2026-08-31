@@ -460,34 +460,6 @@ class PPAdmissionEntry:
     extent will normally be honourable, NOT that a rank may derive one
     locally when the fact is absent."""
 
-    load_back_key: Optional[int] = None
-    """#968: the PREFIX IDENTITY `load_back_len` is about (`offered_prefix_key`).
-
-    THE FACT IS KEYED BY CONTENT, NOT BY RID, and that correction is what makes
-    the mechanism reach the case it exists for. Measured,
-    boot_855_968sticky_0840f82601_0831_063048: five rids, three ranks, every rid
-    deferring EXACTLY ONCE (`occurrence=1..5` on each rank). A request reaches
-    the load-back site once, and the extent is only learned DURING that visit --
-    so a rid-keyed fact is always one visit too late for the rid it names, and
-    the sticky map never had anything to hand back.
-
-    Worse, the warm hit is by definition a DIFFERENT request: the acceptance
-    cell's `mid_cold`, `mid_warm` and `mid_warm2` carry identical content under
-    three distinct rids, so a rid-keyed extent can never travel from the request
-    that discovered it to the request that needs it. Keyed by prefix identity it
-    travels across rids, across cutovers, and across the one-lap delivery lag at
-    once.
-
-    KEYED ON THE FULL FILL, not on the device match. `offered_prefix_key`
-    returns None for `prefix_len <= 0`, and the device match at the moment of
-    the offer is measured as 0 on exactly the warm path this serves (`#969
-    EXTENT` tuples read `(rid, 0, 350, 0, 350)`), so a device-match key would be
-    None precisely when it is needed. The full fill is stable between two
-    requests carrying the same prompt, which is the identity the hit is about.
-
-    `None` means "no identity available", and a receiver treats that exactly as
-    `load_back_len=None`: no load-back, recompute, never a local substitute."""
-
 
 @dataclass(frozen=True)
 class PPAdmissionDecision:
@@ -1443,8 +1415,17 @@ def build_pp_admission_decision(
                     # second derivation of the quantity whose disagreement IS
                     # the defect is how #995's first version manufactured false
                     # refusals.
-                    load_back_len=getattr(req, "pp_load_back_offer", None),
-                    load_back_key=getattr(req, "pp_load_back_key", None),
+                    # ROW-COLLAPSE: read the LIVE hit off the request at
+                    # build time. The `pp_load_back_offer` field existed only
+                    # to carry this number from the load-back site to here,
+                    # within one pass on one rank -- a private hand-off that
+                    # never needed to be request state. `host_hit_length` is
+                    # the same number, set by `init_next_round_input` earlier
+                    # in this same pass, and it is what the deferral line
+                    # prints.
+                    load_back_len=(
+                        int(getattr(req, "host_hit_length", 0) or 0) or None
+                    ),
                 )
             )
             continue
@@ -1527,8 +1508,8 @@ def build_pp_admission_decision(
                 # with it either.
                 last_chunk=_last_chunk_verdict(told, extend_len, fallback_fill_len),
                 # #968/#1035: same offer, same reader, on the fallback branch.
-                load_back_len=getattr(req, "pp_load_back_offer", None),
-                load_back_key=getattr(req, "pp_load_back_key", None),
+                # ROW-COLLAPSE: see the sibling constructor above.
+                load_back_len=(int(getattr(req, "host_hit_length", 0) or 0) or None),
             )
         )
     return PPAdmissionDecision(mb_id=mb_id, entries=tuple(entries))

@@ -1225,15 +1225,6 @@ class Req(ReqDllmMixin):
         # `prefix_indices`, and the two are separated on purpose so that "what
         # PP0 proposed" and "what this rank did" can never be read off the same
         # name.
-        self.pp_load_back_offer: Optional[int] = None
-        # #968: the prefix identity `pp_load_back_offer` is about. Keyed by
-        # CONTENT so the fact survives the rid it was discovered under -- a warm
-        # hit is by definition a different request carrying the same prompt.
-        self.pp_load_back_key: Optional[int] = None
-        # Total cached prefix length (on-device prefix_indices + host_hit_length),
-        # capped at the max allowed prefix. Set during prefix matching at schedule
-        # time and used to estimate uncached tokens / sort by longest prefix for
-        # load reporting.
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0

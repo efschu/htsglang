@@ -89,27 +89,12 @@ def _pp_load_back_extent(req) -> Optional[int]:
         return req.host_hit_length
     told = getattr(req, "pp_load_back_told", None)
     if told is None:
-        # #968 CAPTURE THE OFFER WHERE THE HIT IS PROVEN LIVE.
-        #
-        # This assignment used to live in the admission loop, read off
-        # `can_run_list` after the loop had run. Measured, boot
-        # boot_855_968ratio1_..._0831_072638, by the publish instrument:
-        # `entries=1 with_offer=0 with_key=1 published=0`, with the sole entry
-        # being a health-check request. The key was set on every entry and the
-        # EXTENT on none -- because the request that HAS a host hit is the one
-        # that lands here and defers, and it is not the request that reaches
-        # the decision on that pass. The offer was therefore always read off a
-        # member whose `host_hit_length` is 0, while the rank that owned the
-        # 4618-token hit was standing at this line.
-        #
-        # Here the value is not inferred: this branch only runs when
-        # `needs_host_load_back()` is true, so the hit exists by construction
-        # -- it is the same number the line below prints. It rides on the
-        # REQUEST, so whenever that request next reaches the decision it
-        # carries the extent with it, however many passes later that is.
-        _hit = int(getattr(req, "host_hit_length", 0) or 0)
-        if _hit > 0:
-            req.pp_load_back_offer = _hit
+        # ROW-COLLAPSE: no offer is captured here any more. PP0 builds the
+        # row straight from each admitted request's live `host_hit_length` at
+        # the decision site, so the number no longer has to be parked on the
+        # request to survive the trip from here to there. Deferring is still
+        # exactly what it was: no fact yet, no load-back this chunk, recompute
+        # -- never a rank-local substitute.
         _1035_LOADBACK_REFUSED["n"] += 1
         n = _1035_LOADBACK_REFUSED["n"]
         if n <= 5 or n % 64 == 0:
@@ -2451,13 +2436,6 @@ class PrefillAdder:
                 # Per-branch bail patches are how #965 was paid for twice.
                 req.set_extend_range(prefix_len, prefix_len)
                 _note_988_loadback(req, prefix_len)
-                # #968: SPENT. The caller pops this rid out of the sticky
-                # extent map on seeing this flag, which is what keeps the map
-                # bounded without it needing to know when a request ends. Same
-                # shape as `pp_clear_parked_continuation`: the fact is consumed
-                # where it is acted on, and PP0 simply re-stamps it on the next
-                # pass if the rid still needs one.
-                req.pp_load_back_applied = True
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

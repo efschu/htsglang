@@ -330,11 +330,13 @@ def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, ob
                     # `load_back_len=None`, which every consumer treats as "no
                     # load-back", i.e. exactly the behaviour before this field
                     # existed.
+                    # ROW-COLLAPSE: the extent is now matched to its request
+                    # by RID, which the row already carries in column 0. The
+                    # separate content KEY column existed to let a sticky
+                    # side-map survive a cutover; the fact now lives on the
+                    # rank-local Req, which survives the cutover by
+                    # construction, so the key has nothing left to identify.
                     e.load_back_len,
-                    # #968: the prefix identity that extent is ABOUT. Travels
-                    # with it or not at all -- an extent whose key a receiver
-                    # cannot read names a cache state it cannot identify.
-                    e.load_back_key,
                 )
                 for e in decision.entries
             ),
@@ -378,9 +380,6 @@ def _pp_admission_entry_from_row(row: Sequence) -> PPAdmissionEntry:
         # #968/#1035: same index-and-width discipline as the #987 pair above.
         load_back_len=(
             row[10] if n > _ADMISSION_ROW_WIDTH_PRE_987 + 2 else None
-        ),
-        load_back_key=(
-            row[11] if n > _ADMISSION_ROW_WIDTH_PRE_987 + 3 else None
         ),
     )
 
@@ -4210,7 +4209,9 @@ class SchedulerPPMixin:
                 # `effective`. Kept here as well so the PP path's ordering is
                 # unchanged; the helper is idempotent (an empty `pending` is a
                 # no-op), so calling it twice in a pass costs nothing.
-                self.promote_pp_load_back_pending()
+                # ROW-COLLAPSE: no promote step exists any more. The row
+                # applies itself onto the local requests at the receive point
+                # below; there is no intermediate map to advance here.
                 # The forward payload is PASS-SCOPED, unlike the two above: a
                 # rank owes its downstream only what it learned THIS pass. Left
                 # standing it would re-send a decision the downstream already
@@ -6646,67 +6647,102 @@ class SchedulerPPMixin:
         """
         self.last_mbs[slot] = self.mbs[slot]
 
-    def promote_pp_load_back_pending(self: Scheduler) -> int:
-        """#968 FIX-2: promote `pending -> effective`, in ANY phase.
+    def _local_reqs_by_rid(self: Scheduler) -> Dict[str, object]:
+        """Every Req this rank currently holds, indexed by rid.
 
-        Returns the number of extents promoted (0 when there was nothing),
-        so a caller can instrument it without re-deriving the answer.
-
-        WHY THIS IS A METHOD AND NOT A LINE IN A LOOP BODY. It used to be a
-        line in `_event_loop_pp_body`, which made a statement about the HOST
-        TIER conditional on which LAYOUT happened to be up. Those two are
-        independent: PP0 builds the admission decision inside
-        `_get_new_batch_prefill_raw`, which runs in both phases, and the warm
-        prefill this fact exists for runs boot-measured in the TP phase. A
-        fact published in one phase and promoted only in another is not
-        transported -- it is dropped, silently, and it was: three boots with
-        `#968 LOAD-BACK PROMOTED` at a genuine zero.
-
-        IDEMPOTENT BY CONSTRUCTION -- an empty or absent `pending` is a no-op
-        and clears nothing that a later caller still needs. That is what lets
-        the PP loop body keep its original call while the prefill builder adds
-        one, without the two having to agree on an order.
-
-        The merge direction is UPDATE, not replace: `effective` is sticky
-        until spent (popped at application), `pending` is the newest word on
-        the rids it names, and a newer offer must win for the same key.
+        The rid is the ONE identifier that is the same object-independent
+        value on every rank: it comes off the wire object each rank builds
+        its own `Req` from (`handle_generate_request`, scheduler.py). That is
+        exactly what the row needs, and it is why the collapse can drop the
+        separate content key.
         """
-        _lb_new = getattr(self, "_pp_load_back_pending", None)
-        if not _lb_new:
-            # Nothing to promote. Deliberately does NOT clear `effective`:
-            # sticky-until-spent is that field's contract.
+        out: Dict[str, object] = {}
+        for req in list(getattr(self, "waiting_queue", None) or ()):
+            rid = getattr(req, "rid", None)
+            if rid is not None:
+                out[str(rid)] = req
+        running = getattr(self, "running_batch", None)
+        for req in list(getattr(running, "reqs", None) or ()):
+            rid = getattr(req, "rid", None)
+            if rid is not None:
+                out[str(rid)] = req
+        chunked = getattr(self, "chunked_req", None)
+        rid = getattr(chunked, "rid", None) if chunked is not None else None
+        if rid is not None:
+            out[str(rid)] = chunked
+        return out
+
+    def apply_pp_load_back_row(self: Scheduler, decision) -> int:
+        """ROW-COLLAPSE (#968): write PP0's extents onto the LOCAL requests.
+
+        Returns how many requests were stamped.
+
+        THIS REPLACES A FOUR-STAGE SIDE CHANNEL -- `pp_load_back_offer` ->
+        `pp_load_back_key` -> `_pp_load_back_pending` -> promote ->
+        `_pp_load_back_effective` -> keyed lookup at the application site.
+        All of it existed to do two jobs that the row and the request already
+        do between them:
+
+        * DELIVERY across ranks -- that is the row, and only the row. It is
+          the sole arc that carries a PP0 decision to its peers; the intake
+          chain forward happens before the decision exists and carries the
+          wire object, not the `Req` (measured: scheduler.py's per-rank
+          `Req(...)` construction, and `_pull_raw_reqs` at the head of the
+          round).
+        * LIFETIME on one rank -- that is the request itself. A `Req` is
+          rank-locally resident and the cutover retracts and re-admits it
+          from the local waiting queue rather than re-receiving it, so a
+          field written here survives the cutover BY CONSTRUCTION. The
+          sticky map and the content key were emulating exactly that
+          property, in a second place, where it could rot out of agreement.
+
+        THE ONE-LAP DELAY IS PRESERVED AND IT IS LOAD-BEARING. This runs at
+        the row-receive point, which is measured to sit AFTER this pass's
+        planning in the same straight-line loop body (plan at
+        `get_next_batch_to_run`, receive ~190 lines later). So an extent
+        stamped here is first honoured on the request's NEXT chunk -- which
+        is precisely the documented contract ("stamped by PP0 on the frame
+        of the pass that ADMITS the request ... every later chunk honours
+        it", at most one HiCache chunk of recompute per re-admission). DO
+        NOT "fix" that delay: a rank applying an extent on the pass it
+        learns it would run at a prefix its peers cannot reach, which is the
+        divergence boot 1815081d46 died in.
+        """
+        entries = getattr(decision, "entries", None) or ()
+        wanted = {}
+        for e in entries:
+            n = getattr(e, "load_back_len", None)
+            rid = getattr(e, "rid", None)
+            if n and rid is not None:
+                wanted[str(rid)] = int(n)
+        if not wanted:
             return 0
-        _lb_eff = dict(getattr(self, "_pp_load_back_effective", None) or {})
-        _lb_eff.update(_lb_new)
-        self._pp_load_back_effective = _lb_eff
-        # #968 THE SUCCESS INSTRUMENT, and the reason it exists: up to here
-        # the chain had only a FAILURE marker (LOAD-BACK DEFERRED) and an
-        # APPLICATION marker (#988 LOADBACK), so the middle -- did the fact
-        # ever arrive and get promoted -- was blind, and two boots of
-        # "0 applied" could not be attributed to a missing publish, a missing
-        # hop or a missing consume. This line is the difference between
-        # "nobody sent it" and "it arrived and nobody used it".
-        # Cadence counts PROMOTIONS, not passes, so the first one always
-        # prints -- this instrument does not have the cold-head blindness
-        # FIX-7 had to repair on the publish probe.
-        _n = getattr(self, "_968_promote_n", 0) + 1
-        self._968_promote_n = _n
-        if _n <= 5 or _n % 64 == 0:
-            logger.info(
-                "#968 LOAD-BACK PROMOTED n=%d new=%d live=%d phase=%s "
-                "extents=%s -- PP0 extents this rank may now apply "
-                "(keyed by prefix identity, not rid).",
-                _n,
-                len(_lb_new),
-                len(_lb_eff),
-                getattr(getattr(self, "phase_flip_runtime", None), "phase", "?"),
-                sorted(_lb_new.values())[:5],
-            )
-        # Spent: the fact has moved to `effective`, which is the field the
-        # application site reads. Leaving it standing would re-promote the
-        # same extents every pass for the life of the request.
-        self._pp_load_back_pending = None
-        return len(_lb_new)
+        local = self._local_reqs_by_rid()
+        stamped = 0
+        for rid, extent in wanted.items():
+            req = local.get(rid)
+            if req is None:
+                # The row names a request this rank does not hold. Not an
+                # error: PP0 admits against its own queue and a peer may have
+                # completed or retracted that rid. No fact is invented.
+                continue
+            req.pp_load_back_told = extent
+            stamped += 1
+        if stamped:
+            _n = getattr(self, "_968_applied_n", 0) + 1
+            self._968_applied_n = _n
+            if _n <= 5 or _n % 64 == 0:
+                logger.info(
+                    "#968 LOAD-BACK ROW APPLIED n=%d stamped=%d/%d phase=%s "
+                    "extents=%s -- PP0 extents written onto this rank's own "
+                    "requests, honoured from their next chunk.",
+                    _n,
+                    stamped,
+                    len(wanted),
+                    getattr(getattr(self, "phase_flip_runtime", None), "phase", "?"),
+                    sorted(wanted.values())[:5],
+                )
+        return stamped
 
     def init_pp_loop_state(self: Scheduler):
         # #969: NOTHING IS HARVESTED HERE ANY MORE. `init_pp_loop_state` is
@@ -6903,10 +6939,12 @@ class SchedulerPPMixin:
         # an extent its host tier no longer covers raises `#968 LOAD-BACK
         # EXTENT UNHONOURABLE` at the application site, against the tier the
         # number is actually about.
-        if not hasattr(self, "_pp_load_back_pending"):
-            self._pp_load_back_pending: Optional[Dict[str, int]] = None
-        if not hasattr(self, "_pp_load_back_effective"):
-            self._pp_load_back_effective: Optional[Dict[str, int]] = None
+        # ROW-COLLAPSE: `_pp_load_back_pending` / `_pp_load_back_effective`
+        # are GONE. They were the side-channel's two-stage store, and the
+        # unconditional null of the first of them (against a `hasattr` guard
+        # on the second) was one of the two binding terms that kept this
+        # chain dead for six boots. The fact now rides the row across ranks
+        # and the Req within a rank, and neither can be cleared here.
         self._pp_pass_voided_incoming: bool = False
         self._pp_upstream_launched_incoming: bool = False
         # #978: pass-scoped like its per-hop twin above.
@@ -9132,21 +9170,20 @@ class SchedulerPPMixin:
                 _lb_decision = pp_admission_decision_from_wire(
                     self._pp_load_back_wire
                 )
-                _lb_map = {
-                    _e.load_back_key: int(_e.load_back_len)
-                    for _e in _lb_decision.entries
-                    if _e.load_back_len and _e.load_back_key is not None
-                }
                 # ONE FIELD OF THE ROW, DELIBERATELY. The row carries PP0's
                 # whole admission decision; this slice consumes `load_back_len`
                 # and nothing else. The retraction half is not lit up here --
                 # see the note at the build site in scheduler.py.
-                self._pp_load_back_pending = _lb_map or None
+                #
+                # ROW-COLLAPSE: applied straight onto this rank's own requests.
+                # There is no pending map and no promote step any more -- those
+                # were a second place for the same fact to live, and the fact
+                # they were protecting already survives on the Req.
+                self.apply_pp_load_back_row(_lb_decision)
             except Exception:  # noqa: BLE001
                 # A row this rank cannot read is a fact it does not have, which
                 # is a state the applying site already handles honestly (no
                 # load-back, recompute instead). Never a local substitute.
-                self._pp_load_back_pending = None
                 logger.warning(
                     "#968 LOAD-BACK ROW UNREADABLE mb_id=%s -- treating as "
                     "'no fact this pass'; the extent will be re-stamped on the "
