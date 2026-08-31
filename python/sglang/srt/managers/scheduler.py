@@ -10591,6 +10591,38 @@ class Scheduler(
                 if _e.load_back_len and _e.load_back_key is not None
             }
             self._pp_load_back_pending = _lb_pending or None
+            # #968 PUBLISH INSTRUMENT. The promote marker proved the fact is
+            # never promoted, which narrows the break to THIS side -- PP0 fills
+            # `pending` straight from its own decision, with no wire in
+            # between. Three boots of static reasoning about which half is
+            # empty were wrong three times; this prints the halves instead.
+            # Names the DENOMINATOR (entries) beside the two numerators, so a
+            # zero can be attributed to "no entries at all", "no offer" or "no
+            # key" rather than to the chain.
+            try:
+                _es = self._pp_admission_last_built_decision.entries
+                _n = getattr(self, "_968_pub_n", 0) + 1
+                self._968_pub_n = _n
+                if _n <= 5 or _n % 64 == 0:
+                    logger.info(
+                        "#968 LOAD-BACK PUBLISH n=%d entries=%d with_offer=%d "
+                        "with_key=%d published=%d | first=%s",
+                        _n,
+                        len(_es),
+                        sum(1 for _e in _es if _e.load_back_len),
+                        sum(1 for _e in _es if _e.load_back_key is not None),
+                        len(_lb_pending),
+                        [
+                            (
+                                str(_e.rid)[:8],
+                                _e.load_back_len,
+                                None if _e.load_back_key is None else "key",
+                            )
+                            for _e in _es[:3]
+                        ],
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("#968 PUBLISH PROBE RAISED", exc_info=True)
             # THE ROW ITSELF IS WHAT TRAVELS, not the extracted number. The
             # decision goes onto the wire through its own established codec
             # (`pp_admission_decision_to_wire`), so the fact rides as
