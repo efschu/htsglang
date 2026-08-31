@@ -322,8 +322,60 @@ _1060_EPOCH_BY_RID: Dict[str, int] = {}
 _1060_EPOCH_CAP = 4096
 
 
+#: #1060b/#1061: the APPLY-SITE ledger for the told row. Counted where the fact
+#: takes effect, not where a reader might look for it -- see the comment in
+#: `apply_uniform_pass_geometry_1059` for the boot-30 reason.
+_1061_STATE: Dict[str, int] = {}
+
+
 def _1060_bump(key: str, n: int = 1) -> None:
     _1060_STATE[key] = _1060_STATE.get(key, 0) + n
+
+
+def _1061_bump(key: str, n: int = 1) -> None:
+    _1061_STATE[key] = _1061_STATE.get(key, 0) + n
+
+
+def _1061_emit_census(reason: str) -> None:
+    """#1060b: the told row's fate AT THE APPLY SITE, with a denominator.
+
+    Boot 30's lesson in one line: the arrival of a told value was proved by the
+    process death, while the instrument built to measure it read `absent` on the
+    only rank that survived long enough to print. `apply_reached` is the
+    denominator -- how often the apply ran at all -- and every other counter is a
+    disjoint outcome of it, so a zero anywhere is readable against a population
+    instead of against nothing.
+
+    Emitted unconditionally at teardown and on the death path, like #1058b and
+    #1060, never gated on an observation count.
+    """
+    try:
+        s = _1061_STATE
+        reached = s.get("apply_reached", 0)
+        refused = s.get("refused_epoch", 0)
+        logger.warning(
+            "#1060b/#1061 TOLD-APPLY CENSUS (%s): apply_reached=%d "
+            "no_fact=%d refused_epoch=%d epoch_ok=%d adopted=%d "
+            "not_adopted=%d | refused_epoch_lines_emitted=%d "
+            "refused_epoch_lines_suppressed=%d. `apply_reached` is the "
+            "denominator: how often the apply site ran at all. adopted>0 is "
+            "the ONLY positive proof that a told row travelled AND took "
+            "effect -- boot 30 had to prove that with a process death because "
+            "the census sat at the consult instead of here. "
+            "apply_reached=0 means the apply site was never reached on this "
+            "rank, which is not the same as no row arriving.",
+            reason,
+            reached,
+            s.get("no_fact", 0),
+            refused,
+            s.get("epoch_ok", 0),
+            s.get("adopted", 0),
+            s.get("not_adopted", 0),
+            s.get("refused_epoch_lines", 0),
+            max(0, refused - s.get("refused_epoch_lines", 0)),
+        )
+    except Exception:  # noqa: BLE001 - a diagnostic may never mask a death
+        pass
 
 
 def _1060_note_readmit_recovery(req, tree_cache) -> None:
@@ -1840,10 +1892,56 @@ class Req(ReqDllmMixin):
         can both tell adoption from "no fact this pass".
         """
         told_prefix = getattr(self, "_1059_told_prefix", None)
-        if told_prefix is None:
-            return False
 
-        from sglang.srt.managers.pp_uniform_width import uniform_pass_geometry
+        from sglang.srt.managers.pp_uniform_width import (
+            current_epoch as _now_epoch_1061,
+            epoch_admits_row as _epoch_admits_1061,
+            uniform_pass_geometry,
+        )
+
+        # #1061 THE EPOCH GATE, and #1060b THE APPLY-SITE COUNTER, in one place
+        # because they answer the same question from opposite sides: did a told
+        # value actually take effect here?
+        #
+        # WHY THE COUNTER MOVED HERE. Boot 30 proved the row arrives -- by dying
+        # on it -- while `#1058 TOLD-VS-LOCAL CENSUS` read `evaluated=13
+        # absent=13` on PP0 and `evaluated=0` on the two ranks that crashed. The
+        # census sat at the CONSULT; PP0 makes the offer and never receives one,
+        # and the peers died before reaching their own consult. A fact's arrival
+        # has to be counted where it is APPLIED, not where someone might look
+        # for it.
+        _row_epoch = getattr(self, "_1059_told_epoch", None)
+        _now_epoch = _now_epoch_1061()
+        _1061_bump("apply_reached")
+        if told_prefix is None:
+            _1061_bump("no_fact")
+            return False
+        if not _epoch_admits_1061(_row_epoch, _now_epoch):
+            # STALE OR UNVERIFIABLE ACROSS A CUTOVER. Uniform on every rank by
+            # construction: the verdict reads only (row epoch, current epoch),
+            # two group quantities, and never this rank's span. The way onward
+            # is the contract's own already-proven no-adopt path -- the rank
+            # runs its own geometry, exactly as on boot 29, which ran it for its
+            # whole life without a divergence.
+            _1061_bump("refused_epoch")
+            _n = _1061_STATE.get("refused_epoch", 0)
+            if _n <= 8 or _n % 256 == 0:
+                _1061_bump("refused_epoch_lines")
+                logger.warning(
+                    "#1061 CROSS-EPOCH TOLD ROW NOT ADOPTED occurrence=%d "
+                    "rid=%s told_prefix=%s row_epoch=%s now_epoch=%s. The row "
+                    "was decided under a different cutover generation, so it is "
+                    "not applied -- on EVERY rank identically, because this "
+                    "verdict reads only the two epochs and never a rank-local "
+                    "span. This rank runs its own geometry for this pass.",
+                    _n,
+                    str(getattr(self, "rid", "?"))[:8],
+                    told_prefix,
+                    _row_epoch,
+                    _now_epoch,
+                )
+            return False
+        _1061_bump("epoch_ok")
 
         local = 0 if self.prefix_indices is None else len(self.prefix_indices)
         # The pin is the promise this rank made on the previous lap and
@@ -1864,6 +1962,7 @@ class Req(ReqDllmMixin):
             # call above has already raised rather than let it pass silently.
             self.truncate_prefix_to(geom.prefix)
         self._1059_applied = geom
+        _1061_bump("adopted" if geom.adopted else "not_adopted")
         return bool(geom.adopted)
 
     def init_next_round_input(

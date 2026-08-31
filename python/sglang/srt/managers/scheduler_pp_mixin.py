@@ -343,6 +343,22 @@ def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, ob
                     # rank-local Req, which survives the cutover by
                     # construction, so the key has nothing left to identify.
                     e.load_back_len,
+                    # #1061: the cutover epoch this row was decided under.
+                    # Appended at the END under the same index-and-width
+                    # discipline as the #987 pair and #968's load_back_len: a
+                    # shorter row from an older sender reads back as
+                    # `decided_epoch=None`, which `epoch_admits_row` treats as
+                    # "unverifiable" rather than as a match.
+                    #
+                    # PER ENTRY RATHER THAN PER DECISION, and not because the
+                    # epoch is a per-request property -- it is not. The outer
+                    # payload is unpacked as a FIXED 2-arity tuple
+                    # (`mb_id, raw_entries` in `pp_admission_decision_from_wire`),
+                    # so growing THAT tuple is exactly the fixed-arity crash the
+                    # per-row width tolerance exists to avoid. The row is the
+                    # only width-tolerant place on this wire, so the group fact
+                    # rides there, repeated.
+                    e.decided_epoch,
                 )
                 for e in decision.entries
             ),
@@ -386,6 +402,12 @@ def _pp_admission_entry_from_row(row: Sequence) -> PPAdmissionEntry:
         # #968/#1035: same index-and-width discipline as the #987 pair above.
         load_back_len=(
             row[10] if n > _ADMISSION_ROW_WIDTH_PRE_987 + 2 else None
+        ),
+        # #1061: same discipline again. Absent reads as None = "no epoch
+        # named", which the apply gate treats as unverifiable, never as a
+        # match.
+        decided_epoch=(
+            row[11] if n > _ADMISSION_ROW_WIDTH_PRE_987 + 3 else None
         ),
     )
 
@@ -9361,6 +9383,14 @@ class SchedulerPPMixin:
                     try:
                         _req._1059_told_prefix = int(_e.prefix_len)
                         _req._1059_told_extend = int(_e.extend_len)
+                        # #1061: the row's DECIDED epoch rides with its values
+                        # and is compared at the APPLY, not here. The apply is
+                        # where boot 30 died -- inside
+                        # `_release_residents_for_cutover`, i.e. after a cutover
+                        # that happened between this receive and that apply. A
+                        # check placed here would have passed and the row would
+                        # still have been applied one generation later.
+                        _req._1059_told_epoch = _e.decided_epoch
                     except Exception:  # noqa: BLE001 - a stamp may never break a recv
                         continue
             except Exception:  # noqa: BLE001
