@@ -5944,7 +5944,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             try:
                 from sglang.srt.mem_cache.kv_row_ownership import read_free_rows
 
-                reading = read_free_rows(self.token_to_kv_pool_allocator)
+                # DIFFERENCE AGAINST THE ALLOCATOR THE FREE ACTUALLY REACHES.
+                # `_free_full` routes to `full_attn_allocator` when SWA is in
+                # the tree (full_component.py), so reading the free set off the
+                # TOP allocator there would check membership in one pool and
+                # free into another -- the guard would pass while doing exactly
+                # the double free it exists to prevent. Same mismatch class as
+                # #941, one level up: not which object is held, but which
+                # object is ASKED.
+                alloc = self.token_to_kv_pool_allocator
+                if ComponentType.SWA in self.tree_components:
+                    alloc = getattr(alloc, "full_attn_allocator", alloc)
+                reading = read_free_rows(alloc)
                 if not reading.is_enumerable:
                     out["reason"] = (
                         "allocator free set is not enumerable; refusing to free "
