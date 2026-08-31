@@ -4151,7 +4151,40 @@ class SchedulerPPMixin:
                         mb_id = int(resume_slot)
                         continue
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.request_receiver.recv_requests()
+                    # #631 ROW AUTHORITY: the chain receive is COUNTER-GATED
+                    # on downstream ranks, because the loop -- not any single
+                    # wire -- is the pacemaker now. Boot 631row3 measured the
+                    # indefinite park (frame arrived while this rank was
+                    # parked on the chain; three-arc ring); boot 631row5
+                    # measured the per-slot budgeted wait (30 s per hop, the
+                    # rank's own output work stalled behind it). So: chain
+                    # provably posted -> take it (bounded by transfer, the
+                    # consume_up_to argument); nothing posted and TRULY idle
+                    # (no queue, no chunked, no occupied slot, no frame
+                    # anywhere) -> the ordinary indefinite park, which is
+                    # safe because the chain hop for any pass precedes its
+                    # frame (requests travel the chain before PP0 can plan
+                    # them); otherwise -> skip the chain this cycle and keep
+                    # the loop turning (2 ms throttle).
+                    _chain_gate = None
+                    if (
+                        pp_row_authority_enabled(self)
+                        and self.ps.pp_size > 1
+                        and self.ps.pp_rank != 0
+                    ):
+                        _chain_gate = self._pp_row_chain_pending()
+                    if _chain_gate is None or _chain_gate:
+                        recv_reqs = self.request_receiver.recv_requests()
+                    elif (
+                        not self.waiting_queue
+                        and getattr(self, "chunked_req", None) is None
+                        and not any(b is not None for b in self.mbs)
+                        and not self._pp_row_any_proxy_signal()
+                    ):
+                        recv_reqs = self.request_receiver.recv_requests()
+                    else:
+                        recv_reqs = []
+                        time.sleep(0.002)
                 # #1015d: reap the last rank's deferred wrap send HERE, after
                 # this rank has taken its upstream's chain off the wire. See
                 # the deferral site in
@@ -4470,36 +4503,17 @@ class SchedulerPPMixin:
                 _row_auth = pp_row_authority_enabled(self)
                 _pre_proxy = None
                 if _row_auth and self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+                    # NO WAIT HERE -- boot 631row5 measured why: a budgeted
+                    # per-slot wait stalls the WHOLE body, including the
+                    # output-side work of the rank's own in-flight slots, so
+                    # a serial workload turned into a 30 s-per-hop crawl
+                    # (PP0 admit 22:08:07, PP1 forward 22:08:37, PP2
+                    # 22:09:07 -- one readiness budget per hop). The pacing
+                    # lives at the TOP of the loop instead: the chain recv is
+                    # counter-gated there, so the loop keeps cycling and this
+                    # probe is asked again within milliseconds of a frame
+                    # actually landing.
                     _pending = self._pp_proxy_frame_pending(mb_id)
-                    if _pending is False and (
-                        self.waiting_queue
-                        or getattr(self, "chunked_req", None) is not None
-                        or any(b is not None for b in self.mbs)
-                        or getattr(
-                            getattr(self, "running_batch", None), "reqs", None
-                        )
-                    ):
-                        # WORK IS VISIBLE ON THIS RANK, so a frame may be owed
-                        # and the RIGHT wire to park on is the proxy wire --
-                        # boot 631row3's wedge is the measured reason: the
-                        # chain hop precedes the frame by the upstream's whole
-                        # forward, the probe was correctly False at that
-                        # instant, and the loop then parked in the BLOCKING
-                        # chain receive while PP0 parked in the output receive
-                        # downstream never fed: a three-arc ring. This is the
-                        # budgeted, soft readiness wait (the pre-row world
-                        # parked here too, via the cur_batch proxy receive);
-                        # it returns the moment the counters prove a message,
-                        # declines loudly on budget exhaustion (#1002), and
-                        # cannot deadlock the idle form -- an idle rank has no
-                        # visible work and still parks on the chain.
-                        if (
-                            self._pp_wait_for_dict_readiness(
-                                mb_id, kind="proxy", soft=True
-                            )
-                            is not False
-                        ):
-                            _pending = self._pp_proxy_frame_pending(mb_id)
                     if _pending is None:
                         _row_auth = False
                         if not getattr(self, "_pp_row_auth_no_signal_warned", False):
@@ -8437,6 +8451,46 @@ class SchedulerPPMixin:
                 first.observed_local,
             )
         return {}, void_pp_admission_decision(amended)
+
+    def _pp_row_chain_pending(self: Scheduler) -> Optional[bool]:
+        """#631 ROW AUTHORITY: is a chain message provably available?
+
+        True: the receiver's inbox holds one, or the upstream's CHAN_REQ
+        counter proves one is posted -- the blocking chain receive is then
+        bounded by transfer time (the `consume_up_to` argument, verbatim).
+        False: provably nothing. None: no signal channel -- the caller must
+        use the legacy blocking receive rather than guess.
+        """
+        receiver = getattr(self, "pp_chain_receiver", None)
+        counters = getattr(self, "pp_flip_counters", None)
+        if receiver is None or counters is None:
+            return None
+        if getattr(receiver, "inbox", None):
+            return True
+        posted = counters.sent(CHAN_REQ, self._pp_flip_upstream())
+        return int(getattr(receiver, "consumed", 0)) < int(posted)
+
+    def _pp_row_any_proxy_signal(self: Scheduler) -> bool:
+        """#631 ROW AUTHORITY: any proxy frame stashed or provably in flight?
+
+        Pure counter/inbox read -- never drains, never blocks. Used only to
+        decide whether the loop may enter the INDEFINITE idle chain park:
+        with a frame anywhere, it may not.
+        """
+        src = resolve_src(self.pp_group, None)
+        if typed_inbox(self.pp_group).get((src, "proxy")):
+            return True
+        counters = getattr(self, "pp_flip_counters", None)
+        if counters is None:
+            return False
+        upstream = self._pp_flip_upstream()
+        if kind_axis_covers(counters, CHAN_DICT, upstream):
+            consumed = counters.local_consumed_of_kind(CHAN_DICT, "proxy")
+            return consumed < counters.sent_of_kind(
+                CHAN_DICT, "proxy", upstream
+            ) or consumed < counters.attempted_of_kind(CHAN_DICT, "proxy", upstream)
+        consumed = counters.local_consumed(CHAN_DICT)
+        return consumed < counters.sent(CHAN_DICT, upstream) or consumed < counters.attempted(CHAN_DICT, upstream)
 
     def _pp_proxy_frame_pending(self: Scheduler, mb_id: int) -> Optional[bool]:
         """#631 ROW AUTHORITY: slot-aware, non-blocking frame-presence probe.
