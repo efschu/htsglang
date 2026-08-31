@@ -223,8 +223,6 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionCongruenceGuard,
     PPScheduleRefused,
     build_pp_admission_decision,
-    LOAD_BACK_EXTENT_ATTR as LOAD_BACK_EXTENT_ATTR_1041,
-    holders_with_unspent_extent,
     forwarded_fill_carry,
     forwarded_last_chunk,
     pp_admission_verdict_is_vacuous,
@@ -6079,7 +6077,15 @@ class Scheduler(
             # One rank: nothing to diverge from, so the floor stays OFF and
             # every cache-mutation trigger keeps reading its live local value
             # -- byte-identical to the pre-#616g path.
-            self._publish_uniform_evict_floor(None)
+            # #1045: PUBLISH THE LOCAL VALUE, NOT None, ON THE SINGLE-RANK
+            # PATH. This is what lets `None` become a CONSTRUCTION VIOLATION
+            # everywhere downstream instead of an ambiguous "single rank or
+            # nobody published". `local_avail` IS the group min when the group
+            # is one rank, so the value is correct rather than a placeholder,
+            # and every floor reader behaves exactly as it did on the local
+            # path. The host and mamba floors are a different axis and keep
+            # their None; only the evict floor is being made total here.
+            self._publish_uniform_evict_floor(local_avail)
             self._publish_uniform_host_floor(None)
             self._publish_uniform_mamba_floor(None)
             # #791b: one rank -- nothing to diverge from, ballot off, the
@@ -6744,7 +6750,35 @@ class Scheduler(
         tree = getattr(self, "tree_cache", None)
         if tree is None:
             return
-        if min_avail is None or (max_avail is not None and min_avail >= max_avail):
+        # #1045 OPTION A: THE FLOOR IS PUBLISHED UNCONDITIONALLY ON A GROUP.
+        #
+        # It used to stay None whenever the pools happened to AGREE this
+        # iteration, and that conditionality was load-bearing in the wrong
+        # direction: `unified_radix_cache`'s load-back memory check falls into a
+        # RANK-LOCAL branch when the floor is None, and its only remaining guard
+        # there was the delivery signal `pp_load_back_told`. Tying a
+        # correctness watchman on the MEMORY axis to a tie in availability meant
+        # the watchman stood down exactly when nothing looked wrong.
+        #
+        # PRICE: ZERO NEW COLLECTIVE. Both `min_avail` and `max_avail` are
+        # harvested from the SAME already-performed all-reduce at :6396
+        # (`t[0]` and `t[max_avail_at]`), so dropping the comparison removes
+        # work rather than adding it. Verified before building, per the
+        # standing "no new per-pass collective without a price report" rule.
+        #
+        # BEHAVIOURALLY IDENTICAL ON EVEN POOLS: when the pools agree,
+        # `min_avail` IS this rank's live availability, so every trigger reads
+        # the same number it read from the local path before -- the docstring's
+        # own "byte-identical" claim, now reached by publishing the equal value
+        # instead of by publishing nothing. `uniform_admitted_since_floor` is
+        # the #694 ledger that keeps a published floor tracking allocations, so
+        # the equivalence holds through the iteration and not only at the
+        # instant of publication.
+        #
+        # `min_avail is None` remains the ONE None case: the single-rank path
+        # (:6082, guarded by `grp is None or world_size <= 1`), where there is
+        # no peer to diverge from.
+        if min_avail is None:
             tree.uniform_avail_floor = None
             # #694: the ledger corrects a floor; with no floor there is nothing
             # to correct, and a value left over from a previous generation
@@ -6752,6 +6786,26 @@ class Scheduler(
             tree.uniform_admitted_since_floor = 0
             return
         tree.uniform_avail_floor = int(min_avail)
+        # #1045 LIVENESS: a floor that is published on every iteration must be
+        # SEEN to be published on every iteration, or "the watchman is armed" is
+        # an assumption again. Unconditional first, then sampled WITH the
+        # suppression count printed -- a zero from a rate-limited emitter is not
+        # a zero (this campaign's fourth denominator instance, now a rule).
+        _n = getattr(self, "_1045_floor_pub", 0) + 1
+        self._1045_floor_pub = _n
+        _eq = max_avail is not None and int(min_avail) >= int(max_avail)
+        if _n <= 3 or _n % 512 == 0:
+            logger.info(
+                "#1045 FLOOR PUBLISHED n=%d floor=%d max=%s pools_equal=%s -- "
+                "published unconditionally on a group; the memory-axis watchman "
+                "no longer stands down on a tie. (sampled every 512 after the "
+                "third; suppressed since last print: %d)",
+                _n,
+                int(min_avail),
+                max_avail,
+                _eq,
+                0 if _n <= 3 else 511,
+            )
         # #694: RESET IN THE SAME CALL THAT PUBLISHES, so the ledger never
         # outlives the number it corrects. The floor is a snapshot of this
         # instant; allocations charged against the PREVIOUS snapshot have
@@ -9213,16 +9267,12 @@ class Scheduler(
         # lines. Host-side strings only (#790).
         self._admission_decline_note = None
 
-        # ROW-COLLAPSE: PP0 applies the row it built LAST pass, here, before
-        # this pass plans anything. That makes PP0's timing identical to a
-        # follower's (which applies at its proxy-receive point, after its own
-        # planning) without PP0 having to receive its own frame. Above every
-        # early return, so a pass that bails out still adopts what the last
-        # one decided.
-        _own_row = getattr(self, "_pp_load_back_row_self", None)
-        if _own_row is not None:
-            self._pp_load_back_row_self = None
-            self.apply_pp_load_back_row(_own_row)
+        # #1046: PP0'S SELF-APPLY IS GONE WITH THE REST OF THE DELIVERY CHAIN.
+        # PP0 used to apply the row it built last pass so its timing matched a
+        # follower's. There is no row column to apply any more: every rank,
+        # PP0 included, derives the extent at its own match, so PP0's timing is
+        # identical to its peers' by construction rather than by imitation --
+        # and one lap of latency disappears with it.
 
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -9991,17 +10041,8 @@ class Scheduler(
 
             _pp_parked_priority(self)
 
-        # #1041: ONE SITE, AT THE TOP, BEFORE ANY SKIP. Everything the loop
-        # LOOKED AT lands here, whichever of the eight `continue` branches or
-        # the adder's budget then declines it. Appending inside each skip branch
-        # instead would be the per-path retrofit this slice exists to avoid --
-        # and it would have missed boot 8's second, still-unproven decline
-        # mechanism exactly as the first one was missed.
-        _seen_this_pass: List[Req] = []
-
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            _seen_this_pass.append(req)
             # #988 A REQUEST ALREADY COLLECTED THIS PASS IS NOT A CANDIDATE.
             # `add_chunked_req` appends the continuation to `can_run_list`
             # while the request may still be resident in `waiting_queue` (the
@@ -10551,127 +10592,11 @@ class Scheduler(
             )
             adder.can_run_list = can_run_list
 
-        def _publish_pp_decision_1041(admitted_list):
-            """#1041: PUBLICATION IS NOT GATED ON ADMISSION.
-
-            The extent is a property of (request + its host hit), not of this
-            pass admitting the request. Boot 8 measured the coupling: on the
-            passes where the hit was live the loop skipped the holder at
-            `prefetch_pending`, `can_run_list` came back empty, and the early
-            return below meant no decision was built AT ALL -- three ranks,
-            `#788 PP-ADMISSION verdict=DECLINE ... loop_skips(prefetch_pending
-            =1(first=f7f997c0fafc451e))`, with the same rid deferring for want
-            of an extent two seconds later.
-
-            Everything the loop SAW that is not in `admitted_list` rides along
-            as an `admitted=False` FACT CARRIER, which `forwarded_schedule`
-            filters out of the executable geometry by construction. So this is
-            mechanism-agnostic: it covers the proven `prefetch_pending` skip and
-            the still-unproven budget-refusal-after-deferral path identically,
-            because both are only instances of "the holder is not a member of
-            the published pass".
-            """
-            if not (self.ps.pp_size > 1 and self.ps.pp_rank == 0):
-                return
-            # #1041 POPULATION = EVERYTHING THIS PASS TOUCHED, and boot 9
-            # measured why the narrower reading is worthless. `_seen_this_pass`
-            # holds only what the WAITING-QUEUE LOOP visited -- but
-            # `add_chunked_req` (scheduler.py:9878) fills `can_run_list` BEFORE
-            # that loop runs, so a pass serving only chunked continuations
-            # visits nothing and the counter read `seen=0 published=0 delta=0`
-            # beside `admitted=1`: a green delta on a pass it could not see.
-            # A detector whose denominator excludes a whole filler cannot
-            # detect that filler's bypass, which is the denominator trap this
-            # instrument exists to prevent. The union is the honest population.
-            # #1043: THE CARRIER POPULATION IS A PROPERTY OF THE REQUEST, NOT
-            # OF THIS PASS. Two pass-scoped denominators have now been wrong in
-            # the same way -- `_seen_this_pass` alone missed `add_chunked_req`,
-            # and the union with `admitted_list` still missed every request that
-            # HOLDS an extent without being touched this pass (boot 11: the
-            # deferring rids carried 4618/1295 while the publisher counted
-            # seen=0). `holders_with_unspent_extent` is the one authority,
-            # derived from the cutover's own residency enumeration; anything the
-            # loop touched is unioned in so a freshly stamped request cannot be
-            # missed on the pass that stamps it.
-            _admitted_ids = {id(r) for r in admitted_list}
-            _touched = list(admitted_list)
-            _seen_ids = set(_admitted_ids)
-            for r in list(holders_with_unspent_extent(self)) + _seen_this_pass:
-                if id(r) in _seen_ids:
-                    continue
-                _seen_ids.add(id(r))
-                _touched.append(r)
-            _carriers = [r for r in _touched if id(r) not in _admitted_ids]
-            # #1043b: MEASURE THE POPULATION BEFORE THE BUILD SPENDS IT.
-            # Boot 12 read `seen=0 published=1 delta=-1`: `_spend_for_entry`
-            # clears the field DURING the build, so counting holders afterwards
-            # counts what is left over, not what was there. A detector that
-            # samples its own denominator after the consumer has run measures
-            # the wrong population -- the same defect class it exists to catch,
-            # for the third time and now inside its own timing.
-            _seen_with_extent = sum(
-                1
-                for r in _touched
-                if getattr(r, LOAD_BACK_EXTENT_ATTR_1041, None)
-            )
-            self._pp_admission_last_built_decision = build_pp_admission_decision(
-                0,  # placeholder mb_id; stamped with the real one downstream
-                admitted_list,
-                pp_size=self.ps.pp_size,
-                guard=self._pp_admission_guard,
-                # #791 CORE: the ONE production call site, and the only one
-                # that must never fall back. A `can_run_list` member with no
-                # `extend_range` is a torn-down request, not a missing
-                # optimisation -- refuse and name it.
-                require_executed_geometry=True,
-                fact_only_reqs=_carriers,
-            )
-            # #1041 POPULATION EQUALITY, the standing instrument. `seen` counts
-            # the requests this pass looked at that HOLD an extent; `published`
-            # counts the entries that actually carry one. They must be equal.
-            # The only legitimate differences are named and structural: a
-            # request with no host hit never enters `seen` (no extent stamped),
-            # `pp_size <= 1` never reaches this function at all, and a rid the
-            # RECEIVER does not hold is a different counter on the other side.
-            # Anything else is a bypass, and it shows as a nonzero delta instead
-            # of as a silent zero that costs a boot to interpret.
-            _published = sum(
-                1
-                for e in self._pp_admission_last_built_decision.entries
-                if getattr(e, "load_back_len", None)
-            )
-            _d = _seen_with_extent - _published
-            _n = getattr(self, "_1041_pop_n", 0) + 1
-            self._1041_pop_n = _n
-            # #1043c: NEVER SUPPRESS A PASS THAT HAD HOLDERS. The boot-13
-            # overlay (PP0 `set` at 10:14:33/10:15:04 against `#1041` at
-            # 10:14:15/:21/:54 -- zero intersection) reads as a clean time
-            # disjunction, but it is BOUNDED BY THIS RATE LIMIT: only the first
-            # five publisher calls emit, so "no emission after 10:14:54" cannot
-            # distinguish "the publisher did not run" from "it ran and was not
-            # printed". An overlay drawn from a rate-limited sample is a
-            # denominator claim about the sample, not about the pass stream.
-            # Emitting unconditionally whenever holders exist makes the next
-            # overlay decisive; the volume is bounded by how rare holders are.
-            if _seen_with_extent > 0 or _d != 0 or _n <= 5 or _n % 64 == 0:
-                logger.info(
-                    "#1041 EXTENT POPULATION seen=%d published=%d delta=%d "
-                    "admitted=%d carriers=%d n=%d -- delta!=0 means a request "
-                    "held an extent this pass and no entry carried it, i.e. a "
-                    "bypass of the publication path.",
-                    _seen_with_extent,
-                    _published,
-                    _d,
-                    len(admitted_list),
-                    len(_carriers),
-                    _n,
-                )
-
+        # #1046: the #1041 publisher wrapper is gone with the carrier half it
+        # existed for. PP0 builds its decision at the one site below, exactly as
+        # before the delivery chain was built -- the admission row's batch
+        # geometry never needed a second publication point.
         if len(can_run_list) == 0:
-            # #1041: PUBLISH BEFORE RETURNING. This is the exact path boot 8
-            # died on -- an empty admission that still had a live host hit to
-            # announce.
-            _publish_pp_decision_1041([])
             # #791b-instr22: an empty loop names its skips -- the silent
             # local narrowing, made loud. "loop=clean" means the loop saw
             # every queued request and admitted none WITHOUT any skip
@@ -10721,12 +10646,21 @@ class Scheduler(
         # second clamp (`prefix_len_for` on an already-clamped candidate
         # returns that same candidate).
         # ROW-COLLAPSE: the entry-stamp that stood here is gone with the content
-        # key it existed to write. #1041: and the derivation that replaced it is
-        # gone too -- the extent is CHOSEN at the match and only READ here, so
-        # this call no longer has to be the pass that admits the holder. Both
-        # exits of this method now go through one publisher.
-        _publish_pp_decision_1041(can_run_list)
+        # key it existed to write. #1046: so is the load-back column -- this row
+        # now carries BATCH GEOMETRY only (`prefix_len`/`extend_len`), which is
+        # the #791 axis and was never the thing in doubt.
         if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
+            self._pp_admission_last_built_decision = build_pp_admission_decision(
+                0,  # placeholder mb_id; stamped with the real one downstream
+                can_run_list,
+                pp_size=self.ps.pp_size,
+                guard=self._pp_admission_guard,
+                # #791 CORE: the ONE production call site, and the only one that
+                # must never fall back. A `can_run_list` member with no
+                # `extend_range` is a torn-down request, not a missing
+                # optimisation -- refuse and name it.
+                require_executed_geometry=True,
+            )
             # #968/#1035 PP0 SEEDS ITS OWN PENDING MAP, because PP0 is the one
             # rank that never receives this fact off the wire -- it is the one
             # that makes it. Downstream ranks fill the same map when they pop
@@ -10741,18 +10675,16 @@ class Scheduler(
             # its batch at :4292 -- so a PP0 that applied immediately would run
             # one pass at a prefix its peers cannot reach, which is precisely
             # the divergence boot 1815081d46 died in.
-            # ROW-COLLAPSE: PP0 APPLIES ITS OWN DECISION THE SAME WAY ITS
-            # PEERS DO -- through the row, one lap later.
-            #
-            # It cannot simply write its extents now: the peers receive this
-            # row only at their proxy-receive point, which is measured to sit
-            # AFTER their planning in the same loop body. A PP0 that applied
-            # immediately would spend one pass at a prefix its peers cannot
-            # reach -- the divergence boot 1815081d46 died in. So PP0 stamps
-            # its own requests from its own row on the NEXT pass, exactly as
-            # a follower does, and the one-lap delay is uniform across ranks
-            # by construction rather than by a matching pair of side-maps.
-            self._pp_load_back_row_self = self._pp_admission_last_built_decision
+            # #1046: THE ONE-LAP DELAY IS GONE, AND SO IS WHAT IT PROTECTED.
+            # PP0 used to park its own decision here and apply it a pass later,
+            # so that it reached the same prefix at the same time as peers who
+            # only see the row at their proxy-receive point. With the extent
+            # derived at each rank's own match, every rank -- PP0 included --
+            # has the number at the same point in its own pass, so the lap has
+            # nothing left to synchronise and is simply latency. The
+            # 1815081d46 divergence it guarded is prevented one level up
+            # instead: identical derivation from identical content, plus the
+            # group availability floor for the memory axis (#1045).
             # THE ROW ITSELF IS WHAT TRAVELS, not the extracted number. The
             # decision goes onto the wire through its own established codec
             # (`pp_admission_decision_to_wire`), so the fact rides as

@@ -292,61 +292,6 @@ _PP_ADMISSION_PENDING_SENDS_CAP = 64
 #: times for instrumenting ONE branch and leaving its neighbour silent, so these
 #: two ledgers cover every exit of the ship site and every exit of the apply
 #: function -- not just the branch currently under suspicion.
-_1044_SHIP = {
-    "posted_with_row": 0,
-    "posted_no_row": 0,
-    "posted_no_decision": 0,
-    "skipped_with_row": 0,
-    "skipped_no_row": 0,
-    "entries_shipped": 0,
-}
-_1044_APPLY = {
-    "calls": 0,
-    "no_entries": 0,
-    "entry_no_extent": 0,
-    "entry_no_rid": 0,
-    "no_wanted": 0,
-    "unknown_rid": 0,
-    "stamped": 0,
-}
-
-
-def _1044_note_apply(sched, wanted: int, stamped: int, entries) -> None:
-    """#1044: the receiver's line. UNCONDITIONAL whenever the row wanted
-    anything -- the whole point is that a decline must never be a silence."""
-    n = _1044_APPLY["calls"]
-    if wanted or n <= 3 or n % 512 == 0:
-        logger.info(
-            "#1044 ROW RECV wanted=%d stamped=%d entries=%d -- calls=%d "
-            "no_entries=%d entry_no_extent=%d entry_no_rid=%d no_wanted=%d "
-            "unknown_rid=%d stamped_total=%d "
-            "(sampled every 512 after the third when wanted=0)",
-            wanted, stamped, len(entries or ()),
-            _1044_APPLY["calls"], _1044_APPLY["no_entries"],
-            _1044_APPLY["entry_no_extent"], _1044_APPLY["entry_no_rid"],
-            _1044_APPLY["no_wanted"], _1044_APPLY["unknown_rid"],
-            _1044_APPLY["stamped"],
-        )
-
-
-def _1044_note_ship(kind: str, mb_id, entries: int) -> None:
-    _1044_SHIP[kind] += 1
-    _1044_SHIP["entries_shipped"] += int(entries or 0)
-    # UNCONDITIONAL whenever a row is actually involved; otherwise sampled AND
-    # the suppression count is printed, because a zero from a rate-limited
-    # emitter is not a zero.
-    n = _1044_SHIP[kind]
-    if entries or n <= 3 or n % 512 == 0:
-        logger.info(
-            "#1044 ROW SHIP %s mb=%s entries=%d -- posted_with_row=%d "
-            "posted_no_row=%d posted_no_decision=%d skipped_with_row=%d "
-            "skipped_no_row=%d entries_shipped=%d (this kind seen %d times, "
-            "sampled every 512 after the third)",
-            kind, mb_id, int(entries or 0),
-            _1044_SHIP["posted_with_row"], _1044_SHIP["posted_no_row"],
-            _1044_SHIP["posted_no_decision"], _1044_SHIP["skipped_with_row"],
-            _1044_SHIP["skipped_no_row"], _1044_SHIP["entries_shipped"], n,
-        )
 
 
 def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, object]:
@@ -2377,34 +2322,14 @@ def pp_output_payload_with_return_trip(
     pp_parked_continuation_stamp(
         holder, {_PP_PARKED_CONTINUATION_KEY: _pp_parked_carry_wire(holder)}, parked_out
     )
-    # #1044 SENDER HALF. Boot 14 published a row (`#1041 ... published=1`) and
-    # NO rank ever stamped one (`ROW APPLIED` 0 in the whole boot). Two shapes
-    # cannot be told apart from the receiver alone: the frame was never posted
-    # (delivery), or it was posted and the receiver could not use it (lap). This
-    # line is the sender's half of that partition and it counts the SKIPPED
-    # passes too -- a frame that is never posted is exactly the case a
-    # posted-only counter cannot see.
-    _lb_entries = 0
-    if decision is not None:
-        _lb_entries = sum(
-            1 for _e in (getattr(decision, "entries", ()) or ())
-            if getattr(_e, "load_back_len", None)
-        )
+    # #1046: the #1044 sender ledger is deleted with the delivery chain it was
+    # built to diagnose. The row still rides this payload for the #791 batch
+    # geometry; only the load-back column stopped needing to be watched.
     if decision is None and not chain and not parked_out:
-        if _lb_entries:
-            # Unreachable by construction (decision is None here), kept as a
-            # can-fail tell rather than an assumption.
-            _1044_note_ship("skipped_with_row", mb_id, _lb_entries)
-        else:
-            _1044_note_ship("skipped_no_row", mb_id, 0)
         return payload
     out = dict(payload)
     if decision is not None:
         out.update(pp_admission_decision_to_wire(decision))
-        _1044_note_ship("posted_with_row" if _lb_entries else "posted_no_row",
-                        mb_id, _lb_entries)
-    else:
-        _1044_note_ship("posted_no_decision", mb_id, 0)
     if chain:
         out[_PP_LAUNCHED_CHAIN_KEY] = tuple(bool(x) for x in chain)
     if parked_out:
@@ -6756,119 +6681,24 @@ class SchedulerPPMixin:
             out[str(rid)] = chunked
         return out
 
-    def apply_pp_load_back_row(self: Scheduler, decision) -> int:
-        """ROW-COLLAPSE (#968): write PP0's extents onto the LOCAL requests.
-
-        Returns how many requests were stamped.
-
-        THIS REPLACES A FOUR-STAGE SIDE CHANNEL -- `pp_load_back_offer` ->
-        `pp_load_back_key` -> `_pp_load_back_pending` -> promote ->
-        `_pp_load_back_effective` -> keyed lookup at the application site.
-        All of it existed to do two jobs that the row and the request already
-        do between them:
-
-        * DELIVERY across ranks -- that is the row, and only the row. It is
-          the sole arc that carries a PP0 decision to its peers; the intake
-          chain forward happens before the decision exists and carries the
-          wire object, not the `Req` (measured: scheduler.py's per-rank
-          `Req(...)` construction, and `_pull_raw_reqs` at the head of the
-          round).
-        * LIFETIME on one rank -- that is the request itself. A `Req` is
-          rank-locally resident and the cutover retracts and re-admits it
-          from the local waiting queue rather than re-receiving it, so a
-          field written here survives the cutover BY CONSTRUCTION. The
-          sticky map and the content key were emulating exactly that
-          property, in a second place, where it could rot out of agreement.
-
-        THE ONE-LAP DELAY IS PRESERVED AND IT IS LOAD-BEARING. This runs at
-        the row-receive point, which is measured to sit AFTER this pass's
-        planning in the same straight-line loop body (plan at
-        `get_next_batch_to_run`, receive ~190 lines later). So an extent
-        stamped here is first honoured on the request's NEXT chunk -- which
-        is precisely the documented contract ("stamped by PP0 on the frame
-        of the pass that ADMITS the request ... every later chunk honours
-        it", at most one HiCache chunk of recompute per re-admission). DO
-        NOT "fix" that delay: a rank applying an extent on the pass it
-        learns it would run at a prefix its peers cannot reach, which is the
-        divergence boot 1815081d46 died in.
-        """
-        # #1044 RECEIVER HALF -- EVERY EXIT OF THIS FUNCTION IS NAMED.
-        # `ROW APPLIED` only ever emitted on `stamped > 0`, so all four ways
-        # this function can decline were one indistinguishable silence. That is
-        # the shape the campaign has paid for three times: one branch
-        # instrumented, its neighbour left mute. Swept in one go rather than one
-        # branch per boot.
-        _1044_APPLY["calls"] += 1
-        entries = getattr(decision, "entries", None) or ()
-        wanted = {}
-        for e in entries:
-            n = getattr(e, "load_back_len", None)
-            rid = getattr(e, "rid", None)
-            if not n:
-                _1044_APPLY["entry_no_extent"] += 1
-                continue
-            if rid is None:
-                _1044_APPLY["entry_no_rid"] += 1
-                continue
-            wanted[str(rid)] = int(n)
-        if not entries:
-            _1044_APPLY["no_entries"] += 1
-        if not wanted:
-            _1044_APPLY["no_wanted"] += 1
-            _1044_note_apply(self, 0, 0, entries)
-            return 0
-        local = self._local_reqs_by_rid()
-        stamped = 0
-        # #1040 MAMBA COLUMN. A boot that stamps KV extents onto requests whose
-        # recurrent anchor this rank does not hold is a HALF SUCCESS with a
-        # named link, never a green one, and one counter cannot say which half
-        # ran. `anchors` counts the stamped requests that carry a state-bearing
-        # boundary at all; `retracted` counts those that have survived at least
-        # one cutover retraction, which is the free pre-measurement for the
-        # lifecycle half (#1039: does the anchor outlive the node it hangs on?).
-        anchors = 0
-        retracted_survivors = 0
-        for rid, extent in wanted.items():
-            req = local.get(rid)
-            if req is None:
-                # The row names a request this rank does not hold. Not an
-                # error: PP0 admits against its own queue and a peer may have
-                # completed or retracted that rid. No fact is invented.
-                # #1044: NOT AN ERROR IS NOT THE SAME AS NOT WORTH COUNTING.
-                # This is candidate (D) -- the row arrived a lap after the rid
-                # left this rank -- and it was the one silent branch that could
-                # absorb the entire chain without a single line of evidence.
-                _1044_APPLY["unknown_rid"] += 1
-                continue
-            req.pp_load_back_told = extent
-            stamped += 1
-            _anchor = getattr(req, "state_anchor_depth", None)
-            if _anchor:
-                anchors += 1
-            if getattr(req, "_1040_seen_retract", False):
-                retracted_survivors += 1
-        _1044_APPLY["stamped"] += stamped
-        _1044_note_apply(self, len(wanted), stamped, entries)
-        if stamped:
-            _n = getattr(self, "_968_applied_n", 0) + 1
-            self._968_applied_n = _n
-            if _n <= 5 or _n % 64 == 0:
-                logger.info(
-                    "#968 LOAD-BACK ROW APPLIED n=%d stamped=%d/%d anchors=%d/%d "
-                    "retract_survivors=%d phase=%s extents=%s -- PP0 extents "
-                    "written onto this rank's own requests, honoured from their "
-                    "next chunk. anchors < stamped means this rank holds the KV "
-                    "half of the fact without the recurrent half.",
-                    _n,
-                    stamped,
-                    len(wanted),
-                    anchors,
-                    stamped,
-                    retracted_survivors,
-                    getattr(getattr(self, "phase_flip_runtime", None), "phase", "?"),
-                    sorted(wanted.values())[:5],
-                )
-        return stamped
+    # #1046 DELETED: `apply_pp_load_back_row`, and the whole receiving half of
+    # the load-back delivery chain with it.
+    #
+    # It stamped `req.pp_load_back_told` from the admission row so every rank
+    # would apply PP0's extent. The extent is now chosen at each rank's own
+    # match, by one shared expression over the same content, so there is nothing
+    # to deliver and nothing to stamp. Seven boots measured the chain end to
+    # end: the extent was chosen correctly and rank-identically, PP0 published
+    # it, and no rank ever applied it -- the delivery was pure latency.
+    #
+    # THE #1044 SHIP/RECV LEDGERS DIED HERE TOO, and that is the correct
+    # outcome rather than wasted work: they were built to partition WHY the row
+    # was not applied, and they answered by making the whole question
+    # disappear. The zombie test covers their markers.
+    #
+    # WHAT DID NOT DIE: the admission row itself, its `prefix_len`/`extend_len`
+    # columns, and the #791 membership and ordering rules. Those police BATCH
+    # GEOMETRY, a different axis, and are untouched.
 
     def init_pp_loop_state(self: Scheduler):
         # #969: NOTHING IS HARVESTED HERE ANY MORE. `init_pp_loop_state` is
@@ -9296,16 +9126,14 @@ class SchedulerPPMixin:
                 _lb_decision = pp_admission_decision_from_wire(
                     self._pp_load_back_wire
                 )
-                # ONE FIELD OF THE ROW, DELIBERATELY. The row carries PP0's
-                # whole admission decision; this slice consumes `load_back_len`
-                # and nothing else. The retraction half is not lit up here --
-                # see the note at the build site in scheduler.py.
-                #
-                # ROW-COLLAPSE: applied straight onto this rank's own requests.
-                # There is no pending map and no promote step any more -- those
-                # were a second place for the same fact to live, and the fact
-                # they were protecting already survives on the Req.
-                self.apply_pp_load_back_row(_lb_decision)
+                # #1046: NOTHING IS CONSUMED FROM THE ROW HERE ANY MORE.
+                # This read the `load_back_len` column and stamped it onto this
+                # rank's requests. The extent is now derived at this rank's own
+                # match, so the column has no consumer and this receive point
+                # has no work. The decision object is still received and
+                # forwarded for the #791 batch geometry -- that is a different
+                # axis and is untouched.
+                pass
             except Exception:  # noqa: BLE001
                 # A row this rank cannot read is a fact it does not have, which
                 # is a state the applying site already handles honestly (no

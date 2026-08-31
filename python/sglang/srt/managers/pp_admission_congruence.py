@@ -1206,7 +1206,8 @@ LOAD_BACK_EXTENT_ATTR = "pp_load_back_extent"
 #:
 #:   set            a match WITH a host hit chooses an extent          (writer)
 #:   hitless_noop   a match WITHOUT a hit -- NO-OP, never a clear      (was the bug)
-#:   spend          the row carried it; the fact is delivered          (consumer)
+#:   (spend)        DELETED with the delivery chain (#1046) -- there is no
+#:                  row consumption left for a fact to be retired by
 #:   retract        the request was retracted; the fact is void        (deleter)
 #:
 #: BOOT 10 MEASURED WHY `hitless_noop` MUST NOT BE A CLEAR. The stamp nulled the
@@ -1216,7 +1217,7 @@ LOAD_BACK_EXTENT_ATTR = "pp_load_back_extent"
 #: rid. Writer, eraser and reader separated by an ordinary intervening match --
 #: the lifecycle shape the pre-boot table exists to catch, reproduced inside the
 #: mechanism that was supposed to fix it.
-_1042_LIFECYCLE = {"set": 0, "hitless_noop": 0, "spend": 0, "retract": 0}
+_1042_LIFECYCLE = {"set": 0, "hitless_noop": 0, "retract": 0}
 
 
 def _1042_note(kind: str, req, extent=None) -> None:
@@ -1225,33 +1226,15 @@ def _1042_note(kind: str, req, extent=None) -> None:
     if n <= 3 or n % 256 == 0:
         logger.info(
             "#1042 EXTENT LIFECYCLE %s rid=%s extent=%s held=%s -- set=%d "
-            "hitless_noop=%d spend=%d retract=%d",
+            "hitless_noop=%d retract=%d",
             kind,
             getattr(req, "rid", None),
             extent,
             getattr(req, LOAD_BACK_EXTENT_ATTR, None),
             _1042_LIFECYCLE["set"],
             _1042_LIFECYCLE["hitless_noop"],
-            _1042_LIFECYCLE["spend"],
             _1042_LIFECYCLE["retract"],
         )
-
-
-def spend_state_aligned_extent(req) -> None:
-    """#1042 transition SPEND: the row carried the fact, so the field is done.
-
-    Cleared at the ROW BUILD, which is where the value is consumed into an
-    entry. Clearing later (at apply) would need the field to survive a rank
-    hop it does not travel on; clearing never would let one hit republish
-    forever, which is the stale-HIGH republish e0bc96008e already paid for.
-    """
-    if getattr(req, LOAD_BACK_EXTENT_ATTR, None) is None:
-        return
-    _1042_note("spend", req)
-    try:
-        setattr(req, LOAD_BACK_EXTENT_ATTR, None)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def clear_state_aligned_extent_on_retract(req) -> None:
@@ -1264,74 +1247,6 @@ def clear_state_aligned_extent_on_retract(req) -> None:
         setattr(req, LOAD_BACK_EXTENT_ATTR, None)
     except Exception:  # noqa: BLE001
         pass
-
-
-def holders_with_unspent_extent(scheduler) -> List:
-    """#1043: EVERY request this rank holds that still carries an extent.
-
-    THE ONE CARRIER AUTHORITY, and it is DERIVED rather than hand-listed --
-    because the hand-list has now been wrong twice in the same class. First
-    `_seen_this_pass` alone missed `add_chunked_req` (which fills
-    `can_run_list` before the loop); then the union with `admitted_list` still
-    missed every request that HOLDS an extent without being touched by this
-    pass. A third hand-written enumeration would be the same defect a third
-    time, so this one is built on the residency authority the CUTOVER already
-    uses and states its single deviation.
-
-    BASE: `phase_flip_runtime._live_reqs(scheduler)` -- the rank's resident set
-    across ALL microbatch slots. Its own docstring records why each route is
-    there, and it covers: `running_mbs` (per-slot residents), `last_mbs` (the
-    W30 route -- a request that just finished a prefill iteration sits there and
-    nowhere else), `running_batch`/`last_batch` (the non-PP handles), and
-    `chunked_req` (resident, in no batch at all, #631 defect O).
-
-    THE #858b LAST_MBS GAP WAS CHECKED, NOT ASSUMED, AND IS CLOSED. The warning
-    that `_live_reqs` does not enumerate `last_mbs` is STALE: W30 added that
-    route to the AUTHORITY (phase_flip_runtime.py:1346-1347) after
-    `ResidentCarryError` measured it on all three ranks, explicitly under the
-    rule "fix it at the one authority, not at the consumers". Deriving from it
-    therefore inherits the fix instead of re-opening the hole.
-
-    THE ONE DEVIATION, stated rather than silent: `waiting_queue` is added. The
-    cutover authority answers "what holds POOL ROWS I must move", and a queued
-    request holds none. This function answers "what holds a FACT I must
-    publish", and a queued request does -- it is exactly the boot-8 population
-    (skipped at `prefetch_pending`, never admitted, still queued, still holding
-    a host hit). Excluding it would reproduce the original defect.
-
-    Deduplicated by identity: the same Req legitimately appears on several
-    routes. `spend` is what prevents a held extent from being published twice,
-    so this set may safely be broad.
-    """
-    from sglang.srt.managers.phase_flip_runtime import _live_reqs
-
-    seen = set()
-    out: List = []
-    try:
-        sources = list(_live_reqs(scheduler) or [])
-    except Exception:  # noqa: BLE001 - never break admission on a census
-        sources = []
-    sources.extend(list(getattr(scheduler, "waiting_queue", []) or []))
-    for req in sources:
-        if id(req) in seen:
-            continue
-        seen.add(id(req))
-        if getattr(req, LOAD_BACK_EXTENT_ATTR, None):
-            out.append(req)
-    return out
-
-
-def _spend_for_entry(req) -> Optional[int]:
-    """#1042: read the stamped extent INTO an entry and mark it spent.
-
-    One expression for "the row carried it", so no branch can publish without
-    spending and none can spend without publishing -- the two-populations defect
-    this whole slice exists to remove, kept out of its own fix.
-    """
-    extent = getattr(req, LOAD_BACK_EXTENT_ATTR, None)
-    if extent:
-        spend_state_aligned_extent(req)
-    return extent
 
 
 def stamp_state_aligned_extent(req) -> Optional[int]:
@@ -1370,8 +1285,8 @@ def stamp_state_aligned_extent(req) -> Optional[int]:
     choosing, exactly as before -- what changes is only WHEN it chooses.
     """
     # #1042 TRANSITION GUARD. A hitless match is a NO-OP WITH A COUNTER, never
-    # a clear -- only `spend_state_aligned_extent` and
-    # `clear_state_aligned_extent_on_retract` may empty this field. The counter
+    # a clear -- only `clear_state_aligned_extent_on_retract` may empty this
+    # field now that the spend transition is gone with the delivery chain. The counter
     # is also the discriminator for boot 10's unstamped rid (364e5b59: DEFERRED
     # x3 with kv=4618, zero stamps): if it appears here, the stamp ran with a
     # zero hit; if it appears nowhere, a third path sets `host_hit_length`
@@ -1608,7 +1523,6 @@ def build_pp_admission_decision(
     pp_size: int,
     guard: Optional[PPAdmissionCongruenceGuard] = None,
     require_executed_geometry: bool = False,
-    fact_only_reqs: Sequence = (),
 ) -> PPAdmissionDecision:
     """PP0's (or, under `pp_size<=1`, the only rank's) committed decision.
 
@@ -1706,45 +1620,12 @@ def build_pp_admission_decision(
     guard and the #796 tensor read and never reach a real batch.
     """
     entries = []
-    # #1041 FACT CARRIERS: entries that deliver an extent and NOTHING else.
-    #
-    # These are requests this rank SAW this pass and did not admit -- skipped by
-    # one of the admission loop's eight `continue` branches, or refused by the
-    # adder's budget. Boot 8 proved the cost of leaving them silent: the request
-    # holding the host hit was skipped at `prefetch_pending` before the adder,
-    # `can_run_list` came back empty, the method returned above this call, and
-    # the extent was never published for anyone.
-    #
-    # `admitted=False` is what makes them safe, and it is enforced by
-    # CONSTRUCTION rather than by care at each reader:
-    #   * `forwarded_schedule` filters `e.admitted and not e.retracted`, so a
-    #     carrier can never enter `_pp_scheduled_extents` and therefore never
-    #     reaches the #791 membership comparison (scheduler.py:10508/:10522) --
-    #     the PPScheduleRefused-storm direction is closed at the source, not by
-    #     a second test here.
-    #   * `reconcile_pp_admission_decision` passes a non-admitted entry through
-    #     verbatim and never schedules it.
-    #   * `forwarded_last_chunk` / `forwarded_fill_carry` key on `fill_len`,
-    #     which a carrier does not carry, so it is absent from both maps.
-    #   * `apply_pp_load_back_row` iterates ALL entries and stamps by rid, which
-    #     is exactly what a carrier is for; a rid the receiver does not hold is
-    #     already a counted no-op there, never a refusal (the rid may legitimately
-    #     live only on PP0).
-    # A carrier with no extent would be pure noise on the wire, so it is not
-    # emitted at all.
-    for req in fact_only_reqs or ():
-        _extent = _spend_for_entry(req)
-        if not _extent:
-            continue
-        entries.append(
-            PPAdmissionEntry(
-                rid=req.rid,
-                prefix_len=0,
-                extend_len=0,
-                admitted=False,
-                load_back_len=int(_extent),
-            )
-        )
+    # #1046 FACT CARRIERS DELETED. They existed so a request holding an extent
+    # could publish it even when this pass did not admit it. With the extent
+    # derived at each rank's own match there is nothing to publish, so the
+    # carriers, the holder authority that fed them and the spend transition that
+    # retired them all go together. They were correct for the problem they had;
+    # the cut removes the problem.
     for req in reqs:
         executed = _executed_extent(req)
         if executed is not None:
@@ -1801,12 +1682,11 @@ def build_pp_admission_decision(
                     # rounded DOWN to the deepest boundary that carries a
                     # recurrent state, because the KV half of a prefix can stop
                     # anywhere and the GDN half cannot.
-                    # #1041: READ, never re-derive. The choice was made at the
-                    # match (`stamp_state_aligned_extent`), which is the one
-                    # site every executable request must pass. Deriving it here
-                    # made the fact depend on this pass admitting the request,
-                    # and boot 8 measured what that costs.
-                    load_back_len=_spend_for_entry(req),
+                    # #1046: NOT POPULATED ANY MORE. The column existed to
+                    # deliver the extent to peers; every rank now derives it at
+                    # its own match, so it has no reader. The FIELD is kept so
+                    # the wire codec stays width-tolerant against a peer built
+                    # before this cut; it simply always travels as None.
                 )
             )
             continue
@@ -1890,10 +1770,7 @@ def build_pp_admission_decision(
                 last_chunk=_last_chunk_verdict(told, extend_len, fallback_fill_len),
                 # #968/#1035: same offer, same reader, on the fallback branch.
                 # ROW-COLLAPSE: see the sibling constructor above.
-                # #1040/#1041: the SAME stamped field, not a second copy of the
-                # arithmetic -- one chooser at the writer, so the two branches
-                # cannot publish extents chosen by different rules.
-                load_back_len=_spend_for_entry(req),
+                # #1046: not populated -- see the sibling constructor above.
             )
         )
     return PPAdmissionDecision(mb_id=mb_id, entries=tuple(entries))

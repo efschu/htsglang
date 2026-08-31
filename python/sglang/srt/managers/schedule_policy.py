@@ -12,6 +12,10 @@ _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBU
 logger = logging.getLogger(__name__)
 
 #: #988: rate-limit state for the load-back instrument, module-level.
+from sglang.srt.managers.pp_admission_congruence import (
+    LOAD_BACK_EXTENT_ATTR,
+)
+
 _988_LOADBACK_SEEN = {"n": 0, "mamba": 0, "kv_only": 0}
 
 
@@ -41,7 +45,7 @@ def _note_988_loadback(req, new_prefix_len: int) -> None:
         logger.info(
             "#988 LOADBACK rid=%s prefix moved to %d, extend_range re-derived "
             "to the parked shape at the mutation (seen=%d) "
-            "kv_applied=%d mamba_restored=%d kv_only=%d anchor_depth=%s told=%s",
+            "kv_applied=%d mamba_restored=%d kv_only=%d anchor_depth=%s extent=%s",
             getattr(req, "rid", None),
             new_prefix_len,
             n,
@@ -49,151 +53,62 @@ def _note_988_loadback(req, new_prefix_len: int) -> None:
             _988_LOADBACK_SEEN["mamba"],
             _988_LOADBACK_SEEN["kv_only"],
             getattr(req, "state_anchor_depth", None),
-            getattr(req, "pp_load_back_told", None),
+            # #1046: the extent this rank chose at its own match. `told` is gone
+            # with the delivery chain; the number printed here is the one that
+            # was actually applied.
+            getattr(req, "pp_load_back_extent", None),
         )
 
 
-#: #1035: rank-local host load-backs refused by the PP congruence rule.
-_1035_LOADBACK_REFUSED = {"n": 0}
+#: #1035/#1046: DELETED WITH ITS CAUSE. This counted the passes on which a
+#: rank held a host hit and refused to use it because PP0's extent had not
+#: arrived yet. There is no arrival to wait for any more -- the extent is chosen
+#: at this rank's own match -- so the deferral it counted cannot occur. Kept as
+#: a named deletion rather than a silent one: `#968 LOAD-BACK DEFERRED` reading
+#: 0 in a future boot must be read as "this cannot happen", not as "this did not
+#: happen to happen".
 
 
 def _pp_load_back_extent(req) -> Optional[int]:
-    """#968/#1035: how many tokens THIS rank may load back, or None for none.
+    """#1046: how many tokens THIS rank may load back -- from its OWN match.
 
-    THE REPLACEMENT FOR `_pp_forbids_rank_local_load_back`, and the reason the
-    gate could be removed rather than merely relaxed. That gate bought
-    rank-uniformity by throwing the information away -- nobody loaded back, so
-    nobody diverged, and every revived token was recomputed on every rank. This
-    keeps the uniformity and gives the tokens back, by taking the extent from
-    ONE rank instead of letting each rank measure its own:
+    THE DELIVERY CHAIN IS GONE, AND THE REASON IS AN INVARIANT, NOT A HOPE.
+    The extent is chosen at the two writers of `host_hit_length`
+    (`stamp_state_aligned_extent`), i.e. at the match, which every admissible
+    request must pass -- a request without a match has no `prefix_indices`. So
+    the number is on the request BEFORE this function is ever reached, on every
+    rank, derived from the same content by the same expression. Uniformity comes
+    from the DERIVATION being identical, not from one rank shipping a value to
+    the others.
 
-      * `pp_size <= 1` -- plain TP and every upstream configuration -- returns
-        this rank's own host hit. There the host tier is sharded by HEAD, holds
-        the same tokens on every rank, and the hit is uniform already. This
-        path is unchanged, and that is deliberate: upstream has no gate here
-        and gets none from us.
-      * `pp_size > 1` returns ONLY what PP0 published for this rid
-        (`PPAdmissionEntry.load_back_len`, delivered as `req.pp_load_back_told`
-        by the admission loop). Every rank applies that same number against its
-        own layer slice, so the resulting prefix length is equal on all ranks
-        by CONSTRUCTION.
+    WHAT THIS REPLACES. PP0 used to publish the extent on the admission row and
+    every rank waited a lap for it (`pp_load_back_told`). Seven boots measured
+    that chain: the extent was chosen correctly (`loss=0`, rank-identical values
+    -- boot 14 `4618/1298/4618` on PP0, PP1 and PP2 alike), it survived, PP0
+    published it, and NO rank ever applied it. The lap it cost was real; the
+    divergence it prevented was never observed on this axis in six boots.
 
-    NO FACT MEANS NO LOAD-BACK -- NEVER A LOCAL SUBSTITUTE, AND THIS IS THE
-    LOAD-BEARING HALF. A rank that answered an absent fact with its own
-    measurement would be back in the defect exactly: boot 1815081d46 died at
-    23:40:52 with `Bar1CollectiveAborted` on all three ranks because PP0 alone
-    grew its prefix (PP0 prefix 8541/extend 1 against its peers' 8192/350), the
-    attention-TP `all_reduce` never matched, and every rank's spin kernel sat on
-    its cycle deadline. Ninety-four consecutive `#969 EXTENT` events before it
-    were rank-uniform; the ninety-fifth was the boot's only host load-back.
+    THE PROHIBITION THAT USED TO STAND HERE IS ANSWERED, NOT IGNORED. The old
+    docstring forbade a local substitute because a rank-local number "is not a
+    property anything enforces". Two things now enforce it: the extent is
+    state-aligned by one shared predicate, and the MEMORY axis -- the one that
+    actually killed the 21:52:25 boot, and which this chain was silently also
+    guarding -- moved to the group availability floor, which is published every
+    iteration and CRASHES when absent (`unified_radix_cache` load-back, #1045).
+    That guard no longer depends on this value being delivered.
 
-    AND THE MEASUREMENT THAT LOOKS LIKE A LICENCE IS NOT ONE. In
-    `boot_855_939reread_0840f82601_0830_232150` all 15 refusals -- 5 rids across
-    3 ranks -- carried a rank-IDENTICAL host hit (1278, 350, 4618, 4618, 350).
-    It is tempting to read that as "the ranks agree anyway, so a local fast path
-    when the fact is late would be harmless". It would not be: that uniformity
-    is an observation about five requests on one boot, not a property anything
-    enforces, and the whole point of this function is that the guarantee stops
-    depending on it. Do not add a `or req.host_hit_length` fallback below.
+    `None` still means NO LOAD-BACK. A match with no host hit stamps nothing,
+    and nothing is exactly the right amount to revive.
 
-    THE COST OF THE ABSENT FACT IS BOUNDED AT ONE CHUNK, not at the prompt. The
-    fact is stamped by PP0 on the frame of the pass that ADMITS the request, so
-    the first chunk of a cold-warm request runs without the prefix and every
-    later chunk honours it -- the standing "at most one HiCache chunk of
-    recompute" bound, paid once per re-admission.
+    NOTE ON `pp_size <= 1`: this now returns the STATE-ALIGNED length where it
+    used to return the raw `host_hit_length`. Measured difference on this fork:
+    none -- every observed event was already `class=aligned` with `loss=0`,
+    because `host_hit_length` is measured to `best_match_node` and that node is
+    only accepted where the mamba resume predicate accepted. The change is a
+    correctness tightening, not a behaviour change, and it is named rather than
+    left for a reader to discover.
     """
-    if int(getattr(get_server_args(), "pp_size", 1) or 1) <= 1:
-        return req.host_hit_length
-    told = getattr(req, "pp_load_back_told", None)
-    if told is None:
-        # ROW-COLLAPSE: no offer is captured here any more. PP0 builds the
-        # row straight from each admitted request's live `host_hit_length` at
-        # the decision site, so the number no longer has to be parked on the
-        # request to survive the trip from here to there. Deferring is still
-        # exactly what it was: no fact yet, no load-back this chunk, recompute
-        # -- never a rank-local substitute.
-        _1035_LOADBACK_REFUSED["n"] += 1
-        n = _1035_LOADBACK_REFUSED["n"]
-        if n <= 5 or n % 64 == 0:
-            logger.info(
-                "#968 LOAD-BACK DEFERRED rid=%s: this rank has a host hit "
-                "(kv=%s swa=%s mamba=%s) but holds no PP0 extent for it yet, "
-                "so it loads back nothing and recomputes instead. Expected "
-                "exactly once per re-admission -- PP0 stamps the extent onto "
-                "this pass's frame and every rank applies it from the next "
-                "chunk on. A rising count here means the fact is not making "
-                "its lap. occurrence=%d",
-                getattr(req, "rid", None),
-                getattr(req, "host_hit_length", None),
-                getattr(req, "swa_host_hit_length", None),
-                getattr(req, "mamba_host_hit_length", None),
-                n,
-            )
-        return None
-    told = int(told)
-    local = int(getattr(req, "host_hit_length", 0) or 0)
-    if told > local:
-        # LOUD, NOT QUIETLY LESS. Loading `local` here would put this rank at a
-        # different prefix length from the peers that could honour `told` --
-        # the 1815081d46 shape divergence, arrived at by being helpful.
-        # `add_one_req`'s caller already handles PPScheduleRefused
-        # (scheduler.py, the `except PPScheduleRefused` arm).
-        #
-        # WHAT THIS REFUSAL IS AND IS NOT (#968 FIX-6). The sentence that stood
-        # here claimed the raise voided the pass group-wide and was therefore
-        # the uniform outcome. It does neither, and a comment asserting a
-        # uniformity the code does not have is the defect class this file has
-        # already paid for twice.
-        #
-        # The raise breaks the admission loop on THIS
-        # rank only. Its TRIGGER is half rank-local by construction: `told` is
-        # the group fact, but `local` is this rank's own host tier, which the
-        # layer-partitioned host tier (`pp_layer_ratio`) makes non-uniform on
-        # purpose. So a peer may well continue while this rank stops.
-        #
-        # It is kept anyway, and the reason is asymmetric: refusing yields a
-        # rank that grows its prefix by NOTHING, which is a recompute; the
-        # alternative -- loading `local` -- yields a rank that grows its
-        # prefix by a DIFFERENT NUMBER than its peers, which is a collective
-        # entered with mismatched shapes. Recompute is recoverable, shape
-        # divergence is the wedge. This is a bounded-loss stop, not a group
-        # barrier, and nothing downstream may assume otherwise.
-        #
-        # IMPORTED HERE, not at module scope, for the reason every other raise
-        # site in this file does the same (see :1566 and :2120):
-        # `pp_admission_congruence` imports back into this module's world, and
-        # a module-level import closes the cycle at load time.
-        from sglang.srt.managers.pp_admission_congruence import PPScheduleRefused
-
-        raise PPScheduleRefused(
-            f"#968 LOAD-BACK EXTENT UNHONOURABLE for rid="
-            f"{getattr(req, 'rid', '?')}: PP0 published a host load-back "
-            f"extent of {told} token(s) but this rank's own host tier holds "
-            f"only {local}. Loading the shorter amount would leave this rank "
-            f"at a different prefix length than its peers -- the shape "
-            f"divergence boot 1815081d46 died in. Refusing the pass instead."
-        )
-    return told
-
-
-#: #967: how many times the #959 "one continuation at a time" guard has
-#: refused a FRESH request in this process, per mint site.
-#:
-#: THE GUARD WAS UNOBSERVABLE, and that is the whole posten. #959 is closed by
-#: two bare `return AddReqResult.OTHER` statements with no trace of any kind,
-#: so whether they ever fire is not readable from any boot log -- a refusal
-#: that leaves no trace is indistinguishable from a scheduler that simply
-#: built nothing, which is precisely the state the next window has to tell
-#: apart. Its neighbour `Scheduler._note_seam_chunk_refused` shows the
-#: counter-pattern and this follows it: unconditional count, first three
-#: occurrences logged, then every thousandth, so a guard that fires every
-#: round costs a handful of lines rather than one per iteration.
-#:
-#: MODULE-LEVEL, not on the adder: `PrefillAdder` is rebuilt every pass, so an
-#: instance counter would reset before anyone could read it. The question this
-#: answers -- "was this guard reached at all in this boot" -- is a
-#: process-lifetime question.
-_SECOND_CONTINUATION_REFUSALS = {}  # site -> count (str -> int)
+    return getattr(req, LOAD_BACK_EXTENT_ATTR, None)
 
 
 def note_second_continuation_refused(req, site: str) -> int:
@@ -2302,11 +2217,10 @@ class PrefillAdder:
             # keeps its old precondition, because the deferred/offer arm inside
             # that function documents itself as reachable only with a live
             # local hit, and that must stay true.
-            _told_fact = getattr(req, "pp_load_back_told", None)
-            if _told_fact is not None or req.needs_host_load_back():
-                _lb_extent = _pp_load_back_extent(req)
-            else:
-                _lb_extent = None
+            # #1046: the extent is this rank's own, chosen at its own match,
+            # so there is no group fact to wait for and no precondition to
+            # gate on. `None` means the match found no host hit.
+            _lb_extent = _pp_load_back_extent(req)
             if _lb_extent:
                 # #968 FIX-3 (deleter). Armed False for THIS attempt only. The
                 # mamba component sets it True if the load-back plants the
@@ -2357,7 +2271,12 @@ class PrefillAdder:
                 # genuinely different host tier and refuses loudly instead.
                 # Only under a PP0 fact: `pp_load_back_told is None` is the
                 # `pp_size <= 1` path, which stays byte-for-byte upstream.
-                if getattr(req, "pp_load_back_told", None) is not None:
+                # #1046: the clamp stays -- its hazard (a GDN anchor adopted
+                # at `_applied` while the KV is cut to the extent) is created by
+                # the load-back itself and is independent of where the extent
+                # came from. Only its precondition changes: it now runs whenever
+                # an extent was chosen at all.
+                if _lb_extent is not None:
                     _applied = int(new_indices.numel())
                     if _applied != _lb_extent and getattr(
                         req, "mamba_loadback_anchor_adopted", False

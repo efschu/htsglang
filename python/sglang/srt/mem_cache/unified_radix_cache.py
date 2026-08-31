@@ -2703,48 +2703,53 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # is a MIN, so `floor >= kv_tokens` implies this rank's own
         # availability is >= kv_tokens too. None (single rank, or pools that
         # agree) keeps the live local path exactly as it was.
+        # #1045 ONE BRANCH. The memory-axis decision -- "is there room for this
+        # load-back" -- is now taken from the GROUP floor and from nothing else.
+        #
+        # WHAT WAS HERE AND WHY IT HAD TO GO. A second, rank-local branch ran
+        # whenever `uniform_avail_floor` was None, guarded only by
+        # `pp_load_back_told is not None`. That made a correctness watchman on
+        # the memory axis depend on the DELIVERY signal of a different axis: the
+        # moment the extent stopped being delivered, this fell back to deciding
+        # from THIS rank's own free space -- the quantity
+        # `rank_gpu_memory_mib=[31800,18800,19800]` makes unequal by
+        # configuration. The roomy rank loads the prefix back, the tight rank
+        # gives up, the device trees stop being replicas, and the next TP
+        # collective is entered with rank-dependent token counts. That is the
+        # 21:52:25 wedge, and it is measured, not hypothetical.
+        #
+        # The floor is now published on EVERY iteration and on every path
+        # (scheduler.py `_publish_uniform_evict_floor`, including the
+        # single-rank path, where it carries the local value because that IS
+        # the group min for a group of one). So `floor is None` here can no
+        # longer mean "pools happened to agree" or "single rank" -- it can only
+        # mean nobody published, which is a broken construction.
+        #
+        # CRASH, NOT FALLBACK. A rank that cannot answer this question from a
+        # group number must not answer it from a local one: that is precisely
+        # how the ranks stop agreeing, and a compensating local answer is the
+        # defect class, not the remedy. Both numbers are named so the crash is
+        # a measurement.
         floor = getattr(self, "uniform_avail_floor", None)
-        if floor is not None:
-            if floor < kv_tokens:
-                self.dec_lock_ref(best_match_node, ancestor_lock_params)
-                self.dec_host_lock_ref(best_match_node, host_anchor_params)
-                return False
-        else:
-            if req is not None and getattr(req, "pp_load_back_told", None) is not None:
-                # #968 FIX-6: UNDER A GROUP FACT, THIS DECISION MAY NOT BE
-                # TAKEN RANK-LOCALLY. The branch below decides whether the
-                # load-back happens from THIS rank's own free space. That is
-                # the very quantity `rank_gpu_memory_mib=[31800,18800,19800]`
-                # makes unequal, so the roomy rank would load the prefix back
-                # while the tight rank gave up -- the device trees stop being
-                # replicas and the next TP collective is entered with
-                # rank-dependent token counts (the 21:52:25 wedge).
-                #
-                # `pp_load_back_told is not None` means PP0 published an
-                # extent for this request, i.e. the group has committed to one
-                # number and every rank owes exactly that. If the uniform
-                # floor is not available to answer the admission question,
-                # there is no rank-uniform answer to give, so no rank attempts
-                # it. Refusing here yields an empty load-back on every rank;
-                # `add_one_req`'s clamp turns that into the loud, pass-voiding
-                # refusal rather than a silent per-rank divergence.
-                #
-                # Single rank / no PP0 fact keeps the local path exactly as it
-                # was -- `pp_load_back_told` is never stamped there.
-                self.dec_lock_ref(best_match_node, ancestor_lock_params)
-                self.dec_host_lock_ref(best_match_node, host_anchor_params)
-                return False
-            if self.supports_swa():
-                avail = self.token_to_kv_pool_allocator.full_available_size()
-            else:
-                avail = self.token_to_kv_pool_allocator.available_size()
-            if avail < kv_tokens:
-                needed = kv_tokens - avail
-                result = self.evict(EvictParams(num_tokens=needed))
-                if result.num_tokens_evicted < needed:
-                    self.dec_lock_ref(best_match_node, ancestor_lock_params)
-                    self.dec_host_lock_ref(best_match_node, host_anchor_params)
-                    return False
+        if floor is None:
+            raise RuntimeError(
+                "#1045 UNIFORM FLOOR ABSENT AT LOAD-BACK: this rank must decide "
+                f"whether {kv_tokens} token(s) of host load-back fit, and the "
+                "group availability floor was never published for this "
+                "iteration. Deciding from this rank's own free space is exactly "
+                "the rank-divergent path that killed the 21:52:25 boot "
+                "(rank_gpu_memory_mib makes local availability unequal by "
+                "configuration), so this refuses loudly instead. The floor is "
+                "published unconditionally by Scheduler._publish_uniform_evict_"
+                "floor; its absence here is a construction violation, not a "
+                "runtime condition. "
+                f"rid={getattr(req, 'rid', None)} kv_tokens={kv_tokens} "
+                f"local_available={self.token_to_kv_pool_allocator.available_size()}"
+            )
+        if floor < kv_tokens:
+            self.dec_lock_ref(best_match_node, ancestor_lock_params)
+            self.dec_host_lock_ref(best_match_node, host_anchor_params)
+            return False
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
