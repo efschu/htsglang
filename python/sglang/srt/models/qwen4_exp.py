@@ -795,24 +795,96 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
-        # [#1036] Pinned is the FAST path (the Triton kernel below reads this
-        # memory straight over PCIe), but pinned pages cannot be reclaimed, and at
-        # bf16 this table is 95.368 GiB -- which the planner shows leaves no
-        # feasible layout on a 118 GiB host beside the cold experts, at any
-        # context. Pageable hands residency to the OS page cache, so the Zipfian
-        # cold tail may fall through to disk, at the price of a host-side gather.
+        # [#1036] Three ways to hold this table, and only two of them are honest.
+        #
+        # PINNED is the fast path: the Triton kernel below reads this memory
+        # straight over PCIe. But pinned pages cannot be reclaimed, and at bf16 the
+        # table is 95.368 GiB, which the planner shows leaves NO feasible layout on
+        # a 118 GiB host beside the cold experts -- at any context, even at the MoE
+        # scratch floor.
+        #
+        # MMAP (pageable + a directory) is the one that delivers what "partly in RAM,
+        # partly on disk" means: MAP_SHARED from a file, so the pages are clean and
+        # file-backed and the kernel can drop and re-fault them. The page cache owns
+        # residency, and Zipfian n-gram frequency keeps the hot rows warm by itself.
+        #
+        # ANONYMOUS PAGEABLE is the half-measure and it is REFUSED below when there
+        # is no swap. Dropping the pin does not make memory spillable: anonymous
+        # pages can only go to swap, and SwapTotal is 0 here, so all 95.368 GiB stay
+        # resident and the caller gets none of what they asked for. That silence is
+        # exactly the class of defect this register keeps finding, so it is a loud
+        # refusal rather than a warning.
         from sglang.srt.environ import envs
 
         self._pageable = envs.SGLANG_PLE_HOST_PAGEABLE.get()
-        cpu_weight = nn.Parameter(
-            torch.empty(
-                source_weight.shape,
+        mmap_dir = (envs.SGLANG_PLE_HOST_MMAP_DIR.get() or "").strip()
+        self._mmap_path = None
+        self._mmap_flushed = False
+
+        if self._pageable and not mmap_dir:
+            swap_kb = 0
+            try:
+                with open("/proc/meminfo") as fh:
+                    for line in fh:
+                        if line.startswith("SwapTotal:"):
+                            swap_kb = int(line.split()[1])
+                            break
+            except OSError:
+                pass
+            if swap_kb == 0:
+                raise ValueError(
+                    "SGLANG_PLE_HOST_PAGEABLE=1 without SGLANG_PLE_HOST_MMAP_DIR "
+                    "does not spill anything: anonymous pages need swap, and "
+                    "SwapTotal is 0. The table would stay fully resident "
+                    f"({source_weight.numel() * source_weight.element_size() / 2**30:.3f}"
+                    " GiB) while looking offloaded. Set "
+                    "SGLANG_PLE_HOST_MMAP_DIR to a directory on fast storage."
+                )
+
+        if self._pageable and mmap_dir:
+            import os as _os
+
+            _os.makedirs(mmap_dir, exist_ok=True)
+            # Named for the geometry so two different tables cannot collide, and so
+            # a stale file from another model is not silently mapped.
+            self._mmap_path = _os.path.join(
+                mmap_dir,
+                f"ple_table_{source_weight.shape[0]}x{source_weight.shape[1]}"
+                f"_{str(source_weight.dtype).split('.')[-1]}.bin",
+            )
+            need = source_weight.numel() * source_weight.element_size()
+            free = _os.statvfs(mmap_dir).f_bavail * _os.statvfs(mmap_dir).f_frsize
+            if free < need:
+                raise ValueError(
+                    f"SGLANG_PLE_HOST_MMAP_DIR={mmap_dir} has "
+                    f"{free / 2**30:.1f} GiB free but the PLE table needs "
+                    f"{need / 2**30:.1f} GiB. Refusing rather than filling the "
+                    "filesystem during weight load."
+                )
+            backing = torch.from_file(
+                self._mmap_path,
+                shared=True,
+                size=source_weight.numel(),
                 dtype=source_weight.dtype,
-                device="cpu",
-                pin_memory=not self._pageable,
-            ),
-            requires_grad=False,
-        )
+            ).view(source_weight.shape)
+            logger.info(
+                "PLE table mapped MAP_SHARED from %s (%.3f GiB, %s); residency is "
+                "the page cache's, cold rows re-fault from disk",
+                self._mmap_path,
+                need / 2**30,
+                source_weight.dtype,
+            )
+            cpu_weight = nn.Parameter(backing, requires_grad=False)
+        else:
+            cpu_weight = nn.Parameter(
+                torch.empty(
+                    source_weight.shape,
+                    dtype=source_weight.dtype,
+                    device="cpu",
+                    pin_memory=not self._pageable,
+                ),
+                requires_grad=False,
+            )
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
@@ -856,6 +928,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
             if self._pageable:
+                self._maybe_flush_backing()
                 self._gather_host(flat_ids, output)
             else:
                 _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
@@ -869,6 +942,46 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     BLOCK_D=self._block_d,
                 )
         return output
+
+    def _maybe_flush_backing(self) -> None:
+        """Make the mapped table's pages CLEAN, once, before the first gather.
+
+        [#1036] This is the step that makes eviction possible at all. The loader
+        writes 95 GiB through the mapping, which leaves every page DIRTY, and the
+        kernel cannot drop a dirty page -- it must write it back first. Until that
+        happens the table is just as resident as the pinned version was, only
+        without the pin, which is precisely the half-measure this path exists to
+        avoid. One fsync at the boundary between loading and serving turns the whole
+        region into clean file-backed pages the reclaimer can take at will.
+
+        Done lazily on the first gather rather than from a post-load hook, because
+        the adopted load_weights has no such hook and inventing one would mean
+        editing upstream's file for a concern that is entirely local to this class.
+        """
+        if self._mmap_flushed or self._mmap_path is None:
+            return
+        self._mmap_flushed = True
+        import os as _os
+
+        try:
+            fd = _os.open(self._mmap_path, _os.O_RDONLY)
+            try:
+                _os.fsync(fd)
+            finally:
+                _os.close(fd)
+            logger.info(
+                "PLE backing file flushed; its pages are now clean and reclaimable"
+            )
+        except OSError as exc:
+            # Not fatal: the kernel writes dirty pages back on its own schedule, so
+            # this only delays when eviction becomes possible. Say so rather than
+            # swallow it, because "why is the table still resident" is otherwise an
+            # unanswerable question later.
+            logger.warning(
+                "PLE backing flush failed (%s); pages stay dirty until the kernel "
+                "writes them back, and until then the table cannot be evicted",
+                exc,
+            )
 
     def _gather_host(self, flat_ids: torch.Tensor, output: torch.Tensor) -> None:
         """Gather on the HOST, then move only the result.

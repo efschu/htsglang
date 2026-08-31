@@ -2049,6 +2049,28 @@ class Envs:
     #
     # Default False keeps the pinned zero-copy path byte-identical.
     SGLANG_PLE_HOST_PAGEABLE = EnvBool(False)
+    # WHERE the pageable table lives, and the reason this is a separate entry:
+    # unpinned is NOT the same as spillable. Anonymous pageable memory can only be
+    # evicted to swap, and this rig has SwapTotal 0 -- so `PAGEABLE=1` alone drops
+    # the pinning and leaves all 95.368 GiB resident anyway. Measured, after I had
+    # already claimed otherwise.
+    #
+    # Only CLEAN FILE-BACKED pages can be dropped and re-faulted from disk. So set
+    # this to a directory on fast storage and the table is mapped MAP_SHARED from a
+    # file there: the page cache then owns residency exactly as the operator asked
+    # (partly RAM, partly disk), and the Zipfian hot set stays warm on its own.
+    #
+    # A note for whoever sizes the disk: the file is the table's full width
+    # (95.368 GiB at bf16, 47.684 at fp8), and it is ALSO a dense PLE-only region,
+    # which is the second half of the layout problem -- our checkpoint interleaves
+    # PLE with experts and dense inside shards 2..23, so an mmap fault there drags
+    # in neighbouring tensors and wastes the readahead.
+    #
+    # Storage note, measured on this rig: a PLE row is 320 B while the ZFS dataset
+    # under /spinning uses a 128 KiB recordsize, and random 4 KiB reads showed
+    # ~44.6x amplification. A dataset with a small recordsize (4-16 KiB) is worth
+    # having for this file.
+    SGLANG_PLE_HOST_MMAP_DIR = EnvStr("")
     # [#1036] The remaining Qwen4-Exp / JIT env entries the adopted upstream files
     # read. Types and defaults are upstream's VERBATIM (qwen4-main-squashed
     # environ.py:293,296,299,364,1001,1003,1007,1193) -- a guessed default here is

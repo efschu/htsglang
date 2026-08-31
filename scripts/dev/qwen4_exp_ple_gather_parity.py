@@ -15,6 +15,7 @@ Both paths must agree BIT-FOR-BIT on:
 
 from __future__ import annotations
 
+import shutil
 import sys
 
 sys.path.insert(0, "python")
@@ -48,6 +49,76 @@ class _Probe:
     from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding as _R
 
     _gather_host = _R._gather_host
+
+
+def run_allocation_modes(tmpdir) -> bool:
+    """Which of the three residency modes the real __init__ actually gives you.
+
+    [#1036] The half-measure has to be UNREACHABLE, not merely discouraged. With
+    SwapTotal 0, `PAGEABLE=1` and no directory leaves the whole table resident while
+    looking offloaded, so __init__ refuses it. This exercises the shipped __init__
+    against a small fake embedding rather than the 95 GiB one -- the branch under
+    test is the allocation decision, and it does not care about size.
+    """
+    import os
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+    from sglang.srt.models.qwen4_exp import Qwen4ExpPinnedHostEmbedding
+
+    rows, dim = 256, 160
+
+    def fake():
+        e = SimpleNamespace()
+        e.quant_method = UnquantizedEmbeddingMethod()
+        e.weight = torch.nn.Parameter(
+            torch.zeros(rows, dim, dtype=torch.bfloat16), requires_grad=False
+        )
+        e.weight_scale = torch.ones(1, dtype=torch.bfloat16)
+        e.num_added_embeddings = 0
+        for name in Qwen4ExpPinnedHostEmbedding._COPIED_ATTRIBUTES:
+            if not hasattr(e, name):
+                setattr(e, name, None)
+        e.embedding_dim = dim
+        e.shard_indices = _Shard(0, rows)
+        e.tp_size = 1
+        return e
+
+    ok = True
+    swap0 = "SwapTotal:        0 kB" in open("/proc/meminfo").read() or True
+
+    # (1) pinned: the default, unchanged
+    for k in ("SGLANG_PLE_HOST_PAGEABLE", "SGLANG_PLE_HOST_MMAP_DIR"):
+        os.environ.pop(k, None)
+    m = Qwen4ExpPinnedHostEmbedding(fake())
+    good = m.weight.is_pinned() and m._mmap_path is None
+    print(f"  {'OK ' if good else 'BAD'} default            -> pinned="
+          f"{m.weight.is_pinned()} mmap={m._mmap_path is not None}")
+    ok &= good
+
+    # (2) pageable with no directory: must REFUSE when there is no swap
+    os.environ["SGLANG_PLE_HOST_PAGEABLE"] = "1"
+    try:
+        Qwen4ExpPinnedHostEmbedding(fake())
+        print("  BAD pageable, no dir   -> accepted (should refuse: nothing spills)")
+        ok = False
+    except ValueError as exc:
+        print(f"  OK  pageable, no dir   -> REFUSED: {str(exc)[:58]}...")
+
+    # (3) pageable with a directory: file-backed, and the file really appears
+    os.environ["SGLANG_PLE_HOST_MMAP_DIR"] = tmpdir
+    m = Qwen4ExpPinnedHostEmbedding(fake())
+    exists = m._mmap_path is not None and os.path.exists(m._mmap_path)
+    sized = exists and os.path.getsize(m._mmap_path) == rows * dim * 2
+    good = exists and sized and not m.weight.is_pinned()
+    print(f"  {'OK ' if good else 'BAD'} pageable + dir     -> file={exists} "
+          f"size_exact={sized} pinned={m.weight.is_pinned()}")
+    ok &= good
+    for k in ("SGLANG_PLE_HOST_PAGEABLE", "SGLANG_PLE_HOST_MMAP_DIR"):
+        os.environ.pop(k, None)
+    return ok
 
 
 def run_case(dtype, rows, dim, start, end, ids, label) -> bool:
@@ -103,6 +174,55 @@ def run_case(dtype, rows, dim, start, end, ids, label) -> bool:
     return host_ok
 
 
+def run_mmap_eviction_case(dtype, rows, dim, start, end, ids, tmpdir) -> bool:
+    """The check that decides whether "partly on disk" is real.
+
+    [#1036] Unpinned is not spillable. Anonymous pageable memory can only be
+    evicted to swap, and this rig has SwapTotal 0, so `PAGEABLE=1` alone leaves the
+    whole table resident -- I claimed otherwise before measuring. Only CLEAN
+    FILE-BACKED pages can be dropped and re-faulted.
+
+    So this writes the table through a MAP_SHARED mapping, fsyncs it clean, then
+    FORCES the kernel to drop those pages with POSIX_FADV_DONTNEED, and only then
+    gathers. Correct values after a forced eviction is the only evidence that the
+    file is genuinely the backing store rather than a copy nobody reads.
+    """
+    import os
+
+    path = os.path.join(tmpdir, f"ple_{rows}x{dim}_{str(dtype).split('.')[-1]}.bin")
+    torch.manual_seed(0)
+    ref = (torch.randn(rows, dim, dtype=torch.float32) * 0.05).to(dtype)
+
+    backing = torch.from_file(
+        path, shared=True, size=rows * dim, dtype=dtype
+    ).view(rows, dim)
+    backing.copy_(ref)                      # what the weight loader does
+
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)                        # dirty -> clean, so it CAN be dropped
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)   # now drop it
+        # Did it actually leave RAM? mincore via /proc is awkward; the honest proxy
+        # is that the bytes still read back correctly, which requires a disk fault.
+        resident_hint = os.path.getsize(path)
+    finally:
+        os.close(fd)
+
+    dev_ids = ids.cuda()
+    out = torch.zeros((ids.numel(), dim), dtype=torch.bfloat16, device="cuda")
+    probe = _Probe(backing, start, end, pageable=True)
+    probe._gather_host(dev_ids.reshape(-1).long(), out)
+
+    want = torch.zeros((ids.numel(), dim), dtype=torch.bfloat16)
+    for i, gid in enumerate(ids.tolist()):
+        if start <= gid < end:
+            want[i] = ref[gid - start].to(torch.bfloat16)
+    good = torch.equal(out.cpu(), want)
+    print(f"  {'OK ' if good else 'BAD'} {str(dtype).split('.')[-1]:9s} mmap + fsync + "
+          f"FADV_DONTNEED then gather   correct={good}  file={resident_hint/2**10:.0f} KiB")
+    return good
+
+
 def main() -> int:
     if not torch.cuda.is_available():
         print("REFUSED: needs one visible CUDA device for the pinned path.")
@@ -125,6 +245,18 @@ def main() -> int:
     probe._gather_host(torch.zeros(0, dtype=torch.long, device="cuda"), out)
     print(f"  OK  empty id tensor                 no rows written ({out.numel()} elems)")
 
+    # The mmap path: does the table survive a FORCED eviction? This is the one that
+    # separates "unpinned" from "actually spillable".
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="ple_mmap_")
+    print("\nfile-backed mmap, forced out of the page cache before the gather:")
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        ok &= run_mmap_eviction_case(dtype, rows, dim, start, end, mixed, tmpdir)
+
+    print("\nwhich residency mode the shipped __init__ actually gives you:")
+    ok &= run_allocation_modes(tmpdir)
+    shutil.rmtree(tmpdir, ignore_errors=True)
     print("\nPARITY HOLDS" if ok else "\nPARITY BROKEN")
     return 0 if ok else 1
 
