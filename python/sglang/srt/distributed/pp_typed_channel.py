@@ -91,11 +91,40 @@ def stash_typed(group, src: Optional[int], kind: str, message: Any) -> None:
     typed_inbox(group)[(resolve_src(group, src), str(kind))].append(message)
 
 
-def take_typed(group, src: Optional[int], kind: str) -> Optional[Any]:
-    """A previously stashed message for this exact ``(src, kind)``, or None."""
+def take_typed(
+    group,
+    src: Optional[int],
+    kind: str,
+    accept: Optional[Callable[[Any], bool]] = None,
+    on_reject: Optional[Callable[[Any], None]] = None,
+) -> Optional[Any]:
+    """A previously stashed message for this exact ``(src, kind)``, or None.
+
+    #1057: ``accept`` IS THE ONLY PLACE FIFO IS NOT ALREADY DOING THIS JOB.
+    A message that comes off the wire arrives in send order, so the wire path
+    cannot hand a receiver an OLDER pass than one it has already consumed.
+    The inbox can, and it is served BEFORE the wire (that is the point of the
+    stash), so this queue is the one door an out-of-order pass can walk
+    through. That is why the identity filter lives here and not on the wire.
+
+    When ``accept`` rejects the head, the entry is DROPPED, not put back:
+    putting it back would make this a busy loop over a message nobody will
+    ever want, and leaving it in place is exactly the outliving #800 exists
+    to prevent. ``on_reject`` is called for each dropped entry so the loss is
+    counted and named rather than silent -- the #800 rule ("a retired message
+    is a LOST payload if any consumer did in fact owe it") applies verbatim.
+
+    The loop then continues to the NEXT stashed entry and, when the queue
+    empties, returns None so the caller falls through to the wire. There is no
+    branch here that refuses without a way onward.
+    """
     queue = typed_inbox(group).get((resolve_src(group, src), str(kind)))
-    if queue:
-        return queue.popleft()
+    while queue:
+        message = queue.popleft()
+        if accept is None or accept(message):
+            return message
+        if on_reject is not None:
+            on_reject(message)
     return None
 
 
@@ -123,6 +152,8 @@ def recv_typed_tensor_dict(
     src: Optional[int] = None,
     all_gather_group=None,
     on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
+    accept: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    on_reject: Optional[Callable[[Dict[str, Any]], None]] = None,
 ):
     """Receive the next message of ``expected_kind`` from ``src``.
 
@@ -132,8 +163,19 @@ def recv_typed_tensor_dict(
     one served from the inbox -- because the flip's quiescence counters and the
     boundary stats are counting wire traffic, and a stashed message has already
     crossed it.
+
+    #1057: ``accept`` GUARDS THE INBOX ONLY, AND THAT IS DELIBERATE, NOT AN
+    OVERSIGHT. The wire delivers in send order, so a message taken off it can
+    never be an older pass than one already consumed from the same sender --
+    the identity filter would be dead weight there. It would also be the
+    boot-killing direction: rejecting a wire message means dropping it and
+    blocking for the next, and if the predicate is ever wrong that is a wedge
+    with no way onward (#995 v1: 175 refusals on one rid and a dead window).
+    The inbox is the only source that can hand back an out-of-order pass, it
+    is bounded, and draining it always terminates in "fall through to the
+    wire". So the guard sits exactly where the hazard is and nowhere else.
     """
-    served = take_typed(group, src, expected_kind)
+    served = take_typed(group, src, expected_kind, accept=accept, on_reject=on_reject)
     if served is not None:
         return served
 

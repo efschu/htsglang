@@ -7785,6 +7785,105 @@ class SchedulerPPMixin:
         self._pp_flip_bump_sent(CHAN_DICT)
         return p2p_work
 
+    def _pp_stamp_of(self: Scheduler, message) -> Optional[tuple]:
+        """The sender stamp of a raw tensor-dict, or None if unreadable."""
+        try:
+            stamp = message.get("__stamp__") if isinstance(message, dict) else None
+        except Exception:  # noqa: BLE001 - an unreadable message names no pass
+            return None
+        return stamp if isinstance(stamp, (tuple, list)) and len(stamp) >= 2 else None
+
+    def _pp_proxy_seq_key(self: Scheduler, stamp) -> tuple:
+        """The namespace a seq high-water mark lives in: the flip epoch.
+
+        The SENDER half of the key is implicit and that is a fact about PP,
+        not a shortcut: a rank has exactly one upstream, so every proxy it
+        receives comes from the same sender and the seqs form ONE sequence.
+        """
+        return (pp_proxy_stamp_epoch(stamp),)
+
+    def _pp_proxy_is_not_stale(self: Scheduler, message) -> bool:
+        """#1057: has this rank already consumed a pass at or after this one?
+
+        PURE READ -- it never advances the mark, because it is asked about
+        CANDIDATES and only a message that is actually returned may move it
+        (``_pp_note_proxy_consumed`` does that, for the wire and the inbox
+        alike). A predicate that advanced state here would make the mark
+        depend on how many candidates happened to be queued.
+
+        UNREADABLE MEANS TODAY'S BEHAVIOUR, on purpose and in the safe
+        direction: no stamp, no seq, or no recorded mark all return True. This
+        guard may only ever remove a message that is PROVABLY older than one
+        already consumed in the same epoch; everything else it lets through
+        exactly as before, so it cannot invent a refusal.
+        """
+        stamp = self._pp_stamp_of(message)
+        if stamp is None:
+            return True
+        try:
+            seq = int(stamp[1])
+        except Exception:  # noqa: BLE001
+            return True
+        marks = getattr(self, "_pp_proxy_seq_high_water", None)
+        if not marks:
+            return True
+        prev = marks.get(self._pp_proxy_seq_key(stamp))
+        return prev is None or seq > prev
+
+    def _pp_note_proxy_consumed(self: Scheduler, message) -> None:
+        """Advance the per-epoch seq high-water for a proxy actually consumed.
+
+        Called for EVERY consumed proxy, whether it came off the wire or out
+        of the inbox -- the wire is the common path, so a mark fed only by the
+        inbox would stand still and the guard would never have anything to
+        compare against. Monotone by construction (``max``), so an
+        out-of-order arrival can never lower it.
+        """
+        stamp = self._pp_stamp_of(message)
+        if stamp is None:
+            return
+        try:
+            seq = int(stamp[1])
+        except Exception:  # noqa: BLE001
+            return
+        marks = getattr(self, "_pp_proxy_seq_high_water", None)
+        if marks is None:
+            marks = {}
+            self._pp_proxy_seq_high_water = marks
+        key = self._pp_proxy_seq_key(stamp)
+        prev = marks.get(key)
+        marks[key] = seq if prev is None else max(prev, seq)
+
+    def _pp_note_stale_proxy_dropped(self: Scheduler, message) -> None:
+        """A stashed proxy dropped as provably older than one already run.
+
+        LOUD, COUNTED, AND HONEST ABOUT THE LOSS. #800's rule applies word for
+        word: a retired message is a LOST payload if any consumer did in fact
+        owe it. Nothing can owe this one -- its pass has already been run past
+        in this epoch -- but the count is what makes that claim checkable
+        instead of asserted.
+        """
+        stamp = self._pp_stamp_of(message)
+        self._pp_stale_proxy_dropped = (
+            getattr(self, "_pp_stale_proxy_dropped", 0) + 1
+        )
+        _n = self._pp_stale_proxy_dropped
+        if _n <= 8 or _n % 256 == 0:
+            marks = getattr(self, "_pp_proxy_seq_high_water", None) or {}
+            logger.warning(
+                "#1057 STALE PROXY DROPPED FROM THE INBOX occurrence=%d: "
+                "stamp=%s, this rank has already consumed seq=%s in that "
+                "epoch. The inbox is served ahead of the wire, so it is the "
+                "one door an out-of-order pass can walk through; on the wire "
+                "this cannot happen and nothing there is filtered. Before "
+                "this guard the message was handed to model compute and the "
+                "width check in model_runner.forward killed the group "
+                "(#631) -- see TICKET_1057, boot 26.",
+                _n,
+                stamp,
+                marks.get(self._pp_proxy_seq_key(stamp)) if stamp else "?",
+            )
+
     def _pp_recv_typed_dict(
         self: Scheduler,
         expected_kind: str = "default",
@@ -7854,6 +7953,35 @@ class SchedulerPPMixin:
         # a fourth blocking receive lives in the request-relay chain; the
         # watchdog line named none of them on boot_827.
         self._pp_blocked_recv_arm = f"typed-dict/{expected_kind}"
+        # #1057: THE IDENTITY FILTER, ON THE INBOX, FOR PROXIES ONLY.
+        #
+        # `pp_proxy_stamp_names_pass` names its own HONEST RESIDUAL: "within
+        # ONE epoch a leftover a whole ring-cycle stale still names this slot
+        # and is still accepted; `seq` remains stamped and unconsulted because
+        # FIFO delivery already makes it monotone, so it discriminates nothing
+        # a receiver can predict." Boot 26 is that residual on metal
+        # (boot_855_1056acc_..._0831_150350, 15:15:03Z, TICKET_1057).
+        #
+        # THE HALF OF THAT SENTENCE THAT IS WRONG IS "FIFO DELIVERY". The wire
+        # is FIFO; the INBOX is not, and the inbox is served FIRST
+        # (`take_typed` ahead of `group.recv_tensor_dict`). Stashing is the one
+        # mechanism on this channel that can reorder a pass, so `seq` does
+        # discriminate -- at exactly the door it was declared useless for.
+        #
+        # SO seq IS THE PASS ID AND NO NEW ONE IS MINTED. `_pp_proxy_seq`
+        # already increments once per stamped proxy on the sending rank, and a
+        # rank has exactly one upstream, so the seqs it receives are strictly
+        # increasing per (epoch, sender). A leftover from an earlier pass in
+        # the SAME epoch therefore carries a seq at or below one already
+        # consumed. Minting a second PP0-issued id beside a counter that
+        # already has this property would be second bookkeeping beside an
+        # existing truth -- the thing the upstream-minimal law says not to
+        # build. The fix is a CONSUMER for the counter, not another counter.
+        _accept = None
+        _on_reject = None
+        if expected_kind == "proxy":
+            _accept = lambda _m: self._pp_proxy_is_not_stale(_m)  # noqa: E731
+            _on_reject = lambda _m: self._pp_note_stale_proxy_dropped(_m)  # noqa: E731
         try:
             tensor_dict = recv_typed_tensor_dict(
                 self.pp_group,
@@ -7861,10 +7989,19 @@ class SchedulerPPMixin:
                 src=None,
                 all_gather_group=all_gather_group,
                 on_message=_off_the_wire,
+                accept=_accept,
+                on_reject=_on_reject,
             )
         finally:
             self._pp_blocked_recv_since = None
             self._pp_blocked_recv_arm = None
+        # #1057: ONE place advances the mark, and it is downstream of BOTH
+        # sources -- a proxy served from the inbox and one taken off the wire
+        # arrive here identically. Feeding the mark from the inbox alone would
+        # leave it standing still on the common path, and the guard would have
+        # nothing to compare against on the pass that matters.
+        if expected_kind == "proxy":
+            self._pp_note_proxy_consumed(tensor_dict)
         if expected_kind == "default":
             logger.warning_once(
                 f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
