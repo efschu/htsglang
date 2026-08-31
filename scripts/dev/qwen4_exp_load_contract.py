@@ -47,9 +47,34 @@ import json
 import os
 import os.path as osp
 import re
+import struct
 import sys
 import tempfile
 from collections import Counter, defaultdict
+
+_HDR_CACHE: dict[str, dict] = {}
+
+
+def safetensors_header(path: str) -> dict | None:
+    """The header alone: an 8-byte little-endian length, then that many bytes of JSON.
+
+    [#1036] Exists so the shape sidecar can be a CACHE rather than an authority. The
+    sidecar is captured from the checkpoint's headers at one moment; any later repoint
+    -- adopting an fp8 PLE table ADDS a `weight_scale` name -- leaves it stale, and a
+    stale cache must never be the reason a valid checkpoint is rejected. Reading a
+    header is a seek plus a few KB, not a file read.
+    """
+    if path in _HDR_CACHE:
+        return _HDR_CACHE[path]
+    try:
+        with open(path, "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            hdr = json.loads(fh.read(n))
+    except (OSError, ValueError, struct.error):
+        return None
+    hdr.pop("__metadata__", None)
+    _HDR_CACHE[path] = hdr
+    return hdr
 
 # Checkpoint name -> pattern, so 296,474 names collapse to a reviewable set.
 _COLLAPSE = (
@@ -389,21 +414,59 @@ def main() -> int:
     with open(config_path) as fh:
         raw_config = json.load(fh)
 
+    # WHERE SHAPES COME FROM, and the order matters. [#1036] The local safetensors
+    # HEADERS are the authority; the sidecar is only a cache for the case where the
+    # files are not on disk yet (it was captured by HTTP Range request before the
+    # download). A cache must never be the reason a valid checkpoint is rejected, and
+    # it must never be the reason a WRONG dtype is fed.
+    #
+    # Both failure modes were real, one after the other, from the same fp8 PLE adoption:
+    #   * the adoption ADDED one name (`weight_scale`) -> the sidecar had 296,474
+    #     against a 296,475-name index, and the contract died with a FATAL that said
+    #     nothing about the checkpoint. The instrument rejecting a valid tree.
+    #   * the adoption REPOINTED 128 names at fp8 files while their sidecar entries
+    #     still read BF16 -> the contract fed bf16 meta tensors for an fp8 store and
+    #     the model warned "downcasting is lossy". A green exit over a wrong dtype,
+    #     which is worse than the crash.
+    shapes: dict[str, list] = {}
+    from_header, unresolved, drift = 0, [], []
+    for name, shard in weight_map.items():
+        hdr = safetensors_header(osp.join(model_dir, shard))
+        if hdr is not None and name in hdr:
+            shapes[name] = [hdr[name]["dtype"], hdr[name]["shape"]]
+            from_header += 1
+        else:
+            unresolved.append(name)
+
     shapes_path = args.shapes or osp.join(osp.dirname(args.index), "tensor_shapes.json")
-    if not osp.exists(shapes_path):
-        print(f"FATAL: no tensor shape map at {shapes_path}")
-        print("  This contract feeds REAL dtypes and shapes so the loaders' own")
-        print("  assertions stay live. Capture it from the safetensors headers.")
-        return 2
-    with open(shapes_path) as fh:
-        shapes = json.load(fh)
+    cached: dict[str, list] = {}
+    if osp.exists(shapes_path):
+        with open(shapes_path) as fh:
+            cached = json.load(fh)
+        # Fill only what no header could answer, and NAME the disagreements: a
+        # sidecar that contradicts a header is drift, and drift is a finding.
+        for name in list(unresolved):
+            if name in cached:
+                shapes[name] = cached[name]
+                unresolved.remove(name)
+        for name, val in shapes.items():
+            if name in cached and cached[name] != val and len(drift) < 4000:
+                drift.append(name)
 
     patterns = Counter(collapse(k) for k in weight_map)
     print(f"checkpoint: {len(weight_map)} tensors -> {len(patterns)} name patterns")
     print(f"shards:     {len(set(weight_map.values()))}")
-    missing_shapes = set(weight_map) - set(shapes)
-    if missing_shapes:
-        print(f"FATAL: {len(missing_shapes)} indexed tensors absent from the shape map")
+    print(f"shapes:     {from_header} from local headers, "
+          f"{len(shapes) - from_header} from the sidecar cache")
+    if drift:
+        ex = drift[0]
+        print(f"  sidecar DRIFT on {len(drift)} name(s) -- headers win. e.g. {ex}")
+        print(f"    cached {cached[ex]!r} vs header {shapes[ex]!r}")
+    if unresolved:
+        print(f"FATAL: {len(unresolved)} indexed tensors answered by neither a local "
+              f"header nor the sidecar")
+        for n in unresolved[:5]:
+            print(f"  {n} -> {weight_map[n]}")
         return 2
 
     try:
