@@ -1141,33 +1141,31 @@ class HiCacheFile(HiCacheStorage):
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
-        # #969G KEY INSTRUMENT (temporary). The ONE funnel every store key goes
-        # through, read and write alike (6 call sites). The open question is
-        # whether the re-admission asks for the SAME key the retention wrote:
-        # equal keys with an empty answer is a store/lookup defect, different
-        # keys is a derivation defect and the difference names the field.
-        # The caller's name distinguishes read from write with no plumbing.
-        # Grep: "#969G KEY".
-        if component_name is None or component_name in ("__default__", PoolName.KV):
-            out = self._get_suffixed_key(key)
-        else:
-            out = self._get_suffixed_key(f"{key}.{component_name}")
-        try:
-            import sys as _sys
+        """The LOOKUP-side component key.
 
-            _n = getattr(HiCacheFile, "_969g_n", 0) + 1
-            HiCacheFile._969g_n = _n
-            if _n <= 60 or _n % 1024 == 0:
-                logger.warning(
-                    "#969G KEY n=%d caller=%s component=%s key=%s",
-                    _n,
-                    _sys._getframe(1).f_code.co_name,
-                    component_name,
-                    out,
-                )
-        except Exception:  # noqa: BLE001
-            logger.warning("#969G KEY PROBE RAISED", exc_info=True)
-        return out
+        #1062 CORRECTION -- THE COMMENT THAT STOOD HERE LIED, and it is the
+        instrument-text-lies class, so it is replaced rather than amended. It
+        claimed to be "The ONE funnel every store key goes through, READ AND
+        WRITE ALIKE (6 call sites)", and the #969G probe that sat here was built
+        on that claim to answer "does the re-admission ask for the SAME key the
+        retention wrote".
+
+        STATICALLY THERE ARE FIVE CALL SITES AND NOT ONE OF THEM WRITES:
+        ``_get_component_path`` (:1244), ``_collect_existing_component_keys``
+        (:1546, :1549), ``batch_exists_v2`` (:1686, :1694) -- all lookup or
+        existence. Confirmed on metal: across boot 30 the only callers the probe
+        ever observed were ``_collect_existing_component_keys``, ``has_component``
+        and a ``<genexpr>``. So the probe could never see a write key, and its
+        never-observed difference was a property of ITS PLACEMENT, not of the
+        code -- the indicator law, exactly.
+
+        The probe therefore moved DOWN to ``_log_key``, which IS symmetric
+        (``_write_page`` and ``_read_page`` both call it). This function keeps
+        its arithmetic unchanged.
+        """
+        if component_name is None or component_name in ("__default__", PoolName.KV):
+            return self._get_suffixed_key(key)
+        return self._get_suffixed_key(f"{key}.{component_name}")
 
     def _sharded_path(self, stem: str) -> str:
         """Path a NEW file for ``stem`` is written to."""
@@ -1815,7 +1813,52 @@ class HiCacheFile(HiCacheStorage):
         return PoolTransferResult(final_pages, hit_count)
 
     def _log_key(self, pool_name: str, key: str) -> str:
-        return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
+        """The component stem for one pool's page -- READ AND WRITE ALIKE.
+
+        #1062: the #969G instrument lives HERE now, because this is the funnel
+        that is actually symmetric: ``_write_page`` and ``_read_page`` both call
+        it, so a key printed here can be compared across the two directions.
+        Its previous home (``_get_component_key``) has five call sites and none
+        of them writes, so it observed read keys only and its silence meant
+        nothing.
+
+        NO RATE LIMIT, AND THE SUPPRESSED COUNT IS PRINTED. The old probe
+        sampled ``_n <= 60 or _n % 1024`` and printed 602 lines against a
+        population of 235520 on boot 30 -- 0.3 %, in which an absence proves
+        nothing (denominator law). Sampling is kept only as an explicit cap with
+        its own counter, so the log stays bounded AND the reader is told exactly
+        how many keys were not shown.
+        """
+        out = key if pool_name == PoolName.KV else f"{key}.{pool_name}"
+        try:
+            _n = getattr(HiCacheFile, "_969g_n", 0) + 1
+            HiCacheFile._969g_n = _n
+            _cap = int(envs.SGLANG_HICACHE_KEY_TRACE_CAP.get() or 0) or 20000
+            if _n <= _cap:
+                import sys as _sys
+
+                logger.warning(
+                    "#969G KEY n=%d dir=%s pool=%s stem=%s",
+                    _n,
+                    _sys._getframe(1).f_code.co_name,
+                    pool_name,
+                    out,
+                )
+            else:
+                _s = getattr(HiCacheFile, "_969g_suppressed", 0) + 1
+                HiCacheFile._969g_suppressed = _s
+                if _s == 1 or _s % 100000 == 0:
+                    logger.warning(
+                        "#969G KEY TRACE CAPPED at %d lines; %d further key "
+                        "derivations SUPPRESSED so far. A zero difference read "
+                        "off the printed lines is bounded by this number, not "
+                        "by the population.",
+                        _cap,
+                        _s,
+                    )
+        except Exception:  # noqa: BLE001 - a probe may never break an IO path
+            pass
+        return out
 
     def _read_buffer_pool(self, pool_name: str, host_pool):
         """#720: the reusable read target for this pool, or None (today's path).

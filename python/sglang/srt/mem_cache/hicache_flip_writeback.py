@@ -85,8 +85,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +261,180 @@ def _total_nodes(tree_cache: Any) -> int:
 
 
 
+#: #1063: THE DECIDER, three states printed side by side rather than one saldo.
+#: rid-free, keyed by the store STEM the fence believed it had persisted.
+_1063_AT_FENCE: Dict[str, str] = {}
+_1063_STATE: Dict[str, int] = {}
+_1063_STEM_CAP = 4096
+
+
+def _1063_bump(key: str, n: int = 1) -> None:
+    _1063_STATE[key] = _1063_STATE.get(key, 0) + n
+
+
+def _1063_backend(tree_cache):
+    """The storage backend, or None. Never raises."""
+    try:
+        return getattr(
+            getattr(tree_cache, "cache_controller", None), "storage_backend", None
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _1063_stem_state(backend, stem: str) -> str:
+    """What the store holds for ``stem`` RIGHT NOW, as one of three words.
+
+    * ``readable``   -- the final ``.bin`` exists. A reader can serve it.
+    * ``assembling`` -- a ``.part706`` and/or its ``.slots706`` marker exist and
+      the ``.bin`` does NOT. This is the shape the canonical-page protocol calls
+      out itself: *"a writer acting alone leaves nothing readable behind"*
+      (`_set_canonical_slice`). A blob whose writer GROUP was torn apart -- which
+      is exactly what a cutover does to an in-flight assembly -- stays in this
+      state forever and is invisible to every reader.
+    * ``absent``     -- neither. Either never written, or reaped/evicted.
+
+    Read-only stat()s, no locks, never raises: an unreadable probe answers
+    ``unknown`` rather than inventing one of the three.
+    """
+    try:
+        from sglang.srt.mem_cache.canonical_page_store import (
+            marker_path,
+            part_path,
+        )
+
+        final = backend._sharded_path(stem)
+        if os.path.exists(final):
+            return "readable"
+        try:
+            flat = backend._flat_path(stem)
+            if os.path.exists(flat):
+                return "readable"
+        except Exception:  # noqa: BLE001
+            pass
+        if os.path.exists(part_path(final)) or os.path.exists(marker_path(final)):
+            return "assembling"
+        return "absent"
+    except Exception:  # noqa: BLE001 - a probe may never break the seam
+        return "unknown"
+
+
+def _1063_stems_for_node(backend, node) -> list:
+    """The store stems this node's pages would occupy. Never raises."""
+    out = []
+    try:
+        hv = getattr(node, "hash_value", None) or ()
+        for h in hv:
+            try:
+                out.append(backend._get_suffixed_key(str(h)))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def _1063_record_fence(tree_cache, nodes) -> None:
+    """Snapshot the store state of every eligible node AT THE FENCE.
+
+    Two points, not one, and that is the whole design: `evicted_since_flip`
+    cannot be read from a single observation at re-admission -- "absent now" and
+    "absent all along" are the same stat() and have opposite fixes. Recording
+    what the fence BELIEVED it had, and re-reading the same stems later, is what
+    separates them.
+    """
+    try:
+        backend = _1063_backend(tree_cache)
+        if backend is None:
+            _1063_bump("fence_no_backend")
+            return
+        seen = {"readable": 0, "assembling": 0, "absent": 0, "unknown": 0}
+        for node in nodes or ():
+            for stem in _1063_stems_for_node(backend, node):
+                st = _1063_stem_state(backend, stem)
+                seen[st] = seen.get(st, 0) + 1
+                if len(_1063_AT_FENCE) < _1063_STEM_CAP:
+                    _1063_AT_FENCE[stem] = st
+        _1063_bump("fences")
+        for k, v in seen.items():
+            _1063_bump(f"fence_{k}", v)
+        logger.warning(
+            "#1063 FENCE STORE STATE: stems=%d readable=%d assembling=%d "
+            "absent=%d unknown=%d (tracked=%d of cap %d). `assembling` is a "
+            "blob whose writer group never covered the last byte -- invisible "
+            "to every reader, forever. `absent` here is 'not written or already "
+            "reaped'; whether it was LOST LATER is only decidable against this "
+            "snapshot, which is why it is taken.",
+            sum(seen.values()),
+            seen.get("readable", 0),
+            seen.get("assembling", 0),
+            seen.get("absent", 0),
+            seen.get("unknown", 0),
+            len(_1063_AT_FENCE),
+            _1063_STEM_CAP,
+        )
+    except Exception:  # noqa: BLE001 - a census may never break the seam
+        pass
+
+
+def _1063_probe_since_fence(tree_cache) -> None:
+    """Re-read the fence's stems and classify the TRANSITION.
+
+    This is the decider the coordinator asked for, and it prints the three
+    states explicitly rather than a saldo:
+
+    * ``present_and_readable``  -- was persisted and still is. If the
+      re-admission still misses on these, neither candidate root holds and the
+      hunt moves to the lookup.
+    * ``complete_marker_absent``-- the blob is stuck mid-assembly (``.part706``
+      present, no ``.bin``). The cutover tore a writer group apart.
+    * ``evicted_since_flip``    -- it WAS readable at the fence and is gone now.
+    """
+    try:
+        backend = _1063_backend(tree_cache)
+        if backend is None or not _1063_AT_FENCE:
+            return
+        now = {
+            "present_and_readable": 0,
+            "complete_marker_absent": 0,
+            "evicted_since_flip": 0,
+            "still_absent": 0,
+            "unknown": 0,
+        }
+        for stem, was in _1063_AT_FENCE.items():
+            st = _1063_stem_state(backend, stem)
+            if st == "readable":
+                now["present_and_readable"] += 1
+            elif st == "assembling":
+                now["complete_marker_absent"] += 1
+            elif st == "absent":
+                if was == "readable":
+                    now["evicted_since_flip"] += 1
+                else:
+                    now["still_absent"] += 1
+            else:
+                now["unknown"] += 1
+        logger.warning(
+            "#1063 SINCE-FENCE DECIDER (denominator=stems tracked at the last "
+            "fence=%d): present_and_readable=%d complete_marker_absent=%d "
+            "evicted_since_flip=%d still_absent=%d unknown=%d. "
+            "`complete_marker_absent` is the torn-assembly candidate (a cutover "
+            "splitting a writer group leaves a permanently unreadable blob); "
+            "`evicted_since_flip` is the eviction candidate, and it is only "
+            "countable because the fence snapshot exists. If BOTH are ~0 while "
+            "the re-admission still misses, both roots are refuted and the "
+            "defect is in the LOOKUP, not in the bytes.",
+            len(_1063_AT_FENCE),
+            now["present_and_readable"],
+            now["complete_marker_absent"],
+            now["evicted_since_flip"],
+            now["still_absent"],
+            now["unknown"],
+        )
+    except Exception:  # noqa: BLE001 - a census may never break admission
+        pass
+
+
 def _hashed_nodes(tree_cache: Any) -> list:
     """Persistable nodes, PARENT FIRST.
 
@@ -363,6 +538,11 @@ def flip_writeback(
     logger.warning(
         "#969E FENCE-NODES total=%d eligible=%d", _969e_total, len(nodes)
     )
+    # #1063: snapshot what the store ACTUALLY holds for these nodes, before the
+    # staging below changes anything. Two-point measurement -- see
+    # `_1063_record_fence` for why one observation cannot separate
+    # "evicted since" from "never written".
+    _1063_record_fence(tree_cache, nodes)
     root = getattr(tree_cache, "root_node", None)
     staged = 0
     already = 0

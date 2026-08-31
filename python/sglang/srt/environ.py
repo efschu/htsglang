@@ -1183,6 +1183,10 @@ class Envs:
     # to the registry at first use, so the read path's pinned footprint becomes
     # a number the budget can refuse.
     SGLANG_HICACHE_READ_BUFFERS = EnvInt(0)
+    # #1062: cap on the #969G key-trace, in LINES. 0 -> the built-in 20000.
+    # Not a rate limit: past the cap the suppressed count is printed, so an
+    # absence in the trace is always readable against a named denominator.
+    SGLANG_HICACHE_KEY_TRACE_CAP = EnvInt(0)
     # #558: free-space floor, in bytes, below which the #706 canonical write
     # protocol refuses rather than risking ENOSPC in the middle of a
     # multi-writer page assembly. 0 (default) keeps today's behaviour, where

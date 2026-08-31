@@ -519,6 +519,17 @@ def _1060_note_readmit_recovery(req, tree_cache) -> None:
         ):
             _1060_LAST_CENSUS_T[0] = now
             _1060_emit_census("cadence")
+            # #1063: the since-fence decider rides the same cadence. It needs
+            # the tree_cache (for the backend) and this is the only place on
+            # the re-admission path that holds one.
+            try:
+                from sglang.srt.mem_cache.hicache_flip_writeback import (
+                    _1063_probe_since_fence,
+                )
+
+                _1063_probe_since_fence(tree_cache)
+            except Exception:  # noqa: BLE001 - a census may never break admission
+                pass
     except Exception:  # noqa: BLE001 - a measurement may never break admission
         pass
 
