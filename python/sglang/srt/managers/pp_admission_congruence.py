@@ -1266,6 +1266,61 @@ def clear_state_aligned_extent_on_retract(req) -> None:
         pass
 
 
+def holders_with_unspent_extent(scheduler) -> List:
+    """#1043: EVERY request this rank holds that still carries an extent.
+
+    THE ONE CARRIER AUTHORITY, and it is DERIVED rather than hand-listed --
+    because the hand-list has now been wrong twice in the same class. First
+    `_seen_this_pass` alone missed `add_chunked_req` (which fills
+    `can_run_list` before the loop); then the union with `admitted_list` still
+    missed every request that HOLDS an extent without being touched by this
+    pass. A third hand-written enumeration would be the same defect a third
+    time, so this one is built on the residency authority the CUTOVER already
+    uses and states its single deviation.
+
+    BASE: `phase_flip_runtime._live_reqs(scheduler)` -- the rank's resident set
+    across ALL microbatch slots. Its own docstring records why each route is
+    there, and it covers: `running_mbs` (per-slot residents), `last_mbs` (the
+    W30 route -- a request that just finished a prefill iteration sits there and
+    nowhere else), `running_batch`/`last_batch` (the non-PP handles), and
+    `chunked_req` (resident, in no batch at all, #631 defect O).
+
+    THE #858b LAST_MBS GAP WAS CHECKED, NOT ASSUMED, AND IS CLOSED. The warning
+    that `_live_reqs` does not enumerate `last_mbs` is STALE: W30 added that
+    route to the AUTHORITY (phase_flip_runtime.py:1346-1347) after
+    `ResidentCarryError` measured it on all three ranks, explicitly under the
+    rule "fix it at the one authority, not at the consumers". Deriving from it
+    therefore inherits the fix instead of re-opening the hole.
+
+    THE ONE DEVIATION, stated rather than silent: `waiting_queue` is added. The
+    cutover authority answers "what holds POOL ROWS I must move", and a queued
+    request holds none. This function answers "what holds a FACT I must
+    publish", and a queued request does -- it is exactly the boot-8 population
+    (skipped at `prefetch_pending`, never admitted, still queued, still holding
+    a host hit). Excluding it would reproduce the original defect.
+
+    Deduplicated by identity: the same Req legitimately appears on several
+    routes. `spend` is what prevents a held extent from being published twice,
+    so this set may safely be broad.
+    """
+    from sglang.srt.managers.phase_flip_runtime import _live_reqs
+
+    seen = set()
+    out: List = []
+    try:
+        sources = list(_live_reqs(scheduler) or [])
+    except Exception:  # noqa: BLE001 - never break admission on a census
+        sources = []
+    sources.extend(list(getattr(scheduler, "waiting_queue", []) or []))
+    for req in sources:
+        if id(req) in seen:
+            continue
+        seen.add(id(req))
+        if getattr(req, LOAD_BACK_EXTENT_ATTR, None):
+            out.append(req)
+    return out
+
+
 def _spend_for_entry(req) -> Optional[int]:
     """#1042: read the stamped extent INTO an entry and mark it spent.
 

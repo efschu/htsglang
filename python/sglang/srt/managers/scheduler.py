@@ -224,6 +224,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPScheduleRefused,
     build_pp_admission_decision,
     LOAD_BACK_EXTENT_ATTR as LOAD_BACK_EXTENT_ATTR_1041,
+    holders_with_unspent_extent,
     forwarded_fill_carry,
     forwarded_last_chunk,
     pp_admission_verdict_is_vacuous,
@@ -10582,10 +10583,24 @@ class Scheduler(
             # A detector whose denominator excludes a whole filler cannot
             # detect that filler's bypass, which is the denominator trap this
             # instrument exists to prevent. The union is the honest population.
+            # #1043: THE CARRIER POPULATION IS A PROPERTY OF THE REQUEST, NOT
+            # OF THIS PASS. Two pass-scoped denominators have now been wrong in
+            # the same way -- `_seen_this_pass` alone missed `add_chunked_req`,
+            # and the union with `admitted_list` still missed every request that
+            # HOLDS an extent without being touched this pass (boot 11: the
+            # deferring rids carried 4618/1295 while the publisher counted
+            # seen=0). `holders_with_unspent_extent` is the one authority,
+            # derived from the cutover's own residency enumeration; anything the
+            # loop touched is unioned in so a freshly stamped request cannot be
+            # missed on the pass that stamps it.
             _admitted_ids = {id(r) for r in admitted_list}
-            _touched = list(admitted_list) + [
-                r for r in _seen_this_pass if id(r) not in _admitted_ids
-            ]
+            _touched = list(admitted_list)
+            _seen_ids = set(_admitted_ids)
+            for r in list(holders_with_unspent_extent(self)) + _seen_this_pass:
+                if id(r) in _seen_ids:
+                    continue
+                _seen_ids.add(id(r))
+                _touched.append(r)
             _carriers = [r for r in _touched if id(r) not in _admitted_ids]
             self._pp_admission_last_built_decision = build_pp_admission_decision(
                 0,  # placeholder mb_id; stamped with the real one downstream
