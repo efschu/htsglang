@@ -41,10 +41,17 @@ decide the design, and both were verified against the #602 captures:
   The structure was not the wrong one to read; it was STARVED. Armed at process
   start it becomes the exact resident attribution, because it is keyed on the
   blocks the allocator is actually still holding.
-* ``device_traces`` is a fixed-size RING. ``max_entries`` is therefore never
-  capped here (torch's default is effectively unbounded): the #602 capture came
-  back with exactly 100000 entries, i.e. full, i.e. wrapped, retaining only the
-  last ~10.7 s of a boot-long history.
+* ``device_traces`` is a fixed-size RING. ``max_entries`` is therefore not
+  capped BY DEFAULT (torch's default is effectively unbounded): the #602
+  capture came back with exactly 100000 entries, i.e. full, i.e. wrapped,
+  retaining only the last ~10.7 s of a boot-long history. #1054b adds an
+  OPT-IN cap (:data:`CAP_ENV`) for the one configuration that needs it -- a
+  window held open through serving on a swapless box -- and the objection
+  above is answered rather than overruled: what made the #602 wrap harmful was
+  that it was SILENT, so a capped ring here reports its exact drop count
+  (:func:`ring_loss_report`) with every dump, derived from torch's own
+  monotone allocation counter. Uncapped remains the default and the better
+  record.
 
 Neither structure is trusted blind: :func:`resident_attribution` and
 :func:`churn_attribution` each return an explicit COVERAGE verdict and refuse to
@@ -91,6 +98,7 @@ __all__ = [
     "trace_requested_for_rank",
     "disarm_process_trace",
     "hold_trace_through_serving",
+    "ring_loss_report",
     "trace_armed",
     "dump_trace",
     "is_recording_phases",
@@ -141,6 +149,32 @@ TRACE_ENV = "SGLANG_VRAM_FLIGHT_TRACE"
 #: :func:`arm_process_trace`), so host RAM grows with every allocation the
 #: process makes for as long as it runs. Never set it on an acceptance boot.
 HOLD_ENV = "SGLANG_VRAM_FLIGHT_HOLD"
+
+#: #1054b: CAP THE RING, AND SAY EXACTLY WHAT THE CAP COST.
+#:
+#: ``arm_process_trace`` deliberately passes no ``max_entries`` (see its
+#: docstring): #602's capture came back exactly full at 100000, holding its
+#: final 10.7 seconds, and a ring that wraps SILENTLY turns "this post has no
+#: allocation event" into an untrue statement. That reasoning is about SILENCE,
+#: not about caps. It stops applying the moment the wrap is COUNTED.
+#:
+#: And a cap is required once the window is held open through serving
+#: (:data:`HOLD_ENV`): the ring then grows for the life of the process on a
+#: swapless box that has already killed serving by host OOM without foreign
+#: load, where serving carries ``oom_score_adj=500`` and is the preferred
+#: victim. A diagnostic boot that kills the box measures nothing.
+#:
+#: So: set this to bound the ring, and the drop count is DERIVED rather than
+#: guessed. ``torch.cuda.memory_stats()["allocation.all.allocated"]`` is a
+#: monotone count of every allocation the process has made; sampled at arm time
+#: and again at each dump, the difference is how many events the ring was
+#: offered, and everything beyond the cap fell out of it. That number is
+#: printed with every dump. An honest loss counter beside a bounded ring beats
+#: a complete ring that ends the run -- and the ring is BYCATCH here anyway:
+#: the load-bearing artifacts are the snapshots taken at the corridor guard's
+#: first dip and in the crash handler, whose per-block stacks come from the
+#: allocator's live segments, not from the trace ring.
+CAP_ENV = "SGLANG_VRAM_FLIGHT_MAX_ENTRIES"
 
 #: Carries the boot id from the launcher to every rank it spawns. Set by
 #: :func:`publish_boot_id` and inherited through the environment, which is the
@@ -249,22 +283,42 @@ def arm_process_trace(rank: int = 0, force: bool = False) -> bool:
         return True
     if not (force or trace_requested_for_rank(rank)):
         return False
+    global _trace_cap, _alloc_count_at_arm
+    cap = _configured_cap()
     try:
         import torch
 
         # enabled/context/stacks are left at their defaults on purpose: they
         # already are 'all'/'all'/'all'. Naming them would suggest that the
         # #602 capture lacked stacks because of a flag, which it did not.
-        torch.cuda.memory._record_memory_history()
+        if cap:
+            torch.cuda.memory._record_memory_history(max_entries=cap)
+        else:
+            torch.cuda.memory._record_memory_history()
+        _alloc_count_at_arm = _allocations_so_far()
     except Exception as e:  # pragma: no cover - torch/platform differences
         logger.warning("VRAM flight recorder could not arm the trace: %s", e)
         return False
     _trace_armed = True
-    logger.info(
-        "VRAM flight recorder: allocation recording armed for this process "
-        "(uncapped ring). Host RAM grows with the number of allocations; this "
-        "is a measurement boot, not a serving configuration."
-    )
+    _trace_cap = cap
+    if cap:
+        logger.info(
+            "VRAM flight recorder: allocation recording armed for this process "
+            "with a ring of %d entries (%s). BOUNDED ON PURPOSE and the cost is "
+            "COUNTED, not hidden: every dump prints how many allocation events "
+            "the ring was offered beyond this cap, derived from torch's own "
+            "monotone allocation counter. Uncapped is the better record and a "
+            "worse risk once the window is held through serving on a swapless "
+            "box.",
+            cap,
+            CAP_ENV,
+        )
+    else:
+        logger.info(
+            "VRAM flight recorder: allocation recording armed for this process "
+            "(uncapped ring). Host RAM grows with the number of allocations; "
+            "this is a measurement boot, not a serving configuration."
+        )
     return True
 
 
@@ -298,6 +352,76 @@ def disarm_process_trace() -> bool:
     return True
 
 
+_trace_cap: int = 0
+_alloc_count_at_arm: Optional[int] = None
+
+
+def _configured_cap() -> int:
+    """The ring bound, or 0 for the uncapped default. Never negative."""
+    raw = (os.environ.get(CAP_ENV) or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; leaving the ring uncapped", CAP_ENV, raw
+        )
+        return 0
+
+
+def _allocations_so_far() -> Optional[int]:
+    """torch's monotone count of allocations made by this process.
+
+    The denominator of the drop count. ``None`` when the counter is
+    unavailable, and a ``None`` is reported as UNKNOWN rather than as zero
+    drops -- an unmeasurable loss is not an absent loss.
+    """
+    try:
+        import torch
+
+        stats = torch.cuda.memory_stats()
+    except Exception:  # pragma: no cover - no CUDA / no context yet
+        return None
+    for key in ("allocation.all.allocated", "allocation.all.current"):
+        if key in stats:
+            return int(stats[key])
+    return None
+
+
+def ring_loss_report() -> str:
+    """How much the capped ring dropped, in words, for the dump's log line."""
+    if not _trace_cap:
+        return "ring uncapped (no events dropped)"
+    if _alloc_count_at_arm is None:
+        return (
+            f"ring capped at {_trace_cap} entries; DROPPED COUNT UNKNOWN "
+            "(torch's allocation counter was unreadable at arm time -- treat "
+            "this trace as possibly truncated, never as complete)"
+        )
+    now = _allocations_so_far()
+    if now is None:
+        return (
+            f"ring capped at {_trace_cap} entries; DROPPED COUNT UNKNOWN "
+            "(allocation counter unreadable now)"
+        )
+    offered = max(0, now - _alloc_count_at_arm)
+    dropped = max(0, offered - _trace_cap)
+    if dropped:
+        return (
+            f"ring capped at {_trace_cap} entries; {offered} allocation events "
+            f"were offered since arming, so {dropped} FELL OUT of the ring. "
+            "The trace holds only the most recent window; an absence in it is "
+            "NOT evidence that a post never allocated. The per-block stacks in "
+            "the segments below are unaffected -- they come from the live "
+            "allocator, not from the ring."
+        )
+    return (
+        f"ring capped at {_trace_cap} entries; {offered} events offered, none "
+        "dropped -- this trace is COMPLETE for the window since arming"
+    )
+
+
 def hold_trace_through_serving() -> bool:
     """#1054: is this a measurement run that keeps recording past the boot?
 
@@ -324,7 +448,15 @@ def dump_trace(
         os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, f"flight_trace_rank{rank}_{tag}.pickle")
         torch.cuda.memory._dump_snapshot(path)
-        logger.info("VRAM flight recorder: snapshot %s written to %s", tag, path)
+        # #1054b: the loss statement travels WITH the artifact. A reader who
+        # opens this pickle six boots from now must not have to reconstruct
+        # whether the ring wrapped -- the number is in the log beside the path.
+        logger.info(
+            "VRAM flight recorder: snapshot %s written to %s -- %s",
+            tag,
+            path,
+            ring_loss_report(),
+        )
         return path
     except Exception as e:  # pragma: no cover - torch/filesystem differences
         logger.warning("VRAM flight recorder could not dump snapshot %s: %s", tag, e)
