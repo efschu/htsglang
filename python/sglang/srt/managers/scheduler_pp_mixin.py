@@ -8578,6 +8578,36 @@ class SchedulerPPMixin:
         src = resolve_src(self.pp_group, None)
         q = typed_inbox(self.pp_group).get((src, "proxy"))
         if not q:
+            # VANISH FORENSICS (boots 631row8/row10): a drained-and-stashed
+            # frame was gone by the time its named slot probed, with no drop,
+            # no void and no raise on record. When the balance is open, name
+            # the whole inbox -- every key with its depth -- plus the queue
+            # and the group identity, so a key mismatch or a group-object
+            # swap shows itself instead of being theorized about.
+            if stats["drained"] > stats["delivered"]:
+                stats["vanish_probes"] = stats.get("vanish_probes", 0) + 1
+                _vp = stats["vanish_probes"]
+                if _vp <= 8 or _vp % 512 == 0:
+                    try:
+                        _keys = {
+                            f"{k[0]}|{k[1]}": len(v)
+                            for k, v in typed_inbox(self.pp_group).items()
+                        }
+                    except Exception:  # noqa: BLE001
+                        _keys = "?"
+                    logger.warning(
+                        "#631 ROW-PROBE VANISH slot=%s drained=%d delivered=%d "
+                        "expected_key=%s|proxy inbox=%s queue=%d group_id=%s "
+                        "occurrence=%d",
+                        mb_id,
+                        stats["drained"],
+                        stats["delivered"],
+                        src,
+                        _keys,
+                        len(getattr(self, "waiting_queue", ()) or ()),
+                        hex(id(self.pp_group)),
+                        _vp,
+                    )
             counters = getattr(self, "pp_flip_counters", None)
             if counters is None:
                 return None
