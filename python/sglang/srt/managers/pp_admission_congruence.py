@@ -1205,19 +1205,21 @@ LOAD_BACK_EXTENT_ATTR = "pp_load_back_extent"
 #: `pp_load_back_extent`, and every one of them is counted.
 #:
 #:   set            a match WITH a host hit chooses an extent          (writer)
-#:   hitless_noop   a match WITHOUT a hit -- NO-OP, never a clear      (was the bug)
+#:   hitless_clear  a match WITHOUT a hit -- CLEARS (#1048): under local
+#:                  consumption the extent is only valid for the match that
+#:                  made it, and a stale one killed boot 15
 #:   (spend)        DELETED with the delivery chain (#1046) -- there is no
 #:                  row consumption left for a fact to be retired by
 #:   retract        the request was retracted; the fact is void        (deleter)
 #:
-#: BOOT 10 MEASURED WHY `hitless_noop` MUST NOT BE A CLEAR. The stamp nulled the
+#: BOOT 10 MEASURED WHY A HITLESS MATCH MUST NOT CLEAR *UNDER DELIVERY*. It nulled the
 #: field on every hitless match, so a request stamped 4618 on one pass reached
 #: the publisher with None on the next: `#1041 EXTENT POPULATION seen=0
 #: published=0 delta=0 admitted=1`, beside `#1040 ... extent=4618` for the same
 #: rid. Writer, eraser and reader separated by an ordinary intervening match --
 #: the lifecycle shape the pre-boot table exists to catch, reproduced inside the
 #: mechanism that was supposed to fix it.
-_1042_LIFECYCLE = {"set": 0, "hitless_noop": 0, "retract": 0}
+_1042_LIFECYCLE = {"set": 0, "hitless_clear": 0, "retract": 0}
 
 
 def _1042_note(kind: str, req, extent=None) -> None:
@@ -1227,19 +1229,19 @@ def _1042_note(kind: str, req, extent=None) -> None:
     # acceptance window contained ZERO `#1042` lines while the log held nine --
     # the window simply fell between samples, and a reader would have concluded
     # "the contract was never exercised". The `set` and `retract` transitions
-    # are rare and now print unconditionally; only `hitless_noop`, which fires
+    # are rare and now print unconditionally; only `hitless_clear`, which fires
     # on ordinary traffic, is sampled -- and it says how many it skipped.
-    _suppressed = 0 if kind != "hitless_noop" else max(0, n - 1 - ((n - 1) // 256) * 256)
-    if kind != "hitless_noop" or n <= 3 or n % 256 == 0:
+    _suppressed = 0 if kind != "hitless_clear" else max(0, n - 1 - ((n - 1) // 256) * 256)
+    if kind != "hitless_clear" or n <= 3 or n % 256 == 0:
         logger.info(
             "#1042 EXTENT LIFECYCLE %s rid=%s extent=%s held=%s -- set=%d "
-            "hitless_noop=%d retract=%d (suppressed_since_last_print=%d)",
+            "hitless_clear=%d retract=%d (suppressed_since_last_print=%d)",
             kind,
             getattr(req, "rid", None),
             extent,
             getattr(req, LOAD_BACK_EXTENT_ATTR, None),
             _1042_LIFECYCLE["set"],
-            _1042_LIFECYCLE["hitless_noop"],
+            _1042_LIFECYCLE["hitless_clear"],
             _1042_LIFECYCLE["retract"],
             _suppressed,
         )
@@ -1300,8 +1302,32 @@ def stamp_state_aligned_extent(req) -> Optional[int]:
     # zero hit; if it appears nowhere, a third path sets `host_hit_length`
     # without passing either writer, and that is a finding of its own.
     if int(getattr(req, "host_hit_length", 0) or 0) <= 0:
-        _1042_note("hitless_noop", req)
-        return getattr(req, LOAD_BACK_EXTENT_ATTR, None)
+        # #1048: UNDER LOCAL CONSUMPTION A HITLESS MATCH MUST CLEAR. This was a
+        # NO-OP, and that was CORRECT while the extent was consumed a lap later
+        # by the delivery row: the fact had to outlive the match that made it.
+        # The #1046 cut inverted the requirement and the inversion was not
+        # re-derived -- the extent is now consumed by the SAME match that
+        # produced it, so a later match with no host hit means the tree can no
+        # longer serve the old number, and keeping it hands the consumer a stale
+        # demand.
+        #
+        # BOOT 15 DIED OF EXACTLY THIS: rid c9d14e69 kept extent=4618 across a
+        # readmit whose match read `host_hit=0`, the clamp then demanded 4618
+        # against a load-back that yielded 0, and `#968 LOAD-BACK EXTENT
+        # UNREACHABLE` fired 1448 times, refusing the forwarded schedule on
+        # every rank until the ring wedged (#789 PROXY READINESS TIMEOUT) and
+        # all three schedulers crashed at 10:59:42.
+        #
+        # THE LESSON IS THE LIFECYCLE LAW ITSELF: a table is valid for ONE
+        # architecture. #1042's no-clear rule was right for the delivery world
+        # and wrong the moment the consumer moved, and it had to be re-derived
+        # rather than carried across the cut.
+        _1042_note("hitless_clear", req)
+        try:
+            setattr(req, LOAD_BACK_EXTENT_ATTR, None)
+        except Exception:  # noqa: BLE001 - never break a match walk
+            pass
+        return None
     extent = state_aligned_load_back_len(req)
     try:
         setattr(req, LOAD_BACK_EXTENT_ATTR, extent)

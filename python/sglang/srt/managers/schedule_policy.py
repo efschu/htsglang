@@ -17,6 +17,8 @@ from sglang.srt.managers.pp_admission_congruence import (
 )
 
 _988_LOADBACK_SEEN = {"n": 0, "mamba": 0, "kv_only": 0}
+#: #1048: this rank's own stamp went stale between the match and the apply.
+_1048_STALE = {"n": 0}
 
 
 def _note_988_loadback(req, new_prefix_len: int) -> None:
@@ -2396,6 +2398,39 @@ class PrefillAdder:
                     if _applied > _lb_extent:
                         new_indices = new_indices[:_lb_extent]
                     elif _applied < _lb_extent:
+                        # #1048: NO LONGER A GROUP REFUSAL -- THERE IS NO GROUP
+                        # FACT LEFT TO BE UNREACHABLE. This raise existed
+                        # because `_lb_extent` was PP0's published number: a
+                        # rank that could not reach it would sit at a different
+                        # prefix than its peers, so refusing the pass was the
+                        # only safe answer. Since #1046 the extent is this
+                        # rank's OWN, so a shortfall means only that this rank's
+                        # own stamp went stale between the match and here -- a
+                        # local staleness, not a divergence.
+                        #
+                        # Boot 15 measured the cost of leaving it a refusal:
+                        # 1448 `EXTENT UNREACHABLE` raises on one rid, the
+                        # forwarded schedule refused on every rank every pass,
+                        # ring wedge, three dead schedulers. Taking what the
+                        # tree can actually serve is both correct and uniform
+                        # here, because every rank re-derives from its own tree
+                        # and lands on its own servable amount.
+                        _1048_STALE["n"] += 1
+                        _n48 = _1048_STALE["n"]
+                        if _n48 <= 3 or _n48 % 256 == 0:
+                            logger.info(
+                                "#1048 EXTENT STALE rid=%s: this rank's stamp "
+                                "asked for %d token(s) and its own load-back "
+                                "served %d; taking the served amount. The stamp "
+                                "was made by an earlier match and the tree has "
+                                "moved since. occurrence=%d",
+                                getattr(req, "rid", "?"),
+                                _lb_extent,
+                                _applied,
+                                _n48,
+                            )
+                        _lb_extent = _applied
+                    elif False:
                         from sglang.srt.managers.pp_admission_congruence import (
                             PPScheduleRefused,
                         )
