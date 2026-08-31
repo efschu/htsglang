@@ -916,15 +916,25 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
         # WHICH GATHER, decided here and per RANK, because on a heterogeneous rig
-        # the answer differs by card from one boot command. The zero-copy Triton
-        # kernel needs fp8e4nv for an fp8 table, whose floor is compute capability
-        # 8.9 -- measured: 8.6 refuses to compile it, 12.0 compiles it natively. A
-        # boot that discovers that at the first gather has already wasted a window,
-        # and it fails on 2 of 3 ranks here, so "auto" resolves it up front.
+        # the answer differs by card from one boot command.
+        #
+        # THE THRESHOLD IS THIS KERNEL'S, NOT THE HARDWARE'S. `_gather_ple_..._kernel`
+        # loads through an fp8e4nv pointer type, which Triton's Ampere backend does
+        # not offer (it has fp8e4b15/fp8e5), so it fails at COMPILE time on sm86 --
+        # and a boot that discovers that at the first gather has burnt a window, on
+        # 2 of 3 ranks here. Hence resolving it up front.
+        #
+        # But the card is NOT the obstacle, and calling this an fp8 capability floor
+        # would be wrong: sm86 converts fp8 -> bf16 exactly, and a Triton kernel
+        # reading the SAME BYTES as uint8 through a 256-entry LUT compiles there and
+        # is bit-exact (scripts/dev/qwen4_exp_fp8_on_sm86.py, both measured). So the
+        # zero-copy path is RECOVERABLE on Ampere with a uint8+LUT load; it is simply
+        # not built, and building it is unjustified until a QUIET box shows the host
+        # gather costs something. Named so the next reader does not re-derive it.
         mode = (envs.SGLANG_PLE_GATHER.get() or "auto").strip().lower()
         is_fp8_table = cpu_weight.dtype == torch.float8_e4m3fn
         cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
-        kernel_can_fp8 = cap >= (8, 9)
+        kernel_can_fp8 = cap >= (8, 9)  # of THIS kernel, not of the silicon
 
         if mode == "host":
             self._use_host_gather = True
@@ -935,9 +945,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             if is_fp8_table and not kernel_can_fp8:
                 raise ValueError(
                     f"SGLANG_PLE_GATHER=pinned with an fp8 PLE table on sm{cap[0]}"
-                    f"{cap[1]}: the zero-copy kernel needs fp8e4nv, whose floor is "
-                    "8.9, and it fails at COMPILE time rather than degrading. Use "
-                    "auto (or host) on this card."
+                    f"{cap[1]}: THIS kernel loads through an fp8e4nv pointer type, "
+                    "which Triton's pre-8.9 backends do not offer, so it fails at "
+                    "COMPILE time rather than degrading. Not a limit of the card -- "
+                    "sm86 converts fp8 exactly and a uint8+LUT load compiles there "
+                    "(scripts/dev/qwen4_exp_fp8_on_sm86.py), but that variant is not "
+                    "built. Use auto (or host) on this card."
                 )
         elif mode == "auto":
             # Not pinned -> the kernel cannot read it at all (a GPU kernel cannot
@@ -1050,14 +1063,24 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     def _gather_host(self, flat_ids: torch.Tensor, output: torch.Tensor) -> None:
         """Gather on the HOST, then move only the result.
 
-        [#1036] Two independent reasons this path exists, and only the second one is
-        about choice:
-          * On sm86 an fp8 table has NO alternative. Triton there cannot compile
-            fp8e4nv at all ("type fp8e4nv not supported in this architecture"), so
-            the pinned kernel is unavailable rather than slow.
+        [#1036] Two reasons this path exists, and the first one is WEAKER than I
+        first wrote it -- corrected after the operator pushed back on the wording:
+          * On sm86 the SHIPPED pinned kernel cannot serve an fp8 table, because it
+            asks Triton for an fp8e4nv POINTER TYPE and the Ampere backend offers
+            only fp8e4b15/fp8e5. That is a Triton type-support limit in this kernel,
+            NOT a property of the card. The card converts fp8 -> bf16 exactly, and a
+            Triton kernel loading the same bytes as uint8 through a 256-entry LUT
+            compiles on sm86 and is bit-exact -- both measured, see
+            scripts/dev/qwen4_exp_fp8_on_sm86.py. Nothing here asks any card to do
+            fp8 ARITHMETIC; the table is a LOOKUP, and the model computes in bf16.
           * A PAGEABLE table -- page-cache resident, cold tail on disk -- cannot be
-            read by the pinned kernel either: a GPU kernel cannot take a page fault
-            on host memory (:1891 says so about the fp8 auto-switch). The CPU can.
+            read by the pinned kernel at any dtype: a GPU kernel cannot take a page
+            fault on host memory (:1891 says so about the fp8 auto-switch).
+
+        What the HOST actually does here is worth stating plainly, because "host
+        gather" invites the reading that computation moved to the CPU. It did not:
+        the CPU performs an index_select, which is a row MEMCPY of 16 x 160 bytes per
+        token, and zero FLOPs. The widening and the masking both run on the device.
 
         SIZE of the traffic, which is arithmetic and not a benchmark: one token's
         whole gather is n_grams x embedding_dim = 16 x 160 elements, so 2560 B at fp8
