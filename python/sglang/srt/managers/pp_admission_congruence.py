@@ -403,6 +403,48 @@ class PPAdmissionEntry:
     normal case, and void every pass. The verdict simply stops being derived
     from a local length."""
 
+    load_back_len: Optional[int] = None
+    """#968/#1035: PP0's host load-back EXTENT for this rid, in tokens.
+
+    `None` = "say nothing" (a legacy sender, `pp_size <= 1`, or a pass on
+    which PP0 offered no load-back), and a receiver reading `None` performs
+    NO load-back at all -- never a rank-local substitute. That asymmetry is
+    the whole point: an absent fact is an honest miss costing recompute,
+    while a rank-local second derivation is the shape divergence boot
+    1815081d46 died in.
+
+    WHY AN EXTENT TRAVELS WHERE `prefix_len` ALREADY DOES. `prefix_len` is an
+    upper bound the receiver TRUNCATES to (`Req.truncate_prefix_to`), and its
+    contract -- `told <= this rank's local match` -- is what
+    `reconcile_pp_admission_decision` enforces. A host load-back GROWS the
+    prefix beyond the local device match, so folding it into `prefix_len`
+    would make every load-back row violate that contract on arrival and be
+    retracted as unhonourable. The two quantities move in opposite
+    directions; they cannot share a field.
+
+    DECIDED AT PASS N, APPLIED AT PASS N+1, ON EVERY RANK INCLUDING PP0. The
+    per-pass proxy frame is received at `scheduler_pp_mixin.py:4476`, AFTER
+    that rank has already planned its batch at `:4292` -- so a fact stamped
+    on the frame for pass N cannot drive pass N's own admission. PP0
+    therefore does not apply its own offer either: it records the extent, the
+    row makes one lap, and every rank first applies it on the pass after it
+    holds it. Uniformity is then CONSTRUCTIVE -- the number comes from one
+    rank -- rather than a bet that two ranks measured the same thing.
+
+    THE COST, STATED. One pass of latency per rid, which lands exactly on a
+    chunk boundary: the first chunk of a cold-warm request computes without
+    the prefix (that is the batch whose frame carries this fact), and every
+    later chunk honours it. The loss is therefore bounded by ONE HiCache
+    chunk by construction -- the standing #939 bound -- and not by the
+    prompt.
+
+    MEASURED, boot_855_939reread_0840f82601_0830_232150: 15/15 `#1035
+    RANK-LOCAL LOAD-BACK REFUSED` lines, 5 rids x 3 ranks, host hit
+    rank-IDENTICAL for every rid (1278, 350, 4618, 4618, 350). That
+    uniformity is a HAZARD READING, never a licence: it says the offered
+    extent will normally be honourable, NOT that a rank may derive one
+    locally when the fact is absent."""
+
 
 @dataclass(frozen=True)
 class PPAdmissionDecision:
@@ -1352,6 +1394,13 @@ def build_pp_admission_decision(
                     last_chunk=_last_chunk_verdict(
                         executed[0], executed[1], executed_fill_len
                     ),
+                    # #968/#1035: the load-back extent PP0 OFFERS for this rid.
+                    # Read straight off the request, where the load-back site
+                    # recorded it this pass; never re-derived here, because a
+                    # second derivation of the quantity whose disagreement IS
+                    # the defect is how #995's first version manufactured false
+                    # refusals.
+                    load_back_len=getattr(req, "pp_load_back_offer", None),
                 )
             )
             continue
@@ -1433,6 +1482,8 @@ def build_pp_admission_decision(
                 # tokens from prefix to extend), so the verdict does not move
                 # with it either.
                 last_chunk=_last_chunk_verdict(told, extend_len, fallback_fill_len),
+                # #968/#1035: same offer, same reader, on the fallback branch.
+                load_back_len=getattr(req, "pp_load_back_offer", None),
             )
         )
     return PPAdmissionDecision(mb_id=mb_id, entries=tuple(entries))

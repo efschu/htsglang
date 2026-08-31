@@ -323,6 +323,14 @@ def pp_admission_decision_to_wire(decision: PPAdmissionDecision) -> Dict[str, ob
                     # to the behaviour before this pair existed.
                     e.fill_len,
                     tuple(int(t) for t in (e.fill_tail or ())),
+                    # #968/#1035: PP0's host load-back extent. Appended at the
+                    # END for the same reason the #987 pair was, and read back
+                    # by INDEX under the same width guard: a row from a sender
+                    # one commit older is simply shorter and reads back as
+                    # `load_back_len=None`, which every consumer treats as "no
+                    # load-back", i.e. exactly the behaviour before this field
+                    # existed.
+                    e.load_back_len,
                 )
                 for e in decision.entries
             ),
@@ -362,6 +370,10 @@ def _pp_admission_entry_from_row(row: Sequence) -> PPAdmissionEntry:
             tuple(int(t) for t in (row[9] or ()))
             if n > _ADMISSION_ROW_WIDTH_PRE_987 + 1
             else ()
+        ),
+        # #968/#1035: same index-and-width discipline as the #987 pair above.
+        load_back_len=(
+            row[10] if n > _ADMISSION_ROW_WIDTH_PRE_987 + 2 else None
         ),
     )
 
@@ -4117,6 +4129,38 @@ class SchedulerPPMixin:
                 # requirement). PP0 has nothing to consume here -- it is the
                 # one BUILDING the decision, inside the call below.
                 self._pp_admission_incoming_effective = None
+                # #968/#1035 PROMOTE, THE ONE PLACE THE LOAD-BACK FACT CROSSES
+                # A PASS BOUNDARY -- and the one deliberate exception to the
+                # reset discipline this whole block otherwise enforces.
+                #
+                # Everything else here is reset because a pass that receives
+                # nothing must inherit nothing. This fact is different in one
+                # specific, structural way: it is DELIVERED AFTER THE POINT
+                # THAT CONSUMES IT. `get_next_batch_to_run` (:4292 below) runs
+                # the admission loop that applies the extent; the proxy frame
+                # carrying it is not received until :4476, a full admission
+                # later. There is no arc in this loop that lands a PP0 fact
+                # before planning -- the request chain is the only pre-planning
+                # receive and its own induction argument
+                # (`_pp_forward_and_process_input_requests`) promises delivery
+                # only "at the top of the current or NEXT pass" -- and a
+                # blocking pre-planning receive is exactly the shape of the arc
+                # #1015 deleted after it deadlocked PP3-solo.
+                #
+                # So the fact is carried across ONE pass boundary, explicitly,
+                # here, on every rank including PP0. Not inherited silently:
+                # `pending` is consumed and cleared in the same breath, so a
+                # fact is promoted exactly once and a pass that learned nothing
+                # promotes None.
+                self._pp_load_back_effective = getattr(
+                    self, "_pp_load_back_pending", None
+                )
+                self._pp_load_back_pending = None
+                # The forward payload is PASS-SCOPED, unlike the two above: a
+                # rank owes its downstream only what it learned THIS pass. Left
+                # standing it would re-send a decision the downstream already
+                # holds, every pass, for the life of the request.
+                self._pp_load_back_wire = None
                 # #1000b: reset on the same argument -- a pass that receives
                 # nothing must inherit no statement about the upstream's slot.
                 self._pp_upstream_slot_occupant_incoming = None
@@ -4435,11 +4479,18 @@ class SchedulerPPMixin:
                 # attaching a new key there touches the hot compute-tensor
                 # send/receive construction, which this edit does not touch
                 # and cannot verify safe. `_PP_PARKED_CONTINUATION_KEY` itself
-                # is NOT deleted -- it has an independent, unaffected carrier
-                # already: `pp_output_payload_with_return_trip` /
-                # `pp_absorb_admission_return` (:2302-2422) snapshot and
-                # absorb the LAST rank's own parked-continuation table on
-                # every output/void-output send. What is lost is only the
+                # is NOT deleted -- but the carrier this comment used to call
+                # "independent and unaffected" IS ALSO TORN, and saying so
+                # cost a design round on #968. Measured against the index at
+                # 2026-08-31: `pp_output_payload_with_return_trip` has ONE
+                # definition (:2247) and ZERO call sites;
+                # `reconcile_pp_admission_decision` likewise one definition
+                # and zero call sites. The snapshot/absorb pair those two were
+                # said to perform on every output send does not run at all.
+                # Same class as the "#1015 SEND IS UNCONDITIONAL NOW" comment
+                # replaced further down: a comment asserting a live mechanism
+                # over code where it is dead reads as an instruction, and it
+                # was read as one. What is lost is only the
                 # FORWARD, hop-by-hop relay of a fact parked by a MIDDLE rank
                 # (neither first nor last) on its way to the last rank's
                 # snapshot -- that relay lived solely on the deleted wire
@@ -4659,14 +4710,27 @@ class SchedulerPPMixin:
                         # be deleted before the flip rung.
                         self._pp_record_slot_last_batch(next_mb_id)
                 if not self.pp_group.is_last_rank:
-                    # #1015: SEND IS UNCONDITIONAL NOW. No sender-side
-                    # predicate may decide WHETHER a frame goes out any more --
-                    # only what it contains -- because a skipped send here is
-                    # exactly the debt the downstream receive above can no
-                    # longer tell apart from "no message was ever coming"
-                    # (that used to be the admission-decision arc's job, and
-                    # that arc is gone). A pass with no batch posts a void
-                    # frame instead of nothing.
+                    # #969J/#968: THE SEND IS GUARDED, AND SYMMETRIC WITH THE
+                    # RECEIVE. `if cur_batch:` here is the mirror of the
+                    # `if cur_batch:` receive at :4476 above: nothing is owed
+                    # unless the sender has a batch, and when it has one it
+                    # always sends. Both ends derive "is there a frame" from
+                    # the same schedule, so neither an unclaimed frame nor an
+                    # owed-but-unposted one is constructible.
+                    #
+                    # THE COMMENT THAT STOOD HERE UNTIL #968 SAID THE OPPOSITE
+                    # AND WAS STALE BY TWO COMMITS. It announced "#1015: SEND
+                    # IS UNCONDITIONAL NOW ... A pass with no batch posts a
+                    # void frame instead of nothing" -- the contract
+                    # `01a391fa03` [#1015] introduced and `60fdee3dfe` [#969J]
+                    # DELETED, together with the two deaths that hung off it
+                    # (an empty frame reaching the model is `KeyError:
+                    # 'hidden_states'` at qwen3_5.py:1573; a frame owed but not
+                    # posted is what `#789 PROXY READINESS TIMEOUT` bounded).
+                    # It sat directly above the guard that does the opposite of
+                    # what it claimed, i.e. exactly where a reader takes it for
+                    # an instruction -- and one did, costing a full design
+                    # round on this slice. Replaced rather than amended.
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -4679,6 +4743,16 @@ class SchedulerPPMixin:
                                 async_send=True,
                                 msg_type="proxy",
                                 stamp=self._pp_proxy_stamp(mb_id, result),
+                                # #968/#1035: PP0's load-back decision row, or
+                                # the one this rank received and is relaying.
+                                # Both are the same attribute by construction,
+                                # which is why the relay needs no branch: PP0
+                                # fills it when it builds the decision, a
+                                # middle rank fills it when it pops the row off
+                                # its own receive, and every rank forwards
+                                # whatever it holds. None on a rank that
+                                # learned nothing this pass.
+                                load_back=getattr(self, "_pp_load_back_wire", None),
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -6663,6 +6737,14 @@ class SchedulerPPMixin:
         # decided in the epoch that just ended names nothing in the new one --
         # the same argument `_pp_output_expected_by_slot` makes above.
         self._pp_admission_pass_voided: bool = False
+        # #968/#1035: cleared on the SAME argument a cutover clears the voids
+        # above -- a load-back extent decided in the epoch that just ended
+        # names a prefix nothing in the new epoch is holding, and applying it
+        # after the cutover would grow a prefix against a pool that has been
+        # reset underneath it. Both halves go, so no rank can promote a stale
+        # extent on its first pass in the new epoch.
+        self._pp_load_back_pending: Optional[Dict[str, int]] = None
+        self._pp_load_back_effective: Optional[Dict[str, int]] = None
         self._pp_pass_voided_incoming: bool = False
         self._pp_upstream_launched_incoming: bool = False
         # #978: pass-scoped like its per-hop twin above.
@@ -7443,6 +7525,7 @@ class SchedulerPPMixin:
         async_send: bool = True,
         msg_type: str = "default",
         stamp: Optional[tuple] = None,
+        load_back: Optional[Dict[str, object]] = None,
     ):
         # #753: the counterpart of the receive-side skip. A gapped run has
         # already delivered this rank's last owned layer to whoever owns the
@@ -7480,6 +7563,21 @@ class SchedulerPPMixin:
         # into PPProxyTensors without a consumer tripping over it.
         if stamp is not None:
             tensor_dict["__stamp__"] = stamp
+        # #968/#1035: PP0's load-back decision row, on the same terms as the
+        # stamp above -- a non-tensor dict entry, SAFE BY THE SAME PRECEDENT
+        # (`__msg_type__` has always travelled this way), and popped by the
+        # receiver before anything maps over the dict. It is the serialized
+        # ADMISSION ROW, not a bare scalar: `pp_admission_decision_to_wire`
+        # produces plain tuples that the far end reads BY INDEX with a width
+        # guard, so a sender one commit older simply yields a shorter row and
+        # the fact reads back as None.
+        #
+        # ONLY WHEN THERE IS ONE. An unconditional key would put a constant
+        # empty payload on every proxy send for the whole life of the server,
+        # which is both wasted bytes and a second thing the receiver must
+        # learn to tell apart from a real one.
+        if load_back:
+            tensor_dict.update(load_back)
         p2p_work = []
         stats = self._pp_boundary_stats()
         started = time.perf_counter() if stats else 0.0
@@ -8849,6 +8947,51 @@ class SchedulerPPMixin:
         # entry SURVIVES THE WIRE; it does not show one is safe to compute
         # on.
         stamp = raw.pop("__stamp__", None) if isinstance(raw, dict) else None
+        # #968/#1035 POPPED UNDER THE SAME LAW AS THE STAMP ABOVE, and for the
+        # identical reason: what stays in `raw` becomes a PPProxyTensors and is
+        # mapped over by the slice path (`v[key]` for EVERY entry) and by the
+        # cuda-graph buffer copies. A tuple left in here would slice to
+        # nonsense rather than raise -- the worst available outcome. The pop is
+        # unconditional and happens before any other use of `raw`.
+        _lb_row = (
+            raw.pop(_ADMISSION_DECISION_PAYLOAD_KEY, None)
+            if isinstance(raw, dict)
+            else None
+        )
+        if _lb_row is not None:
+            # RELAY VERBATIM. This rank forwards the row it received, byte for
+            # byte, so the extent PP2 applies is the one PP0 decided and not
+            # something a middle rank re-derived on the way. The chain is
+            # PP0 -> PP1 -> PP2, so without this hop the last stage would hold
+            # no fact and would sit at a different prefix from its peers --
+            # the divergence this whole slice exists to make impossible.
+            self._pp_load_back_wire = {_ADMISSION_DECISION_PAYLOAD_KEY: _lb_row}
+            try:
+                _lb_decision = pp_admission_decision_from_wire(
+                    self._pp_load_back_wire
+                )
+                _lb_map = {
+                    _e.rid: int(_e.load_back_len)
+                    for _e in _lb_decision.entries
+                    if _e.load_back_len
+                }
+                # ONE FIELD OF THE ROW, DELIBERATELY. The row carries PP0's
+                # whole admission decision; this slice consumes `load_back_len`
+                # and nothing else. The retraction half is not lit up here --
+                # see the note at the build site in scheduler.py.
+                self._pp_load_back_pending = _lb_map or None
+            except Exception:  # noqa: BLE001
+                # A row this rank cannot read is a fact it does not have, which
+                # is a state the applying site already handles honestly (no
+                # load-back, recompute instead). Never a local substitute.
+                self._pp_load_back_pending = None
+                logger.warning(
+                    "#968 LOAD-BACK ROW UNREADABLE mb_id=%s -- treating as "
+                    "'no fact this pass'; the extent will be re-stamped on the "
+                    "next lap.",
+                    mb_id,
+                    exc_info=True,
+                )
         # #795: the comparison is (epoch, slot). A slot-only test is what let
         # the 2026-08-21 mispair through this exact line -- see
         # `pp_proxy_stamp_names_pass` for why the slot number alone is not an

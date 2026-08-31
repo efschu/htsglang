@@ -1161,6 +1161,23 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        # #968/#1035: PP0's host load-back extent for this request, in tokens.
+        #
+        # A REAL FIELD, not a `setattr`-planted attribute, and deliberately so:
+        # an attribute planted through a module constant is invisible to the
+        # index (`where` returns 0 writers / 0 reads for it -- the documented
+        # trap (a)), and this quantity is exactly the kind a later reader must
+        # be able to enumerate the writers of.
+        #
+        # WRITTEN only by PP0, at the load-back site in
+        # `schedule_policy.PrefillAdder.add_one_req`, as the extent it OFFERS
+        # for this rid; READ only by `build_pp_admission_decision`, which puts
+        # it on the wire as `PPAdmissionEntry.load_back_len`. It is an OFFER,
+        # never an applied quantity -- what a rank actually applied is
+        # `prefix_indices`, and the two are separated on purpose so that "what
+        # PP0 proposed" and "what this rank did" can never be read off the same
+        # name.
+        self.pp_load_back_offer: Optional[int] = None
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for

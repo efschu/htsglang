@@ -1742,6 +1742,23 @@ class Scheduler(
         # scheduler_pp_mixin.py's _event_loop_pp_body, which stamps in the
         # real mb_id (unknown to this method) via dataclasses.replace.
         self._pp_admission_last_built_decision = None
+        # #968/#1035: the host load-back extent PP0 published, in its two
+        # lives. `pending` is what this rank learned during the CURRENT pass
+        # (PP0 by building it, everyone else by popping it off the proxy
+        # frame); `effective` is what it promoted at the top of this pass and
+        # may act on now. Two names rather than one because the fact is
+        # produced after the point that consumes it, so a single map would let
+        # a rank act on a fact its peers have not seen yet.
+        #
+        # Initialised on EVERY configuration, `pp_size == 1` included: the
+        # admission loop reads `effective` through a plain attribute access,
+        # and a non-PP boot must find None there rather than raise.
+        self._pp_load_back_pending = None
+        self._pp_load_back_effective = None
+        # The serialized decision row this rank owes its downstream this pass,
+        # or None. PP0 sets it from the decision it built; a middle rank sets
+        # it to the payload it received, which is the whole of the relay.
+        self._pp_load_back_wire = None
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -10237,6 +10254,39 @@ class Scheduler(
                     # are siblings and drifted identically.
                     req.truncate_prefix_to(told)
 
+                # #968/#1035 THE LOAD-BACK EXTENT, DELIVERED TO THE SITE THAT
+                # APPLIES IT. Two separate quantities travel on the same row and
+                # they must not be confused: `told` above is a prefix CEILING
+                # this rank truncates down to, while this is an EXTENT this rank
+                # may grow by. They move in opposite directions, which is why
+                # they are different fields (see PPAdmissionEntry.load_back_len).
+                #
+                # `_pp_load_back_effective` is what PP0 published one pass ago
+                # and this rank has since promoted (top of the PP loop body).
+                # `None` here means "no fact for this rid yet", and
+                # `_pp_load_back_extent` answers that with recompute rather than
+                # a local measurement -- deliberately, see its docstring.
+                #
+                # SET ON EVERY VISIT, including to None, so a request that is
+                # looked at on a pass with no fact can never inherit the extent
+                # from the pass before it. Same discipline as the reset block at
+                # the top of the loop body: a pass that receives nothing must
+                # inherit no statement.
+                _lb_map = getattr(self, "_pp_load_back_effective", None)
+                req.pp_load_back_told = (
+                    None if _lb_map is None else _lb_map.get(req.rid)
+                )
+                # PP0 RE-OFFERS EVERY PASS, and that is what makes the mechanism
+                # self-correcting rather than authoritative: if the extent does
+                # not make its lap, the next pass simply stamps it again, so a
+                # dropped frame costs one pass of recompute and can never strand
+                # the request. The offer is read off THIS pass's fresh match, so
+                # once the tokens are on device the hit shrinks and the offer
+                # goes to None on its own -- nothing has to clear it.
+                if self.ps.pp_rank == 0:
+                    _hit = int(getattr(req, "host_hit_length", 0) or 0)
+                    req.pp_load_back_offer = _hit if _hit > 0 else None
+
             try:
                 res = adder.add_one_req(
                     req,
@@ -10495,6 +10545,50 @@ class Scheduler(
                 # optimisation -- refuse and name it.
                 require_executed_geometry=True,
             )
+            # #968/#1035 PP0 SEEDS ITS OWN PENDING MAP, because PP0 is the one
+            # rank that never receives this fact off the wire -- it is the one
+            # that makes it. Downstream ranks fill the same map when they pop
+            # the row off the proxy frame; every rank then promotes
+            # pending -> effective at the top of its NEXT pass, so all of them
+            # first apply a given extent on the same pass.
+            #
+            # PP0 DOES NOT APPLY ITS OWN OFFER ON THE PASS IT MAKES IT, and that
+            # is the whole reason this is a pending map rather than a direct
+            # write. The frame carrying the fact is received downstream at
+            # scheduler_pp_mixin.py:4476, AFTER that rank has already planned
+            # its batch at :4292 -- so a PP0 that applied immediately would run
+            # one pass at a prefix its peers cannot reach, which is precisely
+            # the divergence boot 1815081d46 died in.
+            _lb_pending = {
+                _e.rid: int(_e.load_back_len)
+                for _e in self._pp_admission_last_built_decision.entries
+                if _e.load_back_len
+            }
+            self._pp_load_back_pending = _lb_pending or None
+            # THE ROW ITSELF IS WHAT TRAVELS, not the extracted number. The
+            # decision goes onto the wire through its own established codec
+            # (`pp_admission_decision_to_wire`), so the fact rides as
+            # `PPAdmissionEntry.load_back_len` inside the row -- index-read and
+            # width-tolerant at the far end -- rather than as a bare per-pass
+            # scalar in the proxy dict, which would miss the byte-exact shape
+            # cache (parallel_state.py:2296-2331) on every send.
+            #
+            # THIS IS THE ARC BEING RE-ATTACHED, and it is deliberately narrow:
+            # the row carries the whole decision, and THIS slice consumes
+            # exactly one field of it downstream. The retraction/reconcile half
+            # (`reconcile_pp_admission_decision`, still 0 call sites) stays
+            # dark until a slice needs it -- re-lighting it here would be a
+            # second, untested mechanism riding in on the back of this one.
+            if _lb_pending:
+                from sglang.srt.managers.scheduler_pp_mixin import (
+                    pp_admission_decision_to_wire as _lb_to_wire,
+                )
+
+                self._pp_load_back_wire = _lb_to_wire(
+                    self._pp_admission_last_built_decision
+                )
+            else:
+                self._pp_load_back_wire = None
             # #968 THE FACT HAS BEEN ACTED ON. A rid this decision NAMES is a
             # rid the follower may now legally build, so its carried fact is
             # spent here. Self-correcting rather than authoritative: if the
