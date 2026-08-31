@@ -1776,6 +1776,23 @@ class Req(ReqDllmMixin):
             # MEASURES the ring first"). Default OFF, so an unset env is
             # byte-identical to the pre-#1059 tree; boot 29 turns it on.
             if envs.SGLANG_PP_UNIFORM_WIDTH.get():
+                # #1059c: SAY IT ONCE PER PROCESS, so "the gate is on" is
+                # EVIDENCE and not an inference. On boot 29 I tried to derive it
+                # from /proc/<rank>/environ, read ABSENT on all three ranks, and
+                # was about to kill a healthy boot -- until the control showed
+                # SGLANG_UNEVEN_DCP reads ABSENT there too and works anyway
+                # (/proc/environ is the exec-time environment; spawn ranks
+                # rebuild os.environ at runtime). Wrong instrument. A log line
+                # from inside the process is the right one.
+                if not getattr(Req, "_1059_gate_logged", False):
+                    Req._1059_gate_logged = True
+                    logger.warning(
+                        "#1059 UNIFORM PASS GEOMETRY GATE IS ON in this "
+                        "process. PP0's published (prefix, extend) replaces "
+                        "this rank's own HiCache-derived width at the "
+                        "re-admission consult. Absence of this line means the "
+                        "gate is OFF -- do not infer it from the environment."
+                    )
                 self.apply_uniform_pass_geometry_1059()
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len

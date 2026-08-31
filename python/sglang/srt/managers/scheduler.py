@@ -10878,10 +10878,30 @@ class Scheduler(
             # anyone. The gate is read off the decision itself now, not off a
             # side-map built beside it -- one source, so the thing sent and
             # the thing tested can never be two different objects.
-            if any(
-                getattr(_e, "load_back_len", None)
-                for _e in self._pp_admission_last_built_decision.entries
-            ):
+            #
+            # #1059c: THAT GATE WAS DEAD, AND IT MADE THE WHOLE #1059 CHAIN
+            # INERT. It fires only when some entry carries `load_back_len` --
+            # and #1046 deleted that field's last producer, so nothing has
+            # written it since and the condition is permanently false. The row
+            # therefore never reached the wire, `observed_local` never came
+            # home, PP0's MIN had no input, and boot 29's census read
+            # `evaluated=87 absent=87`: the apply never had a fact to apply.
+            #
+            # Measured, boot_855_1059uw_..._171750: 51 flips, `#631` 0 and
+            # `UniformWidthPromiseBroken` 0 -- neither of which was evidence of
+            # anything, because the mechanism did not execute.
+            #
+            # PRESENT-WIRED-NEVER-POPULATED ONE LAYER OUT: the codec round-trips
+            # in both directions (verified at :315 / :358), so "the carrier is
+            # complete" was true and still useless -- nothing ever put the row
+            # ON it. A carrier is not wired until something SENDS.
+            #
+            # The gate is now the honest one: send when the decision has
+            # anything to say. The row is a tuple of ints per request and rides
+            # a message that is already sent, so the cost is bytes on an
+            # existing frame, not a new frame -- and `load_back_len` staying
+            # None simply reads back as None at the far end, exactly as before.
+            if self._pp_admission_last_built_decision.entries:
                 from sglang.srt.managers.scheduler_pp_mixin import (
                     pp_admission_decision_to_wire as _lb_to_wire,
                 )
