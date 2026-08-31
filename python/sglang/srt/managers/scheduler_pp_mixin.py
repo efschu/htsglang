@@ -4502,6 +4502,7 @@ class SchedulerPPMixin:
                 # symmetry). No signal channel -> legacy plan-first, loudly.
                 _row_auth = pp_row_authority_enabled(self)
                 _pre_proxy = None
+                _row_skip_plan = False
                 if _row_auth and self.ps.pp_size > 1 and self.ps.pp_rank != 0:
                     # NO WAIT HERE -- boot 631row5 measured why: a budgeted
                     # per-slot wait stalls the WHOLE body, including the
@@ -4572,6 +4573,9 @@ class SchedulerPPMixin:
                         # enforcement (truncate down, cap async adoption),
                         # one mover for one payload.
                         pp_bulletin.plant_from_row(self, effective)
+                        _st = getattr(self, "_pp_row_probe_stats", None)
+                        if _st is not None:
+                            _st["delivered"] += 1
                     else:
                         # Upstream provably posted nothing for this slot yet.
                         # {} is the "admit nothing" spelling -- None would
@@ -4579,16 +4583,32 @@ class SchedulerPPMixin:
                         self._pp_admission_incoming_effective = {}
                         self._pp_admission_incoming_schedule = {}
                         pp_bulletin.plant_from_row(self, {})
-                try:
-                    with torch.profiler.record_function("get_next_batch_to_run"):
-                        plan = self.get_next_batch_to_run(
-                            running_batch=self.running_batch, last_batch=self.last_batch
-                        )
-                        self.running_batch = plan.running_batch
-                        self.mbs[mb_id] = plan.batch_to_run
-                finally:
-                    if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
-                        pp_bulletin.clear_after_plan(self)
+                        # PLAN BYPASS (boot 631row6): a frameless downstream
+                        # cycle has NOTHING to plan -- the {}-membership plan
+                        # still ran the whole admission loop per cycle, and
+                        # the free-running pacemaker turned that into ~430
+                        # consults/s per rank (74k READMIT-MATCH lines and a
+                        # 144 MB log in four minutes). Under row authority a
+                        # downstream pass exists only when its frame does, so
+                        # the plan is skipped outright, not run empty.
+                        _row_skip_plan = True
+                if _row_skip_plan:
+                    # No frame, no pass: the slot is empty by construction
+                    # and `running_batch` keeps the loop-top value.
+                    self.mbs[mb_id] = None
+                    pp_bulletin.clear_after_plan(self)
+                else:
+                    try:
+                        with torch.profiler.record_function("get_next_batch_to_run"):
+                            plan = self.get_next_batch_to_run(
+                                running_batch=self.running_batch,
+                                last_batch=self.last_batch,
+                            )
+                            self.running_batch = plan.running_batch
+                            self.mbs[mb_id] = plan.batch_to_run
+                    finally:
+                        if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+                            pp_bulletin.clear_after_plan(self)
                 # #631 ROW AUTHORITY: a downstream batch may only exist when a
                 # frame is in hand. `get_next_batch_to_run`'s local
                 # continuation logic (chunked_req, the resident running batch)
@@ -8514,6 +8534,39 @@ class SchedulerPPMixin:
         -- presence is UNDECIDABLE without blocking, and the caller must
         fall back to the legacy plan-first path rather than guess).
         """
+        stats = getattr(self, "_pp_row_probe_stats", None)
+        if stats is None:
+            stats = self._pp_row_probe_stats = {
+                "calls": 0,
+                "drained": 0,
+                "delivered": 0,
+                "head_this": 0,
+                "head_other": 0,
+                "head_stale": 0,
+                "quiet": 0,
+            }
+        stats["calls"] += 1
+        # BALANCE LINE (boot 631row6 forensics: PP0 posted 43, PP1's
+        # consumed counter read 43, but only 41 passes ever launched -- two
+        # frames vanished between consumption and launch with no drop, no
+        # void and no raise on record). Every drained frame must eventually
+        # be delivered; a standing drained>delivered gap is the defect, and
+        # this line is the instrument that names it with its denominator.
+        if stats["calls"] % 4096 == 0 or (
+            stats["drained"] > stats["delivered"] + 1
+            and stats["calls"] % 512 == 0
+        ):
+            logger.info(
+                "#631 ROW-PROBE census calls=%d drained=%d delivered=%d "
+                "head_this=%d head_other=%d head_stale=%d quiet=%d",
+                stats["calls"],
+                stats["drained"],
+                stats["delivered"],
+                stats["head_this"],
+                stats["head_other"],
+                stats["head_stale"],
+                stats["quiet"],
+            )
         src = resolve_src(self.pp_group, None)
         q = typed_inbox(self.pp_group).get((src, "proxy"))
         if not q:
@@ -8526,6 +8579,7 @@ class SchedulerPPMixin:
                 # draining on it could block on the wrong kind. Coverage
                 # establishes with the upstream's first labeled send; until
                 # then this slot simply waits a loop iteration.
+                stats["quiet"] += 1
                 return False
             posted = counters.sent_of_kind(CHAN_DICT, "proxy", upstream)
             consumed = counters.local_consumed_of_kind(CHAN_DICT, "proxy")
@@ -8540,6 +8594,7 @@ class SchedulerPPMixin:
             # cut the same way `_pp_wait_for_dict_readiness` cuts it).
             attempted = counters.attempted_of_kind(CHAN_DICT, "proxy", upstream)
             if consumed >= posted and consumed >= attempted:
+                stats["quiet"] += 1
                 return False
             raw = self._pp_recv_typed_dict(
                 expected_kind="proxy",
@@ -8554,6 +8609,15 @@ class SchedulerPPMixin:
                 mark_consumed=False,
             )
             stash_typed(self.pp_group, None, "proxy", raw)
+            stats["drained"] += 1
+            logger.info(
+                "#631 ROW-PROBE drained a proxy at slot=%s stamp=%s "
+                "(drained=%d delivered=%d)",
+                mb_id,
+                (raw.get("__stamp__") if isinstance(raw, dict) else None),
+                stats["drained"],
+                stats["delivered"],
+            )
             q = typed_inbox(self.pp_group).get((src, "proxy"))
             if not q:
                 return False
@@ -8561,21 +8625,33 @@ class SchedulerPPMixin:
         stamp = head.get("__stamp__") if isinstance(head, dict) else None
         if stamp is None:
             # Unstamped legacy frame: only the slot's own recv may judge it.
+            stats["head_this"] += 1
             return True
         epoch = pp_flip_epoch_of(self)
         if pp_proxy_stamp_names_pass(stamp, mb_id, epoch):
+            stats["head_this"] += 1
             return True
         try:
             _stamp_slot = int(stamp[0])
             _stamp_epoch = int(stamp[3]) if len(stamp) > 3 else epoch
         except Exception:  # noqa: BLE001 - malformed stamp: let recv judge it
+            stats["head_this"] += 1
             return True
         if _stamp_epoch == epoch and _stamp_slot != int(mb_id):
             # Another CURRENT slot's frame: not this slot's business. It is
             # consumed when the loop reaches its named slot.
+            stats["head_other"] += 1
             return False
         # Stale/foreign epoch at the head: hand it to the slot's own recv,
         # whose established refusal logic names it (detection untouched).
+        stats["head_stale"] += 1
+        logger.warning(
+            "#631 ROW-PROBE stale/foreign head at slot=%s: stamp=%s vs "
+            "epoch=%s -- handing to the slot's recv for its refusal logic.",
+            mb_id,
+            stamp,
+            epoch,
+        )
         return True
 
     def _pp_forwarded_schedule_from(
