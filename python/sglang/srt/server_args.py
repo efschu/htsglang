@@ -4580,6 +4580,37 @@ class ServerArgs:
     ] = 1
     offload_prefetch_step: A[int, "Steps to prefetch in offloading."] = 1
     offload_mode: A[str, "Mode of offloading."] = "cpu"
+    # [#1036] REQUIRED, not optional: `load_model_utils.py:284` -- one of the files
+    # adopted from upstream PR #36497 -- reads `server_args.ple_offload_embedding`
+    # UNCONDITIONALLY for every non-draft model load. Without this field that line
+    # is an AttributeError on EVERY boot of EVERY model on this branch, not just
+    # Qwen4-Exp. Adopting the file without the flag it reads was my omission.
+    #
+    # Tri-state on purpose, matching upstream (server_args.py:2612 at 99c9362e66):
+    # None means AUTO, resolved to `is_cuda() and dtype == bfloat16` -- so the
+    # default is ON for a BF16 Qwen4-Exp on CUDA, which is the layout this register
+    # needs (the 95.4 GiB n-gram table cannot be resident; see
+    # ANALYSE_FLASHNEXT.md 9). Upstream spells the off-switch
+    # `--no-ple-offload-embedding`, but this fork's argument generator emits NO
+    # negative forms at all -- `--no-barlink`, `--no-uneven-dcp` and
+    # `--no-enable-multimodal` are all rejected, while 38 `--disable-*` flags
+    # exist. Verified by parsing, not assumed. So the off-switch below follows the
+    # local convention; without one there would be no way to turn the offload off
+    # on a CUDA bf16 box, since AUTO resolves it on.
+    ple_offload_embedding: A[
+        Optional[bool],
+        "Offload the Qwen4 PLE n-gram embedding to CPU pinned memory. Auto: on for "
+        "BF16 Qwen4-Exp on CUDA. Use --disable-ple-offload-embedding to force it "
+        "off. Cannot be combined with --cpu-offload-gb or --offload-group-size, "
+        "which would stage the pinned table back onto the device.",
+    ] = None
+    disable_ple_offload_embedding: A[
+        bool,
+        "Force the Qwen4 PLE n-gram embedding to stay resident on the device. This "
+        "is the A/B arm against the offloaded default -- on this rig the 95.4 GiB "
+        "BF16 table cannot fit, so it is only meaningful for a small model or a "
+        "converted FP8 table.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # LMCache
@@ -7109,6 +7140,11 @@ class ServerArgs:
         # kv-session-offload (S1): validate scope, hard-reject the
         # out-of-scope modes up front (same fail-fast rationale as above).
         self._handle_kv_session_offload()
+
+        # [#1036] Resolve the PLE-offload tri-state and refuse the one combination
+        # upstream refuses. Placed here, beside the other offload validations, so a
+        # nonsense combination is a parse-time error rather than a load-time one.
+        self._handle_ple_offload_embedding()
 
         # #286 offload register: validate the profile + per-class policy
         # syntax at argument time (unknown class/policy = hard error here,
@@ -10074,6 +10110,44 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_ple_offload_embedding(self):
+        """Resolve the PLE-offload tri-state, and refuse the one bad combination.
+
+        [#1036] AUTO (None) resolves exactly as upstream does in
+        `arg_groups/overrides.py:1364-1369` at 99c9362e66: on for CUDA + bfloat16.
+        The resolution happens here rather than in this fork's overrides module
+        because `load_model_utils.py:284` reads the field during model load, which
+        is after argument handling but not necessarily after an override pass -- and
+        a None reaching that line is a silent falsy, i.e. the offload quietly OFF
+        and a 95.4 GiB table quietly resident.
+
+        The dtype test is deliberately string-based: resolving the real torch dtype
+        here would import torch and build a ModelConfig during argument parsing,
+        which is both slow and circular. `dtype` is already normalised to a string
+        by this point.
+        """
+        if self.disable_ple_offload_embedding:
+            if self.ple_offload_embedding:
+                raise ValueError(
+                    "--ple-offload-embedding and --disable-ple-offload-embedding "
+                    "contradict each other. Pass neither for AUTO."
+                )
+            self.ple_offload_embedding = False
+            return
+
+        if self.ple_offload_embedding and (
+            self.cpu_offload_gb > 0 or self.offload_group_size > 0
+        ):
+            raise ValueError(
+                "--ple-offload-embedding cannot be combined with --cpu-offload-gb "
+                "or --offload-group-size: generic layer offload would stage the "
+                "pinned PLE embedding back onto the device."
+            )
+        if self.ple_offload_embedding is None:
+            is_cuda_dev = str(getattr(self, "device", "") or "").startswith("cuda")
+            is_bf16 = str(getattr(self, "dtype", "") or "") in ("bfloat16", "auto")
+            self.ple_offload_embedding = bool(is_cuda_dev and is_bf16)
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
