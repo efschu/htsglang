@@ -100,7 +100,90 @@ class MambaSlotAllocator:
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         self.slot_used[select_index] = True
+        self._note_slot_event(select_index, "ALLOC")
         return select_index
+
+    # ---- #1033b: OWNERSHIP PROVENANCE, the half #924's instrument was missing.
+    #
+    # `_refuse_double_free` names its stack "Releasing caller" -- and that is the
+    # SECOND releaser, the one that merely arrived last. The FIRST releaser, who
+    # actually let go of a slot it did not own (or failed to clear the reference
+    # that let someone else let go again), was recorded NOWHERE. Six boots of
+    # this defect (1046cut 21, 1048fix 24, 1049n9 12, 1050fix 6, 1050dev 42,
+    # 1033edge 3) produced 108 events and not one of them names the offender.
+    # Same class as the health-check line that named the detokenizer: the
+    # instrument names the visible party, not the responsible one.
+    #
+    # AND IT MUST DISTINGUISH TWO DIFFERENT DEFECTS THAT LOOK IDENTICAL HERE:
+    #   * plain double free  -- freed twice with no alloc in between; the second
+    #     releaser holds a reference the first should have cleared.
+    #   * USE-AFTER-RECYCLE  -- freed, RE-ALLOCATED to someone else, then freed
+    #     again by the first owner's stale reference. This one is far worse: the
+    #     slot is live for its new owner at the moment it is handed back to the
+    #     free list, so alloc() will shortly serve it to a THIRD request while
+    #     the second is still reading it. Distinguished by whether an ALLOC event
+    #     sits between the two releases, which is why alloc is recorded too.
+    #
+    # Strings and ints only -- no tensors, no device work. The mamba pool is ~10
+    # slots, so this is a dict of ~10 short entries; it cannot grow with load.
+    _PROV_FRAMES = 9
+
+    def _note_slot_event(self, index, kind: str) -> None:
+        try:
+            book = getattr(self, "_slot_provenance", None)
+            if book is None:
+                book = {}
+                self._slot_provenance = book
+            seq = getattr(self, "_slot_event_seq", 0) + 1
+            self._slot_event_seq = seq
+            if kind == "FREE":
+                where = "".join(traceback.format_stack(limit=self._PROV_FRAMES + 3)[:-3])
+            else:
+                where = ""
+            for slot in index.tolist() if hasattr(index, "tolist") else [index]:
+                slot = int(slot)
+                prev = book.get(slot)
+                book[slot] = {
+                    "kind": kind,
+                    "seq": seq,
+                    "where": where,
+                    "prev_kind": None if prev is None else prev["kind"],
+                    "prev_seq": None if prev is None else prev["seq"],
+                    "prev_where": None if prev is None else prev["where"],
+                }
+        except Exception:  # noqa: BLE001 - provenance may never break the pool
+            pass
+
+    def _describe_slot_history(self, slot: int) -> str:
+        book = getattr(self, "_slot_provenance", None)
+        if not book or int(slot) not in book:
+            return (
+                "  slot %s: NO PROVENANCE RECORDED. It was neither allocated nor "
+                "freed through this allocator since the last clear() -- so the "
+                "reference the second releaser holds did not come from here."
+                % slot
+            )
+        e = book[int(slot)]
+        verdict = (
+            "USE-AFTER-RECYCLE"
+            if e["kind"] == "ALLOC"
+            else ("DOUBLE FREE (no alloc in between)" if e["kind"] == "FREE" else "?")
+        )
+        head = (
+            "  slot %s: %s. Last event before this release was %s (#%s); the "
+            "event before that was %s (#%s)."
+            % (slot, verdict, e["kind"], e["seq"], e["prev_kind"], e["prev_seq"])
+        )
+        if e["kind"] == "FREE" and e["where"]:
+            return head + "\n  FIRST RELEASER (this is the offender):\n" + e["where"]
+        if e["kind"] == "ALLOC" and e["prev_kind"] == "FREE" and e["prev_where"]:
+            return (
+                head
+                + "\n  The slot was RE-ALLOCATED after that free and is LIVE for "
+                "its new owner right now. Releaser BEFORE the re-alloc:\n"
+                + e["prev_where"]
+            )
+        return head
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -113,6 +196,10 @@ class MambaSlotAllocator:
         in_ledger = (free_index >= 0) & (free_index < self.slot_used.numel())
         self._refuse_double_free(free_index[in_ledger])
         self.slot_used[free_index[in_ledger]] = False
+        # #1033b: recorded AFTER the ledger update, so the book holds only
+        # releases that genuinely flipped a slot True->False. A refused release
+        # never becomes somebody's "first releaser".
+        self._note_slot_event(free_index[in_ledger], "FREE")
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def _refuse_double_free(self, free_index: torch.Tensor) -> None:
@@ -138,6 +225,34 @@ class MambaSlotAllocator:
         a doubly-freed KV row is caught by the row-ownership authority, while a
         doubly-freed Mamba slot is handed to two requests and answers both.
         """
+        # #1033b NAMED GAP -- THIS GUARD SEES ONLY HALF OF ITS OWN SUBJECT, and
+        # the half it misses is the worse one. Measured at the desk 2026-08-31
+        # (devtools/check_1033b_mamba_provenance.py case 2):
+        #
+        #   alloc slot 1 -> owner A frees it -> the pool RE-ALLOCATES slot 1 to
+        #   owner B -> A's stale reference frees it again.
+        #
+        # At that second free `slot_used[1]` is True, because B legitimately
+        # holds it. `already_free.any()` is therefore False, this function
+        # returns without a word, and the slot goes back on the free list WHILE
+        # B IS STILL READING IT. alloc() then hands it to C. That is exactly the
+        # outcome the docstring below says this guard exists to prevent -- "a
+        # doubly-freed Mamba slot is handed to two requests and answers both" --
+        # and it happens silently, with no log line and no raise.
+        #
+        # CONSEQUENCE FOR EVERY #924 COUNT EVER REPORTED: the events in the boot
+        # logs (108 across six boots) are only the subset where nothing was
+        # re-allocated in between. They are a LOWER BOUND on the ownership
+        # defect, never a measure of it. Do not read "#924 = 0" as "no double
+        # free"; read it as "none of the visible shape".
+        #
+        # WHY IT IS NOT CLOSED HERE: catching it needs the RELEASER'S identity
+        # at the call site -- a per-slot generation token handed out by alloc()
+        # and presented at free() -- which touches all eleven callers of this
+        # method. That is a real design change, not a guard tweak, and it is
+        # FILED rather than guessed at. What IS built is the provenance book
+        # above, which names the first releaser for the visible shape; rooting
+        # that is the prerequisite for deciding whether the token is needed.
         if free_index.numel() == 0:
             return
         already_free = self.slot_used[free_index].logical_not()
@@ -156,11 +271,17 @@ class MambaSlotAllocator:
             "available_size() by exactly the duplicate count -- which is how "
             "this surfaced, as available=%d on a %d-slot pool at an on_idle "
             "check minutes later, with the duplicate already collapsed by the "
-            "diagnosis's own set(). (%d so far.) Releasing caller:\n%s",
+            "diagnosis's own set(). (%d so far.)\n"
+            "#1033b OWNERSHIP PROVENANCE -- BOTH holders, because naming only "
+            "the second one is what made this unrootable for six boots:\n%s\n"
+            "SECOND RELEASER (the one that merely arrived last -- this is what "
+            "the old 'Releasing caller:' line showed, and it is NOT normally "
+            "the offender):\n%s",
             offenders,
             len(self.free_slots) + int(already_free.sum()),
             self.size,
             n,
+            "\n".join(self._describe_slot_history(s) for s in offenders),
             trace,
         )
         raise MambaSlotDoubleFree(
@@ -173,6 +294,11 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+        # #1033b: the provenance book describes THIS generation of the pool. A
+        # clear() resets ownership wholesale, so a pre-clear releaser must never
+        # be reported as the first releaser of a post-clear slot.
+        self._slot_provenance = {}
+        self._slot_event_seq = 0
         # #924 ownership ledger, the shape ``HostKVCache`` already carries:
         # ``free_slots`` alone cannot answer "is this slot already free?"
         # without an O(n) membership scan, and the answer is what separates a
