@@ -763,7 +763,6 @@ class Envs:
     # byte-identical to the pre-#1059 tree, and the boot that turns it on is
     # the one that proves it. The producer, the pin and the MIN run either way,
     # so the reports are measurable before the apply is trusted.
-    SGLANG_PP_UNIFORM_WIDTH = EnvBool(False)
     # PP: how long the presence gate may keep waiting once EVERY clause of its
     # withhold reason is one no armed service turn can clear (#850). The gate
     # holds four actuators; a reason outside all four cannot change while the

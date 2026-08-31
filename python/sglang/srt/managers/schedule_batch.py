@@ -322,9 +322,11 @@ _1060_EPOCH_BY_RID: Dict[str, int] = {}
 _1060_EPOCH_CAP = 4096
 
 
-#: #1060b/#1061: the APPLY-SITE ledger for the told row. Counted where the fact
-#: takes effect, not where a reader might look for it -- see the comment in
-#: `apply_uniform_pass_geometry_1059` for the boot-30 reason.
+#: #1064: THE CARRIER LEDGER, which is what survives the promise layer.
+#: The apply-site counters went with `apply_uniform_pass_geometry_1059`; the one
+#: question that outlives it is the one boot 30 had to answer with a process
+#: death -- DOES THE ROW ARRIVE AT ALL. #1059c fixed a dead send gate, and
+#: nothing may make that regression silent again.
 _1061_STATE: Dict[str, int] = {}
 
 
@@ -337,45 +339,34 @@ def _1061_bump(key: str, n: int = 1) -> None:
 
 
 def _1061_emit_census(reason: str) -> None:
-    """#1060b: the told row's fate AT THE APPLY SITE, with a denominator.
+    """#1064: did the admission row ARRIVE, and did the retract clear run.
 
-    Boot 30's lesson in one line: the arrival of a told value was proved by the
-    process death, while the instrument built to measure it read `absent` on the
-    only rank that survived long enough to print. `apply_reached` is the
-    denominator -- how often the apply ran at all -- and every other counter is a
-    disjoint outcome of it, so a zero anywhere is readable against a population
-    instead of against nothing.
+    WHAT THIS REPLACED AND WHY THE COUNTER DID NOT SIMPLY DIE WITH IT. The
+    #1060b ledger counted the told row's fate at the apply site
+    (apply_reached / refused_epoch / epoch_ok / adopted). That apply is deleted
+    with the promise layer, but the question underneath it is not: boot 29 shipped
+    a carrier whose send gate had been dead since #1046, and it took a whole
+    window plus a census to notice. `rows_received` is the standing guard against
+    that regression -- a zero here means the wire is dead again, whatever else
+    the boot reports.
 
-    Emitted unconditionally at teardown and on the death path, like #1058b and
-    #1060, never gated on an observation count.
+    Emitted unconditionally at teardown and on the death path. rows_received=0 is
+    a printed measurement, not a missing line.
     """
     try:
         s = _1061_STATE
-        reached = s.get("apply_reached", 0)
-        refused = s.get("refused_epoch", 0)
         logger.warning(
-            "#1060b/#1061 TOLD-APPLY CENSUS (%s): apply_reached=%d "
-            "no_fact=%d refused_epoch=%d epoch_ok=%d adopted=%d "
-            "not_adopted=%d | retract_seen=%d told_cleared_at_retract=%d "
-            "| refused_epoch_lines_emitted=%d "
-            "refused_epoch_lines_suppressed=%d. `apply_reached` is the "
-            "denominator: how often the apply site ran at all. adopted>0 is "
-            "the ONLY positive proof that a told row travelled AND took "
-            "effect -- boot 30 had to prove that with a process death because "
-            "the census sat at the consult instead of here. "
-            "apply_reached=0 means the apply site was never reached on this "
-            "rank, which is not the same as no row arriving.",
+            "#1064 CARRIER CENSUS (%s): rows_received=%d entries_seen=%d "
+            "retract_seen=%d. rows_received is the #1059c regression guard: it "
+            "counts admission rows that actually came off the wire on this "
+            "rank. A ZERO means nothing is sending -- which is exactly the "
+            "state boot 29 ran in for its whole life while reporting #631=0 "
+            "and reading like a success. PP0 never receives, so a zero there "
+            "is expected and only the downstream ranks' zeros are findings.",
             reason,
-            reached,
-            s.get("no_fact", 0),
-            refused,
-            s.get("epoch_ok", 0),
-            s.get("adopted", 0),
-            s.get("not_adopted", 0),
+            s.get("rows_received", 0),
+            s.get("entries_seen", 0),
             s.get("retract_seen", 0),
-            s.get("told_cleared_at_retract", 0),
-            s.get("refused_epoch_lines", 0),
-            max(0, refused - s.get("refused_epoch_lines", 0)),
         )
     except Exception:  # noqa: BLE001 - a diagnostic may never mask a death
         pass
@@ -1890,94 +1881,6 @@ class Req(ReqDllmMixin):
         else:
             self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
-    def apply_uniform_pass_geometry_1059(self) -> bool:
-        """#1059 SITE 5: adopt the group's geometry over this rank's own.
-
-        A NAMED METHOD RATHER THAN AN INLINE BLOCK, and the reason is a false
-        green I produced myself: the first cut lived inline in
-        `init_next_round_input`, whose only reachable assertion was an AST check
-        that `uniform_pass_geometry` is CALLED there -- and a mutant that kept
-        the call but discarded its result (`None and uniform_pass_geometry(...)`)
-        passed every test. A site whose deadness cannot be detected is the
-        present-wired-never-populated shape this whole change exists to remove,
-        so the site is now behaviourally testable instead of proxied.
-
-        Returns True when the told geometry was adopted, so a caller and a test
-        can both tell adoption from "no fact this pass".
-        """
-        told_prefix = getattr(self, "_1059_told_prefix", None)
-
-        from sglang.srt.managers.pp_uniform_width import (
-            current_epoch as _now_epoch_1061,
-            epoch_admits_row as _epoch_admits_1061,
-            uniform_pass_geometry,
-        )
-
-        # #1061 THE EPOCH GATE, and #1060b THE APPLY-SITE COUNTER, in one place
-        # because they answer the same question from opposite sides: did a told
-        # value actually take effect here?
-        #
-        # WHY THE COUNTER MOVED HERE. Boot 30 proved the row arrives -- by dying
-        # on it -- while `#1058 TOLD-VS-LOCAL CENSUS` read `evaluated=13
-        # absent=13` on PP0 and `evaluated=0` on the two ranks that crashed. The
-        # census sat at the CONSULT; PP0 makes the offer and never receives one,
-        # and the peers died before reaching their own consult. A fact's arrival
-        # has to be counted where it is APPLIED, not where someone might look
-        # for it.
-        _row_epoch = getattr(self, "_1059_told_epoch", None)
-        _now_epoch = _now_epoch_1061()
-        _1061_bump("apply_reached")
-        if told_prefix is None:
-            _1061_bump("no_fact")
-            return False
-        if not _epoch_admits_1061(_row_epoch, _now_epoch):
-            # STALE OR UNVERIFIABLE ACROSS A CUTOVER. Uniform on every rank by
-            # construction: the verdict reads only (row epoch, current epoch),
-            # two group quantities, and never this rank's span. The way onward
-            # is the contract's own already-proven no-adopt path -- the rank
-            # runs its own geometry, exactly as on boot 29, which ran it for its
-            # whole life without a divergence.
-            _1061_bump("refused_epoch")
-            _n = _1061_STATE.get("refused_epoch", 0)
-            if _n <= 8 or _n % 256 == 0:
-                _1061_bump("refused_epoch_lines")
-                logger.warning(
-                    "#1061 CROSS-EPOCH TOLD ROW NOT ADOPTED occurrence=%d "
-                    "rid=%s told_prefix=%s row_epoch=%s now_epoch=%s. The row "
-                    "was decided under a different cutover generation, so it is "
-                    "not applied -- on EVERY rank identically, because this "
-                    "verdict reads only the two epochs and never a rank-local "
-                    "span. This rank runs its own geometry for this pass.",
-                    _n,
-                    str(getattr(self, "rid", "?"))[:8],
-                    told_prefix,
-                    _row_epoch,
-                    _now_epoch,
-                )
-            return False
-        _1061_bump("epoch_ok")
-
-        local = 0 if self.prefix_indices is None else len(self.prefix_indices)
-        # The pin is the promise this rank made on the previous lap and
-        # protected with `cache_protected_len`; passing it is what turns an
-        # eviction between laps into a LOUD broken promise instead of a silent
-        # told>local that resurfaces as #631 on a peer three hops away.
-        geom = uniform_pass_geometry(
-            told_prefix,
-            getattr(self, "_1059_told_extend", None),
-            local,
-            pinned_prefix=getattr(self, "cache_protected_len", None),
-        )
-        if geom.adopted and geom.prefix < local:
-            # Truncation is the ONLY direction available here (#930:
-            # prefix_indices and cache_protected_len move together). A told
-            # value ABOVE the local one is unreachable, because PP0 publishes
-            # the MIN over PINNED promises -- and if it ever were reached, the
-            # call above has already raised rather than let it pass silently.
-            self.truncate_prefix_to(geom.prefix)
-        self._1059_applied = geom
-        _1061_bump("adopted" if geom.adopted else "not_adopted")
-        return bool(geom.adopted)
 
     def init_next_round_input(
         self,
@@ -2095,25 +1998,10 @@ class Req(ReqDllmMixin):
             # SHIPS INERT (#947's precedent: "This one ships INERT ... the boot
             # MEASURES the ring first"). Default OFF, so an unset env is
             # byte-identical to the pre-#1059 tree; boot 29 turns it on.
-            if envs.SGLANG_PP_UNIFORM_WIDTH.get():
-                # #1059c: SAY IT ONCE PER PROCESS, so "the gate is on" is
-                # EVIDENCE and not an inference. On boot 29 I tried to derive it
-                # from /proc/<rank>/environ, read ABSENT on all three ranks, and
-                # was about to kill a healthy boot -- until the control showed
-                # SGLANG_UNEVEN_DCP reads ABSENT there too and works anyway
-                # (/proc/environ is the exec-time environment; spawn ranks
-                # rebuild os.environ at runtime). Wrong instrument. A log line
-                # from inside the process is the right one.
-                if not getattr(Req, "_1059_gate_logged", False):
-                    Req._1059_gate_logged = True
-                    logger.warning(
-                        "#1059 UNIFORM PASS GEOMETRY GATE IS ON in this "
-                        "process. PP0's published (prefix, extend) replaces "
-                        "this rank's own HiCache-derived width at the "
-                        "re-admission consult. Absence of this line means the "
-                        "gate is OFF -- do not infer it from the environment."
-                    )
-                self.apply_uniform_pass_geometry_1059()
+            # #1064: THE PROMISE LAYER IS GONE. `apply_uniform_pass_geometry_1059`
+            # stood here and adopted PP0's told prefix over this rank's own.
+            # Deleted with the rest of #1059/#1061 -- see the commit for why the
+            # compensation layer, not its bugs, was the finding.
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:

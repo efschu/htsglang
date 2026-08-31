@@ -1772,19 +1772,6 @@ class Scheduler(
         # it to the payload it received, which is the whole of the relay.
         self._pp_load_back_wire = None
 
-        # #1061: register the LIVE cutover-epoch accessor for the apply gate.
-        # A read-through to the one authority (`_pp_flip_epoch` ->
-        # `PhaseFlipRuntime._epoch`), not a mirrored value: boot 30's apply ran
-        # DURING a cutover, so anything refreshed per pass would have been one
-        # generation stale precisely where the staleness had to be seen.
-        try:
-            from sglang.srt.managers.pp_uniform_width import (
-                set_epoch_source as _set_epoch_source_1061,
-            )
-
-            _set_epoch_source_1061(self._pp_flip_epoch)
-        except Exception:  # noqa: BLE001 - registration may never break init
-            logger.warning("#1061 could not register the epoch source", exc_info=True)
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -5435,19 +5422,10 @@ class Scheduler(
         and the request proceeds.
         """
         try:
-            from sglang.srt.managers.schedule_batch import _1061_bump as _bump_1061
+            from sglang.srt.managers.schedule_batch import _1061_bump as _bump_1064
 
-            _bump_1061("retract_seen")
-            if getattr(req, "_1059_told_prefix", None) is not None:
-                _bump_1061("told_cleared_at_retract")
-            for _attr in (
-                "_1059_told_prefix",
-                "_1059_told_extend",
-                "_1059_told_epoch",
-            ):
-                if hasattr(req, _attr):
-                    setattr(req, _attr, None)
-        except Exception:  # noqa: BLE001 - a clear may never break a retract
+            _bump_1064("retract_seen")
+        except Exception:  # noqa: BLE001 - a count may never break a retract
             pass
         try:
             n = getattr(self, "_969ad_n", 0) + 1
@@ -10963,32 +10941,9 @@ class Scheduler(
                     pp_admission_decision_to_wire as _lb_to_wire,
                 )
 
-                # #1061: STAMP THE DECIDING EPOCH AT PUBLICATION, here, because
-                # this is the exact instant the row becomes a promise to the
-                # group. A relaying rank re-sends the raw row verbatim (it never
-                # re-encodes), so the epoch that travels the whole chain is the
-                # one PP0 put on it -- which is what makes the far-end verdict a
-                # function of two GROUP quantities and of no rank's local state.
-                #
-                # `dataclasses.replace` because PPAdmissionEntry is frozen; the
-                # decision object itself is left untouched so nothing downstream
-                # of it sees a mutated in-flight entry.
-                _dec = self._pp_admission_last_built_decision
-                try:
-                    _ep = self._pp_flip_epoch()
-                except Exception:  # noqa: BLE001 - an unreadable epoch names none
-                    _ep = None
-                try:
-                    _dec = dataclasses.replace(
-                        _dec,
-                        entries=tuple(
-                            dataclasses.replace(_e, decided_epoch=_ep)
-                            for _e in _dec.entries
-                        ),
-                    )
-                except Exception:  # noqa: BLE001 - never break the send on a stamp
-                    _dec = self._pp_admission_last_built_decision
-                self._pp_load_back_wire = _lb_to_wire(_dec)
+                self._pp_load_back_wire = _lb_to_wire(
+                    self._pp_admission_last_built_decision
+                )
             else:
                 self._pp_load_back_wire = None
             # #968 THE FACT HAS BEEN ACTED ON. A rid this decision NAMES is a

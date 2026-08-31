@@ -460,30 +460,6 @@ class PPAdmissionEntry:
     extent will normally be honourable, NOT that a rank may derive one
     locally when the fact is absent."""
 
-    decided_epoch: Optional[int] = None
-    """#1061: the CUTOVER EPOCH this row was decided under, stamped by PP0.
-
-    THE DEFECT THIS CLOSES, measured on boot 30 (2026-08-31). `#1059c` gave the
-    row a sender for the first time, a told prefix of 12288 arrived and was
-    applied to a request the cutover had just re-admitted -- whose pinned span
-    was 0, because the cutover had dropped the tree one line earlier
-    (`RESIDENTS RELEASED ... the prefix tree dropped returning 15943 row(s)`).
-    `uniform_pass_geometry` raised `UniformWidthPromiseBroken` and killed the
-    group. The told value was not wrong; it was STALE ACROSS A CUTOVER.
-
-    WHY THE STALENESS TEST IS THE EPOCH AND NOT THE LOCAL SPAN, which is the
-    whole design and the trap it avoids. "Void when told exceeds my pinned
-    span" reads a RANK-LOCAL quantity -- it is the 26th divergent input into
-    the one replicated decision, and the guard's own message forbids it
-    ("compensating locally here would move the batch and reappear as #631 on a
-    peer"). The epoch is a GROUP quantity: `PhaseFlipRuntime._epoch` advances
-    once per COMPLETED cutover on every rank, and the runtime's consensus
-    reduction raises DESYNC if two ranks ever disagree, so `row.decided_epoch
-    != current epoch` yields the SAME verdict on every rank without any rank
-    consulting its own state.
-
-    `None` = "this sender named no epoch". Read against the receiver's own
-    epoch, never alone -- see `epoch_admits_row`."""
 
 
 @dataclass(frozen=True)
