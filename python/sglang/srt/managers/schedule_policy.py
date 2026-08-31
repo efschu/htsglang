@@ -354,6 +354,16 @@ def match_prefix_for_req(
     # (writer, reader, deleter separated by an event) that cost PP0 boot 1.
     req.state_anchor_depth = match_result.state_anchor_depth
     req.key_match_depth = match_result.key_match_depth
+    # #1041: CHOOSE THE EXTENT HERE, at the writer, not at the row builder.
+    # Writer site 1 of 2 (the other is `Req.init_next_round_input`). See
+    # `stamp_state_aligned_extent` for why the two `host_hit_length` writers
+    # dominate every `can_run_list` filler, and for the boot-8 evidence that the
+    # row builder is NOT reached on the pass where the hit is live.
+    from sglang.srt.managers.pp_admission_congruence import (
+        stamp_state_aligned_extent as _stamp_extent_1041,
+    )
+
+    _stamp_extent_1041(req)
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(
         len(req.prefix_indices) + req.host_hit_length, max_len

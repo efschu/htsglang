@@ -1701,6 +1701,20 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.state_anchor_depth = match_result.state_anchor_depth
+            self.key_match_depth = match_result.key_match_depth
+            # #1041: CHOOSE THE EXTENT HERE, at the writer, not at the row
+            # builder. Writer site 2 of 2 (the other is `match_prefix_for_req`).
+            # These two are the ONLY live writers of `host_hit_length` on a Req,
+            # so a request cannot hold a hit without passing one of them --
+            # which is what makes this placement dominate every `can_run_list`
+            # filler instead of patching them one by one. See
+            # `stamp_state_aligned_extent`.
+            from sglang.srt.managers.pp_admission_congruence import (
+                stamp_state_aligned_extent as _stamp_extent_1041,
+            )
+
+            _stamp_extent_1041(self)
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:

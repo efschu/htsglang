@@ -1195,6 +1195,54 @@ _1040_ALIGN = {
 }
 
 
+#: #1041: the field the WRITER-SIDE choice lands in. Read by the row builder,
+#: never re-derived there.
+LOAD_BACK_EXTENT_ATTR = "pp_load_back_extent"
+
+
+def stamp_state_aligned_extent(req) -> Optional[int]:
+    """#1041: CHOOSE THE EXTENT WHERE THE FACT IS BORN, not where a batch is.
+
+    THE DEFECT THIS CLOSES, measured on boot 8 (1040round). The extent used to
+    be derived inside `build_pp_admission_decision`, which is reached only from
+    `_get_new_batch_prefill_raw`'s tail -- AFTER an admission loop with eight
+    `continue` branches and an `if len(can_run_list) == 0: return` above it. The
+    request that HELD the host hit was skipped at scheduler.py:10170
+    (`prefetch_pending`) before the adder ever saw it, the list came back empty,
+    the method returned, and no decision was built at all: three ranks logged
+    `#788 PP-ADMISSION verdict=DECLINE ... reason=loop_skips(prefetch_pending=
+    1(first=f7f997c0fafc451e))` at 09:13:52 and the same rid logged
+    `#968 LOAD-BACK DEFERRED ... holds no PP0 extent for it yet` two seconds
+    later. The chain fed itself: hit present -> prefetch pending -> skipped ->
+    empty list -> no decision -> no extent -> deferral.
+
+    WHY THE WRITER IS THE RIGHT PLACE, and why this is not one more per-path
+    patch. `Req.host_hit_length` has exactly TWO live writers -- this call's two
+    sites, `Req.init_next_round_input` and `match_prefix_for_req` -- both
+    unpacking one `match_prefix` result; `Req.__init__` only zeroes it, and
+    `truncate_prefix_to` is dead code (0 callers, 0 name reads). A request
+    therefore CANNOT carry a nonzero host hit without executing one of them.
+    Every `can_run_list` filler -- `add_one_req`, `add_chunked_req`,
+    `add_one_req_ignore_eos`, the dllm pair, `_add_scheduled_req` -- must match
+    before it is executable, so the match dominates all of them. That is the
+    dominator argument, and it is made over the WRITERS on purpose: the call
+    graph cannot carry it (`call_path add_chunked_req -> match_prefix_for_req`
+    walks past 156 unresolved edges and finds nothing, which is a bounded
+    negative and no proof of anything).
+
+    Rank-local by design and harmless: every rank stamps its own, but only PP0's
+    is ever published (`scheduler.py`'s `pp_rank == 0` gate), and every other
+    rank reads the told value off the row. Uniformity still comes from ONE rank
+    choosing, exactly as before -- what changes is only WHEN it chooses.
+    """
+    extent = state_aligned_load_back_len(req)
+    try:
+        setattr(req, LOAD_BACK_EXTENT_ATTR, extent)
+    except Exception:  # noqa: BLE001 - never break a match walk
+        pass
+    return extent
+
+
 def state_aligned_load_back_len(req) -> Optional[int]:
     """#1040: PP0's load-back extent, rounded DOWN to a state-bearing boundary.
 
@@ -1415,6 +1463,7 @@ def build_pp_admission_decision(
     pp_size: int,
     guard: Optional[PPAdmissionCongruenceGuard] = None,
     require_executed_geometry: bool = False,
+    fact_only_reqs: Sequence = (),
 ) -> PPAdmissionDecision:
     """PP0's (or, under `pp_size<=1`, the only rank's) committed decision.
 
@@ -1512,6 +1561,45 @@ def build_pp_admission_decision(
     guard and the #796 tensor read and never reach a real batch.
     """
     entries = []
+    # #1041 FACT CARRIERS: entries that deliver an extent and NOTHING else.
+    #
+    # These are requests this rank SAW this pass and did not admit -- skipped by
+    # one of the admission loop's eight `continue` branches, or refused by the
+    # adder's budget. Boot 8 proved the cost of leaving them silent: the request
+    # holding the host hit was skipped at `prefetch_pending` before the adder,
+    # `can_run_list` came back empty, the method returned above this call, and
+    # the extent was never published for anyone.
+    #
+    # `admitted=False` is what makes them safe, and it is enforced by
+    # CONSTRUCTION rather than by care at each reader:
+    #   * `forwarded_schedule` filters `e.admitted and not e.retracted`, so a
+    #     carrier can never enter `_pp_scheduled_extents` and therefore never
+    #     reaches the #791 membership comparison (scheduler.py:10508/:10522) --
+    #     the PPScheduleRefused-storm direction is closed at the source, not by
+    #     a second test here.
+    #   * `reconcile_pp_admission_decision` passes a non-admitted entry through
+    #     verbatim and never schedules it.
+    #   * `forwarded_last_chunk` / `forwarded_fill_carry` key on `fill_len`,
+    #     which a carrier does not carry, so it is absent from both maps.
+    #   * `apply_pp_load_back_row` iterates ALL entries and stamps by rid, which
+    #     is exactly what a carrier is for; a rid the receiver does not hold is
+    #     already a counted no-op there, never a refusal (the rid may legitimately
+    #     live only on PP0).
+    # A carrier with no extent would be pure noise on the wire, so it is not
+    # emitted at all.
+    for req in fact_only_reqs or ():
+        _extent = getattr(req, LOAD_BACK_EXTENT_ATTR, None)
+        if not _extent:
+            continue
+        entries.append(
+            PPAdmissionEntry(
+                rid=req.rid,
+                prefix_len=0,
+                extend_len=0,
+                admitted=False,
+                load_back_len=int(_extent),
+            )
+        )
     for req in reqs:
         executed = _executed_extent(req)
         if executed is not None:
@@ -1568,7 +1656,12 @@ def build_pp_admission_decision(
                     # rounded DOWN to the deepest boundary that carries a
                     # recurrent state, because the KV half of a prefix can stop
                     # anywhere and the GDN half cannot.
-                    load_back_len=state_aligned_load_back_len(req),
+                    # #1041: READ, never re-derive. The choice was made at the
+                    # match (`stamp_state_aligned_extent`), which is the one
+                    # site every executable request must pass. Deriving it here
+                    # made the fact depend on this pass admitting the request,
+                    # and boot 8 measured what that costs.
+                    load_back_len=getattr(req, LOAD_BACK_EXTENT_ATTR, None),
                 )
             )
             continue
@@ -1652,10 +1745,10 @@ def build_pp_admission_decision(
                 last_chunk=_last_chunk_verdict(told, extend_len, fallback_fill_len),
                 # #968/#1035: same offer, same reader, on the fallback branch.
                 # ROW-COLLAPSE: see the sibling constructor above.
-                # #1040: the SAME state-aligning call, not a second copy of the
-                # arithmetic -- one writer, so the two branches cannot publish
-                # extents chosen by different rules.
-                load_back_len=state_aligned_load_back_len(req),
+                # #1040/#1041: the SAME stamped field, not a second copy of the
+                # arithmetic -- one chooser at the writer, so the two branches
+                # cannot publish extents chosen by different rules.
+                load_back_len=getattr(req, LOAD_BACK_EXTENT_ATTR, None),
             )
         )
     return PPAdmissionDecision(mb_id=mb_id, entries=tuple(entries))

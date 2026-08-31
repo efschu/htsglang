@@ -223,6 +223,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionCongruenceGuard,
     PPScheduleRefused,
     build_pp_admission_decision,
+    LOAD_BACK_EXTENT_ATTR as LOAD_BACK_EXTENT_ATTR_1041,
     forwarded_fill_carry,
     forwarded_last_chunk,
     pp_admission_verdict_is_vacuous,
@@ -9989,8 +9990,17 @@ class Scheduler(
 
             _pp_parked_priority(self)
 
+        # #1041: ONE SITE, AT THE TOP, BEFORE ANY SKIP. Everything the loop
+        # LOOKED AT lands here, whichever of the eight `continue` branches or
+        # the adder's budget then declines it. Appending inside each skip branch
+        # instead would be the per-path retrofit this slice exists to avoid --
+        # and it would have missed boot 8's second, still-unproven decline
+        # mechanism exactly as the first one was missed.
+        _seen_this_pass: List[Req] = []
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            _seen_this_pass.append(req)
             # #988 A REQUEST ALREADY COLLECTED THIS PASS IS NOT A CANDIDATE.
             # `add_chunked_req` appends the continuation to `can_run_list`
             # while the request may still be resident in `waiting_queue` (the
@@ -10540,7 +10550,83 @@ class Scheduler(
             )
             adder.can_run_list = can_run_list
 
+        def _publish_pp_decision_1041(admitted_list):
+            """#1041: PUBLICATION IS NOT GATED ON ADMISSION.
+
+            The extent is a property of (request + its host hit), not of this
+            pass admitting the request. Boot 8 measured the coupling: on the
+            passes where the hit was live the loop skipped the holder at
+            `prefetch_pending`, `can_run_list` came back empty, and the early
+            return below meant no decision was built AT ALL -- three ranks,
+            `#788 PP-ADMISSION verdict=DECLINE ... loop_skips(prefetch_pending
+            =1(first=f7f997c0fafc451e))`, with the same rid deferring for want
+            of an extent two seconds later.
+
+            Everything the loop SAW that is not in `admitted_list` rides along
+            as an `admitted=False` FACT CARRIER, which `forwarded_schedule`
+            filters out of the executable geometry by construction. So this is
+            mechanism-agnostic: it covers the proven `prefetch_pending` skip and
+            the still-unproven budget-refusal-after-deferral path identically,
+            because both are only instances of "the holder is not a member of
+            the published pass".
+            """
+            if not (self.ps.pp_size > 1 and self.ps.pp_rank == 0):
+                return
+            _admitted_ids = {id(r) for r in admitted_list}
+            _carriers = [r for r in _seen_this_pass if id(r) not in _admitted_ids]
+            self._pp_admission_last_built_decision = build_pp_admission_decision(
+                0,  # placeholder mb_id; stamped with the real one downstream
+                admitted_list,
+                pp_size=self.ps.pp_size,
+                guard=self._pp_admission_guard,
+                # #791 CORE: the ONE production call site, and the only one
+                # that must never fall back. A `can_run_list` member with no
+                # `extend_range` is a torn-down request, not a missing
+                # optimisation -- refuse and name it.
+                require_executed_geometry=True,
+                fact_only_reqs=_carriers,
+            )
+            # #1041 POPULATION EQUALITY, the standing instrument. `seen` counts
+            # the requests this pass looked at that HOLD an extent; `published`
+            # counts the entries that actually carry one. They must be equal.
+            # The only legitimate differences are named and structural: a
+            # request with no host hit never enters `seen` (no extent stamped),
+            # `pp_size <= 1` never reaches this function at all, and a rid the
+            # RECEIVER does not hold is a different counter on the other side.
+            # Anything else is a bypass, and it shows as a nonzero delta instead
+            # of as a silent zero that costs a boot to interpret.
+            _seen_with_extent = sum(
+                1
+                for r in _seen_this_pass
+                if getattr(r, LOAD_BACK_EXTENT_ATTR_1041, None)
+            )
+            _published = sum(
+                1
+                for e in self._pp_admission_last_built_decision.entries
+                if getattr(e, "load_back_len", None)
+            )
+            _d = _seen_with_extent - _published
+            _n = getattr(self, "_1041_pop_n", 0) + 1
+            self._1041_pop_n = _n
+            if _d != 0 or _n <= 5 or _n % 64 == 0:
+                logger.info(
+                    "#1041 EXTENT POPULATION seen=%d published=%d delta=%d "
+                    "admitted=%d carriers=%d n=%d -- delta!=0 means a request "
+                    "held an extent this pass and no entry carried it, i.e. a "
+                    "bypass of the publication path.",
+                    _seen_with_extent,
+                    _published,
+                    _d,
+                    len(admitted_list),
+                    len(_carriers),
+                    _n,
+                )
+
         if len(can_run_list) == 0:
+            # #1041: PUBLISH BEFORE RETURNING. This is the exact path boot 8
+            # died on -- an empty admission that still had a live host hit to
+            # announce.
+            _publish_pp_decision_1041([])
             # #791b-instr22: an empty loop names its skips -- the silent
             # local narrowing, made loud. "loop=clean" means the loop saw
             # every queued request and admitted none WITHOUT any skip
@@ -10589,24 +10675,13 @@ class Scheduler(
         # application is therefore an idempotent re-confirmation, not a
         # second clamp (`prefix_len_for` on an already-clamped candidate
         # returns that same candidate).
+        # ROW-COLLAPSE: the entry-stamp that stood here is gone with the content
+        # key it existed to write. #1041: and the derivation that replaced it is
+        # gone too -- the extent is CHOSEN at the match and only READ here, so
+        # this call no longer has to be the pass that admits the holder. Both
+        # exits of this method now go through one publisher.
+        _publish_pp_decision_1041(can_run_list)
         if self.ps.pp_size > 1 and self.ps.pp_rank == 0:
-            # ROW-COLLAPSE: the entry-stamp that stood here is gone with
-            # the content key it existed to write. The two populations it was
-            # reconciling (the loop's stamp set vs `can_run_list`) collapse to
-            # one, because the row is now built straight from each member's
-            # live `host_hit_length` at this site -- there is no earlier stamp
-            # for a member to have missed.
-            self._pp_admission_last_built_decision = build_pp_admission_decision(
-                0,  # placeholder mb_id; stamped with the real one downstream
-                can_run_list,
-                pp_size=self.ps.pp_size,
-                guard=self._pp_admission_guard,
-                # #791 CORE: the ONE production call site, and the only one
-                # that must never fall back. A `can_run_list` member with no
-                # `extend_range` is a torn-down request, not a missing
-                # optimisation -- refuse and name it.
-                require_executed_geometry=True,
-            )
             # #968/#1035 PP0 SEEDS ITS OWN PENDING MAP, because PP0 is the one
             # rank that never receives this fact off the wire -- it is the one
             # that makes it. Downstream ranks fill the same map when they pop
