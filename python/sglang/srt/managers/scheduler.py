@@ -10602,6 +10602,18 @@ class Scheduler(
                 _seen_ids.add(id(r))
                 _touched.append(r)
             _carriers = [r for r in _touched if id(r) not in _admitted_ids]
+            # #1043b: MEASURE THE POPULATION BEFORE THE BUILD SPENDS IT.
+            # Boot 12 read `seen=0 published=1 delta=-1`: `_spend_for_entry`
+            # clears the field DURING the build, so counting holders afterwards
+            # counts what is left over, not what was there. A detector that
+            # samples its own denominator after the consumer has run measures
+            # the wrong population -- the same defect class it exists to catch,
+            # for the third time and now inside its own timing.
+            _seen_with_extent = sum(
+                1
+                for r in _touched
+                if getattr(r, LOAD_BACK_EXTENT_ATTR_1041, None)
+            )
             self._pp_admission_last_built_decision = build_pp_admission_decision(
                 0,  # placeholder mb_id; stamped with the real one downstream
                 admitted_list,
@@ -10623,11 +10635,6 @@ class Scheduler(
             # RECEIVER does not hold is a different counter on the other side.
             # Anything else is a bypass, and it shows as a nonzero delta instead
             # of as a silent zero that costs a boot to interpret.
-            _seen_with_extent = sum(
-                1
-                for r in _touched
-                if getattr(r, LOAD_BACK_EXTENT_ATTR_1041, None)
-            )
             _published = sum(
                 1
                 for e in self._pp_admission_last_built_decision.entries
