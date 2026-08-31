@@ -4471,6 +4471,35 @@ class SchedulerPPMixin:
                 _pre_proxy = None
                 if _row_auth and self.ps.pp_size > 1 and self.ps.pp_rank != 0:
                     _pending = self._pp_proxy_frame_pending(mb_id)
+                    if _pending is False and (
+                        self.waiting_queue
+                        or getattr(self, "chunked_req", None) is not None
+                        or any(b is not None for b in self.mbs)
+                        or getattr(
+                            getattr(self, "running_batch", None), "reqs", None
+                        )
+                    ):
+                        # WORK IS VISIBLE ON THIS RANK, so a frame may be owed
+                        # and the RIGHT wire to park on is the proxy wire --
+                        # boot 631row3's wedge is the measured reason: the
+                        # chain hop precedes the frame by the upstream's whole
+                        # forward, the probe was correctly False at that
+                        # instant, and the loop then parked in the BLOCKING
+                        # chain receive while PP0 parked in the output receive
+                        # downstream never fed: a three-arc ring. This is the
+                        # budgeted, soft readiness wait (the pre-row world
+                        # parked here too, via the cur_batch proxy receive);
+                        # it returns the moment the counters prove a message,
+                        # declines loudly on budget exhaustion (#1002), and
+                        # cannot deadlock the idle form -- an idle rank has no
+                        # visible work and still parks on the chain.
+                        if (
+                            self._pp_wait_for_dict_readiness(
+                                mb_id, kind="proxy", soft=True
+                            )
+                            is not False
+                        ):
+                            _pending = self._pp_proxy_frame_pending(mb_id)
                     if _pending is None:
                         _row_auth = False
                         if not getattr(self, "_pp_row_auth_no_signal_warned", False):
