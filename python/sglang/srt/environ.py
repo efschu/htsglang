@@ -2026,6 +2026,29 @@ class Envs:
     #   for, but it depends on kernels whose reachability is audited by
     #   resolve_qsa_route() and refused loudly when a stage is missing.
     SGLANG_QSA_MODE = EnvStr("dense")
+    # [#1036] Let the PLE n-gram table be PAGEABLE instead of pinned, so the OS
+    # page cache owns its residency and the cold tail may live on disk.
+    #
+    # Operator decision 2026-08-31: the table does not have to be quantised; it
+    # may sit partly in system RAM and partly on disk, and their benchmarks show a
+    # fully disk-resident table costs almost no token/s. That is consistent with
+    # the access shape -- n-gram frequency is Zipfian, so the page cache holds the
+    # hot rows, and one token's entire gather is 16 rows x 160 dims x 2 B = 5 KiB.
+    #
+    # It is not merely an option. With the table PINNED at bf16 the planner refuses
+    # every layout on this rig: 95.368 GiB pinned + 21.3 GiB cold experts against
+    # 110 GiB available, SwapTotal 0 -- short by 6.6 GiB even at the MoE scratch
+    # floor, and at every context from 32k to 262k. Pinned pages cannot be
+    # reclaimed, so no amount of context shrinking helps.
+    #
+    # The cost is the gather path: pinned enables the zero-copy Triton kernel that
+    # reads host memory over PCIe, and a GPU kernel CANNOT take a page fault on
+    # host memory. So pageable requires the HOST-side gather in
+    # Qwen4ExpPinnedHostEmbedding.gather(), which is why this is one switch over
+    # both decisions rather than two independent knobs.
+    #
+    # Default False keeps the pinned zero-copy path byte-identical.
+    SGLANG_PLE_HOST_PAGEABLE = EnvBool(False)
     # [#1036] The remaining Qwen4-Exp / JIT env entries the adopted upstream files
     # read. Types and defaults are upstream's VERBATIM (qwen4-main-squashed
     # environ.py:293,296,299,364,1001,1003,1007,1193) -- a guessed default here is

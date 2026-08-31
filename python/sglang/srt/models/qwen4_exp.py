@@ -795,12 +795,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
+        # [#1036] Pinned is the FAST path (the Triton kernel below reads this
+        # memory straight over PCIe), but pinned pages cannot be reclaimed, and at
+        # bf16 this table is 95.368 GiB -- which the planner shows leaves no
+        # feasible layout on a 118 GiB host beside the cold experts, at any
+        # context. Pageable hands residency to the OS page cache, so the Zipfian
+        # cold tail may fall through to disk, at the price of a host-side gather.
+        from sglang.srt.environ import envs
+
+        self._pageable = envs.SGLANG_PLE_HOST_PAGEABLE.get()
         cpu_weight = nn.Parameter(
             torch.empty(
                 source_weight.shape,
                 dtype=source_weight.dtype,
                 device="cpu",
-                pin_memory=True,
+                pin_memory=not self._pageable,
             ),
             requires_grad=False,
         )
@@ -846,17 +855,50 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
-            _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
-                flat_ids,
-                output,
-                embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
-                is_fp8=self.weight.dtype == torch.float8_e4m3fn,
-                BLOCK_D=self._block_d,
-            )
+            if self._pageable:
+                self._gather_host(flat_ids, output)
+            else:
+                _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+                    self.weight.data_ptr(),
+                    flat_ids,
+                    output,
+                    embedding_dim=self.embedding_dim,
+                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                    BLOCK_D=self._block_d,
+                )
         return output
+
+    def _gather_host(self, flat_ids: torch.Tensor, output: torch.Tensor) -> None:
+        """Gather on the HOST, then move only the result.
+
+        [#1036] The pinned path lets the GPU read this table directly over PCIe,
+        which is faster but requires every page to be resident forever. This path
+        exists so the table can be PAGEABLE -- page-cache resident, cold tail on
+        disk -- because a GPU kernel cannot take a page fault on host memory
+        (models/qwen4_exp.py:1891 says so about the fp8 auto-switch). The CPU can,
+        so the lookup moves to the CPU and only the gathered rows cross the bus.
+
+        The traffic is why this is cheap rather than a regression: one token's
+        entire gather is n_grams x embedding_dim x 2 B = 5 KiB at this geometry,
+        so the H2D is negligible next to the round trip it replaces.
+
+        Semantics are the Triton kernel's, line for line: local row is
+        ``global - tp_vocab_start`` when the id falls in this rank's slice, row 0
+        otherwise, and an out-of-range id contributes ZEROS rather than row 0's
+        contents. Getting that masking wrong would be a silent wrong-answer bug of
+        exactly the kind the n-gram prime hashing already nearly caused.
+        """
+        start = self.shard_indices.org_vocab_start_index
+        end = self.shard_indices.org_vocab_end_index
+
+        ids = flat_ids.to("cpu")
+        in_range = (ids >= start) & (ids < end)
+        local = torch.where(in_range, ids - start, torch.zeros_like(ids))
+        rows = self.weight.data.index_select(0, local).to(torch.bfloat16)
+        rows.mul_(in_range.unsqueeze(1).to(torch.bfloat16))
+        output.view(-1, self.embedding_dim).copy_(rows.to(output.device))
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
