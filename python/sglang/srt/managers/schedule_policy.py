@@ -2256,6 +2256,13 @@ class PrefillAdder:
                 # Per-branch bail patches are how #965 was paid for twice.
                 req.set_extend_range(prefix_len, prefix_len)
                 _note_988_loadback(req, prefix_len)
+                # #968: SPENT. The caller pops this rid out of the sticky
+                # extent map on seeing this flag, which is what keeps the map
+                # bounded without it needing to know when a request ends. Same
+                # shape as `pp_clear_parked_continuation`: the fact is consumed
+                # where it is acted on, and PP0 simply re-stamps it on the next
+                # pass if the rid still needs one.
+                req.pp_load_back_applied = True
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

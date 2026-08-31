@@ -4152,9 +4152,28 @@ class SchedulerPPMixin:
                 # `pending` is consumed and cleared in the same breath, so a
                 # fact is promoted exactly once and a pass that learned nothing
                 # promotes None.
-                self._pp_load_back_effective = getattr(
-                    self, "_pp_load_back_pending", None
-                )
+                # MERGED, NOT REPLACED -- the fact is STICKY until it is spent.
+                # The first version of this slice replaced `effective` with
+                # `pending` outright, which gave every extent a life of exactly
+                # ONE pass. Measured: 0 of 12 opportunities were ever served,
+                # because the pass on which PP0 offers an extent and the pass on
+                # which the group re-admits that rid are separated by a cutover
+                # by construction (the post-cutover re-admission IS the
+                # read-through path). A one-pass fact and a next-cutover
+                # consumer cannot meet.
+                #
+                # Sticky is safe in the direction that matters: an extent that
+                # is never used costs nothing, an extent that is stale is
+                # refused at the application site against the host tier it
+                # describes, and PP0 re-stamps the rid every pass anyway -- so a
+                # newer offer always overwrites an older one for the same rid.
+                # Spent on application (popped there), so the map does not grow
+                # without bound.
+                _lb_new = getattr(self, "_pp_load_back_pending", None)
+                if _lb_new:
+                    _lb_eff = dict(getattr(self, "_pp_load_back_effective", None) or {})
+                    _lb_eff.update(_lb_new)
+                    self._pp_load_back_effective = _lb_eff
                 self._pp_load_back_pending = None
                 # The forward payload is PASS-SCOPED, unlike the two above: a
                 # rank owes its downstream only what it learned THIS pass. Left
@@ -6737,14 +6756,34 @@ class SchedulerPPMixin:
         # decided in the epoch that just ended names nothing in the new one --
         # the same argument `_pp_output_expected_by_slot` makes above.
         self._pp_admission_pass_voided: bool = False
-        # #968/#1035: cleared on the SAME argument a cutover clears the voids
-        # above -- a load-back extent decided in the epoch that just ended
-        # names a prefix nothing in the new epoch is holding, and applying it
-        # after the cutover would grow a prefix against a pool that has been
-        # reset underneath it. Both halves go, so no rank can promote a stale
-        # extent on its first pass in the new epoch.
+        # #968/#1035: THE EXTENT SURVIVES THE CUTOVER, and this is the one
+        # place in this block where that is the right answer. Measured, boot
+        # boot_855_968pp0lb_..._0831_060725: every one of the 12 load-back
+        # opportunities fell 1-2 s AFTER a cutover (27 cutovers, deferrals at
+        # 06:14:07 / 06:16:57 / 06:18:24 / 06:19:59, each following a CUTOVER
+        # line by one second), because the post-cutover re-admission IS the
+        # read-through path. Clearing the extent here -- which the first
+        # version of this slice did, by analogy with the voids above --
+        # destroyed the fact with the very event that creates the only chance
+        # to use it: 0 applied load-backs in a whole boot.
+        #
+        # THE ANALOGY THAT MISLED: the voids and slot statements above are
+        # about THIS EPOCH'S PIPELINE, so a cutover invalidates them. A
+        # load-back extent is a statement about the HOST TIER -- how many
+        # tokens of this rid the host holds -- and the host tier is precisely
+        # what survives a cutover; the whole read-through premise depends on
+        # it (measured across these same cutovers: the same rid's host hit
+        # went 1215 -> 1216 -> 2114, i.e. it persisted and grew).
+        #
+        # STALENESS IS CAUGHT WHERE IT IS CHEAP, not prevented here: a rank
+        # told an extent its host tier no longer covers raises
+        # `#968 LOAD-BACK EXTENT UNHONOURABLE` at the application site, which
+        # is an epoch-independent check against the tier the number is about.
+        # Only `pending` is a per-pass quantity; `effective` is sticky until
+        # spent.
         self._pp_load_back_pending: Optional[Dict[str, int]] = None
-        self._pp_load_back_effective: Optional[Dict[str, int]] = None
+        if not hasattr(self, "_pp_load_back_effective"):
+            self._pp_load_back_effective: Optional[Dict[str, int]] = None
         self._pp_pass_voided_incoming: bool = False
         self._pp_upstream_launched_incoming: bool = False
         # #978: pass-scoped like its per-hop twin above.

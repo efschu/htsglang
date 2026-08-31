@@ -10286,6 +10286,15 @@ class Scheduler(
                 if self.ps.pp_rank == 0:
                     _hit = int(getattr(req, "host_hit_length", 0) or 0)
                     req.pp_load_back_offer = _hit if _hit > 0 else None
+                # SPEND WHAT THE LAST VISIT APPLIED. The load-back site sets
+                # this flag when it actually grew the prefix; dropping the rid
+                # here is what bounds the sticky map. Done BEFORE this pass's
+                # `add_one_req` so a rid that is applied and then re-offered in
+                # the same pass keeps the newer offer.
+                if getattr(req, "pp_load_back_applied", False):
+                    req.pp_load_back_applied = False
+                    if _lb_map:
+                        _lb_map.pop(req.rid, None)
 
             try:
                 res = adder.add_one_req(
