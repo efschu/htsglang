@@ -4301,16 +4301,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         _want,
                     )
                 else:
+                    # F1 2026-08-31: the old text here claimed "the PP stages
+                    # are out of step" (a pairing/wire fault). Boot 1065sets
+                    # refuted that reading: PP0 and PP1 ADMITTED THE SAME rids
+                    # at the same slot/fwd_ct and BUILT different batches
+                    # (extend 902 vs 522), because a HiCache prefetch finished
+                    # on PP1 between the two builds and moved that rank's
+                    # prefix (#988 LOADBACK 32768->33148, delta 380 = exactly
+                    # the row difference). Same class with flip off on 08-28:
+                    # #788 verdicts diverged (PP0 ADMIT / PP1 DECLINE). The
+                    # message now names the real class so the next reader
+                    # searches the ADMISSION, not the wire.
                     raise ValueError(
                         f"#631 PP proxy/batch mismatch: received hidden_states with "
                         f"{_hs.shape[0]} row(s) for a {forward_batch.forward_mode} "
                         f"batch of {_want} token(s) "
-                        f"(bs={forward_batch.batch_size}); {_prov}. The hidden "
-                        f"states of one "
-                        f"microbatch have been paired with another microbatch's "
-                        f"metadata -- the PP stages are out of step. Computing on "
-                        f"this pair corrupts memory rather than merely failing: the "
-                        f"cache-index tensors are sized for THIS batch."
+                        f"(bs={forward_batch.batch_size}); {_prov}. The ranks BUILT "
+                        f"divergent batches for the same slot: rank-local state "
+                        f"(HiCache prefetch completion, admission gates) leaked into "
+                        f"this rank's batch derivation, so the sender computed a "
+                        f"different geometry than this rank expects. This guard is "
+                        f"WIDTH-BLIND: divergent batches with an equal token count "
+                        f"pass it silently, so #631==0 never proves rank agreement. "
+                        f"Computing on this pair corrupts memory rather than merely "
+                        f"failing: the cache-index tensors are sized for THIS batch."
                     )
 
         self.forward_pass_id += 1
