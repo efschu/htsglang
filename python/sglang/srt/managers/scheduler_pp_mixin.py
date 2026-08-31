@@ -8641,11 +8641,19 @@ class SchedulerPPMixin:
             return True
         try:
             _stamp_slot = int(stamp[0])
-            _stamp_epoch = int(stamp[3]) if len(stamp) > 3 else epoch
-        except Exception:  # noqa: BLE001 - malformed stamp: let recv judge it
+        except Exception:  # noqa: BLE001 - unreadable stamp: let recv judge it
             stats["head_this"] += 1
             return True
-        if _stamp_epoch == epoch and _stamp_slot != int(mb_id):
+        # MIRROR names_pass's epoch semantics exactly (boot 631row9b died on
+        # the mismatch): an ABSENT epoch -- on the stamp or on this rank --
+        # degrades to the slot-only test, so an epoch-None frame for another
+        # slot routes as "another slot", never as "malformed, refuse here".
+        _stamp_epoch = pp_proxy_stamp_epoch(stamp)
+        if _stamp_slot != int(mb_id) and (
+            _stamp_epoch is None
+            or epoch is None
+            or int(_stamp_epoch) == int(epoch)
+        ):
             # Another CURRENT slot's frame: not this slot's business. It is
             # consumed when the loop reaches its named slot.
             stats["head_other"] += 1
