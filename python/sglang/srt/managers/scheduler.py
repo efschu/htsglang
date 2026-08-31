@@ -8013,13 +8013,41 @@ class Scheduler(
         # again the way they did between defect O and 20:31:48.
         from sglang.srt.managers.phase_flip_runtime import (
             chunk_blocks_quiescence,
+            completed_chunk_pages_acked,
             prefill_runnable_in_current_layout,
         )
+        from sglang.srt.managers.phase_purity import tp_compute_fits_in_one_chunk
 
-        if (
+        # #1033: BOTH new terms travel WITH the shared predicate, for exactly
+        # the reason the strict and budget terms already do -- passing one at
+        # one site only is the drift this helper exists to prevent.
+        #
+        # Computed ONLY while a flip is actually pending. `tp_compute_fits_in_
+        # one_chunk` walks `waiting_queue` through `_pending_prefill_tokens`,
+        # and this method runs every round: an unconditional probe would add a
+        # queue walk to every round of every boot, including boots with the
+        # flip off. The gate itself (`prefill_blocked_here`) pays that walk
+        # once per round already; this is the second reader, not a third.
+        _flip_fits = _flip_acked = None
+        _flip_armed = (
             self.server_args.enable_phase_flip
             and self.phase_flip_runtime is not None
             and self.phase_flip_runtime.pending is not None
+        )
+        if _flip_armed:
+            try:
+                _flip_fits = tp_compute_fits_in_one_chunk(self)
+            except Exception:  # noqa: BLE001 - a probe may never break the loop
+                _flip_fits = None
+            try:
+                _flip_acked = completed_chunk_pages_acked(self)
+            except Exception:  # noqa: BLE001 - a fence read never breaks the loop
+                _flip_acked = None
+
+        if (
+            # #1033: the same three clauses that gate the probes above, read
+            # from one name so the probe and the park can never diverge.
+            _flip_armed
             # #858: the SAME strict term as the ready_fn caller. The helper's
             # own docstring is explicit that these two must never disagree --
             # they drifted apart once already (defect O relaxed one side while
@@ -8039,7 +8067,16 @@ class Scheduler(
                     budget_remaining=phase_tp_compute_budget_remaining(
                         self, self._phase_purity
                     ),
+                    # #1033: the budget is only half of the #887 grant --
+                    # `prefill_blocked_here` also requires the work to FIT in
+                    # one chunk, and without this term the hold waits on a
+                    # chunk the gate silently refuses to build.
+                    fits_in_one_chunk=_flip_fits,
                 ),
+                # #1033: committing over a broken chunk is licensed by #988's
+                # prefix ride (loss <= 1 chunk, the #939 grant) ONLY while the
+                # completed prefix is acked. Unknown is refusal.
+                completed_pages_acked=_flip_acked,
             )
         ):
             # A round withheld for a PENDING FLIP is not a round that could

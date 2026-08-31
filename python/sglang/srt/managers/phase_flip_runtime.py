@@ -127,7 +127,7 @@ def advance_fence_blind_streak(
 
 
 def prefill_runnable_in_current_layout(
-    direction, purity, budget_remaining: int = 0
+    direction, purity, budget_remaining: int = 0, fits_in_one_chunk=None
 ) -> bool:
     """#858b: can a pending prefill make progress in the layout we are in NOW?
 
@@ -152,16 +152,93 @@ def prefill_runnable_in_current_layout(
     a pending prefill CAN make progress in the TP layout, so a hold that
     ignores it is the #858b wedge with the fix already in the tree. Default 0
     keeps every pre-#887 caller's answer byte-identical.
+
+    #1033: ``fits_in_one_chunk`` IS THE OTHER HALF OF THE SAME GRANT, AND
+    WITHOUT IT THIS FUNCTION LIES. The budget is not the gate. The gate is
+    ``phase_purity.prefill_blocked_here``, and its #887 branch requires BOTH
+    ``prefill_allowed_in_tp_now(spent)`` (the budget currency this function
+    already reads) AND ``tp_compute_fits_in_one_chunk`` -- deliberately, so
+    that the gate and the #838 detector permit exactly the same batches
+    (REGISTER_OPEN_876 on #887). Reading only the budget half makes this
+    function claim that TP can make progress on a chunk the gate will refuse
+    to build, and the claim never expires: the grant is spent AT the grant,
+    so a refusal on the `fits` term leaves the budget untouched and the false
+    claim standing for ever.
+
+    MEASURED, boot_855_1050dev_0840f82601_0831_115825 (boot 20, the #1033
+    livelock): the last chunk the gate permitted was 12:22:11
+    (``LAYOUT-ALLOWED tp_compute_one_chunk ... new_tokens=3392
+    chunk_tokens=4096`` -- it fit). The backlog then crossed the 4096 cap and
+    never came back (12347 -> 48866 -> 101075 tok), so ``pending < chunk`` was
+    false on every later round and ``prefill_blocked_here`` refused SILENTLY
+    at its final ``return not _relaxed(...)``. The budget stayed unspent, this
+    function kept answering True, ``chunk_blocks_quiescence`` kept the rank
+    un-quiescent, and every arm ran to its 30 s abandon: PP0 armed 29 /
+    committed 4 / abandoned 48, ``this rank ready=0`` in all 72 abandon lines,
+    with ZERO ``Prefill batch`` lines and 15 ``Decode batch`` lines inside the
+    12:22:19-12:22:49 window. The chunk did not lose a race against the
+    deadline -- it was never attempted.
+
+    Not a second copy of the gate: the caller passes the gate's OWN
+    ``tp_compute_fits_in_one_chunk``, which books nothing (the side-effect-free
+    probe #887's comment reserves for exactly this use, against the W33
+    divergence class where a probe empties the valve without a batch).
+    ``None`` means the caller did not ask, and keeps every existing answer
+    byte-identical; only a measured ``False`` withdraws the claim.
     """
     if direction == TP_TO_PP:
-        if int(budget_remaining or 0) > 0:
+        if int(budget_remaining or 0) > 0 and fits_in_one_chunk is not False:
             return True
         return bool(getattr(purity, "prefill_allowed_in_tp", lambda: True)())
     return True
 
 
+def completed_chunk_pages_acked(scheduler) -> Optional[bool]:
+    """#1033: are this rank's completed write-throughs settled in the store?
+
+    THE PREMISE OF COMMITTING OVER A BROKEN CHUNK, CHECKED RATHER THAN
+    ASSUMED. The flip may drop the chunk it is standing on because #988 rides
+    the prefix back over the cutover, so the loss is bounded by ONE chunk --
+    the user's grant (#939). That bound holds only if the chunks ALREADY
+    completed are present in the host store when the cutover drops the tree.
+    If a write-through is still in flight, #856's no-carry drop discards the
+    device KV while the host copy is short, the load-back rides a stump, and
+    the re-admission recomputes the whole prompt: a silent FULL double
+    prefill, which is the one outcome the grant does not cover.
+
+    DOCKED ON THE EXISTING FENCE, NOT A SECOND ONE. ``ongoing_write_through``
+    is the same counter ``UnifiedRadixCache.reclaim_rows_for_drop`` gates the
+    #1050 cutover reclaim on and the same one ``on_idle`` reads
+    (scheduler.py, ``idle &= len(tc.ongoing_write_through) == 0``); the
+    ``#792 post-retract writeback fence`` line reports it as ``outstanding``.
+    Building a per-request in-flight ledger beside it would be exactly the
+    second bookkeeping this fork keeps deleting.
+
+    CONSERVATIVE BY CONSTRUCTION: it asks whether ANY write-through is in
+    flight, not whether one of THIS request's is. Over-refusing costs a
+    bounded wait (a write-through is milliseconds); under-refusing costs a
+    full recompute. ``None`` = unreadable = unknown, and the caller must treat
+    unknown as refusal, never as permission -- the same direction
+    ``tp_compute_fits_in_one_chunk`` takes for its own unknown.
+    """
+    tree = getattr(scheduler, "tree_cache", None)
+    if tree is None:
+        return None
+    pending = getattr(tree, "ongoing_write_through", None)
+    if pending is None:
+        return None
+    try:
+        return len(pending) == 0
+    except TypeError:
+        return None
+
+
 def chunk_blocks_quiescence(
-    chunked_req, *, strict: bool = False, prefill_runnable_here: bool = True
+    chunked_req,
+    *,
+    strict: bool = False,
+    prefill_runnable_here: bool = True,
+    completed_pages_acked: Optional[bool] = None,
 ) -> bool:
     """Does this chunked prefill prevent a rank from being quiescent?
 
@@ -214,9 +291,49 @@ def chunk_blocks_quiescence(
     re-creates #631 defect O. THE CORRECT NON-STRICT ANSWER IS UNKNOWN AND
     IS FILED, NOT SOLVED. Do not read `if strict` as evidence that the
     non-strict path was analysed and found sound -- it was not analysed.
+
+    #1033: "INCOMPLETE" IS NOT THE HAZARD. THE UNACKED PREFIX IS.
+    The strict arm above blocked on the CHUNK being unfinished, on the premise
+    that the flip would discard it. That premise fell on 2026-08-31: #988
+    carries the prefix (KV + mamba) across the cutover, so what a mid-chunk
+    flip costs is the BROKEN chunk, not the request -- exactly the one-chunk
+    loss the user granted (#939). What the flip can still destroy is the part
+    that is completed but not yet written through: dropping the device KV
+    under an in-flight write-through leaves the host copy short, and the
+    re-admission then recomputes everything, which is the forbidden silent
+    FULL double prefill. So the arm now blocks on THAT, and only while the
+    current layout cannot finish the chunk itself.
+
+    THREE CASES, AND ONLY THE THIRD MOVED:
+      * ``prefill_runnable_here`` TRUE (pp_to_tp: we are in PP and PP may
+        finish this chunk) -- still blocks. This IS drain-and-flip and it is
+        what keeps all prefill in PP; committing here would strand the
+        remainder in a TP layout that strict forbids from prefilling.
+      * mid-admission (no pool row) -- still blocks, untouched. The load-back
+        has no row to ride, so there is nothing to be bounded by.
+      * ``prefill_runnable_here`` FALSE (tp_to_pp with the TP grant closed:
+        the layout we are in may NOT build the next chunk) -- this used to
+        fall straight through to ``return False`` and let the cutover commit
+        over the broken chunk with NO check that the completed pages were
+        safe. That silent path is the one this ticket closes: it now commits
+        only against an acked prefix, and otherwise holds.
+
+    THE HOLD IS BOUNDED BY THE ACK, NOT BY A NEW CLOCK. A write-through is
+    milliseconds; the 30 s park deadline stays the outer backstop and abandons
+    honestly if the ack never lands. A second timer here would be a second
+    bookkeeping beside the fence that already knows the answer.
     """
-    if chunked_req is not None and getattr(chunked_req, "req_pool_idx", None) is None:
+    if chunked_req is None:
+        return False
+    if getattr(chunked_req, "req_pool_idx", None) is None:
         return True
+    if not strict:
+        return False
+    end = getattr(getattr(chunked_req, "extend_range", None), "end", None)
+    full = getattr(chunked_req, "full_untruncated_fill_ids", None)
+    if end is None or full is None or int(end) >= len(full):
+        # A settled boundary: the chunk is finished and its KV is accounted.
+        return False
     # #858b: DO NOT WAIT FOR WORK THAT CANNOT RUN WHILE WE WAIT. Blocking is
     # only drain-and-flip when the drain can actually proceed in the current
     # layout; otherwise it is a hold with no exit. TP has no bounded window --
@@ -224,12 +341,12 @@ def chunk_blocks_quiescence(
     # so nothing times this out, which is why it presented as a wedge rather
     # than as a slow flip. See `validate_purity_policy_pair`, which already
     # makes exactly this argument for PP.
-    if strict and prefill_runnable_here and chunked_req is not None:
-        end = getattr(getattr(chunked_req, "extend_range", None), "end", None)
-        full = getattr(chunked_req, "full_untruncated_fill_ids", None)
-        if end is not None and full is not None and int(end) < len(full):
-            return True
-    return False
+    if prefill_runnable_here:
+        return True
+    # This layout may not build the next chunk, so waiting for the chunk is
+    # waiting for nothing. Commit over it -- but only against an acked prefix.
+    # UNKNOWN IS REFUSAL, never permission.
+    return completed_pages_acked is not True
 
 
 class PhaseFlipJoinTimeout(RuntimeError):
@@ -766,6 +883,7 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         from sglang.srt.managers.phase_purity import (
             purity_of,
             tp_compute_budget_remaining,
+            tp_compute_fits_in_one_chunk,
         )
 
         try:
@@ -781,21 +899,54 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
             _budget = tp_compute_budget_remaining(scheduler, _purity)
         except Exception:  # noqa: BLE001 - a ledger read may never break a flip
             _budget = 0
+        # #1033: the OTHER half of the #887 grant. The budget alone made this
+        # hold claim TP could finish a chunk the gate refuses to build; the
+        # gate's own side-effect-free probe is the truthful term.
+        try:
+            _fits = tp_compute_fits_in_one_chunk(scheduler)
+        except Exception:  # noqa: BLE001 - a probe may never break a flip
+            _fits = None
+        # #1033: the premise under which the flip may commit over a broken
+        # chunk -- checked on the existing #792/#703 fence, never assumed.
+        try:
+            _acked = completed_chunk_pages_acked(scheduler)
+        except Exception:  # noqa: BLE001 - a fence read may never break a flip
+            _acked = None
         # #858b: the ARMED DIRECTION decides whether waiting can ever end.
         _rt = getattr(scheduler, "phase_flip_runtime", None)
         _dir = getattr(_rt, "pending", None) if _rt is not None else None
         _runnable = prefill_runnable_in_current_layout(
-            _dir, _purity, budget_remaining=_budget
+            _dir, _purity, budget_remaining=_budget, fits_in_one_chunk=_fits
         )
         if chunk_blocks_quiescence(
-            chunked, strict=_strict, prefill_runnable_here=_runnable
+            chunked,
+            strict=_strict,
+            prefill_runnable_here=_runnable,
+            completed_pages_acked=_acked,
         ):
+            # #1033 DETECTION: the line must name the term that is actually
+            # holding, not the one that used to. Three distinct reasons now
+            # reach here and reading them as one cost a full window.
+            if not _strict:
+                return "a chunked prefill has no pool row yet (mid-admission)"
+            if getattr(chunked, "req_pool_idx", None) is None:
+                return (
+                    "a chunked prefill has no pool row yet (mid-admission; "
+                    "strict) -- the load-back has no row to ride"
+                )
+            if _runnable:
+                return (
+                    "a chunked prefill is incomplete and THIS layout may "
+                    "finish it (strict drain-and-flip; #856 removed the "
+                    "carry, so the broken chunk would be discarded)"
+                )
             return (
-                "a chunked prefill is incomplete (strict: the flip would "
-                "discard it, #856 removed the carry)"
-                if _strict
-                else "a chunked prefill has no pool row yet (mid-admission)"
-            )
+                "a chunked prefill is broken and its completed prefix is NOT "
+                "yet acked by the write-through fence (acked=%r): committing "
+                "now would drop device KV under a short host copy and the "
+                "re-admission would recompute the WHOLE prompt (#1033). "
+                "Bounded by the ack, not by the park deadline."
+            ) % (_acked,)
         # #631 DEFECT L, and it is the SAME CATEGORY ERROR as the
         # _pp_microbatches_drained one two paragraphs down -- found the
         # same way, by a leg that could never commit.
