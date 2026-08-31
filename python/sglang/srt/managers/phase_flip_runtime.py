@@ -1841,13 +1841,26 @@ def drop_prefix_tree_returning_rows(tree) -> int:
     elif protected > 0:
         _PROTECTED_RESIDUE_ORPHANED_ROWS += protected
         _PROTECTED_RESIDUE_ORPHANED_DROPS += 1
+        # #1050: THE TEXT BELOW USED TO END "so they belong to nobody from here
+        # on ... NOT freed here on purpose", and that sentence became FALSE the
+        # moment the reclaim landed -- measured on boot 20 (2026-08-31), which
+        # emitted 6 of these lines while every one of its 90 census readings
+        # said `unaccounted=0`. Six "orphaned" events and zero orphaned rows.
+        # Leaving the old wording would have handed the next reader six leaks
+        # that did not happen, which is the instrument-text-lies class this
+        # fork keeps paying for. This line now states what it MEASURES (residue
+        # existed at the drop) and points at the line that says what HAPPENED
+        # to it. The two must be read together, in that order.
         logger.error(
-            "%s #938 PROTECTED RESIDUE ORPHANED: %d row(s) still locked after "
-            "a drop that evicted %d; reset() zeroes the protected book without "
-            "freeing them, so they belong to nobody from here on. Sample: %s. "
-            "(%d row(s) over %d drop(s) this process.) NOT freed here on "
-            "purpose: a lock at this point is usually an in-flight "
-            "write-through still reading these rows.",
+            "%s #938 PROTECTED RESIDUE AT DROP: %d row(s) still locked after "
+            "a drop that evicted %d; `evict` refuses locked nodes and reset() "
+            "zeroes the protected book without freeing them. Whether these "
+            "rows are RETURNED or orphaned is decided by the `#1050 CUTOVER "
+            "ROW RECLAIM` line that follows on this same drop -- read it "
+            "before reading this number as a leak. Sample: %s. "
+            "(%d row(s) over %d drop(s) this process.) This site still frees "
+            "nothing itself: a lock here can mean an in-flight write-through "
+            "reading these very rows, and that gate lives in the reclaim.",
             LOG_PREFIX,
             protected,
             returned,
