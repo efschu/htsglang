@@ -10572,8 +10572,21 @@ class Scheduler(
             """
             if not (self.ps.pp_size > 1 and self.ps.pp_rank == 0):
                 return
+            # #1041 POPULATION = EVERYTHING THIS PASS TOUCHED, and boot 9
+            # measured why the narrower reading is worthless. `_seen_this_pass`
+            # holds only what the WAITING-QUEUE LOOP visited -- but
+            # `add_chunked_req` (scheduler.py:9878) fills `can_run_list` BEFORE
+            # that loop runs, so a pass serving only chunked continuations
+            # visits nothing and the counter read `seen=0 published=0 delta=0`
+            # beside `admitted=1`: a green delta on a pass it could not see.
+            # A detector whose denominator excludes a whole filler cannot
+            # detect that filler's bypass, which is the denominator trap this
+            # instrument exists to prevent. The union is the honest population.
             _admitted_ids = {id(r) for r in admitted_list}
-            _carriers = [r for r in _seen_this_pass if id(r) not in _admitted_ids]
+            _touched = list(admitted_list) + [
+                r for r in _seen_this_pass if id(r) not in _admitted_ids
+            ]
+            _carriers = [r for r in _touched if id(r) not in _admitted_ids]
             self._pp_admission_last_built_decision = build_pp_admission_decision(
                 0,  # placeholder mb_id; stamped with the real one downstream
                 admitted_list,
@@ -10597,7 +10610,7 @@ class Scheduler(
             # of as a silent zero that costs a boot to interpret.
             _seen_with_extent = sum(
                 1
-                for r in _seen_this_pass
+                for r in _touched
                 if getattr(r, LOAD_BACK_EXTENT_ATTR_1041, None)
             )
             _published = sum(
