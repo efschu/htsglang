@@ -1223,10 +1223,17 @@ _1042_LIFECYCLE = {"set": 0, "hitless_noop": 0, "retract": 0}
 def _1042_note(kind: str, req, extent=None) -> None:
     _1042_LIFECYCLE[kind] += 1
     n = _1042_LIFECYCLE[kind]
-    if n <= 3 or n % 256 == 0:
+    # #1047: PRINT THE SUPPRESSION COUNT, or do not sample at all. Boot 15's
+    # acceptance window contained ZERO `#1042` lines while the log held nine --
+    # the window simply fell between samples, and a reader would have concluded
+    # "the contract was never exercised". The `set` and `retract` transitions
+    # are rare and now print unconditionally; only `hitless_noop`, which fires
+    # on ordinary traffic, is sampled -- and it says how many it skipped.
+    _suppressed = 0 if kind != "hitless_noop" else max(0, n - 1 - ((n - 1) // 256) * 256)
+    if kind != "hitless_noop" or n <= 3 or n % 256 == 0:
         logger.info(
             "#1042 EXTENT LIFECYCLE %s rid=%s extent=%s held=%s -- set=%d "
-            "hitless_noop=%d retract=%d",
+            "hitless_noop=%d retract=%d (suppressed_since_last_print=%d)",
             kind,
             getattr(req, "rid", None),
             extent,
@@ -1234,6 +1241,7 @@ def _1042_note(kind: str, req, extent=None) -> None:
             _1042_LIFECYCLE["set"],
             _1042_LIFECYCLE["hitless_noop"],
             _1042_LIFECYCLE["retract"],
+            _suppressed,
         )
 
 

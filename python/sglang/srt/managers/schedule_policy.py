@@ -41,7 +41,15 @@ def _note_988_loadback(req, new_prefix_len: int) -> None:
         _988_LOADBACK_SEEN["mamba"] += 1
     else:
         _988_LOADBACK_SEEN["kv_only"] += 1
-    if n == 1 or n % 64 == 0:
+    # #1047: THE ACCEPTANCE METRIC MAY NOT BE SAMPLED. This printed the FIRST
+    # event and then every 64th, with no suppression count -- so three lines
+    # across three ranks were indistinguishable from "one application per rank"
+    # and from "sixty-three applications per rank that were never printed". A
+    # reproducibility run on boot 15 read exactly that ambiguity and could
+    # conclude nothing. `#988 LOADBACK` is the quantity the whole slice is
+    # judged on; it is now unconditional, and the cumulative counters ride every
+    # line so any single line states the totals.
+    if True:
         logger.info(
             "#988 LOADBACK rid=%s prefix moved to %d, extend_range re-derived "
             "to the parked shape at the mutation (seen=%d) "
@@ -109,6 +117,14 @@ def _pp_load_back_extent(req) -> Optional[int]:
     left for a reader to discover.
     """
     return getattr(req, LOAD_BACK_EXTENT_ATTR, None)
+
+
+#: #959 ledger: site -> count. RESTORED -- it was swallowed when the #1046 cut
+#: deleted `_pp_load_back_extent`'s old body by slicing to the next `def`, and
+#: this module-level line sat inside that span. ruff's F821 caught it before the
+#: boot did; a NameError on the #959 refusal path would have fired only under
+#: the traffic that produces a second continuation.
+_SECOND_CONTINUATION_REFUSALS = {}  # site -> count (str -> int)
 
 
 def note_second_continuation_refused(req, site: str) -> int:
