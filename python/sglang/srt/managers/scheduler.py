@@ -15083,6 +15083,16 @@ def run_scheduler_process(
     flight_recorder.arm_process_trace(rank=tp_rank)
     flight_recorder.mark("process_start", rank=tp_rank)
 
+    # #1056: wrap the Triton loader chokepoint BEFORE any kernel can be built,
+    # so no first-loader of this process can slip in ahead of the window. Every
+    # cold cuModuleLoadData then runs group-visible (#615) and a peer at a
+    # collective deadline stretches it instead of aborting the group -- the
+    # boot-22 and boot-25 wedge, covered by construction rather than by a
+    # census or a forward counter.
+    from sglang.srt.utils.triton_loader_window import install_triton_loader_window
+
+    install_triton_loader_window()
+
     # Startup phase timers (#560). The boot phases that dominate time to first
     # token -- weight loading, KV pool sizing, attention backend init, cuda
     # graph capture -- all run in THIS process, not in the parent that calls
