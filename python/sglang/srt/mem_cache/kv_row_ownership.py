@@ -1323,6 +1323,11 @@ CANDIDATE_DISJOINT = "SECOND-POOL-EXISTS-BUT-DISJOINT"
 #: and the hunt goes to the release/retirement paths (reset_tree,
 #: drop_prefix_tree_returning_rows, the #920 id-space retirement neighbourhood).
 CANDIDATE_ABSENT = "NO-SECOND-POOL"
+#: A second pool object exists, but its id space is not NARROWER than the
+#: census's own, so containment is true for every conceivable sample and the
+#: test carries no information. #1050: this verdict exists because the
+#: containment test WAS reported as an explanation in exactly that state.
+CANDIDATE_VACUOUS = "SECOND-POOL-SPANS-EVERYTHING"
 
 
 @dataclass(frozen=True)
@@ -1339,6 +1344,14 @@ class OwnerCandidate:
     name: str
     lo: int
     hi: int
+    #: False when this candidate's id range is not NARROWER than the census's
+    #: own id space. #1050: `pp_stack_allocator owns ids [1, 578995)` against a
+    #: census of size 578994 -- containment then holds for every sample that
+    #: could ever be drawn, so a COVERS verdict from it is not evidence of
+    #: anything. The caller sets this; the verdict below refuses to explain a
+    #: block with a test that cannot fail (indicator law: a counter is a
+    #: finding only once you have checked THAT it measures what it claims).
+    discriminating: bool = True
 
     def covers(self, rows: Iterable[int]) -> bool:
         return all(self.lo <= int(r) < self.hi for r in rows)
@@ -1369,12 +1382,25 @@ def unenumerated_owner_verdict(
             f"({len(candidates)} present)",
         )
     for cand in candidates:
+        if not cand.discriminating:
+            continue
         if cand.covers(rows):
             return (
                 CANDIDATE_COVERS,
                 f"{cand.name} owns ids [{cand.lo}, {cand.hi}) and covers every "
                 f"sampled row -- the census did not enumerate it",
             )
+    vacuous = [c for c in candidates if not c.discriminating]
+    if vacuous and len(vacuous) == len(candidates):
+        shown = ", ".join(f"{c.name}=[{c.lo}, {c.hi})" for c in vacuous[:4])
+        return (
+            CANDIDATE_VACUOUS,
+            f"{len(vacuous)} second pool object(s) present, but every one spans "
+            f"the whole census id space ({shown}), so the containment test is "
+            "true for any sample and explains nothing. This block is NOT "
+            "excused: treat it as unowned until a candidate can name the ids "
+            "it actually holds",
+        )
     shown = ", ".join(f"{c.name}=[{c.lo}, {c.hi})" for c in candidates[:4])
     return (
         CANDIDATE_DISJOINT,

@@ -5641,6 +5641,152 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         parts.append("held=[" + "; ".join(held) + "]")
         return "TREE CENSUS " + " | ".join(parts)
 
+    def reclaim_rows_for_drop(self) -> dict:
+        """Return EVERY row the tree still holds -- locked ones included (#1050).
+
+        THE CONTRACT `drop_prefix_tree_returning_rows` COULD NOT KEEP. That
+        function promises "empty the prefix tree AND return its rows" and pays
+        the allocator back through `evict`, whose leaf walk REFUSES a locked
+        node. `_reset_full` then installs a fresh root and zeroes
+        `component_protected_size_` without freeing one device row, so every
+        row that was locked at the drop belongs to nobody from that moment on.
+        #938 has measured exactly that since 2026-08-27 and deliberately did
+        not free, on a premise this function is allowed to act on only because
+        the premise is now CHECKED rather than assumed.
+
+        THE PREMISE, AND WHY IT IS CHECKED AND NOT TRUSTED. #938's comment says
+        a node is still locked here "mainly because a write-through is IN
+        FLIGHT against it -- a live reader that is copying those exact device
+        rows to the host", and freeing under a live reader is a use-after-free
+        in the #913 IMA family, strictly worse than the leak. That reasoning is
+        correct and is why the release is gated, not removed: this function
+        frees ONLY when `ongoing_write_through` is empty, i.e. when the seam's
+        own post-retract writeback fence has already reported every copy
+        settled. Then no reader exists that could be freed underneath, and a
+        lock that survives a fence with nothing outstanding is not a live
+        claim -- it is a claim whose holder is about to cease to exist with
+        the tree.
+
+        MEASURED, and it is why this is not speculative (boot_855_1049n9,
+        2026-08-31, all 13 drops, PP0): every `#792 post-retract writeback
+        fence` line reports `outstanding=0`, and two of those same drops
+        orphaned 5834 and 4618 rows. The in-flight explanation did not hold on
+        a single drop of that boot. The gate keeps the other case correct
+        anyway -- if a copy ever IS outstanding here, this refuses and says so
+        with a number, which is the state #938 already handles.
+
+        NEVER FREES BLIND. A row that is already on the free list must not be
+        freed twice: that is silent corruption, the one outcome worse than the
+        leak. The candidate set is therefore differenced against the
+        allocator's OWN enumerated free set (`read_free_rows`, the same
+        authority the idle invariant and the #822 census read, a UNION over
+        free+release rather than a double-counting sum). If that reading is not
+        enumerable, this refuses entirely -- a watermark allocator can say HOW
+        MANY rows are free and genuinely cannot say WHICH, and freeing against
+        a count would be inventing membership.
+
+        THE FREE IS ADDRESSED PER ACCESS, never through a captured binding:
+        `FullComponent._free_full` resolves `token_to_kv_pool_allocator` at
+        call time for the #941 reason (a bound method captured at construction
+        carries its instance, and the seam rebinds the pool underneath it --
+        the rows then land on the other phase's free list as duplicates, which
+        is the same symptom with a different root, documented in that method).
+
+        Returns a dict, ALWAYS -- the caller logs it unconditionally including
+        the all-zero reading, because a negative reading is what makes the
+        comparison decisive rather than suggestive.
+        """
+        out = {
+            "reclaimed": False,
+            "reason": "",
+            "full_rows": 0,
+            "mamba_slots": 0,
+            "full_held": 0,
+            "mamba_held": 0,
+            "already_free": 0,
+        }
+        try:
+            outstanding = len(self.ongoing_write_through)
+        except Exception:  # noqa: BLE001 - a reclaim may never break a seam
+            out["reason"] = "ongoing_write_through unreadable"
+            return out
+        if outstanding:
+            # THE DEFERRAL IS INSTRUMENTED, NOT SILENT. Size and reason are
+            # printed by the caller on every drop, so a reclaim that never
+            # runs cannot become the same ratchet one level up.
+            out["reason"] = f"write-through still outstanding ({outstanding})"
+            return out
+
+        try:
+            nodes = [n for n in self._collect_all_nodes() if n is not self.root_node]
+        except Exception:  # noqa: BLE001
+            out["reason"] = "tree walk failed"
+            return out
+
+        # `component_data` is a LIST indexed by the ComponentType int enum, not
+        # a dict -- a `.get` here would raise on every drop. Membership is
+        # asked of `tree_components`, which is fixed at construction.
+        has_mamba = ComponentType.MAMBA in self.tree_components
+        full_vals = []
+        mamba_vals = []
+        for node in nodes:
+            val = getattr(node.component_data[BASE_COMPONENT_TYPE], "value", None)
+            if val is not None and len(val) > 0:
+                full_vals.append(val)
+            if has_mamba:
+                mval = getattr(node.component_data[ComponentType.MAMBA], "value", None)
+                if mval is not None and len(mval) > 0:
+                    mamba_vals.append(mval)
+
+        out["full_held"] = int(sum(len(v) for v in full_vals))
+        out["mamba_held"] = int(sum(len(v) for v in mamba_vals))
+        if not full_vals and not mamba_vals:
+            out["reclaimed"] = True
+            out["reason"] = "tree held nothing"
+            return out
+
+        full_comp = self.components.get(BASE_COMPONENT_TYPE)
+        if full_vals and full_comp is not None:
+            try:
+                from sglang.srt.mem_cache.kv_row_ownership import read_free_rows
+
+                reading = read_free_rows(self.token_to_kv_pool_allocator)
+                if not reading.is_enumerable:
+                    out["reason"] = (
+                        "allocator free set is not enumerable; refusing to free "
+                        "against a count"
+                    )
+                    return out
+                already = reading.rows
+                keep = []
+                dup = 0
+                for v in full_vals:
+                    sel = [int(x) for x in v.tolist()] if hasattr(v, "tolist") else list(v)
+                    fresh = [x for x in sel if x not in already]
+                    dup += len(sel) - len(fresh)
+                    if fresh:
+                        keep.append(torch.tensor(fresh, dtype=torch.int64))
+                out["already_free"] = int(dup)
+                if keep:
+                    merged = torch.cat(keep)
+                    full_comp._free_full(merged)
+                    out["full_rows"] = int(merged.numel())
+            except Exception as exc:  # noqa: BLE001 - never abort a flip
+                out["reason"] = f"full reclaim failed: {type(exc).__name__}"
+                return out
+
+        mamba_comp = self.components.get(ComponentType.MAMBA)
+        if mamba_vals and mamba_comp is not None:
+            for mval in mamba_vals:
+                try:
+                    mamba_comp._free_mamba_value(mval)
+                    out["mamba_slots"] += int(len(mval))
+                except Exception:  # noqa: BLE001 - one slot may not break a flip
+                    continue
+
+        out["reclaimed"] = True
+        return out
+
     def _collect_all_nodes(self) -> list[UnifiedTreeNode]:
         nodes = []
         stack = [self.root_node]

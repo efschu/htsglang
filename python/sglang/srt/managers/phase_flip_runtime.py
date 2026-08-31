@@ -1863,6 +1863,60 @@ def drop_prefix_tree_returning_rows(tree) -> int:
             LOG_PREFIX,
             returned,
         )
+    # #1050: THE DROP NOW KEEPS ITS OWN CONTRACT, under a CHECKED premise.
+    #
+    # Everything above measures; this returns. `evict` refuses locked nodes and
+    # `reset()` then zeroes the protected book without freeing a row, so the
+    # rows that were locked here were leaving with nobody owning them -- a
+    # MONOTONE ratchet, one drop's worth per flip cycle, fatal at the first
+    # genuine idle when `on_idle`'s pool invariant reads the total mismatch.
+    #
+    # MEASURED, five boots, no counter-instance (2026-08-31): zero load-backs
+    # -> zero orphans -> `unaccounted=0` (boots 1043b, 1043c); load-backs > 0 ->
+    # orphans -> ratchet (1046cut 3/18/54626, 1048fix 69/21/43803, 1049n9
+    # 30/6/21608, as loadback-genuine / orphan-events / max-unaccounted). The
+    # orphan sizes are LITERALLY the load-back prefix lengths (5834, 4618, 350),
+    # rank-uniform on PP0/PP1/PP2, and the last census value before death is
+    # identical to the size of the killer's `leaked_full_pages` set (21608 =
+    # 21608, contiguous 1..21608). Not a plausibility -- an identity.
+    #
+    # WHY IT IS SAFE TO FREE HERE NOW, when #938 correctly refused. #938's
+    # premise was that the lock is a LIVE READER (an in-flight write-through
+    # copying these exact rows), and freeing under it is a use-after-free in
+    # the #913 IMA family. That premise is no longer assumed, it is TESTED:
+    # `reclaim_rows_for_drop` frees only when `ongoing_write_through` is empty.
+    # On boot_855_1049n9 every one of the 13 `#792 post-retract writeback
+    # fence` lines reported `outstanding=0`, including the two drops that
+    # orphaned 5834 and 4618 rows -- the in-flight explanation held on no drop
+    # of that boot. When a copy IS outstanding the reclaim refuses and says so
+    # with a number, which is exactly today's behaviour, kept.
+    #
+    # THE DEFERRAL IS INSTRUMENTED UNCONDITIONALLY, including the zero and
+    # including the refusals. A clearer that can silently never run is how the
+    # same ratchet comes back one level up, in a new pocket; this line is what
+    # makes that visible on the drop it happens, not on the boot it kills.
+    reclaim = {}
+    try:
+        reclaimer = getattr(tree, "reclaim_rows_for_drop", None)
+        if reclaimer is not None:
+            reclaim = reclaimer() or {}
+    except Exception:  # noqa: BLE001 - a reclaim may never abort a flip
+        reclaim = {"reason": "reclaim raised"}
+    logger.warning(
+        "%s #1050 CUTOVER ROW RECLAIM: reclaimed=%s full_rows=%s mamba_slots=%s "
+        "(tree still held full=%s mamba=%s, already_free=%s) reason=%r -- "
+        "rows the drop returns that `evict` could not, because the node was "
+        "locked. reclaimed=False with a nonzero held count is the DEFERRED "
+        "state and is the number to watch: it is the ratchet, per drop.",
+        LOG_PREFIX,
+        reclaim.get("reclaimed", False),
+        reclaim.get("full_rows", 0),
+        reclaim.get("mamba_slots", 0),
+        reclaim.get("full_held", 0),
+        reclaim.get("mamba_held", 0),
+        reclaim.get("already_free", 0),
+        reclaim.get("reason", ""),
+    )
     try:
         tree.reset()
     except Exception:  # noqa: BLE001
@@ -6839,7 +6893,20 @@ class PhaseFlipRuntime:
         sched = self._census_scheduler
         if sched is None:
             return out
-        enumerated = id(getattr(sched, "token_to_kv_pool_allocator", None))
+        enumerated_alloc = getattr(sched, "token_to_kv_pool_allocator", None)
+        enumerated = id(enumerated_alloc)
+        # #1050: THE CENSUS'S OWN ID SPACE, so a candidate can be asked whether
+        # its range DISCRIMINATES. Measured 2026-08-31 (boot_855_1048fix): the
+        # audit reported "pp_stack_allocator owns ids [1, 578995) and covers
+        # every sampled row" as the explanation for 43803 unowned rows -- while
+        # the census id space was 578994. A containment test against the whole
+        # space is true for every sample that could ever be drawn: it excused a
+        # real, monotone, ultimately fatal row loss with a test that had no
+        # failing case. The candidate is still reported; it is no longer
+        # allowed to close the question.
+        enumerated_size = getattr(enumerated_alloc, "size", None)
+        if not isinstance(enumerated_size, int) or enumerated_size <= 0:
+            enumerated_size = None
 
         def _add(name, obj):
             if obj is None or id(obj) == enumerated:
@@ -6847,7 +6914,14 @@ class PhaseFlipRuntime:
             size = getattr(obj, "size", None)
             if not isinstance(size, int) or size <= 0:
                 return
-            out.append(OwnerCandidate(name=name, lo=1, hi=size + 1))
+            discriminating = (
+                enumerated_size is not None and (size + 1) < (enumerated_size + 1)
+            )
+            out.append(
+                OwnerCandidate(
+                    name=name, lo=1, hi=size + 1, discriminating=discriminating
+                )
+            )
 
         _add(
             "draft_allocator", getattr(sched, "draft_token_to_kv_pool_allocator", None)
