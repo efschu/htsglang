@@ -269,35 +269,6 @@ class TheUnresolvedDeferIsCapped(unittest.TestCase):
         )
         self.assertEqual(g.unresolved_rounds(RID), 0)
 
-    def test_a_deferral_must_not_clear_the_count_that_bounds_it(self):
-        """#552's own lesson, re-pinned: a defer that resets its own counter
-        makes the bound unreachable, which is the bug wearing a fix."""
-        g = self._guard()
-        for i in range(UNRESOLVED_DEFER_CAP + 2):
-            self._defer_once(g)
-            self.assertEqual(g.unresolved_rounds(RID), i + 1)
-
-    def test_a_measured_shortfall_does_not_count_toward_the_defer_cap(self):
-        g = self._guard()
-        for _ in range(UNRESOLVED_DEFER_CAP + 3):
-            g.record_return_trip(
-                _decision(
-                    512,
-                    admitted=False,
-                    retracted=True,
-                    retracted_by_rank=RANK,
-                    observed_local=128,
-                )
-            )
-        self.assertEqual(
-            g.unresolved_rounds(RID),
-            0,
-            "the #791 shortfall path has its own terminating argument (a "
-            "strictly decreasing learned floor); pooling it into the #944 "
-            "cap would be the two populations read as one again",
-        )
-        self.assertEqual(g.prefix_len_for(RID, 4096), 128)
-
     def test_the_cap_is_disableable_and_that_restores_the_pre_944_shape(self):
         g = self._guard(unresolved_defer_cap=0)
         self._reoffer(g, UNRESOLVED_DEFER_CAP + 5)
@@ -338,43 +309,6 @@ class TheBoundActuallyTerminates(unittest.TestCase):
         if deliver:
             guard.record_return_trip(amended)
         return told, effective
-
-    def test_the_630_SHORTFALL_loop_is_bounded_too_when_the_ring_is_broken(self):
-        """SIBLING SWEEP RESULT (#630, the THIRD instance of the class).
-
-        `_learned_floor` is the other thing `record_return_trip` writes, and it
-        is written on the LEARN side -- so #630's termination argument ("every
-        new retraction sets the floor strictly below the told that just
-        failed") holds only while laps arrive. With the ring broken, a genuine
-        MEASURED shortfall re-offers the identical told for ever, exactly like
-        the unresolved one did. Same class, different population.
-
-        It needs no separate fix, and that is the point of counting the OFFER
-        rather than the reported round: the streak does not care WHY the offer
-        stopped moving. This test is the proof that the class fix covers the
-        sibling, not just the instance that was reported.
-        """
-        g = PPAdmissionCongruenceGuard()
-        tolds = []
-        for _ in range(UNRESOLVED_DEFER_CAP + 3):
-            told = g.prefix_len_for(RID, 4096)
-            tolds.append(told)
-            # A real, MEASURED shortfall (not a miss): local=128 < told. No lap
-            # is delivered, so the floor is never learned.
-            _reconcile(told, 128)
-            if told == 0:
-                break
-        self.assertEqual(
-            tolds[-1],
-            0,
-            f"a measured shortfall whose lesson never gets home must be "
-            f"bounded by the same lap-free streak: {tolds}",
-        )
-        self.assertIsNone(
-            g.learned_floor(RID),
-            "and it terminated with NO floor learned -- proving the bound and "
-            "the #630 floor are independent mechanisms",
-        )
 
 class _CanRunListReq:
     """A request in the shape PRODUCTION re-offers, which is the shape none of
@@ -492,51 +426,6 @@ class TheCompensatorMustBeONTheDefectsPATH(unittest.TestCase):
         )
         self.assertIn("UNRESOLVABLE", catcher.messages[0])
         self.assertIn(RID, catcher.messages[0])
-
-    def test_946_the_learned_floor_is_INERT_on_the_reoffer_path_ON_PURPOSE(self):
-        """#946 DECIDED, NOT INFERRED.
-
-        The question filed as #946 is whether `_learned_floor` is inert on the
-        re-offer path. IT IS, and this test pins that as INTENTIONAL rather
-        than leaving it as a suspicion: the executed branch reports
-        `extend_range.start` -- the prefix the rank actually used -- and
-        applying a floor there would report a prefix the rank did NOT use,
-        which is the instr21 defect the builder's own docstring forbids.
-
-        So #944c does NOT cover #946 by making the floor apply here, and it
-        must not. What it covers is the OBSERVABILITY half: the offer is now
-        counted on this path, so a floor that cannot bite still produces a
-        loud, named refusal instead of silence. The remaining half of #946 --
-        applying an escape to a chunked continuation -- lives upstream, where
-        the prefix is still choosable, and is not this function's to take.
-        """
-        g = PPAdmissionCongruenceGuard()
-        g.record_return_trip(
-            _decision(
-                8192,
-                admitted=False,
-                retracted=True,
-                retracted_by_rank=RANK,
-                observed_local=128,
-            )
-        )
-        self.assertEqual(g.learned_floor(RID), 128, "a floor IS outstanding")
-        req = _CanRunListReq(RID, prefix_len=8192, extend_len=512)
-        d = self._build(g, req)
-        self.assertEqual(
-            d.entries[0].prefix_len,
-            8192,
-            "#946: the floor is deliberately NOT applied to an executed "
-            "geometry -- the report must state what ran, not what a floor "
-            "would have preferred. Changing this to 128 would be the instr21 "
-            "defect, not a fix.",
-        )
-        self.assertEqual(
-            g.offer_streak(RID),
-            1,
-            "but the offer IS counted, which is the half #944c does deliver: "
-            "an inert floor now produces a named refusal instead of silence",
-        )
 
     def test_the_offer_construction_sites_are_all_covered(self):
         """THE RATCHET ITSELF. `prefix_len` is written into a
@@ -690,14 +579,18 @@ class TheConsumerSweepRatchet(unittest.TestCase):
         # case: `observed_local` must be None on every round of the clean
         # drive and 0 on at least one round of the danger mutant.
         "test_pp_unresolved_group_defer_gloo_944.py",
-        # #963: the prefix-scoped floor learns from the same `observed_local`,
-        # so it is a reader of this value's MEANING. Its assertion for the
-        # UNRESOLVED (None) case is that the miss teaches the PREFIX floor
-        # nothing -- the stakes are strictly higher than for the rid-scoped
-        # floor, because a floor invented from a miss would cap every request
-        # over that prefix rather than one request
-        # (`test_an_unresolved_miss_teaches_the_prefix_floor_nothing`).
-        "test_pp_prefix_scoped_floor_963.py",
+        # #1074: `test_pp_prefix_scoped_floor_963.py` is DELETED and therefore
+        # no longer a reader. THE RATCHET CAUGHT THIS REMOVAL on its first run
+        # after the cut, which is the can-fail proof for the "or one vanished"
+        # half of this pin -- it had only ever fired for additions before.
+        #
+        # The decision it recorded is not lost, it is MOOT: the #963
+        # prefix-scoped floor died with the same predicate as the rid-scoped
+        # one, one hop later. `_remember_prefix_floor` was its only writer and
+        # its only caller sat inside the deleted retraction arm, so
+        # `_prefix_floor` became a dict nothing writes. Its UNRESOLVED-case
+        # assertion ("a miss teaches the prefix floor nothing") can no longer
+        # fail, because nothing teaches that floor anything at all.
     }
 
     def _tree(self):

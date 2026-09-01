@@ -304,7 +304,10 @@ def test_admitted_lap_still_resets_every_container():
     assert not guard.is_escalated(RID)
     assert guard.offer_streak(RID) == 0
     assert guard.unresolved_rounds(RID) == 0
-    assert guard.learned_floor(RID) is None
+    # #1074: the `learned_floor` assertion that stood here is gone with the
+    # container itself. The four checks above ARE the reset this test is
+    # about, and they still pass -- the clearer is intact, only its
+    # inventory shrank.
 
 
 def test_a_served_rid_may_escalate_again_later():

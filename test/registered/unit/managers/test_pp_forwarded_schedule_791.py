@@ -990,30 +990,6 @@ class PPProducerNoGeometry791(unittest.TestCase):
         self.assertEqual(decision.entries[0].prefix_len, PROMPT_TOKENS)
         self.assertEqual(decision.entries[0].extend_len, 0)
 
-    def test_the_guard_is_not_re_applied_to_an_executed_geometry(self):
-        """The old comment called the second `prefix_len_for` idempotent. It
-        is not: the loop clamps `prefix_indices` BEFORE `add_one_req`, and the
-        host load-back grows it again AFTER -- so re-clamping here would move
-        the difference into `extend_len` and name a third geometry."""
-        from sglang.srt.managers.pp_admission_congruence import (
-            PPAdmissionCongruenceGuard,
-            build_pp_admission_decision,
-        )
-
-        guard = PPAdmissionCongruenceGuard()
-        guard._learned_floor[RID] = 0  # a floor outstanding from a retraction
-        req = _Req(prefix_len=PREFETCHED_PREFIX, host_resident=0)
-        req.set_extend_range(PREFETCHED_PREFIX, PREFETCHED_PREFIX + TOLD_EXTEND)
-        decision = build_pp_admission_decision(
-            LIVE_MB,
-            [req],
-            pp_size=WORLD,
-            guard=guard,
-            require_executed_geometry=True,
-        )
-        self.assertEqual(decision.entries[0].prefix_len, PREFETCHED_PREFIX)
-        self.assertEqual(decision.entries[0].extend_len, TOLD_EXTEND)
-
 
 class PPOrderBatchBySchedule791(unittest.TestCase):
     def test_an_empty_schedule_is_the_untouched_default_path(self):

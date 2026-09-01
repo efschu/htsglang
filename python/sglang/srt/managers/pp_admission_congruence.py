@@ -548,7 +548,6 @@ class PPAdmissionCongruenceGuard:
     """
 
     def __init__(self, unresolved_defer_cap: int = UNRESOLVED_DEFER_CAP) -> None:
-        self._learned_floor: Dict[str, int] = {}
         #: #963: the same shortfall, scoped to the PREFIX it was measured
         #: against instead of to the request that happened to carry it.
         #:
@@ -571,7 +570,6 @@ class PPAdmissionCongruenceGuard:
         #: PYTHONHASHSEED-salted and would disagree across the very ranks this
         #: exists to keep congruent (`tree_congruence`'s constraint 3, learned
         #: the same way).
-        self._prefix_floor: Dict[int, int] = {}
         #: rid -> the prefix key its most recent offer was made over, so a
         #: retraction arriving on the return trip can be attributed to the
         #: prefix that was actually offered rather than to whatever the
@@ -905,16 +903,6 @@ class PPAdmissionCongruenceGuard:
         """
         return self._offer_streak.get(rid, (None, 0))[1]
 
-    def learned_floor(self, rid: str) -> Optional[int]:
-        """Diagnostic/test hook: the outstanding floor for `rid`, or None.
-
-        The SIBLING of `unresolved_rounds` above, and both exist so a test can
-        tell the two populations apart from the outside -- reading them off one
-        accessor, or off `prefix_len_for`, would fold them back together at the
-        exact seam this ticket is about.
-        """
-        return self._learned_floor.get(rid)
-
     #: #963: cap on `_prefix_floor` / `_offer_prefix_key`. The rid-scoped
     #: tables are bounded by the live request population and clear on serve;
     #: a prefix-scoped one is bounded by nothing, and an unbounded dict on the
@@ -923,15 +911,6 @@ class PPAdmissionCongruenceGuard:
     #: (the prefix is re-offered, one rank retracts, the floor is re-learned),
     #: whereas losing a RECENT one would reopen the livelock.
     PREFIX_FLOOR_SLOTS = 512
-
-    def _remember_prefix_floor(self, key: int, observed: int) -> None:
-        """Tighten (never widen) the floor for one prefix, under the cap."""
-        existing = self._prefix_floor.get(key)
-        self._prefix_floor[key] = (
-            int(observed) if existing is None else min(int(existing), int(observed))
-        )
-        while len(self._prefix_floor) > self.PREFIX_FLOOR_SLOTS:
-            self._prefix_floor.pop(next(iter(self._prefix_floor)))
 
     def prefix_len_for(
         self, rid: str, candidate_prefix_len: int, *, prefix_key: Optional[int] = None
@@ -1000,17 +979,22 @@ class PPAdmissionCongruenceGuard:
         # `prefix_key=None` -- a caller that cannot name the prefix -- leaves
         # the behaviour byte-identical to the pre-#963 rid-scoped path, so
         # this cannot change a call site it was never reasoned about on.
-        floor = self._learned_floor.get(rid)
+        # #1074: BOTH floors are gone, and the second one is a consequence
+        # worth naming rather than leaving as a clamp that can never fire.
+        # The rid-scoped `_learned_floor` died with its producer. The #963
+        # PREFIX-scoped `_prefix_floor` died with the SAME predicate one hop
+        # later: its only writer was `_remember_prefix_floor`, whose only
+        # caller sat inside the deleted retraction arm. A dict that nothing
+        # writes cannot clamp anything, and a `min()` over it would read to
+        # the next maintainer as a live bound.
+        #
+        # `_offer_prefix_key` is still maintained below: it is the OFFER
+        # bookkeeping the #944 escalation path uses, not floor state.
         if prefix_key is not None:
             self._offer_prefix_key[rid] = prefix_key
             while len(self._offer_prefix_key) > self.PREFIX_FLOOR_SLOTS:
                 self._offer_prefix_key.pop(next(iter(self._offer_prefix_key)))
-            prefix_floor = self._prefix_floor.get(prefix_key)
-            if prefix_floor is not None:
-                floor = prefix_floor if floor is None else min(floor, prefix_floor)
-        told = (
-            candidate_prefix_len if floor is None else min(candidate_prefix_len, floor)
-        )
+        told = candidate_prefix_len
         # #944c COUNT, THEN ACT -- and the counting half is shared with the
         # EXECUTED branch, which may count but must never be clamped.
         return 0 if self.note_offer(rid, told) else told
@@ -1043,10 +1027,6 @@ class PPAdmissionCongruenceGuard:
         """
         return getattr(self, "_1059_observed", {}).get(rid)
 
-    def forget_observed_coverage(self, rid) -> None:
-        """Drop a rid's promise once it has been spent or the lap expired."""
-        getattr(self, "_1059_observed", {}).pop(rid, None)
-
     def record_return_trip(self, decision: PPAdmissionDecision) -> None:
         """Consume a fully chain-reconciled decision on its way back to PP0.
 
@@ -1072,67 +1052,29 @@ class PPAdmissionCongruenceGuard:
             # collecting it only on one branch would make the MIN depend on the
             # pass's outcome instead of on the tiers.
             self.note_observed_coverage(entry.rid, entry.observed_local)
-            if entry.retracted:
-                if entry.unresolved:
-                    # #944 THE OTHER POPULATION, COUNTED SEPARATELY. No rank
-                    # could locate this rid, so there is nothing to learn a
-                    # floor from -- but the round still happened and still cost
-                    # a voided pass, and something has to bound how many times
-                    # that may repeat. Counted here rather than at the reporting
-                    # rank because the count has to be the GROUP's: every rank
-                    # reports independently, only PP0 acts (`prefix_len_for`).
-                    #
-                    # INCREMENT-ONLY ON THIS PATH, cleared only by a pass that
-                    # actually served the rid (below). A defer that resets its
-                    # own counter makes the bound unreachable, which is #552's
-                    # measured lesson: "the bug itself wearing a fix".
-                    self._unresolved_rounds[entry.rid] = (
-                        self._unresolved_rounds.get(entry.rid, 0) + 1
-                    )
-                    continue
-                observed = entry.observed_local
-                if observed is None:
-                    # A retraction without an observed value cannot safely
-                    # tighten a floor -- leave any existing floor as-is rather
-                    # than guess.
-                    #
-                    # #944 MADE THIS AN EXPECTED PATH, and the comment is
-                    # corrected rather than left to mislead. It used to read
-                    # "every retraction this module itself produces always sets
-                    # observed_local, so this branch guards a malformed/foreign
-                    # decision, not an expected path". The #944 UNRESOLVED
-                    # branch now retracts with `observed_local=None` on purpose:
-                    # a LOOKUP MISS taught this pass nothing about the rank's
-                    # prefix, so there is no lesson to learn, and inventing one
-                    # (0, or the -1 sentinel) would clamp the next round's offer
-                    # from a number that was never measured. The guard was
-                    # already the correct behaviour; only its reachability
-                    # changed.
-                    continue
-                existing = self._learned_floor.get(entry.rid)
-                self._learned_floor[entry.rid] = (
-                    observed if existing is None else min(existing, observed)
-                )
-                # #963: THE SAME LESSON, SCOPED TO THE PREFIX. The retracting
-                # rank measured its own tree against the prefix this offer was
-                # made over; that measurement is true of every other request
-                # over the same prefix until the trees change. Learning it here
-                # is what turns "one voided pass per rid, for ever" into "one
-                # voided pass, once".
-                offered_key = self._offer_prefix_key.get(entry.rid)
-                if offered_key is not None:
-                    self._remember_prefix_floor(offered_key, observed)
-            elif entry.admitted:
-                self._learned_floor.pop(entry.rid, None)
+            # #1074: the `if entry.retracted:` arm that stood here is DELETED. No
+            # code mints a retraction any more (#1072c removed both branches of
+            # `reconcile_pp_admission_decision`), so the arm was unreachable and
+            # the `_learned_floor` it fed could never be set. The measurement is
+            # by CONSTRUCTION, not by sampling: a consumer whose predicate no
+            # producer can set is unreachable, not merely unused.
+            #
+            # THE ARM BELOW IS NOT PART OF THAT DELETION and must not be folded
+            # into it: it is the ONLY clearer of `_unresolved_rounds` (#944),
+            # `_terminator_spent` (#955) and `_offer_streak` (#944b) -- counted,
+            # one pop site each in this module. `note_observed_coverage` above
+            # stays for the same reason: it is the #1059 group-uniformity feed
+            # and is deliberately harvested BEFORE any retracted/admitted split.
+            if entry.admitted:
                 # #963: SERVED means every rank admitted this pass, ran it and
                 # reached its own `cache_unfinished_req` -- so the trees agree
                 # on this prefix again and the floor must go. Holding it would
                 # convert a transient divergence into permanent cache loss on a
                 # prefix every rank holds, which is the one direction this fix
                 # must never fail in.
-                served_key = self._offer_prefix_key.pop(entry.rid, None)
-                if served_key is not None:
-                    self._prefix_floor.pop(served_key, None)
+                # #1074: the `_prefix_floor` pop that stood here is gone with
+                # the dict itself; the offer key is still retired here.
+                self._offer_prefix_key.pop(entry.rid, None)
                 # #944: the rid was SERVED, so both kinds of outstanding state
                 # are stale -- the learned floor and the unresolved streak. The
                 # streak must clear here and nowhere else: one bad minute of
@@ -1161,10 +1103,6 @@ class PPAdmissionCongruenceGuard:
                 # let one old void count against the first offer of a rid that
                 # is demonstrably being served again.
                 self._refused_since_offer.discard(entry.rid)
-
-    def outstanding_rids(self) -> Tuple[str, ...]:
-        """Diagnostic/test hook: rids currently carrying a learned floor."""
-        return tuple(self._learned_floor)
 
 
 def fill_carry_for(req) -> Tuple[Optional[int], Tuple[int, ...]]:
@@ -2441,49 +2379,6 @@ def schedule_refusal_reason(
             f"request itself, not merely about its cache."
         )
     return None
-
-
-def entries_retracted_by_rank(
-    decision: Optional[PPAdmissionDecision], rank: int
-) -> Tuple[PPAdmissionEntry, ...]:
-    """The entries THIS rank newly retracted from a decision it received.
-
-    #791c. `reconcile_pp_admission_decision` above is the only writer of
-    `retracted_by_rank`, and it writes it ONLY on the hop that first finds
-    the prefix unhonourable -- an entry another rank already retracted takes
-    the pass-through branch and keeps that rank's number. So a non-empty
-    result here means exactly one thing, with no inference: THIS RANK'S BATCH
-    FOR THIS PASS IS NARROWER THAN ITS UPSTREAM'S, because the upstream built
-    and forwarded its own batch from the decision as it stood BEFORE this
-    retraction, and nothing can amend a batch that is already in flight.
-
-    That is the whole content of the 2026-08-21 07:12:49 mispair (boot
-    instr17): PP0 admitted two requests (126 extend tokens), PP1 found
-    rid=5e744c29's told=16896 prefix unhonourable against its own local=0,
-    excluded it from `effective`, and built a one-request batch of 22 tokens
-    -- then paired PP0's 126 rows of hidden states with it. Every identity
-    the proxy carries (slot, sequence, flip epoch) was CORRECT: the message
-    was the current pass's, from the current ring, in the current epoch. Only
-    the WIDTH disagreed, and the width disagreed because of this function's
-    subject.
-
-    PURE, AND KEPT IN THIS MODULE ON PURPOSE. The consumer is the PP proxy
-    receive guard in scheduler_pp_mixin.py, but the fact is a property of a
-    decision, and this module already owns every other such property
-    (`congruent_rids` below is the same shape). `None` -- a caller with no
-    decision recorded for the slot -- yields an empty tuple, which every
-    consumer reads as "nothing known against this pass", i.e. exactly the
-    behaviour that shipped before this function existed.
-    """
-    if decision is None:
-        return ()
-    return tuple(
-        e
-        for e in decision.entries
-        if e.retracted
-        and e.retracted_by_rank is not None
-        and int(e.retracted_by_rank) == int(rank)
-    )
 
 
 def void_pp_admission_decision(
