@@ -963,15 +963,31 @@ class PhaseFlipStacks:
         is the refill leg proper and nothing else" -- is what let this number be
         read as a transfer. It is the refill leg, and the leg is not one
         mechanism. Measured, boot_w40_857strict_0826_0516.log, PP0 pp_to_tp:
-        4.818 s = save 4.342 + checksum 0.319 + wait 0.084 + d2h-issue 0.026 +
-        h2d-issue 0.020 + ring 0.001 + plan 0.001, with `gpu-span d2h 0.000s /
-        h2d 0.000s`. The dominant term is ``ops.save`` -- a HOST-TO-HOST memcpy
-        into the staging ring, which in-place aliasing forces on 90-97 % of the
-        chunks (rotation_executor.py, the ``aliased`` branch) -- and not the
-        PCIe transfer the name implies. The rate this line prints is therefore
-        an aggregate over staging, checksum and transfer; it is comparable to
-        another leg's aggregate and to nothing else. The decomposition is
-        registered with the seam census below so the two are read together.
+        4.818 s = save 4.342 + checksum 0.319 + wait 0.084 + d2h-call 0.026 +
+        h2d-call 0.020 + ring 0.001 + plan 0.001. The dominant term on THAT leg
+        is ``ops.save`` -- a HOST-TO-HOST memcpy into the staging ring, which
+        in-place aliasing forces on 90-97 % of the chunks
+        (rotation_executor.py, the ``aliased`` branch). The rate this line
+        prints is therefore an aggregate over staging, checksum and transfer;
+        it is comparable to another leg's aggregate and to nothing else. The
+        decomposition is registered with the seam census below so the two are
+        read together.
+
+        #1082 -- ONE LEG OF THAT ARGUMENT IS WITHDRAWN, and it was mine. The
+        sentence above used to end "...and not the PCIe transfer the name
+        implies", resting on a quoted `gpu-span d2h 0.000s / h2d 0.000s`. That
+        zero was never a measurement: ``RotationPhases.gpu_d2h_s`` and
+        ``gpu_h2d_s`` had exactly one writer in the whole tree -- their own
+        dataclass default -- and one reader, the renderer. Every boot printed
+        0.000 s because nothing ever wrote them. The save-dominates conclusion
+        stands on the save term itself, which IS measured; the "no device time
+        took part" half had no evidence and is removed rather than reworded.
+        The fields are measured from #1082 on (CUDA events per lane, read once
+        after the drain) and render as `not-measured` when they are not, so a
+        future reader can tell the two apart. Note also that the term names
+        changed with that ticket: ``d2h_issue_s`` -> ``d2h_call_s``, because on
+        a pageable destination the call performs the whole transfer and the
+        word "issue" asserted an enqueue that does not happen.
 
         PER RANK, NOT REDUCED. The flip's cost is the SLOWEST rank's copy --
         the layouts differ in size per rank (pp 17219 / tp 16329 MiB on PP0
@@ -1059,10 +1075,16 @@ class PhaseFlipStacks:
         # deriving a 3.0 s "byte-independent constant" that is the intercept of
         # a model applied to four mechanisms with four cost drivers. What that
         # boot's own phase lines actually say, PP0 pp_to_tp: save 4.342 +
-        # checksum 0.319 + wait 0.084 + d2h-issue 0.026 + h2d-issue 0.020,
-        # gpu-span d2h 0.000s / h2d 0.000s -- the mass is the host-side staging
-        # memcpy that in-place aliasing forces, not the transfer the segment's
-        # name implies.
+        # checksum 0.319 + wait 0.084 + d2h-call 0.026 + h2d-call 0.020 -- on
+        # THAT leg the mass is the host-side staging memcpy that in-place
+        # aliasing forces.
+        #
+        # #1082: the clause "gpu-span d2h 0.000s / h2d 0.000s" stood here as
+        # the second half of that argument and is WITHDRAWN -- those two fields
+        # had no writer, so the zero was a dataclass default, not a device
+        # reading. It is also not a general result: on boot_855_1078spec the
+        # dominant term is d2h-call at 94.7-96.1 % of the leg on all six legs,
+        # with save at 1.5-2.8 s. A decomposition is a per-leg fact.
         #
         # Registered against `weights_refill` because that is the mark the walk
         # stamps when this returns, i.e. the mark that CLOSES this segment.
@@ -1074,8 +1096,12 @@ class PhaseFlipStacks:
                 ("save", rot_phases.save_s),
                 ("checksum", rot_phases.checksum_s),
                 ("wait", rot_phases.wait_s),
-                ("d2h-issue", rot_phases.d2h_issue_s),
-                ("h2d-issue", rot_phases.h2d_issue_s),
+                # #1082: renamed from "d2h-issue"/"h2d-issue". The old labels
+                # asserted an enqueue cost; on a pageable destination the call
+                # carries the whole transfer, and these two segments were read
+                # as cheap plumbing for that reason.
+                ("d2h-call", rot_phases.d2h_call_s),
+                ("h2d-call", rot_phases.h2d_call_s),
                 ("ring", rot_phases.ring_s),
                 ("plan", rot_phases.plan_s),
             ),

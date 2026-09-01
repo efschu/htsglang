@@ -93,16 +93,85 @@ class RotationHazard(RuntimeError):
     """
 
 
+def plan_determined_overlap(h2d_chunks: int, d2h_chunks: int, depth: int) -> int:
+    """The value ``RotationStats.overlapped_steps`` takes, from the PLAN alone.
+
+    ARITHMETIC::
+
+        0                                       if depth <= 1
+        max(0, min(d, h + depth - 1) - 1)       otherwise
+
+    ``h``/``d`` are the number of steps whose respective length is non-zero,
+    i.e. ``ceil(incoming/chunk)`` and ``ceil(outgoing/chunk)``; ``depth`` is the
+    ring depth.
+
+    DERIVATION, so this is a proof and not a fit. One entry is appended to
+    ``inflight`` per step and the deque is capped at ``depth - 1``, so at the
+    start of step ``k`` it holds exactly the entries of steps
+    ``[k - depth + 1, k - 1]``. The H2D lane is non-empty on steps ``1..h``, so
+    ``outstanding_h2d > 0`` at step ``k`` iff that window meets ``[1, h]``, i.e.
+    iff ``2 <= k <= h + depth - 1``. A step increments the counter iff it also
+    carries a D2H, i.e. ``k <= d``. Counting the ``k`` that satisfy both gives
+    the expression above. At ``depth == 1`` the window is empty and the count
+    is 0.
+
+    THE ``depth <= 1`` ARM IS NOT COSMETIC. At depth 1 ``_retire_one`` drains
+    after every step, so nothing is outstanding when the next D2H is enqueued.
+    The #809 test reads that 0 as proof that the counter "measures the
+    executor's behaviour"; it proves only that the counter sees the DEPTH, and
+    depth is a configuration input, not a runtime observation.
+
+    RELATION TO R-TIME'S FITTED FORM, stated because the two look different.
+    R-TIME reported ``min(h, d) - 1 + [d > h]``, exact on 12 of 12 measured
+    legs. That is EXACTLY this expression at ``depth == 2``, which is the
+    production depth (``SGLANG_PHASE_FLIP_REFILL_DEPTH`` defaults to 2,
+    environ.py:358) -- substitute and the two agree for every ``h`` and ``d``.
+    The fit was therefore right about every leg it saw and is not general; this
+    form is, and it was derived rather than fitted because the tests below
+    exercise depths the boot never ran.
+
+    THIS FUNCTION EXISTS TO BE COMPARED AGAINST THE COUNTER, not to replace it.
+    A counter reproducible from two chunk counts and a config knob is not
+    carrying information about what the device did, and the same value appears
+    on a 4 s leg and a 41 s leg of the same shape.
+    """
+    if int(depth) <= 1:
+        return 0
+    h = max(0, int(h2d_chunks))
+    d = max(0, int(d2h_chunks))
+    return max(0, min(d, h + int(depth) - 1) - 1)
+
+
 @dataclass
 class RotationStats:
     """A PURE RECORD of what one rotation did. Every judgement lives elsewhere.
 
-    ``overlapped_steps`` is the falsifier for the duplex premise, and it is
-    measured on the EXECUTOR rather than on the plan: a step counts as
-    overlapped when, at the instant its D2H was enqueued, an earlier chunk's
-    H2D had not yet been waited on. A plan-shaped counter would report overlap
-    for a serialised implementation, which is the reading this number exists to
-    make impossible.
+    ``overlapped_steps`` IS NOT EVIDENCE OF OVERLAP, and this docstring used to
+    claim the opposite. The retraction is kept in full because two readings
+    downstream were built on the old claim.
+
+    WHAT IT SAYS TODAY, arithmetically: a step increments it when, at the
+    instant its D2H is enqueued, ``ops.outstanding_h2d > 0``. Every step that
+    carries an H2D appends to ``inflight``, and ``inflight`` is only drained
+    once it reaches ``depth`` -- so at any depth above 1 the predicate is TRUE
+    by construction from the second step onward, for as long as H2D chunks
+    remain. The counter is therefore a function of the two chunk counts and the
+    ring DEPTH, given by :func:`plan_determined_overlap`, which reproduced it
+    EXACTLY on 12 of 12 measured legs (R-TIME, 2026-09-01). All three inputs
+    are known before the leg starts.
+
+    WHY THAT MATTERS: it carries NO time information. The same counter value
+    appears on a 4 s leg and on a 41 s leg of the same shape. The old docstring
+    -- "measured on the EXECUTOR rather than on the plan ... a plan-shaped
+    counter would report overlap for a serialised implementation, which is the
+    reading this number exists to make impossible" -- described precisely the
+    defect the counter has. A serialised implementation DOES report the same
+    number here, and the boot on which this was found (63.9 s legs, 94.7-96.1 %
+    of the wall inside a single blocking D2H call) is that implementation.
+
+    The duplex premise therefore has NO instrument in this class. The device
+    spans on :class:`RotationPhases` are the ones that can answer it, and they
+    are the reason those fields stopped being a hard-coded zero.
     """
 
     steps: int = 0
@@ -116,6 +185,12 @@ class RotationStats:
 
     @property
     def overlap_share(self) -> float:
+        """``overlapped_steps / steps`` -- a share of a PLAN-DETERMINED count.
+
+        Kept because the log line has carried it for many boots and dropping it
+        silently would break comparability; see the class docstring for why it
+        may not be read as a duplex measurement.
+        """
         return (self.overlapped_steps / self.steps) if self.steps else 0.0
 
 
@@ -145,24 +220,54 @@ class RotationPhases:
     """
 
     save_s: float = 0.0
-    d2h_issue_s: float = 0.0
-    h2d_issue_s: float = 0.0
+    #: WALL TIME THE HOST THREAD SPENDS INSIDE ``ops.d2h`` / ``ops.h2d``.
+    #:
+    #: RENAMED FROM ``d2h_issue_s`` / ``h2d_issue_s`` (2026-09-01). The old
+    #: names asserted that the term was an ENQUEUE cost, and that assertion is
+    #: false whenever the copy's host side is pageable: a D2H into a pageable
+    #: destination -- which the file-backed image arm makes the normal case --
+    #: is synchronous with respect to the host, so this term then contains the
+    #: WHOLE TRANSFER. Measured on boot_855_1078spec, all six legs:
+    #: ``d2h_call_s`` was 94.7-96.1 % of the leg while the device spans were
+    #: printed as 0.000 s, and the name is what made that read as "enqueue is
+    #: expensive" instead of "the transfer is happening here, synchronously".
+    #:
+    #: ARITHMETIC: ``perf_counter`` immediately around the single call, summed
+    #: over steps. It does NOT separate enqueue from transfer -- that is what
+    #: the device spans below are for. Never read it as either alone.
+    d2h_call_s: float = 0.0
+    h2d_call_s: float = 0.0
     wait_s: float = 0.0
     ring_s: float = 0.0
     checksum_s: float = 0.0
     plan_s: float = 0.0
     total_s: float = 0.0
-    #: Device-side spans, read ONCE after the drain (never synchronised inside
-    #: the loop, per the ms-per-round canon). 0.0 when there is no device.
-    gpu_d2h_s: float = 0.0
-    gpu_h2d_s: float = 0.0
+    #: DEVICE-SIDE SPANS, read ONCE after the drain (never synchronised inside
+    #: the loop, per the ms-per-round canon).
+    #:
+    #: ARITHMETIC: ``first_event.elapsed_time(last_event) / 1000`` per lane,
+    #: where the first event is recorded on that lane's stream before its first
+    #: copy is enqueued and the last is the event recorded after its last copy.
+    #: It is a SPAN (first enqueue to last completion), not a busy time: lane
+    #: idle time between chunks is inside it. Two spans that sum to more than
+    #: ``total_s`` are the duplex actually happening; two that tile it are not.
+    #:
+    #: ``None`` MEANS NOT MEASURED and must never be rendered as 0.000. Until
+    #: 2026-09-01 these were plain floats with a 0.0 default and NO WRITER
+    #: anywhere in the tree -- the docstring promised "read ONCE after the
+    #: drain" and nothing ever read them -- so every phase line in every boot
+    #: printed a hard-coded zero that two comments in phase_flip_boot.py then
+    #: cited as a measurement. A None that renders as "not measured" is what
+    #: makes that failure visible instead of plausible.
+    gpu_d2h_s: Optional[float] = None
+    gpu_h2d_s: Optional[float] = None
 
     @property
     def accounted_s(self) -> float:
         return (
             self.save_s
-            + self.d2h_issue_s
-            + self.h2d_issue_s
+            + self.d2h_call_s
+            + self.h2d_call_s
             + self.wait_s
             + self.ring_s
             + self.checksum_s
@@ -187,8 +292,8 @@ class RotationPhases:
         """
         terms = {
             "save": self.save_s,
-            "d2h_issue": self.d2h_issue_s,
-            "h2d_issue": self.h2d_issue_s,
+            "d2h_call": self.d2h_call_s,
+            "h2d_call": self.h2d_call_s,
             "wait": self.wait_s,
             "ring": self.ring_s,
             "checksum": self.checksum_s,
@@ -215,18 +320,29 @@ def phases_reconcile(
     return phases.residual_share <= float(tolerance)
 
 
+def _span_text(value: Optional[float]) -> str:
+    """A device span, or the words that say it was never measured.
+
+    NEVER formats ``None`` as a number. "not measured" and "measured as zero"
+    are different facts and the whole #1082 finding is that they had been made
+    to look identical for the life of this instrument.
+    """
+    return "not-measured" if value is None else f"{value:.3f}s"
+
+
 def rotation_phase_report(phases: RotationPhases) -> str:
     """One line naming every term AND the leftover. Never hides the residual."""
     name, secs = phases.dominant()
     verdict = "RECONCILED" if phases_reconcile(phases) else "UNRECONCILED"
     return (
         f"phases {verdict} total {phases.total_s:.3f}s = "
-        f"save {phases.save_s:.3f} + d2h-issue {phases.d2h_issue_s:.3f} + "
-        f"h2d-issue {phases.h2d_issue_s:.3f} + wait {phases.wait_s:.3f} + "
+        f"save {phases.save_s:.3f} + d2h-call {phases.d2h_call_s:.3f} + "
+        f"h2d-call {phases.h2d_call_s:.3f} + wait {phases.wait_s:.3f} + "
         f"ring {phases.ring_s:.3f} + checksum {phases.checksum_s:.3f} + "
         f"plan {phases.plan_s:.3f} + UNACCOUNTED {phases.residual_s:.3f} "
         f"({phases.residual_share * 100:.1f} %); dominant={name} {secs:.3f}s; "
-        f"gpu-span d2h {phases.gpu_d2h_s:.3f}s / h2d {phases.gpu_h2d_s:.3f}s"
+        f"gpu-span d2h {_span_text(phases.gpu_d2h_s)} / "
+        f"h2d {_span_text(phases.gpu_h2d_s)}"
     )
 
 
@@ -249,6 +365,11 @@ class TorchRotationOps:
         self._d2h_stream = None
         self._h2d_stream = None
         self._outstanding_h2d = 0
+        #: #1082 span markers, one pair per lane: the event recorded on that
+        #: lane BEFORE its first copy is enqueued, and the event recorded after
+        #: its most recent copy. Read once, after the drain, by device_spans().
+        self._span_first = {"d2h": None, "h2d": None}
+        self._span_last = {"d2h": None, "h2d": None}
         self._save_slices = (
             _save_slices_default() if save_slices is None else max(1, int(save_slices))
         )
@@ -351,14 +472,75 @@ class TorchRotationOps:
             return
         list(pool.map(lambda b: dst_buf[b[0] : b[1]].copy_(src[b[0] : b[1]]), bounds))
 
+    # -- device spans (#1082) ---------------------------------------------
+    def reset_spans(self) -> None:
+        """Drop the span markers so a reused ops object times ONE leg.
+
+        ``rotate_arena`` builds its own ops by default, but the parameter
+        exists, and a shared object would otherwise report a span reaching back
+        to the first leg it ever ran -- a number that looks like a measurement
+        and is a lifetime.
+        """
+        self._span_first = {"d2h": None, "h2d": None}
+        self._span_last = {"d2h": None, "h2d": None}
+
+    def _mark_span(self, lane: str, stream) -> None:
+        """Record the lane's FIRST marker once, before its first copy."""
+        if self._span_first[lane] is None:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record(stream)
+            self._span_first[lane] = ev
+
+    def device_spans(self) -> Tuple[Optional[float], Optional[float]]:
+        """``(d2h_span_s, h2d_span_s)`` -- READ ONCE, AFTER THE DRAIN.
+
+        ARITHMETIC per lane: ``first.elapsed_time(last) / 1000.0``, seconds,
+        where ``first`` was recorded on that lane's stream before its first copy
+        was enqueued and ``last`` after its last. It is a SPAN, so lane idle
+        time between chunks is included; it is NOT a busy time and must not be
+        divided by bytes to produce a bandwidth.
+
+        ``None`` for a lane that never ran on a device (the eager/CPU path, or a
+        leg with no chunks in that direction). None is a REFUSAL to answer, not
+        a zero -- that distinction is the whole point of #1082, where these two
+        fields had no writer at all and every boot printed 0.000 s.
+
+        Safe to call after the drain and nowhere else: it synchronises the last
+        marker of each lane. After the drain that sync is already satisfied (the
+        H2D of a step waits on that step's D2H event, and every H2D is waited on
+        by ``_retire_one``), so it costs nothing and cannot stall the loop --
+        which is why it is not called from inside it.
+        """
+        out = []
+        for lane in ("d2h", "h2d"):
+            first = self._span_first[lane]
+            last = self._span_last[lane]
+            if first is None or last is None:
+                out.append(None)
+                continue
+            try:
+                last.synchronize()
+                out.append(float(first.elapsed_time(last)) / 1000.0)
+            except Exception:  # noqa: BLE001 - an instrument, never a gate
+                # A span that cannot be read is reported as unreadable. The one
+                # thing it may never do is fall back to 0.0 and re-enter the
+                # tree as a measurement.
+                logger.debug(
+                    "%s %s span unreadable", LOG_PREFIX, lane, exc_info=True
+                )
+                out.append(None)
+        return out[0], out[1]
+
     def d2h(self, src: torch.Tensor, dst: torch.Tensor) -> Any:
         """Device -> host, on the copy-back lane."""
         d2h_stream, _ = self._streams()
         if d2h_stream is not None and self._is_device(src):
+            self._mark_span("d2h", d2h_stream)
             with torch.cuda.stream(d2h_stream):
                 dst.copy_(src, non_blocking=True)
-            ev = torch.cuda.Event()
+            ev = torch.cuda.Event(enable_timing=True)
             ev.record(d2h_stream)
+            self._span_last["d2h"] = ev
             return ev
         dst.copy_(src)
         return None
@@ -367,12 +549,19 @@ class TorchRotationOps:
         """Host -> device, gated on ``after`` so it cannot outrun the D2H."""
         _, h2d_stream = self._streams()
         if h2d_stream is not None and self._is_device(dst):
+            # BEFORE wait_event, deliberately: the span must start where this
+            # lane's work was HANDED OVER, so that time spent blocked on the
+            # peer lane's event lands inside the H2D span. Recording it after
+            # the wait would hide exactly the serialisation the span exists to
+            # expose.
+            self._mark_span("h2d", h2d_stream)
             if after is not None:
                 h2d_stream.wait_event(after)
             with torch.cuda.stream(h2d_stream):
                 dst.copy_(src, non_blocking=True)
-            ev = torch.cuda.Event()
+            ev = torch.cuda.Event(enable_timing=True)
             ev.record(h2d_stream)
+            self._span_last["h2d"] = ev
             self._outstanding_h2d += 1
             return ev
         dst.copy_(src)
@@ -559,6 +748,8 @@ def rotate_arena(
     """
     t0 = time.perf_counter()
     ops = ops if ops is not None else TorchRotationOps()
+    # #1082: this leg's spans are this leg's. See TorchRotationOps.reset_spans.
+    ops.reset_spans()
     incoming_bytes = int(incoming_bytes)
     outgoing_bytes = int(outgoing_bytes)
     chunk_bytes = int(chunk_bytes)
@@ -669,7 +860,7 @@ def rotate_arena(
                 host_image[step.d2h_offset : step.d2h_offset + step.d2h_len],
             )
             if phases is not None:
-                phases.d2h_issue_s += time.perf_counter() - _t
+                phases.d2h_call_s += time.perf_counter() - _t
             stats.d2h_bytes += step.d2h_len
 
         if step.h2d_len:
@@ -680,7 +871,7 @@ def rotate_arena(
                 after=d2h_handle,
             )
             if phases is not None:
-                phases.h2d_issue_s += time.perf_counter() - _t
+                phases.h2d_call_s += time.perf_counter() - _t
             stats.h2d_bytes += step.h2d_len
             inflight.append((buf, handle, True))
             if timing is not None:
@@ -703,6 +894,18 @@ def rotate_arena(
     if timing is not None:
         timing.drain_s += time.perf_counter() - t_drain
 
+    # #1082: READ THE DEVICE SPANS, ONCE, HERE. This is the line the field
+    # docstring promised since #809/W28 and that never existed -- the two
+    # fields had exactly one writer (their own dataclass default) and one
+    # reader (the renderer), so every phase line ever emitted printed a
+    # hard-coded 0.000 s that phase_flip_boot.py then quoted as evidence that
+    # no device time was involved. Placed after the drain and before the
+    # checksum: every enqueued copy has landed (an H2D waits on its step's D2H
+    # event, and every H2D is waited on above), so reading costs no stall, and
+    # the checksum's own device work has not started and cannot pollute a span.
+    if phases is not None:
+        phases.gpu_d2h_s, phases.gpu_h2d_s = ops.device_spans()
+
     if outgoing_bytes:
         host_image[outgoing_bytes : outgoing_bytes + _CHECKSUM_BYTES] = torch.tensor(
             [out_sum], dtype=torch.int64
@@ -723,6 +926,13 @@ def rotate_arena(
     stats.elapsed_s = time.perf_counter() - t0
     if phases is not None:
         phases.total_s = stats.elapsed_s
+    # #1082: HAND THE BOUND PHRASE ITS DENOMINATOR. refill_bound_phrase judges
+    # read vs h2d-wait; on this path `read_s` has no writer at all, so its
+    # denominator was `h2d_wait_s` alone -- 0.016 s against a 63.9 s leg, and
+    # the verdict was therefore the constant "LINK-BOUND". With the leg total
+    # recorded the phrase can see that it covers 0.02 % of the leg and refuse.
+    if timing is not None:
+        timing.leg_total_s += stats.elapsed_s
     return stats
 
 
@@ -733,6 +943,7 @@ def rotation_report(direction: str, stats: RotationStats) -> str:
         f"{LOG_PREFIX} {direction} {kind} rotation: "
         f"{stats.h2d_bytes / (1024 * 1024):.1f} MiB in / "
         f"{stats.d2h_bytes / (1024 * 1024):.1f} MiB back over "
-        f"{stats.steps} chunk(s), {stats.overlapped_steps} overlapped "
-        f"({stats.overlap_share * 100:.1f} %), {stats.elapsed_s:.3f} s"
+        f"{stats.steps} chunk(s), {stats.overlapped_steps} pipelined "
+        f"({stats.overlap_share * 100:.1f} %, PLAN-DETERMINED -- not evidence "
+        f"of device overlap, see RotationStats), {stats.elapsed_s:.3f} s"
     )
