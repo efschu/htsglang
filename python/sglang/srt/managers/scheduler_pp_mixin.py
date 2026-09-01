@@ -4858,6 +4858,28 @@ class SchedulerPPMixin:
                 # (`pp_note_parked_continuation` at old :8070 inside
                 # `_pp_recv_admission_decision`, unioned back in at old
                 # :7931-7935 inside `_pp_send_admission_decision`).
+                # #631 ROW-DELIVER: name the black hole (row19: d33/d34
+                # delivered+planned, no #969N launch, ring dead). If a
+                # row-driven pass's batch is gone by the time the launch
+                # junction reads it, print every void flag that stands.
+                if _pre_proxy is not None and self.mbs[mb_id] is None:
+                    _vn = getattr(self, "_pp_row_voidtrace_n", 0) + 1
+                    self._pp_row_voidtrace_n = _vn
+                    if _vn <= 30:
+                        logger.warning(
+                            "#631 ROW-DELIVER BATCH NULLED slot=%s before the "
+                            "launch junction: pass_voided=%s voided_incoming=%s "
+                            "upstream_void_withheld=%s occurrence=%d",
+                            mb_id,
+                            bool(getattr(self, "_pp_admission_pass_voided", False)),
+                            bool(getattr(self, "_pp_pass_voided_incoming", False)),
+                            bool(
+                                getattr(
+                                    self, "_pp_upstream_void_withheld_work", False
+                                )
+                            ),
+                            _vn,
+                        )
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
