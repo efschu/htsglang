@@ -153,6 +153,38 @@ def test_pp0_holds_and_followers_never_do():
     )
 
 
+# -- #1067: the armed park is the admission owner's verdict ----------------
+
+
+def test_the_armed_park_is_pp0_only_in_the_pp_layout():
+    """(#1067) A follower that parks under an armed pp_to_tp flip withholds
+    the very pass that would drain the mb its upstream already launched --
+    measured boot_855_1065umbau 06:26:07Z: PP1 received and reconciled pass
+    31 (ROW-PROBE delivered=31), parked before building, PP2 stayed at 30,
+    PP0 blocked 665 s in the output recv and the flip never assembled.
+    Under the PP0-authority order followers execute what the row tells them
+    and decide nothing: in the PP layout only PP0 parks (it stops SOURCING;
+    in-flight mbs keep draining), in the TP layout the park stays
+    group-wide (every rank is a replica of one decision). Pin: the park
+    block's guard names the pending-direction exemption and the PP0 gate
+    together, ahead of the shared quiescence predicate."""
+    import inspect as _i
+
+    import sglang.srt.managers.scheduler as sched
+
+    src = _i.getsource(sched)
+    idx = src.index("and not chunk_blocks_quiescence(self.chunked_req)")
+    window = src[max(0, idx - 2600) : idx]
+    assert "pending != PP_TO_TP" in window, "the PP-layout exemption is gone"
+    assert "pp_rank == 0" in window, "the PP0-only gate is gone"
+    # The exemption must be a disjunction (follower passes the park), not a
+    # conjunction that would park everyone again.
+    tail = window[window.index("pending != PP_TO_TP") :]
+    assert "or" in tail.split("pp_rank == 0")[0], (
+        "the direction exemption and the PP0 gate must be OR-joined"
+    )
+
+
 # -- Schicht 3: no single-rid vote, no owed ledger (RED until deleted) -----
 
 
