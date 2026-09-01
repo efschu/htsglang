@@ -71,6 +71,12 @@ from sglang.srt.mem_cache.match_refusal_census import (
     note_prefetch_gate as _note_prefetch_gate,
     prefetch_gate_due as _prefetch_gate_due,
 )
+from sglang.srt.mem_cache.producer_phase_census import (
+    emit as _producer_emit,
+    new_producer_census as _new_producer_census,
+    note_prefetch_adopted as _pp_note_prefetch_adopted,
+    note_walk_node as _pp_note_walk_node,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaLoadBackUnservable,
@@ -1722,6 +1728,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # nothing: "the root had no matching child" is NOT_PRESENT, a real
             # verdict, and must not be reported as "I did not measure".
             census.note_reached(0)
+        # #631/#1061: the producer-phase census -- the OTHER half of #904's
+        # answer: not whether a hit happened, but which PHASE produced the
+        # accepted bytes. Armed by the SAME knob as #904 (deliberately, see
+        # `census_armed`), so `census is not None` implies it is armed too and
+        # the disarmed default builds and feeds nothing. The window object
+        # lives on the cache across walks (the denominator spans walks) and is
+        # renewed after every emitted line.
+        p_census = None
+        if census is not None:
+            p_census = getattr(self, "_producer_census", None)
+            if p_census is None:
+                p_census = self._producer_census = _new_producer_census()
+        walk_saw_hit = False
+        walk_saw_cross = False
         component_names = tuple(type(comp).__name__ for comp in self._components_tuple)
 
         def _all_valid(validators, node, depth):
@@ -1764,6 +1784,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         def _update_best_if_valid(node, depth, key_tokens=0):
             nonlocal best_match_node
             nonlocal best_match_device_value_len, best_match_device_node
+            nonlocal walk_saw_hit, walk_saw_cross
             matched = _all_valid(validators, node, depth)
             if census is not None:
                 census.note_reached(key_tokens)
@@ -1771,6 +1792,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     census.note_accepted(key_tokens)
                 else:
                     _census_refusals(node, depth, key_tokens)
+            if p_census is not None:
+                # #1061: classify this node's accepted tokens by the phase
+                # that PRODUCED them (write ledger vs. the consuming
+                # generation) and by the arm that adopted them. The node's
+                # `hash_value` is the only storage-key carrier at the walk;
+                # None (device-only node) classifies UNKNOWN, never guessed.
+                if matched and key_tokens:
+                    walk_saw_hit = True
+                if _pp_note_walk_node(
+                    p_census, node.hash_value, key_tokens, self.page_size, matched
+                ):
+                    walk_saw_cross = True
             if matched:
                 best_match_node = node
 
@@ -1824,6 +1857,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         census_emit(census, logger)
+        if p_census is not None:
+            # #1061: the walk itself is the DENOMINATOR event -- recorded once
+            # per walk by the same code path that recorded the numerator's
+            # opportunity, so the two cannot drift (#873). A walk that
+            # traversed nothing still counts (hit=False).
+            p_census.note_walk(hit=walk_saw_hit)
+            if walk_saw_cross:
+                p_census.note_cross_phase_walk()
+            if _producer_emit(p_census, logger):
+                # A line went out: start a fresh window, so ok/denom on the
+                # next line describe the walks since THIS line, not since boot.
+                self._producer_census = None
         # #915 THE OTHER HALF, wired at last. The reason a prefetch declined has
         # been recorded on every attempt since #915 landed and was never once
         # printed, because this call did not exist. See `prefetch_gate_due`.
@@ -3975,6 +4020,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 _adopt[:min_completed_tokens],
                 hash_value[: min_completed_tokens // self.page_size],
             )
+            # #1061: the adopted tail arrived via the PREFETCH arm. Only the
+            # keys the tree NEWLY adopted count as arrivals -- the matched
+            # head (`prefix_len`) was already resident, and a declined insert
+            # (`host_span_unclaimed`) adopted nothing. Disarmed -> no-op.
+            if not insert_result.host_span_unclaimed:
+                _pp_note_prefetch_adopted(
+                    hash_value[
+                        insert_result.prefix_len
+                        // self.page_size : min_completed_tokens
+                        // self.page_size
+                    ]
+                )
             if _rehomed is not None:
                 # Whatever the tree did NOT adopt out of the re-homed span
                 # belongs to the CURRENT generation's pool -- not to the stale

@@ -2890,6 +2890,26 @@ class HiCacheController:
                     # treats as a partial backup, so the caller sees a cache
                     # miss rather than a stalled queue.
                     self.storage_backend.check_disk_space()
+                    # #1061: stamp every key this operation hands to the store
+                    # with the #719 binding generation it was OPENED under --
+                    # the stamp `StorageOperation.__init__` already carries
+                    # (the existing carrier; no second scheme). This is the
+                    # producer-phase ledger's only production writer; disarmed
+                    # it records nothing. Placed BEFORE `_page_backup` so a
+                    # partial backup can only OVER-stamp: a stamped-but-
+                    # unwritten key reads as a store miss later, never as a
+                    # wrongly-attributed phase.
+                    try:
+                        from sglang.srt.mem_cache.producer_phase_census import (
+                            note_backup_keys,
+                        )
+
+                        note_backup_keys(
+                            getattr(operation, "hash_value", None),
+                            getattr(operation, "binding_generation", None),
+                        )
+                    except Exception:  # noqa: BLE001 - never break the backup thread
+                        pass
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 

@@ -125,11 +125,28 @@ class BindingState:
 
     def advance(self, phase: str, host_pool=None) -> int:
         with self._lock:
+            prior_generation = self._generation
+            prior_phase = self._phase
             self._phase = str(phase)
             self._generation += 1
             if host_pool is not None:
                 self._pools[self._generation] = host_pool
-            return self._generation
+            generation = self._generation
+        # #1061: record generation -> phase for the producer-phase census, at
+        # the one place that mints generations (the census docstring names
+        # this ``advance()`` as its intended feed). The OUTGOING pair is
+        # recorded too, so generation 0 / the boot phase is renderable after
+        # the first cutover; ``note_generation`` is idempotent. Ungated on the
+        # census knob deliberately: one dict write per CUTOVER, and a census
+        # armed later (tests, a restarted reader) still needs the history.
+        try:
+            from sglang.srt.mem_cache.producer_phase_census import note_generation
+
+            note_generation(prior_generation, prior_phase)
+            note_generation(generation, str(phase))
+        except Exception:  # noqa: BLE001 - an instrument may never break a rebind
+            pass
+        return generation
 
     def host_pool_at(self, generation):
         """The host pool bound at ``generation``, or None if unknown."""

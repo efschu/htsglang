@@ -133,15 +133,21 @@ __all__ = [
     "ObservationState",
     "ProducerPhase",
     "ProducerPhaseCensus",
+    "adoption_source_of",
     "arrival_stats",
     "census_armed",
     "emit",
     "ledger_stats",
     "new_producer_census",
     "note_arrival",
+    "note_backup_keys",
     "note_consult",
     "note_generation",
+    "note_prefetch_adopted",
+    "note_prefill_hit_tokens",
     "note_store_write",
+    "note_walk_node",
+    "reset_prefill_window",
     "payload_verdict",
     "phase_of_generation",
     "prefill_provenance_field",
@@ -352,6 +358,11 @@ _late_arrivals = 0
 _arrivals = 0
 _consults = 0
 _consult_misses = 0
+#: #1061: keys whose bytes were adopted via the PREFETCH arm. Kept (bounded,
+#: FIFO on insertion order like the write ledger) so the match walk can render
+#: ``by_source`` from what actually happened instead of needing a second
+#: carrier on the tree node. Value = arrival count for the key.
+_arrived: dict[str, int] = {}
 
 
 def note_consult(key: str, accepted: bool) -> None:
@@ -388,6 +399,15 @@ def note_arrival(key: str) -> None:
         _arrivals += 1
         if _missed_consults.pop(k, 0):
             _late_arrivals += 1
+        # #1061: remember the key itself (bounded), so `adoption_source_of`
+        # can answer PREFETCH for it later without a per-node carrier.
+        if k not in _arrived and len(_arrived) >= _LEDGER_MAX:
+            try:
+                oldest = next(iter(_arrived))
+                del _arrived[oldest]
+            except StopIteration:  # pragma: no cover - empty dict at the cap
+                pass
+        _arrived[k] = _arrived.get(k, 0) + 1
 
 
 def arrival_stats() -> dict[str, int]:
@@ -406,6 +426,27 @@ def arrival_stats() -> dict[str, int]:
             "late": _late_arrivals,
             "never_yet": len(_missed_consults),
         }
+
+
+def adoption_source_of(key: str) -> AdoptionSource:
+    """By which arm this key's bytes are known to this process (#1061).
+
+    ARITHMETIC: PREFETCH if ``note_arrival`` ever recorded the key (the store
+    handed its bytes back and the tree adopted them); else BACKUP_HOST if the
+    write ledger stamped it (this process's own backup thread wrote it, so a
+    hit on it is the eviction axis); else UNKNOWN -- never guessed. A key both
+    prefetched and later re-backed-up reads PREFETCH: the adoption event is
+    what put its bytes into this layout, the later copy is bookkeeping.
+    """
+    if key is None:
+        return AdoptionSource.UNKNOWN
+    k = str(key)
+    with _order_lock:
+        if k in _arrived:
+            return AdoptionSource.PREFETCH
+    if producer_generation_of(k) is not None:
+        return AdoptionSource.BACKUP_HOST
+    return AdoptionSource.UNKNOWN
 
 
 # --------------------------------------------------------------------------
@@ -515,6 +556,12 @@ def prefill_provenance_field(hit_tokens: int) -> str:
         n = _prefill_producer_tokens.get(phase.value, 0)
         if n:
             parts.append(f"{phase.value}:{n}")
+    # #1061: the line that renders the window DRAINS it (the "drained by the
+    # prefill line" contract below). Draining only on the render path -- after
+    # every early return above -- means a line with zero cached tokens leaves
+    # the window accumulating for the next rendering line instead of silently
+    # dropping attribution that belongs to a batch not yet printed.
+    _prefill_producer_tokens.clear()
     if not parts:
         # Armed but nothing attributed: say NO_OBSERVATION, never omit the
         # field and never print a zero. An absent field reads as "no cached
@@ -551,6 +598,7 @@ def reset_for_test() -> None:
         _ledger_writes = 0
     with _order_lock:
         _missed_consults.clear()
+        _arrived.clear()
         _late_arrivals = 0
         _arrivals = 0
         _consults = 0
@@ -732,6 +780,109 @@ def _bound_phase_or_none():
 
 
 # --------------------------------------------------------------------------
+# 3b. THE WIRING GLUE (#1061) -- the writers the recording sites call
+# --------------------------------------------------------------------------
+#
+# Built 2026-08-31, wired 2026-09-01 (#1061): until these existed the module
+# had ZERO production writers, so even a successful boot could not produce the
+# acceptance line (built-never-wired). Each function is a no-op while the
+# census is disarmed (SGLANG_MATCH_REFUSAL_CENSUS_EVERY=0, the shared #904
+# knob), so the default path builds and records nothing.
+
+
+def note_backup_keys(keys, generation) -> None:
+    """The store-write ledger's writer, called by the backup thread.
+
+    ARITHMETIC: one ledger entry per storage key handed to the backend;
+    ``generation`` is ``operation.binding_generation`` -- the #719 stamp the
+    operation was OPENED under. That stamp is the EXISTING provenance carrier
+    (stamped in ``StorageOperation.__init__``); no second scheme is invented
+    here. Disarmed, or an unstamped operation (generation None) -> records
+    nothing; an unstamped key later classifies UNKNOWN, never same/cross.
+    """
+    if census_armed() <= 0 or not keys or generation is None:
+        return
+    for k in keys:
+        note_store_write(k, generation)
+
+
+def note_prefetch_adopted(keys) -> None:
+    """The arrival side's writer: these keys' bytes were ADOPTED into the
+    tree via the PREFETCH arm (store -> host tier -> tree).
+
+    ARITHMETIC: one ``note_arrival`` per adopted key -- the caller passes only
+    the keys the insert actually adopted (matched head excluded, declined
+    insert excluded), so ``arrivals`` counts adoptions, not fetch attempts.
+    Disarmed -> records nothing.
+    """
+    if census_armed() <= 0 or not keys:
+        return
+    for k in keys:
+        note_arrival(k)
+
+
+def note_walk_node(census, keys, key_tokens, page_size, accepted) -> bool:
+    """One walked tree node, classified against the ledger. Returns True when
+    any accepted token classified CROSS_PHASE, so the caller can count the
+    walk as a mission hit.
+
+    ARITHMETIC, field by field:
+      * per-key tokens = min(page_size, key_tokens - i*page_size): storage
+        keys are page-granular and ``key_tokens`` is this node's matched KEY
+        tokens, so the last key may carry a partial page and the per-key
+        tokens sum to exactly ``key_tokens``.
+      * ``keys`` falsy (a device-only node that was never backuped carries
+        ``hash_value=None``): there is NO storage-key carrier for this node,
+        so its accepted tokens are classified UNKNOWN in one lump -- never
+        guessed into same/cross (the gap stays visible as ``unknown:N``).
+      * producer = ``producer_phase_of(key, current_generation())``: the
+        write-ledger stamp against the #719 generation consuming right now.
+      * source = ``adoption_source_of(key)``: PREFETCH / BACKUP_HOST /
+        UNKNOWN, from the arrival record and the write ledger.
+      * consults: every walked key is consulted (hit or miss), feeding the
+        late/never ordering partition.
+
+    Accepted tokens ALSO feed the per-batch prefill-line window
+    (``note_prefill_hit_tokens``), so the ``#cached-producer`` field on the
+    ``Prefill batch`` line fills from the same classification -- one
+    arithmetic, two lines that cannot disagree.
+    """
+    if census is None:
+        return False
+    tokens = int(key_tokens or 0)
+    if tokens <= 0:
+        return False
+    if not keys:
+        if accepted:
+            census.note_accepted_tokens(
+                tokens, ProducerPhase.UNKNOWN, AdoptionSource.UNKNOWN
+            )
+            note_prefill_hit_tokens(tokens, ProducerPhase.UNKNOWN)
+        return False
+    try:
+        from sglang.srt.mem_cache.hicache_phase_binding import current_generation
+
+        cgen = int(current_generation())
+    except Exception:  # pragma: no cover - unit tests run without sglang
+        cgen = None
+    page = max(1, int(page_size or 1))
+    saw_cross = False
+    for i, k in enumerate(keys):
+        t = min(page, tokens - i * page)
+        if t <= 0:
+            break
+        note_consult(k, accepted=bool(accepted))
+        if not accepted:
+            continue
+        producer = producer_phase_of(k, cgen)
+        census.note_accepted_tokens(t, producer, adoption_source_of(k))
+        note_prefill_hit_tokens(t, producer)
+        if producer is ProducerPhase.CROSS_PHASE:
+            saw_cross = True
+    return saw_cross
+
+
+# --------------------------------------------------------------------------
 # 4. arming and emission
 # --------------------------------------------------------------------------
 #
@@ -762,7 +913,7 @@ def new_producer_census() -> ProducerPhaseCensus | None:
     return ProducerPhaseCensus() if census_armed() > 0 else None
 
 
-def emit(census: ProducerPhaseCensus | None, logger) -> None:
+def emit(census: ProducerPhaseCensus | None, logger) -> bool:
     """Log the census, rate-limited, and ALWAYS on a cross-phase window.
 
     A cross-phase hit is the finding this instrument exists for, so it is
@@ -771,13 +922,19 @@ def emit(census: ProducerPhaseCensus | None, logger) -> None:
     SUPPRESSED emissions rides the line, because an absence after the first N
     lines of a rate-limited emitter is not a zero (DENOMINATOR LAW, measured
     2026-08-31).
+
+    #1061: returns True when a line actually went out (the broken-partition
+    error line included -- it is an emission, just a self-indicting one), so
+    the wiring can start a fresh window per emitted line and ``ok``/``denom``
+    on each line describe the walks SINCE the previous line, not since boot.
+    False = suppressed or disarmed; the caller keeps accumulating.
     """
     global _emitted, _suppressed
     if census is None or not census.observed:
-        return
+        return False
     every = census_armed()
     if every <= 0:
-        return
+        return False
     _emitted += 1
     if census.cross_phase_walks > 0 or _emitted % every == 0:
         try:
@@ -789,8 +946,9 @@ def emit(census: ProducerPhaseCensus | None, logger) -> None:
                 ACCEPT_LINE_PREFIX,
                 exc,
             )
-    else:
-        _suppressed += 1
+        return True
+    _suppressed += 1
+    return False
 
 
 # --------------------------------------------------------------------------
