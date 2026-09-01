@@ -4253,6 +4253,47 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.cached_tokens = req.readmit_cached_tokens
                 if new_cached > 0:
                     _note_968_readmit_cached(req, pre_len, new_cached)
+                # #1047: THE #939 ACCEPTANCE LINE'S ONLY WRITER.
+                #
+                # WHY HERE. This is the point at which a re-admitted request
+                # COMMITS to computing tokens again: `alloc_for_extend` has
+                # run, `pre_len` is what the read-through recovered (after
+                # `init_load_back` extended it, :4198-4199), and the request
+                # is about to forward everything above it. Earlier sites see
+                # a prefix that is not final -- `init_next_round_input` is
+                # called TWICE per admission (once from `_prefetch_kvcache`
+                # BEFORE the fetch lands, once at admission), so recording
+                # there would double the denominator and understate recovery.
+                #
+                # `prior == 0` selects the FIRST chunk of THIS admission:
+                # `readmit_already_computed` is zeroed by `reset_for_retract`
+                # (:2679) and set to `seq_len` two lines above, so later
+                # chunks of the same admission are skipped and each
+                # re-admission contributes exactly ONE observation.
+                #
+                # The seam stamp is the population gate, and it is the SAME
+                # attribute #969B/#969C/#1060 use -- an OOM-preempted
+                # request's re-prefill is real workload, not a double
+                # prefill, and must not enter the denominator.
+                if prior == 0:
+                    try:
+                        from sglang.srt.managers.phase_purity import (
+                            SEAM_READMIT_ATTR as _SRA_1047,
+                        )
+                        from sglang.srt.mem_cache.producer_phase_census import (
+                            emit_double_prefill as _emit_1047,
+                            note_double_prefill as _note_1047,
+                        )
+
+                        if getattr(req, _SRA_1047, None) is not None:
+                            _note_1047(
+                                getattr(req, "rid", "?"),
+                                getattr(req, "cached_prompt_tokens_at_retract", 0),
+                                pre_len,
+                            )
+                            _emit_1047(logger)
+                    except Exception:  # noqa: BLE001 - an instrument may never break admission
+                        logger.warning("#1047 DOUBLE-PREFILL PROBE RAISED", exc_info=True)
 
             # #783 half 2: restore instead of recomputing, for the cutover
             # population only. Here and not in `readmit_seam_residents`, which

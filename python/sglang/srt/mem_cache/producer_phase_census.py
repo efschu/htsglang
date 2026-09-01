@@ -136,7 +136,11 @@ __all__ = [
     "adoption_source_of",
     "arrival_stats",
     "census_armed",
+    "double_prefill_census",
     "emit",
+    "emit_double_prefill",
+    "note_double_prefill",
+    "reset_double_prefill_census",
     "ledger_stats",
     "new_producer_census",
     "note_arrival",
@@ -590,6 +594,11 @@ def reset_for_test() -> None:
     """Clear all module state. Tests only."""
     global _ledger_dropped, _ledger_writes, _emitted, _suppressed
     global _late_arrivals, _arrivals, _consults, _consult_misses
+    global _dpc, _dpc_emitted, _dpc_suppressed, _dpc_over_bound_seen
+    _dpc = None
+    _dpc_emitted = 0
+    _dpc_suppressed = 0
+    _dpc_over_bound_seen = 0
     with _gen_lock:
         _gen_phases.clear()
     with _ledger_lock:
@@ -1142,3 +1151,145 @@ class DoublePrefillCensus:
     def format_line(self, prefix: str = DOUBLE_PREFILL_LINE_PREFIX) -> str:
         body = " ".join(f"{k}={v}" for k, v in self.log_fields().items())
         return f"[{prefix}] {body}"
+
+
+# --------------------------------------------------------------------------
+# 5b. THE WIRING GLUE FOR #939 (#1047) -- the writer the recording site calls
+# --------------------------------------------------------------------------
+#
+# Built with section 5, wired 2026-09-01 (#1047). Until this existed
+# `DoublePrefillCensus` had ZERO production writers: the class, its
+# arithmetic and its bound were all present and NOTHING ever called
+# `note_readmitted_request`, so the second half of the acceptance ("no double
+# prefill, under load, PROVABLE") could not be produced by any boot. Same
+# built-never-wired shape #1061 closed for the producer-phase half.
+#
+# NO SECOND BOOKKEEPING. Both quantities are read off carriers that already
+# exist and are already written on the seam path:
+#
+#   S_i = ``req.cached_prompt_tokens_at_retract``   schedule_batch.py:2607
+#         Written by `Req.reset_for_retract`, whose own comment says it
+#         records "WHAT WAS ALREADY COMPUTED, BEFORE THE FIELDS THAT SAY SO
+#         ARE CLEARED THREE LINES DOWN". That is S_i by construction; nothing
+#         else writes it and nothing clears it before the re-prefill.
+#   C_i = ``pre_len``                               schedule_batch.py:4147
+#         The per-chunk prefix length the extend is built against, i.e.
+#         `len(req.prefix_indices)` after the read-through and after
+#         `init_load_back` extended it (:4198-4199).
+#
+# THE POPULATION marker is likewise existing: ``phase_purity.SEAM_READMIT_ATTR``
+# (`seam_readmit_epoch`), stamped ONLY by the #856 cutover retraction
+# (`phase_flip_runtime.py:1973`) and by nothing else -- so an OOM-preempted
+# request's ordinary re-prefill, which is real workload and NOT a double
+# prefill, cannot enter the denominator. The three sibling probes (#969B,
+# #969C, #1060) key on the identical attribute; a fourth definition of "the
+# readmit population" would be exactly the drift this module exists to stop.
+
+_dpc: DoublePrefillCensus | None = None
+_dpc_emitted = 0
+_dpc_suppressed = 0
+_dpc_over_bound_seen = 0
+
+
+def note_double_prefill(
+    request_id,
+    already_computed,
+    recovered,
+    scheduler=None,
+) -> None:
+    """Record ONE re-admitted request's re-prefill against what it had.
+
+    ARITHMETIC, field by field -- all of it lives in
+    ``DoublePrefillCensus.note_readmitted_request``; this function adds no
+    arithmetic of its own and exists only to own the census's LIFETIME:
+
+      * ``already_computed`` -> S_i, the caller passes
+        ``req.cached_prompt_tokens_at_retract``.
+      * ``recovered``        -> C_i, the caller passes this chunk's
+        ``pre_len``.
+      * the census is created on FIRST observation and its chunk bound is
+        bound THEN, from the live scheduler (`resolve_chunk_size`), so the
+        threshold is the one in force at the cutover being measured rather
+        than one captured at import.
+
+    Disarmed (the shared #904 knob) -> returns immediately and builds no
+    census, so the default path is byte-identical: no object, no counters, no
+    line. A DISARMED run and a run with no double prefill are therefore NOT
+    the same state, and `emit_double_prefill` prints which one it is.
+    """
+    global _dpc
+    if census_armed() <= 0:
+        return
+    if _dpc is None:
+        _dpc = DoublePrefillCensus()
+        _dpc.bind_chunk(scheduler)
+    _dpc.note_readmitted_request(request_id, already_computed, recovered)
+
+
+def emit_double_prefill(logger) -> bool:
+    """Log the #939 acceptance line, rate-limited, ALWAYS on a breach.
+
+    Mirrors `emit` deliberately, including its reasons:
+
+      * a request that broke the one-chunk bound is THE finding this
+        instrument exists for, so it is never sampled away -- the emission is
+        forced whenever ``over_bound`` has grown since the last line;
+      * the periodic emission supplies the denominator a breach-only stream
+        would lack;
+      * ``suppressed`` rides the line, because an absence after the first N
+        lines of a rate-limited emitter is NOT a zero (DENOMINATOR LAW).
+
+    Returns True when a line went out. A broken partition is reported as an
+    error line and still counts as an emission -- it is self-indicting, not
+    silent.
+
+    NOT DRAINED on emission, unlike the producer-phase window: the contract in
+    section 5 is ONE CENSUS PER CUTOVER and the acceptance is the WORST
+    request of that cutover, so ``worst`` must be monotone across the
+    cutover's whole readmit wave. `reset_double_prefill_census` is what ends
+    a census, and only the cutover calls it.
+    """
+    global _dpc_emitted, _dpc_suppressed, _dpc_over_bound_seen
+    census = _dpc
+    if census is None or not census.observed:
+        return False
+    every = census_armed()
+    if every <= 0:
+        return False
+    breach = census.over_bound > _dpc_over_bound_seen
+    _dpc_over_bound_seen = census.over_bound
+    _dpc_emitted += 1
+    if breach or _dpc_emitted % every == 0:
+        try:
+            logger.warning(
+                "%s suppressed=%d", census.format_line(), _dpc_suppressed
+            )
+        except ValueError as exc:
+            logger.error(
+                "[%s] BROKEN PARTITION -- the instrument is miscounting, do "
+                "not read its verdict: %s",
+                DOUBLE_PREFILL_LINE_PREFIX,
+                exc,
+            )
+        return True
+    _dpc_suppressed += 1
+    return False
+
+
+def reset_double_prefill_census() -> None:
+    """End the current census. Called by the cutover, per the section-5
+    contract 'one census per cutover'.
+
+    Deliberately does NOT emit: the emission is the recording site's, so a
+    cutover that retracted nothing cannot manufacture a line about a wave
+    that never happened.
+    """
+    global _dpc, _dpc_over_bound_seen
+    _dpc = None
+    _dpc_over_bound_seen = 0
+
+
+def double_prefill_census():
+    """The live census, or None. Tests and callers that need to assert on the
+    state read it here rather than reaching for the module global."""
+    return _dpc
