@@ -131,65 +131,8 @@ class TheZeroOfferIsHonourableRegardlessOfTheLookup(unittest.TestCase):
                 self.assertEqual(effective, {RID: 0})
                 self.assertFalse(amended.entries[0].retracted)
 
-    def test_a_positive_offer_to_an_unresolved_rid_still_defers(self):
-        """The hoist must not become a blanket amnesty: told>0 on a rid
-        nobody could find is still not admissible this pass."""
-        effective, amended = _reconcile(512, None)
-        self.assertEqual(effective, {})
-        self.assertTrue(amended.entries[0].retracted)
-        self.assertTrue(amended.entries[0].unresolved)
-
-
 class TheTwoPopulationsAreSeparableOnTheWire(unittest.TestCase):
     """Part 2. The whole reason #797c and #798 each read as a fresh defect."""
-
-    def test_a_lookup_miss_is_unresolved_and_teaches_nothing(self):
-        _, amended = _reconcile(512, None)
-        entry = amended.entries[0]
-        self.assertTrue(entry.unresolved, "the miss must say it is a miss")
-        self.assertIsNone(
-            entry.observed_local,
-            "a miss measured nothing, so it must put no number on the wire -- "
-            "`observed_local` feeds `_learned_floor`, which clamps the next "
-            "offer, and a floor from an unmeasured number is the class again",
-        )
-        self.assertEqual(entry.retracted_by_rank, RANK)
-
-    def test_a_genuine_shortfall_is_measured_and_is_not_unresolved(self):
-        _, amended = _reconcile(512, 128)
-        entry = amended.entries[0]
-        self.assertFalse(
-            entry.unresolved,
-            "a rank that resolved the rid and found 128 tokens measured "
-            "something; it must never be pooled with the ranks that found "
-            "nothing to measure",
-        )
-        self.assertEqual(entry.observed_local, 128)
-
-    def test_the_explicit_sentinel_and_the_absent_key_agree(self):
-        """`local_match_lens` may spell the miss either way (the mixin writes
-        the sentinel; a caller that never wrote the key at all is the same
-        fact). Both must land in the same population."""
-        by_absence = _reconcile(512, None)[1].entries[0]
-        by_sentinel = _reconcile(512, UNKNOWN_MATCH)[1].entries[0]
-        self.assertEqual(by_absence.unresolved, by_sentinel.unresolved)
-        self.assertEqual(by_absence.observed_local, by_sentinel.observed_local)
-        self.assertTrue(by_sentinel.unresolved)
-
-    def test_the_flag_survives_the_wire_codec(self):
-        from sglang.srt.managers.scheduler_pp_mixin import (
-            pp_admission_decision_from_wire,
-            pp_admission_decision_to_wire,
-        )
-
-        _, amended = _reconcile(512, None)
-        back = pp_admission_decision_from_wire(pp_admission_decision_to_wire(amended))
-        self.assertTrue(
-            back.entries[0].unresolved,
-            "PP0 is not the rank that observes the miss, so the flag is "
-            "useless unless it crosses the wire",
-        )
-        self.assertIsNone(back.entries[0].observed_local)
 
     def test_an_already_retracted_entry_passes_through_verbatim(self):
         """#791's exactly-once contract, re-pinned against the new field: a
@@ -396,36 +339,6 @@ class TheBoundActuallyTerminates(unittest.TestCase):
             guard.record_return_trip(amended)
         return told, effective
 
-    def test_the_bound_holds_with_the_RING_BROKEN(self):
-        """#944b THE REGRESSION THE LIVE BOOT FOUND, as a desk test.
-
-        No lap is ever delivered -- `record_return_trip` is never called, which
-        is the measured live condition. The bound must still terminate, because
-        a bound that needs the ring cannot end a failure that stops the ring.
-        """
-        g = PPAdmissionCongruenceGuard()
-        tolds, served_at = [], None
-        for i in range(UNRESOLVED_DEFER_CAP + 5):
-            told, effective = self._round(g, 4096, deliver=False)
-            tolds.append(told)
-            if RID in effective:
-                served_at = i
-                break
-        self.assertIsNotNone(
-            served_at,
-            f"THE 2026-08-27 LIVE FAILURE, reproduced: told never moved and "
-            f"nothing was ever served -- {tolds}. A lap-fed counter reads 0 "
-            f"exactly when the ring is broken, which is when it must not.",
-        )
-        self.assertEqual(tolds[-1], 0, f"the terminator is told=0: {tolds}")
-        self.assertEqual(
-            g.unresolved_rounds(RID),
-            0,
-            "and it terminated with the LAP-FED counter still at zero -- proof "
-            "the bound did not lean on the return trip",
-        )
-        self.assertGreater(g.offer_streak(RID), 0)
-
     def test_the_630_SHORTFALL_loop_is_bounded_too_when_the_ring_is_broken(self):
         """SIBLING SWEEP RESULT (#630, the THIRD instance of the class).
 
@@ -462,39 +375,6 @@ class TheBoundActuallyTerminates(unittest.TestCase):
             "and it terminated with NO floor learned -- proving the bound and "
             "the #630 floor are independent mechanisms",
         )
-
-    def test_a_permanently_unresolvable_rid_is_served_within_the_cap(self):
-        g = PPAdmissionCongruenceGuard()
-        tolds, served_at = [], None
-        for i in range(UNRESOLVED_DEFER_CAP + 5):
-            told, effective = self._round(g, 4096)
-            tolds.append(told)
-            if RID in effective:
-                served_at = i
-                break
-        self.assertIsNotNone(
-            served_at,
-            f"the re-offer never terminated: told sequence {tolds} -- this is "
-            f"the 2106-void loop, and an unbounded defer is the #858 shape",
-        )
-        self.assertLessEqual(
-            served_at,
-            UNRESOLVED_DEFER_CAP,
-            f"the bound must be the cap, not 'eventually': {tolds}",
-        )
-        self.assertEqual(tolds[-1], 0, f"the terminator is told=0: {tolds}")
-
-    def test_without_the_cap_the_same_drive_never_terminates(self):
-        """CAN-FAIL PROOF. Neuter only the cap; the sentinel, the wire flag
-        and the told=0 hoist all still run. If this converges anyway, the cap
-        is not what is doing the terminating and this file is measuring
-        nothing."""
-        g = PPAdmissionCongruenceGuard(unresolved_defer_cap=0)
-        for _ in range(UNRESOLVED_DEFER_CAP + 20):
-            told, effective = self._round(g, 4096)
-            self.assertEqual(told, 4096, "nothing else damps the re-offer")
-            self.assertEqual(effective, {})
-
 
 class _CanRunListReq:
     """A request in the shape PRODUCTION re-offers, which is the shape none of
@@ -764,6 +644,19 @@ class TheConsumerSweepRatchet(unittest.TestCase):
     EXPECTED_OBSERVED_LOCAL_READERS = {
         "sglang/srt/managers/pp_admission_congruence.py",
         "sglang/srt/managers/scheduler_pp_mixin.py",
+        # #1058c, and the ratchet caught it rather than a human noticing:
+        # the told-vs-local census gained its observation point here after
+        # its only previous caller turned out to sit in the one arm of the
+        # three-way clamp choice that the shipping form never takes
+        # (Row Authority is the default, so every boot of this campaign
+        # reported `evaluated=0` -- "nobody ever looked", read for weeks as
+        # "PP0 never overshot"). ITS DECISION FOR THE None CASE, which is
+        # what this pin exists to force someone to state: the census counts
+        # a None into its own `absent` bucket and NEVER folds it into
+        # `agree`/`told_over`/`told_under`, and its reading rule is printed
+        # beside the numbers -- `told_over=0` counts only when
+        # (evaluated - absent) > 0. A miss stays a miss.
+        "sglang/srt/managers/scheduler.py",
     }
 
     #: The TEST readers, pinned separately and deliberately. A value's meaning
@@ -774,12 +667,22 @@ class TheConsumerSweepRatchet(unittest.TestCase):
     #: failing test. Adding a reader here is cheap; the point is that it cannot
     #: happen silently.
     EXPECTED_OBSERVED_LOCAL_TEST_READERS = {
-        "test_pp_admission_retry_livelock_630.py",
+        # #1072c: `test_pp_admission_retry_livelock_630.py` NO LONGER READS
+        # `observed_local`. Its three tests that did were pinning the
+        # retraction retry/defer cycle, and that mechanism is deleted -- the
+        # told/local comparison it drove compared PP0's plan for chunk N
+        # against a downstream rank's state after chunk N-1 (measured on
+        # boot 1071cut: told=8192 local=4096 on an EMPTY store, one
+        # --chunked-prefill-size apart, i.e. the pipeline stagger). The file
+        # itself survives with its remaining tests.
         "test_pp_admission_wiring_791.py",
         "test_pp_dead_peer_is_not_the_wedge_801.py",
         "test_pp_proxy_retracted_pass_mispair_791c.py",
         "test_pp_reconcile_slot_blind_798.py",
-        "test_pp_retracted_pass_void_797.py",
+        # #1072/#1072c: `test_pp_retracted_pass_void_797.py` and
+        # `test_pp_void_send_contract_801.py` are DELETED with the void relay
+        # and the retraction they pinned. A test of a deleted mechanism is
+        # deleted with it, not kept green against a stub.
         "test_pp_unresolved_defer_cap_944.py",
         # Added because THIS RATCHET CAUGHT IT, on its first run after the
         # gloo falsifiers were written -- which is the can-fail proof this
@@ -787,7 +690,6 @@ class TheConsumerSweepRatchet(unittest.TestCase):
         # case: `observed_local` must be None on every round of the clean
         # drive and 0 on at least one round of the danger mutant.
         "test_pp_unresolved_group_defer_gloo_944.py",
-        "test_pp_void_send_contract_801.py",
         # #963: the prefix-scoped floor learns from the same `observed_local`,
         # so it is a reader of this value's MEANING. Its assertion for the
         # UNRESOLVED (None) case is that the miss teaches the PREFIX floor

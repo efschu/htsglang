@@ -109,44 +109,6 @@ class TheLoopWithoutTheGuardTest(CustomTestCase):
     reproduce the FIRST cycle's exact failure, not just fail again by
     coincidence -- that reproduction is the loop."""
 
-    def test_the_second_pass_repeats_the_identical_exclusion(self):
-        decision0_c1 = build_pp_admission_decision(
-            mb_id=0, reqs=_reqs(), pp_size=WORLD, guard=None
-        )
-        eff1_c1, decision1_c1 = reconcile_pp_admission_decision(
-            decision0_c1, PP1_LOCAL_MATCH, rank=PP1, pp_size=WORLD
-        )
-
-        # Cycle 2: "later pass" re-admission, per #791's degrade contract --
-        # PP0's own local state has not changed (nothing warmed it), so it
-        # re-derives from the SAME raw fixture, with no guard consulted.
-        decision0_c2 = build_pp_admission_decision(
-            mb_id=1, reqs=_reqs(), pp_size=WORLD, guard=None
-        )
-        eff2_c2, decision1_c2 = reconcile_pp_admission_decision(
-            decision0_c2, PP1_LOCAL_MATCH, rank=PP1, pp_size=WORLD
-        )
-
-        self.assertNotIn("req", eff1_c1, "cycle 1 must exclude the unhonourable rid")
-        self.assertNotIn(
-            "req",
-            eff2_c2,
-            "cycle 2 excludes it AGAIN -- with no guard, nothing forced a "
-            "lower told, so it is unserved twice in a row",
-        )
-
-        entry_c1 = decision1_c1.by_rid()["req"]
-        entry_c2 = decision1_c2.by_rid()["req"]
-        self.assertEqual(
-            (entry_c1.prefix_len, entry_c1.observed_local, entry_c1.retracted),
-            (entry_c2.prefix_len, entry_c2.observed_local, entry_c2.retracted),
-            "the SAME (told, local, retracted) outcome twice is the loop, "
-            "not just 'it failed again' -- an identical repeat is what "
-            "distinguishes 'stuck' from 'still degrading'",
-        )
-        self.assertEqual(entry_c1.prefix_len, 120, "told did not move between cycles")
-        self.assertEqual(entry_c2.prefix_len, 120)
-
     def test_liveness_and_sibling_unaffected_across_the_looping_cycles(self):
         decision0_c1 = build_pp_admission_decision(
             mb_id=0, reqs=_reqs(), pp_size=WORLD, guard=None
@@ -176,86 +138,6 @@ class TheGuardBreaksTheLoopTest(CustomTestCase):
     carry a STRICTLY lower `told` and the request must be SERVED -- and the
     learned floor must be gone afterward, or the guard would simply have
     swapped one permanent penalty (exclusion) for another (a frozen cap)."""
-
-    def test_the_second_pass_advances_and_serves_the_request(self):
-        guard = PPAdmissionCongruenceGuard()
-
-        # Cycle 1: identical to the RED test -- an empty guard changes nothing.
-        decision0_c1 = build_pp_admission_decision(
-            mb_id=0, reqs=_reqs(), pp_size=WORLD, guard=guard
-        )
-        self.assertEqual(
-            decision0_c1.by_rid()["req"].prefix_len,
-            120,
-            "an empty guard must not alter the first pass -- there is "
-            "nothing yet to have learned",
-        )
-        eff1_c1, decision1_c1 = reconcile_pp_admission_decision(
-            decision0_c1, PP1_LOCAL_MATCH, rank=PP1, pp_size=WORLD
-        )
-        self.assertNotIn("req", eff1_c1)
-
-        # The return trip: this is the ONLY new wiring the guard needs --
-        # feeding the SAME amended_decision the caller already forwards.
-        guard.record_return_trip(decision1_c1)
-        self.assertEqual(
-            guard.outstanding_rids(),
-            ("req",),
-            "the guard must learn from the retraction, and ONLY the "
-            "retracted rid -- sibling was served cleanly and must not "
-            "appear here",
-        )
-
-        # Cycle 2: same raw fixture (PP0's own state is still unchanged --
-        # this is the whole point), but now the guard clamps `told`.
-        decision0_c2 = build_pp_admission_decision(
-            mb_id=1, reqs=_reqs(), pp_size=WORLD, guard=guard
-        )
-        entry0_c2 = decision0_c2.by_rid()["req"]
-        self.assertEqual(
-            entry0_c2.prefix_len,
-            64,
-            "cycle 2 must ask for the learned floor (PP1's observed local "
-            "match), STRICTLY less than cycle 1's told=120 -- this is the "
-            "state advancing, not merely retrying",
-        )
-        self.assertLess(
-            entry0_c2.prefix_len,
-            decision0_c1.by_rid()["req"].prefix_len,
-            "strict decrease: the formal termination property",
-        )
-        self.assertEqual(
-            entry0_c2.prefix_len + entry0_c2.extend_len,
-            120 + 80,
-            "clamping told down must not shrink the request -- the "
-            "difference moves to extend_len, the total token count is "
-            "invariant",
-        )
-
-        eff2_c2, decision1_c2 = reconcile_pp_admission_decision(
-            decision0_c2, PP1_LOCAL_MATCH, rank=PP1, pp_size=WORLD
-        )
-        self.assertEqual(
-            eff2_c2.get("req"),
-            64,
-            "SERVED: local (64) now meets told (64) -- the safe-truncate "
-            "branch, not another retraction",
-        )
-        entry1_c2 = decision1_c2.by_rid()["req"]
-        self.assertFalse(entry1_c2.retracted, "no second exclusion")
-        self.assertTrue(entry1_c2.admitted)
-
-        # The return trip for the successful pass must clear the floor --
-        # served-once, not a permanent cap.
-        guard.record_return_trip(decision1_c2)
-        self.assertEqual(
-            guard.outstanding_rids(),
-            (),
-            "the learned floor must clear once the rid is served with no "
-            "retraction anywhere in the chain -- an uncleared floor would "
-            "permanently cap this rid's reuse even after its cache state "
-            "improves",
-        )
 
     def test_liveness_and_sibling_unaffected_across_both_guarded_cycles(self):
         guard = PPAdmissionCongruenceGuard()
@@ -308,54 +190,6 @@ class TerminationAcrossMoreThanOneDownstreamRankTest(CustomTestCase):
     now offered told=64 -- can only honour 50 (tightens floor=50), and only
     on the pass after THAT does every rank finally agree. Three strictly
     decreasing tolds (120 -> 64 -> 50), never a repeat, then served."""
-
-    def test_three_cycles_strictly_decreasing_then_served(self):
-        guard = PPAdmissionCongruenceGuard()
-        req = [_Req(rid="req", prefix_len=120, extend_len=80)]
-        tolds = []
-
-        # Cycle 1: PP1 can only honour 64.
-        d0 = build_pp_admission_decision(mb_id=0, reqs=req, pp_size=WORLD, guard=guard)
-        tolds.append(d0.by_rid()["req"].prefix_len)
-        _eff, d1 = reconcile_pp_admission_decision(
-            d0, {"req": 64}, rank=PP1, pp_size=WORLD
-        )
-        self.assertTrue(d1.by_rid()["req"].retracted)
-        guard.record_return_trip(d1)
-
-        # Cycle 2: told is now clamped to 64. PP1 honours it (its match is
-        # stable at 64), but PP2 -- seeing this decision for the first time
-        # on this pass -- can only honour 50.
-        d0 = build_pp_admission_decision(mb_id=1, reqs=req, pp_size=WORLD, guard=guard)
-        tolds.append(d0.by_rid()["req"].prefix_len)
-        self.assertEqual(d0.by_rid()["req"].prefix_len, 64)
-        _eff1, d1 = reconcile_pp_admission_decision(
-            d0, {"req": 64}, rank=PP1, pp_size=WORLD
-        )
-        self.assertFalse(d1.by_rid()["req"].retracted, "PP1 honours told=64")
-        _eff2, d2 = reconcile_pp_admission_decision(
-            d1, {"req": 50}, rank=PP2, pp_size=WORLD
-        )
-        self.assertTrue(d2.by_rid()["req"].retracted, "PP2 cannot honour told=64")
-        guard.record_return_trip(d2)
-
-        # Cycle 3: told is now clamped to 50. Both PP1 and PP2 honour it.
-        d0 = build_pp_admission_decision(mb_id=2, reqs=req, pp_size=WORLD, guard=guard)
-        tolds.append(d0.by_rid()["req"].prefix_len)
-        self.assertEqual(d0.by_rid()["req"].prefix_len, 50)
-        eff1, d1 = reconcile_pp_admission_decision(
-            d0, {"req": 64}, rank=PP1, pp_size=WORLD
-        )
-        eff2, d2 = reconcile_pp_admission_decision(
-            d1, {"req": 50}, rank=PP2, pp_size=WORLD
-        )
-        guard.record_return_trip(d2)
-
-        self.assertEqual(tolds, [120, 64, 50], "strictly decreasing, never repeated")
-        self.assertEqual(eff2.get("req"), 50, "served on the third pass")
-        self.assertFalse(d2.by_rid()["req"].retracted)
-        self.assertEqual(guard.outstanding_rids(), (), "floor cleared once served")
-
 
 if __name__ == "__main__":
     unittest.main()

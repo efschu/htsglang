@@ -190,75 +190,6 @@ class TestTheGuardMustStillBeAbleToFire(unittest.TestCase):
     reintroduce the mispair #791 exists to prevent. Each of these is a
     dying mutant for that fix."""
 
-    def test_a_rid_no_slot_holds_is_still_retracted(self):
-        """Genuinely absent everywhere -> the retraction is CORRECT."""
-        holder = _holder(chunked_req=None, by_slot=[None, None, None])
-        decision = _decision(SLOT_UNDER_TEST, RID_STUCK)
-
-        effective, amended = holder._pp_reconcile_incoming_admission(decision)
-
-        entry = _entry(amended, RID_STUCK)
-        self.assertTrue(
-            entry.retracted,
-            "a rank that really has nothing for this rid MUST retract, or the "
-            "pass it runs is a strict subset of the one already launched",
-        )
-        # #944 CONTRACT INVERTED, NOT RELAXED. This pinned the miss as the
-        # specimen's exact 0 -- correct while a lookup miss was SPELLED AS A
-        # MEASUREMENT, which is the class #944 removes (#797c, #798 and #944
-        # are three instances of it). The BEHAVIOUR reproduced here is
-        # unchanged: the entry is still retracted and still absent from
-        # `effective`. Only the number changes, from a 0 indistinguishable
-        # from "no prefix" to a named sentinel. Inverted deliberately and
-        # never deleted -- this file is the proof the class fix landed.
-        self.assertIsNone(entry.observed_local)
-        self.assertTrue(
-            entry.unresolved,
-            "and it says WHY it retracted: no slot holds this rid, so nothing "
-            "was measured. A rank that had measured a genuine 0 would say the "
-            "opposite -- those are the two populations, and keeping them "
-            "apart is the fix",
-        )
-        self.assertNotIn(RID_STUCK, effective)
-
-    def test_a_short_local_match_is_still_retracted(self):
-        """Present in the right slot, but SHORT. Still unhonourable."""
-        short = _chunked_req(RID_STUCK, TOLD - 4096)
-        holder = _holder(chunked_req=None, by_slot=[None, None, short])
-        decision = _decision(SLOT_UNDER_TEST, RID_STUCK)
-
-        _effective, amended = holder._pp_reconcile_incoming_admission(decision)
-
-        entry = _entry(amended, RID_STUCK)
-        self.assertTrue(
-            entry.retracted,
-            "slot-awareness must make the measurement TRUE, not permissive",
-        )
-        self.assertEqual(
-            entry.observed_local,
-            TOLD - 4096,
-            "and the shortfall #630 learns must be the real one",
-        )
-
-    def test_the_wrong_slot_is_not_consulted_as_a_fallback(self):
-        """Reading ANY slot that happens to hold the rid would be the same
-        class of bug with a wider blast radius: it would answer a question
-        about slot 2 with slot 0's progress. The decision names its slot;
-        only that slot may answer for it."""
-        stale = _chunked_req(RID_STUCK, TOLD)
-        holder = _holder(chunked_req=None, by_slot=[stale, None, None])
-        decision = _decision(SLOT_UNDER_TEST, RID_STUCK)
-
-        _effective, amended = holder._pp_reconcile_incoming_admission(decision)
-
-        entry = _entry(amended, RID_STUCK)
-        self.assertTrue(
-            entry.retracted,
-            "slot %d holds nothing for this rid; slot %d's progress is not an "
-            "answer about slot %d" % (SLOT_UNDER_TEST, OTHER_SLOT, SLOT_UNDER_TEST),
-        )
-
-
 class TestTheShippedPathsAreUnchanged(unittest.TestCase):
     def test_the_single_slot_chunked_request_still_matches(self):
         """#797c's own case: ``self.chunked_req`` IS the request. This is the
@@ -308,26 +239,6 @@ class TestTheShippedPathsAreUnchanged(unittest.TestCase):
         self.assertEqual(effective, {})
         self.assertIs(amended, decision)
 
-    def test_a_missing_slot_ring_does_not_raise(self):
-        """A holder predating the ring (or a stand-in) must degrade to the
-        shipped behaviour, not to an AttributeError on the admission path."""
-        holder = _holder(chunked_req=None, by_slot=[None, None, None])
-        del holder._pp_chunked_req_before_by_slot
-        decision = _decision(SLOT_UNDER_TEST, RID_STUCK)
-
-        _effective, amended = holder._pp_reconcile_incoming_admission(decision)
-
-        self.assertTrue(_entry(amended, RID_STUCK).retracted)
-
-    def test_an_out_of_range_mb_id_does_not_raise(self):
-        holder = _holder(chunked_req=None, by_slot=[None, None, None])
-        decision = _decision(RING + 5, RID_STUCK)
-
-        _effective, amended = holder._pp_reconcile_incoming_admission(decision)
-
-        self.assertTrue(_entry(amended, RID_STUCK).retracted)
-
-
 class TestNeuteringTheSlotLookupRestoresTheDefect(unittest.TestCase):
     """THE DYING MUTANT for the one call edge this change adds.
 
@@ -336,47 +247,6 @@ class TestNeuteringTheSlotLookupRestoresTheDefect(unittest.TestCase):
     then the passing tests above are passing for some other reason and this
     fix is not the thing doing the work.
     """
-
-    def test_blinding_the_slot_lookup_brings_the_livelock_back(self):
-        stuck = _chunked_req(RID_STUCK, TOLD)
-        holder = _holder(chunked_req=None, by_slot=[None, None, stuck])
-
-        with mock.patch.object(
-            spm, "pp_chunked_req_for_slot", lambda holder, mb_id: None
-        ):
-            _effective, amended = holder._pp_reconcile_incoming_admission(
-                _decision(SLOT_UNDER_TEST, RID_STUCK)
-            )
-
-        entry = _entry(amended, RID_STUCK)
-        self.assertTrue(
-            entry.retracted,
-            "with the slot lookup blinded the rank must fall back to the "
-            "false negative -- if it does not, this test file is not "
-            "measuring the fix it claims to measure",
-        )
-        # #944 CONTRACT INVERTED, NOT RELAXED. This pinned the miss as the
-        # specimen's exact 0 -- correct while a lookup miss was SPELLED AS A
-        # MEASUREMENT, which is the class #944 removes (#797c, #798 and #944
-        # are three instances of it). The BEHAVIOUR reproduced here is
-        # unchanged: the entry is still retracted and still absent from
-        # `effective`. Only the number changes, from a 0 indistinguishable
-        # from "no prefix" to a named sentinel. Inverted deliberately and
-        # never deleted -- this file is the proof the class fix landed.
-        self.assertIsNone(
-            entry.observed_local,
-            "the blinded lookup must still reproduce the defect, and it does; "
-            "the miss now teaches the learned floor NOTHING instead of "
-            "clamping it from a number nobody measured",
-        )
-        self.assertTrue(
-            entry.unresolved,
-            "and the blinded lookup is reported as a LOOKUP failure -- which "
-            "is what makes this neuter visible at all. Before #944 blinding a "
-            "lookup and having a genuinely cold rank produced byte-identical "
-            "output, so a can-fail proof of a lookup could not distinguish "
-            "itself from the thing it was proving",
-        )
 
     def test_the_shipped_chunked_lookup_is_a_separate_edge(self):
         """#797c's lookup must survive the neuter, or a single proof could
