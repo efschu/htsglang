@@ -2904,10 +2904,35 @@ class Scheduler(
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
-                )
-                continue
+                # #631 ROW AUTHORITY: this idle verdict is RANK-LOCAL, and on
+                # a downstream PP rank it is exactly the divergence class the
+                # row channel exists to end -- measured on boot 631row18:
+                # PP0 (idle after check-1) queued check-2 and admitted it
+                # (fwd_ct=1), while PP1's own is_fully_idle still read busy
+                # and this `continue` silently dropped the relayed request;
+                # the row then named a rid this rank could never locate and
+                # the ring wedged. Downstream does not verdict: PP0 owns the
+                # admission truth, a relayed health request is enqueued, and
+                # it lives or dies by PP0's rows. Older lingering health rids
+                # are purged first -- upstream dispatches a health probe only
+                # at idle and each carries a fresh rid, so at most the newest
+                # can ever be named by a row; an older one was completed or
+                # dropped on PP0 and would only pollute the idle predicate.
+                if (
+                    pp_row_authority_enabled(self)
+                    and getattr(getattr(self, "ps", None), "pp_rank", 0) != 0
+                    and getattr(getattr(self, "ps", None), "pp_size", 1) > 1
+                ):
+                    self.waiting_queue = [
+                        r
+                        for r in self.waiting_queue
+                        if not is_health_check_generate_req(r)
+                    ]
+                else:
+                    self.return_health_check_ipcs.append(
+                        getattr(recv_req, "http_worker_ipc", None)
+                    )
+                    continue
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
