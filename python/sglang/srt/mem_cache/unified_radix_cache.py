@@ -65,11 +65,22 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.match_refusal_census import (
+    WB_EVICT_SHORT,
+    WB_GRANTED,
+    WB_HOST_FLOOR,
+    WB_MAMBA_PIN,
+    WB_NO_CONTROLLER,
+    WB_PARENT_DECLINED,
+    WB_RING_DECLINED,
+    WB_WRITE_FAILED,
     emit as census_emit,
     format_prefetch_gate as _format_prefetch_gate,
+    format_write_backup as _format_write_backup,
     new_match_census,
     note_prefetch_gate as _note_prefetch_gate,
+    note_write_backup as _note_write_backup,
     prefetch_gate_due as _prefetch_gate_due,
+    write_backup_reason_due as _wb_reason_due,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
@@ -815,6 +826,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # law. Counted rather than silent, so a collapsing storage hit rate is
         # attributable to the law and not to the backend.
         self._host_insert_refused_unbacked_parent = 0
+        # #1081: per-reason counts for the write-through declines that leave a
+        # node un-backed in the first place. Separate from the census dict so
+        # the RATE LIMIT is per reason -- one saturated term must not silence
+        # the first occurrence of another.
+        self._wb_decline_n: dict[str, int] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -1829,6 +1845,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # printed, because this call did not exist. See `prefetch_gate_due`.
         if _prefetch_gate_due():
             logger.info("%s", _format_prefetch_gate())
+            # #1081 WIRED IN THE SAME BREATH, deliberately. `format_prefetch_gate`
+            # existed with ZERO callers for twelve days and its counters were
+            # unreadable the whole time (PRESENT-BUT-UNWIRED, the middle state
+            # of the three-state delivery rule and the most expensive one).
+            # Sharing this cadence means the write-backup census cannot repeat
+            # that: if the prefetch-gate line appears in a log, this one does
+            # too, and one env knob arms both.
+            logger.info("%s", _format_write_backup())
         # #1040: THE KEY DEPTH IS RETURNED BESIDE THE ANCHOR, NOT INSTEAD OF IT.
         # `cum_tokens` is how far the KEY matched, with no validator consulted;
         # `best_match_node` is how far a node was accepted BY the validators,
@@ -2210,15 +2234,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._host_insert_refused_unbacked_parent <= 40
                 or self._host_insert_refused_unbacked_parent % 256 == 0
             ):
+                # #1081 THE FIFTH STATE, and it is the one a reader cannot
+                # guess. `backuped` is FALSE while a write-through is still in
+                # flight -- `write_backup` returns after
+                # `_track_write_through_node`, and the host copy only becomes
+                # visible at `_finish_write_through_ack`. So this line has two
+                # completely different meanings and printed neither:
+                #   inflight=0  the backup was REFUSED (or never attempted);
+                #               `#1081 write-backup declined reason=...` names
+                #               which term said no.
+                #   inflight=1  the backup is UNDERWAY and this decline is a
+                #               RACE, not a refusal -- retrying later would
+                #               succeed and no capacity fix would help.
+                # Without it the transient reads exactly like the permanent
+                # one, and the next reader roots the wrong half.
+                _inflight = int(node.id in self.ongoing_write_through)
                 logger.warning(
                     "#841 host-only insert declined (n=%d): parent node %s "
                     "carries no host copy, so a backed child under it could be "
                     "orphaned by a device eviction. matched=%d declined=%d "
-                    "-- the declined tail is released, NOT published.",
+                    "#1081 inflight=%d -- the declined tail is released, NOT "
+                    "published.",
                     self._host_insert_refused_unbacked_parent,
                     node.id,
                     matched_length,
                     total_len - matched_length,
+                    _inflight,
                 )
             # The caller reserved the tail for a node that will not exist.
             # Nothing in the tree can free it, so say so.
@@ -2598,6 +2639,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """Backup a node's data from device to host (D->H)."""
         if self.cache_controller is None:
+            _note_write_backup(WB_NO_CONTROLLER)
             return 0
 
         # #581 pin budget, #773: a write-through pin on a node that carries a
@@ -2613,6 +2655,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # not use nor strands a host allocation.
         if not self._mamba_write_through_pin_admissible(node, write_back=write_back):
             self._note_mamba_pin_skipped()
+            _note_write_backup(WB_MAMBA_PIN)
             return 0
 
         # Backup invariant (write-through): parent must be backuped first
@@ -2620,6 +2663,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.parent is not self.root_node and not node.parent.backuped
         ):
             if self.write_backup(node.parent) <= 0:
+                # #1081: this node is not refused on its own merits -- it
+                # INHERITS its parent's refusal. Counted apart so the census
+                # can point at the one node that actually declined instead of
+                # at the whole chain below it.
+                self._note_wb_decline(
+                    WB_PARENT_DECLINED,
+                    node,
+                    f" parent={getattr(node.parent, 'id', '?')}",
+                )
                 return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
@@ -2698,10 +2750,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if host_avail < kv_tokens:
             if uniform_host_floor_active(self):
+                self._note_wb_decline(
+                    WB_HOST_FLOOR,
+                    node,
+                    f" host_avail={host_avail} kv_tokens={kv_tokens}",
+                )
                 return 0
             needed = kv_tokens - host_avail
             evicted = self.evict_host(needed)
             if evicted < needed:
+                self._note_wb_decline(
+                    WB_EVICT_SHORT, node, f" needed={needed} evicted={evicted}"
+                )
                 return 0
 
         # #810: the STAGING bound, taken BEFORE the allocation rather than
@@ -2713,6 +2773,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # role skips the gate entirely.
         ring = self.staging_write_ring
         if ring is not None and not ring.admit(node.id, kv_tokens):
+            self._note_wb_decline(WB_RING_DECLINED, node, f" kv_tokens={kv_tokens}")
             return 0
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -2725,6 +2786,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # never reaches the drain and its admission must not stay charged.
             if ring is not None:
                 ring.abort(node.id)
+            self._note_wb_decline(WB_WRITE_FAILED, node)
             return 0
 
         # #645: charge the admission against the published floor, so the next
@@ -2750,6 +2812,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
         self._track_write_through_node(node, lock_params)
+        # #1081: the denominator. Counting only refusals reads as a
+        # decomposition of a population nobody measured (#873).
+        _note_write_backup(WB_GRANTED)
         return len(host_indices)
 
     def _track_write_through_node(
@@ -5302,6 +5367,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if node.component_data[ComponentType.MAMBA].value is None:
             return True
         return self._mamba_pins_held() < budget
+
+    def _note_wb_decline(self, reason: str, node, detail: str = "") -> None:
+        """#1081: count one ``write_backup`` decline and, rate-limited, name it.
+
+        PURE INSTRUMENT. It decides nothing, returns nothing, and is called
+        immediately before the `return 0` it describes -- never in place of it,
+        so the control flow is byte-identical to before.
+
+        WHY PER-REASON RATE LIMITING rather than one shared counter: a term
+        that saturates (a host tier that is simply full) would otherwise
+        consume the budget and silence the FIRST occurrence of a different
+        term. The reasons point at different files; whichever is loudest must
+        not hide the others.
+        """
+        _note_write_backup(reason)
+        n = self._wb_decline_n.get(reason, 0) + 1
+        self._wb_decline_n[reason] = n
+        if _wb_reason_due(n):
+            logger.warning(
+                "#1081 write-backup declined reason=%s node=%s n=%d%s -- the "
+                "node stays un-backed, so a later host-only insert under it is "
+                "refused by the #841 contiguous-backup law and the fetched "
+                "tail (KV and its mamba anchor) is released.",
+                reason,
+                getattr(node, "id", "?"),
+                n,
+                detail,
+            )
 
     def _note_mamba_pin_skipped(self) -> None:
         """Count and (rate-limited) announce a backup declined by the budget.

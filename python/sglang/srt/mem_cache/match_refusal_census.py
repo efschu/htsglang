@@ -393,3 +393,101 @@ def emit(census: Optional[MatchRefusalCensus], logger) -> None:
                 census.accepted_tokens,
                 census.dead_tokens,
             )
+
+
+#: #1081: why a host WRITE-THROUGH did not happen, counted per reason.
+#:
+#: THE THIRD HALF OF THE SAME ZERO. `#904` says the match refused, `#915` says
+#: no prefetch was attempted -- and both can be downstream of a node that never
+#: acquired a host copy in the first place. `#841` then declines the host insert
+#: under that un-backed parent, and its own log line can name the parent but not
+#: WHY the parent is un-backed.
+#:
+#: Measured on boot_855_1078spec (2026-09-01): three `#841 host-only insert
+#: declined` lines, all three ranks, always `parent node 26`, always
+#: `matched=4096`. `write_backup` has SEVEN exits and only two of them said
+#: anything -- the mamba pin budget (`_note_mamba_pin_skipped`) and the #810
+#: write failure. The other five returned 0 in silence, so the log could not
+#: distinguish a host-budget refusal from an eviction shortfall from a staging
+#: ring decline from a PARENT that was itself refused. Those point at four
+#: different fixes.
+#:
+#: Process-wide and unconditional, exactly like PREFETCH_GATE_COUNTS above and
+#: for the same reason: a counter that only counts when someone remembered to
+#: arm it cannot answer "was it ever tried". `granted` is counted too, so the
+#: parts sum and a rate has a denominator on the same line (#873).
+WRITE_BACKUP_COUNTS: Dict[str, int] = {}
+
+#: The exits of ``UnifiedRadixCache.write_backup``. Named apart because their
+#: remedies are in different files: a host-budget refusal is a capacity
+#: decision (#645), an eviction shortfall is a victim-selection problem, a ring
+#: decline is a drain-rate problem (#810), and PARENT_DECLINED is none of those
+#: -- it is this node inheriting another node's refusal.
+WB_GRANTED = "granted"
+WB_NO_CONTROLLER = "no_controller"
+WB_MAMBA_PIN = "mamba_pin"
+WB_PARENT_DECLINED = "parent_declined"
+WB_HOST_FLOOR = "host_floor"
+WB_EVICT_SHORT = "evict_short"
+WB_RING_DECLINED = "ring_declined"
+WB_WRITE_FAILED = "write_failed"
+
+#: Every reason a caller may pass. A typo becomes a new bucket otherwise, and a
+#: new bucket reads like a new phenomenon.
+WB_REASONS = (
+    WB_GRANTED,
+    WB_NO_CONTROLLER,
+    WB_MAMBA_PIN,
+    WB_PARENT_DECLINED,
+    WB_HOST_FLOOR,
+    WB_EVICT_SHORT,
+    WB_RING_DECLINED,
+    WB_WRITE_FAILED,
+)
+
+#: THE CASCADE DISCRIMINATOR, and it is the reason this census is not just a
+#: counter. `write_backup` recurses into its parent and returns 0 when the
+#: parent is refused, so ONE deep refusal makes every node below it report a
+#: refusal too. Without separating PARENT_DECLINED from the terminal reasons,
+#: the census would report N refusals of the same kind and hide the single node
+#: that actually caused them.
+TERMINAL_WB_REASONS = (
+    WB_MAMBA_PIN,
+    WB_HOST_FLOOR,
+    WB_EVICT_SHORT,
+    WB_RING_DECLINED,
+    WB_WRITE_FAILED,
+)
+
+
+def note_write_backup(reason: str) -> None:
+    """Record one ``write_backup`` outcome. ``WB_GRANTED`` means it succeeded.
+
+    Never raises and never decides anything: an instrument on this path may not
+    be able to change what the path does (#1081 is a measurement, not a fix).
+    """
+    key = str(reason)
+    WRITE_BACKUP_COUNTS[key] = WRITE_BACKUP_COUNTS.get(key, 0) + 1
+
+
+def format_write_backup() -> str:
+    """One line, stable keys, for a log-counter grep.
+
+    Prints `terminal=` beside the raw parts: that is the count of refusals that
+    are somebody's OWN, i.e. the population a fix has to address, as opposed to
+    the ones inherited through the parent recursion.
+    """
+    if not WRITE_BACKUP_COUNTS:
+        return "[#1081 write-backup] no observation"
+    terminal = sum(WRITE_BACKUP_COUNTS.get(r, 0) for r in TERMINAL_WB_REASONS)
+    body = " ".join(f"{k}={v}" for k, v in sorted(WRITE_BACKUP_COUNTS.items()))
+    return f"[#1081 write-backup] {body} terminal={terminal}"
+
+
+def write_backup_reason_due(count: int) -> bool:
+    """The #841 cadence, reused so the two lines cannot drift apart.
+
+    Same shape as `UnifiedRadixCache._insert_helper_host`'s own limiter
+    (`<= 40 or % 256 == 0`): loud while it is news, bounded on a hot loop.
+    """
+    return count <= 40 or count % 256 == 0
