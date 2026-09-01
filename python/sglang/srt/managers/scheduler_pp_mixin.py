@@ -8557,6 +8557,13 @@ class SchedulerPPMixin:
         counters = getattr(self, "pp_flip_counters", None)
         if receiver is None or counters is None:
             return None
+        if getattr(self, "_pp_row_chain_owed", False):
+            # A deferred frame proved a request hop is in flight (see the
+            # defer site); the blocking receive completes the sender's
+            # rendezvous. One-shot: re-armed by the next defer if the hop
+            # carried something else.
+            self._pp_row_chain_owed = False
+            return True
         if getattr(receiver, "inbox", None):
             return True
         # THE MATCHED PAIR, not the receiver's own counter (boot 631row7:
@@ -8821,6 +8828,18 @@ class SchedulerPPMixin:
                             str(_missing[0])[:8],
                             _dr,
                         )
+                    # THE DEFERRED FRAME IS THE ATTEMPTED-COUNTER OF THE
+                    # CHAIN (boot 631row15, 43k hot defers): PP0 queues the
+                    # request hop BEFORE it plans the pass, so a frame whose
+                    # row names an unlocatable rid PROVES a chain send is in
+                    # flight -- and the chain wire has no attempted counter
+                    # (shm carries only .s/.c for req), so the sender's
+                    # rendezvous-blocked isend is invisible to the gate:
+                    # sent bumps only after this rank enters the receive
+                    # (the instr7/instr8 cycle, chain edition). Entering the
+                    # blocking chain receive is what completes it, bounded
+                    # by rendezvous+transfer.
+                    self._pp_row_chain_owed = True
                     _trace("defer_rid")
                     return False
             stats["head_this"] += 1
