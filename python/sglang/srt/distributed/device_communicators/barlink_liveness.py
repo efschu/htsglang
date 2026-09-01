@@ -689,6 +689,96 @@ class PeerWatchdog:
 
         return barlink_abort_gate.poll_status_words()
 
+    def abort_poll_suspended(self) -> bool:
+        """#1073: must the DEVICE-side abort poll stand aside right now?
+
+        THE CYCLE THIS BREAKS, measured on boot_855_1072cut (14:00Z), native
+        frames on all three ranks:
+
+            MainThread  cuModuleLoadData <- loadBinary <- _init_handles
+                        <- _init_handles_in_window <- causal_conv1d_fn
+            this thread cuStreamSynchronize <- poll_status_word
+                        (barlink_bar1.py:4948)
+
+        A rank loading a Triton module needs the CUDA context; this thread's
+        poll is a copy plus ``_abort_poll_stream.synchronize()`` and holds it.
+        Closed cycle, 0.0% CPU on every rank, GPU pinned at 100% with the PCIe
+        link idle, no abort raised -- the group simply stops.
+
+        WHY #1056 DOES NOT COVER THIS, and it is a gap in AXIS, not in quality.
+        The loader chokepoint window (#1056) and the publication layer (#615)
+        both reason about "a peer that reaches a COLLECTIVE DEADLINE stretches
+        it instead of aborting". That is the deadline axis, and it is why the
+        symptom changed shape: with the window armed the group no longer
+        ABORTS, it HANGS. This thread is not a collective participant at all --
+        it runs on a timer, in its own thread, so no deadline logic applies to
+        it by construction, and stretching a deadline never frees the device
+        it is occupying.
+
+        THE BLINDNESS THIS COSTS IS BOUNDED THREE WAYS, because a liveness
+        watchdog that goes quiet is exactly the thing this class exists to
+        prevent:
+
+        1. ONLY THE DEVICE HALF STANDS DOWN. ``probe_once`` keeps running on
+           its own cadence: peer death is a HOST fact read from /proc (see
+           ``poll_abort_words``' own docstring on why the two were split), so
+           a genuinely dead peer is still detected and still trips every abort
+           window during the pause. What pauses is the sticky abort-WORD read,
+           which reports a peer that decided to abort -- and a peer cannot
+           reach that decision while the group is stalled in the load anyway.
+        2. RESUME NEEDS NO CLEANUP PATH. This is a stateless question asked
+           fresh every round, not a flag someone has to remember to clear. The
+           window closes in ``cold_build_window``'s ``finally`` on the normal
+           AND the exception path, and the next round therefore polls again.
+           There is no code path on which the poll can stay suspended because
+           an unwind was missed -- which is the failure direction that matters,
+           since a poll that never comes back is silent.
+        3. THE CAP IS THE ONE THAT ALREADY GOVERNS THIS WINDOW, not a second
+           timer for the same deadline. ``in_cold_build_window()`` is a bare
+           depth counter with no clock of its own, so this reads
+           ``barlink_build_window.build_cap_s()`` -- the very frist the PEERS
+           use to decide how long a published window may still matter
+           (default 900 s; this rig's launcher sets 60). Past it the window is
+           void for everyone, so staying blind past it would buy nothing and
+           risk everything.
+        """
+        try:
+            from sglang.srt.utils import jit_cold_build
+        except Exception:  # pragma: no cover - the window is optional context
+            return False
+        if not jit_cold_build.in_cold_build_window():
+            self._abort_poll_suspended_since = None
+            return False
+        now = time.monotonic()
+        since = getattr(self, "_abort_poll_suspended_since", None)
+        if since is None:
+            self._abort_poll_suspended_since = now
+            return True
+        try:
+            from sglang.srt.distributed.device_communicators import (
+                barlink_build_window,
+            )
+
+            cap = barlink_build_window.build_cap_s()
+        except Exception:  # pragma: no cover - fall back to the published default
+            cap = 900.0
+        if cap > 0 and (now - since) > cap:
+            # The window has outlived the frist the peers honour. Whatever is
+            # holding it open is no longer a build the group is waiting for,
+            # and an unbounded blind spot is the worse of the two failures.
+            logger.warning(
+                "#1073 abort-word poll RESUMING under a still-open cold-build "
+                "window: it has been open %.1fs, past the %.1fs cap the peers "
+                "honour (%s). The device poll comes back rather than stay "
+                "blind; if a load really is still running this may re-form the "
+                "contention, and THAT is the event to chase.",
+                now - since,
+                cap,
+                barlink_build_window.ENV_CAP_S,
+            )
+            return False
+        return True
+
     def _stop_on_poison(self, what: str, exc: BaseException) -> bool:
         """#867: the OUTER swallow layer, and the trap it was leaving behind.
 
@@ -755,12 +845,37 @@ class PeerWatchdog:
                 if self._stop_on_poison("peer watchdog probe", exc):
                     break
                 logger.exception("barlink peer watchdog probe failed")
-            try:
-                self.poll_abort_words()
-            except Exception as exc:  # a watchdog must not die
-                if self._stop_on_poison("abort-word poll", exc):
-                    break
-                logger.exception("barlink abort-word poll failed")
+            # #1073: the DEVICE half stands aside inside a cold-build window,
+            # because this poll's `synchronize()` is what the loading rank is
+            # blocked behind. The peer probe above is untouched -- it is a
+            # /proc read, so host-side peer death is still caught while this
+            # is quiet. Counted, not merely skipped: a watchdog that goes
+            # silent without saying for how long is the next benign zero.
+            if self.abort_poll_suspended():
+                self._abort_poll_skipped = getattr(self, "_abort_poll_skipped", 0) + 1
+            else:
+                skipped = getattr(self, "_abort_poll_skipped", 0)
+                if skipped:
+                    self._abort_poll_skipped = 0
+                    self.abort_poll_suspensions = (
+                        getattr(self, "abort_poll_suspensions", 0) + 1
+                    )
+                    logger.info(
+                        "#1073 abort-word poll RESUMED after %d suspended "
+                        "round(s) (~%.1fs) inside a cold-build window: the "
+                        "device was left to the rank loading a Triton module. "
+                        "Host-side peer probing continued throughout; this "
+                        "names the span in which the device abort word was "
+                        "NOT read, so a quiet log here is a measured quiet.",
+                        skipped,
+                        skipped * max(barlink_abort_gate.poll_interval_s(), 0.001),
+                    )
+                try:
+                    self.poll_abort_words()
+                except Exception as exc:  # a watchdog must not die
+                    if self._stop_on_poison("abort-word poll", exc):
+                        break
+                    logger.exception("barlink abort-word poll failed")
             tick = barlink_abort_gate.poll_interval_s()
             self._stop.wait(max(min(tick, max(self._interval, 0.05)), 0.001))
 

@@ -11864,8 +11864,14 @@ class Scheduler(
             "%s #1033c CUTOVER FORWARD WARMUP begin: %s. Shapes first touched "
             "in this layout load their Triton modules now; the window is "
             "PUBLISHED so peers stretch their collective deadlines instead of "
-            "aborting the group (#615). A minutes-long pause here is a cold "
-            "module load, not a wedge.",
+            "aborting the group (#615). A pause here is a cold module load "
+            "ONLY WHILE THE RANKS BURN CPU -- check %%CPU before you wait. "
+            "Compiling is CPU-bound; 0%% CPU with the log frozen and the GPU "
+            "at 100%% is the #1073 wedge (cuModuleLoadData behind this "
+            "thread's own abort-poll synchronize), not a build. This sentence "
+            "said 'not a wedge' unconditionally until 2026-09-01, when "
+            "boot_855_1072cut hung exactly that way on all three ranks and the "
+            "line invited the reader to keep waiting.",
             f"[rank {self.attn_tp_rank if hasattr(self, 'attn_tp_rank') else '?'}]",
             reason,
         )
