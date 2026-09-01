@@ -71,16 +71,43 @@ def _layouts():
 
 class TestBootHoldsOneImageNotTwo(CustomTestCase):
     def test_PhaseFlipStacks_has_no_second_lifetime_image(self):
-        # RED-FIRST AGAINST THE OLD SHAPE: while `image_pp` and `image_tp` are
-        # both fields, RAM holds two layouts for the life of the process and
-        # this assertion fails. That is the dual pin, by another name.
+        # #1078 UPDATED THE PREMISE, NOT THE GUARD. This assertion used to read
+        # "`image_pp`/`image_tp` must not be FIELDS", because while both were
+        # fields RAM held two layouts for the process life -- the dual pin by
+        # another name. That inference is sound for PINNED images and only for
+        # those: two pinned lifetime images are 55.99 GiB across this rig's
+        # three ranks. A FILE-BACKED image is reclaimable page cache and not a
+        # pinned post at all, so the same two images cost disk and no locked
+        # RAM (#1078, weights_arena.require_two_file_preconditions).
+        #
+        # So the guard now pins what it always MEANT: the default stack holds
+        # ONE image. Field absence was a proxy for that, and the proxy stopped
+        # tracking the property. Asserting the fields are gone would now forbid
+        # a scheme that satisfies the memory rule the guard exists to enforce.
+        import sglang.srt.model_executor.weights_arena as _wa
         from sglang.srt.managers.phase_flip_boot import PhaseFlipStacks
 
         names = {f.name for f in dataclasses.fields(PhaseFlipStacks)}
-        self.assertNotIn("image_pp", names)
-        self.assertNotIn("image_tp", names)
         self.assertIn("rotation_image", names)
         self.assertIn("image_holds", names)
+        # The two-file fields exist but are OPT-IN and default to absent, so a
+        # stack that nobody armed still holds exactly one image.
+        defaults = {
+            f.name: f.default
+            for f in dataclasses.fields(PhaseFlipStacks)
+            if f.name in ("image_pp", "image_tp")
+        }
+        self.assertEqual(defaults, {"image_pp": None, "image_tp": None})
+        # And the second image is unreachable under the allocator that would
+        # make it a pin. This is the can-fail half: drop the refusal in
+        # `require_two_file_preconditions` and the dual pin becomes reachable
+        # again, which is the whole content of the original assertion.
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.override(True):
+            with envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.override(False):
+                with self.assertRaises(_wa.WeightsArenaError):
+                    _wa.require_two_file_preconditions()
 
     def test_the_buffer_is_sized_from_the_LARGER_layout(self):
         _pp_named, pp, _tp_named, tp = _layouts()
