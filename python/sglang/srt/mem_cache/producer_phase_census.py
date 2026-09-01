@@ -417,51 +417,56 @@ def payload_verdict(
 ) -> str:
     """What a prefetch-completion line is allowed to call itself.
 
-    FULL COUNT, not a sample. The first reading of this line came from a
-    4-line sample that happened to hit only zeros and reported "18 of 18
-    empty"; the full count says 7 of 18 are empty and 11 carry
-    ``completed_local`` between 3072 and 8192 with ``matched`` following. The
-    retraction is recorded here rather than quietly corrected, because the
-    sampled number was already on its way into a verdict. SAMPLING A LOG IS
-    NOT MEASURING IT.
+    TWO RETRACTIONS ARE RECORDED HERE, both mine, because each was already on
+    its way into a verdict when it was caught.
 
-    WHAT THE FULL COUNT ACTUALLY FOUND, and it is sharper than the sampled
-    claim: the dead column is ``loaded``. SEVENTEEN of eighteen lines carry
-    ``loaded=0`` DESPITE ``matched>0``; exactly one loads (4096). So the
-    defect is not an empty line. It is a line that prints ``matched`` and
-    ``loaded`` side by side, calls itself ``success``, and draws no
-    consequence from the contradiction between them.
+    FIRST: "18 of 18 lines carry an all-zero payload" came from a FOUR-LINE
+    SAMPLE that happened to hit only zeros. Sampling a log is not measuring
+    it. The full count: 7 of 18 empty, 11 carrying ``completed_local``
+    3072-8192.
 
-    ``matched`` says THE STORE HAS IT. ``loaded`` says HOW MUCH ARRIVED. A
-    success label must be read off the second one: what a prefetch is for is
-    the bytes, not the lookup. Hence five verdicts, one per actionable world:
+    SECOND, and this is the one that matters: I then read ``matched>0`` with
+    ``loaded=0`` as a defect signal and called it ``matched_not_loaded``,
+    17/18. That is a FALSE POSITIVE in 14 of the 18, and the refutation is in
+    the emitter's own arithmetic three lines above the log call
+    (``unified_radix_cache.py``): ``matched`` is ``insert_result.prefix_len``
+    -- WHAT THE TREE ALREADY HELD -- and ``loaded`` is
+    ``min_completed_tokens - prefix_len``. So ``matched == completed_synced``
+    forces ``loaded == 0`` as the identity x-x=0, and the emitter says so in
+    as many words: "Arithmetic, not a defect."
 
-      ``delivered``      ``loaded > 0``. Bytes arrived. The only success.
-      ``matched_not_loaded``  ``matched > 0`` and ``loaded == 0``. The store
-                         HAD the page and none of it came across. THE
-                         MEASURED STATE, 17/18 -- and the one that must never
-                         again be spelled "success".
-      ``refused``        nothing arrived, nothing matched, and a refusal was
-                         recorded. The store had an opinion. Read-side.
-      ``empty``          the operation completed and there was nothing to
-                         move. Write-side.
-      ``no_completion``  the operation did not complete. Not a result at all;
-                         calling this success claims the absence of a result
-                         as one.
+    This is the INSTRUMENT-TEXT-LUEGT class B failure exactly -- the
+    conclusion was drawn from a CORRECT line, and the counter-check is to
+    read the line above it. I did not, and the axis I built on it would have
+    reported a healthy tree as broken 14 times out of 18.
 
-    Order matters: ``matched_not_loaded`` is tested BEFORE ``refused`` and
-    ``empty`` so that a partial refusal cannot re-absorb it into a world
-    where nothing was ever there.
+    THE REAL PARTITION OF THE MEASURED 18, which the corrected predicate
+    reproduces: 7 storage-miss, 7 arithmetic, 3 GENUINE refusal (#841
+    ``host_span_unclaimed``), 1 genuine load.
+
+      ``delivered``     ``loaded > 0``. Bytes arrived. 1/18.
+      ``refused``       ``refused > 0``: the tail WAS fetched and the tree
+                        declined to adopt it (#841 contiguous-backup law).
+                        THE ONLY READ-SIDE DEFECT ON THIS LINE. 3/18.
+      ``storage_miss``  ``completed_synced == 0``: nothing came back from the
+                        storage tier at all. Write-side or routing. 7/18.
+      ``arithmetic``    completed, not refused, and the tree already held the
+                        whole fetched span. ``loaded=0`` is the identity, NOT
+                        a defect. 7/18 -- and never again a finding.
+      ``no_completion`` the operation did not complete. Not a result at all.
+
+    ``matched`` is deliberately NOT a discriminator anywhere above. It is the
+    column that produced the false positive, and it earns no vote.
     """
     if int(loaded) > 0:
         return "delivered"
-    if int(matched) > 0:
-        return "matched_not_loaded"
     if int(refused) > 0:
         return "refused"
-    if int(completed_local) > 0 or int(completed_synced) > 0:
-        return "empty"
-    return "no_completion"
+    if int(completed_synced) == 0:
+        if int(completed_local) > 0:
+            return "storage_miss"
+        return "no_completion"
+    return "arithmetic"
 
 
 # --------------------------------------------------------------------------

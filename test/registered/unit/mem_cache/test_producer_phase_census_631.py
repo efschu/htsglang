@@ -202,19 +202,29 @@ def test_numerator_cannot_exceed_denominator():
 # -- a success label must measure its payload ----------------------------
 
 
-def test_the_measured_17_of_18_are_not_successes():
-    """THE specimen, from the FULL count (not the 4-line sample that said 18/18).
+def test_matched_equals_completed_is_arithmetic_not_a_defect():
+    """THE regression that guards my own retracted reading.
 
-    17 of 18 'HiCache prefetch success' lines carry loaded=0 despite
-    matched>0: the store had the page and nothing came across. That is a
-    named state, and it is not success.
+    ``matched == completed_synced`` forces ``loaded == 0`` as the identity
+    x-x=0: the tree already held the whole fetched span. Calling this a
+    defect was a false positive in 14 of the measured 18.
     """
     assert (
         payload_verdict(
             completed_local=8192, completed_synced=8192, matched=8192, loaded=0
         )
-        == "matched_not_loaded"
+        == "arithmetic"
     )
+
+
+def test_matched_never_votes():
+    """The column that produced the false positive earns no vote.
+
+    Same completion, same refusal state, wildly different ``matched``: the
+    verdict must not move.
+    """
+    base = dict(completed_local=8192, completed_synced=8192, loaded=0)
+    assert payload_verdict(matched=0, **base) == payload_verdict(matched=8192, **base)
 
 
 def test_only_arrived_bytes_are_delivery():
@@ -224,19 +234,68 @@ def test_only_arrived_bytes_are_delivery():
     )
 
 
-def test_matched_not_loaded_is_not_reabsorbed_by_refused_or_empty():
-    """A partial refusal must not hide the 17/18 state."""
-    assert payload_verdict(matched=8192, loaded=0, refused=3) == "matched_not_loaded"
+def test_the_three_genuine_841_refusals_are_the_only_read_side_defect():
+    """3 of 18: the tail WAS fetched and the tree declined to adopt it."""
     assert (
-        payload_verdict(completed_local=8192, matched=8192, loaded=0)
-        == "matched_not_loaded"
+        payload_verdict(
+            completed_local=8192, completed_synced=8192, matched=0, loaded=0, refused=1
+        )
+        == "refused"
     )
 
 
-def test_payload_verdict_separates_the_remaining_worlds():
-    assert payload_verdict(completed_local=1, refused=3) == "refused"
-    assert payload_verdict(completed_local=1) == "empty"
-    assert payload_verdict() == "no_completion", "the 7/18 genuinely-empty lines"
+def test_refusal_outranks_arithmetic():
+    """A refusal with a full match is still the defect, not the identity."""
+    assert (
+        payload_verdict(
+            completed_local=8192, completed_synced=8192, matched=8192, refused=1
+        )
+        == "refused"
+    )
+
+
+def test_storage_miss_is_the_seven():
+    """completed_synced == 0: nothing came back from the store at all."""
+    assert (
+        payload_verdict(completed_local=8192, completed_synced=0, matched=0)
+        == "storage_miss"
+    )
+
+
+def test_no_completion_is_not_a_storage_miss():
+    """Nothing completed at all is not a result; it must not be a finding."""
+    assert payload_verdict() == "no_completion"
+
+
+def test_the_partition_reproduces_the_measured_eighteen():
+    """7 storage-miss / 7 arithmetic / 3 refusal / 1 load, from the real shape."""
+    lines = (
+        [dict(completed_local=8192, completed_synced=0, matched=0, loaded=0)] * 7
+        + [dict(completed_local=8192, completed_synced=8192, matched=8192, loaded=0)]
+        * 7
+        + [
+            dict(
+                completed_local=8192,
+                completed_synced=8192,
+                matched=0,
+                loaded=0,
+                refused=1,
+            )
+        ]
+        * 3
+        + [dict(completed_local=4096, completed_synced=4096, matched=0, loaded=4096)]
+    )
+    counts: dict[str, int] = {}
+    for line in lines:
+        v = payload_verdict(**line)
+        counts[v] = counts.get(v, 0) + 1
+    assert counts == {
+        "storage_miss": 7,
+        "arithmetic": 7,
+        "refused": 3,
+        "delivered": 1,
+    }, counts
+    assert sum(counts.values()) == 18, "the parts must sum to the population"
 
 
 # -- the ledger must not forget silently ---------------------------------
