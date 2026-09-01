@@ -8,10 +8,6 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
-    List,
-    Optional,
-    Tuple,
-    Union,
 )
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -44,6 +40,37 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+
+
+def _cached_producer_field(hit_tokens) -> str:
+    """#631 emitter: say which phase PRODUCED the ``#cached-token`` above it.
+
+    THE TRAP THIS CLOSES, caught live on 2026-09-01, and it is the sibling of
+    the one ``_active_phase_field`` closes. That boot printed three TP-phase
+    prefills at ``#cached-token: 16384`` -- which reads exactly like "PP3
+    context was decoded in the TP3 layout", the mission's success condition.
+    The identical 4096/4096/16384 pattern stands in the SAME FILE in the PP
+    phase before any flip: it is in-phase chunked continuation and proves
+    nothing about the flip. ``phase=tp`` names the phase that CONSUMED the
+    tokens; until this field existed, nothing on the line named the phase that
+    PRODUCED them, and the two worlds were byte-identical to a reader.
+
+    So the acceptance clause "ok>0 WITH producer phase" is not a formality: it
+    is the only guard against that inference, and a guard has to sit on the
+    line the reader actually reads, not only in a census line that is off by
+    default.
+
+    Silent when there is nothing to say, exactly as ``_active_phase_field``
+    is, so a boot without the flip prints a byte-identical line.
+    """
+    try:
+        from sglang.srt.mem_cache.producer_phase_census import (
+            prefill_provenance_field,
+        )
+
+        return prefill_provenance_field(hit_tokens)
+    except Exception:  # noqa: BLE001 - a metrics line never breaks a batch
+        return ""
 
 
 def _active_phase_field() -> str:
@@ -227,7 +254,7 @@ class PrefillStats:
     def from_adder(
         cls,
         adder: PrefillAdder,
-        running_reqs: List[Req],
+        running_reqs: list[Req],
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
     ):
@@ -309,8 +336,8 @@ class RankPrefillLog:
     def __init__(self) -> None:
         # Installed by SchedulerMetricsReporter when CUDA-event timing is
         # applicable; stays None otherwise.
-        self.timer: Optional[DeviceTimer] = None
-        self.clock: Optional[CollectiveClock] = None
+        self.timer: DeviceTimer | None = None
+        self.clock: CollectiveClock | None = None
         # #691. Set once, never cleared: the streams have been observed not to
         # pair, so no further duration may be attached to any record on this
         # rank. Reporting resumes in the untimed form rather than stopping,
@@ -322,8 +349,8 @@ class RankPrefillLog:
         self._durations: deque = deque()
         # #363 structured tap: the last flushed line's numbers, for the
         # regime observer. ``None`` until the first timed prefill flushes.
-        self.last_gpu_ms: Optional[float] = None
-        self.last_wait_ms: Optional[float] = None
+        self.last_gpu_ms: float | None = None
+        self.last_wait_ms: float | None = None
         self.last_split_known: bool = False
         # #363 defect 8b. The fields above CARRY FORWARD: they keep the last
         # measurable forward's numbers until another one flushes, which is
@@ -508,9 +535,9 @@ class SchedulerMetricsReporter:
     scheduler: Scheduler
     tp_rank: int
     pp_rank: int
-    dp_rank: Optional[int]
+    dp_rank: int | None
     metrics_collector_context: SchedulerMetricsCollectorContext
-    metrics_collector: Optional[SchedulerMetricsCollector]
+    metrics_collector: SchedulerMetricsCollector | None
     num_retracted_reqs: int = 0
     num_paused_reqs: int = 0
 
@@ -533,7 +560,7 @@ class SchedulerMetricsReporter:
         self,
         tp_rank: int,
         pp_rank: int,
-        dp_rank: Optional[int],
+        dp_rank: int | None,
     ):
         # Basic stats
         self.forward_ct_decode = 0
@@ -590,7 +617,7 @@ class SchedulerMetricsReporter:
 
         self.rank_prefill_log = RankPrefillLog()
 
-        self.forward_pass_device_timer: Optional[DeviceTimer] = None
+        self.forward_pass_device_timer: DeviceTimer | None = None
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
@@ -929,7 +956,7 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
+    def _estimate_prefill_perf(self, batch) -> tuple[float, float, float]:
         if batch is None or batch.extend_lens is None:
             return 0.0, 0.0, 0.0
         tokens = max(0, int(sum(batch.extend_lens)))
@@ -957,7 +984,7 @@ class SchedulerMetricsReporter:
 
     def _estimate_decode_perf(
         self, batch: ScheduleBatch, num_tokens: int
-    ) -> Tuple[float, float, float]:
+    ) -> tuple[float, float, float]:
         tokens = max(0, int(num_tokens))
         if tokens == 0:
             return 0.0, 0.0, 0.0
@@ -1013,10 +1040,10 @@ class SchedulerMetricsReporter:
 
     def report_prefill_stats(
         self,
-        batch: Optional[ScheduleBatch],
+        batch: ScheduleBatch | None,
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
-        dp_cooperation_info: Optional[DPCooperationInfo] = None,
+        dp_cooperation_info: DPCooperationInfo | None = None,
     ):
         # Per-rank line first: it runs on EVERY rank, ahead of the
         # logging-rank gate below.
@@ -1074,7 +1101,8 @@ class SchedulerMetricsReporter:
             f"Prefill batch{iter_msg}{_active_phase_field()}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
-            f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"#cached-token: {prefill_stats.log_hit_tokens}"
+            f"{_cached_producer_field(prefill_stats.log_hit_tokens)}, "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
@@ -1473,7 +1501,7 @@ class SchedulerMetricsReporter:
     def log_batch_result_stats(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: GenerationBatchResult | EmbeddingBatchResult,
     ):
         if not self.enable_metrics:
             return
