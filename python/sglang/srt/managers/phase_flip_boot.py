@@ -59,6 +59,10 @@ from sglang.srt.model_executor.weights_arena import (
     release_host_image,
     pack_into_arena,
     plan_arena_layout,
+    require_two_file_preconditions,
+    tag_layout_image,
+    two_file_images_enabled,
+    two_file_leg,
 )
 
 logger = logging.getLogger(__name__)
@@ -839,6 +843,25 @@ class PhaseFlipStacks:
     #: the weights arena on a VA-stable reservation so the tail can be handed
     #: back to the driver in the phase whose layout does not reach it.
     arena_carrier: object = None
+    #: #1078: the TWO-FILE arm's images -- one per layout, each its own
+    #: exact-sized file, each carrying a trailer that is a BOOT CONSTANT.
+    #: Both None on the default single-image path, and that is the switch
+    #: `_timed_arena_refill` reads: the two arms cannot both be armed, because
+    #: a rotation needs one max-sized buffer and this needs two exact ones.
+    #: Under this arm `rotation_image` is `image_tp` and is never rotated --
+    #: it is simply the resting layout's image at the end of boot, which is
+    #: what `image_holds="tp"` already says.
+    image_pp: Optional[torch.Tensor] = None
+    image_tp: Optional[torch.Tensor] = None
+
+    def two_file_arm(self) -> bool:
+        """Is this stack running the #1078 two-file scheme?
+
+        Read off the STACK, not off the env: the images were decided at boot
+        and an env flipped mid-process must not change which scheme a leg
+        thinks it is running. That is the #742 class in the other direction.
+        """
+        return self.image_pp is not None and self.image_tp is not None
 
     def refill(self, direction: str) -> None:
         """The weights leg of a flip: a chunk ROTATION of the arena (#809/W28).
@@ -1001,6 +1024,11 @@ class PhaseFlipStacks:
         # narrowed candidate set reads as a decomposition. The real one is
         # registered with the seam census below.
         leg_timing = RefillLegTiming()
+        if self.two_file_arm():
+            self._two_file_refill(
+                direction, incoming, outgoing, wants, leg_timing, started
+            )
+            return
         # #809/W28: the leg IS the rotation. `incoming` streams out of the one
         # host buffer and `outgoing` is placed back into it, so the buffer ends
         # holding the layout that just left the arena.
@@ -1135,6 +1163,85 @@ class PhaseFlipStacks:
             logger.info("%s %s", LOG_PREFIX, rotation_report(direction, rot_stats))
             logger.info(
                 "%s %s %s", LOG_PREFIX, direction, rotation_phase_report(rot_phases)
+            )
+        except Exception:  # noqa: BLE001 - an instrument may never break a flip
+            pass
+
+    def _two_file_refill(
+        self, direction: str, incoming, outgoing, wants: str, leg_timing, started
+    ) -> None:
+        """#1078: the leg WITHOUT a copy-back.
+
+        THREE TERMS OF THE ROTATION DO NOT HAPPEN HERE, and their measured
+        share of the leg is why this exists (boot_855_1078spec, PP0 pp_to_tp,
+        63.911 s total): the D2H copy-back 60.692 s (95.0 %), the host-to-host
+        staging `save` 2.805 s (4.4 %), and the trailer write. What is left is
+        the read, which `arena_refill` already routes through #802's `preadv`
+        path for a file-backed image.
+
+        THE MARKER STILL MOVES. `image_holds` means "which layout is resting",
+        and under two files that is still exactly one of them -- the one whose
+        image the next leg will stream in. Keeping it truthful costs nothing
+        and keeps every existing reader (the seam emitters, #758) correct.
+        """
+        import time as _time
+
+        from sglang.srt.managers import phase_flip_seam_census as seam_census
+
+        incoming_image = self.image_tp if wants == "tp" else self.image_pp
+        outgoing_image = self.image_pp if wants == "tp" else self.image_tp
+        outgoing_phase = "pp" if wants == "tp" else "tp"
+        phases: Dict[str, float] = {}
+        two_file_leg(
+            arena=self.arena,
+            incoming_layout=incoming,
+            incoming_image=incoming_image,
+            incoming_phase=wants,
+            outgoing_layout=outgoing,
+            outgoing_image=outgoing_image,
+            outgoing_phase=outgoing_phase,
+            timing=leg_timing,
+            phases=phases,
+        )
+        # Only after the leg returned. A leg that raised left the arena in a
+        # state this marker must not describe -- the same reason the rotation
+        # sets it on the success path only.
+        self.image_holds = outgoing_phase
+        elapsed = _time.perf_counter() - started
+        # #873's requirement, met by the arm that replaces it: the census gets
+        # the decomposition, not one bar. Two terms only, because there are
+        # only two -- naming a phase that does not exist here would be the
+        # narrowed-candidate-set defect #873 recorded on the rotation.
+        seam_census.explain(
+            "weights_refill",
+            (
+                ("anchor", phases.get("anchor", 0.0)),
+                ("read", phases.get("read", 0.0)),
+            ),
+        )
+        try:
+            logger.info(
+                "%s %s -- %s",
+                LOG_PREFIX,
+                refill_report(
+                    direction,
+                    elapsed,
+                    int(incoming.total_bytes),
+                    self._images_are_file_backed(),
+                ),
+                refill_bound_phrase(leg_timing),
+            )
+            logger.info(
+                "%s #1078 %s TWO-FILE leg: %.1f MiB in from the %r image, "
+                "0.0 MiB back (no copy-back) -- anchor %.3fs + read %.3fs "
+                "= %.3fs",
+                LOG_PREFIX,
+                direction,
+                int(incoming.total_bytes) / 1048576.0,
+                wants,
+                phases.get("anchor", 0.0),
+                phases.get("read", 0.0),
+                elapsed,
             )
         except Exception:  # noqa: BLE001 - an instrument may never break a flip
             pass
@@ -1455,11 +1562,25 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             vec,
         )
 
+    # #1078: BEFORE anything is allocated. The two-file arm keeps both layout
+    # images for the life of the process, which is only affordable when they
+    # are file-backed (reclaimable page cache) rather than pinned. Refusing
+    # here means a misconfiguration costs a boot message, not the OOM kill W26
+    # took in the LAUNCH phase.
+    require_two_file_preconditions()
+    two_file = two_file_images_enabled()
+
     # 2. Snapshot the PP checkpoint weights to host, free device originals
     # (VRAM ledger: PP originals + TP originals + arena never coexist).
     pp_named = checkpoint_param_dict(primary_runner.model)
     layout_pp = plan_arena_layout(pp_named)
     image_pp = snapshot_and_free(pp_named, layout_pp, pin=True)
+    if two_file:
+        # Its own exact-sized file already -- `snapshot_and_free` without
+        # `out=` allocates one. Tagging is what makes a leg handed the wrong
+        # image refuse structurally instead of relying on the two layouts
+        # happening to differ in size.
+        tag_layout_image(image_pp, "pp")
     if device == "cuda":
         torch.cuda.empty_cache()
 
@@ -1541,12 +1662,23 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
             # the PP snapshot above necessarily predates layout_tp. From here
             # on there is exactly one lifetime image; `image_pp` is a boot
             # transient and is released once the arena carries the PP layout.
-            rotation_image = allocate_rotation_image(
-                layout_pp.total_bytes, layout_tp.total_bytes, pin=True
-            )
-            image_tp = snapshot_and_free(
-                tp_named, layout_tp, pin=True, out=rotation_image
-            )
+            if two_file:
+                # #1078: NO max-sized rotation buffer. Each layout gets its own
+                # exact-sized file, so a leg reads the incoming layout from its
+                # own file and discards the outgoing arena content -- there is
+                # no copy-back, hence nothing for a shared buffer to receive.
+                # The size asymmetry that the rotation's overshoot existed to
+                # cover (rotation_plan.py:51-59) stops being a term at all.
+                image_tp = snapshot_and_free(tp_named, layout_tp, pin=True)
+                tag_layout_image(image_tp, "tp")
+                rotation_image = image_tp
+            else:
+                rotation_image = allocate_rotation_image(
+                    layout_pp.total_bytes, layout_tp.total_bytes, pin=True
+                )
+                image_tp = snapshot_and_free(
+                    tp_named, layout_tp, pin=True, out=rotation_image
+                )
             if device == "cuda":
                 torch.cuda.empty_cache()
             arena_total = max(layout_pp.total_bytes, layout_tp.total_bytes)
@@ -1867,8 +1999,18 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     # them to the allocator while CUDA still maps them makes the next big host
     # allocation fail with rc=712 (W28 attempt 1 died exactly there, in
     # HiCache's 5.6 GB KV buffer).
-    release_host_image(image_pp)
-    del image_pp
+    #
+    # #1078: THE TWO-FILE ARM KEEPS IT, and the sentence above is why that is
+    # allowed only here. "Keeping it would be the dual pin W26 OOM-killed"
+    # holds for PINNED images and for no others: two pinned lifetime images
+    # are 55.99 GiB across this rig's three ranks. A file-backed image is
+    # reclaimable page cache and not a pinned post at all, so keeping both
+    # costs +27.15 GiB of DISK (501 GiB free) and no locked RAM. That is the
+    # whole trade, and `require_two_file_preconditions` at the top of this
+    # function is what stops it from being taken under the pinned allocator.
+    if not two_file:
+        release_host_image(image_pp)
+        del image_pp
 
     # The mode qualifier keeps this line honest for the host ledger: a
     # file-backed image (SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED) is reclaimable
@@ -1902,6 +2044,8 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
         token_vector=token_verdict.vector,
         draft_worker=draft_worker,
         arena_carrier=arena_carrier,
+        image_pp=image_pp if two_file else None,
+        image_tp=image_tp if two_file else None,
     )
 
 

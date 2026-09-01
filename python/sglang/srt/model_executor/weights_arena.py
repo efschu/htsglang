@@ -1270,3 +1270,179 @@ def arena_refill(
             f"arena image checksum mismatch (stored {want}, computed "
             f"{have}); refusing to serve from a corrupted image{restored}"
         )
+
+
+# --------------------------------------------------------------------------
+# #1078: TWO layout images, so a flip leg never copies back.
+# --------------------------------------------------------------------------
+
+#: Which layout a two-file image belongs to, keyed by the image tensor's
+#: ``data_ptr()`` -- the same keying as ``_FILE_BACKED_IMAGES`` above and for
+#: the same reason: these images are allocated once per rank and live for the
+#: process, so the address is stable.
+#:
+#: WHY A TAG AND NOT THE SIZE CHECK ``arena_refill`` ALREADY HAS. The trailer
+#: TRAVELS WITH the image it describes, so an image handed to the wrong layout
+#: verifies GREEN against its own trailer -- the checksum structurally cannot
+#: see the swap. What would catch it today is only ``arena_refill``'s payload
+#: size check, and that is a COINCIDENCE of this rig's layouts differing
+#: (PP0: 13288.2 pp against 13724.7 tp MiB). On a rank whose two layouts came
+#: out the same size, the wrong layout would load and every existing check
+#: would pass. That is the silent-corruption form this scheme introduces, so
+#: it gets a structural guard rather than a note about sizes.
+_LAYOUT_IMAGE_PHASE: Dict[int, str] = {}
+
+
+def two_file_images_enabled() -> bool:
+    """Read per call, never frozen at import (see ``_staged_refill_enabled``)."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.get())
+
+
+def require_two_file_preconditions() -> None:
+    """The two-file arm may not exist without file-backed images.
+
+    REFUSES rather than degrading to one image, because the failure it prevents
+    is not a slow boot but a dead one. Two PINNED lifetime images are 55.99 GiB
+    across this rig's three ranks (PP0 13288.2+13724.7, PP1 7255.5+7422.5,
+    PP2 7255.5+8382.4 MiB) against #721's measured cgroup peak of 111.3 of
+    118 GiB -- the same class as the 68.7 GiB dual pin whose BOTH arms W26
+    OOM-killed in the LAUNCH phase, before any flip ran. ``phase_flip_boot``
+    releases the PP image at :1870 precisely to avoid it, and this arm is only
+    entitled to keep it because a file-backed image is reclaimable page cache
+    rather than a pinned post: the cost moves to DISK (+27.15 GiB against
+    501 GiB free) and no RAM is locked.
+
+    So the precondition is the whole safety argument, and a docstring is where
+    the #742 silently-inert-flag class lives. It is a raise.
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.get():
+        return
+    if not envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.get():
+        raise WeightsArenaError(
+            "SGLANG_PHASE_FLIP_IMAGE_TWO_FILE=1 requires "
+            "SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED=1. Two PINNED lifetime images "
+            "are 55.99 GiB on this rig's three ranks -- the dual pin W26 "
+            "OOM-killed before any flip ran, merely renamed. The two-file "
+            "scheme is affordable ONLY because file-backed images are "
+            "reclaimable page cache, which moves the second image to disk "
+            "instead of locking it in RAM. Refusing rather than silently "
+            "falling back to one image."
+        )
+
+
+def tag_layout_image(image: torch.Tensor, phase: str) -> None:
+    """Record that ``image`` is the boot snapshot of the ``phase`` layout."""
+    _LAYOUT_IMAGE_PHASE[int(image.data_ptr())] = str(phase)
+
+
+def require_layout_image(image: torch.Tensor, phase: str) -> None:
+    """Refuse an image that is not the one tagged for ``phase``."""
+    tagged = _LAYOUT_IMAGE_PHASE.get(int(image.data_ptr()))
+    if tagged is None:
+        raise WeightsArenaError(
+            f"#1078 two-file leg was handed an UNTAGGED image for the "
+            f"{phase!r} layout. Every lifetime image is tagged at boot; an "
+            f"untagged one means this is not a two-file image and the leg "
+            f"cannot know which layout it holds."
+        )
+    if tagged != str(phase):
+        raise WeightsArenaError(
+            f"#1078 two-file leg is streaming the {phase!r} layout but the "
+            f"image it was given is tagged {tagged!r}. The trailer travels "
+            f"with the image, so this would verify GREEN and load the wrong "
+            f"weights whenever the two layouts happen to be the same size."
+        )
+
+
+def verify_boot_anchor(
+    arena: torch.Tensor, layout: ArenaLayout, image: torch.Tensor, phase: str
+) -> None:
+    """The arena still holds the layout the boot put there -- or refuse.
+
+    THE INVARIANT THIS PINS, and it is strictly stronger than the one it
+    replaces. Under the single-image rotation the trailer is SELF-REFERENTIAL:
+    leg N computes it from the arena (rotation_executor.py:604), writes it over
+    the bytes it just copied out (:707-709), and leg N+1 verifies against that
+    same trailer (:712-719). It therefore certifies "what left the arena came
+    back intact" and NOT "these are the boot weights". An in-place write to an
+    arena-backed weight page during serving is copied out, covered by a trailer
+    computed from the mutated bytes, and verified green forever after.
+
+    Under two files the trailer is a BOOT CONSTANT: ``image_from_tensors``
+    writes it once (:1156-1159) and nothing rewrites it. Checking the arena
+    against it before the layout is discarded is the only detector this corpus
+    has for that mutation, so it is not optional and it names what it found
+    rather than saying "checksum mismatch".
+    """
+    if not int(layout.total_bytes):
+        return
+    want = int(image[layout.total_bytes :].clone().view(torch.int64).item())
+    have = uint8_checksum(arena[: layout.total_bytes])
+    if want != have:
+        raise WeightsArenaError(
+            f"#1078 the {phase!r} layout in arena[0, {layout.total_bytes}) was "
+            f"MUTATED WHILE SERVING: it sums to {have} but its boot image "
+            f"trailer says {want}. The weights are supposed to be immutable, "
+            f"so this is a real finding and not a transfer fault -- some code "
+            f"path writes an arena-backed weight page at runtime. Refusing to "
+            f"discard it: under the two-file scheme the next leg would reload "
+            f"the pristine boot snapshot and silently REVERT the mutation, "
+            f"while the single-image scheme would instead carry it forward "
+            f"under a trailer it computed from the mutated bytes. Neither is "
+            f"visible without this check."
+        )
+
+
+def two_file_leg(
+    *,
+    arena: torch.Tensor,
+    incoming_layout: ArenaLayout,
+    incoming_image: torch.Tensor,
+    incoming_phase: str,
+    outgoing_layout: ArenaLayout,
+    outgoing_image: torch.Tensor,
+    outgoing_phase: str,
+    timing: Optional["RefillLegTiming"] = None,
+    phases: Optional[Dict[str, float]] = None,
+) -> None:
+    """One flip leg with NO copy-back: verify the outgoing, then read the
+    incoming from its own file.
+
+    The three things the rotation did that this does not do -- the D2H, the
+    host-to-host staging ``save``, and the trailer write -- are 94.7-95.2 %,
+    2.6-4.2 % and ~0 % of the measured leg. What is left is the read, which is
+    ``arena_refill``'s existing #802 path: ``preadv`` off the image's own fd at
+    2 595 MiB/s buffered / 8 304 MiB/s O_DIRECT, against the 153-226 MiB/s the
+    copy-back reached writing through the mapping.
+
+    ORDER IS THE CONTENT. The mutation check runs BEFORE the refill overwrites
+    anything, or the fix destroys the evidence of the fault it just found.
+
+    ``restore=`` IS BACK, and it is a genuine restoration rather than a new
+    mechanism: ``PhaseFlipStacks.refill``'s docstring records that the
+    single-image rotation had to GIVE UP the abort arm that rewrites the active
+    layout from its own image, because with one buffer there was no second
+    image to read from. With two there is, and it is pristine by construction.
+    """
+    require_layout_image(outgoing_image, outgoing_phase)
+    require_layout_image(incoming_image, incoming_phase)
+    # BEFORE the read. See the docstring: the detector must not run on an arena
+    # the refill has already overwritten.
+    _t = time.perf_counter()
+    verify_boot_anchor(arena, outgoing_layout, outgoing_image, outgoing_phase)
+    if phases is not None:
+        phases["anchor"] = time.perf_counter() - _t
+    _t = time.perf_counter()
+    arena_refill(
+        arena,
+        incoming_layout,
+        incoming_image,
+        restore=(outgoing_layout, outgoing_image),
+        timing=timing,
+    )
+    if phases is not None:
+        phases["read"] = time.perf_counter() - _t
