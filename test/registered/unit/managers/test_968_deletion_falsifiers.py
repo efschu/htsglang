@@ -83,6 +83,76 @@ def test_the_runnability_oracle_is_gone():
     assert not hasattr(pfr, "prefill_runnable_in_current_layout")
 
 
+# -- Slice B (c): the post-cutover fresh-fetch sweep ----------------------
+
+
+def test_the_post_cutover_readmit_consumes_the_stash_once():
+    """(c) The deferred requeue is a one-shot handoff: the release half
+    STASHES (`_pending_seam_readmit = (released, n)`), the post-cutover half
+    CONSUMES AND CLEARS. Two producers or a missing clear would re-admit a
+    cutover's residents twice -- the double-prefill shape from the other
+    side."""
+    import inspect as _i
+
+    from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+    assert hasattr(PhaseFlipRuntime, "_post_cutover_readmit")
+    body = _i.getsource(PhaseFlipRuntime._post_cutover_readmit)
+    assert "_pending_seam_readmit" in body
+    assert "self._pending_seam_readmit = None" in body, "one-shot clear missing"
+    import sglang.srt.managers.phase_flip_runtime as pfr
+
+    src = _i.getsource(pfr)
+    assert src.count("self._pending_seam_readmit = (") == 1, "exactly one stasher"
+
+
+def test_the_sweep_instrument_exists():
+    """(c) '#1066 POST-CUTOVER FRESH-FETCH' is the execution proof the
+    speed-mode law demands: a deferred path with no log line is
+    desk-written-never-executed waiting to happen."""
+    import inspect as _i
+
+    import sglang.srt.managers.phase_flip_runtime as pfr
+
+    assert "#1066 POST-CUTOVER FRESH-FETCH" in _i.getsource(pfr)
+
+
+# -- Slice B (d): PP0 holds on its prefetch verdict, followers never ------
+
+
+def test_pp0_holds_and_followers_never_do():
+    """(d) ONE verdict, at PP0: under the PP admission branch only
+    ``pp_rank == 0`` consults the drained prefetch verdict and skips
+    (``prefetch_pending_pp0``); followers stay credit-only
+    (``pop_prefetch_loaded_tokens``) and never decide -- the row they
+    receive before planning IS their verdict (Order: downstream verdiktfrei).
+    Pins: the skip exists exactly once, its guard window names pp_rank == 0,
+    and no second prefetch-pending skip variant gates followers."""
+    import inspect as _i
+
+    import sglang.srt.managers.scheduler as sched
+
+    src = _i.getsource(sched)
+    assert src.count('_note_skip("prefetch_pending_pp0"') == 1
+    idx = src.index('_note_skip("prefetch_pending_pp0"')
+    window = src[max(0, idx - 2000) : idx]
+    assert "pp_rank == 0" in window, "the PP0 gate must guard the skip"
+    # Scope the no-follower-verdict law to the PP arm: the ballot machinery
+    # in the `elif enable_hicache_storage:` (non-PP) arm keeps its own
+    # per-request hold -- that IS the upstream-equivalent and stays.
+    pp_arm_start = src.index("if self.enable_hicache_storage and _pp_group:")
+    pp_arm_end = src.index("elif self.enable_hicache_storage:", pp_arm_start)
+    pp_arm = src[pp_arm_start:pp_arm_end]
+    assert pp_arm.count('_note_skip("prefetch_pending') == 1, (
+        "a second prefetch-pending skip inside the PP arm would put a "
+        "verdict on a follower"
+    )
+    assert "prefetch_pending_pp0" in pp_arm
+    assert "pop_prefetch_loaded_tokens" in pp_arm, (
+        "the follower credit-only path must survive in the PP arm"
+    )
+
+
 # -- Schicht 3: no single-rid vote, no owed ledger (RED until deleted) -----
 
 
