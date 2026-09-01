@@ -8076,6 +8076,7 @@ class Scheduler(
         # with (chunk_blocks_quiescence), so the two cannot drift apart
         # again the way they did between defect O and 20:31:48.
         from sglang.srt.managers.phase_flip_runtime import (
+            PP_TO_TP,
             chunk_blocks_quiescence,
         )
 
@@ -8091,6 +8092,29 @@ class Scheduler(
             # continuation chunks the current layout's builder refuses to
             # build (the 2026-09-01 tp_to_pp livelock, 37 abandons/rank over
             # 1114 s with 11 queued / 0 running).
+            #
+            # #1067: THE PARK IS THE ADMISSION OWNER'S VERDICT, NOT EVERY
+            # RANK'S. In the PP layout (pp_to_tp armed) a follower that parks
+            # stops the very drain the park exists to wait for: it withholds
+            # the pass that would execute an mb already launched upstream.
+            # Measured boot_855_1065umbau 06:26:07Z: pp_to_tp armed one pass
+            # after PP0 launched the final 118-token chunk mb; PP1 had
+            # RECEIVED and reconciled it (ROW-PROBE delivered=31) but parked
+            # before building, PP2 stayed at delivered=30, and PP0 blocked
+            # forever in the output recv (mb slots [0, 2] in flight) -- with
+            # the abandon carrier blocked, no 30 s abandon ever fired.
+            # Pre-#1065 the strict chunk clause kept the park open during a
+            # chunk ladder and masked this rank-local verdict. Under the PP0
+            # authority order followers execute what the row tells them and
+            # decide nothing: in the PP layout only PP0 parks (it stops
+            # SOURCING new work; in-flight mbs keep draining downstream). In
+            # the TP layout every rank is a replica of one decision made
+            # from replicated state, so the park stays group-wide.
+            and (
+                self.phase_flip_runtime.pending != PP_TO_TP
+                or self.ps.pp_size == 1
+                or self.ps.pp_rank == 0
+            )
             and not chunk_blocks_quiescence(self.chunked_req)
         ):
             # A round withheld for a PENDING FLIP is not a round that could
