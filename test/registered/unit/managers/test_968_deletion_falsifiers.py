@@ -185,6 +185,72 @@ def test_the_armed_park_is_pp0_only_in_the_pp_layout():
     )
 
 
+# -- #1068: an instrument may never gate ----------------------------------
+
+
+def test_the_fence_store_scan_is_time_budgeted():
+    """(#1068) The #1063 fence snapshot walks every page stem through
+    os.path.exists against a million-file store, ON THE CUTOVER'S NO-RETURN
+    PATH. Measured boot_855_1067park: the warm scan took ~3 s over 221862
+    stems at 06:47:10; the very next fence hit the re-prefill's fresh stems
+    cold and never returned -- all three ranks' last line for 25 minutes was
+    the FENCE-NODES header, no abandon could run (PP0 is the timeout
+    carrier), and the deadman killed the boot at 07:15:37. The scan now
+    carries a hard deadline and reports itself CAPPED (counts become a
+    declared sample) instead of holding the seam."""
+    import inspect as _i
+
+    from sglang.srt.mem_cache.hicache_flip_writeback import _1063_record_fence
+
+    body = _i.getsource(_1063_record_fence)
+    assert "_scan_deadline" in body, "the hard time budget is gone"
+    assert "SCAN CAPPED" in body, "the capped self-report is gone"
+    # The budget must be checked INSIDE the walk, not once before it: a
+    # single pre-check cannot stop a scan that goes cold mid-walk.
+    assert body.index("_scan_deadline = ") < body.index("> _scan_deadline"), (
+        "deadline set after its check -- the budget cannot bind"
+    )
+
+
+def test_the_capped_scan_returns_within_budget(monkeypatch):
+    """(#1068) Behavioral arm: a store whose exists() is pathologically slow
+    must not hold the fence past its budget. Every stem probe costs 50 ms;
+    an unbudgeted walk over 4096 tracked stems would take minutes -- the
+    capped walk must return in ~2 s and still record a fence snapshot."""
+    import time as _t
+
+    import sglang.srt.mem_cache.hicache_flip_writeback as fwb
+
+    class _Node:
+        def __init__(self, i):
+            self.id = i
+
+    class _Backend:
+        pass
+
+    class _CC:
+        storage_backend = _Backend()
+
+    class _Tree:
+        cache_controller = _CC()
+
+    def _slow_stems(backend, node):
+        return [f"stem_{node.id}_{j}" for j in range(64)]
+
+    def _slow_state(backend, stem):
+        _t.sleep(0.05)
+        return "readable"
+
+    monkeypatch.setattr(fwb, "_1063_stems_for_node", _slow_stems)
+    monkeypatch.setattr(fwb, "_1063_stem_state", _slow_state)
+    start = _t.monotonic()
+    fwb._1063_record_fence(_Tree(), [_Node(i) for i in range(256)])
+    elapsed = _t.monotonic() - start
+    assert elapsed < 10.0, (
+        "the fence scan held the seam for %.1fs despite the budget" % elapsed
+    )
+
+
 # -- Schicht 3: no single-rid vote, no owed ledger (RED until deleted) -----
 
 
