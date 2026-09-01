@@ -688,7 +688,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             label="symmetrize_prefetch_capacity",
         )
         min_size = int(size_tensor.item())
-        cc.prefetch_capacity_limit = int(0.5 * min_size)
+        # #968/#1065: one authority for the halved-with-floor budget --
+        # see `prefetch_capacity_limit_for`. Lazy import: this module is
+        # imported by the controller's own dependency chain.
+        from sglang.srt.managers.cache_controller import (
+            prefetch_capacity_limit_for,
+        )
+
+        cc.prefetch_capacity_limit = prefetch_capacity_limit_for(min_size)
         logger.info(
             "[uneven-dcp hicache] prefetch_capacity_limit symmetrized to %d "
             "(min host-pool %d across attn groups; local host-pool %d)",
@@ -885,8 +892,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         storage_backend = server_args.hicache_storage_backend
         storage_extra_config = None
         storage_prefetch_threshold = 256
-        prefetch_timeout_base = 1.0
-        prefetch_timeout_per_ki_token = 0.25
+        # #968/#1065: re-priced from 1.0/0.25. GELTUNGSBEREICH: the old pair
+        # bounded a 16k-token cutover re-admission at ~5 s while the store
+        # MEASURABLY delivers ~0.32 s/KiToken best case under page_size=1
+        # (12556 tok in ~4 s, trainA 2026-09-01 log:66678/66823) and draft
+        # miss-fetch storms slow it further -- so the wait, not the store,
+        # was the starving term. Overridable per backend via
+        # hicache_storage_backend_extra_config (prefetch_timeout_*).
+        prefetch_timeout_base = 2.0
+        prefetch_timeout_per_ki_token = 1.0
         hicache_storage_pass_prefix_keys = False
         if storage_backend is not None:
             (

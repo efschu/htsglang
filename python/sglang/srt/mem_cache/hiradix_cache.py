@@ -349,7 +349,16 @@ class HiRadixCache(RadixCache):
             torch.distributed.ReduceOp.MIN,
             label="symmetrize_prefetch_capacity",
         )
-        cc.prefetch_capacity_limit = int(0.5 * int(size_tensor[0].item()))
+        # #968/#1065: one authority for the halved-with-floor budget -- see
+        # `prefetch_capacity_limit_for` (a floor applied at only one caller
+        # would be undone by this symmetrize pass).
+        from sglang.srt.managers.cache_controller import (
+            prefetch_capacity_limit_for,
+        )
+
+        cc.prefetch_capacity_limit = prefetch_capacity_limit_for(
+            int(size_tensor[0].item())
+        )
 
     def _barrier_attn_groups(self, label: str = "hicache"):
         waited = False

@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -286,6 +287,40 @@ class PrefetchOperation(StorageOperation):
 
     def is_terminated(self) -> bool:
         return self._terminated_flag
+
+
+#: #968/#1065: floor for the speculative-prefetch budget, in tokens.
+#: 20480 covers the largest measured cutover re-admission (15.9k) with
+#: headroom; override per rig via the env below.
+PREFETCH_CAP_FLOOR_TOKENS = int(
+    os.environ.get("SGLANG_HICACHE_PREFETCH_CAP_FLOOR_TOKENS", "20480")
+)
+
+
+def prefetch_capacity_limit_for(host_pool_size: int) -> int:
+    """#968/#1065: the speculative-prefetch budget for a host pool of
+    ``host_pool_size`` tokens -- half the pool, FLOORED so ONE full cutover
+    re-admission stays prefetchable.
+
+    The half-formula's premise is a retention-scale pool. The phase-flip
+    TP-phase pool is 23x smaller (measured #905: 703472 rows PP vs 30518
+    TP), and half of THAT (15259) sits below one 16k readmit -- so
+    `prefetch_tokens_occupied >= limit` structurally banned the SECOND
+    readmit prefetch of every TP window (the starvation family's feeder;
+    unified_radix_cache.py's own RATE paragraph names the hazard). Decision
+    per #1065: the POOL-REFERENCE was the wrong half, not the reserve idea.
+    The floor restores one-request prefetchability, never claims more than
+    90% of the pool, and stays coherent with the write-staging ring, which
+    derives its capacity as the complement AFTER this bound
+    (staging_write_ring.py) and warns loudly -- rather than silently -- when
+    nothing is left for write-through.
+
+    ONE AUTHORITY, THREE CALLERS (boot init here, the two symmetrize sites
+    in unified_radix_cache/hiradix_cache): a floor applied at only one of
+    them would be undone by the next symmetrize pass.
+    """
+    size = max(0, int(host_pool_size))
+    return max(int(0.5 * size), min(PREFETCH_CAP_FLOOR_TOKENS, int(0.9 * size)))
 
 
 def canonical_identity_hash_for(server_args, canonical_page: bool) -> str:
@@ -861,8 +896,12 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
-            self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
+            # Budget speculative prefetch at half the host pool (floored so
+            # one full cutover re-admission stays prefetchable, #968/#1065),
+            # leaving the rest for the write-back staging path.
+            self.prefetch_capacity_limit = prefetch_capacity_limit_for(
+                self.mem_pool_host.size
+            )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -2382,7 +2421,11 @@ class HiCacheController:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
-        # cancel prefetch if too much memory is occupied
+        # cancel prefetch if too much memory is occupied.
+        # #968/#1065: the fix for the structural second-readmit ban lives at
+        # the LIMIT PRODUCER (`prefetch_capacity_limit_for`: the halved
+        # TP-phase pool sat below one 16k readmit), not here -- this check is
+        # the correct occupancy gate once the limit can hold one request.
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
             return True
         # todo: more sophisticated rate limiting based on storage backend performance

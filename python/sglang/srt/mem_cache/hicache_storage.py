@@ -159,9 +159,17 @@ class HiCacheStorageExtraInfo:
 class PrefetchTimeoutConfig:
     """Knobs for the linear prefetch-timeout policy used by HiCache."""
 
+    # #968/#1065 re-pricing (2026-09-01). The old 0.1 s/KiToken with max 30 s
+    # was priced for small prefixes; a 13-16k-token cutover re-admission under
+    # page_size=1 measures ~0.32 s/KiToken best case from the live store
+    # (12556 tok in ~4 s, trainA log:66678/66823) with 40-52k draft
+    # miss-fetches competing. 1.0 s/KiToken carries ~3x headroom; max 60 s
+    # keeps a 16k readmit (2 + 16 = 18 s linear) unclipped with margin.
+    # Per-backend override: hicache_storage_backend_extra_config
+    # (prefetch_timeout_base / _per_ki_token / _max).
     base: float = 2.0  # seconds, fixed overhead unrelated to token count
-    per_ki_token: float = 0.1  # seconds per 1024 tokens
-    max: float = 30.0  # seconds, upper bound for the linear timeout
+    per_ki_token: float = 1.0  # seconds per 1024 tokens
+    max: float = 60.0  # seconds, upper bound for the linear timeout
 
 
 class PoolName(str, Enum):
