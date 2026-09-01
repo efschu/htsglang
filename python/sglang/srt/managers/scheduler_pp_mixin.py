@@ -5668,6 +5668,27 @@ class SchedulerPPMixin:
             isinstance(r, PhaseFlipReqInput) for r in recv_reqs
         )
 
+        # #631 REQ-TRACE (bounded): the check-2 wedge's open question is
+        # where a relayed request dies between the consumed chain hop and
+        # the downstream waiting queue (boot 631row16: s0=150=c1 balanced,
+        # request never locatable). Name every non-empty batch of received
+        # requests per rank, first 30.
+        if recv_reqs:
+            _rn = getattr(self, "_pp_req_trace_n", 0) + 1
+            self._pp_req_trace_n = _rn
+            if _rn <= 30:
+                try:
+                    logger.info(
+                        "#631 REQ-TRACE r%d rank=%s n=%d kinds=%s rids=%s",
+                        _rn,
+                        getattr(getattr(self, "ps", None), "pp_rank", "?"),
+                        len(recv_reqs),
+                        [type(r).__name__ for r in recv_reqs][:4],
+                        [str(getattr(r, "rid", "?"))[:8] for r in recv_reqs][:4],
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
         if not self.pp_group.is_last_rank:
             # #969 §W3: THE FORWARD IS UNCONDITIONAL AGAIN, ARMED OR NOT.
             #
