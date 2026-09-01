@@ -327,3 +327,122 @@ def test_the_owed_ledger_is_gone():
 
     src = _i.getsource(urc)
     assert "_reissue_pending" not in src
+
+
+# -- #1069: cohort-in-service (falsifiers for commit 929525805e) -----------
+#
+# Metal evidence 1068cap (2026-09-01): 4 group flip pairs, the SAME
+# 3-request cohort seam-re-prefilled from zero in every TP window
+# (4 x 110710 tok), zero decode batches. Two arm faces of one blind spot:
+# windows 1+4 armed on "pending prefill > 0 ... nothing decoding" while the
+# cohort sat queued; windows 2+3 armed on "set has not shrunk for 51.8s"
+# while a member's prefix was actively growing. The fix is ONE mechanism
+# (cohort-in-service) at two sites; these tests pin both clauses and the
+# phase-entry reset, so a revert of either half goes red by name.
+
+
+class _ObserveStub:
+    """The attribute surface ``observe_idle`` actually reads. Methods return
+    'work exists, someone decodes' so the idle clock stays out of the way."""
+
+    def __init__(self, phase, now, seam_cohort_pending_tokens):
+        self.phase = phase
+        self.now = now
+        self.pending_prefill_tokens = 500
+        self.running_bs = 2  # FLAT across observations: the bs-shrink clause
+        self.seam_cohort_pending_tokens = seam_cohort_pending_tokens
+        self.nothing_can_run = False
+        self.ready_carriers = 0
+        self.queue_nonempty = False
+
+    def decode_work_bs(self):
+        return 1
+
+    def work_exists(self):
+        return True
+
+
+def test_1069_sinking_cohort_pending_is_bundle_progress():
+    """The clock clause: with running_bs FLAT, a SINKING
+    seam_cohort_pending_tokens must stamp last_bundle_progress_at; flat or
+    RISING must not. This is the exact 1068cap failure inverted: windows 2+3
+    fired 'set has not shrunk for 51.8s' at a member whose prefix was
+    actively growing."""
+    from sglang.srt.managers import phase_policy as pp
+
+    state = pp.PhasePolicyState()
+    # t=100: phase entry -- baseline, marker None, stamp comes from entry.
+    pp.observe_idle(state, _ObserveStub("tp", 100.0, 8000))
+    assert state.last_seam_cohort_pending == 8000
+    # t=110: cohort pending flat -> NO progress stamp (clock stays at entry;
+    # note the bs-shrink clause cannot fire either, running_bs is flat).
+    pp.observe_idle(state, _ObserveStub("tp", 110.0, 8000))
+    assert state.last_bundle_progress_at == 100.0, (
+        "flat cohort pending stamped progress -- the clause lost its "
+        "comparison and became a level read"
+    )
+    # t=120: cohort pending SINKS 8000 -> 4000 -> progress stamp at 120.
+    pp.observe_idle(state, _ObserveStub("tp", 120.0, 4000))
+    assert state.last_bundle_progress_at == 120.0, (
+        "sinking seam_cohort_pending_tokens did not stamp bundle progress "
+        "-- the #1069 clock clause is gone and the 51.8s false STALL arm "
+        "(1068cap windows 2+3) is back"
+    )
+    # t=130: RISING 4000 -> 9000 (a new cutover's larger cohort) -> no stamp.
+    pp.observe_idle(state, _ObserveStub("tp", 130.0, 9000))
+    assert state.last_bundle_progress_at == 120.0, (
+        "rising cohort pending stamped progress -- refill would now reset "
+        "the stall clock forever, the un-drainable-bundle wedge"
+    )
+
+
+def test_1069_phase_entry_resets_the_cohort_marker():
+    """A cutover ZEROES the cohort accounting; comparing across the phase
+    boundary would credit that zeroing as service progress. The marker must
+    restart with the phase (same law as last_running_bs / #833)."""
+    from sglang.srt.managers import phase_policy as pp
+
+    state = pp.PhasePolicyState()
+    pp.observe_idle(state, _ObserveStub("tp", 100.0, 8000))
+    # Phase change tp -> pp with a LOWER cohort value: the entry reset must
+    # eat the comparison; the progress stamp must be the ENTRY stamp, and a
+    # subsequent flat observation must not inherit the pre-flip baseline.
+    pp.observe_idle(state, _ObserveStub("pp", 200.0, 0))
+    assert state.last_bundle_progress_at == 200.0  # entry stamp, not "sink"
+    pp.observe_idle(state, _ObserveStub("pp", 210.0, 0))
+    assert state.last_bundle_progress_at == 200.0, (
+        "the cohort marker survived the phase boundary -- a cutover's own "
+        "zeroing now reads as service progress"
+    )
+
+
+def test_1069_dwell_holds_the_ppward_arm_and_is_bounded():
+    """The arm clause: _decide_from_load must consult
+    seam_cohort_dwell_active() on the pp-ward (tp_to_pp) path and refuse with
+    the NAMED holding line -- the metal grepper 'seam cohort in service
+    (#1069)'. And the predicate itself must stay BOUNDED: dwell lapses at
+    SEAM_COHORT_DWELL_ROUNDS, so the hold can never become the W37-E wedge."""
+    import inspect as _i
+
+    from sglang.srt.managers import phase_policy as pp
+
+    src = _i.getsource(pp._decide_from_load)
+    assert "seam cohort in service (#1069)" in src, (
+        "the named holding line left _decide_from_load -- the pp-ward arm "
+        "no longer declares the cohort hold"
+    )
+    assert "seam_cohort_dwell_active()" in src, (
+        "the arm no longer consults the dwell predicate -- windows 1+4 "
+        "('nothing decoding' ~13s in, cohort still queued) are back"
+    )
+    # The bound, behaviorally: active inside the dwell, lapsed at the bound.
+    class _S:
+        seam_cohort_pending_bs = 2
+        seam_cohort_stall_rounds = 0
+
+    assert pp.PhasePolicyInputs.seam_cohort_dwell_active(_S()) is True
+    _S.seam_cohort_stall_rounds = pp.SEAM_COHORT_DWELL_ROUNDS
+    assert pp.PhasePolicyInputs.seam_cohort_dwell_active(_S()) is False, (
+        "the dwell no longer lapses at SEAM_COHORT_DWELL_ROUNDS -- the hold "
+        "is unbounded, which is the livelock this campaign has paid for"
+    )
