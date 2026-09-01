@@ -2036,6 +2036,15 @@ class PhasePolicyState:
     last_bundle_progress_at: Optional[float] = None
     #: The previous observation's ``running_bs``. Compared, never a level.
     last_running_bs: Optional[int] = None
+    #: #1069: the previous observation's ``seam_cohort_pending_tokens``.
+    #: Compared, never a level -- a SINKING value means the seam service is
+    #: moving the re-admitted cohort toward residency, which is progress the
+    #: bundle clock must credit. Measured 1068cap (2026-09-01): the progress
+    #: clock knew only bs-shrink, so a member actively re-prefilling read as
+    #: "set has not shrunk for 51.8s" and the STALL verdict armed the very
+    #: flip that retracted it again -- the same 3-request cohort was
+    #: re-prefilled from zero in all four TP windows (442840 tok, 0 decode).
+    last_seam_cohort_pending: Optional[int] = None
     #: #677 hot fix 2: how many requests were decoding when this TP window
     #: opened, so the exit receipt can name the BUNDLE it finished rather than
     #: only the instant it ended. Set by ``observe_idle`` at the phase change.
@@ -3643,6 +3652,27 @@ def _decide_from_load(
                 f"the gate spends the chunk and the arm returns"
             )
         if inp.pending_prefill_tokens > tp_threshold or strict_demands_flip:
+            # #1069: THE COHORT IN SERVICE HOLDS THE PP-WARD ARM. While the
+            # last cutover's re-admissions are still being served toward
+            # residency in THIS layout, arming tp_to_pp retracts them a
+            # second time -- measured 1068cap (2026-09-01): windows 1+4 armed
+            # on "pending prefill > 0 ... nothing decoding" ~13 s into the
+            # TP phase, while the cohort members still sat in the QUEUE
+            # (bundle_is_mid_flight answers False for queued-retracted by
+            # the W37-E clause, correctly -- but "not decoding" is not
+            # "not owed this layout's service"). Same bound as #1032 FIX 1:
+            # an unservable cohort lapses after SEAM_COHORT_DWELL_ROUNDS and
+            # the demand returns, so this can never hold forever.
+            if inp.seam_cohort_dwell_active():
+                return _no(
+                    f"seam cohort in service (#1069): "
+                    f"{inp.seam_cohort_pending_bs} re-admitted request(s) "
+                    f"({inp.seam_cohort_pending_tokens} tok) are being served "
+                    f"toward decode in this layout; arming tp_to_pp now would "
+                    f"retract them again (1068cap: the same 3-request cohort "
+                    f"re-prefilled from zero in all four TP windows, 442840 "
+                    f"tok, zero decode). Bounded by SEAM_COHORT_DWELL_ROUNDS"
+                )
             # THE DECODE FLOOR. Under purity every token of prefill has to
             # wait for a PP window, so the backlog is essentially always
             # above N and this rule would otherwise fire the instant
@@ -4135,6 +4165,9 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
         # THIS residency and never inherited from the last.
         state.last_bundle_progress_at = inp.now
         state.last_running_bs = None
+        # #1069: the cohort-service marker restarts with the phase too --
+        # cross-phase comparison would credit a cutover's own zeroing.
+        state.last_seam_cohort_pending = None
     # #677(a) PREFILL PROGRESS, MEASURED. The wedge signature is pending
     # frozen at a value while every slot is held by a carried decode, so the
     # observable that separates it from a slow drain is whether the backlog
@@ -4154,6 +4187,21 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     if prev_bs is None or int(inp.running_bs) < int(prev_bs):
         state.last_bundle_progress_at = inp.now
     state.last_running_bs = int(inp.running_bs)
+    # #1069: SEAM-COHORT SERVICE IS BUNDLE PROGRESS. A re-admitted cohort
+    # member being re-prefilled toward decode keeps ``running_bs`` flat for
+    # its whole service, and the bs-only clock read that as a stall: 1068cap
+    # fired "set has not shrunk for 51.8s" at a member whose prefix was
+    # actively growing, and the resulting flip retracted the cohort it was
+    # waiting for (windows 2+3 of the four-window oscillation). Sinking
+    # ``seam_cohort_pending_tokens`` is the same convergence the bs-shrink
+    # clause credits -- toward a served cohort -- and it terminates: the
+    # tokens can only run out. Fresh non-cohort refill keeps reading as
+    # non-progress exactly as before.
+    _cohort_pending = int(getattr(inp, "seam_cohort_pending_tokens", 0) or 0)
+    prev_cohort = state.last_seam_cohort_pending
+    if prev_cohort is not None and _cohort_pending < int(prev_cohort):
+        state.last_bundle_progress_at = inp.now
+    state.last_seam_cohort_pending = _cohort_pending
 
 
 def note_flip_armed(
