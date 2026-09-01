@@ -227,10 +227,45 @@ class SidecarPoolSpec:
 
 @dataclass
 class PoolTransferResult:
-    """Tracks how many pages were successfully processed per pool."""
+    """Tracks how many pages were successfully processed per pool.
+
+    THE ARITHMETIC OF EVERY FIELD, STATED. This paragraph is not decoration:
+    two of the fields below carry a quantity their NAME does not describe, and
+    both misreadings were made -- by readers of this file -- before it existed.
+
+    * ``kv_hit_pages`` -- **NOT the KV prefix.** It is the CROSS-POOL MINIMUM,
+      ``min(kv_prefix, boundary(pool) for every pool_transfer)``
+      (``batch_exists_v2``: ``final_pages = min(final_pages, boundary)``), and
+      it is what the caller SLICES with. A missing mamba page therefore pulls
+      the KV pages down with it: measured, ``kv=276 claimed=0`` with 276 KV
+      pages present on disk and no anchor in range.
+    * ``extra_pool_hit_pages`` -- per pool, and **only NON-ZERO entries are
+      recorded** (``if boundary: hit_count[name] = boundary``). So a pool whose
+      boundary was exactly 0 is ABSENT from this dict, and absence therefore
+      reads as "no constraint" while meaning "capped to nothing". Never infer
+      "uncapped" from a missing key; use ``zero_capped_pools`` below.
+    * ``keys_asked`` -- how many keys the probe was GIVEN. This is the term
+      that used to die at the return, and it is the ONLY way to tell
+      ``kv_hit_pages == 0`` because the store said no from ``== 0`` because the
+      probe was never asked anything. ``keys_asked == 0`` is "never asked".
+    * ``kv_uncapped`` -- the KV prefix BEFORE any component cap, i.e.
+      ``final_pages`` with the ``min`` not yet applied. ``kv_uncapped > 0`` with
+      ``kv_hit_pages == 0`` is the capped-to-zero case, and the pool that did it
+      is named in ``zero_capped_pools``.
+    * ``zero_capped_pools`` -- the pools whose boundary was exactly 0, which is
+      precisely the set ``extra_pool_hit_pages`` cannot represent. Names, not a
+      count, because "which pool" is the actionable half.
+
+    The three new fields DEFAULT, so every existing construction site and every
+    existing reader is unchanged; nothing here alters a decision.
+    """
 
     kv_hit_pages: int
     extra_pool_hit_pages: dict[str, int]
+    #: see the arithmetic block above -- these three are REPORTING ONLY.
+    keys_asked: int = 0
+    kv_uncapped: int = 0
+    zero_capped_pools: tuple = ()
 
     @classmethod
     def empty(cls) -> PoolTransferResult:
@@ -1743,7 +1778,7 @@ class HiCacheFile(HiCacheStorage):
                     n,
                     mismatch,
                 )
-            return PoolTransferResult(0, {})
+            return PoolTransferResult(0, {}, keys_asked=len(keys))
         existing_files = self._collect_existing_component_keys(keys, pool_transfers)
 
         def has_component(page_idx: int, name: str) -> bool:
@@ -1763,6 +1798,9 @@ class HiCacheFile(HiCacheStorage):
 
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
+        #: pools whose boundary came back exactly 0 -- the set `hit_count`
+        #: structurally cannot hold. See PoolTransferResult's arithmetic block.
+        _zero_capped: list[str] = []
 
         # #1035 R13: THE MISS THAT LOOKS LIKE SILENCE.
         # `#1028B` below only fires when a COMPONENT cap moved the number
@@ -1804,6 +1842,16 @@ class HiCacheFile(HiCacheStorage):
                         break
             if boundary:
                 hit_count[name] = boundary
+            else:
+                # THE ABSENCE THAT LOOKS LIKE CONSENT. `hit_count` records only
+                # non-zero boundaries, so a pool capped to exactly 0 vanishes
+                # from it and its `caps={}` reads as "nothing capped this" when
+                # it means "this capped it to nothing". Recorded here as a NAME
+                # rather than added to `hit_count`, because that dict is read by
+                # live consumers (`mamba_component`, `swa_component`,
+                # `unified_radix_cache`) and adding a zero entry would change a
+                # decision. This list changes none.
+                _zero_capped.append(str(name))
             final_pages = min(final_pages, boundary)
 
         # #1028B THE CAP, NAMED. This `min` is the only place that decides how
@@ -1877,7 +1925,13 @@ class HiCacheFile(HiCacheStorage):
                     _anchor_probe,
                 )
 
-        return PoolTransferResult(final_pages, hit_count)
+        return PoolTransferResult(
+            final_pages,
+            hit_count,
+            keys_asked=len(keys),
+            kv_uncapped=kv_pages,
+            zero_capped_pools=tuple(_zero_capped),
+        )
 
     def _log_key(self, pool_name: str, key: str) -> str:
         """The component stem for one pool's page -- READ AND WRITE ALIKE.

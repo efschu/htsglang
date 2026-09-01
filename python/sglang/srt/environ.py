@@ -334,6 +334,22 @@ class Envs:
     SGLANG_SEAM_SHRINK_GROW_DEBT_ROUNDS = EnvInt(32)
     SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED = EnvBool(False)
     SGLANG_PHASE_FLIP_IMAGE_DIR = EnvStr("")
+    # #1078: keep BOTH layout images as their own files, so a flip leg reads
+    # the incoming layout from its own file and DISCARDS the outgoing arena
+    # content instead of copying it back. The copy-back is 94.7-95.2 % of the
+    # leg under the file-backed arm (measured PP0 pp_to_tp 63.911 s, of which
+    # d2h-issue 60.692 s) because its destination is an unregistered ZFS
+    # MAP_SHARED mapping: the copy cannot be async and goes out through the
+    # mmap write path at 153-226 MiB/s, while the SAME file reads at 2 595
+    # MiB/s buffered / 8 304 O_DIRECT.
+    #
+    # VALID ONLY WITH SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED, and that is a
+    # refusal in `require_two_file_preconditions`, not a note. Two PINNED
+    # lifetime images are 55.99 GiB across this rig's three ranks -- the dual
+    # pin W26 OOM-killed, merely renamed (phase_flip_boot.py:1861-1865).
+    # File-backed they are reclaimable page cache: +27.15 GiB of DISK against
+    # 501 GiB free, and no locked RAM.
+    SGLANG_PHASE_FLIP_IMAGE_TWO_FILE = EnvBool(False)
     # #802: refill a FILE-BACKED image by READING the file into a pinned
     # staging ring, instead of copying straight off the mapping and taking one
     # synchronous major fault per 4 KiB page. Measured on this rig 2026-08-22

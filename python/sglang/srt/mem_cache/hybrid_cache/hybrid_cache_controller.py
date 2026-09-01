@@ -758,6 +758,7 @@ class HybridCacheController(BaseHiCacheController):
         )
         if operation.pool_transfers:
             self._hitq_v2_n = getattr(self, "_hitq_v2_n", 0) + 1
+            _arm = "v2"
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
             )
@@ -801,15 +802,93 @@ class HybridCacheController(BaseHiCacheController):
                     ",".join(str(n) for n in self.extra_host_mem_release_entries),
                     getattr(self, "_hitq_v2_n", 0),
                 )
-            hit_result = PoolTransferResult(kv_hit_pages=0, extra_pool_hit_pages={})
+            _arm = "refused-uncapped-publish"
+            hit_result = PoolTransferResult(
+                kv_hit_pages=0,
+                extra_pool_hit_pages={},
+                keys_asked=len(hash_value),
+            )
         else:
+            _arm = "v1-uncapped"
             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
             hit_result = PoolTransferResult(
-                kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
+                kv_hit_pages=kv_hit_count,
+                extra_pool_hit_pages={},
+                keys_asked=len(hash_value),
+                kv_uncapped=kv_hit_count,
             )
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+
+        # #1035c: RESOLVE "ANSWERED ZERO" INTO ITS THREE CAUSES.
+        #
+        # WHAT WAS INVISIBLE. `len(hash_value)` is the number of keys this probe
+        # was GIVEN, it is computed on the line above, and it died at the return
+        # -- so `([], 0)` from an empty key set and `([], 0)` after asking about
+        # 8564 keys were byte-identical to every reader. Downstream that zero
+        # reaches `completed_local`, whose own value at that point is its
+        # `__init__` default, so a zero there is an INITIALISATION and not a
+        # measurement. Three different states, one indistinguishable output.
+        #
+        # THE PARTITION, and each term names the field that decides it:
+        #   NEVER-ASKED  keys_asked == 0     -- nothing was put to the store.
+        #   ASKED-AND-NO kv_uncapped == 0    -- the store holds no leading page.
+        #   CAPPED       kv_uncapped > 0     -- pages EXIST and a component pool
+        #                                       cut the claim; `by=` names it.
+        # `by=` reads `zero_capped_pools`, NOT `extra_pool_hit_pages`: that dict
+        # records only non-zero boundaries, so the pool that capped to exactly 0
+        # is ABSENT from it and its emptiness reads as "uncapped" while meaning
+        # "capped to nothing". That misreading is the reason this line exists.
+        #
+        # THIS IS NOT A SECOND COUNTER. The prohibition at
+        # `phase_flip_runtime.py:8807-8810` governs a quantity measured TWICE;
+        # this one is measured ZERO times -- the terms are already computed and
+        # then discarded, and nothing below changes a decision.
+        #
+        # Emitted only on the zero answer, which is the ambiguous case; a
+        # non-zero claim is already attributable from `#1028B`. Rate-limited
+        # WITH its suppressed count, because a bounded emitter that hides its
+        # own suppression is how a zero becomes unreadable a second time.
+        #
+        # NO SECOND CLASSIFIER. `by=` says WHICH pool capped the claim to zero
+        # and stops there. Whether that pool's shortfall is a SPAN problem (an
+        # anchor exists but not in range) or a DENSITY problem (no anchor at
+        # all) is already answered by `#1035b anchors_in_range(count,
+        # deepest_idx)` on the `#1028B` line -- `(0, -1)` is "none in range",
+        # `(1, 4095)` is "one, and here it ends". Read that field for the
+        # cause; this line only partitions the zero.
+        if kv_hit_pages == 0:
+            self._1035c_n = getattr(self, "_1035c_n", 0) + 1
+            n = self._1035c_n
+            if n <= 40 or n % 256 == 0:
+                asked = hit_result.keys_asked
+                uncapped = hit_result.kv_uncapped
+                if asked == 0:
+                    cause = "NEVER-ASKED (no keys were put to the store)"
+                elif uncapped == 0:
+                    cause = "ASKED-AND-NO (store holds no leading page)"
+                else:
+                    cause = (
+                        f"CAPPED (store holds {uncapped} leading KV page(s); a "
+                        f"component pool cut the claim to 0)"
+                    )
+                logger.warning(
+                    "#1035c ZERO-ANSWER PARTITION n=%d arm=%s cause=%s "
+                    "asked=%d kv_uncapped=%d claimed=%d by=%s "
+                    "(suppressed_so_far=%d). `by` lists pools capped to EXACTLY "
+                    "0 -- they are absent from extra_pool_hit_pages by "
+                    "construction, so an empty caps dict there means 'capped to "
+                    "nothing', never 'uncapped'.",
+                    n,
+                    _arm,
+                    cause,
+                    asked,
+                    uncapped,
+                    kv_hit_pages,
+                    ",".join(hit_result.zero_capped_pools) or "-",
+                    max(0, n - min(n, 40) - (n // 256)),
+                )
 
         return (
             hash_value[:kv_hit_pages],
