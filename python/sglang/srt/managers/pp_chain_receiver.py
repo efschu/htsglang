@@ -512,15 +512,44 @@ class PpChainReceiver:
             absorbed += 1
         return absorbed
 
-    def recv(self) -> List[Any]:
+    def recv(self, max_messages: int = 64) -> List[Any]:
         """Return the next chain message, blocking until one exists.
 
         Inbox first: messages absorbed while a flip was armed are handed
         over here, in arrival order, before anything new is taken off the
         wire.
+
+        #1071 (A-ii): BOUNDED THE SAME WAY ITS SIBLING ALREADY IS. Until
+        here this loop was a bare ``while not self.inbox:
+        self._advance(block=True)`` -- no counter evidence, no runaway
+        guard -- while ``consume_up_to`` twenty lines above takes neither
+        step without both. The asymmetry was not a design: it is where PP1
+        sat for five minutes in 1068cap (07:34:09 until the deadman) after
+        a one-shot armed a wait for a hop nobody owed. Two bounds, and
+        neither of them invents a policy:
+
+        * ``self._stall_timeout_s`` (``STALL_ENV``) already bounds each
+          blocking ``_advance`` and raises ``PpChainRecvStalled``. Nothing
+          new is added here; the launcher now sets it, because the default
+          of 0 kept the pre-#824 unbounded block.
+        * ``max_messages`` is the runaway guard, verbatim the sibling's:
+          it can only be reached if this loop absorbs messages that never
+          land in the inbox, and stopping loudly is then better than
+          spinning. ``self.consumed`` is reported with it so the counter
+          and the wire can be compared at the point they disagreed.
         """
+        absorbed = 0
         while not self.inbox:
+            if absorbed >= int(max_messages):
+                raise PpChainRecvStalled(
+                    f"{LOG_PREFIX} recv absorbed {absorbed} messages "
+                    f"(consumed={self.consumed}) without one reaching the "
+                    f"inbox; the counter and the wire disagree. Blocking on "
+                    f"further advances here is the 1068cap park (PP1, "
+                    f"07:34:09), so this stops instead."
+                )
             self._advance(block=True)
+            absorbed += 1
         return self.inbox.popleft()
 
 

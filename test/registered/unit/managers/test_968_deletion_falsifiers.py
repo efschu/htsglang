@@ -446,3 +446,353 @@ def test_1069_dwell_holds_the_ppward_arm_and_is_bounded():
         "the dwell no longer lapses at SEAM_COHORT_DWELL_ROUNDS -- the hold "
         "is unbounded, which is the livelock this campaign has paid for"
     )
+
+
+# -- (A-i)/(A-ii): the DEFER-armed chain wait (1068cap end-wedge) ----------
+#
+# RED-FIRST against 929525805e. Metal: 1068cap 07:34:09, PP1's DEFER armed
+# `_pp_row_chain_owed` for rid 41fcb9cd -- a rid that had traveled the chain
+# long before (READMIT-MATCH n=179/181 two seconds earlier) and became
+# unlocatable through PP1's own #791/#797 void of the told=37147/local=0
+# pass. The premise comment at the arm site ("PROVES a chain send is in
+# flight") was false, the one-shot bypassed the counter-against-twin gate
+# (:8622) that fixed row7, and pp_chain_receiver.recv() blocked forever:
+# PP0 in the output recv, PP1 in a chain recv nobody owes, PP2 spinning on
+# its occupant. These go green with F2b's (A-i)+(A-ii) cut.
+
+
+def _defer_arm_slice():
+    """The DEFER block of `_pp_proxy_frame_pending`, anchored on the
+    `defer_rid` stats key (stable across the fix; the premise comment is
+    not) up to the arm's `_trace("defer_rid")`."""
+    import inspect as _i
+
+    from sglang.srt.managers import scheduler_pp_mixin as mixin
+
+    src = _i.getsource(mixin.SchedulerPPMixin._pp_proxy_frame_pending)
+    start = src.index('"defer_rid"')
+    end = src.index('_trace("defer_rid")')
+    return src[start:end]
+
+
+# (A-i) IS WITHDRAWN, AND THE WITHDRAWAL IS THE POINT (P1, 2026-09-01).
+#
+# The two tests that stood here demanded counter proof and a raise INSIDE the
+# DEFER block. Both were correct about that block and both were the wrong
+# instrument, for two independent reasons recorded rather than deleted:
+#
+#   1. F2b's own retraction: the counter proof is BLIND at that site -- the
+#      rendezvous bumps `sent` only when the receiver ENTERS the recv, so
+#      "balanced counters" cannot distinguish in-flight from never-posted.
+#   2. The arc-breaker rule (user order 2026-09-01, "nicht wieder in den
+#      Endlosbogen einbiegen"): the DEFER one-shot is a COMPENSATION for a
+#      rank-local verdict. Hardening it is answer (a) -- a deletion
+#      candidate, never a fix order. Its trigger was a rid whose ownership
+#      moved under it because a mid-rank #797 void had swallowed the pass
+#      (`told=37147/local=0`, 1068cap 07:34). #1071 deletes that void, so the
+#      trigger is removed at its source instead of survived at its symptom.
+#
+# What replaces them asserts the DELETION, which is the thing that must not
+# silently grow back.
+
+
+def test_the_rank_local_shortfall_verdict_is_gone():
+    """#1071 ZOMBIE TEST. `_pp_void_retracted_pass` let ONE rank decide the
+    GROUP's pass ran nowhere, and told nobody upstream -- PP0's slot stayed
+    set, the last rank's did not, and PP0 parked in `_do_recv` until the
+    deadman (1068cap 07:34:09, 1069cohort 08:00:55). Its own docstring named
+    the return trip that made it safe; #969 CUT V had already deleted that
+    emitter. The verdict is deleted, not repaired."""
+    from sglang.srt.managers import scheduler_pp_mixin as mixin
+
+    assert not hasattr(mixin.SchedulerPPMixin, "_pp_void_retracted_pass"), (
+        "the rank-local shortfall void grew back: a downstream rank may not "
+        "void a pass PP0 launched, because the void reaches downstream ranks "
+        "and never PP0 (RAENGE-NIE-UNEINS / #968 PP0 authority)"
+    )
+
+
+def test_an_unhonourable_told_is_loud_not_silent():
+    """#1071, the other half. Deleting the void is only safe if the state it
+    used to swallow is now NAMED. An unhonourable told is the ranks
+    disagreeing about a pass; detection is a crash, never a clamp (a clamp
+    would be rank-local geometry, i.e. #631) and never a wait."""
+    import inspect as _i
+
+    from sglang.srt.managers import scheduler_pp_mixin as mixin
+
+    src = _i.getsource(mixin.SchedulerPPMixin._pp_assert_told_honourable)
+    assert "raise" in src and "entries_retracted_by_rank" in src, (
+        "the replacement for the deleted void does not stop on a detected "
+        "shortfall -- silence here is the 1069cohort park again"
+    )
+
+
+def test_Aii_chain_recv_is_counter_bounded():
+    """(A-ii) RED-FIRST. `PpChainReceiver.recv` blocks with
+    `while not self.inbox: self._advance(block=True)` -- no counter check,
+    no guard, unlike its sibling `consume_up_to` (max_messages guard,
+    counter-against-wire comparison). 1068cap: PP1 sat in exactly this
+    loop for 5+ minutes with nothing posted. The fix bounds recv the same
+    way its sibling already is."""
+    import inspect as _i
+
+    from sglang.srt.managers import pp_chain_receiver as pcr
+
+    src = _i.getsource(pcr.PpChainReceiver.recv)
+    assert any(k in src for k in ("self.consumed", "sent", "max_messages")), (
+        "recv() still blocks unbounded with no counter evidence -- a "
+        "one-shot armed on a false premise parks the rank forever "
+        "(1068cap PP1, 07:34:09 until the deadman)"
+    )
+
+
+# -- (C): the occupant-sleep node and the half-built void relay ------------
+#
+# RED-FIRST against ca0ee3acd4. This is the node BOTH measured stall
+# instances have in common, and neither (A-i) nor (A-ii) touches it:
+#
+#   1068cap 07:34:09  PP1 in pp_chain_receiver.recv, PP2 spinning on its
+#                     occupant, PP0 in the output recv (cur_batch SET).
+#   1069cohort 08:00:55  roles SWAPPED -- PP1 in the occupant throttle
+#                     (py-spy, scheduler_pp_mixin :4189), PP2 reading
+#                     counters at :8622, PP0 identical to 1068cap.
+#
+# Different entries (1069cohort's ROW-DELIVER d41-d43 are clean: planned,
+# no void, no DEFER, no #992), same halting member: the `else:` arm of the
+# chain-receive gate sleeps 2 ms on "my slot is occupied and no upstream
+# statement came", forever, instead of moving the in-flight pass or saying
+# anything. It is a throttle where a horizon belongs.
+#
+# WHY THE NODE EXISTS AT ALL -- named here because it decides which of the
+# two green paths below is the right one (UPSTREAM-MINIMAL, user order
+# 2026-08-29). The occupant is not a race; it is the PRODUCT of a rank-local
+# verdict. Metal, 1068cap 07:34:02-09: the #797 shortfall void ran on rank 1
+# ONLY -- no void/retract line on PP0 or PP2, PP0 admitted fwd 174 three
+# seconds later, PP2's occupant counter climbed. A rank-local
+# state-changing decision leaves exactly this shape: PP0's slot stays set,
+# downstream is nulled, and the middle rank owes a statement its own void
+# swallowed. #969 CUT V then deleted the void-output EMITTER (the deletion
+# is recorded verbatim in the comment at `_pp_send_output_to_next_stage`)
+# on the premise "the batch IS the verdict, both sides ask mbs[slot]" --
+# which holds for an ordinary pass and breaks for a MID-RANK void.
+#
+# So the compensation layer here is the void RELAY, and it is half-built:
+# `pp_void_forward_payload` (the #801 relay invariant, in full prose) is
+# computed into `self._pp_void_forward_payload` by the absorber and read by
+# NOBODY (1 writer / 0 readers, devindex `where` at pin ca0ee3acd4 and grep
+# on the branch, both), while `_PP_VOID_OUTPUT_KEY: True` is constructed at
+# exactly one site -- inside the absorber that consumes it. A message no
+# rank originates, relayed by nobody, absorbed by one.
+#
+# The falsifiers below are therefore written so BOTH exits go green: wire
+# the relay (the O2 E-a/E-b form), or delete it whole and let PP0 own the
+# verdict (the structural cut). What they forbid is the third state we are
+# actually in -- half a relay and a silent sleep under it.
+
+
+def _occupant_throttle_sources():
+    """The `else:` arm of the chain-receive gate in `_event_loop_pp_body`
+    (scheduler_pp_mixin :4180-4189 at ca0ee3acd4), plus ONE HOP: the source
+    of every `self.<method>()` it calls, so a fix that puts the horizon in a
+    helper still reads as green.
+
+    Anchored structurally (ast: the `with record_function("recv_requests")`
+    block, then the terminal `else` of the `_chain_gate` if-chain), not on
+    comment text -- the comments at this node are being rewritten by the
+    fix that makes these tests pass.
+    """
+    import ast as _ast
+    import inspect as _i
+    import textwrap as _t
+
+    from sglang.srt.managers import scheduler_pp_mixin as mixin
+
+    src = _t.dedent(_i.getsource(mixin.SchedulerPPMixin._event_loop_pp_body))
+    tree = _ast.parse(src)
+    lines = src.splitlines()
+
+    gate = None
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.With) and "recv_requests" in lines[node.lineno - 1]:
+            gate = node
+            break
+    assert gate is not None, (
+        "the chain-receive gate block is gone from _event_loop_pp_body -- "
+        "re-derive this anchor against the new loop before trusting a pass"
+    )
+
+    # The gate is the if-chain whose TEST reads the gate variable -- not the
+    # row-authority guard that assigns it, which is the first `If` in the
+    # block and has no else arm at all.
+    branch = None
+    for node in gate.body:
+        if not isinstance(node, _ast.If):
+            continue
+        if "_chain_gate" not in (_ast.get_source_segment(src, node.test) or ""):
+            continue
+        cur = node
+        while len(cur.orelse) == 1 and isinstance(cur.orelse[0], _ast.If):
+            cur = cur.orelse[0]
+        if cur.orelse:
+            branch = cur.orelse
+        break
+    assert branch is not None, (
+        "the gate no longer has a terminal else arm -- if the occupant case "
+        "was folded away entirely, re-derive this test rather than pass it"
+    )
+
+    texts = [_ast.get_source_segment(src, stmt) or "" for stmt in branch]
+
+    # one hop: helpers called from the branch count as part of the branch
+    for stmt in branch:
+        for call in _ast.walk(stmt):
+            if not isinstance(call, _ast.Call):
+                continue
+            fn = call.func
+            if (
+                isinstance(fn, _ast.Attribute)
+                and isinstance(fn.value, _ast.Name)
+                and fn.value.id == "self"
+            ):
+                target = getattr(mixin.SchedulerPPMixin, fn.attr, None)
+                if callable(target):
+                    try:
+                        texts.append(_i.getsource(target))
+                    except (OSError, TypeError):
+                        pass
+    return "\n".join(texts)
+
+
+def test_C_the_occupant_throttle_carries_a_verdict_horizon():
+    """(C) RED-FIRST. The throttle arm today is two statements -- empty the
+    request list, sleep 2 ms -- with no memory of how long the occupant has
+    been unanswered. A rank that sleeps on "occupied slot, no upstream
+    statement" with no horizon cannot distinguish the 2 ms of ordinary
+    pipeline skew from the 12 minutes of 1069cohort. The fix gives the arm
+    a horizon: a clock or a round count measured against a bound (whichever
+    form -- this asserts the vocabulary of one, not a particular one).
+
+    Honest bound of this assertion: it pins that SOME horizon term is
+    consulted at or one hop below the node, not that the bound is correct.
+    The bound's correctness is boot evidence, not desk evidence."""
+    seg = _occupant_throttle_sources()
+    horizon_terms = (
+        "monotonic",
+        "deadline",
+        "horizon",
+        "elapsed",
+        "_since",
+        "since_",
+        "timeout",
+        "stall",
+        "budget",
+        "rounds",
+        "_ROUNDS",
+        "perf_counter",
+    )
+    assert any(t in seg for t in horizon_terms), (
+        "the occupant throttle still sleeps with no horizon: the arm cannot "
+        "tell 2 ms of skew from 12 minutes of stall, which is exactly what "
+        "both measured instances did (1068cap PP2, 1069cohort PP1 at :4189)"
+    )
+
+
+def test_C_an_occupant_past_the_horizon_is_loud():
+    """(C) RED-FIRST, second half. An occupant that outlives its horizon is
+    not a slow peer -- it is the ranks disagreeing about who owes the next
+    statement for that slot, and RAENGE-NIE-UNEINS says detected
+    disagreement is a crash/stop, never a compensating wait. The arm must
+    carry a loud path (raise, or at minimum a named error line with rid,
+    slot and counters) for the lapsed case.
+
+    Note the asymmetry that makes this safe: taking the arm is legitimate
+    and frequent; OUTLIVING the horizon on it never is."""
+    seg = _occupant_throttle_sources()
+    assert ("raise" in seg) or ("logger.error" in seg), (
+        "no loud path at the occupant node: a slot occupied past any "
+        "reasonable horizon degrades into a silent 2 ms spin instead of "
+        "naming the rank-divergence it actually is"
+    )
+
+
+def _void_relay_census():
+    """(emitter_sites_outside_the_absorber, payload_readers) for the #797
+    void-output relay, by ast over the module -- the two halves that decide
+    whether the relay is wired, deleted, or (today) half-built."""
+    import ast as _ast
+    import inspect as _i
+
+    from sglang.srt.managers import scheduler_pp_mixin as mixin
+
+    src = open(_i.getsourcefile(mixin)).read()
+    tree = _ast.parse(src)
+
+    def enclosing(lineno):
+        best = None
+        for n in _ast.walk(tree):
+            if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if n.lineno <= lineno <= (n.end_lineno or n.lineno):
+                    if best is None or n.lineno > best.lineno:
+                        best = n
+        return best.name if best else None
+
+    emitters = []
+    for n in _ast.walk(tree):
+        if isinstance(n, _ast.Dict):
+            for k in n.keys:
+                if isinstance(k, _ast.Name) and k.id == "_PP_VOID_OUTPUT_KEY":
+                    owner = enclosing(n.lineno)
+                    if owner != "_pp_absorb_void_output":
+                        emitters.append((n.lineno, owner))
+
+    readers = [
+        (n.lineno, enclosing(n.lineno))
+        for n in _ast.walk(tree)
+        if isinstance(n, _ast.Attribute)
+        and n.attr == "_pp_void_forward_payload"
+        and isinstance(n.ctx, _ast.Load)
+    ]
+    gone = not any(
+        name in src
+        for name in (
+            "_PP_VOID_OUTPUT_KEY",
+            "pp_void_forward_payload",
+        )
+    )
+    return emitters, readers, gone
+
+
+def test_C_the_void_relay_is_wired_or_deleted_but_never_half_built():
+    """(C) RED-FIRST, third half -- and deliberately satisfiable BOTH ways.
+
+    Measured at ca0ee3acd4: `_PP_VOID_OUTPUT_KEY: True` is constructed at
+    exactly ONE site, inside `_pp_absorb_void_output`, i.e. only ever when
+    re-forwarding a void that was already received; no rank originates one,
+    because #969 CUT V deleted the emitter. And the re-forward payload is
+    assigned to `self._pp_void_forward_payload` and read by nobody (1
+    writer / 0 readers). `pp_void_forward_payload`'s own docstring states
+    the #801 relay invariant it can no longer keep: "a non-last rank that
+    took exactly one message off this wire for a ring generation must put
+    exactly one back on it, void included".
+
+    Half a relay is the worst of the three states: PP0 parks on an output
+    the mid-rank void swallowed, and the successor throttles on an occupant
+    nobody will speak for. Either exit closes it --
+
+      WIRED   an originating emitter exists AND the forward payload is
+              actually read/sent (the O2 E-a/E-b form), or
+      DELETED the relay symbols are gone, PP0 owns the verdict, and the
+              downstream ranks carry no void bookkeeping at all (the
+              structural cut, and the default under UPSTREAM-MINIMAL:
+              repair carries the burden of proof, deletion does not).
+    """
+    emitters, readers, gone = _void_relay_census()
+    wired = bool(emitters) and bool(readers)
+    assert wired or gone, (
+        "the #797 void relay is half-built: originating emitters outside "
+        f"the absorber = {emitters or 'NONE'}, readers of "
+        f"_pp_void_forward_payload = {readers or 'NONE'}. A void nobody "
+        "originates, nobody relays and one rank absorbs leaves PP0 parked "
+        "and the successor spinning on an occupant (1068cap + 1069cohort)"
+    )

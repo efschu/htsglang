@@ -4177,6 +4177,9 @@ class SchedulerPPMixin:
                         _chain_gate = self._pp_row_chain_pending()
                     if _chain_gate is None or _chain_gate:
                         recv_reqs = self.request_receiver.recv_requests()
+                        # #1071: the ring moved for this rank -- every slot's
+                        # horizon starts again from here.
+                        self._pp_occupant_since = {}
                     elif (
                         not self.waiting_queue
                         and getattr(self, "chunked_req", None) is None
@@ -4184,7 +4187,25 @@ class SchedulerPPMixin:
                         and not self._pp_row_any_proxy_signal()
                     ):
                         recv_reqs = self.request_receiver.recv_requests()
+                        self._pp_occupant_since = {}
                     else:
+                        # #1071 HORIZON. Taking this arm is legitimate and
+                        # frequent -- it is the ordinary 2 ms of pipeline skew
+                        # while an occupied slot waits for its upstream's
+                        # statement. OUTLIVING it never is: a slot still
+                        # occupied and still unspoken-for after a bounded
+                        # horizon is the ranks disagreeing about who owes the
+                        # next statement for it, and a 2 ms sleep cannot tell
+                        # those two apart (measured: 1068cap PP2 and
+                        # 1069cohort PP1 spun here for minutes, PP2 alone
+                        # logging 585585 occupant passes after the ring had
+                        # stopped). The horizon does not repair anything and
+                        # deliberately does not: it converts a silent spin
+                        # into a named stop (RAENGE-NIE-UNEINS).
+                        if self._pp_occupant_horizon_lapsed(mb_id):
+                            raise RuntimeError(
+                                self._pp_occupant_horizon_message(mb_id)
+                            )
                         recv_reqs = []
                         time.sleep(0.002)
                 # #1015d: reap the last rank's deferred wrap send HERE, after
@@ -4570,9 +4591,34 @@ class SchedulerPPMixin:
                         effective, amended = self._pp_reconcile_incoming_admission(
                             _decision
                         )
-                        effective, amended = self._pp_void_retracted_pass(
-                            effective, amended
-                        )
+                        # #1071: the rank-local shortfall VOID is DELETED here.
+                        # What stood at this line was
+                        # `_pp_void_retracted_pass`, a rank-local
+                        # state-changing verdict: rank r decided the GROUP's
+                        # pass ran nowhere. Its own docstring named the return
+                        # trip that made it safe -- "the void output carries
+                        # the observed local match home, and PP0's guard learns
+                        # it as a floor" -- and #969 CUT V deleted that emitter
+                        # (`_PP_VOID_OUTPUT_KEY`: zero originating senders at
+                        # ca0ee3acd4). The verdict therefore travelled
+                        # DOWNSTREAM only, and PP0's slot stayed set while the
+                        # last rank's did not, which is exactly the premise
+                        # CUT V's own comment at `_do_recv` relies on ("sender
+                        # and receiver ask one question of one batch"). PP0
+                        # then parks in the output receive for ever: measured
+                        # twice, 1068cap 07:34:09 and 1069cohort 08:00:55, and
+                        # in the second the #797 lines sit on the stall second
+                        # itself (PP1, told=12493 local=8397 then told=13399
+                        # local=12493 -- local exactly one pass behind told).
+                        #
+                        # Repairing the return trip would repair a compensation
+                        # layer for a rank-local verdict, which is the arc the
+                        # #968 order forbids continuing (upstream-minimal:
+                        # repair carries the burden of proof, deletion does
+                        # not). So the verdict is gone and the disagreement is
+                        # DETECTED instead: RAENGE-NIE-UNEINS, a detected
+                        # divergence is a crash, never a compensating wait.
+                        self._pp_assert_told_honourable(mb_id, amended)
                         self._pp_admission_incoming_effective = effective
                         self._pp_admission_incoming_schedule = (
                             self._pp_forwarded_schedule_from(amended)
@@ -8542,52 +8588,124 @@ class SchedulerPPMixin:
             log=logger,
         )
 
-    def _pp_void_retracted_pass(
+    def _pp_assert_told_honourable(
         self: Scheduler,
-        effective: Dict[str, int],
+        mb_id: int,
         amended: PPAdmissionDecision,
-    ) -> Tuple[Dict[str, int], PPAdmissionDecision]:
-        """#797: a retraction drops the PASS, not just the rid.
+    ) -> None:
+        """#1071: the ranks agree about this pass, or the group stops. Loudly.
 
-        RESTORED VERBATIM from the pre-#1015 tree (01a391fa03^), for the same
-        reason `_pp_reconcile_incoming_admission` above is: the mechanism was
-        deleted with the wire that fed it, and the row on the proxy frame is
-        the new feed. A rank that cannot honour a told prefix has no third
-        membership option -- it cannot ADMIT the rid (no KV for the reused
-        prefix) and the upstream cannot be AMENDED (its batch is in flight) --
-        so the pass runs NOWHERE on this rank, the void relays group-uniformly
-        (#797), the void output carries the observed local match home, and
-        PP0's `PPAdmissionCongruenceGuard` learns it as a floor so the next
-        offer for that rid is honourable ("PP0 defers its raise to the group
-        floor" -- the exact next-slice the boot-631cut under-coverage counter
-        ordered).
+        THIS REPLACES `_pp_void_retracted_pass`, WHICH IS DELETED. That method
+        let a downstream rank decide, alone, that the GROUP's pass ran nowhere
+        -- the rank-local state-changing verdict the #968 order forbids. Its
+        safety argument was a RETURN TRIP ("the void output carries the
+        observed local match home ... PP0's guard learns it as a floor"), and
+        #969 CUT V deleted the emitter for that trip. What was left ran the
+        verdict downstream-only:
+
+            1068cap   07:34:02-09  #797 void on rank 1 ONLY; no void or
+                                   retract line on PP0 or PP2.
+            1069cohort 08:00:54/55 #791 unhonourable on PP1, told=12493
+                                   local=8397 then told=13399 local=12493 --
+                                   `local` exactly one pass behind `told` --
+                                   and the ring never moved again.
+
+        In both, PP0's `mbs[slot]` stayed set while the last rank's did not,
+        so the last rank sent no output and PP0 blocked in `_do_recv` until
+        the deadman. `_do_recv`'s own comment states the invariant that
+        breaks: "sender and receiver ask one question of one batch". Deleting
+        the only remaining producer of a rank-local `mbs[slot] = None`
+        RESTORES that invariant rather than compensating for its loss.
+
+        WHY A RAISE AND NOT A CLAMP. Clamping this rank's prefix to its own
+        local match is rank-local geometry, i.e. #631 -- the very divergence
+        Row Authority exists to end. Under Row Authority the row is PP0's and
+        every rank EXECUTES it; a rank whose cache cannot honour the row is
+        not entitled to renegotiate it, and a told the group cannot honour is
+        a defect at the ONE place that stamps it (PP0), not here. So this
+        names the divergence and stops, per RAENGE-NIE-UNEINS (detection is a
+        crash, never refusal-and-continue). On a group whose told is
+        honourable it never fires, and if it does fire it has pointed at PP0's
+        told derivation -- one place, not the next node of the ring family.
         """
         rank = getattr(getattr(self, "ps", None), "pp_rank", None)
-        voided = pp_pass_should_void(
-            amended, rank, getattr(self, "_pp_pass_voided_incoming", False)
-        )
-        self._pp_admission_pass_voided = voided
-        if not voided:
-            return effective, amended
         mine = entries_retracted_by_rank(amended, rank) if rank is not None else ()
-        if mine:
-            self._pp_pass_voids = getattr(self, "_pp_pass_voids", 0) + 1
-            first = mine[0]
-            logger.warning(
-                "#797 PP-ADMISSION pass voided on rank %s: this rank retracted "
-                "%d request(s) (first: rid=%s told=%d local=%s), so its batch "
-                "would have been a strict SUBSET of the one the upstream "
-                "already launched. Running the whole pass nowhere instead: "
-                "rank 0's requests are released and re-queued by the void "
-                "output, and the observed local match is fed back as a prefix "
-                "floor so the next offer for this rid is honourable.",
-                rank,
-                len(mine),
-                first.rid,
-                first.prefix_len,
-                first.observed_local,
-            )
-        return {}, void_pp_admission_decision(amended)
+        if not mine:
+            return
+        first = mine[0]
+        self._pp_pass_voids = getattr(self, "_pp_pass_voids", 0) + 1
+        raise RuntimeError(
+            f"#1071 PP RANKS DISAGREE ABOUT THIS PASS: rank {rank} cannot "
+            f"honour the told prefix PP0 stamped for slot {mb_id} -- "
+            f"{len(mine)} request(s) retracted, first rid={first.rid} "
+            f"told={first.prefix_len} local={first.observed_local}. Until "
+            f"#1071 this rank voided the pass for the whole group by itself "
+            f"and told nobody upstream, which parked PP0 in the output "
+            f"receive for ever (1068cap 07:34:09, 1069cohort 08:00:55). The "
+            f"defect is NOT here: it is wherever PP0 derived a told the group "
+            f"cannot honour. Detected rank disagreement stops the group; it "
+            f"is never compensated for."
+        )
+
+    def _pp_occupant_horizon_lapsed(self: Scheduler, mb_id: int) -> bool:
+        """#1071: has this slot been occupied-and-unspoken-for past the bound?
+
+        First sighting of a slot on the throttle arm starts its clock and
+        answers False -- the arm is a normal part of a turning ring and must
+        stay cheap. Only continued occupancy of the SAME slot past
+        `SGLANG_PP_OCCUPANT_HORIZON_S` answers True. Any pass on which this
+        rank actually took a chain receive clears every clock (see the two
+        receive branches), so a ring that moves at all can never accumulate
+        toward the bound.
+
+        0 disables, for a workload where a genuinely long unspoken occupancy
+        is legitimate. Default 90 s: an order of magnitude above the longest
+        healthy TP window measured on this rig (52 s, 1068cap group flip
+        pairs) and two orders below the observed stalls (both ran until the
+        deadman).
+        """
+        bound = float(os.environ.get("SGLANG_PP_OCCUPANT_HORIZON_S", "90") or 0.0)
+        since = getattr(self, "_pp_occupant_since", None)
+        if since is None:
+            since = {}
+            self._pp_occupant_since = since
+        now = time.monotonic()
+        first = since.get(mb_id)
+        if first is None:
+            since[mb_id] = now
+            return False
+        if bound <= 0.0:
+            return False
+        return (now - float(first)) > bound
+
+    def _pp_occupant_horizon_message(self: Scheduler, mb_id: int) -> str:
+        """The named stop for a lapsed occupant: rank, slot, rids, counters."""
+        since = getattr(self, "_pp_occupant_since", None) or {}
+        held = ()
+        try:
+            batch = self.mbs[mb_id] if mb_id < len(self.mbs) else None
+            held = tuple(
+                str(getattr(r, "rid", ""))[:8]
+                for r in (getattr(batch, "reqs", None) or ())
+            )[:4]
+        except Exception:  # noqa: BLE001 - a stop message may never itself raise
+            held = ("<unreadable>",)
+        counters = getattr(self, "pp_flip_counters", None)
+        receiver = getattr(self, "pp_chain_receiver", None)
+        waited = time.monotonic() - float(since.get(mb_id, time.monotonic()))
+        return (
+            f"#1071 PP OCCUPANT PAST ITS HORIZON: rank "
+            f"{getattr(getattr(self, 'ps', None), 'pp_rank', None)} has held "
+            f"slot {mb_id} occupied (rids={held or 'NONE'}) for {waited:.1f}s "
+            f"with no upstream statement and nothing provably posted on the "
+            f"chain (consumed={getattr(receiver, 'consumed', None)}, "
+            f"counters={'present' if counters is not None else 'absent'}). "
+            f"That is not pipeline skew: it is the ranks disagreeing about "
+            f"who owes the next statement for this slot, and until #1071 it "
+            f"degraded into a silent 2 ms spin (1068cap PP2, 1069cohort PP1 "
+            f"-- 585585 occupant passes after the ring had already stopped). "
+            f"Raise or disable with SGLANG_PP_OCCUPANT_HORIZON_S (0 disables)."
+        )
 
     def _pp_row_chain_pending(self: Scheduler) -> Optional[bool]:
         """#631 ROW AUTHORITY: is a chain message provably available?
