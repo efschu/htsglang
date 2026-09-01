@@ -1777,24 +1777,13 @@ class PhasePolicyConfig:
     #: comment at DEFAULT_PP_WINDOW_S.
     pp_window_s: float = DEFAULT_PP_WINDOW_S
     tp_decode_floor_s: float = DEFAULT_TP_DECODE_FLOOR_S
-    #: W30: can a resident the cutover RETRACTS be re-admitted in the layout
-    #: it is flipped into?
-    #:
-    #: The tp-ward arm's whole justification is "N requests are decoding, so
-    #: take them to the decode layout". Under the #856 no-carry rule the
-    #: cutover RETRACTS those very requests, so the justification only holds
-    #: if the target layout can then re-admit them by read-through. When it
-    #: cannot, the arm's own execution destroys the reason it armed -- which
-    #: is not a subtle failure: W30 measured 150 flips in 17 minutes, zero
-    #: decode batches and zero completed requests, with the arm auditor
-    #: calling the verdict wrong 12 times.
-    #:
-    #: True whenever the purity contract permits the re-admission -- either
-    #: the mode allows prefill in TP outright, or the seam-transport
-    #: exemption covers it (`phase_purity.seam_transport_exempt`). Static
-    #: boot config, therefore identical on every rank, which is what lets the
-    #: arm predicate read it without splitting the group.
-    seam_readmit_available: bool = True
+    #: W30/#968: the boot-static `seam_readmit_available` knob that stood
+    #: here is DELETED (upstream-minimal). Its one producer
+    #: (`config_from_env`) hardcoded it True, so the arm refusal it fed was
+    #: never once reachable (#1040's finding); the LIVE question is
+    #: `PhasePolicyInputs.seam_readmit_ready`, whose authority
+    #: (`seam_transport_premise_holds`) since #968 also probes live store
+    #: presence instead of retract stamps alone.
     #: #689 WINDOW FORMATION. How many completed carriers a PP window should
     #: accumulate before the tp-ward arm is allowed, normally
     #: max_running_requests. 0 or 1 disables the gate entirely and restores
@@ -2559,10 +2548,10 @@ class PhasePolicyInputs:
     ready_carriers: int = 0
 
     #: #1040: can the TP layout ACTUALLY re-admit the residents this cutover
-    #: would retract, RIGHT NOW? The tp-ward DRAINED arm already has a refusal
-    #: for "the target cannot re-admit them" -- but it reads
-    #: `cfg.seam_readmit_available`, which is BOOT-STATIC and hardcoded True
-    #: (`config_from_env`), so the refusal has never once been reachable.
+    #: would retract, RIGHT NOW? The tp-ward DRAINED arm's refusal used to
+    #: read the boot-static `cfg.seam_readmit_available` beside this --
+    #: hardcoded True, never once reachable; #968 deleted that knob, so this
+    #: live field is the refusal's only input.
     #: Its own comment credits it with holding W30 to 3 flips instead of 150.
     #:
     #: The static True rests on "under strict/threshold the seam-transport
@@ -3847,19 +3836,20 @@ def _decide_from_load(
             # ever. Refusing here is what keeps that at 3 flips instead of
             # 150, and it is a REFUSAL rather than a silent hold so the
             # operator sees which contract is missing.
-            # #1040: ASK THE LIVE QUESTION TOO. `cfg.seam_readmit_available`
-            # is boot-static and hardcoded True, so this refusal has never
-            # been reachable; `inp.seam_readmit_ready` is the same question
-            # asked of the current queue, via the same authority the
-            # post-cutover builder uses. Either one saying "no" stands the arm
-            # down. Measured specimens this closes, both `ARM-VERDICT-WRONG`
-            # on boot 13633687a7: armed with `running_bs=4 ready_carriers=2`
-            # and with `running_bs=5`, cutover COMMITTED, then no batch in 8
-            # rounds -- the flip arriving with nothing to do, which is exactly
-            # what the refusal below was written for.
-            if not getattr(cfg, "seam_readmit_available", True) or not getattr(
-                inp, "seam_readmit_ready", True
-            ):
+            # #1040/#968: ASK THE LIVE QUESTION. `inp.seam_readmit_ready`
+            # asks the current queue via the same authority the post-cutover
+            # builder uses (`seam_readmit_candidates` +
+            # `seam_transport_premise_holds`, which since #968 also probes
+            # LIVE store presence, not retract stamps alone). The boot-static
+            # `cfg.seam_readmit_available` that used to be consulted beside
+            # it is DELETED: hardcoded True, it never once stood an arm
+            # down. Measured specimens the live term closes, both
+            # `ARM-VERDICT-WRONG` on boot 13633687a7: armed with
+            # `running_bs=4 ready_carriers=2` and with `running_bs=5`,
+            # cutover COMMITTED, then no batch in 8 rounds -- the flip
+            # arriving with nothing to do, which is exactly what the refusal
+            # below was written for.
+            if not getattr(inp, "seam_readmit_ready", True):
                 return _no(
                     f"NOT ARMING pp_to_tp despite {inp.running_bs} req "
                     f"decoding and {inp.pending_prefill_tokens} tok pending: "
@@ -4623,22 +4613,14 @@ def config_from_env(
     # "no measurement yet".
     note_flip_tokens_pricing(flip_tokens, tp_tok_s, pp_tok_s, explicit > 0)
 
-    # W30: can the layout a cutover flips INTO re-admit the residents that
-    # same cutover retracts? Derived from the purity contract, once, at boot:
-    #   * a mode that allows prefill in TP outright re-admits trivially;
-    #   * under strict/threshold the seam-transport exemption
-    #     (`phase_purity.seam_transport_exempt`) covers exactly this
-    #     population, so it is available too.
-    # It is therefore True for every mode this tree ships. It is computed and
-    # passed rather than hard-coded because the tp-ward arm now DEPENDS on it
-    # (see the DRAINED branch), and a future mode that cannot re-admit must
-    # make that arm stand down rather than reproduce W30's 150-flip livelock
-    # silently. Static config, so identical on every rank.
-    seam_readmit_available = True
+    # W30/#968: the boot-static `seam_readmit_available` computation that
+    # stood here is deleted with its config field -- it reduced to a
+    # hardcoded True on every shipped mode, so the arm refusal it fed was
+    # unreachable by construction. The live `seam_readmit_ready` input
+    # carries the question now.
 
     cfg = PhasePolicyConfig(
         enabled=enabled,
-        seam_readmit_available=seam_readmit_available,
         drain_mode=_flag_or_env(
             server_args,
             "phase_policy_drain_mode",

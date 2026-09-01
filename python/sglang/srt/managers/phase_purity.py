@@ -1291,6 +1291,65 @@ def seam_transport_pending_tokens(scheduler) -> int:
     return total
 
 
+def seam_store_presence_refuted(scheduler):
+    """#968 W30 point 3: LIVE store-presence probe for the tp-ward arm.
+
+    The premise check below (`seam_transport_premise_holds`) used to rest on
+    RETRACT STAMPS alone (`cached_prompt_tokens_at_retract`): evidence that
+    the tokens were once computed and fenced -- which says nothing about
+    whether any tier still HOLDS them at arm time. A host-pool clear between
+    retraction and re-admission leaves every stamp intact and every read
+    empty (the #1060 census measured 714 of 771 READMIT-MATCH lines at
+    host_hit=0 on boot 29 while the stamps read "restored"), and all four
+    acceptance logs of 2026-09-01 carry 0 premise refusals beside measured
+    total re-prefill (#939 recomputed==already on every measured flip).
+
+    This moves the #1060 tier probes (device tree / host pool / storage
+    flag) from the measure-only census onto the ARM path, as REFUTERS:
+
+        refuted := device tree EMPTY  AND  host pool ALL-FREE
+                   AND storage tier OFF
+
+    i.e. only when every READABLE tier positively refutes presence and no
+    tier that could still hold it is unprobed. An unreadable probe never
+    refutes (denominator law: unknown is not empty), and storage-on never
+    refutes (its per-rid presence is not cheaply readable here) -- so this
+    can only stand down an arm that would provably re-prefill cold, never
+    block a warm one.
+
+    Returns ``(refuted, detail)``; pure read, never raises past its guards.
+    """
+    tree_cache = getattr(scheduler, "tree_cache", None)
+    try:
+        root = getattr(tree_cache, "root_node", None)
+        children = getattr(root, "children", None)
+        tree_empty = (len(children) == 0) if children is not None else None
+    except Exception:  # noqa: BLE001 - a probe may never break arming
+        tree_empty = None
+    try:
+        pool = getattr(
+            getattr(tree_cache, "cache_controller", None), "mem_pool_host", None
+        )
+        if pool is None:
+            host_all_free = None
+        else:
+            avail = int(pool.available_size())
+            size = int(getattr(pool, "size", 0))
+            host_all_free = size > 0 and avail >= size
+    except Exception:  # noqa: BLE001
+        host_all_free = None
+    try:
+        storage_on = bool(getattr(tree_cache, "enable_storage", False))
+    except Exception:  # noqa: BLE001
+        storage_on = False
+    refuted = tree_empty is True and host_all_free is True and not storage_on
+    detail = (
+        f"tree_empty={tree_empty} host_all_free={host_all_free} "
+        f"storage_enabled={storage_on}"
+    )
+    return refuted, detail
+
+
 def seam_transport_premise_holds(scheduler) -> bool:
     """Is the re-admission actually a RESTORE? Checked, not asserted. #861d.
 
@@ -1397,6 +1456,27 @@ def seam_transport_premise_holds(scheduler) -> bool:
         except (TypeError, ValueError):
             continue
     if restored:
+        # #968 W30 point 3: the stamps say COMPUTED-AND-FENCED; the tiers say
+        # whether anything still HOLDS it. Both must agree before the arm may
+        # rest on this premise -- a stamp that outlives a host-pool clear was
+        # exactly the unprobed hole (see seam_store_presence_refuted).
+        refuted, tiers = seam_store_presence_refuted(scheduler)
+        if refuted:
+            if not getattr(scheduler, "_seam_premise_refused_announced", False):
+                scheduler._seam_premise_refused_announced = True
+                logger.error(
+                    "%s SEAM TRANSPORT REFUSED (store presence): %d stamped "
+                    "request(s) carry restore evidence, but every readable "
+                    "tier refutes presence (%s) -- the stamps outlived the "
+                    "content, so re-admitting in TP would be a COLD PREFILL "
+                    "of real work. Holding; the #861c existence term raises "
+                    "the flip demand instead. (#968 point 3: the #1060 tier "
+                    "probe, moved from the census to the arm.)",
+                    LOG_PREFIX,
+                    restored,
+                    tiers,
+                )
+            return False
         # #890 EDGE-TRIGGERED, on this module's own rule for exactly this shape:
         # "Cleared on recovery, so a flapping rig logs each engagement rather
         # than only the first in the process's life" (`_drain_yield_announced`).
