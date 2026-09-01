@@ -349,22 +349,55 @@ def _1063_record_fence(tree_cache, nodes) -> None:
             _1063_bump("fence_no_backend")
             return
         seen = {"readable": 0, "assembling": 0, "absent": 0, "unknown": 0}
+        # #1068: HARD TIME BUDGET on a diagnostic that sits on the cutover's
+        # no-return path. This scan walks every page stem of every eligible
+        # node through 2-4 os.path.exists() against a million-file store.
+        # Warm dcache that is ~3 s for 221862 stems (measured 06:47:10,
+        # boot_855_1067park); the very NEXT fence hit the re-prefill's fresh
+        # stems cold and never returned -- PP0's last line for 25 minutes was
+        # the FENCE-NODES header above, no abandon could run (PP0 is the
+        # timeout carrier), and the deadman killed the boot at 07:15:37.
+        # An instrument may never gate. A scan that cannot finish inside the
+        # budget reports itself CAPPED -- the counts become a sample and say
+        # so -- instead of holding the seam. The two-point consumer
+        # (`_1063_probe_since_fence`) reads only `_1063_AT_FENCE`, which is
+        # capped at 4096 stems anyway, so nothing downstream loses coverage
+        # it ever had.
+        # NOTE: deliberately time.monotonic(), not the fence's `now` -- that
+        # is a PARAMETER of the fence function and is not in scope here; a
+        # bare now() would NameError into the outer except and silently
+        # delete this whole snapshot (the #872 silent-zero shape).
+        _scan_deadline = time.monotonic() + 2.0
+        _scan_capped = False
         for node in nodes or ():
             for stem in _1063_stems_for_node(backend, node):
+                if time.monotonic() > _scan_deadline:
+                    _scan_capped = True
+                    break
                 st = _1063_stem_state(backend, stem)
                 seen[st] = seen.get(st, 0) + 1
                 if len(_1063_AT_FENCE) < _1063_STEM_CAP:
                     _1063_AT_FENCE[stem] = st
+            if _scan_capped:
+                break
         _1063_bump("fences")
+        if _scan_capped:
+            _1063_bump("fence_scan_capped")
         for k, v in seen.items():
             _1063_bump(f"fence_{k}", v)
         logger.warning(
-            "#1063 FENCE STORE STATE: stems=%d readable=%d assembling=%d "
+            "#1063 FENCE STORE STATE%s: stems=%d readable=%d assembling=%d "
             "absent=%d unknown=%d (tracked=%d of cap %d). `assembling` is a "
             "blob whose writer group never covered the last byte -- invisible "
             "to every reader, forever. `absent` here is 'not written or already "
             "reaped'; whether it was LOST LATER is only decidable against this "
             "snapshot, which is why it is taken.",
+            (
+                " (SCAN CAPPED at 2.0s -- #1068: counts are a SAMPLE of the "
+                "population, not the population)"
+                if _scan_capped
+                else ""
+            ),
             sum(seen.values()),
             seen.get("readable", 0),
             seen.get("assembling", 0),
