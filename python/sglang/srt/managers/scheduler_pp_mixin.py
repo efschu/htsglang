@@ -4536,6 +4536,22 @@ class SchedulerPPMixin:
                         _decision = getattr(
                             self, "_pp_last_recv_admission_decision", None
                         )
+                        _dn = getattr(self, "_pp_row_deliver_trace_n", 0) + 1
+                        self._pp_row_deliver_trace_n = _dn
+                        if _dn <= 50:
+                            logger.info(
+                                "#631 ROW-DELIVER d%d slot=%s proxy=%s "
+                                "decision_entries=%s queue=%d",
+                                _dn,
+                                mb_id,
+                                "set" if _pre_proxy is not None else "None",
+                                (
+                                    len(getattr(_decision, "entries", ()) or ())
+                                    if _decision is not None
+                                    else None
+                                ),
+                                len(getattr(self, "waiting_queue", ()) or ()),
+                            )
                         if _decision is None:
                             # PP0 only omits the row when it planned nothing,
                             # and then it sends no frame (#969J). A frame
@@ -4576,6 +4592,17 @@ class SchedulerPPMixin:
                         _st = getattr(self, "_pp_row_probe_stats", None)
                         if _st is not None:
                             _st["delivered"] += 1
+                        if _dn <= 50:
+                            logger.info(
+                                "#631 ROW-DELIVER d%d reconciled: effective=%d "
+                                "voided=%s schedule=%d",
+                                _dn,
+                                len(effective),
+                                bool(
+                                    getattr(self, "_pp_admission_pass_voided", False)
+                                ),
+                                len(self._pp_admission_incoming_schedule or {}),
+                            )
                     else:
                         # Upstream provably posted nothing for this slot yet.
                         # {} is the "admit nothing" spelling -- None would
@@ -4597,6 +4624,41 @@ class SchedulerPPMixin:
                     # and `running_batch` keeps the loop-top value.
                     self.mbs[mb_id] = None
                     pp_bulletin.clear_after_plan(self)
+                elif _pre_proxy is not None:
+                    _dn2 = getattr(self, "_pp_row_deliver_trace_n", 0)
+                    if _dn2 <= 50:
+                        try:
+                            with torch.profiler.record_function(
+                                "get_next_batch_to_run"
+                            ):
+                                plan = self.get_next_batch_to_run(
+                                    running_batch=self.running_batch,
+                                    last_batch=self.last_batch,
+                                )
+                                self.running_batch = plan.running_batch
+                                self.mbs[mb_id] = plan.batch_to_run
+                        finally:
+                            if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+                                pp_bulletin.clear_after_plan(self)
+                        logger.info(
+                            "#631 ROW-DELIVER d%d planned: batch=%s",
+                            _dn2,
+                            "set" if self.mbs[mb_id] is not None else "None",
+                        )
+                    else:
+                        try:
+                            with torch.profiler.record_function(
+                                "get_next_batch_to_run"
+                            ):
+                                plan = self.get_next_batch_to_run(
+                                    running_batch=self.running_batch,
+                                    last_batch=self.last_batch,
+                                )
+                                self.running_batch = plan.running_batch
+                                self.mbs[mb_id] = plan.batch_to_run
+                        finally:
+                            if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+                                pp_bulletin.clear_after_plan(self)
                 else:
                     try:
                         with torch.profiler.record_function("get_next_batch_to_run"):
@@ -7933,6 +7995,16 @@ class SchedulerPPMixin:
         # next stage has no receive posted for them. Sending anyway would leave
         # one unmatched message per pass on the channel -- the bounded-recv
         # corpse, from the sender's side.
+        if msg_type == "proxy":
+            _n = getattr(self, "_pp_proxy_send_trace_n", 0) + 1
+            self._pp_proxy_send_trace_n = _n
+            if _n <= 50:
+                logger.info(
+                    "#631 PROXY-SEND t%d stamp=%s gapped=%s",
+                    _n,
+                    stamp,
+                    getattr(self, "_pp_gapped_wire", False),
+                )
         if msg_type == "proxy" and getattr(self, "_pp_gapped_wire", False):
             return []
         # Warn once if using default untyped messages
@@ -8696,6 +8768,61 @@ class SchedulerPPMixin:
             return True
         epoch = pp_flip_epoch_of(self)
         if pp_proxy_stamp_names_pass(stamp, mb_id, epoch):
+            # THE FRAME MUST NOT OVERTAKE ITS REQUESTS (boot 631row14,
+            # ROW-DELIVER d2: frame consumed with queue=0 -- the request
+            # chain hop and the proxy frame travel on two wires with no
+            # cross-wire ordering, and a told=0 entry bypasses the #944
+            # lookup by design, so the plan found nothing, the frame was
+            # already consumed, and the ring died upstream-waiting). Peek
+            # the head's row WITHOUT consuming: an admitted rid this rank
+            # cannot locate yet means the chain hop is still in flight --
+            # answer False, leave the frame in the inbox, and let the chain
+            # catch up; the hop provably precedes the row on the sender.
+            _row_raw = (
+                head.get(_ADMISSION_DECISION_PAYLOAD_KEY)
+                if isinstance(head, dict)
+                else None
+            )
+            if _row_raw is not None:
+                try:
+                    _peek = pp_admission_decision_from_wire(
+                        {_ADMISSION_DECISION_PAYLOAD_KEY: _row_raw}
+                    )
+                    _known = {
+                        getattr(r, "rid", None) for r in self.waiting_queue
+                    }
+                    _known.add(getattr(getattr(self, "chunked_req", None), "rid", None))
+                    _known.add(
+                        getattr(pp_chunked_req_for_slot(self, mb_id), "rid", None)
+                    )
+                    for _r in (
+                        getattr(getattr(self, "running_batch", None), "reqs", None)
+                        or ()
+                    ):
+                        _known.add(getattr(_r, "rid", None))
+                    _missing = [
+                        e.rid
+                        for e in _peek.entries
+                        if e.admitted and not e.retracted and e.rid not in _known
+                    ]
+                except Exception:  # noqa: BLE001 - peek is advisory only
+                    _missing = []
+                if _missing:
+                    stats["defer_rid"] = stats.get("defer_rid", 0) + 1
+                    _dr = stats["defer_rid"]
+                    if _dr <= 8 or _dr % 1024 == 0:
+                        logger.info(
+                            "#631 ROW-PROBE DEFER slot=%s: frame's row names "
+                            "%d rid(s) not yet locatable here (first=%s) -- "
+                            "the chain hop is still in flight; frame left in "
+                            "the inbox (occurrence=%d).",
+                            mb_id,
+                            len(_missing),
+                            str(_missing[0])[:8],
+                            _dr,
+                        )
+                    _trace("defer_rid")
+                    return False
             stats["head_this"] += 1
             _trace("head_this")
             return True
