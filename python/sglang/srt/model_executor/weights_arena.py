@@ -563,6 +563,31 @@ class RefillLegTiming:
     h2d_wait_s: float = 0.0
     drain_s: float = 0.0
     chunks: int = 0
+    #: #1082: THE LEG'S OWN WALL CLOCK, so the bound verdict has a denominator
+    #: it did not choose for itself.
+    #:
+    #: ARITHMETIC: seconds of the whole refill leg, added by whichever executor
+    #: ran it (``rotate_arena`` sets it from ``RotationStats.elapsed_s``;
+    #: ``_staged_file_refill`` brackets its own body). 0.0 means no executor
+    #: recorded one, which ``refill_bound_phrase`` treats as "cannot judge",
+    #: never as "the leg took no time".
+    #:
+    #: WHY IT HAD TO EXIST. ``read_s`` + ``h2d_wait_s`` was the verdict's ENTIRE
+    #: denominator, and on the rotation path ``read_s`` has no writer at all
+    #: (its only one lives inside ``_staged_file_refill``, which that path never
+    #: reaches). The denominator was therefore ``h2d_wait_s`` alone -- 0.016 s
+    #: against a 63.931 s leg on boot_855_1078spec -- so ``read_share`` was
+    #: always 0.0 and the verdict was always LINK-BOUND, on 0.02 % coverage. A
+    #: verdict that can take only one value is not a verdict.
+    leg_total_s: float = 0.0
+
+
+#: The share of a leg that ``read_s + h2d_wait_s`` must cover before naming a
+#: bound is a judgement rather than a guess. CHOSEN, NOT DERIVED, and the two
+#: measured regimes sit far from it in both directions: the rotation path
+#: covered 0.00025 of its leg, the staged-file path covers most of its own.
+#: Half is the point at which the unaccounted mass can no longer be the winner.
+BOUND_MIN_COVERAGE = 0.50
 
 
 def refill_bound_phrase(timing: Optional["RefillLegTiming"]) -> str:
@@ -572,6 +597,20 @@ def refill_bound_phrase(timing: Optional["RefillLegTiming"]) -> str:
     was not instrumented. "unattributed" is a real answer here -- it is the
     state the whole ticket is about -- and collapsing it into one of the two
     named bounds would rebuild the ambiguity this split exists to remove.
+
+    #1082 -- AND IT DID INVENT ONE, for the life of the rotation path. The two
+    halves this function weighs are read (storage) and h2d-wait (link), and on
+    the rotation path ``read_s`` is never written by anyone. ``read_share`` was
+    thus a constant 0.0, ``LINK-BOUND`` a constant verdict, printed on legs
+    where the link wait was 0.016 s of 63.931 s. The rule below adds the only
+    thing that can tell a real verdict from that one: what share of the LEG the
+    two halves actually explain.
+
+    ARITHMETIC:
+      * ``coverage  = (read_s + h2d_wait_s) / leg_total_s``
+      * ``read_share = read_s / (read_s + h2d_wait_s)``
+      * coverage < :data:`BOUND_MIN_COVERAGE` -> REFUSE, and print the coverage
+      * read_share >= 0.65 -> STORAGE-BOUND; <= 0.35 -> LINK-BOUND; else MIXED
     """
     if timing is None or timing.chunks <= 0:
         return "bound unattributed (leg not instrumented)"
@@ -580,11 +619,30 @@ def refill_bound_phrase(timing: Optional["RefillLegTiming"]) -> str:
     total = read_s + wait_s
     if total <= 0.0:
         return "bound unattributed (no time accounted)"
-    read_share = read_s / total
     detail = (
         f"read {read_s:.3f}s / h2d-wait {wait_s:.3f}s "
         f"over {int(timing.chunks)} chunk(s), drain {timing.drain_s:.3f}s"
     )
+    leg_total = float(timing.leg_total_s)
+    if leg_total <= 0.0:
+        return (
+            f"bound unattributed (no leg total recorded, so the coverage of "
+            f"these terms is unknown; {detail})"
+        )
+    coverage = total / leg_total
+    if coverage < BOUND_MIN_COVERAGE:
+        # THE REFUSAL IS THE POINT. Naming a bound from terms that explain
+        # 0.02 % of the leg is what produced a constant verdict for the life of
+        # this path; the unexplained mass is reported so the next reader knows
+        # WHERE to instrument rather than which of two names to believe.
+        return (
+            f"bound REFUSED: these terms cover {coverage * 100:.2f} % of the "
+            f"{leg_total:.3f}s leg, below the {BOUND_MIN_COVERAGE * 100:.0f} % "
+            f"a verdict needs -- {1.0 - coverage:.4f} of the leg is outside "
+            f"both halves being weighed ({detail})"
+        )
+    read_share = read_s / total
+    detail = f"{detail}, coverage {coverage * 100:.1f} %"
     if read_share >= 0.65:
         return f"STORAGE-BOUND ({detail})"
     if read_share <= 0.35:
@@ -648,6 +706,10 @@ def _staged_file_refill(
     DIVERGE again (2651 / 2602 / 3751 MiB/s, PP0 ahead on its better link),
     because the transfer is real and the link is allowed to matter.
     """
+    # #1082: this function IS the leg it instruments, so it records the leg's
+    # own wall clock. Without it refill_bound_phrase weighs read against
+    # h2d-wait with no idea what share of the leg the two together explain.
+    _t_leg = time.monotonic()
     pool = _refill_staging_pool(_refill_chunk_bytes(), _refill_depth())
     chunk = pool.page_bytes
     depth = pool.capacity
@@ -724,6 +786,8 @@ def _staged_file_refill(
     finally:
         for b in bufs:
             pool.release(b)
+        if timing is not None:
+            timing.leg_total_s += time.monotonic() - _t_leg
 
 
 def _staged_refill_enabled() -> bool:

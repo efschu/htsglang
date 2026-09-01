@@ -179,11 +179,24 @@ class TestTheRotationIsByteExact(CustomTestCase):
 
 
 class TestTheDuplexActuallyOverlaps(CustomTestCase):
-    """Falsifier 1, measured on the EXECUTOR rather than on the plan.
+    """WHAT THIS CLASS ACTUALLY PINS -- retracted claim kept in place (#1082).
 
-    Slice 1 could only count co-scheduled steps. Here overlap means what it
-    has to mean on metal: at the instant a chunk's D2H is enqueued, an earlier
-    chunk's H2D had not yet been waited on.
+    It used to read: "Falsifier 1, measured on the EXECUTOR rather than on the
+    plan ... at the instant a chunk's D2H is enqueued, an earlier chunk's H2D
+    had not yet been waited on." The mechanism description is right; the word
+    FALSIFIER is not, and the class name is now wrong on purpose rather than by
+    accident -- it is left alone so log and test greps still find it.
+
+    ``overlapped_steps`` is reproducible from (h2d chunks, d2h chunks, depth)
+    by ``plan_determined_overlap``: exact on 12 of 12 production legs, and the
+    same value on a 4 s leg and a 41 s leg of identical shape. So these two
+    tests pin a PIPELINING DECISION of the executor -- real, and worth pinning
+    -- and NOT that the two directions overlapped on the device. The
+    ``depth=1`` case below reads as a can-fail partner and is not one: it varies
+    with a CONFIG input, which every plan-shaped counter also does.
+
+    The duplex premise is answered by ``RotationPhases.gpu_d2h_s`` /
+    ``gpu_h2d_s``, which had no writer at all until #1082.
     """
 
     def test_a_real_rotation_overlaps_on_almost_every_step(self):
@@ -433,7 +446,19 @@ class TestThePrimingFlipIsInstrumentedApart(CustomTestCase):
 
 class TestTheLegNamesItsBound(CustomTestCase):
     """Reuse the #856(a) instrument rather than build new telemetry: the
-    acceptance readout for W28 is `refill_bound_phrase` over this leg."""
+    acceptance readout for W28 is `refill_bound_phrase` over this leg.
+
+    #1082 RETRACTION, in the class that carried the claim. Reusing that
+    instrument here was wrong in a way this file could not see: the phrase
+    weighs read against h2d-wait, and on THIS path ``read_s`` has no writer at
+    all (its only one lives in ``_staged_file_refill``, which the rotation does
+    not call). So the phrase was structurally incapable of returning anything
+    but LINK-BOUND, and the test below asserted exactly that outcome as the
+    ticket's acceptance -- a green that could not have gone red. On metal it
+    printed `LINK-BOUND (read 0.000s / h2d-wait 0.016s)` on a 63.931 s leg.
+    The phrase now refuses below ``BOUND_MIN_COVERAGE``, and these tests assert
+    the refusal instead of the verdict.
+    """
 
     def test_an_instrumented_rotation_is_not_unattributed(self):
         timing = RefillLegTiming()
@@ -458,9 +483,15 @@ class TestTheLegNamesItsBound(CustomTestCase):
         self.assertIn("unattributed", refill_bound_phrase(RefillLegTiming()))
 
     def test_a_rotation_reads_no_storage_which_is_the_whole_point(self):
-        # W28's acceptance criterion in one assertion: a WARM rotation touches
-        # no disk, so its read_s is zero and the bound must land on the link.
-        # W26 measured this leg 99.8-100 % storage-bound; that is what moves.
+        # W28's acceptance criterion, CORRECTED (#1082). The old comment read:
+        # "a WARM rotation touches no disk, so its read_s is zero and the bound
+        # must land on the link." The first half is the real acceptance and is
+        # still asserted below. The second half was a non-sequitur: read_s is
+        # zero on this path whether the rotation touched disk or not, because
+        # nothing on this path ever writes it. "The bound lands on the link"
+        # therefore followed from the instrument's wiring, not from the leg.
+        # What the leg is actually bound by is now an open question with an
+        # instrument attached -- see RotationPhases.gpu_d2h_s / gpu_h2d_s.
         timing = RefillLegTiming()
         arena, image, _i, _o = _fresh()
         rotate_arena(
