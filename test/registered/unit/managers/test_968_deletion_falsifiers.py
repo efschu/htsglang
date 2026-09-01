@@ -98,6 +98,56 @@ def test_the_group_vote_is_gone():
     assert not hasattr(UnifiedRadixCache, "take_agreed_reissue")
 
 
+# -- Slice B (F2b, 2026-09-01): the seam re-admission takes the normal path --
+
+
+def test_the_resident_requeue_left_the_release_path():
+    """(a) RED-FIRST. Today `readmit_seam_residents` runs inside the RELEASE
+    half of the cutover (phase_flip_runtime, before rebind), so the re-issued
+    prefetch registers on the OUTGOING binding generation and #937 refuses
+    its insert every time -- fetched, paid for, thrown away (the docstring of
+    reissue_seam_prefetch names the sequencing as the defect). The cut moves
+    the requeue BEHIND cutover_fn/rebind via a deferred carrier
+    (`_pending_seam_readmit`), so the intake prefetch opens on the INCOMING
+    binding. Structural pin: the deferred carrier exists, and the release
+    module no longer calls the requeue directly."""
+    import inspect as _i
+
+    import sglang.srt.managers.phase_flip_runtime as pfr
+
+    src = _i.getsource(pfr)
+    assert "_pending_seam_readmit" in src, "deferred requeue carrier missing"
+    # The release half must not requeue any more; the one surviving call runs
+    # post-cutover, off the pending carrier.
+    release_calls = src.count("readmit_seam_residents(")
+    assert release_calls <= 1, (
+        "readmit_seam_residents called %d times in phase_flip_runtime -- the "
+        "release-path call grew back" % release_calls
+    )
+
+
+def test_retracted_equals_readmitted_survives_the_move():
+    """(a) guard for the count law: RETRACTED MUST EQUAL READMITTED (W31).
+    The move behind the rebind must not lose the reconciliation -- a dropped
+    request is owned by nobody, which is the W31 defect verbatim."""
+    import inspect as _i
+
+    import sglang.srt.managers.phase_flip_runtime as pfr
+
+    assert "readmitted != " in _i.getsource(pfr)
+
+
+def test_the_outgoing_binding_reissue_shim_is_gone():
+    """(b) RED-FIRST. `reissue_seam_prefetch` (#1025b) re-issued the fetches
+    that the release-path requeue had burned on the outgoing binding -- a
+    compensation for the sequencing defect, not a mechanism. With the requeue
+    deferred behind the rebind (a), the first issue already lands on the
+    incoming binding and the shim is objectless."""
+    import sglang.srt.managers.phase_flip_runtime as pfr
+
+    assert not hasattr(pfr, "reissue_seam_prefetch")
+
+
 def test_the_owed_ledger_is_gone():
     """``_reissue_pending`` was second bookkeeping beside the upstream hold:
     written only where the stale insert was refused, read only by the vote.
