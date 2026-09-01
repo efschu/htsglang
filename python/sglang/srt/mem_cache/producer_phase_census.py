@@ -133,15 +133,25 @@ __all__ = [
     "ObservationState",
     "ProducerPhase",
     "ProducerPhaseCensus",
+    "adoption_source_of",
     "arrival_stats",
     "census_armed",
+    "double_prefill_census",
     "emit",
+    "emit_double_prefill",
+    "note_double_prefill",
+    "reset_double_prefill_census",
     "ledger_stats",
     "new_producer_census",
     "note_arrival",
+    "note_backup_keys",
     "note_consult",
     "note_generation",
+    "note_prefetch_adopted",
+    "note_prefill_hit_tokens",
     "note_store_write",
+    "note_walk_node",
+    "reset_prefill_window",
     "payload_verdict",
     "phase_of_generation",
     "prefill_provenance_field",
@@ -352,6 +362,11 @@ _late_arrivals = 0
 _arrivals = 0
 _consults = 0
 _consult_misses = 0
+#: #1061: keys whose bytes were adopted via the PREFETCH arm. Kept (bounded,
+#: FIFO on insertion order like the write ledger) so the match walk can render
+#: ``by_source`` from what actually happened instead of needing a second
+#: carrier on the tree node. Value = arrival count for the key.
+_arrived: dict[str, int] = {}
 
 
 def note_consult(key: str, accepted: bool) -> None:
@@ -388,6 +403,15 @@ def note_arrival(key: str) -> None:
         _arrivals += 1
         if _missed_consults.pop(k, 0):
             _late_arrivals += 1
+        # #1061: remember the key itself (bounded), so `adoption_source_of`
+        # can answer PREFETCH for it later without a per-node carrier.
+        if k not in _arrived and len(_arrived) >= _LEDGER_MAX:
+            try:
+                oldest = next(iter(_arrived))
+                del _arrived[oldest]
+            except StopIteration:  # pragma: no cover - empty dict at the cap
+                pass
+        _arrived[k] = _arrived.get(k, 0) + 1
 
 
 def arrival_stats() -> dict[str, int]:
@@ -406,6 +430,27 @@ def arrival_stats() -> dict[str, int]:
             "late": _late_arrivals,
             "never_yet": len(_missed_consults),
         }
+
+
+def adoption_source_of(key: str) -> AdoptionSource:
+    """By which arm this key's bytes are known to this process (#1061).
+
+    ARITHMETIC: PREFETCH if ``note_arrival`` ever recorded the key (the store
+    handed its bytes back and the tree adopted them); else BACKUP_HOST if the
+    write ledger stamped it (this process's own backup thread wrote it, so a
+    hit on it is the eviction axis); else UNKNOWN -- never guessed. A key both
+    prefetched and later re-backed-up reads PREFETCH: the adoption event is
+    what put its bytes into this layout, the later copy is bookkeeping.
+    """
+    if key is None:
+        return AdoptionSource.UNKNOWN
+    k = str(key)
+    with _order_lock:
+        if k in _arrived:
+            return AdoptionSource.PREFETCH
+    if producer_generation_of(k) is not None:
+        return AdoptionSource.BACKUP_HOST
+    return AdoptionSource.UNKNOWN
 
 
 # --------------------------------------------------------------------------
@@ -515,6 +560,12 @@ def prefill_provenance_field(hit_tokens: int) -> str:
         n = _prefill_producer_tokens.get(phase.value, 0)
         if n:
             parts.append(f"{phase.value}:{n}")
+    # #1061: the line that renders the window DRAINS it (the "drained by the
+    # prefill line" contract below). Draining only on the render path -- after
+    # every early return above -- means a line with zero cached tokens leaves
+    # the window accumulating for the next rendering line instead of silently
+    # dropping attribution that belongs to a batch not yet printed.
+    _prefill_producer_tokens.clear()
     if not parts:
         # Armed but nothing attributed: say NO_OBSERVATION, never omit the
         # field and never print a zero. An absent field reads as "no cached
@@ -543,6 +594,11 @@ def reset_for_test() -> None:
     """Clear all module state. Tests only."""
     global _ledger_dropped, _ledger_writes, _emitted, _suppressed
     global _late_arrivals, _arrivals, _consults, _consult_misses
+    global _dpc, _dpc_emitted, _dpc_suppressed, _dpc_over_bound_seen
+    _dpc = None
+    _dpc_emitted = 0
+    _dpc_suppressed = 0
+    _dpc_over_bound_seen = 0
     with _gen_lock:
         _gen_phases.clear()
     with _ledger_lock:
@@ -551,6 +607,7 @@ def reset_for_test() -> None:
         _ledger_writes = 0
     with _order_lock:
         _missed_consults.clear()
+        _arrived.clear()
         _late_arrivals = 0
         _arrivals = 0
         _consults = 0
@@ -732,6 +789,109 @@ def _bound_phase_or_none():
 
 
 # --------------------------------------------------------------------------
+# 3b. THE WIRING GLUE (#1061) -- the writers the recording sites call
+# --------------------------------------------------------------------------
+#
+# Built 2026-08-31, wired 2026-09-01 (#1061): until these existed the module
+# had ZERO production writers, so even a successful boot could not produce the
+# acceptance line (built-never-wired). Each function is a no-op while the
+# census is disarmed (SGLANG_MATCH_REFUSAL_CENSUS_EVERY=0, the shared #904
+# knob), so the default path builds and records nothing.
+
+
+def note_backup_keys(keys, generation) -> None:
+    """The store-write ledger's writer, called by the backup thread.
+
+    ARITHMETIC: one ledger entry per storage key handed to the backend;
+    ``generation`` is ``operation.binding_generation`` -- the #719 stamp the
+    operation was OPENED under. That stamp is the EXISTING provenance carrier
+    (stamped in ``StorageOperation.__init__``); no second scheme is invented
+    here. Disarmed, or an unstamped operation (generation None) -> records
+    nothing; an unstamped key later classifies UNKNOWN, never same/cross.
+    """
+    if census_armed() <= 0 or not keys or generation is None:
+        return
+    for k in keys:
+        note_store_write(k, generation)
+
+
+def note_prefetch_adopted(keys) -> None:
+    """The arrival side's writer: these keys' bytes were ADOPTED into the
+    tree via the PREFETCH arm (store -> host tier -> tree).
+
+    ARITHMETIC: one ``note_arrival`` per adopted key -- the caller passes only
+    the keys the insert actually adopted (matched head excluded, declined
+    insert excluded), so ``arrivals`` counts adoptions, not fetch attempts.
+    Disarmed -> records nothing.
+    """
+    if census_armed() <= 0 or not keys:
+        return
+    for k in keys:
+        note_arrival(k)
+
+
+def note_walk_node(census, keys, key_tokens, page_size, accepted) -> bool:
+    """One walked tree node, classified against the ledger. Returns True when
+    any accepted token classified CROSS_PHASE, so the caller can count the
+    walk as a mission hit.
+
+    ARITHMETIC, field by field:
+      * per-key tokens = min(page_size, key_tokens - i*page_size): storage
+        keys are page-granular and ``key_tokens`` is this node's matched KEY
+        tokens, so the last key may carry a partial page and the per-key
+        tokens sum to exactly ``key_tokens``.
+      * ``keys`` falsy (a device-only node that was never backuped carries
+        ``hash_value=None``): there is NO storage-key carrier for this node,
+        so its accepted tokens are classified UNKNOWN in one lump -- never
+        guessed into same/cross (the gap stays visible as ``unknown:N``).
+      * producer = ``producer_phase_of(key, current_generation())``: the
+        write-ledger stamp against the #719 generation consuming right now.
+      * source = ``adoption_source_of(key)``: PREFETCH / BACKUP_HOST /
+        UNKNOWN, from the arrival record and the write ledger.
+      * consults: every walked key is consulted (hit or miss), feeding the
+        late/never ordering partition.
+
+    Accepted tokens ALSO feed the per-batch prefill-line window
+    (``note_prefill_hit_tokens``), so the ``#cached-producer`` field on the
+    ``Prefill batch`` line fills from the same classification -- one
+    arithmetic, two lines that cannot disagree.
+    """
+    if census is None:
+        return False
+    tokens = int(key_tokens or 0)
+    if tokens <= 0:
+        return False
+    if not keys:
+        if accepted:
+            census.note_accepted_tokens(
+                tokens, ProducerPhase.UNKNOWN, AdoptionSource.UNKNOWN
+            )
+            note_prefill_hit_tokens(tokens, ProducerPhase.UNKNOWN)
+        return False
+    try:
+        from sglang.srt.mem_cache.hicache_phase_binding import current_generation
+
+        cgen = int(current_generation())
+    except Exception:  # pragma: no cover - unit tests run without sglang
+        cgen = None
+    page = max(1, int(page_size or 1))
+    saw_cross = False
+    for i, k in enumerate(keys):
+        t = min(page, tokens - i * page)
+        if t <= 0:
+            break
+        note_consult(k, accepted=bool(accepted))
+        if not accepted:
+            continue
+        producer = producer_phase_of(k, cgen)
+        census.note_accepted_tokens(t, producer, adoption_source_of(k))
+        note_prefill_hit_tokens(t, producer)
+        if producer is ProducerPhase.CROSS_PHASE:
+            saw_cross = True
+    return saw_cross
+
+
+# --------------------------------------------------------------------------
 # 4. arming and emission
 # --------------------------------------------------------------------------
 #
@@ -762,7 +922,7 @@ def new_producer_census() -> ProducerPhaseCensus | None:
     return ProducerPhaseCensus() if census_armed() > 0 else None
 
 
-def emit(census: ProducerPhaseCensus | None, logger) -> None:
+def emit(census: ProducerPhaseCensus | None, logger) -> bool:
     """Log the census, rate-limited, and ALWAYS on a cross-phase window.
 
     A cross-phase hit is the finding this instrument exists for, so it is
@@ -771,13 +931,19 @@ def emit(census: ProducerPhaseCensus | None, logger) -> None:
     SUPPRESSED emissions rides the line, because an absence after the first N
     lines of a rate-limited emitter is not a zero (DENOMINATOR LAW, measured
     2026-08-31).
+
+    #1061: returns True when a line actually went out (the broken-partition
+    error line included -- it is an emission, just a self-indicting one), so
+    the wiring can start a fresh window per emitted line and ``ok``/``denom``
+    on each line describe the walks SINCE the previous line, not since boot.
+    False = suppressed or disarmed; the caller keeps accumulating.
     """
     global _emitted, _suppressed
     if census is None or not census.observed:
-        return
+        return False
     every = census_armed()
     if every <= 0:
-        return
+        return False
     _emitted += 1
     if census.cross_phase_walks > 0 or _emitted % every == 0:
         try:
@@ -789,8 +955,9 @@ def emit(census: ProducerPhaseCensus | None, logger) -> None:
                 ACCEPT_LINE_PREFIX,
                 exc,
             )
-    else:
-        _suppressed += 1
+        return True
+    _suppressed += 1
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -984,3 +1151,145 @@ class DoublePrefillCensus:
     def format_line(self, prefix: str = DOUBLE_PREFILL_LINE_PREFIX) -> str:
         body = " ".join(f"{k}={v}" for k, v in self.log_fields().items())
         return f"[{prefix}] {body}"
+
+
+# --------------------------------------------------------------------------
+# 5b. THE WIRING GLUE FOR #939 (#1047) -- the writer the recording site calls
+# --------------------------------------------------------------------------
+#
+# Built with section 5, wired 2026-09-01 (#1047). Until this existed
+# `DoublePrefillCensus` had ZERO production writers: the class, its
+# arithmetic and its bound were all present and NOTHING ever called
+# `note_readmitted_request`, so the second half of the acceptance ("no double
+# prefill, under load, PROVABLE") could not be produced by any boot. Same
+# built-never-wired shape #1061 closed for the producer-phase half.
+#
+# NO SECOND BOOKKEEPING. Both quantities are read off carriers that already
+# exist and are already written on the seam path:
+#
+#   S_i = ``req.cached_prompt_tokens_at_retract``   schedule_batch.py:2607
+#         Written by `Req.reset_for_retract`, whose own comment says it
+#         records "WHAT WAS ALREADY COMPUTED, BEFORE THE FIELDS THAT SAY SO
+#         ARE CLEARED THREE LINES DOWN". That is S_i by construction; nothing
+#         else writes it and nothing clears it before the re-prefill.
+#   C_i = ``pre_len``                               schedule_batch.py:4147
+#         The per-chunk prefix length the extend is built against, i.e.
+#         `len(req.prefix_indices)` after the read-through and after
+#         `init_load_back` extended it (:4198-4199).
+#
+# THE POPULATION marker is likewise existing: ``phase_purity.SEAM_READMIT_ATTR``
+# (`seam_readmit_epoch`), stamped ONLY by the #856 cutover retraction
+# (`phase_flip_runtime.py:1973`) and by nothing else -- so an OOM-preempted
+# request's ordinary re-prefill, which is real workload and NOT a double
+# prefill, cannot enter the denominator. The three sibling probes (#969B,
+# #969C, #1060) key on the identical attribute; a fourth definition of "the
+# readmit population" would be exactly the drift this module exists to stop.
+
+_dpc: DoublePrefillCensus | None = None
+_dpc_emitted = 0
+_dpc_suppressed = 0
+_dpc_over_bound_seen = 0
+
+
+def note_double_prefill(
+    request_id,
+    already_computed,
+    recovered,
+    scheduler=None,
+) -> None:
+    """Record ONE re-admitted request's re-prefill against what it had.
+
+    ARITHMETIC, field by field -- all of it lives in
+    ``DoublePrefillCensus.note_readmitted_request``; this function adds no
+    arithmetic of its own and exists only to own the census's LIFETIME:
+
+      * ``already_computed`` -> S_i, the caller passes
+        ``req.cached_prompt_tokens_at_retract``.
+      * ``recovered``        -> C_i, the caller passes this chunk's
+        ``pre_len``.
+      * the census is created on FIRST observation and its chunk bound is
+        bound THEN, from the live scheduler (`resolve_chunk_size`), so the
+        threshold is the one in force at the cutover being measured rather
+        than one captured at import.
+
+    Disarmed (the shared #904 knob) -> returns immediately and builds no
+    census, so the default path is byte-identical: no object, no counters, no
+    line. A DISARMED run and a run with no double prefill are therefore NOT
+    the same state, and `emit_double_prefill` prints which one it is.
+    """
+    global _dpc
+    if census_armed() <= 0:
+        return
+    if _dpc is None:
+        _dpc = DoublePrefillCensus()
+        _dpc.bind_chunk(scheduler)
+    _dpc.note_readmitted_request(request_id, already_computed, recovered)
+
+
+def emit_double_prefill(logger) -> bool:
+    """Log the #939 acceptance line, rate-limited, ALWAYS on a breach.
+
+    Mirrors `emit` deliberately, including its reasons:
+
+      * a request that broke the one-chunk bound is THE finding this
+        instrument exists for, so it is never sampled away -- the emission is
+        forced whenever ``over_bound`` has grown since the last line;
+      * the periodic emission supplies the denominator a breach-only stream
+        would lack;
+      * ``suppressed`` rides the line, because an absence after the first N
+        lines of a rate-limited emitter is NOT a zero (DENOMINATOR LAW).
+
+    Returns True when a line went out. A broken partition is reported as an
+    error line and still counts as an emission -- it is self-indicting, not
+    silent.
+
+    NOT DRAINED on emission, unlike the producer-phase window: the contract in
+    section 5 is ONE CENSUS PER CUTOVER and the acceptance is the WORST
+    request of that cutover, so ``worst`` must be monotone across the
+    cutover's whole readmit wave. `reset_double_prefill_census` is what ends
+    a census, and only the cutover calls it.
+    """
+    global _dpc_emitted, _dpc_suppressed, _dpc_over_bound_seen
+    census = _dpc
+    if census is None or not census.observed:
+        return False
+    every = census_armed()
+    if every <= 0:
+        return False
+    breach = census.over_bound > _dpc_over_bound_seen
+    _dpc_over_bound_seen = census.over_bound
+    _dpc_emitted += 1
+    if breach or _dpc_emitted % every == 0:
+        try:
+            logger.warning(
+                "%s suppressed=%d", census.format_line(), _dpc_suppressed
+            )
+        except ValueError as exc:
+            logger.error(
+                "[%s] BROKEN PARTITION -- the instrument is miscounting, do "
+                "not read its verdict: %s",
+                DOUBLE_PREFILL_LINE_PREFIX,
+                exc,
+            )
+        return True
+    _dpc_suppressed += 1
+    return False
+
+
+def reset_double_prefill_census() -> None:
+    """End the current census. Called by the cutover, per the section-5
+    contract 'one census per cutover'.
+
+    Deliberately does NOT emit: the emission is the recording site's, so a
+    cutover that retracted nothing cannot manufacture a line about a wave
+    that never happened.
+    """
+    global _dpc, _dpc_over_bound_seen
+    _dpc = None
+    _dpc_over_bound_seen = 0
+
+
+def double_prefill_census():
+    """The live census, or None. Tests and callers that need to assert on the
+    state read it here rather than reaching for the module global."""
+    return _dpc

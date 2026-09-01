@@ -10670,6 +10670,25 @@ class PhaseFlipRuntime:
         abort there is a failed flip (KvReshardError) that takes the instance
         down regardless. Named, not hidden.
         """
+        # #1047: ONE CENSUS PER CUTOVER (producer_phase_census section 5).
+        # Ended HERE, at the last seam step before this cutover's readmit wave
+        # begins, so the census that follows describes THIS cutover's wave and
+        # its `worst` is that cutover's worst request. A breach has already
+        # forced its line out before this point (`emit_double_prefill` never
+        # samples a breach away), so ending the census cannot swallow one.
+        try:
+            from sglang.srt.mem_cache.producer_phase_census import (
+                reset_double_prefill_census as _reset_dpc_1047,
+            )
+
+            _reset_dpc_1047()
+        except Exception as exc:  # noqa: BLE001 - an instrument may never break a flip
+            logger.warning(
+                "%s #1047 double-prefill census could not be ended (%s); the "
+                "next wave's `worst` may include the previous cutover's.",
+                LOG_PREFIX,
+                exc,
+            )
         stash = getattr(self, "_pending_seam_readmit", None)
         self._pending_seam_readmit = None
         scheduler = getattr(self, "_census_scheduler", None)
