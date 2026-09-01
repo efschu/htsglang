@@ -185,6 +185,37 @@ class TritonGDNKernel(LinearAttnKernelBase):
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
 
+        # #631b GDN-EXTEND TRACE (bounded): boot 631row20 wedged with rank1
+        # ACTIVE inside fla's prepare_chunk_indices for minutes (ranks 0/2
+        # spinning in the matched collective) -- the classic shape of a
+        # degenerate cu_seqlens after a flip carry. Name the geometry of
+        # every extend for the first 40 calls, and ALWAYS when the total is
+        # absurd, so the poisoned batch identifies itself at entry.
+        try:
+            import logging as _lg
+
+            _q = query_start_loc
+            _total = int(_q[-1].item()) if _q is not None and _q.numel() else -1
+            _n = getattr(TritonGDNKernel, "_631b_n", 0) + 1
+            TritonGDNKernel._631b_n = _n
+            if _n <= 40 or _total < 0 or _total > 500000:
+                _lg.getLogger(__name__).warning(
+                    "#631b GDN-EXTEND t%d cu_seqlens=%s total=%s q=%s "
+                    "states=%s cache_idx=%s",
+                    _n,
+                    (_q[: min(9, _q.numel())].tolist() if _q is not None else None),
+                    _total,
+                    tuple(q.shape),
+                    tuple(ssm_states.shape),
+                    (
+                        cache_indices[: min(8, cache_indices.numel())].tolist()
+                        if cache_indices is not None
+                        else None
+                    ),
+                )
+        except Exception:  # noqa: BLE001 - the trace may never break a forward
+            pass
+
         return chunk_gated_delta_rule(
             q=q,
             k=k,
