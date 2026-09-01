@@ -829,3 +829,195 @@ def test_C_the_void_relay_is_wired_or_deleted_but_never_half_built():
         "originates, nobody relays and one rank absorbs leaves PP0 parked "
         "and the successor spinning on an occupant (1068cap + 1069cohort)"
     )
+
+
+# -- #1079: the idle gate may not ask about work this rank cannot schedule --
+#
+# Fourth deletion candidate of the #968 class (LOESCH_LANDKARTE §10). The
+# chain-receive gate's idle test opened with `not self.waiting_queue`, so a
+# downstream rank holding queued rids took the 2 ms spin instead of the
+# blocking receive.
+#
+# POPULATION IS THE POINT, and it is what makes this a deletion rather than a
+# tuning choice. `_chain_gate` is computed only under
+# `pp_row_authority_enabled and pp_size > 1 and pp_rank != 0`; on PP0 it stays
+# None and the first branch is taken unconditionally. The elif and its `else`
+# therefore execute ONLY on downstream ranks under row authority -- exactly
+# the population that may not act on its own queue: PP0 decides admission
+# (`build_pp_admission_decision` under `pp_rank == 0`) and a downstream rank's
+# admission loop is driven by the row it receives on this very wire.
+# scheduler.py:2910-2917 states it and names this predicate as the thing a
+# queued rid "would only pollute".
+#
+# The queue is CHAIN-filled, not broadcast: `_broadcast_reqs_across_ranks` is
+# dp-attention-scoped (request_receiver.py:396-397) and does nothing under
+# TP=1/PP=3. A non-empty downstream queue is therefore the CONSTRUCTIVE normal
+# state between chain delivery and frame arrival.
+#
+# These evaluate the REAL expression lifted out of the live source, not a copy
+# of it, and they are written to fail in both danger directions: too little
+# deletion (the term or any re-reading of the queue comes back) and too much
+# (a rank that owns in-flight work walks away from it).
+
+
+class _DownstreamRankAtRest:
+    """The population: a downstream rank under row authority whose queue is
+    non-empty and which owns NOTHING in flight -- no chunked continuation, no
+    occupied slot, no announced frame. It is not busy; it is waiting for the
+    row that drains the queue, and that row arrives on the receive the deleted
+    term made it refuse."""
+
+    def __init__(self, queued: int = 3, occupied: bool = False, chunked=None):
+        self.waiting_queue = [_FakeQueued(f"rid{i}") for i in range(queued)]
+        self.chunked_req = chunked
+        self.mbs = [object() if occupied else None, None, None]
+        self._proxy = False
+
+    def _pp_row_any_proxy_signal(self):
+        return self._proxy
+
+
+class _FakeQueued:
+    def __init__(self, rid):
+        self.rid = rid
+
+
+def _idle_branch_test_source():
+    """Source of the TEST expression of the elif arm of the chain-receive
+    gate in `_event_loop_pp_body` -- the idle test itself.
+
+    Anchored structurally (the `with record_function("recv_requests")` block,
+    then the `_chain_gate` if-chain's first elif), like
+    `_occupant_throttle_sources` above and for the same reason: the comments
+    at this node are rewritten by the very change these tests pin.
+    """
+    import ast as _ast
+    import inspect as _i
+    import textwrap as _t
+
+    from sglang.srt.managers import scheduler_pp_mixin as mixin
+
+    src = _t.dedent(_i.getsource(mixin.SchedulerPPMixin._event_loop_pp_body))
+    tree = _ast.parse(src)
+    lines = src.splitlines()
+
+    gate = None
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.With) and "recv_requests" in lines[node.lineno - 1]:
+            gate = node
+            break
+    assert gate is not None, (
+        "the chain-receive gate block is gone from _event_loop_pp_body -- "
+        "re-derive this anchor against the new loop before trusting a pass"
+    )
+
+    for node in gate.body:
+        if not isinstance(node, _ast.If):
+            continue
+        if "_chain_gate" not in (_ast.get_source_segment(src, node.test) or ""):
+            continue
+        assert len(node.orelse) == 1 and isinstance(node.orelse[0], _ast.If), (
+            "the gate's elif arm is gone -- if the idle branch was folded "
+            "away entirely, re-derive this test rather than pass it"
+        )
+        return _ast.get_source_segment(src, node.orelse[0].test) or ""
+    raise AssertionError("no _chain_gate if-chain found in the gate block")
+
+
+def _eval_idle_test(stub) -> bool:
+    # Parenthesised because the lifted segment keeps its source indentation on
+    # the continuation lines; inside brackets that is legal again.
+    expr = "(" + _idle_branch_test_source() + ")"
+    # `self` goes in globals so the genexp scope inside `any(...)` sees it too.
+    return bool(eval(compile(expr, "<idle-gate>", "eval"), {"self": stub}))
+
+
+def test_1079_a_queued_downstream_rank_takes_the_blocking_receive():
+    """#1079 RED-FIRST, and red in the direction that matters: the POPULATION,
+    not the line. A downstream rank under row authority, holding queued rids
+    and owning nothing in flight, must reach the blocking receive.
+
+    Before the cut this evaluated False -- `not self.waiting_queue` was False,
+    so the rank fell to the 2 ms `else` and refused the very wire that carries
+    the row which would drain those rids. The predicate confused OWNING work
+    with being able to EXECUTE it: a downstream rank cannot schedule its own
+    queue at all, so a queued rid does not make it busy. It makes it the most
+    perfectly waiting thing in the loop."""
+    assert _eval_idle_test(_DownstreamRankAtRest(queued=3)) is True, (
+        "a downstream rank with a non-empty waiting_queue is still held out "
+        "of the blocking chain receive -- but it cannot drain that queue "
+        "itself (PP0 owns admission; the row arrives on THIS wire), so the "
+        "queue is not evidence of work this rank can do"
+    )
+
+
+def test_1079_the_queue_term_did_not_grow_back_in_any_shape():
+    """#1079 ZOMBIE TEST -- mutation proof in the danger direction. The term
+    is deleted, not compensated, so the idle test must not read the waiting
+    queue in ANY form: not `not self.waiting_queue`, not a length compare, not
+    behind a horizon, timer or counter. Those would all be second bookkeeping
+    over a fact this rank is not entitled to act on."""
+    expr = _idle_branch_test_source()
+    assert "waiting_queue" not in expr, (
+        f"the idle test reads the waiting queue again: {expr!r}. #1079 "
+        "deleted that term (UPSTREAM-MINIMAL: deletion, not a replacement "
+        "term) -- re-adding it in any shape re-encodes a downstream autonomy "
+        "that row authority already removed"
+    )
+
+
+def test_1079_the_three_terms_this_rank_owns_still_hold_it():
+    """#1079 OVER-DELETION GUARD. The cut is ONE term, never the predicate.
+    A chunked continuation, an occupied slot and an announced frame all
+    describe work this rank OWNS and EXECUTES; it may not walk away from
+    those into an indefinite park. Each must still, on its own, keep the rank
+    off the blocking receive."""
+    occupied = _DownstreamRankAtRest(queued=0, occupied=True)
+    assert _eval_idle_test(occupied) is False, (
+        "an occupied slot no longer holds the rank: the cut went too wide"
+    )
+
+    chunked = _DownstreamRankAtRest(queued=0, chunked=_FakeQueued("c0"))
+    assert _eval_idle_test(chunked) is False, (
+        "a chunked continuation no longer holds the rank: the cut went too wide"
+    )
+
+    framed = _DownstreamRankAtRest(queued=0)
+    framed._proxy = True
+    assert _eval_idle_test(framed) is False, (
+        "an announced frame no longer holds the rank: the cut went too wide"
+    )
+
+    idle = _DownstreamRankAtRest(queued=0)
+    assert _eval_idle_test(idle) is True, (
+        "a rank owning nothing at all is held out of the park -- the idle "
+        "branch has become unreachable, which is a different defect"
+    )
+
+
+def test_1079_the_horizon_instrument_moved_with_the_mechanism():
+    """#1079, second half of the counting probe. The #1073c horizon message
+    called this "the four-term idle test" and offered `waiting_queue` as one
+    of the candidate spinners. After the cut a queued rid can no longer spin
+    the rank, so an instrument still naming it would send the next reader
+    after the one term that is now provably innocent -- the
+    INSTRUMENT-TEXT-LUEGT class, class A (the text no longer describes what
+    the code does). It is still printed as CONTEXT (the queued rids carry
+    their own throttles below it), but outside the candidate set."""
+    import inspect as _i
+
+    from sglang.srt.managers import scheduler_pp_mixin as mixin
+
+    src = _i.getsource(mixin.SchedulerPPMixin._pp_occupant_horizon_message)
+    assert "four-term" not in src, (
+        "the horizon message still advertises a four-term idle test over a "
+        "three-term one -- a stale instrument costs the next reader a round"
+    )
+    assert "three-term" in src, "the horizon message no longer names the arity"
+    # The queued rids stay readable: they are context and they carry the
+    # lap-cleared throttles that #1073c added them for.
+    assert "waiting_queue" in src, (
+        "the queued rids vanished from the horizon message -- they are no "
+        "longer a spinner candidate but they are still the only rids in play "
+        "on an empty ring, and their throttles hang off them"
+    )

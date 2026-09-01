@@ -3840,12 +3840,61 @@ class SchedulerPPMixin:
                     # rank's own output work stalled behind it). So: chain
                     # provably posted -> take it (bounded by transfer, the
                     # consume_up_to argument); nothing posted and TRULY idle
-                    # (no queue, no chunked, no occupied slot, no frame
-                    # anywhere) -> the ordinary indefinite park, which is
-                    # safe because the chain hop for any pass precedes its
-                    # frame (requests travel the chain before PP0 can plan
-                    # them); otherwise -> skip the chain this cycle and keep
-                    # the loop turning (2 ms throttle).
+                    # (no chunked, no occupied slot, no frame anywhere) ->
+                    # the ordinary indefinite park, which is safe because the
+                    # chain hop for any pass precedes its frame (requests
+                    # travel the chain before PP0 can plan them); otherwise
+                    # -> skip the chain this cycle and keep the loop turning
+                    # (2 ms throttle).
+                    #
+                    # #1079: `not self.waiting_queue` WAS the first term of
+                    # that idle test and is DELETED, not compensated. It
+                    # confused OWNING work with being able to EXECUTE it.
+                    #
+                    # POPULATION FIRST, because it is what makes this a
+                    # deletion rather than a tuning choice: `_chain_gate`
+                    # stays None on PP0 (the guard below is `pp_rank != 0`),
+                    # so PP0 always takes the first branch. This elif and its
+                    # 2 ms `else` run ONLY on DOWNSTREAM ranks under row
+                    # authority -- and that is exactly the population that
+                    # may not act on its own queue. PP0 decides admission
+                    # (`build_pp_admission_decision`, called from
+                    # `_get_new_batch_prefill_raw` under `pp_rank == 0`,
+                    # scheduler.py:8587-8590); a downstream rank's admission
+                    # loop is DRIVEN by `_pp_admission_incoming_effective`,
+                    # consumed from the row that arrives on this very wire.
+                    # scheduler.py:2910-2917 says it in its own words --
+                    # "Downstream does not verdict: PP0 owns the admission
+                    # truth" -- and names this predicate as the thing a
+                    # queued rid "would only pollute".
+                    #
+                    # So a downstream rank holding queued rids is not busy.
+                    # It is in the most perfectly waiting state there is: it
+                    # is waiting for the row that drains them, and that row
+                    # can only reach it through the receive this term made it
+                    # refuse. The queue is CHAIN-filled
+                    # (`_pp_forward_and_process_input_requests`, forwarded
+                    # unconditionally, :94), NOT broadcast --
+                    # `_broadcast_reqs_across_ranks` is dp-attention-scoped
+                    # (request_receiver.py:396-397) and under TP=1/PP=3 does
+                    # nothing at all. That makes a non-empty downstream queue
+                    # not merely frequent but the CONSTRUCTIVE normal state
+                    # between chain delivery and frame arrival -- precisely
+                    # the order the paragraph above calls guaranteed.
+                    #
+                    # A deletion, with no replacement term: no horizon, no
+                    # timer, no counter. The #1071/#1073 occupant horizon
+                    # stays what it is -- the backstop for what this does
+                    # NOT address -- and is not the cure. NOT CLAIMED: that
+                    # this resolves the 1078 wedge. The `else` arm still
+                    # polls `_pp_row_chain_pending()`, and whether PP0 ever
+                    # wanted to post in that specimen is the other half,
+                    # readable at the specimen and not at the desk.
+                    #
+                    # The three surviving terms stay rank-local on purpose:
+                    # a chunked continuation, an occupied slot and an
+                    # announced frame are all work this rank OWNS and
+                    # EXECUTES. It may not walk away from those.
                     _chain_gate = None
                     if (
                         pp_row_authority_enabled(self)
@@ -3859,8 +3908,7 @@ class SchedulerPPMixin:
                         # horizon starts again from here.
                         self._pp_occupant_since = {}
                     elif (
-                        not self.waiting_queue
-                        and getattr(self, "chunked_req", None) is None
+                        getattr(self, "chunked_req", None) is None
                         and not any(b is not None for b in self.mbs)
                         and not self._pp_row_any_proxy_signal()
                     ):
@@ -8345,9 +8393,19 @@ class SchedulerPPMixin:
         # OCCUPIED ... no rid held" -- so the previous version named a slot
         # occupancy that did not exist, and said nothing about the condition
         # that actually kept this rank out of the blocking-idle branch. The
-        # arm is the ELSE of a four-term idle test; exactly one of those terms
-        # is what spun the rank for 90 s, and only naming which one turns this
-        # from "something is stuck" into a specimen.
+        # arm is the ELSE of a three-term idle test; exactly one of those
+        # terms is what spun the rank for 90 s, and only naming which one
+        # turns this from "something is stuck" into a specimen.
+        #
+        # #1079: FOUR TERMS BECAME THREE, and this text moves with the
+        # mechanism rather than outliving it. `waiting_queue` was deleted
+        # from that test (a downstream rank may not act on its own queue), so
+        # it can no longer be the spinner and must not be offered as a
+        # candidate -- an instrument that still named it would send the next
+        # reader after the one term that is now provably innocent. It is
+        # still PRINTED, because it is real context and because the queued
+        # rids below carry their own throttles, but as CONTEXT, outside the
+        # "exactly one of these" set.
         try:
             _wq = list(getattr(self, "waiting_queue", ()) or ())
         except Exception:  # noqa: BLE001
@@ -8359,10 +8417,14 @@ class SchedulerPPMixin:
         except Exception:  # noqa: BLE001
             _proxy = None
         why = (
-            f"waiting_queue={len(_wq)}"
-            f"{'[' + ','.join(r[:8] for r in _wq_rids[:4]) + ']' if _wq_rids else ''}, "
             f"chunked_req={'set(' + str(getattr(_chunked, 'rid', '?'))[:8] + ')' if _chunked is not None else 'None'}, "
             f"any_slot_occupied={bool(occupied)}, proxy_signal={_proxy}"
+        )
+        # CONTEXT, not a candidate: #1079 deleted this term from the idle
+        # test, so a queued rid can no longer hold the rank on this arm.
+        context = (
+            f"waiting_queue={len(_wq)}"
+            f"{'[' + ','.join(r[:8] for r in _wq_rids[:4]) + ']' if _wq_rids else ''}"
         )
         # The throttles for the QUEUED rids too -- with an empty ring those are
         # the only rids in play, and the earlier version reported none of them.
@@ -8387,8 +8449,10 @@ class SchedulerPPMixin:
             f"{getattr(getattr(self, 'ps', None), 'pp_rank', None)} spent "
             f"{waited:.1f}s on the throttle arm while the ring held OCCUPIED "
             f"{occ_txt} (loop was on slot {mb_id}; rids={held or 'NONE'}). "
-            f"WHY THE ARM WAS TAKEN (the four-term idle test; exactly one of "
+            f"WHY THE ARM WAS TAKEN (the three-term idle test; exactly one of "
             f"these is the spinner): {why}. "
+            f"CONTEXT ONLY, not a candidate since #1079 deleted it from that "
+            f"test: {context}. "
             f"No upstream statement and nothing provably posted on the chain "
             f"(consumed={getattr(receiver, 'consumed', None)}, "
             f"counters={'present' if counters is not None else 'absent'}). "
