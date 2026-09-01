@@ -8274,32 +8274,98 @@ class SchedulerPPMixin:
         return (now - float(first)) > bound
 
     def _pp_occupant_horizon_message(self: Scheduler, mb_id: int) -> str:
-        """The named stop for a lapsed occupant: rank, slot, rids, counters."""
+        """The named stop for a lapsed occupant: rank, OCCUPIED slot, rids, throttles.
+
+        #1073b -- TWO CORRECTIONS, BOTH FROM READING THIS MESSAGE'S OWN OUTPUT
+        ON boot_855_1076filebacked (15:32:40, `rank 1 ... slot 0 ... rids=NONE`).
+
+        1. IT NAMED THE WRONG SLOT. The throttle arm is taken when ANY slot is
+           occupied (`any(b is not None for b in self.mbs)`), but this message
+           reported `self.mbs[mb_id]` -- the slot the loop happens to be on.
+           Those are different slots, so `rids=NONE` read as "no request is
+           stuck" when it actually meant "wrong key". Every occupied slot is
+           now listed with its own rids.
+        2. THE THROTTLES THAT COULD HOLD IT WERE INVISIBLE. `_unresolved_rounds`,
+           `_terminator_spent` and `_offer_streak` each have exactly ONE
+           clear site -- the `elif entry.admitted:` arm of `record_return_trip`,
+           i.e. they clear ONLY WHEN THE RING TURNS, while their increments are
+           deliberately lap-free. A ring that has stopped therefore cannot
+           clear the very states that throttle the next attempt: gate and
+           clearer in one cycle (#955 / #888-D2 / #858 / #748 family).
+           MEASURED 2026-09-01: none of the three is logged ANYWHERE in the
+           tree, so the hypothesis could not be tested against the 1076 wedge
+           at all -- grepping them returned zero because they have no emitter,
+           which is absence of an instrument and not absence of the state.
+           They are printed here, at the one moment the question is live.
+        """
         since = getattr(self, "_pp_occupant_since", None) or {}
-        held = ()
+        guard = getattr(self, "_pp_admission_guard", None)
+
+        def _rids_of(slot: int) -> tuple:
+            try:
+                b = self.mbs[slot] if 0 <= slot < len(self.mbs) else None
+                return tuple(
+                    str(getattr(r, "rid", "")) for r in (getattr(b, "reqs", None) or ())
+                )
+            except Exception:  # noqa: BLE001 - a stop message may never raise
+                return ("<unreadable>",)
+
+        occupied = []
         try:
-            batch = self.mbs[mb_id] if mb_id < len(self.mbs) else None
-            held = tuple(
-                str(getattr(r, "rid", ""))[:8]
-                for r in (getattr(batch, "reqs", None) or ())
-            )[:4]
-        except Exception:  # noqa: BLE001 - a stop message may never itself raise
-            held = ("<unreadable>",)
+            for _s in range(len(getattr(self, "mbs", ()) or ())):
+                if self.mbs[_s] is not None:
+                    occupied.append((_s, _rids_of(_s)))
+        except Exception:  # noqa: BLE001
+            occupied = [(-1, ("<unreadable>",))]
+        occ_txt = (
+            ", ".join(
+                f"slot{_s}=[{','.join(r[:8] for r in _r) or 'no-reqs'}]"
+                for _s, _r in occupied
+            )
+            or "NONE OCCUPIED"
+        )
+
+        # The three lap-cleared throttles, for every rid actually held.
+        throttles = []
+        for _s, _rids in occupied:
+            for _rid in _rids[:4]:
+                try:
+                    throttles.append(
+                        f"{_rid[:8]}(unresolved_rounds="
+                        f"{guard.unresolved_rounds(_rid) if guard else '?'},"
+                        f"terminator_spent="
+                        f"{guard.terminator_spent(_rid) if guard else '?'},"
+                        f"offer_streak={guard.offer_streak(_rid) if guard else '?'})"
+                    )
+                except Exception:  # noqa: BLE001
+                    throttles.append(f"{_rid[:8]}(<unreadable>)")
+        thr_txt = "; ".join(throttles) or "no rid held"
+
+        held = tuple(r[:8] for _s, _r in occupied for r in _r)[:4]
         counters = getattr(self, "pp_flip_counters", None)
         receiver = getattr(self, "pp_chain_receiver", None)
         waited = time.monotonic() - float(since.get(mb_id, time.monotonic()))
         return (
             f"#1071 PP OCCUPANT PAST ITS HORIZON: rank "
-            f"{getattr(getattr(self, 'ps', None), 'pp_rank', None)} has held "
-            f"slot {mb_id} occupied (rids={held or 'NONE'}) for {waited:.1f}s "
-            f"with no upstream statement and nothing provably posted on the "
-            f"chain (consumed={getattr(receiver, 'consumed', None)}, "
+            f"{getattr(getattr(self, 'ps', None), 'pp_rank', None)} spent "
+            f"{waited:.1f}s on the throttle arm while the ring held OCCUPIED "
+            f"{occ_txt} (loop was on slot {mb_id}; rids={held or 'NONE'}). "
+            f"No upstream statement and nothing provably posted on the chain "
+            f"(consumed={getattr(receiver, 'consumed', None)}, "
             f"counters={'present' if counters is not None else 'absent'}). "
-            f"That is not pipeline skew: it is the ranks disagreeing about "
-            f"who owes the next statement for this slot, and until #1071 it "
-            f"degraded into a silent 2 ms spin (1068cap PP2, 1069cohort PP1 "
-            f"-- 585585 occupant passes after the ring had already stopped). "
-            f"Raise or disable with SGLANG_PP_OCCUPANT_HORIZON_S (0 disables)."
+            f"THE LAP-CLEARED THROTTLES FOR THE HELD RIDS: {thr_txt}. Read "
+            f"those three first: each has exactly ONE clear site (the "
+            f"`elif entry.admitted:` arm of record_return_trip) which runs "
+            f"only when the ring TURNS, while their increments are lap-free "
+            f"by design -- so a non-zero here on a stopped ring is a gate "
+            f"whose clearer sits behind the gate (#955/#888-D2/#858/#748), "
+            f"and the wedge is self-sustaining rather than a slow peer. All "
+            f"zero instead means the throttles are innocent and the stall is "
+            f"upstream of admission. That is not pipeline skew either way: "
+            f"until #1071 it degraded into a silent 2 ms spin (1068cap PP2, "
+            f"1069cohort PP1 -- 585585 occupant passes after the ring had "
+            f"already stopped). Raise or disable with "
+            f"SGLANG_PP_OCCUPANT_HORIZON_S (0 disables)."
         )
 
     def _pp_row_chain_pending(self: Scheduler) -> Optional[bool]:
