@@ -93,7 +93,7 @@ import logging
 import os
 import pickle
 import time
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -125,6 +125,48 @@ DEFAULT_STEP_BUDGET_S = 30.0
 #: ``SGLANG_PP_CHAIN_RECV_STALL_S`` and for the same reason).
 ENV_ABORT_AFTER = "SGLANG_PP_RECV_OBJECT_ABORT_S"
 DEFAULT_ABORT_AFTER_S = 0.0
+
+#: #968 P2: a DYNAMIC abort bound beside the static env one. The scheduler
+#: (PP0 only) registers a zero-argument callable returning the bound in
+#: seconds that its CURRENT state justifies -- >0 while PP0 holds an ARMED
+#: flip (park deadline + slack), 0 otherwise. Rationale, measured on trainA
+#: (2026-09-01): PP0 armed a pp_to_tp flip, then parked inside this module's
+#: wait for 90 s while its own 30 s flip-abandon deadline could never run,
+#: because the abandon actuator lives in the very thread that was parked
+#: (the #977 form). The provider lets the recv abort loudly
+#: (``ObjectRecvStalled``, frame resumable) exactly when an unbounded wait
+#: would silently outlive the one recovery the group has.
+#:
+#: The provider is consulted on EXPIRED STEPS only (every
+#: ``ENV_STEP_BUDGET`` seconds, default 30), never on the hot completion
+#: path, and a provider error reads as "no dynamic bound" -- a diagnostics
+#: hook may not become a new way to abort a healthy receive.
+_DYNAMIC_ABORT_PROVIDER: Optional[Callable[[], float]] = None
+
+
+def set_recv_abort_provider(provider: Optional[Callable[[], float]]) -> None:
+    """Register (or clear, with None) the dynamic abort-bound provider."""
+    global _DYNAMIC_ABORT_PROVIDER
+    _DYNAMIC_ABORT_PROVIDER = provider
+
+
+def effective_abort_after_s(static_abort_s: float) -> float:
+    """Merge the static env bound with the dynamic provider's. Pure apart
+    from reading the registered provider: the TIGHTER positive bound wins,
+    0/absent means unbounded on that side, a provider error means no
+    dynamic bound."""
+    dynamic = 0.0
+    provider = _DYNAMIC_ABORT_PROVIDER
+    if provider is not None:
+        try:
+            dynamic = float(provider() or 0.0)
+        except Exception:  # noqa: BLE001 - a hook may never abort a healthy recv
+            dynamic = 0.0
+    if dynamic <= 0:
+        return static_abort_s
+    if static_abort_s <= 0:
+        return dynamic
+    return min(static_abort_s, dynamic)
 
 #: State machine positions. ``_IDLE`` is the ONLY state in which this stream
 #: may be abandoned safely: in the other two a message is half-received and
@@ -409,6 +451,12 @@ class ObjectRecvFrame:
         The default (``abort_after_s <= 0``) keeps waiting for ever, exactly as
         the pre-#980 naked ``work.wait()`` pair did -- but names the stall once
         per expired step instead of going silent.
+
+        #968 P2: the effective bound is re-read from the DYNAMIC provider on
+        every expired step (`effective_abort_after_s`), because the state that
+        justifies a bound can arise WHILE this frame is parked -- trainA
+        (2026-09-01 19:31:30) armed a flip and then sat in exactly this wait
+        for 90 s while the abandon actuator lived in this blocked thread.
         """
         if step_budget_s <= 0:
             # Documented escape hatch: byte-for-byte the pre-#980 behaviour,
@@ -417,9 +465,10 @@ class ObjectRecvFrame:
                 pass
             return self.take()
         while not self.advance(step_budget_s):
+            bound_s = effective_abort_after_s(abort_after_s)
             if (
-                abort_after_s > 0
-                and (time.monotonic() - self._armed_at) > abort_after_s
+                bound_s > 0
+                and (time.monotonic() - self._armed_at) > bound_s
             ):
                 RECV_OBJECT_STATS["aborted"] += 1
                 self._log("aborted", logging.ERROR, self.peer_statement())
@@ -433,7 +482,10 @@ class ObjectRecvFrame:
                     f"The frame is RESUMABLE: call recv_object on this "
                     f"(src, tag) again to continue the SAME receive. Raise or "
                     f"disable the bound with {ENV_ABORT_AFTER} (<= 0 restores "
-                    f"the unbounded wait). See #980."
+                    f"the unbounded wait). bound={bound_s:.1f}s (static "
+                    f"{abort_after_s:.1f}s, dynamic provider "
+                    f"{'armed' if _DYNAMIC_ABORT_PROVIDER is not None else 'none'}"
+                    f" -- #968 P2 flip-hold). See #980."
                 )
                 raise ObjectRecvStalled(message)
         return self.take()

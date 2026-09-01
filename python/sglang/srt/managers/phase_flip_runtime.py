@@ -316,6 +316,47 @@ ENV_SEAM_ABANDON_CAP = "SGLANG_SEAM_ABANDON_CAP"
 DEFAULT_SEAM_ABANDON_BACKOFF_MAX = 16
 ENV_SEAM_ABANDON_BACKOFF_MAX = "SGLANG_SEAM_ABANDON_BACKOFF_MAX"
 
+#: #968 P2: slack added on top of the flip park deadline for the dynamic
+#: recv-abort bound (see `pp0_flip_hold_recv_bound_s`).
+DEFAULT_FLIP_HOLD_RECV_SLACK_S = 30.0
+ENV_FLIP_HOLD_RECV_SLACK_S = "SGLANG_PP0_FLIP_HOLD_RECV_SLACK_S"
+
+
+def pp0_flip_hold_recv_bound_s(runtime) -> float:
+    """#968 P2: the abort bound PP0's CURRENT flip state justifies for a
+    parked ``recv_object``, in seconds; 0 = no bound (no flip armed).
+
+    trainA (2026-09-01 19:31:30): PP0 armed pp_to_tp with microbatches in
+    flight, then parked inside ``recv_object[src=2]`` for 90 s. Its 30 s
+    park deadline (``_park_deadline_s`` -- THE one timeout in the system,
+    rank 0 only) could never fire, because the abandon decision runs in the
+    scheduler loop, i.e. in the very thread that was parked (the #977 form:
+    recovery actuator inside the wedged thread). The ring starved until
+    #1071 killed rank 1 at 90 s.
+
+    Bound = park deadline + slack: the deadline is the design's own budget
+    for a healthy armed wait, so a recv outliving it by the slack means the
+    one recovery the group has is being outlived. Registered by
+    ``event_loop_pp`` on PP0 only; consulted by the transport layer on
+    expired steps. Defensive throughout -- any surprise reads as "no bound".
+    """
+    try:
+        if runtime is None:
+            return 0.0
+        if getattr(runtime, "_pending", None) is None:
+            return 0.0
+        if getattr(runtime, "_armed_at", None) is None:
+            return 0.0
+        deadline = float(getattr(runtime, "_park_deadline_s", 0.0) or 0.0)
+        if deadline <= 0:
+            return 0.0
+        slack = float(
+            os.environ.get(ENV_FLIP_HOLD_RECV_SLACK_S, DEFAULT_FLIP_HOLD_RECV_SLACK_S)
+        )
+        return deadline + max(0.0, slack)
+    except Exception:  # noqa: BLE001 - a bound provider may never wedge the recv
+        return 0.0
+
 #: #662-F4 / A0: may an arm SPILL for the arming floor before refusing for it?
 #:
 #: On by default, and a no-op whenever the card already holds the floor, which

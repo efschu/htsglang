@@ -3786,6 +3786,30 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        # #968 P2: while PP0 holds an ARMED flip it is the group's ONLY
+        # abandon carrier (#969 §W3), and trainA (2026-09-01 19:31:30)
+        # measured it parked inside `recv_object` for 90 s past its own 30 s
+        # park deadline -- the abandon actuator lived in the blocked thread
+        # (the #977 form), so the ring starved until #1071 killed rank 1.
+        # While a flip is armed, the resumable recv gets a dynamic abort
+        # bound of park-deadline + slack: PP0 then speaks (ObjectRecvStalled,
+        # frame resumable, peer named) instead of silently outliving its own
+        # recovery. Registered once per loop entry; the provider returns 0
+        # (no bound) whenever no flip is armed, so ordinary receives keep
+        # the pre-#968 unbounded behaviour byte-for-byte.
+        if getattr(getattr(self, "ps", None), "pp_rank", None) == 0:
+            from sglang.srt.distributed.pp_object_recv import (
+                set_recv_abort_provider,
+            )
+            from sglang.srt.managers.phase_flip_runtime import (
+                pp0_flip_hold_recv_bound_s,
+            )
+
+            set_recv_abort_provider(
+                lambda: pp0_flip_hold_recv_bound_s(
+                    getattr(self, "phase_flip_runtime", None)
+                )
+            )
         # #631: the phase-flip consensus must not run inside
         # get_next_batch_to_run here -- that is the TOP of the iteration,
         # before this rank's sends are issued, and a blocking world-
