@@ -46,7 +46,6 @@ from sglang.srt.managers.pp_admission_congruence import (
     UNKNOWN_MATCH,
     PPAdmissionDecision,
     PPAdmissionEntry,
-    entries_retracted_by_rank,
     forwarded_schedule,
     order_batch_by_schedule,
     pp_row_authority_enabled,
@@ -1494,80 +1493,6 @@ def pp_proxy_stamp_names_pass(stamp, mb_id: int, epoch: Optional[int]) -> bool:
     return stamp_epoch == int(epoch)
 
 
-def pp_proxy_pass_retraction_reason(
-    amended: Optional[PPAdmissionDecision], rank: Optional[int]
-) -> Optional[str]:
-    """#791c: why the proxy about to be paired belongs to a WIDER batch.
-
-    THE IDENTITY IS NOT THE PROBLEM ANY MORE; THE MEMBERSHIP IS. `mb_id`,
-    `seq` and the flip `epoch` all answer "WHICH PASS is this message from",
-    and by 2026-08-21 all three answered correctly and the instance still
-    died. Boot instr17, 07:12:49 PP1:
-
-        PP0  #788 PP-ADMISSION verdict=ADMIT n_reqs=2
-             rids=51a294650b...,5e744c29f8... prefix_lens=0,16896
-        PP1  #791 PP-ADMISSION unhonourable prefix on rank 1:
-             rid=5e744c29f8... told=16896 local=0
-        PP1  #788 PP-ADMISSION verdict=ADMIT n_reqs=1
-             rids=51a294650b... prefix_lens=0
-        PP1  ValueError: #631 PP proxy/batch mismatch: received hidden_states
-             with 126 row(s) for a 1 batch of 22 token(s)
-
-    126 = 22 + 104: PP0's batch is PP1's batch PLUS the request PP1 retracted.
-    Same pass, same slot, same flip epoch, `PROXY LEFTOVER REFUSED` correctly
-    0 on the whole boot. Nothing was stale, nothing was stranded, no cutover
-    was involved -- and no sharper pass identity, per-slot generation or
-    receiver-derived sequence could ever have discriminated it, because the
-    message WAS this pass's.
-
-    WHAT ACTUALLY DIVERGED. `reconcile_pp_admission_decision`
-    (pp_admission_congruence.py) drops a rid whose `told` prefix this rank
-    cannot honour from `effective`, and scheduler.py's admission loop then
-    omits it from this rank's batch. The UPSTREAM rank built and forwarded
-    its own batch from the decision as it stood before that retraction and
-    has already launched: a batch in flight cannot be amended. So the
-    retraction, which is rank-local and correct in itself, makes this rank's
-    batch a strict subset of the one whose hidden states are on the wire.
-
-    WHY THIS PREDICATE AND NOT A WIDTH COMPARISON. The width is already
-    checked, at model_runner.py's `_hs.shape[0] != _want` -- 30 layers into
-    compute, naming no cause, and BLIND WHENEVER THE TWO BATCHES HAPPEN TO
-    HAVE THE SAME TOKEN COUNT. Chunked prefill caps a chunk at
-    `chunked_prefill_size`, so two ranks running DIFFERENT requests routinely
-    present the SAME width; that pair is not a shape error, it is silent
-    wrong output, and it is the same hazard the #631 stamp exists for ("a
-    leftover of the SAME width, which is silent wrong output rather than a
-    shape error"). This predicate reads the retraction itself, so it fires on
-    membership, not on arithmetic.
-
-    RECEIVER-PREDICTABLE BY CONSTRUCTION, which is the property `seq` never
-    had. The receiver does not infer this from anything the sender wrote: it
-    IS the rank that performed the retraction, it did so at the top of this
-    same pass (`_event_loop_pp_body`'s #791 block, strictly before the proxy
-    receive), and #791b already records the amended decision per slot in
-    `_pp_admission_amended_by_slot`. Nothing new crosses the wire.
-
-    NONE MEANS "NOTHING KNOWN AGAINST THIS PASS", on both arguments -- a rank
-    with no decision recorded for the slot, a stand-in that never ran the
-    #791 block, `pp_size <= 1`, the first rank. Every such case reproduces
-    exactly the behaviour that shipped before this function, per this file's
-    `_pp_note_output_expectation` / `pp_flip_epoch_of` convention (#787).
-    """
-    if amended is None or rank is None:
-        return None
-    retracted = entries_retracted_by_rank(amended, rank)
-    if not retracted:
-        return None
-    first = retracted[0]
-    return (
-        f"this rank retracted {len(retracted)} request(s) from the admission "
-        f"decision for this pass (first: rid={first.rid} told="
-        f"{first.prefix_len} local={first.observed_local} extend="
-        f"{first.extend_len}), so its batch is a strict SUBSET of the one the "
-        f"upstream had already launched when it forwarded these hidden states"
-    )
-
-
 def pp_upstream_void_pending(scheduler) -> bool:
     """#951: is this pass ALREADY void because the upstream did not launch?
 
@@ -2312,18 +2237,37 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
     holder._pp_ring_admissions = getattr(holder, "_pp_ring_admissions", 0) + 1
     every = int(os.environ.get("SGLANG_947_RING_EVERY", "25") or 25)
     if every > 0 and holder._pp_ring_admissions % every == 0:
-        # #995e THE WIDTH-AGREEMENT CENSUS, EMITTED OFF THE PATH IT MEASURES.
+        # #1072: THE #995c/#995e WIDTH-AGREEMENT PROBE AND ITS CENSUS ARE
+        # DELETED, and the reason is a MEASUREMENT, not a tidy-up.
         #
-        # The counters are incremented in `_pp_recv_proxy_tensors`; printing
-        # them from there cost this window two boots, because the log call
-        # perturbed the receive timing and moved the leftover to a slot where
-        # an EARLIER guard caught it (see the note at the increment site).
-        # This site is the ADMISSION path -- it already logs on a cadence, it
-        # is not the proxy receive, and it therefore cannot shift the timing
-        # of the thing being measured.
+        # #995e's own text warned that `disagree=0` counts only if `evaluated`
+        # is non-zero. Measured on two boots, it never once evaluated on the
+        # ranks that matter:
         #
-        # Three numbers plus the skip reason, always, so `disagree=0` never
-        # again arrives without its denominator.
+        #     1069cohort  PP1 evaluated=54 agree=0 disagree=0 skipped=54
+        #                 PP2 evaluated=52 agree=0 disagree=0 skipped=52
+        #     1071cut     PP1 3/0/0/3        PP2 3/0/0/3
+        #
+        # Skip reason ALWAYS `no_local_input_ids`: at proxy-receive time this
+        # rank's `input_ids` are not materialised yet, so the comparison it
+        # exists to make is structurally impossible exactly where #791 sees
+        # anything at all. A counter that skips 100% of the population it
+        # names, while printing `disagree=0`, is read on the next pass as
+        # "checked, all good" -- an indicator-law violation left standing in
+        # the tree, which is how an arc lengthens quietly.
+        #
+        # NOTHING IS LOST, and this is the load-bearing half: the SAME length
+        # comparison already exists at the point where it can actually be
+        # made, and it CRASHES rather than counting. `model_runner.py:4233-4236`
+        # -- the one funnel every PP stage's forward passes through -- compares
+        # the received hidden-states rows against
+        # `forward_batch.input_ids.shape[0]` once `input_ids` is materialised,
+        # and raises (`ValueError #631 PP proxy/batch mismatch`) with a sender
+        # stamp that separates a pairing error from a payload error. #791
+        # (intent, BEFORE the pass) and #995c (proxy receive, input_ids not yet
+        # there) were the same check at the wrong time -- one a category
+        # error, one skipped 100% of the time. All three measure the LENGTH
+        # axis. Deleting the two that cannot fire leaves the one that executes.
         try:
             from sglang.srt.managers.schedule_batch import (
                 _998_BREAKS,
@@ -2408,40 +2352,6 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
                 len(_m),
                 dict(list(_m.items())[:4]) or "-",
             )
-        except Exception:  # noqa: BLE001 - a census may never break admission
-            pass
-        try:
-            _seen = getattr(holder, "_995c_seen", 0)
-            if _seen:
-                logger.warning(
-                    "#995e WIDTH-AGREEMENT CENSUS (emitted off the measured "
-                    "path): evaluated=%d agree=%d disagree=%d skipped=%d "
-                    "(last skip reason: %s). A zero in `disagree` counts ONLY "
-                    "if `evaluated` is non-zero.",
-                    _seen,
-                    getattr(holder, "_995c_agree", 0),
-                    getattr(holder, "_995c_disagree", 0),
-                    getattr(holder, "_995c_skip", 0),
-                    getattr(holder, "_995c_skip_why", "-"),
-                )
-                _sk = getattr(holder, "_995c_skip_ids", None)
-                if _sk:
-                    # EXTRACTION COUNT PROBE beside the list: if the number of
-                    # recorded identities does not equal the skip counter, the
-                    # list is measuring something other than the counter and
-                    # neither may be quoted.
-                    logger.warning(
-                        "#995f SKIPPED RECEIVES, identified: %s (listed=%d "
-                        "counter=%d%s). A skip is a receive whose width was "
-                        "NEVER COMPARED -- if the dying receive is in this "
-                        "list, `disagree=0` says nothing about it.",
-                        _sk[:16],
-                        len(_sk),
-                        getattr(holder, "_995c_skip", 0),
-                        ""
-                        if len(_sk) == getattr(holder, "_995c_skip", 0)
-                        else " MISMATCH: list is capped or counts differently",
-                    )
         except Exception:  # noqa: BLE001 - a census may never break admission
             pass
         runs = list(hist)
@@ -3729,7 +3639,8 @@ def pp_void_keeps_request(req, resident_rids, chunked_before) -> bool:
         chunk already stashed. It is parked instead, by
         `_park_chunked_prefill_chunk`.
 
-    A SEPARATE, NAMED PREDICATE for the same reason `pp_pass_should_void` is:
+    A SEPARATE, NAMED PREDICATE for the same reason the deleted
+    `pp_pass_should_void` was (#1072 removed it with the retraction it read):
     it is the one thing a can-fail proof must be able to neuter on its own.
     Blinding it to False is exactly the disposal that shipped before these two
     guards existed, while the put-back and the park still run their own
@@ -3741,57 +3652,6 @@ def pp_void_keeps_request(req, resident_rids, chunked_before) -> bool:
     if chunked_before is not None and req is chunked_before:
         return True
     return getattr(req, "rid", None) in (resident_rids or ())
-
-
-def pp_pass_should_void(
-    amended: Optional[PPAdmissionDecision],
-    rank: Optional[int],
-    incoming_voided: bool,
-) -> bool:
-    """#797: must this rank run NOTHING for this pass?
-
-    #1015: this function has zero live callers left in this module -- its
-    caller inside the deleted forward admission-decision arc is gone (see
-    the EDIT-E block at the top of `_event_loop_pp_body`), and nothing else
-    in this file ever called it. Not deleted: it is a pure function of its
-    three arguments, does not itself read `_PP_PASS_VOIDED_KEY` or any other
-    wire state, and is exercised directly by four out-of-scope tests
-    (test_pp_unresolved_defer_cap_944.py, test_pp_retracted_pass_void_797.py,
-    test_chunked_continuation_clamp_946.py,
-    test_pp_reverse_wire_reachability_801.py) that hand-build
-    `incoming_voided`. Deleting it would break those tests' collection for
-    no requirement in this task's edit list.
-
-    TWO WAYS IN, AND THEY ARE DIFFERENT FACTS (historical -- describes the
-    production feed that no longer exists; `incoming_voided` is now supplied
-    only by test callers). Either this rank performed a
-    #791 retraction against the decision it received -- in which case its own
-    batch would be a strict subset of the one its upstream already launched,
-    which is the mispair -- or a rank BEFORE it did, and said so on the wire
-    (`_PP_PASS_VOIDED_KEY`, deleted), in which case the pass is already off
-    and this rank must not restart it with a decode batch of its own.
-
-    ORed, NEVER CLEARED. A rank downstream of a retraction retracts nothing
-    itself (`reconcile_pp_admission_decision` passes an already-retracted
-    entry through verbatim, which is what `entries_retracted_by_rank` is
-    `retracted_by_rank ==`-keyed for), so a rank that consulted only its own
-    verdict would un-void the pass and be the only rank running it.
-
-    A SEPARATE, NAMED PREDICATE because it is the one thing a can-fail proof
-    has to be able to neuter WITHOUT taking `entries_retracted_by_rank` down
-    with it -- that lookup also feeds #791c's receive guard, and a proof that
-    blinds both cannot show which of the two did the preventing. Looked up
-    through this module's globals at call time, like every other function
-    here.
-
-    `None` on either argument means "nothing known", the same convention
-    `pp_proxy_pass_retraction_reason` and `pp_flip_epoch_of` use.
-    """
-    if bool(incoming_voided):
-        return True
-    if amended is None or rank is None:
-        return False
-    return bool(entries_retracted_by_rank(amended, rank))
 
 
 def pp_pass_retraction_reason_of(holder, mb_id: int) -> Optional[str]:
@@ -4399,35 +4259,31 @@ class SchedulerPPMixin:
                         effective, amended = self._pp_reconcile_incoming_admission(
                             _decision
                         )
-                        # #1071: the rank-local shortfall VOID is DELETED here.
-                        # What stood at this line was
-                        # `_pp_void_retracted_pass`, a rank-local
-                        # state-changing verdict: rank r decided the GROUP's
-                        # pass ran nowhere. Its own docstring named the return
-                        # trip that made it safe -- "the void output carries
-                        # the observed local match home, and PP0's guard learns
-                        # it as a floor" -- and #969 CUT V deleted that emitter
-                        # (measured at ca0ee3acd4: the void-output key had zero
-                        # originating senders; #1072 then removed the orphaned
-                        # relay it left behind). The verdict therefore travelled
-                        # DOWNSTREAM only, and PP0's slot stayed set while the
-                        # last rank's did not, which is exactly the premise
-                        # CUT V's own comment at `_do_recv` relies on ("sender
-                        # and receiver ask one question of one batch"). PP0
-                        # then parks in the output receive for ever: measured
-                        # twice, 1068cap 07:34:09 and 1069cohort 08:00:55, and
-                        # in the second the #797 lines sit on the stall second
-                        # itself (PP1, told=12493 local=8397 then told=13399
-                        # local=12493 -- local exactly one pass behind told).
+                        # #1072: AND THE WATCHPOST THAT REPLACED IT IS GONE TOO.
                         #
-                        # Repairing the return trip would repair a compensation
-                        # layer for a rank-local verdict, which is the arc the
-                        # #968 order forbids continuing (upstream-minimal:
-                        # repair carries the burden of proof, deletion does
-                        # not). So the verdict is gone and the disagreement is
-                        # DETECTED instead: RAENGE-NIE-UNEINS, a detected
-                        # divergence is a crash, never a compensating wait.
-                        self._pp_assert_told_honourable(mb_id, amended)
+                        # #1071 deleted the rank-local shortfall VOID that stood at this line
+                        # -- a downstream rank ending the GROUP's pass by itself, whose own
+                        # safety argument was a return trip #969 CUT V had already deleted.
+                        # It put a loud watchpost here in its place, and the watchpost did its
+                        # job: on boot 1071cut it fired 60 s after READY and named the one
+                        # place to look (PP1, told=8192 local=4096).
+                        #
+                        # WHAT IT NAMED WAS ITS OWN PREMISE. That boot was the FIRST chunked
+                        # prefill of a FRESH boot against an EMPTY store, so nothing could be
+                        # reused and no rank could be short of anything: told was chunk 3's
+                        # extend_range.start, local was chunk 1's extend_range.end, one
+                        # --chunked-prefill-size apart. The comparison was reading PP0's
+                        # forward-most plan against a downstream rank's rear-most completed
+                        # extent -- the pipeline stagger itself. `reconcile_pp_admission_
+                        # decision` no longer retracts anything (#1072), so there is no
+                        # disagreement left here to watch for, and a watchpost over a deleted
+                        # comparison would be second bookkeeping in its own right.
+                        #
+                        # The length axis is still guarded, once, where it can actually be
+                        # measured: model_runner.py:4233-4236 compares received hidden-states
+                        # rows against forward_batch.input_ids.shape[0] AFTER input_ids exist,
+                        # and raises. Ranks are held in agreement by #631 ROW AUTHORITY
+                        # (PP0 geometry bulletin, 642b99c7f5), not by a downstream veto.
                         self._pp_admission_incoming_effective = effective
                         self._pp_admission_incoming_schedule = (
                             self._pp_forwarded_schedule_from(amended)
@@ -8302,28 +8158,6 @@ class SchedulerPPMixin:
             self._pp_launched_chain_by_slot = carried
         carried[int(mb_id)] = tuple(bool(x) for x in chain)
 
-    def _pp_pass_retraction_reason(self: Scheduler, mb_id: int) -> Optional[str]:
-        """#791c: did THIS rank narrow its own batch for slot ``mb_id``?
-
-        Reads the amended decision `_pp_note_output_expectation` already
-        records per slot (#791b) -- written on EVERY pass by every non-first
-        rank, at the top of the pass, strictly before the proxy receive -- so
-        this asks a question that is fully answered before the message it
-        judges has even arrived. That is what makes it a discriminator the
-        RECEIVER CAN PREDICT rather than another label on the wire.
-
-        getattr-based and None-tolerant throughout, by this file's stand-in
-        convention (#787): a holder with no slot array, a rank with no
-        `ps.pp_rank`, `pp_size <= 1` and the first rank all yield None, which
-        `_pp_recv_proxy_tensors` reads as "nothing known against this pass" --
-        exactly the behaviour that shipped before #791c.
-        """
-        carried = getattr(self, "_pp_admission_amended_by_slot", None)
-        if not carried or int(mb_id) < 0 or int(mb_id) >= len(carried):
-            return None
-        rank = getattr(getattr(self, "ps", None), "pp_rank", None)
-        return pp_proxy_pass_retraction_reason(carried[int(mb_id)], rank)
-
     def _pp_reconcile_incoming_admission(
         self: Scheduler, decision: PPAdmissionDecision
     ) -> Tuple[Dict[str, int], PPAdmissionDecision]:
@@ -8395,65 +8229,6 @@ class SchedulerPPMixin:
             rank=self.ps.pp_rank,
             pp_size=pp_size,
             log=logger,
-        )
-
-    def _pp_assert_told_honourable(
-        self: Scheduler,
-        mb_id: int,
-        amended: PPAdmissionDecision,
-    ) -> None:
-        """#1071: the ranks agree about this pass, or the group stops. Loudly.
-
-        THIS REPLACES `_pp_void_retracted_pass`, WHICH IS DELETED. That method
-        let a downstream rank decide, alone, that the GROUP's pass ran nowhere
-        -- the rank-local state-changing verdict the #968 order forbids. Its
-        safety argument was a RETURN TRIP ("the void output carries the
-        observed local match home ... PP0's guard learns it as a floor"), and
-        #969 CUT V deleted the emitter for that trip. What was left ran the
-        verdict downstream-only:
-
-            1068cap   07:34:02-09  #797 void on rank 1 ONLY; no void or
-                                   retract line on PP0 or PP2.
-            1069cohort 08:00:54/55 #791 unhonourable on PP1, told=12493
-                                   local=8397 then told=13399 local=12493 --
-                                   `local` exactly one pass behind `told` --
-                                   and the ring never moved again.
-
-        In both, PP0's `mbs[slot]` stayed set while the last rank's did not,
-        so the last rank sent no output and PP0 blocked in `_do_recv` until
-        the deadman. `_do_recv`'s own comment states the invariant that
-        breaks: "sender and receiver ask one question of one batch". Deleting
-        the only remaining producer of a rank-local `mbs[slot] = None`
-        RESTORES that invariant rather than compensating for its loss.
-
-        WHY A RAISE AND NOT A CLAMP. Clamping this rank's prefix to its own
-        local match is rank-local geometry, i.e. #631 -- the very divergence
-        Row Authority exists to end. Under Row Authority the row is PP0's and
-        every rank EXECUTES it; a rank whose cache cannot honour the row is
-        not entitled to renegotiate it, and a told the group cannot honour is
-        a defect at the ONE place that stamps it (PP0), not here. So this
-        names the divergence and stops, per RAENGE-NIE-UNEINS (detection is a
-        crash, never refusal-and-continue). On a group whose told is
-        honourable it never fires, and if it does fire it has pointed at PP0's
-        told derivation -- one place, not the next node of the ring family.
-        """
-        rank = getattr(getattr(self, "ps", None), "pp_rank", None)
-        mine = entries_retracted_by_rank(amended, rank) if rank is not None else ()
-        if not mine:
-            return
-        first = mine[0]
-        self._pp_pass_voids = getattr(self, "_pp_pass_voids", 0) + 1
-        raise RuntimeError(
-            f"#1071 PP RANKS DISAGREE ABOUT THIS PASS: rank {rank} cannot "
-            f"honour the told prefix PP0 stamped for slot {mb_id} -- "
-            f"{len(mine)} request(s) retracted, first rid={first.rid} "
-            f"told={first.prefix_len} local={first.observed_local}. Until "
-            f"#1071 this rank voided the pass for the whole group by itself "
-            f"and told nobody upstream, which parked PP0 in the output "
-            f"receive for ever (1068cap 07:34:09, 1069cohort 08:00:55). The "
-            f"defect is NOT here: it is wherever PP0 derived a told the group "
-            f"cannot honour. Detected rank disagreement stops the group; it "
-            f"is never compensated for."
         )
 
     def _pp_occupant_horizon_lapsed(self: Scheduler, mb_id: int) -> bool:
@@ -8857,7 +8632,7 @@ class SchedulerPPMixin:
 
         A one-line method and not a one-line expression inline in
         `_event_loop_pp_body`, for the same reason `_pp_pass_retraction_reason`
-        and `pp_pass_should_void` are methods: it is the single point at which
+        was a method (deleted with the retraction, #1072): it is the single point at which
         the forwarded chunk lengths enter this rank, so it is the single point
         a test can neuter to prove the rest of the machinery actually depends
         on them. Resolves `forwarded_schedule` through this module's globals,
@@ -10112,7 +9887,8 @@ class SchedulerPPMixin:
             # top of THIS pass makes its batch a strict subset of the one the
             # upstream had already launched, so the current pass's own proxy
             # is the wrong width -- or, worse, the right width and the wrong
-            # requests. See `pp_proxy_pass_retraction_reason`.
+            # requests. (The #791c retraction-reason discriminator that
+            # stood here was deleted with the retraction itself, #1072.)
             diverged = pp_pass_retraction_reason_of(self, mb_id)
             if diverged is None:
                 # #995b THE SENDER ALREADY DECLARED ITS WIDTH; NOBODY READ IT.
@@ -10182,147 +9958,6 @@ class SchedulerPPMixin:
                     # the guard compares like with like.
                     _proxy._pp_recv_geom = _999_geom(self, mb_id)
                 except Exception:  # noqa: BLE001 - provenance may never break a recv
-                    pass
-                # #995c THE FALSE-REFUSAL SIDE, MEASURED BEFORE ANYTHING IS
-                # ARMED. This is the can-fail on the DANGEROUS direction.
-                #
-                # The evidence says the enforcement belongs here: boot 26
-                # showed sender rows == received rows (payload intact,
-                # PAIRING wrong), with mb_id and epoch matching, so
-                # `pp_proxy_stamp_names_pass` cannot separate the two
-                # messages. The seqno can -- it exists for exactly this
-                # ("distinguishes two messages for the SAME slot, which is
-                # exactly the pair a stranded leftover creates") and no
-                # consumer reads it.
-                #
-                # BUT REFUSING HERE IS THE BOOT-KILLING DIRECTION, and #995's
-                # first version proved it: a refusal on the live path with no
-                # way onward cost 175 refusals on ONE rid and a dead window.
-                # So NOTHING IS REFUSED YET. This only asks whether the width
-                # available here agrees with the width the downstream guard
-                # will use -- because if it does not, an armed check would
-                # reject VALID messages, which is worse than the leftover it
-                # would catch.
-                #
-                # THE COMPARISON IS NOT A SECOND DERIVATION, which is what
-                # makes it trustworthy: `ForwardBatch` is built with
-                # `input_ids=batch.input_ids` (forward_batch_info.py:709), so
-                # `self.mbs[mb_id].input_ids` IS the tensor
-                # `model_runner.forward` measures. Same object, not a parallel
-                # computation of the same idea -- the distinction that made
-                # #994's truncation dangerous.
-                # #995d THREE NUMBERS, NOT ONE -- AND THE DENOMINATOR IS
-                # EMITTED WHETHER OR NOT THE EVENT HAPPENS.
-                #
-                # The first version of this probe counted agreements only
-                # INSIDE the disagreement line. Boot 27 then reported zero
-                # disagreements while `#631` fired on the very pass it was
-                # built to see -- and with no denominator printed, that zero
-                # could not be told apart from "the probe never evaluated"
-                # (`_local` is -1 whenever `self.mbs[mb_id]` is None or its
-                # `input_ids` is not yet set, which is reachable here). A
-                # counter visible only on the error path cannot separate
-                # ABSENCE from NON-EXECUTION.
-                #
-                # That is the same class this window caught four times in
-                # other people's instruments on the same evening -- and it was
-                # built into this fresh one anyway. Vigilance does not defend
-                # against it; a structural rule does. Hence: agreements,
-                # disagreements and SKIPS are three separate counters, and the
-                # census below prints all three on a fixed cadence, so the
-                # log always states the denominator and the skip count even
-                # when nothing is wrong.
-                try:
-                    _srows = (
-                        int(stamp[2])
-                        if isinstance(stamp, (tuple, list)) and len(stamp) >= 3
-                        else -1
-                    )
-                    _cb = (
-                        self.mbs[mb_id]
-                        if 0 <= mb_id < len(getattr(self, "mbs", ()) or ())
-                        else None
-                    )
-                    _ii = getattr(_cb, "input_ids", None) if _cb is not None else None
-                    _local = int(_ii.shape[0]) if _ii is not None else -1
-                    if _srows < 0 or _local < 0:
-                        # THE THIRD NUMBER. Not "nothing happened" -- a named
-                        # reason the comparison could not be made, so a quiet
-                        # log is a measured quiet and not an unread one.
-                        self._995c_skip = getattr(self, "_995c_skip", 0) + 1
-                        _why = "no_stamp_rows" if _srows < 0 else "no_local_input_ids"
-                        self._995c_skip_why = _why
-                        # #995f IDENTITY OF THE SKIP, not just its count.
-                        # Appending to a list is not I/O -- the EMISSION is
-                        # off-path in `pp_ring_note`, per the rule this window
-                        # produced. Bounded so a long boot cannot grow it.
-                        _sk = getattr(self, "_995c_skip_ids", None)
-                        if _sk is None:
-                            _sk = []
-                            self._995c_skip_ids = _sk
-                        if len(_sk) < 64:
-                            _sk.append(
-                                (
-                                    int(mb_id),
-                                    stamp[1]
-                                    if isinstance(stamp, (tuple, list))
-                                    and len(stamp) >= 2
-                                    else None,
-                                    _why,
-                                )
-                            )
-                    elif _srows == _local:
-                        self._995c_agree = getattr(self, "_995c_agree", 0) + 1
-                    else:
-                        self._995c_disagree = getattr(self, "_995c_disagree", 0) + 1
-                        _n = self._995c_disagree
-                        if _n <= 8 or _n % 256 == 0:
-                            logger.warning(
-                                "#995c PROXY WIDTH DISAGREES AT RECV "
-                                "occurrence=%d: sender stamp says %d row(s) "
-                                "(mb_id=%s seq=%s epoch=%s), this rank's "
-                                "batch for slot %d holds %d token(s). "
-                                "NOT REFUSED -- this pass still runs and the "
-                                "downstream width check in "
-                                "model_runner.forward remains the only gate. "
-                                "An armed check here is safe only once this "
-                                "line fires ONLY on genuine leftovers; a hit "
-                                "on a VALID message means the local width is "
-                                "not the downstream width and arming would "
-                                "kill good passes.",
-                                _n,
-                                _srows,
-                                stamp[0],
-                                stamp[1],
-                                stamp[3] if len(stamp) >= 4 else "?",
-                                mb_id,
-                                _local,
-                            )
-                    # #995e COUNT HERE, PRINT ELSEWHERE.
-                    #
-                    # The counters stay on this path -- they are integer
-                    # increments and cost nothing measurable. The EMISSION
-                    # moved to `pp_ring_note` (admission path), and that move
-                    # is the whole point of this revision.
-                    #
-                    # MEASURED, and it is the sharpest methodological result
-                    # of this window: the previous revision printed the census
-                    # from right here, every 50 receives. Across five boots the
-                    # death form tracked the pin EXACTLY -- 2001952378,
-                    # ddb582bc91 and 04e511c35e all died at the WIDTH guard;
-                    # f752270171, which added that `logger.info`, died at the
-                    # IDENTITY guard twice out of two. One I/O call on a
-                    # latency-sensitive receive path shifted the timing enough
-                    # to land the leftover on a different slot, where the
-                    # identity check caught it FIRST -- and the identity check
-                    # sits UPSTREAM of this probe. The instrument perturbed
-                    # away the very condition it was built to observe.
-                    #
-                    # A COUNTER MAY NOT PRINT ITS DENOMINATOR ON THE PATH IT
-                    # MEASURES. The denominator rule from the previous revision
-                    # is right and stays; only the LOCATION was wrong.
-                    self._995c_seen = getattr(self, "_995c_seen", 0) + 1
-                except Exception:  # noqa: BLE001 - a probe may never break a recv
                     pass
                 return _proxy
             self._pp_proxy_batch_divergences = (

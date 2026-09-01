@@ -512,20 +512,53 @@ def test_the_rank_local_shortfall_verdict_is_gone():
     )
 
 
-def test_an_unhonourable_told_is_loud_not_silent():
-    """#1071, the other half. Deleting the void is only safe if the state it
-    used to swallow is now NAMED. An unhonourable told is the ranks
-    disagreeing about a pass; detection is a crash, never a clamp (a clamp
-    would be rank-local geometry, i.e. #631) and never a wait."""
+def test_the_told_local_comparison_mints_no_verdict():
+    """#1072. This test asserted, one iteration ago, that #1071's WATCHPOST
+    raised on an unhonourable told. The watchpost is now deleted too, and
+    that is not a weakening -- it is what its own firing bought.
+
+    On boot 1071cut the watchpost fired 60 s after READY (PP1, told=8192
+    local=4096) on the FIRST chunked prefill of a FRESH boot against an EMPTY
+    store: nothing to reuse, so nothing to be short of. `told` was chunk 3's
+    `extend_range.start`, `local` was chunk 1's `extend_range.end` -- one
+    `--chunked-prefill-size` apart, i.e. the pipeline stagger. The comparison
+    it guarded was a category error, so the comparison went, and a watchpost
+    over a deleted comparison would be second bookkeeping of its own.
+
+    What is pinned now is the DELETION, by AST rather than by prose (prose
+    cannot fail): `reconcile_pp_admission_decision` mints no retraction at
+    all. The length axis is still guarded once, where the operands are
+    finally comparable -- `model_runner.py:4233-4236`, after `input_ids` is
+    materialised, and it raises."""
+    import ast as _ast
     import inspect as _i
 
+    from sglang.srt.managers import pp_admission_congruence as cong
     from sglang.srt.managers import scheduler_pp_mixin as mixin
 
-    src = _i.getsource(mixin.SchedulerPPMixin._pp_assert_told_honourable)
-    assert "raise" in src and "entries_retracted_by_rank" in src, (
-        "the replacement for the deleted void does not stop on a detected "
-        "shortfall -- silence here is the 1069cohort park again"
+    fn = next(
+        n
+        for n in _ast.walk(_ast.parse(open(_i.getsourcefile(cong)).read()))
+        if isinstance(n, _ast.FunctionDef)
+        and n.name == "reconcile_pp_admission_decision"
     )
+    minted = {
+        k.arg
+        for n in _ast.walk(fn)
+        if isinstance(n, _ast.Call)
+        for k in n.keywords
+        if k.arg
+    }
+    assert "retracted_by_rank" not in minted and "retracted" not in minted, (
+        f"the reconcile mints a retraction again ({sorted(minted)}) -- a "
+        "downstream rank deciding it may not execute PP0's row is the "
+        "rank-local verdict #968 forbids"
+    )
+    for gone in ("_pp_assert_told_honourable", "_pp_void_retracted_pass"):
+        assert not hasattr(mixin.SchedulerPPMixin, gone), (
+            f"{gone} came back: the verdict and the watchpost over it were "
+            "deleted together and belong together"
+        )
 
 
 def test_Aii_chain_recv_is_counter_bounded():

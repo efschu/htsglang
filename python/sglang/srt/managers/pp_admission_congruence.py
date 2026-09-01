@@ -600,7 +600,8 @@ class PPAdmissionCongruenceGuard:
         #: carrying the chain-reconciled decision home
         #: (`scheduler_pp_mixin.py:6357` -> `_pp_void_output_payload:6394` ->
         #: `pp_output_payload_with_return_trip:1060`, absorbed at
-        #: `_pp_absorb_void_output:6414` -> `pp_absorb_admission_return:6473`).
+        #: the void-output absorber (deleted with the relay, #1072) ->
+        #: `pp_absorb_admission_return`).
         #: THE VOID THAT MUST BE COUNTED IS THE SAME EVENT THAT BLOCKS THE LAP:
         #: the voided pass parks a middle rank in `_pp_drain_voided_proxy`
         #: (blocking `_pp_recv_typed_dict`), so the output never completes the
@@ -632,7 +633,7 @@ class PPAdmissionCongruenceGuard:
         #: SO THE KEY IS THE REFUSAL, NOT THE OFFER. What this set records is
         #: the one fact the alternation cannot fake: the pass carrying that
         #: offer came home VOID. It is PP0-local in exactly the sense #944b
-        #: requires -- `_pp_absorb_void_output` is rank 0's own consumption of
+        #: requires -- the void-output absorber (deleted, #1072) was rank 0's own consumption of
         #: its own launched batch, needs no peer to answer and no lap to
         #: complete, and runs precisely on the passes that fail. It is NOT
         #: `_unresolved_rounds`: that one is fed by the chain-reconciled
@@ -839,7 +840,7 @@ class PPAdmissionCongruenceGuard:
         """#987: these rids were offered on a pass that came home VOID.
 
         The write side of `_refused_since_offer`. Called by PP0 as it absorbs
-        a void output (`scheduler_pp_mixin._pp_absorb_void_output`), over the
+        a void output (absorber deleted with the relay, #1072), over the
         members of the batch that void names -- so the argument is rank 0's
         own launched batch, not a downstream report, and no lap has to
         complete for it to be true.
@@ -1902,25 +1903,29 @@ def reconcile_pp_admission_decision(
 
     Returns `(effective_prefix_len_by_rid, amended_decision)`:
       * `effective_prefix_len_by_rid` contains exactly the rids this rank may
-        safely admit THIS pass, each mapped to the prefix length it must use
-        (always `<= told`, and `<= this rank's own local match`). A retracted
-        rid is simply ABSENT here -- callers must never default a missing rid
-        to 0-is-safe-to-proceed-with; absence means "do not admit this pass".
-      * `amended_decision` is what this rank forwards to the next stage: the
-        same entries, except any newly-retracted rid has `admitted=False`,
-        `retracted=True`, `retracted_by_rank=rank`. An already-retracted
-        entry (set by an earlier rank) is passed through unchanged and does
-        NOT get re-logged or re-evaluated -- see the "exactly one WARNING"
-        pin in the paired test.
+        admit THIS pass, each mapped to the prefix length it must use --
+        which, since #1072, is always exactly `told`.
+      * `amended_decision` is what this rank forwards to the next stage.
 
-    `pp_size<=1`: pure identity pass-through (every `told` becomes
-    `effective` unconditionally, no entry is ever retracted, nothing is
-    logged) -- see DEFAULT PATH above.
+    #1072: THIS FUNCTION NO LONGER RETRACTS ANYTHING, and the paragraph that
+    stood here describing when it does is deleted rather than softened. Both
+    retraction branches are gone (see their sites below for the measurement
+    that removed them): `local < told` is the PIPELINE STAGGER, not a
+    shortfall, and a lookup miss was never a measurement at all. A downstream
+    rank EXECUTES the row it is given; deciding it may not is the rank-local
+    verdict #968 forbids, and #1071 already deleted the void that verdict fed.
+    An entry retracted by an EARLIER rank can therefore no longer exist
+    either; the pass-through branch at the top of the loop is kept only so a
+    decision minted by an older peer during a rolling restart is carried
+    verbatim instead of being re-derived.
 
-    Raises nothing. An unhonourable entry is data, not an exception -- see
-    the module docstring's "TWO FAILURE SHAPES" section for why a raise here
-    would turn an ordinary, expected cache-topology fact (a downstream rank's
-    cache is colder than PP0's) into a crash on every such admission.
+    `pp_size<=1`: unchanged, and now the same path as every other size --
+    every `told` becomes `effective` unconditionally.
+
+    Raises nothing, and now for a stronger reason than before: there is no
+    longer a condition here that could warrant one. The old "unhonourable
+    prefix" it declined to raise on was a false positive of its own
+    comparison.
     """
     log = log or logger
     if pp_size <= 1:
@@ -1987,14 +1992,19 @@ def reconcile_pp_admission_decision(
             # one, which is the whole reason #797c and #798 each looked like a
             # fresh defect instead of the same one twice.
             #
-            # THE GROUP DEFERS, NOT THIS RANK. Excluding the rid from
-            # `effective` and retracting the entry puts the pass through the
-            # existing #797 void, and that void is already group-uniform:
-            # `pp_pass_should_void` ORs the incoming flag and never clears it,
-            # so a retraction anywhere on the ring stops every rank. This rank
-            # therefore does not decide anything -- it reports. Whether the
-            # group defers AGAIN or gives up is decided once, by PP0, from the
-            # count `unresolved` feeds (`PPAdmissionCongruenceGuard`,
+            # THE GROUP DEFERS, NOT THIS RANK -- the argument that USED to
+            # make retracting here safe, kept verbatim because it is exactly
+            # what stopped being true. Excluding the rid from `effective` and
+            # retracting the entry put the pass through the #797 void, and
+            # that void was group-uniform: the void predicate ORed the
+            # incoming flag and never cleared it, so a retraction anywhere on
+            # the ring stopped every rank. #1071 deleted that void and #1072
+            # deletes this retraction with it -- had only the void gone, this
+            # branch would have kept dropping the rid on ONE rank and the
+            # pass would have run with divergent membership, which is the
+            # #631 class. Whether the group defers AGAIN or gives up was
+            # decided once, by PP0, from the count `unresolved` feeds
+            # (`PPAdmissionCongruenceGuard`,
             # `UNRESOLVED_DEFER_CAP`). A defer that only one rank takes IS the
             # next divergence.
             log.warning(
@@ -2024,43 +2034,93 @@ def reconcile_pp_admission_decision(
             # Same discipline the sentinel exists for, one level up: a value's
             # meaning is a property of its READERS, and `observed_local` has
             # readers `local_match_lens` does not.
-            amended.append(
-                replace(
-                    entry,
-                    admitted=False,
-                    retracted=True,
-                    retracted_by_rank=rank,
-                    observed_local=None,
-                    unresolved=True,
-                )
-            )
+            # #1072: THIS BRANCH MUST GO TOO, AND ITERATION 1 IS WHY.
+            #
+            # Its own comment above says the safety of retracting here rests
+            # on the #797 void being GROUP-UNIFORM ("a retraction anywhere on
+            # the ring stops every rank ... this rank therefore does not
+            # decide anything -- it reports"). #1071 deleted that void. With
+            # it gone, a retraction no longer stops the group: it only drops
+            # this rid from `effective` ON THIS RANK, and the pass then runs
+            # with rank-divergent batch MEMBERSHIP -- which is #631, the exact
+            # class Row Authority exists to end. So Iteration 1 turned a
+            # covered branch into an uncovered one, and leaving it would be
+            # the hole its own docstring warned about ("a defer that only one
+            # rank takes IS the next divergence").
+            #
+            # A lookup miss was never a measurement in the first place -- the
+            # comment says so verbatim ("a statement about the LOOKUP, not
+            # about this rank's cache"). The honest response to "I could not
+            # find it" is to execute the row as told, exactly as the
+            # `told <= 0` branch above already does without a measurement,
+            # and to let the executed-geometry instruments speak if anything
+            # actually diverges.
+            effective[entry.rid] = told
+            amended.append(entry)
             continue
 
-        # UNSAFE and physically un-fixable this pass (see module docstring).
-        # Fail loudly and boundedly: exactly one WARNING, never a raise, and
-        # the request is excluded from `effective` rather than handed a
-        # length it cannot honour. The BOOT and every OTHER request in this
-        # decision are unaffected.
-        log.warning(
-            "#791 PP-ADMISSION unhonourable prefix on rank %d: rid=%s "
-            "told=%d local=%d -- serving this request without prefix reuse "
-            "on a later pass instead of corrupting the cross-stage tensor",
-            rank,
-            entry.rid,
-            told,
-            local,
-        )
-        amended.append(
-            replace(
-                entry,
-                admitted=False,
-                retracted=True,
-                retracted_by_rank=rank,
-                observed_local=local,
-            )
-        )
-        # Deliberately absent from `effective`: see the docstring above on
-        # why "missing" must mean "do not admit", not "assume 0 is safe".
+        # #1072: `local < told` IS NOT A SHORTFALL. IT IS THE PIPELINE STAGGER,
+        # AND THIS COMPARISON IS A CATEGORY ERROR.
+        #
+        # MEASURED, boot_855_1071cut, 12:09:58, ONE MINUTE after READY, on the
+        # FIRST chunked prefill of a FRESH boot against an EMPTY store
+        # (/tmp/hicache_855_1071cut, created by the launcher that same minute):
+        #
+        #     PP1  rid=0d43edbc  told=8192  local=4096
+        #
+        # Nothing was in the store, so nothing could be reused and no rank
+        # could be SHORT of anything -- a cache shortfall is constructively
+        # impossible in that state. `told` is `extend_range.start` of chunk 3;
+        # `local` is `extend_range.end` of chunk 1; the difference is exactly
+        # one `--chunked-prefill-size` (4096). The two operands are read at
+        # DIFFERENT PIPELINE POSITIONS: PP0's forward-most plan against a
+        # downstream rank's rear-most completed extent. In a 3-stage pipeline
+        # that offset is the stagger itself, i.e. the machine working, and the
+        # only thing this branch ever measured on this rig.
+        #
+        # It also retracts the 1068cap and 1069cohort events the strand read
+        # as "store skew" and as a "moving told" (told=12493/local=8397 and
+        # told=13399/local=12493): same structural false positive, later in
+        # the run, then AMPLIFIED by the void it triggered --
+        # `_pp_void_own_batch` restored `chunked_req` to its pre-admission
+        # value, freezing `local` while PP0's `told` ran on. Cause and
+        # amplifier were the same mechanism.
+        #
+        # WHY DELETING THE CHECK IS THE FIX AND NOT A RISK. The rank does not
+        # execute this row now; it executes rows IN ORDER, one per pass, and
+        # by the time chunk 3's row reaches the forward, chunk 2's row has
+        # already been executed on this rank. The check evaluates a FUTURE
+        # row against a PRESENT state and can therefore only be wrong. The
+        # ordering guarantee -- not this comparison -- is what makes the
+        # geometry congruent, and it is enforced where it belongs: #631 ROW
+        # AUTHORITY (PP0 geometry bulletin, 642b99c7f5). Under Row Authority
+        # the row IS the geometry and a downstream rank EXECUTES it; a rank
+        # entitled to renegotiate it is the rank-local verdict #968 forbids
+        # (#1071 deleted the void this branch used to feed).
+        #
+        # Divergence detection does NOT move to a new check -- that would be
+        # the same second bookkeeping under a new name. It does not need to:
+        # the SAME length comparison already exists at the point where it can
+        # actually be made, and it CRASHES rather than counting.
+        # `model_runner.py:4233-4236` -- the one funnel every PP stage's
+        # forward passes through -- compares the received hidden-states rows
+        # against `forward_batch.input_ids.shape[0]` once `input_ids` is
+        # materialised, and raises `ValueError #631 PP proxy/batch mismatch`
+        # with a sender stamp that separates a pairing error from a payload
+        # error.
+        #
+        # An earlier draft of this comment claimed the cover came from the
+        # #995e WIDTH-AGREEMENT census and the #998 EXTEND-INVARIANT probe.
+        # That was wrong and was measured to be wrong: #995e skipped 100% of
+        # its population on exactly the downstream ranks where this branch
+        # ever saw anything (1069cohort PP1 54/54 skipped, PP2 52/52;
+        # 1071cut 3/3 and 3/3; reason always `no_local_input_ids`), and #998
+        # is rank-local by construction and can never see rank against rank.
+        # Both are deleted in this same cut. This branch, #995c and #995e were
+        # the same length check at three wrong moments; what remains is the
+        # one that executes.
+        effective[entry.rid] = told
+        amended.append(entry)
 
     return effective, PPAdmissionDecision(mb_id=decision.mb_id, entries=tuple(amended))
 
