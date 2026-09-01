@@ -148,6 +148,9 @@ __all__ = [
     "producer_generation_of",
     "producer_phase_of",
     "reset_for_test",
+    "DoublePrefillCensus",
+    "DOUBLE_PREFILL_LINE_PREFIX",
+    "resolve_chunk_size",
 ]
 
 
@@ -155,6 +158,9 @@ __all__ = [
 #: deliberately NOT a bare ticket number: a four-digit number matches every
 #: millisecond figure in a boot log (#995 / measured on boot 49).
 ACCEPT_LINE_PREFIX = "#631 producer-phase"
+
+#: The second half of the acceptance. Same anchoring discipline.
+DOUBLE_PREFILL_LINE_PREFIX = "#939 double-prefill"
 
 
 class ObservationState(str, Enum):
@@ -785,3 +791,196 @@ def emit(census: ProducerPhaseCensus | None, logger) -> None:
             )
     else:
         _suppressed += 1
+
+
+# --------------------------------------------------------------------------
+# 5. THE SECOND HALF OF THE ACCEPTANCE: #939, no double prefill
+# --------------------------------------------------------------------------
+#
+# THE LAW, verbatim from the user: a double prefill is "natuerlich nicht"
+# acceptable, and the admissible residual loss is AT MOST ONE HICACHE CHUNK
+# SIZE. Until now that was a prose condition -- there was no line that could
+# pass or break it, so a green producer-phase number could sit next to a
+# silent double prefill and read as a win. That is the same false-win family
+# this module already closed once.
+#
+# OPERATIONAL DEFINITION, on quantities the code CARRIES rather than ones
+# derived here:
+#
+#   S_i  the span request i had ALREADY COMPUTED when the cutover retracted
+#        it. The retraction stashes the live Req objects
+#        (`phase_flip_runtime.py:8889`, `self._pending_seam_readmit`), so
+#        this is read off the request at that instant, not reconstructed.
+#   C_i  what its post-cutover re-prefill RECOVERED from cache:
+#        ``len(req.prefix_indices)``, the same quantity the scheduler uses at
+#        `scheduler.py:5260` (`_matched_len`) and the same one that reaches
+#        the log as this request's share of ``#cached-token``.
+#
+#   recomputed_i = max(0, S_i - C_i)
+#
+# That is the double prefill, in tokens, per request: work that was done
+# before the cutover and is being done again after it. The denominator is
+# sum(S_i) -- the span that was already computed and therefore COULD have
+# been recomputed. Without it a token count is not a finding.
+#
+# WHY THE POPULATION IS THE READMIT SET AND NOTHING ELSE: a request that was
+# never retracted was never at risk of a double prefill, and including it
+# would inflate the denominator with requests that cannot contribute to the
+# numerator -- the denominator trap in its classic form.
+#
+# THE THRESHOLD IS READ, NEVER HARDCODED. The bound is one chunk C, and the
+# code that owns the arithmetic says so at `scheduler.py:5261-5286`:
+#
+#       realised loss = L - floor((L-1)/C) * C   <=   C   for every L
+#       worked there:  L=4618, C=4096 -> 522;  L=8192, C=4096 -> 4096
+#
+# The bound is ATTAINED and never exceeded, so the comparison is ``<=``, and
+# a specimen that loses exactly C must PASS while C+1 must FAIL. That same
+# comment warns that ``dynamic_chunked_prefill_size`` can vary C at runtime
+# -- "which moves the number but not the 'at most one chunk' bound". A
+# constant captured here would be the next number that was calibrated once
+# and then lied; `resolve_chunk_size` reads the live value and REPORTS WHICH
+# SOURCE ANSWERED, so a threshold with no stated source is visibly unusable.
+
+
+def resolve_chunk_size(scheduler=None) -> tuple[int | None, str]:
+    """The live chunk size C, WITH the source that produced it.
+
+    Order: the scheduler's dynamic property (what actually chunks a prefill
+    right now), then its static field, then the server arg. None means the
+    threshold is unknown -- which makes the verdict NO_OBSERVATION, never a
+    PASS against a guessed bound.
+    """
+    if scheduler is not None:
+        try:
+            v = scheduler.dynamic_chunked_prefill_size
+            if v and int(v) > 0:
+                return int(v), "scheduler.dynamic_chunked_prefill_size"
+        except Exception:  # noqa: BLE001 - a missing property is not a crash
+            pass
+        try:
+            v = scheduler.chunked_prefill_size
+            if v and int(v) > 0:
+                return int(v), "scheduler.chunked_prefill_size"
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        v = getattr(get_server_args(), "chunked_prefill_size", None)
+        if v and int(v) > 0:
+            return int(v), "server_args.chunked_prefill_size"
+    except Exception:  # noqa: BLE001 - no runtime context in unit tests
+        pass
+    return None, "UNRESOLVED"
+
+
+@dataclasses.dataclass
+class DoublePrefillCensus:
+    """Re-computed tokens across a cutover, against what was already computed.
+
+    One census per cutover. A boot with several flips produces several, and
+    the acceptance is the WORST of them: the law is per-request, so a single
+    request losing more than a chunk breaks it no matter how many did not.
+    """
+
+    #: Requests the cutover retracted and re-admitted. THE DENOMINATOR's
+    #: population -- never all requests, only those that were at risk.
+    readmitted: int = 0
+    #: sum(S_i): tokens that were already computed before the cutover.
+    already_computed: int = 0
+    #: sum(max(0, S_i - C_i)): tokens being computed a second time.
+    recomputed: int = 0
+    #: max over requests of recomputed_i. THE TERM THE LAW BOUNDS.
+    worst_request_tokens: int = 0
+    #: Which request attained the worst, so a failure is actionable.
+    worst_request_id: str = "-"
+    #: Requests whose own loss exceeded one chunk.
+    over_bound: int = 0
+    chunk_size: int | None = None
+    chunk_source: str = "UNRESOLVED"
+    observed: bool = False
+
+    def note_readmitted_request(
+        self,
+        request_id: str,
+        already_computed: int,
+        recovered: int,
+    ) -> None:
+        """One re-admitted request, with both carried quantities.
+
+        ``recovered`` is ``len(req.prefix_indices)`` at the post-cutover
+        re-prefill. It is passed in rather than read here because this object
+        holds no reference to a request -- the census is a passive recorder
+        and must not be able to keep a Req alive.
+        """
+        self.observed = True
+        self.readmitted += 1
+        s = max(0, int(already_computed))
+        c = max(0, int(recovered))
+        lost = max(0, s - c)
+        self.already_computed += s
+        self.recomputed += lost
+        if lost > self.worst_request_tokens:
+            self.worst_request_tokens = lost
+            self.worst_request_id = str(request_id)
+        if self.chunk_size is not None and lost > self.chunk_size:
+            self.over_bound += 1
+
+    def bind_chunk(self, scheduler=None) -> None:
+        self.chunk_size, self.chunk_source = resolve_chunk_size(scheduler)
+
+    def state(self) -> ObservationState:
+        if not self.observed:
+            return ObservationState.NO_OBSERVATION
+        if self.chunk_size is None:
+            # A bound we cannot name cannot be compared against. This is NOT
+            # a pass, and it is not a failure either.
+            return ObservationState.NO_OBSERVATION
+        if self.readmitted == 0:
+            return ObservationState.EMPTY
+        return ObservationState.VALUE
+
+    def within_bound(self) -> bool | None:
+        """True/False, or None when there is nothing to decide.
+
+        None is returned rather than a default True: a bound that was never
+        evaluated must not be able to contribute a pass.
+        """
+        if self.state() is not ObservationState.VALUE:
+            return None
+        return self.worst_request_tokens <= int(self.chunk_size)
+
+    def check_partition(self) -> None:
+        if self.recomputed > self.already_computed:
+            raise ValueError(
+                f"#939 census does not partition: recomputed="
+                f"{self.recomputed} > already_computed={self.already_computed}"
+            )
+        if self.worst_request_tokens > self.recomputed:
+            raise ValueError(
+                f"#939 census worst exceeds total: "
+                f"{self.worst_request_tokens} > {self.recomputed}"
+            )
+
+    def log_fields(self) -> dict[str, object]:
+        self.check_partition()
+        w = self.within_bound()
+        return {
+            "state": self.state().value,
+            "within_bound": "-" if w is None else str(bool(w)).lower(),
+            # THE BOUNDED TERM and THE BOUND, adjacent and never separable.
+            "worst": self.worst_request_tokens,
+            "chunk": "-" if self.chunk_size is None else self.chunk_size,
+            "chunk_src": self.chunk_source,
+            "worst_req": self.worst_request_id,
+            "over_bound": self.over_bound,
+            # THE NUMERATOR and THE DENOMINATOR.
+            "recomputed": self.recomputed,
+            "already": self.already_computed,
+            "readmitted": self.readmitted,
+        }
+
+    def format_line(self, prefix: str = DOUBLE_PREFILL_LINE_PREFIX) -> str:
+        body = " ".join(f"{k}={v}" for k, v in self.log_fields().items())
+        return f"[{prefix}] {body}"

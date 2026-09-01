@@ -342,3 +342,132 @@ def test_disarmed_emits_nothing(caplog):
     with caplog.at_level(logging.INFO, logger="t631b"):
         m.emit(c, logger)
     assert not caplog.records, "disarmed must be silent, not zero-valued"
+
+
+# ========================================================================
+# #939: the second half -- no double prefill
+# ========================================================================
+
+from sglang.srt.mem_cache.producer_phase_census import (  # noqa: E402
+    DoublePrefillCensus,
+)
+
+
+def _census(chunk=4096):
+    c = DoublePrefillCensus()
+    c.chunk_size = chunk
+    c.chunk_source = "test"
+    return c
+
+
+def test_939_no_cutover_is_no_observation_not_pass():
+    """No readmit population means nothing was at risk. Not a pass."""
+    c = _census()
+    assert c.state() is ObservationState.NO_OBSERVATION
+    assert c.within_bound() is None, "an unevaluated bound must not pass"
+
+
+def test_939_unresolved_chunk_cannot_pass():
+    """A bound we cannot name cannot be compared against."""
+    c = DoublePrefillCensus()  # chunk_size stays None
+    c.note_readmitted_request("r1", already_computed=8192, recovered=8192)
+    assert c.state() is ObservationState.NO_OBSERVATION
+    assert c.within_bound() is None
+    assert c.log_fields()["chunk"] == "-"
+    assert c.log_fields()["chunk_src"] == "UNRESOLVED"
+
+
+def test_939_green_full_recovery_is_zero_recompute():
+    """Everything already computed came back from cache: no double prefill."""
+    c = _census()
+    c.note_readmitted_request("r1", already_computed=8192, recovered=8192)
+    assert c.within_bound() is True
+    f = c.log_fields()
+    assert f["recomputed"] == 0
+    assert f["already"] == 8192, "the denominator rides the same line"
+    assert f["readmitted"] == 1
+
+
+def test_939_red_full_recompute_breaks_the_law():
+    """The measured shape: 'every re-admitted prefix MISSES and is recomputed
+    in full' (phase_flip_runtime.py:8855). That must FAIL."""
+    c = _census()
+    c.note_readmitted_request("r1", already_computed=16384, recovered=0)
+    assert c.within_bound() is False
+    f = c.log_fields()
+    assert f["recomputed"] == 16384
+    assert f["worst"] == 16384
+    assert f["worst_req"] == "r1", "a failure must name the request"
+    assert f["over_bound"] == 1
+
+
+# -- THE BOUNDARY, hit from BOTH sides -----------------------------------
+
+
+def test_939_boundary_exactly_one_chunk_passes():
+    """L=8192, C=4096 -> loss 4096: the code's own worked case.
+
+    'the bound is attained, never exceeded' (scheduler.py:5279), so exactly
+    one chunk is the last passing value, not the first failing one.
+    """
+    c = _census(chunk=4096)
+    c.note_readmitted_request("r1", already_computed=8192, recovered=4096)
+    assert c.log_fields()["worst"] == 4096
+    assert c.within_bound() is True, "exactly one chunk is PASS"
+    assert c.log_fields()["over_bound"] == 0
+
+
+def test_939_boundary_one_token_over_fails():
+    c = _census(chunk=4096)
+    c.note_readmitted_request("r1", already_computed=8193, recovered=4096)
+    assert c.log_fields()["worst"] == 4097
+    assert c.within_bound() is False, "one chunk plus one token is FAIL"
+
+
+def test_939_boundary_moves_with_the_configured_chunk():
+    """The threshold is read, not hardcoded: the same loss flips verdict."""
+    loss = dict(already_computed=8192, recovered=4096)  # 4096 lost
+    small = _census(chunk=2048)
+    small.note_readmitted_request("r1", **loss)
+    big = _census(chunk=4096)
+    big.note_readmitted_request("r1", **loss)
+    assert small.within_bound() is False
+    assert big.within_bound() is True
+
+
+# -- the law is PER REQUEST ----------------------------------------------
+
+
+def test_939_one_bad_request_breaks_it_however_many_are_good():
+    c = _census(chunk=4096)
+    for i in range(20):
+        c.note_readmitted_request(f"ok{i}", already_computed=8192, recovered=8192)
+    c.note_readmitted_request("bad", already_computed=16384, recovered=0)
+    assert c.within_bound() is False
+    assert c.log_fields()["worst_req"] == "bad"
+    assert c.log_fields()["readmitted"] == 21
+
+
+def test_939_aggregate_cannot_hide_a_single_violation():
+    """A large denominator must not dilute one request's breach."""
+    c = _census(chunk=4096)
+    for i in range(100):
+        c.note_readmitted_request(f"ok{i}", already_computed=100000, recovered=100000)
+    c.note_readmitted_request("bad", already_computed=9000, recovered=0)
+    assert c.within_bound() is False, "the worst request decides, not the mean"
+
+
+def test_939_recovered_beyond_already_computed_is_not_negative():
+    c = _census()
+    c.note_readmitted_request("r1", already_computed=4096, recovered=9999)
+    assert c.log_fields()["recomputed"] == 0
+
+
+def test_939_partition_is_checked():
+    c = _census()
+    c.observed = True
+    c.readmitted = 1
+    c.already_computed = 10
+    c.recomputed = 99
+    with pytest.raises(ValueError):
+        c.check_partition()
