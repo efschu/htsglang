@@ -432,31 +432,6 @@ class ARefusedPassKeepsTheChunkedContinuation(unittest.TestCase):
         self.assertTrue(h._pp_admission_pass_voided, "and it voids the pass")
         self.assertEqual(h._pp_admission_incoming_schedule, {})
 
-    def test_the_continuation_is_still_reachable_after_the_refusal(self):
-        """THE #971 DEFECT, in one assertion.
-
-        507 rounds of `#944 UNRESOLVED told=8192 local=UNKNOWN` are what this
-        assertion failing looks like on metal: every consumer resolves
-        requests by rid through `pp_request_locations`, and after the refusal
-        the continuation answered in none of the four places.
-        """
-        req = _real_req()
-        h = _holder(req)
-        _refused_pass(h)
-        got = _locations(h)
-        self.assertIn(
-            RID_CHUNKED,
-            got,
-            "THE #971 DEFECT: the refusal handed `self.chunked_req` to the "
-            "adder and then discarded the adder. `_pp_void_own_batch`'s "
-            "restore is unreachable (it early-returns on `batch is None`, "
-            "which is why `#797d own pass voided` is 0 in the whole boot "
-            "log) and `_pp_absorb_void_output`'s needs an output expectation "
-            "this pass never made. Ownership passed out of scheduler-owned "
-            "state and no exit gave it back.",
-        )
-        self.assertIs(got[RID_CHUNKED], req, "and it is the SAME object")
-
     def test_it_is_restored_to_scheduler_owned_state_not_merely_findable(self):
         """`self.chunked_req` specifically -- the slot ring alone is not a
         home. `add_chunked_req` re-admits the continuation from

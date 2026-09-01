@@ -179,13 +179,6 @@ def _msg_kind_of(message) -> Optional[str]:
 _ADMISSION_DECISION_PAYLOAD_KEY = "__admission_decision__"
 
 
-# #791b: marks an output message the last rank sent ONLY to keep the ring
-# matched -- the slot PP0 expects an output for produced none, because the
-# pipeline retracted it. Never carries tokens; see `_pp_absorb_void_output`
-# for what PP0 does with it and why it may not be turned into a placeholder
-# result.
-_PP_VOID_OUTPUT_KEY = "__pp_void_output__"
-
 # #1015: `_PP_PASS_VOIDED_KEY` and `_PP_UPSTREAM_LAUNCHED_KEY` (the two
 # per-hop facts this block used to define) are DELETED, not merely retired --
 # unlike `_PP_OUTPUT_EXPECTED_KEY` above, each had exactly the one consumer
@@ -200,10 +193,10 @@ _PP_VOID_OUTPUT_KEY = "__pp_void_output__"
 # named alongside these two in the original scope: its docstring's own text
 # ("The chain rides ... the output/void payload that already rides back")
 # is correct and current -- `pp_output_payload_with_return_trip` (:2322)
-# still writes it and `pp_void_forward_payload` (:1853) / `pp_absorb_
-# admission_return` (:2364) still read it, entirely independent of the
-# deleted forward arc. Deleting it would break that live mechanism; kept
-# in full, unedited except for this note.
+# still writes it and `pp_absorb_admission_return` still reads it, entirely
+# independent of the deleted forward arc. (#1072 deleted the void relay,
+# which was this key's SECOND reader; the surviving reader is what keeps the
+# key alive.) Deleting it would break that live mechanism; kept in full.
 #
 # #978: THE SAME STATEMENT, KEPT PER GENERATION INSTEAD OF PER HOP. One bool
 # per rank, index = pp_rank, accumulated as the admission decision travels
@@ -219,16 +212,14 @@ _PP_VOID_OUTPUT_KEY = "__pp_void_output__"
 # generation on the successor -- a SAME-SLOT closure. The output ring's
 # receive reads a LAGGED slot (`mbs[next_mb_id]`, committed passes earlier),
 # and the void for a generation is forwarded or withheld hop by hop passes
-# AFTER its admission, when the per-hop fact is long overwritten. The legacy
-# stop rule (`pp_void_relay_stop_rank`) reconstructs the occupancy from the
-# RETRACTION structure and is exactly right for retraction voids -- but a
-# void that names no retraction is not proof that every rank launched: a
-# rank that lost the request admits nothing and retracts nothing (#944's
-# zero-offer escape), and forwarding the void to it leaves an unmatched
-# message that the demultiplexer later serves POSITIONALLY to a healthy
-# generation's receive (`_pp_absorb_void_output` then empties a live batch
-# on one rank only -- the boot-2 ring wedge, 2026-08-28, PP2 in `_do_recv`
-# unbounded while PP0/PP1 sat in `_pp_commit_comm_work`).
+# AFTER its admission, when the per-hop fact is long overwritten. #1072
+# DELETED the entire void relay this paragraph used to weigh -- the legacy
+# retraction-derived stop rule and the absorbing consumer alike. No rank
+# originates a void output any more, so there is no unmatched message for
+# the demultiplexer to serve POSITIONALLY into a healthy generation's
+# receive: the boot-2 ring wedge of 2026-08-28 (PP2 unbounded in `_do_recv`
+# while PP0/PP1 sat in `_pp_commit_comm_work`) is closed by construction
+# rather than by a stop rule.
 #
 # The chain rides the decision message that already travels within the pass
 # and the output/void payload that already rides back (`pp_output_payload_
@@ -1577,78 +1568,6 @@ def pp_proxy_pass_retraction_reason(
     )
 
 
-def pp_first_retracting_rank(decision: Optional[PPAdmissionDecision]) -> Optional[int]:
-    """#797: the lowest rank that retracted anything from this decision.
-
-    THE RANKS ABOVE IT RAN THE PASS AND THE RANKS FROM IT DOWN DID NOT, and
-    that split is the whole content of this number. A rank voids when it
-    retracts (`pp_pass_should_void`) and every rank after it inherits the
-    void on the wire, while every rank BEFORE it built and launched its batch
-    from the decision as it stood earlier -- they cannot join a void decided
-    after they had already gone.
-
-    `None` when nothing in the decision names a retracting rank: an ordinary
-    pass, or a void produced by something other than a #791 retraction.
-
-    #801: WHAT A CONSUMER MAY CONCLUDE FROM THAT `None` IS NOT "do not
-    forward", and reading it that way was the intermediate-hop wedge. It
-    says only that this decision names no retraction; on a void it therefore
-    says every rank still RAN the pass, which is the case in which the void
-    must travel FURTHEST. `pp_void_relay_stop_rank` turns the two states
-    into a ring position instead of into silence.
-    """
-    if decision is None:
-        return None
-    ranks = [
-        int(e.retracted_by_rank)
-        for e in decision.entries
-        if e.retracted and e.retracted_by_rank is not None
-    ]
-    return min(ranks) if ranks else None
-
-
-def pp_void_relay_stop_rank(
-    first_retracting_rank: Optional[int], pp_size: Optional[int]
-) -> Optional[int]:
-    """#801: the first ring position that will NOT receive this void.
-
-    THE DEFAULT IS THE WHOLE FIX, and the defect it closes is a DEFAULT and
-    not a missing branch. `pp_first_retracting_rank` answers `None` for two
-    unrelated states -- "this decision names no retraction" and "this void
-    carries no decision at all" -- and #797 read both as "stop here". On a
-    ring, "stop" is the one answer that cannot be taken back: the successor's
-    blocking receive is already posted, and no later pass can satisfy it.
-    Specimen wedge_802f_1712 is that shape, with PP1 parked in
-    `_pp_recv_dict_from_prev_stage` while PP0 held a void it forwarded
-    nowhere.
-
-    WHAT THE ABSENCE ACTUALLY MEANS, and it points the other way. The void
-    arm of `_pp_send_output_to_next_stage` fires when the LAST rank has no
-    output to give for a slot the first rank published an expectation for.
-    If no rank retracted, then no rank voided its own pass, so every rank
-    except that last one still holds a launched batch for the slot and has a
-    receive posted for it. The void must then reach `pp_size - 2` and stop
-    one hop short of its own source -- the widest travel, not the narrowest.
-
-    THE STOP IS STILL A STOP, and that half is unchanged: when a retraction
-    IS named, ranks from it down have empty slots and their receives
-    early-return, so a hop past `first_retracting_rank - 1` would leave an
-    unmatched message on the channel -- the bounded-recv corpse, from the
-    sender's side, which is exactly what #796's law forbids. This function
-    widens the default; it does not remove the rule.
-
-    `None` only when `pp_size` is unknown. No production `Scheduler` is in
-    that state (`ps.pp_size` is set at init), and a stand-in that lacks it
-    keeps the pre-#801 behaviour rather than having a ring size guessed for
-    it.
-    """
-    if first_retracting_rank is not None:
-        return int(first_retracting_rank)
-    if pp_size is None:
-        return None
-    return max(int(pp_size) - 1, 0)
-
-
 def pp_upstream_void_pending(scheduler) -> bool:
     """#951: is this pass ALREADY void because the upstream did not launch?
 
@@ -1766,121 +1685,6 @@ def pp_idle_void_streak_exceeded(streak: int, bound: int) -> bool:
     launching once is not serving anybody.
     """
     return bound > 0 and streak >= bound
-
-
-def pp_void_relay_launched_verdict(
-    chain, rank: Optional[int], pp_size: Optional[int]
-) -> Optional[bool]:
-    """#978: should rank ``rank`` forward this void to its successor?
-
-    ``True``/``False`` when the message carries a launched chain that can
-    answer it; ``None`` when it cannot (no chain, unknown rank/ring, or a
-    chain too short to name the successor) -- the caller then applies the
-    legacy retraction-derived stop rule, which is byte-for-byte the pre-#978
-    behaviour.
-
-    THE PREDICATE IS THE SUCCESSOR'S OWN STATEMENT. ``chain[nxt]`` was
-    written by the successor itself at the moment it admitted this
-    generation (`launched=self.mbs[mb_id] is not None`, the same expression
-    #951's per-hop key carries), so the sender's forward gate and the
-    successor's receive gate (`_do_recv`'s ``mbs[next_mb_id] is not None``,
-    not rewritten between admission and receive) finally read the SAME
-    source. The legacy rule inferred the successor's occupancy from the
-    retraction structure, which is silent about a rank that lost the
-    request and therefore retracts nothing while launching nothing.
-
-    THE SOURCE IS NEVER HANDED ITS OWN VOID BACK. Voids originate at the
-    last rank (`_pp_void_output_payload`); a hop to it would be the
-    unmatched message #796's law forbids, whatever the chain says --
-    identical to the legacy rule's ``pp_size - 1`` ceiling.
-    """
-    if not chain or rank is None or pp_size is None:
-        return None
-    nxt = int(rank) + 1
-    if nxt >= int(pp_size) - 1:
-        return False
-    if nxt >= len(chain):
-        return None
-    return bool(chain[nxt])
-
-
-def pp_void_forward_payload(
-    holder, message: Dict[str, object]
-) -> Optional[Dict[str, object]]:
-    """#797: the void this rank must pass on, or None if it is the last one.
-
-    THE WEDGE THIS CLOSES, and it is one #797 would otherwise CREATE. #791b's
-    void keeps the output ring matched for the FIRST rank, because that is
-    where boot instr11 died. It stops there. When the retraction happens on
-    rank r, every rank in 1..r-1 also holds a launched batch for that slot and
-    also has an output receive posted for it -- and PP0, having absorbed the
-    void, forwards nothing, so they block on a message no rank will send.
-
-    Before #797 that shape produced a MISPAIR rather than a wedge (the
-    retracting rank narrowed its batch and the last rank still sent a real
-    output), so trading one for the other would not be a fix. The void
-    therefore travels the whole way the real output would have: last -> 0 ->
-    1 -> ... -> r-1, each rank absorbing it, releasing its own copies of the
-    requests and passing it on.
-
-    IT MUST STOP AT r-1. Rank r and everything after it voided, so their slots
-    are empty and their receives early-return (`_do_recv`'s `target is None`);
-    one more hop would be an unmatched message, the bounded-recv corpse. The
-    stopping point is not guessed -- it is `pp_first_retracting_rank` of the
-    decision the void already carries.
-
-    #801 -- THE RELAY INVARIANT, AND IT IS WHY THIS FUNCTION IS THE FIX SITE.
-    A non-last rank that took exactly one message off this wire for a ring
-    generation must put exactly one back on it, void included; the ring is
-    then a strict relay and the message count on hop r -> r+1 equals the
-    count the last rank emitted. #797 held that for the one state it could
-    name -- a decision with a retraction in it -- and fell SILENT for the two
-    it could not: a void carrying no decision, and a void whose decision
-    names no retracting rank (the last rank simply had no batch for a slot
-    PP0 expected an output for). Both are states in which every intermediate
-    rank still holds a launched batch, so both are states in which silence
-    parks the successor for ever. `pp_void_relay_stop_rank` supplies the
-    ring position for those two, and the argument for the value it picks is
-    in its own docstring.
-
-    Returns the payload VERBATIM (a copy), decision included, so the next hop
-    can apply the identical rule. None whenever the rule does not fire, which
-    is every ordinary pass and every rank at or past the stop position.
-    """
-    if not isinstance(message, dict):
-        return None
-    group = getattr(holder, "pp_group", None)
-    if group is None or getattr(group, "is_last_rank", False):
-        return None
-    rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
-    if rank is None:
-        return None
-    # #978: the launched chain, when the message carries one, answers the
-    # forward question from the successor's own admission-time statement --
-    # see `pp_void_relay_launched_verdict`. The legacy retraction-derived
-    # rule below is the fallback for a message without a chain, which keeps
-    # every older sender and every stand-in at the pre-#978 behaviour.
-    verdict = pp_void_relay_launched_verdict(
-        message.get(_PP_LAUNCHED_CHAIN_KEY),
-        rank,
-        getattr(getattr(holder, "ps", None), "pp_size", None),
-    )
-    if verdict is not None:
-        return dict(message) if verdict else None
-    raw = message.get(_ADMISSION_DECISION_PAYLOAD_KEY)
-    first = (
-        pp_first_retracting_rank(
-            pp_admission_decision_from_wire({_ADMISSION_DECISION_PAYLOAD_KEY: raw})
-        )
-        if raw is not None
-        else None
-    )
-    stop = pp_void_relay_stop_rank(
-        first, getattr(getattr(holder, "ps", None), "pp_size", None)
-    )
-    if stop is None or int(rank) + 1 >= int(stop):
-        return None
-    return dict(message)
 
 
 #: #968b: how often a repeating chain line is re-printed after its first
@@ -2176,9 +1980,10 @@ def pp_parked_continuation_priority(scheduler) -> Tuple[str, ...]:
     there (mixin :6791-6793/:8104-8106)". BOTH CITATIONS WERE DEAD: :6791 is
     inside `_pp_reconcile_incoming_admission`'s local-match loop and :8104 is
     a #951/#978 comment block, and neither contains a requeue. The real
-    requeues are `_pp_void_own_batch`'s :7099 and `_pp_absorb_void_output`'s
-    :8411 -- and `pp_void_keeps_request` deliberately SKIPS both for a
-    chunked continuation (:7088/:8402), because while a request IS the
+    requeue is `_pp_void_own_batch`'s :7099 (the void-output consumer that
+    carried the second one was deleted with the relay, #1072) -- and
+    `pp_void_keeps_request` deliberately SKIPS it for a
+    chunked continuation (:7088), because while a request IS the
     scheduler's `chunked_req`, `add_chunked_req` re-admits it from that field
     directly and queueing it would put it in the batch twice (:798-802). So
     the premise was false in exactly the case this function exists for, and
@@ -2193,12 +1998,12 @@ def pp_parked_continuation_priority(scheduler) -> Tuple[str, ...]:
     at exactly four unguarded writers, and each now re-homes into the queue
     instead of dropping:
 
-      * `pp_rehome_displaced_chunked_req`, called by both per-slot restores
-        (`_pp_absorb_void_output`, `_pp_void_own_batch`) before they
-        overwrite the ONE `chunked_req` field with their own slot's
-        snapshot. Back-to-back restores mean last-slot-wins, and any other
-        slot's continuation was previously dropped out of the only place it
-        lived.
+      * `pp_rehome_displaced_chunked_req`, called by the per-slot restore
+        (`_pp_void_own_batch`; the second caller went with the void relay,
+        #1072) before it overwrites the ONE `chunked_req` field with its own
+        slot's snapshot. Back-to-back restores mean last-slot-wins, and any
+        other slot's continuation was previously dropped out of the only
+        place it lived.
       * `pp_requeue_cleared_chunked_carry`, called by the reset-shape clears
         beside them, whose comment used to justify the drop with "the
         request is re-admitted from the waiting queue by the ordinary path"
@@ -3212,10 +3017,11 @@ def pp_rehome_refused_chunked_req(scheduler, mb_id) -> bool:
     returned without a restore. The request was then in NONE of the four
     places `pp_request_locations` enumerates: 507 rounds of `#944 UNRESOLVED
     told=8192 local=UNKNOWN` until the #801-spin guard killed the boot. The
-    two existing restores cannot reach this path: `_pp_void_own_batch`
-    early-returns on `batch is None` ABOVE its own restore, and
-    `_pp_absorb_void_output`'s restore needs an output expectation a pass that
-    built nothing never made (`#797d own pass voided` = 0 across the boot).
+    the surviving restore cannot reach this path: `_pp_void_own_batch`
+    early-returns on `batch is None` ABOVE its own restore. (The second
+    restore lived in the void-output consumer and needed an output
+    expectation a pass that built nothing never made -- `#797d own pass
+    voided` = 0 across the boot -- and was deleted with the relay, #1072.)
 
     WHY THE PARK, and it is not optional. `add_chunked_req` has already
     written `extend_range=(8192, 8422)` for a chunk that no rank will ever
@@ -3407,10 +3213,11 @@ def pp_queue_orphaned_chunked_req(scheduler, req, *, tag, mb_id, route) -> bool:
 def pp_rehome_displaced_chunked_req(scheduler, incoming, *, mb_id, route):
     """#968b: the request about to be DISPLACED from `chunked_req` is queued.
 
-    THE DEFECT, in the shipped code's own words. `_pp_absorb_void_output`
-    states at its own instr19 guard that void-output "fires ONCE PER SLOT,
-    several times in a row, with no `get_next_batch_to_run` in between" and
-    that "each call restores ITS OWN slot's `chunked_before`".
+    THE DEFECT, in the shipped code's own words. The void-output consumer
+    (deleted with the relay, #1072) stated at its own instr19 guard that
+    void-output "fires ONCE PER SLOT, several times in a row, with no
+    `get_next_batch_to_run` in between" and that "each call restores ITS OWN
+    slot's `chunked_before`".
     `self.chunked_req` is ONE field. Slot A's restore puts A's continuation
     in it; slot B's restore overwrites it with B's, back to back. LAST SLOT
     WINS, and A's continuation is dropped out of the only place it lived --
@@ -4403,7 +4210,8 @@ class SchedulerPPMixin:
                 # pass has to put it back -- a rank downstream of the
                 # retraction never ran this round at all, so ITS chunked state
                 # is the pre-admission one and that is what every rank must
-                # agree on. See `_pp_absorb_void_output`.
+                # agree on. See `_pp_void_own_batch` (the incoming-wire twin
+                # was deleted with the void relay, #1072).
                 self._pp_note_chunked_req_before_admission(mb_id)
                 # #947 THE RING SITE, and the whole reason this instrument
                 # exists. This line runs on EVERY iteration of the PP body --
@@ -4599,8 +4407,9 @@ class SchedulerPPMixin:
                         # trip that made it safe -- "the void output carries
                         # the observed local match home, and PP0's guard learns
                         # it as a floor" -- and #969 CUT V deleted that emitter
-                        # (`_PP_VOID_OUTPUT_KEY`: zero originating senders at
-                        # ca0ee3acd4). The verdict therefore travelled
+                        # (measured at ca0ee3acd4: the void-output key had zero
+                        # originating senders; #1072 then removed the orphaned
+                        # relay it left behind). The verdict therefore travelled
                         # DOWNSTREAM only, and PP0's slot stayed set while the
                         # last rank's did not, which is exactly the premise
                         # CUT V's own comment at `_do_recv` relies on ("sender
@@ -9109,13 +8918,12 @@ class SchedulerPPMixin:
         `launched=self.mbs[mb_id] is not None` is never sent True) and
         strictly before `cur_batch = self.mbs[mb_id]` is read.
 
-        Mirrors `_pp_absorb_void_output`'s restore idiom -- chunked_req
-        restored to its pre-admission value and parked, never retracted;
-        resident decode requests kept, not released -- but for THIS rank's
-        own decision rather than an incoming wire message, so it does not
-        touch `pp_absorb_admission_return` / `_pp_void_forward_payload`:
-        those are PP0-only return-trip bookkeeping that has no counterpart
-        here.
+        Keeps the restore idiom the deleted void-output consumer shared
+        (#1072) -- chunked_req restored to its pre-admission value and
+        parked, never retracted; resident decode requests kept, not released
+        -- but for THIS rank's own decision rather than an incoming wire
+        message, so it does not touch `pp_absorb_admission_return`: that is
+        PP0-only return-trip bookkeeping with no counterpart here.
 
         `self.running_batch` / `self.running_mbs[mb_id]` are deliberately
         NOT touched. Both were already reassigned this pass from `plan.
@@ -9124,7 +8932,7 @@ class SchedulerPPMixin:
         mode.is_extend()` merge, reached and completed before that
         function's void check), not a product of THIS pass's now-voided
         admission -- undoing it would discard already-validated resident
-        state on the same reasoning `_pp_absorb_void_output` itself gives for
+        state on the same reasoning the deleted void-output consumer gave for
         never releasing a resident request: "the pass simply did not run,
         and it decodes again next pass from the state it still holds".
 
@@ -9201,10 +9009,11 @@ class SchedulerPPMixin:
             if carried_slots and 0 <= mb_id < len(carried_slots)
             else None
         )
-        # #968b: THE TWIN OF `_pp_absorb_void_output`'s cross-slot re-home,
-        # and the sibling sweep is part of the fix rather than a follow-up --
+        # #968b: THE TWIN of the void-output consumer's cross-slot re-home
+        # (that exit was deleted with the relay, #1072; this one remains, and
+        # the sibling sweep was part of the fix rather than a follow-up --
         # a class closed at one of its two exits is a class that returns
-        # through the other. This site carries the identical eight lines and
+        # through the other). This site carries the identical eight lines and
         # therefore the identical displacement: `self.chunked_req` is ONE
         # field, and a slot restoring its own snapshot overwrites whatever
         # another slot's restore put there. Reached whenever consecutive
@@ -10736,380 +10545,6 @@ class SchedulerPPMixin:
                         msg_type="output",
                     )
         return send_output_work
-
-    def _pp_absorb_void_output(
-        self: Scheduler,
-        mb_id: int,
-        message: Dict[str, object],
-        mbs: List[ScheduleBatch],
-        mb_metadata: List[Optional[PPBatchMetadata]],
-    ) -> bool:
-        """#791b: consume a void output on the first rank. True iff it was one.
-
-        THREE THINGS HAPPEN, AND THE ORDER IS NOT ARBITRARY.
-
-        1. The slot is EMPTIED. `_event_loop_pp_body` guards result processing
-           on `self.mbs[next_mb_id] is not None`, not on whether a result
-           arrived, so leaving the batch in place would run
-           `d2h_event.synchronize()` on None. Emptying it also makes
-           `_pp_record_slot_last_batch` record None, which keeps the
-           un-processed prefill out of `get_next_batch_to_run`'s
-           `last_batch.filter_batch(...)` / `running_batch.merge_batch(...)`
-           path -- where it would have become a resident decode request whose
-           sampled token never existed.
-
-        2. Every request in it is RELEASED and RE-QUEUED. This is the wiring
-           `pp_admission_congruence`'s docstring names and explicitly leaves
-           out of its own scope ("expected to be re-queued and re-admitted on
-           a LATER pass ... that is scheduler-loop wiring"). Without it the
-           batch's KV pages, mamba slot and req-pool slot have no owner at
-           all: `process_batch_result_prefill` is what normally hands them to
-           the tree cache, and it never runs for a voided pass.
-           The release goes through `_release_voided_request`, i.e. through
-           the same `release_req` both retraction paths use. It was
-           `_release_dynamic_chunk_probe` until #969, "reused verbatim
-           because it already frees the three in the one order that works",
-           and that reasoning was itself the defect: freeing the three is not
-           the whole obligation. The probe helper never reaches
-           `cache_finished_req`, so it returned the pages to the allocator
-           and left the tree's lock ref standing on them. A voided request is
-           a RETRACTED request and is released as one.
-
-        3. The carried decision teaches `PPAdmissionCongruenceGuard` the
-           shortfall. Without it PP0 re-offers the identical `told` next pass,
-           the same rank retracts again, and the void repeats for ever -- a
-           degrade that makes no forward progress, which is #630's livelock
-           rather than a fix. With it, `told` is clamped to the observed local
-           match, and a strictly decreasing sequence of non-negative integers
-           terminates.
-        """
-        if not isinstance(message, dict) or not message.pop(_PP_VOID_OUTPUT_KEY, False):
-            return False
-
-        # #978 TRIPWIRE, log-only. A void names the slot it was built for
-        # (its return-trip decision's mb_id); consuming it against a
-        # different slot is the lagged-slot mispair -- a stale void emptying
-        # a healthy generation's batch on one rank only. The launched-chain
-        # relay stop makes this unreachable; if this line ever fires, the
-        # relay let a void past a rank that never launched, and THAT is the
-        # defect to chase (#791c tripwire convention: stays in place, a boot
-        # carrying the fix should count zero of it).
-        _raw_stale = message.get(_ADMISSION_DECISION_PAYLOAD_KEY)
-        if _raw_stale is not None:
-            _stale_mb = getattr(
-                pp_admission_decision_from_wire(
-                    {_ADMISSION_DECISION_PAYLOAD_KEY: _raw_stale}
-                ),
-                "mb_id",
-                None,
-            )
-            if _stale_mb is not None and int(_stale_mb) != int(mb_id):
-                logger.error(
-                    "#978 STALE VOID: a void built for slot %s is being "
-                    "consumed against slot %s -- the lagged-slot mispair the "
-                    "launched-chain relay stop exists to prevent. The batch "
-                    "about to be emptied belongs to a healthy generation.",
-                    _stale_mb,
-                    mb_id,
-                )
-
-        # #797: decided BEFORE the pops below strip the decision out, and
-        # published for `_do_recv` to forward. See `pp_void_forward_payload`
-        # for why a void that stops at the first rank turns #797 into a wedge
-        # whenever the retraction happens on a rank other than the first
-        # downstream one.
-        self._pp_void_forward_payload = pp_void_forward_payload(
-            self, {_PP_VOID_OUTPUT_KEY: True, **message}
-        )
-
-        batch = mbs[mb_id] if mb_id < len(mbs) else None
-        reqs = list(getattr(batch, "reqs", None) or ())
-        # #987 THE REFUSAL FACT, READ WHERE IT IS ACTUALLY TRUE. This method is
-        # rank 0 consuming a void for a batch rank 0 itself launched, so `reqs`
-        # IS the set of rids that were offered and not served -- rank 0's own
-        # state, needing no peer and no completed lap, which is the property
-        # #944b's docstring demands of anything that bounds this loop.
-        #
-        # IT CANNOT BE READ OFF THE DECISION, and that is why this line is
-        # here and not in `pp_absorb_admission_return` below.
-        # `_pp_refuse_forwarded_schedule` runs `void_pp_admission_decision`
-        # before the void starts home, so a schedule refusal arrives carrying
-        # ZERO entries: `record_return_trip` is handed an empty tuple and
-        # learns nothing. That is exactly the R9 census shape -- 506 refusals,
-        # `UNRESOLVABLE=0`, `_unresolved_rounds` never incremented once -- and
-        # the compensator-unreachability class (#939) it belongs to.
-        _guard = getattr(self, "_pp_admission_guard", None)
-        _note_refused = getattr(_guard, "note_pass_refused", None)
-        if callable(_note_refused) and reqs:
-            try:
-                _note_refused(getattr(r, "rid", None) for r in reqs)
-            except Exception:  # noqa: BLE001 - bookkeeping may never break a void
-                logger.warning(
-                    "#987 could not record the refusal for slot %s; the void "
-                    "is absorbed normally, but the #944 bound will not count "
-                    "this pass",
-                    mb_id,
-                )
-        if mb_id < len(mbs):
-            mbs[mb_id] = None
-        if mb_id < len(mb_metadata):
-            mb_metadata[mb_id] = None
-
-        pp_absorb_admission_return(self, message)
-
-        # #797b: PUT THE CHUNKED REQUEST BACK WHERE THE ROUND FOUND IT, and do
-        # it BEFORE the disposal loop, because that loop is what killed boot
-        # instr19 (53 s, all three ranks, `'NoneType' object has no attribute
-        # 'end'` at `get_next_batch_to_run`'s `self.chunked_req.extend_range.
-        # end`). `self.chunked_req` is SCHEDULER state that outlives the
-        # round, and `get_next_batch_to_run` is the only thing that moves it:
-        # `add_chunked_req` clears it when a chunk finishes, `adder.
-        # new_chunked_req` starts a new one. A rank downstream of the
-        # retraction never ran that code this pass at all, so ITS chunked
-        # state is the pre-admission one -- which makes the pre-admission
-        # value the only one every rank can agree on, and restoring it here
-        # the only disposal that leaves the ranks congruent.
-        #
-        # Both directions matter. A chunk STARTED this round is un-started, so
-        # its request goes back to being an ordinary waiting-queue member and
-        # is retracted by the loop below like any other. A chunk CARRIED into
-        # this round stays carried, is excluded from that loop, and has this
-        # round's prepared-but-never-run chunk parked -- see
-        # `_park_chunked_prefill_chunk` for why a park and not a retraction,
-        # and why only `[len(prefix_indices):extend_range.end]` may be freed.
-        carried_slots = getattr(self, "_pp_chunked_req_before_by_slot", None)
-        chunked_before = (
-            carried_slots[mb_id]
-            if carried_slots and 0 <= mb_id < len(carried_slots)
-            else None
-        )
-        # #968b: WHAT LEAVES THE FIELD, not only what arrives in it. The
-        # eight lines above were reasoned through for the request being
-        # restored and never for the one being overwritten -- and this
-        # method's own guard comment below says why that matters: it "fires
-        # ONCE PER SLOT, several times in a row, with no
-        # `get_next_batch_to_run` in between", so slot B's restore displaces
-        # slot A's continuation out of the single `chunked_req` field. Last
-        # slot wins; the displaced request was in NONE of the four
-        # `pp_request_locations` places from here on, which is boot 4's 407
-        # unnamed extras. Re-homed BEFORE the overwrite -- after it, the
-        # reference is already gone.
-        displaced = pp_rehome_displaced_chunked_req(
-            self, chunked_before, mb_id=mb_id, route="void-output-cross-slot"
-        )
-        if getattr(self, "chunked_req", None) is not chunked_before:
-            self.chunked_req = chunked_before
-        parked = _park_chunked_prefill_chunk(self, chunked_before)
-
-        # THE INSTR19 STATE, AND HERE IT IS REACHED RATHER THAN MERELY
-        # GUARDED AGAINST. The own-void twin of this site (`#797d own-void`,
-        # earlier in this file) carries the identical eight lines above and
-        # then this identical check, and its comment argues the state should
-        # be unreachable: `chunked_before` is a snapshot taken at the top of
-        # THIS pass, so if its `extend_range` were already None going into the
-        # pass, `get_next_batch_to_run`'s own unconditional read of
-        # `self.chunked_req.extend_range.end` would have raised earlier in the
-        # same pass. THAT ARGUMENT DOES NOT CARRY OVER TO THIS SITE, and the
-        # difference is the whole reason this guard has to exist here too:
-        # void-OUTPUT is driven by the retraction arriving from downstream and
-        # fires ONCE PER SLOT, several times in a row, with no
-        # `get_next_batch_to_run` in between. Each call restores ITS OWN
-        # slot's `chunked_before` and then, in the loop below, calls
-        # `reset_for_retract` on every batch member that is not kept for THAT
-        # slot. A request that is slot B's carried chunk but only an ordinary
-        # member of slot A's batch is therefore reset by slot A's loop and
-        # then reinstated, already reset, as `self.chunked_req` by slot B's
-        # restore. `pp_void_keeps_request` cannot prevent it: it is asked per
-        # slot, and per slot it answers correctly.
-        #
-        # MEASURED, boot_798_0822_0646.log, commit 9478e774b6: rank 0 logged
-        # three `#791b PP-ADMISSION void output` messages back to back on
-        # slots 2, 0 and 1 at 06:51:15-06:51:16 (releasing 1 of 2, 1 of 2, and
-        # then 0 of 1 -- the last request kept precisely because it was that
-        # slot's chunked request), and the very next line is the scheduler
-        # exception: `AttributeError: 'NoneType' object has no attribute
-        # 'end'` at `self.chunked_req.extend_range.end`, raised on the
-        # following pass out of `_event_loop_pp_body`. PP1 and PP2 then died
-        # on gloo `Connection closed by peer`, a cascade rather than three
-        # independent faults. This path only became reachable once the seam
-        # could fund a cutover at all (#796): nothing survived a committed
-        # `tp_to_pp` before, because the flip never committed.
-        #
-        # `_park_chunked_prefill_chunk` cannot repair it -- it treats
-        # `extend_range is None` on the way in as "already parked, already
-        # reset, or never prepared, nothing to give back" and leaves it
-        # untouched, which is right for the KV-release question it answers and
-        # silent on this site's obligation. Whatever is left in
-        # `self.chunked_req` is what the next pass dereferences with no guard
-        # of its own. Clearing it is the correct disposal and not a loss: the
-        # request keeps its pages, is re-admitted from the waiting queue by
-        # the ordinary path, and a chunk that was reset has no stashed tree
-        # handles left to honour. The rid and slot are logged so the next boot
-        # names the cross-slot pair rather than leaving it to be re-derived.
-        #
-        # THE CONDITION NAMES THE CLASS, NOT THE SYMPTOM, and that is
-        # deliberate. `extend_range` is merely the field the next reader
-        # happens to touch FIRST; `reset_for_retract` clears seventeen more in
-        # the same breath (`last_node`, `swa_uuid_for_lock`, `mamba_pool_idx`,
-        # `routed_experts`, `prefix_indices` back to empty, ...), and a
-        # None-check on one of them would leave the next edit to rediscover
-        # this bug through whichever field a future reader dereferences first.
-        # `is_retracted` is the marker of the shape itself: `reset_for_retract`
-        # sets it (schedule_batch.py:1590) and only `prepare_for_extend` clears
-        # it (schedule_batch.py:2439), so it is True over exactly the window in
-        # which the request has been reset and not yet re-prepared -- which is
-        # exactly the window in which it must not be carried as the scheduler's
-        # chunked request. The `extend_range` test is kept beside it as the
-        # narrower belt: it is what actually raised, and a request could in
-        # principle reach the reset shape by a path that does not set the flag.
-        # `getattr` rather than a plain attribute read, matching the idiom the
-        # eight lines above already use. A scheduler that has never set
-        # `chunked_req` is a real shape here -- the restore above only assigns
-        # the attribute when the carried value DIFFERS from the current one, so
-        # a holder that never had the attribute and carries None still does not
-        # have it by this line. `test_ring_survives_the_retraction_with_the_fix`
-        # is the case that proves it, and a plain read raised there.
-        #
-        # #968b CORRECTION TO THE PARAGRAPH ABOVE. "Clearing it is the correct
-        # disposal and not a loss: the request ... is re-admitted from the
-        # waiting queue by the ordinary path" -- the first half is true and
-        # the second was never checked. A chunked continuation is NOT in the
-        # waiting queue (`_park_chunked_prefill_chunk` :798-802 says so and
-        # `pp_request_locations` names it as the structural fact behind three
-        # tickets), so for that shape the sentence licensed exactly the loss
-        # it was denying. Boot 4 slice line 408 is the witness: this clear
-        # dropped `4077b704`, which the very next refusals reported MISSING.
-        # The field is still cleared -- the next pass dereferences it with no
-        # guard of its own -- but the REQUEST is now queued when nothing else
-        # can reach it, which is what makes the claim true rather than
-        # asserted.
-        chunked_carry = getattr(self, "chunked_req", None)
-        if chunked_carry is not None and (
-            getattr(chunked_carry, "is_retracted", False)
-            or getattr(chunked_carry, "extend_range", None) is None
-        ):
-            requeued = pp_requeue_cleared_chunked_carry(
-                self, chunked_carry, mb_id=mb_id, route="void-output-reset-shape"
-            )
-            logger.warning(
-                "#791b void-output: the chunked request for slot %d (rid=%s) "
-                "is in the reset_for_retract shape that "
-                "_park_chunked_prefill_chunk cannot repair "
-                "(is_retracted=%s, extend_range=%s), produced by an earlier "
-                "slot's disposal loop in this same retraction -- clearing "
-                "self.chunked_req instead of carrying a request the next "
-                "pass's get_next_batch_to_run cannot read (#968b: re-queued "
-                "so the ordinary path can actually reach it = %s).",
-                mb_id,
-                getattr(chunked_carry, "rid", None),
-                getattr(chunked_carry, "is_retracted", False),
-                getattr(chunked_carry, "extend_range", None),
-                requeued,
-            )
-            self.chunked_req = None
-
-        # #797: A RESIDENT REQUEST MUST NOT BE RELEASED HERE, and this is not
-        # a hardening detail -- it is a double-free. `_release_dynamic_chunk_
-        # probe` hands back the request's KV pages, mamba slot and req-pool
-        # row; a request that is also in `running_mbs[mb_id]` keeps decoding
-        # from those same pages on the next pass, so freeing them corrupts
-        # another request's cache and re-queueing it duplicates it. It was
-        # unreachable while only a FULL decline could void a slot (the void
-        # then carried a freshly built prefill batch, whose requests are not
-        # merged into the running batch until the next visit) and #797 makes
-        # it reachable, because a mixed chunked-prefill batch voids the same
-        # way and carries resident decode requests in it. A resident request
-        # needs nothing done to it: the pass simply did not run, and it
-        # decodes again next pass from the state it still holds.
-        running_mbs = getattr(self, "running_mbs", None) or ()
-        running = running_mbs[mb_id] if 0 <= mb_id < len(running_mbs) else None
-        resident = {r.rid for r in (getattr(running, "reqs", None) or ())}
-        released = 0
-        released_rids, kept_rids, parked_rids, reachable_rids = [], [], [], []
-        for req in reqs:
-            if pp_void_keeps_request(req, resident, chunked_before):
-                kept_rids.append(getattr(req, "rid", None))
-                continue
-            # #984: THE TWIN OF `_pp_void_own_batch`'s park, and the sibling
-            # sweep is part of the fix rather than a follow-up -- an asymmetry
-            # closed at one of its two exits is an asymmetry that returns
-            # through the other (the #968b lesson, one junction up this same
-            # file). This site is if anything the more load-bearing of the
-            # two: it fires because a rank DOWNSTREAM retracted, which is
-            # precisely the case in which the followers park their
-            # continuations while rank 0 was retracting its members.
-            #
-            # Same three facts as the twin: (1) the pass never ran, so
-            # `release_req` -> `reset_for_retract` was disposing of state that
-            # was still correct; (2) #969 is not reopened, because the prefix
-            # PAGES and `last_node` are kept while this pass's admission-side
-            # lock ref is handed back -- re-admission takes a fresh one, so
-            # keeping the old would leak one per voided member per cycle
-            # (`pp_give_back_admission_lock_ref`); (3) `retract_decode` /
-            # `retract_all` are untouched and
-            # still release, correctly. `_release_voided_request` keeps its one
-            # remaining caller here: an already-FINISHED member, whose pages no
-            # future admission would ever return.
-            verdict = pp_park_voided_batch_member(
-                self, req, mb_id=mb_id, route="void-output"
-            )
-            if verdict == VOID_PARK_FINISHED:
-                _release_voided_request(self, req, len(reqs) - released)
-                self.waiting_queue.append(req)
-                released_rids.append(getattr(req, "rid", None))
-                released += 1
-            elif verdict == VOID_PARK_QUEUED:
-                parked_rids.append(getattr(req, "rid", None))
-            else:
-                # Already reachable in `waiting_queue` / `running_batch`. This
-                # site is the one that "fires ONCE PER SLOT, several times in a
-                # row" (its own guard comment above), so the same request can
-                # legitimately arrive here from two slots' batches -- which is
-                # exactly boot 6's 6 duplicate-rid decisions when the append
-                # was unconditional.
-                reachable_rids.append(getattr(req, "rid", None))
-        pp_log_void_park_census(
-            self,
-            mb_id=mb_id,
-            route="void-output",
-            considered=len(reqs),
-            parked=len(parked_rids),
-            reachable=len(reachable_rids),
-            released=released,
-        )
-
-        # #968b: RIDS, NOT ONLY COUNTS. All 514 of boot 4's void lines were
-        # rid-free, so no void could be joined to the refusal that followed
-        # it and the whole chain had to be re-derived from a slice trawl. A
-        # count answers "how many"; the refusal on the other side of the ring
-        # asks "which one". Capped, because a batch can be large and this
-        # line is on the void path.
-        logger.warning(
-            "#791b PP-ADMISSION void output on slot %d: the pipeline retracted "
-            "this microbatch downstream, so the last rank produced nothing for "
-            "it, and %d of rank 0's %d request(s) have been PARKED and "
-            "re-queued with prefix and pages intact (#984 -- the pass never "
-            "ran, so nothing is retracted; %d released because already "
-            "finished, %d skipped as already reachable; the rest are resident "
-            "in the running batch, or are the chunked request, and keep their "
-            "pages -- #797/#797b; chunk parked=%s). parked=%s released=%s "
-            "kept=%s dup-skipped=%s displaced=%s. The message itself "
-            "is what keeps the output ring matched -- without it rank 0 blocks "
-            "for ever in a receive no rank is required to satisfy (boot "
-            "instr11, 2026-08-21).",
-            mb_id,
-            len(parked_rids),
-            len(reqs),
-            released,
-            len(reachable_rids),
-            parked,
-            pp_rid_digest(parked_rids),
-            pp_rid_digest(released_rids),
-            pp_rid_digest(kept_rids),
-            pp_rid_digest(reachable_rids),
-            displaced,
-        )
-        return True
 
     def _pp_send_recv_and_preprocess_output_tensors(
         self: Scheduler,

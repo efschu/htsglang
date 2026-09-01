@@ -8814,12 +8814,12 @@ class Scheduler(
         # discards the adder, and with it the request: boot 1's 512-void
         # livelock, 507 rounds of `#944 UNRESOLVED told=8192 local=UNKNOWN`.
         #
-        # Neither existing restore is reachable from here.
+        # The surviving restore is not reachable from here.
         # `_pp_void_own_batch` early-returns on `batch is None` above its
         # restore -- and this pass built no batch, which is why `#797d own
-        # pass voided` is 0 in the whole boot log -- and
-        # `_pp_absorb_void_output`'s restore is keyed on an output
-        # expectation this pass never made.
+        # pass voided` is 0 in the whole boot log. (The second restore lived
+        # in the void-output consumer, was keyed on an output expectation
+        # this pass never made, and went with the void relay in #1072.)
         #
         # THE SLOT is `amended.mb_id`: the forwarded decision is stamped with
         # the loop's own `mb_id` (`replace(raw, mb_id=mb_id)` in
