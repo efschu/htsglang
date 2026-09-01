@@ -380,8 +380,10 @@ def validate_tp_exit_pair(purity: PhasePurity, policy_cfg) -> None:
     THE ASYMMETRY IS THE MISSING EXIT. Measured on
     boot_w40_857strict_0825_1931: 225 of 228 quiescence holds were tp_to_pp,
     258 ADMISSION-WEDGE reports, 11 queued / 0 running, no first token for
-    535 s. The predicate that produced them is fixed at its own site
-    (`prefill_runnable_in_current_layout`); this refuses the deadlocking
+    535 s. The runtime predicate that produced them was later DELETED
+    outright (#1065, 2026-09-01: the strict quiescence clause and its
+    runnability plumbing are gone -- an incomplete chunk no longer holds a
+    flip at all); this refuses the deadlocking
     CONFIGURATION at parse time, where refusing is free -- the same reason
     the PP guard exists rather than a runtime recovery.
 

@@ -206,10 +206,6 @@ from sglang.srt.managers.phase_purity import (
 from sglang.srt.managers.phase_purity import (
     prefill_blocked_here as phase_prefill_blocked_here,
 )
-from sglang.srt.managers.phase_purity import (
-    tp_compute_budget_remaining as phase_tp_compute_budget_remaining,
-)
-
 # #791b: imported AS A MODULE, not from-imported: the admission loop resolves
 # `prefetch_ballot.prefetch_done_under_ballot` through the module's globals,
 # which is what lets a test neuter exactly that one function in a child
@@ -8081,34 +8077,21 @@ class Scheduler(
         # again the way they did between defect O and 20:31:48.
         from sglang.srt.managers.phase_flip_runtime import (
             chunk_blocks_quiescence,
-            prefill_runnable_in_current_layout,
         )
 
         if (
             self.server_args.enable_phase_flip
             and self.phase_flip_runtime is not None
             and self.phase_flip_runtime.pending is not None
-            # #858: the SAME strict term as the ready_fn caller. The helper's
-            # own docstring is explicit that these two must never disagree --
-            # they drifted apart once already (defect O relaxed one side while
-            # this one kept the blanket test, 2026-08-09 20:31:38Z).
-            and not chunk_blocks_quiescence(
-                self.chunked_req,
-                strict=bool(getattr(self._phase_purity, "strict", False)),
-                # #858b: same direction term as the ready_fn caller. A
-                # direction-blind hold deadlocks tp_to_pp, which is armed FOR
-                # the prefill that strict forbids in the TP layout.
-                # #887: and the SAME budget term as the ready_fn caller. A
-                # chunk still owed to this TP phase is an exit the hold must
-                # see, or the valve is installed and unreachable.
-                prefill_runnable_here=prefill_runnable_in_current_layout(
-                    self.phase_flip_runtime.pending,
-                    self._phase_purity,
-                    budget_remaining=phase_tp_compute_budget_remaining(
-                        self, self._phase_purity
-                    ),
-                ),
-            )
+            # #1065: the strict/runnability terms are deleted with the shared
+            # predicate's strict clause (see chunk_blocks_quiescence). With
+            # them gone the park holds every armed round except the one-round
+            # mid-admission transient, so the drain reaches a settled chunk
+            # boundary and the flip lands -- instead of waiting on
+            # continuation chunks the current layout's builder refuses to
+            # build (the 2026-09-01 tp_to_pp livelock, 37 abandons/rank over
+            # 1114 s with 11 queued / 0 running).
+            and not chunk_blocks_quiescence(self.chunked_req)
         ):
             # A round withheld for a PENDING FLIP is not a round that could
             # not build a batch -- it is one that deliberately did not try. It
@@ -9205,64 +9188,16 @@ class Scheduler(
         # records this fix exists to reclaim. Hence: here, every round,
         # independent of the comprehension below.
         self.tree_cache.drain_retired_prefetch()
-        # #943b: RE-ISSUE ONE AGREED STALE-REFUSED PREFETCH, from the same
-        # per-round point and for the same reason the reap above lives here.
-        #
-        # #937 refuses to publish a prefetch whose binding generation went stale
-        # across a cutover -- correctly: the bisection (#943) put the garbage
-        # fix at exactly that commit. What it leaves behind is a request owed
-        # its prefix, and the only correct way to give it back is to fetch AGAIN
-        # under the binding that is current now. `take_agreed_reissue` picks the
-        # request, and it is the group that picks it: a split verdict returns
-        # None and every rank waits, because entering the re-registration on a
-        # subset is the #580 failure.
-        #
-        # The re-issue then runs through the ORDINARY `_prefetch_kvcache`, so it
-        # inherits the existing participation vote, the rank-local eligibility
-        # handling and the symmetric-mode branch rather than reproducing them.
-        # A second, subtly different path here is how the two would drift.
-        #
-        # THE CANDIDATE SET IS THE INTERSECTION, not the pending set: only
-        # requests this rank can actually act on -- present in the replicated
-        # waiting queue -- are nominated, so an agreement can never name a
-        # request some rank would have to sit out.
-        # UNCONDITIONAL, and the first draft of this block was not -- it read
-        # `if self.tree_cache._reissue_pending:` before calling. That is a
-        # rank-local predicate in front of a collective: a rank with nothing
-        # owed would skip the all_reduce its peers had already entered. The
-        # comment on the reap above states the same rule for the same reason
-        # ("an empty retired list contributes zeros and the reduce is a no-op"),
-        # and the vote is built to answer 0 for an empty candidate set exactly
-        # so this call needs no guard. Recorded rather than quietly corrected:
-        # it is the failure this whole path is arranged around, and it was one
-        # line away in the code meant to prevent it.
-        _rid = None
-        _by_rid = {}
-        try:
-            # #946: THE CANDIDATE SET IS THE FOUR PLACES, NOT THE QUEUE.
-            # This read `{r.rid: r for r in self.waiting_queue}` and a chunked
-            # continuation is never in the waiting queue -- #797b restores it
-            # as `self.chunked_req`, deliberately, because that state outlives
-            # the round. So the re-issue could not nominate the one request
-            # that was stuck: measured `PREFETCH RE-ISSUED` 0 across six boots
-            # while a single rid was re-offered `told=8192` thousands of times.
-            # Same structural fact also kept that rid out of the waiting-queue
-            # path where the #630/#944 clamp applies -- one cause, two defects.
-            from sglang.srt.managers.scheduler_pp_mixin import (
-                pp_request_locations as _pp_request_locations,
-            )
-
-            _by_rid = _pp_request_locations(self)
-            _rid = self.tree_cache.take_agreed_reissue(list(_by_rid.keys()))
-        except Exception as exc:  # noqa: BLE001 - a re-issue may never break a round
-            logger.warning(
-                "#943b re-issue vote skipped this round (%s); every request "
-                "keeps its recompute, which is today's behaviour and never a "
-                "wrong answer",
-                exc,
-            )
-        if _rid is not None and _rid in _by_rid:
-            self._prefetch_kvcache(_by_rid[_rid])
+        # #1066: the #943b one-rid-per-round re-issue vote that stood here is
+        # DELETED (it carried a CPU all_reduce on the admission path -- a
+        # collective the PP0-authority order forbids -- and its one-rid cadence
+        # left every other stale-refused request recomputing uncovered,
+        # measured boot_855_tiprevert1033). Its job is done structurally now:
+        # the cutover defers re-admission until after the pool rebind and
+        # sweeps the queue's stale prefetch records there
+        # (`phase_flip_runtime._post_cutover_readmit`), so a #937-doomed
+        # operation is retired and re-opened on the incoming binding at the
+        # group-uniform event itself -- whole population, no collective.
         return {
             req.rid: self.tree_cache.check_prefetch_progress(req.rid)
             for req in self.waiting_queue
@@ -10369,7 +10304,31 @@ class Scheduler(
             # anywhere in a PP group.
             _pp_group = self.ps.pp_size > 1
             if self.enable_hicache_storage and _pp_group:
-                # Credit a completed store hit if there is one; decide nothing.
+                # #1066: PP0 DOES WAIT NOW -- and only PP0. The #969Z verdict
+                # above ("TAKE WITHOUT WAITING, uniform and therefore
+                # wireless") was priced against the §W3 carrier, where
+                # membership could only travel one pass late. The row
+                # authority changed that premise: downstream receives
+                # frame+row BEFORE it plans (#631 row authority, d25b096fcd
+                # et seq.), so PP0's membership decision travels same-pass
+                # and followers execute it without forming an opinion. PP0
+                # consulting its OWN drained verdict is therefore wireless
+                # again: no collective, no rank-local divergence (followers
+                # never decide). Without this wait the re-admission recompute
+                # races its own read-through and builds unbacked nodes into
+                # the fetch's walk path -- the #841 decline that threw away a
+                # correct 28672-token fetch (boot_855_tiprevert1033,
+                # 05:04:33). The wait is bounded by the prefetch policy
+                # ('timeout' by default) exactly as on the non-PP path.
+                if self.ps.pp_rank == 0:
+                    _local_prefetch_done = self._prefetch_done_for(
+                        req, prefetch_verdicts
+                    )
+                    if not _local_prefetch_done:
+                        _note_skip("prefetch_pending_pp0", req.rid)
+                        continue
+                # Credit a completed store hit if there is one; followers
+                # (pp_rank>0) credit only and decide nothing (#969Z).
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens

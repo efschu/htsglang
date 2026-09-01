@@ -2747,11 +2747,13 @@ def pp_request_locations(holder) -> Dict[str, object]:
     symptoms -- the fourth instance of the compensator-reachability class.
 
     EVERY LOOKUP IS A getattr (#787 convention), and that is load-bearing here
-    rather than defensive: this mapping feeds `take_agreed_reissue`, which is a
-    COLLECTIVE. A rank that raised while building its candidate set would skip
-    an all_reduce its peers had already entered -- the deadlock family this
-    whole feature is a list of. A holder that carries none of the fields yields
-    an empty mapping, which the vote is already built to answer 0 for.
+    rather than defensive: this mapping FED `take_agreed_reissue` (a
+    COLLECTIVE; deleted by #1066 with the whole owed-ledger vote -- the
+    cutover now re-issues the affected population itself,
+    `phase_flip_runtime._post_cutover_readmit`). A rank that raised while
+    building its candidate set would have skipped an all_reduce its peers had
+    already entered -- the deadlock family this whole feature is a list of.
+    The getattr convention stays for the remaining consumers.
 
     WAITING QUEUE FIRST, so a request that is somehow in two places resolves to
     the one the admission loop would act on.

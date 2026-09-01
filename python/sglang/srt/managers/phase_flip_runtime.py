@@ -127,43 +127,7 @@ def advance_fence_blind_streak(
     return 0
 
 
-def prefill_runnable_in_current_layout(
-    direction, purity, budget_remaining: int = 0
-) -> bool:
-    """#858b: can a pending prefill make progress in the layout we are in NOW?
-
-    The armed DIRECTION names the layout that currently holds:
-      * ``pp_to_tp`` armed  -> we are in PP  -> prefill runs there.
-      * ``tp_to_pp`` armed  -> we are in TP  -> only if purity permits it.
-
-    THIS IS THE TERM #858 WAS MISSING. Its block was direction-blind, and its
-    own justification -- "the flip is armed for the DECODE that follows the
-    drain, so waiting IS drain-and-flip" -- is true ONLY for pp_to_tp. For
-    tp_to_pp the flip is armed FOR the prefill, and under strict that prefill
-    may not run in the TP layout that holds while we wait. Waiting there waits
-    for work the current layout forbids: a deadlock by construction.
-
-    Measured, boot_w40_857strict_0825_1931: 225 of 228 holds were tp_to_pp,
-    258 ADMISSION-WEDGE, 11 queued / 0 running, no first token for 535 s.
-
-    #887: ``budget_remaining`` IS THE ANSWER TO THE SAME QUESTION IN THE OTHER
-    CURRENCY, and it has to be asked here or the valve is installed and
-    unreachable -- the W31 shape, where a correct exemption sat below a gate
-    that returned first and fired once in 144 flips. With a chunk still owed,
-    a pending prefill CAN make progress in the TP layout, so a hold that
-    ignores it is the #858b wedge with the fix already in the tree. Default 0
-    keeps every pre-#887 caller's answer byte-identical.
-    """
-    if direction == TP_TO_PP:
-        if int(budget_remaining or 0) > 0:
-            return True
-        return bool(getattr(purity, "prefill_allowed_in_tp", lambda: True)())
-    return True
-
-
-def chunk_blocks_quiescence(
-    chunked_req, *, strict: bool = False, prefill_runnable_here: bool = True
-) -> bool:
+def chunk_blocks_quiescence(chunked_req) -> bool:
     """Does this chunked prefill prevent a rank from being quiescent?
 
     ONE definition with TWO callers, and they must never disagree:
@@ -171,66 +135,39 @@ def chunk_blocks_quiescence(
       * ``ready_fn`` asks it to decide whether this rank may announce
         itself at the flip entry;
       * ``get_next_batch_to_run``'s armed park asks it to decide whether
-        the scheduler may build the NEXT chunk while a flip is armed.
-
-    They are the same question -- "is this request at a settled boundary?"
-    -- and when they were written as two separate expressions they drifted
-    apart within one session. Defect O relaxed the quiescence side to
-    "mid-admission only" (between chunks is settled: committed KV, a fully
-    accounted extend_range, exactly the state the carry moves) while the
-    park side kept the old blanket ``chunked_req is None``. The result was
-    an armed tp_to_pp that could commit but was never allowed to stop
-    prefilling, so it prefilled the whole pending queue in the slow layout
-    and committed with nothing left to do -- production, 2026-08-09
-    20:31:38-48Z. Sharing the definition is the fix for the drift; the
-    narrowing is the fix for the behaviour.
+        the scheduler may keep working while a flip is armed.
 
     True ONLY while the request is mid-admission -- it has been chosen but
-    has no pool row yet, so its KV has no home the carry could move.
+    has no pool row yet, so its KV has no home and the state is at no
+    settled boundary. That clears within a round. Between chunks IS a
+    settled boundary: committed KV, a fully accounted extend_range.
 
-    #858: AND, UNDER STRICT BATCHING, WHILE THE PREFILL IS INCOMPLETE.
-    The "between chunks is settled" relaxation above was written 2026-08-09
-    (#631 defect O) and its justification is quoted in this very docstring:
-    "exactly the state the carry moves". #856 DELETED THE CARRY on
-    2026-08-24 -- the flip now retracts residents and drops the tree -- so
-    that state is freed, not moved. This predicate was never revisited: a
-    6019-token prompt needs two chunks, the flip commits between them, and
-    the re-admission restarts at prefix_lens=0 (measured, W38-B). W37-H arm
-    A: 51 flips, 132 pp prefills, 57 tp prefills, ZERO decode rounds, zero
-    completions.
+    #1065 (2026-09-01): THE STRICT CLAUSE IS DELETED, together with its
+    #858b/#887 runnability plumbing (``prefill_runnable_in_current_layout``).
+    It held the flip on "the flip would discard an incomplete chunk" -- but
+    under the cutover-full-reset design the flip discards nothing: the
+    committed chunks sit in the tree, the save fence persists them, and
+    re-admission serves them back by read-through. A flip behaves like a
+    freshly started server with a cache hit (user design, 2026-09-01); an
+    incomplete chunk is therefore never a reason to refuse the cutover.
 
-    NOT UNCONDITIONAL, and the condition is the whole design. Blocking on
-    every incomplete chunk re-creates defect O, where a flip armed FOR a
-    prefill could not land until that prefill had already finished -- the
-    32768-token prefill that ran in the slow layout and paid two cutovers
-    for nothing. Under STRICT batching the flip is not armed for the pending
-    prefill: it is armed for the DECODE that follows the drain, so waiting
-    for prefill to finish IS drain-and-flip rather than a stall. That is
-    also the user's specification for the target mode -- all prefill in PP,
-    then all decode in TP, never work in the wrong layout.
-
-    RESIDUAL, NAMED RATHER THAN LEFT IMPLICIT (own posten): post-#856 there
-    is no carry in EITHER mode, so a mid-chunk flip discards the prefill in
-    NON-STRICT too. We decline to block there because an unconditional block
-    re-creates #631 defect O. THE CORRECT NON-STRICT ANSWER IS UNKNOWN AND
-    IS FILED, NOT SOLVED. Do not read `if strict` as evidence that the
-    non-strict path was analysed and found sound -- it was not analysed.
+    The clause was also a TWO-ORACLE defect: its runnability term answered
+    "can this chunk make progress here" from the raw #887 chunk budget,
+    while the builder's own gate (``phase_purity.prefill_blocked_here``)
+    additionally requires ``tp_compute_fits_in_one_chunk`` and an open seam
+    grant. Measured 2026-09-01 05:04:53-05:23Z (boot_855_tiprevert1033):
+    33094 tok pending, budget>0 but fits=False -> the builder refused every
+    continuation chunk while this predicate blocked quiescence on it -- 37
+    arm/abandon cycles per rank over 1114 s, 11 queued / 0 running, and the
+    abort of the hanging request deferred until after a cutover that never
+    came. Same class as the #1033 half-grant hold (F3, bc934655a1): a second
+    site answering the builder's question differently. Waiting for work the
+    current layout's builder will not run is never drain-and-flip.
     """
-    if chunked_req is not None and getattr(chunked_req, "req_pool_idx", None) is None:
-        return True
-    # #858b: DO NOT WAIT FOR WORK THAT CANNOT RUN WHILE WE WAIT. Blocking is
-    # only drain-and-flip when the drain can actually proceed in the current
-    # layout; otherwise it is a hold with no exit. TP has no bounded window --
-    # `--phase-policy-tp-decode-floor-s` is a MINIMUM dwell, not a bound --
-    # so nothing times this out, which is why it presented as a wedge rather
-    # than as a slow flip. See `validate_purity_policy_pair`, which already
-    # makes exactly this argument for PP.
-    if strict and prefill_runnable_here and chunked_req is not None:
-        end = getattr(getattr(chunked_req, "extend_range", None), "end", None)
-        full = getattr(chunked_req, "full_untruncated_fill_ids", None)
-        if end is not None and full is not None and int(end) < len(full):
-            return True
-    return False
+    return (
+        chunked_req is not None
+        and getattr(chunked_req, "req_pool_idx", None) is None
+    )
 
 
 class PhaseFlipJoinTimeout(RuntimeError):
@@ -761,41 +698,24 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
         # that the flip would move the layout out from under a request
         # whose KV stayed behind. The two changes are one change.
         chunked = getattr(scheduler, "chunked_req", None)
-        # #858: the strict term travels WITH the shared predicate. Both
-        # callers must ask the same question; passing it here and not at the
-        # park site is exactly the drift this helper exists to prevent.
-        from sglang.srt.managers.phase_purity import (
-            purity_of,
-            tp_compute_budget_remaining,
-        )
-
-        try:
-            _purity = purity_of(scheduler)
-            _strict = bool(_purity.strict)
-        except Exception:  # noqa: BLE001 - a purity read may never break a flip
-            _purity, _strict = None, False
-        # #887: the one-chunk allowance travels WITH the shared predicate for
-        # the same reason the strict term does -- both callers must ask the
-        # same question, and passing it at one site only is exactly the drift
-        # this helper exists to prevent.
-        try:
-            _budget = tp_compute_budget_remaining(scheduler, _purity)
-        except Exception:  # noqa: BLE001 - a ledger read may never break a flip
-            _budget = 0
-        # #858b: the ARMED DIRECTION decides whether waiting can ever end.
-        _rt = getattr(scheduler, "phase_flip_runtime", None)
-        _dir = getattr(_rt, "pending", None) if _rt is not None else None
-        _runnable = prefill_runnable_in_current_layout(
-            _dir, _purity, budget_remaining=_budget
-        )
-        if chunk_blocks_quiescence(
-            chunked, strict=_strict, prefill_runnable_here=_runnable
+        if chunk_blocks_quiescence(chunked):
+            return "a chunked prefill has no pool row yet (mid-admission)"
+        # #1065 execution proof: an incomplete chunk no longer holds the
+        # flip (strict clause deleted -- see chunk_blocks_quiescence).
+        # Logged once per boot, on the first flip a pre-#1065 tree would
+        # have held.
+        if chunked is not None and not getattr(
+            scheduler, "_1065_chunk_unblock_announced", False
         ):
-            return (
-                "a chunked prefill is incomplete (strict: the flip would "
-                "discard it, #856 removed the carry)"
-                if _strict
-                else "a chunked prefill has no pool row yet (mid-admission)"
+            scheduler._1065_chunk_unblock_announced = True
+            logger.info(
+                "%s #1065 CHUNK DOES NOT HOLD THE FLIP: chunked prefill %s "
+                "is between chunks (settled boundary); the flip proceeds and "
+                "re-admission serves the committed prefix by read-through "
+                "(cutover-full-reset design). The strict hold that livelocked "
+                "tp_to_pp on 2026-09-01 is deleted.",
+                LOG_PREFIX,
+                str(getattr(chunked, "rid", "?"))[:8],
             )
         # #631 DEFECT L, and it is the SAME CATEGORY ERROR as the
         # _pp_microbatches_drained one two paragraphs down -- found the
@@ -1452,109 +1372,6 @@ def releasable_cache_bytes_from_stats(stats, alloc_conf: str = "") -> Optional[i
 
 class SeamOrderError(RuntimeError):
     """A seam step ran before the step it depends on (#856)."""
-
-
-def reissue_seam_prefetch(scheduler) -> int:
-    """#1025b: re-issue the cutover's own re-admission prefetches ON THE
-    BINDING THAT WILL ACTUALLY SERVE THEM.
-
-    THE SEQUENCING IS THE DEFECT, and it makes the seam's read-through
-    unreachable by construction. Inside one cutover:
-
-      1. `readmit_seam_residents` puts every retracted resident back on the
-         queue through `_add_request_to_queue`, which issues
-         `_prefetch_kvcache` -- registering the operation at binding
-         generation N, because that is the binding installed at that instant.
-      2. `rebind_for_cutover` then moves the pools and the generation to N+1.
-      3. The operation completes and is offered to the tree, where
-         `#937 STALE PREFETCH INSERT REFUSED` correctly refuses it: the span
-         sits in generation N's host pool and publishing it into an N+1 tree
-         would name rows nothing owns.
-
-    So the prefetch is FETCHED, PAID FOR, AND THROWN AWAY -- every time, for
-    every re-admitted resident. The seam's promise ("their KV is in the
-    canonical store from the fence; the new layout re-admits them and serves
-    the prefix by read-through") cannot be kept by this ordering no matter how
-    healthy the store is.
-
-    MEASURED on boot d70f38320e (2026-08-29, no-grid, agent load):
-        HiCache prefetch success                 35
-        ...of those refused as stale (#937)      30   (86%)
-        Prefill batches 82   Decode batches 0   cutovers 12
-    and the downstream refusals name the missing span by hand: `#928 anchor
-    REFUSING resume: node carries no recurrent state on device or host, so its
-    KV prefix cannot be reused; re-prefilling`. The request re-prefills 8470
-    tokens it had already fetched, cannot finish inside the TP phase's chunk
-    budget, is flipped away, and comes back -- the treadmill that reads from
-    outside as "the instance does nothing".
-
-    WHY RE-ISSUE RATHER THAN PUBLISH EARLY. Publishing the in-flight span
-    before the swap would need the tree to accept a generation-N span it is
-    about to drop anyway (the cutover resets the tree by law), i.e. a second
-    ownership scheme beside the binding generation -- the compensation class
-    this campaign is deleting. Re-issuing needs no new mechanism at all: the
-    same `_prefetch_kvcache` authority, one call later, when the answer to
-    "which pool does this land in" is finally the pool that will read it.
-
-    Paired with #1025's quiesce, which is what makes the re-issue meaningful:
-    without it the transfer thread was being KILLED by the swap instead of
-    completing, so there was no pipeline left to re-issue into.
-
-    Reaps first, deliberately: `check_prefetch_progress` retires the doomed
-    generation-N operation (logging its #937 refusal as it always has) so the
-    rid is out of `ongoing_prefetch` and the re-issue is not refused as a
-    duplicate of the very operation it replaces.
-
-    Returns how many requests were re-issued, so the seam can count rather
-    than hope.
-    """
-    if not getattr(scheduler, "enable_hicache_storage", False):
-        return 0
-    tree = getattr(scheduler, "tree_cache", None)
-    check = getattr(tree, "check_prefetch_progress", None)
-    issue = getattr(scheduler, "_prefetch_kvcache", None)
-    if check is None or issue is None:
-        return 0
-    try:
-        from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
-    except Exception:  # noqa: BLE001
-        return 0
-    reissued = 0
-    verdicts: dict = {}
-    for req in list(getattr(scheduler, "waiting_queue", []) or []):
-        if getattr(req, SEAM_READMIT_ATTR, None) is None:
-            continue
-        rid = getattr(req, "rid", None)
-        if rid is None:
-            continue
-        try:
-            check(rid)
-        except Exception:  # noqa: BLE001 - a reap that cannot run is not a reason to skip the re-issue
-            pass
-        try:
-            verdict = issue(req)
-        except Exception as exc:  # noqa: BLE001 - never strand a flip on a prefetch
-            logger.error(
-                "%s #1025b re-issue RAISED for %s (%s); this request serves no "
-                "read-through in the incoming layout and re-prefills in full.",
-                LOG_PREFIX,
-                str(rid)[:8],
-                exc,
-            )
-            continue
-        reissued += 1
-        verdicts[str(verdict)] = verdicts.get(str(verdict), 0) + 1
-    if reissued:
-        logger.info(
-            "%s #1025b SEAM PREFETCH RE-ISSUED on the incoming binding: %d "
-            "re-admitted resident(s), verdicts %s. Without this every one of "
-            "them was fetched at the outgoing generation and refused by #937 "
-            "on arrival (30 of 35 completions on boot d70f38320e).",
-            LOG_PREFIX,
-            reissued,
-            verdicts,
-        )
-    return reissued
 
 
 def release_residents_for_cutover(reqs, *, retract, reset_tree):
@@ -3819,10 +3636,11 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 LOG_PREFIX,
                 e,
             )
-        # #1025b: THE SEAM'S OWN PREFETCHES ARE ISSUED AT THE WRONG GENERATION
-        # AND ARE DOOMED BY CONSTRUCTION. Re-issue them here, where the binding
-        # is finally current. See `reissue_seam_prefetch` for the measurement.
-        reissue_seam_prefetch(scheduler)
+        # #1066: the #1025b re-issue that stood here is DELETED. Re-admission
+        # itself now runs after this cutover (deferred by
+        # `_release_residents_for_cutover`, executed by
+        # `_post_cutover_readmit`), so its intake prefetch opens on the
+        # current binding and there is nothing mis-stamped left to re-issue.
         trace_cutover(scheduler, direction)
         _mark("verify+publish+trace")
         # #690 capture A: one line, sorted by cost, so the 24x spread can be
@@ -9055,35 +8873,21 @@ class PhaseFlipRuntime:
                     else "no report"
                 ),
             )
-        readmitted = 0
-        try:
-            readmitted = scheduler.readmit_seam_residents(list(released or ()))
-        except Exception:  # noqa: BLE001 - never strand a flip mid-release
-            logger.error(
-                "%s #856/W31: RE-ADMISSION FAILED for %s after %d request(s) "
-                "were already retracted. Those requests are now owned by "
-                "nobody -- this is the W31 defect happening live, and it is "
-                "logged rather than raised only because the residents are "
-                "already released and raising here would strand the flip.",
-                LOG_PREFIX,
-                direction,
-                n,
-                exc_info=True,
-            )
-        if readmitted != n:
-            # RETRACTED MUST EQUAL READMITTED. Anything else means requests
-            # were dropped, and dropping them silently is the whole W31
-            # defect. Loud and greppable so the next boot's first check is
-            # arithmetic rather than inference.
-            logger.error(
-                "%s #856/W31 RE-ADMISSION MISMATCH for %s: retracted %d but "
-                "re-admitted %d. The difference is requests owned by nobody.",
-                LOG_PREFIX,
-                direction,
-                n,
-                readmitted,
-            )
-        self._seam_readmitted = readmitted
+        # #1066: RE-ADMISSION IS DEFERRED TO AFTER THE CUTOVER. The requeue
+        # (and the fresh prefetch `_add_request_to_queue` issues with it)
+        # used to run HERE -- before `_cutover_fn` rebinds the HiCache pools
+        # -- so every re-admission prefetch was opened at the OUTGOING
+        # binding generation and refused as stale on completion
+        # (#937/#1025b; measured boot_855_tiprevert1033: 6/6 refusals,
+        # cached=0 on 90/90 prefills). The flip behaves like a freshly
+        # started server with a cache hit (user design, 2026-09-01): first
+        # everything is nulled and rebound, THEN the residents re-enter
+        # through the ordinary intake path, whose prefetch lands on the
+        # binding that will serve it. `_execute_body` performs the deferred
+        # readmit right after `_cutover_fn` via `_post_cutover_readmit`,
+        # which carries the W31 retracted==readmitted assertion with it.
+        self._pending_seam_readmit = (list(released or ()), n)
+        self._seam_readmitted = 0
         # W36 rung 3: the stale-generation gates report per CUTOVER, from here,
         # because this runs on every flip. A gate that is never reached still
         # produces a line reading checked=0, so "clean" and "blind" can never
@@ -10840,6 +10644,104 @@ class PhaseFlipRuntime:
         finally:
             seam_coverage.exit_cutover(direction, rank=self._rank)
 
+    def _post_cutover_readmit(self, direction: str) -> None:
+        """#1066: re-admit the cutover's retractions on the INCOMING binding.
+
+        The requeue used to run inside `_release_residents_for_cutover`,
+        BEFORE the cutover rebound the HiCache pools, so the intake prefetch
+        `_add_request_to_queue` issues was opened at the OUTGOING binding
+        generation and completed into a #937 stale refusal every time
+        (boot_855_tiprevert1033: 6/6 refused, cached=0 on 90/90 prefills; the
+        one voted re-fetch then #841-declined against recompute-built
+        unbacked nodes). Deferred to here -- after `_cutover_fn` -- the flip
+        behaves like a freshly started server with a cache hit (user design):
+        everything nulled and rebound first, then the residents re-enter
+        through the ordinary intake path.
+
+        Sweeps the UNTOUCHED waiting queue first: every prefetch still
+        registered was opened pre-cutover and can only complete into the same
+        #937 refusal; one `_prefetch_kvcache` call retires the doomed record
+        and opens a fresh one (URC #939 retire-then-register). This replaces
+        the deleted #943b one-rid-per-round vote: whole population, no
+        collective, at the group-uniform event itself.
+
+        HONEST RESIDUAL: between the retraction (in `_release_residents_for_
+        cutover`) and this call the retracted requests are owned by nobody.
+        An abort inside that window strands them -- the pre-#1066 code had the
+        same exposure for the window up to its earlier requeue point, and an
+        abort there is a failed flip (KvReshardError) that takes the instance
+        down regardless. Named, not hidden.
+        """
+        stash = getattr(self, "_pending_seam_readmit", None)
+        self._pending_seam_readmit = None
+        scheduler = getattr(self, "_census_scheduler", None)
+        if scheduler is None:
+            if stash and stash[0]:
+                logger.error(
+                    "%s #1066: no scheduler bound at the seam; %d retracted "
+                    "request(s) cannot be re-admitted (W31 shape).",
+                    LOG_PREFIX,
+                    len(stash[0]),
+                )
+            return
+        swept = 0
+        tree = getattr(scheduler, "tree_cache", None)
+        ongoing = getattr(tree, "ongoing_prefetch", None) or {}
+        issue = getattr(scheduler, "_prefetch_kvcache", None)
+        if ongoing and callable(issue):
+            stale_rids = set(ongoing.keys())
+            for req in list(getattr(scheduler, "waiting_queue", []) or []):
+                if getattr(req, "rid", None) in stale_rids:
+                    try:
+                        issue(req)
+                        swept += 1
+                    except Exception:  # noqa: BLE001 - a sweep never strands a flip
+                        logger.warning(
+                            "%s #1066 stale-prefetch re-issue RAISED for %s",
+                            LOG_PREFIX,
+                            str(getattr(req, "rid", "?"))[:8],
+                            exc_info=True,
+                        )
+        released, n = (stash[0], stash[1]) if stash else ([], 0)
+        readmitted = 0
+        if released:
+            try:
+                readmitted = scheduler.readmit_seam_residents(list(released))
+            except Exception:  # noqa: BLE001 - never strand a committed flip
+                logger.error(
+                    "%s #856/W31: RE-ADMISSION FAILED for %s after %d "
+                    "request(s) were already retracted. Those requests are "
+                    "now owned by nobody -- the W31 defect happening live; "
+                    "logged rather than raised because the flip is committed.",
+                    LOG_PREFIX,
+                    direction,
+                    n,
+                    exc_info=True,
+                )
+        if readmitted != n:
+            # RETRACTED MUST EQUAL READMITTED. Anything else means requests
+            # were dropped, and dropping them silently is the whole W31
+            # defect. Loud and greppable.
+            logger.error(
+                "%s #856/W31 RE-ADMISSION MISMATCH for %s: retracted %d but "
+                "re-admitted %d. The difference is requests owned by nobody.",
+                LOG_PREFIX,
+                direction,
+                n,
+                readmitted,
+            )
+        self._seam_readmitted = readmitted
+        logger.info(
+            "%s #1066 POST-CUTOVER FRESH-FETCH after %s: swept %d stale "
+            "prefetch op(s) from the queue, re-admitted %d/%d resident(s), "
+            "all on the incoming binding.",
+            LOG_PREFIX,
+            direction,
+            swept,
+            readmitted,
+            n,
+        )
+
     def _execute_body(self, direction: str) -> Optional[dict]:
         t0 = self._clock()
         # #631 seam census: per-STAGE memory attribution across this cutover.
@@ -11819,6 +11721,19 @@ class PhaseFlipRuntime:
         # enforcement inherits the exact silence it exists to end.
         self._enforce_exposure_at_seam(f"{direction} cutover")
         seam_census.mark("cutover")
+        # #1066: deferred seam re-admission -- see `_post_cutover_readmit`.
+        # Runs after the stacks are swapped and the HiCache pools rebound, so
+        # the requeue's intake prefetch opens on the binding that serves it.
+        try:
+            self._post_cutover_readmit(direction)
+        except Exception:  # noqa: BLE001 - never strand a committed flip
+            logger.error(
+                "%s #1066 post-cutover readmit FAILED after %s (W31 shape)",
+                LOG_PREFIX,
+                direction,
+                exc_info=True,
+            )
+        seam_census.mark("post_cutover_readmit")
         # #856: the warm-up ledger's clock. Everything served from here until
         # the next cutover is warming the cache back up, which is the price
         # this design pays for carrying no KV. Counting the cutovers is the
