@@ -8341,6 +8341,43 @@ class SchedulerPPMixin:
                     throttles.append(f"{_rid[:8]}(<unreadable>)")
         thr_txt = "; ".join(throttles) or "no rid held"
 
+        # #1073c: WHY THE ARM WAS TAKEN AT ALL. Boot 1077 printed "NONE
+        # OCCUPIED ... no rid held" -- so the previous version named a slot
+        # occupancy that did not exist, and said nothing about the condition
+        # that actually kept this rank out of the blocking-idle branch. The
+        # arm is the ELSE of a four-term idle test; exactly one of those terms
+        # is what spun the rank for 90 s, and only naming which one turns this
+        # from "something is stuck" into a specimen.
+        try:
+            _wq = list(getattr(self, "waiting_queue", ()) or ())
+        except Exception:  # noqa: BLE001
+            _wq = []
+        _wq_rids = tuple(str(getattr(r, "rid", "")) for r in _wq)
+        _chunked = getattr(self, "chunked_req", None)
+        try:
+            _proxy = bool(self._pp_row_any_proxy_signal())
+        except Exception:  # noqa: BLE001
+            _proxy = None
+        why = (
+            f"waiting_queue={len(_wq)}"
+            f"{'[' + ','.join(r[:8] for r in _wq_rids[:4]) + ']' if _wq_rids else ''}, "
+            f"chunked_req={'set(' + str(getattr(_chunked, 'rid', '?'))[:8] + ')' if _chunked is not None else 'None'}, "
+            f"any_slot_occupied={bool(occupied)}, proxy_signal={_proxy}"
+        )
+        # The throttles for the QUEUED rids too -- with an empty ring those are
+        # the only rids in play, and the earlier version reported none of them.
+        for _rid in _wq_rids[:4]:
+            try:
+                throttles.append(
+                    f"queued:{_rid[:8]}(unresolved_rounds="
+                    f"{guard.unresolved_rounds(_rid) if guard else '?'},"
+                    f"terminator_spent={guard.terminator_spent(_rid) if guard else '?'},"
+                    f"offer_streak={guard.offer_streak(_rid) if guard else '?'})"
+                )
+            except Exception:  # noqa: BLE001
+                throttles.append(f"queued:{_rid[:8]}(<unreadable>)")
+        thr_txt = "; ".join(throttles) or "no rid held and none queued"
+
         held = tuple(r[:8] for _s, _r in occupied for r in _r)[:4]
         counters = getattr(self, "pp_flip_counters", None)
         receiver = getattr(self, "pp_chain_receiver", None)
@@ -8350,6 +8387,8 @@ class SchedulerPPMixin:
             f"{getattr(getattr(self, 'ps', None), 'pp_rank', None)} spent "
             f"{waited:.1f}s on the throttle arm while the ring held OCCUPIED "
             f"{occ_txt} (loop was on slot {mb_id}; rids={held or 'NONE'}). "
+            f"WHY THE ARM WAS TAKEN (the four-term idle test; exactly one of "
+            f"these is the spinner): {why}. "
             f"No upstream statement and nothing provably posted on the chain "
             f"(consumed={getattr(receiver, 'consumed', None)}, "
             f"counters={'present' if counters is not None else 'absent'}). "
