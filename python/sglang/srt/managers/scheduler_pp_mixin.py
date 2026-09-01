@@ -2350,7 +2350,18 @@ def pp_ring_note(holder, site: str, voided: bool) -> None:
                 getattr(getattr(holder, "ps", None), "pp_rank", "?"),
                 getattr(holder, "_997d_seen", 0),
                 len(_m),
-                dict(list(_m.items())[:4]) or "-",
+                # #997f: NEWEST FOUR, NOT OLDEST FOUR -- the same one-character
+                # defect #998 was corrected for 48 lines above this, in the
+                # same emission block, left standing on its sibling. `_997d_last`
+                # is an insertion-ordered dict that is never pruned, so `[:4]`
+                # pinned the sample to whatever arrived first (in practice the
+                # boot's opening HEALTH_CHECK probe) and reprinted it unchanged
+                # for the rest of the boot. This instrument's own reading
+                # instruction is "Compare the SAME rid across ranks" -- with a
+                # permanently stale sample that instruction cannot be carried
+                # out, and an instrument whose stated purpose is cross-rank
+                # divergence was showing the boot's first seconds instead.
+                dict(list(_m.items())[-4:]) or "-",
             )
         except Exception:  # noqa: BLE001 - a census may never break admission
             pass
