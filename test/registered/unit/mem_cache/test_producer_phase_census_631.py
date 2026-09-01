@@ -79,9 +79,7 @@ def test_red_when_every_hit_is_same_phase():
     for _ in range(12):
         c.note_walk(hit=True)
     assert producer_phase_of("page-a", 2) is ProducerPhase.SAME_PHASE
-    c.note_accepted_tokens(
-        49152, ProducerPhase.SAME_PHASE, AdoptionSource.BACKUP_HOST
-    )
+    c.note_accepted_tokens(49152, ProducerPhase.SAME_PHASE, AdoptionSource.BACKUP_HOST)
 
     f = c.log_fields()
     assert f["ok"] == 0, "same-phase hits must not be counted as the mission"
@@ -100,7 +98,9 @@ def test_red_survives_the_false_win_specimen():
     note_store_write("chunk", 2)
     c = ProducerPhaseCensus()
     c.note_walk(hit=True)
-    c.note_accepted_tokens(16384, producer_phase_of("chunk", 2), AdoptionSource.BACKUP_HOST)
+    c.note_accepted_tokens(
+        16384, producer_phase_of("chunk", 2), AdoptionSource.BACKUP_HOST
+    )
     assert c.log_fields()["ok"] == 0
 
 
@@ -202,25 +202,41 @@ def test_numerator_cannot_exceed_denominator():
 # -- a success label must measure its payload ----------------------------
 
 
-def test_the_18_success_lines_are_not_successes():
-    """The measured specimen: 'success' with an all-zero payload."""
+def test_the_measured_17_of_18_are_not_successes():
+    """THE specimen, from the FULL count (not the 4-line sample that said 18/18).
+
+    17 of 18 'HiCache prefetch success' lines carry loaded=0 despite
+    matched>0: the store had the page and nothing came across. That is a
+    named state, and it is not success.
+    """
     assert (
         payload_verdict(
-            completed_local=0,
-            completed_synced=0,
-            matched=0,
-            loaded=0,
-            refused=0,
+            completed_local=8192, completed_synced=8192, matched=8192, loaded=0
         )
-        == "no_completion"
+        == "matched_not_loaded"
     )
 
 
-def test_payload_verdict_separates_the_three_non_success_worlds():
-    assert payload_verdict(loaded=8192) == "delivered"
-    assert payload_verdict(matched=8192) == "delivered"
+def test_only_arrived_bytes_are_delivery():
+    """The one line of eighteen that actually loaded."""
+    assert (
+        payload_verdict(completed_local=4096, matched=4096, loaded=4096) == "delivered"
+    )
+
+
+def test_matched_not_loaded_is_not_reabsorbed_by_refused_or_empty():
+    """A partial refusal must not hide the 17/18 state."""
+    assert payload_verdict(matched=8192, loaded=0, refused=3) == "matched_not_loaded"
+    assert (
+        payload_verdict(completed_local=8192, matched=8192, loaded=0)
+        == "matched_not_loaded"
+    )
+
+
+def test_payload_verdict_separates_the_remaining_worlds():
     assert payload_verdict(completed_local=1, refused=3) == "refused"
     assert payload_verdict(completed_local=1) == "empty"
+    assert payload_verdict() == "no_completion", "the 7/18 genuinely-empty lines"
 
 
 # -- the ledger must not forget silently ---------------------------------

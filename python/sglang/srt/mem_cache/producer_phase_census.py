@@ -80,6 +80,32 @@ It is cheap and it does not carry. Five failures, any one of which is fatal:
   5. COST IN THE HOT PATH. One ``stat()`` per accepted page inside the match
      walk, to obtain a number that is wrong in case 2 anyway.
 
+THE STAMP IS ON THE RECORD, NEVER IN THE KEY
+--------------------------------------------
+Explicit because it is the obvious wrong turn and it is already forbidden:
+the storage key is deliberately GEOMETRY-NEUTRAL (#706/#555). A phase stamp
+inside the key would re-introduce the two-geometry key -- the same page
+written in PP3 and looked up in TP3 would no longer be the same page, and the
+mission would become unreachable by the very instrument meant to measure it.
+So provenance is keyed BY the key and never carried IN it: the ledger below
+maps key -> write generation, and the key itself is untouched.
+
+In the hermetic roundtrip test provenance is solved CONSTRUCTIVELY instead --
+the store starts empty and only the PP chain writes, so anything read back is
+PP-produced by construction. That argument does not survive contact with a
+live boot, where both phases write into one store, which is why the live side
+still needs this axis.
+
+THE ARM LABEL IS PART OF THE ANSWER, NOT A DECORATION
+-----------------------------------------------------
+``AdoptionSource`` (``by_source`` on the emitted line) says whether the bytes
+came through the PREFETCH arm or the BACKUP_HOST arm. Without it a green
+number from BACKUP_HOST reads as evidence for a path that never ran -- the
+confusion that nearly closed this whole mission as "impossible". It rides the
+SAME line as ``ok``, and the #904 refusal census is armed by the SAME knob, so
+the two lines cannot drift apart in a log and the arm label never has to be
+re-derived from a second one.
+
 THREE STATES, NEVER TWO
 -----------------------
 Every field this module reports is one of VALUE / NO_OBSERVATION / EMPTY, and
@@ -300,16 +326,19 @@ def ledger_stats() -> dict[str, int]:
 
 
 # --------------------------------------------------------------------------
-# 2b. ARRIVAL ORDER: "it never came" and "it came too late" are two fixes
+# 2b. ARRIVAL ORDER -- REFUTED AS A CAUSE, RETAINED AS THE WITNESS
 # --------------------------------------------------------------------------
 #
-# Measured on the booted commit: the MATCH runs ~1 s BEFORE the prefetch
-# completes. A hit counter that cannot say whether the fetch had landed when
-# the walk consulted the key reports one number for two different defects --
-# a store that never produced the page (write-side) and a store that produced
-# it after the only reader looked (ordering). Their fixes are in different
-# files pointing in opposite directions, which is the #913 lesson applied to
-# the time axis instead of the blame axis.
+# The hypothesis was that the match consults a key BEFORE its prefetch lands,
+# so a real page would be missed for timing reasons. FULL-COUNT MEASUREMENT
+# REFUTED IT (2026-09-01): the prefetch completes within the same second and
+# the consult reads correctly. Nothing arrives late; nothing arrives at all.
+#
+# These counters stay, and the reason is not sentiment. A refutation that
+# lives only in prose gets re-litigated; one that a running boot re-prints
+# every window does not. ``late`` is expected to remain 0, and if it ever
+# stops being 0 the refutation has expired and should be re-argued rather
+# than assumed. No further work is owed here.
 
 _order_lock = threading.Lock()
 _missed_consults: dict[str, int] = {}  # key -> count of consults that missed
@@ -388,26 +417,46 @@ def payload_verdict(
 ) -> str:
     """What a prefetch-completion line is allowed to call itself.
 
-    Measured on the booted commit: 18 lines reading ``HiCache prefetch
-    success`` with ``completed_local=0 completed_synced=0 matched=0 loaded=0
-    refused=0`` -- on exactly the rids that had been given ``verdict=issued``.
-    The word "success" there describes the code REACHING the line, not
-    anything having been transferred: the catalogued
-    success-value-without-action class in its pure form.
+    FULL COUNT, not a sample. The first reading of this line came from a
+    4-line sample that happened to hit only zeros and reported "18 of 18
+    empty"; the full count says 7 of 18 are empty and 11 carry
+    ``completed_local`` between 3072 and 8192 with ``matched`` following. The
+    retraction is recorded here rather than quietly corrected, because the
+    sampled number was already on its way into a verdict. SAMPLING A LOG IS
+    NOT MEASURING IT.
 
-    Four verdicts, because the three non-success worlds are different bugs:
+    WHAT THE FULL COUNT ACTUALLY FOUND, and it is sharper than the sampled
+    claim: the dead column is ``loaded``. SEVENTEEN of eighteen lines carry
+    ``loaded=0`` DESPITE ``matched>0``; exactly one loads (4096). So the
+    defect is not an empty line. It is a line that prints ``matched`` and
+    ``loaded`` side by side, calls itself ``success``, and draws no
+    consequence from the contradiction between them.
 
-      ``delivered``    payload moved: something was loaded or matched.
-      ``refused``      nothing moved and a refusal was recorded -- the store
-                       had an opinion. Read-side defect.
-      ``empty``        nothing moved, nothing refused, and the operation did
-                       complete. Nothing was there to move. Write-side.
-      ``no_completion``  the operation did not even complete. Not a result at
-                       all; a line claiming success here is claiming the
-                       absence of a result as one.
+    ``matched`` says THE STORE HAS IT. ``loaded`` says HOW MUCH ARRIVED. A
+    success label must be read off the second one: what a prefetch is for is
+    the bytes, not the lookup. Hence five verdicts, one per actionable world:
+
+      ``delivered``      ``loaded > 0``. Bytes arrived. The only success.
+      ``matched_not_loaded``  ``matched > 0`` and ``loaded == 0``. The store
+                         HAD the page and none of it came across. THE
+                         MEASURED STATE, 17/18 -- and the one that must never
+                         again be spelled "success".
+      ``refused``        nothing arrived, nothing matched, and a refusal was
+                         recorded. The store had an opinion. Read-side.
+      ``empty``          the operation completed and there was nothing to
+                         move. Write-side.
+      ``no_completion``  the operation did not complete. Not a result at all;
+                         calling this success claims the absence of a result
+                         as one.
+
+    Order matters: ``matched_not_loaded`` is tested BEFORE ``refused`` and
+    ``empty`` so that a partial refusal cannot re-absorb it into a world
+    where nothing was ever there.
     """
-    if int(loaded) > 0 or int(matched) > 0:
+    if int(loaded) > 0:
         return "delivered"
+    if int(matched) > 0:
+        return "matched_not_loaded"
     if int(refused) > 0:
         return "refused"
     if int(completed_local) > 0 or int(completed_synced) > 0:
