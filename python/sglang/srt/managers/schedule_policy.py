@@ -1558,14 +1558,24 @@ class PrefillAdder:
         which is the one direction in which uniform membership can still be
         restored.
 
-        NO HOST LOAD-BACK EITHER, and this is the instr20 line specifically.
-        `add_one_req` grows `req.prefix_indices` by `init_load_back`'s freshly
-        revived indices, which on instr20 put 512 host-resident prefix tokens
-        back onto a `prefix_indices` the admission loop had just clamped to
-        the schedule's 0 -- turning a 512-token chunk into a 333-token
-        remainder on PP1 and PP2 while PP0, whose `needs_host_load_back()` was
-        false, kept the 512. A load-back is a rank-local improvement to a
-        quantity this rank no longer owns, so on this path it does not run.
+        HOST LOAD-BACK RUNS ONLY TOWARD THE SCHEDULE (#968, 2026-09-01).
+        The old rule here ("no host load-back either", the instr20 line)
+        banned the load-back because on instr20 it grew `prefix_indices`
+        PAST the schedule and re-derived the chunk -- a rank-local
+        improvement to a quantity this rank no longer owns. The ban threw
+        out the direction that is not an opinion: when this rank holds LESS
+        than the scheduled prefix, reading the missing KV back from its own
+        host tier is not a re-derivation, it is the only way to EXECUTE the
+        decision at all. trainA/B/B2 (2026-09-01, d2b78d38d8) measured the
+        ban's cost: the equality refusal voided the pass while the KV sat in
+        this rank's host tier (host_hit=15891 = the scheduled 15891), and
+        the ring starved to death. `execute_scheduled_prefix` now
+        materialises UP TO the scheduled prefix, clamped there (the instr20
+        growth stays impossible), waits bounded and length-priced for the
+        storage read (#1065: the store usually HAS the bytes; the 1-5 s
+        constants were the underpriced term), and a genuine shortfall is a
+        loud RuntimeError group stop -- never a silent short prefix and
+        never a rank-local void-and-continue.
         """
         # Imported here rather than at module scope: this file's import block
         # is already an E402 region, and a local import keeps the new
@@ -1574,11 +1584,17 @@ class PrefillAdder:
         from sglang.srt.managers.pp_admission_congruence import (
             PPScheduleRefused,
             adopt_carried_fill,
+            execute_scheduled_prefix,
             schedule_refusal_reason,
         )
 
         prefix_len, extend_len = int(extent[0]), int(extent[1])
-        local_prefix_len = len(req.prefix_indices)
+        # #968 THE MATERIALISATION STATION: make this rank hold exactly the
+        # scheduled prefix (truncate down / host-read-back up, bounded and
+        # length-priced), or stop the group loudly. After this call
+        # `len(req.prefix_indices) == prefix_len` holds by construction, which
+        # is what lets the equality refusal clause stay deleted.
+        execute_scheduled_prefix(req, self.tree_cache, prefix_len)
         # #987 THE ADOPT, IMMEDIATELY BEFORE THE COMPARISON IT SERVES. The
         # third clause of `schedule_refusal_reason` measures the forwarded
         # geometry against `len(full_untruncated_fill_ids)`, and R9's census
@@ -1606,7 +1622,6 @@ class PrefillAdder:
             rid=req.rid,
             scheduled_prefix_len=prefix_len,
             scheduled_extend_len=extend_len,
-            local_prefix_len=local_prefix_len,
             local_fill_len=local_fill_len,
         )
         if reason is not None:

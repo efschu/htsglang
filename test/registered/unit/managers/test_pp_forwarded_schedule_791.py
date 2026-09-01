@@ -302,6 +302,11 @@ class _Req:
 
         self.extend_range = Range(start, end)
 
+    def init_next_round_input(self, tree_cache=None) -> None:
+        # #968: the materialisation wait polls a rank-local re-match; this
+        # stand-in's state does not change between polls.
+        pass
+
     def finished(self) -> bool:
         return False
 
@@ -868,16 +873,18 @@ class PPForwardedSchedulePure791(unittest.TestCase):
         self.assertEqual(forwarded_schedule(None), {})
 
     def test_the_refusal_quotes_the_forwarded_decision(self):
+        # #968: the equality clause is deleted (a prefix mismatch is now
+        # EXECUTED by `execute_scheduled_prefix`); the quoting contract is
+        # carried by the surviving fill-overrun clause.
         reason = schedule_refusal_reason(
             rid=RID,
             scheduled_prefix_len=TOLD_PREFIX,
-            scheduled_extend_len=TOLD_EXTEND,
-            local_prefix_len=PREFETCHED_PREFIX,
+            scheduled_extend_len=PROMPT_TOKENS + 1,
             local_fill_len=PROMPT_TOKENS,
         )
         self.assertIsNotNone(reason)
         self.assertIn(f"prefix_len={TOLD_PREFIX}", reason)
-        self.assertIn(str(PREFETCHED_PREFIX), reason)
+        self.assertIn(str(PROMPT_TOKENS), reason)
         self.assertIn(RID, reason)
 
     def test_an_executable_geometry_has_no_reason(self):
@@ -886,7 +893,6 @@ class PPForwardedSchedulePure791(unittest.TestCase):
                 rid=RID,
                 scheduled_prefix_len=TOLD_PREFIX,
                 scheduled_extend_len=TOLD_EXTEND,
-                local_prefix_len=TOLD_PREFIX,
                 local_fill_len=PROMPT_TOKENS,
             )
         )
@@ -896,7 +902,6 @@ class PPForwardedSchedulePure791(unittest.TestCase):
             rid=RID,
             scheduled_prefix_len=TOLD_PREFIX,
             scheduled_extend_len=PROMPT_TOKENS + 1,
-            local_prefix_len=TOLD_PREFIX,
             local_fill_len=PROMPT_TOKENS,
         )
         self.assertIsNotNone(reason)
@@ -912,7 +917,6 @@ class PPForwardedSchedulePure791(unittest.TestCase):
                 rid=RID,
                 scheduled_prefix_len=TOLD_PREFIX,
                 scheduled_extend_len=0,
-                local_prefix_len=TOLD_PREFIX,
                 local_fill_len=PROMPT_TOKENS,
             )
         )
@@ -923,7 +927,6 @@ class PPForwardedSchedulePure791(unittest.TestCase):
                 rid=RID,
                 scheduled_prefix_len=TOLD_PREFIX,
                 scheduled_extend_len=-1,
-                local_prefix_len=TOLD_PREFIX,
                 local_fill_len=PROMPT_TOKENS,
             )
         )
@@ -1078,12 +1081,47 @@ class PPOrderBatchBySchedule791(unittest.TestCase):
         self.assertIsNone(adder.new_chunked_req)
 
     def test_an_impossible_geometry_raises_rather_than_narrowing(self):
+        """#968: the old 'impossible' (local prefix != scheduled) is now
+        EXECUTED -- a local surplus truncates to the schedule and the batch
+        runs at the decision's geometry. The genuinely impossible geometry
+        is a deficit no tier can serve, and that is a RuntimeError group
+        stop (RAENGE-NIE-UNEINS) -- never PPScheduleRefused, whose void
+        disposal left PP0 starving in its ring recv (trainA/B/B2,
+        2026-09-01), and never a narrowed batch."""
+        import sglang.srt.managers.pp_admission_congruence as congruence
+        from sglang.srt.managers.schedule_policy import AddReqResult
+
+        # Surplus direction: executes, at the scheduled geometry.
         adder = _adder({RID: (TOLD_PREFIX, TOLD_EXTEND)})
         req = _Req(prefix_len=PREFETCHED_PREFIX, host_resident=PREFETCHED_PREFIX)
-        with self.assertRaises(PPScheduleRefused) as ctx:
-            adder.add_one_req(req, truncation_align_size=None)
-        self.assertIn(RID, str(ctx.exception))
-        self.assertEqual(adder.can_run_list, [], "no partial batch may survive")
+        outcome = adder.add_one_req(req, truncation_align_size=None)
+        self.assertEqual(outcome, AddReqResult.CONTINUE)
+        self.assertEqual(int(req.extend_range.start), TOLD_PREFIX)
+        self.assertEqual(len(req.prefix_indices), TOLD_PREFIX)
+
+        # Deficit no tier serves: loud group stop, no partial batch.
+        old_base = congruence.MATERIALISE_BASE_S
+        old_max = congruence.MATERIALISE_MAX_S
+        congruence.MATERIALISE_BASE_S, congruence.MATERIALISE_MAX_S = 0.0, 0.1
+        try:
+            adder2 = _adder({RID: (PREFETCHED_PREFIX, TOLD_EXTEND)})
+            adder2.tree_cache.init_load_back = lambda params: (
+                torch.zeros(0, dtype=torch.long),
+                "node",
+            )
+            req2 = _Req(prefix_len=0, host_resident=0)
+            with self.assertRaises(RuntimeError) as ctx:
+                adder2.add_one_req(req2, truncation_align_size=None)
+            self.assertIn(
+                "#968 PREFIX MATERIALISATION SHORTFALL", str(ctx.exception)
+            )
+            self.assertNotIsInstance(ctx.exception, PPScheduleRefused)
+            self.assertEqual(
+                adder2.can_run_list, [], "no partial batch may survive"
+            )
+        finally:
+            congruence.MATERIALISE_BASE_S = old_base
+            congruence.MATERIALISE_MAX_S = old_max
 
 
 if __name__ == "__main__":

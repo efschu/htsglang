@@ -155,7 +155,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import struct
+import time
 from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -2319,31 +2321,248 @@ def _clear_carried_fill(req) -> None:
     req._refresh_fill_ids()
 
 
+#: #968/#1065: pricing of the bounded wait for the store read that backs a
+#: prefix materialisation. GELTUNGSBEREICH of the old constants, named: the
+#: shipped prefetch-timeout defaults (base 1-2 s, 0.1-0.25 s/KiToken) were
+#: priced for small prefixes; a cutover re-admission carries 13-16k tokens
+#: under page_size=1, and #1065 MEASURED the store serving 12556 tokens in
+#: ~4 s (trainA log:66678/66823, ~0.32 s/KiToken best case) WHILE 40-52k
+#: draft miss-fetches competed for the same backend. 1.0 s/KiToken is that
+#: measured best case with ~3x headroom for the miss-fetch storm. The MAX
+#: stays under the #824 chain-recv bound (60 s) so a shortfall dies as the
+#: specific #968 verdict, not as the transport bound's generic one.
+MATERIALISE_BASE_S = float(os.environ.get("SGLANG_PP_MATERIALISE_BASE_S", "2.0"))
+MATERIALISE_S_PER_KI_TOKEN = float(
+    os.environ.get("SGLANG_PP_MATERIALISE_S_PER_KI_TOKEN", "1.0")
+)
+MATERIALISE_MAX_S = float(os.environ.get("SGLANG_PP_MATERIALISE_MAX_S", "45.0"))
+MATERIALISE_POLL_S = 0.05
+
+
+def store_read_bound_s(deficit_tokens: int) -> float:
+    """Length-priced wait bound for materialising ``deficit_tokens`` of
+    prefix from the store. Pure; see the constants above for provenance."""
+    return min(
+        MATERIALISE_MAX_S,
+        MATERIALISE_BASE_S
+        + MATERIALISE_S_PER_KI_TOKEN * (max(0, int(deficit_tokens)) / 1024.0),
+    )
+
+
+def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
+    """#968: make this rank HOLD exactly the scheduled prefix, or die loudly.
+
+    THE STATION THIS REPLACES is the `local_prefix_len != scheduled_prefix_len`
+    refusal clause that stood in `schedule_refusal_reason` until 2026-09-01.
+    Measured on the train-0901 acceptance boots (d2b78d38d8): PP0 named
+    prefix_len=15891 for a cutover re-admission whose HiCache prefetch had
+    completed on PP1 the same second (`HiCache prefetch success ...
+    completed_local=15891`, host_hit=15891) -- the KV was RESIDENT IN THIS
+    RANK'S HOST TIER -- and the equality clause refused anyway, the pass was
+    voided, PP0 stayed blocked in its ring recv with a launched microbatch,
+    and the group starved to death (trainB2: PpChainRecvStalled 63.5s;
+    trainB: #1071 rank 2 with the refused rid still queued). #1072c had
+    deleted the reconcile-side retraction for `local < told` on the argument
+    "a downstream rank EXECUTES the row it is given" -- but the ability to
+    execute was never built. This function is that ability.
+
+    TWO DIRECTIONS, ONE INVARIANT (`len(prefix_indices) == scheduled` after
+    this call):
+
+      * local > scheduled: truncate DOWN to the schedule. Safe direction
+        (more recompute, never more memory), rank-uniform because the
+        schedule is, and the same clamp the admission loop already applies
+        where its incoming-effective memo is populated. Done inline (slice +
+        protected-len min, #930: the two move together) rather than via
+        `Req.truncate_prefix_to`, because that helper also zeroes
+        `host_hit_length`, which the load-back below may still need on a
+        LATER pass of the same request.
+      * local < scheduled: MATERIALISE the deficit from this rank's host
+        tier via `tree_cache.init_load_back` -- a read-back of KV this rank
+        already holds (the #703 fence / prefetch put it there), never a
+        recompute and never a growth PAST the schedule. The instr20 defect
+        (load-back growing the prefix BEYOND the decision and re-deriving
+        the chunk) stays impossible: the result is clamped to exactly the
+        deficit, and an over-serve under an adopted GDN anchor is a fatal
+        error rather than a cut (the S1/FIX-3 hazard: a recurrent state
+        cannot be trimmed to a length it does not belong to).
+
+    SHORTFALL IS A GROUP STOP, NEVER A FALLBACK. If the tiers cannot serve
+    the deficit, this raises RuntimeError -- deliberately NOT
+    `PPScheduleRefused`: the refusal path voids the pass rank-locally and
+    leaves PP0 blocked in a ring recv it can never be released from (the
+    measured starvation above). A rank that cannot hold the prefix the
+    group's decision rests on is detected rank divergence, and the standing
+    law for detected divergence is CRASH/STOP of the group, never
+    refusal-and-continue (memory: RAENGE-NIE-UNEINS, 2026-08-29). Silently
+    proceeding with the short prefix -- today's defect returning as a
+    fallback -- is the one behaviour the red-first tests pin as forbidden.
+
+    Returns the number of tokens materialised (0 when none were needed).
+    """
+    local = len(req.prefix_indices)
+    scheduled = int(scheduled_prefix_len)
+    if local == scheduled:
+        return 0
+    if local > scheduled:
+        req.prefix_indices = req.prefix_indices[:scheduled]
+        req.cache_protected_len = min(
+            int(getattr(req, "cache_protected_len", 0) or 0), scheduled
+        )
+        logger.info(
+            "#968 PREFIX-EXEC truncate rid=%s local=%d -> scheduled=%d: this "
+            "rank's own reuse exceeds the decision; executing the decision.",
+            getattr(req, "rid", "?"),
+            local,
+            scheduled,
+        )
+        return 0
+
+    deficit = scheduled - local
+    storage_on = (
+        bool(getattr(tree_cache, "enable_storage", False)) if tree_cache else False
+    )
+    bound_s = store_read_bound_s(deficit)
+    started = time.monotonic()
+
+    def _die(served: int, why: str) -> "RuntimeError":
+        host_offer = int(getattr(req, "host_hit_length", 0) or 0)
+        best_now = getattr(req, "best_match_node", None)
+        return RuntimeError(
+            f"#968 PREFIX MATERIALISATION SHORTFALL for rid="
+            f"{getattr(req, 'rid', '?')}: the decision names prefix_len="
+            f"{scheduled}, this rank holds {len(req.prefix_indices)} after "
+            f"waiting {time.monotonic() - started:.2f}s of a {bound_s:.2f}s "
+            f"length-priced bound ({why}; served {served} so far). "
+            f"host_hit_length={host_offer} best_match_node="
+            f"{'present' if best_now is not None else 'ABSENT'} "
+            f"storage_enabled={storage_on}. A rank that cannot hold the "
+            f"prefix the group's decision rests on is DETECTED RANK "
+            f"DIVERGENCE: stopping the group loudly instead of voiding the "
+            f"pass rank-locally (the void left PP0 blocked in its ring recv "
+            f"and starved boots trainA/B/B2 of 2026-09-01 to death). "
+            f"RAENGE-NIE-UNEINS."
+        )
+
+    if tree_cache is None:
+        raise _die(0, "no tree cache -- nothing to materialise from")
+
+    from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+    import torch
+
+    loaded_total = 0
+    while True:
+        best = getattr(req, "best_match_node", None)
+        if best is not None:
+            # Armed False for THIS attempt only; the mamba component sets it
+            # True if the load-back plants a node-END anchor (same protocol
+            # as the S1 site in schedule_policy.add_one_req).
+            req.mamba_loadback_anchor_adopted = False
+            new_indices, new_last = tree_cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=best,
+                    # Consumed as a trigger by the callee (unified_radix_cache:
+                    # the amount actually returned is the local node run); the
+                    # clamp below is what enforces the scheduled amount.
+                    host_hit_length=deficit,
+                    req=req,
+                )
+            )
+            try:
+                applied = int(new_indices.numel())
+            except AttributeError:
+                applied = len(new_indices)
+            if applied != deficit and bool(
+                getattr(req, "mamba_loadback_anchor_adopted", False)
+            ):
+                raise _die(
+                    loaded_total + applied,
+                    "load-back adopted a GDN anchor at a depth the schedule "
+                    "does not name; KV extent and recurrent state stand or "
+                    "fall together (S1/FIX-3), so neither clamping nor taking "
+                    "the served amount is legal",
+                )
+            if applied > deficit:
+                # The instr20 direction: never grow past the decision.
+                new_indices = new_indices[:deficit]
+                applied = deficit
+            if applied > 0:
+                req.last_node = new_last
+                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                req.cache_protected_len = len(req.prefix_indices)
+                loaded_total += applied
+                deficit -= applied
+        if deficit <= 0:
+            logger.info(
+                "#968 PREFIX-EXEC materialised rid=%s local=%d -> scheduled=%d "
+                "loaded=%d waited=%.2fs of %.2fs bound (host read-back, "
+                "clamped to the decision): the follower executes the "
+                "forwarded geometry instead of refusing it.",
+                getattr(req, "rid", "?"),
+                local,
+                scheduled,
+                loaded_total,
+                time.monotonic() - started,
+                bound_s,
+            )
+            return loaded_total
+        if time.monotonic() - started >= bound_s:
+            raise _die(
+                loaded_total,
+                "tiers could not serve the full deficit within the bound "
+                "(#1065: the store usually HAS the bytes and the WAIT was the "
+                "underpriced term; if this fires, either the store genuinely "
+                "lacks the prefix -- the loud special case -- or the rate "
+                "assumptions in store_read_bound_s no longer hold)",
+            )
+        # #1065 THE WAIT, priced instead of skipped: the storage prefetch
+        # delivers into the host tier on its own thread; poll rank-locally
+        # and re-match so the fresh host nodes become loadable. No
+        # collectives on this path (match_prefix and init_load_back are
+        # rank-local; the #580 hazard lives in check_prefetch_progress,
+        # which is deliberately NOT called here).
+        time.sleep(MATERIALISE_POLL_S)
+        try:
+            req.init_next_round_input(tree_cache)
+        except TypeError:
+            req.init_next_round_input()
+        local_now = len(req.prefix_indices)
+        if local_now > scheduled:
+            req.prefix_indices = req.prefix_indices[:scheduled]
+            req.cache_protected_len = min(
+                int(getattr(req, "cache_protected_len", 0) or 0), scheduled
+            )
+            local_now = scheduled
+        deficit = scheduled - local_now
+
+
 def schedule_refusal_reason(
     *,
     rid: str,
     scheduled_prefix_len: int,
     scheduled_extend_len: int,
-    local_prefix_len: int,
     local_fill_len: int,
 ) -> Optional[str]:
     """`None` when this rank can execute the forwarded geometry verbatim;
     otherwise the LOUD REFUSAL text, quoting the forwarded decision.
 
-    THE THREE WAYS A FORWARDED GEOMETRY CAN BE LOCALLY IMPOSSIBLE, and none
-    of them may be answered by adjusting the geometry:
+    THE TWO WAYS A FORWARDED GEOMETRY CAN BE LOCALLY IMPOSSIBLE, and neither
+    may be answered by adjusting the geometry:
 
-      * the rank's own prefix is not the scheduled one. The admission loop
-        clamps `prefix_indices` to the schedule before the adder ever sees the
-        request, and `reconcile_pp_admission_decision` retracts anything it
-        cannot reach, so this is unreachable on a healthy pass -- which is
-        exactly why it is checked. A silent re-clamp here would be the same
-        local narrowing this module exists to abolish.
       * the request does not have the tokens. `prefix + extend` past
         `full_untruncated_fill_ids` cannot be filled from anything this rank
         holds.
       * a NEGATIVE extend. Not merely unrunnable -- unrepresentable, so it can
         only mean a malformed decision.
+
+    THE PREFIX CLAUSE IS GONE (#968, 2026-09-01). `local_prefix_len !=
+    scheduled_prefix_len` used to be refused here; it is now EXECUTED by
+    `execute_scheduled_prefix` (truncate down / materialise up from the host
+    tier), which runs before this check and either establishes equality or
+    stops the group loudly. Refusing it voided the pass rank-locally and
+    starved the ring (trainA/B/B2, 2026-09-01) -- see that function's
+    docstring for the measurement.
 
     A ZERO EXTEND IS EXECUTABLE, and the change of mind is #791-core's own
     doing. Before the producer reported the EXECUTED geometry, a zero could
@@ -2354,21 +2573,13 @@ def schedule_refusal_reason(
     own is precisely what this module abolishes. See `_executed_extent`.
 
     The caller turns this into a voided pass (the #797 path), never into a
-    narrower batch. Pure: five integers in, a string or None out.
+    narrower batch. Pure: four integers in, a string or None out.
     """
     if scheduled_extend_len < 0:
         return (
             f"#791 FORWARDED SCHEDULE UNEXECUTABLE for rid={rid}: the decision "
             f"names extend_len={scheduled_extend_len}, which is not a length. "
             f"A downstream rank may not substitute one of its own."
-        )
-    if local_prefix_len != scheduled_prefix_len:
-        return (
-            f"#791 FORWARDED SCHEDULE UNEXECUTABLE for rid={rid}: the decision "
-            f"names prefix_len={scheduled_prefix_len}, this rank holds "
-            f"{local_prefix_len}. The batch geometry is the upstream's to "
-            f"decide; narrowing or widening it here is what pairs one "
-            f"microbatch's hidden states with another's metadata."
         )
     if scheduled_prefix_len + scheduled_extend_len > local_fill_len:
         return (
