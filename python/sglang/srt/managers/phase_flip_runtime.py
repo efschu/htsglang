@@ -10658,12 +10658,10 @@ class PhaseFlipRuntime:
         everything nulled and rebound first, then the residents re-enter
         through the ordinary intake path.
 
-        Sweeps the UNTOUCHED waiting queue first: every prefetch still
-        registered was opened pre-cutover and can only complete into the same
-        #937 refusal; one `_prefetch_kvcache` call retires the doomed record
-        and opens a fresh one (URC #939 retire-then-register). This replaces
-        the deleted #943b one-rid-per-round vote: whole population, no
-        collective, at the group-uniform event itself.
+        (#1070: the stale-op sweep that preceded the readmit here is deleted
+        -- it counted a constructively empty set; see the comment at its old
+        site below. The #943b vote's real replacement is the readmit's own
+        post-rebind intake prefetch plus the #937 refusal as safety net.)
 
         HONEST RESIDUAL: between the retraction (in `_release_residents_for_
         cutover`) and this call the retracted requests are owned by nobody.
@@ -10684,24 +10682,19 @@ class PhaseFlipRuntime:
                     len(stash[0]),
                 )
             return
-        swept = 0
-        tree = getattr(scheduler, "tree_cache", None)
-        ongoing = getattr(tree, "ongoing_prefetch", None) or {}
-        issue = getattr(scheduler, "_prefetch_kvcache", None)
-        if ongoing and callable(issue):
-            stale_rids = set(ongoing.keys())
-            for req in list(getattr(scheduler, "waiting_queue", []) or []):
-                if getattr(req, "rid", None) in stale_rids:
-                    try:
-                        issue(req)
-                        swept += 1
-                    except Exception:  # noqa: BLE001 - a sweep never strands a flip
-                        logger.warning(
-                            "%s #1066 stale-prefetch re-issue RAISED for %s",
-                            LOG_PREFIX,
-                            str(getattr(req, "rid", "?"))[:8],
-                            exc_info=True,
-                        )
+        # #1070: THE STALE-OP SWEEP THAT STOOD HERE IS DELETED -- it counted a
+        # constructively EMPTY set. It ran over waiting_queue BEFORE the
+        # readmit below, and the only population whose prefetch ops survive a
+        # cutover is exactly the residents the readmit has not yet requeued;
+        # their fresh fetch is issued by the readmit's own intake path
+        # (_add_request_to_queue -> _prefetch_kvcache). Ordinary queued
+        # requests' ops terminate within ~1 s under the 'timeout' drain and
+        # never straddle a cutover (measured 1068cap, F2a Bericht 2: swept=0
+        # in all 24 emissions). A #937 stale refusal remains the safety net
+        # for anything that ever does straddle: the request stays admissible
+        # (check_prefetch_progress reads True once the op is reaped) and
+        # re-fetches on its own admission. Second bookkeeping, deleted per
+        # the upstream-minimal order.
         released, n = (stash[0], stash[1]) if stash else ([], 0)
         readmitted = 0
         if released:
@@ -10732,12 +10725,11 @@ class PhaseFlipRuntime:
             )
         self._seam_readmitted = readmitted
         logger.info(
-            "%s #1066 POST-CUTOVER FRESH-FETCH after %s: swept %d stale "
-            "prefetch op(s) from the queue, re-admitted %d/%d resident(s), "
-            "all on the incoming binding.",
+            "%s #1066 POST-CUTOVER FRESH-FETCH after %s: re-admitted %d/%d "
+            "resident(s) on the incoming binding (their intake prefetch is "
+            "issued post-rebind; the pre-#1070 stale-op sweep is deleted).",
             LOG_PREFIX,
             direction,
-            swept,
             readmitted,
             n,
         )
