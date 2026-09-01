@@ -10490,6 +10490,31 @@ class Scheduler(
                         told = self._pp_admission_guard.prefix_len_for(
                             req.rid, len(req.prefix_indices)
                         )
+                        # #1058c: OBSERVE BEFORE THE CLAMP. Until here the
+                        # census's only observation point was the `else` arm
+                        # below -- the arm taken when NEITHER clamp is armed.
+                        # Row authority is the shipping default
+                        # (SGLANG_PP_ROW_AUTHORITY unset -> "1", pp_size>1),
+                        # so on every boot this campaign actually runs, THIS
+                        # branch is taken and the observation point was
+                        # unreachable. Measured: boot_855_1071cut printed
+                        # `evaluated=0 absent=0 agree=0 told_over=0
+                        # told_under=0` on ALL THREE ranks. `told_over=0` then
+                        # reads as "PP0 never overshot" while meaning "nobody
+                        # ever looked" -- on the ONE axis where rank
+                        # divergence is proven on metal (#944 told=8192
+                        # local=0; #984 told=8192 local=4096, 514x
+                        # UNEXECUTABLE -> 512 voids).
+                        #
+                        # BEFORE the truncate, and that ordering IS the
+                        # measurement: `truncate_prefix_to` sets
+                        # prefix_indices to `told`, so an observation taken
+                        # afterwards compares told against itself and reports
+                        # agree=100% by construction. Both operands are read
+                        # at the SAME point (this rank, this admission, pre-
+                        # clamp): `told` = PP0's published prefix for this
+                        # rid, local = what this rank actually holds.
+                        self._1058_note_told_vs_local(req, len(req.prefix_indices))
                         # #930: prefix_indices and cache_protected_len move
                         # TOGETHER. See Req.truncate_prefix_to.
                         req.truncate_prefix_to(told)
@@ -10497,6 +10522,9 @@ class Scheduler(
                         told = self._pp_admission_guard.prefix_len_for(
                             req.rid, len(req.prefix_indices)
                         )
+                        # #1058c: same observation, same reason, same ordering
+                        # as the row-authority arm above.
+                        self._1058_note_told_vs_local(req, len(req.prefix_indices))
                         # #930: prefix_indices and cache_protected_len move
                         # TOGETHER. See Req.truncate_prefix_to.
                         req.truncate_prefix_to(told)
