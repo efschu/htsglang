@@ -1203,6 +1203,21 @@ _dpc: DoublePrefillCensus | None = None
 _dpc_emitted = 0
 _dpc_suppressed = 0
 _dpc_over_bound_seen = 0
+#: #1154: has THIS wave's census emitted a line yet?
+#:
+#: The rate limit alone made the whole instrument unreachable. `_dpc_emitted`
+#: is a process-lifetime counter and the gate was `_dpc_emitted % every == 0`
+#: with `every` = the shared #904 knob, default 64 -- so the FIRST #939 line
+#: of a boot needed the 64th recording call. A boot whose seam re-admits a
+#: handful of requests per cutover never reaches it: measured on
+#: boot_855_weg1b2 (2026-09-02), two readmit waves, ZERO
+#: '[#939 double-prefill]' lines, and the acceptance read that absence as
+#: "half B is not wired" rather than as a rate limit it could not clear.
+#: The section-5 contract is ONE CENSUS PER CUTOVER, so the honest floor is
+#: one LINE per cutover wave: the first observation after a reset always
+#: emits, and the periodic sampling plus the always-on breach rule are kept
+#: unchanged on top of it.
+_dpc_wave_emitted = False
 # #1068 (G9): fence proceeds noted since the last reset (this cutover's
 # arm/preflight), and the seed the NEXT census is created with. ORDER in
 # `PhaseFlipRuntime._execute_body`: fence verdict -> cutover -> reset (ends the
@@ -1283,7 +1298,7 @@ def emit_double_prefill(logger) -> bool:
     cutover's whole readmit wave. `reset_double_prefill_census` is what ends
     a census, and only the cutover calls it.
     """
-    global _dpc_emitted, _dpc_suppressed, _dpc_over_bound_seen
+    global _dpc_emitted, _dpc_suppressed, _dpc_over_bound_seen, _dpc_wave_emitted
     census = _dpc
     if census is None or not census.observed:
         return False
@@ -1293,11 +1308,15 @@ def emit_double_prefill(logger) -> bool:
     breach = census.over_bound > _dpc_over_bound_seen
     _dpc_over_bound_seen = census.over_bound
     _dpc_emitted += 1
-    if breach or _dpc_emitted % every == 0:
+    # FIRST OF THE WAVE ALWAYS GOES OUT (#1154). Without this the denominator
+    # the periodic arm is supposed to supply never arrives on a low-volume
+    # boot, and the acceptance cannot tell "nothing was recomputed" from
+    # "the emitter never cleared its own rate limit".
+    first_of_wave = not _dpc_wave_emitted
+    if breach or first_of_wave or _dpc_emitted % every == 0:
+        _dpc_wave_emitted = True
         try:
-            logger.warning(
-                "%s suppressed=%d", census.format_line(), _dpc_suppressed
-            )
+            logger.warning("%s suppressed=%d", census.format_line(), _dpc_suppressed)
         except ValueError as exc:
             logger.error(
                 "[%s] BROKEN PARTITION -- the instrument is miscounting, do "
@@ -1319,8 +1338,14 @@ def reset_double_prefill_census() -> None:
     that never happened.
     """
     global _dpc, _dpc_over_bound_seen, _dpc_fence_pending, _dpc_fence_seed
+    global _dpc_wave_emitted
     _dpc = None
     _dpc_over_bound_seen = 0
+    # #1154: the next wave starts owing a line again. Reset here and NOT at
+    # census creation, because `reset_double_prefill_census` is the only thing
+    # that ends a census (the docstring above), so it is the only place where
+    # "a new cutover wave begins" is actually known.
+    _dpc_wave_emitted = False
     # #1068 (G9): the proceeds noted for THIS cutover seed the wave that
     # follows this reset; an unconsumed seed from a wave that never came is
     # overwritten here, never accumulated.
