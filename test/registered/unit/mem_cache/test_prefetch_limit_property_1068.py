@@ -1,19 +1,32 @@
-"""#1068 WEG 1 slice 2 (WEG1_BUILD_SPEC_0901 section 4.2): the speculative
-prefetch budget is the upstream ``buffer_only`` form -- a LIVE property of the
-bound host pool, and a rate brake on LIVE occupancy.
+"""#1068 WEG 1 slice 2 (WEG1_BUILD_SPEC_0901 section 4.2, corrected by the
+slice 2 review): the speculative prefetch budget is a LIVE property of the
+bound host pool (upstream buffer_only fraction for a staging tier, the
+cache-mode half for a retention tier), and the rate brake is the upstream
+CACHE-MODE form ``prefetch_tokens_occupied >= prefetch_capacity_limit`` in
+BOTH roles.
 
-THE DEFECT. ``prefetch_capacity_limit`` was a NUMBER stored once at storage
-attach (``prefetch_capacity_limit_for(mem_pool_host.size)``), and the rate
-brake compared the fork's own ``prefetch_tokens_occupied`` counter against
-it. The phase flip rebinds ``mem_pool_host`` to a pool 23x smaller (measured
-#905: 703472 rows PP vs 30518 TP), so the stored number described a pool the
-controller no longer held, and the fork answered with a floor
-(``PREFETCH_CAP_FLOOR_TOKENS``) and two symmetrize passes that re-derived the
-number at each site -- second bookkeeping beside the upstream truth
-(``upstream-minimal-statt-eigenbau``). Upstream (cache_controller.py:253 and
-:575-581) makes the limit ``int(fraction * mem_pool_host.size)`` and the brake
-``size - available_size() - write_staged >= limit`` (:1150-1163): no stored
-number, nothing to re-derive at a rebind.
+THE DEFECT (slice 2 as shipped). ``prefetch_capacity_limit`` was a NUMBER
+stored once at storage attach (``prefetch_capacity_limit_for``), and the
+phase flip rebinds ``mem_pool_host`` to a pool 23x smaller (measured #905:
+703472 rows PP vs 30518 TP), so the stored number described a pool the
+controller no longer held; the fork answered with a floor and two
+symmetrize passes -- second bookkeeping beside the upstream truth. Slice 2
+made the limit a property (kept here, T6) but transcribed the brake as the
+upstream ``buffer_only`` LIVE form, ``size - available_size() - staged >=
+limit``, unconditionally. Upstream dispatches that form on
+``host_memory_mode == "buffer_only"`` only, where the host pool is a
+transient buffer whose rows are freed once their storage write is acked.
+This fork's host tier RETAINS in both roles: ``_drain_backup``
+(unified_radix_cache.py) answers a storage ack with ``ring.release`` +
+``dec_host_lock_ref`` and never frees the rows, ``evict_host`` has no role
+branch, and ``available_size()`` is ``len(free_slots)``. On every warm tier
+the live form read ``used == size``, tripped permanently at 0.5 (retention,
+the default) or 0.9 (staging) of the pool, and refused every prefetch
+BEFORE ``prefetch_from_storage`` reached its alloc -> evict_host -> retry
+path -- store-read path B dead, every re-admission recomputing the whole
+prefix: the double-prefill class WEG 1 exists to remove. Three mutants
+survived the shipped suite (retention -> counter form; ``>=`` -> ``>``;
+attach not copying ``host_role``). T7 and T7b below pin all three.
 
 Hermetic: a controller shell built with ``__new__`` carries exactly the
 attributes the property and the brake read; a tree shell carries the
@@ -23,9 +36,13 @@ symmetric predicate. Nothing allocates.
         test/registered/unit/mem_cache/test_prefetch_limit_property_1068.py -q
 """
 
+import ast
 import inspect
+import textwrap
+import threading
 import types
 import unittest
+from unittest import mock
 
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -79,44 +96,139 @@ class TestTheLimitFollowsTheBoundPool(CustomTestCase):
         self.assertEqual(cc.prefetch_capacity_limit, 0)
 
 
-class TestRateLimitReadsLiveOccupancy(CustomTestCase):
-    """T7: the brake reads the pool's live occupancy minus what the
-    write-through ring has staged, never the fork's counter."""
+class TestRateLimitIsTheCounterForm(CustomTestCase):
+    """T7 (slice 2 fix, review finding B1): the brake is the upstream
+    CACHE-MODE form in BOTH roles -- ``prefetch_tokens_occupied >= limit``
+    (upstream cache_controller.py:1164-1166) -- because this fork's host
+    tier retains rows in both roles, so the buffer_only live form would
+    read ``used == size`` on every warm tier and refuse every prefetch
+    before ``prefetch_from_storage`` reaches alloc -> evict_host -> retry."""
 
-    def test_rate_limit_reads_live_occupancy_minus_write_staged(self):
-        cc = _controller("staging", _pool(TP_ROWS, available=10000))
-        cc.host_write_staged_tokens_fn = lambda: 5000
-        # The old gate's counter, deliberately at zero: if the brake still
-        # read it, it could never trip below.
+    def test_a_full_idle_pool_is_not_rate_limited(self):
+        """Red-first (1): warm tier, nothing registered. available_size()=0,
+        ring holds 0, counter 0 -> NOT limited. The live form read
+        used = 366211 >= 329589 here and parked store-read path B."""
+        cc = _controller("staging", _pool(TP_ROWS, available=0))
+        cc.host_write_staged_tokens_fn = lambda: 0
         cc.prefetch_tokens_occupied = 0
-        # used = 366211 - 10000 - 5000 = 351211 >= 329589
-        self.assertTrue(cc.prefetch_rate_limited())
-        cc.mem_pool_host = _pool(TP_ROWS, available=200000)
-        # used = 366211 - 200000 - 5000 = 161211 < 329589
         self.assertFalse(cc.prefetch_rate_limited())
-        # The pair that DISCRIMINATES the subtraction: raw occupancy sits
-        # 1622 rows above the limit, the ring holds 5000 of them.
-        cc.mem_pool_host = _pool(TP_ROWS, available=35000)
-        # used = 366211 - 35000 - 5000 = 326211 < 329589 -> not limited
+        cc.host_role = "retention"
         self.assertFalse(cc.prefetch_rate_limited())
-        cc.host_write_staged_tokens_fn = None
-        # used = 366211 - 35000 = 331211 >= 329589 -> limited
-        self.assertTrue(cc.prefetch_rate_limited())
 
-    def test_no_ring_means_nothing_is_subtracted(self):
-        cc = _controller("staging", _pool(TP_ROWS, available=40000))
-        cc.prefetch_tokens_occupied = 0
-        # used = 326211 < 329589
-        self.assertFalse(cc.prefetch_rate_limited())
-        cc.mem_pool_host = _pool(TP_ROWS, available=36000)
-        # used = 330211 >= 329589
-        self.assertTrue(cc.prefetch_rate_limited())
+    def test_the_counter_gates_in_both_roles(self):
+        """Red-first (2), kills mutant M-R1 (retention -> counter form,
+        staging -> live form): the counter is the gate in retention AND
+        staging, whatever the pool's live occupancy says."""
+        for role, limit in (
+            ("retention", int(0.5 * TP_ROWS)),
+            ("staging", int(0.9 * TP_ROWS)),
+        ):
+            with self.subTest(role=role):
+                cc = _controller(role, _pool(TP_ROWS, available=TP_ROWS))
+                cc.host_write_staged_tokens_fn = lambda: 0
+                cc.prefetch_tokens_occupied = limit + 1
+                self.assertTrue(cc.prefetch_rate_limited())
+                cc.prefetch_tokens_occupied = limit - 1
+                self.assertFalse(cc.prefetch_rate_limited())
 
-    def test_the_counter_alone_cannot_trip_the_brake(self):
-        """The fork counter stays an instrument; it no longer gates."""
+    def test_the_boundary_is_inclusive(self):
+        """Red-first (3), kills mutant M-R2: occupied == limit -> limited
+        (``>=``, upstream :1165), never ``>``."""
         cc = _controller("staging", _pool(TP_ROWS, available=TP_ROWS))
-        cc.prefetch_tokens_occupied = 10 * TP_ROWS
+        self.assertEqual(cc.prefetch_capacity_limit, 329589)
+        cc.prefetch_tokens_occupied = 329589
+        self.assertTrue(cc.prefetch_rate_limited())
+        cc.prefetch_tokens_occupied = 329588
         self.assertFalse(cc.prefetch_rate_limited())
+
+    def test_live_occupancy_and_the_ring_do_not_gate(self):
+        """The ring reader stays INSTALLED (staging_write_ring installs and
+        drops it, T9) but is not consulted by the brake until the staging
+        drain frees host rows after ack_backup. A reader that raises proves
+        it is not read."""
+
+        def _boom():
+            raise AssertionError("the brake read the ring")
+
+        cc = _controller("staging", _pool(TP_ROWS, available=0))
+        cc.host_write_staged_tokens_fn = _boom
+        cc.prefetch_tokens_occupied = 0
+        self.assertFalse(cc.prefetch_rate_limited())
+        cc.prefetch_tokens_occupied = 10 * TP_ROWS
+        self.assertTrue(cc.prefetch_rate_limited())
+
+    def test_the_brake_source_carries_no_live_form(self):
+        """Zombie guard: the buffer_only live form returns only WITH a role
+        dispatch AND a drain that frees rows after the ack -- never as an
+        unconditional transcription again."""
+        src = inspect.getsource(HiCacheController.prefetch_rate_limited)
+        fn = ast.parse(textwrap.dedent(src)).body[0]
+        # The docstring names the live form on purpose (it explains why it
+        # is absent); only the CODE body is under test.
+        body = [
+            node
+            for node in fn.body
+            if not (
+                isinstance(node, ast.Expr)
+                and isinstance(getattr(node, "value", None), ast.Constant)
+            )
+        ]
+        code = "\n".join(ast.unparse(node) for node in body)
+        self.assertNotIn("available_size()", code)
+        self.assertIn(
+            "self.prefetch_tokens_occupied >= self.prefetch_capacity_limit", code
+        )
+
+
+class TestAttachCopiesTheHostRole(CustomTestCase):
+    """T7b, kills mutant M-R4: ``attach_storage_backend`` copies the storage
+    config's ``host_role`` onto the controller -- the ONE reader of
+    --hicache-host-role -- and the budget fraction follows it. Without the
+    copy a staging boot silently runs the 0.5 retention fraction (its ring
+    sized to 0.5 x size instead of 0.1 x size), visible only in the L3
+    ``role=`` term. Green on the shipped tree by design; red under M-R4."""
+
+    def _shell(self):
+        cc = HiCacheController.__new__(HiCacheController)
+        cc.enable_storage = False
+        cc.host_role = "retention"
+        cc.page_size = 1
+        cc.mem_pool_host = _pool(TP_ROWS)
+        cc.storage_stop_event = threading.Event()
+        cc.host_write_staged_tokens_fn = None
+        for name in (
+            "_stop_storage_threads",
+            "_start_storage_threads",
+            "_create_prefetch_sync_groups",
+            "_destroy_prefetch_sync_groups",
+            "_maybe_register_draft_with_storage",
+        ):
+            setattr(cc, name, lambda: None)
+        cc._generate_storage_config = lambda *a, **k: types.SimpleNamespace(
+            host_role="staging",
+            dcp_owner_mode=False,
+            canonical_kv_page=None,
+            is_mla_model=False,
+            tp_rank=0,
+            extra_config={},
+        )
+        return cc
+
+    def test_attach_copies_host_role_and_the_fraction_follows(self):
+        cc = self._shell()
+        backend = types.SimpleNamespace(
+            register_mem_pool_host=lambda pool: None, close=lambda: None
+        )
+        with mock.patch(
+            "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend",
+            return_value=backend,
+        ):
+            cc.attach_storage_backend("file")
+        self.assertTrue(cc.enable_storage)
+        self.assertEqual(cc.host_role, "staging")
+        self.assertEqual(cc.prefetch_capacity_fraction, 0.9)
+        self.assertEqual(cc.prefetch_capacity_limit, 329589)
+        self.assertEqual(cc.prefetch_tokens_occupied, 0)
 
 
 class TestRatioSizingUnderSymmetricStorageIsRefused(CustomTestCase):

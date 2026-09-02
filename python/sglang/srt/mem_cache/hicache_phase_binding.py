@@ -552,8 +552,9 @@ def _quiesce_storage_io(cc: Any) -> bool:
 
     NO NEW MECHANISM: ``_stop_storage_threads`` / ``_start_storage_threads``
     already exist for exactly this (runtime detach/attach), and the stop half
-    already joins ``prefetch_io_aux_thread`` -- the half ``reset()`` hand-rolls
-    and omits. This uses them and adds nothing.
+    already joins ``prefetch_io_aux_thread`` -- the half the pre-#1068
+    ``reset()`` hand-rolled and omitted (since slice 2 ``reset()`` goes
+    through the same two helpers). This uses them and adds nothing.
 
     Returns True only when the caller MUST resume. A stop that did not
     complete returns False deliberately: threads are still alive on the old

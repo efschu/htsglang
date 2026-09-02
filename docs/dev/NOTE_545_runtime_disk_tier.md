@@ -158,10 +158,17 @@ component it owns. There is no partial-capability outcome to accept.
 `UnifiedRadixCache.attach_storage_backend` / `detach_storage_backend` are no
 longer stubs. They mirror the shipped `HiRadixCache` pair — same validation,
 same named refusals, same "same backend is success, different backend is a
-refusal rather than a silent swap" rule — with one addition this cache needs:
-`_symmetrize_prefetch_capacity()` after the config is applied.
+refusal rather than a silent swap" rule — with one addition this cache needed
+at the time: `_symmetrize_prefetch_capacity()` after the config is applied.
 
-**Why that addition is safe, which was the open question.** That method enters
+**Superseded by #1068 slice 2.** That method and its `HiRadixCache` twin are
+deleted. The prefetch budget is now the `prefetch_capacity_limit` property of
+the host pool the controller is bound to, rank-uniform under `--hicache-size`
+(MIN-synced rows), and ratio sizing under uneven DCP with `tp_world_size > 1`
+is refused by name at init (G8) instead of repaired with an all_reduce. The
+paragraph below records why the all_reduce was safe while it existed.
+
+**Why that addition was safe, which was the open question.** That method entered
 an **all_reduce** across DCP/TP ranks, and its own guard says a rank-local
 early return "would leave the other ranks in the all_reduce with no partner".
 A single-rank attach would hang. It cannot happen: attach fans out through

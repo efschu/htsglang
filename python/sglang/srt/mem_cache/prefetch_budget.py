@@ -3,7 +3,9 @@ speculative-prefetch budget, so that neither cache carries a twin.
 
 The budget itself is ``HiCacheController.prefetch_capacity_limit`` -- a
 property of the host pool the controller is bound to right now (upstream
-buffer_only form). What lives here:
+:575-584: the buffer_only fraction for a staging tier, the cache-mode half
+for a retention tier; the brake that consumes it is the upstream cache-mode
+counter form in both roles, see ``prefetch_rate_limited``). What lives here:
 
 * the G8 refusal: under uneven DCP with ``tp_world_size > 1`` the per-rank
   host pools are ratio-sized from per-rank DEVICE pools and therefore

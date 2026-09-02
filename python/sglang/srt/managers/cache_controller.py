@@ -611,6 +611,10 @@ class HiCacheController:
         # #1068 (upstream :331): live occupancy of the write-through staging
         # ring, installed by the tree when it builds its ring and cleared when
         # the ring is dropped. None means no ring, i.e. nothing is staged.
+        # Upstream's buffer_only brake subtracts it; this fork's brake does
+        # not read it yet (``prefetch_rate_limited`` says why). It is kept
+        # installed so that switch is one line when the staging drain frees
+        # host rows after the storage ack.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
@@ -887,10 +891,11 @@ class HiCacheController:
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             # #1068: the prefetch budget is the ``prefetch_capacity_limit``
-            # PROPERTY of the bound host pool; nothing is stored here.
-            # Instrument only (upstream keeps it too): the number of tokens
-            # currently locked by registered prefetches, updated by the main
-            # scheduler thread. The rate brake no longer reads it.
+            # PROPERTY of the bound host pool; nothing is stored here. This
+            # counter is the number of tokens currently locked by registered
+            # prefetches, updated by the main scheduler thread, and it is what
+            # ``prefetch_rate_limited`` compares against the property (the
+            # upstream cache-mode form; the method says why not the live one).
             self.prefetch_tokens_occupied = 0
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
@@ -2416,7 +2421,9 @@ class HiCacheController:
     @property
     def prefetch_capacity_limit(self) -> int:
         """The speculative-prefetch budget, in tokens, of the host pool the
-        controller is bound to RIGHT NOW (#1068, upstream buffer_only form).
+        controller is bound to RIGHT NOW (#1068; upstream :575-584 sizes it
+        the same way: the buffer_only fraction for a staging tier, the
+        cache-mode half otherwise).
 
         A property and not a number on purpose: the phase flip rebinds
         ``mem_pool_host`` (hicache_phase_binding._stamp), and a number stored
@@ -2432,22 +2439,40 @@ class HiCacheController:
         return int(self.prefetch_capacity_fraction * int(pool.size))
 
     def prefetch_rate_limited(self) -> bool:
-        """Refuse a new prefetch registration when the host pool is too full
-        (upstream cache_controller.py:1150-1163, buffer_only form).
+        """Refuse a new prefetch registration once the registered prefetches
+        hold the budget: ``prefetch_tokens_occupied >= prefetch_capacity_limit``
+        (upstream cache_controller.py:1164-1166, the cache-mode form), in
+        BOTH host roles.
 
-        Occupancy is read LIVE from the pool -- ``size - available_size()`` --
-        minus what the write-through staging ring currently holds (the ring's
-        tokens are the writer's, not the prefetcher's), and compared against
-        the property above. The fork's ``prefetch_tokens_occupied`` counter
-        is an instrument and does not gate: it counted registrations, never
-        rows, and it was the term the deleted floor had to lift.
+        WHY THE COUNTER AND NOT LIVE OCCUPANCY (slice 2 review, finding B1).
+        Upstream carries two forms and dispatches on ``host_memory_mode``: the
+        live form ``max(0, size - available_size() - write_staged) >= limit``
+        (:1155-1163) is for ``buffer_only``, where the host pool is a
+        TRANSIENT buffer and every row is freed once its storage write is
+        acked. This fork's host tier RETAINS in both roles:
+        ``UnifiedRadixCache._drain_backup`` answers a storage ack with
+        ``ring.release`` + ``dec_host_lock_ref`` and never frees the rows,
+        ``evict_host`` has no role branch, and ``available_size()`` is
+        ``len(free_slots)`` (memory_pool_host.py). On a warm tier the live
+        form therefore reads ``used == size``, trips permanently at 0.5
+        (retention, the default) or 0.9 (staging) of the pool, and refuses
+        every prefetch BEFORE ``prefetch_from_storage`` reaches its
+        alloc -> evict_host -> retry path: store-read path B dead, every
+        re-admission recomputing the whole prefix, the double-prefill class
+        WEG 1 exists to remove. Slice 2 shipped that form unconditionally and
+        its suite never pinned it (mutant retention -> counter form survived
+        20/20).
+
+        The live form becomes the right form for the staging role on the day
+        the staging drain frees host rows after ``ack_backup`` (transient
+        buffer = upstream buffer_only semantics). Until then
+        ``host_write_staged_tokens_fn`` stays installed by the ring
+        (staging_write_ring.py) and unread here, so that switch is one line
+        and one test, and ``prefetch_tokens_occupied`` is the gate: the
+        tokens locked by registered prefetches (written by the three tree
+        caches), zeroed at attach and in ``reset()``.
         """
-        pool = self.mem_pool_host
-        used = int(pool.size) - int(pool.available_size())
-        fn = self.host_write_staged_tokens_fn
-        if fn is not None:
-            used -= int(fn())
-        return used >= self.prefetch_capacity_limit
+        return self.prefetch_tokens_occupied >= self.prefetch_capacity_limit
 
     def _presence_pool_transfers(self) -> Optional[list[PoolTransfer]]:
         """The component transfers the REAL fetch carries, rebuilt for the probe.

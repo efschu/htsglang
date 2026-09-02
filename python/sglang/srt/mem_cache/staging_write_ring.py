@@ -290,8 +290,10 @@ def build_staging_write_ring(
 def install_staging_write_ring(tree: Any, server_args: Any) -> Optional[StagingWriteRing]:
     """#1068 (graft G2): (re)build the tree's ring against the host pool its
     controller is bound to NOW, and install the ring's live occupancy as the
-    controller's ``host_write_staged_tokens_fn`` -- the term the prefetch
-    rate brake subtracts (upstream cache_controller.py:1150-1163).
+    controller's ``host_write_staged_tokens_fn`` -- the term upstream's
+    buffer_only prefetch brake subtracts (cache_controller.py:1155-1163).
+    This fork's brake is the cache-mode counter form and does not read it
+    yet; ``HiCacheController.prefetch_rate_limited`` says why and when.
 
     Called at boot and after every cutover rebind: the read bound is a
     property of the bound pool, so the complement must follow the pool too.
