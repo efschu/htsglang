@@ -3531,8 +3531,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # `_OngoingPrefetch` because that record is a NamedTuple and is unpacked
         # positionally in five places.
         try:
-            _p = self.cache_controller.mem_pool_host
-            _p = getattr(getattr(_p, "anchor_entry", None), "host_pool", None) or _p
+            from sglang.srt.mem_cache.prefetch_budget import host_pool_anchor
+
+            _p = host_pool_anchor(self.cache_controller)
             operation._host_pool_id_at_reg = id(_p)
             operation._host_pool_epoch_at_reg = int(getattr(_p, "_clear_epoch", 0))
         except Exception:  # noqa: BLE001 - a diagnostic may never break a path
@@ -3577,6 +3578,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             bound_phase,
             current_generation,
         )
+        from sglang.srt.mem_cache.prefetch_budget import host_pool_anchor
 
         cc = self.cache_controller
         pool = getattr(cc, "mem_pool_host", None)
@@ -3604,7 +3606,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception:  # noqa: BLE001 - diagnostic only
             pass
         try:
-            _p = getattr(getattr(pool, "anchor_entry", None), "host_pool", None) or pool
+            _p = host_pool_anchor(cc)
             terms["pool_id"] = id(_p)
             terms["epoch"] = int(getattr(_p, "_clear_epoch", 0))
         except Exception:  # noqa: BLE001 - diagnostic only
@@ -3920,8 +3922,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # free-it-twice defect. Logged unconditionally (one line per completion,
         # this is a diagnostic boot) so the NEGATIVE case is visible too.
         try:
-            _p = self.cache_controller.mem_pool_host
-            _p = getattr(getattr(_p, "anchor_entry", None), "host_pool", None) or _p
+            from sglang.srt.mem_cache.prefetch_budget import host_pool_anchor
+
+            _p = host_pool_anchor(self.cache_controller)
             logger.warning(
                 "#905 PREFETCH-COMPLETE free-site: req=%s unclaimed_to=%d "
                 "completed=%d min_synced=%d | pool id now=%d epoch now=%d | "

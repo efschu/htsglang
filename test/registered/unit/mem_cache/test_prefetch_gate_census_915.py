@@ -531,11 +531,17 @@ class TestTheRatchetEveryReturnBehindTheGateIsNamed(CustomTestCase):
 
     @staticmethod
     def _is_note(node) -> bool:
-        return any(
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id == "_note_prefetch_gate"
-            for n in ast.walk(node)
+        """A DIRECT statement `_note_prefetch_gate(...)`, never a note buried
+        in a nested block of an earlier sibling. Slice 4 fix (review,
+        non-blocking): the first form walked `ast.walk` over the siblings, so
+        a bare `return` closing an `if` block counted as named whenever an
+        earlier sibling's INNER block carried a note -- the nested case in
+        `test_the_ratchet_can_fail` is that gap, red on af399f19c1."""
+        return (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "_note_prefetch_gate"
         )
 
     @classmethod
@@ -600,6 +606,24 @@ def f(reason, x):
         unnamed, n = self.unnamed_returns(bad)
         self.assertEqual(n, 3)
         self.assertEqual(unnamed, [7], "the bare return on line 7 must be caught")
+        # The nested shape: a note INSIDE an earlier sibling's block names
+        # nothing outside that block. RED on af399f19c1 (walked as named).
+        nested = """
+def f(reason, x):
+    _note_prefetch_gate(reason, 1)
+    y = x
+    if y:
+        if y > 1:
+            _note_prefetch_gate("inner", 1)
+        return
+"""
+        unnamed, n = self.unnamed_returns(nested)
+        self.assertEqual(n, 1)
+        self.assertEqual(
+            unnamed,
+            [8],
+            "a note inside an earlier sibling's block must not name line 8",
+        )
 
     def test_every_return_behind_the_gate_counts_a_term(self):
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -777,6 +801,112 @@ class TestAnUnnamedExitIsAnErrorLineNotARaise(_CleanCounts):
         self.assertEqual(PREFETCH_GATE_COUNTS.get("attempted_but_unregistered"), 41)
         self.assertEqual(PREFETCH_GATE_COUNTS.get("intake"), 41)
 
+
+
+# ---------------------------------------------------------------------------
+# #1068 slice 4 fix (spec A11.3): T20, bs > pool spans lands via evict_host.
+# ---------------------------------------------------------------------------
+
+SPAN = 4096
+
+
+class _SpanPool(_HostPool):
+    """T20 (spec A11.3): room is CONSUMED by an alloc and RETURNED only by
+    `evict`, and `evict` frees the rows of COMPLETED spans only. That is the
+    tree's lock law in one stub: a span in flight holds the host lock its
+    registration took (`inc_host_lock_ref(last_host_node)`) until
+    `check_prefetch_progress` drops it after PREFETCH-COMPLETE
+    (unified_radix_cache.py: `dec_host_lock_ref(last_host_node,
+    anchor_lock_params)` right after the two generation-stamped frees), and
+    `evict_host` walks only unlocked host leaves."""
+
+    def __init__(self, spans: int):
+        super().__init__(available=spans * SPAN)
+        self.live = []
+        self.completed = set()
+        self.evicts = []
+
+    def alloc(self, n: int):
+        self.allocs.append(n)
+        if n > self.available:
+            return None
+        self.available -= n
+        self.live.append(n)
+        return list(range(n))
+
+    def complete(self, i: int) -> None:
+        self.completed.add(i)
+
+    def evict(self, need: int) -> int:
+        self.evicts.append(need)
+        freed = 0
+        for i, n in enumerate(self.live):
+            if freed >= need:
+                break
+            if i in self.completed and n > 0:
+                freed += n
+                self.available += n
+                self.live[i] = 0
+        return freed
+
+
+class TestExcessRequestsLandAfterEvictHost(_CleanCounts):
+    """T20 (spec A11.3, slice 4): bs > pool spans. The (k+1)-th issued span
+    lands WITHOUT truncation once an earlier span has completed: the
+    truncation retry in `prefetch_from_storage` calls `evict_host(need)`
+    before its second alloc, and a completed span's host rows are evictable
+    because the tree drops its lock after PREFETCH-COMPLETE.
+
+    CHARACTERISATION PIN, not red-first (spec A11.3 says so for this case):
+    both halves exist on the parent 228a66db32 -- the retry (`evict_host`
+    before the second alloc) and the lock release (check_prefetch_progress,
+    `dec_host_lock_ref` after the frees). The pin turns a later change that
+    keeps loaded rows locked beyond the load, or drops the evict before the
+    retry, into a failure here before a boot has to show a '#915 PREFETCH
+    TRUNCATED' line for requests beyond the pool. The control case shows the
+    pin can fail (desk-written-never-executed)."""
+
+    def _tree_with(self, pool: _SpanPool):
+        tree = _serving_tree(available=0)
+        tree.cache_controller.mem_pool_host = pool
+        tree.evict_host = pool.evict
+        return tree
+
+    def test_excess_requests_land_after_evict_host_not_truncated(self):
+        pool = _SpanPool(spans=2)
+        tree = self._tree_with(pool)
+        tree.prefetch_from_storage("r1", _node(), list(range(SPAN)))
+        tree.prefetch_from_storage("r2", _node(), list(range(SPAN)))
+        self.assertEqual(pool.available, 0)
+        pool.complete(0)  # r1 completed: its rows are no longer lock-protected
+        tree.prefetch_from_storage("r3", _node(), list(range(SPAN)))
+        for rid in ("r1", "r2", "r3"):
+            self.assertIn(rid, tree.ongoing_prefetch)
+        self.assertEqual(len(tree.ongoing_prefetch["r3"].prefetch_key), SPAN)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated", 0), 0)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_exhausted", 0), 0)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("attempted"), 3)
+        # the third span: one failed alloc, ONE evict of exactly `need`, one
+        # successful alloc -- the retry shape, not a truncation
+        self.assertEqual(pool.allocs, [SPAN, SPAN, SPAN, SPAN])
+        self.assertEqual(pool.evicts, [SPAN])
+        self.assertEqual(tree.cache_controller.prefetch_tokens_occupied, 3 * SPAN)
+
+    def test_an_uncompleted_span_stays_locked_and_the_excess_request_is_refused(self):
+        """Control: with NO completed span nothing is evictable, so the
+        third request is refused BY NAME (host_pool_exhausted: 0 rows of
+        room is under the threshold), never silently and never registered."""
+        pool = _SpanPool(spans=2)
+        tree = self._tree_with(pool)
+        tree.prefetch_from_storage("r1", _node(), list(range(SPAN)))
+        tree.prefetch_from_storage("r2", _node(), list(range(SPAN)))
+        with self.assertLogs(TREE_LOGGER, level="WARNING") as cm:
+            tree.prefetch_from_storage("r3", _node(), list(range(SPAN)))
+        self.assertNotIn("r3", tree.ongoing_prefetch)
+        self.assertEqual(pool.evicts, [SPAN])
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_exhausted"), 1)
+        self.assertEqual(len(_lines(cm, "#915 PREFETCH REFUSED")), 1)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated", 0), 0)
 
 if __name__ == "__main__":
     unittest.main()

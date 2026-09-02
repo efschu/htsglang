@@ -47,13 +47,24 @@ def refuse_ratio_sized_pools_under_symmetric_prefetch(
     )
 
 
-def host_pool_identity(cache_controller: Any) -> int:
-    """``id()`` of the KV host pool a controller is bound to, unwrapping a
-    pool group to its anchor entry the way the prefetch registration stamp
-    does (unified_radix_cache.py, ``_host_pool_id_at_reg``)."""
+def host_pool_anchor(cache_controller: Any) -> Any:
+    """The KV host pool a controller is bound to, a pool GROUP unwrapped to
+    its anchor entry's pool (``None`` when no pool is bound).
+
+    ONE unwrap for every reader that stamps or prints the pool identity: the
+    prefetch registration stamp (``_host_pool_id_at_reg``), the
+    PREFETCH-COMPLETE free-site diagnostic, the #915 L1/L2 terms and
+    ``host_pool_identity`` (slice 4 fix: those were four copies of the same
+    two lines, the A12.5 cleanup candidate)."""
     pool = getattr(cache_controller, "mem_pool_host", None)
     anchor = getattr(getattr(pool, "anchor_entry", None), "host_pool", None)
-    return id(anchor or pool)
+    return anchor or pool
+
+
+def host_pool_identity(cache_controller: Any) -> int:
+    """``id()`` of the KV host pool a controller is bound to (see
+    ``host_pool_anchor``)."""
+    return id(host_pool_anchor(cache_controller))
 
 
 def log_prefetch_limit(cache_controller: Any, *, site: str) -> None:

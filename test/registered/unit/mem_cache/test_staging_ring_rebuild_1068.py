@@ -142,5 +142,52 @@ class TestTheRingIsRebuiltAtRebind(CustomTestCase):
         )
 
 
+    def test_a_failed_rebuild_after_the_committed_rebind_is_counted_not_raised(self):
+        """Slice 4 fix (spec A12.5, the log-vs-raise decision): a rank whose
+        ring could not be rebuilt after the COMMITTED rebind keeps running --
+        no raise (the seam's `rebind_for_cutover` handler would only report
+        the committed rebind as refused, the #861c form) -- and the failure
+        is COUNTED under the #915 key `staging_ring_rebuild_failed` (a
+        cutover-level key, not part of the intake partition) and spoken as
+        ONE ERROR line naming the term, the phase and the generation. RED on
+        af399f19c1: no key, and the line named no term."""
+        from sglang.srt.mem_cache.match_refusal_census import (
+            PREFETCH_CUTOVER_KEYS,
+            PREFETCH_GATE_COUNTS,
+            PREFETCH_INTAKE_PARTITION,
+        )
+
+        PREFETCH_GATE_COUNTS.clear()
+        try:
+            tree, cc = _tree(TP_ROWS)
+
+            def failing_rebuild(server_args):
+                raise RuntimeError("ring refused")
+
+            tree.rebuild_staging_write_ring = failing_rebuild
+            scheduler = types.SimpleNamespace(
+                server_args=types.SimpleNamespace(hicache_host_role="staging")
+            )
+            readers = {"scheduler": scheduler, "tree_cache": tree, "cache_controller": cc}
+            with self.assertLogs(hpb.logger, level="ERROR") as logs:
+                hpb.rebuild_staging_ring_after_rebind(readers, scheduler)
+            lines = [m for m in logs.output if "STAGING RING REBUILD FAILED" in m]
+            self.assertEqual(len(lines), 1, logs.output)
+            for term in (
+                "term=staging_ring_rebuild_failed",
+                "COMMITTED",
+                "ring refused",
+                "phase=",
+                "generation=",
+                "n=1",
+            ):
+                self.assertIn(term, lines[0])
+            self.assertEqual(PREFETCH_GATE_COUNTS.get("staging_ring_rebuild_failed"), 1)
+            self.assertIn("staging_ring_rebuild_failed", PREFETCH_CUTOVER_KEYS)
+            self.assertNotIn("staging_ring_rebuild_failed", PREFETCH_INTAKE_PARTITION)
+        finally:
+            PREFETCH_GATE_COUNTS.clear()
+
+
 if __name__ == "__main__":
     unittest.main()

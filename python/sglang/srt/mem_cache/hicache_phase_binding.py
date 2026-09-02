@@ -744,12 +744,36 @@ def rebuild_staging_ring_after_rebind(readers: dict, scheduler: Any) -> None:
     """#1068 (G2): rebuild the tree's staging ring against the pool the
     readers were just bound to, then emit L3 from the live budget property.
 
-    A tree without the hook (plain RadixCache) is skipped; a failure is
-    logged and never raised, because the target rebind is COMMITTED at this
-    point and a ring refusal is a strictly smaller failure than an
-    un-reported torn binding. (Whether a rank-local ring failure after a
-    committed rebind should raise instead is the slice-4 refusal sweep's
-    decision, spec A12.5; not changed here.)
+    A tree without the hook (plain RadixCache) is skipped. A failed rebuild
+    after the committed rebind is COUNTED AND LOGGED, NOT RAISED. Decided by
+    the slice 4 refusal sweep (spec A12.5), on three grounds, each one
+    sufficient:
+
+    1. A raise here would not crash-stop. The one caller
+       (`phase_flip_runtime._cutover`, the `rebind_for_cutover` try/except)
+       catches every exception out of the rebind, prints '#719 HiCache
+       rebind refused' and continues the flip -- so a raise would report a
+       COMMITTED rebind as refused (the #861c misattribution, the same
+       reason the draft half and the canonical windows are logged as
+       themselves in `_rebind_for_cutover_inner`) and leave the identical
+       state behind. Crash-stop semantics at the seam are the seam's
+       decision (A12.4(c) changed the seam's own function for the reset
+       failure), not this helper's.
+    2. The state left behind is not a rank disagreement. The ring's inputs
+       are rank-uniform by construction (staging_write_ring.py
+       `build_staging_write_ring`: the role from server_args, the tier size
+       and the budget property of the MIN-synced pool), and a torn binding
+       is refused by `coherence_check` before this runs; a rebuild that
+       fails here fails the same way on every rank, and what every rank then
+       runs is write-through WITHOUT its bound -- the pre-slice-2 state
+       (test_staging_ring_rebuild_1068: the ring was nulled at every cutover
+       and never rebuilt), a named degradation until the next rebuild.
+    3. It is visible where the acceptance reads: the #915 census key
+       `staging_ring_rebuild_failed` (match_refusal_census
+       PREFETCH_CUTOVER_KEYS, printed on every '[#915 prefetch-gate]' line;
+       a cutover-level key, NOT part of PREFETCH_INTAKE_PARTITION) and the
+       ERROR line below, which names the term, the phase, the generation and
+       the running count. Expected 0 on a sized boot.
 
     L3 ('#915 PREFETCH LIMIT') is emitted on EVERY path once the hook ran,
     the failed rebuild included: the budget property is valid regardless of
@@ -763,12 +787,24 @@ def rebuild_staging_ring_after_rebind(readers: dict, scheduler: Any) -> None:
     try:
         rebuild(getattr(scheduler, "server_args", None))
     except Exception as exc:  # noqa: BLE001 - a ring refusal is not a rebind refusal
+        from sglang.srt.mem_cache.match_refusal_census import (
+            PREFETCH_GATE_COUNTS,
+            note_prefetch_gate,
+        )
+
+        note_prefetch_gate("staging_ring_rebuild_failed")
         logger.error(
-            "%s the rebind COMMITTED, but the #810 staging ring could not be "
+            "%s #915 STAGING RING REBUILD FAILED after the COMMITTED rebind "
+            "phase=%s generation=%d: the #810 staging ring could not be "
             "rebuilt against the incoming host pool (%s). Write-through runs "
-            "without its bound until the next successful rebuild.",
+            "WITHOUT its bound until the next successful rebuild; "
+            "term=staging_ring_rebuild_failed n=%d (this process, all "
+            "cutovers). Not raised: see the docstring.",
             LOG_PREFIX,
+            bound_phase(),
+            int(current_generation()),
             exc,
+            int(PREFETCH_GATE_COUNTS.get("staging_ring_rebuild_failed", 0)),
         )
     finally:
         from sglang.srt.mem_cache.prefetch_budget import log_prefetch_limit

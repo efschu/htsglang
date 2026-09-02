@@ -2442,75 +2442,6 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
-    def reread_pages_into(
-        self, hash_values, host_indices, prefix_keys=None, label: str = "#939-reread"
-    ) -> int:
-        """#939: re-read pages BY CONTENT KEY into slots of the CURRENT tier.
-
-        The #939 order's own form: on a stale refusal, re-issue the read under
-        the binding that is current now instead of recomputing the prefix. This
-        is deliberately NOT a second mover for the same payload (`ein-job-ein-
-        mover`): it drives `page_get_func`, the exact dispatch `_page_transfer`
-        uses, so the layout-correct reader stays the only one that ever writes
-        a page into a host tier.
-
-        Why re-reading and not moving the bytes we already hold: BOOT-MEASURED
-        2026-08-30 (boot_855_939rehome), a host->host copy across a flip raised
-        `shape '[2,16,1,4,256]' is invalid for input of size 16384/8192` on all
-        15 attempts -- the PP-phase and TP-phase tiers shard differently, so
-        carrying a span across is a RESHARD, not a relocation. The store is
-        geometry-neutral (#706, "cut only at read time"), verified on that same
-        boot as a single key suffix across 666 KV + 171 mamba keys, so the
-        destination tier can simply read the same keys itself.
-
-        Returns the number of tokens successfully read (a multiple of
-        page_size), 0 on any failure. Never raises: the caller's contract is
-        that a 0 leaves the #937 refusal standing.
-        """
-
-        class _RereadOp:
-            """Minimal operation shim: `page_get_func` needs exactly these two."""
-
-            request_id = label
-
-            def __init__(self):
-                self.completed_tokens = 0
-
-            def increment(self, num_tokens: int) -> bool:
-                self.completed_tokens += num_tokens
-                return True
-
-        op = _RereadOp()
-        # Copy: `_page_transfer` appends to this list as it walks batches, and
-        # mutating the caller's list would be a side effect on the tree's state.
-        keys = list(prefix_keys) if prefix_keys else None
-        try:
-            for i in range(0, len(hash_values), STORAGE_BATCH_SIZE):
-                batch_hashes = hash_values[i : i + STORAGE_BATCH_SIZE]
-                batch_host_indices = host_indices[
-                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
-                ]
-                before = op.completed_tokens
-                self.page_get_func(
-                    op,
-                    batch_hashes,
-                    batch_host_indices,
-                    HiCacheStorageExtraInfo(prefix_keys=keys),
-                )
-                if op.completed_tokens != before + len(batch_hashes) * self.page_size:
-                    # Short read: stop at the contiguous prefix that landed.
-                    break
-                if keys is not None:
-                    keys += batch_hashes
-        except Exception:  # noqa: BLE001 - a failed re-read may never break the path
-            logger.warning(
-                "#939 RE-READ RAISED (%s): returning 0 so the #937 refusal stands.",
-                label,
-                exc_info=True,
-            )
-            return 0
-        return int(op.completed_tokens)
-
     def prefetch_io_aux_func(self):
         """
         Auxiliary function conducting IO operations for prefetching.
@@ -2530,15 +2461,19 @@ class HiCacheController:
         in no health probe. Storage prefetch was simply dead from then on.
 
         THE UNDERLYING DEFECT IS NOT FIXED HERE and this guard must not be
-        mistaken for its fix. Two lines above that traceback the log carries
-        the fork's own diagnosis of the same mismatch --
+        mistaken for its fix. Two lines above that traceback the log of boot
+        22 carried the fork's own diagnosis of the same mismatch -- the
         `#939 RE-HOME VIA RE-READ ... source page 16384 elems vs destination
-        page 32768 elems` -- alongside `[#719 hicache-rebind] rebound 3
-        reader(s) to the 'tp' pools (generation 3)`. The host pool carries TWO
-        page geometries across a flip; the #939 re-home path knows both and
-        re-reads, this path does not. That is the #718/#719/#875 family and a
-        violation of the standing phase-uniformity law (two geometries for one
-        key is a bug). It is its own posten.
+        page 32768 elems` line of the re-homing pass that existed until
+        af399f19c1 (#1068 slice 4 deleted it as second bookkeeping beside the
+        slice-3 re-issue; `reread_pages_into`, its only reader in this file,
+        went with it in the slice 4 fix) -- alongside `[#719 hicache-rebind]
+        rebound 3 reader(s) to the 'tp' pools (generation 3)`. The host pool
+        carries TWO page geometries across a flip. That is the
+        #718/#719/#875 family and a violation of the standing
+        phase-uniformity law (two geometries for one key is a bug). It is
+        its own posten; nothing in this file re-reads across geometries any
+        more, so the line above is HISTORY, not a line to look for.
 
         WHY A BROAD `except` IS DEFENSIBLE HERE, given that warn-then-continue
         is a catalogued defect class in this tree: the comparison is not
@@ -2587,9 +2522,9 @@ class HiCacheController:
                     "the thread and storage prefetch died silently for the rest "
                     "of the boot). Failures on this thread so far: %d. A "
                     "reshape/geometry error here is the two-geometry host pool "
-                    "across a flip -- see the '#939 RE-HOME VIA RE-READ ... "
-                    "source page N elems vs destination page M elems' line, "
-                    "which is the same mismatch handled correctly elsewhere.",
+                    "across a flip (#718/#719/#875 family: the page this "
+                    "operation reads was minted under a host tier geometry "
+                    "other than the one bound now).",
                     n_failed,
                     exc_info=True,
                 )
@@ -2921,7 +2856,45 @@ class HiCacheController:
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
-                    self.append_host_mem_release(operation.host_indices)
+                    # #1068 (A12.5 addition, decided in the slice 4 fix): the
+                    # LOST-REVOKE-AT-QUIESCE candidate is MOOT on every
+                    # re-entry of `_start_storage_threads`. The candidate: a
+                    # TERMINATED operation drained here after the stop lands
+                    # on the revoke queue and on the release queue, then
+                    # `_start_storage_threads` rebuilds both queues, the revoke
+                    # is lost, and a tree record that survived would reach
+                    # `check_prefetch_progress` and free the same slots a
+                    # second time (#989 class). No record survives, by the seam
+                    # order in `phase_flip_runtime._execute_body` (the whole
+                    # seam runs on the scheduler thread, the only issuer):
+                    #   1. `_release_residents_for_cutover` -> `_drop_tree` ->
+                    #      `drop_prefix_tree_returning_rows` -> `tree.reset()`
+                    #      -> `UnifiedRadixCache._reset_full`: ongoing_prefetch
+                    #      = {} BEFORE `cache_controller.reset()` (stop, then
+                    #      `_start_storage_threads`), then
+                    #      `mem_pool_host.clear()`. Records gone, the pool
+                    #      forgets every allocation: a revoke or a release lost
+                    #      with the old queues names nothing.
+                    #   2. `_cutover_fn` -> `rebind_for_cutover` ->
+                    #      `_quiesce_storage_io` / `_resume_storage_io`
+                    #      (hicache_phase_binding.py): the queues rebuilt in
+                    #      step 1 are still EMPTY -- nothing between step 1 and
+                    #      the rebind calls `prefetch_from_storage` (the
+                    #      pre-cutover fns are the labelled movers; re-admission
+                    #      is `_post_cutover_readmit`, AFTER the rebind) -- so
+                    #      this branch drains no operation at that quiesce.
+                    #   3. `attach_storage_backend` starts the first pipeline;
+                    #      there is no predecessor to drain.
+                    # The release is stamped with the operation's binding
+                    # generation all the same, as the aux loop and
+                    # `_drain_revoke` already do (W35 sibling): a producer that
+                    # names slots without its generation is the shape W35
+                    # measured, and the stamp is a no-op while the generation
+                    # is current.
+                    self.append_host_mem_release(
+                        operation.host_indices,
+                        generation=getattr(operation, "binding_generation", None),
+                    )
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )

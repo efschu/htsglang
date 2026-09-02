@@ -304,6 +304,15 @@ PREFETCH_INTAKE_PARTITION = (
     "unreported",
 )
 
+#: #1068 (slice 4 fix, spec A12.5): CUTOVER-LEVEL keys. They live in the same
+#: dict so they print on the same '[#915 prefetch-gate]' line, and they are
+#: part of NO per-call partition (one per cutover event, never per intake):
+#: `staging_ring_rebuild_failed` -- hicache_phase_binding.
+#: rebuild_staging_ring_after_rebind could not rebuild the write-through ring
+#: after a COMMITTED rebind; write-through runs without its bound until the
+#: next rebuild (logged, not raised; the docstring there says why).
+PREFETCH_CUTOVER_KEYS = ("staging_ring_rebuild_failed",)
+
 
 def note_prefetch_gate(reason: Optional[str], tokens: int = 0) -> None:
     """Record one prefetch-gate verdict. ``None`` means the prefetch ran.
