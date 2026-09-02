@@ -747,7 +747,14 @@ def rebuild_staging_ring_after_rebind(readers: dict, scheduler: Any) -> None:
     A tree without the hook (plain RadixCache) is skipped; a failure is
     logged and never raised, because the target rebind is COMMITTED at this
     point and a ring refusal is a strictly smaller failure than an
-    un-reported torn binding.
+    un-reported torn binding. (Whether a rank-local ring failure after a
+    committed rebind should raise instead is the slice-4 refusal sweep's
+    decision, spec A12.5; not changed here.)
+
+    L3 ('#915 PREFETCH LIMIT') is emitted on EVERY path once the hook ran,
+    the failed rebuild included: the budget property is valid regardless of
+    the ring, and the acceptance counts exactly one budget line per cutover
+    (slice 2 review round 3, non-blocking note).
     """
     tree = readers.get("tree_cache")
     rebuild = getattr(tree, "rebuild_staging_write_ring", None)
@@ -763,10 +770,10 @@ def rebuild_staging_ring_after_rebind(readers: dict, scheduler: Any) -> None:
             LOG_PREFIX,
             exc,
         )
-        return
-    from sglang.srt.mem_cache.prefetch_budget import log_prefetch_limit
+    finally:
+        from sglang.srt.mem_cache.prefetch_budget import log_prefetch_limit
 
-    log_prefetch_limit(readers.get("cache_controller"), site="rebind_for_cutover")
+        log_prefetch_limit(readers.get("cache_controller"), site="rebind_for_cutover")
 
 
 def current_generation() -> int:

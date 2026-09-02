@@ -90,9 +90,15 @@ class TestTheLimitFollowsTheBoundPool(CustomTestCase):
         with self.assertRaises(AttributeError):
             cc.prefetch_capacity_limit = 5
 
-    def test_no_host_pool_means_no_budget(self):
+    def test_no_host_pool_is_a_named_raise_not_a_silent_zero(self):
+        """Slice 2 fix 3 (A12.4, #606 class): with no host pool bound the
+        property RAISES by name. A silent 0 would make prefetch_rate_limited
+        read True forever and refuse every prefetch without a line."""
         cc = _controller("staging", None)
-        self.assertEqual(cc.prefetch_capacity_limit, 0)
+        with self.assertRaises(RuntimeError) as ctx:
+            cc.prefetch_capacity_limit
+        self.assertIn("#1068", str(ctx.exception))
+        self.assertIn("no host pool bound", str(ctx.exception))
 
 
 class TestRateLimitIsTheCounterForm(CustomTestCase):

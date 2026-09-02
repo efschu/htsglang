@@ -93,6 +93,12 @@ def _controller(stop_event, joins):
     cc.backup_thread = _ThreadStub("backup", stop_event, joins)
     cc.prefetch_io_aux_thread = _ThreadStub("prefetch_io_aux", stop_event, joins)
     cc.prefetch_tokens_occupied = 4096
+    # Slice 2 fix 3 (A12.4): the stop helper terminates in-flight work through
+    # these four fields before it joins; the shell carries them empty.
+    cc._prefetch_current = None
+    cc._prefetch_io_current = None
+    cc._prefetch_drained_after_stop = 0
+    cc._prefetch_io_drained_after_stop = 0
     return cc
 
 

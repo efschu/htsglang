@@ -805,6 +805,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._host_insert_refused_unbacked_parent = 0
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # #1068 (A12.4): clearing this dict drops the tree's RECORDS only; the
+        # operations behind them are terminated by `cache_controller.reset()`
+        # below, whose `_stop_storage_threads` marks every operation the
+        # controller still holds (both queues plus the two loops' current
+        # operations) BEFORE it joins. A record whose operation is in none of
+        # those places has already completed or been revoked. Delegating is
+        # deliberate: walking the records here would be a second terminate
+        # pass over the same operations, and the controller's view is the one
+        # the join bound depends on.
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         # #939: prefetch records displaced by a RE-ISSUE of the same req_id.
         # They are terminated but NOT freed here -- see `_retire_ongoing_prefetch`.

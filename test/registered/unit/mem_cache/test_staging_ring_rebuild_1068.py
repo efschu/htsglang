@@ -118,6 +118,29 @@ class TestTheRingIsRebuiltAtRebind(CustomTestCase):
         readers = {"scheduler": scheduler, "tree_cache": object(), "cache_controller": None}
         hpb.rebuild_staging_ring_after_rebind(readers, scheduler)
 
+    def test_l3_is_emitted_even_when_the_ring_rebuild_fails(self):
+        """Slice 2 fix 3 (review round 3, non-blocking note): a failed ring
+        rebuild after a committed rebind still emits the '#915 PREFETCH
+        LIMIT' line, so the acceptance can count exactly one budget line per
+        cutover. Before: the error path returned before L3."""
+        tree, cc = _tree(TP_ROWS)
+
+        def failing_rebuild(server_args):
+            raise RuntimeError("ring refused")
+
+        tree.rebuild_staging_write_ring = failing_rebuild
+        scheduler = types.SimpleNamespace(
+            server_args=types.SimpleNamespace(hicache_host_role="staging")
+        )
+        readers = {"scheduler": scheduler, "tree_cache": tree, "cache_controller": cc}
+        from sglang.srt.mem_cache import prefetch_budget
+
+        with self.assertLogs(prefetch_budget.logger, level="INFO") as logs:
+            hpb.rebuild_staging_ring_after_rebind(readers, scheduler)
+        self.assertEqual(
+            len([m for m in logs.output if "#915 PREFETCH LIMIT" in m]), 1, logs.output
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -289,16 +289,45 @@ class PrefetchOperation(StorageOperation):
 
 
 #: #1068 (WEG 1 slice 2): the speculative-prefetch budget in the upstream
-#: ``buffer_only`` form (upstream cache_controller.py:253 and :575-584).
-#: A STAGING host tier lends this fraction of its rows to prefetch; the
-#: remainder is the write-through ring's capacity (staging_write_ring.py).
+#: ``buffer_only`` form (upstream c66a285c94 cache_controller.py:253 and
+#: :575-584). A STAGING host tier lends this fraction of its rows to
+#: prefetch; the remainder is the write-through ring's capacity
+#: (staging_write_ring.py).
 HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
-#: A RETENTION host tier (upstream "cache mode", the else branch of :575-584)
-#: keeps half for prefetch. Neither number is a stored quantity: see
+#: A RETENTION host tier (upstream "cache mode", the else branch of upstream
+#: c66a285c94 :575-584) keeps half for prefetch. The upstream literal is
+#: 0.5; the name is this fork's (A12.5: no rename, the SHA carries the
+#: provenance). Neither number is a stored quantity: see
 #: ``HiCacheController.prefetch_capacity_limit``, a property of the pool the
 #: controller is bound to RIGHT NOW, so a phase rebind that swaps
 #: ``mem_pool_host`` needs no re-derivation pass and no floor.
 HICACHE_CACHE_MODE_LOAD_FRACTION = 0.5
+
+#: #1068 (WEG 1 slice 2 fix 3, spec A12.4): the bound, in seconds, that
+#: ``HiCacheController._stop_storage_threads`` gives EACH storage thread to
+#: leave its loop AFTER every in-flight prefetch operation has been
+#: terminated. The bound is meant to hold by construction: a terminated
+#: operation aborts ``_page_transfer`` at the next 128-page batch boundary
+#: (~4 MiB, milliseconds) and ``_storage_hit_query`` at the next batch of
+#: ``batch_exists``; without the termination a 39365-token span in flight at
+#: the cutover needed ~12.6 s at the spec's N5 rate (0.32 s/KiToken) and
+#: outlived any bound of this size (review finding (d)). A thread that is
+#: STILL alive after this bound is a torn pipeline, which is the
+#: raenge-nie-uneins crash-stop form: the helper raises, it never returns.
+STORAGE_THREAD_JOIN_BOUND_S = 10.0
+
+
+class StorageStopResult(NamedTuple):
+    """What ``_stop_storage_threads`` did, for the ONE '#1068 RESET JOIN' line
+    ``reset()`` prints: which thread roles were joined, how many distinct
+    prefetch operations were terminated before the join, how many operations
+    the two loops still consumed after the stop event (each one cheap,
+    because terminated), and the seconds the joins took."""
+
+    threads: List[str]
+    terminated_ops: int
+    drained_ops: int
+    joined_s: float
 
 
 def canonical_identity_hash_for(server_args, canonical_page: bool) -> str:
@@ -639,6 +668,18 @@ class HiCacheController:
 
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
+        # #1068 (A12.4): the operation each storage loop is working on RIGHT
+        # NOW, one pointer per loop, written only by that loop. Together with
+        # the two queues this is the controller's complete view of in-flight
+        # prefetch work, which is what `_stop_storage_threads` terminates
+        # before it joins. Not a registry: an operation is here only while a
+        # loop holds it, and the tree's `ongoing_prefetch` stays the record.
+        self._prefetch_current: Optional[PrefetchOperation] = None
+        self._prefetch_io_current: Optional[PrefetchOperation] = None
+        # Operations a loop consumed AFTER the stop event was set (one counter
+        # per loop, single writer each); summed into the RESET JOIN line.
+        self._prefetch_drained_after_stop = 0
+        self._prefetch_io_drained_after_stop = 0
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -744,21 +785,94 @@ class HiCacheController:
         # Read by `_drain_release` when it finds a duplicate or an
         # already-free slot, so the crash names PRODUCERS and not only slots.
         self.host_release_provenance: dict[int, str] = {}
+        # #1068 (A12.4): a fresh pipeline holds nothing and has drained nothing.
+        self._prefetch_current = None
+        self._prefetch_io_current = None
+        self._prefetch_drained_after_stop = 0
+        self._prefetch_io_drained_after_stop = 0
 
         self.prefetch_thread.start()
         self.backup_thread.start()
 
-    def _stop_storage_threads(self):
-        """Stop storage prefetch/backup threads and drain internal queues.
+    def _terminate_inflight_prefetch(self) -> int:
+        """#1068 (A12.4): mark every prefetch operation the controller still
+        holds as terminated, and return how many DISTINCT operations that was.
 
-        Caller should ensure no in-flight requests.
+        The controller's complete view of in-flight prefetch work is four
+        places: ``prefetch_queue`` (registered, not yet probed), the prefetch
+        loop's current operation (inside ``_storage_hit_query``),
+        ``prefetch_buffer`` (probed, not yet transferred) and the aux loop's
+        current operation (inside ``_page_transfer``). An operation that is
+        in none of them has already completed or been revoked, so a record
+        the tree still keeps in ``ongoing_prefetch`` for it needs no
+        termination -- which is why ``UnifiedRadixCache._reset_full`` may
+        clear that dict and delegate to ``reset()`` instead of walking it.
+
+        Must run AFTER ``storage_stop_event`` is set: both loops terminate on
+        their own whatever they dequeue after the stop, so the only operations
+        this pass can miss are ones dequeued before the stop, and those are
+        either still current (visible through the pointer) or already in the
+        next queue (visible through its deque). The queues are read under
+        their own mutex without dequeuing, so the loops keep the drain (the
+        prefetch loop carries a rank-uniform gloo all_reduce per operation;
+        a drain from the caller's thread would run that collective on one
+        rank and not on a peer whose loop already holds the operation, the
+        #580/#645 rank-divergence class).
         """
+        seen: dict[int, PrefetchOperation] = {}
+
+        def take(op) -> None:
+            if isinstance(op, PrefetchOperation):
+                seen.setdefault(id(op), op)
+
+        for name in ("prefetch_queue", "prefetch_buffer"):
+            q = getattr(self, name, None)
+            if q is None:
+                continue
+            with q.mutex:
+                for op in list(q.queue):
+                    take(op)
+        take(self._prefetch_current)
+        take(self._prefetch_io_current)
+        for op in seen.values():
+            op.mark_terminate()
+        return len(seen)
+
+    def _stop_storage_threads(self) -> StorageStopResult:
+        """Stop the storage prefetch/backup/io-aux threads: terminate every
+        in-flight prefetch operation, then join each thread within
+        ``STORAGE_THREAD_JOIN_BOUND_S``.
+
+        THE ONE JOIN AUTHORITY, and its callers (#1068 graft G6 / A12.4):
+        ``reset()`` (the tree reset, which runs at EVERY phase-flip cutover
+        through ``UnifiedRadixCache._reset_full`` -- the caller that turned
+        the bound into a boot killer while nothing terminated the transfer
+        in flight, review finding (d)), the #1025 cutover quiesce
+        (``hicache_phase_binding._quiesce_storage_io``, same join without a
+        preceding termination), ``attach_storage_backend`` (idempotency
+        guard) and ``detach_storage_backend``. The old precondition "caller
+        should ensure no in-flight requests" is therefore no longer a
+        precondition: in-flight work is terminated HERE, before the join,
+        so the bound holds by construction (a terminated operation leaves
+        ``_page_transfer`` at the next batch boundary and
+        ``_storage_hit_query`` at the next batch of ``batch_exists``).
+
+        Returns what it did for the caller's log line. Raises RuntimeError
+        ONLY when a thread is still alive after termination plus the bound:
+        that is a torn pipeline, and starting a second set of threads on
+        top of it would double the hazard (raenge-nie-uneins crash-stop).
+        """
+        t0 = time.monotonic()
         # Always request stop. This is safe even when storage is already disabled,
         # and makes detach truly idempotent (previous partial detach may have left
         # threads alive).
         # NOTE: do NOT clear storage_stop_event unless threads have fully stopped; otherwise
         # a still-alive thread may resume and touch released state.
         self.storage_stop_event.set()
+
+        # A12.4: terminate BEFORE the join, so the join is bounded by the
+        # batch boundary and not by the length of the span in flight.
+        terminated_ops = self._terminate_inflight_prefetch()
 
         # Best-effort wakeups so threads exit promptly even if blocked on queues.
         try:
@@ -771,28 +885,43 @@ class HiCacheController:
         except Exception:
             pass
 
-        # Best-effort joins (threads are daemon, but join keeps state clean).
+        # Bounded joins (threads are daemon, but join keeps state clean).
         threads = []
         if hasattr(self, "prefetch_thread"):
-            threads.append(self.prefetch_thread)
+            threads.append(("prefetch", self.prefetch_thread))
         if hasattr(self, "backup_thread"):
-            threads.append(self.backup_thread)
+            threads.append(("backup", self.backup_thread))
         if hasattr(self, "prefetch_io_aux_thread"):
-            threads.append(self.prefetch_io_aux_thread)
+            threads.append(("prefetch_io_aux", self.prefetch_io_aux_thread))
 
-        for t in threads:
+        for _, t in threads:
             try:
-                t.join(timeout=10)
+                t.join(timeout=STORAGE_THREAD_JOIN_BOUND_S)
             except Exception:
                 pass
 
-        alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
+        alive = [
+            role for role, t in threads if getattr(t, "is_alive", lambda: False)()
+        ]
         if alive:
             logger.error(
-                "Failed to stop HiCache storage threads cleanly: %s",
-                [getattr(t, "name", repr(t)) for t in alive],
+                "Failed to stop HiCache storage threads cleanly: %s still alive "
+                "%.1f s after %d in-flight prefetch operation(s) were terminated "
+                "(bound_s=%d per thread)",
+                alive,
+                time.monotonic() - t0,
+                terminated_ops,
+                int(STORAGE_THREAD_JOIN_BOUND_S),
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+
+        return StorageStopResult(
+            threads=[role for role, _ in threads],
+            terminated_ops=terminated_ops,
+            drained_ops=self._prefetch_drained_after_stop
+            + self._prefetch_io_drained_after_stop,
+            joined_s=time.monotonic() - t0,
+        )
 
     def attach_storage_backend(
         self,
@@ -1368,8 +1497,23 @@ class HiCacheController:
         at the cutover left it alive on the OUTGOING binding while the pools
         swapped (boot 22, #1052). ``_start_storage_threads`` rebuilds the
         queues fresh, which subsumes the per-queue clears that lived here.
+
+        Slice 2 fix 3 (A12.4): the helper terminates every in-flight prefetch
+        operation BEFORE it joins, so the join bound holds at the batch
+        boundary of the span in flight and not at its length; this method
+        prints the ONE line that names the bound, the joined thread roles,
+        the terminated and drained operation counts and the seconds spent.
         """
-        self._stop_storage_threads()
+        stop = self._stop_storage_threads()
+        logger.info(
+            "#1068 RESET JOIN bound_s=%d threads=%s terminated_ops=%d "
+            "drained_ops=%d joined_s=%.2f",
+            int(STORAGE_THREAD_JOIN_BOUND_S),
+            stop.threads,
+            stop.terminated_ops,
+            stop.drained_ops,
+            stop.joined_s,
+        )
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -2219,6 +2363,13 @@ class HiCacheController:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            if operation.is_terminated():
+                # #1068 (A12.4): a stop or a revoke lands at the next batch
+                # boundary (~4 MiB), never after one more storage read. The
+                # per-page increment below would refuse anyway; checking
+                # here saves the batch_get and makes the join bound of
+                # `_stop_storage_threads` hold by construction.
+                break
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
@@ -2361,6 +2512,15 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                # #1068 (A12.4): publish the current operation BEFORE reading
+                # the stop event, so a stop that lands between the two lines
+                # is seen by exactly one side: either this loop terminates
+                # the operation itself (stop already set), or the pointer was
+                # published before `_terminate_inflight_prefetch` read it.
+                self._prefetch_io_current = operation
+                if self.storage_stop_event.is_set():
+                    operation.mark_terminate()
+                    self._prefetch_io_drained_after_stop += 1
                 self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
                 # W35: this thread runs across cutovers, so the slots it
@@ -2401,12 +2561,14 @@ class HiCacheController:
                             exc_info=True,
                         )
                 continue
+            finally:
+                self._prefetch_io_current = None
 
     @property
     def prefetch_capacity_fraction(self) -> float:
         """The share of the bound host pool that speculative prefetch may
         hold: 0.9 for a staging tier, 0.5 for a retention tier (upstream
-        cache_controller.py:253 / :575-584)."""
+        c66a285c94 cache_controller.py:253 / :575-584)."""
         if self.host_role == "staging":
             return HICACHE_LOAD_POOL_USAGE_FRACTION
         return HICACHE_CACHE_MODE_LOAD_FRACTION
@@ -2414,9 +2576,9 @@ class HiCacheController:
     @property
     def prefetch_capacity_limit(self) -> int:
         """The speculative-prefetch budget, in tokens, of the host pool the
-        controller is bound to RIGHT NOW (#1068; upstream :575-584 sizes it
-        the same way: the buffer_only fraction for a staging tier, the
-        cache-mode half otherwise).
+        controller is bound to RIGHT NOW (#1068; upstream c66a285c94
+        :575-584 sizes it the same way: the buffer_only fraction for a
+        staging tier, the cache-mode half otherwise).
 
         A property and not a number on purpose: the phase flip rebinds
         ``mem_pool_host`` (hicache_phase_binding._stamp), and a number stored
@@ -2425,22 +2587,49 @@ class HiCacheController:
         With ``--hicache-size`` both phase pools are MIN-synced across ranks
         (pool_host/base.py sync_fixed_hicache_size), so this value is
         rank-uniform by construction and no group reduce is needed.
+
+        With NO host pool bound this RAISES (A12.4; #606 class): a silent 0
+        would make ``prefetch_rate_limited`` read True forever and refuse
+        every prefetch without a line that names why. ``__init__`` binds
+        ``mem_pool_host`` unconditionally, so the raise is reachable only
+        from a shell or a torn binding, and both must be loud.
         """
-        pool = getattr(self, "mem_pool_host", None)
+        pool = self.mem_pool_host
         if pool is None:
-            return 0
+            raise RuntimeError(
+                "#1068 prefetch_capacity_limit read with no host pool bound "
+                "(mem_pool_host is None): the budget is a property of the bound "
+                "pool and has no value without one; a 0 here would refuse every "
+                "prefetch silently"
+            )
         return int(self.prefetch_capacity_fraction * int(pool.size))
 
     def prefetch_rate_limited(self) -> bool:
         """Refuse a new prefetch registration once the registered prefetches
         hold the budget: ``prefetch_tokens_occupied >= prefetch_capacity_limit``
-        (upstream cache_controller.py:1164-1166, the cache-mode form), in
-        BOTH host roles.
+        (upstream c66a285c94 cache_controller.py:1164-1166, the cache-mode
+        form), in BOTH host roles.
+
+        WHAT THIS BOUNDS, honestly (slice 2 review round 3, finding (g), spec
+        A12.1): ``prefetch_tokens_occupied`` is released at COMPLETION
+        (unified_radix_cache.py, the decrement in the completion path), so
+        the budget bounds CONCURRENT in-flight spans, not resident rows: at
+        most floor(prefetch_capacity_limit / prompt_max) spans of the largest
+        prompt class can be registered at once (Boot-2 sizing: 329589 /
+        39365 = 8 spans; the 9th concurrent span reads True here). Today a
+        True verdict in ``prefetch_from_storage`` is a DECLINE before its
+        alloc -> evict_host -> retry path, and ``_prefetch_kvcache`` is
+        issued once per request at intake, so the declined request recomputes
+        its whole prefix. That is the double-prefill class this brake was
+        never meant to cause; it is owned by slice 3 (A12.2: a rate_limited
+        verdict becomes a DEFERRAL that retries on every scheduling pass and
+        lands sequentially, never a decline). Until A12.2 lands, this method
+        is exactly the concurrency bound above, no more.
 
         WHY THE COUNTER AND NOT LIVE OCCUPANCY (slice 2 review, finding B1).
         Upstream carries two forms and dispatches on ``host_memory_mode``: the
         live form ``max(0, size - available_size() - write_staged) >= limit``
-        (:1155-1163) is for ``buffer_only``, where the host pool is a
+        (c66a285c94 :1155-1163) is for ``buffer_only``, where the host pool is a
         TRANSIENT buffer and every row is freed once its storage write is
         acked. This fork's host tier RETAINS in both roles:
         ``UnifiedRadixCache._drain_backup`` answers a storage ack with
@@ -2459,8 +2648,8 @@ class HiCacheController:
         The live form becomes the right form for the staging role on the day
         the staging drain frees host rows after ``ack_backup`` (transient
         buffer = upstream buffer_only semantics). That day brings back the
-        staged-tokens reader of upstream :331 together with its consumer and
-        its tests; this controller carries no such reader until then, because
+        staged-tokens reader of upstream c66a285c94 :331 together with its
+        consumer and its tests; this controller carries no such reader until then, because
         a wire that nobody reads is second bookkeeping (slice 2 fix 2). Until
         then ``prefetch_tokens_occupied`` is the gate: the tokens locked by
         registered prefetches (written by the three tree caches), zeroed at
@@ -2629,6 +2818,11 @@ class HiCacheController:
         )
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
+            if operation.is_terminated():
+                # #1068 (A12.4): a terminated operation asks the store no
+                # further batch; the partial count is what the rank-uniform
+                # MIN all_reduce in `prefetch_thread_func` then agrees on.
+                break
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
@@ -2653,8 +2847,22 @@ class HiCacheController:
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
-                if operation is None:
-                    continue
+            except Empty:
+                continue
+            if operation is None:
+                continue
+            # #1068 (A12.4): publish-then-check, same protocol as the aux
+            # loop, so an operation dequeued around the stop is terminated
+            # by exactly one side. The drain of this queue stays HERE (loop
+            # condition above): it carries one rank-uniform MIN all_reduce
+            # per operation, and after the stop each one is terminated, so
+            # `_storage_hit_query` asks the store nothing and the drain is
+            # one collective per operation, not one storage walk.
+            self._prefetch_current = operation
+            try:
+                if self.storage_stop_event.is_set():
+                    operation.mark_terminate()
+                    self._prefetch_drained_after_stop += 1
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
@@ -2684,9 +2892,8 @@ class HiCacheController:
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
-
-            except Empty:
-                continue
+            finally:
+                self._prefetch_current = None
 
     def write_storage(
         self,
