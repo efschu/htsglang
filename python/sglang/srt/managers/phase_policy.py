@@ -2325,7 +2325,9 @@ class PhasePolicyInputs:
 
         ``running_bs`` is the size of the running batch, and the #856 cutover
         EMPTIES that batch as its second step -- it retracts every resident and
-        puts them back at the front of the queue. So in the round after a
+        re-issues them through the intake queue (#1068: in arrival order
+        together with the queue occupants; the line below is the pre-#1068
+        form, quoted verbatim from the specimen). So in the round after a
         cutover ``running_bs == 0`` is true, and it is true BECAUSE of the
         transition, not because the work is gone. W37-D/d4, verbatim, four
         consecutive log lines::

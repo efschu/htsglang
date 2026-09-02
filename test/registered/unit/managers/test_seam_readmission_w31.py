@@ -22,9 +22,11 @@ ping-ponging over an instance whose work it had already dropped on the floor.
 
 WHAT THIS FILE PINS
   * every retracted resident comes back, exactly once;
-  * at the FRONT, as a block, in original arrival order -- they are the oldest
-    work and the flip's own justification, and appending them behind new
-    arrivals lets a busy instance starve the bundle it just flipped for;
+  * #1068 (spec 4.3, G3/G4): the WHOLE run-willing population -- retracted
+    residents AND queue occupants -- is re-issued through the one intake
+    site in `kv_arrival_seq` order; occupants are NOT stamped as retracts;
+    the old front-of-queue block sort is gone (the queue is rebuilt as a
+    whole in arrival order, so the oldest work is first by construction);
   * CAN-FAIL: dropping the return value again turns this red;
   * the abort path: there is no window where the list is computed and lost;
   * rank-uniformity: the rebuilt queue is a pure function of rank-uniform
@@ -71,13 +73,16 @@ class _Sched:
         self.added = []
         self.refuse = set()
         self.retract_sites = []
+        self.verdicts = {}
 
     def _add_request_to_queue(self, req, is_retracted=False):
         # Models the real one's contract: it MAY refuse (priority validation,
-        # queued-limit abort), and it appends rather than front-inserts.
+        # queued-limit abort), it appends rather than front-inserts, and it
+        # stamps the intake prefetch verdict (`_969c_verdict`, #1068).
         self.added.append((req.rid, is_retracted))
         if req.rid in self.refuse:
             return
+        req._969c_verdict = self.verdicts.get(req.rid, "issued")
         self.waiting_queue.append(req)
 
     def _969ad_note_retract(self, req, site):
@@ -111,18 +116,19 @@ class TestEverythingRetractedComesBack(CustomTestCase):
         self.assertEqual(s.waiting_queue, [])
 
 
-class TestFrontOfQueueAsABlockInArrivalOrder(CustomTestCase):
-    def test_they_go_in_front_of_newer_work(self):
-        # THE STARVATION DIRECTION. Appended behind new arrivals, the bundle
-        # the flip was armed for waits behind the work that arrived while it
-        # flipped -- on a busy instance, for ever.
-        newer = [_Req("new1", 100), _Req("new2", 101)]
-        s = _Sched(newer)
-        carried = [_Req("old1", 1), _Req("old2", 2)]
-        s.readmit_seam_residents(carried)
-        self.assertEqual(
-            [r.rid for r in s.waiting_queue], ["old1", "old2", "new1", "new2"]
-        )
+class TestArrivalOrderOverAll(CustomTestCase):
+    """#1068 spec 4.3 (G4): issue order = kv_arrival_seq over the WHOLE
+    population, residents and occupants alike. The pre-#1068 pin put the
+    retracted block in FRONT of every occupant; an occupant that arrived
+    BEFORE a resident now precedes it, because the queue is rebuilt as one
+    arrival-ordered sequence."""
+
+    def test_an_older_occupant_precedes_a_younger_resident(self):
+        # THE INVERSION of the retired front-of-queue pin: occupant q(3) sits
+        # between residents old(1) and new(5).
+        s = _Sched([_Req("q", 3)])
+        s.readmit_seam_residents([_Req("new", 5), _Req("old", 1)])
+        self.assertEqual([r.rid for r in s.waiting_queue], ["old", "q", "new"])
 
     def test_arrival_order_is_restored_even_if_released_out_of_order(self):
         # The seam enumerates residents by slot, which is not arrival order.
@@ -131,9 +137,9 @@ class TestFrontOfQueueAsABlockInArrivalOrder(CustomTestCase):
         self.assertEqual([r.rid for r in s.waiting_queue], ["a", "b", "c"])
 
     def test_a_request_the_queue_refused_is_not_conjured_in(self):
-        # `_add_request_to_queue` may legitimately refuse. The front-insert is
-        # identity-keyed on what actually landed, so a refused request must
-        # not appear -- inventing it would be worse than dropping it.
+        # `_add_request_to_queue` may legitimately refuse. The count reports
+        # what LANDED, and a refused request must not appear -- inventing it
+        # would be worse than dropping it.
         s = _Sched()
         s.refuse = {"b"}
         n = s.readmit_seam_residents([_Req("a", 1), _Req("b", 2), _Req("c", 3)])
@@ -147,6 +153,97 @@ class TestFrontOfQueueAsABlockInArrivalOrder(CustomTestCase):
         n = s.readmit_seam_residents([_Req("live", 1), _Req("gone", 2, done=True)])
         self.assertEqual([r.rid for r in s.waiting_queue], ["live"])
         self.assertEqual(n, 1)
+
+
+class TestQueueOccupantsAreReissued(CustomTestCase):
+    """#1068 spec 4.3 (G3): the cutover nulls everything (tree, prefetch
+    records, host pool), so a queue occupant's intake prefetch is gone too.
+    It must be RE-ISSUED through the same intake site, in arrival order, and
+    it is NOT a retract (no #969AD stamp, `is_retracted=False`)."""
+
+    def test_queue_occupants_are_reissued_not_stamped_as_retracts(self):
+        # T11. RED on 846c6797b9: readmit_seam_residents has no
+        # requeue_waiting parameter and iterates only `reqs`.
+        q1 = _Req("q1", 2)
+        r1 = _Req("r1", 1)
+        s = _Sched([q1])
+        n = s.readmit_seam_residents([r1], requeue_waiting=True)
+        self.assertEqual(n, 1, "the return value counts RESIDENTS only")
+        self.assertEqual(s.added, [("r1", True), ("q1", False)])
+        self.assertEqual(s.retract_sites, [("r1", "readmit_seam_residents")])
+        self.assertEqual(q1._969c_population, "queue")
+        self.assertEqual(r1._969c_population, "retract")
+        self.assertEqual([r.rid for r in s.waiting_queue], ["r1", "q1"])
+        summary = s.last_seam_readmit
+        self.assertEqual(summary["retracted"], 1)
+        self.assertEqual(summary["requeued"], 1)
+        self.assertEqual(summary["residents"], 1)
+        self.assertEqual(summary["occupants"], 1)
+        self.assertEqual(summary["queue_before"], 1)
+        self.assertEqual(summary["queue_after"], 2)
+        self.assertEqual(summary["dropped_by_queue_limit"], 0)
+        self.assertEqual(summary["verdicts"], {"issued": 2})
+
+    def test_issue_order_is_arrival_order(self):
+        # T12. RED on 846c6797b9: the loop runs in retract order and the
+        # sort happens only after the loop, on the block alone.
+        new, old, q = _Req("new", 5), _Req("old", 1), _Req("q", 3)
+        s = _Sched([q])
+        s.readmit_seam_residents([new, old], requeue_waiting=True)
+        self.assertEqual([rid for rid, _ in s.added], ["old", "q", "new"])
+        self.assertEqual([r.rid for r in s.waiting_queue], ["old", "q", "new"])
+
+    def test_requeue_waiting_false_leaves_occupants_untouched(self):
+        # The knob is honoured: occupants stay where they are, and they are
+        # NOT re-issued.
+        q = _Req("q", 3)
+        s = _Sched([q])
+        s.readmit_seam_residents([_Req("r", 1)], requeue_waiting=False)
+        self.assertEqual(s.added, [("r", True)])
+        self.assertIsNone(getattr(q, "_969c_population", None))
+        self.assertEqual(s.last_seam_readmit["requeued"], 0)
+        self.assertEqual(s.last_seam_readmit["occupants"], 0)
+
+    def test_a_refused_occupant_is_named_as_dropped_not_requeued(self):
+        # R8: under a queued limit an occupant can be refused by the intake;
+        # it is counted as dropped_by_queue_limit, never silently.
+        q = _Req("q", 3)
+        s = _Sched([q])
+        s.refuse = {"q"}
+        s.readmit_seam_residents([_Req("r", 1)], requeue_waiting=True)
+        self.assertEqual(s.last_seam_readmit["requeued"], 0)
+        self.assertEqual(s.last_seam_readmit["dropped_by_queue_limit"], 1)
+
+    def test_no_residents_still_reissues_the_occupants(self):
+        # A cutover with nothing retracted still dropped every occupant's
+        # prefetch record at _reset_full; the occupants must be re-issued.
+        q = _Req("q", 3)
+        s = _Sched([q])
+        n = s.readmit_seam_residents([], requeue_waiting=True)
+        self.assertEqual(n, 0)
+        self.assertEqual(s.added, [("q", False)])
+        self.assertEqual(s.last_seam_readmit["requeued"], 1)
+
+    def test_the_verdict_histogram_names_declines(self):
+        s = _Sched([_Req("q", 3)])
+        s.verdicts = {"q": "declined:store_absent"}
+        s.readmit_seam_residents([_Req("r", 1)], requeue_waiting=True)
+        self.assertEqual(
+            s.last_seam_readmit["verdicts"],
+            {"issued": 1, "declined:store_absent": 1},
+        )
+
+    def test_the_l5_line_names_both_populations(self):
+        from sglang.srt.managers import scheduler as sched_mod
+
+        s = _Sched([_Req("q", 3)])
+        with self.assertLogs(sched_mod.logger, level="INFO") as caught:
+            s.readmit_seam_residents([_Req("r", 1)], requeue_waiting=True)
+        line = [ln for ln in caught.output if "SEAM RE-ADMISSION" in ln]
+        self.assertEqual(len(line), 1, caught.output)
+        self.assertIn("1 retracted resident(s) + 1 queue occupant(s)", line[0])
+        self.assertIn("queue 1 -> 2", line[0])
+        self.assertIn("dropped_by_queue_limit=0", line[0])
 
 
 class TestTheStampSurvivesTheRoundTrip(CustomTestCase):

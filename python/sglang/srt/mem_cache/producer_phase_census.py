@@ -595,10 +595,13 @@ def reset_for_test() -> None:
     global _ledger_dropped, _ledger_writes, _emitted, _suppressed
     global _late_arrivals, _arrivals, _consults, _consult_misses
     global _dpc, _dpc_emitted, _dpc_suppressed, _dpc_over_bound_seen
+    global _dpc_fence_pending, _dpc_fence_seed
     _dpc = None
     _dpc_emitted = 0
     _dpc_suppressed = 0
     _dpc_over_bound_seen = 0
+    _dpc_fence_pending = 0
+    _dpc_fence_seed = 0
     with _gen_lock:
         _gen_phases.clear()
     with _ledger_lock:
@@ -1067,6 +1070,15 @@ class DoublePrefillCensus:
     chunk_size: int | None = None
     chunk_source: str = "UNRESOLVED"
     observed: bool = False
+    #: #1068 (G9): cutovers of THIS wave that proceeded past the
+    #: `_WRITEBACK_DEFER_LIMIT` with an incomplete write-back fence. Such a
+    #: wave may miss the store and recompute in full for a reason that is
+    #: neither a store defect nor a read-path defect; the term is carried
+    #: beside the bound so `within_bound=false` stays attributable.
+    fence_proceeds: int = 0
+
+    def note_fence_proceed(self) -> None:
+        self.fence_proceeds += 1
 
     def note_readmitted_request(
         self,
@@ -1146,6 +1158,8 @@ class DoublePrefillCensus:
             "recomputed": self.recomputed,
             "already": self.already_computed,
             "readmitted": self.readmitted,
+            # #1068 (G9, L10): the loss term that is NOT the read path's.
+            "fence_proceeds": self.fence_proceeds,
         }
 
     def format_line(self, prefix: str = DOUBLE_PREFILL_LINE_PREFIX) -> str:
@@ -1189,6 +1203,23 @@ _dpc: DoublePrefillCensus | None = None
 _dpc_emitted = 0
 _dpc_suppressed = 0
 _dpc_over_bound_seen = 0
+# #1068 (G9): fence proceeds noted since the last reset (this cutover's
+# arm/preflight), and the seed the NEXT census is created with. ORDER in
+# `PhaseFlipRuntime._execute_body`: fence verdict -> cutover -> reset (ends the
+# previous wave's census) -> readmit (creates this wave's census). A proceed
+# noted before the reset therefore belongs to the wave AFTER it, never to the
+# census being closed; the reset moves pending -> seed, creation consumes the
+# seed. A seed nobody consumed (a cutover that re-admitted nothing) is
+# overwritten by the next reset, so it cannot leak into a later wave.
+_dpc_fence_pending = 0
+_dpc_fence_seed = 0
+
+
+def note_fence_proceed() -> None:
+    """#1068 (G9): the flip proceeded past `_WRITEBACK_DEFER_LIMIT` with an
+    incomplete write-back fence. Counted for the wave this cutover re-admits."""
+    global _dpc_fence_pending
+    _dpc_fence_pending += 1
 
 
 def note_double_prefill(
@@ -1217,12 +1248,15 @@ def note_double_prefill(
     line. A DISARMED run and a run with no double prefill are therefore NOT
     the same state, and `emit_double_prefill` prints which one it is.
     """
-    global _dpc
+    global _dpc, _dpc_fence_seed
     if census_armed() <= 0:
         return
     if _dpc is None:
         _dpc = DoublePrefillCensus()
         _dpc.bind_chunk(scheduler)
+        # #1068 (G9): the fence proceeds this wave was re-admitted under.
+        _dpc.fence_proceeds = int(_dpc_fence_seed)
+        _dpc_fence_seed = 0
     _dpc.note_readmitted_request(request_id, already_computed, recovered)
 
 
@@ -1284,9 +1318,14 @@ def reset_double_prefill_census() -> None:
     cutover that retracted nothing cannot manufacture a line about a wave
     that never happened.
     """
-    global _dpc, _dpc_over_bound_seen
+    global _dpc, _dpc_over_bound_seen, _dpc_fence_pending, _dpc_fence_seed
     _dpc = None
     _dpc_over_bound_seen = 0
+    # #1068 (G9): the proceeds noted for THIS cutover seed the wave that
+    # follows this reset; an unconsumed seed from a wave that never came is
+    # overwritten here, never accumulated.
+    _dpc_fence_seed = _dpc_fence_pending
+    _dpc_fence_pending = 0
 
 
 def double_prefill_census():

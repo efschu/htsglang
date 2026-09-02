@@ -5286,6 +5286,11 @@ class Scheduler(
         # moves the number but not the "at most one chunk" bound.
         _match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
         _new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]
+        # #1068 (spec A12.2): the request's OWN span, stamped rank-locally
+        # before any verdict is taken, so the UNDEFERRABLE exit of the
+        # deferral can price it against the budget without re-deriving the
+        # walk. Read by `_apply_prefetch_deferral`; never a decision here.
+        req._prefetch_span_tokens = len(_new_input_tokens)
         _prefix_keys = (
             last_host_node.get_prefix_hash_values(last_host_node.parent)
             if self.tree_cache.hicache_storage_pass_prefix_keys
@@ -5307,7 +5312,24 @@ class Scheduler(
             _cc = getattr(self.tree_cache, "cache_controller", None)
             _probe = getattr(_cc, "store_presence_pages", None)
             if callable(_probe):
-                _key = (_matched_len, len(_new_input_tokens))
+                # #1060 (G7, #1068 slice 3): THE KEY CARRIES THE BINDING
+                # GENERATION. A presence verdict is a statement about the
+                # pool the readers were bound to when it was taken; the
+                # cutover rebinds them (`hicache_phase_binding.rebind`), and
+                # a verdict cached under the PP binding must not govern the
+                # TP binding -- "PP-Verdikt regiert TP" was the measured
+                # form: a store absent for PP's pool answered 'absent' for
+                # TP's without ever being asked. Same span, new generation:
+                # ask again. Same generation, same span: cached, one probe.
+                from sglang.srt.mem_cache.hicache_phase_binding import (
+                    current_generation as _current_generation,
+                )
+
+                _key = (
+                    int(_current_generation()),
+                    _matched_len,
+                    len(_new_input_tokens),
+                )
                 _cached = getattr(req, "_pp_store_presence_cache", None)
                 if _cached is not None and _cached[0] == _key:
                     store_present = _cached[1]
@@ -5480,6 +5502,15 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
+            # #1068 (spec 4.3, L6): the POPULATION marker the cutover re-issue
+            # plants (`readmit_seam_residents`: 'retract' for a retracted
+            # resident, 'queue' for a queue occupant) is read here and
+            # CONSUMED below, so a later decode-pressure retraction of the same
+            # request is attributed to its own site and never prints a stale
+            # 'queue'. `available_before` is read BEFORE the prefetch so the
+            # line names the host-pool room the verdict was taken against.
+            _population = getattr(req, "_969c_population", None)
+            _available_before = self._host_pool_available_size()
             _pf_verdict = self._prefetch_kvcache(req)
             # #969C: THE VERDICT WAS COMPUTED AND THROWN AWAY (success-value-
             # without-action, this tree's own catalogued class). #969B measured
@@ -5489,23 +5520,47 @@ class Scheduler(
             # a rid it never registered, the admission gate then waits for
             # nothing and the request is matched against an empty tree and
             # re-prefilled from token 0. `_prefetch_kvcache` names its exit in
-            # this string; nothing read it. Logged for re-admitted requests only.
+            # this string. #1068: it is now STAMPED on the request
+            # (`_969c_verdict`, read by the readmit's verdict histogram) and
+            # a rate-limited verdict is routed into the deferral (A12.2)
+            # instead of being a decline. Logged for re-admitted requests
+            # (stamped residents AND re-issued occupants).
             # Grep: "#969C READMIT-PREFETCH".
+            req._969c_verdict = _pf_verdict
+            self._apply_prefetch_deferral(req, _pf_verdict, site="intake")
             try:
                 from sglang.srt.managers.phase_purity import (
                     SEAM_READMIT_ATTR as _SRA,
                 )
 
-                if getattr(req, _SRA, None) is not None:
+                _stamped = getattr(req, _SRA, None) is not None
+                if _stamped or _population is not None:
                     _n = getattr(self, "_969c_n", 0) + 1
                     self._969c_n = _n
+                    try:
+                        from sglang.srt.mem_cache.hicache_phase_binding import (
+                            current_generation as _current_generation,
+                        )
+
+                        _generation = int(_current_generation())
+                    except Exception:  # noqa: BLE001 - no binding in unit tests
+                        _generation = -1
                     logger.warning(
-                        "#969C READMIT-PREFETCH n=%d rid=%s verdict=%s "
-                        "last_host_node=%s host_hit=%s prefix_len=%s "
-                        "storage_hit=%s readmit_epoch=%s",
+                        "#969C READMIT-PREFETCH n=%d rid=%s population=%s "
+                        "verdict=%s generation=%d pool_id=%d "
+                        "available_before=%d last_host_node=%s host_hit=%s "
+                        "prefix_len=%s storage_hit=%s readmit_epoch=%s",
                         _n,
                         str(getattr(req, "rid", "?"))[:8],
+                        (
+                            _population
+                            if _population is not None
+                            else ("retract" if is_retracted else "intake")
+                        ),
                         _pf_verdict,
+                        _generation,
+                        self._host_pool_identity(),
+                        _available_before,
                         type(getattr(req, "last_host_node", None)).__name__,
                         getattr(req, "host_hit_length", None),
                         (
@@ -5522,14 +5577,23 @@ class Scheduler(
             # intake. A lap that starts here came off the request stream (or,
             # on PP0, off the socket) rather than from a void this rank
             # decided for itself -- which is the distinction §AC's count
-            # divergence has to be read against.
+            # divergence has to be read against. #1068: a queue occupant the
+            # cutover re-issued is its own site ('cutover-requeue') -- it is
+            # neither a retract nor a fresh intake.
             try:
-                req._969ac_site = "retract-intake" if is_retracted else "intake"
+                if is_retracted:
+                    req._969ac_site = "retract-intake"
+                elif _population == "queue":
+                    req._969ac_site = "cutover-requeue"
+                else:
+                    req._969ac_site = "intake"
                 req._969ac_lap = int(getattr(req, "_969ac_lap", 0)) + 1
                 req._969ac_fwd = int(getattr(self, "forward_ct", -1))
                 req._969ac_rank = int(getattr(self.ps, "pp_rank", -1))
             except Exception:  # noqa: BLE001 - a probe may never break intake
                 pass
+            # The population marker is consumed by this intake (see above).
+            req._969c_population = None
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -5547,89 +5611,386 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
-    def readmit_seam_residents(self, reqs: List[Req]) -> int:
-        """W31: put the residents the #856 cutover retracted BACK ON THE QUEUE.
+    def readmit_seam_residents(
+        self, reqs: List[Req], requeue_waiting: bool = True
+    ) -> int:
+        """W31 / #1068: re-issue the WHOLE run-willing population after a cutover.
 
-        THE MISSING HALF OF #856. The seam's own log line has always promised
-        "their KV is in the canonical store from the fence; the new layout
-        RE-ADMITS them and serves the prefix by read-through" -- and nothing
-        did the re-admitting. `retract_all` returns the list it retracted,
-        `_release_residents_for_cutover` returned it upward, and its caller
-        discarded it. The requests were prefilled once, retracted at the next
-        cutover, and never seen again.
+        THE MISSING HALF OF #856 (W31). The seam's own log line has always
+        promised "their KV is in the canonical store from the fence; the new
+        layout RE-ADMITS them and serves the prefix by read-through" -- and
+        nothing did the re-admitting. W31 arm 2 measured exactly that
+        (SPECIMEN_w31_a2_residents_never_readmitted.log): 28 rids admitted
+        exactly once, 78 retractions, ZERO completions.
 
-        W31 arm 2 measured exactly that (SPECIMEN_w31_a2_residents_never_
-        readmitted.log): 28 distinct rids, each admitted EXACTLY ONCE ever
-        (three log lines apiece, one per rank), 14 requests prefilled once,
-        78 requests retracted by the seam, and ZERO completions -- every
-        client waited out its 600 s timeout. Two windows (W30, W31) read as a
-        flip "livelock" were in truth the flip ping-ponging over an instance
-        whose work it had already dropped on the floor.
+        THE SECOND HALF, #1068 (spec 4.3, G3/G4, cutover-full-reset-reentry):
+        the cutover nulls EVERYTHING -- the radix tree, every prefetch record
+        (`_reset_full`: ongoing_prefetch={}, cache_controller.reset(),
+        mem_pool_host.clear()) -- so a QUEUE OCCUPANT's intake prefetch is gone
+        with the residents'. Boot 2 (boot_855_968umbauB_228a66db32) refuted the
+        premise that occupants 'never straddle a cutover': d188185a sat in the
+        queue at 21:16:57 and recomputed 0->14921 (log 153596). So the queue is
+        rebuilt as ONE arrival-ordered sequence (`kv_arrival_seq`, the FCFS
+        counter `_add_request_to_queue` assigns once and keeps across a
+        retracted re-queue) of retracted residents AND occupants, and every
+        member goes through the ONE intake site (`_add_request_to_queue` ->
+        `_prefetch_kvcache`) under the incoming binding generation. Occupants
+        are NOT retracts: no #969AD stamp, `is_retracted=False`; they carry
+        `_969c_population='queue'` for the #969C line and the
+        'cutover-requeue' lap site.
 
-        FRONT OF THE QUEUE, AS A BLOCK, IN ARRIVAL ORDER. These are the OLDEST
-        work in the instance and they are the flip's own justification -- the
-        tp-ward arm fires *because* they are ready to decode, and under strict
-        batching the target phase exists to serve precisely them. Appending
-        them behind newly arrived prefill would let a busy instance starve the
-        bundle it just flipped for, which is the same starvation the phase
-        policy's fairness window exists to prevent. Original arrival order is
-        preserved by `kv_arrival_seq`, which `_add_request_to_queue` already
-        keeps across a retracted re-queue.
-
-        REUSES THE ONE QUEUE AUTHORITY rather than hand-rolling a second
-        mover: `_add_request_to_queue(req, is_retracted=True)` carries the
-        priority validation, the queued-limit abort, the retract timestamp
-        and -- load-bearing here -- `_prefetch_kvcache`, which is what makes
-        the promised read-through actually hit. This method then moves the
-        block it just queued to the front; it does not re-implement queueing.
+        The pre-#1068 front-of-queue block sort is gone: with the whole queue
+        rebuilt in arrival order the oldest work is first BY CONSTRUCTION.
 
         ORDERING AGAINST THE LIVE UNIVERSE IS THE CALLER'S, AND IT IS STRICT:
         `consume_retracted_from_live_universe` runs FIRST (inside the retract
-        closure), this runs SECOND. A request that were both live-referenced
+        closure), this runs SECOND, after the pool rebind
+        (`_post_cutover_readmit`). A request that were both live-referenced
         and queued would be counted twice by every consumer that sums the two
         -- the #731 double-billing shape this tree has already paid for once.
 
-        Returns how many were re-admitted, so the seam can assert
-        retracted == readmitted rather than hope.
+        `_add_request_to_queue` MAY refuse (priority validation, the
+        queued-limit abort -- R8: unreachable on Boot 2 where
+        max_queued_requests is None, named nonetheless): the counts report what
+        LANDED, identity-keyed, and a refused occupant is named as
+        `dropped_by_queue_limit`, never silently.
+
+        Publishes `self.last_seam_readmit` (retracted / requeued / residents /
+        occupants / verdicts histogram / queue_before / queue_after /
+        dropped_by_queue_limit) for the cutover's aggregate line (L7, G11) and
+        emits L5. Returns how many RESIDENTS were re-admitted, so the seam can
+        assert retracted == readmitted rather than hope.
         """
-        if not reqs:
-            return 0
         before = len(self.waiting_queue)
-        block: List[Req] = []
+        occupants: List[Req] = list(self.waiting_queue) if requeue_waiting else []
+        if requeue_waiting:
+            # ALL of it is nulled and rebuilt through the normal path
+            # (cutover-full-reset-reentry). The occupants are re-issued below.
+            self.waiting_queue = []
+        residents: List[Req] = []
         for req in reqs:
             if getattr(req, "finished", None) is not None and req.finished():
                 # A request whose client gave up between retraction and here
                 # must not be re-admitted into a queue nobody is waiting on.
                 continue
-            self._969ad_note_retract(req, "readmit_seam_residents")
-            self._add_request_to_queue(req, is_retracted=True)
-            block.append(req)
-        if not block:
+            residents.append(req)
+        resident_ids = {id(r) for r in residents}
+
+        def _arrival(r) -> int:
+            seq = getattr(r, "kv_arrival_seq", None)
+            return int(seq) if seq is not None else 0
+
+        # G4: issue order = kv_arrival_seq over the WHOLE population, sorted
+        # BEFORE the loop. Rank-uniform: the resident set is group-unanimous,
+        # the queue is replicated, the counter is rank-uniform.
+        population = sorted(residents + occupants, key=_arrival)
+        for req in population:
+            is_res = id(req) in resident_ids
+            if is_res:
+                # Only residents are RETRACTS (G3).
+                self._969ad_note_retract(req, "readmit_seam_residents")
+            req._969c_population = "retract" if is_res else "queue"
+            req._969c_verdict = None
+            self._add_request_to_queue(req, is_retracted=is_res)
+
+        landed_ids = {id(r) for r in self.waiting_queue}
+        verdicts: Dict[str, int] = {}
+        readmitted = 0
+        requeued = 0
+        for req in population:
+            if id(req) not in landed_ids:
+                continue
+            verdict = getattr(req, "_969c_verdict", None) or "unreported"
+            verdicts[verdict] = verdicts.get(verdict, 0) + 1
+            if id(req) in resident_ids:
+                readmitted += 1
+            else:
+                requeued += 1
+        dropped_by_queue_limit = len(occupants) - requeued
+        self.last_seam_readmit = {
+            "retracted": readmitted,
+            "requeued": requeued,
+            "residents": len(residents),
+            "occupants": len(occupants),
+            "verdicts": verdicts,
+            "queue_before": before,
+            "queue_after": len(self.waiting_queue),
+            "dropped_by_queue_limit": dropped_by_queue_limit,
+        }
+        if population:
+            logger.info(
+                "PHASE-FLIP SEAM RE-ADMISSION: %d retracted resident(s) + %d "
+                "queue occupant(s) re-issued through the intake path in "
+                "arrival order (queue %d -> %d, dropped_by_queue_limit=%d)",
+                readmitted,
+                requeued,
+                before,
+                len(self.waiting_queue),
+                dropped_by_queue_limit,
+            )
+        return readmitted
+
+    # ------------------------------------------------------------------
+    # #1068 slice 3 (spec A12.2): a rate-limited prefetch is DEFERRED, never
+    # declined into a full recompute.
+    #
+    # THE DEFECT (A12.1, verified in the tree): the #915 gate declines a
+    # prefetch on `prefetch_rate_limited()` BEFORE alloc -> evict_host ->
+    # truncation, and `_prefetch_kvcache` is issued exactly once per request
+    # at intake. A rate-declined request therefore never got a prefetch and
+    # recomputed its whole prefix (up to prompt_max 39365 >> the 4096 one-chunk
+    # bound) -- Kein-Doppel-Prefill violated from the 9th concurrent span on
+    # (staging limit 0.9 x 366211 = 329589 tokens = 8.37 spans of 39365).
+    #
+    # THE RULE: the request keeps a pending-prefetch mark
+    # (`req.prefetch_deferred`), stays queued in kv_arrival_seq order, is NOT
+    # admitted to prefill while marked (PP0 / the single rank; a follower never
+    # withholds admission for its own prefetch, #969Z), and is retried on every
+    # scheduling pass. Landing is sequential by construction: the spans ahead
+    # complete (or hit the #968/#1065 length-priced prefetch timeout), the
+    # counter drops, the next deferred span registers. Two bounded exits, both
+    # named, never silent: UNDEFERRABLE (the request's own span alone exceeds
+    # the limit; falls to the recompute path, counted) and DEFER EXPIRED (waited
+    # longer than the length-priced timeout for its own span; admitted with
+    # reason=rate_expired so a stuck budget can never hold the queue forever --
+    # wedge-freedom law). A retry that meets a NON-rate reason releases the
+    # mark through a third named exit (DEFER RELEASED) onto the normal path.
+    #
+    # NO NEW COLLECTIVE on the intake path: the retry re-enters the same
+    # `_prefetch_kvcache` the intake used. Under the SYMMETRIC prefetch
+    # participation mode (tp_world_size>1 under uneven DCP) the rate verdict is
+    # rank-local while the registration is a group vote, so a rank-divergent
+    # mark set would walk into the #580 vote unevenly; deferral is therefore
+    # refused BY NAME there (once) and the pre-#1068 decline stands. The
+    # phase-flip boot form (tp_size=1 per stage) is never symmetric.
+    #
+    # COUNTERS ride the #915 gate census (rank-uniform by the same argument as
+    # the gate's own terms): deferred, landed, undeferrable, defer_expired,
+    # defer_released. Identity the acceptance reads:
+    #   deferred == landed + undeferrable + defer_expired + defer_released.
+    # ------------------------------------------------------------------
+    def _host_pool_identity(self) -> int:
+        """id() of the host pool the prefetch registers against (the
+        HostPoolGroup's anchor KV pool when there is one), or -1."""
+        try:
+            _p = self.tree_cache.cache_controller.mem_pool_host
+            _p = getattr(getattr(_p, "anchor_entry", None), "host_pool", None) or _p
+            return id(_p)
+        except Exception:  # noqa: BLE001 - a diagnostic may never break intake
+            return -1
+
+    def _host_pool_available_size(self) -> int:
+        try:
+            return int(self.tree_cache.cache_controller.mem_pool_host.available_size())
+        except Exception:  # noqa: BLE001 - a diagnostic may never break intake
+            return -1
+
+    def _prefetch_capacity_limit_or_none(self) -> Optional[int]:
+        """The controller's live budget property, or None when there is no
+        bound host pool (slice 2: the property RAISES rather than reading 0)."""
+        try:
+            return int(self.tree_cache.cache_controller.prefetch_capacity_limit)
+        except Exception:  # noqa: BLE001 - no pool -> no judgement, never 0
+            return None
+
+    def _prefetch_deferral_enabled(self) -> bool:
+        if not getattr(self, "enable_hicache_storage", False):
+            return False
+        symmetric = getattr(self.tree_cache, "_hicache_prefetch_symmetric", None)
+        try:
+            if symmetric is not None and bool(symmetric()):
+                if not getattr(self, "_1068_deferral_refused_logged", False):
+                    self._1068_deferral_refused_logged = True
+                    logger.warning(
+                        "#1068 PREFETCH DEFERRAL REFUSED reason=symmetric_vote: the "
+                        "rate verdict is rank-local while registration is the "
+                        "#580 group vote (tp_world_size>1 under uneven DCP); a "
+                        "rank-divergent deferred set would enter that vote "
+                        "unevenly. rate_limited stays a decline on this boot form."
+                    )
+                return False
+        except Exception:  # noqa: BLE001 - a probe may never break intake
+            return False
+        return True
+
+    def _deferred_prefetch_bound_s(self, span_tokens: int) -> float:
+        """The #968/#1065 length-priced prefetch timeout for ONE span:
+        base + pages x per_page, read from the tree the way
+        `_prefetch_timeout_check_linear_func` reads it."""
+        tc = self.tree_cache
+        base = float(getattr(tc, "prefetch_timeout_base", 2.0))
+        page_size = max(1, int(getattr(tc, "page_size", 1) or 1))
+        per_page = getattr(tc, "prefetch_timeout_per_page", None)
+        if per_page is None:
+            per_page = page_size / 1024 * 1.0
+        pages = (max(0, int(span_tokens)) + page_size - 1) // page_size
+        return base + pages * float(per_page)
+
+    def _apply_prefetch_deferral(self, req, verdict: str, site: str) -> Optional[str]:
+        """Route one prefetch verdict through the A12.2 deferral state machine.
+
+        Returns the named outcome ('deferred' / 'undeferrable' / 'expired' /
+        'landed' / 'released') or None when the verdict is not the deferral's
+        business (an unmarked request with any non-rate verdict).
+        """
+        from sglang.srt.mem_cache.match_refusal_census import (
+            note_prefetch_gate as _note_prefetch_gate,
+        )
+
+        rid = str(getattr(req, "rid", "?"))[:8]
+        marked = getattr(req, "prefetch_deferred", None) is not None
+        span = getattr(req, "_prefetch_span_tokens", None)
+        if verdict == "declined:rate_limited":
+            if not self._prefetch_deferral_enabled():
+                return None
+            limit = self._prefetch_capacity_limit_or_none()
+            if not marked:
+                if span is not None and limit is not None and int(span) > int(limit):
+                    # Exit (1): can never land. Falls to the section-11.2
+                    # ledger-cap degradation (recompute), counted.
+                    _note_prefetch_gate("undeferrable")
+                    logger.warning(
+                        "#1068 PREFETCH UNDEFERRABLE rid=%s span=%d limit=%d "
+                        "site=%s -- the request's own span exceeds the prefetch "
+                        "budget and can never land; it proceeds on the recompute "
+                        "path (ledger-cap degradation, counted)",
+                        rid,
+                        int(span),
+                        int(limit),
+                        site,
+                    )
+                    return "undeferrable"
+                req.prefetch_deferred = "rate_limited"
+                req.prefetch_defer_attempts = 1
+                req.prefetch_defer_passes = 0
+                req.prefetch_defer_since = time.monotonic()
+                req.prefetch_defer_reason = None
+                _note_prefetch_gate("deferred")
+                occupied = -1
+                try:
+                    occupied = int(
+                        self.tree_cache.cache_controller.prefetch_tokens_occupied
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                # L14, edge-triggered: the FIRST deferral only, never per pass.
+                logger.warning(
+                    "#1068 PREFETCH DEFERRED rid=%s reason=rate_limited occupied=%d "
+                    "limit=%d attempt=%d span=%d site=%s",
+                    rid,
+                    occupied,
+                    -1 if limit is None else int(limit),
+                    1,
+                    -1 if span is None else int(span),
+                    site,
+                )
+                return "deferred"
+            # A retry that is still rate-limited.
+            req.prefetch_defer_attempts = int(getattr(req, "prefetch_defer_attempts", 0)) + 1
+            req.prefetch_defer_passes = int(getattr(req, "prefetch_defer_passes", 0)) + 1
+            waited = time.monotonic() - float(getattr(req, "prefetch_defer_since", 0.0))
+            bound = self._deferred_prefetch_bound_s(span or 0)
+            if waited > bound:
+                # Exit (2): the wedge-freedom bound. Admitted with
+                # reason=rate_expired; counted.
+                req.prefetch_deferred = None
+                req.prefetch_defer_reason = "rate_expired"
+                _note_prefetch_gate("defer_expired")
+                logger.warning(
+                    "#1068 PREFETCH DEFER EXPIRED rid=%s waited_s=%.1f bound_s=%.1f "
+                    "attempts=%d span=%d -- admitted with reason=rate_expired; the "
+                    "bound is the #968/#1065 length-priced prefetch timeout for "
+                    "this span, so a stuck budget cannot hold the queue forever",
+                    rid,
+                    waited,
+                    bound,
+                    int(req.prefetch_defer_attempts),
+                    -1 if span is None else int(span),
+                )
+                return "expired"
+            return "deferred"
+        if not marked:
+            return None
+        # Marked, and the retry came back with a NON-rate verdict.
+        passes = int(getattr(req, "prefetch_defer_passes", 0)) + 1
+        waited = time.monotonic() - float(getattr(req, "prefetch_defer_since", 0.0))
+        req.prefetch_deferred = None
+        req.prefetch_defer_passes = passes
+        if verdict in ("issued", "declined:already_in_flight"):
+            _note_prefetch_gate("landed")
+            # L15: the deferred prefetch registered. Held for THIS pass still
+            # (see `_admission_held_for_deferred_prefetch`): the TP loop drains
+            # the progress verdicts BEFORE the retry, so the drain of this
+            # pass cannot know the operation yet.
+            req._prefetch_landed_hold_once = True
+            logger.info(
+                "#1068 PREFETCH LANDED rid=%s after_passes=%d waited_s=%.1f verdict=%s",
+                rid,
+                passes,
+                waited,
+                verdict,
+            )
+            return "landed"
+        req.prefetch_defer_reason = verdict
+        _note_prefetch_gate("defer_released")
+        logger.warning(
+            "#1068 PREFETCH DEFER RELEASED rid=%s reason=%s after_passes=%d "
+            "waited_s=%.1f -- the gate moved from rate_limited to a non-rate "
+            "term; the request proceeds on that term's normal path",
+            rid,
+            verdict,
+            passes,
+            waited,
+        )
+        return "released"
+
+    def _retry_deferred_prefetches(self) -> int:
+        """Every scheduling pass: re-issue `_prefetch_kvcache` for the marked
+        queue occupants in kv_arrival_seq order (A12.2). Returns how many
+        were retried. Rank-local; no collective beyond what the intake path
+        already carries."""
+        if not getattr(self, "enable_hicache_storage", False):
             return 0
-        # Move exactly the block just queued to the FRONT, in arrival order.
-        # Identity-keyed: `_add_request_to_queue` may legitimately refuse a
-        # request (priority validation, queued-limit abort), and one that never
-        # landed must not be conjured into the queue here.
-        landed = {id(r) for r in block}
-        queued_block = [r for r in self.waiting_queue if id(r) in landed]
-        rest = [r for r in self.waiting_queue if id(r) not in landed]
-        queued_block.sort(
-            key=lambda r: r.kv_arrival_seq if r.kv_arrival_seq is not None else 0
+        marked = [
+            r
+            for r in self.waiting_queue
+            if getattr(r, "prefetch_deferred", None) is not None
+        ]
+        if not marked:
+            return 0
+        marked.sort(
+            key=lambda r: (
+                int(r.kv_arrival_seq)
+                if getattr(r, "kv_arrival_seq", None) is not None
+                else 0
+            )
         )
-        self.waiting_queue = queued_block + rest
-        n = len(queued_block)
-        logger.info(
-            "PHASE-FLIP SEAM RE-ADMISSION: %d retracted resident(s) put back "
-            "at the FRONT of the waiting queue in arrival order (queue %d -> "
-            "%d). They are the oldest work and the flip's own justification; "
-            "their prefixes are served by read-through from the canonical "
-            "store. Without this the seam retracts and DROPS them, which is "
-            "what produced zero completions in W30 and W31.",
-            n,
-            before,
-            len(self.waiting_queue),
-        )
-        return n
+        for req in marked:
+            verdict = self._prefetch_kvcache(req)
+            req._969c_verdict = verdict
+            self._apply_prefetch_deferral(req, verdict, site="retry")
+        return len(marked)
+
+    def _admission_held_for_deferred_prefetch(self, req) -> bool:
+        """True when the admission loop must skip ``req`` this pass.
+
+        PP0 / the single rank only: a follower never withholds admission for
+        its own prefetch (#969Z); it follows PP0's decision through the
+        existing join. A request whose deferred prefetch LANDED this pass is
+        held once more, so the next pass's progress drain -- not this pass's
+        stale one -- decides its admission.
+        """
+        landed_once = bool(getattr(req, "_prefetch_landed_hold_once", False))
+        if landed_once:
+            req._prefetch_landed_hold_once = False
+        marked = getattr(req, "prefetch_deferred", None) is not None
+        if not marked and not landed_once:
+            return False
+        ps = getattr(self, "ps", None)
+        if ps is not None:
+            if int(getattr(ps, "pp_size", 1) or 1) > 1 and int(getattr(ps, "pp_rank", 0) or 0) != 0:
+                return False
+        return True
 
     def _1040_seam_readmit_ready(self) -> bool:
         """#1040: can the TP layout re-admit the residents a cutover retracts?
@@ -9464,6 +9825,15 @@ class Scheduler(
         # budget site) from reading a stale TP memo: absent memo means this
         # path drains for itself, byte-identical to before. The ballot is
         # popped with the same consume-once discipline for the same reason.
+        # #1068 (A12.2): retry the DEFERRED (rate-limited) prefetches of the
+        # marked queue occupants, in kv_arrival_seq order, every pass and
+        # BEFORE the progress drain below, so a prefetch that lands here is
+        # drained here on the PP loop (the TP loop drained at its budget site
+        # already; a landing there is held one more pass, see
+        # `_admission_held_for_deferred_prefetch`). Rank-local; no collective
+        # beyond what the intake path already carries.
+        if self.enable_hicache_storage:
+            self._retry_deferred_prefetches()
         prefetch_verdicts = self.__dict__.pop("_pass_prefetch_verdicts", None)
         if prefetch_verdicts is None:
             prefetch_verdicts = self._drain_prefetch_progress()
@@ -10222,6 +10592,15 @@ class Scheduler(
                 # remaining tokens back to the policy as ordinary pending
                 # prefill -- that is what sends it to PP instead of wedging it.
                 _note_skip("seam_transport_only", req.rid)
+                continue
+            # #1068 (A12.2): a request whose prefetch is DEFERRED (rate-limited
+            # budget) is not admitted to prefill while the mark stands --
+            # admitting it would recompute the whole prefix, the very thing
+            # the deferral exists to avoid. The retry at the top of this pass
+            # clears the mark when the prefetch registers; the two bounded
+            # exits (UNDEFERRABLE / DEFER EXPIRED) clear it by name.
+            if self._admission_held_for_deferred_prefetch(req):
+                _note_skip("prefetch_deferred", req.rid)
                 continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 _note_skip("lora", req.rid)

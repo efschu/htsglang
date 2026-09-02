@@ -10602,35 +10602,39 @@ class PhaseFlipRuntime:
                     len(stash[0]),
                 )
             return
-        # #1070: THE STALE-OP SWEEP THAT STOOD HERE IS DELETED -- it counted a
-        # constructively EMPTY set. It ran over waiting_queue BEFORE the
-        # readmit below, and the only population whose prefetch ops survive a
-        # cutover is exactly the residents the readmit has not yet requeued;
-        # their fresh fetch is issued by the readmit's own intake path
-        # (_add_request_to_queue -> _prefetch_kvcache). Ordinary queued
-        # requests' ops terminate within ~1 s under the 'timeout' drain and
-        # never straddle a cutover (measured 1068cap, F2a Bericht 2: swept=0
-        # in all 24 emissions). A #937 stale refusal remains the safety net
-        # for anything that ever does straddle: the request stays admissible
-        # (check_prefetch_progress reads True once the op is reaped) and
-        # re-fetches on its own admission. Second bookkeeping, deleted per
-        # the upstream-minimal order.
+        # #1068 (spec 4.3, G3/G4): THE WHOLE RUN-WILLING POPULATION IS
+        # RE-ISSUED HERE -- the retracted residents AND the queue occupants.
+        # The #1070 premise that queued requests 'never straddle a cutover'
+        # is refuted on Boot 2 (boot_855_968umbauB_228a66db32): occupant
+        # d188185a was queued at 21:16:57 and recomputed 0->14921 (log
+        # 153596). `_reset_full` drops EVERY prefetch record
+        # (ongoing_prefetch={}, cache_controller.reset(), mem_pool_host.clear())
+        # regardless of who owned it, so an occupant's intake prefetch dies
+        # with the residents' and must be re-issued under the incoming
+        # binding generation through the ONE intake site -- which is why the
+        # readmit runs even when nothing was retracted (released is empty).
+        # No second issue site, no stale-op sweep (upstream-minimal): the
+        # scheduler rebuilds the queue in kv_arrival_seq order and every
+        # member passes _add_request_to_queue -> _prefetch_kvcache once.
         released, n = (stash[0], stash[1]) if stash else ([], 0)
         readmitted = 0
-        if released:
-            try:
-                readmitted = scheduler.readmit_seam_residents(list(released))
-            except Exception:  # noqa: BLE001 - never strand a committed flip
-                logger.error(
-                    "%s #856/W31: RE-ADMISSION FAILED for %s after %d "
-                    "request(s) were already retracted. Those requests are "
-                    "now owned by nobody -- the W31 defect happening live; "
-                    "logged rather than raised because the flip is committed.",
-                    LOG_PREFIX,
-                    direction,
-                    n,
-                    exc_info=True,
-                )
+        summary: dict = {}
+        try:
+            readmitted = scheduler.readmit_seam_residents(
+                list(released), requeue_waiting=True
+            )
+            summary = dict(getattr(scheduler, "last_seam_readmit", None) or {})
+        except Exception:  # noqa: BLE001 - never strand a committed flip
+            logger.error(
+                "%s #856/W31: RE-ADMISSION FAILED for %s after %d "
+                "request(s) were already retracted. Those requests are "
+                "now owned by nobody -- the W31 defect happening live; "
+                "logged rather than raised because the flip is committed.",
+                LOG_PREFIX,
+                direction,
+                n,
+                exc_info=True,
+            )
         if readmitted != n:
             # RETRACTED MUST EQUAL READMITTED. Anything else means requests
             # were dropped, and dropping them silently is the whole W31
@@ -10644,14 +10648,47 @@ class PhaseFlipRuntime:
                 readmitted,
             )
         self._seam_readmitted = readmitted
+        # L7 (G11): ONE aggregate line per cutover with the verdict histogram,
+        # so the acceptance can read issued/declined per wave without
+        # counting #969C lines by hand.
+        try:
+            from sglang.srt.mem_cache.hicache_phase_binding import (
+                current_generation as _current_generation,
+            )
+
+            generation = int(_current_generation())
+        except Exception:  # noqa: BLE001 - no binding bound in unit tests
+            generation = -1
+        pool_id, pool_rows = -1, -1
+        try:
+            _pool = scheduler.tree_cache.cache_controller.mem_pool_host
+            _pool = getattr(getattr(_pool, "anchor_entry", None), "host_pool", None) or _pool
+            pool_id = id(_pool)
+            pool_rows = int(getattr(_pool, "size", -1))
+        except Exception:  # noqa: BLE001 - a diagnostic may never break a flip
+            pass
+        verdicts = dict(summary.get("verdicts") or {})
+        issued = int(verdicts.get("issued", 0))
+        declined = sum(int(v) for k, v in verdicts.items() if k != "issued")
+        reasons = dict(sorted((k, v) for k, v in verdicts.items() if k != "issued"))
         logger.info(
             "%s #1066 POST-CUTOVER FRESH-FETCH after %s: re-admitted %d/%d "
-            "resident(s) on the incoming binding (their intake prefetch is "
-            "issued post-rebind; the pre-#1070 stale-op sweep is deleted).",
+            "resident(s) + re-issued %d/%d queue occupant(s) on the incoming "
+            "binding generation=%d pool_id=%d pool_rows=%d issued=%d "
+            "declined=%d reasons=%s dropped_by_queue_limit=%d",
             LOG_PREFIX,
             direction,
             readmitted,
             n,
+            int(summary.get("requeued", 0)),
+            int(summary.get("occupants", 0)),
+            generation,
+            pool_id,
+            pool_rows,
+            issued,
+            declined,
+            reasons,
+            int(summary.get("dropped_by_queue_limit", 0)),
         )
 
     def _execute_body(self, direction: str) -> Optional[dict]:
@@ -10862,6 +10899,25 @@ class PhaseFlipRuntime:
                     writeback_detail,
                 )
                 self._writeback_defers = 0
+                # #1068 (G9): the proceed is a LOSS TERM of the wave this
+                # cutover re-admits, carried on the #939 census line
+                # (`fence_proceeds`, L10) so a `within_bound=false` can be
+                # told apart from a store defect. Seeded into the NEXT census
+                # (the reset in `_post_cutover_readmit` ends the previous one
+                # after this point).
+                try:
+                    from sglang.srt.mem_cache.producer_phase_census import (
+                        note_fence_proceed as _note_fence_proceed,
+                    )
+
+                    _note_fence_proceed()
+                except Exception:  # noqa: BLE001 - an instrument may never break a flip
+                    logger.warning(
+                        "%s #1068 the fence proceed could not be noted in the "
+                        "#939 census",
+                        LOG_PREFIX,
+                        exc_info=True,
+                    )
         else:
             self._writeback_defers = 0
 
