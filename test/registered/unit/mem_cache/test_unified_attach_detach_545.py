@@ -13,14 +13,13 @@ WHY THIS EXISTS. ``UnifiedRadixCache.attach_storage_backend`` and
 component for ``is_hybrid_ssm``, so the hybrid-GDN family had resize-only: the
 ticket's headline capability was exactly the half that was stubbed.
 
-WHY IT IS SAFE TO IMPLEMENT, which was the open question. Attach must
-re-derive the prefetch capacity through ``_symmetrize_prefetch_capacity``,
-which enters an **all_reduce** across DCP/TP ranks and whose own guard says a
-rank-local early return "would leave the other ranks in the all_reduce with no
-partner". A single-rank attach would hang. It cannot happen: attach fans out
-through ``FanOutCommunicator`` (``tokenizer_control_mixin.py:125,:360``) to
-every rank and merges the results, so the group runs it together, and the
-scheduler refuses a non-idle scheduler by name first.
+WHY IT IS SAFE TO IMPLEMENT, which was the open question. Attach used to
+re-derive the prefetch capacity through a group all_reduce; since #1068 the
+budget is a PROPERTY of the bound host pool and nothing is re-derived after
+the attach (the group concern survives only as the G8 refusal, evaluated
+before any side effect). Attach still fans out through ``FanOutCommunicator``
+(``tokenizer_control_mixin.py:125,:360``) to every rank and merges the
+results, and the scheduler refuses a non-idle scheduler by name first.
 
 These pins drive the real methods against a controller double. The double is
 deliberately thin -- the methods under test are orchestration, and what must
@@ -65,7 +64,6 @@ def _cache(*, controller=_Controller, enable_storage=False, backend_type=None):
     c._retired_prefetch = []
     c.calls = []
     c._apply_storage_runtime_config = lambda **kw: c.calls.append(("config", kw))
-    c._symmetrize_prefetch_capacity = lambda: c.calls.append(("symmetrize", None))
     c._drain_storage_control_queues_impl = lambda **kw: c.calls.append(("drain", kw))
     return c
 
@@ -117,14 +115,16 @@ class TestAttachHappyPath(unittest.TestCase):
         self.assertIn("mamba", pools)
         self.assertIn("full", pools)
 
-    def test_capacity_is_resymmetrized_AFTER_the_config_is_applied(self):
-        """Order matters: the limit is the MIN host-pool size across ranks and
-        can only be derived once each rank knows storage is on."""
+    def test_no_capacity_pass_runs_after_the_config_is_applied(self):
+        """#1068 inverted the old pin: the budget is a property of the bound
+        pool, so attach re-derives nothing after the config -- the call list
+        ends with the config application."""
         c = _cache()
         c.attach_storage_backend("file")
         names = [n for n, _ in c.calls]
-        self.assertIn("symmetrize", names)
-        self.assertLess(names.index("config"), names.index("symmetrize"))
+        self.assertEqual(names[-1], "config")
+        self.assertNotIn("symmetrize", names)
+        self.assertFalse(hasattr(UnifiedRadixCache, "_symmetrize_prefetch_capacity"))
 
 
 class TestAttachIdempotenceAndBackendSwap(unittest.TestCase):

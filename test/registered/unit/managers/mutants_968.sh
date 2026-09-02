@@ -10,8 +10,9 @@
 #       past the decision)
 #   M3  the store-presence refuter is neutered (the premise trusts retract
 #       stamps alone again -- the W30 arm feeder)
-#   M4  the prefetch-cap floor is removed (back to the plain half that sat
-#       below one 16k readmit -- the #915 feeder)
+#   M4  RETIRED (#1068 slice 2): the prefetch-cap floor it mutated is gone;
+#       the budget is a property of the bound host pool (see
+#       test_prefetch_limit_property_1068.py for its mutants)
 #
 # Hermetic: no CUDA, no NVML. Restores every file unconditionally on exit.
 set -u
@@ -93,13 +94,8 @@ src = src.replace(needle, "        refuted, tiers = False, \"neutered\"", 1)
 run_suite; verdict M3 $?
 restore
 
-# M4: the cap floor is removed (plain half again).
-mutate "$CC" '
-needle = "    return max(int(0.5 * size), min(PREFETCH_CAP_FLOOR_TOKENS, int(0.9 * size)))"
-assert needle in src, "M4 anchor missing"
-src = src.replace(needle, "    return int(0.5 * size)", 1)
-'
-run_suite; verdict M4 $?
-restore
+# M4 retired with #1068 slice 2: the prefetch-cap floor it mutated is gone
+# (the budget is a property of the bound host pool; its mutants live next to
+# test_prefetch_limit_property_1068.py).
 
 exit $fail

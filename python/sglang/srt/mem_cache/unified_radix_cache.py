@@ -631,9 +631,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         collectives in can_terminate_prefetch / check_prefetch_progress, while the
         ranks that did register ENTER them -> collective desync -> NCCL deadlock.
 
-        The two symmetrization mechanisms (participation consensus in
-        prefetch_from_storage; capacity floor in _symmetrize_prefetch_capacity)
-        are gated on this predicate. Stock even-TP HiCache (uniform host pools)
+        The participation consensus in prefetch_from_storage is gated on
+        this predicate. The former capacity symmetrize pass is gone (#1068):
+        under this predicate the boot REQUIRES ``--hicache-size`` instead, so
+        the per-rank budget property is rank-uniform by construction
+        (prefetch_budget.py). Stock even-TP HiCache (uniform host pools)
         never trips it -> that path is byte-identical. Uses the same attn/TP
         groups the existing prefetch collectives run on."""
         return (
@@ -654,55 +656,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         return self._hicache_prefetch_symmetric()
 
-    def _symmetrize_prefetch_capacity(self) -> None:
-        """Mechanism (2): derive the speculative-prefetch capacity limit from the
-        MIN host-pool size across the DCP/TP ranks.
-
-        Under weighted DCP the host pools differ per rank, so the stock per-rank
-        ``int(0.5 * mem_pool_host.size)`` limit makes ``prefetch_rate_limited()``
-        answer differently on different ranks -> ranks diverge on whether to even
-        start a prefetch, BEFORE the participation consensus in
-        prefetch_from_storage is reached (that divergence would desync the
-        consensus all-reduce itself). Using the shared MIN makes the rate-limit
-        gate trip in lockstep on every rank. Gated so the general (even-TP) path
-        keeps its per-rank limit unchanged."""
-        if not self._hicache_prefetch_symmetric():
-            return
-        cc = self.cache_controller
-        if getattr(cc, "mem_pool_host", None) is None:
-            # The gate above is rank-uniform (config + uneven_dcp_active), so a
-            # rank-local early return HERE would leave the other ranks in the
-            # all_reduce below with no partner. A HybridCacheController always
-            # owns a host pool, so this is a structural break, not a state the
-            # collective may be skipped for: name it instead of hanging.
-            raise HiCacheCollectiveError(
-                "cache controller has no mem_pool_host while prefetch "
-                "symmetrization is active; the peer ranks are entering the "
-                "capacity all_reduce and this rank cannot."
-            )
-        local_size = int(cc.mem_pool_host.size)
-        size_tensor = torch.tensor([local_size], dtype=torch.long)
-        self._all_reduce_attn_groups(
-            size_tensor,
-            torch.distributed.ReduceOp.MIN,
-            label="symmetrize_prefetch_capacity",
-        )
-        min_size = int(size_tensor.item())
-        # #968/#1065: one authority for the halved-with-floor budget --
-        # see `prefetch_capacity_limit_for`. Lazy import: this module is
-        # imported by the controller's own dependency chain.
-        from sglang.srt.managers.cache_controller import (
-            prefetch_capacity_limit_for,
+    def _refuse_ratio_sizing_under_symmetric_storage(self, server_args) -> None:
+        """#1068 (G8): group-decided prefetch needs rank-uniform host pools,
+        i.e. ``--hicache-size``; see prefetch_budget.py."""
+        from sglang.srt.mem_cache.prefetch_budget import (
+            refuse_ratio_sized_pools_under_symmetric_prefetch,
         )
 
-        cc.prefetch_capacity_limit = prefetch_capacity_limit_for(min_size)
-        logger.info(
-            "[uneven-dcp hicache] prefetch_capacity_limit symmetrized to %d "
-            "(min host-pool %d across attn groups; local host-pool %d)",
-            cc.prefetch_capacity_limit,
-            min_size,
-            local_size,
+        refuse_ratio_sized_pools_under_symmetric_prefetch(
+            symmetric=self._hicache_prefetch_symmetric(), server_args=server_args
         )
+
+    def rebuild_staging_write_ring(self, server_args) -> None:
+        """#1068 (G2): the write-through ring follows the bound host pool;
+        rebuilt at boot and after every cutover rebind."""
+        from sglang.srt.mem_cache.staging_write_ring import install_staging_write_ring
+
+        install_staging_write_ring(self, server_args)
+
+    def _drop_staging_write_ring(self) -> None:
+        from sglang.srt.mem_cache.staging_write_ring import drop_staging_write_ring
+
+        drop_staging_write_ring(self)
 
     def _barrier_attn_groups(self, label: str = "hicache"):
         waited = False
@@ -844,10 +819,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._retired_prefetch_reaped = 0
         self._retired_prefetch_recompute = 0
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
-        # #810: built in `init_hicache`, once the controller and the
-        # symmetrized prefetch reservation exist. None here and for the whole
-        # of `--hicache-host-role retention`, which is the default.
-        self.staging_write_ring = None
+        # #810/#1068: built by `rebuild_staging_write_ring` at boot and after
+        # every cutover rebind. None here and for the whole of
+        # `--hicache-host-role retention`, which is the default. The drop
+        # also clears the controller's occupancy reader (G2).
+        self._drop_staging_write_ring()
         self._init_pin_trace()
 
         if self.cache_controller is not None:
@@ -943,23 +919,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
             )
-            # Uneven-DCP: make the storage-prefetch handshake rank-symmetric so
-            # concurrent bursts don't desync the prefetch collectives (deadlock).
-            self._symmetrize_prefetch_capacity()
+            # #1068 (G8): group-decided prefetch over ratio-sized pools would
+            # give every rank a different budget property -- refuse by name.
+            self._refuse_ratio_sizing_under_symmetric_storage(server_args)
 
-            # #810: bound the write-through consumer of a STAGING host tier,
-            # AFTER the symmetrization above so the capacity is the complement
-            # of the GROUP-agreed prefetch reservation. A later runtime attach
-            # re-derives that reservation; it is not the staging shape (the
-            # role requires a backend at boot) and the ring keeps its boot
-            # capacity there rather than dropping live admissions.
-            from sglang.srt.mem_cache.staging_write_ring import (
-                build_staging_write_ring,
-            )
+            # #810/#1068 (G2): bound the write-through consumer of a STAGING
+            # host tier as the complement of the budget PROPERTY of the pool
+            # bound now; rebuilt again after every cutover rebind.
+            self.rebuild_staging_write_ring(server_args)
 
-            self.staging_write_ring = build_staging_write_ring(
-                server_args, self.cache_controller
-            )
+            from sglang.srt.mem_cache.prefetch_budget import log_prefetch_limit
+
+            log_prefetch_limit(self.cache_controller, site="init_hicache")
 
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
@@ -3287,9 +3258,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         #
         # #580: these MUST NOT gate entry into the collective. They did until
         # 2026-08-05, on the (false) assumption recorded here that the gate was
-        # rank-symmetric because _symmetrize_prefetch_capacity symmetrizes the
-        # capacity LIMIT. It symmetrizes the limit, never the occupancy counter
-        # and never `backuped`. A rank that tripped one of them returned before
+        # rank-symmetric because the (since deleted, #1068) capacity symmetrize
+        # pass made the LIMIT uniform. A uniform limit never made the
+        # occupancy or `backuped` uniform. A rank that tripped one of them returned before
         # the vote, so its peers stood in a collective it never entered: TP0
         # posted the 4-byte vote while TP1/TP2 had moved on to the 64-byte
         # kv-pressure consensus on the same gloo group, and gloo aborted TP0
@@ -4816,19 +4787,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         Mirrors ``HiRadixCache.attach_storage_backend`` -- same validation, same
         named refusals, same "already attached to this backend is success,
-        attached to a DIFFERENT backend is failure" rule -- with one addition
-        this cache needs and HiRadixCache does not: the prefetch capacity must
-        be re-symmetrized across ranks afterwards.
+        attached to a DIFFERENT backend is failure" rule.
 
-        THE CALLER IS THE WHOLE GROUP, and that is what makes this safe.
-        ``_symmetrize_prefetch_capacity`` enters an all_reduce over the DCP/TP
-        ranks, and its own guard says a rank-local early return "would leave
-        the other ranks in the all_reduce with no partner". A single-rank
-        attach would therefore hang or raise. It does not happen because
-        ``attach_hicache_storage`` fans out through ``FanOutCommunicator`` to
-        every rank and merges the results, so every rank runs this method or
-        none does. The scheduler additionally refuses a non-idle scheduler by
-        name before reaching here.
+        #1068: the prefetch budget is a property of the bound host pool, so
+        nothing is re-derived here after the attach. What remains of the old
+        group concern is the G8 refusal below: a runtime attach that would
+        make the prefetch group-decided over ratio-sized (rank-divergent)
+        host pools is refused by name BEFORE any side effect, exactly as the
+        boot-time init refuses it. ``attach_hicache_storage`` fans out through
+        ``FanOutCommunicator`` to every rank, so the refusal is rank-uniform.
         """
         if hicache_storage_prefetch_policy is not None:
             allowed = ["best_effort", "wait_complete", "timeout"]
@@ -4855,6 +4822,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 "runtime is a separate capability (the host pool and its "
                 "threads are built at boot).",
             )
+
+        # #1068 (G8), evaluated as if storage were already on: the predicate
+        # `_hicache_prefetch_symmetric` reads enable_storage, which is still
+        # False here, so its two other terms are read directly.
+        try:
+            from sglang.srt.distributed.utils import uneven_dcp_active
+            from sglang.srt.mem_cache.prefetch_budget import (
+                refuse_ratio_sized_pools_under_symmetric_prefetch,
+            )
+            from sglang.srt.runtime_context import get_server_args
+
+            symmetric_after = int(getattr(self, "tp_world_size", 1) or 1) > 1 and bool(
+                uneven_dcp_active()
+            )
+            if symmetric_after:
+                refuse_ratio_sized_pools_under_symmetric_prefetch(
+                    symmetric=True, server_args=get_server_args()
+                )
+        except ValueError as e:
+            return False, str(e)
 
         # Already attached: same backend is success (policies may still be
         # updated), a DIFFERENT backend is a refusal rather than a silent
@@ -4915,10 +4902,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 1 if hicache_write_policy == "write_through" else 2
             )
 
-        # AFTER the config is applied, and on every rank: the capacity limit is
-        # derived from the MIN host-pool size across ranks, so it can only be
-        # computed once each rank knows storage is on.
-        self._symmetrize_prefetch_capacity()
+        # #1068: no capacity pass here -- the budget is a property of the
+        # bound pool and the G8 refusal above ran before any side effect.
         return True, "Attached HiCache storage backend successfully."
 
     def _get_hybrid_storage_attach_kwargs(self) -> dict:

@@ -353,22 +353,11 @@ class RecvAbortProvider968(unittest.TestCase):
 class Feeders968(unittest.TestCase):
     """P4: the two feeders named by #1065."""
 
-    def test_rate_cap_floor_restores_one_request_prefetchability(self):
-        """#1065: half of the measured TP-phase pool (30518 -> 15259) sat
-        below one 16k readmit, structurally banning the second readmit
-        prefetch. The producer floor lifts the budget to one request's
-        worth; retention-scale pools keep the plain half; tiny pools are
-        never over-claimed past 90%."""
-        from sglang.srt.managers.cache_controller import (
-            PREFETCH_CAP_FLOOR_TOKENS,
-            prefetch_capacity_limit_for,
-        )
-
-        self.assertGreaterEqual(PREFETCH_CAP_FLOOR_TOKENS, 16384)
-        self.assertGreaterEqual(prefetch_capacity_limit_for(30518), 16384)
-        self.assertEqual(prefetch_capacity_limit_for(1_000_000), 500_000)
-        self.assertLessEqual(prefetch_capacity_limit_for(8192), int(0.9 * 8192))
-        self.assertEqual(prefetch_capacity_limit_for(0), 0)
+    # #1068 slice 2: the floor test that stood here pinned the deleted
+    # ``prefetch_capacity_limit_for`` compensation; its successors are T6/T7
+    # in test/registered/unit/mem_cache/test_prefetch_limit_property_1068.py
+    # (the budget is a property of the bound pool, the brake reads live
+    # occupancy).
 
     def test_timeout_pricing_covers_a_16k_readmit_at_measured_rate(self):
         """#1065: measured best-case store rate ~0.32 s/KiToken; the linear

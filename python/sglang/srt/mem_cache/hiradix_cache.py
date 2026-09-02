@@ -29,7 +29,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_collective import (
-    HiCacheCollectiveError,
     bounded_recv,
     bounded_wait,
     collective_rank_desc,
@@ -123,8 +122,8 @@ class HiRadixCache(RadixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         # Deadline for every cross-rank control collective issued from this
-        # cache (#630). Set before the first collective below
-        # (_symmetrize_prefetch_capacity) can run. Without it a dead TP peer or
+        # cache (#630). Set before the first prefetch control collective can
+        # run. Without it a dead TP peer or
         # a PP rank that never posts the matching receive parks this rank until
         # the gloo group's two-hour default timeout expires -- the PP + disk
         # HiCache warmup wedge, where health stays 503 with nothing logged.
@@ -202,21 +201,19 @@ class HiRadixCache(RadixCache):
             extra_metric_labels=self.extra_metric_labels,
         )
 
-        # #610: must run after the controller exists and before any request is
-        # served, so every rank enters the capacity reduce from the same point.
-        self._symmetrize_prefetch_capacity()
+        # #1068 (G8): group-decided prefetch over ratio-sized pools would give
+        # every rank a different budget property -- refuse by name.
+        self._refuse_ratio_sizing_under_symmetric_storage(server_args)
 
-        # #810: bound the write-through consumer of a STAGING host tier. Built
-        # AFTER `_symmetrize_prefetch_capacity` above, so the capacity is the
-        # complement of the group-agreed prefetch reservation rather than of a
-        # rank-local one -- a rank-dependent admission bound on this path is
-        # exactly the #645 defect. None under `--hicache-host-role retention`,
-        # which is the default and leaves this path unchanged.
-        from sglang.srt.mem_cache.staging_write_ring import build_staging_write_ring
+        # #810/#1068 (G2): bound the write-through consumer of a STAGING host
+        # tier as the complement of the budget PROPERTY of the bound pool.
+        # None under `--hicache-host-role retention`, which is the default and
+        # leaves this path unchanged.
+        self.rebuild_staging_write_ring(server_args)
 
-        self.staging_write_ring = build_staging_write_ring(
-            server_args, self.cache_controller
-        )
+        from sglang.srt.mem_cache.prefetch_budget import log_prefetch_limit
+
+        log_prefetch_limit(self.cache_controller, site="hiradix_init")
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -320,45 +317,23 @@ class HiRadixCache(RadixCache):
         """
         return self._hicache_prefetch_symmetric()
 
-    def _symmetrize_prefetch_capacity(self) -> None:
-        """Derive the speculative-prefetch capacity limit from the MIN host-pool
-        size across the group (#610, mirroring unified_radix_cache.py:543).
-
-        Under weighted DCP the host pools differ per rank, so the stock per-rank
-        `int(0.5 * mem_pool_host.size)` limit (cache_controller.py:477) makes
-        `prefetch_rate_limited()` trip on different iterations on different
-        ranks -- a divergence UPSTREAM of the participation vote, which would
-        desync the vote itself. The shared MIN makes the rate-limit gate trip in
-        lockstep. Gated so the even-TP path keeps its per-rank limit unchanged.
-        """
-        if not self._hicache_prefetch_symmetric():
-            return
-        cc = self.cache_controller
-        if getattr(cc, "mem_pool_host", None) is None:
-            # The gate above is rank-uniform (config + uneven_dcp_active), so a
-            # rank-local early return HERE would leave the peers alone in the
-            # all_reduce below. Name it instead of hanging.
-            raise HiCacheCollectiveError(
-                "cache controller has no mem_pool_host while prefetch "
-                "symmetrization is active; the peer ranks are entering the "
-                "capacity all_reduce and this rank cannot."
-            )
-        size_tensor = torch.tensor([int(cc.mem_pool_host.size)], dtype=torch.long)
-        self._all_reduce_attn_groups(
-            size_tensor,
-            torch.distributed.ReduceOp.MIN,
-            label="symmetrize_prefetch_capacity",
-        )
-        # #968/#1065: one authority for the halved-with-floor budget -- see
-        # `prefetch_capacity_limit_for` (a floor applied at only one caller
-        # would be undone by this symmetrize pass).
-        from sglang.srt.managers.cache_controller import (
-            prefetch_capacity_limit_for,
+    def _refuse_ratio_sizing_under_symmetric_storage(self, server_args) -> None:
+        """#1068 (G8): group-decided prefetch needs rank-uniform host pools,
+        i.e. ``--hicache-size``; see prefetch_budget.py. Same refusal as the
+        unified cache, one implementation."""
+        from sglang.srt.mem_cache.prefetch_budget import (
+            refuse_ratio_sized_pools_under_symmetric_prefetch,
         )
 
-        cc.prefetch_capacity_limit = prefetch_capacity_limit_for(
-            int(size_tensor[0].item())
+        refuse_ratio_sized_pools_under_symmetric_prefetch(
+            symmetric=self._hicache_prefetch_symmetric(), server_args=server_args
         )
+
+    def rebuild_staging_write_ring(self, server_args) -> None:
+        """#1068 (G2): the write-through ring follows the bound host pool."""
+        from sglang.srt.mem_cache.staging_write_ring import install_staging_write_ring
+
+        install_staging_write_ring(self, server_args)
 
     def _barrier_attn_groups(self, label: str = "hicache"):
         waited = False

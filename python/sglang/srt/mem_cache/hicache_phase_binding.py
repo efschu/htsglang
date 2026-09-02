@@ -659,6 +659,10 @@ def _rebind_for_cutover_inner(
     settle_pending_releases(scheduler)
     generation = rebind(readers, incoming)
     coherence_check(readers)
+    # #1068 (G2): the write-through ring is the complement of the prefetch
+    # budget PROPERTY of the pool just bound; rebuild it here, AFTER the
+    # coherence check, and print the budget now in force (L3).
+    rebuild_staging_ring_after_rebind(readers, scheduler)
     # #861: THE FOURTH PARTICIPANT. The draft half is registered here and
     # nowhere else, for the same reason the other three are rebound here: its
     # host indices are 1-to-1 with the target host pool's, and that pool has
@@ -733,6 +737,35 @@ def _rebind_for_cutover_inner(
             exc,
         )
     return generation
+
+
+def rebuild_staging_ring_after_rebind(readers: dict, scheduler: Any) -> None:
+    """#1068 (G2): rebuild the tree's staging ring against the pool the
+    readers were just bound to, then emit L3 from the live budget property.
+
+    A tree without the hook (plain RadixCache) is skipped; a failure is
+    logged and never raised, because the target rebind is COMMITTED at this
+    point and a ring refusal is a strictly smaller failure than an
+    un-reported torn binding.
+    """
+    tree = readers.get("tree_cache")
+    rebuild = getattr(tree, "rebuild_staging_write_ring", None)
+    if rebuild is None:
+        return
+    try:
+        rebuild(getattr(scheduler, "server_args", None))
+    except Exception as exc:  # noqa: BLE001 - a ring refusal is not a rebind refusal
+        logger.error(
+            "%s the rebind COMMITTED, but the #810 staging ring could not be "
+            "rebuilt against the incoming host pool (%s). Write-through runs "
+            "without its bound until the next successful rebuild.",
+            LOG_PREFIX,
+            exc,
+        )
+        return
+    from sglang.srt.mem_cache.prefetch_budget import log_prefetch_limit
+
+    log_prefetch_limit(readers.get("cache_controller"), site="rebind_for_cutover")
 
 
 def current_generation() -> int:

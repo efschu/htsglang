@@ -14,12 +14,11 @@ limitations under the License.
 """
 
 import logging
-import os
 import sys
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -289,38 +288,17 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
-#: #968/#1065: floor for the speculative-prefetch budget, in tokens.
-#: 20480 covers the largest measured cutover re-admission (15.9k) with
-#: headroom; override per rig via the env below.
-PREFETCH_CAP_FLOOR_TOKENS = int(
-    os.environ.get("SGLANG_HICACHE_PREFETCH_CAP_FLOOR_TOKENS", "20480")
-)
-
-
-def prefetch_capacity_limit_for(host_pool_size: int) -> int:
-    """#968/#1065: the speculative-prefetch budget for a host pool of
-    ``host_pool_size`` tokens -- half the pool, FLOORED so ONE full cutover
-    re-admission stays prefetchable.
-
-    The half-formula's premise is a retention-scale pool. The phase-flip
-    TP-phase pool is 23x smaller (measured #905: 703472 rows PP vs 30518
-    TP), and half of THAT (15259) sits below one 16k readmit -- so
-    `prefetch_tokens_occupied >= limit` structurally banned the SECOND
-    readmit prefetch of every TP window (the starvation family's feeder;
-    unified_radix_cache.py's own RATE paragraph names the hazard). Decision
-    per #1065: the POOL-REFERENCE was the wrong half, not the reserve idea.
-    The floor restores one-request prefetchability, never claims more than
-    90% of the pool, and stays coherent with the write-staging ring, which
-    derives its capacity as the complement AFTER this bound
-    (staging_write_ring.py) and warns loudly -- rather than silently -- when
-    nothing is left for write-through.
-
-    ONE AUTHORITY, THREE CALLERS (boot init here, the two symmetrize sites
-    in unified_radix_cache/hiradix_cache): a floor applied at only one of
-    them would be undone by the next symmetrize pass.
-    """
-    size = max(0, int(host_pool_size))
-    return max(int(0.5 * size), min(PREFETCH_CAP_FLOOR_TOKENS, int(0.9 * size)))
+#: #1068 (WEG 1 slice 2): the speculative-prefetch budget in the upstream
+#: ``buffer_only`` form (upstream cache_controller.py:253 and :575-584).
+#: A STAGING host tier lends this fraction of its rows to prefetch; the
+#: remainder is the write-through ring's capacity (staging_write_ring.py).
+HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
+#: A RETENTION host tier (upstream "cache mode", the else branch of :575-584)
+#: keeps half for prefetch. Neither number is a stored quantity: see
+#: ``HiCacheController.prefetch_capacity_limit``, a property of the pool the
+#: controller is bound to RIGHT NOW, so a phase rebind that swaps
+#: ``mem_pool_host`` needs no re-derivation pass and no floor.
+HICACHE_CACHE_MODE_LOAD_FRACTION = 0.5
 
 
 def canonical_identity_hash_for(server_args, canonical_page: bool) -> str:
@@ -625,6 +603,15 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        # #1068: the host tier's role, copied from the storage config at
+        # attach (``_generate_storage_config`` is the ONE reader of the
+        # --hicache-host-role flag). Retention until a backend is attached,
+        # matching that reader's default.
+        self.host_role: str = "retention"
+        # #1068 (upstream :331): live occupancy of the write-through staging
+        # ring, installed by the tree when it builds its ring and cleared when
+        # the ring is dropped. None means no ring, i.e. nothing is staged.
+        self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -843,6 +830,9 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
+        # #1068: the role the budget property reads; same source as the
+        # backend's own host_role field, never a second read of the flag.
+        self.host_role = str(getattr(self.storage_config, "host_role", "retention"))
         # Weighted uneven-DCP owner mode: page files are owner-written and
         # rank-shared; only the file backend implements that key scheme, and
         # the per-page owner rule needs page_size == 1 (a multi-token page
@@ -896,13 +886,11 @@ class HiCacheController:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
-            # Budget speculative prefetch at half the host pool (floored so
-            # one full cutover re-admission stays prefetchable, #968/#1065),
-            # leaving the rest for the write-back staging path.
-            self.prefetch_capacity_limit = prefetch_capacity_limit_for(
-                self.mem_pool_host.size
-            )
-            # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
+            # #1068: the prefetch budget is the ``prefetch_capacity_limit``
+            # PROPERTY of the bound host pool; nothing is stored here.
+            # Instrument only (upstream keeps it too): the number of tokens
+            # currently locked by registered prefetches, updated by the main
+            # scheduler thread. The rate brake no longer reads it.
             self.prefetch_tokens_occupied = 0
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
@@ -1371,33 +1359,32 @@ class HiCacheController:
         return True
 
     def reset(self):
-        self.storage_stop_event.set()
+        """Quiesce and restart the storage pipeline through the ONE join
+        authority (#1068 graft G6).
+
+        ``_stop_storage_threads`` joins the prefetch thread, the backup thread
+        AND ``prefetch_io_aux_thread`` (the transfer thread that
+        ``prefetch_thread_func`` starts); the hand-rolled joins this method
+        carried before omitted the aux thread -- #1025's own docstring names
+        it as the half ``reset()`` "hand-rolls and omits" -- so a tree reset
+        at the cutover left it alive on the OUTGOING binding while the pools
+        swapped (boot 22, #1052). ``_start_storage_threads`` rebuilds the
+        queues fresh, which subsumes the per-queue clears that lived here.
+        """
+        self._stop_storage_threads()
 
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
-        if self.enable_storage:
-            self.prefetch_thread.join()
-            self.backup_thread.join()
-            self.prefetch_queue.queue.clear()
-            self.backup_queue.queue.clear()
-            self.prefetch_revoke_queue.queue.clear()
-            self.ack_backup_queue.queue.clear()
-            self.host_mem_release_queue.queue.clear()
-            self.prefetch_tokens_occupied = 0
 
         self.storage_stop_event.clear()
 
         if self.enable_storage:
-            self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
-            )
-            self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
-            )
-            self.prefetch_thread.start()
-            self.backup_thread.start()
+            # N2 (spec section 12): the restart helper does not touch the
+            # instrument counter, so it is zeroed here with the pipeline.
+            self.prefetch_tokens_occupied = 0
+            self._start_storage_threads()
 
     def write(
         self,
@@ -2417,19 +2404,50 @@ class HiCacheController:
                         )
                 continue
 
+    @property
+    def prefetch_capacity_fraction(self) -> float:
+        """The share of the bound host pool that speculative prefetch may
+        hold: 0.9 for a staging tier, 0.5 for a retention tier (upstream
+        cache_controller.py:253 / :575-584)."""
+        if self.host_role == "staging":
+            return HICACHE_LOAD_POOL_USAGE_FRACTION
+        return HICACHE_CACHE_MODE_LOAD_FRACTION
+
+    @property
+    def prefetch_capacity_limit(self) -> int:
+        """The speculative-prefetch budget, in tokens, of the host pool the
+        controller is bound to RIGHT NOW (#1068, upstream buffer_only form).
+
+        A property and not a number on purpose: the phase flip rebinds
+        ``mem_pool_host`` (hicache_phase_binding._stamp), and a number stored
+        at attach kept describing the pool of the previous phase -- which is
+        what the deleted floor and the two symmetrize passes compensated for.
+        With ``--hicache-size`` both phase pools are MIN-synced across ranks
+        (pool_host/base.py sync_fixed_hicache_size), so this value is
+        rank-uniform by construction and no group reduce is needed.
+        """
+        pool = getattr(self, "mem_pool_host", None)
+        if pool is None:
+            return 0
+        return int(self.prefetch_capacity_fraction * int(pool.size))
+
     def prefetch_rate_limited(self) -> bool:
+        """Refuse a new prefetch registration when the host pool is too full
+        (upstream cache_controller.py:1150-1163, buffer_only form).
+
+        Occupancy is read LIVE from the pool -- ``size - available_size()`` --
+        minus what the write-through staging ring currently holds (the ring's
+        tokens are the writer's, not the prefetcher's), and compared against
+        the property above. The fork's ``prefetch_tokens_occupied`` counter
+        is an instrument and does not gate: it counted registrations, never
+        rows, and it was the term the deleted floor had to lift.
         """
-        Rate limit the prefetching operations to avoid overwhelming the storage backend.
-        """
-        # cancel prefetch if too much memory is occupied.
-        # #968/#1065: the fix for the structural second-readmit ban lives at
-        # the LIMIT PRODUCER (`prefetch_capacity_limit_for`: the halved
-        # TP-phase pool sat below one 16k readmit), not here -- this check is
-        # the correct occupancy gate once the limit can hold one request.
-        if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
-            return True
-        # todo: more sophisticated rate limiting based on storage backend performance
-        return False
+        pool = self.mem_pool_host
+        used = int(pool.size) - int(pool.available_size())
+        fn = self.host_write_staged_tokens_fn
+        if fn is not None:
+            used -= int(fn())
+        return used >= self.prefetch_capacity_limit
 
     def _presence_pool_transfers(self) -> Optional[list[PoolTransfer]]:
         """The component transfers the REAL fetch carries, rebuilt for the probe.

@@ -2695,9 +2695,9 @@ def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
                 "#946 REFETCH DECLINED rid=%s reason=%s streak=%d/%d: the "
                 "dead-premise escape asked for a re-fetch and NONE WAS ISSUED. "
                 "The mark is kept and the escape retries next round. If "
-                "reason=rate_limited persists, the root is the #915 host-tier "
-                "capacity asymmetry across the flip (prefetch_capacity_limit "
-                "is 0.5 * mem_pool_host.size, cache_controller.py:841) and "
+                "reason=rate_limited persists, read the #915 PREFETCH LIMIT "
+                "line of this generation (prefetch_capacity_limit is a "
+                "property of the bound host pool since #1068) and "
                 "NOT this escape.",
                 getattr(req, "rid", "?"),
                 reason,

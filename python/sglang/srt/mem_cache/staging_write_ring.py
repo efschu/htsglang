@@ -43,11 +43,15 @@ rate above the drain rate, so a finite size is only meaningful if the producer
 can be made to wait.
 
 WHERE THE CAPACITY COMES FROM, and why it is not a new number. The read
-consumer is already bounded at runtime: ``cache_controller.prefetch_capacity_
-limit`` is ``int(0.5 * mem_pool_host.size)``. The two consumers share one
-tier, so the write consumer's bound is that number's COMPLEMENT. Deriving it
-keeps this module from becoming a second sizing authority next to the planner
-(#584/#785) -- it introduces no constant of its own.
+consumer is already bounded at runtime: the controller's
+``prefetch_capacity_limit`` PROPERTY (#1068: ``int(fraction * size)`` of the
+host pool the controller is bound to right now, 0.9 for a staging tier). The
+two consumers share one tier, so the write consumer's bound is that number's
+COMPLEMENT, and because the read bound follows the bound pool the ring is
+rebuilt whenever the pool moves (``install_staging_write_ring`` at boot and
+after every cutover rebind). Deriving it keeps this module from becoming a
+second sizing authority next to the planner (#584/#785) -- it introduces no
+constant of its own.
 
 NO HYSTERESIS, deliberately. A refused backup is not lost work that has to be
 re-driven: the node stays in the tree and the next insert that reaches it
@@ -245,10 +249,10 @@ def build_staging_write_ring(
     it did before this module existed.
 
     The capacity is the complement of the read consumer's existing bound
-    (``prefetch_capacity_limit``), read AFTER the caller has symmetrized that
-    limit across ranks -- so on an uneven rig the write bound is derived from
-    the same group-agreed number the read bound uses, and stays rank-uniform
-    with it. A rank-dependent admission bound on this path is the #645 defect.
+    (the ``prefetch_capacity_limit`` property of the bound host pool). Under
+    ``--hicache-size`` that pool is MIN-synced across ranks, so the write
+    bound derived from it is rank-uniform with the read bound. A
+    rank-dependent admission bound on this path is the #645 defect.
     """
     if getattr(server_args, "hicache_host_role", "retention") != "staging":
         return None
@@ -281,3 +285,33 @@ def build_staging_write_ring(
         read_reserved,
     )
     return ring
+
+
+def install_staging_write_ring(tree: Any, server_args: Any) -> Optional[StagingWriteRing]:
+    """#1068 (graft G2): (re)build the tree's ring against the host pool its
+    controller is bound to NOW, and install the ring's live occupancy as the
+    controller's ``host_write_staged_tokens_fn`` -- the term the prefetch
+    rate brake subtracts (upstream cache_controller.py:1150-1163).
+
+    Called at boot and after every cutover rebind: the read bound is a
+    property of the bound pool, so the complement must follow the pool too.
+    ``None`` (retention role, or no controller) installs no reader.
+    """
+    cc = getattr(tree, "cache_controller", None)
+    ring = build_staging_write_ring(server_args, cc)
+    tree.staging_write_ring = ring
+    if cc is not None:
+        cc.host_write_staged_tokens_fn = (
+            (lambda: ring.occupied_tokens) if ring is not None else None
+        )
+    return ring
+
+
+def drop_staging_write_ring(tree: Any) -> None:
+    """The ONE place that nulls the ring AND its occupancy reader (a reader
+    left behind would subtract the occupancy of a ring that no longer
+    admits anything)."""
+    tree.staging_write_ring = None
+    cc = getattr(tree, "cache_controller", None)
+    if cc is not None:
+        cc.host_write_staged_tokens_fn = None
