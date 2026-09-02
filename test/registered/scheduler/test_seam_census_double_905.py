@@ -39,7 +39,6 @@ from sglang.srt.managers.phase_flip_runtime import (
 from sglang.test.test_utils import CustomTestCase
 
 from seam_census_double import (  # noqa: E402 (sibling)
-    ROWS_PER_RESIDENT,
     FaithfulBatch,
     FaithfulCensusScheduler,
 )
@@ -49,8 +48,10 @@ def _run_the_seam(sched):
     """The #856 release step, driven through the SHIPPED functions only.
 
     This is deliberately a transcription of `_release_residents_for_cutover`'s
-    body rather than a call to it, because that method needs a whole
-    `PhaseFlipRuntime`. Every function it names is the production one.
+    body followed by `_post_cutover_readmit`'s (#1066: the requeue runs after
+    the cutover, on the incoming binding) rather than a call to them, because
+    those methods need a whole `PhaseFlipRuntime`. Every function it names is
+    the production one.
     """
     built = build_cutover_release(sched)
     assert built is not None
@@ -139,17 +140,6 @@ class TestTheSeamReachesTheStateItPromises(CustomTestCase):
         _run_the_seam(sched)
         self.assertEqual(sched.tree_cache.evict_calls, 1)
         self.assertEqual(sched.tree_cache.resets, 1)
-
-    def test_the_state_copy_ran_while_the_rows_were_still_held(self):
-        # `seam_copy_state` runs BEFORE `release_kv_cache`, "while the rows
-        # still hold live bytes". A double that released first would record a
-        # copy over zero rows and every #783 assertion above it would be a
-        # copy of nothing.
-        sched = FaithfulCensusScheduler()
-        _run_the_seam(sched)
-        for req in sched.residents:
-            self.assertEqual(req.rows_at_offload, ROWS_PER_RESIDENT)
-            self.assertEqual(req.offloaded_at_extent, req.kv_committed_len)
 
     def test_the_seam_stamped_its_own_retractions(self):
         # W30: the seam stamps `seam_readmit_epoch` at exactly one site, so

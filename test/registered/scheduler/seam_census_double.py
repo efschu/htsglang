@@ -57,7 +57,7 @@ tests actually exercise rather than restate:
     phase_flip_runtime.drop_prefix_tree_returning_rows    (evict-then-reset)
     phase_flip_runtime.tree_evictable_full_rows           (the W29 reader)
     phase_flip_runtime.consume_retracted_from_live_universe
-    schedule_batch.retract_all -> release_req -> seam_copy_state
+    schedule_batch.retract_all -> release_req
     mem_cache.common.release_kv_cache, evict_from_tree_cache
     scheduler.Scheduler.readmit_seam_residents
 
@@ -74,7 +74,7 @@ which plants the contract violations this file claims to catch.
 from __future__ import annotations
 
 import types
-from typing import List, Optional
+from typing import List
 
 from sglang.srt.managers.phase_flip_runtime import PHASE_PP
 from sglang.srt.managers.scheduler import Scheduler
@@ -364,9 +364,9 @@ class FaithfulReq:
         self.kv_committed_len = ROWS_PER_RESIDENT
         self.kv_spill_state = None
         self.skip_radix_cache_insert = False
-        # A decode resident: prefill complete, so `seam_copy_state` COPIES
-        # rather than declining. Declining would silently skip the one leg of
-        # the retraction that runs while the rows still hold live bytes.
+        # A decode resident: prefill complete. (The seam copy that this state
+        # once fed is deleted, #1068; the fields stay because the retraction
+        # order law still reads them.)
         self.origin_input_ids = list(range(ROWS_PER_RESIDENT))
         self.output_ids = [0]
         self.seqlen = ROWS_PER_RESIDENT + 1
@@ -374,15 +374,12 @@ class FaithfulReq:
         self.extend_range = types.SimpleNamespace(end=ROWS_PER_RESIDENT)
         self.retraction_count = 0
         self.is_retracted = False
-        self.offloaded_at_extent: Optional[int] = None
-        self.rows_at_offload: Optional[int] = None
         self.time_stats = types.SimpleNamespace(
             set_wait_queue_entry_time=lambda: None,
             set_retract_time=lambda: None,
         )
         self.seam_readmit_epoch = None
         self.kv_cache_cpu = None
-        self.kv_cache_cpu_extent = None
 
     def finished(self) -> bool:
         return False
@@ -397,13 +394,10 @@ class FaithfulReq:
         return self.kv_committed_len
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
-        """The seam's state copy. Records the extent AND how many rows were
-        still held, so "the copy ran while the rows still held live bytes"
-        is an assertion rather than an assumption."""
-        self.offloaded_at_extent = self.seqlen - 1
-        self.rows_at_offload = len(self.rows)
+        """Models `Req.offload_kv_cache` (the decode-disaggregation retraction
+        backup). Unreachable under this double's server_args; kept so the
+        double's surface matches `Req`. The seam copy is deleted (#1068)."""
         self.kv_cache_cpu = object()
-        self.kv_cache_cpu_extent = self.seqlen - 1
 
     def reset_for_retract(self):
         self.retraction_count += 1
@@ -436,18 +430,18 @@ class FaithfulCensusScheduler:
         self.token_to_kv_pool_allocator = self.ledger
         self.hisparse_coordinator = None
         self.phase_flip_runtime = None
-        # #920: THE DOUBLE HAS TO SAY WHICH LAYOUT IT IS, because that is now
-        # what decides whether the cutover may copy resident state out. This
-        # ledger hands out row ids that ARE its pool's rows -- the PP-side
-        # identity `local_pp = my_slots` (layers/dcp/phase_flip_plan.py:573) --
-        # so `pp` is the truthful declaration and the copy assertions above
-        # keep exercising the path they were written for. Leaving it unset
-        # would make the double an UNKNOWN layout, which the seam declines,
-        # and the decline is correct for an unknown: a row id means nothing
-        # without the pool it was enumerated in (`_active_layout_tag`).
+        # THE DOUBLE SAYS WHICH LAYOUT IT IS. The #920 copy decision that used
+        # to key on this is deleted with the seam copy (#1068), but the
+        # readers of `phase_flip_active_stack` on the release path are not,
+        # and this ledger hands out row ids that ARE its pool's rows -- the
+        # PP-side identity `local_pp = my_slots`
+        # (layers/dcp/phase_flip_plan.py:573) -- so `pp` stays the truthful
+        # declaration.
         self.phase_flip_active_stack = PHASE_PP
         self.waiting_queue: List[FaithfulReq] = []
         self.queued: List[tuple] = []
+        #: (rid, site) per retraction, recorded by the #969AD probe stand-in.
+        self.retract_sites: List[tuple] = []
         self.rank = rank
         reqs = [
             FaithfulReq(
@@ -474,6 +468,13 @@ class FaithfulCensusScheduler:
     def _add_request_to_queue(self, req, is_retracted: bool = False):
         self.queued.append((req.rid, is_retracted))
         self.waiting_queue.append(req)
+
+    def _969ad_note_retract(self, req, site: str) -> None:
+        # Stand-in for the #969AD probe `readmit_seam_residents` calls on
+        # every request it requeues (scheduler.py, `_969ad_note_retract`): a
+        # bounded per-rid site recorder with no scheduling effect. Recorded,
+        # not swallowed, so a fixture can assert the site was named.
+        self.retract_sites.append((req.rid, site))
 
     # -- what the fixtures assert on ---------------------------------------
     @property

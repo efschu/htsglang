@@ -340,58 +340,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if getattr(self, "_owner_bias", None) is not None:
             self._apply_owner_bias()
 
-    def supports_mamba_cpu_copy(self) -> bool:
-        """#783: does the copy this allocator hands back carry the mamba state?
-
-        FORWARDED, because the allocator forwards the copy itself: every
-        concrete allocator here implements `get_cpu_copy` as
-        `self._kvcache.get_cpu_copy(...)`. If the declaration did not follow the
-        same hop, `Req` would ask the allocator (base default False) while the
-        underlying pool actually copies mamba, and the state would be copied
-        TWICE -- the mirror-image bug of the one this closes.
-
-        THE getattr DEFAULT IS LOAD-BEARING HERE, unlike at the `Req` callsite
-        where it was removed as dead defensive (#606/#608). Checked rather than
-        assumed: `UnifiedKVPool` (unified_memory_pool.py:177) and
-        `DeepSeekV4UnifiedKVPool` (deepseek_v4_memory_pool.py:390) declare NO
-        base class at all, so they do not inherit `KVCache.supports_mamba_cpu_
-        copy` and genuinely cannot answer. (`UnifiedSWAKVPool` DOES answer --
-        it reaches `KVCache` via `SWAKVPool` -> `BaseSWAKVPool`.)
-
-        A pool that cannot answer must read as "does not move mamba": `Req`
-        then copies it, and a redundant copy is a cost while a missing one is a
-        wrong answer.
-        """
-        return bool(
-            getattr(
-                getattr(self, "_kvcache", None),
-                "supports_mamba_cpu_copy",
-                lambda: False,
-            )()
-        )
-
-    def cpu_copy_layout(self):
-        """#861c: forward the pool's per-layer identity, one hop like the copy.
-
-        Same shape and same reason as `supports_mamba_cpu_copy` above: every
-        concrete allocator implements `get_cpu_copy` as
-        `self._kvcache.get_cpu_copy(...)`, so a declaration that did not take
-        the same hop would describe the allocator (which has no layers) instead
-        of the pool that built the list.
-
-        THE getattr DEFAULT IS LOAD-BEARING, for the reason named above:
-        `UnifiedKVPool` (unified_memory_pool.py:177) and
-        `DeepSeekV4UnifiedKVPool` (deepseek_v4_memory_pool.py:390) declare no
-        base class and genuinely cannot answer. `None` means UNKNOWN, and the
-        caller treats unknown as "no layout evidence" rather than as a refusal:
-        refusing on silence would switch the seam carry off for pools that never
-        had this defect, and the pool-level `check_cpu_copy_layers` backstop
-        still covers them on the count axis.
-        """
-        pool = getattr(self, "_kvcache", None)
-        fn = getattr(pool, "cpu_copy_layout", None)
-        return fn() if fn is not None else None
-
     def get_cpu_copy(self, indices, mamba_indices=None):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
         raise NotImplementedError()

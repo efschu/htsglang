@@ -880,138 +880,6 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
     return _ready
 
 
-#: Tag meaning "the layout was not readable". Readers must treat it as "I
-#: cannot rule this extent out" and keep protecting -- the safe direction.
-LAYOUT_TAG_UNKNOWN = None
-
-
-def _active_layout_tag(scheduler) -> Optional[str]:
-    """Which of the two flip layouts is RESIDENT right now, as a plain tag.
-
-    #802. The flip's two layouts are two pools with two id spaces, and only
-    one is backed at a time -- the same fact ``_active_layout_pool`` resolves
-    per call in ``kv_backing_relief``. A row id only means something relative
-    to the pool it was enumerated in, so anything that stores a row id across
-    a possible cutover has to store WHICH pool it came from.
-
-    Returns None when the answer is not unambiguous, and every reader treats
-    None as "cannot rule it out". An unreadable layout must never be the
-    reason a live row gets unmapped (#722/#744).
-    """
-    try:
-        tag = getattr(scheduler, "phase_flip_active_stack", None)
-        return LAYOUT_TAG_UNKNOWN if tag is None else str(tag)
-    except Exception:  # noqa: BLE001 -- an instrument, never a gate
-        return LAYOUT_TAG_UNKNOWN
-
-
-#: The layouts in which a ``req_to_token`` entry IS a row of the pool that is
-#: bound while that layout is resident. Exhaustive by intent, not by accident:
-#: an unlisted or unreadable layout is NOT lawful for the seam copy (#920).
-#:
-#: PP is on the list because ``build_phase_flip_transition`` states the identity
-#: outright -- ``local_pp = my_slots.clone()  # PP row of slot L is L itself
-#: (dcp_size=1)`` (layers/dcp/phase_flip_plan.py:573). TP is deliberately NOT on
-#: it: the same builder's next line is ``local_tp = rows_of(my_slots, vec,
-#: rank)`` (:574), the weighted-DCP compaction
-#: ``(L // S) * ratio + (L % S - lo)`` (layers/dcp/reshard_plan.py:155-166),
-#: which is also what the hot read path applies
-#: (``dcp_weighted_read_slots``, layers/dcp/owner.py:440, whose own docstring
-#: says its input is "a flat list of GLOBAL cache slots (typically the
-#: ``req_to_token`` rows of a paged read)").
-SEAM_COPY_GLOBAL_ROW_LAYOUTS = (PHASE_PP,)
-
-
-def seam_copy_addresses_the_bound_pool(scheduler) -> bool:
-    """#920: may the cutover copy hand ``req_to_token`` rows to the bound pool?
-
-    THE MEASURED DEATH. Boot 2c, 2026-08-27 00:45:53, a ``tp_to_pp`` cutover,
-    two of three ranks dead inside ``_release_residents_for_cutover``::
-
-        PP1  row 144956 does not address this pool, which has 140588 rows
-        PP2  row 148793 does not address this pool, which has 147894 rows
-
-    (boot_accept2c0827_0827_0029.log:75388 and :75449.) Those two row counts
-    are this rank's TP-stack pool, and they are RANK-LOCAL -- the same boot's
-    seam-reserve line prints all three, against one shared id space::
-
-        rank 0 ... pp_to_tp ... id space of 467565 ... [this rank holds 483951 rows]
-                   tp_to_pp ...                        [this rank holds 228260 rows]
-        rank 1 ... tp_to_pp ...                        [this rank holds 140588 rows]
-        rank 2 ... tp_to_pp ...                        [this rank holds 147894 rows]
-
-    (:1153, :1154, :1173; ``src`` there is the DIRECTION'S SOURCE pool,
-    phase_flip_seam_reserve.py:1489.) PP0 survived only because 228260 happens
-    to sit above the ids in play, which is luck, not correctness.
-
-    WHY THE NUMBERS LOOK LIKE THAT, and it is not an under-sized pool: under
-    the TP layout this rank stores its SHARE of the token axis, so its pool is
-    about ``T/3`` rows for a ``T``-row id space -- the seam sizer says so in as
-    many words ("under the TP layout that is its token SHARE of the id space",
-    phase_flip_seam_reserve.py:1515-1518). ``req_to_token`` keeps GLOBAL slot
-    ids in BOTH layouts; the TP read path compacts them per access
-    (``dcp_weighted_read_slots``). So a global id is not a TP-pool row, and
-    ``Req.offload_kv_cache`` (schedule_batch.py:1789-1793) hands the raw
-    ``req_to_token`` slice to ``get_cpu_copy`` with no compaction at all.
-
-    THE FAILURE HAS TWO SIGNS AND THE LOUD ONE IS THE LESSER. An id above the
-    rank's row count is the ``ValueError`` above -- fatal, past the seam's
-    no-return point, but visible. An id BELOW it is silently a DIFFERENT row's
-    KV copied out under this request's name, which is the wrong-answer half
-    and is why a bounds check on the ids is not the fix: it would pass exactly
-    the cases that are silently wrong. The question has to be asked about the
-    LAYOUT, not about the magnitudes.
-
-    TWO INDEPENDENT READINGS, AND THE COPY NEEDS BOTH TO SAY YES.
-
-    1. The resident layout must be one in which a ``req_to_token`` entry IS a
-       pool row (``SEAM_COPY_GLOBAL_ROW_LAYOUTS``). This is the structural
-       question, and it is the one that catches the silent sign.
-    2. The bound pool must physically address the allocator's whole id space.
-       This is arithmetic, layout-agnostic, and it is what would have caught
-       the measured deaths on its own. It ABSTAINS on a paged lane, where the
-       pool's leading dimension counts PAGES and the allocator's ``size``
-       counts tokens, because there the two numbers are not the same quantity
-       and a comparison would decline a lane that is perfectly addressable.
-
-    Returns ``False`` only when a reading says so. An unreadable scheduler,
-    pool or size leaves reading 2 abstaining and reading 1 deciding, and an
-    unreadable LAYOUT is ``False`` -- the safe direction here is to decline a
-    copy (which costs a recompute the design already pays for) rather than to
-    take one that can kill the rank or forge a prefix.
-
-    NOTHING IS SOFTENED BY THIS. ``check_cpu_copy_rows``'s refusal
-    (mem_cache/memory_pool.py:753) is untouched and still fatal for any path
-    that reaches it; this function keeps the seam from being that path.
-    """
-    if scheduler is None:
-        return False
-    tag = _active_layout_tag(scheduler)
-    if tag not in SEAM_COPY_GLOBAL_ROW_LAYOUTS:
-        return False
-    alloc = getattr(scheduler, "token_to_kv_pool_allocator", None)
-    if alloc is None:
-        return False
-    try:
-        # Only meaningful where a pool row is one token slot. See the paged
-        # abstention in the docstring.
-        if int(getattr(alloc, "page_size", 1) or 1) != 1:
-            return True
-        pool = None
-        for attr in ("_kvcache", "kvcache"):
-            pool = getattr(alloc, attr, None)
-            if pool is not None:
-                break
-        rows = int(getattr(pool, "store_bound_rows", 0) or 0)
-        size = int(getattr(alloc, "size", 0) or 0)
-    except Exception:  # noqa: BLE001 -- an unreadable pool is not a verdict
-        return True
-    if rows <= 0 or size <= 0:
-        # Unanswerable, not "zero rows": reading 1 has already said yes.
-        return True
-    return rows >= size
-
-
 _EXTENT_FALLBACK_SAID: set = set()
 
 
@@ -1905,32 +1773,6 @@ def build_cutover_release(scheduler):
     if tree_cache is None or not callable(getattr(tree_cache, "reset", None)):
         return None
 
-    # #920: AND WHETHER THE COPY MAY BE TAKEN AT ALL, decided ONCE per cutover
-    # here rather than per request inside `seam_copy_state`. This is the only
-    # site in the tree that turns `copy_state` on, so it is the only site that
-    # can turn it off, and the question it answers -- "are this rank's
-    # `req_to_token` entries rows of the pool that is bound right now?" -- is a
-    # property of the resident LAYOUT, which is a fact about the scheduler and
-    # not about any one request. Logged once, at the cadence a flip already
-    # logs at, instead of once per resident on a path whose per-request lines
-    # were already at occurrence=91 in the boot this fixes.
-    copy_state = seam_copy_addresses_the_bound_pool(scheduler)
-    if not copy_state:
-        logger.warning(
-            "%s #920: the cutover will NOT copy resident state out. The "
-            "resident layout is %r and the bound pool does not address the "
-            "allocator's id space one-to-one, so this rank's req_to_token "
-            "entries are GLOBAL slot ids and not rows of that pool. Copying "
-            "would either address no row at all (the fatal half, measured "
-            "2026-08-27: row 144956 against a 140588-row pool) or silently "
-            "copy a different row's KV under this request's name (the wrong-"
-            "answer half). These residents are retracted without a host copy "
-            "and their tokens are recomputed after the flip, which is the "
-            "path #856 already designs for.",
-            LOG_PREFIX,
-            _active_layout_tag(scheduler),
-        )
-
     def _retract(reqs):
         if not reqs:
             return []
@@ -1959,12 +1801,11 @@ def build_cutover_release(scheduler):
         # surviving copy". The hit-count write-through heuristic must not get
         # a vote here for the same reason it must not for a session hand-off.
         #
-        # Independent of #920. That refusal governs `copy_state`, the
-        # PER-REQUEST `req.mamba_state_cpu` carry, which is measured OFF on
-        # this rig ("the cutover will NOT copy resident state out", all three
-        # ranks, every flip). This route is the CANONICAL one: it deposits the
-        # anchor in the shared store keyed by the prefix, where a re-admission
-        # -- or any other request sharing that prefix -- can read it back.
+        # This route is the CANONICAL carrier (#1068: the per-request seam
+        # copy that used to sit beside it is deleted; the store is the single
+        # carrier). It deposits the anchor in the shared store keyed by the
+        # prefix, where a re-admission -- or any other request sharing that
+        # prefix -- can read it back.
         for r in reqs or ():
             try:
                 setattr(r, FORCE_HOST_WRITE_THROUGH_ATTR, True)
@@ -1979,12 +1820,6 @@ def build_cutover_release(scheduler):
             tree_cache=tree_cache,
             hisparse_coordinator=getattr(scheduler, "hisparse_coordinator", None),
             offload_kv=False,
-            # #783 half 1: THE ONE SITE THAT COPIES. `offload_kv=False` skips
-            # the decode-disagg host copy (unreachable here); `copy_state`
-            # is the seam's own, which transfers no row ownership. Set here and
-            # nowhere else, so the host cost stays priced at the flip cadence.
-            # #920 made it a decision instead of a constant; see above.
-            copy_state=copy_state,
             # #969D: the cutover RETAINS. This is the one caller whose
             # retraction is a park-and-re-read, not a discard -- see
             # schedule_batch.release_req.
@@ -6966,8 +6801,8 @@ class PhaseFlipRuntime:
 
         THE GENERALIZATION OF THE LINE BELOW IT. ``self._parked_extent = None``
         (#746) and ``last_req_extent``'s layout tag (#802, 689161de77) each
-        clear ONE holder of a pre-cutover row id by hand, because
-        ``_active_layout_tag`` states the rule correctly -- "a row id only
+        clear ONE holder of a pre-cutover row id by hand, because the #802
+        rule is stated correctly -- "a row id only
         means something relative to the pool it was enumerated in, so anything
         that stores a row id across a possible cutover has to store WHICH pool
         it came from" -- and then leaves every holder to obey it individually.

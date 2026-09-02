@@ -1128,16 +1128,6 @@ SEAM_READMIT_ATTR = "seam_readmit_epoch"
 #: open, read by the prefill builder to keep the batch to transport only.
 SEAM_TRANSPORT_ROUND_ATTR = "_seam_transport_round"
 
-#: #890: attribute stamped on a request whose seam restore was REFUSED where it
-#: is executed, i.e. whose tokens the refusal sends back to be RECOMPUTED.
-#: Written only by `schedule_batch.restore_seam_state`'s two refusal branches
-#: and cleared there by a restore that actually happens, so it is a statement
-#: about the last attempt rather than a life sentence. Read by
-#: `seam_transport_premise_holds`, which is the whole point: the exemption is
-#: granted on the claim that a re-admission recomputes nothing, and this is the
-#: one signal that says the claim was false for this request.
-
-
 #: #906: the grant this request has already SPENT. The seam stamp
 #: (`SEAM_READMIT_ATTR`) says a cutover retracted this request; it does not say
 #: how much prefill that buys. One chunk is the answer, and this is the ledger
@@ -1413,9 +1403,9 @@ def seam_transport_premise_holds(scheduler) -> bool:
             # #890: THE GRANT IS WITHDRAWN BY THE EXECUTION THAT DISPROVED IT.
             #
             # Everything below this line is EVIDENCE -- what was true when the
-            # request was retracted. This is OUTCOME: `restore_seam_state`
-            # refused the copy and said so in its own words, "Dropped; these
-            # tokens are recomputed" (W38: 90 and 21 occurrences). A recompute
+            # request was retracted. This is OUTCOME: the seam restore (deleted
+            # in #1068) refused the copy and said so in its own words, "Dropped;
+            # these tokens are recomputed" (W38: 90 and 21 occurrences). A recompute
             # is the one thing the exemption promised would not happen, so the
             # request stops counting as restore evidence until a restore
             # actually succeeds for it again.
@@ -1493,15 +1483,15 @@ def seam_transport_premise_holds(scheduler) -> bool:
             "%d stamped request(s) are queued and NONE carries restore "
             "evidence (cache_protected_len=0 AND "
             "cached_prompt_tokens_at_retract=0 for all), or %d of them had "
-            "their restore REFUSED at execution (#890 -- the copy was dropped "
-            "and the tokens go back to be recomputed), so re-admitting "
-            "them in the TP "
+            "their restore REFUSED at execution (the retired #890 revocation, "
+            "always 0 since the seam copy was deleted in #1043/#1068), so "
+            "re-admitting them in the TP "
             "layout would be a COLD PREFILL of real work, not a cache restore "
             "-- the user's strict-batch law, broken by the exemption meant to "
             "respect it. Holding instead; the #861c existence term raises the "
             "flip demand and the work runs in the layout that owns it. "
             "Measured W37-D: 258 such batches at #cached-token 0; W38: 90 and "
-            "21 SEAM RESTORE REFUSED (LAYOUT).",
+            "21 layout refusals of the since-deleted seam restore.",
             LOG_PREFIX,
             len(reqs),
             revoked,

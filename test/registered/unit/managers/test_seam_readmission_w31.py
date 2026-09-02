@@ -70,6 +70,7 @@ class _Sched:
         self.waiting_queue = list(queue)
         self.added = []
         self.refuse = set()
+        self.retract_sites = []
 
     def _add_request_to_queue(self, req, is_retracted=False):
         # Models the real one's contract: it MAY refuse (priority validation,
@@ -78,6 +79,12 @@ class _Sched:
         if req.rid in self.refuse:
             return
         self.waiting_queue.append(req)
+
+    def _969ad_note_retract(self, req, site):
+        # The #969AD probe the real `readmit_seam_residents` calls per
+        # requeued request: a bounded per-rid site recorder, no scheduling
+        # effect. Recorded so the stand-in stays faithful, never swallowed.
+        self.retract_sites.append((req.rid, site))
 
 
 class TestEverythingRetractedComesBack(CustomTestCase):
@@ -156,43 +163,76 @@ class TestTheStampSurvivesTheRoundTrip(CustomTestCase):
 
 
 class TestTheSeamActuallyCallsIt(CustomTestCase):
-    """CAN-FAIL: dropping the return value again must turn this red."""
+    """CAN-FAIL: dropping the return value again must turn this red.
 
-    def test_the_release_site_requeues_what_it_released(self):
+    CONTRACT AS OF #1066 (8bac764f4b): the release site retracts and STASHES
+    the released list (`_pending_seam_readmit`); the requeue runs in
+    `_post_cutover_readmit`, after the stacks are swapped and the HiCache
+    pools rebound, so the intake prefetch opens on the binding that will
+    serve it. The pre-#1066 pins asserted the requeue inside the release
+    method; that order was retired deliberately (its prefetch opened on the
+    outgoing binding and refused stale every time) and the pins below follow
+    the tree.
+    """
+
+    def test_the_release_site_stashes_what_it_released(self):
         import inspect
 
         from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
         src = inspect.getsource(PhaseFlipRuntime._release_residents_for_cutover)
-        self.assertIn("readmit_seam_residents", src)
+        self.assertIn("_pending_seam_readmit", src)
         self.assertIn("released", src)
+
+    def test_the_post_cutover_readmit_requeues_the_stash(self):
+        import inspect
+
+        from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
+
+        src = inspect.getsource(PhaseFlipRuntime._post_cutover_readmit)
+        self.assertIn("_pending_seam_readmit", src)
+        self.assertIn("readmit_seam_residents", src)
 
     def test_the_seam_asserts_retracted_equals_readmitted(self):
         import inspect
 
         from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
-        src = inspect.getsource(PhaseFlipRuntime._release_residents_for_cutover)
+        src = inspect.getsource(PhaseFlipRuntime._post_cutover_readmit)
         self.assertIn("RE-ADMISSION MISMATCH", src)
 
-    def test_the_requeue_happens_at_the_release_site_not_later(self):
-        # THE ABORT PATH, pinned structurally. Requeuing here means there is
-        # no window in which the list exists and is owned by nobody: if the
-        # cutover raises after this point the flip abandons, the layout is
-        # unchanged, and the requests are already back on the SOURCE layout's
-        # queue. Deferring the requeue to the end of the cutover would
-        # recreate the W31 defect for exactly the abort case.
+    def test_the_requeue_is_deferred_past_the_cutover_not_done_at_the_release_site(
+        self,
+    ):
+        # INVERSION of the pre-#1066 pin. The old test wanted the requeue at
+        # the release site so an abort mid-cutover could not strand the list.
+        # #1066 measured the price of that order (intake prefetch opened on
+        # the OUTGOING binding: 6/6 stale refusals, cached=0 on 90/90
+        # prefills) and moved the requeue behind `_cutover_fn`; the abort
+        # window is named in `_post_cutover_readmit`'s docstring as the
+        # honest residual (a failed flip takes the instance down regardless).
+        # Pinned here so the retired order cannot creep back one line at a
+        # time.
         import inspect
 
         from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
-        src = inspect.getsource(PhaseFlipRuntime._release_residents_for_cutover)
-        readmit_at = src.find("readmit_seam_residents")
-        return_at = src.rfind("return released")
-        self.assertGreater(readmit_at, -1)
-        self.assertLess(
-            readmit_at, return_at, "the requeue must happen before the method returns"
+        release_src = inspect.getsource(
+            PhaseFlipRuntime._release_residents_for_cutover
         )
+        self.assertNotIn(
+            "readmit_seam_residents",
+            release_src,
+            "the requeue moved to _post_cutover_readmit in #1066; a requeue at "
+            "the release site would open its intake prefetch on the outgoing "
+            "binding again",
+        )
+        body_src = inspect.getsource(PhaseFlipRuntime._execute_body)
+        release_at = body_src.find("self._release_residents_for_cutover(")
+        readmit_at = body_src.find("self._post_cutover_readmit(")
+        self.assertGreater(release_at, -1)
+        self.assertGreater(readmit_at, -1)
+        self.assertLess(release_at, readmit_at, "release first, then the readmit")
 
     def test_the_703_fence_coverage_is_asserted_not_assumed(self):
         import inspect
@@ -212,11 +252,17 @@ class TestOrderAgainstTheLiveUniverse(CustomTestCase):
 
         from sglang.srt.managers.phase_flip_runtime import PhaseFlipRuntime
 
-        src = inspect.getsource(PhaseFlipRuntime._release_residents_for_cutover)
         # the consume happens inside `_retract_and_consume`, which is passed
-        # to `release_residents_for_cutover` -- both must precede the requeue
-        release_at = src.find("release_residents_for_cutover(")
-        readmit_at = src.find("readmit_seam_residents")
+        # to `release_residents_for_cutover` inside the release method; the
+        # requeue lives in `_post_cutover_readmit` (#1066), and the cutover
+        # body runs the release method before it.
+        release_src = inspect.getsource(
+            PhaseFlipRuntime._release_residents_for_cutover
+        )
+        self.assertGreater(release_src.find("release_residents_for_cutover("), -1)
+        body_src = inspect.getsource(PhaseFlipRuntime._execute_body)
+        release_at = body_src.find("self._release_residents_for_cutover(")
+        readmit_at = body_src.find("self._post_cutover_readmit(")
         self.assertGreater(release_at, -1)
         self.assertLess(release_at, readmit_at)
 

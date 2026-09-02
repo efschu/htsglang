@@ -29,7 +29,7 @@ import math
 import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -565,24 +565,22 @@ def note_mamba_carry_without_copy(pool: Any, req: Any) -> None:
 class CpuCopyUnmappedRows(ValueError):
     """A CPU copy named rows whose pages are not committed (#913).
 
-    ITS OWN TYPE BECAUSE THE SEAM MUST BE ABLE TO CATCH EXACTLY THIS. The
-    cutover's response to "this request cannot be copied" already exists and is
-    to DECLINE it and let its tokens be recomputed (`seam_copy_state`). It must
-    not respond that way to a genuine addressing bug, which is what the plain
-    `ValueError` from `check_cpu_copy_rows` reports -- an id that addresses no
-    pool at all is a defect to surface, not a request to drop. Two conditions,
-    two responses, so two types.
+    ITS OWN TYPE so a caller can tell this apart from a genuine addressing
+    bug: the plain `ValueError` from `check_cpu_copy_rows` reports an id that
+    addresses no pool at all (a defect to surface), this one reports an id
+    that addresses THIS pool at a moment when its page has been released by
+    the backing dial. Two conditions, two types. Since #1068 deleted the
+    cutover's per-request copy, the only remaining producer is the
+    decode-disaggregation retraction backup (`Req.offload_kv_cache`), where
+    both propagate as errors; the type distinction is kept for the log.
     """
 
 
 class CpuCopyIdsUnreadable(CpuCopyUnmappedRows):
-    """The guard could not READ the ids, so it declines instead of dying (#916).
+    """The guard could not READ the ids, so it refuses instead of dying (#916).
 
-    A SUBCLASS ON PURPOSE. `seam_copy_state` already catches
-    `CpuCopyUnmappedRows` and answers it with the decline-and-recompute path
-    that exists for exactly this cost; a sibling type would have needed a
-    second `except` clause at every call site, and the one that got forgotten
-    would be the one that killed a rank.
+    A SUBCLASS ON PURPOSE: a caller that catches `CpuCopyUnmappedRows` sees
+    this one too, with no second `except` clause to forget.
 
     IT IS STILL ITS OWN NAME, because the two facts are not the same fact.
     `CpuCopyUnmappedRows` is a VERDICT about these ids: they were read, and
@@ -651,7 +649,7 @@ def check_cpu_copy_rows(
     failure this function's own docstring calls "the LOUD half", one level up.
     Measured, R7 of the 0826 acceptance window, 18:27:14Z: PP2 held live rows
     to a high-water id of 122898 while its backing had been dialled down to
-    114688, `release_residents_for_cutover` -> `seam_copy_state` ->
+    114688, the cutover copy path (deleted in #1068) ->
     `offload_kv_cache` -> `get_cpu_copy` read them, and the rank died at the
     next `synchronize()` with the traceback naming the sync and not the read.
     The reservation-axis check passed every one of those ids.
@@ -686,8 +684,8 @@ def check_cpu_copy_rows(
     # had just reported "#760 quiesce ... synchronizing load_stream failed
     # (illegal memory access)" one line earlier. `indices.min()` is a device
     # reduction, so the guard died on its own first sync and the rank went with
-    # it: `SEAM COPY DECLINED: 0` and `CpuCopyUnmappedRows: 0` in a boot whose
-    # crash was on exactly this path. A guard that must read a CUDA tensor
+    # it: the (since deleted, #1068) seam decline counter read 0 and
+    # `CpuCopyUnmappedRows` read 0 in a boot whose crash was on exactly this path. A guard that must read a CUDA tensor
     # before it can decide cannot decline a fault that already exists.
     # ------------------------------------------------------------------
     n = int(indices.numel())
@@ -709,8 +707,8 @@ def check_cpu_copy_rows(
     try:
         # ONE device round trip instead of two, and fault-isolated. A driver
         # error raised here is NOT this copy's fault and must not be reported
-        # as one -- it is converted into a DECLINE so the seam's existing
-        # recompute path runs and the log names the real state.
+        # as one -- it is converted into a NAMED refusal (CpuCopyIdsUnreadable)
+        # so the caller sees the real state instead of a second driver fault.
         #
         # THE FUSE IS ONLY TAKEN FOR A DEVICE TENSOR. A host tensor's min/max
         # are already host math, and this function is also handed non-torch id
@@ -758,60 +756,6 @@ def check_cpu_copy_rows(
             f"{axis} (a wrong answer, no crash) and an out-of-range id is an "
             f"asynchronous illegal memory access (W40b). These tokens are "
             f"recomputed instead."
-        )
-
-
-class CpuCopyLayout(NamedTuple):
-    """#861c: the per-layer geometry a CPU copy was taken from.
-
-    DECLARED BY THE POOL, NOT INFERRED FROM THE PAYLOAD -- the house idiom for
-    exactly this question (`supports_mamba_cpu_copy`, memory_pool.py:2359), for
-    the same reason it gives: asking the copy "which layers are you?" is the
-    mechanism that produced the silent version of the defect.
-
-    `start_layer` is carried and not only `layer_num`, because the count alone
-    is blind to a layout change that preserves it -- two PP stages of the same
-    size, or a permuted stage ratio. `kind` separates the axes so a KV layout
-    can never compare equal to a mamba one.
-
-    #875d: `layer_ids` IS FOR THE POOLS WHOSE LAYERS ARE NOT A RANGE. Every
-    `KVCache` holds `start_layer .. start_layer + layer_num - 1` and leaves this
-    None, comparing exactly as it did before. `MambaPool` does not: in a hybrid
-    checkpoint its layers are a SUBSET of the global numbering (0, 4, 8, ... on
-    this rig's GDN interleave), so `start_layer + i` is not the id of local slot
-    i and reading it that way is the wrong-layer write with extra steps.
-
-    The field is optional rather than mandatory because a pool that cannot name
-    its ids must keep saying so. `None` means "the range arithmetic is the whole
-    truth", not "unknown" -- `layer_num`/`start_layer` are always populated.
-    """
-
-    kind: str
-    layer_num: int
-    start_layer: int
-    layer_ids: Optional[Tuple[int, ...]] = None
-
-    def global_layers(self) -> Tuple[int, ...]:
-        """The GLOBAL layer ids this geometry holds, in LOCAL slot order.
-
-        One place, so the range case and the id-list case cannot answer the same
-        question differently -- which is the drift that produced the defect this
-        field exists to close.
-        """
-        if self.layer_ids is not None:
-            return tuple(int(g) for g in self.layer_ids)
-        return tuple(
-            range(int(self.start_layer), int(self.start_layer) + int(self.layer_num))
-        )
-
-    def describe(self) -> str:
-        if self.layer_ids is not None:
-            shown = ", ".join(str(int(g)) for g in self.layer_ids[:8])
-            more = "" if len(self.layer_ids) <= 8 else ", ..."
-            return f"{self.kind}[{self.layer_num} layer(s), global {shown}{more}]"
-        return (
-            f"{self.kind}[{self.layer_num} layer(s), global "
-            f"{self.start_layer}..{self.start_layer + self.layer_num - 1}]"
         )
 
 
@@ -986,7 +930,8 @@ class MambaPool:
         num_mamba_layers = len(mamba_layer_ids)
         # #875d: KEEP THE IDENTITY, NOT ONLY ITS LENGTH. This constructor was
         # handed the GLOBAL layer ids and reduced them to a count on the next
-        # line, so `cpu_copy_layout` had nothing to answer with and defaulted
+        # line, so the (since deleted, #1068) per-layer layout declaration had
+        # nothing to answer with and defaulted
         # `start_layer` to 0 for every stage. Two consequences, and the second
         # is a defect that predates the carry: a stage's copy could not be
         # placed on the layers it actually holds, AND two stages of EQUAL SIZE
@@ -1582,40 +1527,6 @@ class MambaPool:
         )
         current_platform.synchronize()
         return conv_cpu, temporal_cpu
-
-    def cpu_copy_layout(self) -> CpuCopyLayout:
-        """#861c: this pool's mamba-layer geometry, as an identity.
-
-        `start_layer` is `self.start_layer` when the pool carries one and 0
-        otherwise -- `MambaPool` is not a `KVCache` and does not always set it,
-        so the attribute is read with a default HERE rather than assumed to
-        exist. The `kind` tag keeps this from ever comparing equal to a KV
-        layout even when both counts coincide.
-
-        #875d: AND `start_layer` ON ITS OWN WAS ALWAYS THAT DEFAULT. Nothing in
-        this tree assigns `MambaPool.start_layer` -- the `getattr` above had no
-        setter to find, so EVERY stage declared itself to start at global 0.
-        Two stages of the same size therefore compared EQUAL and #861c's drift
-        check passed a copy straight into the wrong global layers with no
-        crash, which is the failure mode that guard exists for.
-        `mamba_layer_ids` is the identity the constructor is handed, and it is
-        an ID LIST rather than an offset because these layers are a SUBSET of
-        the global numbering: `start_layer + i` is not the id of local slot i.
-
-        Read with a default for the same reason as `start_layer`: a stand-in or
-        a partially wired pool must still be able to answer, and `None` means
-        "the range arithmetic is the whole truth" rather than "unknown".
-        """
-        ids = getattr(self, "mamba_layer_ids", None)
-        ids = tuple(int(x) for x in ids) if ids is not None else None
-        return CpuCopyLayout(
-            kind="mamba",
-            layer_num=len(self.mamba_cache.conv),
-            start_layer=int(ids[0])
-            if ids
-            else int(getattr(self, "start_layer", 0) or 0),
-            layer_ids=ids,
-        )
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
         conv_cpu, temporal_cpu = mamba_cache_cpu
@@ -2843,55 +2754,6 @@ class KVCache(abc.ABC):
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
-
-    def supports_mamba_cpu_copy(self) -> bool:
-        """#783: does THIS pool's `get_cpu_copy` actually move the mamba state?
-
-        DECLARED, NOT INFERRED FROM THE SIGNATURE. `get_cpu_copy` takes
-        `mamba_indices` on every pool in this tree and only `HybridLinearKVPool`
-        reads it -- it is the one that OWNS a `mamba_pool`. The others accept
-        the parameter and drop it, which is not a bug in them: a KV pool with no
-        mamba pool has nothing to copy and nothing to delegate to.
-
-        The damage was that a caller could not tell the two apart.
-        `Req.offload_kv_cache` promised "copies over both the kv cache and mamba
-        state" and, on this rig's pool, silently copied only the KV -- the
-        failure would surface as a phase flip that loses GDN state, with better
-        cache numbers arguing against looking further.
-
-        So the capability is stated by the class instead of implied by its
-        signature, and `Req` dispatches on the statement. This is a STRUCTURAL
-        property, not a query about what a call did at runtime: asking a pool
-        "did you honour that parameter?" is the very mechanism that produced the
-        silent drop, and it is deliberately not rebuilt here.
-
-        Form follows the existing house idiom for exactly this
-        (`BasePrefixCache.supports_mamba` / `supports_swa` /
-        `supports_streaming_session`): a plain predicate, False on the base,
-        overridden True by the class that can deliver. The allocator tree had no
-        such idiom of its own -- checked, see `allocator/base.py` -- so this
-        reuses the cache side's rather than inventing a second one.
-        """
-        return False
-
-    def cpu_copy_layout(self):
-        """#861c: the per-layer geometry a copy taken from THIS pool describes.
-
-        Answered on the base because `KVCache.__init__` is where `layer_num` /
-        `start_layer` are set, so every subclass in this tree can answer without
-        restating it. Composite pools (`HybridLinearKVPool`, `SWAKVPool`,
-        `UnifiedSWAKVPool`) override with a tuple of their sub-pools' layouts,
-        since their copy payload is likewise composite.
-
-        The caller (`restore_seam_state`) only ever compares two of these for
-        EQUALITY -- it must not parse one, the same discipline that keeps `Req`
-        independent of the copy payload's shape (schedule_batch.py:1698).
-        """
-        return CpuCopyLayout(
-            kind="kv",
-            layer_num=int(self.layer_num),
-            start_layer=int(self.start_layer),
-        )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
@@ -5134,27 +4996,6 @@ class HybridLinearKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
-
-    def supports_mamba_cpu_copy(self) -> bool:
-        """#783: TRUE, and the body below is the proof. This pool owns
-        `self.mamba_pool`, so the mover lives where the state lives -- `Req`
-        must NOT copy it a second time. Pinned by
-        test_unified_mamba_cpu_copy_783."""
-        return True
-
-    def cpu_copy_layout(self):
-        """#861c: composite payload, composite identity.
-
-        This pool's copy is `(kv_cpu, mamba_cpu)`, so its layout is the pair of
-        the sub-pools' layouts. Recording only the KV half would leave a flip
-        that changes the mamba-layer split -- which the same `--pp-stage-ratio`
-        does -- invisible to the caller's check.
-        """
-        return (
-            "hybrid",
-            self.full_kv_pool.cpu_copy_layout(),
-            self.mamba_pool.cpu_copy_layout(),
-        )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)

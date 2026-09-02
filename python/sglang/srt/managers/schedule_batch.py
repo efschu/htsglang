@@ -96,11 +96,7 @@ from sglang.srt.mem_cache.common import (
     peer_needs_mamba_evict,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import (
-    CpuCopyIdsUnreadable,
-    CpuCopyUnmappedRows,
-    ReqToTokenPool,
-)
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -658,9 +654,6 @@ def _note_1036_prefix_demotion(req, start: int, hwm: int) -> None:
     except Exception:  # noqa: BLE001
         # An instrument may never be the thing that kills a boot.
         logger.warning("#1036 PREFIX-DEMOTION PROBE RAISED", exc_info=True)
-
-#: #783 seam state transfer log prefix, so the acceptance lines are greppable.
-SEAM_STATE_PREFIX = "[#783 seam-state]"
 
 # #622: per-finish trace for cross-rank finish-divergence attribution.
 _FINISH_TRACE = os.environ.get("SGLANG_FINISH_TRACE", "0") not in ("0", "", "false")
@@ -1531,13 +1524,6 @@ class Req(ReqDllmMixin):
         # `phase_flip_runtime.build_cutover_release._retract`; spent (cleared)
         # on the one re-admission it licenses.
         self.seam_readmit_epoch = None
-
-        # #890: DID THE LAST SEAM RESTORE ACTUALLY RESTORE?
-        #
-        # The exemption above is granted on the claim that a re-admission
-        # #1043: the `seam_restore_refused` field and the #890 revocation it
-        # drove are DELETED together with the rank-local carry whose failures
-        # they described. See `restore_seam_state`.
 
         # kv-session-offload Prefill-Spill (born-spilled, PS1-V1a): set at
         # admission when the prompt's lifetime KV would not fit VRAM but its
@@ -2694,77 +2680,6 @@ class Req(ReqDllmMixin):
         if self.input_embeds is not None:
             self.output_ids = array("q")
 
-    #: #783: the mamba half of the copy, when the pool does not do it itself.
-    #:
-    #: SHAPE DECISION, MADE DELIBERATELY. `HybridLinearKVPool.get_cpu_copy`
-    #: returns a TUPLE `(kv_cpu, mamba_cpu)` and `UnifiedSWAKVPool` a DICT
-    #: `{"full", "swa"}` -- two shapes for one role, which is the next naming
-    #: error waiting to happen. This does NOT add a third, and does NOT unify
-    #: them: `Req` never inspects the allocator's payload, it only hands the
-    #: same object back to `load_cpu_copy`. The mamba copy therefore lives in
-    #: its own attribute, which works for every pool regardless of shape and
-    #: keeps `Req` independent of a decision that belongs to the pools.
-    #: Unifying the two payload shapes is a real cleanup and a separate one; it
-    #: touches every caller of both pools and is filed rather than smuggled in
-    #: here.
-    mamba_state_cpu: Optional[object] = None
-
-    #: #783: how many token rows `kv_cache_cpu` actually covers. None = no copy.
-    #: RECORDED rather than re-derived, because `seqlen` is a LOGICAL length
-    #: (`len(origin_input_ids) + len(output_ids)`) and says nothing about how
-    #: much of `req_to_token` has been written. W38-A crashed on exactly that
-    #: gap: a restore whose extent had grown walked off the end of the saved
-    #: chunk list (memory_pool.py:3295). Every pool-level `load_cpu_copy` just
-    #: forwards the indices it is handed, so there is NO backstop below this
-    #: class -- the guarantee has to be established here.
-    kv_cache_cpu_extent: Optional[int] = None
-
-    #: #861c: WHICH per-layer layout `kv_cache_cpu` was taken from. None = the
-    #: pool could not say (see `BaseTokenToKVPoolAllocator.cpu_copy_layout`).
-    #:
-    #: The sibling of `kv_cache_cpu_extent`, one axis over. That field records
-    #: how many ROWS the copy covers; this one records how many LAYERS, and
-    #: which. W40 crashed on the axis that was not recorded: the copy was taken
-    #: from the PP-stage pool (18 layers) and applied to the TP pool (64), and
-    #: the extent contract passed because the ROW count had not changed.
-    #:
-    #: NEVER PARSED HERE, only compared for equality -- the same discipline that
-    #: keeps `Req` independent of the copy payload's shape (see the note on
-    #: `mamba_state_cpu` above). The pools decide what a layout IS.
-    kv_cache_cpu_layout: Optional[object] = None
-
-    #: #861c: and the same for the mamba half, when `Req` owns that copy. It is
-    #: a separate field because it is a separate copy taken from a separate pool
-    #: -- the flip can change the mamba-layer split independently of the KV one.
-    mamba_state_cpu_layout: Optional[object] = None
-
-    def _mamba_cpu_copy_is_mine(self, token_to_kv_pool_allocator) -> bool:
-        """#783: does THIS caller own the mamba copy, or does the pool?
-
-        Exactly one of the two moves it -- Ein-Job-ein-Mover, enforced by a
-        declaration rather than promised by a comment. The pool that owns a
-        mamba pool declares `supports_mamba_cpu_copy()` and keeps its mover;
-        this path covers the pools that have no mamba pool to delegate to.
-
-        NO getattr DEFAULT HERE (#606/#608). Since `BaseTokenToKVPoolAllocator`
-        carries the method, every allocator that can be passed as
-        `token_to_kv_pool_allocator` ANSWERS: TokenToKVPoolAllocator,
-        PagedTokenToKVPoolAllocator, SWATokenToKVPoolAllocator (and its
-        PureSWA subclass), HiSparseTokenToKVPoolAllocator,
-        DeepSeekV4HiSparseTokenToKVPoolAllocator, MultiEndedAllocator,
-        UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator --
-        all of them inherit it. The only allocator classes in this tree that do
-        NOT are `MambaSlotAllocator` and `UnifiedMambaSlotAllocator`, which
-        allocate mamba SLOTS and are never passed here.
-
-        So a missing attribute would be a real defect, and an AttributeError
-        saying so is worth more than a silent False that would quietly make
-        `Req` copy state the pool had already copied.
-        """
-        if self.mamba_pool_idx is None:
-            return False
-        return not bool(token_to_kv_pool_allocator.supports_mamba_cpu_copy())
-
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -2773,36 +2688,6 @@ class Req(ReqDllmMixin):
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
             token_indices, mamba_indices=self.mamba_pool_idx
         )
-        # #783: say what was covered, so a later restore can tell drift from
-        # agreement instead of discovering it as an IndexError.
-        self.kv_cache_cpu_extent = int(token_indices.numel())
-        # #861c: say WHICH per-layer layout it was taken from, on the same
-        # principle and for the axis the extent does not cover. Asked of the
-        # allocator rather than derived from the payload: the payload's shape is
-        # the pool's business (tuple, dict, list of lists), and inspecting it
-        # here is exactly the coupling the `mamba_state_cpu` note refuses.
-        self.kv_cache_cpu_layout = token_to_kv_pool_allocator.cpu_copy_layout()
-        # #783: and when the pool declares it does NOT move mamba, move it here.
-        # Without this the comment above was false on this rig's pool: the KV
-        # came back and the GDN state did not.
-        self.mamba_state_cpu = None
-        self.mamba_state_cpu_layout = None
-        if self._mamba_cpu_copy_is_mine(token_to_kv_pool_allocator):
-            mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
-            if mamba_pool is not None:
-                translate = getattr(
-                    req_to_token_pool, "translate_mamba_indices", lambda ids: ids
-                )
-                self.mamba_state_cpu = mamba_pool.get_cpu_copy(
-                    translate(self.mamba_pool_idx)
-                )
-                # #861c: the mamba copy is a second copy from a second pool, so
-                # it needs its own layout stamp. `MambaPool` is not a `KVCache`
-                # and does not inherit the allocator hop.
-                layout_fn = getattr(mamba_pool, "cpu_copy_layout", None)
-                self.mamba_state_cpu_layout = (
-                    layout_fn() if layout_fn is not None else None
-                )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2812,19 +2697,7 @@ class Req(ReqDllmMixin):
         token_to_kv_pool_allocator.load_cpu_copy(
             self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
-        if self.mamba_state_cpu is not None:
-            mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
-            if mamba_pool is not None:
-                translate = getattr(
-                    req_to_token_pool, "translate_mamba_indices", lambda ids: ids
-                )
-                mamba_pool.load_cpu_copy(
-                    self.mamba_state_cpu, translate(self.mamba_pool_idx)
-                )
-            self.mamba_state_cpu = None
-            self.mamba_state_cpu_layout = None
         del self.kv_cache_cpu
-        self.kv_cache_cpu_layout = None
 
     def build_rebootstrap_payload(self) -> dict:
         """Build the prefill ``/generate`` payload that asks the original prefill
@@ -2982,41 +2855,27 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-    copy_state: bool = False,
     retain: bool = False,
 ) -> None:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
-
-    # #783 half 1: the #856 cutover copies its state out before letting go.
-    # Default False, set at EXACTLY ONE site (build_cutover_release._retract);
-    # `retract_all`'s only other caller is the decode-pressure path, whose rate
-    # is load-dependent and outside the flip-cadence host budget. Not a flag --
-    # the condition is structural. Routed through `seam_copy_state` so a
-    # mid-chunk request is DECLINED rather than copied at an extent that cannot
-    # be restored. Runs before `release_kv_cache` below, while the rows still
-    # hold live bytes, and transfers no ownership (`is_insert` stays False).
-    if copy_state:
-        seam_copy_state(req, req_to_token_pool, token_to_kv_pool_allocator)
 
     # In decode disaggregation the retracted KV is offloaded to host so it can be
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
     #
-    # #920 SIBLING, NAMED RATHER THAN GUESSED. This branch reaches the SAME
-    # `Req.offload_kv_cache` with the SAME raw `req_to_token` slice as the seam
-    # copy above, so under a layout whose pool is indexed by compacted rows --
-    # this fork's TP stack, see `seam_copy_addresses_the_bound_pool`
-    # (phase_flip_runtime.py) -- it carries the identical defect: a global slot
-    # id handed to a pool that does not store it at that row. It is NOT gated
-    # here because the gate's input is the resident layout, which is a property
-    # of the scheduler and is not reachable from this frame, and because no
-    # measured specimen exists for it (this branch needs
-    # `disaggregation_mode == "decode"`, which no boot in the #918/#920 family
-    # ran). Gating it on a guess would put an ungrounded refusal on a live
-    # decode-disagg path; recording it is what keeps it from being rediscovered
-    # as a new finding.
+    # #920, RECORDED RATHER THAN GUESSED. `Req.offload_kv_cache` hands the
+    # raw `req_to_token` slice to `get_cpu_copy`. Under a layout whose pool
+    # is indexed by compacted rows (this fork's TP stack: the weighted-DCP
+    # compaction in layers/dcp/reshard_plan.py) a global slot id is not a
+    # row of that pool, so the copy would address no row at all (fatal) or
+    # another row's KV (silently wrong). It is NOT gated here: the resident
+    # layout is a scheduler property unreachable from this frame, and no
+    # boot of the #918/#920 family ran `disaggregation_mode == "decode"`.
+    # The cutover's own copy, which shared this defect, is deleted (#1068);
+    # recording it here keeps it from being rediscovered as a new finding
+    # on the decode-disaggregation path.
     if server_args.disaggregation_mode == "decode" and offload_kv:
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
     # TODO (csy): for preempted requests, we may want to insert into the tree
@@ -3060,24 +2919,6 @@ def release_req(
     req.reset_for_retract()
 
 
-#: #783: seam state-transfer counters. AFFIRMATIVE REPORTING -- these exist so
-#: "did the restore happen" is a grep and not an inference from #cached-token.
-#: `refused` and `declined` are the numbers that matter most: a contract never
-#: exercised in the failure direction is untested, and `declined` doubles as the
-#: measurement of how often a mid-chunk request meets the seam at all -- i.e. it
-#: MEASURES the PS3 question instead of guessing it.
-# `refused` is the #783 extent (ROW) refusal; `refused_layout` is the #861c
-# per-LAYER one. Counted apart on purpose: they diagnose different things. An
-# extent refusal says a request grew across the seam; a layout refusal says the
-# seam carry is structurally impossible in that direction, i.e. every flip loses
-# its prefixes. One number for both would let the second hide inside the first.
-# #875d: `carried` is the layout drift that was ANSWERED rather than refused --
-# a copy whose global layers cover the destination's, re-selected onto them
-# rank-locally. It is counted apart from `restored` for the reason `refused` and
-# `refused_layout` are counted apart: folded into `restored` it would be
-# indistinguishable from a same-layout restore, and the one thing an operator
-# needs to read off these numbers is which flips keep their prefixes and by
-# which route. `carried + refused_layout` is every flip that crossed a geometry.
 #: #998 reader-side invariant probe: rid -> (start, end, len_prefix,
 #: len_input, break). `break` is `start - len(prefix_indices)`; 0 means the
 #: invariant holds, -1 means unreadable (a DISTINCT sentinel, because 0 is a
@@ -3086,407 +2927,6 @@ def release_req(
 _998_LAST: dict = {}
 _998_SEEN = [0]
 _998_BREAKS = [0]
-
-_SEAM_STATE_COUNTS = {
-    "copied": 0,
-    "declined": 0,
-    "restored": 0,
-    "refused": 0,
-    "refused_layout": 0,
-    "carried": 0,
-    # #913: counted apart from `declined` for the reason `refused_layout` is
-    # counted apart from `refused` -- they diagnose different things. A
-    # `declined` says the request was mid-chunk, which is normal traffic; a
-    # `declined_unmapped` says the backing dial released pages under a live
-    # row, which is a defect upstream of this file. Folded into one number the
-    # second would be invisible inside the first at exactly the rate the first
-    # is common.
-    "declined_unmapped": 0,
-    # #916: and apart from THAT one again, for the same reason one more time.
-    # `declined_unmapped` is a verdict about the ids -- they were read and they
-    # sit above the backing. `declined_unreadable` is the absence of a verdict:
-    # the device would not answer at all, because the context was already
-    # faulted when the copy was requested (0826 rerun boot #2, 21:53:36). One
-    # says the dial released a page under a live row; the other says something
-    # else had already gone wrong and this path is downstream of it. Reading
-    # the second as the first would send the next window hunting the dial.
-    "declined_unreadable": 0,
-}
-
-
-def _seam_extent_of(req: Req) -> int:
-    """The number of token rows a copy of this request would cover."""
-    return int(req.seqlen) - 1
-
-
-def _seam_prefill_is_complete(req: Req) -> bool:
-    """#783: is this request's row actually filled to its logical length?
-
-    `Req.seqlen` is LOGICAL (`len(origin_input_ids) + len(output_ids)`); the row
-    is filled only to `kv_allocated_len` (== `extend_range.end`), which is
-    strictly less while the prompt is still being chunk-prefilled. Indexing by
-    `seqlen - 1` is therefore only sound once those agree.
-    """
-    allocated = getattr(req, "kv_allocated_len", None)
-    if allocated is None:
-        return False
-    return int(allocated) >= _seam_extent_of(req)
-
-
-def seam_copy_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bool:
-    """#783 half 1: copy this request's state out at the cutover, or decline.
-
-    DECLINES a request whose prefill is still chunked. Such a request has no
-    well-defined full extent, and the tree has already settled what to do about
-    that: `kv_session_offload` refuses chunked admission outright rather than
-    restoring into it (":445 return False  # would be CHUNKED -> needs PS3";
-    the assert at :4496 names "PS3 (host-prefix extend read)"). PS3 is
-    unimplemented -- four mentions, all comments. So mid-chunk is declined here
-    too, loudly and counted, rather than half-built in passing.
-
-    Declining costs a recompute of work that was unfinished anyway; a
-    decode-phase resident, which is the population the cutover actually
-    retracts, loses real session state and IS covered.
-    """
-    if not _seam_prefill_is_complete(req):
-        _SEAM_STATE_COUNTS["declined"] += 1
-        n = _SEAM_STATE_COUNTS["declined"]
-        if n <= 3 or n % 100 == 0:
-            logger.info(
-                "%s SEAM COPY DECLINED rid=%s: prefill still chunked "
-                "(allocated=%s, needs=%d), so there is no full extent to copy. "
-                "Its tokens are recomputed after the flip. occurrence=%d",
-                SEAM_STATE_PREFIX,
-                getattr(req, "rid", None),
-                getattr(req, "kv_allocated_len", None),
-                _seam_extent_of(req),
-                n,
-            )
-        return False
-    # #913: DECLINE A ROW WHOSE PAGE IS GONE, do not read it.
-    #
-    # The backing dial releases pages under ids that live requests still hold
-    # (`runtime_set_backing_tokens` states "rows above n are dead the moment
-    # size is n", which is false while a resident holds one), and this copy is
-    # the consumer that turns that into a CUDA illegal memory access: R7 of the
-    # 0826 window, 18:27:14Z, PP2, live high-water 122898 against a backing of
-    # 114688, the whole instance down with a traceback naming `synchronize()`.
-    #
-    # CAUGHT HERE AND NOT LOWER because this is the frame that owns the
-    # response. `check_cpu_copy_rows` can only refuse; only the seam knows that
-    # a refused copy is survivable -- it is the DECLINE path three lines above,
-    # already built, already counted, whose cost is a recompute. Letting the
-    # refusal propagate would replace an unrecoverable rank death with a
-    # recoverable-in-principle one that still kills the flip, which is not the
-    # improvement it looks like: `release_residents_for_cutover` is past the
-    # no-return point and its caller has no abort left.
-    #
-    # NARROW ON PURPOSE. Only `CpuCopyUnmappedRows` is caught. A plain
-    # ValueError from the same guard means the id addresses NO pool -- the
-    # #783b defect -- and must still surface loudly; swallowing it here would
-    # hide an addressing bug behind a counter that reads as normal traffic.
-    try:
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-    except CpuCopyUnmappedRows as refusal:
-        # #916: the unreadable-ids refusal is a SUBCLASS of this one on purpose
-        # -- one `except` keeps the decline path unforgettable -- but it is
-        # counted on its own line so the two cannot be read as one population.
-        key = (
-            "declined_unreadable"
-            if isinstance(refusal, CpuCopyIdsUnreadable)
-            else "declined_unmapped"
-        )
-        _SEAM_STATE_COUNTS[key] += 1
-        n = _SEAM_STATE_COUNTS[key]
-        if n <= 3 or n % 100 == 0:
-            logger.error(
-                "%s SEAM COPY DECLINED (%s) rid=%s: %s %s Declined; its tokens "
-                "are recomputed after the flip. occurrence=%d",
-                SEAM_STATE_PREFIX,
-                "IDS UNREADABLE" if key == "declined_unreadable" else "UNMAPPED",
-                getattr(req, "rid", None),
-                refusal,
-                (
-                    "Nothing is claimed about these ids -- the decline is about "
-                    "the device, not about them (#916)."
-                    if key == "declined_unreadable"
-                    else "The rows were minted at a larger backing and a dial "
-                    "shrink released their pages while this request still held "
-                    "them, so the copy would read unmapped device memory."
-                ),
-                n,
-            )
-        # Leave nothing half-taken: a partially populated copy would be applied
-        # at restore against an extent it does not cover.
-        req.kv_cache_cpu = None
-        req.kv_cache_cpu_extent = None
-        req.kv_cache_cpu_layout = None
-        req.mamba_state_cpu = None
-        req.mamba_state_cpu_layout = None
-        return False
-    _SEAM_STATE_COUNTS["copied"] += 1
-    return True
-
-
-def restore_seam_state(req, req_to_token_pool, token_to_kv_pool_allocator) -> bool:
-    """#783 half 2: put back what the cutover copied, or REFUSE on extent drift.
-
-    THE CONTRACT: a copy may only be applied to the extent it was taken from.
-    W38-A applied one to a longer extent and the pool walked off the end of its
-    saved chunk list (IndexError, memory_pool.py:3295, three ranks, 14 s into
-    the load). The refusal happens HERE, at the caller that knows both numbers,
-    because every pool-level `load_cpu_copy` merely forwards indices and adds no
-    length check of its own beyond a per-chunk one (:3298) on the wrong axis.
-
-    NOT A CLAMP. The two extents describe different things, so a `min()` would
-    write a prefix's KV into the wrong rows -- a wrong ANSWER rather than a
-    crash. A refusal costs a recompute, which is merely slow.
-
-    A REFUSED COPY IS DROPPED, not kept: it is stale against a request the model
-    has since advanced, and holding it would let a later coincidentally-matching
-    extent restore ancient bytes.
-
-    #890: A REFUSAL ALSO REVOKES THE PERMISSION THAT BROUGHT THE REQUEST HERE.
-    Dropping the copy is only half of it. The request was admitted into the TP
-    layout under `phase_purity.seam_transport_exempt`, whose premise -- verified
-    at the GRANT by `seam_transport_premise_holds` -- is that the re-admission
-    "recomputes nothing". Each refusal below says in its own log line that the
-    tokens ARE recomputed, so the premise is false for this request and the
-    permission must not be issued to it again on the same evidence. The
-    evidence field (`cached_prompt_tokens_at_retract`) cannot carry that: the
-    recompute the refusal forces re-stamps it at the next retraction, so it
-    reads "computed and fenced" precisely when the copy has just proven
-    unusable. Hence a separate mark, set here and cleared on the success path
-    below, where the claim becomes true again.
-
-    NOTHING IS MARKED WHEN THERE WAS NO COPY. This function runs for every
-    request in an extend batch and `kv_cache_cpu` is None for almost all of
-    them -- a request that never went through the seam, or one whose copy the
-    cutover DECLINED. Marking that path would revoke the exemption for the
-    whole world and put the W30 livelock back.
-    """
-    saved = getattr(req, "kv_cache_cpu", None)
-    if saved is None:
-        return False
-
-    covered = getattr(req, "kv_cache_cpu_extent", None)
-    now = _seam_extent_of(req)
-    # #968 FIX-10 / D2: the refusal is a THREE-TERM disjunction and the message
-    # used to be written for one of them. `_seam_prefill_is_complete` is pure
-    # (a getattr and a comparison), so evaluating it here rather than inside the
-    # `or` changes nothing but lets the message name the term that fired.
-    complete = _seam_prefill_is_complete(req)
-    if covered is None or int(covered) != int(now) or not complete:
-        _SEAM_STATE_COUNTS["refused"] += 1
-        n = _SEAM_STATE_COUNTS["refused"]
-        # NAME THE TERM THAT ACTUALLY FIRED, WITH NUMBERS THAT DIFFER.
-        # Boot-measured on the warm pass: "the copy covers 4618 row(s) but the
-        # request now needs 4618 (allocated=4096)" -- two IDENTICAL numbers,
-        # because the sentence described the extent-drift branch while the term
-        # that fired was the completeness one. `allocated` is not a chunk size:
-        # it is how far this request's row is actually filled, which is
-        # `rem_chunk_tokens` at admission (the same 4618-token prompt was
-        # measured at 4096 once and 2817 another time). A reader who took the
-        # old sentence at face value looked for a drift that was not there.
-        if covered is None:
-            reason = (
-                "NO RECORDED EXTENT: the copy carries no row count "
-                "(kv_cache_cpu_extent=None), so there is nothing to check it "
-                "against"
-            )
-        elif int(covered) != int(now):
-            reason = (
-                f"EXTENT DRIFT: the copy covers {covered} row(s) but the "
-                f"request now needs {now}"
-            )
-        else:
-            reason = (
-                f"PREFILL INCOMPLETE: the copy's {covered} row(s) match what "
-                f"the request needs, but its row is filled only to "
-                f"allocated={getattr(req, 'kv_allocated_len', None)}, so "
-                f"indexing at seqlen-1 is not yet sound"
-            )
-        logger.warning(
-            "%s SEAM RESTORE REFUSED rid=%s: %s. Applying it would index past "
-            "the saved chunks (the W38-A crash) or write a prefix into the "
-            "wrong rows. Dropped; these tokens are recomputed. occurrence=%d",
-            SEAM_STATE_PREFIX,
-            getattr(req, "rid", None),
-            reason,
-            n,
-        )
-        req.kv_cache_cpu = None
-        req.kv_cache_cpu_extent = None
-        req.kv_cache_cpu_layout = None
-        req.mamba_state_cpu = None
-        req.mamba_state_cpu_layout = None
-        # #890: the tokens this line just sent back to be recomputed are the
-        # ones the exemption promised would not be. Rank-uniform: both sides of
-        # the comparison above are the LOGICAL extent (`kv_cache_cpu_extent` is
-        # stamped in `offload_kv_cache` from `[: seqlen - 1]`), which is
-        # replicated across the group.
-        return False
-
-    # #875: THIS REFUSAL WAS A NON-ANSWER FOR BOTH DIRECTIONS AND IS NOW THE
-    # ANSWER FOR ONE. The counter comment above says what it costs -- a layout
-    # refusal means every flip in that direction loses its prefixes. #875d
-    # splits the two directions apart (see the carry attempt below):
-    #   * the copy is MISSING layers (PP stage -> TP pool): they are on a peer,
-    #     the exchange is an all-to-all in the cutover's no-return region, and
-    #     #875 measured it against the recompute it saves and returned DO NOT
-    #     BUILD. This refusal is the answer there, and it names the layers.
-    #   * the copy is a SUPERSET (TP -> PP stage): nothing is missing and the
-    #     answer is a rank-local slice. Carried, not refused.
-    # The TOKEN axis (PP at allocator slots, TP under the owner rule,
-    # layers/dcp/owner.py:159) is untouched by either: the carry moves nothing
-    # on the row axis, so it cannot produce the "matching row ids at mismatched
-    # widths" shape #719 walked into. The extent contract above still owns that
-    # axis and still runs first.
-    #
-    # #861c: the SECOND axis, and the one W40 died on. The extent check above
-    # compares ROW counts; a phase flip does not change those, so it passed and
-    # handed the copy straight to a pool with a different LAYER count. See
-    # `check_cpu_copy_layers` (memory_pool.py) for the mechanism and for why a
-    # remap is refused rather than built.
-    #
-    # THE REFUSAL LIVES HERE AND NOT ONLY IN THE POOL. The pool-level guard
-    # turns the IndexError into a ValueError -- still a dead scheduler, because
-    # `load_kv_cache` is called unguarded. This is the check that keeps the
-    # instance up; the pool's is the backstop for every other caller.
-    #
-    # A None layout on either side means the pool could not state one. That is
-    # tolerated rather than refused: refusing on silence would switch the seam
-    # carry off for pools that never had this defect, and the pool-level count
-    # guard still covers them.
-    saved_layout = getattr(req, "kv_cache_cpu_layout", None)
-    live_layout = token_to_kv_pool_allocator.cpu_copy_layout()
-    saved_mamba_layout = getattr(req, "mamba_state_cpu_layout", None)
-    live_mamba_layout = None
-    if saved_mamba_layout is not None:
-        mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
-        layout_fn = getattr(mamba_pool, "cpu_copy_layout", None)
-        live_mamba_layout = layout_fn() if layout_fn is not None else None
-    kv_drifted = (
-        saved_layout is not None
-        and live_layout is not None
-        and saved_layout != live_layout
-    )
-    mamba_drifted = (
-        saved_mamba_layout is not None
-        and live_mamba_layout is not None
-        and saved_mamba_layout != live_mamba_layout
-    )
-    # #1043: THE RANK-LOCAL CARRY IS DELETED. `seam_layer_carry` scored 162
-    # refusals to ZERO successes over 57 cutovers (135 LAYOUT + 27 extent, 0
-    # carried, 0 restored, 0 even attempted) while the HiCache store served
-    # the same prefix independently -- rid 12f312df was refused here while its
-    # own `HiCache prefetch success ... matched=8192` had already landed, and
-    # the re-admission batches read `new=1672 cached=40960`. Pure cost, and
-    # the one direction it could never answer (PP stage -> TP pool, layers on
-    # a peer) is forbidden by #875's DO-NOT-BUILD. Second bookkeeping beside
-    # the store: deleted, not repaired.
-    if kv_drifted or mamba_drifted:
-        _SEAM_STATE_COUNTS["refused_layout"] += 1
-        n = _SEAM_STATE_COUNTS["refused_layout"]
-        # #941: THE EXTENT IS PRINTED HERE BECAUSE IT IS THE ONE NUMBER THAT
-        # CAN REOPEN #875's DO-NOT-BUILD, AND NOTHING EMITS IT ON THIS PATH.
-        # `ec1717491f` refused the PP->TP completion (an all-to-all in the
-        # cutover's no-return region) on an explicitly FALSIFIABLE ground: it
-        # priced the collective against a 13-row specimen and said so --
-        # "payload is linear in extent while the collective is latency-
-        # dominated, so a break-even exists somewhere in the hundreds-to-
-        # thousands of tokens. What would settle it is the DISTRIBUTION of
-        # `extent` over requests actually retracted at a flip. I do not have it
-        # and am not entitled to infer it."
-        #
-        # That distribution was not harvestable: this line named the missing
-        # LAYERS (via `carry_refusal`) but never the ROWS, and the extent-
-        # mismatch refusal above -- the only other emitter of `covered` on a
-        # refusal -- by construction never fires for a request that reaches
-        # here. So the gate that governs whether the carry may ever be built
-        # could not be measured from a boot log, only re-argued from the same
-        # single specimen. One value per refusal closes that: 57 refusals is 57
-        # samples, and `#941 extent=` greps the distribution straight out.
-        #
-        # AN INSTRUMENT, NOT A GATE. Nothing below reads it and no behaviour
-        # depends on it; the refusal is unchanged in every branch. The payload
-        # this prices is (missing_layers x extent x row_bytes) -- `carry_refusal`
-        # already carries the layer count, this supplies the extent, and the
-        # row width is a property of the checkpoint. The DO-NOT-BUILD stands
-        # until that product is measured against the #656 PHB numbers; this
-        # only makes measuring it possible without a new boot instrument.
-        logger.warning(
-            "%s SEAM RESTORE REFUSED (LAYOUT) rid=%s #941 extent=%s row(s): the "
-            "copy was taken from "
-            "%s and this pool is %s (mamba: %s -> %s). Applying it would index "
-            "past the saved per-layer list (the W40 IndexError) or write the "
-            "copy's layers into the wrong global layers -- a wrong answer with "
-            "no crash. No rank-local carry was available either: %s Dropped; "
-            "these tokens are recomputed. occurrence=%d",
-            SEAM_STATE_PREFIX,
-            getattr(req, "rid", None),
-            covered,
-            saved_layout,
-            live_layout,
-            saved_mamba_layout,
-            live_mamba_layout,
-            "the rank-local carry is deleted (#1043) -- it never once succeeded and this prefix is served by the store",
-            n,
-        )
-        req.kv_cache_cpu = None
-        req.kv_cache_cpu_extent = None
-        req.kv_cache_cpu_layout = None
-        req.mamba_state_cpu = None
-        req.mamba_state_cpu_layout = None
-        # #890: THE AXIS THE MEASUREMENT ACTUALLY LANDED ON -- W38 logged 90 and
-        # 21 of exactly this line, each one an exempt admission whose tokens
-        # were then recomputed in the decode layout. Rank-uniform: a flip that
-        # repartitions layers changes `layer_num` on EVERY rank (a stage's slice
-        # against the whole), so this verdict is a property of the flip and not
-        # of the rank; a flip that repartitions nothing leaves the two equal on
-        # every rank. Whether a pool can state a layout at all is a property of
-        # the pool CLASS, which is likewise the same on every rank.
-        return False
-
-    # #783b: ANNOUNCE BEFORE THE DANGEROUS CALL. This emitter sat only
-    # AFTER `load_kv_cache`, so the one event it exists to explain -- a
-    # restore that does not return -- was the one it structurally could not
-    # witness. W40a logged 18 seam lines; W40b crashed INSIDE this call and
-    # logged ZERO, leaving the traceback to name `synchronize()` rather than
-    # the restore. Rate-limited on the same cadence as the success line
-    # below, so the pair costs one extra line per restore at the head and
-    # nothing in steady state.
-    n_try = _SEAM_STATE_COUNTS["restored"] + 1
-    if n_try <= 5 or n_try % 50 == 0:
-        logger.info(
-            "%s SEAM RESTORE ATTEMPT rid=%s extent=%s rows -- entering load_kv_cache",
-            SEAM_STATE_PREFIX,
-            getattr(req, "rid", None),
-            covered,
-        )
-    req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-    req.kv_cache_cpu_extent = None
-    # #890: THE REVOCATION IS NOT A LIFE SENTENCE. A restore that actually
-    # happens is the premise coming true again for this request, so the mark
-    # clears here. Without this one flip whose geometry did not match would
-    # exile the request from an exemption that exists to keep the instance out
-    # of the W30 livelock, for the rest of its life.
-    _SEAM_STATE_COUNTS["restored"] += 1
-    n = _SEAM_STATE_COUNTS["restored"]
-    if n <= 5 or n % 50 == 0:
-        logger.info(
-            "%s SEAM RESTORE rid=%s extent=%d restored from the host copy "
-            "instead of recomputing (copied=%d declined=%d restored=%d "
-            "refused=%d)",
-            SEAM_STATE_PREFIX,
-            getattr(req, "rid", None),
-            now,
-            _SEAM_STATE_COUNTS["copied"],
-            _SEAM_STATE_COUNTS["declined"],
-            n,
-            _SEAM_STATE_COUNTS["refused"],
-        )
-    return True
 
 
 def retract_all(
@@ -3498,7 +2938,6 @@ def retract_all(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-    copy_state: bool = False,
     retain: bool = False,
 ) -> List[Req]:
     retracted_reqs = reqs
@@ -3512,7 +2951,6 @@ def retract_all(
             tree_cache=tree_cache,
             hisparse_coordinator=hisparse_coordinator,
             offload_kv=offload_kv,
-            copy_state=copy_state,
             retain=retain,
         )
     return retracted_reqs
@@ -4295,16 +3733,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     except Exception:  # noqa: BLE001 - an instrument may never break admission
                         logger.warning("#1047 DOUBLE-PREFILL PROBE RAISED", exc_info=True)
 
-            # #783 half 2: restore instead of recomputing, for the cutover
-            # population only. Here and not in `readmit_seam_residents`, which
-            # only re-queues: by then `reset_for_retract()` has cleared
-            # `req_pool_idx` and there is nothing to load into. `alloc_for_extend`
-            # above has just given this request rows back. The extent contract
-            # inside REFUSES on drift rather than indexing, which is what W38-A
-            # needed. Before `is_retracted` is cleared, so the order is visible.
-            restore_seam_state(
-                req, self.req_to_token_pool, self.token_to_kv_pool_allocator
-            )
             req.is_retracted = False
 
             if server_args.enable_mamba_extra_buffer():

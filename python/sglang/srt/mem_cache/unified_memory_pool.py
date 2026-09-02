@@ -1217,17 +1217,6 @@ class UnifiedSWAKVPool(SWAKVPool):
         phys_pages = allocator.virtual_to_physical[virt_pages]
         return phys_pages * ps + offsets
 
-    def cpu_copy_layout(self):
-        """#861c: `UnifiedSWAKVPool` reaches `KVCache` through `SWAKVPool`, so
-        it would inherit an answer -- but its copy is `{"full", "swa"}`, a
-        composite, and the inherited scalar answer would describe only one half.
-        Overridden so the identity matches the payload it labels."""
-        return (
-            "unified-swa",
-            self.full_kv_pool.cpu_copy_layout(),
-            self.swa_kv_pool.cpu_copy_layout(),
-        )
-
     def get_cpu_copy(self, indices, mamba_indices=None):
         assert self._full_allocator is not None
         assert self._swa_allocator is not None
