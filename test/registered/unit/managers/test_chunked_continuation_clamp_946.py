@@ -808,6 +808,20 @@ class ADeclinedRefetchKeepsTheMarkAndIsBounded(unittest.TestCase):
         self.assertEqual(len(req.prefix_indices), 8192, "and the prefix is kept")
 
     def test_the_decline_names_its_REASON_in_the_log(self):
+        """RE-PINNED 2026-09-02 (weg1 drift pass): DRIFT(51fedc4c36). Slice 2
+        of #1068 deleted ``prefetch_capacity_limit_for`` and
+        ``PREFETCH_CAP_FLOOR_TOKENS`` (WEG1_BUILD_SPEC_0901 section 4.2) and
+        made the limit a live property of the bound host pool
+        (``HiCacheController.prefetch_capacity_limit``), spoken by the spec-L3
+        line ``#915 PREFETCH LIMIT now=...``. The decline line's pointer moved
+        with it: from the file:line of the deleted function
+        ("cache_controller.py:841") to the L3 line name and the property name.
+        The subject is unchanged -- the decline names its reason
+        (rate_limited) AND points at the capacity limit by name rather than
+        leaving it to be rediscovered; the pointer is now a log-line name plus
+        a symbol instead of a line number, so an unrelated edit above it can
+        no longer make it lie.
+        """
         req = self._marked(_Req(RID_CHUNKED, prefix_len=8192, extend_len=4096))
         holder = _holder(chunked_req=req)
         holder._prefetch_kvcache = lambda r: "declined:rate_limited"
@@ -822,11 +836,16 @@ class ADeclinedRefetchKeepsTheMarkAndIsBounded(unittest.TestCase):
         self.assertIn("REFETCH DECLINED", msg)
         self.assertIn("rate_limited", msg)
         self.assertIn(
-            "cache_controller.py:841",
+            "#915 PREFETCH LIMIT",
             msg,
             "a persistent rate_limited decline points at the #915 capacity "
-            "asymmetry, and the line must say so rather than leave it to be "
-            "rediscovered",
+            "limit -- by the name of the L3 line that prints it -- and the "
+            "line must say so rather than leave it to be rediscovered",
+        )
+        self.assertIn(
+            "prefetch_capacity_limit",
+            msg,
+            "and at the property that holds the limit since #1068 slice 2",
         )
 
     def test_the_retry_is_BOUNDED_and_ends_in_the_named_terminator(self):

@@ -219,6 +219,16 @@ class _FakeScheduler:
     _drain_prefetch_progress = Scheduler._drain_prefetch_progress
     _prefetch_done_for = Scheduler._prefetch_done_for
     _get_new_batch_prefill_raw = Scheduler._get_new_batch_prefill_raw
+    # #1068 weg1 slice 3 (0ad85647cb): `_get_new_batch_prefill_raw` now runs
+    # the A12.2 rate-limited-deferral retry on every pass, ABOVE the progress
+    # drain (`if self.enable_hicache_storage: self._retry_deferred_prefetches()`).
+    # Bound off the real class, not stubbed (#624 stub-drift class): with no
+    # `prefetch_deferred` mark on any _FakeReq it returns 0 before touching
+    # anything, and the retry is rank-local by ruling (spec A12.6 CORRECTION,
+    # 597a7f21eb) -- it must never add an entry into the progress collectives
+    # this module pins, and binding the real method is what would show it if
+    # it ever did.
+    _retry_deferred_prefetches = Scheduler._retry_deferred_prefetches
 
 
 def _run_rank(sched: _FakeScheduler) -> List[str]:
