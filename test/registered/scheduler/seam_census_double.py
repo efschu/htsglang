@@ -415,6 +415,20 @@ class FaithfulCensusScheduler:
     """
 
     readmit_seam_residents = Scheduler.readmit_seam_residents
+    # #1068 slice-3 fix (review round 1): `readmit_seam_residents` now clears
+    # the A12.2 deferral fields of the whole population BEFORE the re-issue
+    # (lifecycle CLEARER (c), scheduler.py `_clear_prefetch_deferral_for_reissue`).
+    # Both are bound from the REAL class -- a no-op stand-in here would be the
+    # W29 direction again: the double would pass a cutover that never cleared,
+    # which is the exact defect the clearer exists for (a PP-phase mark riding
+    # into the symmetric TP phase, tp1 retried=1 / tp0 retried=0). The A12.2
+    # fields themselves are NOT pre-planted on `FaithfulReq`, because the real
+    # `Req` does not declare them either -- they are planted dynamically by
+    # `_apply_prefetch_deferral` and every reader uses `getattr(..., default)`.
+    _clear_prefetch_deferral_for_reissue = (
+        Scheduler._clear_prefetch_deferral_for_reissue
+    )
+    _clear_prefetch_deferral_fields = Scheduler._clear_prefetch_deferral_fields
 
     def __init__(self, *, n_residents: int = 3, rank: int = 0, cached_rows: int = 12):
         _ensure_global_server_args()

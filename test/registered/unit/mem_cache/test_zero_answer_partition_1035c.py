@@ -170,6 +170,16 @@ class TestZeroAnswerPartition1035c(CustomTestCase):
             extra_host_mem_release_entries=None,
         )
         op = SimpleNamespace(
+            # #1068 slice-2 fix 4: every storage operation carries the
+            # termination protocol (`StorageOperation.is_terminated`,
+            # managers/cache_controller.py:287), and this override reads it
+            # DIRECTLY -- it is a full replacement of the base probe, so the
+            # base class's per-batch guard never runs. A live (non-terminated)
+            # operation is what these four fixtures are about, so the stand-in
+            # answers False. `mark_terminate` is deliberately absent: this
+            # path never calls it, and a stub method nothing drives would be
+            # surface without a contract behind it.
+            is_terminated=lambda: False,
             token_ids=[1, 2, 3],
             last_hash=None,
             prefix_keys=None,
