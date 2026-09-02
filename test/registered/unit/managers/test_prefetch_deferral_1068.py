@@ -32,9 +32,26 @@ SLICE 3 FIX (review round 1 on 0ad85647cb), two blocking findings:
       test: RED on 0ad85647cb (tp1 retried=1, tp0 retried=0).
   (2) the hold was the first deliberately rank-asymmetric gate in the
       admission loop, with the mark itself rank-local on followers.
-      `TestFollowersCarryNoMark`: followers refuse the deferral BY NAME
-      (reason=pp_follower), carry no mark, retry nothing, and the join that
-      carries PP0's hold to them (#631 row authority) is pinned alive.
+      Round 1 answered with option (ii): followers refuse the deferral BY
+      NAME (reason=pp_follower), carry no mark, retry nothing.
+
+SLICE 3 FIX ROUND 2 (review round 2 on 63afbdc121, spec A12.6 CORRECTION):
+option (ii) is WITHDRAWN. Storage prefetch and host load-back are PER RANK
+(each rank fetches its own slot window into its own host pool and loads back
+from its OWN match), and a follower executes PP0's told unconditionally
+(#1072). A follower that did not mark and retry never landed the span PP0
+landed: PP0 admitted with prefix=P, the follower held 0 rows of it and
+recomputed the whole span -- the 'PP0=(0,4096) PP1=(8192,N)' extent
+divergence, deterministic. `TestFollowersMarkAndRetryButNeverHold`: the
+mark and the retry run on EVERY rank (same requests, same MIN-synced
+capacity, same landing sequence), only the admission HOLD is PP0's, and the
+join that carries PP0's hold to the followers (#631 row authority) is pinned
+alive. RED on 63afbdc121: a follower's request carries no mark after
+intake and its retry calls nobody. Also from that review: a rate_limited
+verdict that meets a refused deferral is COUNTED (census key defer_refused,
+the suppressed count of the once-per-process REFUSED line); the CLEARED AT
+CUTOVER line is unconditional (n=0 included); page_size is part of the
+unpriced_timeout refusal; prefetch_defer_reason (write-only) is deleted.
 """
 
 import copy
@@ -166,7 +183,6 @@ class _Intake:
     _deferred_prefetch_bound_s = _method("_deferred_prefetch_bound_s")
     _prefetch_capacity_limit_or_none = _method("_prefetch_capacity_limit_or_none")
     _admission_held_for_deferred_prefetch = _method("_admission_held_for_deferred_prefetch")
-    _prefetch_deferral_enabled = _method("_prefetch_deferral_enabled")
     _prefetch_deferral_refusal_reason = _method("_prefetch_deferral_refusal_reason")
     _clear_prefetch_deferral_fields = _method("_clear_prefetch_deferral_fields")
     _drop_prefetch_deferral = _method("_drop_prefetch_deferral")
@@ -374,7 +390,6 @@ class TestTheNamedExits(_Clean):
             with self.assertLogs(LOG, level="WARNING") as caught:
                 s._retry_deferred_prefetches()
         self.assertIsNone(r.prefetch_deferred)
-        self.assertEqual(r.prefetch_defer_reason, "rate_expired")
         self.assertFalse(s._admission_held_for_deferred_prefetch(r))
         self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_expired", 0), 1)
         lines = [ln for ln in caught.output if "#1068 PREFETCH DEFER EXPIRED" in ln]
@@ -458,7 +473,6 @@ def _plant_mark(req):
     req.prefetch_defer_attempts = 1
     req.prefetch_defer_passes = 0
     req.prefetch_defer_since = time.monotonic()
-    req.prefetch_defer_reason = None
 
 
 def _assert_unmarked(tc, req):
@@ -526,7 +540,23 @@ class TestTheMarkDoesNotSurviveTheCutover(_Clean):
         self.assertEqual(tp0._retry_deferred_prefetches(), 0)
         self.assertEqual(tp1.prefetch_calls, [])
         self.assertEqual(tp0.prefetch_calls, [])
-        self.assertFalse(tp1._prefetch_deferral_enabled())
+        self.assertEqual(tp1._prefetch_deferral_refusal_reason(), "symmetric_vote")
+
+    def test_the_cleared_line_is_emitted_for_a_population_without_marks(self):
+        # Denominator law (review round 2): the A12.3 identity is read per
+        # cutover, and a zero from an ABSENT line is not a zero. RED on
+        # 63afbdc121: the line was guarded by `if cleared:`.
+        s = _Intake(lambda r: "issued")
+        s.waiting_queue = [_Req("p", seq=1)]
+        with self.assertLogs(LOG, level="INFO") as caught:
+            s.readmit_seam_residents([], requeue_waiting=True)
+        cleared = [ln for ln in caught.output if "#1068 PREFETCH DEFER CLEARED AT CUTOVER" in ln]
+        self.assertEqual(len(cleared), 1, caught.output)
+        self.assertIn("n=0", cleared[0])
+        self.assertIn("rids=-", cleared[0])
+        self.assertIn("population=1", cleared[0])
+        self.assertEqual(s.last_seam_readmit["deferral_cleared"], 0)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_cleared_cutover", 0), 0)
 
     def test_the_readmit_clears_a_landed_hold_too(self):
         # `_prefetch_landed_hold_once` guards one more pass for a landing
@@ -554,7 +584,6 @@ class TestTheMarkDoesNotSurviveTheCutover(_Clean):
         self.assertEqual(n, 0)
         self.assertEqual(s.prefetch_calls, [], "never rank-locally into prefetch_from_storage")
         _assert_unmarked(self, r)
-        self.assertEqual(r.prefetch_defer_reason, "dropped:symmetric_vote")
         self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_dropped", 0), 1)
         lines = [ln for ln in caught.output if "#1068 PREFETCH DEFER DROPPED" in ln]
         self.assertEqual(len(lines), 1, caught.output)
@@ -580,46 +609,104 @@ class TestTheMarkDoesNotSurviveTheCutover(_Clean):
         self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_dropped", 0), 1)
 
 
-class TestFollowersCarryNoMark(_Clean):
-    """Review finding 2: the hold is PP0-authoritative, not rank-asymmetric.
+class TestFollowersMarkAndRetryButNeverHold(_Clean):
+    """Review round 2 (spec A12.6 CORRECTION): the mark and the retry are
+    rank-local bookkeeping and run on EVERY rank of the PP phase; only the
+    admission HOLD is PP0's verdict (#968).
 
-    The verdict site is PP0 (#968). A follower refuses the deferral BY NAME
-    (reason=pp_follower): it never sets a mark at intake, never retries, and
-    drops a planted mark. Its membership comes from PP0's decision through
-    the #631 row (`_pp_admission_incoming_effective`): PP0 skips the held rid
-    before `add_one_req`, so `build_pp_admission_decision` (built from
-    `can_run_list`) never names it, and the follower skips it as
-    `pp_not_named`. There is no rank-local mark on a follower to converge.
+    WHY (verified in the tree): storage prefetch is per rank
+    (hicache_storage.py `_derive_key_suffixes`: each rank fetches its own
+    slot window into its own host pool), the host load-back is from each
+    rank's OWN match (schedule_policy.py `_pp_load_back_extent`), and a
+    follower executes PP0's told unconditionally (pp_admission_congruence.py
+    `reconcile_pp_admission_decision`, #1072: `local < told` is the pipeline
+    stagger). Under round 1's option (ii) PP0 deferred, held, retried and
+    landed the 9th span from the store while PP1/PP2 refused by name and
+    never called `_prefetch_kvcache` for it again: PP0 admitted with
+    prefix=P, the follower held 0 rows of it and recomputed the whole span.
+    Two ranks on the same pass with different widths is the
+    'PP0=(0,4096) PP1=(8192,N)' form six boots died of -- here deterministic.
+
+    RED on 63afbdc121: `prefetch_deferred` is None on the follower after
+    intake, the REFUSED reason=pp_follower line is printed, the retry calls
+    nobody.
     """
 
-    def test_a_follower_never_marks_at_intake_and_never_retries(self):
-        f = _Intake(lambda r: "declined:rate_limited", pp_size=3, pp_rank=1)
+    def test_a_follower_marks_and_retries_but_never_holds(self):
+        occ = _Occupancy(limit=0)  # rate_limited until the budget is raised
+        f = _Intake(occ, pp_size=3, pp_rank=1)
         r = _Req("w", seq=1)
         with self.assertLogs(LOG, level="INFO") as caught:
             f._add_request_to_queue(r)
-        self.assertIsNone(getattr(r, "prefetch_deferred", None))
+        # the mark is set on the follower exactly as on PP0
+        self.assertEqual(r.prefetch_deferred, "rate_limited")
         self.assertEqual(r._969c_verdict, "declined:rate_limited")
-        self.assertEqual(PREFETCH_GATE_COUNTS.get("deferred", 0), 0)
-        self.assertEqual([ln for ln in caught.output if "PREFETCH DEFERRED" in ln], [])
-        self.assertTrue(
-            any("#1068 PREFETCH DEFERRAL REFUSED reason=pp_follower" in ln for ln in caught.output),
-            caught.output,
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("deferred", 0), 1)
+        self.assertEqual(
+            len([ln for ln in caught.output if "#1068 PREFETCH DEFERRED rid=w" in ln]), 1
         )
-        self.assertEqual(f._prefetch_deferral_refusal_reason(), "pp_follower")
-        # a planted mark on a follower is dropped by name, never retried
-        _plant_mark(r)
-        f.prefetch_calls.clear()
-        with self.assertLogs(LOG, level="WARNING") as caught2:
-            self.assertEqual(f._retry_deferred_prefetches(), 0)
-        self.assertEqual(f.prefetch_calls, [])
-        _assert_unmarked(self, r)
-        self.assertTrue(
-            any("DEFER DROPPED" in ln and "reason=pp_follower" in ln for ln in caught2.output),
-            caught2.output,
+        self.assertEqual(
+            [ln for ln in caught.output if "DEFERRAL REFUSED" in ln], [], caught.output
         )
+        self.assertIsNone(f._prefetch_deferral_refusal_reason())
+        # ... but it never withholds admission on it: the hold is PP0's
         self.assertFalse(f._admission_held_for_deferred_prefetch(r))
+        self.assertEqual(
+            r.prefetch_deferred, "rate_limited", "reading the hold does not clear the mark"
+        )
+        # the retry runs on the follower, rank-locally, and lands the span
+        # in the follower's own host pool once the budget opens
+        f.prefetch_calls.clear()
+        self.assertEqual(f._retry_deferred_prefetches(), 1)
+        self.assertEqual(f.prefetch_calls, ["w"], "the follower retries its own prefetch")
+        self.assertEqual(r.prefetch_deferred, "rate_limited", "still rate-limited: still marked")
+        occ.limit = LIMIT
+        f.prefetch_calls.clear()
+        with self.assertLogs(LOG, level="INFO") as caught2:
+            self.assertEqual(f._retry_deferred_prefetches(), 1)
+        self.assertEqual(f.prefetch_calls, ["w"])
+        self.assertIsNone(r.prefetch_deferred)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("landed", 0), 1)
+        self.assertEqual(
+            len([ln for ln in caught2.output if "#1068 PREFETCH LANDED rid=w" in ln]), 1
+        )
+        # a landing is not held on a follower either; the once-flag is consumed
+        self.assertFalse(f._admission_held_for_deferred_prefetch(r))
+        self.assertFalse(getattr(r, "_prefetch_landed_hold_once", False))
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_dropped", 0), 0, "nothing dropped by name")
 
-    def test_pp0_is_the_verdict_site(self):
+    def test_pp0_and_a_follower_land_the_same_sequence(self):
+        # The rank-uniformity argument, as a test: the same wave through a
+        # PP0 and a follower stand-in with the same (MIN-synced) capacity
+        # marks the same rid, retries the same rid and lands it after the
+        # same completion -- the follower's host pool holds what PP0's holds.
+        waves = {}
+        for rank in (0, 1):
+            PREFETCH_GATE_COUNTS.clear()
+            occ = _Occupancy()
+            s = _Intake(occ, pp_size=3, pp_rank=rank)
+            for i in range(9):
+                s._add_request_to_queue(_Req(f"r{i}", seq=i))
+            marked = [r.rid for r in s.waiting_queue if getattr(r, "prefetch_deferred", None)]
+            s.prefetch_calls.clear()
+            retried = s._retry_deferred_prefetches()
+            first_retry_calls = list(s.prefetch_calls)
+            occ.complete_one()
+            s.prefetch_calls.clear()
+            s._retry_deferred_prefetches()
+            second_retry_calls = list(s.prefetch_calls)
+            still = [r.rid for r in s.waiting_queue if getattr(r, "prefetch_deferred", None)]
+            census = dict(PREFETCH_GATE_COUNTS)
+            waves[rank] = (marked, retried, first_retry_calls, second_retry_calls, still, census)
+        self.assertEqual(waves[0], waves[1])
+        self.assertEqual(waves[0][0], ["r8"], "the 9th span is the one deferred, on both ranks")
+        self.assertEqual(waves[0][4], [], "landed on both ranks after one completion")
+        self.assertEqual(waves[0][5].get("deferred"), 1)
+        self.assertEqual(waves[0][5].get("landed"), 1)
+        # only the HOLD differs: PP0 held r8 while marked, the follower never
+        # did (TestTheHold.test_a_marked_request_is_held_from_prefill)
+
+    def test_the_hold_is_pp0s_and_the_single_ranks(self):
         pp0 = _Intake(lambda r: "declined:rate_limited", pp_size=3, pp_rank=0)
         r = _Req("z", seq=1)
         pp0._add_request_to_queue(r)
@@ -628,6 +715,16 @@ class TestFollowersCarryNoMark(_Clean):
         self.assertIsNone(pp0._prefetch_deferral_refusal_reason())
         single = _Intake(lambda r: "declined:rate_limited", pp_size=1, pp_rank=0)
         self.assertIsNone(single._prefetch_deferral_refusal_reason())
+        # the refusal predicate has no rank term at all: PP0 and a follower
+        # of the same stage row read the same answer from the same tree
+        follower = _Intake(lambda r: "declined:rate_limited", pp_size=3, pp_rank=2)
+        self.assertEqual(
+            follower._prefetch_deferral_refusal_reason(),
+            pp0._prefetch_deferral_refusal_reason(),
+        )
+        src = inspect.getsource(Scheduler._prefetch_deferral_refusal_reason)
+        self.assertNotIn("pp_rank", src, "the refusal predicate is rank-symmetric by construction")
+        self.assertNotIn("pp_follower", src)
 
     def test_the_follower_join_that_carries_pp0s_hold_is_alive_in_the_tree(self):
         # (i) the row-authority predicate defaults ON for every multi-stage
@@ -683,11 +780,88 @@ class TestTheBoundIsPricedFromTheTree(_Clean):
         )
         self.assertEqual(PREFETCH_GATE_COUNTS.get("deferred", 0), 0)
 
+    def test_a_tree_without_page_size_refuses_deferral_by_name(self):
+        # `_deferred_prefetch_bound_s` prices the bound in pages and reads
+        # tc.page_size without a default, so page_size is part of the
+        # unpriced_timeout refusal (review round 2). RED on 63afbdc121: the
+        # predicate read only the two timeout terms, and the retry path
+        # would have raised AttributeError inside _get_new_batch_prefill_raw.
+        s = _Intake(lambda r: "declined:rate_limited")
+        del s.tree_cache.page_size
+        r = _Req("v", seq=1)
+        with self.assertLogs(LOG, level="WARNING") as caught:
+            s._add_request_to_queue(r)
+        self.assertIsNone(getattr(r, "prefetch_deferred", None))
+        self.assertEqual(s._prefetch_deferral_refusal_reason(), "unpriced_timeout")
+        self.assertTrue(
+            any("reason=unpriced_timeout" in ln and "page_size" in ln for ln in caught.output),
+            caught.output,
+        )
+
     def test_the_bound_reads_the_tree_terms_without_defaults(self):
         s = _Intake(lambda r: "declined:rate_limited")
         s.tree_cache.prefetch_timeout_base = 1.0
         s.tree_cache.prefetch_timeout_per_page = 0.25
         self.assertAlmostEqual(s._deferred_prefetch_bound_s(SPAN), 1.0 + SPAN * 0.25, places=6)
+
+
+class TestARefusedRateVerdictIsCounted(_Clean):
+    """Review round 2, denominator law: the DEFERRAL REFUSED line is emitted
+    once per process and reason, so every rate_limited verdict that meets
+    the refusal afterwards would be silent. It is COUNTED instead (census
+    key defer_refused, taken BEFORE a mark exists, outside the mark
+    partition), and the A12.2 rule reads as built: 'never a decline' on the
+    PP phase and the single rank; in the symmetric TP phase the pre-#1068
+    decline stands and is counted here. RED on 63afbdc121: no such key.
+    """
+
+    def test_every_refused_rate_verdict_counts_and_the_line_prints_once(self):
+        s = _Intake(lambda r: "declined:rate_limited", symmetric=True, tp_size=3)
+        a, b = _Req("a", seq=1), _Req("b", seq=2)
+        with self.assertLogs(LOG, level="WARNING") as caught:
+            s._add_request_to_queue(a)
+            s._add_request_to_queue(b)
+        refused = [
+            ln
+            for ln in caught.output
+            if "#1068 PREFETCH DEFERRAL REFUSED reason=symmetric_vote" in ln
+        ]
+        self.assertEqual(len(refused), 1, caught.output)
+        self.assertIn("defer_refused", refused[0], "the line names its suppressed-count key")
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_refused", 0), 2)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("deferred", 0), 0)
+        for r in (a, b):
+            self.assertIsNone(getattr(r, "prefetch_deferred", None))
+            self.assertEqual(r._969c_verdict, "declined:rate_limited")
+        self.assertEqual(
+            s._apply_prefetch_deferral(a, "declined:rate_limited", site="intake"), "refused"
+        )
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_refused", 0), 3)
+
+    def test_a_non_rate_verdict_under_a_refusal_is_not_counted_as_refused(self):
+        s = _Intake(lambda r: "declined:too_short", symmetric=True, tp_size=3)
+        s._add_request_to_queue(_Req("c", seq=1))
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_refused", 0), 0)
+
+    def test_a_mark_under_storage_disabled_is_dropped_by_that_name_at_retry(self):
+        # The call site (_get_new_batch_prefill_raw) guards on
+        # enable_hicache_storage; the retry itself has no second guard, so
+        # storage_disabled is not a writer-only reason. RED on 63afbdc121:
+        # the retry returned 0 before reading the refusal and the mark stood.
+        s = _Intake(lambda r: "declined:rate_limited")
+        r = _Req("d", seq=1)
+        s.waiting_queue = [r]
+        _plant_mark(r)
+        s.enable_hicache_storage = False
+        with self.assertLogs(LOG, level="WARNING") as caught:
+            self.assertEqual(s._retry_deferred_prefetches(), 0)
+        self.assertEqual(s.prefetch_calls, [])
+        _assert_unmarked(self, r)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_dropped", 0), 1)
+        self.assertTrue(
+            any("DEFER DROPPED" in ln and "reason=storage_disabled" in ln for ln in caught.output),
+            caught.output,
+        )
 
 
 if __name__ == "__main__":

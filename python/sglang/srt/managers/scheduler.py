@@ -564,11 +564,6 @@ def _arriving_prefill_tokens(inflight, _already_queued=None, exclude=None) -> in
 # (slice-3 fix, review round 1).
 _DEFERRAL_REFUSAL_TEXT_1068 = {
     "storage_disabled": "no HiCache storage on this boot, nothing to defer for.",
-    "pp_follower": (
-        "the verdict site is PP0 (#968); this rank takes its membership "
-        "from PP0's decision through the #631 row and never carries a "
-        "rank-local pending-prefetch mark."
-    ),
     "symmetric_vote": (
         "the rate verdict is rank-local while registration is the #580 "
         "group vote (tp_world_size>1 under uneven DCP); a rank-divergent "
@@ -580,8 +575,9 @@ _DEFERRAL_REFUSAL_TEXT_1068 = {
     ),
     "unpriced_timeout": (
         "the tree does not carry prefetch_timeout_base / "
-        "prefetch_timeout_per_page (the #968/#1065 length-priced terms), "
-        "so the DEFER EXPIRED exit cannot be priced; no silent default."
+        "prefetch_timeout_per_page / page_size (the #968/#1065 length-priced "
+        "terms and the page the bound is priced in), so the DEFER EXPIRED "
+        "exit cannot be priced; no silent default."
     ),
 }
 
@@ -5793,15 +5789,29 @@ class Scheduler(
     # THE RULE: the request keeps a pending-prefetch mark
     # (`req.prefetch_deferred`), stays queued in kv_arrival_seq order, is NOT
     # admitted to prefill while marked, and is retried on every scheduling
-    # pass. THE VERDICT SITE IS PP0 / THE SINGLE RANK (#968, slice-3 fix): a
-    # follower REFUSES the deferral by name (reason=pp_follower), sets no
-    # mark, retries nothing, and takes its membership from PP0's decision
-    # through the #631 row (`_pp_admission_incoming_effective`): PP0 skips
-    # the held rid BEFORE `add_one_req`, `build_pp_admission_decision` is
-    # built from `can_run_list` AFTER the loop, so the held rid is never
-    # named and the follower skips it as `pp_not_named`. No rank-local mark
-    # exists on a follower, so there is nothing to converge (RAENGE-NIE-
-    # UNEINS). Landing is sequential by construction: the spans ahead
+    # pass. THE MARK AND THE RETRY ARE RANK-LOCAL BOOKKEEPING AND RUN ON
+    # EVERY RANK (slice-3 fix round 2, spec A12.6 CORRECTION): storage
+    # prefetch is per rank (each rank fetches its own slot window into its
+    # own host pool, hicache_storage.py `_derive_key_suffixes`) and the host
+    # load-back is from each rank's OWN match (schedule_policy.py
+    # `_pp_load_back_extent`), so a follower that did not mark and retry
+    # would never land the span PP0 lands: PP0 would admit with prefix=P
+    # while the follower holds 0 rows of it and, executing PP0's told
+    # unconditionally (#1072, `reconcile_pp_admission_decision`), recomputes
+    # the whole span -- the 'PP0=(0,4096) PP1=(8192,N)' extent-divergence
+    # form, deterministic. The landing sequence is rank-uniform because its
+    # inputs are: the same requests in the same kv_arrival_seq order, the
+    # MIN-synced capacity (prefetch_budget.py under --hicache-size), the
+    # same occupancy dynamics; the refusal predicate below carries no rank
+    # term for the same reason. ONLY THE ADMISSION HOLD IS THE PP0 VERDICT
+    # (#968): a follower's mark has no admission effect
+    # (`_admission_held_for_deferred_prefetch` answers False on
+    # pp_rank != 0); it takes its membership from PP0's decision through
+    # the #631 row (`_pp_admission_incoming_effective`): PP0 skips the held
+    # rid BEFORE `add_one_req`, `build_pp_admission_decision` is built from
+    # `can_run_list` AFTER the loop, so the held rid is never named and the
+    # follower skips it as `pp_not_named`. Landing is sequential by
+    # construction: the spans ahead
     # complete (or hit the #968/#1065 length-priced prefetch timeout), the
     # counter drops, the next deferred span registers. Two bounded exits, both
     # named, never silent: UNDEFERRABLE (the request's own span alone exceeds
@@ -5818,22 +5828,30 @@ class Scheduler(
     # mark set would walk into the #580 vote unevenly; deferral is therefore
     # refused BY NAME there (once) and the pre-#1068 decline stands. The
     # phase-flip boot form is symmetric in its TP PHASE (tp_size=3 under
-    # uneven DCP) and never in its PP phase (tp_size=1 per stage) -- which is
-    # exactly why the mark needs a clearer at the cutover (below).
+    # uneven DCP) and never in its PP phase (tp_size=1 per stage, on PP0 and
+    # followers alike) -- which is exactly why the mark needs a clearer at
+    # the cutover (below). A rate_limited verdict that meets a refusal is
+    # COUNTED (census key defer_refused, taken before any mark exists): the
+    # A12.2 'never a decline' rule is built for the PP phase and the single
+    # rank; in the symmetric TP phase it is the pre-#1068 decline, counted,
+    # never silent (denominator law: it is the suppressed count of the
+    # once-per-process DEFERRAL REFUSED line).
     #
     # LIFECYCLE TABLE for `prefetch_deferred` (+ prefetch_defer_since /
-    # attempts / passes / reason, `_prefetch_landed_hold_once`) -- the
+    # attempts / passes, `_prefetch_landed_hold_once`) -- the
     # WRITER / READER / CLEARER rows with the separating event between them
     # (MCP-INDEX-BRIEFING-BLOCK "LEBENSZYKLUS-TABELLE"; a clearer between
     # writer and reader, or a missing one, is the finding):
-    #   WRITER    `_apply_prefetch_deferral` at intake and at retry, on the
-    #             verdict site only (PP0 / single rank, deferral enabled):
-    #             sets the mark on the first rate_limited verdict, bumps
-    #             attempts/passes per retry, sets `_prefetch_landed_hold_once`
-    #             on a landing.
-    #   READERS   `_retry_deferred_prefetches` (every pass, before the drain)
-    #             and `_admission_held_for_deferred_prefetch` (the admission
-    #             loop). Separating event: the pass boundary, same rank.
+    #   WRITER    `_apply_prefetch_deferral` at intake and at retry, on EVERY
+    #             rank where the deferral is enabled (PP0 and followers alike
+    #             in the PP phase; the single rank): sets the mark on the
+    #             first rate_limited verdict, bumps attempts/passes per
+    #             retry, sets `_prefetch_landed_hold_once` on a landing.
+    #   READERS   `_retry_deferred_prefetches` (every pass, before the drain,
+    #             every rank) and `_admission_held_for_deferred_prefetch`
+    #             (the admission loop; PP0 / single rank only -- on a
+    #             follower it reads the mark and answers False). Separating
+    #             event: the pass boundary, same rank.
     #   CLEARERS  (a) the named exits inside `_apply_prefetch_deferral`:
     #                 LANDED / DEFER EXPIRED / DEFER RELEASED (same pass);
     #             (b) `_drop_prefetch_deferral` at the retry when the deferral
@@ -5852,15 +5870,18 @@ class Scheduler(
     #   the missing row (c): tp1 retried=1 / tp0 retried=0 on the reviewer's
     #   probe -- a rank-divergent marked set entering the symmetric phase.
     #
-    # COUNTERS ride the #915 gate census (rank-uniform by the same argument as
-    # the gate's own terms): deferred, landed, undeferrable, defer_expired,
-    # defer_released, defer_dropped, defer_cleared_cutover. Every MARK has
-    # exactly one exit, so the identity the acceptance reads is
+    # COUNTERS ride the #915 gate census PER PROCESS, i.e. PER RANK (each
+    # rank counts its own marks and exits; the census line is emitted by
+    # each rank's own tree, unified_radix_cache.py `prefetch_gate_due`):
+    # deferred, landed, undeferrable, defer_expired, defer_released,
+    # defer_dropped, defer_cleared_cutover, defer_refused. Every MARK has
+    # exactly one exit, so the identity the acceptance reads, per rank, is
     #   deferred == landed + defer_expired + defer_released + defer_dropped
     #               + defer_cleared_cutover
-    # UNDEFERRABLE is taken BEFORE a mark exists (the request's own span
-    # exceeds the limit) and sits OUTSIDE the partition: counted, never a
-    # member. (Spec A12.3 listed it inside the sum; as built that is
+    # UNDEFERRABLE and DEFER REFUSED are taken BEFORE a mark exists (the
+    # request's own span exceeds the limit / the deferral is refused on this
+    # rank-phase) and sit OUTSIDE the partition: counted, never members.
+    # (Spec A12.3 listed UNDEFERRABLE inside the sum; as built that is
     # impossible -- an undeferrable request prints no DEFERRED line. The
     # spec carries the correction line.)
     # ------------------------------------------------------------------
@@ -5894,63 +5915,70 @@ class Scheduler(
         ONE predicate for every reader -- the writer at intake/retry
         (`_apply_prefetch_deferral`), the retry gate
         (`_retry_deferred_prefetches`) and the hold -- so they can never be
-        armed apart. Reasons, by name (each logged ONCE per process):
-          storage_disabled        no HiCache storage;
-          pp_follower             the verdict site is PP0 (#968);
+        armed apart. RANK-SYMMETRIC BY CONSTRUCTION (slice-3 fix round 2):
+        every term it reads is the same on every rank of a phase (the
+        storage flag, the tree's vote mode, the tree's timeout terms and
+        page), so the marked set cannot diverge across the ranks of a PP
+        stage row. A follower is NOT a refusal reason: its mark is the retry
+        bookmark that lands the same span PP0 lands (spec A12.6
+        CORRECTION); only the admission hold is PP0's
+        (`_admission_held_for_deferred_prefetch`).
+        Reasons, by name:
+          storage_disabled        no HiCache storage (returned without a
+                                  line: nothing to defer for, and the rate
+                                  verdict never occurs there);
           symmetric_vote          #580 group vote, rank-local rate verdict;
           symmetric_probe_failed  the tree's probe raised;
           unpriced_timeout        the tree lacks the #968/#1065 timeout
-                                  terms (the #606 getattr-default form is
-                                  gone: refused by name, never defaulted).
+                                  terms or the page_size the bound is
+                                  priced in (the #606 getattr-default form
+                                  is gone: refused by name, never defaulted).
+        The line is emitted ONCE per process and reason; every rate_limited
+        verdict that meets the refusal afterwards is counted under the #915
+        census key defer_refused (`_apply_prefetch_deferral`), which is the
+        suppressed count of this emitter (denominator law).
         """
         if not getattr(self, "enable_hicache_storage", False):
             return "storage_disabled"
         reason = None
-        ps = getattr(self, "ps", None)
-        if (
-            ps is not None
-            and int(getattr(ps, "pp_size", 1) or 1) > 1
-            and int(getattr(ps, "pp_rank", 0) or 0) != 0
+        tc = getattr(self, "tree_cache", None)
+        symmetric = getattr(tc, "_hicache_prefetch_symmetric", None)
+        try:
+            if symmetric is not None and bool(symmetric()):
+                reason = "symmetric_vote"
+        except Exception:  # noqa: BLE001 - a probe may never break intake
+            reason = "symmetric_probe_failed"
+        if reason is None and (
+            getattr(tc, "prefetch_timeout_base", None) is None
+            or getattr(tc, "prefetch_timeout_per_page", None) is None
+            or getattr(tc, "page_size", None) is None
         ):
-            reason = "pp_follower"
-        else:
-            tc = getattr(self, "tree_cache", None)
-            symmetric = getattr(tc, "_hicache_prefetch_symmetric", None)
-            try:
-                if symmetric is not None and bool(symmetric()):
-                    reason = "symmetric_vote"
-            except Exception:  # noqa: BLE001 - a probe may never break intake
-                reason = "symmetric_probe_failed"
-            if reason is None and (
-                getattr(tc, "prefetch_timeout_base", None) is None
-                or getattr(tc, "prefetch_timeout_per_page", None) is None
-            ):
-                reason = "unpriced_timeout"
+            reason = "unpriced_timeout"
         if reason is not None:
             logged = self.__dict__.setdefault("_1068_deferral_refused_logged", set())
             if reason not in logged:
                 logged.add(reason)
-                emit = logger.info if reason == "pp_follower" else logger.warning
-                emit(
+                logger.warning(
                     "#1068 PREFETCH DEFERRAL REFUSED reason=%s: %s rate_limited "
-                    "stays a decline on this rank/phase.",
+                    "stays a decline on this rank/phase. Logged once per process "
+                    "and reason; every rate_limited verdict that meets this "
+                    "refusal is counted under the #915 prefetch-gate census key "
+                    "defer_refused (the suppressed count of this line).",
                     reason,
                     _DEFERRAL_REFUSAL_TEXT_1068.get(reason, ""),
                 )
         return reason
-
-    def _prefetch_deferral_enabled(self) -> bool:
-        return self._prefetch_deferral_refusal_reason() is None
 
     def _deferred_prefetch_bound_s(self, span_tokens: int) -> float:
         """The #968/#1065 length-priced prefetch timeout for ONE span:
         base + pages x per_page, read from the tree the way
         `_prefetch_timeout_check_linear_func` reads it.
 
-        Read WITHOUT defaults: `_prefetch_deferral_refusal_reason` refuses
-        the deferral by name (unpriced_timeout) on a tree that lacks the
-        terms, so a mark -- and therefore this call -- only exists on a tree
-        that carries them (UnifiedRadixCache sets both in __init__).
+        Read WITHOUT defaults (base, per_page AND page_size):
+        `_prefetch_deferral_refusal_reason` refuses the deferral by name
+        (unpriced_timeout) on a tree that lacks any of the three, so a mark
+        -- and therefore this call -- only exists on a tree that carries
+        them (UnifiedRadixCache sets all three in __init__).
         """
         tc = self.tree_cache
         base = float(tc.prefetch_timeout_base)
@@ -5963,8 +5991,9 @@ class Scheduler(
         """Route one prefetch verdict through the A12.2 deferral state machine.
 
         Returns the named outcome ('deferred' / 'undeferrable' / 'expired' /
-        'landed' / 'released') or None when the verdict is not the deferral's
-        business (an unmarked request with any non-rate verdict).
+        'landed' / 'released' / 'refused') or None when the verdict is not
+        the deferral's business (an unmarked request with any non-rate
+        verdict).
         """
         from sglang.srt.mem_cache.match_refusal_census import (
             note_prefetch_gate as _note_prefetch_gate,
@@ -5974,8 +6003,15 @@ class Scheduler(
         marked = getattr(req, "prefetch_deferred", None) is not None
         span = getattr(req, "_prefetch_span_tokens", None)
         if verdict == "declined:rate_limited":
-            if not self._prefetch_deferral_enabled():
-                return None
+            if self._prefetch_deferral_refusal_reason() is not None:
+                # The pre-#1068 decline stands on this rank/phase (the TP
+                # phase of the flip boot form, under the #580 vote). COUNTED,
+                # never silent: this key is the suppressed count of the
+                # once-per-process DEFERRAL REFUSED line (denominator law)
+                # and the acceptance reads it per phase. Taken BEFORE a mark
+                # exists, so it sits outside the mark partition.
+                _note_prefetch_gate("defer_refused")
+                return "refused"
             limit = self._prefetch_capacity_limit_or_none()
             if not marked:
                 if span is not None and limit is not None and int(span) > int(limit):
@@ -5997,7 +6033,6 @@ class Scheduler(
                 req.prefetch_defer_attempts = 1
                 req.prefetch_defer_passes = 0
                 req.prefetch_defer_since = time.monotonic()
-                req.prefetch_defer_reason = None
                 _note_prefetch_gate("deferred")
                 occupied = -1
                 try:
@@ -6027,7 +6062,6 @@ class Scheduler(
                 # Exit (2): the wedge-freedom bound. Admitted with
                 # reason=rate_expired; counted.
                 req.prefetch_deferred = None
-                req.prefetch_defer_reason = "rate_expired"
                 _note_prefetch_gate("defer_expired")
                 logger.warning(
                     "#1068 PREFETCH DEFER EXPIRED rid=%s waited_s=%.1f bound_s=%.1f "
@@ -6064,7 +6098,6 @@ class Scheduler(
                 verdict,
             )
             return "landed"
-        req.prefetch_defer_reason = verdict
         _note_prefetch_gate("defer_released")
         logger.warning(
             "#1068 PREFETCH DEFER RELEASED rid=%s reason=%s after_passes=%d "
@@ -6106,7 +6139,6 @@ class Scheduler(
         since = getattr(req, "prefetch_defer_since", None)
         waited = time.monotonic() - float(since) if since is not None else 0.0
         self._clear_prefetch_deferral_fields(req)
-        req.prefetch_defer_reason = f"dropped:{reason}"
         _note_prefetch_gate("defer_dropped")
         logger.warning(
             "#1068 PREFETCH DEFER DROPPED rid=%s reason=%s site=%s after_passes=%d "
@@ -6131,7 +6163,6 @@ class Scheduler(
         cleared: List[str] = []
         for req in population:
             if self._clear_prefetch_deferral_fields(req):
-                req.prefetch_defer_reason = "cleared:cutover"
                 cleared.append(str(getattr(req, "rid", "?"))[:8])
         if cleared:
             from sglang.srt.mem_cache.match_refusal_census import (
@@ -6140,28 +6171,35 @@ class Scheduler(
 
             for _ in cleared:
                 _note_prefetch_gate("defer_cleared_cutover")
-            logger.info(
-                "#1068 PREFETCH DEFER CLEARED AT CUTOVER n=%d rids=%s -- the "
-                "operations that guarded these marks died at _reset_full; the "
-                "fresh intake verdict under the incoming binding generation "
-                "decides anew (population=%d)",
-                len(cleared),
-                ",".join(cleared),
-                len(population),
-            )
+        # ONE line per cutover, UNCONDITIONAL (n=0 included, slice-3 fix
+        # round 2): the A12.3 identity is read per cutover, and a zero from
+        # an ABSENT line is not a zero (denominator law).
+        logger.info(
+            "#1068 PREFETCH DEFER CLEARED AT CUTOVER n=%d rids=%s -- the "
+            "operations that guarded these marks died at _reset_full; the "
+            "fresh intake verdict under the incoming binding generation "
+            "decides anew (population=%d)",
+            len(cleared),
+            ",".join(cleared) or "-",
+            len(population),
+        )
         return len(cleared)
 
     def _retry_deferred_prefetches(self) -> int:
         """Every scheduling pass: re-issue `_prefetch_kvcache` for the marked
         queue occupants in kv_arrival_seq order (A12.2). Returns how many
-        were retried. Rank-local; no collective beyond what the intake path
-        already carries -- and NONE AT ALL when the deferral is refused on
-        this rank/phase: a mark that meets a refusal here is DROPPED by name
-        (slice-3 fix, review round 1: a PP-phase mark that survived into the
-        symmetric TP phase made this retry walk one rank alone into the
-        #580 vote; the refusal is read LIVE at every pass, never cached)."""
-        if not getattr(self, "enable_hicache_storage", False):
-            return 0
+        were retried. Rank-local and run on EVERY rank (slice-3 fix round 2:
+        a follower's retry is the same rank-local storage read the intake
+        made, into its own host pool; no collective beyond what the intake
+        path already carries) -- and NONE AT ALL when the deferral is
+        refused on this rank/phase: a mark that meets a refusal here is
+        DROPPED by name (slice-3 fix, review round 1: a PP-phase mark that
+        survived into the symmetric TP phase made this retry walk one rank
+        alone into the #580 vote; the refusal is read LIVE at every pass,
+        never cached). The call site (`_get_new_batch_prefill_raw`) guards
+        on enable_hicache_storage; there is no second guard here, so a mark
+        that meets storage_disabled (plantable only by hand) is dropped by
+        that name too instead of surviving a writer-only reason."""
         marked = [
             r
             for r in self.waiting_queue
@@ -6190,15 +6228,17 @@ class Scheduler(
     def _admission_held_for_deferred_prefetch(self, req) -> bool:
         """True when the admission loop must skip ``req`` this pass.
 
-        PP0 / the single rank only. A follower carries NO mark -- the
-        deferral is refused by name there
-        (`_prefetch_deferral_refusal_reason` -> pp_follower) -- and takes its
-        membership from PP0's decision through the #631 row
-        (`_pp_admission_incoming_effective`, `pp_not_named`); the pp_rank
-        check below is defense in depth, not the mechanism (#969Z).
-        A request whose deferred prefetch LANDED this pass is
-        held once more, so the next pass's progress drain -- not this pass's
-        stale one -- decides its admission.
+        PP0 / the single rank only -- and the pp_rank check below IS the
+        mechanism (#968: the admission verdict is PP0's). A follower carries
+        the same mark (its retry bookmark, spec A12.6 CORRECTION) but never
+        withholds admission on it: it takes its membership from PP0's
+        decision through the #631 row (`_pp_admission_incoming_effective`,
+        `pp_not_named`), so a follower's mark has no admission effect and
+        there is no rank-local verdict to converge (#969Z).
+        A request whose deferred prefetch LANDED this pass is held once
+        more, so the next pass's progress drain -- not this pass's stale
+        one -- decides its admission. The landed-once flag is consumed on
+        every rank; a follower's landing is not held either.
         """
         landed_once = bool(getattr(req, "_prefetch_landed_hold_once", False))
         if landed_once:
