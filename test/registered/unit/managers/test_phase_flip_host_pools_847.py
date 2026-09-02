@@ -176,6 +176,78 @@ def _build_patched(sched, builder=None):
     return pools, builder
 
 
+#: The Boot-2 anchor pool (WEG1_BUILD_SPEC_0901 section 5): 2400 MiB at
+#: 37.41 MiB per slot on PP0 buys 64 slots; the group MIN plus the one page
+#: of pool_host/base.py:146-147 is 65, and the tp anchor half must land on
+#: exactly that count. 20 device slots is the boot form's mamba pool.
+ANCHOR_MIB = 2400
+ANCHOR_SLOTS = 65
+ANCHOR_PER_SLOT = int(37.41 * 2**20)
+DEVICE_MAMBA_SLOTS = 20
+
+
+class _FakeMambaPoolHost:
+    """Stands in for memory_pool_host.MambaPoolHost and RECORDS its call.
+
+    The recorded kwargs are the pin: the tp anchor half must be built from
+    the SAME knob the pp anchor pool takes (--hicache-mamba-host-mib), with
+    ratio 1.0 and host_size 0 (the fallback form below the knob). What the
+    fake returns is the shape the post-build check reads: size (slots) and
+    size_per_token (bytes per slot).
+    """
+
+    def __init__(self, size=ANCHOR_SLOTS, per_slot=ANCHOR_PER_SLOT):
+        self.size = size
+        self.per_slot = per_slot
+        self.calls = []
+
+    def __call__(self, device_pool, host_to_device_ratio, host_size, **kw):
+        self.calls.append(
+            dict(device_pool=device_pool, ratio=host_to_device_ratio, host_size=host_size, **kw)
+        )
+        return types.SimpleNamespace(size=self.size, size_per_token=self.per_slot)
+
+
+def _hybrid_sched(
+    *,
+    device_slots=DEVICE_MAMBA_SLOTS,
+    pp_anchor_slots=ANCHOR_SLOTS,
+    mamba_mib=ANCHOR_MIB,
+    handles=True,
+):
+    """A pp tier describing KV AND MAMBA, and a TP stack exposing the mamba
+    handles `_hybrid_pin_entries` mirrors: req_to_token_pool.mamba_pool /
+    mamba_map / mamba_allocator, and the device pool's own
+    full_attention_layer_id_mapping. `handles=False` is the #871 path where
+    the TP side cannot supply them."""
+    pp_host = _PPHost(mamba_host=types.SimpleNamespace(size=pp_anchor_slots))
+    s = _sched(pp_host=pp_host, mamba_mib=mamba_mib)
+    runner = s.phase_flip_stacks.tp_worker.model_runner
+    runner.token_to_kv_pool.full_attention_layer_id_mapping = {
+        i: i for i in range(TP_LAYERS)
+    }
+    if handles:
+        runner.req_to_token_pool = types.SimpleNamespace(
+            mamba_pool=types.SimpleNamespace(size=device_slots),
+            mamba_map={TP_LAYERS + i: i for i in range(48)},
+            mamba_allocator=types.SimpleNamespace(
+                alloc=lambda *a, **k: None, free=lambda *a, **k: None
+            ),
+        )
+    return s
+
+
+def _build_hybrid(sched, mamba=None):
+    """`_build_patched` with the anchor-pool constructor replaced by a
+    recording fake; returns (pools, kv_builder, mamba_fake)."""
+    import unittest.mock as mock
+
+    mamba = mamba if mamba is not None else _FakeMambaPoolHost()
+    with mock.patch("sglang.srt.mem_cache.memory_pool_host.MambaPoolHost", new=mamba):
+        pools, builder = _build_patched(sched)
+    return pools, builder, mamba
+
+
 class TestTheDefaultBootIsUntouched(CustomTestCase):
     def test_the_flag_off_allocates_nothing(self):
         # Every boot that does not ask for the rebind must be byte-identical.
@@ -280,6 +352,25 @@ class TestTheTpPinIsRowCoupledToThePpPool(CustomTestCase):
         self.assertIn("chunked_prefill_size=4096", msg)
         self.assertIn("--hicache-size", msg)
 
+    def test_a_degenerate_wave_skips_the_floor_by_name(self):
+        # chunked_prefill_size=-1 (chunking off) leaves the wave size
+        # undefined, so the floor cannot be applied. The exit is NAMED in the
+        # log rather than silently skipped: 30518 rows would be refused under
+        # any positive chunk, and the operator must be able to see why not.
+        s = _sched(pp_host=_PPHost(_PPKVHost(size=30518)), chunked_prefill_size=-1)
+        with self.assertLogs("sglang.srt.managers.phase_flip_boot", level="WARNING") as logs:
+            pools, _ = _build_patched(s)
+        self.assertIn("tp", pools)
+        self.assertTrue(
+            any(
+                "#1068 ONE-WAVE FLOOR SKIPPED" in m
+                and "chunked_prefill_size=-1" in m
+                and "pp_rows=30518" in m
+                for m in logs.output
+            ),
+            logs.output,
+        )
+
     def test_a_cell_the_pp_layers_do_not_divide_is_refused(self):
         # per_layer * layer_num must reproduce the pp cell exactly, or the
         # tp cell derived from it is a guess (R7 of the spec).
@@ -294,6 +385,80 @@ class TestTheTpPinIsRowCoupledToThePpPool(CustomTestCase):
         s = _sched(pp_host=types.SimpleNamespace())
         pools, _ = _build_patched(s)
         self.assertEqual(sorted(pools), ["pp"])
+
+
+class TestTheTpPinAnchorHalfIsCoupledToThePpAnchor(CustomTestCase):
+    """#1068 WEG 1 slice 1 (WEG1_BUILD_SPEC_0901 section 4.1, the MAMBA half
+    of L12) -- review findings R1/R2 of 2026-09-02.
+
+    On a hybrid model the bound tier carries KV AND MAMBA and the tp pin
+    mirrors both (#871). The anchor half is sized per SLOT from the same
+    knob the pp anchor pool takes, --hicache-mamba-host-mib, MIN-synced in
+    MambaPoolHost -- so both phases hold the same slot count by construction
+    -- and the builder HOLDS them to it: a pin whose anchor slots differ from
+    the pp anchor pool is RAENGE-NIE-UNEINS and a boot refusal, and an anchor
+    pool that cannot hold device_slots + max_running_requests + 1 is a
+    too-small knob. Before these tests neither raise had a test, and the two
+    mutants "mismatch raise off" and "knob nulled" both survived the suite.
+    """
+
+    def test_the_anchor_half_takes_the_same_knob_as_the_pp_anchor_pool(self):
+        # R2. The knob IS the coupling: without it MambaPoolHost falls back to
+        # the ratio path (host_size=0 -> sync_fixed_hicache_size returns early,
+        # no collective, no group MIN), and "one budget, both phases" has no
+        # carrier. The fallback form around it stays exactly as it was.
+        pools, _, mamba = _build_hybrid(_hybrid_sched())
+        self.assertEqual(len(mamba.calls), 1)
+        call = mamba.calls[-1]
+        self.assertEqual(call["anchor_host_mib"], ANCHOR_MIB)
+        self.assertEqual(call["ratio"], 1.0, "fallback form untouched")
+        self.assertEqual(call["host_size"], 0, "fallback form untouched")
+        self.assertEqual(call["layout"], "layer_first")
+        self.assertIn("tp", pools)
+        self.assertEqual(set(pools["tp"].entry_map), {PoolName.KV, PoolName.MAMBA})
+
+    def test_anchor_slot_mismatch_is_a_raise_not_a_soft_refusal(self):
+        # R1. tp anchor 129 slots against pp anchor 65: the two phases would
+        # hold different ceilings -- refuse the BOOT, never log-and-go.
+        with self.assertRaises(RuntimeError) as cm:
+            _build_hybrid(_hybrid_sched(), mamba=_FakeMambaPoolHost(size=129))
+        msg = str(cm.exception)
+        self.assertIn("#1068 TP PIN ANCHOR SLOT MISMATCH", msg)
+        self.assertIn("tp_slots=129", msg)
+        self.assertIn(f"pp_slots={ANCHOR_SLOTS}", msg)
+        self.assertIn("RAENGE-NIE-UNEINS", msg)
+        self.assertIn("--hicache-mamba-host-mib", msg)
+
+    def test_an_anchor_pool_below_the_floor_is_refused(self):
+        # 65 == 65 agrees, but 60 device slots + 8 in flight + 1 = 69 > 65.
+        with self.assertRaises(ValueError) as cm:
+            _build_hybrid(_hybrid_sched(device_slots=60))
+        msg = str(cm.exception)
+        self.assertIn("--hicache-mamba-host-mib too small", msg)
+        self.assertIn(f"{ANCHOR_SLOTS} slots", msg)
+        self.assertIn("device_slots 60", msg)
+        self.assertIn("max_running_requests 8", msg)
+        self.assertIn("= 69", msg)
+
+    def test_the_floor_is_inclusive(self):
+        # device_slots + max_running_requests + 1 == slots exactly is enough.
+        pools, _, _ = _build_hybrid(_hybrid_sched(device_slots=ANCHOR_SLOTS - 8 - 1))
+        self.assertIn("tp", pools)
+
+    def test_the_mismatch_is_named_before_the_floor(self):
+        # 10 slots is BOTH a mismatch (vs 65) and below the floor (20+8+1=29):
+        # the disagreement is the graver refusal (RAENGE-NIE-UNEINS) and wins.
+        with self.assertRaises(RuntimeError) as cm:
+            _build_hybrid(_hybrid_sched(), mamba=_FakeMambaPoolHost(size=10))
+        self.assertIn("#1068 TP PIN ANCHOR SLOT MISMATCH", str(cm.exception))
+
+    def test_a_tp_stack_without_mamba_handles_keeps_the_kv_only_pin(self):
+        # #871 contract: the hybrid half cannot be mirrored -> named reason,
+        # KV-only pin registered, check_pool_coverage keeps refusing.
+        pools, _, mamba = _build_hybrid(_hybrid_sched(handles=False))
+        self.assertEqual(mamba.calls, [], "no anchor pool without the handles")
+        self.assertIn("tp", pools)
+        self.assertEqual(set(pools["tp"].entry_map), {PoolName.KV})
 
 
 class TestTheRefusalIsCONVERTEDNotDeleted(CustomTestCase):

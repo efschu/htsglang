@@ -2353,7 +2353,20 @@ def build_phase_flip_host_pools(scheduler):
         )
     # G10 BOOT FLOOR, replacing the old silent max(1, ...): the pool must hold
     # one wave of in-flight prefill, or the first wave is refused/truncated.
-    if max_running > 0 and chunk > 0 and pp_rows < max_running * chunk:
+    if max_running <= 0 or chunk <= 0:
+        # A non-positive term leaves the wave size undefined (chunking off is
+        # chunked_prefill_size=-1), so the floor cannot be applied. NAMED, not
+        # skipped silently: every exit of this builder is legible in the log.
+        logger.warning(
+            "#1068 ONE-WAVE FLOOR SKIPPED rank=%d: max_running_requests=%d "
+            "chunked_prefill_size=%d leave the wave size undefined, so pp_rows=%d "
+            "is not checked against max_running_requests x chunked_prefill_size",
+            rank,
+            max_running,
+            chunk,
+            pp_rows,
+        )
+    elif pp_rows < max_running * chunk:
         raise ValueError(
             "#1068 HOST POOL BELOW ONE WAVE rank=%d pp_rows=%d < "
             "max_running_requests=%d x chunked_prefill_size=%d = %d rows: "

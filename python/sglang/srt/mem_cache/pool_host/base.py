@@ -35,8 +35,11 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     """Sync fixed-size HiCache token capacity across ranks with unequal
     bytes/token.
 
-    A fixed --hicache-size is specified in GB, but the bytes/token can
-    differ per rank: PP stages own different layers, and uneven-TP ranks
+    ``host_size`` is the absolute budget behind the fixed size (GB for the
+    KV host pools via --hicache-size; MiB for the mamba anchor pool via
+    --hicache-mamba-host-mib, #1068) and is only a > 0 gate here: it never
+    enters the arithmetic. A fixed budget is rank-invariant, but the bytes/token
+    can differ per rank: PP stages own different layers, and uneven-TP ranks
     (--rank-tp-ratio) own different kv-head/GDN-state shares. Use the
     global minimum token capacity within the affected group so all ranks
     expose the same host-cache capacity (the lockstep schedulers and the
