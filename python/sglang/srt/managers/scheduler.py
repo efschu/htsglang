@@ -563,7 +563,11 @@ def _arriving_prefill_tokens(inflight, _already_queued=None, exclude=None) -> in
 # test stand-ins by method, and a class attribute would not travel with it
 # (slice-3 fix, review round 1).
 _DEFERRAL_REFUSAL_TEXT_1068 = {
-    "storage_disabled": "no HiCache storage on this boot, nothing to defer for.",
+    # storage_disabled has NO entry on purpose: `_prefetch_deferral_refusal_reason`
+    # returns it BEFORE the emitter that reads this table (nothing to defer
+    # for; the rate verdict never occurs there), so a text here was
+    # unreachable and is deleted, not kept (upstream-minimal; slice-3 fix
+    # round 3).
     "symmetric_vote": (
         "the rate verdict is rank-local while registration is the #580 "
         "group vote (tp_world_size>1 under uneven DCP); a rank-divergent "
@@ -5811,9 +5815,33 @@ class Scheduler(
     # rid BEFORE `add_one_req`, `build_pp_admission_decision` is built from
     # `can_run_list` AFTER the loop, so the held rid is never named and the
     # follower skips it as `pp_not_named`. Landing is sequential by
-    # construction: the spans ahead
-    # complete (or hit the #968/#1065 length-priced prefetch timeout), the
-    # counter drops, the next deferred span registers. Two bounded exits, both
+    # construction: the spans ahead complete (or hit the #968/#1065
+    # length-priced prefetch timeout), the counter drops, the next deferred
+    # span registers -- ON THE CLASS THE SERVING PATH CONSTRUCTS, not on a
+    # stand-in (review round 3, operator ruling point (3)): the rate verdict
+    # is read in `UnifiedRadixCache.prefetch_from_storage`
+    # (mem_cache/unified_radix_cache.py:3309,
+    # `self.cache_controller.prefetch_rate_limited()`); the serving path
+    # builds `UnifiedRadixCache(params)` (mem_cache/registry.py:191,
+    # `_create_unified_radix_cache`) and attaches a `HybridCacheController`
+    # (mem_cache/hybrid_cache/hybrid_pool_assembler.py `build_*_stack`,
+    # :146/228/500/593/663/1388), which is
+    # `class HybridCacheController(BaseHiCacheController)`
+    # (hybrid_cache_controller.py:158; the base is managers/
+    # cache_controller.py `HiCacheController`) and overrides NEITHER
+    # `prefetch_rate_limited` (cache_controller.py:2653) NOR
+    # `prefetch_capacity_limit` (:2623); its only write to the
+    # `prefetch_tokens_occupied` counter is `reset()` zeroing it
+    # (hybrid_cache_controller.py:451). The counter is charged at
+    # registration (unified_radix_cache.py:3523) and released at completion
+    # in `check_prefetch_progress` (:4147), `drain_retired_prefetch`
+    # (:4351), `_release_retired_prefetch_local` (:4411) and
+    # `release_aborted_request` (:4470) -- so "span ahead completes ->
+    # counter drops -> next deferred span registers" is the sequence on
+    # every rank of the serving class, and the `_Occupancy` stand-in of
+    # test_prefetch_deferral_1068.py models exactly that counter
+    # (`test_the_serving_controller_carries_the_rate_verdict_unchanged`
+    # pins the inheritance). Two bounded exits, both
     # named, never silent: UNDEFERRABLE (the request's own span alone exceeds
     # the limit; falls to the recompute path, counted) and DEFER EXPIRED (waited
     # longer than the length-priced timeout for its own span; admitted with
@@ -5872,7 +5900,8 @@ class Scheduler(
     #
     # COUNTERS ride the #915 gate census PER PROCESS, i.e. PER RANK (each
     # rank counts its own marks and exits; the census line is emitted by
-    # each rank's own tree, unified_radix_cache.py `prefetch_gate_due`):
+    # each rank's own tree -- match_refusal_census.py `prefetch_gate_due`,
+    # called from unified_radix_cache.py:1868):
     # deferred, landed, undeferrable, defer_expired, defer_released,
     # defer_dropped, defer_cleared_cutover, defer_refused. Every MARK has
     # exactly one exit, so the identity the acceptance reads, per rank, is

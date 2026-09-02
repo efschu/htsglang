@@ -630,6 +630,27 @@ class TestFollowersMarkAndRetryButNeverHold(_Clean):
     RED on 63afbdc121: `prefetch_deferred` is None on the follower after
     intake, the REFUSED reason=pp_follower line is printed, the retry calls
     nobody.
+
+    THE CLASS THE ARGUMENT IS MADE ON (review round 3, operator ruling point
+    (3)): the serving path constructs `UnifiedRadixCache` (mem_cache/
+    registry.py:191, `_create_unified_radix_cache`) with a
+    `HybridCacheController` attached (mem_cache/hybrid_cache/
+    hybrid_pool_assembler.py `build_*_stack`, :146/228/500/593/663/1388).
+    `_Occupancy` above models THAT controller's `prefetch_tokens_occupied`
+    counter the way `UnifiedRadixCache.prefetch_from_storage` reads it
+    through `cache_controller.prefetch_rate_limited()`
+    (unified_radix_cache.py:3309): charged at registration (:3523), released
+    at completion (`check_prefetch_progress` :4147, `drain_retired_prefetch`
+    :4351, `_release_retired_prefetch_local` :4411,
+    `release_aborted_request` :4470). `HybridCacheController`
+    (hybrid_cache_controller.py:158) inherits `prefetch_rate_limited` /
+    `prefetch_capacity_limit` from managers/cache_controller.py
+    `HiCacheController` (:2653 / :2623) unchanged and writes the counter
+    only in `reset()` (:451, zeroed);
+    `test_the_serving_controller_carries_the_rate_verdict_unchanged` pins
+    that, so the class reference cannot fall back onto a stand-in. RED on
+    597a7f21eb: the A12.2 block in scheduler.py names no serving class and
+    attributes `prefetch_gate_due` to unified_radix_cache.py.
     """
 
     def test_a_follower_marks_and_retries_but_never_holds(self):
@@ -680,6 +701,10 @@ class TestFollowersMarkAndRetryButNeverHold(_Clean):
         # PP0 and a follower stand-in with the same (MIN-synced) capacity
         # marks the same rid, retries the same rid and lands it after the
         # same completion -- the follower's host pool holds what PP0's holds.
+        # `_Occupancy` stands in for the `prefetch_tokens_occupied` counter
+        # the serving `HybridCacheController` inherits unchanged
+        # (HiCacheController.prefetch_rate_limited, cache_controller.py:2653;
+        # the class docstring names the chain).
         waves = {}
         for rank in (0, 1):
             PREFETCH_GATE_COUNTS.clear()
@@ -760,6 +785,52 @@ class TestFollowersMarkAndRetryButNeverHold(_Clean):
         # slice-3 fix (the claim dated from ff62244431, the writer from the
         # #631 row-authority commits 287d5d3946/e1da0a4d98 the same day)
         self.assertNotIn("permanently None", src)
+
+    def test_the_serving_controller_carries_the_rate_verdict_unchanged(self):
+        # Operator ruling point (3), review round 3: the landing-sequence
+        # argument is made on the class the serving path constructs, not on
+        # the stand-ins of this file. (i) the controller the assembler
+        # attaches (hybrid_pool_assembler.py build_*_stack) inherits the rate
+        # verdict and its budget from HiCacheController unchanged ...
+        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache.hybrid_cache import (
+            hybrid_cache_controller as hcc_mod,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        hcc = hcc_mod.HybridCacheController
+        self.assertIs(hcc.__mro__[1], HiCacheController)
+        for name in ("prefetch_rate_limited", "prefetch_capacity_limit"):
+            self.assertNotIn(name, hcc.__dict__, f"{name} overridden on the serving controller")
+            self.assertIn(name, HiCacheController.__dict__)
+        # ... (ii) and writes the occupancy counter in exactly one place,
+        # reset(), zeroed: the drops the landing sequence rests on are the
+        # tree's, not the subclass's
+        self.assertEqual(inspect.getsource(hcc_mod).count("prefetch_tokens_occupied"), 1)
+        self.assertIn("self.prefetch_tokens_occupied = 0", inspect.getsource(hcc.reset))
+        # (iii) the verdict is read on the serving tree class at registration,
+        # and the charge the completions release is taken there too
+        tree_src = inspect.getsource(UnifiedRadixCache.prefetch_from_storage)
+        self.assertIn("self.cache_controller.prefetch_rate_limited()", tree_src)
+        self.assertIn("prefetch_tokens_occupied += len(prefetch_key)", tree_src)
+        # (iv) the A12.2 block says so ON THAT CLASS, chain named, and
+        # attributes prefetch_gate_due to the module that defines it
+        with open(inspect.getsourcefile(sched_mod)) as fh:
+            text = fh.read()
+        start = text.index("THE DEFECT (A12.1")
+        block = text[start : text.index("def _apply_prefetch_deferral", start)]
+        for needle in (
+            "HybridCacheController",
+            "UnifiedRadixCache.prefetch_from_storage",
+            "hybrid_cache_controller.py",
+            "prefetch_capacity_limit",
+            "match_refusal_census.py `prefetch_gate_due`",
+        ):
+            self.assertIn(needle, block, needle)
+        self.assertNotIn("unified_radix_cache.py `prefetch_gate_due`", block)
+        # (v) no unreachable refusal text: storage_disabled returns before the
+        # emitter that reads the table (upstream-minimal)
+        self.assertNotIn("storage_disabled", sched_mod._DEFERRAL_REFUSAL_TEXT_1068)
 
 
 class TestTheBoundIsPricedFromTheTree(_Clean):
