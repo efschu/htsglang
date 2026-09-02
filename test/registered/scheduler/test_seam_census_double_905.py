@@ -141,6 +141,56 @@ class TestTheSeamReachesTheStateItPromises(CustomTestCase):
         self.assertEqual(sched.tree_cache.evict_calls, 1)
         self.assertEqual(sched.tree_cache.resets, 1)
 
+    def test_the_cutover_copies_nothing(self):
+        # #1068: the per-request seam copy A is deleted; the canonical store
+        # (write-through stamped at the seam, read-through on re-admission)
+        # is the single carrier. This is the INVERSE of the deleted
+        # test_the_state_copy_ran_while_the_rows_were_still_held: after the
+        # seam no resident may carry a host copy. The zombie walk in
+        # test_968_seam_copy_deleted_1068 pins NAMES only; a copy revived on
+        # the release path under the RETAINED name `Req.offload_kv_cache`
+        # (the "one helper at a time" regrowth that walk warns about) keeps
+        # the walk green and turns THIS red, because the double records the
+        # call in `kv_cache_cpu`.
+        sched = FaithfulCensusScheduler()
+        _run_the_seam(sched)
+        self.assertTrue(sched.residents, "the fixture has no residents")
+        for req in sched.residents:
+            self.assertIsNone(
+                req.kv_cache_cpu,
+                f"rid={req.rid} carries a host copy after the seam: the seam "
+                "copy A is deleted (#1068), the store is the single carrier",
+            )
+
+    def test_can_fail_a_release_that_copies_is_noticed(self):
+        # The inverse above is only a pin while the double's
+        # `offload_kv_cache` still RECORDS a copy (#630: a double that only
+        # satisfies the `is None` check measures nothing). Plant a release
+        # that copies every resident before it retracts, through the shipped
+        # functions, and require the tripwire to fire on all of them.
+        sched = FaithfulCensusScheduler()
+        retract, drop = build_cutover_release(sched)
+
+        def _copying_retract(rs):
+            for r in rs:
+                r.offload_kv_cache(
+                    sched.req_to_token_pool, sched.token_to_kv_pool_allocator
+                )
+            out = retract(rs)
+            sched.retired_refs = consume_retracted_from_live_universe(sched, rs)
+            return out
+
+        reqs = list(_live_reqs(sched))
+        release_residents_for_cutover(
+            reqs, retract=_copying_retract, reset_tree=drop
+        )
+        self.assertEqual(
+            [req.kv_cache_cpu is None for req in sched.residents],
+            [False] * 3,
+            "the double's offload_kv_cache no longer records a copy, so the "
+            "inverse pin above would wave a revived seam copy through",
+        )
+
     def test_the_seam_stamped_its_own_retractions(self):
         # W30: the seam stamps `seam_readmit_epoch` at exactly one site, so
         # its re-admissions are separable from ordinary OOM preemption.
