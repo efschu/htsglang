@@ -293,8 +293,8 @@ FORWARDED_SCHEDULE_STOP_PREFIX = "#791 FORWARDED SCHEDULE UNEXECUTABLE STOP"
 FORWARDED_SCHEDULE_STOP_FORMAT = (
     FORWARDED_SCHEDULE_STOP_PREFIX + " rank={rank} slot={slot} told=[{told}] "
     "reached=[{reached}] census={census} local={local} limiter={limiter} "
-    "running_bs={running_bs} parked={parked} r2t_avail={r2t_avail} "
-    "headroom={headroom} group_limit={group_limit} "
+    "pp_max_mb={pp_max_mb} running_bs={running_bs} parked={parked} "
+    "r2t_avail={r2t_avail} headroom={headroom} group_limit={group_limit} "
     "batch_full_setter={batch_full_setter} "
     "batch_full_at_loop_entry={batch_full_at_loop_entry}: {refusal}"
 )
@@ -309,6 +309,7 @@ def forwarded_schedule_stop_message(
     census,
     local,
     limiter,
+    pp_max_mb,
     running_bs,
     parked,
     r2t_avail,
@@ -323,7 +324,11 @@ def forwarded_schedule_stop_message(
     Pure formatting: every value arrives already read (or already `n/a`),
     so a probe that cannot be read on some stand-in can never mask the
     stop. `told` and `reached` are iterables of rids, rendered sorted so two
-    ranks' lines are comparable byte for byte.
+    ranks' lines are comparable byte for byte. `pp_max_mb` is the FIRST
+    min() term of `get_num_allocatable_reqs` (`pp_max_micro_batch_size`,
+    =2 under the flip override): `local` is min(pp_max_mb, limiter) minus
+    max(0, running_bs - parked), so without it the line could not tell
+    which of its two ceilings bound.
     """
 
     def _rids(xs) -> str:
@@ -342,6 +347,7 @@ def forwarded_schedule_stop_message(
         census=census if census is not None else "n/a",
         local=local,
         limiter=limiter,
+        pp_max_mb=pp_max_mb,
         running_bs=running_bs,
         parked=parked,
         r2t_avail=r2t_avail,

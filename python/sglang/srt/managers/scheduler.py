@@ -9596,6 +9596,7 @@ class Scheduler(
             census=getattr(self, "_admission_decline_note", None),
             local=_probe(lambda: self.get_num_allocatable_reqs(running_bs)),
             limiter=_probe(lambda: self.admission_limiter.current),
+            pp_max_mb=_probe(lambda: get_server_args().pp_max_micro_batch_size),
             running_bs=running_bs,
             parked=_probe(lambda: self._parked_carrier_discount(running_bs)),
             r2t_avail=_probe(lambda: self.req_to_token_pool.available_size()),
@@ -9621,6 +9622,18 @@ class Scheduler(
             refusal,
         )
         return RuntimeError(message)
+
+    def _pp_record_reached_rids(self, can_run_list) -> None:
+        """#1153: record the rids this pass's admission loop has reached.
+
+        Read by `_pp_forwarded_schedule_stop` for the `reached=[...]` term of
+        the STOP line. Called at the loop's in-loop `except PPScheduleRefused`
+        (the moment of a mid-loop refusal) and once after the loop, before
+        the membership refusals; reset to `()` at pass entry.
+        """
+        self._pp_admission_reached_rids = tuple(
+            str(getattr(r, "rid", "?")) for r in can_run_list
+        )
 
     def _trace_pp_admission_verdict(self, ret: Optional[ScheduleBatch]) -> None:
         """#788: record THIS rank's admission verdict and the inputs behind it.
@@ -10366,10 +10379,21 @@ class Scheduler(
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            _count_veto
+            and self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
+            # #1153 follow-up: THE FOURTH SITE OF THE SAME COUNT ARITHMETIC,
+            # gated on `_count_veto` like the three around it and for a
+            # stronger reason: this one ACTUATES. `_maybe_yield_parked_carrier`
+            # retracts a parked decode carrier (`_retract_decode_and_requeue`)
+            # on THIS rank's own seat count -- a rank-local state change the
+            # peers executing the same forwarded schedule do not make
+            # (RAENGE-NIE-UNEINS). Below PP0 the count is not a verdict, so
+            # it may not spend a seat either: a follower on a non-empty told
+            # map never yields a carrier on its own.
+            #
             # #888b: SPEND A SEAT BEFORE LATCHING, not instead of latching.
             # This is the point at which the drain provably starved: the seat
             # table is full of carriers the phase forbids to run, and the
@@ -11474,6 +11498,10 @@ class Scheduler(
                 # genuinely unexecutable geometry to reach this line at all,
                 # and reaching it kills the pass rather than continuing on the
                 # leaked state. Filed at the site.
+                # #1153 follow-up: name what the loop REACHED at the moment
+                # of the raise, so the STOP line never prints reached=[] for
+                # a pass whose can_run_list held rids.
+                self._pp_record_reached_rids(adder.can_run_list)
                 schedule_refusal = exc
                 break
 
@@ -11595,10 +11623,9 @@ class Scheduler(
             mamba_allocator.alloc_group_end()
 
         # #1153: what this loop REACHED, recorded before any of the three
-        # refusal raises below so the group-STOP line can name it.
-        self._pp_admission_reached_rids = tuple(
-            str(getattr(r, "rid", "?")) for r in adder.can_run_list
-        )
+        # refusal raises below so the group-STOP line can name it (and once
+        # more at the in-loop except above, for a refusal raised mid-loop).
+        self._pp_record_reached_rids(adder.can_run_list)
 
         if schedule_refusal is not None:
             # #971: the refusal path must leave the skip census readable.

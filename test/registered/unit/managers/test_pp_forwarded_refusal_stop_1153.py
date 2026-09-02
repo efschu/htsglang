@@ -44,6 +44,7 @@ import logging
 import re
 import types
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.managers.pp_admission_congruence import (
     FORWARDED_SCHEDULE_STOP_FORMAT,
@@ -154,7 +155,11 @@ class T1ARefusedForwardedScheduleStopsTheGroup(unittest.TestCase):
         self.assertNotIsInstance(exc, PPScheduleRefused)
 
     def test_the_stop_line_names_every_term(self):
-        msg = str(_refuse(_holder()))
+        with patch(
+            "sglang.srt.managers.scheduler.get_server_args",
+            return_value=types.SimpleNamespace(pp_max_micro_batch_size=2),
+        ):
+            msg = str(_refuse(_holder()))
         for term in (
             "rank=1",
             f"slot={MB_ID}",
@@ -163,6 +168,9 @@ class T1ARefusedForwardedScheduleStopsTheGroup(unittest.TestCase):
             "census=loop_skips(batch_full_break=1(first=told-but-unre))",
             "local=6",
             "limiter=8",
+            # #1153 follow-up: the FIRST min() term of get_num_allocatable_reqs
+            # (=2 under the flip override on weg1b2), the likeliest trigger.
+            "pp_max_mb=2",
             "running_bs=1",
             "parked=0",
             "r2t_avail=61",
@@ -210,9 +218,14 @@ class T1ARefusedForwardedScheduleStopsTheGroup(unittest.TestCase):
         del h.req_to_token_pool
         del h.admission_limiter
         del h.parked_decode_set
-        msg = str(_refuse(h))
+        with patch(
+            "sglang.srt.managers.scheduler.get_server_args",
+            side_effect=AttributeError("no server args in this process"),
+        ):
+            msg = str(_refuse(h))
         self.assertTrue(msg.startswith(FORWARDED_SCHEDULE_STOP_PREFIX))
         self.assertIn("limiter=n/a", msg)
+        self.assertIn("pp_max_mb=n/a", msg)
         self.assertIn("r2t_avail=n/a", msg)
         self.assertIn("headroom=n/a", msg)
 
@@ -248,6 +261,7 @@ class T1ARefusedForwardedScheduleStopsTheGroup(unittest.TestCase):
             census="loop=clean",
             local=1,
             limiter=8,
+            pp_max_mb=4,
             running_bs=1,
             parked=1,
             r2t_avail=19,
@@ -260,12 +274,50 @@ class T1ARefusedForwardedScheduleStopsTheGroup(unittest.TestCase):
         self.assertEqual(
             line,
             "#791 FORWARDED SCHEDULE UNEXECUTABLE STOP rank=1 slot=0 told=[a,b] "
-            "reached=[a] census=loop=clean local=1 limiter=8 running_bs=1 "
-            "parked=1 r2t_avail=19 headroom=8 group_limit=None "
+            "reached=[a] census=loop=clean local=1 limiter=8 pp_max_mb=4 "
+            "running_bs=1 parked=1 r2t_avail=19 headroom=8 group_limit=None "
             "batch_full_setter=none batch_full_at_loop_entry=True: why",
         )
         self.assertTrue(
             FORWARDED_SCHEDULE_STOP_FORMAT.startswith(FORWARDED_SCHEDULE_STOP_PREFIX)
+        )
+
+    def test_an_in_loop_raise_still_names_what_the_loop_reached(self):
+        """#1153 follow-up: the reached rids are recorded AT the in-loop
+        `except PPScheduleRefused` (from `adder.can_run_list`, via
+        `_pp_record_reached_rids`), not only after the loop, so a refusal
+        raised inside `add_one_req` never prints `reached=[]` for a pass
+        whose can_run_list held rids."""
+        h = _holder()
+        h._pp_admission_reached_rids = ()
+        h._pp_record_reached_rids = types.MethodType(
+            Scheduler._pp_record_reached_rids, h
+        )
+
+        def _raw(*, prefill_delayer_single_pass, running_batch):
+            # what the loop's except path does at the moment of the raise
+            h._pp_record_reached_rids([_Req(RID_TOLD_A)])
+            raise PPScheduleRefused("#791 FORWARDED SCHEDULE UNEXECUTABLE: in-loop")
+
+        h._get_new_batch_prefill_raw = _raw
+        with self.assertRaises(RuntimeError) as ctx:
+            h.get_new_batch_prefill(running_batch=h.running_batch)
+        self.assertIn(f"reached=[{RID_TOLD_A}]", str(ctx.exception))
+        self.assertEqual(h._pp_admission_reached_rids, (RID_TOLD_A,))
+
+    def test_the_loop_records_reached_at_the_in_loop_except(self):
+        """SOURCE PIN (nothing in this tree drives the loop): the record sits
+        between the `except PPScheduleRefused as exc:` and its `break`, and
+        the post-loop record uses the same helper."""
+        src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
+        self.assertIn(
+            "self._pp_record_reached_rids(adder.can_run_list)\n"
+            "                schedule_refusal = exc\n"
+            "                break",
+            src,
+        )
+        self.assertEqual(
+            src.count("self._pp_record_reached_rids(adder.can_run_list)"), 2
         )
 
 
@@ -325,6 +377,116 @@ class T2TheCountArmIsNotAVerdictOnAForwardedSchedule(unittest.TestCase):
             "_count_veto\n            and self.get_num_allocatable_reqs(running_bs) <= 0",
             src,
         )
+        # #1153 follow-up: the FOURTH site of the same arithmetic, and the
+        # one that ACTUATES (retracts a parked carrier): gated identically.
+        self.assertEqual(
+            src.count(
+                "_count_veto\n            and self.get_num_allocatable_reqs(running_bs) <= 0"
+            ),
+            2,
+            "the parked-carrier yield and the no_allocatable gate",
+        )
+        self.assertNotIn(
+            "        if (\n            self.get_num_allocatable_reqs(running_bs) <= 0\n",
+            src,
+        )
+
+
+class _Sentinel(Exception):
+    """Stops the real `_get_new_batch_prefill_raw` right after the gates."""
+
+
+def _loop_holder(*, rank):
+    """A stand-in that drives the REAL `_get_new_batch_prefill_raw` from its
+    first line to the parked-carrier yield site, with a local seat count of
+    0 and one queued request. PP0 declines at the no_allocatable gate; a
+    follower on a non-empty told map runs past both gates into
+    `policy.calc_priority`, which is stood in by `_Sentinel`."""
+
+    def _stop(*args, **kwargs):
+        raise _Sentinel()
+
+    h = types.SimpleNamespace(
+        ps=types.SimpleNamespace(pp_rank=rank, pp_size=3),
+        pp_group=types.SimpleNamespace(is_first_rank=rank == 0, is_last_rank=False),
+        server_args=types.SimpleNamespace(enable_flexkv=False),
+        grammar_manager=types.SimpleNamespace(has_waiting_grammars=lambda: False),
+        enable_hierarchical_cache=False,
+        enable_hicache_storage=False,
+        enable_priority_preemption=False,
+        is_hybrid_swa=False,
+        chunked_req=None,
+        min_free_slots_delayer=None,
+        waiting_queue=[_Req("queued-1153")],
+        running_batch=types.SimpleNamespace(
+            reqs=[_Req("carrier-1153")], batch_is_full=False, is_empty=lambda: False
+        ),
+        _pp_admission_incoming_schedule={RID_TOLD_A: (0, 64)},
+        policy=types.SimpleNamespace(calc_priority=_stop),
+        yield_calls=[],
+    )
+    h._drain_prefetch_progress = lambda: {}
+    h._take_uniform_head_inputs = lambda: None
+    h._rederive_latched_batch_full = lambda running_batch: False
+    h.get_num_allocatable_reqs = lambda running_bs: 0
+
+    def _yield(running_batch, running_bs, allocatable):
+        h.yield_calls.append((running_bs, allocatable))
+        return False
+
+    h._maybe_yield_parked_carrier = _yield
+    h._pp_scheduled_extents = types.MethodType(Scheduler._pp_scheduled_extents, h)
+    h._get_new_batch_prefill_raw = types.MethodType(
+        Scheduler._get_new_batch_prefill_raw, h
+    )
+    return h
+
+
+class T4TheParkedCarrierYieldIsGatedLikeTheCountGates(unittest.TestCase):
+    """#1153 follow-up: `_maybe_yield_parked_carrier` retracts a parked decode
+    carrier on THIS rank's own seat count -- an actuator, a rank-local state
+    change the peers do not make. On a forwarded schedule it must not run."""
+
+    def test_pp0_with_no_seat_still_yields_and_then_declines(self):
+        h = _loop_holder(rank=0)
+        ret, rb = h._get_new_batch_prefill_raw(
+            prefill_delayer_single_pass=None, running_batch=h.running_batch
+        )
+        self.assertIsNone(ret)
+        self.assertEqual(h.yield_calls, [(1, 0)])
+        self.assertEqual(h._pp_batch_full_setter, "no_allocatable_reqs_gate")
+        self.assertTrue(rb.batch_is_full)
+
+    def test_a_follower_on_a_told_map_never_yields_a_carrier_on_its_own(self):
+        h = _loop_holder(rank=1)
+        with self.assertRaises(_Sentinel):
+            h._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=None, running_batch=h.running_batch
+            )
+        self.assertEqual(h.yield_calls, [], "a rank-local retraction below PP0")
+        self.assertFalse(h.running_batch.batch_is_full)
+        self.assertIsNone(h._pp_batch_full_setter)
+
+
+class T5TheMembershipLineIsTheOnlyStopAndIsNotVetoGated(unittest.TestCase):
+    """#1153 follow-up (reviewer mutant MC): with the count veto off, the
+    post-loop `if missing:` is the only thing turning a follower's physical
+    inability (add_one_req NO_TOKEN -> a told rid not reached) into a STOP.
+    SOURCE PIN, because nothing in this tree drives the loop: the block is
+    not gated on `_count_veto`, and the mutant `if missing and _count_veto:`
+    is red here."""
+
+    def test_the_missing_check_is_ungated(self):
+        src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
+        start = src.index(
+            "scheduled_extents = self._pp_scheduled_extents()\n"
+            "        if scheduled_extents:"
+        )
+        seg = src[start : src.index("extra = [rid for rid in admitted_rids", start)]
+        self.assertIn("            if missing:\n", seg)
+        self.assertNotIn("_count_veto", seg)
+        self.assertIn("raise PPScheduleRefused(", seg)
+        self.assertIn("missing rid(s)=", seg)
 
 
 class T3ALaunchedSlotIsNeverNulledSilently(unittest.TestCase):
