@@ -303,17 +303,31 @@ HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
 #: ``mem_pool_host`` needs no re-derivation pass and no floor.
 HICACHE_CACHE_MODE_LOAD_FRACTION = 0.5
 
-#: #1068 (WEG 1 slice 2 fix 3, spec A12.4): the bound, in seconds, that
-#: ``HiCacheController._stop_storage_threads`` gives EACH storage thread to
-#: leave its loop AFTER every in-flight prefetch operation has been
-#: terminated. The bound is meant to hold by construction: a terminated
-#: operation aborts ``_page_transfer`` at the next 128-page batch boundary
-#: (~4 MiB, milliseconds) and ``_storage_hit_query`` at the next batch of
-#: ``batch_exists``; without the termination a 39365-token span in flight at
-#: the cutover needed ~12.6 s at the spec's N5 rate (0.32 s/KiToken) and
-#: outlived any bound of this size (review finding (d)). A thread that is
-#: STILL alive after this bound is a torn pipeline, which is the
-#: raenge-nie-uneins crash-stop form: the helper raises, it never returns.
+#: #1068 (WEG 1 slice 2 fix 3 + fix 4, spec A12.4 and its amendment): the
+#: bound, in seconds, that ``HiCacheController._stop_storage_threads`` gives
+#: EACH storage thread to leave its loop AFTER every in-flight prefetch
+#: operation has been terminated. The helper and both loops are inherited
+#: unchanged by ``HybridCacheController``
+#: (mem_cache/hybrid_cache/hybrid_cache_controller.py), the controller the
+#: serving path actually runs, and the bound holds by construction on BOTH
+#: classes only because both carry the guard: a terminated operation aborts
+#: ``_page_transfer`` at the next 128-page batch boundary (~4 MiB,
+#: milliseconds; the hybrid override calls the base one first and inherits
+#: that guard) and ``_storage_hit_query`` before its next ``batch_exists``
+#: (per batch in the base class; at the top of the hybrid override, which
+#: asks the store ONCE for the whole span). Without the termination a
+#: 39365-token span in flight at the cutover needed ~12.6 s at the spec's N5
+#: rate (0.32 s/KiToken) and outlived any bound of this size (review finding
+#: (d)); without the hybrid guard a terminated probe still walked the whole
+#: span on the store (review round 4, B1b).
+#: PRE-EXISTING PEER-SKEW TERM, named and not removed here: the prefetch
+#: loop drains its queue with one rank-uniform gloo MIN all_reduce per
+#: operation (``_all_reduce_prefetch_groups`` in ``prefetch_thread_func``),
+#: so the bound holds only if the peer rank's prefetch thread reaches the
+#: paired collective within it. A thread that is STILL alive after this
+#: bound is a torn pipeline, which is the raenge-nie-uneins
+#: (ranks-never-disagree) crash-stop form: the helper raises, it never
+#: returns.
 STORAGE_THREAD_JOIN_BOUND_S = 10.0
 
 
@@ -818,11 +832,24 @@ class HiCacheController:
         a drain from the caller's thread would run that collective on one
         rank and not on a peer whose loop already holds the operation, the
         #580/#645 rank-divergence class).
+
+        CLASS-AGNOSTIC on the operation (slice 2 fix 4, A12.4 amendment (a)):
+        ``HybridCacheController``, the controller the serving path runs,
+        queues its own ``hybrid_cache_controller.PrefetchOperation`` -- an
+        upstream twin hierarchy (0986bed8e2) that does NOT subclass this
+        module's ``PrefetchOperation`` and is not reparented. The pass keys
+        on the termination protocol (``mark_terminate``/``is_terminated``),
+        never on isinstance against the base class, which saw none of them
+        and terminated nothing on the serving path (review round 4, B1).
         """
-        seen: dict[int, PrefetchOperation] = {}
+        seen: dict[int, object] = {}
 
         def take(op) -> None:
-            if isinstance(op, PrefetchOperation):
+            if op is None:
+                return
+            if callable(getattr(op, "mark_terminate", None)) and callable(
+                getattr(op, "is_terminated", None)
+            ):
                 seen.setdefault(id(op), op)
 
         for name in ("prefetch_queue", "prefetch_buffer"):
@@ -832,8 +859,10 @@ class HiCacheController:
             with q.mutex:
                 for op in list(q.queue):
                     take(op)
-        take(self._prefetch_current)
-        take(self._prefetch_io_current)
+        # getattr defaults: a controller stopped between attach/detach and its
+        # first _start_storage_threads has not published these pointers yet.
+        take(getattr(self, "_prefetch_current", None))
+        take(getattr(self, "_prefetch_io_current", None))
         for op in seen.values():
             op.mark_terminate()
         return len(seen)
@@ -853,14 +882,31 @@ class HiCacheController:
         guard) and ``detach_storage_backend``. The old precondition "caller
         should ensure no in-flight requests" is therefore no longer a
         precondition: in-flight work is terminated HERE, before the join,
-        so the bound holds by construction (a terminated operation leaves
+        so the bound holds by construction on BOTH controller classes: on
+        ``HiCacheController`` a terminated operation leaves
         ``_page_transfer`` at the next batch boundary and
-        ``_storage_hit_query`` at the next batch of ``batch_exists``).
+        ``_storage_hit_query`` at the next batch of ``batch_exists``; on
+        ``HybridCacheController`` (the serving controller, which inherits
+        this helper and both loops) ``_page_transfer`` calls the base one
+        first and inherits that guard, and its full ``_storage_hit_query``
+        override carries the same guard at its top (slice 2 fix 4). The
+        terminate pass is class-agnostic on the operation (duck-typed on
+        ``mark_terminate``/``is_terminated``) because the hybrid controller
+        queues its own PrefetchOperation twin.
+
+        PRE-EXISTING PEER-SKEW TERM, named and not removed here: the prefetch
+        loop's drain carries one rank-uniform gloo MIN all_reduce per queued
+        operation, so the bound holds only if the peer rank's prefetch thread
+        reaches the paired collective inside it; a peer late by more than
+        the bound trips the raise on this rank first.
 
         Returns what it did for the caller's log line. Raises RuntimeError
         ONLY when a thread is still alive after termination plus the bound:
         that is a torn pipeline, and starting a second set of threads on
-        top of it would double the hazard (raenge-nie-uneins crash-stop).
+        top of it would double the hazard -- raenge-nie-uneins
+        (ranks-never-disagree): crash-stop, never compensation. A caller on
+        the cutover path must let that RuntimeError propagate (see
+        ``phase_flip_runtime.drop_prefix_tree_returning_rows``).
         """
         t0 = time.monotonic()
         # Always request stop. This is safe even when storage is already disabled,

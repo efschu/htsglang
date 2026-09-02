@@ -1474,8 +1474,20 @@ def drop_prefix_tree_returning_rows(tree) -> int:
     line -- a drop that returns zero on a non-empty tree is exactly the defect
     this function exists to remove, and it has to be visible.
 
-    Never raises: it runs at the seam with requests already retracted, and
-    aborting here would strand a flip that has already released its state.
+    Does not raise on a COUNT or EVICTION shortfall: it runs at the seam
+    with requests already retracted, and an unreadable count or a refused
+    evict is reported, never thrown. A failed ``tree.reset()`` is the one
+    exception, and it PROPAGATES (#1068 slice 2 fix 4, A12.4 amendment
+    (c)): since slice 2 the reset chain reaches
+    ``UnifiedRadixCache._reset_full`` -> ``cache_controller.reset()`` ->
+    ``_stop_storage_threads``, which raises RuntimeError on a torn storage
+    pipeline AFTER ``_reset_full`` has already cleared ``enable_storage``
+    and ``ongoing_prefetch``. Swallowing that left the rank serving with
+    enable_storage False, the stop event set and no storage threads, so its
+    next ``prefetch_from_storage`` returned before the #580 vote: a
+    rank-divergent wedge on one rank instead of a crash-stop on all of
+    them. raenge-nie-uneins (ranks-never-disagree): a torn rank crashes, it
+    never compensates. The #856 line is still printed before the re-raise.
     """
     returned = 0
     evictable = tree_evictable_full_rows(tree)
@@ -1659,8 +1671,21 @@ def drop_prefix_tree_returning_rows(tree) -> int:
     )
     try:
         tree.reset()
-    except Exception:  # noqa: BLE001
-        logger.error("%s #856: prefix tree reset failed after eviction", LOG_PREFIX)
+    except Exception as exc:
+        # #1068 (A12.4 amendment (c), slice 2 fix 4): print the #856
+        # instrument line, then PROPAGATE. The reset has already torn the
+        # rank (root replaced, enable_storage cleared, storage threads
+        # stopped); returning here would be compensation on one rank, the
+        # raenge-nie-uneins (ranks-never-disagree) form this fork
+        # crash-stops instead.
+        logger.error(
+            "%s #856: prefix tree reset failed after eviction (%s: %s); "
+            "propagating, the rank is torn and must not serve",
+            LOG_PREFIX,
+            type(exc).__name__,
+            exc,
+        )
+        raise
     return returned
 
 

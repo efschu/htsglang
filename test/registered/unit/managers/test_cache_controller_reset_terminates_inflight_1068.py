@@ -33,11 +33,30 @@ sees its operation terminated. GREEN after the fix: both loops exit within
 milliseconds, and the ONE '#1068 RESET JOIN' line names the bound, the
 threads, the terminated and the drained operations and the seconds spent.
 
+SLICE 2 FIX 4 (A12.4 AMENDMENT, review round 4 findings B1 and B1b, verified
+on e5b7eb3b79): fix 3 landed on the BASE class only. The serving path never
+runs it: ``UnifiedRadixCache`` is attached by ``hybrid_pool_assembler.py``
+(six construction sites) to ``HybridCacheController``, whose ``prefetch()``
+builds ``hybrid_cache_controller.PrefetchOperation`` -- a class that does
+NOT subclass ``managers.cache_controller.PrefetchOperation`` (upstream twin
+hierarchy, 0986bed8e2; not reparented). On e5b7eb3b79 the terminate pass
+keyed on ``isinstance(op, PrefetchOperation)`` against the base class, so on
+the serving controller ``terminated_ops`` was ALWAYS 0, the aux thread never
+saw its transfer terminated and ``reset()`` raised after the bound exactly
+as before fix 3 (reviewer probe hybrid_timing_probe.py: base returned in
+0.00 s, hybrid raised RuntimeError after the 2.0 s bound with
+terminated_ops=0). And ``HybridCacheController._storage_hit_query`` is a
+full override without the ``is_terminated()`` guard, so a terminated probe
+still walked the whole span on the store. The same scenario therefore runs
+TWICE below: once on ``HiCacheController`` with the base operation class,
+once on ``HybridCacheController`` with the hybrid one. RED on e5b7eb3b79 for
+the hybrid half; GREEN after fix 4.
+
 Hermetic: real ``prefetch_thread_func`` and real ``prefetch_io_aux_func`` on
-real threads, real ``_storage_hit_query`` against a stub backend, only
-``_page_transfer`` replaced by the blocking stub. The restart half of
-``reset()`` runs against a recording thread stand-in so no fresh real loop
-is started.
+real threads, real ``_storage_hit_query`` (the class's own override) against
+a stub backend, only ``_page_transfer`` replaced by the blocking stub. The
+restart half of ``reset()`` runs against a recording thread stand-in so no
+fresh real loop is started.
 
     CUDA_VISIBLE_DEVICES='' PYTHONPATH=python python -m pytest \\
         test/registered/unit/managers/test_cache_controller_reset_terminates_inflight_1068.py -q
@@ -55,13 +74,17 @@ import torch
 
 from sglang.srt.managers import cache_controller as cc_module
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hyb_module
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 PAGE = 64
 SPAN = 39365  # the prompt_max of the acceptance population (spec section 5)
+
+HybridCacheController = hyb_module.HybridCacheController
+HybridPrefetchOperation = hyb_module.PrefetchOperation
 
 
 class _FakeThread:
@@ -86,15 +109,20 @@ class _FakeThread:
         pass
 
 
-def _op(rid: str, base: int) -> PrefetchOperation:
+def _op(rid: str, base: int, cls=PrefetchOperation):
+    """One prefetch operation of the acceptance span; ``cls`` picks the
+    hierarchy (base ``PrefetchOperation`` or the hybrid twin, which shares
+    the positional signature up to ``prefix_keys``)."""
     tokens = list(range(base, base + SPAN))
-    return PrefetchOperation(
-        rid, torch.arange(SPAN, dtype=torch.int64), tokens, None, None
-    )
+    return cls(rid, torch.arange(SPAN, dtype=torch.int64), tokens, None, None)
 
 
-def _shell(stop_event: threading.Event) -> HiCacheController:
-    cc = HiCacheController.__new__(HiCacheController)
+def _hybrid_op(rid: str, base: int):
+    return _op(rid, base, cls=HybridPrefetchOperation)
+
+
+def _shell(stop_event: threading.Event, cls=HiCacheController):
+    cc = cls.__new__(cls)
     cc.enable_storage = True
     cc.storage_stop_event = stop_event
     cc.page_size = PAGE
@@ -120,7 +148,20 @@ def _shell(stop_event: threading.Event) -> HiCacheController:
     cc.get_hash_str = lambda tokens, last_hash, page_size: [
         f"h{tokens[0] // 1_000_000}-{i}" for i in range(len(tokens) // page_size)
     ]
+    if cls is not HiCacheController:
+        # HybridCacheController, the serving controller: its
+        # _storage_hit_query override takes the v1 arm (plain batch_exists)
+        # when no non-KV pool is registered and the operation carries no
+        # pool transfers; its reset() and _start_storage_threads() touch the
+        # extra release queues.
+        cc.extra_host_mem_release_entries = []
+        cc.extra_host_mem_release_queues = {}
+        cc._init_extra_host_mem_release_queues = lambda: None
     return cc
+
+
+def _hybrid_shell(stop_event: threading.Event):
+    return _shell(stop_event, cls=HybridCacheController)
 
 
 class TestResetTerminatesInFlightPrefetchBeforeJoining(CustomTestCase):
@@ -131,13 +172,17 @@ class TestResetTerminatesInFlightPrefetchBeforeJoining(CustomTestCase):
     def tearDown(self):
         self.abort.set()
 
-    def test_reset_terminates_the_transfer_the_query_and_the_queue_inside_the_bound(self):
-        stop_event = threading.Event()
-        cc = _shell(stop_event)
+    def _drive_three_inflight_and_reset(self, cc, mk_op):
+        """The A12.4 scenario on ``cc``: one operation in transfer (the aux
+        thread's current op), one in the presence probe (the prefetch
+        thread's current op), one still queued; then ``reset()`` under a 2 s
+        bound. Every assertion of the contract lives here so the base and
+        the serving controller are held to exactly the same bar."""
+        stop_event = cc.storage_stop_event
 
-        op_transfer = _op("in-transfer", 0)  # will be the aux thread's current op
-        op_query = _op("in-query", 1_000_000)  # will be the prefetch thread's current op
-        op_queued = _op("queued", 2_000_000)  # will still sit in prefetch_queue
+        op_transfer = mk_op("in-transfer", 0)
+        op_query = mk_op("in-query", 1_000_000)
+        op_queued = mk_op("queued", 2_000_000)
 
         transfer_entered = threading.Event()
         observed = {}
@@ -156,8 +201,10 @@ class TestResetTerminatesInFlightPrefetchBeforeJoining(CustomTestCase):
         cc._page_transfer = blocking_transfer
 
         query_entered = threading.Event()
+        asked = []
 
         def batch_exists(hashes, extra_info=None):
+            asked.append(list(hashes))
             if hashes and hashes[0].startswith("h1-"):
                 # The second operation's presence probe: parks the prefetch
                 # thread INSIDE _storage_hit_query until the stop event.
@@ -226,6 +273,13 @@ class TestResetTerminatesInFlightPrefetchBeforeJoining(CustomTestCase):
         self.assertFalse(stop_event.is_set())
         self.assertEqual(len(_FakeThread.started), 2)
         self.assertEqual(cc.prefetch_tokens_occupied, 0)
+        # The operation drained after the stop (op_queued, token base
+        # 2_000_000, hashes 'h2-*') was terminated by the loop and asked the
+        # store NOTHING: the probe guard holds on the class under test.
+        self.assertFalse(
+            any(h and h[0].startswith("h2-") for h in asked),
+            "a terminated operation drained after the stop walked the store",
+        )
 
         # ONE line, every term named: bound, threads, terminated, drained,
         # seconds. terminated_ops counts the three distinct operations;
@@ -241,6 +295,41 @@ class TestResetTerminatesInFlightPrefetchBeforeJoining(CustomTestCase):
         for name in ("prefetch", "backup", "prefetch_io_aux"):
             self.assertIn(name, line)
         self.assertRegex(line, r"joined_s=\d+\.\d\d")
+
+    def test_reset_terminates_the_transfer_the_query_and_the_queue_inside_the_bound(self):
+        self._drive_three_inflight_and_reset(_shell(threading.Event()), _op)
+
+    def test_reset_terminates_in_flight_work_on_the_serving_controller(self):
+        """Fix 4 (B1): the SAME contract on HybridCacheController with its own
+        PrefetchOperation twin -- the shape UnifiedRadixCache actually runs.
+        RED on e5b7eb3b79: terminated_ops=0, the aux thread never leaves the
+        transfer, reset() raises RuntimeError after the bound."""
+        self._drive_three_inflight_and_reset(
+            _hybrid_shell(threading.Event()), _hybrid_op
+        )
+
+    def test_the_terminate_pass_is_class_agnostic(self):
+        """Fix 4 (B1) pin on the helper itself, without threads: a hybrid
+        operation sitting in prefetch_queue and one held as the aux loop's
+        current operation are both terminated and both counted. RED on
+        e5b7eb3b79 (isinstance against the base class: 0 terminated)."""
+        cc = _hybrid_shell(threading.Event())
+        op_queued = _hybrid_op("q", 0)
+        op_io = _hybrid_op("io", 1_000_000)
+        cc.prefetch_queue.put(op_queued)
+        cc._prefetch_io_current = op_io
+        self.assertEqual(cc._terminate_inflight_prefetch(), 2)
+        self.assertTrue(op_queued.is_terminated())
+        self.assertTrue(op_io.is_terminated())
+        # A None / a stray non-operation in a queue is skipped, not counted.
+        cc.prefetch_queue.put(None)
+        cc.prefetch_queue.put(object())
+        self.assertEqual(cc._terminate_inflight_prefetch(), 2)
+        # The pointer reads tolerate a shell that never ran __init__ or
+        # _start_storage_threads (attach/detach before the first start).
+        del cc._prefetch_current
+        del cc._prefetch_io_current
+        self.assertEqual(cc._terminate_inflight_prefetch(), 1)
 
     def test_a_terminated_transfer_issues_no_page_reads(self):
         """The batch loop of _page_transfer aborts at the batch boundary of a
@@ -258,17 +347,35 @@ class TestResetTerminatesInFlightPrefetchBeforeJoining(CustomTestCase):
     def test_a_terminated_probe_issues_no_storage_queries(self):
         """_storage_hit_query of a terminated operation asks the store
         nothing and reports zero hits, so the prefetch thread revokes it in
-        one pass instead of walking 308 batches of batch_exists."""
-        cc = _shell(threading.Event())
-        asked = []
-        cc.storage_backend = types.SimpleNamespace(
-            batch_exists=lambda hashes, extra_info=None: asked.append(hashes) or len(hashes)
-        )
-        op = _op("q", 0)
-        op.mark_terminate()
-        hash_value, hits = cc._storage_hit_query(op)
-        self.assertEqual(asked, [])
-        self.assertEqual((hash_value, hits), ([], 0))
+        one pass instead of walking 308 batches of batch_exists.
+
+        Fix 4 (B1b): held on BOTH classes. HybridCacheController overrides
+        _storage_hit_query in full (one batch_exists / batch_exists_v2 call
+        over the whole span, no batch loop), so the base guard does not
+        reach it; the override carries its own. RED on e5b7eb3b79 for the
+        hybrid subtest (one batch_exists call over all 615 page hashes)."""
+        for label, mk_shell, mk_op in (
+            ("HiCacheController", _shell, _op),
+            ("HybridCacheController", _hybrid_shell, _hybrid_op),
+        ):
+            with self.subTest(controller=label):
+                cc = mk_shell(threading.Event())
+                asked = []
+                cc.storage_backend = types.SimpleNamespace(
+                    batch_exists=lambda hashes, extra_info=None: asked.append(
+                        ("v1", list(hashes))
+                    )
+                    or len(hashes),
+                    batch_exists_v2=lambda hashes, transfers, extra_info=None: asked.append(
+                        ("v2", list(hashes))
+                    )
+                    or None,
+                )
+                op = mk_op("q", 0)
+                op.mark_terminate()
+                hash_value, hits = cc._storage_hit_query(op)
+                self.assertEqual(asked, [])
+                self.assertEqual((hash_value, hits), ([], 0))
 
     def test_the_bound_is_a_named_constant_and_the_helper_names_its_callers(self):
         self.assertIsInstance(cc_module.STORAGE_THREAD_JOIN_BOUND_S, float)
@@ -278,6 +385,11 @@ class TestResetTerminatesInFlightPrefetchBeforeJoining(CustomTestCase):
         doc = HiCacheController._stop_storage_threads.__doc__ or ""
         self.assertIn("reset", doc)
         self.assertIn("quiesce", doc)
+        # Fix 4 (docstrings): the bound is claimed for BOTH controller
+        # classes, and the pre-existing peer-skew term of the drain is named
+        # rather than hidden behind "by construction".
+        self.assertIn("HybridCacheController", doc)
+        self.assertIn("peer", doc)
 
 
 if __name__ == "__main__":

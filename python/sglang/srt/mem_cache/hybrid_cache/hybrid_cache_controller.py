@@ -749,6 +749,21 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        if operation.is_terminated():
+            # #1068 (A12.4 amendment (b), slice 2 fix 4): this is a FULL
+            # override of the base probe (ONE batch_exists / batch_exists_v2
+            # call over the whole span, no per-batch loop), so the base
+            # class's per-batch is_terminated() guard never reaches it. A
+            # terminated operation (stop event at the cutover, or a revoke)
+            # asks the store nothing. Without this line every operation
+            # dequeued after the stop still cost one presence walk of its
+            # span on the store (39365 tokens on the acceptance population,
+            # times drained_ops), and the join bound of
+            # _stop_storage_threads held on the serving controller only by
+            # luck (review round 4, B1b). The zero is the same answer the
+            # base class gives; the rank-uniform MIN all_reduce in
+            # prefetch_thread_func then agrees on it.
+            return [], 0
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
