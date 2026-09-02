@@ -5243,7 +5243,7 @@ class Scheduler(
         deliver). Every one of them is a decline that could not be counted.
 
         THE VERDICT IS AN OBSERVATION, NOT A PROMISE, and that is the whole
-        design. There are SIX silent exits between here and registration --
+        design. There WERE six silent exits between here and registration --
         two here (`:storage_disabled`, `:anchor_no_vote`) and four more inside
         `prefetch_from_storage` (`not enable_storage`, the
         `not eligible and not symmetric` gate, and two alloc-failure returns).
@@ -5254,12 +5254,36 @@ class Scheduler(
         ones nobody has written yet. A mutant that returns "issued"
         unconditionally cannot pass this, and the falsifier says so.
 
+        #1068 (slice 4): NONE OF THEM IS SILENT ANY MORE. Every exit of this
+        function counts its term in the #915 census and every entry counts
+        `intake`, so `intake == sum(PREFETCH_INTAKE_PARTITION)` is checkable
+        on the one `[#915 prefetch-gate]` line (match_refusal_census.py); the
+        tree's exits behind its gate count theirs (host_pool_exhausted,
+        host_alloc_failed, vote_negative, alloc_failed_post_vote) and speak
+        ONE line each. The effect-based verdict stays the authority: a call
+        that registered nothing and that no exit named is counted as
+        `attempted_but_unregistered` and spoken as an ERROR line (L4), never
+        raised -- this sits on every intake (G12).
+
         The deep reason, when there is one, comes from the #915 prefetch-gate
-        counters (`anchor` / `too_short` / `rate_limited`), sampled as a DELTA
-        across the call so it names THIS request's verdict rather than the
-        boot's running total.
+        counters, sampled as a DELTA across the call so it names THIS
+        request's verdict rather than the boot's running total, in the fixed
+        attribution order `PREFETCH_DECLINE_ORDER`.
         """
+        # #1068 (slice 4): the denominator sits at the FUNCTION boundary, not
+        # at one call site: the A12.2 retry (`_retry_deferred_prefetches`) and
+        # the #946 escape enter here too, and a denominator that missed them
+        # would leave their exits counted against nothing. The site is named
+        # by the lines that already carry it (#969C, the deferral's site=).
+        from sglang.srt.mem_cache.match_refusal_census import (
+            gate_reason_since as _gate_reason_since,
+            gate_snapshot as _gate_snapshot,
+            note_prefetch_gate as _note_prefetch_gate,
+        )
+
+        _note_prefetch_gate("intake")
         if not self.enable_hicache_storage:
+            _note_prefetch_gate("storage_disabled")
             return "declined:storage_disabled"
         req.init_next_round_input(self.tree_cache, cow_mamba=False)
         last_host_node = req.last_host_node
@@ -5380,11 +5404,9 @@ class Scheduler(
             # `anchor_no_vote` survives for tree caches with no controller to
             # ask: there the old criterion is still the only one available, and
             # calling that "store_absent" would claim a check we never made.
-            return (
-                "declined:store_absent"
-                if callable(_probe)
-                else "declined:anchor_no_vote"
-            )
+            _term = "store_absent" if callable(_probe) else "anchor_no_vote"
+            _note_prefetch_gate(_term)
+            return f"declined:{_term}"
 
         if locally_eligible:
             last_hash = _last_hash
@@ -5401,11 +5423,6 @@ class Scheduler(
         # (unified_radix_cache.py:2996) is the one event that means "a prefetch
         # exists"; every silent exit above it, present or future, leaves this
         # set unchanged.
-        from sglang.srt.mem_cache.match_refusal_census import (
-            gate_reason_since as _gate_reason_since,
-            gate_snapshot as _gate_snapshot,
-        )
-
         _ongoing = getattr(self.tree_cache, "ongoing_prefetch", None)
         _was_registered = _ongoing is not None and req.rid in _ongoing
         _gate_before = _gate_snapshot()
@@ -5432,14 +5449,77 @@ class Scheduler(
             # No such set on this tree cache (hiradix/flexkv variants). We
             # cannot observe delivery here, and saying "issued" would be the
             # very promise this function exists to stop making.
+            _note_prefetch_gate("unobservable")
             return "declined:unobservable"
         if req.rid in _ongoing and not _was_registered:
+            _note_prefetch_gate("issued")
             return "issued"
         if _was_registered:
             # It was already in flight before we asked; the escape did not
-            # create it and must not take credit for it.
+            # create it and must not take credit for it. The tree's own term
+            # for this call (`attempted`, or a gate decline) was counted by
+            # the tree beside this key.
+            _note_prefetch_gate("already_in_flight")
             return "declined:already_in_flight"
-        return f"declined:{_gate_reason_since(_gate_before)}"
+        _reason = _gate_reason_since(_gate_before)
+        if _reason in ("attempted_but_unregistered", "unreported"):
+            # No named exit counted this call: counted under the honest name
+            # and spoken as L4. NEVER a raise on the live intake path (G12).
+            _note_prefetch_gate(_reason)
+            self._note_prefetch_unregistered(req, _reason)
+        return f"declined:{_reason}"
+
+    def _note_prefetch_unregistered(self, req, verdict: str) -> None:
+        """L4 (#1068 slice 4, G12): `_prefetch_kvcache` observed NO
+        registration and the #915 census named NO exit for the call.
+
+        ``attempted_but_unregistered``: the gate admitted the request and it
+        still never registered -- a seventh silent exit exists between
+        `unified_radix_cache.prefetch_from_storage` and registration (the AST
+        ratchet in test_prefetch_gate_census_915 is meant to catch it first).
+        ``unreported``: the gate never recorded a verdict at all -- the tree
+        returned above it (storage off or no controller on the tree while the
+        scheduler has storage enabled), or this tree class does not carry the
+        census.
+
+        logger.error, rate-limited (n <= 40, then every 256th) with ``n``
+        printed so the suppressed count is readable beside the census key,
+        which carries the full count. Never a raise: this sits on every intake
+        (`_add_request_to_queue`), and an AssertionError here is a scheduler
+        death on a diagnostic.
+        """
+        n = getattr(self, "_915_unregistered_n", 0) + 1
+        self._915_unregistered_n = n
+        if not (n <= 40 or n % 256 == 0):
+            return
+        from sglang.srt.mem_cache.hicache_phase_binding import (
+            bound_phase,
+            current_generation,
+        )
+
+        if verdict == "attempted_but_unregistered":
+            why = (
+                "the #915 gate admitted this request and no named exit counted "
+                "it: a seventh silent exit exists between "
+                "unified_radix_cache.prefetch_from_storage and registration"
+            )
+        else:
+            why = (
+                "the #915 gate never recorded a verdict for this call: the tree "
+                "returned above the gate (enable_storage off or no "
+                "cache_controller on the tree while the scheduler has storage "
+                "enabled), or this tree class does not carry the census"
+            )
+        logger.error(
+            "#915 PREFETCH UNREGISTERED rid=%s phase=%s generation=%d n=%d "
+            "verdict=%s -- %s",
+            str(getattr(req, "rid", "?"))[:8],
+            bound_phase(),
+            int(current_generation()),
+            n,
+            verdict,
+            why,
+        )
 
     def _969ad_note_retract(self, req, site: str) -> None:
         """#969AD: name the RETRACT call site, per rid, bounded.

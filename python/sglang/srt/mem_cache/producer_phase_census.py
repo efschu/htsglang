@@ -34,9 +34,9 @@ THE CARRIER IS NOT REINVENTED (upstream-minimal)
 ``hicache_phase_binding`` already owns phase identity: ``BindingState`` holds
 the bound phase and a monotone generation, ``advance(phase, host_pool)`` mints
 one generation per cutover, and ``current_generation()`` is already read on the
-neighbouring prefetch path (``unified_radix_cache.py``, the ``_rehomed``
-release route). A second phase-identity scheme beside it would be exactly the
-second bookkeeping the upstream-minimal law forbids.
+neighbouring prefetch path (``scheduler.py``, the #1060 store-presence key and
+the #969C intake line). A second phase-identity scheme beside it would be
+exactly the second bookkeeping the upstream-minimal law forbids.
 
 But the honest statement of what that carrier does and does NOT give, because
 this is the sentence a reader will otherwise get wrong:

@@ -871,6 +871,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
         self.extra_metric_labels = server_args.extra_metric_labels
+        # #1068 (slice 4, L2): the one-chunk bound the truncation line is
+        # priced against. Read once here from the same ServerArgs the rest of
+        # this init reads; no process-global lookup on the prefetch path.
+        self._prefetch_chunk_tokens = int(server_args.chunked_prefill_size or -1)
 
         # Parse storage config once, share with assembler and tree
         storage_backend = server_args.hicache_storage_backend
@@ -3320,6 +3324,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         sidecar_xfers: list[PoolTransfer] = []
         alloc_failed = True
+        # #1068 (slice 4): the span the verdict was taken on, BEFORE any
+        # truncation. It is the `need` term of every L1/L2 line below and the
+        # token count of the refusal keys (the `_tokens` companion counts the
+        # span that was refused, exactly as the gate's own keys do).
+        need = prefetch_length
         if eligible:
             anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
@@ -3332,14 +3341,28 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 available_size = self.cache_controller.mem_pool_host.available_size()
                 prefetch_length = available_size - (available_size % self.page_size)
                 if prefetch_length >= self.prefetch_threshold:
+                    # #1068 L2: the span is CUT to the room the pool has.
+                    # Counted and spoken, NOT a refusal -- the shortened
+                    # prefetch registers below. `lost` against the chunk
+                    # bound says whether the loss stays inside the one-chunk
+                    # law (#939); the acceptance reads over_bound per line.
+                    _note_prefetch_gate("host_pool_truncated", need - prefetch_length)
+                    self._log_prefetch_truncated(req_id, need, prefetch_length)
                     prefetch_key = prefetch_key[:prefetch_length]
                     host_indices = self.cache_controller.mem_pool_host.alloc(
                         prefetch_length
                     )
                 else:
+                    # #1068 L1: less than one threshold of room in the pool.
+                    _note_prefetch_gate("host_pool_exhausted", need)
+                    self._log_prefetch_refused("host_pool_exhausted", req_id, need)
                     self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                     return
             if host_indices is None and not symmetric:
+                # #1068 L1: room was reported and the alloc still failed
+                # (fragmentation, or a pool whose available_size() lies).
+                _note_prefetch_gate("host_alloc_failed", prefetch_length)
+                self._log_prefetch_refused("host_alloc_failed", req_id, need)
                 self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 return
             # NOTE: under `symmetric` we deliberately SKIP the truncation-retry so
@@ -3383,6 +3406,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         # is dimensioned against a measured exhaustion rate
                         # instead of an assumed one.
                         alloc_failed = True
+                        # #1068 (slice 4, G1): counted on EVERY occurrence --
+                        # the WARNING below is rate-limited, this key never
+                        # is. It is the CAUSE of the alloc-failed exit this
+                        # call then leaves through (alloc_failed_post_vote,
+                        # or vote_negative under the #580 vote); that exit
+                        # counts itself, so the two keys are read together
+                        # (match_refusal_census.PREFETCH_INTAKE_PARTITION).
+                        _note_prefetch_gate("anchor_pool_exhausted", len(prefetch_key))
                         self._1035_n = getattr(self, "_1035_n", 0) + 1
                         if self._1035_n <= 40 or self._1035_n % 256 == 0:
                             _hp = getattr(comp, "_mamba_pool_host", None)
@@ -3456,6 +3487,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "failure -- and continuing would corrupt the vote."
                 )
             if int(vote[2].item()) == 0:
+                # #1068 L1: the group declined. Named on every rank, including
+                # the one whose own gate term or anchor exhaustion lowered
+                # the vote (that rank counted its local term above as well;
+                # the attribution order names the local term first).
+                _note_prefetch_gate("vote_negative", prefetch_length)
+                self._log_prefetch_refused("vote_negative", req_id, need)
                 if host_indices is not None:
                     self.cache_controller.append_host_mem_release(
                         host_indices=host_indices,
@@ -3466,6 +3503,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return
             # Positive consensus: every rank allocated -> all fall through to register.
         elif alloc_failed:
+            # #1068 L1: a component could not take its host resource -- the
+            # #1035 site above, which counted the cause (anchor_pool_exhausted).
+            _note_prefetch_gate("alloc_failed_post_vote", prefetch_length)
+            self._log_prefetch_refused("alloc_failed_post_vote", req_id, need)
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices,
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
@@ -3521,6 +3562,107 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+
+    def _prefetch_line_terms(self, need: int) -> dict:
+        """The named terms of the #915 L1/L2 lines (#1068 slice 4), read in
+        ONE place so the two lines cannot drift apart.
+
+        Diagnostic reads in the #1035 form: a collaborator that lacks a term
+        prints -1 for it and never breaks the prefetch path. On the serving
+        class (UnifiedRadixCache + HybridCacheController) every term exists.
+        ``phase``/``generation`` come from the binding carrier
+        (hicache_phase_binding), never from a second scheme.
+        """
+        from sglang.srt.mem_cache.hicache_phase_binding import (
+            bound_phase,
+            current_generation,
+        )
+
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        terms = {
+            "need": int(need),
+            "available": -1,
+            "threshold": int(self.prefetch_threshold),
+            "occupied": -1,
+            "limit": -1,
+            "pool_id": -1,
+            "epoch": -1,
+            "phase": bound_phase(),
+            "generation": int(current_generation()),
+        }
+        try:
+            terms["available"] = int(pool.available_size())
+        except Exception:  # noqa: BLE001 - diagnostic only
+            pass
+        try:
+            terms["occupied"] = int(cc.prefetch_tokens_occupied)
+        except Exception:  # noqa: BLE001 - diagnostic only
+            pass
+        try:
+            terms["limit"] = int(cc.prefetch_capacity_limit)
+        except Exception:  # noqa: BLE001 - diagnostic only
+            pass
+        try:
+            _p = getattr(getattr(pool, "anchor_entry", None), "host_pool", None) or pool
+            terms["pool_id"] = id(_p)
+            terms["epoch"] = int(getattr(_p, "_clear_epoch", 0))
+        except Exception:  # noqa: BLE001 - diagnostic only
+            pass
+        return terms
+
+    def _log_prefetch_refused(self, reason: str, req_id: str, need: int) -> None:
+        """L1 (#1068 slice 4): ONE line per refused prefetch behind the #915
+        gate, every term named. The census key for ``reason`` is incremented
+        AT THE EXIT, in the exit's own block, so the AST ratchet in
+        test_prefetch_gate_census_915 can see it; this method only speaks.
+        Not rate-limited: one line per refused intake, bounded by the intake
+        rate, and the acceptance expects 0 of them on a sized boot.
+        """
+        t = self._prefetch_line_terms(need)
+        logger.warning(
+            "#915 PREFETCH REFUSED reason=%s rid=%s need=%d available=%d "
+            "threshold=%d occupied=%d limit=%d pool_id=%d epoch=%d phase=%s "
+            "generation=%d",
+            reason,
+            str(req_id)[:8],
+            t["need"],
+            t["available"],
+            t["threshold"],
+            t["occupied"],
+            t["limit"],
+            t["pool_id"],
+            t["epoch"],
+            t["phase"],
+            t["generation"],
+        )
+
+    def _log_prefetch_truncated(self, req_id: str, need: int, got: int) -> None:
+        """L2 (#1068 slice 4): the span was cut to the pool's room and still
+        registers. ``over_bound`` is the one-chunk law (#939) read per line:
+        'true' when the lost tokens exceed chunked_prefill_size, 'false' when
+        not, 'unknown' when this tree was built without the chunk term (a
+        stand-in) -- never a verdict against an unmeasured bound.
+        """
+        t = self._prefetch_line_terms(need)
+        lost = int(need) - int(got)
+        chunk = int(getattr(self, "_prefetch_chunk_tokens", -1))
+        over_bound = "unknown" if chunk <= 0 else ("true" if lost > chunk else "false")
+        logger.warning(
+            "#915 PREFETCH TRUNCATED rid=%s need=%d got=%d lost=%d chunk=%d "
+            "over_bound=%s available=%d pool_id=%d epoch=%d phase=%s generation=%d",
+            str(req_id)[:8],
+            int(need),
+            int(got),
+            lost,
+            chunk,
+            over_bound,
+            t["available"],
+            t["pool_id"],
+            t["epoch"],
+            t["phase"],
+            t["generation"],
+        )
 
     def _retire_ongoing_prefetch(self, req_id: str) -> bool:
         """Displace the record under ``req_id``, terminated but NOT freed.
@@ -3621,266 +3763,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
 
-    def _rehome_stale_prefetch_span(
-        self,
-        req_id: str,
-        stale_indices,
-        n_tokens: int,
-        stale_generation,
-        hash_values=None,
-        prefix_keys=None,
-    ):
-        """#939: re-home an already-fetched span into the CURRENT generation's pool.
-
-        WHY THIS EXISTS. A prefetch opened under binding generation N completes
-        after the request's own prefill flip, so it lands under N+1/N+2. That is
-        not a race that can be tuned away: BOOT-MEASURED 2026-08-30 on
-        boot_855_1039ingen, the request that triggers the prefetch also triggers
-        the flips, so under drain-and-flip EVERY request spans a flip pair
-        (generations 0,2,4,6,8 across five requests; a min_dwell of 60 s refused
-        117581 flips and changed the pattern not at all). #937 therefore refused
-        100 % of non-zero fetches, five of five, zero counterexamples.
-
-        WHAT IS ACTUALLY STALE, and what is not. The fetched BYTES are keyed by
-        content hash and are generation-independent -- they are as valid now as
-        when they were read. What is stale is only the HOST SLOTS they were
-        written into, which were minted by the pool of `stale_generation` and
-        will be freed against it. So the correct move is not to discard the
-        bytes and re-read them (#943b's re-issue, which loses the race with
-        admission anyway), but to mint fresh slots under the CURRENT binding and
-        copy the bytes across.
-
-        THIS IS NOT A BYPASS OF #937 -- IT IS A NEW LEGITIMATE EXIT FROM IT.
-        The form #937 was built against is measured and specific (0827 soak:
-        every prompt >= 256 tokens returned non-deterministic garbage at
-        temperature 0 because a span was adopted WHOLE out of a pool that had
-        already been replaced). That form stays structurally impossible here:
-        the caller adopts ONLY the tensor this function returns, and that tensor
-        can only ever come from `dst_pool.alloc` on the pool bound RIGHT NOW.
-        `stale_indices` is never returned, never adopted, and still travels the
-        generation-stamped release to the pool that minted it. Every failure
-        path below returns None, which leaves the #937 refusal exactly as it was.
-
-        Returns the freshly minted indices, or None to decline (caller refuses).
-        """
-        # EVERY DECLINE BELOW CARRIES A NAMED REASON. Measured 2026-08-30
-        # (boot_855_939reread): one refusal per rank (req=e1ad3aac, 4618 tokens)
-        # could not be attributed to ANY counter, because several of these
-        # branches used to `return None` in silence. A silent exit is the class
-        # this campaign has already paid for twice; the reason is now always on
-        # the record, even when the outcome is simply "nothing to do".
-        def _decline(reason: str, detail: str = "") -> None:
-            attr = f"_rehome_declined_{reason}"
-            n = getattr(self, attr, 0) + 1
-            setattr(self, attr, n)
-            if n <= 5 or n % 256 == 0:
-                logger.warning(
-                    "#939 RE-HOME DECLINED (%s) req=%s tokens=%s "
-                    "from_generation=%s%s -- #937 refusal stands. (%d so far.)",
-                    reason,
-                    req_id,
-                    n_tokens,
-                    stale_generation,
-                    f" {detail}" if detail else "",
-                    n,
-                )
-            return None
-
-        if n_tokens <= 0:
-            return _decline("empty_span")
-        cc = self.cache_controller
-        dst_pool = getattr(cc, "mem_pool_host", None)
-        if dst_pool is None:
-            return _decline("no_destination_pool")
-        try:
-            from sglang.srt.mem_cache.hicache_phase_binding import (
-                current_generation,
-                host_pool_for_generation,
-            )
-
-            src_pool = host_pool_for_generation(stale_generation)
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "#939 RE-HOME DECLINED (binding_lookup_raised) req=%s: could not "
-                "resolve the pool for generation %s.",
-                req_id,
-                stale_generation,
-                exc_info=True,
-            )
-            return _decline("binding_lookup_raised")
-        if src_pool is None:
-            # The generation that minted the span no longer resolves to a pool.
-            return _decline("source_pool_gone")
-        if src_pool is dst_pool:
-            # The stamp moved but the tier did not: nothing to re-home, and a
-            # copy onto itself would be a no-op at best. Not an error -- but it
-            # must still be VISIBLE, or it looks exactly like a lost span.
-            return _decline("same_pool_object", "tier did not move")
-        page = int(getattr(dst_pool, "page_size", 1) or 1)
-        if int(getattr(src_pool, "page_size", page) or page) != page:
-            # Different page geometry between the two tiers: a page-wise copy
-            # would silently reinterpret bytes. Refuse; a wrong prefix is worse
-            # than a missing one, which is the whole lesson of #937.
-            return None
-
-        # PER-PAGE GEOMETRY, BOOT-MEASURED (boot_855_939rehome, 2026-08-30):
-        # equal `page_size` is NOT enough. All 15 copy attempts of that boot
-        # raised
-        #     RuntimeError: shape '[2, 16, 1, 4, 256]' is invalid for input of
-        #     size 16384   (and 8192)
-        # -- the source page carried HALF, or a QUARTER, of the destination's
-        # elements. The PP-phase and TP-phase host tiers shard differently under
-        # uneven DCP, so carrying a span across a flip is a RESHARD, not a
-        # relocation. Compare the geometry up front and decline cheaply, rather
-        # than allocating a span and then catching a reshape deep inside the
-        # pool. The exception handler below stays as the backstop; this makes
-        # the common case explicit and free.
-        try:
-            _src_page = src_pool.get_dummy_flat_data_page()
-            _dst_page = dst_pool.get_dummy_flat_data_page()
-            _geom_ok = (
-                _src_page.numel() == _dst_page.numel()
-                and _src_page.dtype == _dst_page.dtype
-            )
-        except Exception:  # noqa: BLE001
-            _geom_ok = False
-            _src_page = _dst_page = None
-        # NOT a decline any more: when the geometry differs the span is RE-READ
-        # by content key into the fresh slots instead of copied. That is the
-        # #939 order's own form ("re-issue the read under the current
-        # generation"), and it keeps the layout-correct reader as the only
-        # writer of a host page -- a reshard mover beside it would be the
-        # bespoke second mover `ein-job-ein-mover` forbids.
-        if not _geom_ok:
-            self._rehome_geometry_reshard = (
-                getattr(self, "_rehome_geometry_reshard", 0) + 1
-            )
-            if self._rehome_geometry_reshard <= 5:
-                logger.warning(
-                    "#939 RE-HOME VIA RE-READ req=%s tokens=%d from_generation=%s: "
-                    "source page %s elems vs destination page %s elems -- the "
-                    "tiers shard differently, so this is a RESHARD, not a copy. "
-                    "Re-reading by content key into the current tier. (%d so far.)",
-                    req_id,
-                    int(n_tokens),
-                    stale_generation,
-                    None if _src_page is None else _src_page.numel(),
-                    None if _dst_page is None else _dst_page.numel(),
-                    self._rehome_geometry_reshard,
-                )
-            if not hash_values:
-                # No content keys for this span -> nothing to re-read against.
-                self._rehome_declined_no_keys = (
-                    getattr(self, "_rehome_declined_no_keys", 0) + 1
-                )
-                return None
-
-        t0 = time.perf_counter()
-        new_indices = dst_pool.alloc(n_tokens)
-        if new_indices is None:
-            self.evict_host(n_tokens)
-            new_indices = dst_pool.alloc(n_tokens)
-        if new_indices is None:
-            self._rehome_declined_no_room = (
-                getattr(self, "_rehome_declined_no_room", 0) + 1
-            )
-            logger.warning(
-                "#939 RE-HOME DECLINED (no room) req=%s tokens=%d: the current "
-                "generation's host pool could not seat the span even after "
-                "evict_host. Falling through to the #937 refusal. (%d so far.)",
-                req_id,
-                int(n_tokens),
-                self._rehome_declined_no_room,
-            )
-            return None
-        if not _geom_ok:
-            # RESHARD PATH: the canonical reader writes the pages, in the
-            # destination tier's own layout, from the geometry-neutral store.
-            n_pages = (n_tokens + page - 1) // page
-            got = cc.reread_pages_into(
-                list(hash_values)[:n_pages],
-                new_indices,
-                prefix_keys=prefix_keys,
-                label=f"#939-reread:{req_id[:8]}",
-            )
-            if int(got) < int(n_tokens):
-                # A partial re-read cannot be published: the caller inserts
-                # `n_tokens` and a short span would advertise pages that were
-                # never written. Hand the slots back and let #937 stand.
-                try:
-                    dst_pool.free(new_indices)
-                except Exception:  # noqa: BLE001
-                    pass
-                self._rehome_reread_short = (
-                    getattr(self, "_rehome_reread_short", 0) + 1
-                )
-                logger.warning(
-                    "#939 RE-READ SHORT req=%s wanted=%d got=%d from_generation=%s: "
-                    "slots returned, #937 refusal stands. (%d so far.)",
-                    req_id,
-                    int(n_tokens),
-                    int(got),
-                    stale_generation,
-                    self._rehome_reread_short,
-                )
-                return None
-            _via = "reread"
-        else:
-            _via = "copy"
-        try:
-            n_pages = 0 if not _geom_ok else 0
-            if _geom_ok:
-                for off in range(0, n_tokens, page):
-                    dst_pool.set_from_flat_data_page(
-                        int(new_indices[off]),
-                        src_pool.get_data_page(int(stale_indices[off]), flat=True),
-                    )
-                    n_pages += 1
-            else:
-                n_pages = (n_tokens + page - 1) // page
-        except Exception:  # noqa: BLE001
-            # Hand the fresh slots straight back and decline. NEVER fall through
-            # to adopting `stale_indices` -- that is precisely the #937 form.
-            try:
-                dst_pool.free(new_indices)
-            except Exception:  # noqa: BLE001
-                pass
-            self._rehome_copy_failed = getattr(self, "_rehome_copy_failed", 0) + 1
-            logger.warning(
-                "#939 RE-HOME COPY FAILED req=%s tokens=%d from_generation=%s: "
-                "fresh slots returned, #937 refusal stands. (%d so far.)",
-                req_id,
-                int(n_tokens),
-                stale_generation,
-                self._rehome_copy_failed,
-                exc_info=True,
-            )
-            return None
-
-        self._prefetch_span_rehomed = getattr(self, "_prefetch_span_rehomed", 0) + 1
-        # THE RECONCILIATION INSTRUMENT (#939 guardrail 2): after this change,
-        # `refused_stale + re_homed` must equal what `refused_stale` alone used
-        # to be. If the two do not add up, a THIRD exit is running silently and
-        # that is the finding, not the ratio.
-        logger.warning(
-            "#939 PREFETCH SPAN RE-HOMED n=%d via=%s req=%s tokens=%d pages=%d "
-            "from_generation=%s to_generation=%s copy_ms=%.1f | reconcile: "
-            "refused_stale=%d re_homed=%d sum=%d",
-            self._prefetch_span_rehomed,
-            _via,
-            req_id,
-            int(n_tokens),
-            n_pages,
-            stale_generation,
-            current_generation(),
-            (time.perf_counter() - t0) * 1e3,
-            getattr(self, "_prefetch_insert_refused_stale", 0),
-            self._prefetch_span_rehomed,
-            getattr(self, "_prefetch_insert_refused_stale", 0)
-            + self._prefetch_span_rehomed,
-        )
-        return new_indices
-
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
@@ -3963,25 +3845,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         _stamp = getattr(operation, "binding_generation", None)
         _stale = not write_back_stamp_is_current(_stamp)
-        # #939 RE-HOMING, tried BEFORE the refusal. The bytes are content-keyed
-        # and still valid; only the slots holding them belong to a superseded
-        # generation. `_rehome_stale_prefetch_span` mints fresh slots under the
-        # CURRENT binding and copies the bytes there, returning None to decline
-        # -- and on None the #937 refusal below runs exactly as it always did.
-        # The stale indices are never adopted on either branch.
-        _rehomed = (
-            self._rehome_stale_prefetch_span(
-                req_id,
-                host_indices,
-                int(min_completed_tokens),
-                _stamp,
-                hash_values=hash_value,
-                prefix_keys=getattr(operation, "prefix_keys", None),
-            )
-            if _stale
-            else None
-        )
-        if _stale and _rehomed is None:
+        # #1068 (slice 4): the #939 re-homing pass that stood here is DELETED
+        # (upstream-minimal). After `_reset_full` no record of a superseded
+        # generation survives (`ongoing_prefetch` is emptied at the cutover),
+        # and the cutover re-issues the whole population through the intake
+        # path under the CURRENT generation (`_post_cutover_readmit`), so a
+        # stale stamp here can only be a record that escaped the reset. It is
+        # refused by name below, as the debug catch it now is; the boot
+        # acceptance expects 0 such lines.
+        if _stale:
             self._prefetch_insert_refused_stale = (
                 getattr(self, "_prefetch_insert_refused_stale", 0) + 1
             )
@@ -4002,15 +3874,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # population itself, after the rebind, through the ordinary
             # intake prefetch (`phase_flip_runtime._post_cutover_readmit`).
         else:
-            # `_rehomed` is None on the normal (current-stamp) path and carries
-            # freshly minted current-generation slots on the re-homed path. The
-            # tree therefore only ever adopts slots that belong to the binding
-            # that is live right now -- never `host_indices` when it is stale.
-            _adopt = _rehomed if _rehomed is not None else host_indices
+            # The stamp is current: the slots adopted here belong to the
+            # binding that is live right now.
             insert_result = self._insert_helper_host(
                 last_host_node,
                 fetched_key,
-                _adopt[:min_completed_tokens],
+                host_indices[:min_completed_tokens],
                 hash_value[: min_completed_tokens // self.page_size],
             )
             # #1061: the adopted tail arrived via the PREFETCH arm. Only the
@@ -4024,25 +3893,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         // self.page_size : min_completed_tokens
                         // self.page_size
                     ]
-                )
-            if _rehomed is not None:
-                # Whatever the tree did NOT adopt out of the re-homed span
-                # belongs to the CURRENT generation's pool -- not to the stale
-                # one that `host_indices` is routed to further below. Sending
-                # these two spans down one route is exactly the head/tail drift
-                # #905 was written to stop.
-                from sglang.srt.mem_cache.hicache_phase_binding import (
-                    current_generation as _cur_gen,
-                )
-
-                _new_unclaimed_to = (
-                    min_completed_tokens
-                    if insert_result.host_span_unclaimed
-                    else insert_result.prefix_len
-                )
-                self.cache_controller.append_host_mem_release(
-                    host_indices=_rehomed[:_new_unclaimed_to],
-                    generation=_cur_gen(),
                 )
 
         for ct, xfers in comp_xfers.items():
@@ -4058,14 +3908,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # and when the contiguous-backup law declined the insert the fetched
         # TAIL was not adopted either. Both are this rank's to release: no
         # tree node references them, so nothing else ever will.
-        # #939: when the span was RE-HOMED, the tree references the fresh slots
-        # and the ENTIRE stale span is unreferenced -- so all of it goes back to
-        # the generation that minted it, regardless of how much of the re-homed
-        # copy the tree adopted. Reading `insert_result` here (which now
-        # describes the FRESH span) would under-free the stale one and leak it.
         unclaimed_to = (
             min_completed_tokens
-            if (insert_result.host_span_unclaimed or _rehomed is not None)
+            if insert_result.host_span_unclaimed
             else insert_result.prefix_len
         )
         # DIAGNOSTIC ONLY (#905 window): the decisive datum. If the pool object

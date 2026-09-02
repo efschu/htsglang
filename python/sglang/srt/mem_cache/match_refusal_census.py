@@ -249,6 +249,61 @@ class MatchRefusalCensus:
 #: someone remembered to arm it cannot answer "was it ever tried".
 PREFETCH_GATE_COUNTS: Dict[str, int] = {}
 
+#: #1068 (slice 4): the decline terms `UnifiedRadixCache.prefetch_from_storage`
+#: can record for ONE call, in ATTRIBUTION order -- `gate_reason_since` names
+#: the first that tripped. The three gate terms come first (evaluated in that
+#: sequence at the gate), then the exits behind the gate in path order:
+#: host_pool_exhausted / host_alloc_failed (the non-symmetric alloc branch),
+#: anchor_pool_exhausted (the #1035 site, a CAUSE counted before the exit it
+#: precedes), vote_negative (the #580 group vote), alloc_failed_post_vote (the
+#: alloc-failed exit after the components ran).
+PREFETCH_DECLINE_ORDER = (
+    "anchor",
+    "too_short",
+    "rate_limited",
+    "host_pool_exhausted",
+    "host_alloc_failed",
+    "anchor_pool_exhausted",
+    "vote_negative",
+    "alloc_failed_post_vote",
+)
+
+#: #1068 (slice 4): the EXIT terms of `Scheduler._prefetch_kvcache`. Every
+#: entry counts `intake` and every exit exactly one of these, so
+#:
+#:     intake == sum(PREFETCH_GATE_COUNTS[t] for t in PREFETCH_INTAKE_PARTITION)
+#:
+#: holds per rank at every instant on the flip boot form (tp_world_size == 1,
+#: no #580 vote). Named exceptions, so the identity is never read wrong:
+#: `anchor_pool_exhausted` is NOT in the sum -- it is the CAUSE counter of the
+#: #1035 site and the same call then leaves through `alloc_failed_post_vote`
+#: (or `vote_negative` under the vote), so
+#: anchor_pool_exhausted <= alloc_failed_post_vote + vote_negative.
+#: `host_pool_truncated` is not a decline and stands beside `issued`.
+#: `already_in_flight` is decided after the tree ran, so the tree's own term
+#: for that call (`attempted`, or a gate decline) is counted beside it. Under
+#: the #580 vote (tp_world_size > 1) a rank whose own gate term declined ALSO
+#: counts `vote_negative` (the group's exit), so there the sum over-counts by
+#: exactly those calls. The A12.2 deferral keys (deferred, landed, ...) are a
+#: separate partition of the rate_limited verdicts.
+PREFETCH_INTAKE_PARTITION = (
+    "issued",
+    "storage_disabled",
+    "store_absent",
+    "anchor_no_vote",
+    "unobservable",
+    "already_in_flight",
+    "anchor",
+    "too_short",
+    "rate_limited",
+    "host_pool_exhausted",
+    "host_alloc_failed",
+    "vote_negative",
+    "alloc_failed_post_vote",
+    "attempted_but_unregistered",
+    "unreported",
+)
+
 
 def note_prefetch_gate(reason: Optional[str], tokens: int = 0) -> None:
     """Record one prefetch-gate verdict. ``None`` means the prefetch ran.
@@ -318,16 +373,21 @@ def gate_snapshot() -> Dict[str, int]:
 def gate_reason_since(before: Dict[str, int]) -> str:
     """Which #915 term declined during the call bracketed by ``before``.
 
-    Order is attribution order, matching the caller in `prefetch_from_storage`
-    which evaluates the three terms in sequence and names the FIRST that fails;
-    a request can trip several and summing them would double-count.
+    Order is attribution order (`PREFETCH_DECLINE_ORDER`), matching the caller
+    in `prefetch_from_storage` which evaluates the three gate terms in
+    sequence and names the FIRST that fails; a request can trip several and
+    summing them would double-count. #1068 (slice 4) extends the order with
+    the exits BEHIND the gate -- host_pool_exhausted, host_alloc_failed,
+    anchor_pool_exhausted, vote_negative, alloc_failed_post_vote -- each of
+    which now counts itself at its own return.
 
     ``attempted_but_unregistered`` is the honest answer for "the gate let it
-    through and it still never registered" -- an alloc failure or a negative
-    consensus vote below the gate. It is deliberately NOT called a success:
-    the whole defect being fixed is a path that reported one.
+    through and it still never registered" and, since slice 4, means an exit
+    that NO term counted: a new silent exit (the scheduler speaks it as L4).
+    It is deliberately NOT called a success: the whole defect being fixed is a
+    path that reported one.
     """
-    for key in ("anchor", "too_short", "rate_limited"):
+    for key in PREFETCH_DECLINE_ORDER:
         if PREFETCH_GATE_COUNTS.get(key, 0) > before.get(key, 0):
             return key
     if PREFETCH_GATE_COUNTS.get("attempted", 0) > before.get("attempted", 0):

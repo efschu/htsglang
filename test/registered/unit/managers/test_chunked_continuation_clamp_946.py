@@ -686,6 +686,10 @@ class TheRefetchVerdictMustBeAnOBSERVATIONNotAPromise(unittest.TestCase):
         sched.enable_hicache_storage = enable
         sched.tree_cache = tree_cache
         sched._prefetch_kvcache = types.MethodType(Scheduler._prefetch_kvcache, sched)
+        # #1068 (slice 4): an unnamed exit is spoken by this real method (L4).
+        sched._note_prefetch_unregistered = types.MethodType(
+            Scheduler._note_prefetch_unregistered, sched
+        )
         return sched
 
     def _req(self):
@@ -1047,6 +1051,10 @@ class TheEscapeMustIssueWithoutALocalAnchor(unittest.TestCase):
         s.enable_hicache_storage = enable
         s.tree_cache = tc
         s._prefetch_kvcache = types.MethodType(Scheduler._prefetch_kvcache, s)
+        # #1068 (slice 4): an unnamed exit is spoken by this real method (L4).
+        s._note_prefetch_unregistered = types.MethodType(
+            Scheduler._note_prefetch_unregistered, s
+        )
         return s
 
     def _anchorless_req(self):

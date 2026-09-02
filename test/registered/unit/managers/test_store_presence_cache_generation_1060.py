@@ -78,6 +78,8 @@ class _Req:
 
 class _Sched:
     _prefetch_kvcache = Scheduler._prefetch_kvcache
+    # #1068 (slice 4): an unnamed exit is spoken by this real method (L4).
+    _note_prefetch_unregistered = Scheduler._note_prefetch_unregistered
 
     def __init__(self, probe):
         self.enable_hicache_storage = True

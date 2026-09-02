@@ -43,6 +43,7 @@ remembered to arm it cannot answer "was it ever tried" -- which is the whole
 question.
 """
 
+import logging
 import unittest
 
 from sglang.srt.mem_cache.match_refusal_census import (
@@ -169,14 +170,51 @@ class TestTheGateIsWiredAndOrdered(CustomTestCase):
         self.assertEqual(code.count("prefetch_rate_limited()"), 1)
 
 
-class TestBehaviourIsUnchanged(CustomTestCase):
-    """This ticket is an instrument. It must not move a single prefetch."""
+class TestTheAttributionOrderIsTheExtendedOne(CustomTestCase):
+    """#1068 slice 4 INVERTS the old 'the three terms are the same three as
+    before': every exit behind the gate now has a term, and `gate_reason_since`
+    attributes in ONE fixed order (first tripped wins) that the boot acceptance
+    and the #969C verdict string both read."""
 
-    def test_the_three_terms_are_the_same_three_as_before(self):
-        src = TestTheGateIsWiredAndOrdered()._src()
-        self.assertIn("locally_eligible", src)
-        self.assertIn("self.prefetch_threshold", src)
-        self.assertIn("prefetch_rate_limited", src)
+    def test_the_attribution_order_is_the_extended_one(self):
+        from sglang.srt.mem_cache.match_refusal_census import (
+            PREFETCH_DECLINE_ORDER,
+        )
+
+        self.assertEqual(
+            PREFETCH_DECLINE_ORDER,
+            (
+                "anchor",
+                "too_short",
+                "rate_limited",
+                "host_pool_exhausted",
+                "host_alloc_failed",
+                "anchor_pool_exhausted",
+                "vote_negative",
+                "alloc_failed_post_vote",
+            ),
+        )
+
+    def test_the_first_tripped_term_in_order_is_the_verdict(self):
+        from sglang.srt.mem_cache.match_refusal_census import (
+            gate_reason_since,
+            gate_snapshot,
+        )
+
+        PREFETCH_GATE_COUNTS.clear()
+        before = gate_snapshot()
+        note_prefetch_gate("alloc_failed_post_vote")
+        note_prefetch_gate("anchor_pool_exhausted")
+        self.assertEqual(gate_reason_since(before), "anchor_pool_exhausted")
+        before = gate_snapshot()
+        note_prefetch_gate("vote_negative")
+        self.assertEqual(gate_reason_since(before), "vote_negative")
+        before = gate_snapshot()
+        note_prefetch_gate(None)
+        self.assertEqual(gate_reason_since(before), "attempted_but_unregistered")
+        before = gate_snapshot()
+        self.assertEqual(gate_reason_since(before), "unreported")
+        PREFETCH_GATE_COUNTS.clear()
 
     def test_the_symmetric_escape_is_untouched(self):
         """#580: under `symmetric` a locally ineligible rank must still enter
@@ -184,6 +222,560 @@ class TestBehaviourIsUnchanged(CustomTestCase):
         self.assertIn(
             "if not eligible and not symmetric:", TestTheGateIsWiredAndOrdered()._src()
         )
+
+
+# ---------------------------------------------------------------------------
+# #1068 slice 4 (WEG1 spec 4.4): EVERY EXIT BEHIND THE GATE IS NAMED.
+#
+# The scheduler's own docstring counted SIX silent exits between the #915 gate
+# and registration and answered them with an effect-based verdict. Slice 4
+# gives each exit a term and ONE line (L1 refusal / L2 truncation), counts the
+# scheduler's exits and the intake denominator, and speaks an unnamed exit as
+# an ERROR line (L4) -- never a raise on the live intake path (G12).
+#
+# THE CLASS UNDER TEST IS THE SERVING ONE. The flip boot runs
+# `UnifiedRadixCache` attached to `HybridCacheController`; the tree stand-in
+# below is a bare instance of that class with only the collaborators
+# `prefetch_from_storage` touches replaced, so the exits, counters and lines
+# are proven on the method the boot executes, not on a copy.
+# ---------------------------------------------------------------------------
+
+import ast
+import inspect
+import textwrap
+import types
+
+TREE_LOGGER = "sglang.srt.mem_cache.unified_radix_cache"
+SCHED_LOGGER = "sglang.srt.managers.scheduler"
+POOL_ROWS = 366211
+POOL_LIMIT = 329589
+
+
+class _HostPool:
+    """Host pool stand-in: an alloc succeeds iff the span fits `available`.
+    `fragmented=True` reports room and still refuses every alloc -- the
+    `host_alloc_failed` shape (room reported, alloc failed twice)."""
+
+    def __init__(self, available: int, fragmented: bool = False):
+        self.available = available
+        self.fragmented = fragmented
+        self.size = POOL_ROWS
+        self.allocs = []
+
+    def alloc(self, n: int):
+        self.allocs.append(n)
+        if self.fragmented or n > self.available:
+            return None
+        return list(range(n))
+
+    def available_size(self) -> int:
+        return self.available
+
+
+class _Controller:
+    def __init__(self, available: int, fragmented: bool = False):
+        self.mem_pool_host = _HostPool(available, fragmented)
+        self.prefetch_tokens_occupied = 0
+        self.prefetch_capacity_limit = POOL_LIMIT
+        self.released = []
+        self.ops = []
+
+    def prefetch_rate_limited(self) -> bool:
+        return False
+
+    def prefetch(
+        self,
+        request_id,
+        host_indices,
+        new_input_tokens,
+        last_hash=None,
+        prefix_keys=None,
+        extra_pools=None,
+    ):
+        op = types.SimpleNamespace(
+            request_id=request_id,
+            host_indices=host_indices,
+            mark_terminate=lambda: None,
+        )
+        self.ops.append(op)
+        return op
+
+    def append_host_mem_release(self, *args, **kwargs):
+        self.released.append((args, kwargs))
+
+
+class _AnchorlessComponent:
+    """A component whose host anchor pool is exhausted: `[]`, the #1035 shape."""
+
+    component_type = "mamba-stand-in"
+    _mamba_pool_host = None
+
+    def build_hicache_transfers(self, *args, **kwargs):
+        return []
+
+
+def _node():
+    return types.SimpleNamespace(
+        key=None,
+        backuped=True,
+        parent=None,
+        get_last_hash_value=lambda: None,
+        get_prefix_hash_values=lambda parent: None,
+    )
+
+
+def _serving_tree(
+    available: int,
+    *,
+    fragmented: bool = False,
+    symmetric: bool = False,
+    vote=None,
+    components=(),
+    chunk: int = 4096,
+):
+    """A bare `UnifiedRadixCache` (the serving class) with only the
+    collaborators `prefetch_from_storage` touches stubbed. Every method that
+    runs is the real one on the real class."""
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    tree = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    tree.enable_storage = True
+    tree.cache_controller = _Controller(available, fragmented)
+    tree.is_eagle = False
+    tree.page_size = 1
+    tree.prefetch_threshold = 256
+    tree.ongoing_prefetch = {}
+    tree._retired_prefetch = []
+    tree._retired_prefetch_attempts = {}
+    tree._retired_prefetch_recompute = 0
+    tree._components_tuple = tuple(components)
+    tree._hicache_prefetch_symmetric = lambda: symmetric
+    tree._all_reduce_attn_groups = vote or (lambda t, op, label="": None)
+    tree.inc_host_lock_ref = lambda node: types.SimpleNamespace(
+        to_dec_params=lambda: ("dec", node)
+    )
+    tree.dec_host_lock_ref = lambda node, params: None
+    tree.evict_host = lambda n: 0
+    tree._build_sidecar_transfers = lambda phase, kv_xfer, comp_xfers: []
+    tree._prefetch_chunk_tokens = chunk
+    return tree
+
+
+def _lines(cm, marker: str):
+    return [r.getMessage() for r in cm.records if marker in r.getMessage()]
+
+
+class TestEveryExitBehindTheGateIsNamed(_CleanCounts):
+    """T16/T17 and the two exits the spec names beside them."""
+
+    def test_host_pool_exhausted_is_named(self):
+        """T16: the pool has no room at all -> refused, counted, ONE line with
+        every term, and NOT registered. RED on 228a66db32: the exit was a bare
+        `return` and the verdict read 'attempted_but_unregistered'."""
+        from sglang.srt.mem_cache.match_refusal_census import (
+            gate_reason_since,
+            gate_snapshot,
+        )
+
+        tree = _serving_tree(available=0)
+        before = gate_snapshot()
+        with self.assertLogs(TREE_LOGGER, level="WARNING") as cm:
+            tree.prefetch_from_storage("rid-exhausted", _node(), list(range(14921)))
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_exhausted"), 1)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_exhausted_tokens"), 14921)
+        self.assertEqual(gate_reason_since(before), "host_pool_exhausted")
+        lines = _lines(cm, "#915 PREFETCH REFUSED")
+        self.assertEqual(len(lines), 1, lines)
+        for term in (
+            "reason=host_pool_exhausted",
+            "rid=rid-exha",
+            "need=14921",
+            "available=0",
+            "threshold=256",
+            "occupied=0",
+            f"limit={POOL_LIMIT}",
+            "pool_id=",
+            "epoch=",
+            "phase=",
+            "generation=",
+        ):
+            self.assertIn(term, lines[0])
+        self.assertNotIn("rid-exhausted", tree.ongoing_prefetch)
+
+    def test_truncation_is_named_with_loss(self):
+        """T17: room for 5000 of 39364 -> the span is CUT, counted as
+        host_pool_truncated with the lost tokens, spoken with lost= and
+        over_bound=, and REGISTERED (it is not a refusal). RED: no line, no
+        key."""
+        tree = _serving_tree(available=5000)
+        with self.assertLogs(TREE_LOGGER, level="WARNING") as cm:
+            tree.prefetch_from_storage("rid-truncated", _node(), list(range(39364)))
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated"), 1)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated_tokens"), 34364)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("attempted"), 1)
+        lines = _lines(cm, "#915 PREFETCH TRUNCATED")
+        self.assertEqual(len(lines), 1, lines)
+        for term in (
+            "rid=rid-trun",
+            "need=39364",
+            "got=5000",
+            "lost=34364",
+            "chunk=4096",
+            "over_bound=true",
+            "available=5000",
+            "pool_id=",
+            "phase=",
+            "generation=",
+        ):
+            self.assertIn(term, lines[0])
+        self.assertEqual(_lines(cm, "#915 PREFETCH REFUSED"), [])
+        self.assertIn("rid-truncated", tree.ongoing_prefetch)
+        self.assertEqual(len(tree.ongoing_prefetch["rid-truncated"].prefetch_key), 5000)
+        self.assertEqual(tree.cache_controller.prefetch_tokens_occupied, 5000)
+
+    def test_a_truncation_inside_the_chunk_bound_says_so(self):
+        tree = _serving_tree(available=39000)
+        with self.assertLogs(TREE_LOGGER, level="WARNING") as cm:
+            tree.prefetch_from_storage("rid-inbound", _node(), list(range(39364)))
+        lines = _lines(cm, "#915 PREFETCH TRUNCATED")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("lost=364", lines[0])
+        self.assertIn("over_bound=false", lines[0])
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated_tokens"), 364)
+
+    def test_host_alloc_failed_is_named(self):
+        """Room reported, alloc refused anyway (a fragmented pool): the second
+        exit of the truncation branch, by its own name."""
+        from sglang.srt.mem_cache.match_refusal_census import (
+            gate_reason_since,
+            gate_snapshot,
+        )
+
+        tree = _serving_tree(available=5000, fragmented=True)
+        before = gate_snapshot()
+        with self.assertLogs(TREE_LOGGER, level="WARNING") as cm:
+            tree.prefetch_from_storage("rid-fragment", _node(), list(range(39364)))
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_alloc_failed"), 1)
+        self.assertEqual(gate_reason_since(before), "host_alloc_failed")
+        lines = _lines(cm, "#915 PREFETCH REFUSED")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("reason=host_alloc_failed", lines[0])
+        self.assertIn("need=39364", lines[0])
+        self.assertIn("available=5000", lines[0])
+        self.assertNotIn("rid-fragment", tree.ongoing_prefetch)
+
+    def test_the_1035_anchor_exit_counts_the_cause_and_the_exit(self):
+        """#1035 (G1): the anchor-pool counter is incremented on EVERY
+        occurrence (the WARNING stays rate-limited), and the exit this call
+        then leaves through (alloc_failed_post_vote) counts itself; the
+        verdict names the CAUSE first."""
+        from sglang.srt.mem_cache.match_refusal_census import (
+            gate_reason_since,
+            gate_snapshot,
+        )
+
+        tree = _serving_tree(available=100000, components=(_AnchorlessComponent(),))
+        before = gate_snapshot()
+        with self.assertLogs(TREE_LOGGER, level="WARNING") as cm:
+            tree.prefetch_from_storage("rid-anchor", _node(), list(range(4096)))
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("anchor_pool_exhausted"), 1)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("anchor_pool_exhausted_tokens"), 4096)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("alloc_failed_post_vote"), 1)
+        self.assertEqual(gate_reason_since(before), "anchor_pool_exhausted")
+        lines = _lines(cm, "#915 PREFETCH REFUSED")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("reason=alloc_failed_post_vote", lines[0])
+        self.assertEqual(len(_lines(cm, "#1035 PREFETCH DROPPED")), 1)
+        self.assertNotIn("rid-anchor", tree.ongoing_prefetch)
+        self.assertEqual(len(tree.cache_controller.released), 1)
+
+    def test_a_negative_vote_is_named(self):
+        """#580 symmetric form: a peer lowered the vote; this rank was ready.
+        The exit is vote_negative, counted and spoken."""
+        from sglang.srt.mem_cache.match_refusal_census import (
+            gate_reason_since,
+            gate_snapshot,
+        )
+
+        def _peer_declines(tensor, op, label=""):
+            if label == "prefetch_participation_vote":
+                tensor[2] = 0
+
+        tree = _serving_tree(available=100000, symmetric=True, vote=_peer_declines)
+        before = gate_snapshot()
+        with self.assertLogs(TREE_LOGGER, level="WARNING") as cm:
+            tree.prefetch_from_storage(
+                "rid-vote", _node(), list(range(4096)), locally_eligible=True
+            )
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("vote_negative"), 1)
+        self.assertEqual(gate_reason_since(before), "vote_negative")
+        lines = _lines(cm, "#915 PREFETCH REFUSED")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("reason=vote_negative", lines[0])
+        self.assertNotIn("rid-vote", tree.ongoing_prefetch)
+        self.assertEqual(len(tree.cache_controller.released), 1)
+
+
+class TestTheRatchetEveryReturnBehindTheGateIsNamed(CustomTestCase):
+    """T19b, the AST ratchet: a `return` in `prefetch_from_storage` after the
+    gate line that does not count a term in its own block is the seventh
+    silent exit, and this test refuses it before a boot has to.
+
+    An exit is NAMED when (a) its own block calls `_note_prefetch_gate(`
+    before the return, or (b) it is the gate's own exit: the `if` that holds
+    it is directly preceded by the gate line `_note_prefetch_gate(reason, ...)`
+    (a second note there would double-count the gate's term). RED on
+    228a66db32: four returns without a term (the truncation `else`, the
+    post-truncation alloc failure, the negative vote, the post-vote alloc
+    failure)."""
+
+    @staticmethod
+    def _is_note(node) -> bool:
+        return any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == "_note_prefetch_gate"
+            for n in ast.walk(node)
+        )
+
+    @classmethod
+    def _gate_line(cls, fn) -> int:
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_note_prefetch_gate"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "reason"
+            ):
+                return node.lineno
+        raise AssertionError("the #915 gate line `_note_prefetch_gate(reason, ...)` is gone")
+
+    @classmethod
+    def unnamed_returns(cls, src: str):
+        fn = ast.parse(textwrap.dedent(src)).body[0]
+        gate = cls._gate_line(fn)
+        unnamed, after_gate = [], 0
+
+        def walk(body, chain):
+            nonlocal after_gate
+            for i, stmt in enumerate(body):
+                if isinstance(stmt, ast.Return) and stmt.lineno > gate:
+                    after_gate += 1
+                    named = any(cls._is_note(s) for s in body[:i])
+                    if not named and chain:
+                        pbody, pidx = chain[-1]
+                        prev = pbody[pidx - 1] if pidx > 0 else None
+                        named = (
+                            prev is not None
+                            and prev.lineno == gate
+                            and cls._is_note(prev)
+                        )
+                    if not named:
+                        unnamed.append(stmt.lineno)
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(stmt, field, None)
+                    if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                        walk(sub, chain + [(body, i)])
+                for handler in getattr(stmt, "handlers", []) or []:
+                    walk(handler.body, chain + [(body, i)])
+
+        walk(fn.body, [])
+        return unnamed, after_gate
+
+    def test_the_ratchet_can_fail(self):
+        """DESK-WRITTEN-NEVER-EXECUTED guard: the checker must catch a bare
+        return and accept the gate's own exit."""
+        bad = """
+def f(reason, x):
+    _note_prefetch_gate(reason, 1)
+    if x:
+        return
+    if x > 1:
+        return
+    _note_prefetch_gate("named", 1)
+    return
+"""
+        unnamed, n = self.unnamed_returns(bad)
+        self.assertEqual(n, 3)
+        self.assertEqual(unnamed, [7], "the bare return on line 7 must be caught")
+
+    def test_every_return_behind_the_gate_counts_a_term(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        src = inspect.getsource(UnifiedRadixCache.prefetch_from_storage)
+        unnamed, n = self.unnamed_returns(src)
+        self.assertGreaterEqual(n, 5, "the exits behind the gate are gone?")
+        self.assertEqual(
+            unnamed,
+            [],
+            f"return(s) at function-relative line(s) {unnamed} of "
+            "prefetch_from_storage count no #915 term: a silent exit",
+        )
+
+
+class _TreeCache:
+    """Scheduler-side tree stand-in whose only honest signal is the ongoing
+    set; `gate_reason` makes it record a #915 verdict the way the real gate
+    does, `register` makes it register."""
+
+    def __init__(self, *, register=False, gate_reason="absent", ongoing=True, probe=None):
+        if ongoing:
+            self.ongoing_prefetch = {}
+        self._register = register
+        self._gate_reason = gate_reason
+        self.calls = []
+        self.hicache_storage_pass_prefix_keys = False
+        self.root_node = object()
+        if probe is not None:
+            self.cache_controller = types.SimpleNamespace(store_presence_pages=probe)
+
+    def prefetch_from_storage(self, req_id, *a, **kw):
+        self.calls.append(req_id)
+        if self._gate_reason != "absent":
+            note_prefetch_gate(self._gate_reason, 4096)
+        if self._register:
+            self.ongoing_prefetch[req_id] = object()
+
+
+def _sched(tree, enable=True):
+    from sglang.srt.managers.scheduler import Scheduler
+
+    s = Scheduler.__new__(Scheduler)
+    s.enable_hicache_storage = enable
+    s.tree_cache = tree
+    return s
+
+
+def _req(rid: str, backuped: bool = True):
+    return types.SimpleNamespace(
+        rid=rid,
+        init_next_round_input=lambda *a, **kw: None,
+        last_host_node=types.SimpleNamespace(
+            backuped=backuped,
+            parent=None,
+            get_last_hash_value=lambda: "h",
+            get_prefix_hash_values=lambda parent: None,
+        ),
+        prefix_indices=[],
+        host_hit_length=0,
+        full_untruncated_fill_ids=list(range(600)),
+        _compute_max_prefix_len=lambda n: n - 1,
+    )
+
+
+class TestTheIntakePartitionSums(_CleanCounts):
+    """T18: every entry into `_prefetch_kvcache` is one `intake`, and every
+    exit counts exactly one partition term, so intake == sum(partition) at
+    every instant. RED on 228a66db32: the scheduler exits counted nothing."""
+
+    def test_intake_partition_sums(self):
+        from sglang.srt.mem_cache.match_refusal_census import (
+            PREFETCH_INTAKE_PARTITION,
+        )
+
+        verdicts = []
+        # storage_disabled
+        verdicts.append(_sched(_TreeCache(), enable=False)._prefetch_kvcache(_req("r1")))
+        # store_absent: not locally eligible, the store says no
+        verdicts.append(
+            _sched(_TreeCache(probe=lambda *a: False))._prefetch_kvcache(
+                _req("r2", backuped=False)
+            )
+        )
+        # anchor_no_vote: not locally eligible, no store to ask
+        verdicts.append(_sched(_TreeCache())._prefetch_kvcache(_req("r3", backuped=False)))
+        # unobservable: a tree without an ongoing set
+        verdicts.append(_sched(_TreeCache(ongoing=False))._prefetch_kvcache(_req("r4")))
+        # already_in_flight
+        t = _TreeCache(register=True, gate_reason=None)
+        t.ongoing_prefetch["r5"] = object()
+        verdicts.append(_sched(t)._prefetch_kvcache(_req("r5")))
+        # issued
+        verdicts.append(
+            _sched(_TreeCache(register=True, gate_reason=None))._prefetch_kvcache(_req("r6"))
+        )
+        # attempted_but_unregistered: the gate admitted, nothing registered
+        verdicts.append(_sched(_TreeCache(gate_reason=None))._prefetch_kvcache(_req("r7")))
+        # a named tree decline (rate_limited)
+        verdicts.append(
+            _sched(_TreeCache(gate_reason="rate_limited"))._prefetch_kvcache(_req("r8"))
+        )
+        # unreported: the tree recorded no verdict at all
+        verdicts.append(_sched(_TreeCache())._prefetch_kvcache(_req("r9")))
+
+        self.assertEqual(
+            verdicts,
+            [
+                "declined:storage_disabled",
+                "declined:store_absent",
+                "declined:anchor_no_vote",
+                "declined:unobservable",
+                "declined:already_in_flight",
+                "issued",
+                "declined:attempted_but_unregistered",
+                "declined:rate_limited",
+                "declined:unreported",
+            ],
+        )
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("intake"), 9)
+        for key in (
+            "storage_disabled",
+            "store_absent",
+            "anchor_no_vote",
+            "unobservable",
+            "already_in_flight",
+            "issued",
+            "attempted_but_unregistered",
+            "rate_limited",
+            "unreported",
+        ):
+            self.assertEqual(PREFETCH_GATE_COUNTS.get(key), 1, key)
+        self.assertEqual(
+            PREFETCH_GATE_COUNTS["intake"],
+            sum(PREFETCH_GATE_COUNTS.get(k, 0) for k in PREFETCH_INTAKE_PARTITION),
+            f"intake != sum of the partition: {sorted(PREFETCH_GATE_COUNTS.items())}",
+        )
+        self.assertNotIn("anchor_pool_exhausted", PREFETCH_INTAKE_PARTITION)
+        self.assertNotIn("host_pool_truncated", PREFETCH_INTAKE_PARTITION)
+
+
+class TestAnUnnamedExitIsAnErrorLineNotARaise(_CleanCounts):
+    """T19: the verdict 'attempted_but_unregistered' (the gate admitted, no
+    named exit counted, nothing registered) is spoken as L4 -- logger.error,
+    rate-limited with its count printed -- and NEVER raised (G12: this sits on
+    every intake). RED on 228a66db32: no line, no key."""
+
+    def test_an_unnamed_exit_is_an_error_line_not_a_raise(self):
+        sched = _sched(_TreeCache(gate_reason=None))
+        with self.assertLogs(SCHED_LOGGER, level="ERROR") as cm:
+            verdict = sched._prefetch_kvcache(_req("rid-seventh-exit"))
+        self.assertEqual(verdict, "declined:attempted_but_unregistered")
+        lines = _lines(cm, "#915 PREFETCH UNREGISTERED")
+        self.assertEqual(len(lines), 1, lines)
+        for term in (
+            "rid=rid-seve",
+            "phase=",
+            "generation=",
+            "n=1",
+            "verdict=attempted_but_unregistered",
+            "seventh silent exit",
+        ):
+            self.assertIn(term, lines[0])
+        self.assertEqual(cm.records[0].levelno, logging.ERROR)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("attempted_but_unregistered"), 1)
+
+    def test_the_error_line_is_rate_limited_and_prints_its_count(self):
+        sched = _sched(_TreeCache(gate_reason=None))
+        with self.assertLogs(SCHED_LOGGER, level="ERROR") as cm:
+            for i in range(41):
+                sched._prefetch_kvcache(_req(f"rid-{i}"))
+        lines = _lines(cm, "#915 PREFETCH UNREGISTERED")
+        self.assertEqual(len(lines), 40, "n<=40 spoken, the 41st suppressed")
+        self.assertIn("n=40", lines[-1])
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("attempted_but_unregistered"), 41)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("intake"), 41)
 
 
 if __name__ == "__main__":

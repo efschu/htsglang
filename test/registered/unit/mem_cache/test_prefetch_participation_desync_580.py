@@ -156,6 +156,14 @@ def make_cache(
     cache._retire_ongoing_prefetch = types.MethodType(
         UnifiedRadixCache._retire_ongoing_prefetch, cache
     )
+    # #1068 (slice 4): every exit behind the gate names itself through these
+    # real methods (L1/L2 lines); carried as the REAL bound methods too.
+    for name in (
+        "_prefetch_line_terms",
+        "_log_prefetch_refused",
+        "_log_prefetch_truncated",
+    ):
+        setattr(cache, name, types.MethodType(getattr(UnifiedRadixCache, name), cache))
     return cache
 
 
