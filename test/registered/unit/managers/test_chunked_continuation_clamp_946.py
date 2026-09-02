@@ -384,7 +384,28 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
 
     def test_the_census_is_rate_limited_and_never_one_line_per_pass(self):
         """9471 log lines is the defect this is investigating. The census may
-        not become it."""
+        not become it.
+
+        RE-PINNED 2026-09-02 (weg1 drift pass; PRE-EXISTING red at pin
+        228a66db32, NOT branch drift). Four sibling instruments were put ON
+        the census tick on 2026-08-29 and share ``SGLANG_947_RING_EVERY``:
+        #996b ac25c748a3 (group_floor/rank_budget), #997d 8b057bc8d9
+        (OUTPUT-FILL), #998 bf3058eea8 (EXTEND-INVARIANT), #1000 59830ce72d
+        (SLOT-OCCUPANT). All of them sit inside the same
+        ``if every > 0 and admissions % every == 0`` block of ``pp_ring_note``
+        as the census line itself (#996b even puts the census text ON its
+        own line, so a census line now starts with "#996"), so the old
+        assertion -- every WARNING on the logger counted as one census line,
+        and the census expected first -- read 8 for 2 ticks and has been red
+        since those four commits. The subject is unchanged and is now pinned
+        PER EMITTER: the census marker speaks exactly twice, and every marker
+        family that speaks on this logger during 60 admissions at every=25
+        speaks exactly twice. What this no longer pins: that the census is
+        the ONLY line on a tick, or the first (the four commits above
+        sanction riding on it). What it pins MORE than before: a sibling that
+        fires off-tick -- once per pass -- now fails by its own marker name,
+        where the old total could only say "got N".
+        """
         import os
 
         h = _holder()
@@ -403,13 +424,25 @@ class TheRingInstrumentMustNotLIE(unittest.TestCase):
                 os.environ.pop("SGLANG_947_RING_EVERY", None)
             else:
                 os.environ["SGLANG_947_RING_EVERY"] = old
+        census = [m for m in catcher.messages if "#947 VOID-RING CENSUS" in m]
         self.assertEqual(
-            len(catcher.records),
+            len(census),
             2,
-            f"60 admissions at every=25 must emit exactly 2 lines, got "
-            f"{len(catcher.records)}",
+            f"60 admissions at every=25 must emit exactly 2 census lines, got "
+            f"{len(census)} (the census rides ON the #996 line since "
+            f"ac25c748a3, so it is found by its marker, not by position)",
         )
-        self.assertIn("#947 VOID-RING CENSUS", catcher.messages[0])
+        by_marker = {}
+        for m in catcher.messages:
+            by_marker.setdefault(m.split(None, 1)[0], []).append(m)
+        cadence = {k: len(v) for k, v in by_marker.items()}
+        off_tick = {k: n for k, n in cadence.items() if n != 2}
+        self.assertEqual(
+            off_tick,
+            {},
+            f"60 admissions at every=25 must emit exactly 2 lines PER EMITTER "
+            f"on this logger; off-cadence: {off_tick} (all: {cadence})",
+        )
 
     def test_the_relocated_actuator_is_OFF_unless_the_env_says_otherwise(self):
         """DEFAULT-OFF IS THE DISCIPLINE, not a convenience. Five placements
