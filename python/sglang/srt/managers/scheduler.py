@@ -222,8 +222,9 @@ from sglang.srt.managers.pp_admission_congruence import (
     forwarded_fill_carry,
     forwarded_last_chunk,
     pp_admission_verdict_is_vacuous,
+    forwarded_schedule_stop_message,
     pp_row_authority_enabled,
-    void_pp_admission_decision,
+    rank_local_count_veto_applies,
 )
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -9438,16 +9439,37 @@ class Scheduler(
                 running_batch=running_batch,
             )
         except PPScheduleRefused as refusal:
-            # #791 CORE: THE LOUD REFUSAL, and the ONLY thing it may do.
-            # It may not narrow the batch, retry with different numbers, or
-            # fall through to a decode batch -- every one of those pairs this
-            # rank's metadata with the upstream's hidden states for a
-            # different pass. It voids the pass, through #797's existing
-            # machinery and with no new mechanism: `_pp_admission_pass_voided`
-            # is what `_event_loop_pp_body` reads to forward `pass_voided`
-            # and, with no batch built, to drain the upstream's orphaned
-            # proxy.
-            ret = self._pp_refuse_forwarded_schedule(refusal)
+            # #791 CORE: THE LOUD REFUSAL. It may not narrow the batch, retry
+            # with different numbers, or fall through to a decode batch --
+            # every one of those pairs this rank's metadata with the
+            # upstream's hidden states for a different pass.
+            #
+            # #1153: AND IT MAY NOT VOID THE PASS EITHER. The previous answer,
+            # `_pp_refuse_forwarded_schedule` (deleted), set
+            # `_pp_admission_pass_voided` and emptied the decision dicts: a
+            # rank-local compensation that nulled THIS rank's slot while
+            # PP0's stayed set. Nothing carried that void upstream (the #797
+            # return trip has had zero call sites since CUT V, #1072 deleted
+            # the void relay), so PP0's blocking recv consumed the last
+            # rank's NEXT real output under this slot's label and stayed one
+            # output ahead for the rest of the boot: boot_855_weg1b2 log
+            # 65000 (the refusal) -> 65004 (BATCH NULLED) -> 65119 (PP0
+            # merges an output it never received) -> the pp_to_tp arm at
+            # 21:42:05 turns the debt into an unproducible 26th output ->
+            # #980 / #1071 stalls. Same form #1071 (169f53c027) deleted for
+            # `_pp_void_retracted_pass`; this was the second writer.
+            #
+            # A detected rank disagreement is a group STOP
+            # (RAENGE-NIE-UNEINS), never a rank-local repair: the refusal is
+            # re-raised as a RuntimeError that names the told and reached
+            # rids, the skip census and every count-arm input at this
+            # moment, so the TRIGGER of the refusal is readable from one
+            # boot. The RuntimeError leaves `run_event_loop`,
+            # `run_scheduler_process` logs it and signals the parent
+            # (SIGQUIT), and the peers die in their bounded receives
+            # (#980 ObjectRecvStalled / #1071 PpChainRecvStalled) or the
+            # barlink dead-peer probe -- no new collective on this path.
+            raise self._pp_forwarded_schedule_stop(refusal) from refusal
 
         if self.prefill_delayer:
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
@@ -9486,10 +9508,10 @@ class Scheduler(
         Derived from `_pp_admission_amended_to_forward` -- the same object
         `_pp_forwarded_schedule_from` projects the extents out of -- rather
         than from a third piece of scheduler state kept in step by hand. That
-        is the point: `_pp_refuse_forwarded_schedule` and the void paths empty
-        the amended decision, so this map empties with the extents map on
-        exactly the same passes, and the two can never name different rid
-        sets. Adding a parallel field would have been one more thing to reset
+        is the point: the void paths empty the amended decision (the #791
+        refusal used to as well; since #1153 it stops the group instead), so
+        this map empties with the extents map on exactly the same passes,
+        and the two can never name different rid sets. Adding a parallel field would have been one more thing to reset
         on five paths and one more way for the two halves of one fact to
         disagree.
         """
@@ -9520,94 +9542,85 @@ class Scheduler(
             getattr(self, "_pp_admission_amended_to_forward", None)
         )
 
-    def _pp_refuse_forwarded_schedule(self, refusal: Exception) -> None:
-        """#791 CORE: turn an unexecutable forwarded geometry into a void.
+    def _pp_forwarded_schedule_stop(self, refusal: Exception) -> RuntimeError:
+        """#1153: the group STOP for a refused forwarded schedule.
 
-        QUOTING THE DECISION IS THE POINT. `PPScheduleRefused` carries the
-        forwarded numbers and this rank's own, formatted by
-        `pp_admission_congruence.schedule_refusal_reason`, so the log line
-        names what the upstream committed rather than only what this rank
-        found -- the failure mode this replaces was a rank quietly building a
-        different batch and saying nothing at all.
+        KEEPS THE DETECTOR, DELETES THE COMPENSATION. `PPScheduleRefused`
+        carries the forwarded numbers and this rank's own (formatted by
+        `pp_admission_congruence.schedule_refusal_reason` or the membership
+        check), so the line names what the upstream committed rather than
+        only what this rank found. What is gone is everything the old
+        `_pp_refuse_forwarded_schedule` did AFTER logging: the
+        write of the `_pp_admission_pass_voided` flag, the emptied decision
+        dicts, the `#971` re-home of the chunked continuation. A pass the
+        group cannot agree on is not executed anywhere, and the process
+        that detected the disagreement ends the group.
 
-        NO NEW MECHANISM. The pass is voided exactly as a #797 retraction
-        voids it: `_pp_admission_pass_voided` is set so `_event_loop_pp_body`
-        forwards `pass_voided=True` and drains the upstream's orphaned proxy,
-        and the decision this rank forwards is emptied by
-        `void_pp_admission_decision` so every rank after it makes the same
-        membership decision. Re-noted against the slot, because the
-        expectation was recorded before this refusal could be known.
+        THE COUNT-ARM INPUTS ARE PRINTED HERE, not merely the rid counts,
+        because the 0902 specimen's TRIGGER (why PP1's loop bound at 1 while
+        PP0 admitted 2) could not be established from its refusal line:
+        local `get_num_allocatable_reqs`, `admission_limiter.current`,
+        `running_bs`, the parked-carrier discount, the req_to_token pool's
+        `available_size()`, the GDN slot-pool `admission_headroom`, the
+        group admit limit, the site that set `batch_is_full` this pass and
+        the flag's value at loop entry. Every read is guarded: a probe may
+        never mask the stop, so an unreadable value prints as `n/a`.
+
+        Returns the RuntimeError rather than raising it, so the funnel's
+        `raise ... from refusal` keeps the refusal as the cause.
         """
-        self._pp_pass_schedule_refusals = (
-            getattr(self, "_pp_pass_schedule_refusals", 0) + 1
-        )
-        logger.error(
-            "#791 PP-ADMISSION forwarded schedule REFUSED on rank %s: %s "
-            "Voiding the whole pass rather than building a batch of a shape "
-            "the upstream did not decide.",
-            getattr(getattr(self, "ps", None), "pp_rank", None),
-            refusal,
-        )
-        self._pp_admission_pass_voided = True
-        self._pp_admission_incoming_effective = {}
-        self._pp_admission_incoming_schedule = {}
+        ps = getattr(self, "ps", None)
+        rank = getattr(ps, "pp_rank", None)
+
+        def _probe(fn):
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001 - a probe may never mask the stop
+                return "n/a"
+
         amended = getattr(self, "_pp_admission_amended_to_forward", None)
-        if amended is not None:
-            amended = void_pp_admission_decision(amended)
-            self._pp_admission_amended_to_forward = amended
-            note = getattr(self, "_pp_note_admission_amendment", None)
-            if note is not None:
-                note(amended.mb_id, amended)
-
-        # #971 THE JUNCTION. Every exit of this pass must re-home the chunked
-        # continuation, and this is the exit that did not.
-        #
-        # `_get_new_batch_prefill_raw` hands `self.chunked_req` -- scheduler-
-        # owned, alive across rounds, and never a member of `waiting_queue` --
-        # into the pass-owned adder at `self.chunked_req =
-        # adder.add_chunked_req(self.chunked_req)`. On a FINAL extend the
-        # adder appends it to `can_run_list` and returns None, so after that
-        # line the adder holds the only reference. Refusing the pass here
-        # discards the adder, and with it the request: boot 1's 512-void
-        # livelock, 507 rounds of `#944 UNRESOLVED told=8192 local=UNKNOWN`.
-        #
-        # The surviving restore is not reachable from here.
-        # `_pp_void_own_batch` early-returns on `batch is None` above its
-        # restore -- and this pass built no batch, which is why `#797d own
-        # pass voided` is 0 in the whole boot log. (The second restore lived
-        # in the void-output consumer, was keyed on an output expectation
-        # this pass never made, and went with the void relay in #1072.)
-        #
-        # THE SLOT is `amended.mb_id`: the forwarded decision is stamped with
-        # the loop's own `mb_id` (`replace(raw, mb_id=mb_id)` in
-        # `_pp_reconcile_incoming_admission`), which is the same number
-        # `_pp_note_chunked_req_before_admission` wrote the snapshot under and
-        # the same one the `note(amended.mb_id, ...)` call directly above
-        # already relies on. `_pp_live_mb_id` is the fallback for a pass that
-        # carries no amended decision.
-        #
-        # THE PARK is part of the restore, not an extra -- and it is the
-        # GEOMETRY ONLY: this pass was refused above both the KV allocation
-        # and the `inflight_middle_chunks` increment, so it has nothing to
-        # give back and giving anyway would free another request's pages. See
-        # `pp_rehome_refused_chunked_req` and `_park_chunked_prefill_chunk`'s
-        # `pass_allocated`. Nothing is discarded here -- the
-        # refusal is raised before this function's `self.waiting_queue`
-        # prune, so every other admitted request is still queued, and the
-        # parked continuation keeps its full cached prefix. This junction
-        # costs zero tokens; the status quo cost 8192.
-        from sglang.srt.managers.scheduler_pp_mixin import (
-            pp_rehome_refused_chunked_req as _pp_rehome_refused_chunked_req,
-        )
-
         slot = (
-            amended.mb_id
+            getattr(amended, "mb_id", None)
             if amended is not None
             else getattr(self, "_pp_live_mb_id", None)
         )
-        if slot is not None:
-            _pp_rehome_refused_chunked_req(self, slot)
-        return None
+        told = _probe(self._pp_scheduled_extents)
+        told_rids = None if told in (None, "n/a") else list(told.keys())
+        running_batch = getattr(self, "running_batch", None)
+        running_bs = _probe(lambda: len(running_batch.reqs))
+        message = forwarded_schedule_stop_message(
+            rank=rank,
+            slot=slot,
+            told=told_rids,
+            reached=getattr(self, "_pp_admission_reached_rids", None),
+            census=getattr(self, "_admission_decline_note", None),
+            local=_probe(lambda: self.get_num_allocatable_reqs(running_bs)),
+            limiter=_probe(lambda: self.admission_limiter.current),
+            running_bs=running_bs,
+            parked=_probe(lambda: self._parked_carrier_discount(running_bs)),
+            r2t_avail=_probe(lambda: self.req_to_token_pool.available_size()),
+            headroom=_probe(
+                lambda: self.parked_decode_set.admission_headroom(
+                    running_bs, self.get_num_allocatable_reqs(running_bs)
+                )
+            ),
+            group_limit=_probe(
+                lambda: getattr(self._pp_head_inputs_this_pass, "admit_limit", None)
+            ),
+            batch_full_setter=getattr(self, "_pp_batch_full_setter", None),
+            batch_full_at_loop_entry=getattr(
+                self, "_pp_batch_full_at_loop_entry", "n/a"
+            ),
+            refusal=refusal,
+        )
+        logger.error(
+            "#791 PP-ADMISSION forwarded schedule REFUSED on rank %s: %s "
+            "Stopping the group rather than voiding this rank's pass "
+            "(#1153).",
+            rank,
+            refusal,
+        )
+        return RuntimeError(message)
 
     def _trace_pp_admission_verdict(self, ret: Optional[ScheduleBatch]) -> None:
         """#788: record THIS rank's admission verdict and the inputs behind it.
@@ -10242,6 +10255,20 @@ class Scheduler(
         # so it raised AttributeError on all 105 passes of
         # boot_window2_0823_1554 and every batch formed rank-locally.
         _head_inputs = self._take_uniform_head_inputs()
+        self._pp_head_inputs_this_pass = _head_inputs
+        # #1153 (PP0 order): on a FORWARDED schedule this rank's seat-count
+        # arithmetic is not a verdict. `rank_local_count_veto_applies` is
+        # True on PP0 and on every non-PP boot (the pre-#1153 expression,
+        # unchanged); False on a rank > 0 executing PP0's decision, where
+        # the count gates below and the #823 count arm in the loop are
+        # skipped and the told rids are seated in told order. The physical
+        # allocator still refuses (NO_TOKEN -> membership refusal -> group
+        # STOP naming the numbers); only the rank-local COUNT no longer
+        # ends a pass PP0 launched.
+        _count_veto = rank_local_count_veto_applies(self._pp_scheduled_extents())
+        self._pp_batch_full_setter = None
+        self._pp_batch_full_at_loop_entry = "n/a"
+        self._pp_admission_reached_rids = ()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -10307,7 +10334,8 @@ class Scheduler(
                 )
 
         if (
-            running_batch.batch_is_full or len(self.waiting_queue) == 0
+            (running_batch.batch_is_full and _count_veto)
+            or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             self._admission_decline_note = (
                 f"gate=batch_full_or_empty_queue(batch_is_full="
@@ -10319,6 +10347,7 @@ class Scheduler(
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
+            and _count_veto
             and self.chunked_req is None
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
@@ -10357,11 +10386,13 @@ class Scheduler(
             ):
                 running_bs = len(running_batch.reqs)
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            _count_veto
+            and self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            self._pp_batch_full_setter = "no_allocatable_reqs_gate"
             self._admission_decline_note = (
                 f"gate=no_allocatable_reqs(running_bs={running_bs})"
             )
@@ -10964,6 +10995,7 @@ class Scheduler(
 
             _pp_parked_priority(self)
 
+        self._pp_batch_full_at_loop_entry = bool(running_batch.batch_is_full)
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # #988 A REQUEST ALREADY COLLECTED THIS PASS IS NOT A CANDIDATE.
@@ -11009,17 +11041,29 @@ class Scheduler(
             # beside the "#cached-token 0 vs 16384" the order arm explains.
             # MIN, so this can only stop EARLIER than the local number would:
             # admit fewer, never more.
-            if len(adder.can_run_list) >= self._uniform_allocatable_reqs(
-                running_bs, _head_inputs
-            ):
+            #
+            # #1153: NOT ON A FORWARDED SCHEDULE. Below PP0 this arm is a
+            # downstream admission verdict on PP0's decision (the 0902
+            # specimen: it bound at 1 on PP1 while PP0 admitted 2, and the
+            # refusal that detected it was answered with a void). The
+            # follower seats the told rids; `add_one_req` and the pools
+            # refuse physically, the membership check turns that into a
+            # STOP. See `rank_local_count_veto_applies`.
+            if _count_veto and len(
+                adder.can_run_list
+            ) >= self._uniform_allocatable_reqs(running_bs, _head_inputs):
                 running_batch.batch_is_full = True
+                self._pp_batch_full_setter = "count_arm"
+            _disagg_full = False
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     running_batch.batch_is_full = True
+                    self._pp_batch_full_setter = "disagg_prefill_r2t_avail"
+                    _disagg_full = True
 
-            if running_batch.batch_is_full:
+            if running_batch.batch_is_full and (_count_veto or _disagg_full):
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req, self.server_args
                 ):
@@ -11458,6 +11502,8 @@ class Scheduler(
                         )
                     else:
                         running_batch.batch_is_full = True
+                    if running_batch.batch_is_full:
+                        self._pp_batch_full_setter = "add_one_req_NO_TOKEN"
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -11547,6 +11593,12 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        # #1153: what this loop REACHED, recorded before any of the three
+        # refusal raises below so the group-STOP line can name it.
+        self._pp_admission_reached_rids = tuple(
+            str(getattr(r, "rid", "?")) for r in adder.can_run_list
+        )
 
         if schedule_refusal is not None:
             # #971: the refusal path must leave the skip census readable.

@@ -264,14 +264,114 @@ UNRESOLVED_DEFER_CAP = 3
 class PPScheduleRefused(Exception):
     """#791 CORE: this rank cannot EXECUTE the forwarded pass geometry.
 
-    Raised out of the admission adder and caught by the scheduler, which
-    voids the pass through #797's existing machinery. It is deliberately an
-    exception and not a return code: every `AddReqResult` a caller can return
-    means "build a batch without this request", and building a batch without a
-    request the upstream already launched hidden states for is precisely the
-    corruption this refusal exists to prevent. There is no narrower batch to
-    fall back to.
+    Raised out of the admission adder and caught by the scheduler. It is
+    deliberately an exception and not a return code: every `AddReqResult` a
+    caller can return means "build a batch without this request", and
+    building a batch without a request the upstream already launched hidden
+    states for is precisely the corruption this refusal exists to prevent.
+    There is no narrower batch to fall back to.
+
+    #1153: AND THERE IS NO VOID TO FALL BACK TO EITHER. The scheduler's
+    funnel (`Scheduler.get_new_batch_prefill`) used to answer this refusal
+    with `_pp_refuse_forwarded_schedule`, a rank-local compensation that set
+    `_pp_admission_pass_voided`, nulled this rank's slot and sent no proxy
+    while PP0's slot stayed set -- nothing carried the void upstream, so PP0
+    consumed the next real output under this slot's label and was one output
+    ahead of the last rank for the rest of the boot (boot_855_weg1b2, log
+    65000-65119). A detected rank disagreement is a group STOP
+    (RAENGE-NIE-UNEINS): the funnel re-raises this as a RuntimeError whose
+    message is `FORWARDED_SCHEDULE_STOP_FORMAT`.
     """
+
+
+#: #1153: the STOP line, formatted by `forwarded_schedule_stop_message`. The
+#: prefix is what a boot-log acceptance grep anchors on; the fields after it
+#: are the count-arm inputs at the moment of refusal, so the trigger of a
+#: refusal is diagnosable from ONE boot (the 0902 specimen's trigger was
+#: not: the refusal line quoted only the rid counts).
+FORWARDED_SCHEDULE_STOP_PREFIX = "#791 FORWARDED SCHEDULE UNEXECUTABLE STOP"
+FORWARDED_SCHEDULE_STOP_FORMAT = (
+    FORWARDED_SCHEDULE_STOP_PREFIX + " rank={rank} slot={slot} told=[{told}] "
+    "reached=[{reached}] census={census} local={local} limiter={limiter} "
+    "running_bs={running_bs} parked={parked} r2t_avail={r2t_avail} "
+    "headroom={headroom} group_limit={group_limit} "
+    "batch_full_setter={batch_full_setter} "
+    "batch_full_at_loop_entry={batch_full_at_loop_entry}: {refusal}"
+)
+
+
+def forwarded_schedule_stop_message(
+    *,
+    rank,
+    slot,
+    told,
+    reached,
+    census,
+    local,
+    limiter,
+    running_bs,
+    parked,
+    r2t_avail,
+    headroom,
+    group_limit,
+    batch_full_setter,
+    batch_full_at_loop_entry,
+    refusal,
+) -> str:
+    """#1153: the group-STOP line for a refused forwarded schedule.
+
+    Pure formatting: every value arrives already read (or already `n/a`),
+    so a probe that cannot be read on some stand-in can never mask the
+    stop. `told` and `reached` are iterables of rids, rendered sorted so two
+    ranks' lines are comparable byte for byte.
+    """
+
+    def _rids(xs) -> str:
+        if xs is None:
+            return "n/a"
+        try:
+            return ",".join(sorted(str(x) for x in xs))
+        except Exception:  # noqa: BLE001 - a probe may never mask the stop
+            return "n/a"
+
+    return FORWARDED_SCHEDULE_STOP_FORMAT.format(
+        rank=rank,
+        slot=slot,
+        told=_rids(told),
+        reached=_rids(reached),
+        census=census if census is not None else "n/a",
+        local=local,
+        limiter=limiter,
+        running_bs=running_bs,
+        parked=parked,
+        r2t_avail=r2t_avail,
+        headroom=headroom,
+        group_limit=group_limit,
+        batch_full_setter=batch_full_setter if batch_full_setter else "none",
+        batch_full_at_loop_entry=batch_full_at_loop_entry,
+        refusal=refusal,
+    )
+
+
+def rank_local_count_veto_applies(scheduled_extents) -> bool:
+    """#1153 (PP0 order): does this pass's admission loop own its seat count?
+
+    True on every rank that owns its admission truth -- PP0, and every boot
+    with `pp_size <= 1` -- where `scheduled_extents` is None (see
+    `Scheduler._pp_scheduled_extents`), and on a forwarded pass that names
+    nothing (`{}`: there is nothing to seat, the veto is moot either way).
+
+    False on a FORWARDED schedule: a rank > 0 executing PP0's decision seats
+    the told rids in told order. Its own `get_num_allocatable_reqs` (the
+    #823 count arm, `batch_is_full`, `batch_full_break`) is a downstream
+    admission verdict on PP0's decision -- the 0902 specimen: PP1's count arm
+    bound at 1 while PP0 admitted 2, and the refusal that detected it was
+    answered with a void. If the physical allocator truly cannot seat a told
+    rid, `add_one_req` returns NO_TOKEN, the membership check raises
+    `PPScheduleRefused`, and the funnel STOPs the group naming the allocator
+    numbers -- never a silent skip.
+    """
+    return not scheduled_extents
 
 
 #: #987: the widest fill divergence a decision may carry across the seam.

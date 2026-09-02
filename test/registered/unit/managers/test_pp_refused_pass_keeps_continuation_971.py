@@ -1,5 +1,26 @@
 """#971: a REFUSED PP pass must re-home the chunked continuation it borrowed.
 
+#1153 WITHDRAWAL (2026-09-02), read this before the rest of the docstring:
+the junction this file was written around, `_pp_refuse_forwarded_schedule`,
+is DELETED. A follower's refusal of a forwarded schedule is a detected rank
+disagreement, and a detected rank disagreement is a group STOP
+(RAENGE-NIE-UNEINS) -- the funnel now re-raises `PPScheduleRefused` as a
+RuntimeError (`#791 FORWARDED SCHEDULE UNEXECUTABLE STOP ...`, see
+test_pp_forwarded_refusal_stop_1153) and the process ends the group. The
+void the junction performed (`_pp_admission_pass_voided = True`, emptied
+decision dicts) nulled ONE rank's slot while PP0's stayed set and nothing
+carried it upstream; PP0 then consumed the last rank's next output under
+this slot's label and stayed one output ahead for the rest of the boot
+(boot_855_weg1b2, log 65000-65119). The #971 re-home was a repair inside
+that compensation layer: with no process left to continue, there is nothing
+to re-home, and the arms below that pinned the restore are INVERTED to pin
+its absence -- each keeps its name and says what it now asserts. The
+handover facts (arm 0), the sibling park sites and the skip census remain
+true and remain pinned unchanged.
+
+THE ORIGINAL #971 TEXT FOLLOWS, kept as the record of why the junction had
+the shape it had.
+
 THE SPECIMEN, boot 1 of window-flip-0828: a 512-void livelock that ran until
 the #801-spin guard killed the boot.
 
@@ -251,6 +272,9 @@ def _holder(chunked_req, *, ring_shape="list", amended=True):
         _pp_output_expected_incoming=False,
         _pp_live_mb_id=MB_ID,
         _admission_decline_note=None,
+        # #1153: the forwarded extents `_pp_scheduled_extents` reads, as
+        # `_pp_reconcile_incoming_admission` would have set them.
+        _pp_admission_incoming_schedule={RID_UNREACHED: (0, 64)},
         noted_expectations=[],
     )
 
@@ -287,9 +311,11 @@ def _holder(chunked_req, *, ring_shape="list", amended=True):
         h.noted_expectations.append((mb_id, expected))
     )
     h._trace_pp_admission_verdict = lambda ret: None
-    h._pp_refuse_forwarded_schedule = types.MethodType(
-        Scheduler._pp_refuse_forwarded_schedule, h
+    # #1153: the junction is deleted; the funnel raises through this instead.
+    h._pp_forwarded_schedule_stop = types.MethodType(
+        Scheduler._pp_forwarded_schedule_stop, h
     )
+    h._pp_scheduled_extents = types.MethodType(Scheduler._pp_scheduled_extents, h)
     h.get_new_batch_prefill = types.MethodType(Scheduler.get_new_batch_prefill, h)
     return h
 
@@ -329,8 +355,14 @@ def _refused_pass(h):
         )
 
     h._get_new_batch_prefill_raw = _raw
-    plan = h.get_new_batch_prefill(running_batch=h.running_batch)
-    return plan, captured
+    # #1153: the funnel no longer returns a plan for a refused pass; it
+    # raises the group STOP. The exception is handed back where the plan
+    # used to be, so every arm below reads the same tuple shape.
+    try:
+        h.get_new_batch_prefill(running_batch=h.running_batch)
+    except RuntimeError as stop:
+        return stop, captured
+    raise AssertionError("#1153: a refused forwarded schedule must STOP")
 
 
 def _locations(h):
@@ -420,220 +452,135 @@ class TheSiblingVoidSitesAreUnchanged(unittest.TestCase):
 
 
 class ARefusedPassKeepsTheChunkedContinuation(unittest.TestCase):
-    """ARM 1 -- THE LOSS, through the real funnel and the real junction."""
+    """ARM 1 -- INVERTED by #1153. Was: 'the pass is refused and voided, and
+    the continuation is restored to `self.chunked_req`'. Now: the pass is
+    refused and the group STOPS; nothing is voided and nothing is restored,
+    because no rank continues from a pass the group could not agree on."""
 
     def test_the_pass_is_refused_and_voided(self):
-        """The harness really reaches the defect, before anything is asserted
-        about the repair."""
+        """INVERTED (#1153): refused and STOPPED, not voided."""
         h = _holder(_real_req())
-        plan, captured = _refused_pass(h)
+        stop, captured = _refused_pass(h)
         self.assertTrue(captured["handed_over"], "the handover really happened")
-        self.assertIsNone(plan.batch_to_run, "a refused pass builds no batch")
-        self.assertTrue(h._pp_admission_pass_voided, "and it voids the pass")
-        self.assertEqual(h._pp_admission_incoming_schedule, {})
+        self.assertIsInstance(stop, RuntimeError)
+        self.assertTrue(
+            str(stop).startswith("#791 FORWARDED SCHEDULE UNEXECUTABLE STOP"),
+            str(stop),
+        )
+        self.assertIn(f"told=[{RID_UNREACHED}]", str(stop))
+        self.assertFalse(
+            getattr(h, "_pp_admission_pass_voided", False),
+            "#1153 withdrawal: the void flag is never written by the funnel",
+        )
+        self.assertNotEqual(
+            h._pp_admission_incoming_schedule,
+            {},
+            "#1153 withdrawal: the decision dicts are not emptied",
+        )
 
     def test_it_is_restored_to_scheduler_owned_state_not_merely_findable(self):
-        """`self.chunked_req` specifically -- the slot ring alone is not a
-        home. `add_chunked_req` re-admits the continuation from
-        `self.chunked_req` directly, so a request reachable only through the
-        ring is still one the next round will not continue."""
+        """INVERTED (#1153): there is no restore. The handover left the
+        continuation adder-owned and the STOP leaves it there -- the process
+        ends; `self.chunked_req` is not re-homed by the funnel."""
         req = _real_req()
         h = _holder(req)
         _refused_pass(h)
-        self.assertIs(
+        self.assertIsNone(
             h.chunked_req,
-            req,
-            "the next round continues `self.chunked_req`; nothing else",
+            "#1153: the funnel performs no re-home; a STOP has no next round",
         )
 
 
 class TheRestoredChunkIsParked(unittest.TestCase):
-    """ARM 2 -- GEOMETRY. Restoring the request without parking its range
-    would leave the next round caching a chunk that never executed."""
+    """ARM 2 -- INVERTED by #1153. Was: the restored request's geometry is
+    parked so the next round does not cache a never-run chunk. Now: there is
+    no next round and no restore, so the geometry is left exactly as the
+    handover wrote it -- the STOP touches no request."""
 
     def test_extend_range_survives_the_refusal(self):
-        """instr19's crash is the other direction of this same field: a
-        restore that nulls `extend_range` makes the next round dereference
-        `self.chunked_req.extend_range.end` on None."""
+        """INVERTED (#1153): the funnel does not touch the request at all,
+        so the never-run range written by the handover is still on it."""
         h = _holder(_real_req())
-        _refused_pass(h)
-        self.assertIsNotNone(h.chunked_req.extend_range)
+        _, captured = _refused_pass(h)
+        (req,) = captured["can_run_list"]
+        self.assertIsNotNone(req.extend_range)
+        self.assertEqual(req.extend_range.start, PREFIX_DONE)
+        self.assertEqual(req.extend_range.end, TOTAL_FILL)
 
     def test_the_never_run_chunk_is_parked_so_the_next_stash_is_a_no_op(self):
-        """THE PARK, and why the restore is incomplete without it.
-
-        `add_chunked_req` already wrote `extend_range=(8192, 8422)` for a
-        chunk no rank will run. The next round's stash site is
-        UNCONDITIONAL -- `if self.chunked_req.extend_range.end >
-        len(self.chunked_req.prefix_indices): self.stash_chunked_request(...)`
-        -- so an unparked restore caches a chunk that never executed. The
-        parked shape is the one that site already documents as its own no-op.
-        """
+        """INVERTED (#1153): nothing is parked, because the park was part of
+        the restore and the restore is withdrawn with the junction."""
         h = _holder(_real_req())
-        _refused_pass(h)
-        req = h.chunked_req
-        self.assertEqual(
-            req.extend_range.end,
-            len(req.prefix_indices),
-            "parked: `extend_range.end == len(prefix_indices)`, which is "
-            "exactly the state the stash site no-ops on",
-        )
-        self.assertFalse(
-            req.extend_range.end > len(req.prefix_indices),
-            "the next round's unconditional stash must not fire on a chunk "
-            "that never ran",
-        )
+        _, captured = _refused_pass(h)
+        (req,) = captured["can_run_list"]
+        self.assertNotEqual(req.extend_range.end, PREFIX_DONE, "not parked")
+        self.assertEqual(req.inflight_middle_chunks, 1, "not given back")
 
 
 class TheRefusalDiscardsNoTokens(unittest.TestCase):
-    """ARM 5 -- ACCOUNTING. Kein-Doppel-Prefill: this junction must cost zero
-    prefilled tokens. The status quo cost all 8192."""
+    """ARM 3 -- kept under #1153 with its meaning sharpened: a STOP releases
+    NOTHING. The refused pass allocated nothing, so the funnel must not free
+    KV rows, req slots or tree handles on its way out -- a release here would
+    be a second give-back on another pass's pages, exactly the hazard the
+    old `pass_allocated=False` park avoided, now avoided by doing nothing."""
 
     def test_nothing_is_released_because_this_pass_allocated_nothing(self):
-        """NO KV RELEASE AT ALL on this path, and that is the exact opposite
-        of what the sibling void sites owe.
-
-        Every pre-#971 caller of `_park_chunked_prefill_chunk` undoes a pass
-        whose batch was BUILT: `prepare_for_extend` allocated the chunk's rows,
-        so freeing `req_to_token[.., 8192:8422]` returns pages that pass really
-        took. A REFUSED pass is raised above that allocation -- the membership
-        check fires before the batch is ever constructed -- so those columns
-        still hold STALE pointers belonging to whatever request last occupied
-        them. Freeing them would be the "double free, not a leak" the park's
-        own docstring warns about, committed against a third party.
-
-        So the refusal path takes the geometry park and neither give-back.
-        """
         h = _holder(_real_req())
         _refused_pass(h)
-        self.assertEqual(
-            h.token_to_kv_pool_allocator.freed,
-            [],
-            "a pass that allocated nothing may release nothing -- the "
-            "[8192:8422] columns were never this pass's to give back",
-        )
-        self.assertEqual(
-            h.req_to_token_pool.freed_req, [], "and no req-pool row is freed"
-        )
+        self.assertEqual(h.token_to_kv_pool_allocator.freed, [])
+        self.assertEqual(h.req_to_token_pool.freed_req, [])
 
     def test_the_prefix_the_request_keeps_is_the_full_cached_prefix(self):
         h = _holder(_real_req())
-        _refused_pass(h)
-        self.assertEqual(
-            len(h.chunked_req.prefix_indices),
-            PREFIX_DONE,
-            "zero tokens lost: the continuation resumes from 8192, not 0",
-        )
+        _, captured = _refused_pass(h)
+        (req,) = captured["can_run_list"]
+        self.assertEqual(len(req.prefix_indices), PREFIX_DONE)
 
     def test_the_request_is_not_retracted_and_keeps_its_tree_handles(self):
-        """A void is a PARK, not a retraction (#797b). `reset_for_retract`
-        would throw away `prefix_indices` and `last_node` -- the handles every
-        already-stashed chunk is held by."""
         h = _holder(_real_req())
-        _refused_pass(h)
-        self.assertEqual(h.chunked_req.last_node, "node")
-        self.assertFalse(getattr(h.chunked_req, "is_retracted", False))
+        _, captured = _refused_pass(h)
+        (req,) = captured["can_run_list"]
+        self.assertEqual(req.last_node, "node")
+        self.assertFalse(getattr(req, "is_retracted", False))
 
     def test_the_inflight_count_is_left_exactly_as_it_was(self):
-        """NO give-back either, because no increment was taken.
-
-        `self.chunked_req.inflight_middle_chunks += 1` lives in
-        `_get_new_batch_prefill_raw` BELOW the membership raise, so a refused
-        pass never took it. Decrementing here would be the mirror of the leak
-        the park exists to prevent: the park's own docstring calls a leaked
-        increment "a request that can never report finished", and a spurious
-        give-back is a request that reports finished while a chunk is still
-        owed. The count belongs to the round that really took it.
-        """
         h = _holder(_real_req())
-        _refused_pass(h)
-        self.assertEqual(
-            h.chunked_req.inflight_middle_chunks,
-            1,
-            "unchanged: this pass never incremented it, so it owes nothing",
-        )
+        _, captured = _refused_pass(h)
+        (req,) = captured["can_run_list"]
+        self.assertEqual(req.inflight_middle_chunks, 1)
 
 
 class TheRestoreIsWhatMakesTheGreen(unittest.TestCase):
-    """ARM 3 -- THE CAN-FAIL PROOF, and the reason the arms above are worth
-    reading.
-
-    ONE return value is neutered, through `scheduler_pp_mixin`'s own module
-    globals and in the idiom this directory already uses for
-    `pp_void_keeps_request`: `pp_rehome_refused_chunked_req` becomes a no-op,
-    which is EXACTLY the behaviour that shipped before it existed. Everything
-    else still runs its own body -- the pre-admission snapshot is still
-    written, the real adder still performs the handover, the real junction
-    still voids the pass. A wholesale revert would fail somewhere in the
-    harness and prove nothing.
-    """
-
-    def _blinded_pass(self, h):
-        from sglang.srt.managers import scheduler_pp_mixin as m
-
-        original = getattr(m, "pp_rehome_refused_chunked_req", None)
-        self.assertIsNotNone(
-            original,
-            "#971's restore must be a module-global in `scheduler_pp_mixin`, "
-            "so that a can-fail proof can neuter THAT ONE return value "
-            "without reverting the harness with it",
-        )
-        m.pp_rehome_refused_chunked_req = lambda scheduler, mb_id: False
-        try:
-            return _refused_pass(h)
-        finally:
-            m.pp_rehome_refused_chunked_req = original
+    """ARM 4 -- INVERTED by #1153. Was: neutering the restore turns arms 1
+    and 2 red, proving the green came from the restore. Now: the restore
+    does not exist in the shipped funnel, and THAT is what is pinned --
+    a future re-insertion of any re-home into the refusal path is red here."""
 
     def test_arm1_fails_when_only_the_restore_is_neutered(self):
-        req = _real_req()
-        h = _holder(req)
-        self._blinded_pass(h)
-        self.assertIsNone(
-            h.chunked_req,
-            "ARM 1's decisive assertion must FAIL without the restore -- "
-            "otherwise its green is the harness's, not the product's",
-        )
+        """INVERTED (#1153): there is no restore to neuter. The funnel and
+        the STOP builder reference no re-home and no void."""
+        funnel = inspect.getsource(Scheduler.get_new_batch_prefill)
+        stop = inspect.getsource(Scheduler._pp_forwarded_schedule_stop)
+        for src in (funnel, stop):
+            self.assertNotIn("pp_rehome_refused_chunked_req", src)
+            self.assertNotIn("_park_chunked_prefill_chunk", src)
+            self.assertNotIn("_pp_admission_pass_voided = True", src)
+            self.assertNotIn("void_pp_admission_decision(", src)
 
     def test_the_slot_ring_alone_is_not_a_home(self):
-        """THE TWO FIXES ARE NOT SUBSTITUTES, and this measures the seam.
-
-        With the restore neutered, the sibling fix (`pp_request_locations`
-        reading the production LIST ring) still resolves the rid -- the
-        pre-admission snapshot is in the ring, and that is a real gain: the
-        #943b re-issue and the dead-premise sweep can now nominate the
-        request where before they saw nothing.
-
-        It is NOT the repair. `add_chunked_req` re-admits the continuation
-        from `self.chunked_req` DIRECTLY, and the ring slot is overwritten
-        every pass by `_pp_note_chunked_req_before_admission`. So a request
-        reachable only through the ring is visible and still not continued --
-        findable is not continuable. Only the restore puts it back where the
-        next round will act on it.
-        """
+        """INVERTED (#1153): the ring is not consulted by the funnel at all;
+        a refused pass leaves the ring untouched and stops."""
         req = _real_req()
-        h = _holder(req)
-        self._blinded_pass(h)
-        self.assertIn(
-            RID_CHUNKED,
-            _locations(h),
-            "the sibling fix alone makes the request VISIBLE",
-        )
-        self.assertIsNone(
-            h.chunked_req,
-            "and visible is not restored -- the next round continues "
-            "`self.chunked_req`, which is still None",
-        )
+        h = _holder(req, ring_shape="list")
+        before = list(h._pp_chunked_req_before_by_slot)
+        _refused_pass(h)
+        self.assertEqual(h._pp_chunked_req_before_by_slot, before)
+        self.assertIsNone(h.chunked_req)
 
     def test_arm2_fails_when_only_the_restore_is_neutered(self):
-        req = _real_req()
-        h = _holder(req)
-        self._blinded_pass(h)
-        self.assertEqual(
-            req.extend_range.end,
-            TOTAL_FILL,
-            "blinded, the never-run chunk stays unparked on the request and "
-            "the next round's unconditional stash would cache it",
-        )
+        """INVERTED (#1153): the junction the neuter targeted is deleted
+        from the shipped class."""
+        self.assertFalse(hasattr(Scheduler, "_pp_refuse_forwarded_schedule"))
 
 
 class TheSlotRingIsReadInItsProductionShape(unittest.TestCase):
@@ -796,13 +743,16 @@ class TheHarnessMatchesProduction(unittest.TestCase):
             )
 
     def test_the_funnel_routes_every_refusal_through_the_one_junction(self):
+        """INVERTED (#1153): the one junction is now the one STOP. Every
+        `PPScheduleRefused` raise site still funnels through the single
+        `except`, and that `except` raises the group STOP."""
         funnel = inspect.getsource(Scheduler.get_new_batch_prefill)
         self.assertIn("except PPScheduleRefused", funnel)
+        self.assertNotIn("self._pp_refuse_forwarded_schedule(refusal)", funnel)
         self.assertIn(
-            "self._pp_refuse_forwarded_schedule(refusal)",
+            "raise self._pp_forwarded_schedule_stop(refusal) from refusal",
             funnel,
-            "ONE junction is what makes one restore sufficient for all three "
-            "raise sites",
+            "ONE junction is what makes one STOP sufficient for all three raise sites",
         )
 
 

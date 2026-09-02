@@ -4417,8 +4417,10 @@ class SchedulerPPMixin:
                         _row_skip_plan = True
                 if _row_skip_plan:
                     # No frame, no pass: the slot is empty by construction
-                    # and `running_batch` keeps the loop-top value.
-                    self.mbs[mb_id] = None
+                    # and `running_batch` keeps the loop-top value -- unless
+                    # this rank still owes itself a result on the slot
+                    # (#1020 guard, #1153 sibling sweep).
+                    self._pp_null_frameless_slot(mb_id)
                     pp_bulletin.clear_after_plan(self)
                 elif _pre_proxy is not None:
                     _dn2 = getattr(self, "_pp_row_deliver_trace_n", 0)
@@ -8862,6 +8864,60 @@ class SchedulerPPMixin:
         """
         return order_batch_by_schedule(reqs, schedule)
 
+    def _pp_slot_holds_unconsumed_launch(
+        self: Scheduler, mb_id: int, site: str
+    ) -> bool:
+        """#1020 / #1153: the ONE guard against nulling a launched slot.
+
+        True iff `mb_id` holds a pass THIS rank launched whose result has not
+        been consumed yet (`_pp_launched_pending`, written at the launch
+        junction, cleared by `_pp_process_batch_result`). Such a slot is not
+        idle and must not be vacated: a count that keeps growing for one
+        slot means the result never arrives -- a delivery defect -- and this
+        refusal keeps it visible instead of erasing the evidence with the
+        batch. Emits the named `#1020 VOID REFUSED ON A LAUNCHED SLOT` line
+        (bounded) and returns True; the caller leaves the slot alone.
+
+        #1153 (sibling sweep): the guard used to live inline in
+        `_pp_void_own_batch` only, so the row-authority `_row_skip_plan`
+        branch of `_event_loop_pp_body` nulled a slot with no frame WITHOUT
+        it -- a launched slot could be vacated on one rank silently, the
+        same class as the #791 void this ticket deletes. Both sites now call
+        this one predicate, with `site` naming the caller in the line.
+        """
+        if mb_id not in getattr(self, "_pp_launched_pending", ()):
+            return False
+        self._1020_refused = getattr(self, "_1020_refused", 0) + 1
+        if self._1020_refused <= 3 or self._1020_refused % 512 == 0:
+            logger.warning(
+                "#1020 VOID REFUSED ON A LAUNCHED SLOT: mb_id=%s holds a "
+                "pass this rank launched whose result has not been "
+                "consumed yet, so it is not idle and must not be vacated "
+                "(occurrence=%d, site=%s). A count that keeps growing for "
+                "one slot means the result never arrives -- that is a "
+                "delivery defect, and this refusal keeps it visible instead "
+                "of erasing the evidence with the batch.",
+                mb_id,
+                self._1020_refused,
+                site,
+            )
+        return True
+
+    def _pp_null_frameless_slot(self: Scheduler, mb_id: int) -> bool:
+        """#1153: the `_row_skip_plan` exit -- no upstream frame, no pass.
+
+        The slot is empty by construction on a pass the upstream posted
+        nothing for, UNLESS this rank still owes itself the result of a
+        pass it launched on that slot: then the #1020 guard refuses the
+        null (same named line as the void path) and the slot keeps its
+        batch, so the outstanding launch stays visible rather than being
+        vacated on one rank silently. True iff the slot was nulled.
+        """
+        if self._pp_slot_holds_unconsumed_launch(mb_id, "row_skip_plan"):
+            return False
+        self.mbs[mb_id] = None
+        return True
+
     def _pp_void_own_batch(self: Scheduler, mb_id: int) -> bool:
         """#797d: THIS rank's own voided pass must build nothing for `mb_id`,
         even when `get_next_batch_to_run` still handed back a batch.
@@ -8966,20 +9022,7 @@ class SchedulerPPMixin:
         # #1009 keep reporting exactly what they see, and the leak checker is
         # untouched. What changes is that "void" stops meaning "discard a pass
         # I myself launched and am still owed a result for".
-        if mb_id in getattr(self, "_pp_launched_pending", ()):
-            self._1020_refused = getattr(self, "_1020_refused", 0) + 1
-            if self._1020_refused <= 3 or self._1020_refused % 512 == 0:
-                logger.warning(
-                    "#1020 VOID REFUSED ON A LAUNCHED SLOT: mb_id=%s holds a "
-                    "pass this rank launched whose result has not been "
-                    "consumed yet, so it is not idle and must not be vacated "
-                    "(occurrence=%d). A count that keeps growing for one slot "
-                    "means the result never arrives -- that is a delivery "
-                    "defect, and this refusal keeps it visible instead of "
-                    "erasing the evidence with the batch.",
-                    mb_id,
-                    self._1020_refused,
-                )
+        if self._pp_slot_holds_unconsumed_launch(mb_id, "void_own_batch"):
             return False
         self.mbs[mb_id] = None
         if mb_id < len(self.mb_metadata):
@@ -9328,6 +9371,21 @@ class SchedulerPPMixin:
         # arranges them, so that what this rank FORWARDS names the same empty
         # pass its own batch now is. Set before `_pp_void_own_batch` below so
         # the clearing runs under the same flag the #797 path sets.
+        #
+        # #1153 SIBLING SWEEP -- THIS WRITER CANNOT FIRE, on a slot PP0
+        # launched or on any other. This method returns at its first
+        # statement whenever `pp_upstream_void_pending(self)` is False, and
+        # that predicate returns False on EVERY path: its four early exits
+        # and its final `return False` (scheduler_pp_mixin.py, the body of
+        # `pp_upstream_void_pending`; the docstring there records why --
+        # `_pp_upstream_launched_incoming` lost its only writer when #1015
+        # deleted the decision wire, so the fact it answered no longer
+        # exists). The #791 writer of the same flag in scheduler.py, which
+        # DID fire (boot_855_weg1b2 log 65000-65004), is deleted by #1153;
+        # this one is left standing with the proof rather than swept blind,
+        # because the #801-spin bound above it is the only remaining reader
+        # of the idle-void streak and the whole method is a deletion
+        # candidate for the sweep that removes the streak with it.
         self._pp_admission_pass_voided = True
         self._pp_admission_incoming_effective = {}
         amended = getattr(self, "_pp_admission_amended_to_forward", None)
