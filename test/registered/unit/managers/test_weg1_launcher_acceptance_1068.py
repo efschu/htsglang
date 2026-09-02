@@ -1,7 +1,23 @@
-"""#1068 WEG 1 slice 5 (+fix): the launcher sizes the host pools from the
-in-tree demand formula, refuses instead of falling back, proves its export,
-refuses a tree without the contract; the acceptance can fail per re-admitted
-rid; every line it greps exists.
+"""#1068 WEG 1 slice 5 (+fix, +fix 2): the launcher sizes the host pools from
+the in-tree demand formula, refuses instead of falling back, proves its
+export, refuses a tree without the contract; the acceptance can fail per
+re-admitted rid, on a 0-process deadman proof and at the host floor; every
+line it greps exists.
+
+FIX 2 (round-2 review, 2026-09-02). (a) BLOCKING: the A10 term 'deadman
+pgrep proof: 0 process(es) -- unwatched boot' was pinned by no arm (mutant
+R3 `elif P.deadman < 1` -> `< 0` survived); the selftest arm 'deadman-zero'
+pins it. (b) nb1: a negative knob sized the pool silently wrong at rc 0
+(WEG1_QUEUE_DEPTH=-100 -> S_demand=-58 GB, the launcher would have composed
+'--hicache-size -58'); every knob and every config flag is validated BY NAME
+as a positive term (queue depth: >= 0, a zero queue is a configuration
+someone chose; see the module) and refused with rc 2. (c) nb2: A10 compared
+host free against the literal 16 while the floor is 16 GiB = 17.18 GB; the
+acceptance now reads FLOOR_BYTES from the IN-TREE module of the tree that
+booted (--tree / WEG1_TREE / the log's own 'tree :' header), and the L8
+emitter prints the floor through the module's ONE rendering, '16 GiB (17.18
+GB)', with the host-free term in the unit it claims (MemAvailable in GB; the
+old `free -g` value was GiB floored under a GB label).
 
 THE LAW. WEG1_BUILD_SPEC_0901.md section 4.6 (launcher: the HICACHE_RATIO
 fallback -- 'nobody chose this number' -- is REPLACED by
@@ -266,6 +282,102 @@ class TestTheLauncherSizesFromTheDemandFormula(CustomTestCase):
         self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
         self.assertIn("#1068 WEG1 SIZING REFUSED", p.stdout + p.stderr)
 
+    def test_a_non_positive_knob_is_a_refusal_naming_the_knob_and_its_value(self):
+        """Fix 2 (b), nb1: WEG1_QUEUE_DEPTH=-100 sized S_demand=-58 GB at rc 0
+        and the launcher would have composed '--hicache-size -58'. Every knob
+        refuses BY NAME with rc 2, the refusal line names knob and value, and
+        NO machine line is printed (a mutant that drops one validation goes
+        red on that knob)."""
+        env_base = dict(
+            os.environ, WEG1_MEMAVAIL_GB="119", WEG1_CELL_PP0_BYTES="16384",
+            PYTHONPATH=str(TREE / "python"),
+        )
+        argv = [PY, "-m", MODULE, "--max-running-requests", "8",
+                "--chunked-prefill-size", "4096", "--ranks", "3"]
+        knobs = {
+            "WEG1_QUEUE_DEPTH": "-100",
+            "WEG1_PROMPT_MAX_TOKENS": "0",
+            "WEG1_CELL_PP0_BYTES": "-16384",
+            "WEG1_MEMAVAIL_GB": "-119",
+            "WEG1_MAMBA_HOST_MIB": "0",
+            "WEG1_PER_SLOT_RANK0_MIB": "-37.41",
+            "WEG1_DEVICE_SLOTS": "-20",
+        }
+        for name, value in knobs.items():
+            env = dict(env_base)
+            env[name] = value
+            p = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120)
+            out = p.stdout + p.stderr
+            self.assertEqual(p.returncode, 2, f"{name}={value}: {out}")
+            line = [ln for ln in out.splitlines() if ln.startswith("#1068 WEG1 SIZING REFUSED")]
+            self.assertEqual(len(line), 1, f"{name}={value}: {out}")
+            self.assertIn(f"{name}={value!r}", line[0])
+            self.assertNotIn("WEG1_S_GB=", out, f"{name}={value}: machine line after a refusal")
+            self.assertNotIn("WEG1_M_MIB=", out)
+            self.assertNotIn("#1068 WEG1 DEMAND", out)
+        # The config flags are terms of the same formula and refuse the same way.
+        for flag, value in (("--max-running-requests", "0"), ("--chunked-prefill-size", "-1"), ("--ranks", "0")):
+            a2 = list(argv)
+            a2[a2.index(flag) + 1] = value
+            p = subprocess.run(a2, env=env_base, capture_output=True, text=True, timeout=120)
+            out = p.stdout + p.stderr
+            self.assertEqual(p.returncode, 2, f"{flag} {value}: {out}")
+            self.assertIn("#1068 WEG1 SIZING REFUSED", out)
+            self.assertIn(f"{flag}={value}", out)
+            self.assertNotIn("WEG1_S_GB=", out)
+        # A finite-but-absurd float is not the same defect as a non-number:
+        # nan and inf are refused by name too.
+        for value in ("nan", "inf"):
+            env = dict(env_base, WEG1_PER_SLOT_RANK0_MIB=value)
+            p = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120)
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            self.assertIn(f"WEG1_PER_SLOT_RANK0_MIB={value!r}", p.stdout + p.stderr)
+
+    def test_the_importable_form_refuses_non_positive_terms_by_name(self):
+        m = _sizing()
+        for term, over in (
+            ("memavail_bytes", dict(memavail_bytes=-1)),
+            ("memavail_bytes", dict(memavail_bytes=0)),
+            ("n_queue", dict(n_queue=-1)),
+            ("mamba_host_mib", dict(mamba_host_mib=0)),
+            ("device_slots", dict(device_slots=0)),
+            ("cell_pp0_bytes", dict(cell_pp0_bytes=0)),
+            ("prompt_max_tokens", dict(prompt_max_tokens=-5)),
+            ("per_slot_rank0_mib", dict(per_slot_rank0_mib=0.0)),
+            ("max_running_requests", dict(max_running_requests=0)),
+            ("chunked_prefill_size", dict(chunked_prefill_size=0)),
+            ("ranks", dict(ranks=-3)),
+        ):
+            with self.assertRaises(m.SizingRefused, msg=term) as cm:
+                m.size_host_pools(**dict(BOOT2, **over))
+            msg = str(cm.exception)
+            self.assertIn("#1068 WEG1 SIZING REFUSED", msg)
+            self.assertIn(f"{term}=", msg)
+        # n_queue=0 is a configuration someone chose (residents only) and
+        # stays sized: (8 + 0 + 1) x 39365 (pinned above as well).
+        self.assertEqual(m.size_host_pools(**dict(BOOT2, n_queue=0)).demand_rows, 354285)
+
+    def test_the_floor_is_rendered_by_one_function_shared_with_the_l8_emitter(self):
+        """Fix 2 (c): '16 GiB (17.18 GB)' is rendered ONCE in the tree; the
+        sizing lines and the HOST-LEDGER emitter (phase_flip_boot.py) both
+        call it, and the emitter carries no '16 GB floor' literal."""
+        import inspect
+
+        from sglang.srt.managers import phase_flip_boot
+
+        m = _sizing()
+        self.assertEqual(m.floor_text(), "16 GiB (17.18 GB)")
+        r = m.size_host_pools(**BOOT2)
+        self.assertIn(f"floor={m.floor_text()}", "\n".join(r.lines))
+        src = inspect.getsource(phase_flip_boot.build_phase_flip_host_pools)
+        self.assertIn("floor_text", src)
+        self.assertIn("against the %s floor", src)
+        self.assertNotIn("16 GB floor", src)
+        # The host-free term is read in the unit it claims: MemAvailable
+        # bytes -> GB, not `free -g` (GiB floored) under a GB label.
+        self.assertIn("MemAvailable:", src)
+        self.assertNotIn('"free", "-g"', src)
+
     def test_the_anchor_floor_is_a_refusal(self):
         m = _sizing()
         with self.assertRaises(m.SizingRefused) as cm:
@@ -341,6 +453,17 @@ class TestTheLauncherDryRun(CustomTestCase):
         self.assertNotIn("sglang.launch_server", out)
         self.assertNotIn("hicache flags EFFECTIVE", out)
 
+    def test_a_negative_knob_composes_no_argv(self):
+        """Fix 2 (b) on the launcher: the refusal reaches the dry-run, no
+        '--hicache-size -58' is ever composed."""
+        rc, out = _dry_run(_launcher_env(WEG1_QUEUE_DEPTH="-100"))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("#1068 WEG1 SIZING REFUSED: WEG1_QUEUE_DEPTH='-100'", out)
+        self.assertIn("#1068 WEG1 SIZING REFUSED (exit 2)", out)
+        self.assertNotIn("sglang.launch_server", out)
+        self.assertNotIn("--hicache-size -", out)
+        self.assertNotIn("hicache flags EFFECTIVE", out)
+
     def test_a_sizing_without_machine_lines_stops_the_launcher(self):
         """The second refusal branch: a sizing that exits 0 but chooses no
         number is the exact defect the block exists for."""
@@ -391,7 +514,7 @@ class TestTheAcceptanceCanFail(CustomTestCase):
     def test_selftest_can_fail_per_rid_and_per_wedge_form(self):
         self.assertTrue(ACCEPT.is_file(), f"missing {ACCEPT}")
         p = subprocess.run(
-            [PY, str(ACCEPT), "--selftest"],
+            [PY, str(ACCEPT), "--selftest", "--tree", str(TREE)],
             capture_output=True, text=True, timeout=300,
         )
         out = p.stdout + p.stderr
@@ -399,6 +522,20 @@ class TestTheAcceptanceCanFail(CustomTestCase):
         self.assertIn("SELFTEST empty-log exit=1", out)
         self.assertIn("missing line", out)
         self.assertIn("SELFTEST full-log exit=0", out)
+        # Fix 2 (a), the round-2 blocking finding: the 0-process deadman
+        # proof is a FAIL that names the unwatched boot (mutant R3).
+        self.assertIn("SELFTEST deadman-zero exit=1 (want 1); A10 names unwatched boot: True", out)
+        # Fix 2 (c): the floor is the tree module's FLOOR_BYTES in the L8
+        # unit, 16 GiB = 17.18 GB, never the literal 16: 16.5 GB fails, 17.3
+        # GB passes, and the source of the number is named.
+        m = _sizing()
+        floor_txt = f"{m.FLOOR_BYTES / 2**30:.0f} GiB ({m.FLOOR_BYTES / 1e9:.2f} GB)"
+        self.assertEqual(floor_txt, "16 GiB (17.18 GB)")
+        self.assertIn(f"SELFTEST floor-under exit=1 (want 1); host free 16.50 GB < floor {floor_txt}: A10 FAIL names the floor: True", out)
+        self.assertIn(f"SELFTEST floor-over exit=0 (want 0); host free 17.30 GB >= floor {floor_txt}: A10 PASS: True", out)
+        self.assertIn(f"SELFTEST floor source: FLOOR_BYTES={m.FLOOR_BYTES} from {TREE / 'python/sglang/srt/planner/weg1_host_sizing.py'}", out)
+        self.assertIn("SELFTEST tree-from-header:", out)
+        self.assertIn("(want the selftest tree): True", out)
         # Decision 8: the follower gap is caught per rid, naming rid,
         # follower and P; A11.5 stays existential and NAMES the gap cutover.
         self.assertIn("SELFTEST follower-gap-one exit=1 (want 1); A5 FAIL names rid/follower/P: True; A11.5 verdict as expected (named, still PASS): True", out)
@@ -410,6 +547,37 @@ class TestTheAcceptanceCanFail(CustomTestCase):
             out,
         )
         self.assertIn("SELFTEST PASS", out)
+
+    def test_the_acceptance_reads_the_floor_from_the_tree_never_a_literal(self):
+        """Fix 2 (c): A10's threshold is FLOOR_BYTES of the tree that booted,
+        expressed in the L8 unit (GB); a tree without the module is a NAMED
+        refusal, and the acceptance source carries no `< 16` literal."""
+        m = _load_file(ACCEPT, "accept_weg1_1068_floor")
+        floor = m.load_tree_floor(str(TREE))
+        sizing = _sizing()
+        self.assertEqual(floor.bytes, sizing.FLOOR_BYTES)
+        self.assertAlmostEqual(floor.gb, sizing.FLOOR_BYTES / 1e9, places=6)
+        self.assertEqual(floor.text, "16 GiB (17.18 GB)")
+        self.assertIn("weg1_host_sizing.py", floor.source)
+        with tempfile.TemporaryDirectory(prefix="weg1_fake_tree_") as td:
+            root = _fake_tree(td, with_module=False, with_symbol=True)
+            with self.assertRaises(m.AcceptanceRefused) as cm:
+                m.load_tree_floor(str(root))
+            self.assertIn("#1068 WEG1 ACCEPTANCE REFUSED", str(cm.exception))
+            self.assertIn("weg1_host_sizing.py", str(cm.exception))
+        src = ACCEPT.read_text()
+        self.assertNotIn('d["host_free"] < 16', src)
+        self.assertNotIn("< 16\n", src)
+        # The tree is resolvable from the log's own header line
+        # (boot_855_train0901.sh: 'tree        : <path> @ <sha> (<branch>)').
+        with tempfile.TemporaryDirectory(prefix="weg1_hdr_") as td:
+            log = pathlib.Path(td) / "boot.log"
+            log.write_text(f"=== #855 BOOT ===\ntree        : {TREE} @ 0123456789 (feat/x)\n")
+            tree, how = m.resolve_tree(None, str(log))
+            self.assertEqual(pathlib.Path(tree), TREE)
+            self.assertIn("header", how)
+            with self.assertRaises(m.AcceptanceRefused):
+                m.resolve_tree(None, str(log.with_name("absent.log")))
 
     def test_every_grepped_line_exists_verbatim_in_the_tree(self):
         """Lesson (B): grep each anchor in python/ at HEAD; cite file:line.

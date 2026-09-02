@@ -76,6 +76,23 @@ section 11 A11.1/A11.2, both binding for slice 5):
   device_slots + max_running_requests + 1 (the in-tree anchor floor of
   phase_flip_boot.py); below it this refuses (exit 2).
 
+EVERY TERM IS VALIDATED BY NAME (slice 5 fix 2, round-2 finding nb1).
+Measured before this: WEG1_QUEUE_DEPTH=-100 gave '#1068 WEG1 DEMAND
+rows=-3582215 ... S_demand=-58 GB' and the machine line WEG1_S_GB=-58 at
+rc 0 -- a silently wrong size the launcher would have composed as
+'--hicache-size -58'. Now every knob (WEG1_QUEUE_DEPTH, WEG1_PROMPT_MAX_TOKENS,
+WEG1_CELL_PP0_BYTES, WEG1_MEMAVAIL_GB, WEG1_MAMBA_HOST_MIB,
+WEG1_PER_SLOT_RANK0_MIB, WEG1_DEVICE_SLOTS), every config flag
+(--max-running-requests, --chunked-prefill-size, --ranks) and every term of
+`size_host_pools` is refused with rc 2 and one '#1068 WEG1 SIZING REFUSED'
+line naming the knob/term and its value unless it is a positive integer
+(floats: finite and > 0). The ONE exception, chosen by name: the queue
+depth (n_queue / WEG1_QUEUE_DEPTH) may be 0 -- a load with residents and no
+queue is a configuration someone chose, (n_resident + 0 + chain_lag) is a
+well-defined demand and the slice-5 test pins it; the nb1 defect class is
+the SIGN, not the zero. chain_lag is a module constant and is checked with
+the others so a future edit cannot make it silently non-positive.
+
 UNITS, SAID ONCE. GB means 1e9 bytes (the unit of --hicache-size and of
 base.py:140), GiB means 2**30 (the unit of the floor, the reserve and the
 transient), MiB means 2**20 (the unit of --hicache-mamba-host-mib).
@@ -135,6 +152,15 @@ DEMAND_EXCEEDS_LEDGER_A123 = (
     "recompute"
 )
 REFUSED_PREFIX = "#1068 WEG1 SIZING REFUSED"
+
+
+def floor_text() -> str:
+    """The #721 floor rendered in BOTH units, ONCE: '16 GiB (17.18 GB)'. The
+    sizing TERMS/LEDGER lines print it, the HOST-LEDGER POST emitter (L8,
+    phase_flip_boot.py build_phase_flip_host_pools) prints it, and the
+    acceptance (accept_weg1_1068.py A10) reads FLOOR_BYTES from this module;
+    there is no second literal of the floor anywhere (slice 5 fix 2, nb2)."""
+    return f"{FLOOR_BYTES / GIB:.0f} GiB ({FLOOR_BYTES / GB:.2f} GB)"
 
 
 class SizingRefused(RuntimeError):
@@ -227,17 +253,31 @@ def size_host_pools(
     def p(term: str) -> str:
         return prov.get(term, "unstated")
 
-    if max_running_requests <= 0 or chunked_prefill_size <= 0 or ranks <= 0:
+    # Every term BY NAME, one refusal per bad term (fix 2, nb1): a negative or
+    # zero term does not raise anywhere downstream, it sizes the pool wrong
+    # at rc 0. n_queue is the one term allowed to be 0 (module docstring).
+    for term, value, minimum, prov_key in (
+        ("max_running_requests", max_running_requests, 1, "n_resident"),
+        ("chunked_prefill_size", chunked_prefill_size, 1, "chunked_prefill_size"),
+        ("ranks", ranks, 1, "ranks"),
+        ("memavail_bytes", memavail_bytes, 1, "memavail"),
+        ("cell_pp0_bytes", cell_pp0_bytes, 1, "cell_pp0"),
+        ("prompt_max_tokens", prompt_max_tokens, 1, "prompt_max"),
+        ("n_queue", n_queue, 0, "n_queue"),
+        ("chain_lag", CHAIN_LAG, 1, "chain_lag"),
+        ("mamba_host_mib", mamba_host_mib, 1, "m_mib"),
+        ("device_slots", device_slots, 1, "device_slots"),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise SizingRefused(
+                f"{REFUSED_PREFIX}: term {term}={value!r} must be an integer >= {minimum} "
+                f"(provenance: {p(prov_key)}); a non-positive term sizes the pool "
+                "silently wrong at rc 0 (nb1: WEG1_QUEUE_DEPTH=-100 gave S_demand=-58 GB)"
+            )
+    if not (isinstance(per_slot_rank0_mib, (int, float)) and math.isfinite(per_slot_rank0_mib) and per_slot_rank0_mib > 0):
         raise SizingRefused(
-            f"{REFUSED_PREFIX}: config terms must be positive "
-            f"(max_running_requests={max_running_requests} "
-            f"chunked_prefill_size={chunked_prefill_size} ranks={ranks})"
-        )
-    if cell_pp0_bytes <= 0 or prompt_max_tokens <= 0 or per_slot_rank0_mib <= 0:
-        raise SizingRefused(
-            f"{REFUSED_PREFIX}: rig terms must be positive "
-            f"(cell_pp0={cell_pp0_bytes} prompt_max={prompt_max_tokens} "
-            f"per_slot_rank0={per_slot_rank0_mib})"
+            f"{REFUSED_PREFIX}: term per_slot_rank0_mib={per_slot_rank0_mib!r} must be a finite "
+            f"number > 0 (provenance: {p('per_slot_rank0')})"
         )
     n_resident = int(max_running_requests)
     n_queue = int(n_queue)
@@ -261,7 +301,7 @@ def size_host_pools(
     kv_budget = cap_bytes - anchors_bytes
     s_ledger = int(math.floor(kv_budget / (KV_MULTIPLE_OF_S * GB))) if kv_budget > 0 else 0
 
-    floor_txt = f"{FLOOR_BYTES / GIB:.0f} GiB ({FLOOR_BYTES / GB:.2f} GB)"
+    floor_txt = floor_text()
     lines: list[str] = []
     lines.append(
         "#1068 WEG1 SIZING TERMS "
@@ -386,24 +426,42 @@ def size_host_pools(
     )
 
 
-def _env_int(name: str, default: int):
+# The refusal prose names the defect without quoting an argv fragment: a
+# log must not carry a fake '--hicache-size <n>' in its own sentences (#995).
+_NON_POSITIVE = (
+    "a non-positive knob sizes the pool silently wrong at rc 0 (nb1: "
+    "WEG1_QUEUE_DEPTH=-100 gave S_demand=-58 GB, a negative hicache size the "
+    "launcher would have composed); there is no fallback, fix the knob by name"
+)
+
+
+def _env_int(name: str, default: int, minimum: int = 1):
+    """An integer knob, refused BY NAME unless >= minimum (1 for every knob
+    but the queue depth, which may be 0; module docstring)."""
     v = os.environ.get(name, "")
     if v == "":
         return default, f"default ({name} unset)"
     try:
-        return int(v), f"knob {name}={v}"
+        iv = int(v)
     except ValueError as e:
         raise SizingRefused(f"{REFUSED_PREFIX}: {name}={v!r} is not an integer") from e
+    if iv < minimum:
+        raise SizingRefused(f"{REFUSED_PREFIX}: {name}={v!r} must be an integer >= {minimum}; {_NON_POSITIVE}")
+    return iv, f"knob {name}={v}"
 
 
 def _env_float(name: str, default: float):
+    """A float knob, refused BY NAME unless finite and > 0."""
     v = os.environ.get(name, "")
     if v == "":
         return default, f"default ({name} unset)"
     try:
-        return float(v), f"knob {name}={v}"
+        fv = float(v)
     except ValueError as e:
         raise SizingRefused(f"{REFUSED_PREFIX}: {name}={v!r} is not a number") from e
+    if not (math.isfinite(fv) and fv > 0):
+        raise SizingRefused(f"{REFUSED_PREFIX}: {name}={v!r} must be a finite number > 0; {_NON_POSITIVE}")
+    return fv, f"knob {name}={v}"
 
 
 def main(argv=None) -> int:
@@ -414,12 +472,21 @@ def main(argv=None) -> int:
     ap.add_argument("--prev-log", default="", help="previous boot log; cell_pp0 is read from its HOST-LEDGER POST lines when present")
     args = ap.parse_args(argv)
     try:
+        # The config flags are terms of the same formula: refused BY FLAG NAME
+        # (fix 2, nb1), before any knob is read.
+        for flag, value in (
+            ("--max-running-requests", args.max_running_requests),
+            ("--chunked-prefill-size", args.chunked_prefill_size),
+            ("--ranks", args.ranks),
+        ):
+            if value < 1:
+                raise SizingRefused(f"{REFUSED_PREFIX}: {flag}={value} must be an integer >= 1; {_NON_POSITIVE}")
         prov = {
             "n_resident": "config --max-running-requests",
             "ranks": "config --pp-size x --tp-size",
             "chunked_prefill_size": "config --chunked-prefill-size",
         }
-        n_queue, prov["n_queue"] = _env_int("WEG1_QUEUE_DEPTH", args.max_running_requests)
+        n_queue, prov["n_queue"] = _env_int("WEG1_QUEUE_DEPTH", args.max_running_requests, minimum=0)
         if "unset" in prov["n_queue"]:
             prov["n_queue"] = "default = max_running_requests (knob WEG1_QUEUE_DEPTH)"
         prompt_max, prov["prompt_max"] = _env_int("WEG1_PROMPT_MAX_TOKENS", DEFAULT_PROMPT_MAX)

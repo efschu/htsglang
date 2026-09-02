@@ -2565,16 +2565,31 @@ def build_phase_flip_host_pools(scheduler):
     # #721 HOST-LEDGER: the pin is a NAMED POST, and the floor never yields to
     # it. Printed here, at the allocation, so the number in the ledger is the
     # number that was actually taken rather than an intention.
-    try:
-        import subprocess
+    #
+    # THE HOST-FREE TERM IN THE UNIT IT CLAIMS (#1068 slice 5 fix 2, nb2):
+    # MemAvailable from /proc/meminfo in bytes, printed in GB (1e9, the unit
+    # of --hicache-size and of the sizing module). Until this fix the value
+    # was `free -g` column 'available', which procps prints in GiB floored to
+    # an integer (-g is --gibi; measured on this box: `free -g` 112 against
+    # `free --giga` 121 for the same MemAvailable), under a 'GB' label: the
+    # number sat ~7% under the unit it claimed and the acceptance's floor
+    # compare (A10) read it 1.18 GB too strict at the boundary. Same
+    # quantity, same instrument as weg1_host_sizing.read_memavail_bytes.
+    # THE FLOOR IS RENDERED BY THE SIZING MODULE, ONCE: FLOOR_BYTES (16 GiB
+    # as host_ledger_preflight.sh FLOOR_G gates it; the spec's '16 GB' is a
+    # unit slip) through floor_text() -> '16 GiB (17.18 GB)'; the acceptance
+    # reads the same constant from the tree that booted. No second literal.
+    from sglang.srt.planner.weg1_host_sizing import floor_text as _weg1_floor_text
 
-        free_g = int(
-            subprocess.run(["free", "-g"], capture_output=True, text=True)
-            .stdout.split("\n")[1]
-            .split()[6]
-        )
+    host_free_gb = None
+    try:
+        with open("/proc/meminfo") as _meminfo:
+            for _ln in _meminfo:
+                if _ln.startswith("MemAvailable:"):
+                    host_free_gb = int(_ln.split()[1]) * 1024 / 1e9
+                    break
     except Exception:  # noqa: BLE001 - the ledger must not break the boot
-        free_g = -1
+        host_free_gb = None
     # #871: the MAMBA half is a POST OF ITS OWN, priced from what was actually
     # allocated rather than from the intention. An unpriced post is the thing
     # the ledger exists to prevent, and adding a second pinned pool without
@@ -2602,7 +2617,7 @@ def build_phase_flip_host_pools(scheduler):
         "the 'tp' phase-matched host view (tp_rows=%d pp_rows=%d cell_tp=%d B "
         "cell_pp=%d B role=%s source=--hicache-size=%d rows-coupled) + MAMBA "
         "half %s (%s slots, per_slot=%.2f MiB, source=--hicache-mamba-host-mib=%d "
-        "synced_min) pools=%s host free after = %s GB against the 16 GB floor "
+        "synced_min) pools=%s host free after = %s GB against the %s floor "
         "spans_at_prompt_max=%s. This post exists so the #718 device tier stays "
         "ARMED across the cutover; without it load() returns None for the whole "
         "TP phase and every read-through misses. The POST is refused if it does "
@@ -2629,7 +2644,8 @@ def build_phase_flip_host_pools(scheduler):
         # boot -- reporting "unknown" is the honest answer when the shape is
         # not there.
         sorted(str(n) for n in (getattr(tp_host, "entry_map", None) or ())) or "unknown",
-        free_g if free_g >= 0 else "unknown",
+        f"{host_free_gb:.2f}" if host_free_gb is not None else "unknown",
+        _weg1_floor_text(),
         spans_at_prompt_max,
     )
     return {"pp": pp_host, "tp": tp_host}
