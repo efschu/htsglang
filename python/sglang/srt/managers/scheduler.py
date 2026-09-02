@@ -5883,11 +5883,16 @@ class Scheduler(
     # while the follower holds 0 rows of it and, executing PP0's told
     # unconditionally (#1072, `reconcile_pp_admission_decision`), recomputes
     # the whole span -- the 'PP0=(0,4096) PP1=(8192,N)' extent-divergence
-    # form, deterministic. The landing sequence is rank-uniform because its
-    # inputs are: the same requests in the same kv_arrival_seq order, the
-    # MIN-synced capacity (prefetch_budget.py under --hicache-size), the
-    # same occupancy dynamics; the refusal predicate below carries no rank
-    # term for the same reason. ONLY THE ADMISSION HOLD IS THE PP0 VERDICT
+    # form, deterministic. The landing sequence is PER RANK, not lockstep:
+    # each rank charges the counter at its own registration and releases it
+    # at its own completion (every writer is enumerated below), so nothing
+    # synchronises the sequences across ranks -- they are expected to agree
+    # because their inputs agree (the same requests in the same
+    # kv_arrival_seq order against the same MIN-synced capacity,
+    # prefetch_budget.py under --hicache-size), and the refusal predicate
+    # below carries no rank term for the same reason (spec A12.6(c)
+    # withdrawn: the mark and the retry run on every rank; only the
+    # admission hold is PP0's). ONLY THE ADMISSION HOLD IS THE PP0 VERDICT
     # (#968): a follower's mark has no admission effect
     # (`_admission_held_for_deferred_prefetch` answers False on
     # pp_rank != 0); it takes its membership from PP0's decision through
@@ -5912,13 +5917,29 @@ class Scheduler(
     # `prefetch_rate_limited` (cache_controller.py:2653) NOR
     # `prefetch_capacity_limit` (:2623); its only write to the
     # `prefetch_tokens_occupied` counter is `reset()` zeroing it
-    # (hybrid_cache_controller.py:451). The counter is charged at
-    # registration (unified_radix_cache.py:3523) and released at completion
-    # in `check_prefetch_progress` (:4147), `drain_retired_prefetch`
-    # (:4351), `_release_retired_prefetch_local` (:4411) and
-    # `release_aborted_request` (:4470) -- so "span ahead completes ->
-    # counter drops -> next deferred span registers" is the sequence on
-    # every rank of the serving class, and the `_Occupancy` stand-in of
+    # (hybrid_cache_controller.py:451). EVERY WRITER of the counter, from
+    # `git grep -n prefetch_tokens_occupied -- python/` at dd3a133aa2 (the
+    # #1068 residue sweep; line numbers as of that tree, the function names
+    # are the durable part): on the serving tree class the charge is
+    # `UnifiedRadixCache.prefetch_from_storage` (unified_radix_cache.py:3565,
+    # at registration) and the releases are `check_prefetch_progress`
+    # (:3995, completion), `drain_retired_prefetch` (:4199),
+    # `_release_retired_prefetch_local` (:4259, clamped at 0),
+    # `release_aborted_request` (:4318) and the `_drain_revoke` closure of
+    # `_drain_storage_control_queues_impl` (:4390, clamped at 0 -- the
+    # storage thread's below-threshold revoke, drained on the scheduler
+    # thread); on the controller the zeroings are
+    # `HiCacheController.attach_storage_backend` (cache_controller.py:1067,
+    # construction), `HiCacheController.reset` (:1574) and the
+    # `HybridCacheController.reset` above. The sibling trees carry the same
+    # charge/release shape on their own classes and are NOT the serving
+    # class: hiradix_cache.py `prefetch_from_storage` :2097,
+    # `check_prefetch_progress` :1925, `release_aborted_request` :2305,
+    # `_drain_revoke` :755, `_force_release_pending_storage_ops` :689;
+    # hi_mamba_radix_cache.py :2288, :2361, :2452, :1993, :1937 (same five
+    # sites, same order). So "span ahead completes -> counter drops -> next
+    # deferred span registers" is the sequence on every rank of the serving
+    # class, and the `_Occupancy` stand-in of
     # test_prefetch_deferral_1068.py models exactly that counter
     # (`test_the_serving_controller_carries_the_rate_verdict_unchanged`
     # pins the inheritance). Two bounded exits, both
@@ -5996,11 +6017,17 @@ class Scheduler(
     # ------------------------------------------------------------------
     def _host_pool_identity(self) -> int:
         """id() of the host pool the prefetch registers against (the
-        HostPoolGroup's anchor KV pool when there is one), or -1."""
+        HostPoolGroup's anchor KV pool when there is one), or -1.
+
+        ONE unwrap, `prefetch_budget.host_pool_anchor` -- the same one the
+        registration stamp, the PREFETCH-COMPLETE diagnostic and the #915
+        L1/L2/L3 terms read (the slice 4 fix folded four copies into it;
+        this was the fifth, #1068 residue sweep)."""
         try:
-            _p = self.tree_cache.cache_controller.mem_pool_host
-            _p = getattr(getattr(_p, "anchor_entry", None), "host_pool", None) or _p
-            return id(_p)
+            from sglang.srt.mem_cache.prefetch_budget import host_pool_anchor
+
+            pool = host_pool_anchor(self.tree_cache.cache_controller)
+            return -1 if pool is None else id(pool)
         except Exception:  # noqa: BLE001 - a diagnostic may never break intake
             return -1
 

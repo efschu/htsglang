@@ -2462,18 +2462,18 @@ class HiCacheController:
 
         THE UNDERLYING DEFECT IS NOT FIXED HERE and this guard must not be
         mistaken for its fix. Two lines above that traceback the log of boot
-        22 carried the fork's own diagnosis of the same mismatch -- the
-        `#939 RE-HOME VIA RE-READ ... source page 16384 elems vs destination
-        page 32768 elems` line of the re-homing pass that existed until
-        af399f19c1 (#1068 slice 4 deleted it as second bookkeeping beside the
-        slice-3 re-issue; `reread_pages_into`, its only reader in this file,
-        went with it in the slice 4 fix) -- alongside `[#719 hicache-rebind]
+        22 carried the fork's own diagnosis of the same mismatch (`source
+        page 16384 elems vs destination page 32768 elems`, printed by the
+        re-homing pass of that day) alongside `[#719 hicache-rebind]
         rebound 3 reader(s) to the 'tp' pools (generation 3)`. The host pool
         carries TWO page geometries across a flip. That is the
         #718/#719/#875 family and a violation of the standing
         phase-uniformity law (two geometries for one key is a bug). It is
-        its own posten; nothing in this file re-reads across geometries any
-        more, so the line above is HISTORY, not a line to look for.
+        its own posten. HISTORY (2026-09-02, #1068 slice 4 af399f19c1 and
+        its fix 285e3685b6): the re-homing pass and its page re-reader were
+        deleted as second bookkeeping beside the slice-3 re-issue, so
+        nothing in this file re-reads across geometries any more and that
+        diagnosis line no longer exists to look for.
 
         WHY A BROAD `except` IS DEFENSIBLE HERE, given that warn-then-continue
         is a catalogued defect class in this tree: the comparison is not

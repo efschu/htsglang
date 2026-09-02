@@ -57,6 +57,7 @@ unpriced_timeout refusal; prefetch_defer_reason (write-only) is deleted.
 import copy
 import inspect
 import os
+import re
 import time
 import types
 import unittest
@@ -75,6 +76,13 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 SPAN = 39365
 LIMIT = 329589  # 0.9 x 366211 (spec section 5)
 LOG = "sglang.srt.managers.scheduler"
+
+
+def _field(key, value):
+    """Anchored `key=value` match on a fork log line. A bare substring pin
+    is satisfiable by a NEIGHBOURING field: `n=1` is a substring of
+    `population=1` on the same CLEARED line, and of `n=10`."""
+    return rf"(?<![\w.]){re.escape(str(key))}={re.escape(str(value))}(?![\w.])"
 
 
 def _method(name):
@@ -464,6 +472,47 @@ class TestThe969CIntakeLine(_Clean):
         # retraction of the same request must not print population=queue
         self.assertIsNone(occupant._969c_population)
 
+    def test_pool_id_is_the_anchor_pools_identity_not_the_groups(self):
+        """#1068 residue sweep (MUT-B): `prefetch_budget.host_pool_anchor`
+        unwraps a pool GROUP to its anchor entry's pool, and every reader
+        that prints a pool identity goes through it. Read through two real
+        consumers -- the #969C L6 line (`Scheduler._host_pool_identity`, the
+        fifth copy routed through the one unwrap) and the #915 L3 line
+        (`prefetch_budget.log_prefetch_limit`) -- both must carry the
+        anchor's id() and never the group's. Mutant 'return anchor or pool'
+        -> 'return pool' reds the first assert and both lines."""
+        from sglang.srt.mem_cache import prefetch_budget
+
+        s = _Intake(lambda req: "issued")
+        cc = s.tree_cache.cache_controller
+        anchor = _HostPool()
+        group = types.SimpleNamespace(
+            size=anchor.size,
+            available_size=anchor.available_size,
+            anchor_entry=types.SimpleNamespace(host_pool=anchor),
+        )
+        cc.mem_pool_host = group
+        cc.prefetch_capacity_fraction = 0.9
+        cc.host_role = "staging"
+        self.assertEqual(s._host_pool_identity(), id(anchor))
+        self.assertNotEqual(id(anchor), id(group))
+        with self.assertLogs(LOG, level="WARNING") as caught:
+            sched_mod.logger.warning("probe: intake driven")
+            s._add_request_to_queue(
+                _Req("res", seq=1, stamped=True, population="retract"),
+                is_retracted=True,
+            )
+        l6 = [ln for ln in caught.output if "#969C READMIT-PREFETCH" in ln]
+        self.assertEqual(len(l6), 1, caught.output)
+        self.assertRegex(l6[0], _field("pool_id", id(anchor)))
+        self.assertNotIn(f"pool_id={id(group)}", l6[0])
+        with self.assertLogs(prefetch_budget.logger, level="INFO") as caught:
+            prefetch_budget.log_prefetch_limit(cc, site="residue-sweep")
+        l3 = [ln for ln in caught.output if "#915 PREFETCH LIMIT" in ln]
+        self.assertEqual(len(l3), 1, caught.output)
+        self.assertRegex(l3[0], _field("pool_id", id(anchor)))
+        self.assertNotIn(f"pool_id={id(group)}", l3[0])
+
 
 def _plant_mark(req):
     """The fields exactly as `_apply_prefetch_deferral` leaves them after
@@ -527,8 +576,8 @@ class TestTheMarkDoesNotSurviveTheCutover(_Clean):
         self.assertEqual(tp0.last_seam_readmit["deferral_cleared"], 1)
         cleared = [ln for ln in caught.output if "#1068 PREFETCH DEFER CLEARED AT CUTOVER" in ln]
         self.assertEqual(len(cleared), 2, caught.output)
-        self.assertIn("n=1", cleared[0])
-        self.assertIn("rids=x", cleared[0])
+        self.assertRegex(cleared[0], _field("n", 1))
+        self.assertRegex(cleared[0], _field("rids", "x"))
         # the re-issue under the refused deferral leaves no mark either side
         self.assertEqual(x._969c_verdict, "declined:rate_limited")
         self.assertEqual(x_tp0._969c_verdict, "declined:attempted_but_unregistered")
@@ -552,9 +601,9 @@ class TestTheMarkDoesNotSurviveTheCutover(_Clean):
             s.readmit_seam_residents([], requeue_waiting=True)
         cleared = [ln for ln in caught.output if "#1068 PREFETCH DEFER CLEARED AT CUTOVER" in ln]
         self.assertEqual(len(cleared), 1, caught.output)
-        self.assertIn("n=0", cleared[0])
-        self.assertIn("rids=-", cleared[0])
-        self.assertIn("population=1", cleared[0])
+        self.assertRegex(cleared[0], _field("n", 0))
+        self.assertRegex(cleared[0], _field("rids", "-"))
+        self.assertRegex(cleared[0], _field("population", 1))
         self.assertEqual(s.last_seam_readmit["deferral_cleared"], 0)
         self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_cleared_cutover", 0), 0)
 

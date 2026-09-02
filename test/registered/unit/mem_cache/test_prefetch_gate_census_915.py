@@ -857,14 +857,22 @@ class TestExcessRequestsLandAfterEvictHost(_CleanCounts):
     before its second alloc, and a completed span's host rows are evictable
     because the tree drops its lock after PREFETCH-COMPLETE.
 
-    CHARACTERISATION PIN, not red-first (spec A11.3 says so for this case):
-    both halves exist on the parent 228a66db32 -- the retry (`evict_host`
-    before the second alloc) and the lock release (check_prefetch_progress,
-    `dec_host_lock_ref` after the frees). The pin turns a later change that
-    keeps loaded rows locked beyond the load, or drops the evict before the
-    retry, into a failure here before a boot has to show a '#915 PREFETCH
-    TRUNCATED' line for requests beyond the pool. The control case shows the
-    pin can fail (desk-written-never-executed)."""
+    CHARACTERISATION PIN, not red-first (spec A11.3 says so for this case);
+    both halves exist on the parent 228a66db32. WHAT IT COVERS: the retry
+    half only -- `prefetch_from_storage` calls `evict_host(need)` between a
+    failed alloc and its second alloc, with exactly `need` (the alloc/evict
+    call shapes asserted below). A later change that drops the evict before
+    the retry, or truncates instead of retrying, fails here.
+    WHAT IT DOES NOT COVER: the lock-release half. `_serving_tree` stubs
+    `inc_host_lock_ref` / `dec_host_lock_ref` as lambdas,
+    `check_prefetch_progress` never runs, and `pool.complete(0)` is the
+    test's own hand-simulation of "r1's rows became evictable" -- so the
+    release of the anchor lock after PREFETCH-COMPLETE
+    (unified_radix_cache.py `check_prefetch_progress`,
+    `dec_host_lock_ref(last_host_node, anchor_lock_params)` right after the
+    two generation-stamped frees) is NOT exercised here, and a change that
+    keeps loaded rows locked beyond the load PASSES this pin. The control
+    case shows the pin can fail (desk-written-never-executed)."""
 
     def _tree_with(self, pool: _SpanPool):
         tree = _serving_tree(available=0)

@@ -150,9 +150,12 @@ class TestTheRingIsRebuiltAtRebind(CustomTestCase):
         is COUNTED under the #915 key `staging_ring_rebuild_failed` (a
         cutover-level key, not part of the intake partition) and spoken as
         ONE ERROR line naming the term, the phase and the generation. RED on
-        af399f19c1: no key, and the line named no term."""
+        af399f19c1: no key, and the line named no term (that red was an
+        ImportError on PREFETCH_CUTOVER_KEYS pre-empting the behaviour
+        asserts; the constant is now read by name AFTER them, so a missing
+        line reds on the line count first)."""
+        from sglang.srt.mem_cache import match_refusal_census as census
         from sglang.srt.mem_cache.match_refusal_census import (
-            PREFETCH_CUTOVER_KEYS,
             PREFETCH_GATE_COUNTS,
             PREFETCH_INTAKE_PARTITION,
         )
@@ -183,7 +186,13 @@ class TestTheRingIsRebuiltAtRebind(CustomTestCase):
             ):
                 self.assertIn(term, lines[0])
             self.assertEqual(PREFETCH_GATE_COUNTS.get("staging_ring_rebuild_failed"), 1)
-            self.assertIn("staging_ring_rebuild_failed", PREFETCH_CUTOVER_KEYS)
+            # The cutover-key constant is read by name, after the behaviour
+            # asserts: a tree without it reds HERE, never on an ImportError.
+            cutover_keys = getattr(census, "PREFETCH_CUTOVER_KEYS", None)
+            self.assertIsNotNone(
+                cutover_keys, "PREFETCH_CUTOVER_KEYS missing from match_refusal_census"
+            )
+            self.assertIn("staging_ring_rebuild_failed", cutover_keys)
             self.assertNotIn("staging_ring_rebuild_failed", PREFETCH_INTAKE_PARTITION)
         finally:
             PREFETCH_GATE_COUNTS.clear()
