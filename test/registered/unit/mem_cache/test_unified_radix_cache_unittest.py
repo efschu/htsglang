@@ -2623,16 +2623,28 @@ class UnifiedRadixCacheSuite:
         cache.write_through_threshold = 1 << 30
         cache.load_back_threshold = 0
         if storage_backend is not None:
-            # Unit fixtures size host/device pools equally, which makes the
-            # production prefetch capacity limit (host - device) zero.  Keep the
-            # L3 tests focused on storage round trips by allowing one fixture
-            # worth of prefetch tokens.
-            cache.cache_controller.prefetch_capacity_limit = max(
-                cache.cache_controller.prefetch_capacity_limit,
-                cache.cache_controller.mem_pool_host.size,
+            # Unit fixtures size host/device pools equally, which leaves the
+            # production prefetch budget (#1068: a setterless PROPERTY of the
+            # bound host pool, 0.5 x size in the retention role) below one
+            # fixture worth of tokens. Keep the L3 tests focused on storage
+            # round trips by lifting the budget to one fixture worth: the
+            # property cannot be assigned (a stored number is the defect it
+            # removed), so override it on the controller's class for this
+            # test's lifetime.
+            cc = cache.cache_controller
+            lifted_limit = max(
+                int(cc.prefetch_capacity_limit), int(cc.mem_pool_host.size)
             )
+            limit_patcher = mock.patch.object(
+                type(cc),
+                "prefetch_capacity_limit",
+                new_callable=mock.PropertyMock,
+                return_value=lifted_limit,
+            )
+            limit_patcher.start()
+            self.addCleanup(limit_patcher.stop)
             # Background prefetch/backup threads are daemon; stop them per-test.
-            self.addCleanup(cache.cache_controller._stop_storage_threads)
+            self.addCleanup(cc._stop_storage_threads)
 
     def _build_hicache_fixture(self):
         fixture = build_fixture(self.cfg)

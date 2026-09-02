@@ -65,7 +65,6 @@ def _controller(role: str = "staging", pool=None):
     cc = HiCacheController.__new__(HiCacheController)
     cc.host_role = role
     cc.mem_pool_host = pool
-    cc.host_write_staged_tokens_fn = None
     return cc
 
 
@@ -106,10 +105,9 @@ class TestRateLimitIsTheCounterForm(CustomTestCase):
 
     def test_a_full_idle_pool_is_not_rate_limited(self):
         """Red-first (1): warm tier, nothing registered. available_size()=0,
-        ring holds 0, counter 0 -> NOT limited. The live form read
+        counter 0 -> NOT limited. The live form read
         used = 366211 >= 329589 here and parked store-read path B."""
         cc = _controller("staging", _pool(TP_ROWS, available=0))
-        cc.host_write_staged_tokens_fn = lambda: 0
         cc.prefetch_tokens_occupied = 0
         self.assertFalse(cc.prefetch_rate_limited())
         cc.host_role = "retention"
@@ -125,7 +123,6 @@ class TestRateLimitIsTheCounterForm(CustomTestCase):
         ):
             with self.subTest(role=role):
                 cc = _controller(role, _pool(TP_ROWS, available=TP_ROWS))
-                cc.host_write_staged_tokens_fn = lambda: 0
                 cc.prefetch_tokens_occupied = limit + 1
                 self.assertTrue(cc.prefetch_rate_limited())
                 cc.prefetch_tokens_occupied = limit - 1
@@ -141,21 +138,20 @@ class TestRateLimitIsTheCounterForm(CustomTestCase):
         cc.prefetch_tokens_occupied = 329588
         self.assertFalse(cc.prefetch_rate_limited())
 
-    def test_live_occupancy_and_the_ring_do_not_gate(self):
-        """The ring reader stays INSTALLED (staging_write_ring installs and
-        drops it, T9) but is not consulted by the brake until the staging
-        drain frees host rows after ack_backup. A reader that raises proves
-        it is not read."""
+    def test_no_staged_tokens_reader_survives(self):
+        """Zombie guard (slice 2 fix 2, Upstream-Minimal law): the ring
+        occupancy reader of upstream :331 that slice 2 kept installed on the
+        controller was read by nobody (the brake is the counter form), so it
+        is gone from the controller's __init__ and from the ring module. It
+        returns only together with the staging drain that frees host rows
+        after ack_backup, i.e. with a consumer and its own tests."""
+        from sglang.srt.mem_cache import staging_write_ring
 
-        def _boom():
-            raise AssertionError("the brake read the ring")
-
-        cc = _controller("staging", _pool(TP_ROWS, available=0))
-        cc.host_write_staged_tokens_fn = _boom
-        cc.prefetch_tokens_occupied = 0
-        self.assertFalse(cc.prefetch_rate_limited())
-        cc.prefetch_tokens_occupied = 10 * TP_ROWS
-        self.assertTrue(cc.prefetch_rate_limited())
+        for src in (
+            inspect.getsource(HiCacheController.__init__),
+            inspect.getsource(staging_write_ring),
+        ):
+            self.assertNotIn("host_write_staged_tokens_fn", src)
 
     def test_the_brake_source_carries_no_live_form(self):
         """Zombie guard: the buffer_only live form returns only WITH a role
@@ -175,6 +171,7 @@ class TestRateLimitIsTheCounterForm(CustomTestCase):
         ]
         code = "\n".join(ast.unparse(node) for node in body)
         self.assertNotIn("available_size()", code)
+        self.assertNotIn("host_write_staged_tokens_fn", code)
         self.assertIn(
             "self.prefetch_tokens_occupied >= self.prefetch_capacity_limit", code
         )
@@ -182,8 +179,9 @@ class TestRateLimitIsTheCounterForm(CustomTestCase):
 
 class TestAttachCopiesTheHostRole(CustomTestCase):
     """T7b, kills mutant M-R4: ``attach_storage_backend`` copies the storage
-    config's ``host_role`` onto the controller -- the ONE reader of
-    --hicache-host-role -- and the budget fraction follows it. Without the
+    config's ``host_role`` onto the controller -- the one reader on the
+    controller; build_staging_write_ring and phase_flip_boot read the flag
+    too -- and the budget fraction follows it. Without the
     copy a staging boot silently runs the 0.5 retention fraction (its ring
     sized to 0.5 x size instead of 0.1 x size), visible only in the L3
     ``role=`` term. Green on the shipped tree by design; red under M-R4."""
@@ -195,7 +193,6 @@ class TestAttachCopiesTheHostRole(CustomTestCase):
         cc.page_size = 1
         cc.mem_pool_host = _pool(TP_ROWS)
         cc.storage_stop_event = threading.Event()
-        cc.host_write_staged_tokens_fn = None
         for name in (
             "_stop_storage_threads",
             "_start_storage_threads",

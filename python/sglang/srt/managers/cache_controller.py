@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
@@ -604,18 +604,11 @@ class HiCacheController:
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
         # #1068: the host tier's role, copied from the storage config at
-        # attach (``_generate_storage_config`` is the ONE reader of the
-        # --hicache-host-role flag). Retention until a backend is attached,
-        # matching that reader's default.
+        # attach (``_generate_storage_config`` is the one reader on the
+        # controller; build_staging_write_ring and phase_flip_boot read the
+        # --hicache-host-role flag too). Retention until a backend is
+        # attached, matching that reader's default.
         self.host_role: str = "retention"
-        # #1068 (upstream :331): live occupancy of the write-through staging
-        # ring, installed by the tree when it builds its ring and cleared when
-        # the ring is dropped. None means no ring, i.e. nothing is staged.
-        # Upstream's buffer_only brake subtracts it; this fork's brake does
-        # not read it yet (``prefetch_rate_limited`` says why). It is kept
-        # installed so that switch is one line when the staging drain frees
-        # host rows after the storage ack.
-        self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -2465,12 +2458,13 @@ class HiCacheController:
 
         The live form becomes the right form for the staging role on the day
         the staging drain frees host rows after ``ack_backup`` (transient
-        buffer = upstream buffer_only semantics). Until then
-        ``host_write_staged_tokens_fn`` stays installed by the ring
-        (staging_write_ring.py) and unread here, so that switch is one line
-        and one test, and ``prefetch_tokens_occupied`` is the gate: the
-        tokens locked by registered prefetches (written by the three tree
-        caches), zeroed at attach and in ``reset()``.
+        buffer = upstream buffer_only semantics). That day brings back the
+        staged-tokens reader of upstream :331 together with its consumer and
+        its tests; this controller carries no such reader until then, because
+        a wire that nobody reads is second bookkeeping (slice 2 fix 2). Until
+        then ``prefetch_tokens_occupied`` is the gate: the tokens locked by
+        registered prefetches (written by the three tree caches), zeroed at
+        attach and in ``reset()``.
         """
         return self.prefetch_tokens_occupied >= self.prefetch_capacity_limit
 

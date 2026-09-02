@@ -289,31 +289,24 @@ def build_staging_write_ring(
 
 def install_staging_write_ring(tree: Any, server_args: Any) -> Optional[StagingWriteRing]:
     """#1068 (graft G2): (re)build the tree's ring against the host pool its
-    controller is bound to NOW, and install the ring's live occupancy as the
-    controller's ``host_write_staged_tokens_fn`` -- the term upstream's
-    buffer_only prefetch brake subtracts (cache_controller.py:1155-1163).
-    This fork's brake is the cache-mode counter form and does not read it
-    yet; ``HiCacheController.prefetch_rate_limited`` says why and when.
+    controller is bound to NOW.
 
     Called at boot and after every cutover rebind: the read bound is a
     property of the bound pool, so the complement must follow the pool too.
-    ``None`` (retention role, or no controller) installs no reader.
+    ``None`` (retention role, or no controller) installs no ring. Nothing
+    but the ring's own admit/release reads its occupancy: the upstream
+    buffer_only brake that subtracts a staged-tokens term (upstream
+    cache_controller.py:1155-1163) is not this fork's brake
+    (``HiCacheController.prefetch_rate_limited`` says why), so no occupancy
+    reader is installed on the controller. The slice that builds a
+    staged-row drain reintroduces that reader together with its consumer.
     """
     cc = getattr(tree, "cache_controller", None)
     ring = build_staging_write_ring(server_args, cc)
     tree.staging_write_ring = ring
-    if cc is not None:
-        cc.host_write_staged_tokens_fn = (
-            (lambda: ring.occupied_tokens) if ring is not None else None
-        )
     return ring
 
 
 def drop_staging_write_ring(tree: Any) -> None:
-    """The ONE place that nulls the ring AND its occupancy reader (a reader
-    left behind would subtract the occupancy of a ring that no longer
-    admits anything)."""
+    """The ONE place that nulls the tree's ring."""
     tree.staging_write_ring = None
-    cc = getattr(tree, "cache_controller", None)
-    if cc is not None:
-        cc.host_write_staged_tokens_fn = None

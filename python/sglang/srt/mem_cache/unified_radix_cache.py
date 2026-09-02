@@ -821,8 +821,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         # #810/#1068: built by `rebuild_staging_write_ring` at boot and after
         # every cutover rebind. None here and for the whole of
-        # `--hicache-host-role retention`, which is the default. The drop
-        # also clears the controller's occupancy reader (G2).
+        # `--hicache-host-role retention`, which is the default (G2).
         self._drop_staging_write_ring()
         self._init_pin_trace()
 

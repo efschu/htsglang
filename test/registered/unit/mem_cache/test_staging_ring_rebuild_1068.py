@@ -1,14 +1,16 @@
 """#1068 WEG 1 slice 2 (WEG1_BUILD_SPEC_0901 section 4.2, graft G2): the
 write-through staging ring is rebuilt against the pool the readers are bound
-to, and its live occupancy is what the prefetch rate brake subtracts.
+to; its capacity is the complement of that pool's prefetch budget.
 
 THE DEFECT. ``build_staging_write_ring`` had exactly one caller
 (``init_hicache``), and ``_reset_full`` nulled the ring at every cutover.
 After the first flip a staging boot ran with NO ring at all -- write-through
-unbounded, and the controller's ``host_write_staged_tokens_fn`` (the upstream
-:331 hook the brake subtracts) had nothing to read. The ring's capacity is the
-complement of ``prefetch_capacity_limit``, which is a property of the bound
-pool since slice 2, so the ring must be rebuilt whenever the pool moves.
+unbounded. The ring's capacity is the complement of
+``prefetch_capacity_limit``, which is a property of the bound pool since
+slice 2, so the ring must be rebuilt whenever the pool moves. (Slice 2 fix 2
+removed the controller-side occupancy reader the ring used to install: the
+brake is the cache-mode counter form and read it nowhere, so the pins that
+described that wire are retired from this file.)
 
 Hermetic: tree and controller shells via ``__new__``; the real
 ``build_staging_write_ring`` and the real ``StagingWriteRing`` run. Nothing
@@ -43,26 +45,22 @@ def _tree(size: int, role: str = "staging"):
     cc = HiCacheController.__new__(HiCacheController)
     cc.host_role = role
     cc.mem_pool_host = _pool(size)
-    # Stale readers from a previous binding, deliberately: the rebuild must
-    # replace them, the drop must null them.
-    cc.host_write_staged_tokens_fn = lambda: 999
     tree.cache_controller = cc
     tree.staging_write_ring = object()
     return tree, cc
 
 
 class TestTheRingIsRebuiltAtRebind(CustomTestCase):
-    def test_reset_drops_the_ring_and_its_occupancy_reader(self):
-        tree, cc = _tree(PP_ROWS)
+    def test_reset_drops_the_ring(self):
+        tree, _cc = _tree(PP_ROWS)
         tree._drop_staging_write_ring()
         self.assertIsNone(tree.staging_write_ring)
-        self.assertIsNone(cc.host_write_staged_tokens_fn)
-        # ONE place nulls both: _reset_full goes through it.
+        # ONE place nulls it: _reset_full goes through it.
         self.assertIn(
             "_drop_staging_write_ring()", inspect.getsource(UnifiedRadixCache._reset_full)
         )
 
-    def test_rebuild_binds_capacity_to_the_current_pool_and_installs_the_reader(self):
+    def test_rebuild_binds_capacity_to_the_current_pool(self):
         tree, cc = _tree(TP_ROWS)
         sa = types.SimpleNamespace(hicache_host_role="staging")
         tree.rebuild_staging_write_ring(sa)
@@ -70,12 +68,10 @@ class TestTheRingIsRebuiltAtRebind(CustomTestCase):
         self.assertIsNotNone(ring)
         self.assertEqual(ring.capacity_tokens, TP_ROWS - cc.prefetch_capacity_limit)
         self.assertEqual(ring.capacity_tokens, TP_ROWS - 329589)
-        fn = cc.host_write_staged_tokens_fn
-        self.assertIsNotNone(fn)
-        self.assertEqual(fn(), 0)
+        # A real ring, empty at build.
+        self.assertEqual(ring.occupied_tokens, 0)
         self.assertTrue(ring.admit("page-a", 4096))
-        self.assertEqual(fn(), 4096)
-        self.assertEqual(fn(), ring.occupied_tokens)
+        self.assertEqual(ring.occupied_tokens, 4096)
 
     def test_rebuild_after_a_pool_swap_follows_the_new_pool(self):
         tree, cc = _tree(PP_ROWS)
@@ -89,16 +85,15 @@ class TestTheRingIsRebuiltAtRebind(CustomTestCase):
         second = tree.staging_write_ring
         self.assertIsNot(second, first)
         self.assertEqual(second.capacity_tokens, TP_ROWS - 329589)
-        # The reader now reads the NEW ring, which starts empty.
-        self.assertEqual(cc.host_write_staged_tokens_fn(), 0)
+        # The NEW ring starts empty; the old one's admission does not carry.
+        self.assertEqual(second.occupied_tokens, 0)
 
-    def test_retention_role_builds_nothing_and_installs_no_reader(self):
-        tree, cc = _tree(PP_ROWS, role="retention")
+    def test_retention_role_builds_nothing(self):
+        tree, _cc = _tree(PP_ROWS, role="retention")
         tree.rebuild_staging_write_ring(
             types.SimpleNamespace(hicache_host_role="retention")
         )
         self.assertIsNone(tree.staging_write_ring)
-        self.assertIsNone(cc.host_write_staged_tokens_fn)
 
     def test_the_cutover_rebind_rebuilds_the_ring_after_the_coherence_check(self):
         tree, cc = _tree(TP_ROWS)
