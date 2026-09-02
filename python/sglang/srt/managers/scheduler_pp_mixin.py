@@ -6972,9 +6972,12 @@ class SchedulerPPMixin:
         # `_pp_recv_admission_decision` / `_pp_commit_admission_send_work`,
         # see the EDIT-E block at the top of `_event_loop_pp_body`). The
         # three memos below survive: `scheduler.py`'s admission consumer
-        # (:9521) still reads `_pp_admission_incoming_effective`, now
-        # permanently None post-#1015 -- NAMED, NOT FIXED, see that same
-        # EDIT-E block.
+        # still reads `_pp_admission_incoming_effective`. It was permanently
+        # None between #1015 and the #631 row authority; since then the
+        # downstream body writes it from the row on every pass (`effective`
+        # when a frame is pending, `{}` when provably none -- see
+        # `_event_loop_pp_body`). The EDIT-E block's "permanently None"
+        # wording is history dated 2026-08-31 morning, before that writer.
         self._pp_admission_incoming_effective: Optional[Dict[str, int]] = None
         # #791 CORE: the forwarded pass geometry this rank EXECUTES --
         # `rid -> (prefix_len, extend_len)`, filled from the same amended

@@ -5,7 +5,7 @@ THE DEFECT: `_prefetch_kvcache` caches the content-key presence probe on the
 request as `(matched_len, span_len) -> present`. The key carries no binding
 generation, so a verdict taken under the PP binding (before a cutover)
 governs the TP binding (after it): a store that was absent for PP's pool
-answers 'absent' for TP without ever being asked -- "PP-Verdikt regiert TP".
+answers 'absent' for TP without ever being asked (#1060).
 
 RED on 846c6797b9: the key is `(_matched_len, len(_new_input_tokens))`; with
 the generation advanced the probe is NOT re-run (call count stays 1).

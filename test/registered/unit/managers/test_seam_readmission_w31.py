@@ -59,6 +59,21 @@ class _Req:
         return self._done
 
 
+def _method(name):
+    # Tolerant binding (same shape as test_prefetch_deferral_1068._method):
+    # on a tree that predates the slice-3 fix the method is absent and the
+    # stand-in must still import, so the red-first run fails in the TEST
+    # that reaches the missing method, not at collection.
+    fn = getattr(Scheduler, name, None)
+    if fn is not None:
+        return fn
+
+    def _missing(self, *a, **k):
+        raise AssertionError(f"Scheduler.{name} does not exist (slice 3 fix not built)")
+
+    return _missing
+
+
 class _Sched:
     """A scheduler stand-in exposing only what the re-admission touches.
 
@@ -67,6 +82,11 @@ class _Sched:
     """
 
     readmit_seam_residents = Scheduler.readmit_seam_residents
+    # slice-3 fix (review round 1): the cutover CLEARER of the A12.2
+    # deferral mark runs inside readmit_seam_residents; bound from the real
+    # class too, so the stand-in exercises the shipped re-issue path whole.
+    _clear_prefetch_deferral_for_reissue = _method("_clear_prefetch_deferral_for_reissue")
+    _clear_prefetch_deferral_fields = _method("_clear_prefetch_deferral_fields")
 
     def __init__(self, queue=()):
         self.waiting_queue = list(queue)
@@ -114,6 +134,22 @@ class TestEverythingRetractedComesBack(CustomTestCase):
         s = _Sched()
         self.assertEqual(s.readmit_seam_residents([]), 0)
         self.assertEqual(s.waiting_queue, [])
+
+    def test_the_l5_line_is_emitted_for_an_empty_population(self):
+        # slice-3 fix: spec 4.3 says `Log L5` unconditionally and section
+        # 10 counts ONE L5 per cutover; a cutover whose whole population
+        # finished() (k+m == 0) printed nothing on 0ad85647cb (the
+        # `if population:` guard was an unnamed deviation). RED there.
+        from sglang.srt.managers import scheduler as sched_mod
+
+        s = _Sched()
+        with self.assertLogs(sched_mod.logger, level="INFO") as caught:
+            self.assertEqual(s.readmit_seam_residents([], requeue_waiting=True), 0)
+        line = [ln for ln in caught.output if "SEAM RE-ADMISSION" in ln]
+        self.assertEqual(len(line), 1, caught.output)
+        self.assertIn("0 retracted resident(s) + 0 queue occupant(s)", line[0])
+        self.assertIn("queue 0 -> 0", line[0])
+        self.assertIn("dropped_by_queue_limit=0", line[0])
 
 
 class TestArrivalOrderOverAll(CustomTestCase):
