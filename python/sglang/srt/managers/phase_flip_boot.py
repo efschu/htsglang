@@ -2077,19 +2077,18 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
 
 #: #847/#810: how much of a phase's KV view the staging pin has to hold.
 #:
-#: A STAGING PIN, NOT A MIRROR. #810 draws the line: a `retention` host tier is
-#: sized as a ratio of the device pool and exists to KEEP prefixes; a `staging`
-#: tier holds only what is in flight and is sized to the work, never to the
-#: pool. The rebind needs the second kind. What it must stage is the seam's own
-#: re-admission -- the requests one cutover retracts, read back through in the
-#: layout it flips into -- so the pin is sized to a re-admission batch and to
-#: nothing else: `max_running_requests` requests of one chunk each.
-#:
-#: A ratio-sized second pool would be the wrong answer twice over: it would
-#: duplicate retention the pp-side tier already provides, and on this box the
-#: pinned host budget is the binding constraint (DESIGN_706 C1), so it would be
-#: charged against the 16 GiB floor for capacity nothing reads.
-PHASE_FLIP_STAGING_CHUNKS = 1
+#: #1068 (WEG 1, slice 1): THE TP PIN IS ROW-COUPLED TO THE PP POOL. Both
+#: phase host pools are built from ONE absolute knob, --hicache-size: the pp
+#: pool directly (pool_host/base.py, MIN-synced over the pp group), the tp pin
+#: by ROW COUNT -- its GB figure is derived so that the same sizing arithmetic
+#: lands on exactly the pp pool's rows. A pin sized to "one chunk per request"
+#: (the pre-#1068 staging pin, 30518 rows against a 923497-row pp pool on
+#: boot_855_968umbauB) was 23x smaller than the pool the same prefixes were
+#: prefetched into, so the first resident filled it whole and every later
+#: prefetch was refused or truncated in the tp phase (WEG1_BUILD_SPEC_0901
+#: sections 1 and 5). Equal rows on both sides make a prefetch registered in
+#: one phase representable in the other, which is what the store-read path
+#: needs after the seam copy was deleted (slice 0).
 
 
 def host_tier_of(tree):
@@ -2125,31 +2124,6 @@ def host_tier_of(tree):
     return getattr(controller, "mem_pool_host", None)
 
 
-def _staging_pin_gib(scheduler, device_pool, fallback_pool=None) -> float:
-    """Bytes the phase-matched staging pin needs, in GiB, from measured cells.
-
-    Derived, never guessed: the pool's own per-token cell size times the tokens
-    a re-admission batch can present. Returns a float so the caller can ledger
-    the real number and round only once, at the allocation boundary.
-    """
-    sa = scheduler.server_args
-    chunk = int(getattr(sa, "chunked_prefill_size", 0) or 0) or 4096
-    conc = int(getattr(sa, "max_running_requests", 0) or 0) or 1
-    tokens = chunk * conc * PHASE_FLIP_STAGING_CHUNKS
-    cell = int(getattr(device_pool, "get_kv_size_per_token", lambda: 0)() or 0)
-    if cell <= 0:
-        cell = int(getattr(device_pool, "cell_size", 0) or 0)
-    if cell <= 0 and fallback_pool is not None:
-        # W34 arm 1 printed "0.000 GiB -> 1 GB": neither probe answered on the
-        # live TP pool, so the derived size collapsed to zero and only the
-        # `max(1, ...)` floor kept it allocatable. A pin sized from nothing is
-        # not a derivation. The pp-side tier reports the same per-token cost
-        # (both phases hold the same token rows), so it is the honest fallback
-        # -- and it is a FALLBACK, named, not the primary reading.
-        cell = int(getattr(fallback_pool, "size_per_token", 0) or 0)
-    return (tokens * cell) / float(1 << 30)
-
-
 def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, logger):
     """#871: the KV+MAMBA entry pair for the 'tp' staging pin, or None.
 
@@ -2166,14 +2140,16 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
     same device pool. Entries yes, controller no.
 
     SIZING IS PER-SLOT, NOT PER-GB, and that is the one place this must NOT copy
-    the KV half. The KV pin is sized in bytes from a token count
-    (``_staging_pin_gib``). Mamba state is allocated per REQUEST slot, and
-    ``MambaPoolHost`` reads ``host_size`` in GB only when it is > 0, otherwise
-    ``int(device_pool.size * host_to_device_ratio)``. Passing the KV pin's GB
-    figure here would size the mamba view by a budget derived for a different
-    unit. Ratio 1.0 with ``host_size=0`` mirrors the device pool exactly, which
-    is what "phase-matched staging pin" means: able to stage what the other
-    phase can actually hold, and no more.
+    the KV half. The KV pin is sized in ROWS coupled to the pp pool
+    (``build_phase_flip_host_pools``). Mamba state is allocated per REQUEST
+    slot, so the anchor half takes the SAME knob the assembler's pp-side pool
+    takes, ``--hicache-mamba-host-mib`` (hybrid_pool_assembler.py, #1035):
+    an absolute per-rank MiB budget that ``MambaPoolHost`` MIN-syncs across
+    the group (#1068), so both phases end with the same anchor slot count by
+    construction and the caller's post-build check can hold them to it.
+    Ratio 1.0 with ``host_size=0`` is the fallback below that knob and is
+    unreachable under the rebind flag: server_args refuses the flag without
+    ``--hicache-mamba-host-mib > 0``.
 
     Returns ``None`` when the TP side cannot supply the mamba handles. The
     caller then keeps today's KV-only pin, ``check_pool_coverage`` keeps
@@ -2225,10 +2201,13 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
 
     mamba_host = MambaPoolHost(
         mamba_pool,
-        1.0,  # host_to_device_ratio: mirror the device pool, see docstring
-        0,  # host_size GB: 0 selects the ratio path
+        1.0,  # host_to_device_ratio: the fallback below the MiB knob
+        0,  # host_size GB: 0 selects the ratio path below the MiB knob
         allocator_type=getattr(sa, "hicache_storage_backend", "default") or "default",
         layout=getattr(sa, "hicache_mem_layout", "layer_first") or "layer_first",
+        # #1068: the SAME knob the assembler passes for the pp-side anchor
+        # pool, MIN-synced inside MambaPoolHost -- one budget, both phases.
+        anchor_host_mib=int(getattr(sa, "hicache_mamba_host_mib", 0) or 0),
     )
     entries = [
         build_pool_entry(
@@ -2282,8 +2261,18 @@ def build_phase_flip_host_pools(scheduler):
     empty mapping and allocates nothing.
 
     The ``pp`` entry is the tier the boot already built -- the rebind needs a
-    handle per phase, not a second pp pool. Only the ``tp`` side is new, and it
-    is a staging pin (see ``PHASE_FLIP_STAGING_CHUNKS``).
+    handle per phase, not a second pp pool. Only the ``tp`` side is new, and
+    since #1068 it is ROW-COUPLED to that pp pool (see the module note above
+    ``host_tier_of``): same rows, both phases, one --hicache-size.
+
+    #1068 REFUSALS ON THIS PATH, all boot-time and all named: the pp cell must
+    divide by the pp layer count (else the tp cell is a guess), the pool must
+    hold one wave (``max_running_requests x chunked_prefill_size`` rows), the
+    built pin must have EXACTLY the pp rows (RAENGE-NIE-UNEINS), and the
+    anchor half must match the pp anchor slots and hold ``device_slots +
+    max_running_requests + 1``. The one soft refusal that stays is the #847
+    contract for a pp tier whose shape cannot be read or a pin that cannot be
+    allocated: logged, and the rebind refuses at the first cutover.
     """
     import logging
 
@@ -2319,8 +2308,59 @@ def build_phase_flip_host_pools(scheduler):
         )
         return {"pp": pp_host}
 
-    gib = _staging_pin_gib(scheduler, tp_device_pool, pp_host)
-    size_gb = max(1, int(gib + 0.999))
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+
+    rank = int(getattr(scheduler, "pp_rank", getattr(scheduler, "tp_rank", 0)) or 0)
+    max_running = int(getattr(sa, "max_running_requests", 0) or 0)
+    chunk = int(getattr(sa, "chunked_prefill_size", 0) or 0)
+    hicache_size_gb = int(getattr(sa, "hicache_size", 0) or 0)
+
+    # #1068 ROW COUPLING. The pp pool's anchor KV host pool (HostPoolGroup
+    # composite: anchor_entry.host_pool; plain tier: the pool itself) carries
+    # the rows every rank agreed on (pool_host/base.py sync MIN) and its own
+    # cell. The tp cell follows from the per-layer bytes, which both phases
+    # share on the same model and KV dtype (spec R7): per_layer = cell_pp //
+    # pp_layers, cell_tp = per_layer x tp_layers.
+    _anchor = getattr(pp_host, "anchor_entry", None)
+    pp_kv = getattr(_anchor, "host_pool", None) if _anchor is not None else pp_host
+    pp_rows = int(getattr(pp_kv, "size", 0) or 0)
+    cell_pp = int(getattr(pp_kv, "size_per_token", 0) or 0)
+    _pp_dev = getattr(pp_kv, "device_pool", None)
+    if _pp_dev is None and _anchor is not None:
+        _pp_dev = getattr(_anchor, "device_pool", None)
+    _pp_dev = getattr(_pp_dev, "full_kv_pool", _pp_dev)
+    pp_layers = int(getattr(_pp_dev, "layer_num", 0) or 0)
+    if pp_rows <= 0 or cell_pp <= 0 or pp_layers <= 0:
+        # The #847 contract: a tier whose shape cannot be read is not a live
+        # composite. Say why, keep the pp handle, and let the rebind refuse at
+        # the first cutover (`phase_pools_for` still raises RebindRefused).
+        logger.error(
+            "#1068 PHASE-FLIP REBIND: the pp host tier does not expose the "
+            "shape the tp pin is row-coupled to (rows=%d cell=%d pp_layers=%d), "
+            "so no pin is built. The rebind will refuse at the first cutover.",
+            pp_rows,
+            cell_pp,
+            pp_layers,
+        )
+        return {"pp": pp_host}
+    per_layer, _rem = divmod(cell_pp, pp_layers)
+    if _rem != 0 or per_layer <= 0:
+        raise ValueError(
+            "#1068 TP PIN CELL UNDERIVABLE rank=%d: the pp cell %d B does not "
+            "divide by the pp layer count %d, so the per-layer bytes the tp "
+            "cell is built from would be a guess (spec R7: both phases must "
+            "share per-layer KV bytes)" % (rank, cell_pp, pp_layers)
+        )
+    # G10 BOOT FLOOR, replacing the old silent max(1, ...): the pool must hold
+    # one wave of in-flight prefill, or the first wave is refused/truncated.
+    if max_running > 0 and chunk > 0 and pp_rows < max_running * chunk:
+        raise ValueError(
+            "#1068 HOST POOL BELOW ONE WAVE rank=%d pp_rows=%d < "
+            "max_running_requests=%d x chunked_prefill_size=%d = %d rows: "
+            "raise --hicache-size (GB, absolute; both phase pools are "
+            "row-coupled to it), currently %d"
+            % (rank, pp_rows, max_running, chunk, max_running * chunk, hicache_size_gb)
+        )
     try:
         # W34: BUILT WITH THE ASSEMBLER'S OWN NAMED PRIMITIVES, not by cloning
         # `type(pp_host)`. The clone was W34 arm 1's defect: the live host tier
@@ -2338,7 +2378,6 @@ def build_phase_flip_host_pools(scheduler):
             build_pool_entry,
         )
         from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
-        from sglang.srt.mem_cache.hicache_storage import PoolName
 
         # The size override rides a COPY of server_args: `build_kv_host_pool`
         # reads `hicache_ratio`/`hicache_size` off it, and a ratio is the
@@ -2346,7 +2385,6 @@ def build_phase_flip_host_pools(scheduler):
         # server_args untouched for every other reader.
         sa_pin = _copy.copy(sa)
         sa_pin.hicache_ratio = 0
-        sa_pin.hicache_size = size_gb
 
         # W34 arm 2: UNWRAP THE WAY THE CONSUMER UNWRAPS. `phase_pools_for`
         # does `inner = getattr(device_pool, "full_kv_pool", device_pool)`
@@ -2365,6 +2403,15 @@ def build_phase_flip_host_pools(scheduler):
                 "cannot be shape-matched to it (check_shapes compares exactly "
                 "that number)"
             )
+        # #1068: the GB figure exists ONLY on this copy and ONLY to make
+        # pool_host/base.py:140-147 (int(host_size*1e9 // cell) + 1 page)
+        # land on EXACTLY pp_rows: the midpoint between (pp_rows - 1) and
+        # pp_rows whole cells floors to pp_rows - 1 regardless of float error
+        # (margin cell_tp/2 against an ulp of a few bytes), and the +1 page
+        # makes it pp_rows. The post-build check below holds it to that.
+        cell_tp = per_layer * layers
+        size_gb_tp = ((pp_rows - 1) * cell_tp + cell_tp // 2) / 1e9
+        sa_pin.hicache_size = size_gb_tp
         use_mla = "MLA" in type(tp_device_pool).__name__
         kv_host = build_kv_host_pool(
             kv_pool=inner_pool,
@@ -2453,14 +2500,54 @@ def build_phase_flip_host_pools(scheduler):
     except Exception as exc:  # noqa: BLE001 - a refusal must be legible
         logger.error(
             "#847 PHASE-FLIP REBIND: could not allocate the phase-matched "
-            "staging pin (%.3f GiB -> %d GB requested): %s. The rebind will "
-            "refuse at the first cutover rather than run against a mis-shaped "
-            "pool, which is the guard working as designed.",
-            gib,
-            size_gb,
+            "staging pin (row-coupled: pp_rows=%d requested): %s. The rebind "
+            "will refuse at the first cutover rather than run against a "
+            "mis-shaped pool, which is the guard working as designed.",
+            pp_rows,
             exc,
         )
         return {"pp": pp_host}
+
+    # #1068 POST-BUILD REFUSALS (L12), OUTSIDE the try on purpose: an
+    # allocation failure above is the #847 soft refusal, but a pin that
+    # DISAGREES with the synced pp pool is a boot refusal. A rank whose pin
+    # rows differ from its peers' pp rows would refuse a prefetch its peers
+    # register -- RAENGE-NIE-UNEINS -- and that must never reach a cutover.
+    tp_rows = int(getattr(kv_host, "size", -1) or -1)
+    if tp_rows != pp_rows:
+        _msg = (
+            "#1068 TP PIN ROW MISMATCH rank=%d tp_rows=%d pp_rows=%d cell_tp=%d "
+            "cell_pp=%d -- RAENGE-NIE-UNEINS: a phase pin whose row count "
+            "differs from the synced pp pool would let this rank refuse a "
+            "prefetch its peers register" % (rank, tp_rows, pp_rows, cell_tp, cell_pp)
+        )
+        logger.error(_msg)
+        raise RuntimeError(_msg)
+    mamba_slots = -1
+    mamba_per_slot_mib = 0.0
+    if mamba_host is not None:
+        _pp_mamba = (getattr(pp_host, "entry_map", None) or {}).get(PoolName.MAMBA)
+        pp_slots = int(getattr(getattr(_pp_mamba, "host_pool", None), "size", -1) or -1)
+        mamba_slots = int(getattr(mamba_host, "size", -1) or -1)
+        mamba_per_slot_mib = float(getattr(mamba_host, "size_per_token", 0) or 0) / (2**20)
+        if mamba_slots != pp_slots:
+            _msg = (
+                "#1068 TP PIN ANCHOR SLOT MISMATCH rank=%d tp_slots=%d pp_slots=%d "
+                "-- RAENGE-NIE-UNEINS: the two phases' anchor pools must hold the "
+                "same MIN-synced slot count (--hicache-mamba-host-mib)"
+                % (rank, mamba_slots, pp_slots)
+            )
+            logger.error(_msg)
+            raise RuntimeError(_msg)
+        _req_pool = getattr(tp_runner, "req_to_token_pool", None)
+        device_slots = int(getattr(getattr(_req_pool, "mamba_pool", None), "size", 0) or 0)
+        _need = device_slots + max_running + 1
+        if mamba_slots < _need:
+            raise ValueError(
+                "--hicache-mamba-host-mib too small: %d slots, need >= "
+                "device_slots %d + max_running_requests %d + 1 = %d (rank=%d)"
+                % (mamba_slots, device_slots, max_running, _need, rank)
+            )
 
     # #721 HOST-LEDGER: the pin is a NAMED POST, and the floor never yields to
     # it. Printed here, at the allocation, so the number in the ledger is the
@@ -2487,32 +2574,49 @@ def build_phase_flip_host_pools(scheduler):
             )
         except Exception:  # noqa: BLE001 - the ledger must not break the boot
             mamba_bytes = -1
+    # A11.4: spans of the load's prompt class the pool holds at once, from
+    # the launcher's WEG1_PROMPT_MAX_TOKENS if it was given, else 'n/a'.
+    import os as _os
+
+    _pm_env = _os.environ.get("WEG1_PROMPT_MAX_TOKENS", "")
+    try:
+        _pm = int(_pm_env) if _pm_env else 0
+    except ValueError:
+        _pm = 0
+    spans_at_prompt_max = f"{pp_rows / _pm:.2f}" if _pm > 0 else "n/a"
     logger.warning(
-        "HOST-LEDGER POST #847/#871 phase-flip staging pin: %d GB pinned for "
-        "the 'tp' phase-matched host view (%.3f GiB derived from %d tok x "
-        "cell) + MAMBA half %s (%s slots mirroring the device pool, ratio 1.0 "
-        "-- per-SLOT not per-GB), pools=%s, host free after = %s GB against "
-        "the 16 GB floor. This post exists so the #718 device tier stays ARMED "
-        "across the cutover; without it load() returns None for the whole TP "
-        "phase and every read-through misses. The POST shrinks if it does not "
-        "fit -- the FLOOR never does.",
-        size_gb,
-        gib,
-        int(getattr(sa, "chunked_prefill_size", 4096) or 4096)
-        * int(getattr(sa, "max_running_requests", 1) or 1),
+        "HOST-LEDGER POST #847/#871 phase-flip staging pin: %.3f GB pinned for "
+        "the 'tp' phase-matched host view (tp_rows=%d pp_rows=%d cell_tp=%d B "
+        "cell_pp=%d B role=%s source=--hicache-size=%d rows-coupled) + MAMBA "
+        "half %s (%s slots, per_slot=%.2f MiB, source=--hicache-mamba-host-mib=%d "
+        "synced_min) pools=%s host free after = %s GB against the 16 GB floor "
+        "spans_at_prompt_max=%s. This post exists so the #718 device tier stays "
+        "ARMED across the cutover; without it load() returns None for the whole "
+        "TP phase and every read-through misses. The POST is refused if it does "
+        "not fit -- the FLOOR never yields.",
+        tp_rows * cell_tp / 1e9,
+        tp_rows,
+        pp_rows,
+        cell_tp,
+        cell_pp,
+        getattr(sa, "hicache_host_role", "?"),
+        hicache_size_gb,
         (
             "not built"
             if mamba_host is None
             else ("unpriceable" if mamba_bytes < 0 else f"{mamba_bytes / 2**30:.3f} GiB")
         ),
-        "0" if mamba_host is None else getattr(mamba_host, "size", "?"),
+        "0" if mamba_host is None else mamba_slots,
+        mamba_per_slot_mib,
+        int(getattr(sa, "hicache_mamba_host_mib", 0) or 0),
         # getattr, for the SAME STAND-IN reason this module states at its other
-        # probes and which I broke by not reading it first: this writer is
-        # driven in tests by scheduler and pool STAND-INS carrying only what
-        # the writer uses, and `HostPoolGroup` itself is patched there. An
-        # instrument may never be the thing that breaks a boot -- reporting
-        # "unknown" is the honest answer when the shape is not there.
+        # probes: this writer is driven in tests by scheduler and pool STAND-INS
+        # carrying only what the writer uses, and `HostPoolGroup` itself is
+        # patched there. An instrument may never be the thing that breaks a
+        # boot -- reporting "unknown" is the honest answer when the shape is
+        # not there.
         sorted(str(n) for n in (getattr(tp_host, "entry_map", None) or ())) or "unknown",
         free_g if free_g >= 0 else "unknown",
+        spans_at_prompt_max,
     )
     return {"pp": pp_host, "tp": tp_host}

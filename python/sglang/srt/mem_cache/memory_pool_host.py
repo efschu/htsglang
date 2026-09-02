@@ -413,9 +413,23 @@ class MambaPoolHost(HostKVCache):
         # naming every post and the flag that shrinks it.
         #
         # Precedence: explicit MiB > absolute --hicache-size > auto multiple.
+        _synced_suffix = ""
         if anchor_host_mib and int(anchor_host_mib) > 0:
             _size_source = f"--hicache-mamba-host-mib={int(anchor_host_mib)}"
-            self.size = int(anchor_host_mib) * (1024**2) // self.size_per_token
+            # #1068 (WEG 1): MIN-SYNCED ACROSS THE GROUP, exactly like the GB
+            # branch below. The MiB budget is rank-invariant by construction,
+            # but the SLOT COUNT it buys is not: per_slot is the rank's own
+            # mamba-layer share (measured 2026-08-30, boot_855: 37.41 / 21.82
+            # / 15.59 MiB on PP0 / PP1 / PP2), so 2400 MiB bought 64 / 109 /
+            # 153 slots -- three different anchor ceilings under a flag whose
+            # help text promises one. The lockstep schedulers and the host
+            # radix index must agree on one slot count; the group MIN is that
+            # count (each rank still allocates its own per-rank-sized buffer
+            # for it). The local count travels on the provenance line as
+            # synced_from_local= so the binding rank is legible in the log.
+            _local_slots = int(anchor_host_mib) * (1024**2) // self.size_per_token
+            self.size = sync_fixed_hicache_size(_local_slots, int(anchor_host_mib))
+            _synced_suffix = f" synced_from_local={_local_slots}"
         elif host_size > 0:
             _size_source = f"--hicache-size={host_size}"
             self.size = sync_fixed_hicache_size(
@@ -450,7 +464,7 @@ class MambaPoolHost(HostKVCache):
         logger.info(
             "#1035 ANCHOR-POOL PROVENANCE: source=%s -> host_anchor_slots=%d "
             "(device_slots=%d, ratio=%.2f, auto_mult=%.2f) "
-            "per_slot=%.2f MiB total=%.2f GiB layout=%s",
+            "per_slot=%.2f MiB total=%.2f GiB layout=%s%s",
             _size_source,
             self.size,
             device_pool.size,
@@ -459,6 +473,7 @@ class MambaPoolHost(HostKVCache):
             self.size_per_token / (1024**2),
             self.size * self.size_per_token / (1024**3),
             layout,
+            _synced_suffix,
         )
 
         if self.size <= device_pool.size:

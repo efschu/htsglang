@@ -30,33 +30,86 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 import types
 import unittest
 
-from sglang.srt.managers.phase_flip_boot import (
-    PHASE_FLIP_STAGING_CHUNKS,
-    _staging_pin_gib,
-    build_phase_flip_host_pools,
-)
+from sglang.srt.managers.phase_flip_boot import build_phase_flip_host_pools
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.test.test_utils import CustomTestCase
 
 
-class _HostPool:
-    """Records the arguments the real host-pool constructors take."""
+#: The Boot-2 pp pool (WEG1_BUILD_SPEC_0901 section 5): 366211 rows of
+#: 16384 B on a stage holding 8 attention layers -> 2048 B per layer.
+PP_ROWS = 366211
+PP_CELL = 16384
+PP_LAYERS = 8
+PER_LAYER = PP_CELL // PP_LAYERS
+TP_LAYERS = 16
+TP_CELL = PER_LAYER * TP_LAYERS
 
-    last = None
 
-    def __init__(
-        self, device_pool, ratio, size_gb, page_size, layout, allocator_type=None
-    ):
-        self.device_pool = device_pool
+class _PPKVHost:
+    """The pp phase's anchor KV host pool (HostKVCache shape: size, cell,
+    device_pool). This is the pool the tp pin is row-coupled TO."""
+
+    def __init__(self, size=PP_ROWS, size_per_token=PP_CELL, layer_num=PP_LAYERS):
+        self.size = size
+        self.size_per_token = size_per_token
+        self.device_pool = types.SimpleNamespace(layer_num=layer_num)
+        self.layout = "layer_first"
+        self.page_size = 1
+        self.device = "cpu"
+
+
+class _PPHost:
+    """The live tier is a HostPoolGroup COMPOSITE: anchor_entry + entry_map."""
+
+    def __init__(self, kv=None, mamba_host=None):
+        kv = kv if kv is not None else _PPKVHost()
+        self.anchor_entry = types.SimpleNamespace(
+            name=PoolName.KV, host_pool=kv, device_pool=kv.device_pool
+        )
+        self.entry_map = {PoolName.KV: self.anchor_entry}
+        if mamba_host is not None:
+            self.entry_map[PoolName.MAMBA] = types.SimpleNamespace(
+                name=PoolName.MAMBA, host_pool=mamba_host
+            )
+        self.size = kv.size
+
+
+class _BuiltKVHost:
+    """What the (faked) assembler returns for the tp pin."""
+
+    def __init__(self, kv_pool, ratio, size_gb, cell):
+        self.device_pool = kv_pool
         self.ratio = ratio
         self.size_gb = size_gb
-        self.page_size = page_size
-        self.layout = layout
-        self.allocator_type = allocator_type
-        _HostPool.last = self
+        self.size_per_token = cell
+        self.layer_num = kv_pool.layer_num
+        # EXACTLY pool_host/base.py:140-147 for host_size > 0: floor to whole
+        # cells, then one page of alignment. This is the faithful double: the
+        # coupling formula must round-trip through THIS arithmetic.
+        self.size = int(size_gb * 1e9 // cell) + 1
+
+
+class _FakeBuildKVHostPool:
+    """Stands in for hybrid_pool_assembler.build_kv_host_pool and records."""
+
+    def __init__(self, per_layer=PER_LAYER, force_size=None):
+        self.per_layer = per_layer
+        self.force_size = force_size
+        self.last = None
+        self.calls = []
+
+    def __call__(self, *, kv_pool, page_size, server_args, use_mla):
+        cell = self.per_layer * int(kv_pool.layer_num)
+        built = _BuiltKVHost(kv_pool, server_args.hicache_ratio, server_args.hicache_size, cell)
+        if self.force_size is not None:
+            built.size = self.force_size
+        self.last = built
+        self.calls.append(dict(kv_pool=kv_pool, server_args=server_args, use_mla=use_mla))
+        return built
 
 
 class _DevicePool:
-    layer_num = 16
+    layer_num = TP_LAYERS
 
     def __init__(self, cell=8192):
         self._cell = cell
@@ -65,18 +118,22 @@ class _DevicePool:
         return self._cell
 
 
-def _sched(*, rebind=True, host=True, tp_pool=True, cell=8192):
+def _sched(*, rebind=True, host=True, tp_pool=True, cell=8192, pp_host=None,
+           max_running_requests=8, chunked_prefill_size=4096, mamba_mib=0):
     sa = types.SimpleNamespace(
         phase_flip_rebind_hicache=rebind,
-        chunked_prefill_size=4096,
-        max_running_requests=8,
+        chunked_prefill_size=chunked_prefill_size,
+        max_running_requests=max_running_requests,
         page_size=1,
         hicache_mem_layout="layer_first",
         hicache_storage_backend="file",
+        hicache_host_role="staging",
+        hicache_size=6,
+        hicache_mamba_host_mib=mamba_mib,
     )
-    tree = types.SimpleNamespace(
-        token_to_kv_pool_host=_HostPool(None, 0, 1, 1, "layer_first") if host else None
-    )
+    if pp_host is None:
+        pp_host = _PPHost()
+    tree = types.SimpleNamespace(token_to_kv_pool_host=pp_host if host else None)
     stacks = types.SimpleNamespace(
         tp_worker=types.SimpleNamespace(
             model_runner=types.SimpleNamespace(
@@ -89,6 +146,36 @@ def _sched(*, rebind=True, host=True, tp_pool=True, cell=8192):
     )
 
 
+def _build_patched(sched, builder=None):
+    """Assembly needs real pools; patch the NAMED primitives instead.
+
+    Patching the builders the writer is required to use is itself the
+    assertion that it uses them -- a writer that went back to cloning
+    `type(pp_host)` would ignore these patches and fail here.
+    """
+    import unittest.mock as mock
+
+    builder = builder if builder is not None else _FakeBuildKVHostPool()
+    with (
+        mock.patch(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.build_kv_host_pool",
+            new=builder,
+        ),
+        mock.patch(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.build_pool_entry"
+        ) as entry,
+        mock.patch("sglang.srt.mem_cache.memory_pool_host.HostPoolGroup") as grp,
+    ):
+        entry.side_effect = lambda **kw: types.SimpleNamespace(**kw)
+        grp.side_effect = lambda entries: types.SimpleNamespace(
+            entries=entries,
+            entry_map={e.name: e for e in entries},
+            device_pool=sched.phase_flip_stacks.tp_worker.model_runner.token_to_kv_pool,
+        )
+        pools = build_phase_flip_host_pools(sched)
+    return pools, builder
+
+
 class TestTheDefaultBootIsUntouched(CustomTestCase):
     def test_the_flag_off_allocates_nothing(self):
         # Every boot that does not ask for the rebind must be byte-identical.
@@ -97,28 +184,8 @@ class TestTheDefaultBootIsUntouched(CustomTestCase):
 
 class TestTheWriterBuildsBothPhases(CustomTestCase):
     def _patched(self, sched):
-        """Assembly needs real pools; patch the NAMED primitives instead.
-
-        Patching the three builders the writer is required to use is itself
-        the assertion that it uses them -- a writer that went back to cloning
-        `type(pp_host)` would ignore these patches and fail here.
-        """
-        import unittest.mock as mock
-
-        m = mock.patch.multiple(
-            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler",
-            build_kv_host_pool=mock.DEFAULT,
-            build_pool_entry=mock.DEFAULT,
-        )
-        with (
-            m,
-            mock.patch("sglang.srt.mem_cache.memory_pool_host.HostPoolGroup") as grp,
-        ):
-            grp.side_effect = lambda entries: types.SimpleNamespace(
-                entries=entries,
-                device_pool=sched.phase_flip_stacks.tp_worker.model_runner.token_to_kv_pool,
-            )
-            return build_phase_flip_host_pools(sched)
+        pools, _ = _build_patched(sched)
+        return pools
 
     def test_both_phases_are_registered(self):
         pools = self._patched(_sched())
@@ -142,30 +209,91 @@ class TestTheWriterBuildsBothPhases(CustomTestCase):
 
 
 class TestItIsAStagingPinNotAMirror(CustomTestCase):
-    """#810: a `retention` tier is sized as a RATIO of the device pool; a
-    `staging` tier holds only what is in flight. The rebind needs the second,
-    and a ratio-sized second pool would duplicate retention the pp tier already
-    provides while charging the pinned host budget for capacity nothing reads.
+    """#810: a `retention` tier is sized as a RATIO of the device pool. The tp
+    pin is never ratio-sized: since #1068 its row count is COUPLED to the pp
+    pool that --hicache-size built, so both phase pools hold the same rows.
     """
 
     def test_the_ratio_is_not_used(self):
-        build_phase_flip_host_pools(_sched())
-        self.assertEqual(_HostPool.last.ratio, 0, "a RATIO is the mirror-shaped answer")
-        self.assertGreater(_HostPool.last.size_gb, 0, "an explicit size instead")
+        _, builder = _build_patched(_sched())
+        sa_pin = builder.calls[-1]["server_args"]
+        self.assertEqual(sa_pin.hicache_ratio, 0, "a RATIO is the mirror-shaped answer")
+        self.assertGreater(sa_pin.hicache_size, 0, "an explicit size instead")
 
-    def test_the_size_is_derived_from_measured_cells_not_guessed(self):
-        s = _sched(cell=8192)
-        gib = _staging_pin_gib(s, _DevicePool(8192))
-        expected = (4096 * 8 * PHASE_FLIP_STAGING_CHUNKS * 8192) / float(1 << 30)
-        self.assertAlmostEqual(gib, expected, places=6)
 
-    def test_it_scales_with_the_work_not_with_the_pool(self):
-        # The defining property of a staging pin: doubling the device pool
-        # changes nothing; doubling the in-flight work doubles the pin.
-        s = _sched()
-        base = _staging_pin_gib(s, _DevicePool(8192))
-        s.server_args.max_running_requests = 16
-        self.assertAlmostEqual(_staging_pin_gib(s, _DevicePool(8192)), 2 * base, 6)
+class TestTheTpPinIsRowCoupledToThePpPool(CustomTestCase):
+    """#1068 WEG 1 slice 1 (WEG1_BUILD_SPEC_0901 section 4.1, G13).
+
+    Both phase pools are built from ONE absolute knob, --hicache-size: the pp
+    pool directly, the tp pin by ROW COUNT. The pin's GB figure is derived so
+    that pool_host/base.py:140-147 (floor to whole cells, plus one page) lands
+    on EXACTLY the pp row count -- never one row more or less, because a
+    phase pin whose rows differ from the synced pp pool would let one rank
+    refuse a prefetch its peers register (RAENGE-NIE-UNEINS).
+    """
+
+    def test_the_tp_pin_rows_equal_the_pp_pool_rows(self):
+        # T1. pp: 366211 rows x 16384 B on 8 layers; tp: 16 layers -> 32768 B.
+        pools, builder = _build_patched(_sched())
+        sa_pin = builder.calls[-1]["server_args"]
+        self.assertEqual(sa_pin.hicache_ratio, 0)
+        # size_gb_tp = ((pp_rows - 1) * cell_tp + cell_tp // 2) / 1e9: the
+        # midpoint between (pp_rows - 1) and pp_rows whole cells, so the
+        # floor division in base.py is robust to float error and lands on
+        # pp_rows - 1, and the +1 page makes it pp_rows exactly.
+        expected_gb = ((PP_ROWS - 1) * TP_CELL + TP_CELL // 2) / 1e9
+        self.assertAlmostEqual(sa_pin.hicache_size, expected_gb, places=9)
+        self.assertAlmostEqual(sa_pin.hicache_size, 11.999985664, places=9)
+        self.assertEqual(builder.last.size, PP_ROWS, "rows must round-trip exactly")
+        self.assertIn("tp", pools)
+
+    def test_the_coupling_holds_for_other_layer_counts(self):
+        # The formula is not a fitted constant: any tp layer count round-trips.
+        for layers in (24, 7, 5, 4):
+            s = _sched()
+            s.phase_flip_stacks.tp_worker.model_runner.token_to_kv_pool.layer_num = layers
+            _, builder = _build_patched(s)
+            self.assertEqual(builder.last.size, PP_ROWS, f"layers={layers}")
+
+    def test_row_mismatch_is_a_raise_not_a_soft_refusal(self):
+        # T2. A builder that lands one row short is a phase pin that would
+        # disagree with its peers' pp pool: refuse the BOOT, never log-and-go.
+        builder = _FakeBuildKVHostPool(force_size=PP_ROWS - 1)
+        with self.assertRaises(RuntimeError) as cm:
+            _build_patched(_sched(), builder=builder)
+        msg = str(cm.exception)
+        self.assertIn("#1068 TP PIN ROW MISMATCH", msg)
+        self.assertIn(f"tp_rows={PP_ROWS - 1}", msg)
+        self.assertIn(f"pp_rows={PP_ROWS}", msg)
+        self.assertIn(f"cell_tp={TP_CELL}", msg)
+        self.assertIn(f"cell_pp={PP_CELL}", msg)
+
+    def test_the_pin_below_one_wave_is_refused(self):
+        # T3 (G10). 30518 rows cannot hold max_running_requests x chunk =
+        # 8 x 4096 = 32768 in flight; the old max(1, ...) built it silently.
+        s = _sched(pp_host=_PPHost(_PPKVHost(size=30518)))
+        with self.assertRaises(ValueError) as cm:
+            _build_patched(s)
+        msg = str(cm.exception)
+        self.assertIn("pp_rows=30518", msg)
+        self.assertIn("max_running_requests=8", msg)
+        self.assertIn("chunked_prefill_size=4096", msg)
+        self.assertIn("--hicache-size", msg)
+
+    def test_a_cell_the_pp_layers_do_not_divide_is_refused(self):
+        # per_layer * layer_num must reproduce the pp cell exactly, or the
+        # tp cell derived from it is a guess (R7 of the spec).
+        s = _sched(pp_host=_PPHost(_PPKVHost(size_per_token=16383)))
+        with self.assertRaises(ValueError) as cm:
+            _build_patched(s)
+        self.assertIn("16383", str(cm.exception))
+
+    def test_a_pp_tier_without_a_readable_shape_refuses_softly(self):
+        # A stand-in with no rows/cell is not a live composite; the rebind
+        # refuses at the first cutover exactly as before (#847 contract).
+        s = _sched(pp_host=types.SimpleNamespace())
+        pools, _ = _build_patched(s)
+        self.assertEqual(sorted(pools), ["pp"])
 
 
 class TestTheRefusalIsCONVERTEDNotDeleted(CustomTestCase):
@@ -195,14 +323,13 @@ class TestTheRefusalIsCONVERTEDNotDeleted(CustomTestCase):
         self.assertIn("host pool", str(caught.exception))
 
     def test_a_constructor_that_refuses_does_not_take_down_the_boot(self):
-        class _Boom(_HostPool):
-            def __init__(self, *a, **k):
+        # A pin whose ALLOCATION fails (the assembler raises) is the #847
+        # soft refusal: logged, pp handle kept, rebind refuses at the cutover.
+        class _Boom:
+            def __call__(self, **kw):
                 raise RuntimeError("mis-shaped pool")
 
-        s = _sched()
-        s.tree_cache.token_to_kv_pool_host = _Boom.__new__(_Boom)
-        s.tree_cache.token_to_kv_pool_host.__class__ = _Boom
-        pools = build_phase_flip_host_pools(s)
+        pools, _ = _build_patched(_sched(), builder=_Boom())
         self.assertEqual(sorted(pools), ["pp"], "refuse loudly, boot anyway")
 
 
@@ -325,30 +452,17 @@ class TestTheDevicePoolIsUnwrappedLikeTheConsumerDoes(CustomTestCase):
     """
 
     def test_a_wrapped_pool_is_unwrapped(self):
-        import unittest.mock as mock
-
         inner = _DevicePool()
         inner.layer_num = 24
         wrapper = types.SimpleNamespace(full_kv_pool=inner)
         s = _sched()
         s.phase_flip_stacks.tp_worker.model_runner.token_to_kv_pool = wrapper
 
-        with (
-            mock.patch.multiple(
-                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler",
-                build_kv_host_pool=mock.DEFAULT,
-                build_pool_entry=mock.DEFAULT,
-            ) as patched,
-            mock.patch("sglang.srt.mem_cache.memory_pool_host.HostPoolGroup") as grp,
-        ):
-            grp.side_effect = lambda entries: types.SimpleNamespace(entries=entries)
-            pools = build_phase_flip_host_pools(s)
-            self.assertIn("tp", pools, "the inner pool has layer_num=24")
-            # and the host pool must be built FROM the inner pool, not the
-            # wrapper -- otherwise check_shapes compares two different things
-            self.assertIs(
-                patched["build_kv_host_pool"].call_args.kwargs["kv_pool"], inner
-            )
+        pools, builder = _build_patched(s)
+        self.assertIn("tp", pools, "the inner pool has layer_num=24")
+        # and the host pool must be built FROM the inner pool, not the
+        # wrapper -- otherwise check_shapes compares two different things
+        self.assertIs(builder.calls[-1]["kv_pool"], inner)
 
     def test_the_writer_unwraps_the_same_field_the_consumer_does(self):
         import inspect

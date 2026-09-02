@@ -9002,6 +9002,45 @@ class ServerArgs:
                 f"{self.admission_release_hysteresis}."
             )
 
+    def _refuse_incomplete_phase_flip_hicache_sizing_1068(self):
+        """#1068 (WEG 1, slice 1): the phase-flip HiCache rebind needs the
+        staging role AND both absolute knobs, or it refuses.
+
+        WHY. Under ``--phase-flip-rebind-hicache`` every rank carries TWO host
+        KV pools (the pp pool the boot builds and the tp pin the rebind binds
+        to at the cutover) plus two mamba anchor pools. Since #1068 the tp pin
+        is not sized on its own: its ROW COUNT is coupled to the pp pool that
+        ``--hicache-size`` built (phase_flip_boot.build_phase_flip_host_pools),
+        so both phase pools hold the same rows by construction. That coupling
+        has no meaning for a ratio-sized pp pool (a ratio scales with the
+        device pool, which differs per phase), and the anchor pool must be
+        rank-uniform and absolute (``--hicache-mamba-host-mib``, MIN-synced
+        across ranks, memory_pool_host.MambaPoolHost) because a divergent
+        anchor ceiling is a divergent prefetch vote. The role is 'staging' per
+        DESIGN_706_BOOT: the host tier is staging, the disk tier is retention.
+
+        NO RATIO FALLBACK, deliberately: falling back would restore the
+        device-pool-scaled pinned pool silently, under a flag set that claims
+        the opposite. Boots without the rebind flag reach none of this.
+        """
+        if not getattr(self, "phase_flip_rebind_hicache", False):
+            return
+        role = str(self.hicache_host_role)
+        size = int(self.hicache_size or 0)
+        mib = int(getattr(self, "hicache_mamba_host_mib", 0) or 0)
+        if role == "staging" and size > 0 and mib > 0:
+            return
+        raise ValueError(
+            "--phase-flip-rebind-hicache requires --hicache-host-role staging, "
+            "--hicache-size > 0 (GB, absolute; both phase pools are row-coupled "
+            "to it) and --hicache-mamba-host-mib > 0 (MiB per rank, MIN-synced "
+            f"across ranks); got role={role} size={size} mamba_mib={mib}.\n"
+            "The host tier is staging and the disk tier is retention "
+            "(DESIGN_706_BOOT); the tp pin is a second host pool whose rows are "
+            "coupled to --hicache-size, and the anchor pool must be rank-uniform "
+            "and absolute. There is no ratio fallback in this mode."
+        )
+
     def _handle_hicache_host_role(self):
         """#810: fail fast when the host tier is declared staging but sized
         like a retention cache.
@@ -9023,7 +9062,13 @@ class ServerArgs:
         picked a number would be a second authority.
 
         With the role left at 'retention' nothing in this method runs and no
-        other argument changes meaning."""
+        other argument changes meaning.
+
+        #1068 (WEG 1): under ``--phase-flip-rebind-hicache`` the three flags
+        are ONE contract and are checked first, before the retention
+        early-return, so a rebind boot can never fall through to a
+        ratio-sized tier."""
+        self._refuse_incomplete_phase_flip_hicache_sizing_1068()
         if self.hicache_host_role == "retention":
             return
         if not self.enable_hierarchical_cache:
@@ -9170,6 +9215,35 @@ class ServerArgs:
                 nbytes=per_rank_bytes * ranks,
             )
         ]
+        # #1068 (WEG 1): under the phase-flip rebind the SECOND phase's pools
+        # are priced too. The tp pin is row-coupled to the staging tier, so
+        # its bytes are per_rank_bytes x (cell_tp / cell_pp); the exact cell
+        # ratio is a model property the launcher does not know, so this is a
+        # parse-time CEILING (2x, the ratio on this cut: 16 attention layers
+        # in tp vs 8 on pp0), and the boot-time HOST-LEDGER line
+        # (phase_flip_boot) prices it exactly. The anchor pools are exact:
+        # --hicache-mamba-host-mib per rank, two phases.
+        rebind = bool(getattr(self, "phase_flip_rebind_hicache", False))
+        tp_pin_bytes = 0
+        anchor_bytes = 0
+        if rebind:
+            tp_pin_bytes = per_rank_bytes * ranks * 2
+            posts.append(
+                PinnedHostPost(
+                    name="phase-flip tp pin (rows-coupled to --hicache-size, ceiling estimate 2x)",
+                    flag="--hicache-size (phase-flip)",
+                    nbytes=tp_pin_bytes,
+                )
+            )
+            anchor_mib = int(getattr(self, "hicache_mamba_host_mib", 0) or 0)
+            anchor_bytes = anchor_mib * (1024**2) * ranks * 2
+            posts.append(
+                PinnedHostPost(
+                    name="HiCache mamba anchor pools x2 phases",
+                    flag="--hicache-mamba-host-mib",
+                    nbytes=anchor_bytes,
+                )
+            )
         kvso_bytes = int((self.kv_session_offload_host_ram_gib or 0) * (1024**3))
         if kvso_bytes > 0:
             posts.append(
@@ -9186,6 +9260,26 @@ class ServerArgs:
         # The ledger entry itself. Without a line the operator can read, a
         # tier that got smaller is invisible in exactly the same way it was
         # when it was large.
+        if rebind:
+            from sglang.srt.mem_cache.pinned_host_budget import (
+                PINNED_HOST_RESERVE_BYTES,
+            )
+
+            logger.info(
+                "#810 host ledger: staging tier %.2f GB x %d rank(s) + phase-flip "
+                "tp pin ceiling %.2f GB (2x) + mamba anchor pools %.2f GB (x%d "
+                "ranks x2 phases) = %.2f GB against available %.2f GB minus "
+                "reserve %.2f GB",
+                per_rank_bytes / 1e9,
+                ranks,
+                tp_pin_bytes / 1e9,
+                anchor_bytes / 1e9,
+                ranks,
+                (per_rank_bytes * ranks + tp_pin_bytes + anchor_bytes) / 1e9,
+                (int(available_bytes) / 1e9) if available_bytes is not None else -1.0,
+                PINNED_HOST_RESERVE_BYTES / 1e9,
+            )
+            return
         logger.info(
             "#810 host ledger: staging tier %.2f GB x %d rank(s) = %.2f GB "
             "pinned host RAM (%s).",
