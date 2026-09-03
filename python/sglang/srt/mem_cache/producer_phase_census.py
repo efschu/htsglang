@@ -1158,6 +1158,23 @@ class DoublePrefillCensus:
             "recomputed": self.recomputed,
             "already": self.already_computed,
             "readmitted": self.readmitted,
+            # #1175 (E4b): THE POPULATION THIS LINE SPEAKS FOR.
+            #
+            # `note_readmitted_request` is called only for requests carrying
+            # SEAM_READMIT_ATTR, and that attribute is stamped in exactly one
+            # place: the retract closure that hands a RESIDENT request back
+            # after a cutover. A request that sat in `waiting_queue` across
+            # the cutover and was re-issued from there (the #1066 fresh-fetch
+            # path) is never stamped, so its re-prefill is invisible here --
+            # measured on boot_855_weg1b5: two 13225-token queue-occupant
+            # re-admissions produced NOT ONE census line.
+            #
+            # Naming the population is the honest half of the denominator
+            # law: a reader must never take `recomputed` for "all the double
+            # prefill there was". Widening the stamp to the queue path is a
+            # separate change with its own risk (a second stamping site on
+            # the admission path), deliberately not made here.
+            "population": "retract_closure_only",
             # #1068 (G9, L10): the loss term that is NOT the read path's.
             "fence_proceeds": self.fence_proceeds,
         }

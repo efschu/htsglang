@@ -227,6 +227,12 @@ from sglang.srt.managers.pp_admission_congruence import (
     forwarded_schedule_stop_message,
     pp_row_authority_enabled,
     rank_local_count_veto_applies,
+    store_read_bound_s,
+)
+from sglang.srt.managers.pp_prefetch_completion import (
+    format_group_fact,
+    group_completion_enabled as _group_completion_on,
+    group_completion_verdict,
 )
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -290,6 +296,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import (
     SchedulerPPMixin,
+    pp_prefetch_completion_table,
     pp_upstream_void_pending,
 )
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
@@ -9985,6 +9992,117 @@ class Scheduler(
             )
         return self.tree_cache.check_prefetch_progress(req.rid)
 
+    def _admit_under_group_completion(self, req, note_skip) -> bool:
+        """#1175 (E1): may PP0 name its own completed store span for ``req``?
+
+        TRUE to admit, FALSE to defer THIS rid (other work in the pass
+        proceeds). PP0 ONLY -- the caller is inside the `pp_rank == 0` branch,
+        and followers form no verdict (#969Z).
+
+        THE THREE OUTCOMES, and why the third is not a STOP:
+
+          * the group floor covers PP0's span -> admit, silently, exactly the
+            pre-#1175 path;
+          * a peer is still fetching, or has said nothing yet -> DEFER with a
+            named line. The peers' prefetches are NOT blocked by this: they
+            run on their own scheduler threads and their reports arrive on the
+            next lap, so a defer is one pass of latency, not a wait;
+          * the length-priced bound expires -> CLAMP to the group floor and
+            admit. Deferring for ever is a wedge; admitting at PP0's own span
+            is the divergence that killed weg1b5; naming the floor is the
+            remedy the #631 bulletin has printed on every under-coverage line
+            since it was built ("PP0 defers its raise to the group floor").
+            The clamp travels through the EXISTING #1059 channel
+            (`note_observed_coverage` -> `uniform_prefix_for` ->
+            `build_pp_admission_decision`), so no second publication path is
+            introduced -- Upstream-Minimal.
+
+        The bound is `store_read_bound_s(span)`, the same pricing the
+        follower's own `execute_scheduled_prefix` wait used, so the failure
+        envelope is unchanged in size and only MOVED to the rank that holds
+        the facts.
+        """
+        rid = str(getattr(req, "rid", "?"))
+        tree = self.tree_cache
+        reader = getattr(tree, "completed_prefetch_tokens", None)
+        if reader is None:
+            return True
+        try:
+            want = reader(rid)
+        except Exception:  # noqa: BLE001 - a gate may never break admission
+            return True
+        if not want:
+            # No completed store span of PP0's own: there is no raise to
+            # defer, and the verdict module returns admit for want <= 0 too.
+            self._pp_group_completion_since.pop(rid, None)
+            return True
+        want = int(want)
+        table = pp_prefetch_completion_table(self)
+        started = self._pp_group_completion_since.get(rid)
+        now = time.monotonic()
+        bound = store_read_bound_s(want)
+        expired = started is not None and (now - started) >= bound
+        verdict = group_completion_verdict(
+            table,
+            rid,
+            want,
+            int(self.ps.pp_size),
+            own_rank=0,
+            deadline_expired=expired,
+        )
+        if verdict.admit and verdict.clamp_to is None:
+            self._pp_group_completion_since.pop(rid, None)
+            return True
+        if verdict.clamp_to is not None:
+            self._pp_group_completion_since.pop(rid, None)
+            guard = getattr(self, "_pp_admission_guard", None)
+            if guard is not None:
+                # THE #1059 CHANNEL, not a second publisher: the decision
+                # builder already clamps `told` to `uniform_prefix_for`.
+                guard.note_observed_coverage(rid, int(verdict.clamp_to))
+            logger.warning(
+                "#1175 GROUP FACT CLAMPED after %.2fs of a %.2fs "
+                "length-priced bound: %s. PP0 admits at the GROUP FLOOR "
+                "instead of its own span -- naming a prefix a peer cannot "
+                "hold is the divergence that ended boot weg1b5 on the #968 "
+                "STOP, and deferring for ever is a wedge. Every rank's "
+                "reading is printed above; 'absent' means that rank made no "
+                "statement this lap, which is never read as zero.",
+                0.0 if started is None else now - started,
+                bound,
+                format_group_fact(rid, want, verdict, own_rank=0),
+            )
+            return True
+        if started is None:
+            self._pp_group_completion_since[rid] = now
+        note_skip("prefix_group_pending_pp0", rid)
+        self._pp_group_defer_seen = getattr(self, "_pp_group_defer_seen", 0) + 1
+        n = self._pp_group_defer_seen
+        if n <= 20 or n % 64 == 0:
+            logger.info(
+                "#1175 GROUP FACT DEFERRED (n=%d, waited=%.2fs of %.2fs): %s. "
+                "This rid alone is held back; the rest of the pass proceeds. "
+                "The peers' prefetches are not blocked by this defer -- they "
+                "run on their own threads and their readings ride the next "
+                "#791 lap home.",
+                n,
+                0.0 if started is None else now - started,
+                bound,
+                format_group_fact(rid, want, verdict, own_rank=0),
+            )
+        return False
+
+    @property
+    def _pp_group_completion_since(self):
+        """#1175: rid -> monotonic time of the FIRST defer, the clock the
+        length-priced bound is measured against. Lives on the scheduler
+        because it must outlive the pass, like the #701 ledger."""
+        table = getattr(self, "_pp_group_completion_since_map", None)
+        if table is None:
+            table = {}
+            self._pp_group_completion_since_map = table
+        return table
+
     @property
     def chunked_commitment_ledger(self):
         """#701 defect (b): the cross-pass reservation, owned HERE.
@@ -11119,6 +11237,9 @@ class Scheduler(
             # stays relevant for the loading; it no longer decides admission
             # anywhere in a PP group.
             _pp_group = self.ps.pp_size > 1
+            # #1175: the group-completion gate, resolved ONCE per request
+            # so the kill switch cannot flip mid-loop and split the pass.
+            _group_completion_enabled = _pp_group and _group_completion_on()
             if self.enable_hicache_storage and _pp_group:
                 # #1066: PP0 DOES WAIT NOW -- and only PP0. The #969Z verdict
                 # above ("TAKE WITHOUT WAITING, uniform and therefore
@@ -11143,6 +11264,28 @@ class Scheduler(
                     if not _local_prefetch_done:
                         _note_skip("prefetch_pending_pp0", req.rid)
                         continue
+                    # #1175 (E1): THE ADMISSION FACT IS THE GROUP FACT.
+                    #
+                    # PP0's own prefetch has completed; the question this term
+                    # answers is whether the OTHER ranks' has. On the weg1b5
+                    # specimen it had not -- PP0 completed 12288 tokens in 3 s
+                    # and admitted `prefix_lens=12288` while PP1 and PP2 were
+                    # still fetching, and PP1 then died on the #968 group STOP
+                    # 14 s later. Nothing in `completed_synced` could have said
+                    # so: its packed MIN reduce is gated on `tp_world_size > 1`
+                    # and this boot runs tp_size=1 (measured, attn_reduce_world
+                    # =1 on 307/307 #1028 lines), so the field carried PP0's
+                    # own number under a name claiming agreement.
+                    #
+                    # NO COLLECTIVE HERE. The peers' readings arrived on the
+                    # #791 ring lap (`pp_prefetch_completion_stamp` puts them
+                    # on the output the followers already send; PP0 absorbs
+                    # them in `pp_absorb_admission_return`), which is the
+                    # carrier the PP0-authority order names -- a collective on
+                    # this path is a recorded fatal.
+                    if _group_completion_enabled:
+                        if not self._admit_under_group_completion(req, _note_skip):
+                            continue
                 # Credit a completed store hit if there is one; followers
                 # (pp_rank>0) credit only and decide nothing (#969Z).
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)

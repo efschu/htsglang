@@ -261,6 +261,16 @@ _PP_LAUNCHED_CHAIN_KEY = "__pp_launched_chain__"
 # every pre-#968 sender and every stand-in produces -- so the legacy path
 # is byte-identical.
 _PP_PARKED_CONTINUATION_KEY = "__pp_parked_continuation__"
+from sglang.srt.managers.pp_prefetch_completion import PENDING as PREFETCH_PENDING
+
+#: #1175: the per-rid store-prefetch completion report a FOLLOWER puts on the
+#: home-bound output. Same carrier class as the parked-continuation key above
+#: and for the same reason: PP0 is the only rank whose prefetch gates
+#: admission, the fact it needs is rank-local on every OTHER rank, and the
+#: PP0-authority order forbids a collective on the admission path. So the
+#: fact rides the lap. Popped at PP0 (`pp_absorb_admission_return`) before the
+#: dict becomes a `PPProxyTensors`, exactly as the two keys above are.
+_PP_PREFETCH_COMPLETION_KEY = "__pp_prefetch_completion__"
 
 # 2026-08-20, fourth deadlock of the "a rank blocked on a peer for something
 # not required for this iteration's forward progress" family -- historical
@@ -2082,6 +2092,175 @@ def pp_stamp_observed_coverage(holder, decision):
     return replace(decision, entries=tuple(entries))
 
 
+def pp_prefetch_completion_facts_from_wire(message) -> Tuple:
+    """#1175: the completion reports already riding this message.
+
+    Tolerant of every shape a stand-in or an older sender can produce, for
+    the reason `pp_parked_continuation_facts_from_wire` gives: this sits on
+    the output path, where raising turns one defect into two.
+    """
+    if not isinstance(message, dict):
+        return ()
+    raw = message.get(_PP_PREFETCH_COMPLETION_KEY)
+    if not raw:
+        return ()
+    out = []
+    for entry in raw:
+        try:
+            rid, completed, rank = entry
+        except (TypeError, ValueError):
+            continue
+        if completed == PREFETCH_PENDING:
+            out.append((str(rid), PREFETCH_PENDING, int(rank)))
+        else:
+            try:
+                out.append((str(rid), int(completed), int(rank)))
+            except (TypeError, ValueError):
+                continue
+    return tuple(out)
+
+
+def pp_prefetch_completion_own(holder) -> Tuple:
+    """#1175: THIS rank's completion reading for every rid it has queued.
+
+    Read off ``waiting_queue`` -- the replicated set the #580 drain already
+    walks -- so the report covers exactly the rids PP0 can be about to admit,
+    and nothing else. Three readings, three different facts:
+
+      * an integer: this rank's storage prefetch for that rid TERMINATED with
+        that many tokens;
+      * ``PREFETCH_PENDING``: an operation is registered and still running;
+      * ABSENT from the tuple: this rank has said nothing about that rid.
+
+    Rank-local, no collective, no I/O: `completed_prefetch_tokens` reads a
+    dict and `prefetch_is_ongoing` a membership test.
+    """
+    rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
+    if rank is None or int(rank) == 0:
+        # PP0 is the CONSUMER of this fact, never a producer of it: its own
+        # reading is already in hand at the gate. Reporting it would also make
+        # the wire disagree with `group_completion_verdict`, whose peer set
+        # excludes the decider by construction.
+        return ()
+    tree = getattr(holder, "tree_cache", None)
+    if tree is None:
+        return ()
+    reader = getattr(tree, "completed_prefetch_tokens", None)
+    ongoing = getattr(tree, "prefetch_is_ongoing", None)
+    if reader is None:
+        return ()
+    out = []
+    for req in getattr(holder, "waiting_queue", ()) or ():
+        rid = getattr(req, "rid", None)
+        if rid is None:
+            continue
+        try:
+            value = reader(rid)
+        except Exception:  # noqa: BLE001 - a report may never break the output path
+            continue
+        if value is None:
+            try:
+                running = bool(ongoing(rid)) if ongoing is not None else False
+            except Exception:  # noqa: BLE001
+                running = False
+            if not running:
+                continue
+            out.append((str(rid), PREFETCH_PENDING, int(rank)))
+            continue
+        out.append((str(rid), int(value), int(rank)))
+    return tuple(out)
+
+
+def pp_prefetch_completion_stamp(holder, incoming, out: Dict[str, object]) -> None:
+    """#1175: union THIS rank's completion reports into what it forwards.
+
+    THE MERGE IS THE POINT, exactly as for the parked continuations: in a
+    three-rank ring PP1 reports, PP2 originates the home-bound output, and
+    PP0 is the only consumer -- so PP2 must relay PP1's reports or they never
+    arrive. Keyed by (rid, rank), so a newer report from the same rank about
+    the same rid replaces the older one and no rank can overwrite another's.
+
+    Writes nothing when there is nothing to say, so a rank with an empty
+    queue produces a byte-identical payload.
+
+    #1175/E3: emits ONE bounded line naming this rank's own state per rid.
+    The specimen's PP2 printed nothing at all about rid 0c34259f -- a silent
+    follower is the #1153 no-statement form and is forbidden; this is the
+    follower's own statement, independent of whether a decision row ever
+    reaches it.
+    """
+    merged: Dict[Tuple[str, int], Tuple] = {}
+    for rid, completed, rank in pp_prefetch_completion_facts_from_wire(incoming):
+        merged[(rid, int(rank))] = (rid, completed, int(rank))
+    own = pp_prefetch_completion_own(holder)
+    own_rank = getattr(getattr(holder, "ps", None), "pp_rank", None)
+    if own_rank is not None:
+        # WITHDRAW THIS RANK'S STALE CLAIMS as the message passes: only the
+        # reporting rank is the authority on its own current reading, and a
+        # report about a rid it no longer holds would let PP0 admit on a fact
+        # nobody stands behind any more (the staleness rule
+        # `pp_note_parked_continuation` states for its own table).
+        fresh = {rid for rid, _c, _r in own}
+        for key in [k for k in merged if k[1] == int(own_rank) and k[0] not in fresh]:
+            merged.pop(key, None)
+    for rid, completed, rank in own:
+        merged[(rid, int(rank))] = (rid, completed, int(rank))
+    if not merged:
+        return
+    out[_PP_PREFETCH_COMPLETION_KEY] = tuple(merged[k] for k in sorted(merged))
+    if own:
+        emit, seen = pp_968_log_gate(f"completion:{own_rank}:{len(own)}")
+        if emit:
+            logger.info(
+                "#1175 COMPLETION REPORT rank=%s rids=%d reports=%s (seen=%d). "
+                "This rank's OWN store-prefetch reading for every rid it has "
+                "queued, riding the #791 lap home to PP0. 'pending' means an "
+                "operation is registered and unterminated; a rid absent here "
+                "is one this rank has made no statement about, which PP0 "
+                "prints as 'absent' rather than reading as zero.",
+                own_rank,
+                len(own),
+                ",".join(f"{rid[:8]}={completed}" for rid, completed, _r in own[:8]),
+                seen,
+            )
+
+
+def pp_note_prefetch_completion(holder, message) -> int:
+    """#1175: PP0 absorbs the completion reports riding home. Count absorbed.
+
+    THE ARRIVING SET IS THE WHOLE TRUTH for the ranks it names, and only for
+    those: every relay unions its own current reports in and withdraws its own
+    stale ones, so a completed lap names each reporting rank's reading right
+    now. Entries for ranks the message does not mention are left alone, which
+    is what keeps a lap that lost one hop from silently zeroing that rank.
+
+    A MESSAGE WITHOUT THE KEY IS NOT AN EMPTY SET (a pre-#1175 rank or a
+    stand-in): the table is left exactly as it was, which is what makes the
+    legacy path byte-identical.
+    """
+    if not isinstance(message, dict) or _PP_PREFETCH_COMPLETION_KEY not in message:
+        return 0
+    facts = pp_prefetch_completion_facts_from_wire(message)
+    table = getattr(holder, "_pp_prefetch_completion", None)
+    if table is None:
+        table = {}
+        holder._pp_prefetch_completion = table
+    reported_ranks = {int(rank) for _rid, _c, rank in facts}
+    for key in [k for k in table if int(k[1]) in reported_ranks]:
+        table.pop(key, None)
+    for rid, completed, rank in facts:
+        table[(str(rid), int(rank))] = completed
+    return len(facts)
+
+
+def pp_prefetch_completion_table(holder) -> Dict[Tuple[str, int], object]:
+    """#1175: PP0's absorbed table, copied. Empty before the first lap."""
+    table = getattr(holder, "_pp_prefetch_completion", None)
+    if not table:
+        return {}
+    return dict(table)
+
+
 def pp_output_payload_with_return_trip(
     holder, payload: Dict[str, object], mb_id: int
 ) -> Dict[str, object]:
@@ -2139,9 +2318,17 @@ def pp_output_payload_with_return_trip(
     # #1046: the #1044 sender ledger is deleted with the delivery chain it was
     # built to diagnose. The row still rides this payload for the #791 batch
     # geometry; only the load-back column stopped needing to be watched.
-    if decision is None and not chain and not parked_out:
+    # #1175: this rank's store-prefetch completion reports ride the same
+    # message for the same reason the parked facts do -- and they are needed
+    # on EVERY lap, including a void, because PP0's admission gate reads them
+    # on the very next pass.
+    completion_out: Dict[str, object] = {}
+    pp_prefetch_completion_stamp(holder, payload, completion_out)
+    if decision is None and not chain and not parked_out and not completion_out:
         return payload
     out = dict(payload)
+    if completion_out:
+        out.update(completion_out)
     if decision is not None:
         # #1059 SITE 1: report this rank's coverage UPWARD, and PIN it in the
         # same breath. This is the only direction a per-rank observation may
@@ -2201,6 +2388,9 @@ def pp_absorb_admission_return(holder, message: Dict[str, object]) -> bool:
     # carrying a parked fact but NO decision is exactly the void case this
     # exists for, so gating the absorption on a decision would starve it.
     pp_note_parked_continuation(holder, message)
+    # #1175: absorbed and popped for the same two reasons.
+    pp_note_prefetch_completion(holder, message)
+    message.pop(_PP_PREFETCH_COMPLETION_KEY, None)
     message.pop(_PP_PARKED_CONTINUATION_KEY, None)
     raw = message.pop(_ADMISSION_DECISION_PAYLOAD_KEY, None)
     if raw is None:

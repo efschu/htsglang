@@ -415,6 +415,12 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+#: #1175: how many rids' completion readings the ring report keeps. Sized
+#: far above any plausible waiting queue (the report only ever needs the
+#: rids currently queued), so the cap is a leak bound, never a policy.
+_PREFETCH_COMPLETION_SLOTS = 4096
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -823,6 +829,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._host_insert_refused_unbacked_parent = 0
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # #1175: THIS RANK'S OWN store-prefetch completion, per rid, kept
+        # ALONGSIDE the credit dict above rather than inside it. The credit
+        # is POPPED at admission (`pop_prefetch_loaded_tokens`) and is a
+        # LOAD-BACK amount; what the ring report needs is the COMPLETED
+        # SPAN, readable on every later pass by a rank that is not the one
+        # admitting. Bounded by the same lifetime as the records above --
+        # `_forget_prefetch_record` drops both.
+        self._prefetch_completed_tokens: dict[str, int] = {}
         # #1068 (A12.4): clearing this dict drops the tree's RECORDS only; the
         # operations behind them are terminated by `cache_controller.reset()`
         # below, whose `_stop_storage_threads` marks every operation the
@@ -3901,6 +3915,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # completed=0) directly visible instead of proven by elimination.
         # Not emitted under best_effort, where every check terminates by
         # design.
+        #
+        # #1175 (E2), WHERE THIS LINE CANNOT FIRE, stated instead of implied.
+        # It reports a TERMINATION, so it is only ever reached from
+        # `check_prefetch_progress`. A prefetch that never terminates -- the
+        # weg1b5 follower case, where the operation was still running when the
+        # group STOP fired -- produces NO line here, and 0 REAPED lines is
+        # therefore not evidence that nothing was reaped: it is equally
+        # consistent with nothing having terminated at all. Two callers reach
+        # this on a PP boot: the per-round drain (`_drain_prefetch_progress`)
+        # and, since #1175, `execute_scheduled_prefix`'s poll where the check
+        # is collective-free. On a rank whose scheduler thread is blocked in
+        # something else, neither runs and this diagnostic is structurally
+        # silent -- by construction, not by chance.
         _hit_pages_kv = len(hash_value)
         _completed_local = (
             _hit_pages_kv > 0 and completed_tokens == _hit_pages_kv * self.page_size
@@ -4140,11 +4167,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # line frequent" -- unmeasurable by construction. 315 of those 339 were
         # arithmetic and 24 were refusals; without this field that split costs
         # a log-and-code archaeology pass.
+        # #1175: the rank-local completion, kept for the ring report that
+        # carries this fact to PP0 (`pp_prefetch_completion`). Written here,
+        # at the ONE site that terminates a prefetch and knows the span.
+        self._prefetch_completed_tokens[req_id] = int(completed_tokens)
+        # BOUNDED BY CONSTRUCTION. `release_aborted_request` drops the
+        # ordinary case; this cap covers rids that finish without ever
+        # reaching that site, so a long boot cannot grow the dict without
+        # limit (the #1048 form: an instrument's own dict as the leak).
+        while len(self._prefetch_completed_tokens) > _PREFETCH_COMPLETION_SLOTS:
+            self._prefetch_completed_tokens.pop(
+                next(iter(self._prefetch_completed_tokens))
+            )
+        # #1175 (E1, Instrument-Text-luegt Klasse A): `completed_synced` is
+        # `min_completed_tokens`, which the packed MIN above overwrites ONLY
+        # under `if self.tp_world_size > 1:`. Under `--tp-size 1 --pp-size 3`
+        # that branch is never taken and the field carried this rank's own
+        # number under a name claiming a group agreement -- measured,
+        # attn_reduce_world=1 on 307/307 #1028 lines of
+        # boot_855_weg1b5_cd5bb69607_0903_115008. The value is unchanged; the
+        # line now says WHETHER it was synced and over which world, so no
+        # reader can mistake it for a group fact again.
+        _synced_world = self._attn_reduce_world()
         logger.info(
-            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d refused=%d tail_release=%d occupied=%d",
+            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d synced=%s attn_reduce_world=%d matched=%d loaded=%d refused=%d tail_release=%d occupied=%d",
             req_id,
             completed_tokens,
             min_completed_tokens,
+            "yes" if _synced_world > 1 else "no",
+            _synced_world,
             insert_result.prefix_len,
             loaded_from_storage,
             int(insert_result.host_span_unclaimed),
@@ -4411,8 +4462,54 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def completed_prefetch_tokens(self, req_id: str) -> Optional[int]:
+        """#1175: how many prefix tokens THIS rank's storage prefetch has
+        completed for ``req_id``, or ``None`` when it has said nothing.
+
+        `None` IS NOT ZERO, and the distinction is the point (#944's rule one
+        level up): a rank that never terminated a prefetch has made no
+        statement, and a group floor built from silence would collapse every
+        admission to 0. `pp_prefetch_completion.group_completion_verdict`
+        branches on the two before any arithmetic.
+
+        NOT popped, unlike `pop_prefetch_loaded_tokens`: the reader is the
+        ring report, which runs on later passes and on ranks that are not the
+        one admitting.
+        """
+        value = self._prefetch_completed_tokens.get(str(req_id))
+        return None if value is None else int(value)
+
+    def prefetch_is_ongoing(self, req_id: str) -> bool:
+        """#1175: True while a prefetch operation is registered for ``req_id``
+        and has not been terminated. Rank-local, no collective, no I/O."""
+        return str(req_id) in self.ongoing_prefetch
+
+    def prefetch_progress_is_collective_free(self) -> bool:
+        """#1175 (E2): True iff `check_prefetch_progress` carries NO cross-rank
+        collective on this boot, so a rank-local caller may drive it.
+
+        THE ONE PREDICATE, NOT A GUESS. Both collectives on that path
+        (`can_terminate_prefetch`'s MAX and the packed MIN) go through
+        `_all_reduce_attn_groups`, and `_attn_reduce_world` is that helper's
+        own measure of how many ranks it actually reduces over -- built for
+        #1028 precisely so a world of 1 could not be read as an agreement.
+        World 1 means every `all_reduce` in there is skipped by construction,
+        so entering from `execute_scheduled_prefix` cannot reopen #580: there
+        is no collective for a peer to be absent from.
+
+        Under `--tp-size N>1` this returns False and the follower's wait does
+        NOT drive completion -- it says so in its own expiry text rather than
+        entering a collective its peers are not in. That is the honest half of
+        the answer, not a gap.
+        """
+        try:
+            return int(self._attn_reduce_world()) <= 1
+        except Exception:  # noqa: BLE001 - a predicate may never break admission
+            return False
+
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self._prefetch_completed_tokens.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
 

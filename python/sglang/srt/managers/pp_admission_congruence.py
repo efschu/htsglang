@@ -2455,6 +2455,15 @@ def store_read_bound_s(deficit_tokens: int) -> float:
     )
 
 
+#: #1175 (E4): how many times `execute_scheduled_prefix` found the prefix
+#: already equal to the schedule. A DENOMINATOR for the materialise line.
+_PREFIX_EXEC_NOOP_SEEN = 0
+
+#: #1175 (E3): how many times this rank ENTERED the materialisation wait
+#: under-covered. Bounds the per-rid under-coverage line below.
+_PREFIX_EXEC_SHORT_SEEN = 0
+
+
 def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     """#968: make this rank HOLD exactly the scheduled prefix, or die loudly.
 
@@ -2509,6 +2518,27 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     local = len(req.prefix_indices)
     scheduled = int(scheduled_prefix_len)
     if local == scheduled:
+        # #1175 (E4): NOT A SILENT RETURN ANY MORE. This is the healthy
+        # majority path, and until now it printed nothing at all -- so
+        # "#968 PREFIX-EXEC materialised = 0 lines on the whole boot"
+        # (weg1b5) could not be told from "the function never ran" (the
+        # INDIKATOR-GESETZ shape: an instrument whose absence is
+        # unreadable). Bounded and rate-limited: the line is a denominator,
+        # not a stream.
+        global _PREFIX_EXEC_NOOP_SEEN
+        _PREFIX_EXEC_NOOP_SEEN += 1
+        n = _PREFIX_EXEC_NOOP_SEEN
+        if n <= 5 or n % 512 == 0:
+            logger.info(
+                "#968 PREFIX-EXEC no-op rid=%s local=scheduled=%d (n=%d): this "
+                "rank already holds exactly the decision's prefix, so nothing "
+                "is truncated and nothing is materialised. Counted so that an "
+                "absence of 'materialised' lines is readable as 'never "
+                "needed' rather than as 'never reached'.",
+                getattr(req, "rid", "?"),
+                scheduled,
+                n,
+            )
         return 0
     if local > scheduled:
         req.prefix_indices = req.prefix_indices[:scheduled]
@@ -2530,6 +2560,43 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     )
     bound_s = store_read_bound_s(deficit)
     started = time.monotonic()
+
+    # #1175 (E3): EVERY FOLLOWER SPEAKS BEFORE IT CAN BE STUCK.
+    #
+    # On boot_855_weg1b5 PP1 printed 256 bulletin lines about rid 0c34259f
+    # and PP2 printed NOT ONE -- and PP2's silence was indistinguishable
+    # from health right up to the group STOP. A silent follower is the #1153
+    # no-statement form and is forbidden, so this rank states its own
+    # under-coverage HERE, at entry, on the same thread that is about to
+    # sleep, before any bound can expire.
+    #
+    # WHAT THIS LINE STILL CANNOT SAY, stated instead of implied: a rank that
+    # never RECEIVES a decision row never calls this function and therefore
+    # emits nothing. That is exactly what happened to PP2 -- the ring hop
+    # PP0 -> PP1 -> PP2 stalled at PP1, which was asleep in this very wait.
+    # The remedy for that silence is not a louder emitter, it is the wait no
+    # longer being unfulfillable (E2) and the decision no longer naming a
+    # prefix only PP0 holds (E1); this line is what makes the FIRST blocked
+    # rank legible while those hold.
+    global _PREFIX_EXEC_SHORT_SEEN
+    _PREFIX_EXEC_SHORT_SEEN += 1
+    _short_n = _PREFIX_EXEC_SHORT_SEEN
+    if _short_n <= 20 or _short_n % 64 == 0:
+        logger.info(
+            "#1175 PREFIX-EXEC UNDER-COVERAGE rid=%s local=%d scheduled=%d "
+            "deficit=%d bound=%.2fs host_hit=%s storage=%s (n=%d): this rank "
+            "is entering the length-priced materialisation wait. If the group "
+            "stops after this line, THIS rank was short and said so; a rank "
+            "that prints nothing at all never received the row.",
+            getattr(req, "rid", "?"),
+            local,
+            scheduled,
+            deficit,
+            bound_s,
+            int(getattr(req, "host_hit_length", 0) or 0),
+            storage_on,
+            _short_n,
+        )
 
     def _die(served: int, why: str) -> "RuntimeError":
         host_offer = int(getattr(req, "host_hit_length", 0) or 0)
@@ -2558,6 +2625,9 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
     import torch
 
     loaded_total = 0
+    # #1175 (E2): whether the poll ever drove the progress check, so the
+    # expiry text can say what it does and does not measure.
+    _drove_ever = False
     while True:
         best = getattr(req, "best_match_node", None)
         if best is not None:
@@ -2620,15 +2690,58 @@ def execute_scheduled_prefix(req, tree_cache, scheduled_prefix_len: int) -> int:
                 "(#1065: the store usually HAS the bytes and the WAIT was the "
                 "underpriced term; if this fires, either the store genuinely "
                 "lacks the prefix -- the loud special case -- or the rate "
-                "assumptions in store_read_bound_s no longer hold)",
+                "assumptions in store_read_bound_s no longer hold). #1175: "
+                f"prefetch_driven_in_loop={_drove_ever} -- when False the "
+                "progress check carries a collective on this boot and was "
+                "NOT called from the poll, so this expiry says nothing about "
+                "whether the bytes had arrived",
             )
         # #1065 THE WAIT, priced instead of skipped: the storage prefetch
         # delivers into the host tier on its own thread; poll rank-locally
-        # and re-match so the fresh host nodes become loadable. No
-        # collectives on this path (match_prefix and init_load_back are
-        # rank-local; the #580 hazard lives in check_prefetch_progress,
-        # which is deliberately NOT called here).
+        # and re-match so the fresh host nodes become loadable.
+        #
+        # #1175 (E2): THE LOOP NOW DRIVES THE WRITER IT USED TO SUSPEND.
+        #
+        # The premise the old comment rested on -- "the #580 hazard lives in
+        # check_prefetch_progress, which is deliberately NOT called here" --
+        # is a hazard statement, not a mechanism statement, and it made this
+        # wait UNFULFILLABLE in the layout where it actually fires. The
+        # prefetched span reaches the radix tree at exactly one site
+        # (`UnifiedRadixCache._insert_helper_host`, called only from
+        # `check_prefetch_progress`), and that function's only callers are
+        # `Scheduler._drain_prefetch_progress` and `_prefetch_done_for` --
+        # both on the scheduler MAIN thread, the thread sleeping here. So the
+        # loop polled `match_prefix` over a structure whose sole writer it
+        # had itself suspended: on the weg1b5 specimen `local` stayed 0 on
+        # all 256 polls and the bound could only expire.
+        #
+        # The #580 hazard is REAL and is answered by asking the tree whether
+        # the call carries a collective AT ALL, rather than by never calling
+        # it. `prefetch_progress_is_collective_free()` is that predicate
+        # (world 1 on every group `_all_reduce_attn_groups` touches = every
+        # all_reduce in there is skipped by construction), so a rank-local
+        # entry cannot meet a peer's collective. Where it is NOT free the
+        # call is skipped exactly as before and the expiry text says so --
+        # the honest half of the answer, not a gap.
         time.sleep(MATERIALISE_POLL_S)
+        _drove = False
+        _free = getattr(tree_cache, "prefetch_progress_is_collective_free", None)
+        if _free is not None:
+            try:
+                _drove = bool(_free())
+            except Exception:  # noqa: BLE001 - a predicate may never break the wait
+                _drove = False
+        if _drove:
+            _drove_ever = True
+            try:
+                tree_cache.check_prefetch_progress(getattr(req, "rid", ""))
+            except Exception:  # noqa: BLE001 - the bound still governs
+                logger.warning(
+                    "#1175 PREFIX-EXEC drive raised for rid=%s; the wait "
+                    "continues on its own bound.",
+                    getattr(req, "rid", "?"),
+                    exc_info=True,
+                )
         try:
             req.init_next_round_input(tree_cache)
         except TypeError:
