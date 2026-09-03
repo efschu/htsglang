@@ -261,6 +261,9 @@ _PP_LAUNCHED_CHAIN_KEY = "__pp_launched_chain__"
 # every pre-#968 sender and every stand-in produces -- so the legacy path
 # is byte-identical.
 _PP_PARKED_CONTINUATION_KEY = "__pp_parked_continuation__"
+from sglang.srt.managers.pp_prefetch_completion import (
+    CONTRADICTION as PREFETCH_CONTRADICTION,
+)
 from sglang.srt.managers.pp_prefetch_completion import PENDING as PREFETCH_PENDING
 
 #: #1175: the per-rid store-prefetch completion report a FOLLOWER puts on the
@@ -2167,8 +2170,38 @@ def pp_prefetch_completion_own(holder) -> Tuple:
                 continue
             out.append((str(rid), PREFETCH_PENDING, int(rank)))
             continue
+        # #1176 (review B3): A TERMINATED RECORD THAT CONTRADICTS THIS RANK'S
+        # OWN RETRACT STAMP IS REPORTED AS SUCH, not as its token count.
+        #
+        # The count alone cannot carry the fact: the witness compares it
+        # against the demand this rank still owes AFTER its current match, and
+        # PP0 cannot compute a peer's match (`prefix_indices`/`host_hit_length`
+        # are rank-local). So the follower states the VERDICT-FREE observation
+        # and PP0 raises on it -- the loud STOP the parent had, moved to the
+        # rank that owns it (#968/#969Z) instead of split silently across the
+        # seam premise (`_note_follower_contradiction_deferred`).
+        if _pp_store_witness_contradicts(holder, req):
+            out.append((str(rid), PREFETCH_CONTRADICTION, int(rank)))
+            continue
         out.append((str(rid), int(value), int(rank)))
     return tuple(out)
+
+
+def _pp_store_witness_contradicts(holder, req) -> bool:
+    """#1176 (review B3): does THIS rank's store witness contradict for ``req``?
+
+    Never raises out of the report path: this rank is a follower by
+    construction (the caller returned early on pp_rank 0), so `store_witness`
+    itself returns the reported state rather than raising -- and any unexpected
+    failure of a REPORT must not break the output ring (the rule the enclosing
+    loop already follows for `completed_prefetch_tokens`).
+    """
+    try:
+        from sglang.srt.managers.phase_purity import store_witness
+
+        return store_witness(holder, req) == PREFETCH_CONTRADICTION
+    except Exception:  # noqa: BLE001 - a report may never break the output path
+        return False
 
 
 def pp_prefetch_completion_stamp(holder, incoming, out: Dict[str, object]) -> None:

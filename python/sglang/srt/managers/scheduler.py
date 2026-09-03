@@ -234,6 +234,7 @@ from sglang.srt.managers.pp_prefetch_completion import (
     format_group_fact,
     group_completion_enabled as _group_completion_on,
     group_completion_verdict,
+    peers_reporting_contradiction,
 )
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -10025,6 +10026,35 @@ class Scheduler(
         """
         rid = str(getattr(req, "rid", "?"))
         tree = self.tree_cache
+        # #1176 (review B3): THE FOLLOWER'S CONTRADICTION IS RAISED HERE, ONCE,
+        # BY THE AUTHORITY -- and BEFORE the `want <= 0` early-out.
+        #
+        # A follower whose own store witness contradicts its retract stamp does
+        # not raise (it holds no verdict, #969Z) and does not withhold the seam
+        # premise either (that would be a silent rank split on a group-uniform
+        # gate). It REPORTS, on the #1175 lap that already carries every peer's
+        # per-rid completion reading, and PP0 turns that report into the group
+        # STOP. Read before the early-out because the dangerous combination is
+        # exactly "PP0 has no completed span of its own while a peer measured a
+        # contradiction": a `want <= 0` return would swallow the only rank that
+        # saw the problem.
+        _contradicted = peers_reporting_contradiction(
+            pp_prefetch_completion_table(self), rid, int(self.ps.pp_size), own_rank=0
+        )
+        if _contradicted:
+            raise StoreWitnessContradiction(
+                f"#1157 STORE WITNESS CONTRADICTION rid={rid} reported by "
+                f"peer pp_rank(s) {list(_contradicted)}: those ranks measured "
+                "their own re-admission presence against their own retract "
+                "stamp and found the prefix short by more than one chunk. "
+                "They do not raise -- a PP follower holds no admission verdict "
+                "(#969Z) and a rank that withholds the seam premise alone "
+                "splits the group's prefill-batch build silently. The verdict "
+                "is PP0's and it is taken HERE: re-admitting this rid would "
+                "let at least one rank recompute a stamped prefix "
+                "(kein-doppel-prefill), so the group STOPs once, loudly, with "
+                "the peer named (raenge-nie-uneins)."
+            )
         reader = getattr(tree, "completed_prefetch_tokens", None)
         if reader is None:
             return True

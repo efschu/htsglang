@@ -53,11 +53,13 @@ import pickle
 import types
 import unittest
 
+from sglang.srt.managers import phase_purity as phase_purity_mod
 from sglang.srt.managers.phase_purity import (
     SEAM_GRANT_CONSUMED_ATTR,
     SEAM_READMIT_ATTR,
     StoreWitnessContradiction,
     assert_store_witness_at_admission,
+    seam_transport_premise_holds,
     store_witness,
     store_witness_census,
 )
@@ -81,13 +83,31 @@ HEADER_STAMP = 80_009
 HEADER_HIT = 40
 
 
-def _req(rid="1e95e023", *, stamp=B6_STAMP, tokens=B6_STAMP, seam_epoch=3):
+def _req(
+    rid="1e95e023",
+    *,
+    stamp=B6_STAMP,
+    tokens=B6_STAMP,
+    seam_epoch=3,
+    prefix_indices=0,
+    host_hit_length=0,
+):
+    """A re-admitted request.
+
+    `prefix_indices` / `host_hit_length` are THIS request's CURRENT match --
+    the pair scheduler.py:5322 reads when it decides the prefetch span, and
+    the pair the witness reads at witness time (review B1). Zero on both is
+    the shape every pre-#1176 stand-in had: nothing matched, so the whole
+    stamp is still owed.
+    """
     r = types.SimpleNamespace(
         rid=rid,
         cached_prompt_tokens_at_retract=stamp,
         cache_protected_len=0,
         origin_input_ids=list(range(tokens)),
         storage_hit_length=0,
+        prefix_indices=list(range(int(prefix_indices))),
+        host_hit_length=int(host_hit_length),
     )
     setattr(r, SEAM_READMIT_ATTR, seam_epoch)
     setattr(r, SEAM_GRANT_CONSUMED_ATTR, False)
@@ -107,6 +127,26 @@ def _sched(reqs, *, outcomes=None, allowance=B6_ALLOWANCE):
         _prefetch_chunk_tokens=allowance,
     )
     return types.SimpleNamespace(tree_cache=tree, waiting_queue=list(reqs))
+
+
+def _carrier():
+    """The #1176 (review B3) carrier symbols, imported LAZILY.
+
+    They do not exist on the parent be3ec1760b. A module-level import would
+    turn every case in this file into a collection error there and destroy the
+    per-case red-first evidence for findings B1 and B2, which are about code
+    that DOES exist on the parent.
+    """
+    from sglang.srt.managers import pp_prefetch_completion as mod
+    from sglang.srt.managers.scheduler_pp_mixin import pp_prefetch_completion_own
+
+    return types.SimpleNamespace(
+        CONTRADICTION=mod.CONTRADICTION,
+        PENDING=mod.PENDING,
+        group_completion_verdict=mod.group_completion_verdict,
+        peers_reporting_contradiction=mod.peers_reporting_contradiction,
+        own=pp_prefetch_completion_own,
+    )
 
 
 class A_TheBoot6ReapedRankIsABoundedRePrefill(CustomTestCase):
@@ -167,10 +207,11 @@ class C_TheChatHeaderFalseHitStillStopsTheGroup(CustomTestCase):
         self.assertIn(f"matched={HEADER_HIT}", msg)
         self.assertIn(f"materialized={HEADER_HIT}", msg)
         self.assertIn(f"shortfall={HEADER_STAMP - HEADER_HIT}", msg)
-        # #1176 (review b): the demand is now the span the prefetch was
-        # asked for; with no span stamp it stays the whole stamped prefix.
-        self.assertIn("span=None", msg)
-        self.assertIn("fell short of that span by more than one chunk", msg)
+        # #1176 (review B1): the demand is what this rank still owes AFTER
+        # its current match; with nothing matched it is the whole stamp.
+        self.assertIn("resident=0", msg)
+        self.assertIn(f"demand={HEADER_STAMP}", msg)
+        self.assertIn("fell short of that demand by more than one chunk", msg)
 
     def test_the_admission_site_raises_too(self):
         r = _req(rid="header", stamp=HEADER_STAMP, tokens=HEADER_STAMP)
@@ -303,11 +344,14 @@ class F_EveryWriterMustPassMatched(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 # The demonstrated (b) case, from the review: a request whose prompt prefix is
-# 19984/20000 present after a prefetch that completed in full.
+# 19984/20000 present after a prefetch that completed in full. `RESIDENT` is
+# what this request's OWN match holds at witness time -- the pair
+# scheduler.py:5322 reads (`len(req.prefix_indices) + req.host_hit_length`)
+# when it decides the span, and the pair the witness reads back.
 SPAN_STAMP = 20_000
-SPAN_MATCHED_AT_REGISTRATION = 10_000
-SPAN_TOKENS = 9_999  # _match_end - _matched_len
-SPAN_LOADED = 9_984  # what the completed prefetch materialized of that span
+SPAN_RESIDENT = 10_000  # this request's current match
+SPAN_DEMAND = SPAN_STAMP - SPAN_RESIDENT  # what the store still owes: 10000
+SPAN_LOADED = 9_984  # what the completed prefetch materialized of that demand
 
 
 def _pp(scheduler, *, pp_rank, pp_size=3):
@@ -317,61 +361,80 @@ def _pp(scheduler, *, pp_rank, pp_size=3):
     return scheduler
 
 
-class G_PresenceIsJudgedAgainstTheSpanThePrefetchWasAskedFor(CustomTestCase):
+class G_PresenceIsJudgedAgainstTheOutstandingDemand(CustomTestCase):
     """(b) The prefetch is only ever asked for `_new_input_tokens`; the rest of
-    the stamped prefix was already matched at registration and is not this
-    operation's to deliver. Judging `matched + loaded` against the WHOLE stamp
-    charges the operation for tokens nobody asked it to fetch."""
+    the stamped prefix was already matched and is not this operation's to
+    deliver. Judging `matched + loaded` against the WHOLE stamp charges the
+    operation for tokens nobody asked it to fetch.
+
+    The demand is read AT WITNESS TIME from the request's CURRENT match, never
+    from a registration-time snapshot -- see class K for the input that
+    separates the two."""
 
     def _delivered(self):
         return PrefetchOutcome(
             SPAN_LOADED, hit_tokens=SPAN_LOADED, probed=True, matched=0
         )
 
-    def _req_with_span(self):
-        r = _req(rid="span", stamp=SPAN_STAMP, tokens=SPAN_STAMP)
-        r._prefetch_span_tokens = SPAN_TOKENS
-        return r
+    def _req_with_match(self):
+        return _req(
+            rid="span",
+            stamp=SPAN_STAMP,
+            tokens=SPAN_STAMP,
+            prefix_indices=SPAN_RESIDENT,
+        )
 
     def test_a_fully_delivered_span_is_a_hit_not_a_contradiction(self):
-        r = self._req_with_span()
+        r = self._req_with_match()
         s = _sched([r], outcomes={r.rid: self._delivered()})
         self.assertEqual(store_witness(s, r), "hit")
 
     def test_the_admission_site_agrees(self):
-        r = self._req_with_span()
+        r = self._req_with_match()
         s = _sched([r])
         assert_store_witness_at_admission(r, self._delivered(), s.tree_cache)
 
-    def test_a_span_short_by_more_than_one_chunk_still_raises(self):
-        """The span narrows the DEMAND; it does not remove the allowance term.
-        A prefetch that delivered 1000 of a 9999-token span is still a
+    def test_the_host_hit_half_of_the_match_counts_too(self):
+        """`_matched_len` at the registration site is prefix_indices PLUS
+        host_hit_length; the witness must read the same sum, or a request whose
+        match came off the host tier is charged for tokens it already holds."""
+        r = _req(
+            rid="hosthalf",
+            stamp=SPAN_STAMP,
+            tokens=SPAN_STAMP,
+            prefix_indices=4_000,
+            host_hit_length=6_000,
+        )
+        s = _sched([r], outcomes={r.rid: self._delivered()})
+        self.assertEqual(store_witness(s, r), "hit")
+
+    def test_a_demand_short_by_more_than_one_chunk_still_raises(self):
+        """The match narrows the DEMAND; it does not remove the allowance term.
+        A prefetch that delivered 1000 of a 10000-token demand is still a
         kein-doppel-prefill contradiction."""
-        r = self._req_with_span()
-        out = PrefetchOutcome(1000, hit_tokens=SPAN_TOKENS, probed=True, matched=0)
+        r = self._req_with_match()
+        out = PrefetchOutcome(1000, hit_tokens=SPAN_DEMAND, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
             store_witness(_sched([r], outcomes={r.rid: out}), r)
         msg = str(cm.exception)
-        self.assertIn(f"demand={SPAN_TOKENS}", msg)
-        self.assertIn(f"span={SPAN_TOKENS}", msg)
+        self.assertIn(f"demand={SPAN_DEMAND}", msg)
+        self.assertIn(f"resident={SPAN_RESIDENT}", msg)
 
-    def test_without_a_span_stamp_the_whole_prefix_is_the_demand(self):
-        """A record whose request carries no span stamp keeps the stamp as the
-        demand -- the conservative reading, unchanged."""
-        r = _req(rid="nospan", stamp=SPAN_STAMP, tokens=SPAN_STAMP)
+    def test_without_a_match_the_whole_prefix_is_the_demand(self):
+        """A request holding nothing keeps the stamp as the demand -- the
+        conservative reading, unchanged."""
+        r = _req(rid="nomatch", stamp=SPAN_STAMP, tokens=SPAN_STAMP)
         out = PrefetchOutcome(SPAN_LOADED, hit_tokens=SPAN_LOADED, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
             store_witness(_sched([r], outcomes={r.rid: out}), r)
         self.assertIn(f"demand={SPAN_STAMP}", str(cm.exception))
 
-    def test_a_span_wider_than_the_stamp_never_widens_the_demand(self):
-        """`_match_end` is derived from full_untruncated_fill_ids, which grows
-        with the OUTPUT; the stamp is the prompt prefix. The demand is the
-        smaller of the two, so an output-bearing request cannot be charged for
-        tokens outside its stamped prefix."""
-        r = _req(rid="wide", stamp=4_000, tokens=4_000)
-        r._prefetch_span_tokens = 40_000
-        out = PrefetchOutcome(4_000, hit_tokens=4_000, probed=True, matched=0)
+    def test_a_match_that_covers_the_stamp_owes_nothing(self):
+        """`resident >= stamp`: the request's own match already covers the
+        stamped prefix, so there is nothing left to re-prefill and nothing for
+        the store to have delivered. That is a hit, not a contradiction."""
+        r = _req(rid="covered", stamp=4_000, tokens=4_000, prefix_indices=4_000)
+        out = PrefetchOutcome(0, hit_tokens=0, probed=True, matched=0)
         self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
 
 
@@ -384,7 +447,6 @@ class H_TheProbeAnsweringIsNotThePrefixBeingPresent(CustomTestCase):
 
     def test_a_full_probe_answer_over_an_empty_prefix_still_raises(self):
         r = _req(rid="probe-vs-presence")
-        r._prefetch_span_tokens = B6_STAMP
         out = PrefetchOutcome(100, hit_tokens=B6_STAMP, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
             store_witness(_sched([r], outcomes={r.rid: out}), r)
@@ -403,7 +465,6 @@ class I_NothingMaterializedIsItsOwnContradiction(CustomTestCase):
 
     def test_a_stamp_inside_the_allowance_with_zero_presence_raises(self):
         r = _req(rid="tiny-stamp", stamp=100, tokens=100)
-        r._prefetch_span_tokens = 100
         out = PrefetchOutcome(0, hit_tokens=40, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
             store_witness(_sched([r], outcomes={r.rid: out}), r)
@@ -427,9 +488,7 @@ class J_OnlyTheAuthorityTurnsAWitnessContradictionIntoAGroupStop(CustomTestCase)
         return PrefetchOutcome(0, hit_tokens=HEADER_HIT, probed=True, matched=HEADER_HIT)
 
     def _req(self):
-        r = _req(rid="divergent", stamp=HEADER_STAMP, tokens=HEADER_STAMP)
-        r._prefetch_span_tokens = HEADER_STAMP
-        return r
+        return _req(rid="divergent", stamp=HEADER_STAMP, tokens=HEADER_STAMP)
 
     def test_pp0_still_stops_the_group(self):
         r = self._req()
@@ -442,10 +501,12 @@ class J_OnlyTheAuthorityTurnsAWitnessContradictionIntoAGroupStop(CustomTestCase)
         s = _pp(_sched([r], outcomes={r.rid: self._contradictory()}), pp_rank=1)
         self.assertEqual(store_witness(s, r), "contradiction")
 
-    def test_the_follower_state_licenses_nothing(self):
-        """'contradiction' must not join the states seam_transport_premise_holds
-        accepts -- otherwise the follower would admit on a premise it just
-        refuted."""
+    def test_the_follower_state_is_not_one_of_the_accepted_readings(self):
+        """'contradiction' must never join the tuple of states that READ as a
+        restore. It is handled by its own named branch instead (review B3,
+        class M): the follower counts the candidate, states the divergence and
+        leaves the verdict to PP0 -- what it must not do is quietly pass as a
+        'hit'."""
         self.assertNotIn("contradiction", ("pending", "hit", "bounded"))
 
     def test_the_follower_admission_site_does_not_raise(self):
@@ -480,6 +541,307 @@ class J_OnlyTheAuthorityTurnsAWitnessContradictionIntoAGroupStop(CustomTestCase)
         census = store_witness_census(s)
         self.assertIn("contradiction=1", census)
 
+
+
+# ---------------------------------------------------------------------------
+# The three blocking findings of the be3ec1760b review, each with the input
+# that separates the defect from the fix.
+# ---------------------------------------------------------------------------
+
+# The worked breaking input of review B1, verbatim.
+TRUNC_STAMP = 80_009
+TRUNC_REGISTRATION_MATCH = 79_000
+TRUNC_SPAN = TRUNC_STAMP - TRUNC_REGISTRATION_MATCH  # 1009 -> stamped as 1008
+TRUNC_DELIVERED = 1_008
+
+
+class K_ATruncatedMatchRestoresTheWholeDemand(CustomTestCase):
+    """(B1) THE LAW-WEAKENING CASE. RED on be3ec1760b, which read the demand
+    off `req._prefetch_span_tokens` -- a number stamped ONCE at registration
+    (scheduler.py:5355) that NOTHING in the tree ever clears.
+
+    `Req.truncate_prefix_to` (schedule_batch.py:2357, called from
+    scheduler.py:11495 and :10975 under the #791/#930 PP-told rule) empties
+    `prefix_indices` AND `host_hit_length` and leaves the span standing. The
+    premise path re-reads the record non-destructively on every pass
+    (phase_purity.py:1631), so the next pass read a STALE-SMALLER span:
+
+        stamp 80009, registration match 79000  -> span stamped 1008
+        prefetch delivers matched+loaded = 1008
+        PP0 tells told=0 -> truncate_prefix_to(0) -> the prefix is GONE
+        parent: demand = min(80009, 1008) = 1008, presence 1008, shortfall 0
+                -> "hit" -> seam-transport exemption -> P=0 re-admission
+                -> 79001 recomputed tokens licensed by a stamp
+
+    That is the exact kein-doppel-prefill violation the witness exists to
+    prevent (#939 licenses at most ONE chunk). Reading the CURRENT match makes
+    the record self-invalidating: the demand returns to the full stamp the
+    moment the match does -- no new state, no clearer, no lifecycle."""
+
+    def _truncated(self, *, span_field):
+        """The record as the witness sees it AFTER the truncation."""
+        r = _req(
+            rid="truncated",
+            stamp=TRUNC_STAMP,
+            tokens=TRUNC_STAMP,
+            prefix_indices=0,  # truncate_prefix_to(0) emptied it
+            host_hit_length=0,  # ... and the #965 co-derived group with it
+        )
+        if span_field:
+            # The stale registration-time stamp the parent trusted.
+            r._prefetch_span_tokens = TRUNC_SPAN
+        out = PrefetchOutcome(
+            0, hit_tokens=TRUNC_DELIVERED, probed=True, matched=TRUNC_DELIVERED
+        )
+        return r, out
+
+    def test_a_stale_smaller_span_cannot_shrink_the_demand(self):
+        """RED-FIRST. On the parent this returned 'hit'."""
+        r, out = self._truncated(span_field=True)
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            store_witness(_sched([r], outcomes={r.rid: out}), r)
+        msg = str(cm.exception)
+        self.assertIn(f"stamped={TRUNC_STAMP}", msg)
+        self.assertIn("resident=0", msg)
+        self.assertIn(f"demand={TRUNC_STAMP}", msg)
+        self.assertIn(f"shortfall={TRUNC_STAMP - TRUNC_DELIVERED}", msg)
+
+    def test_the_admission_site_raises_on_the_same_record(self):
+        r, out = self._truncated(span_field=True)
+        s = _sched([r])
+        with self.assertRaises(StoreWitnessContradiction):
+            assert_store_witness_at_admission(r, out, s.tree_cache)
+
+    def test_the_verdict_does_not_depend_on_the_stale_field_at_all(self):
+        """Same record without the span stamp: identical verdict. The witness
+        reads the live match, so the presence or absence of the retired
+        registration snapshot cannot change the reading."""
+        r_with, out = self._truncated(span_field=True)
+        r_without, _ = self._truncated(span_field=False)
+        msgs = []
+        for req in (r_with, r_without):
+            with self.assertRaises(StoreWitnessContradiction) as cm:
+                store_witness(_sched([req], outcomes={req.rid: out}), req)
+            msgs.append(str(cm.exception).split("rid=")[1].split(" ", 1)[1])
+        self.assertEqual(msgs[0], msgs[1])
+
+    def test_the_witness_module_no_longer_reads_the_registration_snapshot(self):
+        """ZUKUNFTS-CHECK. `_prefetch_span_tokens` has ONE writer and NO
+        clearer; a future reader of it inside the witness re-opens exactly this
+        hole. The field keeps its one legitimate consumer
+        (`_apply_prefetch_deferral`, scheduler.py) -- the witness must not
+        become a second, lifecycle-blind one."""
+        src = inspect.getsource(phase_purity_mod)
+        tree = ast.parse(src)
+        reads = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and node.attr == "_prefetch_span_tokens"
+        ]
+        self.assertEqual(
+            reads,
+            [],
+            "phase_purity must not read the registration-time span snapshot; "
+            "the demand is derived from the CURRENT match (review B1)",
+        )
+
+
+# The input that separates matched+loaded from max(matched, loaded).
+SUM_STAMP = 20_000
+SUM_MATCHED = 9_000
+SUM_LOADED = 9_000
+
+
+class L_ThePresenceIsTheSumNotTheLarger(CustomTestCase):
+    """(B2) THE UNCAUGHT MUTANT. `materialized` is `matched + loaded` -- the
+    single arithmetic the whole #1176 fix turns on -- and every case the suite
+    had left `max(matched, loaded)` alive: they all have matched==0, or
+    loaded==0, or a split whose larger half still lands inside the allowance
+    (the Boot-6 followers are 5966/42, and max 5966 is a shortfall of 42).
+
+    This is the input that separates them. Under the sum, 18000 of a
+    20000-token demand are present: shortfall 2000, inside the 4096 allowance,
+    a sanctioned #939 bounded re-prefill. Under max(), presence reads 9000 and
+    the witness raises -- the false contradiction that killed weg1b6, rebuilt
+    from a different direction."""
+
+    def _split(self):
+        return PrefetchOutcome(
+            SUM_LOADED, hit_tokens=SUM_STAMP, probed=True, matched=SUM_MATCHED
+        )
+
+    def test_materialized_is_the_sum_of_both_halves(self):
+        out = self._split()
+        self.assertEqual(out.materialized, SUM_MATCHED + SUM_LOADED)
+        self.assertNotEqual(out.materialized, max(SUM_MATCHED, SUM_LOADED))
+
+    def test_the_witness_calls_the_split_record_a_hit(self):
+        r = _req(rid="sum-vs-max", stamp=SUM_STAMP, tokens=SUM_STAMP)
+        out = self._split()
+        self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
+        # The two readings must not merely differ -- they must fall on OPPOSITE
+        # sides of the allowance, or this input separates nothing.
+        self.assertLessEqual(SUM_STAMP - out.materialized, B6_ALLOWANCE)
+        self.assertGreater(SUM_STAMP - max(SUM_MATCHED, SUM_LOADED), B6_ALLOWANCE)
+
+    def test_the_admission_site_agrees_on_the_split_record(self):
+        r = _req(rid="sum-vs-max", stamp=SUM_STAMP, tokens=SUM_STAMP)
+        s = _sched([r])
+        assert_store_witness_at_admission(r, self._split(), s.tree_cache)
+
+    def test_a_record_without_the_property_still_sums_both_halves(self):
+        """The witness reads `getattr(outcome, 'materialized', matched +
+        loaded)`. A duck-typed record from another writer has no property, and
+        the DEFAULT must be the sum too -- otherwise the fallback path carries
+        the mutant the annotated path rejects."""
+
+        class _BareRecord(int):
+            hit_tokens = SUM_STAMP
+            probed = True
+            matched = SUM_MATCHED
+
+        r = _req(rid="ducktyped", stamp=SUM_STAMP, tokens=SUM_STAMP)
+        out = _BareRecord(SUM_LOADED)
+        self.assertFalse(hasattr(out, "materialized"))
+        self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
+
+
+class M_AFollowersContradictionNeverSplitsTheGroupSilently(CustomTestCase):
+    """(B3) THE SILENT RANK DIVERGENCE. be3ec1760b made a follower stop RAISING
+    (correct: #968/#969Z, a PP follower holds no admission verdict) but left
+    the returned state outside the tuple `seam_transport_premise_holds`
+    accepts -- so the follower still WITHHELD the seam premise. That boolean
+    gates the WHOLE prefill-batch build one level up (`prefill_blocked_here`,
+    phase_purity.py:1009 -> scheduler.py:8926 `new_batch = None`), and
+    store_witness reads RANK-LOCAL records: under `--tp-size 1 --pp-size 3` the
+    packed MIN all_reduce (unified_radix_cache.py:3879-3907) is never taken.
+
+    THE EXACT INPUT, from weg1b6: stamp 6008 on both ranks. PP0 measured
+    matched=5966/loaded=42 -> hit -> premise True -> PP0 builds a TP prefill
+    batch. PP1, reaped early, measured matched=100/loaded=0 -> contradiction ->
+    restored 0 -> premise False -> PP1 builds none. Mismatched collectives.
+
+    raenge-nie-uneins forbids that trade: a LOUD stop was swapped for a SILENT
+    split, which is the worse of the two. The follower therefore COUNTS the
+    candidate (taking PP0's standing verdict, #969Z) and REPORTS the
+    contradiction on the EXISTING follower -> PP0 completion carrier; PP0
+    raises on the report, once, loudly, naming the peer."""
+
+    STAMP = 6008
+    PP0_MATCHED = 5966
+    PP0_LOADED = 42
+    FOLLOWER_MATCHED = 100
+
+    def _authority_record(self):
+        return PrefetchOutcome(
+            self.PP0_LOADED, hit_tokens=self.STAMP, probed=True, matched=self.PP0_MATCHED
+        )
+
+    def _follower_record(self):
+        return PrefetchOutcome(
+            0, hit_tokens=self.STAMP, probed=True, matched=self.FOLLOWER_MATCHED
+        )
+
+    def _world(self, pp_rank):
+        r = _req(rid="b3", stamp=self.STAMP, tokens=self.STAMP)
+        out = self._authority_record() if pp_rank == 0 else self._follower_record()
+        s = _pp(_sched([r], outcomes={r.rid: out}), pp_rank=pp_rank)
+        s.phase_policy_cfg = None
+        s.last_seam_readmit_generation = 3
+        return s, r
+
+    def test_the_two_ranks_really_do_read_different_states(self):
+        """The premise of the finding: without this asymmetry there is no
+        divergence to close."""
+        s0, r0 = self._world(0)
+        s1, r1 = self._world(1)
+        self.assertEqual(store_witness(s0, r0), "hit")
+        self.assertEqual(store_witness(s1, r1), "contradiction")
+
+    def test_the_authority_holds_the_premise(self):
+        s, _ = self._world(0)
+        self.assertTrue(seam_transport_premise_holds(s))
+
+    def test_the_follower_holds_the_SAME_premise(self):
+        """RED-FIRST. On the parent this returned False while PP0 returned
+        True -- a rank-uniform gate answered two ways."""
+        s, _ = self._world(1)
+        self.assertTrue(seam_transport_premise_holds(s))
+
+    def test_the_follower_reports_the_contradiction_on_the_carrier(self):
+        """The stop is not lost, it MOVES. The follower's per-rid report on the
+        #1175 completion lap carries CONTRADICTION instead of a token count --
+        a count could not carry the fact, because PP0 cannot compute a peer's
+        match (`prefix_indices`/`host_hit_length` are rank-local)."""
+        s, r = self._world(1)
+        s.tree_cache.completed_prefetch_tokens = lambda rid: self.FOLLOWER_MATCHED
+        s.tree_cache.prefetch_is_ongoing = lambda rid: False
+        c = _carrier()
+        reports = c.own(s)
+        self.assertEqual(reports, ((r.rid, c.CONTRADICTION, 1),))
+
+    def test_pp0_is_the_only_rank_that_reports_nothing(self):
+        """PP0 is the CONSUMER of this fact; a self-report would make the wire
+        disagree with the verdict, whose peer set excludes the decider."""
+        s, _ = self._world(0)
+        s.tree_cache.completed_prefetch_tokens = lambda rid: self.PP0_MATCHED
+        s.tree_cache.prefetch_is_ongoing = lambda rid: False
+        self.assertEqual(_carrier().own(s), ())
+
+    def test_the_helper_names_the_contradicting_peers(self):
+        c = _carrier()
+        table = {("b3", 1): c.CONTRADICTION, ("b3", 2): 4096}
+        self.assertEqual(c.peers_reporting_contradiction(table, "b3", 3), (1,))
+        self.assertEqual(c.peers_reporting_contradiction(table, "other", 3), ())
+        # A single-rank world has no peers and therefore no reports.
+        self.assertEqual(c.peers_reporting_contradiction(table, "b3", 1), ())
+
+    def test_pp0_raises_on_a_peer_report_even_with_no_span_of_its_own(self):
+        """The dangerous combination is exactly 'PP0 fetched nothing while a
+        peer measured a contradiction': the `want <= 0` early-out would swallow
+        the only rank that saw the problem, so the report is read BEFORE it."""
+        from sglang.srt.managers.scheduler import Scheduler
+
+        holder = types.SimpleNamespace(
+            ps=types.SimpleNamespace(pp_rank=0, pp_size=3),
+            tree_cache=types.SimpleNamespace(completed_prefetch_tokens=lambda rid: 0),
+            _pp_prefetch_completion={("b3", 1): _carrier().CONTRADICTION},
+            _pp_group_completion_since={},
+        )
+        req = types.SimpleNamespace(rid="b3")
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            Scheduler._admit_under_group_completion(holder, req, lambda *a, **k: None)
+        msg = str(cm.exception)
+        self.assertIn("rid=b3", msg)
+        self.assertIn("[1]", msg)  # the peer is NAMED
+        self.assertIn("kein-doppel-prefill", msg)
+        self.assertIn("raenge-nie-uneins", msg)
+
+    def test_a_clean_group_still_admits(self):
+        """CAN-FAIL companion: with no peer reporting a contradiction the gate
+        must behave exactly as before (want <= 0 -> admit)."""
+        from sglang.srt.managers.scheduler import Scheduler
+
+        holder = types.SimpleNamespace(
+            ps=types.SimpleNamespace(pp_rank=0, pp_size=3),
+            tree_cache=types.SimpleNamespace(completed_prefetch_tokens=lambda rid: 0),
+            _pp_prefetch_completion={("b3", 1): 4096},
+            _pp_group_completion_since={},
+        )
+        req = types.SimpleNamespace(rid="b3")
+        self.assertTrue(
+            Scheduler._admit_under_group_completion(holder, req, lambda *a, **k: None)
+        )
+
+    def test_the_verdict_helper_never_arithmetics_the_sentinel(self):
+        """A kill-switched or stand-in caller must degrade to 'this peer
+        produced no usable reading', never die in int("contradiction")."""
+        c = _carrier()
+        table = {("b3", 1): c.CONTRADICTION, ("b3", 2): c.PENDING}
+        verdict = c.group_completion_verdict(table, "b3", 4096, 3)
+        self.assertFalse(verdict.admit)
+        self.assertIn(1, verdict.missing)
+        self.assertIn((1, c.CONTRADICTION), verdict.reports)
 
 if __name__ == "__main__":
     unittest.main()

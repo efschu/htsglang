@@ -183,12 +183,13 @@ class III_AProbedMissBesideAStampStopsTheGroup(CustomTestCase):
         with self.assertRaises(StoreWitnessContradiction) as cm:
             seam_transport_premise_holds(s)
         msg = str(cm.exception)
-        # #1176 (review b): the line now carries `span=` and `demand=` between
-        # the stamp and the probe's answer -- with no span stamp on the
-        # request the demand IS the stamp, which is what this case asserts.
+        # #1176 (review B1): the line carries `resident=` and `demand=`
+        # between the stamp and the probe's answer. The demand is read AT
+        # WITNESS TIME from this request's CURRENT match -- with nothing
+        # matched the demand IS the whole stamp, which is what this asserts.
         self.assertIn(
             f"#1157 STORE WITNESS CONTRADICTION rid={r.rid} stamped={STAMP} "
-            f"span=None demand={STAMP} probed_hit=0 loaded=0 "
+            f"resident=0 demand={STAMP} probed_hit=0 loaded=0 "
             f"allowance={CHUNK} shortfall={STAMP} requested={LONG}",
             msg,
         )
