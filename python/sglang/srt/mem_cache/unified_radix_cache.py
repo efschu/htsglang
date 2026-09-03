@@ -59,6 +59,8 @@ from sglang.srt.mem_cache.hicache_collective import (
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
+    PrefetchOutcome,
+    PrefetchTimeoutConfig,
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -174,6 +176,16 @@ def _pool_slot(pool_name, offset: int) -> int:
         "rank-invariant slot in the HiCache control collective. Add it to "
         "PoolName instead of keying the collective off rank-local pool names."
     )
+
+
+#: #1157 (review N1): two extra slots in `check_prefetch_progress`'s packed
+#: MIN all_reduce -- `probed` (0/1) and `hit_tokens` -- so the reap annotation
+#: the seam witness reads is derived from the REDUCED vector on every rank,
+#: never from the thread-timing stamp of the local operation. Fixed offsets
+#: after the pool slots keep the vector rank-invariant in length.
+_REAP_SLOT_PROBED = 1 + _POOL_SLOT_COUNT
+_REAP_SLOT_HIT_TOKENS = 2 + _POOL_SLOT_COUNT
+_REAP_PACKED_LEN = 3 + _POOL_SLOT_COUNT
 
 
 class UnifiedTreeNode:
@@ -475,8 +487,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.write_through_threshold = 256
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
-        self.prefetch_timeout_base = 1.0
-        self.prefetch_timeout_per_page = 0.25
+        # #1157: no literal timeout here -- `PrefetchTimeoutConfig` is the ONE
+        # default; `_apply_storage_runtime_config` re-prices from the parse.
+        _timeout_defaults = PrefetchTimeoutConfig()
+        self.prefetch_timeout_base = _timeout_defaults.base
+        self.prefetch_timeout_per_ki_token = _timeout_defaults.per_ki_token
+        self.prefetch_timeout_per_page = (
+            self.page_size / 1024 * _timeout_defaults.per_ki_token
+        )
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
@@ -880,15 +898,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         storage_backend = server_args.hicache_storage_backend
         storage_extra_config = None
         storage_prefetch_threshold = 256
-        # #968/#1065: re-priced from 1.0/0.25. GELTUNGSBEREICH: the old pair
-        # bounded a 16k-token cutover re-admission at ~5 s while the store
-        # MEASURABLY delivers ~0.32 s/KiToken best case under page_size=1
-        # (12556 tok in ~4 s, trainA 2026-09-01 log:66678/66823) and draft
-        # miss-fetch storms slow it further -- so the wait, not the store,
-        # was the starving term. Overridable per backend via
-        # hicache_storage_backend_extra_config (prefetch_timeout_*).
-        prefetch_timeout_base = 2.0
-        prefetch_timeout_per_ki_token = 1.0
+        # #1157: the #968/#1065 re-pricing (2.0 s + 1.0 s/KiToken) used to be
+        # a pair of locals HERE that the tuple unpack below overwrote with the
+        # hybrid parse's own literals (1 / 0.25) -- dead code, and the serving
+        # tree ran at the bare 1.0 s base (boot weg1b3: an 84k-token
+        # re-admission reaped unprobed). The parse now pops its defaults from
+        # `PrefetchTimeoutConfig` (hicache_storage.py), the one source; the
+        # effective pair is printed once at attach ('#1157 PREFETCH TIMEOUT').
+        # The pair is bound only by the unpack below and consumed only inside
+        # the same `storage_backend is not None` arm.
         hicache_storage_pass_prefix_keys = False
         if storage_backend is not None:
             (
@@ -3718,11 +3736,65 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return True
 
+    def _reap_annotation_local(self, operation, hash_value) -> tuple[int, int]:
+        """#1157 (N1): this rank's OWN reading of the probe, as the two packed
+        slots (``probed`` 0/1, ``hit_tokens``). ``probed_hit_tokens`` is
+        stamped by the prefetch thread after its gloo MIN; ``hash_value`` is
+        filled by the same thread after the probe. Both are thread-timing
+        reads on the scheduler thread, so they are only ever PROPOSED here
+        and RESOLVED by `_reap_annotation_from_packed` after the group MIN.
+        """
+        probed_hit_tokens = getattr(operation, "probed_hit_tokens", None)
+        hit_pages_kv = len(hash_value)
+        probed = probed_hit_tokens is not None or hit_pages_kv > 0
+        hit_tokens = (
+            int(probed_hit_tokens)
+            if probed_hit_tokens is not None
+            else hit_pages_kv * int(self.page_size)
+        )
+        return int(bool(probed)), int(hit_tokens)
+
+    @staticmethod
+    def _reap_annotation_from_packed(packed) -> tuple[bool, int]:
+        """#1157 (N1): the reap annotation as the GROUP agreed it, read off
+        the reduced vector only. A rank whose reap landed between its peer's
+        all_reduce and that peer's stamp proposes probed=0 / hit_tokens=0 and
+        the MIN carries that to every rank: the witness premise cannot
+        diverge across ranks on this input (the rank-divergent admission death class of boot weg1b3)."""
+        probed = int(packed[_REAP_SLOT_PROBED].item()) > 0
+        hit_tokens = int(packed[_REAP_SLOT_HIT_TOKENS].item())
+        return probed, hit_tokens
+
+    def _prefetch_priced_pages(self, operation: PrefetchOperation) -> int:
+        """#1157: the page count the timeout is priced on.
+
+        THE REAPER PRICED ITSELF ON A QUANTITY THAT DID NOT EXIST YET.
+        ``hash_value`` is empty until the serial prefetch thread's store probe
+        has run for this operation, so a re-admitted request queued behind its
+        siblings was reaped at the BARE base with ``completed=0`` (boot
+        weg1b3: rid 679e4568, 84,026 pages, issued 23:56:17, reaped ~1.2 s
+        later, store had the pages; the same inverse-queue-order reap at the
+        next cutover). Until the probe answers, the span the operation ASKED
+        FOR is the honest size; after it, the hit-priced form stands
+        unchanged. Same form as `_deferred_prefetch_bound_s` (span-priced).
+        """
+        hit_pages = len(operation.hash_value)
+        if hit_pages:
+            return hit_pages
+        return len(getattr(operation, "token_ids", None) or ()) // max(
+            1, int(self.page_size)
+        )
+
+    def _prefetch_timeout_budget_s(self, operation: PrefetchOperation) -> float:
+        return (
+            self.prefetch_timeout_base
+            + self._prefetch_priced_pages(operation) * self.prefetch_timeout_per_page
+        )
+
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
         return (
             time.monotonic() - operation.start_time
-            > self.prefetch_timeout_base
-            + len(operation.hash_value) * self.prefetch_timeout_per_page
+            > self._prefetch_timeout_budget_s(operation)
         )
 
     def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
@@ -3787,6 +3859,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         min_completed_tokens = completed_tokens
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
+        # #1157 (N1): the reap annotation rides the SAME packed MIN as the
+        # completed count -- proposed locally, resolved from the reduced
+        # vector below on every path (single rank included).
+        _probed_local, _hit_tokens_local = self._reap_annotation_local(
+            operation, hash_value
+        )
+        packed_list = [completed_tokens] + [0] * _POOL_SLOT_COUNT
+        packed_list += [_probed_local, _hit_tokens_local]
+        assert len(packed_list) == _REAP_PACKED_LEN
         if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
             # this prefetch actually transferred, in one all_reduce. The vector
@@ -3796,7 +3877,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # the pools this rank transferred are read back, so the local
             # semantics are unchanged whenever the sets do agree.
             sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
-            packed_list = [completed_tokens] + [0] * _POOL_SLOT_COUNT
             for p in sidecar_pools:
                 packed_list[_pool_slot(p, 1)] = int(hit_pages.get(p, 0))
             packed = torch.tensor(packed_list, dtype=torch.int)
@@ -3808,6 +3888,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             min_completed_tokens = int(packed[0].item())
             for p in sidecar_pools:
                 hit_pages[p] = int(packed[_pool_slot(p, 1)].item())
+        else:
+            packed = torch.tensor(packed_list, dtype=torch.int)
+        _probed, _hit_tokens = self._reap_annotation_from_packed(packed)
+
+        # #1157: THE REAP IS A LINE. `probed` / `hit_pages` are the GROUP's
+        # reading (MIN-reduced above, N1): whether the prefetch thread's store
+        # probe had answered on every rank, and what it answered; a
+        # termination that is not a local completion is printed here, per
+        # request, unconditionally -- rare on a healthy boot, and the ONE
+        # line that makes 'reaped before the probe' (probed=False
+        # completed=0) directly visible instead of proven by elimination.
+        # Not emitted under best_effort, where every check terminates by
+        # design.
+        _hit_pages_kv = len(hash_value)
+        _completed_local = (
+            _hit_pages_kv > 0 and completed_tokens == _hit_pages_kv * self.page_size
+        )
+        if self.prefetch_stop_policy != "best_effort" and not _completed_local:
+            logger.warning(
+                "#1157 PREFETCH REAPED req=%s probed=%s requested_pages=%d "
+                "hit_pages=%d completed=%d elapsed=%.2fs budget=%.2fs "
+                "(completed_local=%d policy=%s)",
+                req_id,
+                _probed,
+                len(getattr(operation, "token_ids", None) or ())
+                // max(1, int(self.page_size)),
+                _hit_tokens // max(1, int(self.page_size)),
+                int(min_completed_tokens),
+                time.monotonic() - operation.start_time,
+                self._prefetch_timeout_budget_s(operation),
+                int(completed_tokens),
+                self.prefetch_stop_policy,
+            )
 
         fetched_key = prefetch_key[:min_completed_tokens]
         # #937: DO NOT PUBLISH A SPAN WHOSE TIER NO LONGER EXISTS.
@@ -4002,7 +4115,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if insert_result.host_span_unclaimed
             else min_completed_tokens - insert_result.prefix_len
         )
-        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        # #1157: the record the admission loop pops, annotated with the
+        # probe's answer so the seam premise can read a MEASURED witness
+        # (pending / hit / probed-miss) off the one record instead of a stamp.
+        self.prefetch_loaded_tokens_by_reqid[req_id] = PrefetchOutcome(
+            loaded_from_storage,
+            hit_tokens=_hit_tokens,  # N1: the reduced value, never the local stamp
+            probed=_probed,
+        )
         # #843: `refused` separates the TWO reasons this line can say loaded=0,
         # which are not the same finding and were indistinguishable at INFO.
         #
@@ -4390,6 +4510,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 cc.prefetch_tokens_occupied -= len(prefetch_key)
                 if cc.prefetch_tokens_occupied < 0:
                     cc.prefetch_tokens_occupied = 0
+                # #1157: a revoke IS the probe's answer (hits below the
+                # prefetch threshold, MIN-reduced across the group). Before
+                # this line the record simply vanished and a stamped
+                # re-admission whose store read answered NOTHING was admitted
+                # at P=0 with no trace; now the outcome is recorded on the one
+                # record the admission loop pops, where the seam witness
+                # reads it.
+                self.prefetch_loaded_tokens_by_reqid[req_id] = PrefetchOutcome(
+                    0,
+                    hit_tokens=int(
+                        getattr(_operation, "probed_hit_tokens", None) or 0
+                    ),
+                    probed=True,
+                )
             return drained
 
         def _drain_backup():
@@ -4588,12 +4722,38 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> None:
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
-        self.prefetch_timeout_base = prefetch_timeout_base
+        self.prefetch_timeout_base = float(prefetch_timeout_base)
+        self.prefetch_timeout_per_ki_token = float(prefetch_timeout_per_ki_token)
         self.prefetch_timeout_per_page = (
             self.page_size / 1024 * prefetch_timeout_per_ki_token
         )
         self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
         self.enable_storage_metrics = enable_storage_metrics
+        # #1157: the EFFECTIVE timeout, printed once per attach. Before this
+        # line no log carried the base the reaper actually used, and the
+        # 1.0 s that killed the weg1b3 store read had to be inferred from a
+        # tuple unpack. `source` is decided by value: a pair equal to
+        # `PrefetchTimeoutConfig()` is the config's own, anything else came
+        # through hicache_storage_backend_extra_config.
+        _defaults = PrefetchTimeoutConfig()
+        _source = (
+            "PrefetchTimeoutConfig"
+            if (
+                self.prefetch_timeout_base == _defaults.base
+                and self.prefetch_timeout_per_ki_token == _defaults.per_ki_token
+            )
+            else "extra_config"
+        )
+        logger.info(
+            "#1157 PREFETCH TIMEOUT base=%.2fs per_ki_token=%.2fs source=%s "
+            "(per_page=%.6fs at page_size=%d; policy=%s)",
+            self.prefetch_timeout_base,
+            self.prefetch_timeout_per_ki_token,
+            _source,
+            self.prefetch_timeout_per_page,
+            int(self.page_size),
+            self.prefetch_stop_policy,
+        )
 
         if self.enable_storage_metrics:
             attn_cp_rank, attn_cp_size = (
@@ -4740,9 +4900,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._apply_storage_runtime_config(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
-            prefetch_timeout_base=getattr(self, "prefetch_timeout_base", 3.0),
+            # #1157: the pair this tree already carries (set in __init__ from
+            # `PrefetchTimeoutConfig`, re-priced by every attach); the 3.0 /
+            # 0.25 literals that stood here were a THIRD default, and
+            # `prefetch_timeout_per_ki_token` was never stored, so a runtime
+            # re-attach silently reset the per-KiToken term.
+            prefetch_timeout_base=getattr(
+                self, "prefetch_timeout_base", PrefetchTimeoutConfig().base
+            ),
             prefetch_timeout_per_ki_token=getattr(
-                self, "prefetch_timeout_per_ki_token", 0.25
+                self,
+                "prefetch_timeout_per_ki_token",
+                PrefetchTimeoutConfig().per_ki_token,
             ),
             hicache_storage_pass_prefix_keys=getattr(
                 self, "hicache_storage_pass_prefix_keys", False

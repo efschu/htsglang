@@ -273,6 +273,11 @@ class PrefetchOperation(StorageOperation):
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
+    #: #1157: the store probe's answer in tokens (MIN-reduced across the
+    #: prefetch group), stamped by `prefetch_thread_func`; None until the
+    #: probe has run. Read by the tree's reap line and the seam witness.
+    probed_hit_tokens: Optional[int] = None
+
     def increment(self, num_tokens: int):
         with self._lock:
             if self._terminated_flag:
@@ -2852,6 +2857,11 @@ class HiCacheController:
                     storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
+                # #1157: the probe has ANSWERED (rank-uniform after the MIN).
+                # Stamped before the threshold branch so a revoke and a
+                # transfer both carry it; a reap that finds None was ahead of
+                # the probe.
+                operation.probed_hit_tokens = int(storage_hit_count)
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits

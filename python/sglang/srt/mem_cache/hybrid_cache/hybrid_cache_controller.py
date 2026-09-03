@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    PrefetchTimeoutConfig,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
 from sglang.srt.utils import get_device_module
@@ -139,6 +140,9 @@ class PrefetchOperation(StorageOperation):
             pool_transfers=pool_transfers,
         )
         self.pool_transfers_done = not bool(pool_transfers)
+
+    #: #1157: see `managers.cache_controller.PrefetchOperation.probed_hit_tokens`.
+    probed_hit_tokens: Optional[int] = None
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -259,9 +263,21 @@ class HybridCacheController(BaseHiCacheController):
                 extra_config = json.loads(storage_backend_extra_config)
 
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)
-        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)
+        # #1157: ONE source of truth for the prefetch timeout. The literals
+        # that stood here (1 / 0.25) were the EFFECTIVE serving values while
+        # the #968/#1065 re-pricing (2.0 s + 1.0 s/KiToken) lived only in
+        # `PrefetchTimeoutConfig` (read by hiradix/hi_mamba) and in a pair of
+        # dead locals in `UnifiedRadixCache.init_hicache` that this parse's
+        # tuple overwrote -- measured boot weg1b3: a re-admitted 84k-token
+        # request reaped at the bare 1.0 s base. The defaults are read from
+        # the config the pin itself declared; an extra-config override still
+        # wins, exactly as before.
+        _timeout_defaults = PrefetchTimeoutConfig()
+        prefetch_timeout_base = extra_config.pop(
+            "prefetch_timeout_base", _timeout_defaults.base
+        )
         prefetch_timeout_per_ki_token = extra_config.pop(
-            "prefetch_timeout_per_ki_token", 0.25
+            "prefetch_timeout_per_ki_token", _timeout_defaults.per_ki_token
         )
         hicache_storage_pass_prefix_keys = extra_config.pop(
             "hicache_storage_pass_prefix_keys", False

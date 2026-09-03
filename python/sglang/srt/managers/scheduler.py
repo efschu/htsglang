@@ -204,6 +204,8 @@ from sglang.srt.managers.phase_purity import (
     decode_blocked_here as phase_decode_blocked_here,
 )
 from sglang.srt.managers.phase_purity import (
+    StoreWitnessContradiction,
+    assert_store_witness_at_admission,
     prefill_blocked_here as phase_prefill_blocked_here,
 )
 # #791b: imported AS A MODULE, not from-imported: the admission loop resolves
@@ -4307,6 +4309,8 @@ class Scheduler(
                 )
             if what == "decode_in_pp":
                 return bool(purity.decode_allowed_in_pp(running_bs))
+        except StoreWitnessContradiction:
+            raise  # #1157: a detected contradiction is the STOP, not a probe error
         except Exception:  # noqa: BLE001 - a probe must not break the round
             return False
         return False
@@ -6423,6 +6427,8 @@ class Scheduler(
             if not candidates:
                 return True
             return bool(seam_transport_premise_holds(self))
+        except StoreWitnessContradiction:
+            raise  # #1157: the STOP passes through the fail-open probe
         except Exception:  # noqa: BLE001 - never wedge the arming path
             return True
 
@@ -11197,8 +11203,15 @@ class Scheduler(
                 # Credit a completed store hit if there is one; followers
                 # (pp_rank>0) credit only and decide nothing (#969Z).
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                # #1157: the popped record carries the probe's answer; a
+                # probed miss (or a probed span short of the stamp by more
+                # than one chunk) beside a restore stamp is the group STOP,
+                # never a P=0 admission. The credit is stored as a bare int:
+                # `storage_hit_length` rides into `cached_tokens_storage` and
+                # the pickled detokenizer output (review B1).
+                assert_store_witness_at_admission(req, loaded_tokens, self.tree_cache)
                 if loaded_tokens > 0:
-                    req.storage_hit_length = loaded_tokens
+                    req.storage_hit_length = int(loaded_tokens)
                 # Counted, never a skip: this rank ADMITS here. The census key
                 # records that the term ran and declined to decide, which is
                 # what makes the deletion visible in the #788 verdict trace
@@ -11247,8 +11260,11 @@ class Scheduler(
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                # #1157: see the PP0 branch above -- the same witness, the
+                # same STOP, the same bare-int credit (review B1).
+                assert_store_witness_at_admission(req, loaded_tokens, self.tree_cache)
                 if loaded_tokens > 0:
-                    req.storage_hit_length = loaded_tokens
+                    req.storage_hit_length = int(loaded_tokens)
 
             req.init_next_round_input(self.tree_cache)
 
@@ -14812,6 +14828,8 @@ class Scheduler(
                 )
 
                 _seam_premise_now = bool(seam_transport_premise_holds(self))
+            except StoreWitnessContradiction:
+                raise  # #1157: the STOP passes through the fail-open probe
             except Exception:  # noqa: BLE001 - an input probe never breaks arming
                 _seam_premise_now = False
         from sglang.srt.managers.phase_purity import seam_transport_deduction

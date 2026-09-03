@@ -115,6 +115,22 @@ logger = logging.getLogger(__name__)
 
 LOG_PREFIX = "PHASE-PURITY"
 
+
+class StoreWitnessContradiction(RuntimeError):
+    """#1157: two rank-uniform measurements disagree about one span.
+
+    A retracted request carries ``cached_prompt_tokens_at_retract > 0`` (its
+    PP-window prefill was computed and the fence fed the canonical store) and
+    the store probe for its re-admission answered nothing loadable, or a
+    probed span short of the stamp by more than one chunk. Under
+    raenge-nie-uneins / kein-doppel-prefill that is a detected contradiction:
+    the only legal reaction is a STOP of the group, never a recompute at P=0
+    (the weg1b3 shape: 6 TP chunks of 4096 recomputed under a premise that
+    had been "verified on the retract credit"). Raised from the seam premise
+    and from the admission loop, whichever reads the witness first, and
+    re-raised through every fail-open probe on the way.
+    """
+
 MODE_STRICT = "strict"
 MODE_THRESHOLD = "threshold"
 MODE_OFF = "off"
@@ -1340,6 +1356,157 @@ def seam_store_presence_refuted(scheduler):
     return refuted, detail
 
 
+def _store_witness_allowance(tree) -> int:
+    """#1157 (review B2): the ONE-CHUNK allowance the witness compares a
+    stamped span against.
+
+    The tree constant is ``_prefetch_chunk_tokens`` (unified_radix_cache.py,
+    read once from ``ServerArgs.chunked_prefill_size`` at init): it is the
+    same "one-chunk bound" the #1068 L2 truncation line already prices the
+    kein-doppel-prefill law against (``over_bound`` on '#915 PREFETCH
+    TRUNCATED'), i.e. the store's prefetch/write chunk in tokens. A stand-in
+    tree without the term (or chunked prefill disabled, value <= 0) falls
+    back to the store's ``prefetch_threshold`` (256), the floor below which
+    no read can be registered at all -- named here so a missing constant is
+    never silently a zero allowance (every stamped hit would STOP) nor
+    unbounded (every stamped miss would pass).
+    """
+    chunk = int(getattr(tree, "_prefetch_chunk_tokens", -1) or -1)
+    if chunk > 0:
+        return chunk
+    return int(getattr(tree, "prefetch_threshold", 256) or 256)
+
+
+def _witness_from_outcome(req, outcome, stamp: int, allowance: int) -> str:
+    """Classify one terminated prefetch's outcome for the store witness.
+
+    ``outcome`` is the value the tree keeps in ``prefetch_loaded_tokens_by_
+    reqid``: a ``PrefetchOutcome`` (loaded tokens annotated with the probe's
+    answer) on ``UnifiedRadixCache``, a bare int on other trees.
+
+    Beside a restore stamp (``stamp > 0``) the witness MEASURES the stamped
+    span (review B2): the chat-template header answers every probe with ~40
+    tokens, so 'any hit_tokens > 0' would read a revoked re-admission
+    (loaded=0, hit_tokens=40) beside stamp=80009 as a restore and license a
+    P=0 recompute of 79,969 tokens. The witness is 'hit' only if something was
+    LOADED and the probed shortfall ``stamp - hit_tokens`` is within the
+    one-chunk ``allowance``; a revoke (loaded=0) beside a stamp and a probed
+    shortfall larger than the allowance are contradictions and raise
+    ``StoreWitnessContradiction``. A cold request (stamp 0) keeps the plain
+    reading: hit if the probe answered, cold otherwise.
+    """
+    if hasattr(outcome, "hit_tokens"):
+        probed = bool(getattr(outcome, "probed", False))
+        hit = int(getattr(outcome, "hit_tokens", 0) or 0)
+    else:
+        # A tree that records only the loaded count: a positive count is a
+        # hit; a zero says nothing about whether the store was asked.
+        hit = int(outcome or 0)
+        probed = hit > 0
+    loaded = int(outcome or 0)
+    if stamp <= 0:
+        if hit > 0:
+            return "hit"
+        return "unprobed" if not probed else "cold"
+    if not probed and hit == 0:
+        return "unprobed"
+    shortfall = int(stamp) - hit
+    if loaded > 0 and shortfall <= int(allowance):
+        return "hit"
+    requested = len(getattr(req, "origin_input_ids", None) or ())
+    raise StoreWitnessContradiction(
+        f"#1157 STORE WITNESS CONTRADICTION rid={getattr(req, 'rid', None)} "
+        f"stamped={stamp} probed_hit={hit} loaded={loaded} "
+        f"allowance={int(allowance)} shortfall={shortfall} requested={requested}: "
+        f"the retract stamp says the prompt was computed and fenced to the "
+        f"canonical store in the previous window, and the store probe for "
+        f"this re-admission (rank-uniform MIN over the prefetch group) "
+        + (
+            "answered NOTHING that could be loaded"
+            if loaded <= 0
+            else "fell short of the stamped span by more than one chunk"
+        )
+        + ". Two measurements of one span disagree; re-admitting at P=0 (or "
+        f"P={loaded}) would be a recompute licensed by a stamp "
+        f"(kein-doppel-prefill), so the group STOPs here instead "
+        f"(raenge-nie-uneins)."
+    )
+
+
+def store_witness(scheduler, req) -> str:
+    """#1157: THE SEAM PREMISE IS A MEASURED WITNESS, NOT A STAMP.
+
+    What the exemption may rest on, per request, read off the tree's OWN
+    prefetch state (the record the admission loop already drains and pops --
+    no second ledger):
+
+      ``pending``   a store prefetch is registered for this rid and has not
+                    terminated (``tree_cache.ongoing_prefetch``), or the #1068
+                    deferral still owes its issue (``req.prefetch_deferred``).
+                    The exemption is HELD OPEN for it: admission itself waits
+                    on the drained verdict (`Scheduler._prefetch_done_for`),
+                    so nothing admits at P=0 while this is the answer.
+      ``hit``       the probe answered and the read-through loaded it; beside
+                    a restore stamp the probed span must cover the stamp
+                    within one chunk (`_store_witness_allowance`).
+      ``bounded``   no prefetch could be registered because the prompt is
+                    below the store's prefetch threshold (`too_short` at the
+                    #915 gate): the recompute is bounded below that floor,
+                    under the one-chunk allowance, and no witness can exist by
+                    construction.
+      ``cold``      the probe answered 0 and the request carries no restore
+                    stamp (never filled), or no prefetch exists for a prompt
+                    long enough to have needed one.
+      ``unprobed``  the operation terminated before the probe ran (the reap
+                    the priced budget exists to make impossible); the
+                    `#1157 PREFETCH REAPED probed=False` line is its trace.
+
+    A probed miss, a revoke, or a probed shortfall beyond one chunk beside a
+    restore stamp is not a state: it raises ``StoreWitnessContradiction``.
+
+    RANK UNIFORMITY of the inputs (review N3): ``ongoing_prefetch`` is
+    removed only after the group MIN in `check_prefetch_progress`, under the
+    barrier of `drain_retired_prefetch`, or at the cutover sweep -- lockstep
+    on the replicated queue; ``prefetch_loaded_tokens_by_reqid`` is written
+    from the SAME reduced vector (loaded, probed, hit_tokens all MIN-reduced
+    in one packed all_reduce, review N1) or on the revoke path whose enqueue
+    the prefetch thread's own MIN precedes; ``prefetch_deferred`` is set from
+    a rank-local counter but its clear and its retry are gated on the group
+    (#1068 slice 3 fix). The remaining rank-local read is the request's own
+    replicated fields.
+    """
+    tree = getattr(scheduler, "tree_cache", None)
+    rid = getattr(req, "rid", None)
+    stamp = int(getattr(req, "cached_prompt_tokens_at_retract", 0) or 0)
+    ongoing = getattr(tree, "ongoing_prefetch", None)
+    if ongoing and rid in ongoing:
+        return "pending"
+    if getattr(req, "prefetch_deferred", None) is not None:
+        return "pending"
+    records = getattr(tree, "prefetch_loaded_tokens_by_reqid", None)
+    outcome = records.get(rid) if records else None
+    if outcome is not None:
+        return _witness_from_outcome(
+            req, outcome, stamp, _store_witness_allowance(tree)
+        )
+    n = len(getattr(req, "origin_input_ids", None) or ())
+    threshold = int(getattr(tree, "prefetch_threshold", 256) or 0)
+    if 0 < n < threshold:
+        return "bounded"
+    return "cold"
+
+
+def assert_store_witness_at_admission(req, outcome, tree=None) -> None:
+    """#1157: the admission-loop half of the witness. Called with the value
+    `pop_prefetch_loaded_tokens` returned for ``req`` (and the tree, for the
+    one-chunk allowance); raises on a probed miss / revoke / over-allowance
+    shortfall beside a restore stamp, is a no-op for an unannotated count."""
+    if outcome is None or not hasattr(outcome, "hit_tokens"):
+        return
+    stamp = int(getattr(req, "cached_prompt_tokens_at_retract", 0) or 0)
+    _witness_from_outcome(req, outcome, stamp, _store_witness_allowance(tree))
+
+
 def seam_transport_premise_holds(scheduler) -> bool:
     """Is the re-admission actually a RESTORE? Checked, not asserted. #861d.
 
@@ -1438,10 +1605,17 @@ def seam_transport_premise_holds(scheduler) -> bool:
             # measured fill boundary BEFORE those fields are cleared and is
             # exactly the claim this premise rests on: the tokens WERE
             # computed and the fence persisted them.
-            if (
-                int(getattr(req, "cache_protected_len", 0) or 0) > 0
-                or int(getattr(req, "cached_prompt_tokens_at_retract", 0) or 0) > 0
-            ):
+            # #1157: THE STAMP IS WITHDRAWN AS EVIDENCE. `cached_prompt_
+            # tokens_at_retract>0` said "computed and fenced" and the arm
+            # fired on it while the store read for the very same request had
+            # been reaped unprobed -- boot weg1b3, rid 679e4568: 'premise
+            # verified on the retract credit' at 23:56:17, P=0 admission and
+            # 6 recomputed TP chunks at 23:56:21. The premise now reads the
+            # re-admission's OWN prefetch state (`store_witness`): a
+            # registered-and-pending or hit prefetch is a restore; a probed
+            # miss beside the stamp raises (`StoreWitnessContradiction`, not
+            # caught here -- it is the group STOP).
+            if store_witness(scheduler, req) in ("pending", "hit", "bounded"):
                 restored += 1
         except (TypeError, ValueError):
             continue
@@ -1480,9 +1654,10 @@ def seam_transport_premise_holds(scheduler) -> bool:
         scheduler._seam_premise_refused_announced = True
         logger.error(
             "%s SEAM TRANSPORT REFUSED: the exemption's premise does not hold. "
-            "%d stamped request(s) are queued and NONE carries restore "
-            "evidence (cache_protected_len=0 AND "
-            "cached_prompt_tokens_at_retract=0 for all), or %d of them had "
+            "%d stamped request(s) are queued and NONE carries a restore "
+            "WITNESS (#1157: no pending or hit store prefetch, and none "
+            "below the prefetch threshold -- the retract stamp alone is no "
+            "longer evidence), or %d of them had "
             "their restore REFUSED at execution (the retired #890 revocation, "
             "always 0 since the seam copy was deleted in #1043/#1068), so "
             "re-admitting them in the TP "

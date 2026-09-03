@@ -270,15 +270,45 @@ class StorePresenceRefuter968(unittest.TestCase):
         sched.waiting_queue = [req]
         self.assertFalse(phase_purity.seam_transport_premise_holds(sched))
 
-    def test_premise_with_stamps_and_host_content_still_holds(self):
+    def test_premise_with_stamps_and_host_content_no_longer_holds_alone(self):
+        """INVERTED under #1157 (was `..._still_holds`, asserting True).
+
+        WITHDRAWN: the retract stamp as restore evidence. Host content beside
+        a stamp says a tier holds SOMETHING; it does not say this request's
+        prefix is served. Boot weg1b3: stamp 80009, 'premise verified on the
+        retract credit', store read reaped unprobed, P=0. The premise now
+        reads the re-admission's own prefetch state; a long stamped request
+        with no registered or answered store read is cold."""
         from sglang.srt.managers import phase_purity
 
         req = types.SimpleNamespace(
-            cached_prompt_tokens_at_retract=4096, cache_protected_len=0
+            rid="r968",
+            cached_prompt_tokens_at_retract=4096,
+            cache_protected_len=0,
+            origin_input_ids=list(range(4096)),
         )
         setattr(req, phase_purity.SEAM_READMIT_ATTR, 1)
         setattr(req, phase_purity.SEAM_GRANT_CONSUMED_ATTR, False)
         sched = self._scheduler(children={}, avail=50, size=100, storage_on=False)
+        sched.waiting_queue = [req]
+        self.assertFalse(phase_purity.seam_transport_premise_holds(sched))
+
+    def test_premise_holds_on_a_registered_store_read(self):
+        """#1157: the same request with its store prefetch REGISTERED on the
+        tree is a restore in progress; the exemption is held open for it
+        (admission itself waits on the drained verdict)."""
+        from sglang.srt.managers import phase_purity
+
+        req = types.SimpleNamespace(
+            rid="r968",
+            cached_prompt_tokens_at_retract=4096,
+            cache_protected_len=0,
+            origin_input_ids=list(range(4096)),
+        )
+        setattr(req, phase_purity.SEAM_READMIT_ATTR, 1)
+        setattr(req, phase_purity.SEAM_GRANT_CONSUMED_ATTR, False)
+        sched = self._scheduler(children={}, avail=50, size=100, storage_on=True)
+        sched.tree_cache.ongoing_prefetch = {"r968": object()}
         sched.waiting_queue = [req]
         self.assertTrue(phase_purity.seam_transport_premise_holds(sched))
 

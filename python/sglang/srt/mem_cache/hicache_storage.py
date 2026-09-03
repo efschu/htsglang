@@ -172,6 +172,52 @@ class PrefetchTimeoutConfig:
     max: float = 60.0  # seconds, upper bound for the linear timeout
 
 
+class PrefetchOutcome(int):
+    """#1157: the tokens a terminated prefetch LOADED (this int), annotated
+    with what the store PROBE answered for that request.
+
+    An ``int`` subclass on purpose: ``prefetch_loaded_tokens_by_reqid`` is the
+    tree's ONE record of a finished prefetch (popped at admission, cleared on
+    abort), and every existing reader treats its value as the loaded count
+    (``> 0``, ``int(...)``). Annotating that same value keeps one record and
+    one lifecycle -- the seam witness reads the record the admission loop
+    already pops, not a second ledger (upstream-minimal law).
+
+    ``probed``     the serial prefetch thread's store probe ran for this
+                   operation (rank-uniform: the hit count is MIN-reduced across
+                   the prefetch group before it is stamped, and the reap
+                   annotation itself rides the tree's packed MIN all_reduce).
+    ``hit_tokens`` the probe's answer in tokens (0 when it answered nothing,
+                   or when the operation was reaped before the probe ran --
+                   ``probed`` tells the two apart).
+
+    SERIALIZATION (#1157 review B1): the record rides
+    ``req.storage_hit_length`` into ``cached_tokens_storage`` and from there
+    into the pickled detokenizer output (``details['storage']``), and the
+    tree state may be deep-copied. A keyword-only ``__new__`` survived
+    ``pickle.dumps`` but not ``pickle.loads`` (int subclasses are rebuilt
+    positionally by ``copyreg.__reduce_ex__``), which would have killed the
+    detokenizer on the FIRST partial store hit. The constructor is therefore
+    positional with defaults and ``__reduce__`` rebuilds the record with its
+    annotation; the admission sites additionally store a bare ``int``.
+    """
+
+    def __new__(cls, loaded: int, hit_tokens=None, probed: bool = False):
+        self = super().__new__(cls, int(loaded))
+        self.hit_tokens = int(hit_tokens if hit_tokens is not None else 0)
+        self.probed = bool(probed)
+        return self
+
+    def __reduce__(self):
+        return (PrefetchOutcome, (int(self), self.hit_tokens, self.probed))
+
+    def __repr__(self) -> str:
+        return (
+            f"PrefetchOutcome(loaded={int(self)}, hit_tokens={self.hit_tokens}, "
+            f"probed={self.probed})"
+        )
+
+
 class PoolName(str, Enum):
     """Well-known pool names used as PoolTransfer/PoolEntry identifiers."""
 

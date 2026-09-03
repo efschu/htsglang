@@ -68,6 +68,14 @@ def _req(rid, *, seam_epoch=None, oom_retracted=False, cached_prefix=4096):
     a re-admission whose KV comes back from the canonical store. W37-D showed
     the other case exists on metal (258 batches at #cached-token 0), so it gets
     its own explicit tests below rather than being the silent default here.
+
+    #1157: the gate no longer reads a STAMP (`cache_protected_len` /
+    `cached_prompt_tokens_at_retract`) as restore evidence -- it reads the
+    re-admission's own store prefetch state off the tree
+    (`store_witness`). `cached_prefix > 0` therefore means "this
+    request's store read is REGISTERED" (`_Sched` puts the rid into
+    `tree_cache.ongoing_prefetch`), and `cached_prefix=0` means no read exists
+    for a prompt long enough to need one: cold.
     """
     return types.SimpleNamespace(
         rid=rid,
@@ -75,6 +83,10 @@ def _req(rid, *, seam_epoch=None, oom_retracted=False, cached_prefix=4096):
         # The prefix length inserted into the tree cache: >0 means the
         # re-admission genuinely restores rather than recomputes.
         cache_protected_len=cached_prefix,
+        # #1157: a long prompt, so the absence of a store read is COLD
+        # rather than "bounded below the prefetch threshold".
+        origin_input_ids=list(range(4096)),
+        _store_read_registered=cached_prefix > 0,
         # What `Req.reset_for_retract` sets -- from ANY retraction path,
         # including plain decode-OOM preemption. Deliberately set on the
         # non-seam doubles so the can-fail tests are about the right thing.
@@ -93,6 +105,17 @@ class _Sched:
         self.phase_flip_active_stack = phase
         self._phase_purity = purity
         self.waiting_queue = list(queue)
+        # #1157: the witness the premise reads -- a registered store read per
+        # restored double, nothing for a cold one.
+        self.tree_cache = types.SimpleNamespace(
+            ongoing_prefetch={
+                r.rid: object()
+                for r in self.waiting_queue
+                if getattr(r, "_store_read_registered", False)
+            },
+            prefetch_loaded_tokens_by_reqid={},
+            prefetch_threshold=256,
+        )
 
 
 class TestTheExemptionOpensExactlyWhenTheSeamOwesAReadmission(CustomTestCase):
@@ -488,9 +511,23 @@ class TheExemptionsPremiseIsCheckedNotAsserted(unittest.TestCase):
         return _Sched(PHASE_TP, PhasePurity(mode=MODE_STRICT), queue)
 
     def test_a_restored_readmission_still_opens_the_exemption(self):
-        """The legitimate case, unchanged: KV really comes back."""
+        """The legitimate case: KV really comes back -- since #1157 measured
+        as a REGISTERED store read for the rid, not a stamp."""
         s = self._s([_req("a", seam_epoch=1, cached_prefix=4096)])
         self.assertTrue(self.pp.seam_transport_premise_holds(s))
+
+    def test_a_stamp_alone_no_longer_opens_the_exemption(self):
+        """INVERTED under #1157: before it, `cached_prompt_tokens_at_retract
+        = 4096` (or `cache_protected_len > 0`) alone made this True. WITHDRAWN
+        on boot weg1b3: the stamp licensed a P=0 TP prefill of 84k tokens
+        while the store read for that request had been reaped unprobed.
+        A stamped long request with no registered or answered store read is
+        COLD; the premise refuses it."""
+        r = _req("a", seam_epoch=1, cached_prefix=0)
+        r.cached_prompt_tokens_at_retract = 4096
+        r.cache_protected_len = 4096
+        s = self._s([r])
+        self.assertFalse(self.pp.seam_transport_premise_holds(s))
 
     def test_a_cold_readmission_is_REFUSED(self):
         """THE W37-D SPECIMEN. Stamped, queued, and nothing cached: admitting

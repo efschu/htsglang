@@ -142,6 +142,25 @@ def _seam_retract(reqs, epoch: int = 3):
         setattr(r, SEAM_READMIT_ATTR, epoch)
 
 
+def _register_store_reads(s, reqs) -> None:
+    """#1157: THE SEAM PREMISE IS A MEASURED WITNESS, NOT A STAMP.
+
+    `seam_transport_premise_holds` no longer reads `cached_prompt_tokens_at_
+    retract` as evidence; it reads the re-admission's OWN prefetch state off
+    the tree (`store_witness`: pending / hit / probed miss). A stamped
+    request whose store read is neither registered nor answered is COLD --
+    that is the weg1b3 root (a stamp licensed a P=0 TP prefill while the
+    store read had been reaped unprobed). The scenarios below are about the
+    hold, its bounded exit and the batch-formation door, so their population
+    carries what the intake path gives a real re-admission: a REGISTERED
+    store prefetch per rid (`tree_cache.ongoing_prefetch`)."""
+    tc = getattr(s, "tree_cache", None)
+    if tc is None:
+        tc = SimpleNamespace()
+        s.tree_cache = tc
+    tc.ongoing_prefetch = {r.rid: object() for r in reqs}
+
+
 def _tp_scheduler_after_cutover(cfg, *, epoch: int = 3):
     """A Scheduler whose METHODS are the real ones; only construction is
     hand-rolled (the class cannot be __init__'ed hermetically). State is the
@@ -192,6 +211,7 @@ class TestDoor1PolicyArmsAwayFromItsOwnReadmission(CustomTestCase):
         s = _tp_scheduler_after_cutover(cfg)
         n = s.readmit_seam_residents(reqs)
         assert n == 7, f"the REAL queue authority re-admitted {n} of 7"
+        _register_store_reads(s, reqs)
         s.phase_policy_state.last_flip_at = time.perf_counter() - dwell_ago_s
         ret = s.maybe_arm_phase_policy()
         return s, ret
@@ -227,28 +247,48 @@ class TestDoor1PolicyArmsAwayFromItsOwnReadmission(CustomTestCase):
 
 
 class TestDoor2PremiseRefusesThePopulationItExistsFor(CustomTestCase):
-    def test_the_purity_gate_must_admit_the_seam_stamped_population(self):
-        """RED ON 35b9914e50. `seam_transport_premise_holds` demands a
-        stamped request with `cache_protected_len > 0` -- but
-        `reset_for_retract` zeroes that field on every request the seam
-        retracts, three lines after stamping the credit
-        (`cached_prompt_tokens_at_retract` = the full prompt: these requests
-        WERE fully prefilled and their KV fenced to the canonical store).
-        The premise reads state the transition it guards manufactures, so
-        the exemption can never admit the population it exists for."""
+    def test_a_stamp_without_a_store_read_no_longer_opens_the_gate(self):
+        """INVERTED under #1157 (was `test_the_purity_gate_must_admit_the_
+        seam_stamped_population`, green since #861j on the retract stamp).
+
+        WITHDRAWN: `cached_prompt_tokens_at_retract > 0` as restore evidence.
+        Boot weg1b3 (rid 679e4568, 84k tokens): the stamp said "computed and
+        fenced", the policy held on 'premise verified on the retract credit',
+        and the store read for the very same request had been reaped before
+        its probe -- P=0 admission, six recomputed TP chunks. The premise now
+        reads the re-admission's prefetch state (`store_witness`); a
+        long stamped request with NO registered store read is cold, and the
+        gate stays closed for it. The population this door exists for is
+        admitted in the sibling test below, on the witness."""
         cfg = _metal_policy_cfg()
         reqs = [_mk_prefilled_req(i) for i in range(7)]
         _seam_retract(reqs)
         s = _tp_scheduler_after_cutover(cfg)
         s.readmit_seam_residents(reqs)
-        blocked = prefill_blocked_here(s, running_bs=0)
+        assert all(r.cached_prompt_tokens_at_retract > 0 for r in reqs)
+        self.assertTrue(
+            prefill_blocked_here(s, running_bs=0),
+            "a retract stamp with no registered or answered store read opened "
+            "the TP prefill gate: the #1157 witness is not being consulted",
+        )
+
+    def test_the_purity_gate_admits_the_stamped_population_on_its_store_read(
+        self,
+    ):
+        """The #861j door, re-grounded (#1157): the same 7 requests, each
+        with its store prefetch REGISTERED (what `_prefetch_kvcache` does at
+        re-admission) -- the exemption opens on the measured witness."""
+        cfg = _metal_policy_cfg()
+        reqs = [_mk_prefilled_req(i) for i in range(7)]
+        _seam_retract(reqs)
+        s = _tp_scheduler_after_cutover(cfg)
+        s.readmit_seam_residents(reqs)
+        _register_store_reads(s, reqs)
         self.assertFalse(
-            blocked,
-            "TP refused the read-through prefill of the 7 requests the seam "
-            "itself stamped: every one carries the full-prompt retract "
-            "credit (KV computed and fenced), yet the premise checks "
-            "cache_protected_len, which the retraction zeroed. The only "
-            "path to TP residency is closed",
+            prefill_blocked_here(s, running_bs=0),
+            "TP refused the read-through prefill of 7 seam-stamped requests "
+            "whose store reads are registered and pending -- the only path "
+            "to TP residency is closed",
         )
 
     def test_a_cold_readmission_is_still_refused(self):
@@ -382,6 +422,7 @@ class TestDoor2TheBatchFormationPathNeverOpens(CustomTestCase):
         _seam_retract(reqs)
         s = _batch_formation_scheduler(cfg)
         s.readmit_seam_residents(reqs)
+        _register_store_reads(s, reqs)
         for _ in range(8):
             Scheduler.get_next_batch_to_run(
                 s, running_batch=s.running_batch, last_batch=None
@@ -408,6 +449,7 @@ class TestTheHoldHasABoundedExit(CustomTestCase):
         _seam_retract(reqs)
         s = _tp_scheduler_after_cutover(cfg)
         s.readmit_seam_residents(reqs)
+        _register_store_reads(s, reqs)
         s.phase_policy_state.last_flip_at = time.perf_counter() - 8.0
         return s
 

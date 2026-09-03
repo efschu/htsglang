@@ -3568,7 +3568,9 @@ def _decide_from_load(
             return _no(
                 f"seam transport: {inp.seam_serviceable_tokens} tok of the "
                 f"cutover's own re-admission are serviceable in THIS layout "
-                f"by read-through (premise verified on the retract credit) "
+                f"by read-through (premise verified on the STORE WITNESS, #1157: "
+                f"a pending or loaded store read per re-admission, never the "
+                f"retract stamp alone) "
                 f"-- holding for the transport batch instead of flipping "
                 f"away from it. Bounded: the transport-debt clock lapses "
                 f"this credit after the drain-stall deadline, and the "

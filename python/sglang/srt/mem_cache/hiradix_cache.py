@@ -1828,7 +1828,15 @@ class HiRadixCache(RadixCache):
     # Timeout is linearly increasing with the number of pages
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
         cfg = self.prefetch_timeout_config
-        num_tokens = len(operation.hash_value) * self.page_size
+        # #1157 sibling of `UnifiedRadixCache._prefetch_priced_pages`: until
+        # the store probe has filled `hash_value`, price the span the
+        # operation ASKED for, not the empty answer.
+        hit_pages = len(operation.hash_value)
+        if not hit_pages:
+            hit_pages = len(getattr(operation, "token_ids", None) or ()) // max(
+                1, int(self.page_size)
+            )
+        num_tokens = hit_pages * self.page_size
         timeout = min(cfg.max, cfg.base + cfg.per_ki_token * num_tokens / 1024)
         return time.monotonic() - operation.start_time > timeout
 
