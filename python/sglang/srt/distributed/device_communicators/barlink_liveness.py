@@ -176,7 +176,7 @@ def wait_timeout_s() -> float:
     is the configured value unchanged.
 
     #1158: the extension is CAPPED at ``base + build_cap_s()`` -- the same
-    frist the peers honour for this rank's published window
+    deadline the peers honour for this rank's published window
     (``jit_cold_build.capped_cold_build_deadline``, one formula for the host
     and the device reader). Uncapped, the opener of a window outlived every
     peer's deadline by minutes and only the 300 s scheduler watchdog ended it.
@@ -756,7 +756,7 @@ class PeerWatchdog:
         3. THE CAP IS THE ONE THAT ALREADY GOVERNS THIS WINDOW, not a second
            timer for the same deadline. ``in_cold_build_window()`` is a bare
            depth counter with no clock of its own, so this reads
-           ``barlink_build_window.build_cap_s()`` -- the very frist the PEERS
+           ``barlink_build_window.build_cap_s()`` -- the very deadline the PEERS
            use to decide how long a published window may still matter
            (default 900 s; this rig's launcher sets 60). Past it the window is
            void for everyone, so staying blind past it would buy nothing and
@@ -788,7 +788,7 @@ class PeerWatchdog:
         except Exception:  # pragma: no cover - fall back to the published default
             cap = 900.0
         if cap > 0 and (now - since) > cap:
-            # The window has outlived the frist the peers honour. Whatever is
+            # The window has outlived the deadline the peers honour. Whatever is
             # holding it open is no longer a build the group is waiting for,
             # and an unbounded blind spot is the worse of the two failures.
             #

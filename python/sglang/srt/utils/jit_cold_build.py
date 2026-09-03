@@ -155,7 +155,7 @@ def build_cap_s() -> float:
     """#1158: the peers' absolute build cap, read from where they read it.
 
     ``barlink_build_window.build_cap_s`` (``SGLANG_BARLINK_BUILD_WINDOW_CAP_S``,
-    default 900 s; this rig's launcher sets 60) is the frist a PEER honours
+    default 900 s; this rig's launcher sets 60) is the deadline a PEER honours
     for a published window. The opener's own extension is bounded by the
     same number below, so the two sides of one collective agree on how long
     a build may hold a deadline open.

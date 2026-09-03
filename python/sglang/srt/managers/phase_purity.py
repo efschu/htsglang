@@ -1370,6 +1370,14 @@ def _store_witness_allowance(tree) -> int:
     no read can be registered at all -- named here so a missing constant is
     never silently a zero allowance (every stamped hit would STOP) nor
     unbounded (every stamped miss would pass).
+
+    Coupling named by review: with a mamba anchor interval larger than
+    chunked_prefill_size (the #750 rule allows interval % chunk == 0), a capped
+    probe lands on the deepest anchor boundary and a shortfall up to interval-1
+    beside a stamp becomes a contradiction by construction; on the shipping
+    form the interval is unset. If that form ever ships, the allowance must
+    become max(chunk, anchor interval) or the witness must judge presence on
+    the uncapped claim.
     """
     chunk = int(getattr(tree, "_prefetch_chunk_tokens", -1) or -1)
     if chunk > 0:

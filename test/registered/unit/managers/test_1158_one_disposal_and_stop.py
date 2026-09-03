@@ -201,6 +201,38 @@ class OneDisposalAtTheOrigin(CustomTestCase):
         self.assertEqual(returned, [])
 
 
+class HealthCheckGateReturnsTheOriginVerdict(CustomTestCase):
+    """Test gap named by review: ``_health_check_gate`` was executed by no
+    test. Mutant: invert the boolean in the method body (``bool(not
+    self.is_fully_idle(...))``); this class must go red on that mutant and
+    on no other change."""
+
+    @staticmethod
+    def _self(idle, queue_len, running_len):
+        calls = []
+
+        def is_fully_idle(for_health_check=False):
+            calls.append(for_health_check)
+            return idle
+
+        fake = types.SimpleNamespace(
+            is_fully_idle=is_fully_idle,
+            waiting_queue=[object()] * queue_len,
+            running_batch=types.SimpleNamespace(reqs=[object()] * running_len),
+        )
+        return fake, calls
+
+    def test_idle_origin_reports_true_with_the_two_queue_lengths(self):
+        fake, calls = self._self(idle=True, queue_len=6, running_len=1)
+        self.assertEqual(Scheduler._health_check_gate(fake), (True, 6, 1))
+        self.assertEqual(calls, [True], "is_fully_idle called for_health_check=True")
+
+    def test_busy_origin_reports_false_with_the_two_queue_lengths(self):
+        fake, calls = self._self(idle=False, queue_len=3, running_len=2)
+        self.assertEqual(Scheduler._health_check_gate(fake), (False, 3, 2))
+        self.assertEqual(calls, [True], "is_fully_idle called for_health_check=True")
+
+
 class NoRankConditionalDisposalSurvives(CustomTestCase):
     """STRUCTURAL: the matched check the operator named."""
 
