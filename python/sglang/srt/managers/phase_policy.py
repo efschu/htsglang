@@ -2034,6 +2034,11 @@ class PhasePolicyState:
     #: flip that retracted it again -- the same 3-request cohort was
     #: re-prefilled from zero in all four TP windows (442840 tok, 0 decode).
     last_seam_cohort_pending: Optional[int] = None
+    #: #1159: the previous observation's ``(chunked_prefill_rid,
+    #: chunked_prefill_computed_tokens)``. Compared as a PAIR, never as a
+    #: level: only the same rid with a strictly larger prefix is progress.
+    last_chunked_prefill_rid: Optional[str] = None
+    last_chunked_prefill_computed: Optional[int] = None
     #: #677 hot fix 2: how many requests were decoding when this TP window
     #: opened, so the exit receipt can name the BUNDLE it finished rather than
     #: only the instant it ended. Set by ``observe_idle`` at the phase change.
@@ -2596,6 +2601,27 @@ class PhasePolicyInputs:
     #:
     #: None = not measured. The decline then says so rather than guessing.
     kv_available_tokens: Optional[int] = None
+
+    #: #1159: THE IN-FLIGHT CHUNKED PREFILL'S OWN COMPUTED PREFIX, and the
+    #: identity of the request it belongs to. Read from ``self.chunked_req``
+    #: at the build site (``len(prefix_indices)``), which is the SAME quantity
+    #: the ADMIT line prints as ``prefix_lens`` and the same one
+    #: ``dynamic_chunked_prefill_size`` calls ``history_len``.
+    #:
+    #: WHY THE RID TRAVELS WITH THE NUMBER. Progress on this axis means the
+    #: SAME request's prefix growing. A different request appearing with a
+    #: larger prefix is admission REFILLING the bundle, which is exactly what
+    #: #833 must keep reading as non-progress -- crediting it would restore
+    #: the divergent binding #833 removed. So the observer compares the rid
+    #: first and the number second.
+    #:
+    #: Replicated: ``chunked_req`` is rank-identical by the same contract the
+    #: scheduler already states for it (scheduler.py:8807), and
+    #: ``prefix_indices`` is derived from the replicated match. None / 0 on
+    #: every stand-in and every non-flip deployment, so an unsupplied field
+    #: reproduces the pre-#1159 behaviour exactly.
+    chunked_prefill_rid: Optional[str] = None
+    chunked_prefill_computed_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -4160,6 +4186,11 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
         # #1069: the cohort-service marker restarts with the phase too --
         # cross-phase comparison would credit a cutover's own zeroing.
         state.last_seam_cohort_pending = None
+        # #1159: the chunked-prefill marker restarts with the phase, same
+        # argument -- a prefix carried across a cutover would compare a
+        # re-admitted request against its pre-flip self.
+        state.last_chunked_prefill_rid = None
+        state.last_chunked_prefill_computed = None
     # #677(a) PREFILL PROGRESS, MEASURED. The wedge signature is pending
     # frozen at a value while every slot is held by a carried decode, so the
     # observable that separates it from a slow drain is whether the backlog
@@ -4194,6 +4225,43 @@ def observe_idle(state: PhasePolicyState, inp: PhasePolicyInputs) -> None:
     if prev_cohort is not None and _cohort_pending < int(prev_cohort):
         state.last_bundle_progress_at = inp.now
     state.last_seam_cohort_pending = _cohort_pending
+    # #1159: AN ADVANCING CHUNKED PREFILL IS BUNDLE PROGRESS.
+    #
+    # Measured weg1b3 (boot_855_weg1b3_6980c75eac_0902_234752.log:100502): the
+    # arm fired "decode bundle STALLED, not draining: 1 of 1 req still
+    # decoding and the set has not shrunk for 11.4s" against rid 679e4568,
+    # whose PP0 ADMIT prefix ladder was strictly monotone through that window
+    # (4096, 6281, 8192 ... 20480 -- one 4096 chunk every ~3 s). A request
+    # being chunk-prefilled holds ``running_bs`` FLAT by construction: it
+    # occupies one slot for its whole prefill. It is not a seam cohort member
+    # either, so neither existing axis moved and an advancing request read as
+    # a frozen set. The 70 s cutover that arm bought then retracted it -- the
+    # #939 breach two lines later, worst=79931 tok recomputed.
+    #
+    # ONLY THE SAME REQUEST COUNTS. A different rid with a larger prefix is
+    # admission REFILLING the bundle, and crediting that would restore exactly
+    # the divergent binding #833 removed (more pressure -> more apparent
+    # progress -> the wait never ends). So the rid is compared first. A set
+    # that neither shrinks nor advances still arms unchanged.
+    _chunk_rid = getattr(inp, "chunked_prefill_rid", None)
+    _chunk_tok = int(getattr(inp, "chunked_prefill_computed_tokens", 0) or 0)
+    _prev_chunk_rid = state.last_chunked_prefill_rid
+    _prev_chunk_tok = state.last_chunked_prefill_computed
+    if (
+        _chunk_rid is not None
+        and _prev_chunk_rid is not None
+        and _chunk_rid == _prev_chunk_rid
+        and _prev_chunk_tok is not None
+        and _chunk_tok > int(_prev_chunk_tok)
+    ):
+        state.last_bundle_progress_at = inp.now
+    # A round with no chunked request in flight must not ERASE the marker: a
+    # chunk boundary momentarily clears ``chunked_req`` and re-arms it, and
+    # forgetting the rid there would make every second chunk read as a fresh
+    # request (i.e. as refill). Keep the last non-empty reading.
+    if _chunk_rid is not None:
+        state.last_chunked_prefill_rid = _chunk_rid
+        state.last_chunked_prefill_computed = _chunk_tok
 
 
 def note_flip_armed(

@@ -11713,22 +11713,6 @@ class Scheduler(
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
 
-        # W30: THE SEAM STAMP IS ONE-SHOT AND IS SPENT HERE.
-        #
-        # It licenses exactly one re-admission -- the one this cutover owes.
-        # Left on the request it would travel with it for the rest of its
-        # life and exempt every later prefill it ever needs, which would turn
-        # a narrow seam carve-out into a permanent hole in the purity rule.
-        # Cleared on admission, so a request that is retracted by the NEXT
-        # cutover is stamped again by that cutover and by nothing else.
-        # The round flag is cleared with it: the exemption is re-derived from
-        # the queue every round rather than latching.
-        if transport_only:
-            for req in can_run_list:
-                if getattr(req, SEAM_READMIT_ATTR, None) is not None:
-                    setattr(req, SEAM_READMIT_ATTR, None)
-            setattr(self, SEAM_TRANSPORT_ROUND_ATTR, False)
-
         # #791 PP ADMISSION UNIFORMITY: PP0 publishes this pass's admission
         # decision here; scheduler_pp_mixin.py's _event_loop_pp_body drains
         # `self._pp_admission_last_built_decision`, stamps in the real
@@ -11966,6 +11950,46 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+
+        # W30: THE SEAM STAMP IS ONE-SHOT AND IS SPENT HERE.
+        #
+        # It licenses exactly one re-admission -- the one this cutover owes.
+        # Left on the request it would travel with it for the rest of its
+        # life and exempt every later prefill it ever needs, which would turn
+        # a narrow seam carve-out into a permanent hole in the purity rule.
+        # Cleared on admission, so a request that is retracted by the NEXT
+        # cutover is stamped again by that cutover and by nothing else.
+        # The round flag is cleared with it: the exemption is re-derived from
+        # the queue every round rather than latching.
+        #
+        # #1159: THE SPEND SITS AFTER `prepare_for_extend`, AND THAT IS THE
+        # WHOLE FIX. It used to sit directly after the can_run_list was cut
+        # out of the waiting queue, ~240 lines above -- i.e. BEFORE the batch
+        # was built. The #939 double-prefill census's only writer lives inside
+        # `prepare_for_extend` (schedule_batch.py, the `prior == 0` block) and
+        # its population gate is exactly this stamp, so on a transport_only
+        # round -- the seam re-admission wave, the one population the census
+        # exists to measure -- every request reached the writer already
+        # cleared. Measured on weg1b3: the boot's two worst double prefills
+        # (679e4568 lost 84027 tok at 23:56:18, 8f31846b lost 13225 tok at
+        # 23:59:54, both pp_to_tp waves) produced NO census line, while the
+        # six lines that do exist all belong to the 23:57:48 tp_to_pp wave.
+        # A census blind on its own population is worse than an absent one:
+        # its silence reads as "no double prefill".
+        #
+        # NOTHING ELSE CHANGES. The stamp is still one-shot, still spent in
+        # this pass, still spent before this function returns, and no
+        # statement between `prepare_for_extend` and here reads
+        # SEAM_READMIT_ATTR or returns early (asserted structurally in
+        # test/registered/unit/mem_cache/test_1159_census_sees_the_wave.py so
+        # the premise cannot rot). The #1154 first-of-wave emission is
+        # untouched -- it is driven by the census the writer now actually
+        # fills.
+        if transport_only:
+            for req in can_run_list:
+                if getattr(req, SEAM_READMIT_ATTR, None) is not None:
+                    setattr(req, SEAM_READMIT_ATTR, None)
+            setattr(self, SEAM_TRANSPORT_ROUND_ATTR, False)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -12710,6 +12734,19 @@ class Scheduler(
         stall was ~150 s, so the cap is not the binding term here; if a future
         stall ever approaches it, the answer is the rendezvous warmup, and that
         is a bigger change than this one.
+
+        #1159: THIS WINDOW STILL HAS NO BOUND OF ITS OWN, AND THAT IS ON
+        PURPOSE. What was added here is a REPORTING bound only -- one named
+        `#1159 CUTOVER FORWARD WARMUP OPEN > Ns` line
+        (``SGLANG_CUTOVER_WARMUP_OPEN_WARN_S``, default 120 s) from a timer
+        thread, so a hung first forward is ONE line instead of 82,350 `#1073
+        ... RESUMING` lines (41 % of boot weg1b3's log). The window is not
+        closed, the forward is not interrupted and the group is not stopped.
+        THE GROUP STOP BELONGS TO #1158: weg1b3 died because two ranks entered
+        this window at 23:59:54 and the third never did, which is a rank
+        divergence, and under ``raenge-nie-uneins-crash-stop`` a detected
+        divergence must crash the group at the single site that owns the
+        decision -- not be compensated for here, one rank at a time.
         """
         n = getattr(self, "_post_cutover_build_batches", 0)
         if n <= 0:
@@ -12743,10 +12780,70 @@ class Scheduler(
             f"[rank {self.attn_tp_rank if hasattr(self, 'attn_tp_rank') else '?'}]",
             reason,
         )
+        # #1159: A BOUND ON THE REPORTING, NOT ON THE WINDOW.
+        #
+        # This wrapper has no clock of its own: it holds the forward for as
+        # long as the forward takes, and `cold_build_window` publishes a marker
+        # rather than enforcing anything. On weg1b3 the window opened at
+        # 23:59:54 on PP0 and PP2 (log lines 104478, 104858), PP1 never entered
+        # it, and no `WARMUP done` and no `build window CLOSE` was ever written
+        # on any rank -- the group deadlocked with two ranks inside the GDN
+        # extend forward and one at the top of the event loop. The ONLY thing
+        # the boot then produced about that state was 82,350 `#1073 ...
+        # RESUMING` lines, 41 % of the log: the symptom of the open window at
+        # tick rate, never the event.
+        #
+        # So a hung first forward gets ONE named line, from a timer thread
+        # (this thread is inside the forward and cannot report on itself). One
+        # shot, cancelled in the `finally` on both the normal and the exception
+        # path, so a healthy warmup -- 28-629 ms for every completed one in
+        # that boot -- never emits it.
+        #
+        # WHAT THIS DELIBERATELY DOES NOT DO, and the boundary is the point:
+        # it does not stop the group, does not abort, does not close the
+        # window and does not redesign this wrapper. A cutover that two ranks
+        # entered and one did not is a RANK DIVERGENCE, and under
+        # `raenge-nie-uneins-crash-stop` the answer to a detected divergence is
+        # a group stop at the one place that owns the decision -- which is
+        # #1158's subject, not this line's. This is an instrument: it makes the
+        # state visible in one line so #1158 has something to key on.
+        _warn_s = 0.0
+        try:
+            from sglang.srt.environ import envs as _envs_1159
+
+            _warn_s = float(_envs_1159.SGLANG_CUTOVER_WARMUP_OPEN_WARN_S.get())
+        except Exception:  # noqa: BLE001 - an instrument never breaks the forward
+            _warn_s = 120.0
+        _timer = None
+        if _warn_s > 0:
+            import threading as _threading_1159
+
+            def _warn_open():
+                logger.error(
+                    "#1159 CUTOVER FORWARD WARMUP OPEN > %.1fs: %s has been "
+                    "open %.1fs on this rank and the forward has not returned. "
+                    "Every completed warmup on this rig takes milliseconds "
+                    "(28-629 ms measured across boot weg1b3), so this is not a "
+                    "slow build. Two shapes produce it: a cold module load "
+                    "that is genuinely still running (the ranks BURN CPU), or "
+                    "a one-sided cutover in which a peer never entered this "
+                    "window and the collective can never form (0%% CPU, GPU at "
+                    "100%%) -- the weg1b3 death, 23:59:54. This line reports; "
+                    "the group stop for the divergence belongs to #1158.",
+                    _warn_s,
+                    reason,
+                    time.monotonic() - _t0,
+                )
+
+            _timer = _threading_1159.Timer(_warn_s, _warn_open)
+            _timer.daemon = True
+            _timer.start()
         try:
             with cold_build_window(reason):
                 return self._run_batch_forward(batch, pp_proxy_tensors)
         finally:
+            if _timer is not None:
+                _timer.cancel()
             logger.warning(
                 "#1033c CUTOVER FORWARD WARMUP done: %s in %.1f ms. "
                 "%d warmed forward(s) left in this window budget.",
@@ -14978,6 +15075,25 @@ class Scheduler(
         except Exception:  # noqa: BLE001 - a probe may never break the policy
             _cohort_n, _cohort_tok, _cohort_spent = 0, 0, 0
 
+        # #1159: THE ADVANCING CHUNKED PREFILL, READ AT THE INPUT BOUNDARY.
+        #
+        # weg1b3 armed `decode bundle STALLED, not draining` (log:100502)
+        # against a request whose prefix was growing one 4096-token chunk
+        # every ~3 s. `running_bs` cannot see that -- a chunk-prefilled
+        # request holds one slot for its whole prefill -- so the policy needs
+        # the prefix itself. Pure read of the replicated `chunked_req`
+        # (scheduler.py:8807 states that contract); books nothing.
+        _chunk_rid_now, _chunk_prefix_now = None, 0
+        try:
+            _chunk = getattr(self, "chunked_req", None)
+            if _chunk is not None:
+                _chunk_rid_now = str(getattr(_chunk, "rid", "") or "") or None
+                _chunk_prefix_now = int(
+                    len(getattr(_chunk, "prefix_indices", ()) or ())
+                )
+        except Exception:  # noqa: BLE001 - an input probe never breaks arming
+            _chunk_rid_now, _chunk_prefix_now = None, 0
+
         inp = PhasePolicyInputs(
             phase=runtime.phase,
             # The same quantity the #363 observer reads, and the one the
@@ -15107,6 +15223,15 @@ class Scheduler(
             # measured nothing, and 'not measured' is a state the policy
             # already reports honestly.
             kv_available_tokens=getattr(self, "_uniform_kv_available", lambda: None)(),
+            # #1159: the in-flight chunked prefill's OWN computed prefix, and
+            # the rid it belongs to. `len(prefix_indices)` is the same
+            # quantity `dynamic_chunked_prefill_size` calls `history_len`
+            # (:9250) and the same one the ADMIT line prints as prefix_lens.
+            # getattr/try for the SAME stand-in reason as every neighbour
+            # here: a stand-in without a chunked request has observed nothing,
+            # and "not observed" must reproduce the pre-#1159 behaviour.
+            chunked_prefill_rid=_chunk_rid_now,
+            chunked_prefill_computed_tokens=_chunk_prefix_now,
             **dict(
                 zip(
                     ("nothing_can_run", "target_can_admit"),

@@ -350,6 +350,20 @@ class Envs:
     # File-backed they are reclaimable page cache: +27.15 GiB of DISK against
     # 501 GiB free, and no locked RAM.
     SGLANG_PHASE_FLIP_IMAGE_TWO_FILE = EnvBool(False)
+    # #1159: how long the #1033c post-cutover forward warmup may stay OPEN
+    # before the scheduler says so in ONE named line. It is a REPORTING bound,
+    # not a stop: the group stop for a one-sided cutover belongs to #1158
+    # (RAENGE-NIE-UNEINS) and is deliberately not built here.
+    #
+    # Measured weg1b3: the window opened at 23:59:54 on PP0 and PP2, PP1 never
+    # entered it, and no 'CUTOVER FORWARD WARMUP done' or 'build window CLOSE'
+    # ever followed. The only evidence the boot produced for that state was
+    # 82,350 '#1073 ... RESUMING' lines -- 41 % of the log -- which is the
+    # symptom, not the event. 120 s is chosen against the honest population:
+    # every completed warmup in that boot took 28-629 ms (tp layout 2/8..8/8 at
+    # 23:53:00, pp layout 1/8..8/8 across 23:54:18-23:58:01), so 120 s is ~190x
+    # the longest honest one and cannot fire on a healthy group.
+    SGLANG_CUTOVER_WARMUP_OPEN_WARN_S = EnvFloat(120.0)
     # #802: refill a FILE-BACKED image by READING the file into a pinned
     # staging ring, instead of copying straight off the mapping and taking one
     # synchronous major fault per 4 KiB page. Measured on this rig 2026-08-22

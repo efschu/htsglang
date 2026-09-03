@@ -191,6 +191,16 @@ def wait_timeout_s() -> float:
 # --- errors ---------------------------------------------------------------
 
 
+#: #1159: minimum wall seconds between two "#1073 ... RESUMING" lines on one
+#: rank. The condition this line reports is PERSISTENT (a cold-build window
+#: that stopped closing stays open), so at the watchdog's tick rate it wrote
+#: 82,350 of boot weg1b3's 200,766 lines. Ten seconds is chosen against the
+#: reader, not against the mechanism: it keeps the first line instant, keeps a
+#: standing condition visible roughly six times a minute, and costs three
+#: orders of magnitude fewer lines than the tick.
+RESUME_LINE_MIN_INTERVAL_S = 10.0
+
+
 class PeerLivenessError(RuntimeError):
     """Base of the two decidable outcomes of a bounded wait."""
 
@@ -748,6 +758,11 @@ class PeerWatchdog:
             return False
         if not jit_cold_build.in_cold_build_window():
             self._abort_poll_suspended_since = None
+            # #1159: a closed window ends the EPISODE, so the next one starts
+            # with its own verbatim first line rather than inheriting a rate
+            # limit from an episode that is over.
+            self._1073_resume_logged_at = None
+            self._1073_resume_suppressed = 0
             return False
         now = time.monotonic()
         since = getattr(self, "_abort_poll_suspended_since", None)
@@ -766,16 +781,56 @@ class PeerWatchdog:
             # The window has outlived the frist the peers honour. Whatever is
             # holding it open is no longer a build the group is waiting for,
             # and an unbounded blind spot is the worse of the two failures.
-            logger.warning(
-                "#1073 abort-word poll RESUMING under a still-open cold-build "
-                "window: it has been open %.1fs, past the %.1fs cap the peers "
-                "honour (%s). The device poll comes back rather than stay "
-                "blind; if a load really is still running this may re-form the "
-                "contention, and THAT is the event to chase.",
-                now - since,
-                cap,
-                barlink_build_window.ENV_CAP_S,
-            )
+            #
+            # #1159 RATE LIMIT. This branch is evaluated on the watchdog's own
+            # tick, and the condition is PERSISTENT: once a window stops
+            # closing it is true on every tick until the process ends. On boot
+            # weg1b3 that produced 82,350 lines of 200,766 -- 41.0 % of the log
+            # at ~97 lines/s/rank from 23:59:54 -- and buried the one event
+            # worth reading, the cutover warmup that opened the window
+            # (scheduler.py's #1033c) and never closed it. A persistent
+            # condition reported at tick rate is not a louder finding, it is a
+            # quieter one.
+            #
+            # THE FIRST LINE IS UNCHANGED, deliberately: the shape a grep or an
+            # acceptance script keys on must not move. Every later line inside
+            # the interval is COUNTED, and the next emitted line names the
+            # count, so the rate limit can never be read as the condition
+            # having ended. The poll still comes back on EVERY tick -- only the
+            # logging is limited, never the behaviour.
+            _suppressed = int(getattr(self, "_1073_resume_suppressed", 0) or 0)
+            _last = getattr(self, "_1073_resume_logged_at", None)
+            if _last is None:
+                logger.warning(
+                    "#1073 abort-word poll RESUMING under a still-open cold-build "
+                    "window: it has been open %.1fs, past the %.1fs cap the peers "
+                    "honour (%s). The device poll comes back rather than stay "
+                    "blind; if a load really is still running this may re-form the "
+                    "contention, and THAT is the event to chase.",
+                    now - since,
+                    cap,
+                    barlink_build_window.ENV_CAP_S,
+                )
+                self._1073_resume_logged_at = now
+                self._1073_resume_suppressed = 0
+            elif (now - _last) >= RESUME_LINE_MIN_INTERVAL_S:
+                logger.warning(
+                    "#1073 abort-word poll STILL RESUMING under a still-open "
+                    "cold-build window: open %.1fs, past the %.1fs cap (%s); "
+                    "%d further identical line(s) suppressed in the last "
+                    "%.1fs. The condition has not ended -- the reporting is "
+                    "rate-limited to one line per %.1fs per rank (#1159).",
+                    now - since,
+                    cap,
+                    barlink_build_window.ENV_CAP_S,
+                    _suppressed,
+                    now - _last,
+                    RESUME_LINE_MIN_INTERVAL_S,
+                )
+                self._1073_resume_logged_at = now
+                self._1073_resume_suppressed = 0
+            else:
+                self._1073_resume_suppressed = _suppressed + 1
             return False
         return True
 
