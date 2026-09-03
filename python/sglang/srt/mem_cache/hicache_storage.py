@@ -190,6 +190,24 @@ class PrefetchOutcome(int):
     ``hit_tokens`` the probe's answer in tokens (0 when it answered nothing,
                    or when the operation was reaped before the probe ran --
                    ``probed`` tells the two apart).
+    ``matched``    the prefix that was ALREADY DEVICE-RESIDENT for this request
+                   when the fetched tail was inserted (``insert_result.
+                   prefix_len``, the "matched=" field of the emitter line). It
+                   is the OTHER half of the presence, disjoint from this int:
+                   `unified_radix_cache.py:4140-4145` computes
+                   ``loaded = min_completed_tokens - prefix_len``, so
+                   ``matched + loaded == completed_synced`` by construction --
+                   including the ``host_span_unclaimed`` branch, where the
+                   refused tail forces ``loaded = 0`` while the already-resident
+                   prefix is untouched and stays counted here.
+
+    ``materialized`` (read-only) is ``matched + loaded``: the post-prefetch
+    device-resident prefix, which is what a reader asking "is the prefix
+    THERE" must consult. #1176: the seam witness read ``loaded`` alone and
+    called a reaped-but-fully-resident re-admission a contradiction (boot
+    weg1b6, rid 1e95e023: matched=3456 loaded=0 against stamp 6008). Same
+    class the #841 comment names for ``loaded`` at :4136-4139 -- an instrument
+    that measures the TRANSFER cannot answer a question about the PRESENCE.
 
     SERIALIZATION (#1157 review B1): the record rides
     ``req.storage_hit_length`` into ``cached_tokens_storage`` and from there
@@ -202,19 +220,40 @@ class PrefetchOutcome(int):
     annotation; the admission sites additionally store a bare ``int``.
     """
 
-    def __new__(cls, loaded: int, hit_tokens=None, probed: bool = False):
+    def __new__(
+        cls,
+        loaded: int,
+        hit_tokens=None,
+        probed: bool = False,
+        matched=None,
+    ):
         self = super().__new__(cls, int(loaded))
         self.hit_tokens = int(hit_tokens if hit_tokens is not None else 0)
         self.probed = bool(probed)
+        self.matched = int(matched if matched is not None else 0)
         return self
 
+    @property
+    def materialized(self) -> int:
+        """#1176: the post-prefetch device-resident prefix in tokens.
+
+        ``matched + loaded``, which equals ``completed_synced`` on the emitter
+        line (unified_radix_cache.py:4140-4145 computes loaded as
+        ``min_completed_tokens - insert_result.prefix_len``). Read-only and
+        derived: there is no second record to keep in step.
+        """
+        return int(self.matched) + int(self)
+
     def __reduce__(self):
-        return (PrefetchOutcome, (int(self), self.hit_tokens, self.probed))
+        return (
+            PrefetchOutcome,
+            (int(self), self.hit_tokens, self.probed, self.matched),
+        )
 
     def __repr__(self) -> str:
         return (
             f"PrefetchOutcome(loaded={int(self)}, hit_tokens={self.hit_tokens}, "
-            f"probed={self.probed})"
+            f"probed={self.probed}, matched={self.matched})"
         )
 
 

@@ -1396,46 +1396,70 @@ def _witness_from_outcome(req, outcome, stamp: int, allowance: int) -> str:
     span (review B2): the chat-template header answers every probe with ~40
     tokens, so 'any hit_tokens > 0' would read a revoked re-admission
     (loaded=0, hit_tokens=40) beside stamp=80009 as a restore and license a
-    P=0 recompute of 79,969 tokens. The witness is 'hit' only if something was
-    LOADED and the probed shortfall ``stamp - hit_tokens`` is within the
-    one-chunk ``allowance``; a revoke (loaded=0) beside a stamp and a probed
-    shortfall larger than the allowance are contradictions and raise
-    ``StoreWitnessContradiction``. A cold request (stamp 0) keeps the plain
-    reading: hit if the probe answered, cold otherwise.
+    P=0 recompute of 79,969 tokens.
+
+    WHAT IS MEASURED IS PRESENCE, NOT TRANSFER (#1176). The quantity compared
+    against the stamp is ``outcome.materialized`` = ``matched + loaded``: the
+    prefix that is device-resident AFTER this prefetch, whether this prefetch
+    fetched it or the tree already held it. Reading ``loaded`` alone made boot
+    weg1b6 STOP the group on rid 1e95e023, whose reaped rank had
+    matched=3456 loaded=0 against stamp 6008 -- 3456 tokens present, a
+    shortfall of 2552 inside the 4096 allowance, i.e. the sanctioned #939
+    bounded re-prefill, reported as a disagreement. Same class the #841
+    comment names for ``loaded`` at unified_radix_cache.py:4136-4139.
+
+    The witness is therefore 'hit' only if something is MATERIALIZED and the
+    shortfall ``stamp - materialized`` is within the one-chunk ``allowance``;
+    nothing materialized beside a stamp, and a shortfall larger than the
+    allowance, are contradictions and raise ``StoreWitnessContradiction``. A
+    record without the annotation (a bare int from another tree) keeps the
+    old reading, where loaded and hit are the same number. A cold request
+    (stamp 0) keeps the plain reading: hit if the probe answered, cold
+    otherwise.
     """
+    loaded = int(outcome or 0)
     if hasattr(outcome, "hit_tokens"):
         probed = bool(getattr(outcome, "probed", False))
         hit = int(getattr(outcome, "hit_tokens", 0) or 0)
+        matched = int(getattr(outcome, "matched", 0) or 0)
+        # #1176: the annotated record knows both halves of the presence.
+        presence = int(getattr(outcome, "materialized", matched + loaded))
     else:
         # A tree that records only the loaded count: a positive count is a
-        # hit; a zero says nothing about whether the store was asked.
-        hit = int(outcome or 0)
+        # hit; a zero says nothing about whether the store was asked. There is
+        # no resident-prefix half on this record, so presence is the count
+        # itself -- the reading these writers had before #1176, unchanged
+        # (hiradix_cache.py:1937, hi_mamba_radix_cache.py:2364).
+        hit = loaded
         probed = hit > 0
-    loaded = int(outcome or 0)
+        matched = 0
+        presence = loaded
     if stamp <= 0:
         if hit > 0:
             return "hit"
         return "unprobed" if not probed else "cold"
     if not probed and hit == 0:
         return "unprobed"
-    shortfall = int(stamp) - hit
-    if loaded > 0 and shortfall <= int(allowance):
+    shortfall = int(stamp) - presence
+    if presence > 0 and shortfall <= int(allowance):
         return "hit"
     requested = len(getattr(req, "origin_input_ids", None) or ())
     raise StoreWitnessContradiction(
         f"#1157 STORE WITNESS CONTRADICTION rid={getattr(req, 'rid', None)} "
         f"stamped={stamp} probed_hit={hit} loaded={loaded} "
-        f"allowance={int(allowance)} shortfall={shortfall} requested={requested}: "
+        f"allowance={int(allowance)} shortfall={shortfall} requested={requested} "
+        f"matched={matched} materialized={presence}: "
         f"the retract stamp says the prompt was computed and fenced to the "
-        f"canonical store in the previous window, and the store probe for "
-        f"this re-admission (rank-uniform MIN over the prefetch group) "
+        f"canonical store in the previous window, and the measured presence of "
+        f"this re-admission -- what the tree already held (matched) plus what "
+        f"this prefetch loaded, rank-uniform MIN over the prefetch group -- "
         + (
-            "answered NOTHING that could be loaded"
-            if loaded <= 0
+            "shows nothing materialized"
+            if presence <= 0
             else "fell short of the stamped span by more than one chunk"
         )
-        + ". Two measurements of one span disagree; re-admitting at P=0 (or "
-        f"P={loaded}) would be a recompute licensed by a stamp "
+        + ". Two measurements of one span disagree; re-admitting at "
+        f"P={presence} would be a recompute licensed by a stamp "
         f"(kein-doppel-prefill), so the group STOPs here instead "
         f"(raenge-nie-uneins)."
     )
@@ -1454,9 +1478,10 @@ def store_witness(scheduler, req) -> str:
                     The exemption is HELD OPEN for it: admission itself waits
                     on the drained verdict (`Scheduler._prefetch_done_for`),
                     so nothing admits at P=0 while this is the answer.
-      ``hit``       the probe answered and the read-through loaded it; beside
-                    a restore stamp the probed span must cover the stamp
-                    within one chunk (`_store_witness_allowance`).
+      ``hit``       the probe answered and the prefix is MATERIALIZED (already
+                    resident plus newly loaded, #1176); beside a restore stamp
+                    that measured presence must cover the stamp within one
+                    chunk (`_store_witness_allowance`).
       ``bounded``   no prefetch could be registered because the prompt is
                     below the store's prefetch threshold (`too_short` at the
                     #915 gate): the recompute is bounded below that floor,
@@ -1469,8 +1494,9 @@ def store_witness(scheduler, req) -> str:
                     the priced budget exists to make impossible); the
                     `#1157 PREFETCH REAPED probed=False` line is its trace.
 
-    A probed miss, a revoke, or a probed shortfall beyond one chunk beside a
-    restore stamp is not a state: it raises ``StoreWitnessContradiction``.
+    A probed miss, a revoke, or a materialized shortfall beyond one chunk
+    beside a restore stamp is not a state: it raises
+    ``StoreWitnessContradiction``.
 
     RANK UNIFORMITY of the inputs (review N3): ``ongoing_prefetch`` is
     removed only after the group MIN in `check_prefetch_progress`, under the
@@ -1508,7 +1534,8 @@ def assert_store_witness_at_admission(req, outcome, tree=None) -> None:
     """#1157: the admission-loop half of the witness. Called with the value
     `pop_prefetch_loaded_tokens` returned for ``req`` (and the tree, for the
     one-chunk allowance); raises on a probed miss / revoke / over-allowance
-    shortfall beside a restore stamp, is a no-op for an unannotated count."""
+    shortfall of the MATERIALIZED presence (#1176) beside a restore stamp, is
+    a no-op for an unannotated count."""
     if outcome is None or not hasattr(outcome, "hit_tokens"):
         return
     stamp = int(getattr(req, "cached_prompt_tokens_at_retract", 0) or 0)

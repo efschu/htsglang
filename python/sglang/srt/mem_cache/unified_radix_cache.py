@@ -4145,10 +4145,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # #1157: the record the admission loop pops, annotated with the
         # probe's answer so the seam premise can read a MEASURED witness
         # (pending / hit / probed-miss) off the one record instead of a stamp.
+        # #1176: `matched` rides along because the witness asks about PRESENCE,
+        # not transfer. `insert_result.prefix_len` is what the tree already held
+        # on device (the "matched=" field of the line below), and by the
+        # arithmetic three lines up it is exactly the complement of
+        # `loaded_from_storage` against `completed_synced` -- including the
+        # `host_span_unclaimed` branch, where the refused tail zeroes loaded but
+        # leaves the resident prefix untouched. Reading loaded alone made boot
+        # weg1b6 call a reaped-but-fully-resident re-admission a contradiction.
         self.prefetch_loaded_tokens_by_reqid[req_id] = PrefetchOutcome(
             loaded_from_storage,
             hit_tokens=_hit_tokens,  # N1: the reduced value, never the local stamp
             probed=_probed,
+            matched=insert_result.prefix_len,
         )
         # #843: `refused` separates the TWO reasons this line can say loaded=0,
         # which are not the same finding and were indistinguishable at INFO.
@@ -4620,6 +4629,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         getattr(_operation, "probed_hit_tokens", None) or 0
                     ),
                     probed=True,
+                    # #1176: matched=0 because a REVOKE never ran an insert --
+                    # there is no `insert_result.prefix_len` on this path and no
+                    # other reading of the device-resident prefix that is a
+                    # measurement rather than a guess. A revoke therefore still
+                    # materializes nothing, which is the same verdict this
+                    # record carried before `matched` existed.
+                    matched=0,
                 )
             return drained
 
