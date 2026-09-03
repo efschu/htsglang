@@ -4349,6 +4349,9 @@ class PhaseFlipRuntime:
         # #1173: () -> (outstanding microbatch slots, this rank's forward
         # count). PP0's arm PRECONDITION, not a post-arm hold: see `arm`.
         launched_passes_fn: Optional[Callable[[], Tuple[Sequence[int], int]]] = None,
+        # #1173 review: seconds of frozen ring (same slots, same forward count)
+        # after which the deferral above escalates to a named group STOP.
+        launched_pass_stall_s: float = 120.0,
         cutover_fn: Optional[Callable[[str], None]] = None,
         pre_cutover_fns: Sequence[Callable[[str], None]] = (),
         pre_write_fns: Sequence[Callable[[str], None]] = (),
@@ -4579,6 +4582,18 @@ class PhaseFlipRuntime:
         #: #1173: DEFERRED arms, so "the arm never fired" and "the arm was
         #: deferred while the ring drained" can never read alike.
         self.arm_deferred_launched = 0
+        #: #1173 review (blocker 4): the deferral STALL clock. Keyed on
+        #: (outstanding slots, forward count) so that any forward progress in
+        #: the ring restarts it -- only a frozen ring can reach the bound.
+        self._launched_defer_key: Optional[Tuple[Tuple[int, ...], int]] = None
+        self._launched_defer_since: Optional[float] = None
+        self._launched_defer_streak = 0
+        #: Seconds of NO ring progress after which a deferral escalates to the
+        #: named group STOP. Generous on purpose: below it the deferral is the
+        #: correct answer, and the false-positive direction is group-killing.
+        #: 0 disables the escalation (deferral only), which is the pre-#1173
+        #: hang and is therefore never the default.
+        self._launched_pass_stall_s = float(launched_pass_stall_s)
         self._cutover_fn = cutover_fn
         self._pre_cutover_fns = tuple(pre_cutover_fns)
         # #631: run at the read/write seam, where the source pool is fully
@@ -5249,18 +5264,94 @@ class PhaseFlipRuntime:
                 _outstanding, _fwd_ct = [], -1
             if _outstanding:
                 self.arm_deferred_launched += 1
+                # #1173 review (blocker 4 / N2): AN UNBOUNDED DEFERRAL IS A
+                # SILENT HANG, AND THE #1153 CONTRACT FORBIDS IT.
+                #
+                # The commit body's "a launched pass returns in one or two
+                # passes" is an assumption, not a guarantee. If the ring truly
+                # never returns the pass, this branch converts what used to be
+                # a crash into a hang in PP that only this counter
+                # distinguishes -- exactly the "no rank ever ends a
+                # PP0-launched pass silently" clause. So the deferral is
+                # bounded, and the bound escalates to the same named STOP the
+                # follower raises.
+                #
+                # THE BOUND IS FORWARD PROGRESS, NOT DEFERRAL COUNT. This
+                # method is driven from the receive poll (one call per poll, at
+                # whatever rate traffic arrives), so N deferrals is not a
+                # duration and a count-only bound would fire at a rate set by
+                # the client. The state that must not persist is (outstanding
+                # slots, forward count): while either moves the ring IS making
+                # progress and the budget restarts. Only a ring frozen on the
+                # SAME slots at the SAME fwd_ct for longer than
+                # `launched_pass_stall_s` is a launched pass nobody will
+                # execute.
+                _key = (tuple(_outstanding), int(_fwd_ct))
+                _now = time.monotonic()
+                if _key != self._launched_defer_key:
+                    self._launched_defer_key = _key
+                    self._launched_defer_since = _now
+                    self._launched_defer_streak = 0
+                self._launched_defer_streak += 1
+                _stalled_s = _now - (self._launched_defer_since or _now)
+                if (
+                    self._launched_pass_stall_s > 0
+                    and _stalled_s > self._launched_pass_stall_s
+                ):
+                    self._launched_defer_key = None
+                    self._launched_defer_since = None
+                    raise RuntimeError(
+                        "#1173 LAUNCHED PASS UNEXECUTED UNDER ARM STOP "
+                        "rank=0 slots=%s fwd_ct=%d direction=%s "
+                        "stalled_s=%.1f bound_s=%.1f deferrals=%d reason=%s"
+                        % (
+                            _outstanding,
+                            int(_fwd_ct),
+                            direction,
+                            _stalled_s,
+                            self._launched_pass_stall_s,
+                            int(self.arm_deferred_launched),
+                            (
+                                "PP0 deferred the arm on the SAME outstanding "
+                                "slots at the SAME forward count for longer "
+                                "than the bound: the ring is not returning the "
+                                "pass and no further deferral can change that. "
+                                "Stopping through the group (#1153) instead of "
+                                "hanging in PP for ever"
+                            ),
+                        )
+                    )
                 msg = (
                     f"#1173 ARM DEFERRED: launched passes outstanding "
                     f"slots={_outstanding} fwd_ct={_fwd_ct} "
-                    f"direction={direction} deferrals={self.arm_deferred_launched}. "
+                    f"direction={direction} deferrals={self.arm_deferred_launched} "
+                    f"streak={self._launched_defer_streak} "
+                    f"stalled_s={_stalled_s:.1f} bound_s={self._launched_pass_stall_s:.1f}. "
                     f"PP0 launched forwarded work the ring has not returned; "
                     f"arming now would stop the followers executing it and "
                     f"then wait for a drain only they can produce (weg1b4). "
                     f"The policy re-evaluates every round -- this is a "
                     f"deferral, not a refusal."
                 )
-                logger.warning("%s %s", LOG_PREFIX, msg)
+                # #1173 review (N1/N10): RATE-LIMITED, the way the sibling
+                # #1020 void guard is. This method is called from the phase
+                # policy hook on the request-origin rank's RECEIVE POLL, so a
+                # persistent deferral emits per poll -- against the #776
+                # precedent (449 MB in 20 min from one armed emitter) that
+                # would drown the very boot log this fix is judged on. The
+                # suppressed occurrences are not lost: `deferrals=` and
+                # `streak=` carry their own denominators, so a gap in the log
+                # is readable rather than a zero (the DENOMINATOR LAW).
+                if (
+                    self.arm_deferred_launched <= 3
+                    or self.arm_deferred_launched % 512 == 0
+                ):
+                    logger.warning("%s %s", LOG_PREFIX, msg)
                 return False, msg
+            # The ring is quiescent (or unreadable): no stall is in progress.
+            self._launched_defer_key = None
+            self._launched_defer_since = None
+            self._launched_defer_streak = 0
         # #662-F4 / A0: SPILL for the arming floor here, where relief is still
         # free -- nothing is armed, no rank has entered the seam, and the
         # staged fund does not exist yet to be pulled out from under.

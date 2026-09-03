@@ -14565,9 +14565,10 @@ class Scheduler(
         # than the other and must not enter the break-even comparison. See
         # `uncached_prompt_tokens`; for a request that was never retracted the
         # credit is zero and this is the pre-#856 sum, token for token.
-        pending = sum(
+        queue_tokens = sum(
             uncached_prompt_tokens(req) for req in queued if not _excluded(req)
         )
+        pending = queue_tokens
         # #731: THE TERMS BELOW MUST NOT RE-BILL WHAT THE QUEUE ALREADY DID.
         #
         # The resident term further down and this one are two different sets,
@@ -14641,6 +14642,29 @@ class Scheduler(
                     except Exception:  # noqa: BLE001 - unreadable mode: price it
                         pass
                 for req in list(getattr(mb, "reqs", None) or ()):
+                    # #1173 review (N5): THE #731 ARGUMENT, RESTATED FOR THREE
+                    # TERMS. #731 excluded exactly one overlap (queue x
+                    # resident) and refused a blanket "count each rid once",
+                    # because a request genuinely holding budget in two places
+                    # is a real state a future reader may need to see. That
+                    # reasoning is unchanged and now covers two more named
+                    # pairs, each argued separately rather than by a global
+                    # dedup:
+                    #   in-flight x QUEUE     -- excluded here. A request the
+                    #     ring launched has left `waiting_queue`; if some path
+                    #     re-introduces the overlap the token must still be
+                    #     billed once, and the queue term is the older one.
+                    #   in-flight x RESIDENT  -- excluded at the resident term
+                    #     below, because the two price the SAME remainder from
+                    #     different offsets (`- start` here, `- end` there).
+                    #   in-flight x ARRIVING  -- NOT excluded, and that is not
+                    #     an oversight: `_arriving_prefill_tokens` reads the
+                    #     recv wire, and a request the ring has already
+                    #     launched is not still arriving on it. The populations
+                    #     are disjoint by construction, so there is no
+                    #     intersection to remove -- and inventing one would
+                    #     hide a genuine double-booking if that construction
+                    #     ever changed.
                     if id(req) in _inflight_ids or id(req) in _queued_ids:
                         continue
                     if _excluded(req):
@@ -14717,7 +14741,13 @@ class Scheduler(
         # decision and its breakdown cannot come from two different calls
         # (#713's rule). Read immediately by `maybe_arm_phase_policy`.
         self._pending_prefill_terms = (
-            f"queue={sum(uncached_prompt_tokens(r) for r in queued if not _excluded(r))} "
+            # #1173 review (N4): the RECORDED sum, not a second call of the
+            # same expression. Pure over unmutated state, so the two agreed
+            # today -- but the block's own rule is that the decision and its
+            # breakdown may not come from two different reads, and a term that
+            # re-derives itself is one refactor away from disagreeing with the
+            # number the verdict used.
+            f"queue={queue_tokens} "
             f"inflight={inflight_tokens} chunked={chunked_tokens} "
             f"arriving={arriving_tokens} resident={resident_tokens} "
             f"total={pending} "
@@ -15179,6 +15209,15 @@ class Scheduler(
             # term whose absence armed weg1b4's fatal flip.
             pending_prefill_terms=_pending_terms_now,
             seam_witness_states=_seam_witness_states_now,
+            # #1173 review (N8): THE RANK-IDENTITY CLAIM BELOW DOES NOT COVER
+            # `pending_prefill_terms`. Its `inflight=` term is derived from
+            # `self.mbs`, which is this rank's own microbatch ring, so that
+            # ONE field is rank-DIVERGENT by construction (weg1b4 measured
+            # 5739 on PP0 against 3827 on PP1 for the same instant). It is a
+            # REPORTING field: no cross-rank ballot reads it, and the verdict
+            # it accompanies is taken on PP0 only. Anything that ever starts
+            # comparing it across ranks must reduce it first.
+            #
             # #861c: the EXISTENCE number beside the ECONOMICS one. Computed
             # here, from the same replicated waiting queue, so both fields of
             # the snapshot are rank-identical by the same argument.

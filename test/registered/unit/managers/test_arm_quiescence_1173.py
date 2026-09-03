@@ -20,6 +20,7 @@ D2b a follower never freezes its microbatch ring while a frame for a
     under the arm STOPS the group through the launcher instead of spinning.
 """
 
+import time
 import types
 import unittest
 
@@ -75,10 +76,28 @@ class TestTheDrainedPremiseCountsLaunchedWork(unittest.TestCase):
 
     def test_the_in_flight_request_is_billed_once_not_twice(self):
         # Same request resident AND in flight: the resident term must yield.
-        req = _req("b64dc1cb", 6008, 4096, 6008)
+        #
+        # #1173 review (N9): `extend_range.end < total` ON PURPOSE. The first
+        # draft used end == total, so the resident term was 0 whatever the
+        # dedup guard did and deleting the guard left the test green -- the
+        # case was vacuous on the very axis it named. Here the resident term
+        # would contribute 6008 - 5000 = 1008 if the guard were removed, so
+        # the assertion measures the double-billing it claims to measure:
+        # 1912 (in-flight, from `start`) and NOT 2920.
+        req = _req("b64dc1cb", 6008, 4096, 5000)
         sched = self._double([_Mb([req])], running=[req])
         self.assertEqual(
             Scheduler._pending_prefill_tokens(sched, None, include_health=False), 1912
+        )
+
+    def test_a_resident_request_the_ring_never_launched_is_still_billed(self):
+        # The other side of the same guard: with no in-flight entry the
+        # resident term is the one that pays, so the dedup above cannot be
+        # "skip the resident term always".
+        req = _req("resident", 6008, 4096, 5000)
+        sched = self._double([None], running=[req])
+        self.assertEqual(
+            Scheduler._pending_prefill_tokens(sched, None, include_health=False), 1008
         )
 
     def test_a_decode_microbatch_owes_no_prefill(self):
@@ -106,7 +125,12 @@ class TestTheHoldReleasesForAStashedFrame(unittest.TestCase):
             {
                 "_pp_flip_stashed_frame_forces_advance": (
                     ppm.SchedulerPPMixin._pp_flip_stashed_frame_forces_advance
-                )
+                ),
+                # #1173 review: the hold's early returns clear the window
+                # through this helper, so the double must carry it too.
+                "_1173_forget_stashed_frame": (
+                    ppm.SchedulerPPMixin._1173_forget_stashed_frame
+                ),
             },
         )
         sched = double()
@@ -117,8 +141,33 @@ class TestTheHoldReleasesForAStashedFrame(unittest.TestCase):
         sched.pp_group = object()
         sched.ps = types.SimpleNamespace(pp_rank=1)
         sched.forward_ct = 81
+        # `_pp_flip_pass_tick` publishes this at the top of every real armed
+        # iteration, before any enable test, so the helper can always read the
+        # slot the loop is on. The budget counts ADVANCES of it (#1173 review
+        # blocker 1), so a faithful double has to move it the way the loop
+        # does -- see `_spin`.
+        sched._pp_live_mb_id = 0
+        sched._pp_flip_epoch = lambda: 2
         self._queue = queue
         return sched
+
+    @staticmethod
+    def _spin(sched, turns):
+        """Run `turns` armed loop iterations, advancing the slot like the loop.
+
+        The ring only advances on an iteration the hold RELEASED, which is
+        exactly what `_pp_flip_hold_slot` returning False means -- so the
+        double reproduces the production coupling instead of asserting on a
+        counter the real loop would never reach.
+        """
+        held = []
+        ring = max(1, len(sched.mbs))
+        for _ in range(turns):
+            hold = ppm.SchedulerPPMixin._pp_flip_hold_slot(sched)
+            held.append(hold)
+            if not hold:
+                sched._pp_live_mb_id = (sched._pp_live_mb_id + 1) % ring
+        return held
 
     def _patch_inbox(self, queue):
         self._orig_src = ppm.resolve_src
@@ -147,8 +196,7 @@ class TestTheHoldReleasesForAStashedFrame(unittest.TestCase):
         self._patch_inbox([{"__stamp__": stamp}])
         sched = self._sched([None, None], [])
         with self.assertRaises(RuntimeError) as caught:
-            for _ in range(64):
-                ppm.SchedulerPPMixin._pp_flip_hold_slot(sched)
+            self._spin(sched, 64)
         msg = str(caught.exception)
         for term in (
             "#1173 LAUNCHED PASS UNEXECUTED UNDER ARM STOP",
@@ -165,20 +213,108 @@ class TestTheHoldReleasesForAStashedFrame(unittest.TestCase):
         queue = [{"__stamp__": (1, 6, 1912, 2, 82, ("b64dc1cb", 4096, 6008))}]
         self._patch_inbox(queue)
         sched = self._sched([None, None], [])
-        for _ in range(4):
-            self.assertFalse(ppm.SchedulerPPMixin._pp_flip_hold_slot(sched))
+        self.assertEqual(self._spin(sched, 4), [False] * 4)
         queue.clear()
         self.assertTrue(ppm.SchedulerPPMixin._pp_flip_hold_slot(sched))
         queue.append({"__stamp__": (0, 7, 8, 2, 83, ("aa", 0, 8))})
         # Counter restarted: a fresh frame gets its own full bound.
-        for _ in range(6):
+        self.assertEqual(self._spin(sched, 6), [False] * 6)
+
+    def test_back_to_back_frames_each_get_their_own_budget(self):
+        """#1173 review, blocker 1: the reviewer's MEASURED false STOP.
+
+        Three frames, each consumed after 3 advances, against a ring of 3
+        (bound 8). The first draft counted CONSECUTIVE VISITS WITH ANY FRAME
+        AT THE HEAD and reset only on an empty queue, so this drained
+        follower -- every frame consumed well inside the bound -- tripped the
+        group STOP after 9 visits. The budget is now keyed to the frame, so
+        no frame can spend another frame's allowance.
+        """
+        queue = [
+            {"__stamp__": (0, 6, 10, 2, 90, ("aaaaaaaa", 0, 10))},
+            {"__stamp__": (1, 6, 11, 2, 91, ("bbbbbbbb", 0, 11))},
+            {"__stamp__": (2, 6, 12, 2, 92, ("cccccccc", 0, 12))},
+        ]
+        self._patch_inbox(queue)
+        sched = self._sched([None, None, None], [])
+        for _ in range(3):
+            self.assertEqual(self._spin(sched, 3), [False] * 3)
+            queue.pop(0)
+        self.assertTrue(ppm.SchedulerPPMixin._pp_flip_hold_slot(sched))
+
+    def test_back_to_back_frames_on_one_slot_each_get_their_own_budget(self):
+        """The sharpest form of blocker 1, on the ring where the bound is 4.
+
+        In the TP phase `pp_loop_size` is 1, so EVERY frame names slot 0 and
+        every lap is an arrival at it. Five frames, each consumed after a
+        single lap, are five healthy consumptions -- but against a budget
+        keyed to the armed window alone they sum to 5 and trip the group STOP
+        at the fourth. Only a budget keyed to the FRAME can tell "one frame
+        the ring never executed" from "five frames the ring executed".
+        """
+        queue = [
+            {"__stamp__": (0, 6, 10 + i, 2, 90 + i, ("f%d" % i, 0, 10))}
+            for i in range(5)
+        ]
+        self._patch_inbox(queue)
+        sched = self._sched([None], [])
+        for _ in range(5):
             self.assertFalse(ppm.SchedulerPPMixin._pp_flip_hold_slot(sched))
+            queue.pop(0)
+        self.assertTrue(ppm.SchedulerPPMixin._pp_flip_hold_slot(sched))
+
+    def test_a_frozen_ring_does_not_burn_the_budget(self):
+        """#1173 review, blocker 1(b): visits are not chances.
+
+        The frame names slot 1 while some other guard freezes the loop on
+        slot 0. The loop can spin far past the bound without ever ARRIVING at
+        the slot the frame names, so the receive never got a chance and no
+        STOP is owed -- the budget must not move.
+        """
+        self._patch_inbox([{"__stamp__": (1, 6, 1912, 2, 82, ("b64dc1cb", 0, 8))}])
+        sched = self._sched([None, None], [])
+        for _ in range(64):
+            self.assertFalse(ppm.SchedulerPPMixin._pp_flip_hold_slot(sched))
+        self.assertEqual(getattr(sched, "_1173_held_frame_visits", 0), 0)
+
+    def test_the_bound_is_reachable_on_a_one_slot_ring(self):
+        """The TP phase has `pp_loop_size` 1, and the guard must work there.
+
+        `mb_id` is 0 on every iteration of a one-slot ring and never CHANGES
+        value, so a change-detector would make this STOP structurally
+        unfireable in exactly the phase whose bound is smallest (4). Counting
+        ARRIVALS at the named slot keeps it reachable.
+        """
+        self._patch_inbox([{"__stamp__": (0, 6, 10, 2, 90, ("aaaaaaaa", 0, 10))}])
+        sched = self._sched([None], [])
+        with self.assertRaises(RuntimeError) as caught:
+            self._spin(sched, 32)
+        self.assertIn(
+            "#1173 LAUNCHED PASS UNEXECUTED UNDER ARM STOP", str(caught.exception)
+        )
+
+    def test_a_disarm_does_not_leave_a_count_for_the_next_window(self):
+        """#1173 review, blocker 2: no early return may leave a count standing.
+
+        In the TP phase `pp_loop_size` is 1, so the bound is 4 and a single
+        inherited visit changes the verdict -- in the group-killing direction.
+        """
+        queue = [{"__stamp__": (0, 6, 10, 2, 90, ("aaaaaaaa", 0, 10))}]
+        self._patch_inbox(queue)
+        sched = self._sched([None], [])
+        self.assertEqual(self._spin(sched, 3), [False] * 3)
+        # Disarm: every early return of the hold must forget the window.
+        sched.pp_phase_flip_armed = lambda: False
+        self.assertFalse(ppm.SchedulerPPMixin._pp_flip_hold_slot(sched))
+        sched.pp_phase_flip_armed = lambda: True
+        # A fresh armed window with the SAME frame gets the full bound again.
+        self.assertEqual(self._spin(sched, 4), [False] * 4)
 
 
 class TestQuiescenceIsAnArmPrecondition(unittest.TestCase):
     """D2a: PP0 defers the arm while it holds a launched pass."""
 
-    def _runtime(self, launched):
+    def _runtime(self, launched, stall_s=120.0):
         import torch
 
         from sglang.srt.managers.kv_reshard import KvPoolView
@@ -212,6 +348,7 @@ class TestQuiescenceIsAnArmPrecondition(unittest.TestCase):
             ready_fn=lambda: True,
             cutover_fn=lambda d: None,
             launched_passes_fn=launched,
+            launched_pass_stall_s=stall_s,
         )
 
     def test_a_launched_pass_defers_the_arm_by_name(self):
@@ -238,6 +375,45 @@ class TestQuiescenceIsAnArmPrecondition(unittest.TestCase):
         armed, msg = rt.arm("pp_to_tp", "test")
         self.assertTrue(armed, msg)
 
+    def test_a_frozen_ring_escalates_the_deferral_to_the_named_stop(self):
+        """#1173 review, blocker 4 / N2: the deferral is BOUNDED.
+
+        Without a bound a launched pass that never returns converts what used
+        to be a crash into a silent hang in PP that only this counter
+        distinguishes -- forbidden by the #1153 contract ("no rank ever ends a
+        PP0-launched pass silently"). With the stall budget set to zero
+        seconds the very next deferral on an unchanged (slots, fwd_ct) must
+        raise the SAME named STOP the follower raises.
+        """
+        rt = self._runtime(lambda: ([1], 81), stall_s=0.001)
+        armed, msg = rt.arm("pp_to_tp", "test")
+        self.assertFalse(armed)
+        self.assertIn("#1173 ARM DEFERRED", msg)
+        time.sleep(0.01)
+        with self.assertRaises(RuntimeError) as caught:
+            rt.arm("pp_to_tp", "test")
+        text = str(caught.exception)
+        self.assertIn("#1173 LAUNCHED PASS UNEXECUTED UNDER ARM STOP", text)
+        self.assertIn("slots=[1]", text)
+        self.assertIn("direction=pp_to_tp", text)
+
+    def test_ring_progress_restarts_the_stall_budget(self):
+        """Forward progress is the discriminator, not the deferral count.
+
+        `arm` is driven from the receive poll, so N deferrals is a function of
+        client traffic, not of time or of the ring being stuck. A ring whose
+        forward count advances between two deferrals is working; only a
+        FROZEN (slots, fwd_ct) may ever reach the bound.
+        """
+        counts = iter([81, 82, 83, 84])
+        rt = self._runtime(lambda: ([1], next(counts)), stall_s=0.001)
+        for _ in range(4):
+            time.sleep(0.005)
+            armed, msg = rt.arm("pp_to_tp", "test")
+            self.assertFalse(armed)
+            self.assertIn("#1173 ARM DEFERRED", msg)
+        self.assertEqual(rt.arm_deferred_launched, 4)
+
 
 class TestTheArmPrintsItsTermAndItsProducer(unittest.TestCase):
     """The small #1173 item: an arm line that can be read back."""
@@ -247,7 +423,9 @@ class TestTheArmPrintsItsTermAndItsProducer(unittest.TestCase):
 
         self.assertIn("UNREPORTED", _pending_terms(types.SimpleNamespace()))
         self.assertEqual(
-            _pending_terms(types.SimpleNamespace(pending_prefill_terms="inflight=1912")),
+            _pending_terms(
+                types.SimpleNamespace(pending_prefill_terms="inflight=1912")
+            ),
             "inflight=1912",
         )
         # Both #1173 fields exist on the dataclass the policy actually reads.
@@ -262,7 +440,11 @@ class TestTheArmPrintsItsTermAndItsProducer(unittest.TestCase):
         orig_w = pp.store_witness
         try:
             reqs = [object(), object(), object()]
-            states = {id(reqs[0]): "hit", id(reqs[1]): "bounded", id(reqs[2]): "bounded"}
+            states = {
+                id(reqs[0]): "hit",
+                id(reqs[1]): "bounded",
+                id(reqs[2]): "bounded",
+            }
             pp.seam_readmit_candidates = lambda sched: list(reqs)
             pp.store_witness = lambda sched, req: states[id(req)]
             self.assertEqual(pp.store_witness_census(object()), "bounded=2 hit=1")
@@ -271,6 +453,53 @@ class TestTheArmPrintsItsTermAndItsProducer(unittest.TestCase):
         finally:
             pp.seam_readmit_candidates = orig_c
             pp.store_witness = orig_w
+
+
+class TestTheRingRebuildForgetsLaunchedSlots(unittest.TestCase):
+    """#1173 review, blocker 2/4: no launched slot number outlives its ring.
+
+    `_pp_launched_pending` holds RING-SCOPED SLOT NUMBERS and had no
+    cutover-scoped clear. Before #1173 a survivor was near-benign (only the
+    #1020 void guard read it); with the arm precondition reading the raw set,
+    ONE survivor defers every future arm in BOTH directions for ever -- the
+    TP-sticky class, visible only as a growing ARM DEFERRED line. The entry
+    CAN survive: the sole discard site sits in the `else` branch after
+    `_pp_process_batch_result`, and a launched batch that became EMPTY reads
+    quiescent to `build_flip_quiescence_fn`, so the cutover commits with the
+    entry still set.
+    """
+
+    def test_the_designated_authority_clears_the_launched_set(self):
+        holder = types.SimpleNamespace(
+            _pp_flip_arm_mb_id=2,
+            _pp_flip_arm_epoch=5,
+            _pp_flip_resume_slot=1,
+            _pp_launched_pending={2},
+        )
+        ppm.pp_flip_forget_ring_scoped_slots(holder)
+        self.assertEqual(holder._pp_launched_pending, set())
+        # The three fields #829 already cleared must still be cleared.
+        self.assertIsNone(holder._pp_flip_arm_mb_id)
+        self.assertIsNone(holder._pp_flip_arm_epoch)
+        self.assertIsNone(holder._pp_flip_resume_slot)
+
+    def test_a_slot_from_the_old_ring_cannot_defer_the_next_arm(self):
+        """The end-to-end shape: set carries slot 2, ring rebuilds to size 1.
+
+        Slot 2 is not merely stale on the TP ring, it is OUT OF RANGE -- and
+        the probe would hand it to `arm()` as an outstanding pass for ever.
+        """
+        holder = types.SimpleNamespace(
+            _pp_flip_arm_mb_id=None,
+            _pp_flip_arm_epoch=None,
+            _pp_flip_resume_slot=None,
+            _pp_launched_pending={2},
+            forward_ct=81,
+        )
+        probe = ppm_build()(holder)
+        self.assertEqual(probe(), ([2], 81))
+        ppm.pp_flip_forget_ring_scoped_slots(holder)
+        self.assertEqual(probe(), ([], 81))
 
 
 class TestTheLaunchedPassProbe(unittest.TestCase):

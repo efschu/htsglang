@@ -169,7 +169,9 @@ class _Rank:
         # #791: a REAL position in the ring, checked. ``pp_group`` is an
         # injection point so the can-fail test can plant an unfaithful one
         # and prove this suite rejects it.
-        self.pp_group = _Group(rank=2, pp_size=_PS.pp_size) if pp_group is None else pp_group
+        self.pp_group = (
+            _Group(rank=2, pp_size=_PS.pp_size) if pp_group is None else pp_group
+        )
         assert_faithful_pp_roles(self.pp_group, self.ps.pp_size)
         self.server_args = _ServerArgs(enable_phase_flip)
         self.request_receiver = _Receiver()
@@ -301,6 +303,11 @@ class _Rank:
     _pp_flip_stashed_frame_forces_advance = (
         SchedulerPPMixin._pp_flip_stashed_frame_forces_advance
     )
+    #: #1173: every early return of the hold now forgets the stashed-frame
+    #: window through this helper, so a double that binds the hold must bind
+    #: this too -- otherwise the release path raises AttributeError and the
+    #: predicate cases below never reach the answer they are asserting.
+    _1173_forget_stashed_frame = SchedulerPPMixin._1173_forget_stashed_frame
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(self, a, b):
         return None, None, _Event()
