@@ -59,6 +59,7 @@ from sglang.srt.managers.phase_purity import (
     StoreWitnessContradiction,
     assert_store_witness_at_admission,
     store_witness,
+    store_witness_census,
 )
 from sglang.srt.mem_cache import unified_radix_cache as unified_mod
 from sglang.srt.mem_cache.hicache_storage import PrefetchOutcome
@@ -166,7 +167,10 @@ class C_TheChatHeaderFalseHitStillStopsTheGroup(CustomTestCase):
         self.assertIn(f"matched={HEADER_HIT}", msg)
         self.assertIn(f"materialized={HEADER_HIT}", msg)
         self.assertIn(f"shortfall={HEADER_STAMP - HEADER_HIT}", msg)
-        self.assertIn("fell short of the stamped span by more than one chunk", msg)
+        # #1176 (review b): the demand is now the span the prefetch was
+        # asked for; with no span stamp it stays the whole stamped prefix.
+        self.assertIn("span=None", msg)
+        self.assertIn("fell short of that span by more than one chunk", msg)
 
     def test_the_admission_site_raises_too(self):
         r = _req(rid="header", stamp=HEADER_STAMP, tokens=HEADER_STAMP)
@@ -264,6 +268,217 @@ class F_EveryWriterMustPassMatched(CustomTestCase):
                 "TRANSFER again and re-open #1176 (the two sites are the "
                 "terminate path near :4148 and the revoke drain near :4617)",
             )
+
+
+# ---------------------------------------------------------------------------
+# #1176 follow-up (adversarial review, 2026-09-03). Three blocking findings on
+# 4b277fff254f954725626b888045c96d6c34b4ff, each red on that parent:
+#
+#  (b) PRESENCE UNDER-COUNTS BY THE REGISTRATION-TIME MATCH. `matched` is
+#      `insert_result.prefix_len`, the prefix of the FETCHED SPAN the tree
+#      already held -- NOT this request's device-resident prefix. The span
+#      itself excludes what was matched at registration
+#      (scheduler.py:5322 `_matched_len = len(req.prefix_indices) +
+#      req.host_hit_length`, :5350 `_new_input_tokens =
+#      full_untruncated_fill_ids[_matched_len:_match_end]`), while the stamp
+#      is the WHOLE prompt prefix (schedule_batch.py:2593). So
+#      `matched + loaded <= stamp - _matched_len` BY CONSTRUCTION, and the
+#      witness raised on a prefix that was 19984/20000 present. Boot 6 hid it
+#      because the tree was reset at the cutover (_matched_len 0, span ==
+#      stamp); it becomes MORE reachable exactly as path B starts serving,
+#      because `host_hit_length` feeds `_matched_len`.
+#
+#  (f) TWO SURVIVING MUTANTS on the axis the commit is about: nothing
+#      separated "the probe ANSWERED" from "the prefix is MATERIALIZED"
+#      (MUT-B), and case (d) only ever raised through the shortfall arm, so
+#      the "nothing materialized" term was unpinned (MUT-C).
+#
+#  (d) RANK DIVERGENCE ON THE VERDICT. Under --tp-size 1 --pp-size 3 the
+#      packed MIN all_reduce is not taken (unified_radix_cache.py:3879-3907,
+#      `if self.tp_world_size > 1`; the boot log reads `synced=no
+#      attn_reduce_world=1`), so every rank evaluates its own record. Boot 6
+#      MEASURED the split: PP0 raised, PP1/PP2 read "hit". The remedy uses the
+#      authority that already exists (#968/#969Z: followers of a PP group
+#      credit and decide nothing) instead of building a second channel.
+# ---------------------------------------------------------------------------
+
+# The demonstrated (b) case, from the review: a request whose prompt prefix is
+# 19984/20000 present after a prefetch that completed in full.
+SPAN_STAMP = 20_000
+SPAN_MATCHED_AT_REGISTRATION = 10_000
+SPAN_TOKENS = 9_999  # _match_end - _matched_len
+SPAN_LOADED = 9_984  # what the completed prefetch materialized of that span
+
+
+def _pp(scheduler, *, pp_rank, pp_size=3):
+    """Give a stand-in scheduler a pipeline identity (`self.ps.pp_rank` /
+    `pp_size`, the shape scheduler.py reads at :11264 and :11288)."""
+    scheduler.ps = types.SimpleNamespace(pp_rank=pp_rank, pp_size=pp_size)
+    return scheduler
+
+
+class G_PresenceIsJudgedAgainstTheSpanThePrefetchWasAskedFor(CustomTestCase):
+    """(b) The prefetch is only ever asked for `_new_input_tokens`; the rest of
+    the stamped prefix was already matched at registration and is not this
+    operation's to deliver. Judging `matched + loaded` against the WHOLE stamp
+    charges the operation for tokens nobody asked it to fetch."""
+
+    def _delivered(self):
+        return PrefetchOutcome(
+            SPAN_LOADED, hit_tokens=SPAN_LOADED, probed=True, matched=0
+        )
+
+    def _req_with_span(self):
+        r = _req(rid="span", stamp=SPAN_STAMP, tokens=SPAN_STAMP)
+        r._prefetch_span_tokens = SPAN_TOKENS
+        return r
+
+    def test_a_fully_delivered_span_is_a_hit_not_a_contradiction(self):
+        r = self._req_with_span()
+        s = _sched([r], outcomes={r.rid: self._delivered()})
+        self.assertEqual(store_witness(s, r), "hit")
+
+    def test_the_admission_site_agrees(self):
+        r = self._req_with_span()
+        s = _sched([r])
+        assert_store_witness_at_admission(r, self._delivered(), s.tree_cache)
+
+    def test_a_span_short_by_more_than_one_chunk_still_raises(self):
+        """The span narrows the DEMAND; it does not remove the allowance term.
+        A prefetch that delivered 1000 of a 9999-token span is still a
+        kein-doppel-prefill contradiction."""
+        r = self._req_with_span()
+        out = PrefetchOutcome(1000, hit_tokens=SPAN_TOKENS, probed=True, matched=0)
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            store_witness(_sched([r], outcomes={r.rid: out}), r)
+        msg = str(cm.exception)
+        self.assertIn(f"demand={SPAN_TOKENS}", msg)
+        self.assertIn(f"span={SPAN_TOKENS}", msg)
+
+    def test_without_a_span_stamp_the_whole_prefix_is_the_demand(self):
+        """A record whose request carries no span stamp keeps the stamp as the
+        demand -- the conservative reading, unchanged."""
+        r = _req(rid="nospan", stamp=SPAN_STAMP, tokens=SPAN_STAMP)
+        out = PrefetchOutcome(SPAN_LOADED, hit_tokens=SPAN_LOADED, probed=True, matched=0)
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            store_witness(_sched([r], outcomes={r.rid: out}), r)
+        self.assertIn(f"demand={SPAN_STAMP}", str(cm.exception))
+
+    def test_a_span_wider_than_the_stamp_never_widens_the_demand(self):
+        """`_match_end` is derived from full_untruncated_fill_ids, which grows
+        with the OUTPUT; the stamp is the prompt prefix. The demand is the
+        smaller of the two, so an output-bearing request cannot be charged for
+        tokens outside its stamped prefix."""
+        r = _req(rid="wide", stamp=4_000, tokens=4_000)
+        r._prefetch_span_tokens = 40_000
+        out = PrefetchOutcome(4_000, hit_tokens=4_000, probed=True, matched=0)
+        self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
+
+
+class H_TheProbeAnsweringIsNotThePrefixBeingPresent(CustomTestCase):
+    """(f) MUT-B. `shortfall = demand - presence` and `demand - hit` coincide
+    on every case the suite had, because those cases all had hit == presence.
+    This is the input that separates them: the probe answered the FULL span
+    and 100 tokens are materialized. Reading the probe's answer as presence
+    would admit at P=100 against a 6008-token stamp."""
+
+    def test_a_full_probe_answer_over_an_empty_prefix_still_raises(self):
+        r = _req(rid="probe-vs-presence")
+        r._prefetch_span_tokens = B6_STAMP
+        out = PrefetchOutcome(100, hit_tokens=B6_STAMP, probed=True, matched=0)
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            store_witness(_sched([r], outcomes={r.rid: out}), r)
+        msg = str(cm.exception)
+        self.assertIn("probed_hit=6008", msg)
+        self.assertIn("materialized=100", msg)
+        self.assertIn(f"shortfall={B6_STAMP - 100}", msg)
+        self.assertIn("fell short", msg)
+
+
+class I_NothingMaterializedIsItsOwnContradiction(CustomTestCase):
+    """(f) MUT-C. Case (d) reaches the raise through the SHORTFALL arm, so
+    `presence > 0` was never load-bearing there. This input is inside the
+    allowance (stamp 100 <= 4096) and reaches the raise ONLY through the
+    'nothing materialized' term."""
+
+    def test_a_stamp_inside_the_allowance_with_zero_presence_raises(self):
+        r = _req(rid="tiny-stamp", stamp=100, tokens=100)
+        r._prefetch_span_tokens = 100
+        out = PrefetchOutcome(0, hit_tokens=40, probed=True, matched=0)
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            store_witness(_sched([r], outcomes={r.rid: out}), r)
+        msg = str(cm.exception)
+        self.assertIn("nothing materialized", msg)
+        # The shortfall arm cannot be what raised here.
+        self.assertIn("shortfall=100", msg)
+        self.assertLessEqual(100, B6_ALLOWANCE)
+
+
+class J_OnlyTheAuthorityTurnsAWitnessContradictionIntoAGroupStop(CustomTestCase):
+    """(d) RANK DIVERGENCE. Boot 6 measured it: PP0 raised while PP1/PP2 read
+    'hit' off their own records. A follower that dies while its peers admit
+    walks the group into a collective with a missing rank -- so the raise
+    belongs to the rank that already owns the admission verdict (#969Z: "no
+    rank of a PP group withholds admission for its own prefetch; PP0's
+    standing verdict is TAKE WITHOUT WAITING"). A follower REPORTS the
+    contradiction and returns a state that licenses nothing."""
+
+    def _contradictory(self):
+        return PrefetchOutcome(0, hit_tokens=HEADER_HIT, probed=True, matched=HEADER_HIT)
+
+    def _req(self):
+        r = _req(rid="divergent", stamp=HEADER_STAMP, tokens=HEADER_STAMP)
+        r._prefetch_span_tokens = HEADER_STAMP
+        return r
+
+    def test_pp0_still_stops_the_group(self):
+        r = self._req()
+        s = _pp(_sched([r], outcomes={r.rid: self._contradictory()}), pp_rank=0)
+        with self.assertRaises(StoreWitnessContradiction):
+            store_witness(s, r)
+
+    def test_a_follower_reports_instead_of_dying(self):
+        r = self._req()
+        s = _pp(_sched([r], outcomes={r.rid: self._contradictory()}), pp_rank=1)
+        self.assertEqual(store_witness(s, r), "contradiction")
+
+    def test_the_follower_state_licenses_nothing(self):
+        """'contradiction' must not join the states seam_transport_premise_holds
+        accepts -- otherwise the follower would admit on a premise it just
+        refuted."""
+        self.assertNotIn("contradiction", ("pending", "hit", "bounded"))
+
+    def test_the_follower_admission_site_does_not_raise(self):
+        r = self._req()
+        s = _sched([r])
+        assert_store_witness_at_admission(
+            r, self._contradictory(), s.tree_cache, is_authority=False
+        )
+
+    def test_a_single_rank_world_is_its_own_authority(self):
+        r = self._req()
+        s = _pp(_sched([r], outcomes={r.rid: self._contradictory()}), pp_rank=0, pp_size=1)
+        with self.assertRaises(StoreWitnessContradiction):
+            store_witness(s, r)
+
+    def test_a_stand_in_without_a_pipeline_identity_still_raises(self):
+        """Every existing #1157/#1176 stand-in has no `ps` attribute; absence
+        of a pipeline identity must not silence the witness."""
+        r = self._req()
+        s = _sched([r], outcomes={r.rid: self._contradictory()})
+        self.assertFalse(hasattr(s, "ps"))
+        with self.assertRaises(StoreWitnessContradiction):
+            store_witness(s, r)
+
+    def test_the_census_counts_the_follower_state(self):
+        """store_witness_census reads the same predicate; a follower's
+        contradiction must be COUNTED, not swallowed as UNREADABLE."""
+        r = self._req()
+        setattr(r, SEAM_READMIT_ATTR, 3)
+        s = _pp(_sched([r], outcomes={r.rid: self._contradictory()}), pp_rank=2)
+        s.last_seam_readmit_generation = 3
+        census = store_witness_census(s)
+        self.assertIn("contradiction=1", census)
 
 
 if __name__ == "__main__":

@@ -207,6 +207,7 @@ from sglang.srt.managers.phase_purity import (
     StoreWitnessContradiction,
     assert_store_witness_at_admission,
     prefill_blocked_here as phase_prefill_blocked_here,
+    witness_stop_authority,
 )
 # #791b: imported AS A MODULE, not from-imported: the admission loop resolves
 # `prefetch_ballot.prefetch_done_under_ballot` through the module's globals,
@@ -11290,12 +11291,24 @@ class Scheduler(
                 # (pp_rank>0) credit only and decide nothing (#969Z).
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 # #1157: the popped record carries the probe's answer; a
-                # probed miss (or a probed span short of the stamp by more
+                # probed miss (or a probed span short of the demand by more
                 # than one chunk) beside a restore stamp is the group STOP,
                 # never a P=0 admission. The credit is stored as a bare int:
                 # `storage_hit_length` rides into `cached_tokens_storage` and
                 # the pickled detokenizer output (review B1).
-                assert_store_witness_at_admission(req, loaded_tokens, self.tree_cache)
+                # #1176 (review d): THIS BRANCH RUNS ON EVERY RANK OF THE PP
+                # GROUP, and only PP0 holds a verdict here (the #969Z note
+                # below says so in the same loop). A follower's record is
+                # rank-local whenever the packed MIN all_reduce is not taken
+                # (`tp_world_size > 1`, unified_radix_cache.py:3879-3907), so
+                # a follower raising here would die while its peers admit --
+                # the split boot weg1b6 measured. Followers report instead.
+                assert_store_witness_at_admission(
+                    req,
+                    loaded_tokens,
+                    self.tree_cache,
+                    is_authority=witness_stop_authority(self),
+                )
                 if loaded_tokens > 0:
                     req.storage_hit_length = int(loaded_tokens)
                 # Counted, never a skip: this rank ADMITS here. The census key
@@ -11346,9 +11359,18 @@ class Scheduler(
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
-                # #1157: see the PP0 branch above -- the same witness, the
-                # same STOP, the same bare-int credit (review B1).
-                assert_store_witness_at_admission(req, loaded_tokens, self.tree_cache)
+                # #1157: see the PP branch above -- the same witness, the
+                # same STOP, the same bare-int credit (review B1). This branch
+                # is the non-PP path, where the record is either the only one
+                # or MIN-reduced across the prefetch group, so the authority
+                # predicate answers True; it is passed rather than assumed so
+                # the two sites cannot drift (#1176 review d).
+                assert_store_witness_at_admission(
+                    req,
+                    loaded_tokens,
+                    self.tree_cache,
+                    is_authority=witness_stop_authority(self),
+                )
                 if loaded_tokens > 0:
                     req.storage_hit_length = int(loaded_tokens)
 

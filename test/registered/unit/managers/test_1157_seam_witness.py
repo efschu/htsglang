@@ -152,9 +152,15 @@ class II_AProbedHitIsAdmittedWithItsPrefix(CustomTestCase):
 
     def test_the_admission_sites_consult_the_witness_right_after_the_pop(self):
         src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
+        # #1176 (review d): the call gained an `is_authority=` argument and is
+        # therefore multi-line; the pin still demands BOTH arms, the tree, the
+        # authority predicate, and the int(...) credit.
         hits = re.findall(
             r"loaded_tokens = self\.tree_cache\.pop_prefetch_loaded_tokens\(req\.rid\)"
-            r"(?:\s*\n\s*#[^\n]*)*\s*\n\s*assert_store_witness_at_admission\(req, loaded_tokens, self\.tree_cache\)"
+            r"(?:\s*\n\s*#[^\n]*)*"
+            r"\s*\n\s*assert_store_witness_at_admission\(\s*\n"
+            r"\s*req,\s*\n\s*loaded_tokens,\s*\n\s*self\.tree_cache,\s*\n"
+            r"\s*is_authority=witness_stop_authority\(self\),\s*\n\s*\)"
             r"\s*\n\s*if loaded_tokens > 0:\s*\n\s*req\.storage_hit_length = int\(loaded_tokens\)",
             src,
         )
@@ -177,10 +183,13 @@ class III_AProbedMissBesideAStampStopsTheGroup(CustomTestCase):
         with self.assertRaises(StoreWitnessContradiction) as cm:
             seam_transport_premise_holds(s)
         msg = str(cm.exception)
+        # #1176 (review b): the line now carries `span=` and `demand=` between
+        # the stamp and the probe's answer -- with no span stamp on the
+        # request the demand IS the stamp, which is what this case asserts.
         self.assertIn(
             f"#1157 STORE WITNESS CONTRADICTION rid={r.rid} stamped={STAMP} "
-            f"probed_hit=0 loaded=0 allowance={CHUNK} shortfall={STAMP} "
-            f"requested={LONG}",
+            f"span=None demand={STAMP} probed_hit=0 loaded=0 "
+            f"allowance={CHUNK} shortfall={STAMP} requested={LONG}",
             msg,
         )
         self.assertNotIn("SEAM RESTORE", msg)

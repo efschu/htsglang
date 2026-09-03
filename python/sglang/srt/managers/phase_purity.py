@@ -1385,7 +1385,38 @@ def _store_witness_allowance(tree) -> int:
     return int(getattr(tree, "prefetch_threshold", 256) or 256)
 
 
-def _witness_from_outcome(req, outcome, stamp: int, allowance: int) -> str:
+_WITNESS_FOLLOWER_REPORTS = 0
+
+
+def witness_stop_authority(scheduler) -> bool:
+    """#1176 (review d): may THIS rank turn a store-witness contradiction into
+    a group STOP?
+
+    Yes on any world that is not a pipeline group (there the record is either
+    the only one, or MIN-reduced across the prefetch group by the packed
+    all_reduce that runs under ``tp_world_size > 1``), and on PP0 -- the rank
+    that already owns the admission verdict for the whole group (#968 PP0
+    authority; scheduler.py:11264 `if self.ps.pp_rank == 0` and the #969Z note
+    beside it, "followers credit only and decide nothing").
+
+    A stand-in without a pipeline identity is its own authority: absence of
+    ``ps`` must never silence the witness, which is the direction a defect
+    would take.
+    """
+    ps = getattr(scheduler, "ps", None)
+    try:
+        pp_size = int(getattr(ps, "pp_size", 1) or 1)
+        pp_rank = int(getattr(ps, "pp_rank", 0) or 0)
+    except (TypeError, ValueError):
+        return True
+    if pp_size <= 1:
+        return True
+    return pp_rank == 0
+
+
+def _witness_from_outcome(
+    req, outcome, stamp: int, allowance: int, is_authority: bool = True
+) -> str:
     """Classify one terminated prefetch's outcome for the store witness.
 
     ``outcome`` is the value the tree keeps in ``prefetch_loaded_tokens_by_
@@ -1408,14 +1439,56 @@ def _witness_from_outcome(req, outcome, stamp: int, allowance: int) -> str:
     bounded re-prefill, reported as a disagreement. Same class the #841
     comment names for ``loaded`` at unified_radix_cache.py:4136-4139.
 
+    WHAT THE PRESENCE IS COMPARED AGAINST IS THE SPAN, NOT THE WHOLE STAMP
+    (#1176 review b). ``matched`` is ``insert_result.prefix_len``: the prefix
+    of the FETCHED SPAN that the tree already held, not this request's whole
+    device-resident prefix. The span itself EXCLUDES what was already matched
+    when the prefetch was registered -- scheduler.py:5322 computes
+    ``_matched_len = len(req.prefix_indices) + req.host_hit_length`` and :5350
+    slices ``_new_input_tokens = full_untruncated_fill_ids[_matched_len:
+    _match_end]`` -- while the stamp is the WHOLE prompt prefix
+    (schedule_batch.py:2593). So ``matched + loaded <= stamp - _matched_len``
+    BY CONSTRUCTION, and comparing the presence against the stamp charges the
+    prefetch for tokens nobody asked it to fetch: a request with stamp 20000
+    that matched 10000 at readmit and whose 9999-token span completed IN FULL
+    read as a shortfall of 10016 on a prefix that was 19984/20000 present.
+    Boot weg1b6 hid this because the tree was reset at the cutover
+    (``_matched_len`` 0, span == stamp); it becomes MORE reachable exactly as
+    the store starts serving, because ``host_hit_length`` feeds
+    ``_matched_len``. The demand is therefore ``min(stamp, span)`` where the
+    span is the rank-local stamp scheduler.py:5354 already writes
+    (``req._prefetch_span_tokens``, one writer, written in the same call that
+    registers the prefetch whose record this is) -- no new plumbing, and the
+    ``min`` keeps the stamped prefix as the ceiling for an output-bearing
+    request whose ``_match_end`` runs past its prompt.
+
     The witness is therefore 'hit' only if something is MATERIALIZED and the
-    shortfall ``stamp - materialized`` is within the one-chunk ``allowance``;
+    shortfall ``demand - materialized`` is within the one-chunk ``allowance``;
     nothing materialized beside a stamp, and a shortfall larger than the
-    allowance, are contradictions and raise ``StoreWitnessContradiction``. A
-    record without the annotation (a bare int from another tree) keeps the
-    old reading, where loaded and hit are the same number. A cold request
-    (stamp 0) keeps the plain reading: hit if the probe answered, cold
-    otherwise.
+    allowance, are contradictions. A record without the annotation (a bare int
+    from another tree) keeps the old reading, where loaded and hit are the
+    same number. A cold request (stamp 0) keeps the plain reading: hit if the
+    probe answered, cold otherwise.
+
+    WHO MAY TURN A CONTRADICTION INTO A GROUP STOP (#1176 review d).
+    ``is_authority`` decides between raising ``StoreWitnessContradiction`` and
+    returning the reported state ``"contradiction"``. Boot weg1b6 MEASURED the
+    divergence this closes: PP0 raised while PP1/PP2 read "hit" off their own
+    records, because the packed MIN all_reduce over the prefetch group is
+    taken only under ``tp_world_size > 1``
+    (unified_radix_cache.py:3879-3907) and that boot ran ``--tp-size 1
+    --pp-size 3`` (``synced=no attn_reduce_world=1`` on every #1028 line). A
+    completed-span spread wider than the allowance therefore splits the
+    verdict on ANY input, and the dangerous half is a FOLLOWER dying while
+    its peers admit and walk into a collective with a rank missing. The
+    authority is the rank that already owns this decision under #968/#969Z
+    ("no rank of a PP group withholds admission for its own prefetch; PP0's
+    standing verdict is TAKE WITHOUT WAITING"), so nothing new is wired and no
+    collective is added on this path. This is not compensating a recognised
+    disagreement (raenge-nie-uneins): a follower cannot SEE PP0's presence, so
+    there is no disagreement to recognise -- it declines to hold a verdict it
+    was already declared verdict-free for, and the returned state licenses
+    nothing (it is not in the tuple `seam_transport_premise_holds` accepts).
     """
     loaded = int(outcome or 0)
     if hasattr(outcome, "hit_tokens"):
@@ -1440,29 +1513,60 @@ def _witness_from_outcome(req, outcome, stamp: int, allowance: int) -> str:
         return "unprobed" if not probed else "cold"
     if not probed and hit == 0:
         return "unprobed"
-    shortfall = int(stamp) - presence
+    # #1176 (review b): what this prefetch WAS ASKED FOR. A missing stamp
+    # keeps the whole prefix as the demand -- the conservative reading, and
+    # the only one available for a record whose registration left no span.
+    span = getattr(req, "_prefetch_span_tokens", None)
+    try:
+        span = int(span) if span is not None else None
+    except (TypeError, ValueError):
+        span = None
+    demand = int(stamp)
+    if span is not None and 0 < span < demand:
+        demand = span
+    shortfall = demand - presence
     if presence > 0 and shortfall <= int(allowance):
         return "hit"
     requested = len(getattr(req, "origin_input_ids", None) or ())
-    raise StoreWitnessContradiction(
+    message = (
         f"#1157 STORE WITNESS CONTRADICTION rid={getattr(req, 'rid', None)} "
-        f"stamped={stamp} probed_hit={hit} loaded={loaded} "
-        f"allowance={int(allowance)} shortfall={shortfall} requested={requested} "
-        f"matched={matched} materialized={presence}: "
+        f"stamped={stamp} span={span} demand={demand} probed_hit={hit} "
+        f"loaded={loaded} allowance={int(allowance)} shortfall={shortfall} "
+        f"requested={requested} matched={matched} materialized={presence}: "
         f"the retract stamp says the prompt was computed and fenced to the "
         f"canonical store in the previous window, and the measured presence of "
         f"this re-admission -- what the tree already held (matched) plus what "
-        f"this prefetch loaded, rank-uniform MIN over the prefetch group -- "
+        f"this prefetch loaded, against the span the prefetch was asked for -- "
         + (
             "shows nothing materialized"
             if presence <= 0
-            else "fell short of the stamped span by more than one chunk"
+            else "fell short of that span by more than one chunk"
         )
         + ". Two measurements of one span disagree; re-admitting at "
         f"P={presence} would be a recompute licensed by a stamp "
         f"(kein-doppel-prefill), so the group STOPs here instead "
         f"(raenge-nie-uneins)."
     )
+    if not is_authority:
+        # #1176 (review d): a follower REPORTS. Rate-limited because a
+        # divergent record repeats on every pass until the authority acts.
+        global _WITNESS_FOLLOWER_REPORTS
+        _WITNESS_FOLLOWER_REPORTS += 1
+        if _WITNESS_FOLLOWER_REPORTS == 1 or _WITNESS_FOLLOWER_REPORTS % 64 == 0:
+            logger.warning(
+                "%s STORE WITNESS CONTRADICTION SEEN BY A FOLLOWER (n=%d): %s "
+                "This rank holds no admission verdict for its own prefetch "
+                "(#969Z), and its record is rank-LOCAL whenever the packed MIN "
+                "all_reduce is not taken (tp_world_size == 1), so raising here "
+                "would kill this rank while its peers admit -- the divergence "
+                "boot weg1b6 measured. The authority (PP0) raises on its own "
+                "measurement; this state licenses nothing.",
+                LOG_PREFIX,
+                _WITNESS_FOLLOWER_REPORTS,
+                message,
+            )
+        return "contradiction"
+    raise StoreWitnessContradiction(message)
 
 
 def store_witness(scheduler, req) -> str:
@@ -1493,9 +1597,15 @@ def store_witness(scheduler, req) -> str:
       ``unprobed``  the operation terminated before the probe ran (the reap
                     the priced budget exists to make impossible); the
                     `#1157 PREFETCH REAPED probed=False` line is its trace.
+      ``contradiction``  #1176 (review d): the measured presence disagrees
+                    with the stamp, AND this rank is not the one that owns the
+                    verdict (a PP follower, which decides nothing per #969Z).
+                    Reported, counted by the census, and licenses NOTHING --
+                    it is deliberately absent from the tuple the caller
+                    accepts. On the authority the same input raises instead.
 
     A probed miss, a revoke, or a materialized shortfall beyond one chunk
-    beside a restore stamp is not a state: it raises
+    beside a restore stamp is not a state on the AUTHORITY: it raises
     ``StoreWitnessContradiction``.
 
     RANK UNIFORMITY of the inputs (review N3): ``ongoing_prefetch`` is
@@ -1521,7 +1631,13 @@ def store_witness(scheduler, req) -> str:
     outcome = records.get(rid) if records else None
     if outcome is not None:
         return _witness_from_outcome(
-            req, outcome, stamp, _store_witness_allowance(tree)
+            req,
+            outcome,
+            stamp,
+            _store_witness_allowance(tree),
+            # #1176 (review d): only the rank that owns the admission verdict
+            # may turn a contradiction into a group STOP.
+            is_authority=witness_stop_authority(scheduler),
         )
     n = len(getattr(req, "origin_input_ids", None) or ())
     threshold = int(getattr(tree, "prefetch_threshold", 256) or 0)
@@ -1530,16 +1646,30 @@ def store_witness(scheduler, req) -> str:
     return "cold"
 
 
-def assert_store_witness_at_admission(req, outcome, tree=None) -> None:
+def assert_store_witness_at_admission(
+    req, outcome, tree=None, *, is_authority: bool = True
+) -> None:
     """#1157: the admission-loop half of the witness. Called with the value
     `pop_prefetch_loaded_tokens` returned for ``req`` (and the tree, for the
     one-chunk allowance); raises on a probed miss / revoke / over-allowance
     shortfall of the MATERIALIZED presence (#1176) beside a restore stamp, is
-    a no-op for an unannotated count."""
+    a no-op for an unannotated count.
+
+    ``is_authority`` (#1176 review d) is False on a PP follower, which credits
+    and decides nothing (#969Z): there the contradiction is REPORTED, never
+    raised, because a follower's record is rank-local whenever the packed MIN
+    all_reduce is not taken and its death would leave its peers in a
+    collective one rank short. The caller passes `witness_stop_authority`."""
     if outcome is None or not hasattr(outcome, "hit_tokens"):
         return
     stamp = int(getattr(req, "cached_prompt_tokens_at_retract", 0) or 0)
-    _witness_from_outcome(req, outcome, stamp, _store_witness_allowance(tree))
+    _witness_from_outcome(
+        req,
+        outcome,
+        stamp,
+        _store_witness_allowance(tree),
+        is_authority=is_authority,
+    )
 
 
 def store_witness_census(scheduler) -> str:
