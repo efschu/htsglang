@@ -579,8 +579,17 @@ class BudgetHarness:
         def uniform_budget_deficit(self):
             return 0
 
-    def __init__(self, collective, avail, evictable, dcp_size=_NRANKS):
+    def __init__(self, collective, avail, evictable, dcp_size=_NRANKS, tp_rank=0):
         self.tp_cpu_group = object()
+        # #1158: the reduce grew a RANK read -- `self.ps.tp_rank` names the
+        # rank in the '#791b PREFETCH-BALLOT DIGEST MISMATCH STOP' line that
+        # replaced the void-ballot fallback -- and the drift guard below
+        # caught it in the same change that caused it (eighth drift after
+        # #616g, #639, #639b, #791b, #794, #701 and #823). A stand-in, not a
+        # binding: the Scheduler keeps its rank on `ps` (scheduler.py, the
+        # `self.ps.tp_rank, NOT self.tp_rank` note), and this harness has no
+        # process state; the only consumer is the STOP line's rank field.
+        self.ps = SimpleNamespace(tp_rank=tp_rank)
         self.kv_session_offload = None
         self.token_to_kv_pool_allocator = SimpleNamespace(available_size=lambda: avail)
         self.tree_cache = SimpleNamespace(
@@ -713,7 +722,9 @@ class PrefillAdmissionBudgetTest(unittest.TestCase):
         collective = ThreadCollective()
 
         def body(rank):
-            harness = BudgetHarness(collective, self.AVAIL[rank], self.EVICT[rank])
+            harness = BudgetHarness(
+                collective, self.AVAIL[rank], self.EVICT[rank], tp_rank=rank
+            )
             with (
                 unittest.mock.patch.object(
                     torch.distributed, "all_reduce", collective.all_reduce

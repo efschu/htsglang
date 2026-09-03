@@ -103,6 +103,18 @@ _DEFAULT_MULT = 40
 
 _ENV_MULT = "SGLANG_JIT_COLD_BUILD_TIMEOUT_MULT"
 
+#: #1158: the nominal device clock the cycle deadlines are documented
+#: against ("60_000_000_000 cycles ~30 s at 2 GHz", barlink_device.py
+#: _TIMEOUT_CYCLES and barlink_host.py). Used only to express the peers'
+#: wall-clock build cap in the device reader's unit; a faster clock makes
+#: the device bound slightly tighter than the host bound, never looser.
+_NOMINAL_CYCLES_PER_S = 2_000_000_000
+
+#: #1158: what the opener's deadline falls back to when the peers' cap
+#: cannot be read at all -- the same 900 s published default the #1073
+#: poller falls back to (barlink_liveness.py), never "uncapped".
+_FALLBACK_CAP_S = 900.0
+
 _lock = threading.Lock()
 _depth = 0
 _reason: Optional[str] = None
@@ -139,18 +151,57 @@ def cold_build_window_reason() -> Optional[str]:
     return _reason
 
 
+def build_cap_s() -> float:
+    """#1158: the peers' absolute build cap, read from where they read it.
+
+    ``barlink_build_window.build_cap_s`` (``SGLANG_BARLINK_BUILD_WINDOW_CAP_S``,
+    default 900 s; this rig's launcher sets 60) is the frist a PEER honours
+    for a published window. The opener's own extension is bounded by the
+    same number below, so the two sides of one collective agree on how long
+    a build may hold a deadline open.
+    """
+    try:
+        from sglang.srt.distributed.device_communicators import (
+            barlink_build_window,
+        )
+
+        return float(barlink_build_window.build_cap_s())
+    except Exception:  # pragma: no cover - the module is optional context
+        return _FALLBACK_CAP_S
+
+
+def capped_cold_build_deadline(base: float, cap: float) -> float:
+    """#1158 THE OPENER HONOURS THE CAP TOO: ``min(base * mult, base + cap)``.
+
+    ONE formula for both readers (host seconds in ``wait_timeout_s``, device
+    cycles in ``resolve_timeout_cycles``), so they cannot drift apart. The
+    rank that OPENS a cold-build window used to extend its own deadline by
+    the bare multiplier (x40) while the peers reading its marker stopped at
+    ``build_cap_s()`` -- so an opener waiting on a peer that never joins sat
+    from the peers' 60 s cap to the 300 s scheduler watchdog (boot weg1b3,
+    23:59:54 -> 00:06:47, '#1033c CUTOVER FORWARD WARMUP begin' with no
+    done). Capped, it ends in the existing named abort within base + cap.
+    ``mult <= 1`` and ``cap <= 0`` both mean "no extension", exactly as they
+    do for the peers.
+    """
+    mult = cold_build_timeout_mult()
+    if mult <= 1 or cap <= 0:
+        return base
+    return min(base * mult, base + cap)
+
+
 def resolve_timeout_cycles(base_cycles: int) -> int:
     """The deadline a device collective should launch with, right now.
 
     Outside the window this is the identity function -- that is what makes
-    the default and the steady-state paths byte-identical.
+    the default and the steady-state paths byte-identical. Inside it the
+    extension is capped at ``build_cap_s()`` worth of nominal device cycles
+    (#1158), the same bound ``barlink_liveness.wait_timeout_s`` applies.
     """
     if not in_cold_build_window():
         return base_cycles
-    mult = cold_build_timeout_mult()
-    if mult <= 1:
-        return base_cycles
-    return min(base_cycles * mult, _U64_MAX)
+    cap_cycles = build_cap_s() * _NOMINAL_CYCLES_PER_S
+    return int(min(capped_cold_build_deadline(base_cycles, cap_cycles), _U64_MAX))
 
 
 def _publish_build_window(reason: str) -> None:

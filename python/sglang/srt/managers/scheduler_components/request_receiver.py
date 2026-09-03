@@ -10,6 +10,7 @@ from typing import (
     Callable,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -28,6 +29,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -100,6 +102,14 @@ class SchedulerRequestReceiver:
     # RING (PpChainRecvStalled), then resume the SAME posted receive. None
     # keeps the pre-#824 behaviour of letting the stall propagate.
     pp_chain_stall_service: Optional[Callable[[], Any]] = None
+    # #1158 ONE DISPOSAL, AT THE ORIGIN, BEFORE RELAY. Returns
+    # (idle, queue_len, running_len) for the request origin's health-probe
+    # verdict; None leaves health-check requests untouched (a receiver built
+    # without a scheduler behind it). The scheduler wires it on every boot.
+    health_check_gate: Optional[Callable[[], Tuple[bool, int, int]]] = None
+    # The ipc of a dropped probe goes back through this so the tokenizer's
+    # /health_generate still gets its answer (the scheduler's deque).
+    return_health_check_ipc: Optional[Callable[[Any], None]] = None
 
     #: How many drain turns one chain receive may trigger before the stall
     #: is allowed to propagate. A closed ring is cut by the FIRST turn; a
@@ -175,6 +185,11 @@ class SchedulerRequestReceiver:
             and self.ps.attn_tp_rank == 0
             and self.ps.attn_cp_rank == 0
         )
+        # #1158: the health-probe disposal happens HERE, once, before the
+        # policy hook reads the list, before the TP broadcast and before the
+        # PP chain forward. Everything below relays exactly what survives.
+        if is_request_origin and recv_reqs:
+            recv_reqs = self._dispose_health_checks_at_origin(recv_reqs)
         if (
             is_request_origin
             and recv_reqs is not None
@@ -219,6 +234,63 @@ class SchedulerRequestReceiver:
         self._finalize_shm_features(recv_reqs)
 
         return recv_reqs
+
+    def _dispose_health_checks_at_origin(self, recv_reqs: List) -> List:
+        """#1158: THE ONE disposal of a health-check request, at the origin.
+
+        Upstream skips a `/health_generate` probe while the server is busy,
+        with a rank-local idle predicate evaluated in every rank's dispatch
+        loop. Under replicated queues that reads the same everywhere; the
+        fork's #631 row-authority special case then let rank 0 DROP a probe
+        while its PP followers ENQUEUED it, after the list had already been
+        broadcast to the TP peers and forwarded down the chain. Measured on
+        boot weg1b3 (23:54:18): PP0 queue=6 vs PP1/PP2 queue=7, a +1
+        occupant through five seams, '#969C ... rid=HEALTH_C' on the
+        followers only, and the #791b ballot void on every pass until the
+        rank-local prefetch verdicts split at 23:59:54.
+
+        So the verdict moves to where the list is BORN: the origin decides
+        busy/idle once, a dropped probe never leaves this process (its ipc is
+        answered from here), and a kept probe is enqueued on EVERY rank by the
+        ordinary relay. No rank-conditional branch exists downstream any more
+        (scheduler.process_input_requests dispatches whatever it receives).
+
+        Same list, same order, for everything that is not a health probe. A
+        second probe behind a kept one in the same intake is busy by
+        construction -- the kept one will occupy the queue -- which is also
+        what upstream's per-request predicate read.
+        """
+        if self.health_check_gate is None:
+            return recv_reqs
+        kept: List = []
+        verdict: Optional[Tuple[bool, int, int]] = None
+        kept_probe = False
+        for req in recv_reqs:
+            if not is_health_check_generate_req(req):
+                kept.append(req)
+                continue
+            if verdict is None:
+                verdict = self.health_check_gate()
+            idle, queue_len, running = verdict
+            if idle and not kept_probe:
+                kept_probe = True
+                kept.append(req)
+                continue
+            if self.return_health_check_ipc is not None:
+                self.return_health_check_ipc(getattr(req, "http_worker_ipc", None))
+            # The two numbers are the gate's own reading (the queue and the
+            # running batch at the moment the verdict was taken); a probe
+            # dropped behind a KEPT probe in the same intake prints the same
+            # reading -- the kept probe is not in the queue yet, it is busy
+            # by construction (see the docstring).
+            logger.info(
+                "#1158 HEALTH-CHECK dropped at origin before broadcast rid=%s "
+                "busy queue=%d running=%d",
+                getattr(req, "rid", None),
+                queue_len,
+                running,
+            )
+        return kept
 
     def _phase_flip_armed(self) -> bool:
         if self.phase_flip_armed_hook is None:

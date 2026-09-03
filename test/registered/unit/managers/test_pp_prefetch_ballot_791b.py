@@ -167,17 +167,25 @@ class PPPrefetchBallot791b(unittest.TestCase):
         self.assertTrue(out[FAST_RANK]["local"][R_SLOW])
         self.assertFalse(out[FAST_RANK]["decisions"][R_SLOW])
 
-    def test_a_divergent_queue_head_voids_the_ballot_loudly(self):
-        """The digest pair catches a rank whose queue head DIFFERS -- the
-        ballot must void on EVERY rank (min != max reaches them all), and
-        the decision falls back to the local verdict, which the caller
-        logs. Papering over a divergent head with slot-wise verdicts would
-        pair verdicts with the wrong rids."""
+    def test_a_divergent_queue_head_stops_every_rank(self):
+        """INVERTED BY #1158 (2026-09-03). This case used to assert that a
+        divergent head VOIDS the ballot on every rank and that each rank
+        then falls back to its local verdict. Boot weg1b3 measured that
+        fallback running 32 consecutive void passes until the local verdicts
+        split and two ranks formed a batch the third never joined. A detected
+        rank disagreement is a STOP (law raenge-nie-uneins): the digest pair
+        still reaches EVERY rank (min != max is group-visible), and now every
+        rank raises `PrefetchBallotDigestMismatch` on that first pass, with
+        both digests in the text. Nobody decides anything from a local
+        verdict."""
         out = _run(_worker, case="mismatch")
-        self._assert_all_ok(out)
         for r in range(WORLD):
-            self.assertTrue(out[r]["ballot_none"], f"rank {r} kept a ballot")
-            self.assertEqual(out[r]["decisions"], out[r]["local"])
+            self.assertFalse(out[r]["ok"], f"rank {r} survived a divergent head")
+            self.assertIn("PrefetchBallotDigestMismatch", out[r]["error"], r)
+            self.assertIn("DIGEST MISMATCH STOP", out[r]["error"], r)
+            self.assertIn("group_min=", out[r]["error"], r)
+            self.assertIn("group_max=", out[r]["error"], r)
+            self.assertNotIn("decisions", out[r], f"rank {r} went on to decide")
 
 
 class PrefetchBallotPure791b(unittest.TestCase):

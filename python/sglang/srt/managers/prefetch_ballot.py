@@ -39,10 +39,18 @@ SELECTION MUST BE REPLICATED, VERDICTS ARE LOCAL. The slots are the first
 the replication premise makes identical across ranks. The premise is
 VERIFIED, not assumed: a CRC of the slot rids rides the same reduce as a
 (x, -x) pair, so every rank sees the group's min and max digest and knows
-whether the heads agreed. On mismatch the ballot is void for the pass and
-the caller falls back to the rank-local verdict -- the status quo ante --
-after saying so once, loudly: a divergent queue head is a deeper breakage
-this module must surface, not paper over.
+whether the heads agreed. A MISMATCH IS A GROUP STOP (#1158, law
+raenge-nie-uneins): ``unpack_prefetch_ballot`` raises
+``PrefetchBallotDigestMismatch`` on the first diverged pass, on every rank
+of the reduce (the min/max pair is group-visible by construction), and the
+scheduler process dies through run_scheduler_process's
+except -> SIGQUIT -> kill_process_tree. It used to void the ballot and fall
+back to the rank-local verdict "after saying so once, loudly"; on boot
+weg1b3 that fallback ran 32 consecutive void passes (23:56:17 -> 23:59:52)
+until the rank-local verdicts split and two ranks formed a batch the third
+never joined -- a detected, never-healing rank disagreement turned into
+3 min 37 s of rank-local admission instead of a STOP. A divergent queue
+head is a deeper breakage this module must END, not survive.
 
 ``hash()`` is process-salted (PYTHONHASHSEED) and MUST NOT touch this
 payload; the digest is ``zlib.crc32``, deterministic across processes.
@@ -98,26 +106,67 @@ def build_prefetch_ballot_payload(
     return payload
 
 
+class PrefetchBallotDigestMismatch(RuntimeError):
+    """#1158: the TP ranks disagree about the head of waiting_queue.
+
+    Raised by ``unpack_prefetch_ballot`` on EVERY rank of the reduce in the
+    same pass. A ``RuntimeError`` so the existing scheduler death path
+    (run_scheduler_process: except Exception -> SIGQUIT -> kill_process_tree)
+    takes it without a new collective or a new handler.
+    """
+
+
+#: How many head rids the STOP line names, and how many chars of each.
+STOP_LINE_HEAD_RIDS = 8
+STOP_LINE_RID_CHARS = 8
+
+
 def unpack_prefetch_ballot(
-    reduced: Sequence[int], rids: Sequence[str]
+    reduced: Sequence[int],
+    rids: Sequence[str],
+    *,
+    rank: int = -1,
+    queue_len: Optional[int] = None,
 ) -> Optional[Dict[str, bool]]:
-    """The GROUP verdict from the reduced ballot slice, or None on a digest
-    mismatch (the ranks disagreed about the queue head -- void the ballot
-    for this pass; the caller falls back to the local verdict and logs).
+    """The GROUP verdict from the reduced ballot slice.
 
     ``reduced`` is the ballot's slice of the MIN-reduced payload, laid out
     exactly as ``build_prefetch_ballot_payload`` packed it. The (x, -x)
     digest pair yields min at [0] and (negated) max at [1]; equality of the
     two IS the uniformity check, on the same trick #616g uses for pool
     availability.
+
+    DIGEST MISMATCH -> ``PrefetchBallotDigestMismatch`` (#1158). Every rank
+    of the reduce holds the same min and max, so every rank raises on the
+    same pass; the line names this rank's own digest beside the group's
+    two, the queue length and the head rids, which is what a post-mortem
+    needs to see WHICH rank carried the odd head.
+
+    ``None`` is returned only for a slice of the wrong width -- a layout
+    defect the TP-loop caller turns into its own STOP -- never for a
+    disagreement.
     """
     if len(reduced) != PREFETCH_BALLOT_SLOTS + 2:
         return None
     digest_min = int(reduced[0])
     digest_max = -int(reduced[1])
-    if digest_min != digest_max:
-        return None
     rids = list(rids)[:PREFETCH_BALLOT_SLOTS]
+    if digest_min != digest_max:
+        head = ",".join(
+            str(r)[:STOP_LINE_RID_CHARS] for r in rids[:STOP_LINE_HEAD_RIDS]
+        )
+        raise PrefetchBallotDigestMismatch(
+            "#791b PREFETCH-BALLOT DIGEST MISMATCH STOP rank=%d digest=%d "
+            "group_min=%d group_max=%d queue_len=%d head=[%s]"
+            % (
+                int(rank),
+                prefetch_ballot_digest(rids),
+                digest_min,
+                digest_max,
+                int(len(rids) if queue_len is None else queue_len),
+                head,
+            )
+        )
     return {rid: bool(int(reduced[2 + i])) for i, rid in enumerate(rids)}
 
 
@@ -126,8 +175,9 @@ def prefetch_done_under_ballot(
 ) -> bool:
     """The verdict the admission loop must consume.
 
-    * ballot None (single rank, PP loop, digest mismatch): the local
-      verdict, byte-identical to the pre-ballot path.
+    * ballot None (single rank, PP loop -- the callers that take NO
+      ballot; a digest mismatch no longer produces one, it raises): the
+      local verdict, byte-identical to the pre-ballot path.
     * rid in the ballot: the GROUP verdict, whatever the local one says.
       MIN semantics guarantee group-done implies locally done, so this
       never admits an unfinished rank; a locally-done rank held back by a
@@ -145,14 +195,21 @@ def prefetch_done_under_ballot(
     return verdict
 
 
-#: #823: log cadence for a PERSISTING queue-head divergence.
+#: #823: log cadence for a PERSISTING rank-local degradation.
 #:
-#: The first diverged pass is always reported, then the cadence widens
-#: geometrically and is capped, so a divergence that never heals costs a
+#: The first degraded pass is always reported, then the cadence widens
+#: geometrically and is capped, so a condition that never heals costs a
 #: handful of lines per minute instead of one per TP-loop iteration. The cap
 #: matters: the boot this was written for emitted 7710 void lines in seven
 #: seconds on a neighbouring code path, which is exactly what an unbounded
 #: per-iteration warning turns into on a hot loop.
+#:
+#: #1158: NO LONGER USED BY THE BALLOT. A queue-head digest mismatch is a
+#: STOP on its first pass (see ``unpack_prefetch_ballot``), so there is no
+#: persisting ballot divergence left to count. The state machine below
+#: stays for the #823 head-congruence COUNT/ORDER arms
+#: (``Scheduler._note_tp_head_degradation``), which still report a
+#: persisting degradation on this cadence.
 PREFETCH_BALLOT_MISMATCH_LOG_CAP = 512
 
 

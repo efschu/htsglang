@@ -2927,40 +2927,17 @@ class Scheduler(
             self._apply_phase_flip_decisions(recv_reqs)
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
-            # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
-                # #631 ROW AUTHORITY: this idle verdict is RANK-LOCAL, and on
-                # a downstream PP rank it is exactly the divergence class the
-                # row channel exists to end -- measured on boot 631row18:
-                # PP0 (idle after check-1) queued check-2 and admitted it
-                # (fwd_ct=1), while PP1's own is_fully_idle still read busy
-                # and this `continue` silently dropped the relayed request;
-                # the row then named a rid this rank could never locate and
-                # the ring wedged. Downstream does not verdict: PP0 owns the
-                # admission truth, a relayed health request is enqueued, and
-                # it lives or dies by PP0's rows. Older lingering health rids
-                # are purged first -- upstream dispatches a health probe only
-                # at idle and each carries a fresh rid, so at most the newest
-                # can ever be named by a row; an older one was completed or
-                # dropped on PP0 and would only pollute the idle predicate.
-                if (
-                    pp_row_authority_enabled(self)
-                    and getattr(getattr(self, "ps", None), "pp_rank", 0) != 0
-                    and getattr(getattr(self, "ps", None), "pp_size", 1) > 1
-                ):
-                    self.waiting_queue = [
-                        r
-                        for r in self.waiting_queue
-                        if not is_health_check_generate_req(r)
-                    ]
-                else:
-                    self.return_health_check_ipcs.append(
-                        getattr(recv_req, "http_worker_ipc", None)
-                    )
-                    continue
-
+            # #1158 NO HEALTH-CHECK DISPOSAL HERE, ON ANY RANK. The one
+            # disposal is on the request ORIGIN, in
+            # SchedulerRequestReceiver._dispose_health_checks_at_origin,
+            # BEFORE the TP broadcast and the PP chain forward -- so every
+            # rank dispatches the identical list and waiting_queue stays
+            # replicated. What lived here (upstream's rank-local idle gate,
+            # plus the #631 row-authority special case that let rank 0 drop
+            # a probe its followers enqueued) is withdrawn: on boot weg1b3
+            # it put a permanent +1 occupant on the follower queues
+            # (23:54:18), voided the #791b ballot for 32 passes, and split
+            # the TP admission at 23:59:54.
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if not isinstance(output, RpcReqOutput):
@@ -3298,6 +3275,26 @@ class Scheduler(
                 if self.server_args.enable_phase_flip
                 else None
             ),
+            # #1158: the ONE health-check disposal, at the origin, before
+            # relay. Wired on every boot: this is upstream's idle gate, moved
+            # from the per-rank dispatch loop to the origin so the verdict
+            # is taken once and the relayed list carries it.
+            health_check_gate=self._health_check_gate,
+            # Resolved per call, not bound at construction: the deque is
+            # created elsewhere in __init__ and this must not depend on order.
+            return_health_check_ipc=lambda ipc: self.return_health_check_ipcs.append(
+                ipc
+            ),
+        )
+
+    def _health_check_gate(self) -> Tuple[bool, int, int]:
+        """#1158: the origin's idle verdict for a health probe, with the two
+        numbers the drop line names. Called only on the request origin, only
+        when a health-check request is in the intake."""
+        return (
+            bool(self.is_fully_idle(for_health_check=True)),
+            len(self.waiting_queue),
+            len(self.running_batch.reqs),
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -7117,9 +7114,29 @@ class Scheduler(
         ].tolist()
         _admit_limit = int(t[_limit_at])
         _ballot_at = len(vals) - (prefetch_ballot.PREFETCH_BALLOT_SLOTS + 2)
+        # #1158 / raenge-nie-uneins: A DIGEST MISMATCH IS A GROUP STOP. The
+        # (x, -x) pair makes the group's min and max digest visible to EVERY
+        # rank of this reduce, so `unpack_prefetch_ballot` raises on all of
+        # them on the FIRST diverged pass, and the process dies through
+        # run_scheduler_process's except -> SIGQUIT -> kill_process_tree. No
+        # void ballot, no fallback to the rank-local verdict, no streak: on
+        # boot weg1b3 that fallback ran 32 consecutive void passes
+        # (23:56:17 -> 23:59:52) until the rank-local verdicts split and
+        # PP0/PP2 formed a batch PP1 never joined. `None` is reserved for the
+        # callers that take no ballot (single rank, PP loop); in THIS loop it
+        # is a layout defect and stops too.
         self._uniform_prefetch_ballot = prefetch_ballot.unpack_prefetch_ballot(
-            t[_ballot_at:].tolist(), _ballot_rids
+            t[_ballot_at:].tolist(),
+            _ballot_rids,
+            rank=int(self.ps.tp_rank),
+            queue_len=len(self.waiting_queue),
         )
+        if self._uniform_prefetch_ballot is None:
+            raise RuntimeError(
+                "#791b PREFETCH-BALLOT LAYOUT STOP: the reduced payload carries "
+                f"no ballot slice (slice_len={len(vals) - _ballot_at}, "
+                f"expected={prefetch_ballot.PREFETCH_BALLOT_SLOTS + 2})"
+            )
         # #823 W9b: ONE VALUE, NOT FOUR ATTRIBUTES. Four attributes published
         # here and read separately over there is what let one of them --
         # #791b's consume-once ballot -- be destroyed between publication and
@@ -7135,84 +7152,6 @@ class Scheduler(
             _admit_limit,
             self._uniform_prefetch_ballot is not None,
         )
-        # #823: A DIVERGENT QUEUE HEAD IS A DURATION, NOT AN EVENT.
-        #
-        # This branch used to latch `_prefetch_ballot_mismatch_logged` and log
-        # ONCE PER PROCESS. Its own comment called a divergent queue head "a
-        # deeper breakage than a divergent prefetch verdict" and then recorded
-        # it exactly once -- so the log can say THAT the TP replicas' queue
-        # heads parted, and can never say for how long, whether it got worse,
-        # or whether it ever healed.
-        #
-        # Measured cost of that, specimen /spinning/evidence-816-18f/
-        # wedge_0823_055757 (boot 0516, 2026-08-23): the three ranks logged
-        # this line once each at 05:55:38 and never again. 37 s later forward
-        # progress stopped for good; at 05:56:15 the flip back to PP was
-        # abandoned over "live slot set divergence"; at 05:56:18 the three
-        # ranks each built a DIFFERENT prefill batch (#new-seq 1 vs 3,
-        # #cached-token 0 vs 16384, #queue-req 6 vs 3); by 05:57:57 py-spy
-        # showed two ranks in the spec VERIFY arm and one in the EXTEND arm of
-        # `eagle_worker_v2.forward_batch_generation` (:2246 vs :2151), all
-        # three GPUs pinned at 100% with frozen stacks, until an external
-        # SIGTERM at 06:00:43. The one warning this code emitted was the
-        # EARLIEST evidence of that whole chain, and the latch made it a
-        # single line with no duration attached.
-        #
-        # SO: keep the fall-back behaviour EXACTLY as it was -- this change
-        # decides nothing differently and admits nothing differently -- and
-        # make the signal legible: count it, log the onset, log again on a
-        # bounded cadence while it persists, and log the RECOVERY EDGE, which
-        # is the half a latch can never report ("it healed after N passes" and
-        # "it never healed" are the same silence to a latched logger).
-        #
-        # NOT UNBOUNDED LOGGING, and this specimen is the reason. The same
-        # boot emitted 7710 #797d/#798 void lines in seven seconds; a
-        # per-iteration warning on a hot loop is how that happens. The cadence
-        # below is geometric-then-capped, so a persistent divergence costs a
-        # handful of lines per minute, not thousands.
-        # The DECISION is `advance_mismatch_streak` (pure, in prefetch_ballot);
-        # everything here is wiring and formatting. That split is deliberate:
-        # inline, the recovery edge could only be checked by grepping this
-        # source, and a source grep cannot tell a live branch from `elif
-        # False:` -- a mutant that disabled the recovery edge survived exactly
-        # that test.
-        (
-            self._prefetch_ballot_mismatch_streak,
-            self._prefetch_ballot_mismatch_total,
-            _mismatch_event,
-        ) = prefetch_ballot.advance_mismatch_streak(
-            getattr(self, "_prefetch_ballot_mismatch_streak", 0),
-            getattr(self, "_prefetch_ballot_mismatch_total", 0),
-            self._uniform_prefetch_ballot is None,
-        )
-        if _mismatch_event is not None:
-            _kind, _streak = _mismatch_event
-            if _kind == "diverged":
-                logger.warning(
-                    "#791b PREFETCH-BALLOT digest mismatch: the TP ranks "
-                    "disagree about the first %d rids of waiting_queue (this "
-                    "rank digest=%d, group min=%d max=%d). Ballot void for "
-                    "this pass; admission falls back to the rank-local "
-                    "prefetch verdict. Consecutive diverged passes: %d "
-                    "(total this process: %d).",
-                    prefetch_ballot.PREFETCH_BALLOT_SLOTS,
-                    prefetch_ballot.prefetch_ballot_digest(_ballot_rids),
-                    int(t[_ballot_at].item()),
-                    -int(t[_ballot_at + 1].item()),
-                    _streak,
-                    int(self._prefetch_ballot_mismatch_total),
-                )
-            else:
-                # THE RECOVERY EDGE. A divergence that heals and one that
-                # never heals are the same silence under a latch, and they
-                # call for opposite responses.
-                logger.warning(
-                    "#791b PREFETCH-BALLOT digest agreement restored after %d "
-                    "consecutive diverged pass(es) (total this process: %d). "
-                    "The TP replicas' queue heads match again.",
-                    _streak,
-                    int(self._prefetch_ballot_mismatch_total),
-                )
         self._uniform_min_avail = int(t[0].item())
         # >= 0: the local budget can only exceed the group minimum.
         self._uniform_budget_deficit = (
@@ -7501,13 +7440,17 @@ class Scheduler(
                 self.waiting_queue[:] = head + [
                     req for req in self.waiting_queue if id(req) not in named
                 ]
-        except Exception as exc:  # noqa: BLE001 - never break admission
-            source = tp_head_congruence.SOURCE_RANK_LOCAL
-            logger.warning(
-                "#823 head-congruence: could not apply the group head order "
-                "(%s); this pass forms rank-locally",
-                exc,
-            )
+        except Exception as exc:  # noqa: BLE001 - re-raised as the named STOP
+            # #1158 sibling of the ballot fallback: a group order this rank
+            # cannot apply used to degrade to a RANK-LOCAL formation under an
+            # ARMED enforcer -- the divergence class the enforcer exists to
+            # end, delivered silently. A detected inability to follow the
+            # group is a STOP, never a compensation (raenge-nie-uneins).
+            raise RuntimeError(
+                "#823 HEAD-ORDER APPLY STOP: the group head order could not be "
+                f"applied on this rank ({exc!r}); a rank-local formation under "
+                "an ARMED enforcer is the divergence class #1158 ends"
+            ) from exc
         # Counted on EVERY pass, degraded or not: the recovery edge is the
         # half a latch can never report, and "it healed" is the answer the
         # window criterion actually needs.
@@ -13777,6 +13720,12 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+        # #1158 sibling, judged and left: this idle verdict is rank-local,
+        # exactly like the health gate was, and it is rank-UNIFORM only while
+        # waiting_queue is replicated. With the one health disposal moved to
+        # the origin (SchedulerRequestReceiver._dispose_health_checks_at_origin)
+        # the queues are replicated again and this reads the same on every
+        # rank; a second origin-side gate for it would be second bookkeeping.
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None

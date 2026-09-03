@@ -174,6 +174,12 @@ def wait_timeout_s() -> float:
     inside the pre-capture warmup the ranks are minutes apart in nvcc, and a
     steady-state bound would fire on a healthy group. Outside the window this
     is the configured value unchanged.
+
+    #1158: the extension is CAPPED at ``base + build_cap_s()`` -- the same
+    frist the peers honour for this rank's published window
+    (``jit_cold_build.capped_cold_build_deadline``, one formula for the host
+    and the device reader). Uncapped, the opener of a window outlived every
+    peer's deadline by minutes and only the 300 s scheduler watchdog ended it.
     """
     base = _env_float(ENV_TIMEOUT_S, _DEFAULT_TIMEOUT_S)
     if base <= 0:
@@ -182,7 +188,11 @@ def wait_timeout_s() -> float:
         from sglang.srt.utils import jit_cold_build
 
         if jit_cold_build.in_cold_build_window():
-            return base * max(jit_cold_build.cold_build_timeout_mult(), 1)
+            return float(
+                jit_cold_build.capped_cold_build_deadline(
+                    base, jit_cold_build.build_cap_s()
+                )
+            )
     except Exception:  # pragma: no cover - the window is optional context
         pass
     return base

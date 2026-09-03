@@ -100,14 +100,20 @@ class TheCadenceReportsOnsetAndBoundsTheRest(unittest.TestCase):
 
 
 class TheFallBackBehaviourIsUnchanged(unittest.TestCase):
-    """'This only changes logging' is a claim. Pinned."""
+    """'This only changes logging' is a claim. Pinned.
 
-    def test_a_void_ballot_still_yields_the_rank_local_verdict(self):
+    #1158 NOTE: `None` here is the ballot of a caller that took NO ballot
+    (single rank, PP loop). A digest mismatch no longer yields None -- it
+    raises (see TheLatchIsGoneAndTheRecoveryEdgeExists) -- so the "void
+    ballot" of the old docstring no longer exists; the local verdict for a
+    ballot-less caller is unchanged."""
+
+    def test_no_ballot_taken_still_yields_the_rank_local_verdict(self):
         for local in (True, False):
             self.assertEqual(
                 prefetch_ballot.prefetch_done_under_ballot(local, "rid-x", None),
                 local,
-                "a void ballot must still fall back to the local verdict, "
+                "a ballot-less caller must still read the local verdict, "
                 "byte-identically to the pre-#823 path",
             )
 
@@ -182,19 +188,35 @@ class TheStateMachineIsDrivenNotGrepped(unittest.TestCase):
 
 
 class TheLatchIsGoneAndTheRecoveryEdgeExists(unittest.TestCase):
-    """STRUCTURAL, reading the shipped source -- the same technique
-    test_pp_admission_wraparound_never_blocks.py uses for its call site."""
+    """INVERTED BY #1158 (2026-09-03): the ballot's mismatch branch is GONE.
+
+    This class used to pin the #823 shape of the TP-loop mismatch branch in
+    `Scheduler._update_uniform_pool_budget`: a counted streak, a geometric
+    log cadence, a recovery edge, and the fall-back to the rank-local
+    verdict. Boot weg1b3 (6980c75eac) measured what that shape is worth:
+    the ranks disagreed on every TP pass from 23:56:17 (18 mismatch lines,
+    cadence 1..32, zero 'restored'), the fallback admitted rank-locally for
+    3 min 37 s, and at 23:59:54 the rank-local prefetch verdicts split --
+    PP0/PP2 formed a batch PP1 never joined. Under the law
+    raenge-nie-uneins a DETECTED rank disagreement is a STOP, never a
+    compensation, so `unpack_prefetch_ballot` now raises on the first
+    diverged pass and the streak/cadence/recovery wiring is deleted from the
+    scheduler. The pure state machine (`advance_mismatch_streak`) survives
+    only for the #823 head-congruence degradation counters.
+
+    The probes below are the OLD probes turned around: each asserts that the
+    withdrawn wiring is absent and that the STOP is what replaced it.
+    STRUCTURAL, reading the shipped source -- the same technique
+    test_pp_admission_wraparound_never_blocks.py uses for its call site.
+    """
 
     @staticmethod
     def _code_only(src):
         """Strip whole-line comments.
 
-        The probe below asks whether a NAME still appears; the branch's own
-        comment explains which latch was removed and names it, so a probe
-        that cannot tell prose from a statement would report the latch as
-        still present. Measured, not predicted: that is exactly how this
-        file failed first.
-        """
+        The probes ask whether a NAME still appears; the branch's own comment
+        names the withdrawn fallback, so a probe that cannot tell prose from a
+        statement would report it as still present."""
         return "\n".join(
             line for line in src.splitlines() if not line.strip().startswith("#")
         )
@@ -202,48 +224,43 @@ class TheLatchIsGoneAndTheRecoveryEdgeExists(unittest.TestCase):
     def _source(self):
         from sglang.srt.managers.scheduler import Scheduler
 
-        for name in dir(Scheduler):
-            attr = getattr(Scheduler, name, None)
-            if not callable(attr):
-                continue
-            try:
-                src = inspect.getsource(attr)
-            except (OSError, TypeError):
-                continue
-            if "PREFETCH-BALLOT digest mismatch" in src:
-                return self._code_only(src)
-        self.fail("could not locate the #791b ballot mismatch branch in Scheduler")
+        return self._code_only(inspect.getsource(Scheduler._update_uniform_pool_budget))
 
     def test_the_once_per_process_latch_is_gone(self):
-        self.assertNotIn(
-            "_prefetch_ballot_mismatch_logged",
-            self._source(),
-            "the once-per-process latch is what made a four-minute divergence "
-            "look like a single event; it must not come back",
-        )
+        self.assertNotIn("_prefetch_ballot_mismatch_logged", self._source())
 
-    def test_the_divergence_is_counted(self):
+    def test_the_divergence_is_not_counted_it_stops(self):
+        """Inverted: no streak, no total -- there is no second diverged pass."""
         src = self._source()
-        self.assertIn("_prefetch_ballot_mismatch_streak", src)
-        self.assertIn("_prefetch_ballot_mismatch_total", src)
+        self.assertNotIn("_prefetch_ballot_mismatch_streak", src)
+        self.assertNotIn("_prefetch_ballot_mismatch_total", src)
 
-    def test_the_recovery_edge_is_logged(self):
-        self.assertIn(
-            "agreement restored",
-            self._source(),
-            "a divergence that heals and one that never heals are the same "
-            "silence without this line, and they call for opposite responses",
-        )
+    def test_the_recovery_edge_is_gone_with_the_divergence_it_reported(self):
+        """Inverted: a divergence that cannot persist has no recovery edge."""
+        self.assertNotIn("agreement restored", self._source())
 
-    def test_the_pure_state_machine_is_the_one_that_gates_the_log(self):
-        """The wiring must delegate the DECISION, not re-implement it -- that
-        delegation is what makes the class above able to drive it."""
-        self.assertIn("advance_mismatch_streak", self._source())
+    def test_the_state_machine_no_longer_gates_a_ballot_log(self):
+        """Inverted: `advance_mismatch_streak` is not called at the ballot
+        site any more; the mismatch decision is `unpack_prefetch_ballot`'s
+        raise."""
+        src = self._source()
+        self.assertNotIn("advance_mismatch_streak", src)
+        self.assertNotIn("Ballot void for", src)
+        self.assertNotIn("falls back to the rank-local", src)
 
-    def test_the_detector_can_fail(self):
-        """Can-fail arm for the structural probe itself: it must actually be
-        reading a real body, not an empty string."""
-        self.assertIn("PREFETCH-BALLOT digest mismatch", self._source())
+    def test_the_stop_replaced_the_fallback(self):
+        """Can-fail arm for the inversion: the site still unpacks a ballot,
+        and a missing ballot in the TP loop is a raise, not a local verdict."""
+        src = self._source()
+        self.assertIn("unpack_prefetch_ballot(", src)
+        tail = src[src.index("unpack_prefetch_ballot(") :]
+        self.assertIn("if self._uniform_prefetch_ballot is None:", tail)
+        self.assertIn("raise RuntimeError(", tail)
+        with self.assertRaises(RuntimeError) as cm:
+            prefetch_ballot.unpack_prefetch_ballot(
+                [1, -2] + [1] * prefetch_ballot.PREFETCH_BALLOT_SLOTS, ["a"]
+            )
+        self.assertIn("DIGEST MISMATCH STOP", str(cm.exception))
 
 
 if __name__ == "__main__":
