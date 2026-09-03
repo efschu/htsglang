@@ -2116,6 +2116,23 @@ class PhasePolicyInputs:
     #: stamp, same argument as ``seam_transport_tokens``.
     seam_serviceable_tokens: int = 0
 
+    #: #1173: THE BREAKDOWN OF ``pending_prefill_tokens``, AS A STRING, from
+    #: the producer that computed it. Every pp-exit arm prints it, because
+    #: weg1b4 armed pp_to_tp on "DRAINED: 0 tok remaining" while the ring
+    #: carried 5739 tokens of launched-but-unreturned extend work and the log
+    #: could not name which term had answered 0. Purely reported -- no
+    #: verdict reads it -- so an unsupplied field changes no decision.
+    pending_prefill_terms: str = ""
+
+    #: #1173: the WITNESS STATE census behind ``seam_serviceable_tokens``
+    #: (pending|hit|bounded|cold|unprobed, per ``phase_purity.store_witness``).
+    #: The hold line used to say "premise verified on the STORE WITNESS"
+    #: without saying WHICH witness, so a sub-threshold ``bounded`` (no
+    #: prefetch could exist by construction) read identically to a ``hit``
+    #: (bytes actually loaded) -- weg1b4 line 2529 against line 2497.
+    #: Reported only.
+    seam_witness_states: str = ""
+
     #: #942: COMPUTED prefill the #887 one-chunk grant will serve in THIS (TP)
     #: layout, in THIS TP phase, expressed in tokens. 0 everywhere the grant is
     #: not open, so an unsupplied field reproduces the pre-#942 behaviour
@@ -2690,6 +2707,18 @@ class PhasePolicyDecision:
 
 def _no(reason: str) -> PhasePolicyDecision:
     return PhasePolicyDecision(direction=None, reason=reason)
+
+
+def _pending_terms(inp) -> str:
+    """#1173: the pending-token breakdown a pp-exit arm must print.
+
+    NEVER a second computation of the quantity. The producer
+    (``Scheduler._pending_prefill_tokens``) records the breakdown of the
+    SAME reading the verdict used, and this returns it verbatim; an absent
+    field says so rather than inventing a decomposition.
+    """
+    terms = getattr(inp, "pending_prefill_terms", "") or ""
+    return terms if terms else "UNREPORTED (producer recorded no breakdown)"
 
 
 def decide(
@@ -3570,7 +3599,9 @@ def _decide_from_load(
                 f"cutover's own re-admission are serviceable in THIS layout "
                 f"by read-through (premise verified on the STORE WITNESS, #1157: "
                 f"a pending or loaded store read per re-admission, never the "
-                f"retract stamp alone) "
+                f"retract stamp alone; #1173 witness states "
+                f"{getattr(inp, 'seam_witness_states', '') or 'unreported'} -- "
+                f"a sub-threshold 'bounded' is NOT a loaded store read) "
                 f"-- holding for the transport batch instead of flipping "
                 f"away from it. Bounded: the transport-debt clock lapses "
                 f"this credit after the drain-stall deadline, and the "
@@ -3892,7 +3923,8 @@ def _decide_from_load(
                 PP_TO_TP,
                 f"DRAINED: {inp.pending_prefill_tokens} tok remaining "
                 f"(<= one chunk of {cfg.pp_exit_tokens}), {inp.running_bs} req "
-                f"decoding -- exit condition: drained",
+                f"decoding -- exit condition: drained "
+                f"[#1173 pending terms: {_pending_terms(inp)}]",
             )
         # #677(a) BLOCKED ADMISSION, CHECKED BEFORE THE RESIDENCY CAP.
         #
@@ -3923,7 +3955,8 @@ def _decide_from_load(
         ):
             return PhasePolicyDecision(
                 PP_TO_TP,
-                f"blocked admission: pending frozen at "
+                f"blocked admission [#1173 pending terms: "
+                f"{_pending_terms(inp)}]: pending frozen at "
                 f"{inp.pending_prefill_tokens} tok for {stalled_for:.1f}s with "
                 f"bs {inp.running_bs} carried (no chunk admitted in "
                 f"{stall_window:.1f}s, solved as {PROGRESS_STALL_CHUNKS}x the "
@@ -3980,7 +4013,8 @@ def _decide_from_load(
                     f"{cfg.decode_stall_slo_s:g}s budget (residency {in_pp:.1f}s "
                     f">= {cap:.1f}s solved as slo - 2x{cfg.flip_cost_s:g}s seam); "
                     f"prefill backlog empty -- exit condition: decode "
-                    f"starvation cap",
+                    f"starvation cap [#1173 pending terms: "
+                    f"{_pending_terms(inp)}]",
                 )
 
         # LEGACY STOPWATCH. Retained so a deployment that set pp_window_s keeps
@@ -4022,7 +4056,8 @@ def _decide_from_load(
                 # window exists to prevent ("returned 'holding in pp' on every
                 # call, without end") and the shape of the live wedge family.
                 # The assumption outranks the prose, so this arm is an EXIT.
-                reason=f"pp window {in_pp:.1f}s >= {cfg.pp_window_s:g}s with "
+                reason=f"pp window [#1173 pending terms: {_pending_terms(inp)}] "
+                f"{in_pp:.1f}s >= {cfg.pp_window_s:g}s with "
                 f"{inp.running_bs} req waiting to decode "
                 f"({inp.pending_prefill_tokens} tok prefill deferred to the "
                 f"next pp window) -- HAND-SET STOPWATCH; drain-based policy "

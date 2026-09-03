@@ -14589,14 +14589,86 @@ class Scheduler(
         # behind a global dedup would make that class silent the way this one
         # was. So exactly one overlap is excluded, and only this one.
         _queued_ids = {id(req) for req in queued}
+        # #1173: LAUNCHED-BUT-UNRETURNED IS STILL OWED PREFILL, and the term
+        # that omitted it is REPLACED here rather than patched beside.
+        #
+        # THE MEASUREMENT (boot_855_weg1b4_f58a71bde0_0903_080200.log). At
+        # 08:06:49 PP0 admitted the last queued request into microbatch slot 1
+        # (`#969N ADMIT slot=1 fwd_ct=81 bs=1 extend=1912 rids=[b64dc1cb]`,
+        # log 82089) and posted its proxy one line later (log 82144). At that
+        # instant the request left EVERY term below: it is no longer in
+        # `waiting_queue`, it is not `chunked_req`, it is not arriving, and
+        # the resident term prices it at `total - extend_range.end` == 0
+        # because `extend_range.end` is advanced when the pass is PREPARED,
+        # not when its forward RETURNS. One line later the DRAINED arm read
+        # "0 tok remaining" (log 82145) and armed pp_to_tp on a ring that was
+        # still carrying 5739 tokens of launched extend work -- the at-arm
+        # census printed exactly that number as `unaccounted` on PP0 and
+        # 3827 on PP1 (log 82157/82223), which is the same population read by
+        # an instrument that could not attribute it either.
+        #
+        # THE QUANTITY IS `total - extend_range.START`, not `- end`. The
+        # tokens of the in-flight pass itself are NOT computed until the
+        # forward returns, so the honest reading of an in-flight microbatch is
+        # everything from where this pass began: the extent now on the wire
+        # PLUS whatever remains behind it. `- end` would have priced
+        # b64dc1cb at 0 and armed anyway.
+        #
+        # DEDUPLICATED AGAINST EVERY OTHER TERM, in the #731 shape: a request
+        # counted here is skipped by the chunked and resident terms below, so
+        # the sum moves work between terms instead of double-billing it.
+        #
+        # EXTEND PASSES ONLY. A decode microbatch owes no prefill; pricing it
+        # here would hold the pp-exit arms open for work the layout is not
+        # waiting on. An unreadable forward_mode is treated as extend, the
+        # conservative direction for a term whose absence armed a flip.
+        _inflight_ids: set = set()
+        inflight_tokens = 0
+        try:
+            for mb in list(getattr(self, "mbs", None) or ()):
+                if mb is None:
+                    continue
+                try:
+                    if mb.is_empty():
+                        continue
+                except Exception:  # noqa: BLE001 - an observation never breaks a round
+                    pass
+                _fm = getattr(mb, "forward_mode", None)
+                if _fm is not None:
+                    try:
+                        if not bool(_fm.is_extend()):
+                            continue
+                    except Exception:  # noqa: BLE001 - unreadable mode: price it
+                        pass
+                for req in list(getattr(mb, "reqs", None) or ()):
+                    if id(req) in _inflight_ids or id(req) in _queued_ids:
+                        continue
+                    if _excluded(req):
+                        continue
+                    rng = getattr(req, "extend_range", None)
+                    if rng is None:
+                        continue
+                    total = len(getattr(req, "origin_input_ids", ()) or ())
+                    _inflight_ids.add(id(req))
+                    inflight_tokens += max(0, total - int(rng.start))
+        except Exception:  # noqa: BLE001 - an observation must not break a round
+            pass
+        pending += inflight_tokens
         chunked = getattr(self, "chunked_req", None)
-        if chunked is not None and not _excluded(chunked):
+        chunked_tokens = 0
+        if (
+            chunked is not None
+            and not _excluded(chunked)
+            and id(chunked) not in _inflight_ids
+        ):
             rng = getattr(chunked, "extend_range", None)
             filled = int(rng.end) if rng is not None else 0
-            pending += max(0, len(chunked.origin_input_ids) - filled)
-        pending += _arriving_prefill_tokens(
+            chunked_tokens = max(0, len(chunked.origin_input_ids) - filled)
+            pending += chunked_tokens
+        arriving_tokens = _arriving_prefill_tokens(
             inflight, _queued_ids, exclude=None if include_health else _excluded
         )
+        pending += arriving_tokens
         # #713 (a): RESIDENT-BUT-UNPREFILLED. The three terms above see a
         # request in the waiting queue, in the chunked slot, or in the recv
         # batch -- and NOWHERE ELSE. A request that has been ADMITTED has left
@@ -14618,6 +14690,7 @@ class Scheduler(
         # policy toward PP permanently and starve decode -- bounded only by the
         # SLO cap. Under-counting merely restores today's behaviour for that
         # request. So a missing extend_range is treated as fully prefilled.
+        resident_tokens = 0
         try:
             running = getattr(self, "running_batch", None)
             for req in list(getattr(running, "reqs", None) or ()):
@@ -14625,15 +14698,32 @@ class Scheduler(
                     continue  # already priced by the chunked term above
                 if id(req) in _queued_ids:
                     continue  # #731: the waiting-queue term already billed it
+                if id(req) in _inflight_ids:
+                    continue  # #1173: the in-flight term already billed it
                 if _excluded(req):
                     continue  # health probe: never an economy term
                 rng = getattr(req, "extend_range", None)
                 if rng is None:
                     continue
                 total = len(getattr(req, "origin_input_ids", ()) or ())
-                pending += max(0, total - int(rng.end))
+                resident_tokens += max(0, total - int(rng.end))
         except Exception:  # noqa: BLE001 - an observation must not break a round
             pass
+        pending += resident_tokens
+        # #1173: THE ARM MUST BE ABLE TO PRINT THE TERM AND ITS PRODUCER.
+        # weg1b4 armed on "0 tok remaining" while the ring held 5739 launched
+        # tokens, and the log could not say which term had answered. Recorded
+        # as a side effect of the reading the verdict already uses, so the
+        # decision and its breakdown cannot come from two different calls
+        # (#713's rule). Read immediately by `maybe_arm_phase_policy`.
+        self._pending_prefill_terms = (
+            f"queue={sum(uncached_prompt_tokens(r) for r in queued if not _excluded(r))} "
+            f"inflight={inflight_tokens} chunked={chunked_tokens} "
+            f"arriving={arriving_tokens} resident={resident_tokens} "
+            f"total={pending} "
+            f"(producer Scheduler._pending_prefill_tokens, "
+            f"include_health={include_health})"
+        )
         return pending
 
     def maybe_arm_phase_policy(self, inflight_reqs=None):
@@ -14729,6 +14819,11 @@ class Scheduler(
         _pending_now = self._pending_prefill_tokens(
             inflight_reqs, include_health=False
         )
+        # #1173: THE BREAKDOWN OF THE READING THE VERDICT USES, captured
+        # HERE and not later -- the #887 grant probe below calls the same
+        # accessor with include_health=True and would overwrite the record.
+        # One read, one breakdown, one message (#713's rule).
+        _pending_terms_now = str(getattr(self, "_pending_prefill_terms", "") or "")
         # W32: SEAM TRANSPORT IS NOT PENDING PP WORK, AND THE POLICY MUST READ
         # THE SAME AUTHORITY THE PURITY GATE DOES.
         #
@@ -14813,6 +14908,18 @@ class Scheduler(
         # leaves TP. Past the drain-stall deadline the credit lapses, the
         # demand fires, and the work goes to PP exactly as it does today --
         # one bounded delay, never a wedge.
+        # #1173: the witness STATE census beside the serviceable token count.
+        # The hold line must not read "verified on the store witness" when the
+        # verified state was `bounded` (no prefetch could exist by
+        # construction) -- that is a bounded recompute, not a loaded read.
+        _seam_witness_states_now = ""
+        try:
+            if _seam_transport_now > 0 and _in_tp_now:
+                from sglang.srt.managers.phase_purity import store_witness_census
+
+                _seam_witness_states_now = str(store_witness_census(self) or "")
+        except Exception:  # noqa: BLE001 - a census never breaks arming
+            _seam_witness_states_now = "UNREADABLE"
         _seam_serviceable_now = 0
         if _seam_transport_now > 0 and _in_tp_now:
             # #869c: the SAME premise reading the deduction above used. It was
@@ -15067,6 +15174,11 @@ class Scheduler(
             # break-even N is denominated in: prompt tokens admitted but
             # not yet computed.
             pending_prefill_tokens=_pending_now,
+            # #1173: reported beside the number so a pp-exit arm can name
+            # the term that answered -- including the in-flight microbatch
+            # term whose absence armed weg1b4's fatal flip.
+            pending_prefill_terms=_pending_terms_now,
+            seam_witness_states=_seam_witness_states_now,
             # #861c: the EXISTENCE number beside the ECONOMICS one. Computed
             # here, from the same replicated waiting queue, so both fields of
             # the snapshot are rank-identical by the same argument.

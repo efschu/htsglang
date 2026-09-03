@@ -1197,6 +1197,13 @@ def _pp_ring_commit_peer_statement(holder, chan: str) -> str:
 #: ``pp_proxy_stamp_epoch``.
 PP_PROXY_STAMP_EPOCH_INDEX = 3
 
+#: Positions of the launcher's forward counter and of the ``_999_geom`` row
+#: triple ``(rid, start, end)`` inside the same stamp, both appended after the
+#: epoch by ``_pp_proxy_stamp``. Read defensively: an older sender's stamp is
+#: shorter, and every reader here degrades to "unknown" rather than refusing.
+PP_PROXY_STAMP_FWD_CT_INDEX = 4
+PP_PROXY_STAMP_ROW_INDEX = 5
+
 
 def _999_geom(scheduler, mb_id: int):
     """#999: (rid8, extend_start, extend_end) of the batch this proxy is built
@@ -6136,7 +6143,90 @@ class SchedulerPPMixin:
         mbs = getattr(self, "mbs", None)
         if not mbs:
             return False
-        return all(mb is None for mb in mbs)
+        if not all(mb is None for mb in mbs):
+            return False
+        # #1173 D2b: A STASHED FRAME IS A LAUNCHED PASS, AND THE ARM DOES NOT
+        # OWN IT. The hold above freezes `mb_id`, which is correct while the
+        # ring is genuinely empty -- but a proxy frame sitting in the typed
+        # inbox names a pass PP0 LAUNCHED BEFORE THE ARM, and its named slot
+        # is only reached by advancing `mb_id`. Freezing here strands it: the
+        # follower spins on one slot for ever (the `#1000 SLOT-OCCUPANT
+        # no-statement` shape of #1153) while the launcher waits on an output
+        # that will never be produced. So while a frame is stashed the hold is
+        # RELEASED and the loop walks the ring to the slot the frame names,
+        # where the ordinary row-authority receive consumes it.
+        return not self._pp_flip_stashed_frame_forces_advance(len(mbs))
+
+    def _pp_flip_stashed_frame_forces_advance(self: Scheduler, ring: int) -> bool:
+        """#1173 D2b: is a launched pass's frame waiting in the typed inbox?
+
+        Reads the inbox ONLY -- never the "provably in flight" counter half of
+        ``_pp_row_any_proxy_signal``. A frame still in transit would otherwise
+        read as present on every one of the ~8 kHz armed spin iterations and
+        turn the bound below into a false STOP; a frame that has actually
+        landed is a frame the loop can reach by advancing.
+
+        THE BOUND IS A GROUP STOP, NOT A PARK (the #1153 mechanism, kept):
+        with the hold released the loop reaches any named slot within one ring
+        of advances, so a frame that survives roughly two rings has named a
+        slot this rank cannot execute under the arm. That is a rank
+        disagreement about what was launched, and the standing law is
+        crash/stop, never compensation -- the launcher learns through the
+        group instead of blocking for ever on an output nobody will send.
+        """
+        try:
+            src = resolve_src(self.pp_group, None)
+            q = typed_inbox(self.pp_group).get((src, "proxy"))
+        except Exception:  # noqa: BLE001 - an unreadable inbox never holds
+            self._1173_held_frame_visits = 0
+            return False
+        if not q:
+            self._1173_held_frame_visits = 0
+            return False
+        n = getattr(self, "_1173_held_frame_visits", 0) + 1
+        self._1173_held_frame_visits = n
+        bound = 2 * max(1, int(ring)) + 2
+        if n > bound:
+            head = q[0]
+            stamp = head.get("__stamp__") if isinstance(head, dict) else None
+            slot = -1
+            rid = "unknown"
+            try:
+                slot = int(stamp[0])
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                rid = str(stamp[PP_PROXY_STAMP_ROW_INDEX][0])
+            except Exception:  # noqa: BLE001
+                pass
+            fwd_ct = int(getattr(self, "forward_ct", -1))
+            try:
+                fwd_ct = int(stamp[PP_PROXY_STAMP_FWD_CT_INDEX])
+            except Exception:  # noqa: BLE001 - fall back to this rank's count
+                pass
+            try:
+                epoch = int(pp_proxy_stamp_epoch(stamp) or -1)
+            except Exception:  # noqa: BLE001
+                epoch = -1
+            self._1173_held_frame_visits = 0
+            raise RuntimeError(
+                "#1173 LAUNCHED PASS UNEXECUTED UNDER ARM STOP rank=%d "
+                "slot=%d fwd_ct=%d rid=%s arm_epoch=%d reason=%s"
+                % (
+                    int(getattr(self.ps, "pp_rank", -1)),
+                    slot,
+                    fwd_ct,
+                    rid,
+                    epoch,
+                    (
+                        "a proxy frame for a launched pass stayed in the typed "
+                        "inbox for %d armed iterations (bound %d = two rings of "
+                        "%d slots); the arm cannot execute it and the launcher "
+                        "would wait for ever" % (n, bound, int(ring))
+                    ),
+                )
+            )
+        return True
 
     def _pp_flip_bump_sent(self: Scheduler, chan: str) -> None:
         counters = getattr(self, "pp_flip_counters", None)

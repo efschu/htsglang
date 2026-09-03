@@ -1515,6 +1515,39 @@ def assert_store_witness_at_admission(req, outcome, tree=None) -> None:
     _witness_from_outcome(req, outcome, stamp, _store_witness_allowance(tree))
 
 
+def store_witness_census(scheduler) -> str:
+    """#1173: WHICH witness state each seam re-admission candidate carries.
+
+    The #861j hold line said "premise verified on the STORE WITNESS" and
+    stopped there. `store_witness` admits the premise on THREE states, and
+    they are not the same claim: `hit` means the read-through actually
+    loaded the prefix, `pending` means a registered prefetch has not
+    terminated, and `bounded` means NO prefetch could be registered at all
+    because the prompt is below the store's threshold -- a recompute the
+    one-chunk allowance covers, never a store read. weg1b4 printed the same
+    sentence for both (log 2497 against 2529), so a reader could not tell a
+    served prefix from a sub-threshold recompute.
+
+    Reported only: this NEVER decides. It reads the same candidates and the
+    same predicate `seam_transport_premise_holds` uses, so the census and
+    the verdict cannot disagree about the population.
+    """
+    try:
+        reqs = seam_readmit_candidates(scheduler)
+    except Exception:  # noqa: BLE001 - a census never breaks the policy
+        return "UNREADABLE (candidate enumeration failed)"
+    if not reqs:
+        return "none (no seam re-admission candidates)"
+    counts: dict = {}
+    for req in reqs:
+        try:
+            state = str(store_witness(scheduler, req))
+        except Exception:  # noqa: BLE001 - a census never breaks the policy
+            state = "UNREADABLE"
+        counts[state] = counts.get(state, 0) + 1
+    return " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+
+
 def seam_transport_premise_holds(scheduler) -> bool:
     """Is the re-admission actually a RESTORE? Checked, not asserted. #861d.
 

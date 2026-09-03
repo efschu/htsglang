@@ -292,6 +292,16 @@ class _Rank:
     def _pp_recv_proxy_tensors(self, mb_id):
         return None
 
+    #: #1173 D2b: the hold now asks whether a launched pass's proxy frame is
+    #: waiting in the typed inbox, because a frame the arm cannot execute is a
+    #: pass its launcher waits for for ever. This double carries the real mixin
+    #: helper; it has no ``pp_group``, so the inbox read raises inside the
+    #: helper's own guard and the answer is the honest "no frame is waiting" --
+    #: which is exactly the state the predicate cases below describe.
+    _pp_flip_stashed_frame_forces_advance = (
+        SchedulerPPMixin._pp_flip_stashed_frame_forces_advance
+    )
+
     def _pp_commit_send_output_work_and_preprocess_output_tensors(self, a, b):
         return None, None, _Event()
 
@@ -362,7 +372,34 @@ def _predicate_rank(**over):
 
 
 def test_holds_when_armed_and_every_slot_is_drained():
+    """NARROWED by #1173 D2b, not withdrawn.
+
+    The original claim was "armed plus every slot drained implies hold". That
+    is still the answer here, but it is no longer the whole predicate: a
+    drained ring whose typed inbox still holds a proxy frame belongs to a pass
+    PP0 already launched, and the arm does not own it. This rank has no
+    readable inbox, so no frame is waiting and the hold stands. The release
+    case is pinned directly below.
+    """
     assert _predicate_rank()._pp_flip_hold_slot() is True
+
+
+def test_does_not_hold_while_a_launched_passs_frame_is_stashed(monkeypatch):
+    """#1173 D2b: followers execute what PP0 launched, arm or not.
+
+    A drained ring is NOT quiescent while a frame for a launched pass sits in
+    the typed inbox. Holding there parks the follower on an order it cannot
+    obey while the launcher waits for a frame that never comes -- the #1153
+    starvation shape. So the hold releases and the loop walks the ring to the
+    slot the frame names.
+    """
+    import sglang.srt.managers.scheduler_pp_mixin as ppm
+
+    r = _predicate_rank()
+    r.pp_group = object()
+    monkeypatch.setattr(ppm, "resolve_src", lambda group, x: 2)
+    monkeypatch.setattr(ppm, "typed_inbox", lambda group: {(2, "proxy"): [{}]})
+    assert r._pp_flip_hold_slot() is False
 
 
 def test_does_not_hold_when_no_flip_is_armed():

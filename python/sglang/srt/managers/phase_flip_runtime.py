@@ -691,6 +691,33 @@ def _flip_can_bootstrap_draft(scheduler) -> bool:
 
 
 
+def build_launched_passes_fn(scheduler) -> Callable[[], Tuple[Sequence[int], int]]:
+    """#1173: which microbatch slots hold a pass THIS rank launched and owes.
+
+    Returns ``(sorted outstanding slot ids, forward_ct)``. The set is
+    ``Scheduler._pp_launched_pending``, which the mixin adds to immediately
+    before ``_pp_launch_batch`` and discards where the slot's result is
+    processed -- i.e. exactly "launched and not yet returned". Reusing it
+    rather than deriving a second notion is the point: the #1020 void guard
+    already refuses to null a slot on this same authority, so the arm and
+    the guard cannot disagree about what is outstanding.
+
+    An empty set on a rank with no PP ring (no attribute) reads as "nothing
+    outstanding", which is the truth there and reproduces the pre-#1173
+    arming behaviour byte for byte.
+    """
+
+    def _launched() -> Tuple[Sequence[int], int]:
+        pending = getattr(scheduler, "_pp_launched_pending", None) or ()
+        try:
+            fwd_ct = int(getattr(scheduler, "forward_ct", -1))
+        except Exception:  # noqa: BLE001 - a probe never breaks the arm
+            fwd_ct = -1
+        return sorted(int(i) for i in pending), fwd_ct
+
+    return _launched
+
+
 def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
     """The flip ready predicate (DESIGN_631 3.5) -- NOT #297 fully-idle.
 
@@ -828,7 +855,22 @@ def build_flip_quiescence_fn(scheduler) -> Callable[[], bool]:
                 i for i, mb in enumerate(mbs) if mb is not None and not mb.is_empty()
             ]
             if live:
-                return f"PP microbatches still in flight (mb slots {live})"
+                # #1173: UNREACHABLE ON PP0 FOR A PASS PP0 ITSELF LAUNCHED.
+                # `arm()` now DEFERS while `_pp_launched_pending` is non-empty
+                # (see the ARM DEFERRED line), so on the request-origin rank
+                # this hold can no longer be entered for the weg1b4 cause.
+                # It is NOT deleted, and the two survivors are named because a
+                # reader must be able to tell them apart: (a) a FOLLOWER, which
+                # takes the arm as an order and may legitimately still hold an
+                # in-flight slot, and (b) a pass launched between PP0's
+                # deferral check and the order reaching this rank. Both drain
+                # on their own; neither is the launch-and-arm race.
+                return (
+                    f"PP microbatches still in flight (mb slots {live}); "
+                    f"#1173: on PP0 this is unreachable for a pass PP0 itself "
+                    f"launched -- arm() defers instead -- so this is a "
+                    f"follower state or a pass launched around the order"
+                )
         # #631: SPECULATION AND THE CARRIED REQUEST.
         #
         # A request that prefills in the PP phase has NO DRAFT STATE: the
@@ -3859,6 +3901,12 @@ def build_phase_flip_runtime(scheduler) -> PhaseFlipRuntime:
         tp_pool_view=tp_view,
         live_slots_fn=build_flip_live_slots_fn(scheduler),
         ready_fn=build_flip_quiescence_fn(scheduler),
+        # #1173: the arm PRECONDITION. Reads the scheduler's own launch
+        # bookkeeping (`_pp_launched_pending`, written at the launch site in
+        # scheduler_pp_mixin and discarded where the slot's result is
+        # consumed) -- no second ledger, and the same set the #1020 void
+        # guard already trusts.
+        launched_passes_fn=build_launched_passes_fn(scheduler),
         cutover_fn=build_production_flip_cutover(
             scheduler, reduce_fn=flip_collective_min
         ),
@@ -4298,6 +4346,9 @@ class PhaseFlipRuntime:
         tp_pool_view: Optional[KvPoolView] = None,
         live_slots_fn: Optional[Callable[[], torch.Tensor]] = None,
         ready_fn: Optional[Callable[[], bool]] = None,
+        # #1173: () -> (outstanding microbatch slots, this rank's forward
+        # count). PP0's arm PRECONDITION, not a post-arm hold: see `arm`.
+        launched_passes_fn: Optional[Callable[[], Tuple[Sequence[int], int]]] = None,
         cutover_fn: Optional[Callable[[str], None]] = None,
         pre_cutover_fns: Sequence[Callable[[str], None]] = (),
         pre_write_fns: Sequence[Callable[[str], None]] = (),
@@ -4524,6 +4575,10 @@ class PhaseFlipRuntime:
         self._tp = tp_pool_view
         self._live_slots_fn = live_slots_fn
         self._ready_fn = ready_fn
+        self._launched_passes_fn = launched_passes_fn
+        #: #1173: DEFERRED arms, so "the arm never fired" and "the arm was
+        #: deferred while the ring drained" can never read alike.
+        self.arm_deferred_launched = 0
         self._cutover_fn = cutover_fn
         self._pre_cutover_fns = tuple(pre_cutover_fns)
         # #631: run at the read/write seam, where the source pool is fully
@@ -5158,6 +5213,54 @@ class PhaseFlipRuntime:
                 direction,
                 source,
             )
+        # #1173: QUIESCENCE IS A PRECONDITION OF THE ARM, NOT A HOLD AFTER IT.
+        #
+        # MEASURED (boot_855_weg1b4_f58a71bde0_0903_080200.log). PP0 posted
+        # forwarded pass fwd_ct=81 into slot 1 at 08:06:50 (`#631 PROXY-SEND
+        # t6`, log 82144) and armed pp_to_tp on the NEXT line (82145). It then
+        # detected its own non-quiescence and only LOGGED it -- "armed
+        # (pp_to_tp) but NOT QUIESCENT: PP microbatches still in flight (mb
+        # slots [0, 1])" (82182) -- and waited for a drain that only the
+        # followers could produce, while the arm is exactly what stops them
+        # producing it. PP0 then blocked 60 s in `recv_object[src=2]` and the
+        # group died (#980 at 90592).
+        #
+        # A POST-ARM HOLD CANNOT CLOSE THIS. By the time the hold fires the
+        # order has already travelled to the followers (`_arm_as_follower`),
+        # so the state it is holding for is one the arm itself created. The
+        # only place the launch can still be waited out for free is BEFORE
+        # `_pending` is set: nothing is armed, no rank has entered the seam,
+        # and the ranks cannot disagree about whether this attempt happened --
+        # the #485 argument for declining here, applied unchanged.
+        #
+        # RANK 0 ONLY, by construction: followers returned at the top of this
+        # method (#969 W3, an arm below rank 0 is an ORDER, not a proposal).
+        # So this adds no rank-local verdict and no new synchronisation point.
+        #
+        # DEFERRED, NOT REFUSED FOR GOOD. The policy re-evaluates every round;
+        # a launched pass returns in one or two passes, and the next arm goes
+        # through. The counter beside the line is what makes "deferred" and
+        # "never asked" distinguishable in a log.
+        if self._launched_passes_fn is not None:
+            try:
+                _slots, _fwd_ct = self._launched_passes_fn()
+                _outstanding = [int(i) for i in (_slots or ())]
+            except Exception:  # noqa: BLE001 - an unreadable probe never arms
+                _outstanding, _fwd_ct = [], -1
+            if _outstanding:
+                self.arm_deferred_launched += 1
+                msg = (
+                    f"#1173 ARM DEFERRED: launched passes outstanding "
+                    f"slots={_outstanding} fwd_ct={_fwd_ct} "
+                    f"direction={direction} deferrals={self.arm_deferred_launched}. "
+                    f"PP0 launched forwarded work the ring has not returned; "
+                    f"arming now would stop the followers executing it and "
+                    f"then wait for a drain only they can produce (weg1b4). "
+                    f"The policy re-evaluates every round -- this is a "
+                    f"deferral, not a refusal."
+                )
+                logger.warning("%s %s", LOG_PREFIX, msg)
+                return False, msg
         # #662-F4 / A0: SPILL for the arming floor here, where relief is still
         # free -- nothing is armed, no rank has entered the seam, and the
         # staged fund does not exist yet to be pulled out from under.
