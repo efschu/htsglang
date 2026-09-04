@@ -31,6 +31,58 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+# ---- #924D: the per-request slot trail that decides #1190 ----------------
+#
+# #1190 is "a long-context probe answered with an OLDER probe's answer" (O-1
+# FAIL on boots 8 and 10). Two carriers can produce it and the boot logs cannot
+# tell them apart: mamba slot ALIASING (#924 -- the tree resumes from a slot
+# alloc() has already handed to somebody else) or a host backup filed under the
+# wrong key. The discriminator is the slot ID, printed once per request at each
+# station of its state's life. If the B probe's decode slot equals the slot
+# A1's tree node still names, #1190 IS the #924 sibling; if it does not, #1190
+# is a separate carrier and stays open.
+#
+# BOUNDED BY CONSTRUCTION -- per (rid, station), never per step, with a global
+# cap. The denominator is printed with the cap line so a missing rid can never
+# be read as "that station was not reached".
+_924D_SEEN: set = set()
+_924D_CAP = 8192
+_924D_SUPPRESSED = 0
+
+
+def note_924d(station: str, *, rid=None, slot=None, node_id=None, extra: str = "") -> None:
+    """One ``#924D`` line per (rid, station). Never raises."""
+    global _924D_SUPPRESSED
+    try:
+        key = (str(rid)[:12], station)
+        if key in _924D_SEEN:
+            return
+        if len(_924D_SEEN) >= _924D_CAP:
+            _924D_SUPPRESSED += 1
+            if _924D_SUPPRESSED in (1, 100) or _924D_SUPPRESSED % 10000 == 0:
+                logger.warning(
+                    "#924D CAP REACHED: %d station event(s) suppressed after "
+                    "%d distinct (rid, station) pairs. Absence of a rid below "
+                    "this line is the cap, not the station.",
+                    _924D_SUPPRESSED,
+                    _924D_CAP,
+                )
+            return
+        _924D_SEEN.add(key)
+        if slot is not None and hasattr(slot, "reshape"):
+            slot = [int(x) for x in slot.reshape(-1).tolist()]
+        logger.info(
+            "#924D station=%s rid=%s mamba_slot=%s node=%s%s",
+            station,
+            key[0],
+            slot,
+            node_id,
+            f" {extra}" if extra else "",
+        )
+    except Exception:  # noqa: BLE001 - an instrument may never break the pool
+        pass
+
+
 class MambaSlotDoubleFree(RuntimeError):
     """A Mamba state slot was returned to the free list twice.
 

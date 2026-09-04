@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     zero_match_result,
 )
+from sglang.srt.mem_cache.allocator.mamba import note_924d
 from sglang.srt.mem_cache.common import peer_needs_mamba_evict
 from sglang.srt.mem_cache.mamba_state_pool import (
     active_mamba_state_pool,
@@ -1353,6 +1354,12 @@ class MambaComponent(TreeComponent):
                 logger.warning("#969H BACKUP PROBE RAISED", exc_info=True)
             if cd.value is None:
                 return None
+            note_924d(
+                "backup",
+                rid=getattr(req, "rid", None),
+                slot=cd.value,
+                node_id=getattr(node, "id", None),
+            )
             return [
                 PoolTransfer(
                     name=PoolName.MAMBA,
@@ -1424,6 +1431,16 @@ class MambaComponent(TreeComponent):
                 and cd.host_value is not None
                 and req.mamba_pool_idx is not None
             ):
+                note_924d(
+                    "load_back",
+                    rid=getattr(req, "rid", None),
+                    slot=req.mamba_pool_idx.unsqueeze(0),
+                    node_id=getattr(node, "id", None),
+                    extra=(
+                        "H->D COW target; node anchor="
+                        f"{None if cd.value is None else [int(x) for x in cd.value.reshape(-1).tolist()]}"
+                    ),
+                )
                 transfers.append(
                     PoolTransfer(
                         name=PoolName.MAMBA,

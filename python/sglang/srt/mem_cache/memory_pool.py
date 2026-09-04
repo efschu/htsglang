@@ -54,7 +54,7 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator, note_924d
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
@@ -2092,6 +2092,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     return None
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
+                note_924d("alloc", rid=getattr(req, "rid", None), slot=mid)
                 # #991: batch-owned from birth; `_rollback_alloc` is the only
                 # give-back this slot has, and it is this call's own.
                 req.mamba_slot_acquired_this_admission = False
@@ -2351,6 +2352,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         mamba_index = req.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
+        note_924d(
+            "free",
+            rid=getattr(req, "rid", None),
+            slot=mamba_index.unsqueeze(0),
+            node_id=getattr(getattr(req, "last_node", None), "id", None),
+        )
         self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.mamba_pool_idx = None
         # #991: the stamp describes the slot, so it dies with it.
@@ -2434,6 +2441,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
             "active slot must still be freed."
         )
         assert req.mamba_pool_idx is not None, "relinquish? mamba_index is None"
+        note_924d(
+            "relinquish",
+            rid=getattr(req, "rid", None),
+            slot=req.mamba_pool_idx.unsqueeze(0),
+            node_id=getattr(getattr(req, "last_node", None), "id", None),
+            extra="tree took the request's own slot as the node anchor",
+        )
         req.mamba_pool_idx = None
         # #991: the stamp describes the slot, so it dies with it.
         req.mamba_slot_acquired_this_admission = False

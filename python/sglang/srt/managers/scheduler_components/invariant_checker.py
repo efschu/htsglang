@@ -437,6 +437,42 @@ class SchedulerInvariantChecker:
             # #767 direction. So the check stays fatal here even when the sums
             # now close, and it says WHICH ids.
             leak = True
+        # #924 NAMED STOP: A NEGATIVE MAMBA OCCUPANCY IS ALIASING, NOT NOISE.
+        #
+        # ``mamba_num_used = pool.size - (available + evictable)``
+        # (pool_stats_observer.py). It goes negative exactly when a slot is on
+        # the free list AND held by a tree node -- one slot counted twice on
+        # the credit side. Boot 10 printed that reading FIVE times over eight
+        # minutes (`mamba usage: -0.10 ... -0.30`, first at 21:21:20Z) and
+        # nothing acted on it; the instance died at 21:29:28Z on the
+        # ``free_and_cached`` term of this very check, at the first idle
+        # moment. The signal was rank-uniform and trivially derivable the whole
+        # time.
+        #
+        # DERIVED HERE RATHER THAN LATCHED AT THE BATCH LINE, and that is the
+        # #969 §W3 rule, not laziness: a raise on a batch line fires inside the
+        # no-return region between collectives, on whichever rank notices
+        # first. ``on_idle`` runs on every rank with nothing in flight, which
+        # is where a divergence may become a crash. The cost is the delay --
+        # bounded by the next idle -- and it is paid deliberately.
+        #
+        # SECOND TERM, cheap and independent: a free list LONGER than the pool
+        # is unrepresentable in a sound allocator and is what a duplicate-free
+        # looks like on an allocator whose free set is not a set.
+        alloc_for_span = self.req_to_token_pool.mamba_allocator
+        pool_size = self.req_to_token_pool.mamba_pool.size
+        num_used = pool_size - (ps.mamba_available_size + ps.mamba_evictable_size)
+        free_span = int(getattr(alloc_for_span, "size", pool_size) or pool_size)
+        if num_used < 0 or ps.mamba_available_size > free_span:
+            leak = True
+            msg += (
+                f", #924 MAMBA SLOT ALIASING: mamba_num_used={num_used}"
+                f" (pool_size={pool_size} - available={ps.mamba_available_size}"
+                f" - evictable={ps.mamba_evictable_size}), allocator_size="
+                f"{free_span}. A negative occupancy means one slot is counted"
+                " on both credit sides -- free AND tree-held -- so alloc()"
+                " hands a live anchor's GDN state to the next request"
+            )
         if leak:
             # Page-level leak diagnosis for mamba
             free_full_pages = set(

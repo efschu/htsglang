@@ -4080,6 +4080,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         clear_tensors = []
         for req in reqs:
             if req.mamba_cow_src_index is not None:
+                # #924D: the state this request will DECODE from, named once
+                # per rid at the moment it is established. `src` is the tree
+                # anchor's slot, `dst` this request's own -- if a later probe's
+                # dst equals a slot some node still names, #1190 is #924.
+                from sglang.srt.mem_cache.allocator.mamba import note_924d
+
+                note_924d(
+                    "first_state",
+                    rid=getattr(req, "rid", None),
+                    slot=req.mamba_pool_idx.unsqueeze(0),
+                    node_id=getattr(getattr(req, "last_node", None), "id", None),
+                    extra=(
+                        "cow_src="
+                        f"{[int(x) for x in req.mamba_cow_src_index.reshape(-1).tolist()]}"
+                    ),
+                )
                 cow_src_tensors.append(req.mamba_cow_src_index)
                 cow_dst_tensors.append(req.mamba_pool_idx.unsqueeze(0))
                 req.mamba_cow_src_index = None

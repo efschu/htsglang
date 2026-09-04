@@ -6066,19 +6066,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # a dict -- a `.get` here would raise on every drop. Membership is
         # asked of `tree_components`, which is fixed at construction.
         has_mamba = ComponentType.MAMBA in self.tree_components
-        full_vals = []
-        mamba_vals = []
+        # #924 SIBLING: THE NODE IS CARRIED BESIDE ITS VALUE, because the value
+        # alone cannot be disowned. See `_disown_reclaimed_value`.
+        full_vals: list[tuple[UnifiedTreeNode, Any]] = []
+        mamba_vals: list[tuple[UnifiedTreeNode, Any]] = []
         for node in nodes:
             val = getattr(node.component_data[BASE_COMPONENT_TYPE], "value", None)
             if val is not None and len(val) > 0:
-                full_vals.append(val)
+                full_vals.append((node, val))
             if has_mamba:
                 mval = getattr(node.component_data[ComponentType.MAMBA], "value", None)
                 if mval is not None and len(mval) > 0:
-                    mamba_vals.append(mval)
+                    mamba_vals.append((node, mval))
 
-        out["full_held"] = int(sum(len(v) for v in full_vals))
-        out["mamba_held"] = int(sum(len(v) for v in mamba_vals))
+        out["full_held"] = int(sum(len(v) for _, v in full_vals))
+        out["mamba_held"] = int(sum(len(v) for _, v in mamba_vals))
         if not full_vals and not mamba_vals:
             out["reclaimed"] = True
             out["reason"] = "tree held nothing"
@@ -6110,7 +6112,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 already = reading.rows
                 keep = []
                 dup = 0
-                for v in full_vals:
+                for _node, v in full_vals:
                     sel = [int(x) for x in v.tolist()] if hasattr(v, "tolist") else list(v)
                     fresh = [x for x in sel if x not in already]
                     dup += len(sel) - len(fresh)
@@ -6135,6 +6137,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     merged = torch.cat(keep)
                     full_comp._free_full(merged)
                     out["full_rows"] = int(merged.numel())
+                # #924 SIBLING, FULL HALF. The rows are back on the free list;
+                # the nodes must stop naming them in the same statement, or the
+                # tree and the allocator both own them until `reset()` runs.
+                for node, _v in full_vals:
+                    self._disown_reclaimed_value(node, BASE_COMPONENT_TYPE)
             except Exception as exc:  # noqa: BLE001 - never abort a flip
                 # THE MESSAGE, NOT JUST THE TYPE. The first version printed
                 # `RuntimeError` and nothing else, which named the failure and
@@ -6196,7 +6203,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             else:
                 dup = 0
                 failed = 0
-                for mval in mamba_vals:
+                for node, mval in mamba_vals:
                     try:
                         sel = (
                             [int(x) for x in mval.reshape(-1).tolist()]
@@ -6207,6 +6214,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         fresh = [s for s in sel if 0 <= s < n and bool(ledger[s])]
                         dup += len(sel) - len(fresh)
                         if not fresh:
+                            # Already free -- and the node STILL NAMES IT. That
+                            # is the aliasing this pass must end, not a reason
+                            # to leave the reference standing.
+                            self._disown_reclaimed_value(node, ComponentType.MAMBA)
                             continue
                         mamba_comp._free_mamba_value(
                             torch.tensor(
@@ -6216,6 +6227,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                             )
                         )
                         out["mamba_slots"] += len(fresh)
+                        # #924 SIBLING, THE ROOT OF BOOT 10 (weg1b10, 21:29:28Z,
+                        # all three ranks). The slot is on the free list from
+                        # the line above; without this the node goes on holding
+                        # it as a resume anchor, and `alloc()` hands the same
+                        # GDN state to the next request while the tree resumes
+                        # from it. Measured at the desk against this very
+                        # function: available=20 evictable=4 free_and_cached=4
+                        # free_list_duplicates=0 on a 20-slot pool -- the exact
+                        # ledger line the boot died on.
+                        self._disown_reclaimed_value(node, ComponentType.MAMBA)
                     except Exception as exc:  # noqa: BLE001 - may not break a flip
                         # NO SILENT `continue` ON THIS PATH. The version this
                         # replaces swallowed every per-slot failure without a
@@ -6253,6 +6274,71 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         out["reclaimed"] = True
         return out
+
+    def _disown_reclaimed_value(self, node: UnifiedTreeNode, ct) -> None:
+        """The node stops naming rows/slots this reclaim just returned.
+
+        #924 SIBLING FORM, and it is the half `reclaim_rows_for_drop` did not
+        have. The named #924 guard catches a slot returned TWICE (a duplicate
+        in the free list, `allocator/mamba.py:_refuse_double_free`). It cannot
+        see the shape this closes, because nothing is returned twice: the slot
+        is returned ONCE and the tree node goes on referencing it. The free
+        list and the radix tree then both own it, `alloc()` hands it to the
+        next request, and the tree keeps offering it as a resume anchor -- one
+        GDN state read by two requests, which is a wrong answer that never
+        raises.
+
+        MEASURED, boot 10 (`boot_855_weg1b10_2126a4a1d2_0904_211702.log`,
+        21:29:28Z, all three ranks)::
+
+            [mamba] total=20, available=20, evictable=4, withheld=0,
+                    free_list_duplicates=0, duplicate_slot_ids=None,
+                    free_and_cached=4
+
+        and reproduced at the desk against this exact function: after
+        ``reclaim_rows_for_drop`` on a two-request tree the reading is
+        ``available=20 evictable=4 free_and_cached=[1,2,3,4]`` on a 20-slot
+        pool -- the same four terms, including the zero that made the existing
+        guard silent.
+
+        WHY IT IS NOT `evict_component`. That primitive is the ONE owner
+        transfer and it would be the right call -- but it frees BLIND, and this
+        pass exists precisely for nodes whose slot may already be on the free
+        list (the drop's own eviction pass ran first, #1055). So the free stays
+        where it is, differenced against the allocator's ledger, and only the
+        DISOWN half is factored out here -- reproducing what `evict_component`
+        does to the node (null the value, correct the size book, leave the
+        device LRU, join the host LRU if a host copy survives) and nothing it
+        does to the pool.
+
+        PROTECTED VERSUS EVICTABLE: this pass is reached for LOCKED nodes by
+        construction (`evict` refuses them, which is why the drop needs it at
+        all), and a locked node's rows are counted in
+        ``component_protected_size_``. Subtracting them from the evictable book
+        instead would trade one accounting defect for another; the census
+        (`_tree_census`, PART 4 of `sanity_check`) reads both terms and would
+        name it.
+        """
+        cd = node.component_data[ct]
+        value = cd.value
+        if value is None:
+            return
+        n = len(value)
+        if cd.lock_ref > 0:
+            self.component_protected_size_[ct] -= n
+        else:
+            self.component_evictable_size_[ct] -= n
+        cd.value = None
+        lru = self.lru_lists.get(ct)
+        if lru is not None and lru.in_list(node):
+            lru.remove_node(node)
+        host_lru = self.host_lru_lists.get(ct)
+        if (
+            host_lru is not None
+            and cd.host_value is not None
+            and not host_lru.in_list(node)
+        ):
+            host_lru.insert_mru(node)
 
     def _collect_all_nodes(self) -> list[UnifiedTreeNode]:
         nodes = []
