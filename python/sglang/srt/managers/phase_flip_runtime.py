@@ -1199,10 +1199,17 @@ def _live_reqs(scheduler) -> List:
     # per-slot equivalent is `last_mbs[mb_id]`, and a request that has just
     # finished a prefill iteration sits THERE and nowhere else until the next
     # `get_next_batch_to_run` merges it into the running batch. The cutover
-    # guard `orphan_resident_reqs` (phase_flip_resident_carry.py) has always
-    # checked `last_mbs`; this authority did not, so the two disagreed about
-    # what "resident" means and the retraction could not see a request the
-    # guard would then refuse to flip past.
+    # guard `orphan_resident_reqs` checked `last_mbs`; this authority did not,
+    # so the two disagreed about what "resident" means and the retraction
+    # could not see a request the guard would then refuse to flip past.
+    #
+    # #1202: THAT GUARD NO LONGER EXISTS. It lived in
+    # `phase_flip_resident_carry`, which #969 deleted whole (911 LOC; see
+    # scheduler.py:6463), and nothing in this tree defines the name any more.
+    # The paragraph is kept because it records WHY `last_mbs` is a route --
+    # the reason is the container, not the guard -- but it is written in the
+    # past tense, because a comment that cites a module a reader cannot open
+    # costs that reader the same hour twice.
     #
     # W30 arm 2 measured it, all three ranks, 21 s into load:
     #   ResidentCarryError: PHASE-FLIP-CARRY 1 request(s) are reachable only
@@ -1216,6 +1223,22 @@ def _live_reqs(scheduler) -> List:
     # consumers" rule the W27 fix above was built on, which simply stopped one
     # route short.
     for mb in getattr(scheduler, "last_mbs", []) or []:
+        _take(mb)
+    # #1202: `mbs` IS THE THIRD PER-SLOT ARRAY AND IT WAS NOT A ROUTE.
+    #
+    # `scheduler_pp_mixin.py:7556-7561` rebuilds `mbs`, `last_mbs` and
+    # `running_mbs` as THREE DISTINCT arrays, and `mbs` is written
+    # unconditionally on all three planning paths (`:4670`, `:4689`, `:4701`)
+    # -- it is the batch a slot is CURRENTLY planning, which under
+    # `event_loop_pp` is a request that is resident on this rank and in none
+    # of the two arrays above. `scheduler_pp_mixin.py:5122-5127` states the
+    # gap in writing.
+    #
+    # Added HERE for the same reason `last_mbs` was: the route belongs to the
+    # AUTHORITY, never to the consumers. Dedup is by `id()` above, so the
+    # alias case (`scheduler.py:8354-8362`, where `mbs[i]` and
+    # `running_mbs[i]` are the same object) costs exactly nothing.
+    for mb in getattr(scheduler, "mbs", []) or []:
         _take(mb)
     for name in ("running_batch", "last_batch"):
         _take(getattr(scheduler, name, None))
@@ -1233,6 +1256,150 @@ def _live_reqs(scheduler) -> List:
         seen.add(id(chunked))
         out.append(chunked)
     return out
+
+
+def note_armed_residents(snapshot: Dict[int, object], scheduler) -> Dict[int, object]:
+    """Union THIS instant's resident set into the armed-window ledger (#1202).
+
+    THE MEASURED DEFECT THIS EXISTS FOR. Boot 9
+    (boot_855_weg1b9_1116175f6d_0904_164023.log) read, at the arm, on all
+    three ranks::
+
+        log:1883 PP0 at-arm pp_to_tp: cur_slot_reqs=1 ...
+        log:1886 PP1 at-arm pp_to_tp: cur_slot_reqs=1 ...
+        log:1888 PP2 at-arm pp_to_tp: cur_slot_reqs=1 ...
+
+    ``cur_slot_reqs`` IS ``len(_live_reqs(scheduler))`` (see ``_pool_census``),
+    so the flip's residency authority saw one request on every rank. One
+    second later the release ran its OWN ``_live_reqs`` and reported
+    ``1 / 0 / 0`` retracted (log:2203/:2210/:2213), the rows stayed locked
+    (log:2189/:2194, ``67 row(s) still locked after a drop that evicted 0``)
+    and the cutover died at ``ReqPoolRebindRefused: 1 of 8 rows are still
+    held`` (log:2305/:2351). The same authority, the same rank, two answers
+    one second apart, and NOTHING RECONCILED THE TWO.
+
+    THE LEDGER IS CUMULATIVE OVER THE WHOLE ARMED WINDOW, not a pair of
+    readings at two instants. Neither endpoint alone is sufficient: the
+    request that killed boot 9 was visible at the arm and gone at the
+    release, and a request admitted after the arm is visible at the release
+    and absent from the arm. A union over every armed round is the only
+    reading that covers both, and it is cheap -- the walk is the one the
+    census already performs, bounded by the park deadline.
+
+    Deliberately holds STRONG references. A request that has left every
+    container is exactly the one this ledger exists to retract, and a weak
+    reference to it may be gone by the time the seam asks. The ledger is
+    cleared at every exit from the armed state, so it never outlives its
+    flip -- the same discipline ``_parked_extent`` is under (#746 M5).
+
+    Never raises: an instrument at the seam may cost a missing entry, never a
+    flip.
+    """
+    try:
+        for req in _live_reqs(scheduler):
+            snapshot.setdefault(id(req), req)
+    except Exception as exc:  # noqa: BLE001 - a ledger may never break a flip
+        logger.warning(
+            "%s #1202 armed-resident ledger could not be updated (%s); the "
+            "cutover falls back to the release-instant enumeration, which is "
+            "the pre-#1202 behaviour",
+            LOG_PREFIX,
+            exc,
+        )
+    return snapshot
+
+
+def cutover_resident_set(scheduler, armed_snapshot=None):
+    """The set the cutover retracts: live NOW, reconciled with the arm (#1202).
+
+    Returns ``(reqs, report)``. ``reqs`` is the release-instant enumeration
+    followed by every armed-window resident that has since become invisible
+    AND still holds a request-pool row. ``report`` carries the arithmetic so
+    the seam's log line can state what it reconciled instead of asserting it.
+
+    THE FILTER IS THE WHOLE DESIGN, AND IT IS ASYMMETRIC ON PURPOSE.
+
+    Under-retraction and over-retraction are not two sides of one error.
+    Retracting too little leaves a row in the outgoing pool and the cutover
+    STOPS, loudly, at ``phase_req_pool_binding.rebind_req_pool_for_cutover``
+    -- which is what boot 9 did, and a loud stop is recoverable. Retracting
+    too much frees a row its current owner still holds; the pool then hands
+    one row to two requests, they share a ``req_to_token`` row and a mamba
+    mapping entry, and nothing raises. That is a WRONG ANSWER, and this
+    module's standing rule is that a wrong answer is worse than a loud
+    failure. So a snapshot member is carried only when all of the following
+    are true, and is dropped -- counted, never guessed -- otherwise:
+
+    * it names a row at all (``req_pool_idx is not None``);
+    * that row is NOT in the pool's free list. The pool's own free list is
+      the authority on whether the row came back, exactly as it is for
+      ``census_outgoing_req_pool``; a request that finished cleanly between
+      arm and release is already free and must not be freed twice
+      (``ReqToTokenPool.free_slot`` calls that "the row was returned twice");
+    * no request that IS live now names the same row. That is the
+      reallocation case: the snapshot member is a stale object and the row
+      has a new owner, who is enumerated on the live half anyway.
+
+    UNKNOWN IS NOT HELD. When the pool cannot be read -- no pool bound, no
+    readable free list -- nothing is carried from the snapshot and the
+    abstention is counted. Carrying blind would be the over-retraction
+    branch, taken on the strength of a measurement that failed.
+
+    The census at ``_pool_census`` deliberately keeps reporting the RAW
+    authority reading. It is the instrument that made this gap visible, and
+    an instrument that reports the reconciled set can no longer show the
+    divergence it exists to find.
+    """
+    live = list(_live_reqs(scheduler))
+    report = {
+        "live_now": len(live),
+        "from_arm_ledger": 0 if not armed_snapshot else len(armed_snapshot),
+        "carried_from_arm": 0,
+        "carried_rids": [],
+        "skipped_no_row": 0,
+        "skipped_row_free": 0,
+        "skipped_row_reallocated": 0,
+        "skipped_pool_unreadable": 0,
+    }
+    if not armed_snapshot:
+        return live, report
+
+    seen = {id(r) for r in live}
+    live_rows = set()
+    for r in live:
+        idx = getattr(r, "req_pool_idx", None)
+        if idx is not None:
+            live_rows.add(int(idx))
+
+    pool = getattr(scheduler, "req_to_token_pool", None)
+    free_slots = getattr(pool, "free_slots", None)
+    try:
+        free_rows = None if free_slots is None else {int(x) for x in free_slots}
+    except (TypeError, ValueError):
+        free_rows = None
+
+    out = list(live)
+    for req in armed_snapshot.values():
+        if id(req) in seen:
+            continue
+        idx = getattr(req, "req_pool_idx", None)
+        if idx is None:
+            report["skipped_no_row"] += 1
+            continue
+        idx = int(idx)
+        if free_rows is None:
+            report["skipped_pool_unreadable"] += 1
+            continue
+        if idx in free_rows:
+            report["skipped_row_free"] += 1
+            continue
+        if idx in live_rows:
+            report["skipped_row_reallocated"] += 1
+            continue
+        out.append(req)
+        report["carried_from_arm"] += 1
+        report["carried_rids"].append(str(getattr(req, "rid", "?"))[:8])
+    return out, report
 
 
 def seam_probe_reading_age(
@@ -4652,6 +4819,14 @@ class PhaseFlipRuntime:
         #: mutation matrix refuses. Read through ``parked_extent()``, never
         #: directly.
         self._parked_extent: Optional[Tuple[int, int]] = None
+        #: #1202: every request this rank saw resident at ANY point of
+        #: the armed window, keyed by ``id()``. The release reconciles
+        #: its own enumeration against this ledger, because boot 9 proved
+        #: the two are taken at different instants and disagree. Cleared
+        #: at EVERY exit from the armed state, exactly like
+        #: ``_parked_extent`` -- a ledger that outlives its flip would
+        #: hand the NEXT cutover a stale object naming a reused row.
+        self._armed_residents: Dict[int, object] = {}
         #: Flips abandoned because the park deadline expired. A counter, so
         #: "this never happens in practice" stops being an assumption.
         self.park_deadline_aborts = 0
@@ -5497,6 +5672,16 @@ class PhaseFlipRuntime:
         # then the requests are quiescing and an enumeration reports the
         # req_rows=0 blindness #744 exists to defeat.
         self._parked_extent = self._snapshot_parked_extent()
+        # #1202: AND SNAPSHOT WHO IS RESIDENT, not just how wide they are.
+        # `_parked_extent` records the SIZE of the resident set at this
+        # instant; nothing recorded its MEMBERS, so the release one second
+        # later enumerated afresh and retracted a different set (boot 9:
+        # cur_slot_reqs=1 on all three ranks at arm, 1/0/0 retracted at
+        # the release). A fresh arm starts a fresh ledger.
+        self._armed_residents = {}
+        note_armed_residents(
+            self._armed_residents, getattr(self, "_census_scheduler", None)
+        )
         # #631 J: census AT ARM. The pre/post-cutover pair proved the move
         # and the cutover innocent (identical unaccounted set on both
         # sides), and a no-flip control boot stayed clean, so the page goes
@@ -5585,6 +5770,15 @@ class PhaseFlipRuntime:
         # cadence legal for it and illegal for the levelling it was split
         # from. Unchanged by the follower cut.
         pay_deferred_grow(self)
+        # #1202: KEEP THE ARMED-WINDOW RESIDENT LEDGER CURRENT.
+        # Rank-local bookkeeping, no collective, no verdict -- it only
+        # widens the set the release will reconcile against, and a set
+        # that is already whole is unchanged by it. Runs only while a
+        # flip is armed, so it is bounded by the park deadline.
+        if self._pending is not None:
+            note_armed_residents(
+                self._armed_residents, getattr(self, "_census_scheduler", None)
+            )
         if self._rank == 0:
             return self._round_as_decider()
         return self._round_as_follower()
@@ -7320,6 +7514,7 @@ class PhaseFlipRuntime:
         # step the flip ends in, not one round later.
         release_prearm_quiesce(self, "nothing pending")
         self._parked_extent = None  # #746: a snapshot never outlives its flip
+        self._armed_residents = {}  # #1202: nor does the resident ledger
         self._last_hold_reason = None
         self.park_deadline_aborts += 1
         logger.error(
@@ -8786,7 +8981,50 @@ class PhaseFlipRuntime:
             tree_rows["returned"] = reset_tree()
             return tree_rows["returned"]
 
-        reqs = list(_live_reqs(scheduler))
+        # #1202 THE LOAD-BEARING HALF: RETRACT THE SET THE ARM APPROVED.
+        #
+        # This line read `list(_live_reqs(scheduler))` -- an enumeration
+        # taken HERE, one second after the arm read the same authority and
+        # got a different answer on two of three ranks. See
+        # `cutover_resident_set` for the measured evidence and for why the
+        # reconciliation is a FILTER over the armed ledger rather than a
+        # union with it.
+        #
+        # WHY A SNAPSHOT AND NOT A RE-RUN OF THE QUIESCENCE TERM HERE.
+        # This point is past the no-return: `hicache_seam_active` is up,
+        # the device tier is drained, and PP0's PROCEED decision has
+        # already ridden the request stream to every rank. A quiescence
+        # term evaluated here could only produce a rank-local verdict at
+        # the one place no rank may hold an opinion -- precisely the shape
+        # #969 §W3 deleted (`_arm_as_follower`: "a rank-local opinion that
+        # can refuse an arm PP0 accepted is how the ranks end up uneins").
+        # A snapshot is not a verdict: it changes WHAT is retracted, never
+        # WHETHER the group cuts over, and it is inert when the two
+        # readings agree.
+        reqs, reconcile = cutover_resident_set(
+            scheduler, getattr(self, "_armed_residents", None)
+        )
+        if reconcile["carried_from_arm"] or reconcile["skipped_pool_unreadable"]:
+            logger.warning(
+                "%s #1202 ARM/RELEASE RESIDENCY RECONCILED for %s: the "
+                "release-instant enumeration saw %d request(s); the armed "
+                "window saw %d; %d of those had become invisible while "
+                "still holding a request-pool row and are retracted here "
+                "(%s). Dropped as already-returned: %d; as reallocated to "
+                "a live request: %d; as rowless: %d; as unverifiable "
+                "(pool unreadable, never retracted blind): %d.",
+                LOG_PREFIX,
+                direction,
+                reconcile["live_now"],
+                reconcile["from_arm_ledger"],
+                reconcile["carried_from_arm"],
+                reconcile["carried_rids"],
+                reconcile["skipped_row_free"],
+                reconcile["skipped_row_reallocated"],
+                reconcile["skipped_no_row"],
+                reconcile["skipped_pool_unreadable"],
+            )
+        self._last_residency_reconcile = reconcile
         released = release_residents_for_cutover(
             reqs, retract=_retract_and_consume, reset_tree=_drop_and_record
         )
@@ -11353,6 +11591,7 @@ class PhaseFlipRuntime:
             # step the flip ends in, not one round later.
             release_prearm_quiesce(self, "nothing pending")
             self._parked_extent = None  # #746: cleared on EVERY exit
+            self._armed_residents = {}  # #1202: and so is the ledger
             self._last_hold_reason = None
             # Which of the two conditions THIS rank hit, so a boot that is
             # short of staging room is not read as a pool-sizing problem.
@@ -11946,6 +12185,11 @@ class PhaseFlipRuntime:
         # extent has no referent, and a surviving snapshot would pin the
         # rung into the next phase for ever (the M5 failure mode).
         self._parked_extent = None
+        # #1202: the ledger's referents are retracted and their rows are
+        # back in the outgoing pool, so every id in it now names a row the
+        # next phase may legally re-mint. Holding it past the commit is
+        # the M5 failure mode on the request axis.
+        self._armed_residents = {}
         self._epoch += 1
         self.completed += 1
         total_ms = (self._clock() - t0) * 1000.0
