@@ -422,6 +422,50 @@ _PREFETCH_COMPLETION_SLOTS = 4096
 
 
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
+    #: The scheduler, once the phase flip has claimed ownership of the request
+    #: pool (`bind_req_pool_owner`). None on every boot that never flips, which
+    #: is why the property below falls back to the constructor's pool.
+    _req_pool_owner = None
+
+    @property
+    def req_to_token_pool(self):
+        """The OWNER's current request pool, read at use (#1201).
+
+        This was a cached object reference, and it is the same hazard
+        `kv_session_offload.py` names in its own property docstring: the phase
+        flip gives each phase its own ``ReqToTokenPool`` and rebinds the
+        scheduler at every cutover, so a cached reference goes on naming the
+        OUTGOING phase's tensor -- and because both pools hold the same number
+        of rows, the reads in `mem_cache/common.py` (``req_to_token[
+        req.req_pool_idx]`` at the KV free path, the mamba allocator, the
+        `free(req)` return) would land IN RANGE on the wrong pool instead of
+        failing.
+
+        The loud half of that -- returning a row to a pool that already has it
+        free -- is refused by `ReqToTokenPool.free_slot`. The SILENT half is
+        the KV read, whose result goes straight to
+        ``token_to_kv_pool_allocator.free()``. Reading the owner here costs one
+        attribute lookup and cannot go stale.
+        """
+        owner = self._req_pool_owner
+        if owner is not None:
+            return owner.req_to_token_pool
+        return self._req_to_token_pool
+
+    @req_to_token_pool.setter
+    def req_to_token_pool(self, pool) -> None:
+        self._req_to_token_pool = pool
+
+    def bind_req_pool_owner(self, owner) -> None:
+        """Name the object whose request pool is the truth (the scheduler).
+
+        Called at the cutover rather than at construction: the cache is built
+        before the flip stacks exist, and until the first cutover the owner's
+        pool IS the constructor's pool, so an unbound cache is byte-identical
+        to the pre-#1201 behaviour. ``None`` restores that fallback.
+        """
+        self._req_pool_owner = owner
+
     def __init__(
         self,
         params: CacheInitParams,

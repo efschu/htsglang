@@ -228,6 +228,7 @@ def rebind_req_pool_for_cutover(scheduler: Any, phase: str) -> ReqPoolCensus:
     # ReqToTokenPool.alloc instead of landing in range on another row.
     incoming.clear()
     scheduler.req_to_token_pool = incoming
+    _restamp_phase_handles(scheduler, outgoing, incoming)
 
     logger.info(
         REBIND_LOG_FORMAT,
@@ -242,3 +243,103 @@ def rebind_req_pool_for_cutover(scheduler: Any, phase: str) -> ReqPoolCensus:
         },
     )
     return census
+
+
+# ---------------------------------------------------------------------------
+# #1201: the OTHER holders of the request pool.
+# ---------------------------------------------------------------------------
+#
+# The rebind above moves the SCHEDULER's handle. Three more objects cached a
+# reference to the same pool at CONSTRUCTION, and none of them is on any
+# cutover path:
+#
+#   * `UnifiedRadixCache.req_to_token_pool` -- answered by the read-at-use
+#     property on that class; this file only has to name its owner;
+#   * the pool's back-reference to the tree cache (`bind_tree_cache`), whose
+#     only two callers are tree-cache constructors, so the INCOMING pool keeps
+#     `tree_cache = None` for the whole phase. That disarms the evict-then-retry
+#     in `_alloc_mamba_slots_or_evict` and silently reintroduces the #581/#773
+#     regression the comment at `unified_radix_cache.py` was written to close;
+#   * the pool's `layer_transfer_counter` (+ its mamba frame), registered once
+#     by the assembler. A join on a pool nothing re-registered is a join that
+#     never happens -- `_wait_for_mamba_layer` returns silently when the
+#     counter is None.
+#
+# WHY RE-STAMP RATHER THAN REFUSE. The counter's None state is a LEGITIMATE
+# steady state, not a defect: `register_layer_transfer_counter` documents
+# `mamba_transfer_frame=None` as "the historic no-wait behaviour", and
+# `swa_memory_pool` registers None deliberately. So a refusal at the join site
+# would refuse every boot without a hierarchical cache. What is a defect is the
+# handle failing to CROSS the seam, and that is decidable here, where both
+# pools are in hand.
+#
+# The fourth holder, `FutureMap.pool` (built once in `Scheduler.init_overlap`),
+# is NOT handled here and is registered as an open gap in
+# `cutover_participants`.
+
+
+def _restamp_phase_handles(scheduler: Any, outgoing: Any, incoming: Any) -> None:
+    """Re-stamp onto the INCOMING pool every handle the boot stamped once.
+
+    Duck-typed on purpose: `ReqToTokenPool` has neither hook, `HybridReqToTokenPool`
+    has both, and a pool that cannot carry a handle simply does not get one.
+    """
+    tree_cache = getattr(scheduler, "tree_cache", None)
+
+    if tree_cache is not None and hasattr(tree_cache, "bind_req_pool_owner"):
+        tree_cache.bind_req_pool_owner(scheduler)
+
+    if tree_cache is not None and hasattr(incoming, "bind_tree_cache"):
+        incoming.bind_tree_cache(tree_cache)
+
+    counter = getattr(outgoing, "layer_transfer_counter", None)
+    if counter is not None and hasattr(incoming, "register_layer_transfer_counter"):
+        if getattr(incoming, "layer_transfer_counter", None) is None:
+            incoming.register_layer_transfer_counter(
+                counter, getattr(outgoing, "_mamba_transfer_frame", None)
+            )
+
+
+def assert_req_pool_identity(scheduler: Any) -> None:
+    """Every holder names ONE pool after the cutover, or the seam stops.
+
+    Called at the END of the cutover, once, on every rank. It is not a
+    re-implementation of the rebind: the rebind moves what it knows about, and
+    this refuses when something it does NOT know about is still divergent --
+    a fifth holder, a cache rebuilt from the outgoing pool, a hook that was
+    added to one pool type and not the other.
+
+    Loud on purpose. The divergence it looks for does not fail on its own:
+    both pools hold the same number of rows, so a wrong-pool read lands in
+    range and returns another phase's row contents (#1201). A boot that stops
+    here is strictly better than a phase that answers wrongly.
+    """
+    pool = getattr(scheduler, "req_to_token_pool", None)
+    if pool is None:
+        raise ReqPoolRebindRefused(
+            f"{LOG_PREFIX} the scheduler has no request pool after the cutover"
+        )
+
+    tree_cache = getattr(scheduler, "tree_cache", None)
+    if tree_cache is not None:
+        cache_pool = getattr(tree_cache, "req_to_token_pool", None)
+        if cache_pool is not None and cache_pool is not pool:
+            raise ReqPoolRebindRefused(
+                f"{LOG_PREFIX} #1201 the tree cache still names a different "
+                f"request pool than the scheduler after the cutover "
+                f"(cache binding={getattr(cache_pool, 'binding_tag', '<untagged>')}, "
+                f"scheduler binding={getattr(pool, 'binding_tag', '<untagged>')}). "
+                "Both pools hold the same row count, so this does not fail on "
+                "its own: the KV free path would read the wrong pool's rows "
+                "and hand those indices to the allocator."
+            )
+
+        if hasattr(pool, "bind_tree_cache"):
+            back = getattr(pool, "tree_cache", None)
+            if back is not tree_cache:
+                raise ReqPoolRebindRefused(
+                    f"{LOG_PREFIX} #1201 the incoming request pool's tree-cache "
+                    f"back-reference is {back!r}, not the scheduler's tree cache. "
+                    "A REQUIRED mamba allocation on this pool cannot evict "
+                    "cached checkpoints before failing (#581/#773)."
+                )

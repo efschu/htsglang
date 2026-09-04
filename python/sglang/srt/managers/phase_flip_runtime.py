@@ -3767,6 +3767,17 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
                 LOG_PREFIX,
                 e,
             )
+        # #1201: every holder of the request pool must now name ONE pool.
+        # Placed AFTER the HiCache rebind so it sees the settled seam, and
+        # OUTSIDE its try/except for the #1040 reason: a divergent request
+        # handle has no disarmed state. The divergence it looks for cannot
+        # fail on its own -- both phases' pools hold the same row count, so a
+        # wrong-pool read lands in range and returns another phase's rows.
+        from sglang.srt.managers.phase_req_pool_binding import (
+            assert_req_pool_identity,
+        )
+
+        assert_req_pool_identity(scheduler)
         # #1066: the #1025b re-issue that stood here is DELETED. Re-admission
         # itself now runs after this cutover (deferred by
         # `_release_residents_for_cutover`, executed by

@@ -242,6 +242,46 @@ REGISTRY: Tuple[Participant, ...] = (
         found_by="boot",
     ),
     Participant(
+        name="request_pool_phase_ownership",
+        what="the REQUEST-INDEX space: each phase owns its own ReqToTokenPool, "
+        "and the scheduler must be pointed at the incoming one. Both pools "
+        "hold the same row count, so a scheduler left on the outgoing pool "
+        "does not fail -- it reads and writes in range on the wrong rows",
+        hook="sglang.srt.managers.phase_req_pool_binding.rebind_req_pool_for_cutover",
+        probe=LOG + "REQ-POOL REBOUND",
+        ticket="#1040",
+        found_by="boot",
+    ),
+    Participant(
+        name="req_pool_back_references",
+        what="the OTHER holders of that pool -- the tree cache's handle, the "
+        "pool's own tree_cache back-reference and its layer_transfer_counter. "
+        "All three are stamped at CONSTRUCTION and were on no cutover path, "
+        "so from the first flip they named the outgoing phase's pool: the "
+        "cache's KV free path read the wrong tensor (silent), the pool could "
+        "not evict before a REQUIRED mamba alloc (#581/#773 reintroduced), "
+        "and the mamba layer join was on a counter nobody re-registered",
+        hook="sglang.srt.managers.phase_req_pool_binding._restamp_phase_handles",
+        probe="sglang.srt.managers.phase_req_pool_binding.assert_req_pool_identity",
+        ticket="#1201",
+        found_by="desk",
+    ),
+    Participant(
+        name="future_map_req_pool_holder",
+        what="FutureMap caches the request pool OBJECT (overlap_utils.py, "
+        "`pool=req_to_token_pool`), built once in Scheduler.init_overlap and "
+        "never rebuilt. It is the fourth phase-stamped holder and the one "
+        "#1201 did NOT move",
+        hook=None,
+        probe=None,
+        ticket="#1201",
+        gap="no rebind built: the overlap future map is constructed from the "
+        "boot pool and the spec path reads through it, so moving it needs the "
+        "spec half's own arming order settled first. Named here rather than "
+        "left to institutional memory",
+        found_by="desk",
+    ),
+    Participant(
         name="hicache_writeback_fence",
         what="warm prefixes must reach the canonical store BEFORE the seam, "
         "or the next phase cannot read them back",
@@ -317,6 +357,12 @@ MUTATED_STATE = {
     "waiting_queue": ReadWindow.OUTSIDE_CUTOVER,
     "tree_cache": ReadWindow.OUTSIDE_CUTOVER,
     "token_to_kv_pool_allocator": ReadWindow.OUTSIDE_CUTOVER,
+    # #1201. Not a scheduler flag but a HANDLE, and the axis this list was
+    # missing: the ten entries above are quantities the cutover recomputes,
+    # this one is an object the cutover REPLACES. A term that cached it before
+    # the seam is as wrong as a term that reads `running_bs` inside it, and
+    # more quietly -- the replacement has the same row count as the original.
+    "req_to_token_pool": ReadWindow.OUTSIDE_CUTOVER,
     "batch_is_full": ReadWindow.OUTSIDE_CUTOVER,
     "spec_algorithm": ReadWindow.OUTSIDE_CUTOVER,
     "spec_info": ReadWindow.OUTSIDE_CUTOVER,
