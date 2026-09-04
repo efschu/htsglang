@@ -47,9 +47,14 @@ behind `running_batch.is_empty()`.
 
 STRICT PHASE PURITY IS WHAT CREATED THE STATE. Upstream has no lap where a
 slot holds requests and runs nothing, so upstream's placement of the publish
-inside the guard was never wrong FOR UPSTREAM. That is the L6 reconciliation:
-this is coverage for a state the fork's own purity feature invented, not a
-break with upstream. The helper `_pp_record_slot_last_batch` was already
+inside the guard was never wrong FOR UPSTREAM. That is HALF the L6 reconciliation, and
+the other half is a real behaviour change: the `else` this change adds also
+fires on the purity-INDEPENDENT idle lap (the outer `else` of
+`grep -n 'Run decode (skip for prefill-only batches)' scheduler.py`, which
+resolves on the fork AND on `main`), and upstream PRESERVES `last_mbs[slot]`
+there while the fork now clears it. That is deliberate, toward the non-PP
+loops' unconditional `self.last_batch = batch` -- see the retraction beside
+`grep -n 'BUT THIS `else` REACHES WIDER' scheduler_pp_mixin.py`. The helper `_pp_record_slot_last_batch` was already
 extracted to be unconditional and its docstring already argues the case --
 only its single call site was never lifted out of the guard.
 
