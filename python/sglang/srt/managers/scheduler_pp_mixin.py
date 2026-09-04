@@ -5088,6 +5088,90 @@ class SchedulerPPMixin:
                                 next_mb_id,
                                 self._1009_skipped,
                             )
+                        # #1189 LAP (B): THIS SLOT RAN NOTHING, AND THAT IS
+                        # A REAL ANSWER -- not a hole that preserves the
+                        # previous one. The slot HOLDS a batch, but its pass
+                        # has not delivered, so `last_mbs[next_mb_id]` must
+                        # not keep the entry the PREVIOUS lap published. That
+                        # entry is an EXTEND batch, and `get_next_batch_to_run`
+                        # re-merges it into `running_batch` on every later
+                        # visit (`schedule_batch.py` `merge_batch` extends
+                        # `reqs` IN PLACE), which is how boot 8 reached
+                        # `running=7768` against max_running_requests=8
+                        # (`/spinning/evidence-665-f1/boot_855_weg1b8_
+                        # e9d1a719ac_0904_064622.log:458441`, a `#788
+                        # PP-ADMISSION verdict=DECLINE` line). NAMED BY
+                        # INSTRUMENT because the figure that stood here,
+                        # `running_bs=7768`, occurs ZERO times in that log --
+                        # its `running_bs` series tops out at 7771. The "at
+                        # most 3 distinct rids" that stood beside it is
+                        # deleted: no query against that log reproduces it.
+                        #
+                        # WHY None AND NOT `mbs[next_mb_id]`: publishing the
+                        # held batch here is the #969 CUT L defect -- the
+                        # un-run prefill batch would be merged into running
+                        # and its requests decoded before they were ever
+                        # prefilled. "Ran nothing" is the honest value.
+                        #
+                        # WHAT THIS LINE DOES NOT BUY -- WRITTEN OUT BECAUSE
+                        # THE COMMENT THAT STOOD HERE CLAIMED IT AND IT IS
+                        # FALSE. The retracted sentence was "it stays in
+                        # `mbs[next_mb_id]` (so `_live_reqs`, which enumerates
+                        # mbs/running_mbs/last_mbs, still sees it)".
+                        # `_live_reqs` does NOT enumerate `mbs`. Measured by
+                        # AST over its body (`phase_flip_runtime.py:1150-1235`,
+                        # 2026-09-04): the only rows it walks are `running_mbs`
+                        # (:1194), `last_mbs` (:1218), `running_batch`/
+                        # `last_batch` (:1220) and `chunked_req` (:1231). A
+                        # batch reachable ONLY through `mbs[slot]` is therefore
+                        # invisible to the flip's residency authority, whose
+                        # own docstring says un-enumerated rows are "not
+                        # MOVED" and the request's context "would simply be
+                        # wrong, silently". `mbs` IS read by
+                        # `_pp_microbatches_drained` (`scheduler.py:13698-13703`,
+                        # `mb is None or mb.is_empty() for mb in self.mbs`) --
+                        # but that is the QUIESCENCE term, not a residency
+                        # route: it decides whether a flip may arm, it does
+                        # not move a row.
+                        #
+                        # WHY THE WRITE IS RIGHT ANYWAY -- THE ARGUMENT THAT
+                        # ACTUALLY HOLDS. It takes no residency route away.
+                        # Before this line existed, `last_mbs[next_mb_id]` on
+                        # this lap held a PREVIOUS-GENERATION batch, not the
+                        # un-run batch this slot is holding. THE ABSOLUTE THAT
+                        # STOOD HERE -- "never `mbs[next_mb_id]` itself" -- IS
+                        # WITHDRAWN: `scheduler.py:8354-8362` records the alias
+                        # case, where an empty `running_batch` is rebound to
+                        # `last_batch` and the same object then sits in
+                        # `running_mbs[mb_id]` and, via `mbs[mb_id]`, in
+                        # `last_mbs[mb_id]`. The conclusion survives by the
+                        # other route: in that case the object IS
+                        # `running_mbs[slot]` (written at
+                        # `scheduler_pp_mixin.py:4734`), which `_live_reqs`
+                        # DOES enumerate (`phase_flip_runtime.py:1194`). So no
+                        # residency route is lost either way -- writing None
+                        # removes a stale entry and removes nothing else.
+                        #
+                        # The residency
+                        # gap for the held batch is #1009's and PREDATES this
+                        # line: `self.mbs[mb_id] = plan.batch_to_run` is
+                        # UNCONDITIONAL on all three planning paths
+                        # (`scheduler_pp_mixin.py:4670`, `:4689`, `:4701` --
+                        # the same three writes that make the `else` arms of
+                        # the three `if self.mbs[next_mb_id] is not None:`
+                        # guards reachable -- `:5046`, `:5512`, `:5717` as of
+                        # this edit, and re-derived BY SHAPE at run time by
+                        # `test/registered/unit/managers/
+                        # test_1189_slot_publish_lap.py`, which is the anchor
+                        # that cannot drift) and none of them consults
+                        # `_pp_launched_pending`, so the held batch's last
+                        # reference is destroyed at the next visit to this
+                        # slot whether or not this line exists. Do NOT read
+                        # "the batch publishes itself on the lap its result
+                        # lands" as a guarantee of this code: it is what
+                        # SHOULD happen, #1009 owns making it true, and no
+                        # line in this arm establishes it.
+                        self.last_mbs[next_mb_id] = None
                     else:
                         with torch.profiler.record_function(
                             "process_batch_result"
@@ -5132,6 +5216,74 @@ class SchedulerPPMixin:
                         # flip, so this is safe for the no-flip rungs; it MUST
                         # be deleted before the flip rung.
                         self._pp_record_slot_last_batch(next_mb_id)
+                else:
+                    # #1189 LAP (A): THE SLOT HOLDS NO BATCH. Same law as lap
+                    # (B) above and the same one writer: `last_mbs[slot]`
+                    # names what this slot ran LAST ITERATION, and on this lap
+                    # that is nothing.
+                    #
+                    # STRICT PHASE PURITY CREATED THIS LAP ON PURPOSE.
+                    # `get_next_batch_to_run` returns None for a resident
+                    # decode batch in the PP layout, so `mbs[slot]` is None
+                    # while requests are still resident in the slot. Upstream
+                    # has no such state (a resident slot always produces a
+                    # decode batch), which is why upstream's placement of the
+                    # publish inside this guard was never wrong FOR UPSTREAM
+                    # -- verified by reading `main:scheduler_pp_mixin.py`
+                    # (`_event_loop_pp`, the `if self.mbs[next_mb_id] is not
+                    # None:` block ending `self.last_mbs[next_mb_id] =
+                    # self.mbs[next_mb_id]`, also with no else; that same
+                    # guard/publish/no-else shape stands three times upstream,
+                    # at main :148/:155, :320/:326 and :507/:514).
+                    #
+                    # BUT THIS `else` REACHES WIDER THAN THE INVENTED STATE,
+                    # AND THAT IS DELIBERATE. The sentence that stood here --
+                    # "not a break with an upstream invariant" -- is FALSE;
+                    # `_pp_record_slot_last_batch.__doc__` below already
+                    # disproves it. The `else` ALSO fires on the
+                    # purity-INDEPENDENT IDLE LAP, whose `ret = None` is the
+                    # outer `else` of `if not running_batch.is_empty() and not
+                    # running_batch.is_prefill_only:` -- not the
+                    # `_decode_blocked` arm above it. That None reaches
+                    # `mbs[slot]` via `NextBatchPlan(batch_to_run=ret, ...)`
+                    # and the three unconditional `self.mbs[mb_id] =
+                    # plan.batch_to_run` writes in this file. UPSTREAM HAS
+                    # THAT LAP (`main:scheduler.py:2737` carries the same
+                    # `# Run decode (skip for prefill-only batches)` arm with
+                    # `ret = None` at `:2742`, and that file has ZERO
+                    # occurrences of `phase_purity` or
+                    # `phase_decode_blocked_here`) and PRESERVES the previous
+                    # `last_mbs[slot]` on it. So on an upstream-reachable lap
+                    # this fork CLEARS an entry upstream KEEPS -- behaviour IS
+                    # changed outside the purity-invented state.
+                    #
+                    # THAT PP CHANGE IS THE INTENT, not a side effect: it
+                    # makes these loops answer "what did the previous
+                    # iteration run" the way the non-PP loops always have --
+                    # `self.last_batch = batch`, unconditional in the
+                    # `while True:` body of `event_loop_normal` and
+                    # `event_loop_overlap`.
+                    #
+                    # ANCHORS as grep recipes (both files are under active
+                    # edit, so bare line numbers rot):
+                    #   grep -n 'Run decode (skip for prefill-only batches)'
+                    #     scheduler.py -- the idle lap; its `if` is the next
+                    #     line and `ret = None` its outer `else`. The SAME
+                    #     recipe resolves on main, which is how the fork lap
+                    #     and the upstream lap are known to be ONE lap.
+                    #   grep -n '_note_round_build_outcome(ret, running_batch)'
+                    #     scheduler.py -- `return NextBatchPlan(...)` follows.
+                    #   grep -n '^ *self\.mbs\[mb_id\] = plan\.batch_to_run$'
+                    #     scheduler_pp_mixin.py -- the three planning writes.
+                    #   grep -n 'self\.last_batch = batch$' scheduler.py --
+                    #     the two non-PP publishes.
+                    #
+                    # NO SECOND BOOKKEEPING LAYER: this goes through the SAME
+                    # `_pp_record_slot_last_batch`, which publishes
+                    # `self.mbs[slot]` -- None on this arm by construction, so
+                    # the helper is exactly right here and there is still one
+                    # writer of `last_mbs[slot]` per loop.
+                    self._pp_record_slot_last_batch(next_mb_id)
                 if not self.pp_group.is_last_rank:
                     # #969J/#968: THE SEND IS GUARDED, AND SYMMETRIC WITH THE
                     # RECEIVE. `if cur_batch:` here is the mirror of the
@@ -5407,7 +5559,16 @@ class SchedulerPPMixin:
                         self.mbs[next_mb_id],
                         next_batch_result,
                     )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self._pp_record_slot_last_batch(next_mb_id)
+                else:
+                    # #1189 LAP (A), SECOND INSTANCE OF THE SAME SHAPE. The
+                    # raw `self.last_mbs[next_mb_id] = self.mbs[next_mb_id]`
+                    # that stood inside the guard was never converted when the
+                    # helper was extracted, so this loop carried the identical
+                    # missing-else. Routed through the one writer here too, so
+                    # a slot that holds no batch publishes "nothing" instead
+                    # of keeping the previous lap's EXTEND entry.
+                    self._pp_record_slot_last_batch(next_mb_id)
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
@@ -5604,7 +5765,14 @@ class SchedulerPPMixin:
                             self.mbs[next_mb_id],
                             next_batch_result,
                         )
-                    self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+                    self._pp_record_slot_last_batch(next_mb_id)
+                else:
+                    # #1189 LAP (A), THIRD INSTANCE. Identical missing-else to
+                    # the prefill loop above; converted to the one writer for
+                    # the same reason. Note the prebuilt arm inside the guard
+                    # deliberately still publishes: a prebuilt batch DID
+                    # occupy this slot, only its result processing is skipped.
+                    self._pp_record_slot_last_batch(next_mb_id)
 
                 if not self.pp_group.is_last_rank:
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
@@ -7177,19 +7345,27 @@ class SchedulerPPMixin:
         slot ``get_next_batch_to_run`` takes its
         ``last_batch.forward_mode.is_extend()`` branch and reaches
         ``running_batch.merge_batch(last_batch)``. ``merge_batch`` extends
-        ``reqs`` IN PLACE, so the same requests are appended again, and
-        again, once per cycle:
-
-            claims 5 -> 13338 -> 26671 -> ... -> 868447   (+1 per round)
+        ``reqs`` IN PLACE (``schedule_batch.py:4755``), so the same requests
+        are appended again, and again, once per cycle. The one figure with a
+        source: boot 8 reached ``running=7768`` against
+        ``max_running_requests=8``
+        (``/spinning/evidence-665-f1/boot_855_weg1b8_e9d1a719ac_0904_064622
+        .log:458441``, a ``#788 PP-ADMISSION verdict=DECLINE`` line). A
+        "claims 5 -> 13338 -> 26671 -> ... -> 868447" series stood here and is
+        DELETED: it named no log and no query reproduces it.
 
         Neither existing defence can see it, and that is not an oversight in
         either of them:
 
-          * the self-merge guard (``scheduler.py``, "SELF-MERGE REFUSED")
-            compares ``last_batch is running_batch`` -- but the stale entry
-            is a DISTINCT object; and
-          * ``harvest_resident_batches`` dedupes by ``id(batch)`` -- but the
-            duplication is INSIDE one batch's ``reqs``, not across batches.
+          * the self-merge guard compares ``last_batch is running_batch``
+            (``scheduler.py:8363``; it prints "SELF-MERGE REFUSED" at
+            ``:8389``) -- but the stale entry is a DISTINCT object; and
+          * ``Scheduler._resident_batches`` (``scheduler.py:6458``) dedupes by
+            ``id(batch)`` (``:6482-6484``) -- but the duplication is INSIDE
+            one batch's ``reqs``, not across batches. (This bullet named
+            ``harvest_resident_batches``; #969 replaced that entry point with
+            these eight lines and kept the identity dedupe verbatim, so the
+            argument stands under the successor's name.)
 
         A distinct object holding already-resident Reqs is the one shape
         that defeats both at once, which is exactly the hazard entry K of
@@ -7209,9 +7385,26 @@ class SchedulerPPMixin:
         overwrites it with whatever that consumption produced -- None
         included.
 
-        The default path is unchanged: with purity off, a resident slot
-        always produces a batch, so ``mbs[slot]`` is non-None on exactly the
-        iterations that previously reached this line.
+        WHAT THIS DOES TO A PP BOOT WITH PURITY OFF -- retracted claim
+        --------------------------------------------------------------------
+        The sentence that stood here was "The default path is unchanged: with
+        purity off, a resident slot always produces a batch, so ``mbs[slot]``
+        is non-None on exactly the iterations that previously reached this
+        line." It is FALSE and disprovable in one hop.
+        ``get_next_batch_to_run`` reaches ``ret = None`` at
+        ``scheduler.py:9090`` and ``ret = running_batch if not
+        running_batch.is_empty() else None`` at ``:9088`` -- the IDLE case, no
+        new batch and an empty running batch, and purity-INDEPENDENT. That
+        None flows through ``self.mbs[mb_id] = plan.batch_to_run``
+        (``scheduler_pp_mixin.py:4670``/``:4689``/``:4701``, unconditional on
+        all three planning paths), so ``mbs[slot]`` IS None on those
+        iterations with purity off too, the caller's new ``else`` fires, and
+        ``last_mbs[slot]`` is CLEARED where it previously persisted.
+
+        The PP change is therefore deliberate, not incidental: it is what
+        makes these loops answer "what did the previous iteration run" the
+        way the non-PP loops always have (``scheduler.py:2774``/``:2871``,
+        ``self.last_batch = batch``, unconditional).
         """
         self.last_mbs[slot] = self.mbs[slot]
 

@@ -1567,6 +1567,17 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     primary_runner = scheduler.tp_worker.model_runner
     device = primary_runner.device
 
+    # #1041 SELF-CHECK, first half. Read free VRAM here -- after the guards,
+    # before this function's first allocation -- so the window that closes at
+    # the return is exactly the span STACK_RESIDUAL_MIB claims to describe.
+    # Failing to read it is not fatal: the check reports, it does not gate.
+    _residual_free_before = None
+    if device == "cuda":
+        try:
+            _residual_free_before = torch.cuda.mem_get_info(primary_runner.gpu_id)[0]
+        except Exception as _e:  # pragma: no cover - driver availability
+            logger.debug("stack residual self-check: no entry reading (%s)", _e)
+
     # 1. Process-global uneven plan + token vector. Installed only NOW --
     # the PP stack was built with both absent (byte-identical primary
     # path) and its runtime reads are gated on its own cached tp_size=1 /
@@ -2068,6 +2079,26 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     # pools were just built with, which is not necessarily the seed parsed at
     # the top of this function -- the worker construction above may have
     # installed the measured optimum. Read it back rather than assuming it.
+    # #1041 SELF-CHECK, second half. The constant this boot already SPENT is
+    # compared against what the stack actually took, using the two subtrahends
+    # the charge itself used. Reports only -- see report_measured_stack_residual.
+    if _residual_free_before is not None:
+        try:
+            from sglang.srt.managers import arena_tail_probe as _probe
+            from sglang.srt.managers.phase_flip_spill import (
+                cold_stack_deferred as _cold_stack_deferred,
+            )
+
+            _probe.report_measured_stack_residual(
+                world_rank,
+                _residual_free_before,
+                torch.cuda.mem_get_info(primary_runner.gpu_id)[0],
+                max(0, layout_tp.total_bytes - layout_pp.total_bytes),
+                int(primary_runner._flip_draft_residency_bytes()),
+                cold_stack_deferred=bool(_cold_stack_deferred(server_args)),
+            )
+        except Exception as _e:  # pragma: no cover - instrument only
+            logger.debug("stack residual self-check unavailable (%s)", _e)
     token_verdict = effective_flip_token_vector(server_args, tok_vec)
 
     return PhaseFlipStacks(

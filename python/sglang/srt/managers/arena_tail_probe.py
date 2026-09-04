@@ -358,6 +358,81 @@ def post_sizing_stack_bytes(
     return arena_over_weights + int(draft_bytes) + int(residual) * 1048576
 
 
+def report_measured_stack_residual(
+    rank: int,
+    free_before_bytes: int,
+    free_after_bytes: int,
+    arena_over_weights_bytes: int,
+    draft_bytes: int,
+    *,
+    cold_stack_deferred: bool = False,
+) -> float:
+    """Measure this boot what ``STACK_RESIDUAL_MIB`` charges from a literal (#1041).
+
+    The constant above was calibrated ONCE, on boot 735-tail785, before the
+    INT8 checkpoint and before #855 moved the GDN layers into the same
+    quantisation.  Every boot since has subtracted 2294/1188/625 MiB from the
+    KV budget on faith, and the line that spends it calls the value "measured
+    stack residual" -- the text describes a measurement the code does not
+    take.  That is the Instrument-Text-luegt class A shape, and this function
+    is the discriminator it was missing.
+
+    The arithmetic is EXACTLY the one the docstring above performed by hand:
+    net VRAM consumed across ``build_phase_flip_tp_stack``, minus the arena
+    above the PP weights, minus the flip draft's weights.  What remains is the
+    backends-and-graphs residual the constant claims to be.
+
+    REPORTS, NEVER ACTS.  By the time the stack is built the pool has already
+    been sized against the constant, so re-charging from this reading could
+    only produce a pool the boot has no memory left to honour.  A disagreement
+    is a capacity question for the planner (#1021 prices the same family), not
+    a mid-boot correction.
+
+    ``free_before`` is read after the guards and before the first allocation of
+    ``build_phase_flip_tp_stack``; ``free_after`` immediately before its
+    return.  The window therefore contains the PP-weight free of step 2 and
+    the arena commit -- which is why both subtrahends exist and why a negative
+    ``measured`` is a legible answer (the freed weights outweighed the stack),
+    not an error to clamp away.
+
+    Returns the measured residual in MiB so a caller can assert on it; the
+    boot itself only reads the log line.
+    """
+    consumed_mib = (int(free_before_bytes) - int(free_after_bytes)) / 1048576.0
+    measured_mib = (
+        consumed_mib
+        - int(arena_over_weights_bytes) / 1048576.0
+        - int(draft_bytes) / 1048576.0
+    )
+    if cold_stack_deferred:
+        charged_mib = 0.0
+        provenance = "0 (deferred, #704 rung-4 credit taken)"
+    elif 0 <= rank < len(STACK_RESIDUAL_MIB):
+        charged_mib = float(STACK_RESIDUAL_MIB[rank])
+        provenance = f"{charged_mib:.0f} (constant, calibrated 735-tail785)"
+    else:
+        charged_mib = 0.0
+        provenance = "0 (no constant for this rank)"
+    logger.info(
+        "%s (rank %d): STACK RESIDUAL SELF-CHECK (#1041) charged=%s MiB vs "
+        "measured=%.1f MiB this boot, delta=%+.1f MiB | net consumed %.1f MiB "
+        "(free %.1f -> %.1f MiB) minus arena above PP weights %.1f minus "
+        "flip-draft weights %.1f. The charge is NOT adjusted from this "
+        "reading: the pool was sized before this line ran.",
+        LOG_PREFIX,
+        rank,
+        provenance,
+        measured_mib,
+        measured_mib - charged_mib,
+        consumed_mib,
+        int(free_before_bytes) / 1048576.0,
+        int(free_after_bytes) / 1048576.0,
+        int(arena_over_weights_bytes) / 1048576.0,
+        int(draft_bytes) / 1048576.0,
+    )
+    return measured_mib
+
+
 def derive_arena_tail_bytes(
     model_config,
     load_config,
