@@ -46,6 +46,8 @@ import subprocess
 import types
 import unittest
 
+import torch
+
 from sglang.srt.managers import phase_purity
 from sglang.srt.managers.phase_purity import (
     SEAM_GRANT_CONSUMED_ATTR,
@@ -79,6 +81,34 @@ DELETED = (
 WITNESS_FUNCS = ("_witness_from_outcome", "witness_readings", "observe_store_witness")
 
 
+def _witness_reachable(module, entries=WITNESS_FUNCS):
+    """Every module-level function TRANSITIVELY reachable from the witness
+    entry points, by name, out of the module AST.
+
+    WHY A CLOSURE AND NOT A LIST (review round 7, non-blocking finding): the
+    round-6 guard named exactly three function bodies, and a reviewer's mutant
+    that inserted a `raise` into `_store_witness_allowance` -- a transitive
+    callee of `observe_store_witness` -- walked straight through it. A callee
+    added tomorrow is covered here without editing the test.
+    """
+    tree = ast.parse(inspect.getsource(module))
+    funcs = {
+        n.name: n
+        for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    seen, stack = set(), list(entries)
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in funcs:
+            continue
+        seen.add(name)
+        for node in ast.walk(funcs[name]):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                stack.append(node.func.id)
+    return seen
+
+
 def _req(rid="1e95e023", *, stamp=B6_STAMP, tokens=8192, resident=0, host_hit=0,
          registered=None, seam_epoch=3):
     r = types.SimpleNamespace(
@@ -86,7 +116,12 @@ def _req(rid="1e95e023", *, stamp=B6_STAMP, tokens=8192, resident=0, host_hit=0,
         cached_prompt_tokens_at_retract=stamp,
         cache_protected_len=0,
         origin_input_ids=list(range(tokens)),
-        prefix_indices=list(range(resident)),
+        # #1176 round 7 (review B4): the production request carries a
+        # torch.Tensor here (schedule_batch.py:1460), and the round-6
+        # suite built a Python list -- so no test in this file could see
+        # the reader raise on the real type. Every scenario below now
+        # runs on the production type.
+        prefix_indices=torch.arange(resident, dtype=torch.int64),
         host_hit_length=host_hit,
         storage_hit_length=0,
     )
@@ -167,6 +202,33 @@ class A_TheWitnessIsInert(CustomTestCase):
             with self.subTest(name):
                 self.assertEqual(
                     raises, [], f"{name} raises -- an observation may never STOP a group"
+                )
+
+    def test_no_function_reachable_from_the_witness_contains_a_raise(self):
+        """WIDER THAN THE THREE ENTRY POINTS (review round 7). The round-6
+        guard scoped itself to three function bodies; a `raise` inside a
+        TRANSITIVE callee reaches the admission path just as well and survived
+        it. The closure is derived from the AST, so it cannot go stale."""
+        reachable = _witness_reachable(phase_purity)
+        self.assertIn(
+            "_store_witness_allowance",
+            reachable,
+            "the closure must reach the allowance helper -- that is the callee "
+            "a reviewer's mutant raised from, unseen by the three-name guard",
+        )
+        tree = ast.parse(inspect.getsource(phase_purity))
+        bodies = {
+            n.name: n
+            for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in sorted(reachable):
+            with self.subTest(name):
+                self.assertEqual(
+                    [n for n in ast.walk(bodies[name]) if isinstance(n, ast.Raise)],
+                    [],
+                    f"{name} is reachable from the observation and raises -- "
+                    "an observation may never STOP a group",
                 )
 
     def test_no_orphan_reference_survives_in_production(self):
@@ -314,6 +376,7 @@ class B_TheGateDecidesIdenticallyWithoutTheWitness(CustomTestCase):
 class C_TheObservationMeasuresEveryDisputedTerm(CustomTestCase):
     def setUp(self):
         phase_purity._WITNESS_OBSERVATIONS = 0
+        phase_purity._WITNESS_BREACHES = 0
 
     def _emit(self, req, outcome, sched=None):
         s = sched or _sched([req], outcomes={req.rid: outcome})
@@ -390,11 +453,16 @@ class C_TheObservationMeasuresEveryDisputedTerm(CustomTestCase):
         self.assertIn("registered=unset", line)
 
     def test_the_rate_limit_is_named_and_holds(self):
+        """ROUND 7: the record here is deliberately WITHIN allowance
+        (stamp=0). Round 6 drove the cap with a record whose shortfall was
+        6008 against a 4096 allowance -- under the round-7 contract that is a
+        BREACH and is always emitted, so the old form would have asserted the
+        cap on exactly the population the cap no longer governs."""
         head = phase_purity._WITNESS_OBSERVE_HEAD
         every = phase_purity._WITNESS_OBSERVE_EVERY
         self.assertGreater(head, 0)
         self.assertGreater(every, 1)
-        r = _req()
+        r = _req(stamp=0)
         out = PrefetchOutcome(0, hit_tokens=1, probed=True)
         s = _sched([r], outcomes={r.rid: out})
         n = head + 2 * every + 5
@@ -409,6 +477,158 @@ class C_TheObservationMeasuresEveryDisputedTerm(CustomTestCase):
         # multiples is silent by design, and the printed n says so.
         self.assertIn(f"(n={due[-1]})", emitted[-1])
         self.assertLess(due[-1], n)
+
+
+class D_TheReaderSurvivesTheProductionType(CustomTestCase):
+    """ROUND 7, blocking review findings B1 and B2.
+
+    B1: `req.prefix_indices` is a torch.Tensor on every real request
+    (schedule_batch.py:1460 constructs `torch.empty((0,), dtype=torch.int64)`,
+    :2477 and :2616 re-bind it to a tensor slice). Round 6 read it as
+    `len(getattr(req, "prefix_indices", None) or ())`, and `x or ()` asks
+    `bool(x)` -- which torch REFUSES with a **RuntimeError** for an empty or
+    multi-element tensor, a class `except TypeError` does not catch. The read
+    was unconditional on both admission arms (scheduler.py:11331 and :11386),
+    so the observation raised on the bare admission path: exactly the fatal
+    direction round 6 set out to remove by construction.
+
+    B2: for a ONE-element tensor holding index 0, `tensor or ()` is falsy and
+    the reader recorded resident=0 instead of 1 -- a silent mis-measurement on
+    the one line the whole round exists to produce.
+
+    The tree documents this idiom twice already (schedule_batch.py:3442-3449,
+    scheduler.py:8300). Both prior instances sat inside try/except diagnostics;
+    round 6 put it on the admission path.
+    """
+
+    PRODUCTION_SHAPES = (
+        ("empty tensor -- a freshly arrived request",
+         torch.empty((0,), dtype=torch.int64), 0),
+        ("one row holding index 0 -- the silent mis-read (B2)",
+         torch.tensor([0], dtype=torch.int64), 1),
+        ("one row holding index 5",
+         torch.tensor([5], dtype=torch.int64), 1),
+        ("many rows -- a resident prefix",
+         torch.arange(4_096, dtype=torch.int64), 4_096),
+    )
+
+    def setUp(self):
+        phase_purity._WITNESS_OBSERVATIONS = 0
+        phase_purity._WITNESS_BREACHES = 0
+
+    def test_the_reader_counts_tensor_rows_and_never_raises(self):
+        out = PrefetchOutcome(0, hit_tokens=B6_STAMP, probed=True, matched=B6_MATCHED)
+        for label, pi, want in self.PRODUCTION_SHAPES:
+            with self.subTest(label):
+                req = types.SimpleNamespace(
+                    rid="prod0001",
+                    cached_prompt_tokens_at_retract=B6_STAMP,
+                    prefix_indices=pi,
+                    host_hit_length=0,
+                )
+                r = witness_readings(req, out, B6_STAMP, CHUNK)
+                self.assertEqual(r["resident"], want)
+
+    def test_the_emitter_never_raises_on_the_production_type(self):
+        """The B1 reproduction end to end: the emitter is what the admission
+        arms actually call, and it read `prefix_indices` unconditionally."""
+        out = PrefetchOutcome(0, hit_tokens=B6_STAMP, probed=True, matched=B6_MATCHED)
+        for label, pi, want in self.PRODUCTION_SHAPES:
+            with self.subTest(label):
+                req = _req()
+                req.prefix_indices = pi
+                s = _sched([req], outcomes={req.rid: out})
+                with self.assertLogs(
+                    "sglang.srt.managers.phase_purity", level="WARNING"
+                ) as cm:
+                    observe_store_witness(s, req, out, s.tree_cache)
+                self.assertIn(f"resident={want}", "\n".join(cm.output))
+
+    def test_a_record_whose_prefix_is_not_sized_is_still_observed(self):
+        """The defensive posture survives the fix: junk that has no length is
+        read as 0, it does not become a boot killer."""
+        req = types.SimpleNamespace(rid="junk0001", prefix_indices=7)
+        self.assertEqual(witness_readings(req, 0, 0, CHUNK)["resident"], 0)
+
+
+class E_ABreachIsNeverSuppressedByTheRateLimit(CustomTestCase):
+    """ROUND 7, blocking review finding B5.
+
+    Round 6 incremented the counter and returned BEFORE reading the stamp, so
+    the rate limit sampled calls blind to what they carried. A reviewer drove
+    300 real observations with a genuine 80009-token over-allowance breach at
+    call 100: the emitter printed 65 lines and the breach was not among them,
+    and the acceptance read the resulting log as **PASS**. Worse, the head is
+    burned by ordinary cold admissions BEFORE the first cutover, so on the
+    exact boot shape this work exists to survive the sampled population is
+    systematically the pre-cutover one -- where a #939 breach cannot occur.
+
+    The rate limit now governs WITHIN-allowance lines only.
+    """
+
+    def setUp(self):
+        phase_purity._WITNESS_OBSERVATIONS = 0
+        phase_purity._WITNESS_BREACHES = 0
+
+    def _drive(self, n_benign, breach_req, breach_out):
+        benign = _req(rid="benign01", stamp=0)
+        bout = PrefetchOutcome(0, hit_tokens=0, probed=True)
+        bs = _sched([benign], outcomes={benign.rid: bout})
+        brs = _sched([breach_req], outcomes={breach_req.rid: breach_out})
+        with self.assertLogs(
+            "sglang.srt.managers.phase_purity", level="WARNING"
+        ) as cm:
+            for _ in range(n_benign):
+                observe_store_witness(bs, benign, bout, bs.tree_cache)
+            observe_store_witness(brs, breach_req, breach_out, brs.tree_cache)
+        return [ln for ln in cm.output if "STORE WITNESS OBSERVATION" in ln]
+
+    def test_a_breach_inside_the_silent_tail_is_still_printed(self):
+        head = phase_purity._WITNESS_OBSERVE_HEAD
+        every = phase_purity._WITNESS_OBSERVE_EVERY
+        n_benign = head + 5
+        self.assertLess(n_benign + 1, every, "the breach must land in the tail")
+        self.assertNotEqual(
+            (n_benign + 1) % every, 0, "the breach must not be a due index"
+        )
+        breach = _req(rid="deadbeef", stamp=80_009)
+        out = PrefetchOutcome(0, hit_tokens=0, probed=True)
+        lines = self._drive(n_benign, breach, out)
+        self.assertTrue(
+            any("rid=deadbeef" in ln for ln in lines),
+            "an over-allowance shortfall was suppressed by the rate limit -- "
+            "the acceptance would read that log as PASS with a real breach in "
+            "it (review B5, reproduced on 300 real calls)",
+        )
+        self.assertEqual(phase_purity._WITNESS_BREACHES, 1)
+
+    def test_every_line_carries_the_breach_counter_as_its_own_denominator(self):
+        """A14 compares this printed counter against the breach lines it can
+        parse: a truncated log then reads as truncated, never as clean."""
+        breach = _req(rid="deadbeef", stamp=80_009)
+        out = PrefetchOutcome(0, hit_tokens=0, probed=True)
+        lines = self._drive(3, breach, out)
+        for ln in lines:
+            self.assertRegex(ln, r"breaches=\d+")
+        self.assertIn("breaches=1", lines[-1])
+
+    def test_a_within_allowance_line_is_still_rate_limited(self):
+        """The cap is real and the fix did not remove it."""
+        head = phase_purity._WITNESS_OBSERVE_HEAD
+        every = phase_purity._WITNESS_OBSERVE_EVERY
+        req = _req(stamp=0)
+        out = PrefetchOutcome(0, hit_tokens=0, probed=True)
+        s = _sched([req], outcomes={req.rid: out})
+        n = head + 2 * every + 5
+        with self.assertLogs(
+            "sglang.srt.managers.phase_purity", level="WARNING"
+        ) as cm:
+            for _ in range(n):
+                observe_store_witness(s, req, out, s.tree_cache)
+        emitted = [ln for ln in cm.output if "STORE WITNESS OBSERVATION" in ln]
+        due = [i for i in range(1, n + 1) if i <= head or i % every == 0]
+        self.assertEqual(len(emitted), len(due))
+        self.assertEqual(phase_purity._WITNESS_BREACHES, 0)
 
 
 if __name__ == "__main__":

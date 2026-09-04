@@ -1375,14 +1375,36 @@ def _store_witness_allowance(tree) -> int:
 #: line is DATA, one per witnessed rid, and a pathological boot must not be
 #: able to flood the log with it: the first ``_WITNESS_OBSERVE_HEAD`` are
 #: printed, then one every ``_WITNESS_OBSERVE_EVERY``. Every line carries
-#: ``n=`` (the running count of witnessed rids), so a rate-limited log still
+#: ``n=`` (the running count of observations), so a rate-limited log still
 #: says how many observations it stands for.
+#:
+#: ROUND 7 (review B5): the cap governs WITHIN-ALLOWANCE lines ONLY. Round 6
+#: sampled blind -- it incremented the counter and returned before it read the
+#: stamp -- and a reviewer drove 300 real observations with a genuine
+#: 80009-token over-allowance breach at call 100: 65 lines were emitted, the
+#: breach was not among them, and the acceptance read that log as PASS. Worse,
+#: ordinary cold admissions burn the 64-line head BEFORE the first cutover, so
+#: the sampled population was systematically the pre-cutover one, where a #939
+#: breach cannot occur, while the post-cutover readmissions the law is about
+#: fell in the 1-in-256 tail.
 _WITNESS_OBSERVE_HEAD = 64
 _WITNESS_OBSERVE_EVERY = 256
 
-#: How many rids this process has witnessed. Printed as ``n=``; never a
-#: decision.
+#: How many OBSERVATIONS this process has taken. Printed as ``n=``; never a
+#: decision. It counts CALLS, not distinct rids: there are two admission arms
+#: (scheduler.py:11331 and :11386) and a rid re-admitted after a cutover is
+#: witnessed again. Round 6 called this "per rid" in three places; the number
+#: never was that, and the acceptance instrument's own wording ("N rid
+#: observation(s)") was the honest half.
 _WITNESS_OBSERVATIONS = 0
+
+#: How many of those observations carried a shortfall ABOVE the allowance under
+#: at least one reading. RATE-LIMIT-INDEPENDENT BY CONSTRUCTION: a breach is
+#: always emitted (see `observe_store_witness`), and every line prints this
+#: counter, so the acceptance instrument can compare it against the number of
+#: breach lines it actually parsed. A log that lost lines then reads as
+#: TRUNCATED rather than as clean -- the direction that matters for a gate.
+_WITNESS_BREACHES = 0
 
 #: The states the witness may report. "contradiction" is NOT among them any
 #: more: it was the return value of a control-flow apparatus that is deleted
@@ -1394,8 +1416,12 @@ def _witness_from_outcome(outcome) -> str:
     """Classify one terminated prefetch. NEVER RAISES. NEVER WEIGHS PRESENCE.
 
     WHY THIS FUNCTION NO LONGER DOES ARITHMETIC (#1176, round 6). The store
-    witness was reformulated SIX times -- 4b277fff25, be3ec1760b, 1634bc3d28,
-    8e73b2a9cc, c6fccf75f0, ac4b1d4bf8 -- and every round was falsified BY
+    witness was reformulated SIX times -- 4b277fff25 [weg1], be3ec1760b [weg1 fix],
+    1634bc3d28 [review], 8e73b2a9cc [review r3], c6fccf75f0 [weg1 r4],
+    ac4b1d4bf8 [weg1 r5] (the tags are the commits' OWN subjects; round 7
+    carries them so no second numbering can drift alongside the shas, as one
+    did between the round-6 code and its commit body) -- and every round was
+    falsified BY
     EXECUTION in one of exactly two fatal directions:
 
       * FALSE STOP -- it raised on a request whose stamped prefix was
@@ -1490,10 +1516,20 @@ def witness_readings(req, outcome, stamp: int, allowance: int) -> dict:
 
     Returns a mapping with the raw terms plus, per reading name, a
     ``(presence, shortfall, verdict)`` triple where ``verdict`` is ``"hit"``
-    when ``shortfall <= allowance`` and ``"short-by-N"`` otherwise. Reads are
-    ``getattr`` with defaults and ``int`` coercion throughout: there is no
-    expression here that can raise on a malformed record, which is the
-    property that makes this safe to call on the admission path.
+    when ``shortfall <= allowance`` and ``"short-by-N"`` otherwise.
+
+    ON THE "CANNOT RAISE" CLAIM, corrected in round 7. The round-6 docstring
+    asserted that no expression here could raise, and that sentence was the
+    load-bearing justification for the whole reformulation -- and it was FALSE
+    as executed: ``len(prefix_indices or ())`` asks ``bool()`` of a torch
+    tensor, which raises RuntimeError, on the bare admission path. What is
+    true, and what is pinned by test, is narrower and stated as such: every
+    read is ``getattr``-with-default plus ``int`` coercion, the only
+    length-taking read is guarded against both the tensor form (len() is
+    exact) and an unsized stand-in (TypeError -> 0), and no reachable callee
+    of this function contains a ``raise`` (pinned by an AST closure, not by a
+    list of three names -- a reviewer's mutant raised from a transitive callee
+    and walked through the narrow guard).
     """
     loaded = int(outcome or 0)
     annotated = hasattr(outcome, "hit_tokens")
@@ -1506,10 +1542,27 @@ def witness_readings(req, outcome, stamp: int, allowance: int) -> dict:
         hit = loaded
         matched = 0
     materialized = matched + loaded
-    try:
-        resident = len(getattr(req, "prefix_indices", None) or ())
-    except TypeError:
+    # #1176 ROUND 7 (review B1/B2). ``prefix_indices`` is a torch.Tensor on
+    # every real request (schedule_batch.py:1460 builds
+    # ``torch.empty((0,), dtype=torch.int64)``; :2477 and :2616 re-bind it to a
+    # tensor slice). ``x or ()`` asks ``bool(x)``, which torch REFUSES with a
+    # **RuntimeError** for an empty or multi-element tensor -- a class
+    # ``except TypeError`` does not catch -- so round 6 raised on the bare
+    # admission path for every production record, and for a one-element tensor
+    # holding index 0 it silently read resident=0 instead of 1. The tree
+    # documents this exact idiom twice (schedule_batch.py:3442-3449,
+    # scheduler.py:8300): len() with an explicit None test is the only correct
+    # spelling. The try/except keeps the defensive posture for a record whose
+    # attribute is not sized at all (a stand-in carrying an int), which len()
+    # answers with TypeError and torch never does.
+    _pi = getattr(req, "prefix_indices", None)
+    if _pi is None:
         resident = 0
+    else:
+        try:
+            resident = len(_pi)
+        except TypeError:
+            resident = 0
     host_hit = int(getattr(req, "host_hit_length", 0) or 0)
     registered_raw = getattr(req, "_prefetch_registered_prefix_len", None)
     if registered_raw is None:
@@ -1556,15 +1609,20 @@ def observe_store_witness(scheduler, req, outcome, tree=None) -> None:
     """#1176 (round 6): the witness OBSERVES. It decides nothing and it
     contains no ``raise``.
 
-    One WARNING line per witnessed rid carrying every term the six falsified
-    rounds argued about, and ALL FOUR candidate presence readings computed
-    side by side with the shortfall and verdict word each one implies. No
-    reading is called "the" presence: the line is DATA, not a claim.
+    One WARNING line per witnessed OBSERVATION -- not per rid, which is what
+    round 6 said in three places and never was: there are two admission arms
+    and a rid re-admitted after a cutover is witnessed again, so ``n=`` counts
+    CALLS (review round 7). Each line carries every term the six falsified
+    rounds argued about and ALL FOUR candidate presence readings computed side
+    by side with the shortfall and verdict word each one implies. No reading is
+    called "the" presence: the line is DATA, not a claim.
 
     THE FRAME IS UNDECIDED AND BOOT 7's LOG IS WHAT DECIDES IT. The six
     falsified attempts, so the next reader cannot restart the loop:
-    4b277fff25, be3ec1760b, 1634bc3d28, 8e73b2a9cc, c6fccf75f0, ac4b1d4bf8.
-    Each raised on a genuinely-present prefix (FALSE STOP, a PP0 group STOP
+    4b277fff25 [weg1], be3ec1760b [weg1 fix], 1634bc3d28 [review],
+    8e73b2a9cc [review r3], c6fccf75f0 [weg1 r4], ac4b1d4bf8 [weg1 r5] -- tags
+    are the commits' own subjects, which is the numbering `witness_readings`
+    uses below. Each raised on a genuinely-present prefix (FALSE STOP, a PP0 group STOP
     that kills the boot) or credited presence an ancestor had refused
     (LICENSING past the one-chunk #939 allowance), and several did both on
     different inputs.
@@ -1576,21 +1634,44 @@ def observe_store_witness(scheduler, req, outcome, tree=None) -> None:
     shortfall is the safe direction for an acceptance gate; a false STOP is
     not a safe direction for a serving group.
 
-    Rate-limited: the first `_WITNESS_OBSERVE_HEAD` (64) lines, then one every
-    `_WITNESS_OBSERVE_EVERY` (256). Every line carries ``n=`` so the log's own
-    denominator is readable.
+    Rate-limited FOR WITHIN-ALLOWANCE LINES ONLY: the first
+    `_WITNESS_OBSERVE_HEAD` (64), then one every `_WITNESS_OBSERVE_EVERY`
+    (256). A reading whose shortfall EXCEEDS the allowance is ALWAYS emitted,
+    whatever ``n`` says, and `_WITNESS_BREACHES` counts every one of them
+    independently of the cap -- printed as ``breaches=`` so the acceptance can
+    compare its own parsed breach count against the emitter's. Round 6 sampled
+    blind and a reviewer showed a real 80009-token breach at call 100 of 300
+    producing 65 lines, none of them the breach, read as PASS; and the head is
+    burned by pre-cutover cold admissions, so the sample was systematically the
+    population in which a #939 breach cannot occur.
 
-    Never raises: every read is ``getattr``-with-default plus ``int``
-    coercion, and there is no ``raise`` statement in this function or in
-    `witness_readings` (pinned by test).
+    Never raises ON A REACHABLE PATH, and the round-7 form of that claim is
+    narrower than round 6's: every read is ``getattr``-with-default plus
+    ``int`` coercion; the one length-taking read handles the production
+    torch.Tensor exactly (len(), never ``bool()`` -- the round-6 defect) and an
+    unsized stand-in defensively; and no module function TRANSITIVELY
+    reachable from here contains a ``raise`` (pinned by an AST closure, after
+    a reviewer's mutant raised from `_store_witness_allowance` and walked
+    through a guard that named only three functions).
     """
-    global _WITNESS_OBSERVATIONS
+    global _WITNESS_OBSERVATIONS, _WITNESS_BREACHES
     _WITNESS_OBSERVATIONS += 1
     n = _WITNESS_OBSERVATIONS
-    if not (n <= _WITNESS_OBSERVE_HEAD or n % _WITNESS_OBSERVE_EVERY == 0):
-        return
+    # ROUND 7 (review B5): READ FIRST, RATE-LIMIT SECOND. Round 6 returned here
+    # BEFORE it read the stamp, so the sample was blind to what a call carried:
+    # a genuine over-allowance breach in the silent tail left NO trace at all --
+    # no line, no counter, nothing for the acceptance to read -- and the
+    # acceptance then answered PASS. The readings are pure arithmetic over a
+    # handful of getattrs, so computing them on every admission is cheap; what
+    # costs is the log line, and that is what the cap still governs.
     stamp = int(getattr(req, "cached_prompt_tokens_at_retract", 0) or 0)
-    r = witness_readings(req, outcome, stamp, _store_witness_allowance(tree))
+    allowance = _store_witness_allowance(tree)
+    r = witness_readings(req, outcome, stamp, allowance)
+    breach = any(short > allowance for _p, short, _v in r["readings"].values())
+    if breach:
+        _WITNESS_BREACHES += 1
+    if not (breach or n <= _WITNESS_OBSERVE_HEAD or n % _WITNESS_OBSERVE_EVERY == 0):
+        return
     rt = getattr(scheduler, "phase_flip_runtime", None)
     phase = getattr(rt, "phase", None)
     ps = getattr(scheduler, "ps", None)
@@ -1598,7 +1679,7 @@ def observe_store_witness(scheduler, req, outcome, tree=None) -> None:
     reg = "unset" if r["registered"] is None else r["registered"]
     logger.warning(
         "%s STORE WITNESS OBSERVATION (n=%d) rid=%s phase=%s pp_rank=%s "
-        "state=%s stamp=%d allowance=%d resident=%d host_hit=%d "
+        "state=%s stamp=%d allowance=%d breaches=%d resident=%d host_hit=%d "
         "registered=%s matched=%d loaded=%d materialized=%d probed=%s "
         "hit_tokens=%d "
         "p_span=%d/short=%d/%s p_device=%d/short=%d/%s "
@@ -1619,6 +1700,7 @@ def observe_store_witness(scheduler, req, outcome, tree=None) -> None:
         _witness_from_outcome(outcome),
         r["stamp"],
         r["allowance"],
+        _WITNESS_BREACHES,
         r["resident"],
         r["host_hit"],
         reg,
