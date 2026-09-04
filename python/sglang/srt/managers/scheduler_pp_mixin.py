@@ -52,6 +52,10 @@ from sglang.srt.managers.pp_admission_congruence import (
     reconcile_pp_admission_decision,
     void_pp_admission_decision,
 )
+from sglang.srt.managers.pp_row_defer_horizon import (
+    PpRowDeferHorizonLapsed,
+    RowDeferHorizon,
+)
 from sglang.srt.managers.pp_stash_disposition import (
     PP_LOOP_ONLY,
     UNDECLARED,
@@ -8917,6 +8921,16 @@ class SchedulerPPMixin:
         bounded by transfer time (the `consume_up_to` argument, verbatim).
         False: provably nothing. None: no signal channel -- the caller must
         use the legacy blocking receive rather than guess.
+
+        ONE ARM IS A HEDGE, NOT A PROOF (#1180). `_pp_row_chain_owed` is set
+        by the row probe's defer on an INFERENCE ("an unlocatable rid means a
+        hop is in flight"), which boot weg1b7 measured false for a retracted
+        rid and for a rank-locally requeued resident. That arm therefore
+        returns True without proving availability, and the receive it opens is
+        bounded not by transfer time but by the defer site's own horizon:
+        the disagreement that armed it is named and raised there before it can
+        be re-armed indefinitely. Do not read this method's True as uniform
+        evidence of a posted message.
         """
         receiver = getattr(self, "pp_chain_receiver", None)
         counters = getattr(self, "pp_flip_counters", None)
@@ -9182,16 +9196,55 @@ class SchedulerPPMixin:
                 if _missing:
                     stats["defer_rid"] = stats.get("defer_rid", 0) + 1
                     _dr = stats["defer_rid"]
+                    # #1180: THE DEFER IS BOUNDED, AND ITS END IS A NAMED
+                    # STOP. The premise below ("a chain send is in flight")
+                    # is TRUE for a rid whose delivery is the chain's job and
+                    # FALSE for the two shapes measured in boot weg1b7: a rid
+                    # the sender RETRACTED after sealing the row (#888b
+                    # relief on c25108f3 one iteration after #631 PROXY-SEND
+                    # t40 named it), and a re-admitted resident requeued
+                    # rank-locally (#968 READMIT CACHED,
+                    # last_queued_as=cutover-requeue) for which no chain hop
+                    # exists at all. In both, waiting cannot cure the row --
+                    # and the deferred frame is never free, because the
+                    # sender has ALREADY launched this pass and is ALREADY
+                    # parked on its output, so an unbounded defer closes the
+                    # ring by construction. A CHANGING missing set is a hop
+                    # landing and keeps the boot 631row15 hot-defer world
+                    # free; only an UNCHANGING one ages toward the bound.
+                    _horizon = getattr(self, "_pp_row_defer_horizon", None)
+                    if _horizon is None:
+                        _horizon = RowDeferHorizon()
+                        self._pp_row_defer_horizon = _horizon
+                    _now_fn = getattr(self, "_pp_row_defer_now", None)
+                    _verdict = _horizon.observe(
+                        mb_id,
+                        _missing,
+                        token=stamp,
+                        now=(_now_fn() if _now_fn is not None else None),
+                    )
+                    if not _verdict.defer:
+                        # RAENGE-NIE-UNEINS: a detected disagreement is a
+                        # bounded, named stop -- never a compensation. This
+                        # deliberately does NOT consume the frame (that
+                        # revives boot 631row14: plan finds nothing, ring
+                        # dies upstream-waiting) and does NOT emit a void
+                        # (that revives the #801 reverse corpse).
+                        _horizon.clear(mb_id)
+                        _trace("defer_rid_horizon")
+                        raise PpRowDeferHorizonLapsed(_verdict.message)
                     if _dr <= 8 or _dr % 1024 == 0:
                         logger.info(
                             "#631 ROW-PROBE DEFER slot=%s: frame's row names "
                             "%d rid(s) not yet locatable here (first=%s) -- "
                             "the chain hop is still in flight; frame left in "
-                            "the inbox (occurrence=%d).",
+                            "the inbox (occurrence=%d, held=%.1fs of the "
+                            "#1180 horizon).",
                             mb_id,
                             len(_missing),
                             str(_missing[0])[:8],
                             _dr,
+                            _verdict.waited_s,
                         )
                     # THE DEFERRED FRAME IS THE ATTEMPTED-COUNTER OF THE
                     # CHAIN (boot 631row15, 43k hot defers): PP0 queues the
@@ -9207,6 +9260,12 @@ class SchedulerPPMixin:
                     self._pp_row_chain_owed = True
                     _trace("defer_rid")
                     return False
+            # The row is satisfied (or unreadable): this slot has no
+            # outstanding disagreement, so its #1180 clock must not survive
+            # into the next frame.
+            _horizon = getattr(self, "_pp_row_defer_horizon", None)
+            if _horizon is not None:
+                _horizon.clear(mb_id)
             stats["head_this"] += 1
             _trace("head_this")
             return True
