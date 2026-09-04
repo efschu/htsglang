@@ -152,15 +152,15 @@ class II_AProbedHitIsAdmittedWithItsPrefix(CustomTestCase):
 
     def test_the_admission_sites_consult_the_witness_right_after_the_pop(self):
         src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
-        # #1176 (review d): the call gained an `is_authority=` argument and is
-        # therefore multi-line; the pin still demands BOTH arms, the tree, the
-        # authority predicate, and the int(...) credit.
+        # #1176 (review r4): the `is_authority=` argument is DELETED -- every
+        # rank raises on its own true contradiction, so there is no authority
+        # parameter for the two sites to drift on. The pin still demands BOTH
+        # arms, the tree, and the int(...) credit.
         hits = re.findall(
             r"loaded_tokens = self\.tree_cache\.pop_prefetch_loaded_tokens\(req\.rid\)"
             r"(?:\s*\n\s*#[^\n]*)*"
             r"\s*\n\s*assert_store_witness_at_admission\(\s*\n"
-            r"\s*req,\s*\n\s*loaded_tokens,\s*\n\s*self\.tree_cache,\s*\n"
-            r"\s*is_authority=witness_stop_authority\(self\),\s*\n\s*\)"
+            r"\s*req, loaded_tokens, self\.tree_cache\s*\n\s*\)"
             r"\s*\n\s*if loaded_tokens > 0:\s*\n\s*req\.storage_hit_length = int\(loaded_tokens\)",
             src,
         )
@@ -169,6 +169,11 @@ class II_AProbedHitIsAdmittedWithItsPrefix(CustomTestCase):
             2,
             "both admission arms (PP0 and TP) must assert with the tree and "
             "store the credit as int(...) (B1)",
+        )
+        self.assertNotIn(
+            "is_authority",
+            src,
+            "the follower-vs-authority split is deleted (#1176 review r4)",
         )
 
 

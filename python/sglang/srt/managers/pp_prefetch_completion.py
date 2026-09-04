@@ -77,48 +77,6 @@ from typing import Mapping, Optional, Tuple
 #: are different facts and must not share a spelling.)
 PENDING = "pending"
 
-#: #1176 (review B3): a follower whose STORE WITNESS contradicts its own retract
-#: stamp reports THIS instead of a token count. It is not a length either, and
-#: every reader branches on it before any arithmetic, for the same reason
-#: :data:`PENDING` does.
-#:
-#: WHY IT RIDES THIS CARRIER AND NOT A NEW ONE. The contradiction is exactly the
-#: fact this table already exists to move: "my own store prefetch did not
-#: deliver what the group is about to admit on". Under #968 a follower holds no
-#: admission verdict, so it may not turn its reading into a group STOP by
-#: raising -- but it may not silently withhold the seam premise either, because
-#: `prefill_blocked_here` gates the WHOLE prefill-batch build and a rank that
-#: builds none while its peers do is mismatched collectives
-#: (raenge-nie-uneins). So the follower counts the candidate, states the
-#: divergence, and lets the ONE verdict happen where it belongs: PP0 raises on
-#: the report, loudly, once, naming the peer.
-CONTRADICTION = "contradiction"
-
-
-def peers_reporting_contradiction(
-    table: Mapping[Tuple[str, int], object],
-    rid: str,
-    pp_size: int,
-    own_rank: int = 0,
-) -> Tuple[int, ...]:
-    """#1176 (review B3): PURE. Which peers reported a store-witness
-    contradiction for ``rid``.
-
-    Read BEFORE the ``want <= 0`` early-out of the admission gate: a follower
-    can contradict on a rid for which PP0 has no completed store span of its
-    own, and that combination is precisely the divergence the report exists to
-    surface. Empty tuple on any world without peers.
-    """
-    peers = _peer_ranks(int(pp_size), int(own_rank))
-    if not peers:
-        return ()
-    return tuple(
-        peer
-        for peer in peers
-        if table.get((str(rid), int(peer))) == CONTRADICTION
-    )
-
-
 def group_completion_enabled() -> bool:
     """#1175 KILL SWITCH, not an opt-in.
 
@@ -211,16 +169,6 @@ def group_completion_verdict(
         if entry == PENDING:
             pending.append(peer)
             reports.append((peer, "pending"))
-            continue
-        if entry == CONTRADICTION:
-            # #1176 (review B3): NOT A NUMBER, and never min()'d into a floor.
-            # The caller raises on this before it ever reaches the verdict
-            # (`peers_reporting_contradiction`, read before the `want <= 0`
-            # early-out); this branch exists so that a kill-switched or
-            # stand-in caller degrades to "this peer produced no usable
-            # reading" instead of dying in `int("contradiction")`.
-            missing.append(peer)
-            reports.append((peer, CONTRADICTION))
             continue
         value = int(entry)  # type: ignore[arg-type]
         floor = value if floor is None else min(floor, value)

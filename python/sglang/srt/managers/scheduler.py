@@ -207,7 +207,6 @@ from sglang.srt.managers.phase_purity import (
     StoreWitnessContradiction,
     assert_store_witness_at_admission,
     prefill_blocked_here as phase_prefill_blocked_here,
-    witness_stop_authority,
 )
 # #791b: imported AS A MODULE, not from-imported: the admission loop resolves
 # `prefetch_ballot.prefetch_done_under_ballot` through the module's globals,
@@ -234,7 +233,6 @@ from sglang.srt.managers.pp_prefetch_completion import (
     format_group_fact,
     group_completion_enabled as _group_completion_on,
     group_completion_verdict,
-    peers_reporting_contradiction,
 )
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -10026,35 +10024,6 @@ class Scheduler(
         """
         rid = str(getattr(req, "rid", "?"))
         tree = self.tree_cache
-        # #1176 (review B3): THE FOLLOWER'S CONTRADICTION IS RAISED HERE, ONCE,
-        # BY THE AUTHORITY -- and BEFORE the `want <= 0` early-out.
-        #
-        # A follower whose own store witness contradicts its retract stamp does
-        # not raise (it holds no verdict, #969Z) and does not withhold the seam
-        # premise either (that would be a silent rank split on a group-uniform
-        # gate). It REPORTS, on the #1175 lap that already carries every peer's
-        # per-rid completion reading, and PP0 turns that report into the group
-        # STOP. Read before the early-out because the dangerous combination is
-        # exactly "PP0 has no completed span of its own while a peer measured a
-        # contradiction": a `want <= 0` return would swallow the only rank that
-        # saw the problem.
-        _contradicted = peers_reporting_contradiction(
-            pp_prefetch_completion_table(self), rid, int(self.ps.pp_size), own_rank=0
-        )
-        if _contradicted:
-            raise StoreWitnessContradiction(
-                f"#1157 STORE WITNESS CONTRADICTION rid={rid} reported by "
-                f"peer pp_rank(s) {list(_contradicted)}: those ranks measured "
-                "their own re-admission presence against their own retract "
-                "stamp and found the prefix short by more than one chunk. "
-                "They do not raise -- a PP follower holds no admission verdict "
-                "(#969Z) and a rank that withholds the seam premise alone "
-                "splits the group's prefill-batch build silently. The verdict "
-                "is PP0's and it is taken HERE: re-admitting this rid would "
-                "let at least one rank recompute a stamped prefix "
-                "(kein-doppel-prefill), so the group STOPs once, loudly, with "
-                "the peer named (raenge-nie-uneins)."
-            )
         reader = getattr(tree, "completed_prefetch_tokens", None)
         if reader is None:
             return True
@@ -11326,18 +11295,20 @@ class Scheduler(
                 # never a P=0 admission. The credit is stored as a bare int:
                 # `storage_hit_length` rides into `cached_tokens_storage` and
                 # the pickled detokenizer output (review B1).
-                # #1176 (review d): THIS BRANCH RUNS ON EVERY RANK OF THE PP
-                # GROUP, and only PP0 holds a verdict here (the #969Z note
-                # below says so in the same loop). A follower's record is
-                # rank-local whenever the packed MIN all_reduce is not taken
-                # (`tp_world_size > 1`, unified_radix_cache.py:3879-3907), so
-                # a follower raising here would die while its peers admit --
-                # the split boot weg1b6 measured. Followers report instead.
+                # #1176 (review r4): THIS BRANCH RUNS ON EVERY RANK OF THE PP
+                # GROUP AND EVERY RANK RAISES ON ITS OWN TRUE CONTRADICTION.
+                # The follower->PP0 report channel that stood here is DELETED:
+                # three tree facts proved it could not deliver the STOP it was
+                # traded for (see `phase_purity.store_witness`), and while it
+                # stood the reporting rank ADMITTED at P=0 against its own
+                # stamp. A raise is a crash, not a state-changing verdict, so
+                # it takes no admission authority from PP0 (#968) and it is
+                # what raenge-nie-uneins prescribes for a measured
+                # disagreement. The corrected arithmetic (presence = device
+                # residency + matched + loaded) is what makes a raise here
+                # RARE: the weg1b6 false STOP could not happen under it.
                 assert_store_witness_at_admission(
-                    req,
-                    loaded_tokens,
-                    self.tree_cache,
-                    is_authority=witness_stop_authority(self),
+                    req, loaded_tokens, self.tree_cache
                 )
                 if loaded_tokens > 0:
                     req.storage_hit_length = int(loaded_tokens)
@@ -11392,14 +11363,11 @@ class Scheduler(
                 # #1157: see the PP branch above -- the same witness, the
                 # same STOP, the same bare-int credit (review B1). This branch
                 # is the non-PP path, where the record is either the only one
-                # or MIN-reduced across the prefetch group, so the authority
-                # predicate answers True; it is passed rather than assumed so
-                # the two sites cannot drift (#1176 review d).
+                # or MIN-reduced across the prefetch group; there is no
+                # authority parameter any more (#1176 review r4), so the two
+                # sites cannot drift by construction.
                 assert_store_witness_at_admission(
-                    req,
-                    loaded_tokens,
-                    self.tree_cache,
-                    is_authority=witness_stop_authority(self),
+                    req, loaded_tokens, self.tree_cache
                 )
                 if loaded_tokens > 0:
                     req.storage_hit_length = int(loaded_tokens)
