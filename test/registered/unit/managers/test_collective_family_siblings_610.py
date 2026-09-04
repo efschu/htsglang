@@ -550,6 +550,16 @@ class BudgetHarness:
     # nothing is published.
     _local_head_prefix_matches = Scheduler._local_head_prefix_matches
     _local_admit_limit = Scheduler._local_admit_limit
+    # #1203 (family A1): the reduce grew the SEAM-PREMISE vote -- one AND-slot
+    # carrying this rank's `restored > 0` so `seam_transport_premise_holds`
+    # branches on a group fact instead of a rank-local reading. Ninth drift
+    # after #616g, #639, #639b, #791b, #794, #701, #823 and #1158, and once
+    # more the guard below named it in the same change that caused it.
+    # Bound, not stubbed: the vote is wrapped in the production
+    # `local_seam_premise_vote`, which returns 1 on any rank-local exception
+    # (unknown votes YES by design), so on this harness -- no phase runtime,
+    # no seam candidates -- it rides neutrally and identically on both ranks.
+    _local_seam_premise_vote = Scheduler._local_seam_premise_vote
 
     def get_num_allocatable_reqs(self, running_bs):
         """A STAND-IN, which is what the guard's own message offers as the

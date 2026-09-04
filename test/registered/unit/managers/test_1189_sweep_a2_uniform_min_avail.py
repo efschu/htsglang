@@ -8,22 +8,22 @@ A2) named it beside the #1189 point fix; the ledger carries it as row
 `#SWEEP-A2`. Both are round-scoped state that outlives its round.
 
 THE CENSUS, RE-VERIFIED AT THIS TREE (`/spinning/wt-weg1`, HEAD
-`6ef2c7f313`) rather than taken from the sweep -- the briefing asked for
+`1116175f6d`, re-derived once more on 1de7687ab7 after #1203 moved the sites) rather than taken from the sweep -- the briefing asked for
 exactly that:
 
     grep -n '_uniform_min_avail' python/sglang/srt/managers/scheduler.py
-      6840   self._uniform_min_avail = int(kvso.dcp_min_avail())      WRITE
-      6843   self._publish_uniform_evict_floor(self._uniform_min_avail)  read
-      6926   self._uniform_min_avail = local_avail                    WRITE
-      7181   self._uniform_min_avail = int(t[0].item())               WRITE
-      8118   v = getattr(self, "_uniform_min_avail", None)            read
+      6851   self._uniform_min_avail = int(kvso.dcp_min_avail())      WRITE
+      6854   self._publish_uniform_evict_floor(self._uniform_min_avail)  read
+      6944   self._uniform_min_avail = local_avail                    WRITE
+      7239   self._uniform_min_avail = int(t[0].item())               WRITE
+      8195   v = getattr(self, "_uniform_min_avail", None)            read
 
     three writers, two reads, ZERO clears. Confirmed: 3 writers / 0 clears,
     as the sweep measured. Nothing outside scheduler.py writes it (the nine
     other tree-wide hits are test files).
 
 WHY THAT IS A DEFECT AND NOT A STYLE NOTE. ``uniform_min_avail()``
-(`scheduler.py:8109-8141`) exists to refuse a rank-local answer to a group
+(`scheduler.py:8186-8218`) exists to refuse a rank-local answer to a group
 question. Its refusal reads:
 
     "a getattr default is precisely the shape that hides such a path (#606):
@@ -59,7 +59,7 @@ correctness STOP is the #924 shape: a stop becomes a log line, and the run
 continues on the premise the stop existed to reject.
 
 WHAT IS *NOT* THE DEFECT, and must not be "fixed": the single-rank fallback
-at `scheduler.py:8138-8141` (`if self.ps.tp_size > 1: raise` ... else return
+at `scheduler.py:8207-8218` (`if self.ps.tp_size > 1: raise` ... else return
 the local `available_size()`). On one rank there is nothing to diverge from
 and that is the correct answer. It has its own green test below.
 
@@ -128,7 +128,7 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
         sets, clears = _writes(self.tree)
         self.assertEqual(
             sets,
-            [6840, 6926, 7181],
+            [6851, 6944, 7239],
             f"the three writers of self.{ATTR} moved: {sets}",
         )
 
@@ -139,13 +139,13 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
             [],
             f"SWEEP A2: self.{ATTR} has {len(sets)} writer(s) at {sets} and "
             f"ZERO clears in {SCHEDULER.name}. The STOP at "
-            f"{SCHEDULER.name}:8131 is keyed on the attribute being ABSENT "
-            f'(`getattr(self, "{ATTR}", None)` at :8118), so after the '
+            f"{SCHEDULER.name}:8208 is keyed on the attribute being ABSENT "
+            f'(`getattr(self, "{ATTR}", None)` at :8195), so after the '
             f"first successful round it can never fire again, and any later "
             f"round that skipped the reduction returns the PREVIOUS round's "
             f"group value without a word. Verified independently at this "
             f"tree: `grep -n '{ATTR}' {SCHEDULER.name}` returns exactly five "
-            f"lines -- :6840 :6843 :6926 :7181 :8118. The fix the sweep "
+            f"lines -- :6851 :6854 :6944 :7239 :8195. The fix the sweep "
             f"names is `self.{ATTR} = None` at the head of the round that "
             f"owns it, beside the reduction in get_next_batch_to_run.",
         )
@@ -219,7 +219,7 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
                 f"SWEEP A2 consequence: round 2 cannot even be expressed, "
                 f"because no clear of self.{ATTR} exists ({len(sets)} "
                 f"writers at {sets}, 0 clears). The STOP at "
-                f"{SCHEDULER.name}:8131 therefore fires at most ONCE per "
+                f"{SCHEDULER.name}:8208 therefore fires at most ONCE per "
                 f"process: after round 1 the attribute is present forever, "
                 f"and every later round that skips the reduction returns "
                 f"round 1's group value -- 4096 here -- as though it were "
@@ -281,7 +281,7 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
             [],
             f"SWEEP A2: blanket handlers at {SCHEDULER.name}:"
             f"{sorted(offenders)} wrap a call to uniform_min_avail() and "
-            f"contain no `raise`, so the group STOP at :8131 becomes a "
+            f"contain no `raise`, so the group STOP at :8208 becomes a "
             f"logger.warning and the round proceeds on the premise the STOP "
             f"exists to reject. Expected offenders at this tree: "
             f"{list(SWALLOWERS)} (:4625 #888b carrier yield, :12235 the "
@@ -292,7 +292,7 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
     # ---- controls that are GREEN today and must stay green ---------------
 
     def test_single_rank_fallback_is_preserved(self):
-        """`scheduler.py:8138-8141`. NOT the defect -- do not remove it.
+        """`scheduler.py:8207-8218`. NOT the defect -- do not remove it.
 
         On one rank there is nothing to diverge from, so the live local
         `available_size()` is the correct answer and the STOP must not fire.
