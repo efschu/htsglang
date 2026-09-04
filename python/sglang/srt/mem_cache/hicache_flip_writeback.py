@@ -129,6 +129,12 @@ class FlipWritebackReport:
     # NO-PROGRESS bound. Printed beside elapsed so a fence that ran long
     # because acks kept landing is distinguishable from one that hung.
     ceiling_s: float = 0.0
+    # #1205: of `refused_silently`, the share the FLIP SEAM refused -- the one
+    # path of the seven whose count answers the seam-arm-ordering question,
+    # measured as a delta across this fence run over
+    # `hicache_phase_guard.seam_refusals`. -1 when the guard carries no
+    # counter, which is NOT the same fact as zero and is not printed as one.
+    seam_refused: int = -1
 
     @property
     def complete(self) -> bool:
@@ -182,12 +188,14 @@ class FlipWritebackReport:
         # facts and a log line that spells them the same way is the #872 probe
         # failure one level up.
         mamba = "?" if self.refused_mamba_pin < 0 else str(self.refused_mamba_pin)
+        seam = "?" if self.seam_refused < 0 else str(self.seam_refused)
         return (
             f"eligible={self.eligible} staged={self.staged} "
             f"already_staged={self.already_staged} acked={self.acknowledged} "
             f"outstanding={self.outstanding} "
             f"refused_silently={self.refused_silently} "
             f"refused_mamba_pin={mamba} "
+            f"seam_refused={seam} "
             f"elapsed={self.elapsed_s:.3f}s/{self.deadline_s:.3f}s"
             f" ceiling={self.ceiling_s:.3f}s"
         )
@@ -497,6 +505,20 @@ def _hashed_nodes(tree_cache: Any) -> list:
     return out
 
 
+def _seam_refusals_or_none() -> Optional[int]:
+    """The guard's monotone seam-refusal total, or None when it carries none.
+
+    #1205. Same sentinel discipline as ``_mamba_pin_skipped`` directly below:
+    an UNMEASURED share must never reach the log line spelled as a zero.
+    """
+    try:
+        from sglang.srt.mem_cache.hicache_phase_guard import seam_refusals
+
+        return int(seam_refusals())
+    except Exception:  # noqa: BLE001 - an instrument never breaks the fence
+        return None
+
+
 def _mamba_pin_skipped(tree_cache: Any) -> int:
     """The tree's monotone #581/#773 pin-budget refusal counter, or -1.
 
@@ -582,6 +604,7 @@ def flip_writeback(
     skipped_unbacked_parent = 0
     refused_silently = 0
     mamba_pin_before = _mamba_pin_skipped(tree_cache)
+    seam_refused_before = _seam_refusals_or_none()
     for node in nodes:
         if getattr(node, "backuped", False):
             already += 1
@@ -663,6 +686,11 @@ def flip_writeback(
         refused_mamba_pin = -1
     else:
         refused_mamba_pin = max(0, mamba_pin_after - mamba_pin_before)
+    seam_refused_after = _seam_refusals_or_none()
+    if seam_refused_before is None or seam_refused_after is None:
+        seam_refused = -1
+    else:
+        seam_refused = max(0, seam_refused_after - seam_refused_before)
     if refused_silently:
         logger.warning(
             "%s #872 %d node(s) were handed to write_backup and refused "
@@ -672,10 +700,12 @@ def flip_writeback(
             "write-through pin budget: %s. The other refusal paths are the "
             "rank-uniform host floor (unified_radix_cache.py:2210), a short "
             "evict_host (:2215), the staging ring (:2226) and a host write "
-            "that returned None (:2234).",
+            "that returned None (:2234). Attributable to the flip SEAM guard "
+            "(cache_controller.py:1596, the #1205 sentinel): %s.",
             LOG_PREFIX,
             refused_silently,
             "unmeasured" if refused_mamba_pin < 0 else refused_mamba_pin,
+            "unmeasured" if seam_refused < 0 else seam_refused,
         )
 
     # Complete the device->host copies. This is also what triggers the
@@ -700,6 +730,7 @@ def flip_writeback(
         refused_silently=refused_silently,
         refused_mamba_pin=refused_mamba_pin,
         ceiling_s=float(ceiling_s),
+        seam_refused=seam_refused,
     )
     if report.complete:
         logger.info("%s %s", LOG_PREFIX, report.as_log())

@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -1160,7 +1161,11 @@ def _live_reqs(scheduler) -> List:
     there samples an arbitrary slot, and an empty one is indistinguishable
     from "no requests resident".
 
-    Measured at a real cutover:
+    Measured at a real cutover (#1205: the labels in these quoted lines are the PRE-FIX ones. No
+    shipped code emits ``cur_slot_reqs``/``resident_reqs`` any more; the
+    census prints ``live_reqs`` (the wide, id-deduped count) and
+    ``resident_slot_entries`` (undeduped list entries across slots).
+    Kept verbatim because they are quotations from real boot logs.)::
 
         at-arm       cur_slot_reqs=1 resident_reqs=1 resident_slots=[1]
         pre-cutover  cur_slot_reqs=0 resident_reqs=1 resident_slots=[1]
@@ -1270,7 +1275,9 @@ def note_armed_residents(snapshot: Dict[int, object], scheduler) -> Dict[int, ob
         log:1888 PP2 at-arm pp_to_tp: cur_slot_reqs=1 ...
 
     ``cur_slot_reqs`` IS ``len(_live_reqs(scheduler))`` (see ``_pool_census``),
-    so the flip's residency authority saw one request on every rank. One
+    so the flip's residency authority saw one request on every rank. That
+    label was the #1205 defect and is now printed as ``live_reqs``; the lines
+    above are quoted from boot 9 and keep the label that boot emitted. One
     second later the release ran its OWN ``_live_reqs`` and reported
     ``1 / 0 / 0`` retracted (log:2203/:2210/:2213), the rows stayed locked
     (log:2189/:2194, ``67 row(s) still locked after a drop that evicted 0``)
@@ -2320,7 +2327,8 @@ def _resident_rows(scheduler) -> Optional[set]:
 
     boot_window1_0823_1204 shows the shape with nothing else moving. The FIRST
     census of the boot, before any cutover, printed ``unaccounted=122 [1..12]``
-    against ``resident_reqs=1`` -- one live request, 122 rows, and every one of
+    against ``resident_reqs=1`` (the pre-#1205 label; today's line spells that
+    term ``resident_slot_entries``) -- one live request, 122 rows, and every one of
     them read as a leak. That is not accretion; it is the working set.
 
     AND IT REFUTES THE RATCHET READING. The same boot's censuses go
@@ -4586,6 +4594,114 @@ def _build_gdn_leg(scheduler) -> Callable[[str], None]:
     return build_gdn_flip_mover(scheduler)
 
 
+#: Consecutive ``checked=0`` cutovers that make the #719 stale-generation gate
+#: an ALARM rather than an ordinary quiet stretch. Raised 2 -> 4 by #861e after
+#: 24 fires on a healthy W37-D boot; kept at 4 by #1205, which repaired the
+#: CONDITION that #861e described but never implemented.
+STALE_GATE_ZERO_STREAK_ALARM = 4
+
+
+def controller_device_queue_depth(cc) -> Optional[int]:
+    """How many device-tier HiCache operations the controller is holding.
+
+    #1205 -- THE PROBE THIS REPLACES COULD NOT RETURN FALSE. It read
+
+        bool(cc.write_queue or cc.load_queue or cc.ack_backup_queue)
+
+    ``write_queue`` and ``load_queue`` are plain lists
+    (``cache_controller.py:716-717``) and are honestly falsy when empty, but
+    ``ack_backup_queue`` is a ``queue.Queue`` (``cache_controller.py:801``) and
+    ``Queue`` defines NEITHER ``__bool__`` NOR ``__len__`` -- so the object is
+    truthy at every depth including zero. Whenever storage is enabled the
+    ``or`` chain therefore ended on a constant ``True`` and the #861e gate
+    ("count a zero-streak only while the controller reports device-tier work in
+    flight") was never in the tree; the only thing that shipped was the
+    threshold change.
+
+    Counts, never tests: a ``Queue`` is read through ``qsize()``, a list
+    through ``len()``. Returns ``None`` when NOTHING readable was found, which
+    is not the same fact as a measured zero and must not be spelled the same
+    way (#872's probe failure, one module over).
+    """
+    if cc is None:
+        return None
+    total = 0
+    seen = False
+    for name in ("write_queue", "load_queue", "ack_backup_queue"):
+        q = getattr(cc, name, None)
+        if q is None:
+            continue
+        try:
+            if hasattr(q, "qsize"):
+                total += int(q.qsize())
+            else:
+                total += len(q)
+        except Exception:  # noqa: BLE001 - a probe never breaks a seam
+            continue
+        seen = True
+    return total if seen else None
+
+
+def parse_gate_heartbeat(report) -> Tuple[Optional[int], Optional[int]]:
+    """``(checked, refused)`` out of ``gate_heartbeat``'s string, or ``(None, None)``.
+
+    Parsed rather than substring-matched, because the streak arithmetic needs
+    the VALUE -- a cutover that checked something is what proves the gate is
+    reachable on this workload. An unreadable report yields ``None``, which the
+    streak treats as "no evidence" rather than as a zero.
+    """
+    if report is None:
+        return (None, None)
+    m = re.search(r"checked=(\d+)\s+refused=(\d+)", str(report))
+    if m is None:
+        return (None, None)
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def stale_gate_zero_streak(
+    prev_streak: int,
+    *,
+    checked: Optional[int],
+    depth: Optional[int],
+    ever_checked: bool,
+) -> int:
+    """The new consecutive-blind-cutover count for the #719 gate.
+
+    #1205 -- WHY THE TRAFFIC TERM IS THE HEARTBEAT'S OWN HISTORY AND NOT THE
+    QUEUE DEPTH. Reading the depth honestly is necessary but not sufficient:
+    this probe runs inside ``_release_residents_for_cutover``, which the seam
+    calls one statement after ``self._seam_drain_ms = self._quiesce_hicache(
+    direction)``. New device-tier I/O is refused for the whole seam by
+    ``hicache_seam_active`` and the old I/O has just been drained, so an honest
+    depth reading there is ~always 0 -- and a depth-only gate would make this
+    alarm permanently SILENT.
+
+    That is the direction that costs a boot. A constant-true probe is noise (24
+    fires on a healthy W37-D boot, #861e's complaint); a constant-false probe is
+    a FALSE ALL-CLEAR, and a false all-clear is precisely how W37-C logged
+    ``checked=0 refused=0`` on all eighteen flips with nobody woken. Both
+    failures are wrong; only one of them lets the next W37-C through.
+
+    So: a zero counts as evidence of blindness when EITHER the controller is
+    demonstrably holding work right now, OR this process has already reported
+    ``checked>0`` at some earlier cutover. The second term is what makes the
+    alarm workload-aware without asking the workload: an instance that has
+    reached the gate once has proved the gate reachable, so a run of zeroes
+    after that is a disconnection and not an idle stretch. An instance that has
+    never reached it may simply have nothing to check, which is #861e's
+    legitimate case and stays silent.
+
+    ``checked=None`` (unreadable heartbeat) neither counts nor clears -- an
+    absent reading is not evidence in either direction.
+    """
+    if checked is None:
+        return int(prev_streak)
+    if checked > 0:
+        return 0
+    traffic = bool(depth) or bool(ever_checked)
+    return int(prev_streak) + 1 if traffic else 0
+
+
 class PhaseFlipRuntime:
     """Drives one group's PP<->TP KV layout flip at a quiescent boundary.
 
@@ -5804,7 +5920,8 @@ class PhaseFlipRuntime:
         # #1202: AND SNAPSHOT WHO IS RESIDENT, not just how wide they are.
         # `_parked_extent` records the SIZE of the resident set at this
         # instant; nothing recorded its MEMBERS, so the release one second
-        # later enumerated afresh and retracted a different set (boot 9:
+        # later enumerated afresh and retracted a different set (boot 9,
+        # quoted with that boot's pre-#1205 label -- now `live_reqs`:
         # cur_slot_reqs=1 on all three ranks at arm, 1/0/0 retracted at
         # the release). A fresh arm starts a fresh ledger.
         self._armed_residents = {}
@@ -6868,16 +6985,27 @@ class PhaseFlipRuntime:
             # requests sit in other slots, which is exactly how "the
             # request finished" got inferred from a slot that was merely
             # empty. Report both scopes so the two can never be confused.
-            resident = 0
+            #
+            # #1205 -- THE LABELS NAMED THE WRONG POPULATIONS, in both
+            # directions at once, on the first line a post-mortem reads.
+            # `cur_slot_reqs` carried `len(_live_reqs(scheduler))`, which is the
+            # WIDE count across every slot -- the exact opposite of what "cur
+            # slot" says. `resident_reqs` sums `len(mb.reqs)` with no dedup
+            # while `_live_reqs` dedups by `id()`, so one request resident in
+            # two slots printed `cur_slot_reqs=1 resident_reqs=2`: not a request
+            # count at all, but a count of LIST ENTRIES. They are now
+            # `live_reqs=` and `resident_slot_entries=`, which is what each of
+            # them has always measured.
+            resident_slot_entries = 0
             slots_with_reqs = []
             for i, mb in enumerate(getattr(scheduler, "running_mbs", []) or []):
                 n = len(getattr(mb, "reqs", []) or [])
                 if n:
-                    resident += n
+                    resident_slot_entries += n
                     slots_with_reqs.append(i)
             logger.warning(
                 "%s POOL CENSUS %s %s: size=%d free=%s cached=%d "
-                "withheld=%d available=%s cur_slot_reqs=%d resident_reqs=%d "
+                "withheld=%d available=%s live_reqs=%d resident_slot_entries=%d "
                 "resident_slots=%s unaccounted=%s %s alloc=%s free_src=%s",
                 LOG_PREFIX,
                 when,
@@ -6896,7 +7024,7 @@ class PhaseFlipRuntime:
                 len(withheld),
                 getattr(alloc, "available_size", lambda: "?")(),
                 len(reqs),
-                resident,
+                resident_slot_entries,
                 slots_with_reqs,
                 unaccounted,
                 sorted(leaked)[:12],
@@ -9432,23 +9560,43 @@ class PhaseFlipRuntime:
                     # traffic, zero is the correct reading and is not counted.
                     # Threshold raised to 4 as well: two consecutive quiet
                     # cutovers is an ordinary idle stretch.
-                    zero = "checked=0" in str(report)
-                    _busy = False
-                    try:
-                        _busy = bool(
-                            getattr(cc, "write_queue", None)
-                            or getattr(cc, "load_queue", None)
-                            or getattr(cc, "ack_backup_queue", None)
-                        )
-                    except Exception:  # noqa: BLE001 - a probe never breaks a seam
-                        _busy = False
-                    streak = int(getattr(self, "_stale_gate_zero_streak", 0) or 0)
-                    streak = streak + 1 if (zero and _busy) else 0
+                    #
+                    # #1205: THAT ARITHMETIC WAS DESCRIBED HERE AND NEVER
+                    # IMPLEMENTED. The busy probe read
+                    # `bool(write_queue or load_queue or ack_backup_queue)`,
+                    # and `ack_backup_queue` is a `queue.Queue`, which defines
+                    # neither `__bool__` nor `__len__` -- so with storage
+                    # enabled the chain was a constant True and the gate was
+                    # byte-for-byte the pre-#861e gate with a bigger threshold.
+                    #
+                    # And repairing it to an honest DEPTH is not enough on its
+                    # own: this runs one statement after `_quiesce_hicache`,
+                    # with `hicache_seam_active` refusing new I/O, so the depth
+                    # here is ~always 0 and a depth-only gate would be
+                    # permanently silent -- the false all-clear that let W37-C
+                    # through eighteen flips. The traffic term therefore also
+                    # reads the heartbeat's OWN history: a process that has
+                    # reached the gate once has proved it reachable, so zeroes
+                    # after that are a disconnection, not an idle stretch. See
+                    # `stale_gate_zero_streak`.
+                    checked, _refused = parse_gate_heartbeat(report)
+                    depth = controller_device_queue_depth(cc)
+                    if checked:
+                        self._stale_gate_ever_checked = True
+                    ever = bool(getattr(self, "_stale_gate_ever_checked", False))
+                    streak = stale_gate_zero_streak(
+                        int(getattr(self, "_stale_gate_zero_streak", 0) or 0),
+                        checked=checked,
+                        depth=depth,
+                        ever_checked=ever,
+                    )
                     self._stale_gate_zero_streak = streak
-                    if zero and _busy and streak >= 4:
+                    if streak >= STALE_GATE_ZERO_STREAK_ALARM:
                         logger.error(
                             "%s #719 STALE-GATE BLIND: checked=0 on %d "
-                            "consecutive cutovers. The stale-generation gate "
+                            "consecutive cutovers (controller queue depth "
+                            "here=%s, this rank has reached the gate before: "
+                            "%s). The stale-generation gate "
                             "has not been REACHED across a full flip cycle. "
                             "Either device-tier HiCache traffic stopped "
                             "entirely (check Decode batch / write_backup / "
@@ -9459,6 +9607,8 @@ class PhaseFlipRuntime:
                             "that is never reached protects nothing.",
                             LOG_PREFIX,
                             streak,
+                            "UNMEASURED" if depth is None else depth,
+                            ever,
                         )
                 except Exception:  # noqa: BLE001 - telemetry never breaks a seam
                     pass

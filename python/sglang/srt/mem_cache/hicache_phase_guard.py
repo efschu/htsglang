@@ -59,6 +59,40 @@ LOG_PREFIX = "[#718 hicache-phase-guard]"
 # so logging per operation would bury the log at decode rates.
 _WARNED: set[str] = set()
 
+# #1205: HOW MANY device-tier operations the SEAM refused, per direction.
+#
+# The warning above is once per direction per process by design (the condition
+# lasts a whole phase and logging per operation would bury the log at decode
+# rates). That makes the seam refusal INVISIBLE from the second flip onward,
+# and it is the only one of `write_backup`'s seven zero-return paths whose
+# count answers the seam-arm-ordering question: the flip writeback fence tallies
+# all seven together as `refused_silently`, so a seam-refused write and a
+# mamba-pin-refused write and a short `evict_host` are one number today.
+#
+# A counter is not a log line: it costs an increment, it never spams, and it
+# lets the fence report the seam's own share as a DELTA across its run. Without
+# it no instrument in this tree can confirm or close that question, which is an
+# honest "unmeasurable" nobody should have to keep re-deriving.
+_SEAM_REFUSALS: dict[str, int] = {}
+
+
+def seam_refusals(direction: Optional[str] = None) -> int:
+    """Device-tier operations refused because the flip seam was up (#1205).
+
+    With ``direction`` ("write" / "load"), that direction's count; without it,
+    the total across every direction. Monotone within a process; the fence
+    reads DIFFERENCES, never the absolute value.
+    """
+    if direction is None:
+        return sum(_SEAM_REFUSALS.values())
+    return int(_SEAM_REFUSALS.get(direction, 0))
+
+
+def reset_seam_refusals() -> None:
+    """Test hook: zero the seam-refusal counters."""
+    _SEAM_REFUSALS.clear()
+
+
 # #760: the flip controller's authoritative phase, when one is running.
 #
 # The parallel_state routing global answers "which group set do collectives
@@ -193,7 +227,11 @@ def device_tier_disarmed(direction: Optional[str] = None) -> bool:
 
     phase = active_phase()
     if phase == SEAM:
+        # #1205: counted BEFORE the once-per-process warning, so the refusals
+        # after the first one stop being invisible. `None` is a real key here:
+        # a caller that did not name its direction still refused something.
         key = f"seam:{direction}"
+        _SEAM_REFUSALS[str(direction)] = _SEAM_REFUSALS.get(str(direction), 0) + 1
         if key not in _WARNED:
             _WARNED.add(key)
             logger.warning(
