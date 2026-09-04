@@ -207,11 +207,13 @@ class C_TheChatHeaderFalseHitStillStopsTheGroup(CustomTestCase):
         self.assertIn(f"matched={HEADER_HIT}", msg)
         self.assertIn(f"materialized={HEADER_HIT}", msg)
         self.assertIn(f"shortfall={HEADER_STAMP - HEADER_HIT}", msg)
-        # #1176 (review B1): the demand is what this rank still owes AFTER
-        # its current match; with nothing matched it is the whole stamp.
-        self.assertIn("resident=0", msg)
-        self.assertIn(f"demand={HEADER_STAMP}", msg)
-        self.assertIn("fell short of that demand by more than one chunk", msg)
+        # #1176 (review r3): the presence is compared against the WHOLE
+        # stamped prefix; `device_resident` is printed as a diagnostic and is
+        # deliberately NOT netted off it (the 1634bc3d28 `demand=` term is
+        # deleted -- it double-subtracted this request's own match).
+        self.assertIn("device_resident=0", msg)
+        self.assertNotIn("demand=", msg)
+        self.assertIn("fell short of the stamped prefix by more than one chunk", msg)
 
     def test_the_admission_site_raises_too(self):
         r = _req(rid="header", stamp=HEADER_STAMP, tokens=HEADER_STAMP)
@@ -361,15 +363,17 @@ def _pp(scheduler, *, pp_rank, pp_size=3):
     return scheduler
 
 
-class G_PresenceIsJudgedAgainstTheOutstandingDemand(CustomTestCase):
-    """(b) The prefetch is only ever asked for `_new_input_tokens`; the rest of
-    the stamped prefix was already matched and is not this operation's to
-    deliver. Judging `matched + loaded` against the WHOLE stamp charges the
-    operation for tokens nobody asked it to fetch.
+class G_PresenceIsJudgedAgainstTheWholeStampedPrefix(CustomTestCase):
+    """#1176 (review r3): NOTHING IS NETTED OFF THE STAMP.
 
-    The demand is read AT WITNESS TIME from the request's CURRENT match, never
-    from a registration-time snapshot -- see class K for the input that
-    separates the two."""
+    1634bc3d28 subtracted `len(prefix_indices) + host_hit_length` from the
+    stamp BEFORE subtracting the presence, on the premise that the two describe
+    disjoint spans. Three reviewed breaking inputs showed they do not, and each
+    of them read "hit" where the parent raised. The witness now compares the
+    prefetch's own whole-prefix presence (`matched + loaded`, ONE reader) with
+    the whole stamp; these tests are what a re-introduced `resident`/`demand`
+    net must kill.
+    """
 
     def _delivered(self):
         return PrefetchOutcome(
@@ -384,20 +388,32 @@ class G_PresenceIsJudgedAgainstTheOutstandingDemand(CustomTestCase):
             prefix_indices=SPAN_RESIDENT,
         )
 
-    def test_a_fully_delivered_span_is_a_hit_not_a_contradiction(self):
+    def test_the_current_match_is_not_netted_off_the_stamp(self):
+        """RED on 1634bc3d28. `matched` (0 here) is the prefetch's own reading
+        of the tree match; a request claiming 10000 resident rows alongside
+        matched=0 is not a state the runtime produces, and crediting BOTH is
+        the double-subtraction reviewed as B4."""
         r = self._req_with_match()
         s = _sched([r], outcomes={r.rid: self._delivered()})
-        self.assertEqual(store_witness(s, r), "hit")
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            store_witness(s, r)
+        msg = str(cm.exception)
+        self.assertIn(f"stamped={SPAN_STAMP}", msg)
+        self.assertIn(f"shortfall={SPAN_STAMP - SPAN_LOADED}", msg)
+        self.assertIn(f"device_resident={SPAN_RESIDENT}", msg)
 
     def test_the_admission_site_agrees(self):
         r = self._req_with_match()
         s = _sched([r])
-        assert_store_witness_at_admission(r, self._delivered(), s.tree_cache)
+        with self.assertRaises(StoreWitnessContradiction):
+            assert_store_witness_at_admission(r, self._delivered(), s.tree_cache)
 
-    def test_the_host_hit_half_of_the_match_counts_too(self):
-        """`_matched_len` at the registration site is prefix_indices PLUS
-        host_hit_length; the witness must read the same sum, or a request whose
-        match came off the host tier is charged for tokens it already holds."""
+    def test_the_host_hit_half_is_not_credited_either(self):
+        """RED on 1634bc3d28 (reviewed as B2). `len(prefix_indices)` and
+        `host_hit_length` OVERLAP once `init_load_back` has run
+        (schedule_batch.py:3637-3645 states the identity; nothing clears
+        `host_hit_length`), so their sum reads STALE-LARGER and covered a
+        30000-token stamp with 15000 real tokens. Neither is netted now."""
         r = _req(
             rid="hosthalf",
             stamp=SPAN_STAMP,
@@ -406,36 +422,73 @@ class G_PresenceIsJudgedAgainstTheOutstandingDemand(CustomTestCase):
             host_hit_length=6_000,
         )
         s = _sched([r], outcomes={r.rid: self._delivered()})
-        self.assertEqual(store_witness(s, r), "hit")
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            store_witness(s, r)
+        self.assertIn("device_resident=4000", str(cm.exception))
 
-    def test_a_demand_short_by_more_than_one_chunk_still_raises(self):
-        """The match narrows the DEMAND; it does not remove the allowance term.
-        A prefetch that delivered 1000 of a 10000-token demand is still a
-        kein-doppel-prefill contradiction."""
+    def test_a_presence_short_by_more_than_one_chunk_still_raises(self):
         r = self._req_with_match()
         out = PrefetchOutcome(1000, hit_tokens=SPAN_DEMAND, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
             store_witness(_sched([r], outcomes={r.rid: out}), r)
         msg = str(cm.exception)
-        self.assertIn(f"demand={SPAN_DEMAND}", msg)
-        self.assertIn(f"resident={SPAN_RESIDENT}", msg)
+        self.assertIn(f"stamped={SPAN_STAMP}", msg)
+        self.assertIn(f"shortfall={SPAN_STAMP - 1000}", msg)
 
-    def test_without_a_match_the_whole_prefix_is_the_demand(self):
-        """A request holding nothing keeps the stamp as the demand -- the
+    def test_without_a_match_the_whole_prefix_is_still_the_measure(self):
+        """A request holding nothing keeps the stamp as the measure -- the
         conservative reading, unchanged."""
         r = _req(rid="nomatch", stamp=SPAN_STAMP, tokens=SPAN_STAMP)
         out = PrefetchOutcome(SPAN_LOADED, hit_tokens=SPAN_LOADED, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
             store_witness(_sched([r], outcomes={r.rid: out}), r)
-        self.assertIn(f"demand={SPAN_STAMP}", str(cm.exception))
+        self.assertIn(f"stamped={SPAN_STAMP}", str(cm.exception))
 
-    def test_a_match_that_covers_the_stamp_owes_nothing(self):
-        """`resident >= stamp`: the request's own match already covers the
-        stamped prefix, so there is nothing left to re-prefill and nothing for
-        the store to have delivered. That is a hit, not a contradiction."""
-        r = _req(rid="covered", stamp=4_000, tokens=4_000, prefix_indices=4_000)
-        out = PrefetchOutcome(0, hit_tokens=0, probed=True, matched=0)
+    def test_a_presence_that_covers_the_stamp_owes_nothing(self):
+        """The prefetch's own reading covers the stamped prefix: hit. This is
+        the #1176 metal shape (PP1/PP2 matched=5966 loaded=42 vs stamp 6008)
+        and it must stay a hit -- the false contradiction stays closed."""
+        r = _req(rid="covered", stamp=6008, tokens=6008, prefix_indices=5966)
+        out = PrefetchOutcome(42, hit_tokens=6008, probed=True, matched=5966)
         self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
+
+    def test_the_reaped_pp0_record_stays_a_sanctioned_bounded_reprefill(self):
+        """The #1176 metal killer: PP0 REAPED with matched=3456 loaded=0
+        against stamp 6008 -- shortfall 2552 <= allowance 4096, a SANCTIONED
+        one-chunk re-prefill (#939), never a STOP."""
+        r = _req(rid="reaped", stamp=6008, tokens=6008, prefix_indices=3456)
+        out = PrefetchOutcome(0, hit_tokens=3456, probed=True, matched=3456)
+        self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
+
+    def test_nothing_materialized_raises_even_when_residency_covers_the_stamp(self):
+        """RED on 1634bc3d28 (reviewed as B3). That commit put a
+        `demand <= 0 -> "hit"` short-circuit ABOVE the `presence > 0` test, so a
+        request whose CREDITED residency reached the stamp was called a hit
+        with nothing materialized at all -- and the credit could come entirely
+        from `host_hit_length`, a HOST-tier hit that may never reach the
+        device. There is no short-circuit now."""
+        r = _req(rid="hostonly", stamp=30_000, tokens=30_000, host_hit_length=30_000)
+        out = PrefetchOutcome(0, hit_tokens=40, probed=True, matched=0)
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            store_witness(_sched([r], outcomes={r.rid: out}), r)
+        self.assertIn("nothing materialized", str(cm.exception))
+
+    def test_device_residency_alone_never_short_circuits_the_gate(self):
+        """The other half of the same short-circuit, found by a MUTANT that
+        SURVIVED the first cut of this class: the reviewed `demand` netted BOTH
+        `prefix_indices` and `host_hit_length` off the stamp, so a credited
+        residency from EITHER term alone reached the early `return "hit"`.
+        The test above covers the host-tier half; this covers the device half,
+        where the prefix indices cover the stamp and the prefetch record still
+        says nothing was materialised."""
+        r = _req(rid="deviceonly", stamp=30_000, tokens=30_000,
+                 prefix_indices=30_000)
+        out = PrefetchOutcome(0, hit_tokens=40, probed=True, matched=0)
+        with self.assertRaises(StoreWitnessContradiction) as cm:
+            store_witness(_sched([r], outcomes={r.rid: out}), r)
+        msg = str(cm.exception)
+        self.assertIn("nothing materialized", msg)
+        self.assertIn("device_resident=30000", msg)
 
 
 class H_TheProbeAnsweringIsNotThePrefixBeingPresent(CustomTestCase):
@@ -602,8 +655,7 @@ class K_ATruncatedMatchRestoresTheWholeDemand(CustomTestCase):
             store_witness(_sched([r], outcomes={r.rid: out}), r)
         msg = str(cm.exception)
         self.assertIn(f"stamped={TRUNC_STAMP}", msg)
-        self.assertIn("resident=0", msg)
-        self.assertIn(f"demand={TRUNC_STAMP}", msg)
+        self.assertIn("device_resident=0", msg)
         self.assertIn(f"shortfall={TRUNC_STAMP - TRUNC_DELIVERED}", msg)
 
     def test_the_admission_site_raises_on_the_same_record(self):

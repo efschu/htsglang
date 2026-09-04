@@ -2115,6 +2115,21 @@ def pp_prefetch_completion_facts_from_wire(message) -> Tuple:
             continue
         if completed == PREFETCH_PENDING:
             out.append((str(rid), PREFETCH_PENDING, int(rank)))
+        elif completed == PREFETCH_CONTRADICTION:
+            # #1176 (review r3, B1): THE NON-NUMERIC VALUES ARE THE POINT.
+            #
+            # Both sentinels are STRINGS by construction (pp_prefetch_
+            # completion.py: "I looked and found N" and "I am still looking"
+            # must not share a spelling), so `int(completed)` raises ValueError
+            # on them and the `except: continue` below DROPS the entry. PENDING
+            # had its pass-through; CONTRADICTION did not, so the follower's
+            # report died at the first parse -- at PP0's absorber and at every
+            # relay hop -- and `peers_reporting_contradiction` saw an empty
+            # table. The STOP that be3ec1760b's silent split was traded FOR was
+            # therefore unreachable on the real carrier: measured, wire
+            # {KEY: (("r1", CONTRADICTION, 1), ("r1", 4096, 2))} parsed to
+            # (("r1", 4096, 2),) alone.
+            out.append((str(rid), PREFETCH_CONTRADICTION, int(rank)))
         else:
             try:
                 out.append((str(rid), int(completed), int(rank)))
@@ -2235,6 +2250,25 @@ def pp_prefetch_completion_stamp(holder, incoming, out: Dict[str, object]) -> No
         # `pp_note_parked_continuation` states for its own table).
         fresh = {rid for rid, _c, _r in own}
         for key in [k for k in merged if k[1] == int(own_rank) and k[0] not in fresh]:
+            # #1176 (review r3, B5): A CONTRADICTION IS NOT A STALE CAPACITY
+            # CLAIM AND IS NEVER WITHDRAWN.
+            #
+            # The withdrawal rule exists so PP0 never admits on a token COUNT
+            # nobody stands behind any more. A contradiction promises nothing:
+            # it states that THIS rank measured a re-admission whose presence
+            # fell short of its own retract stamp by more than one chunk. The
+            # rid leaves `waiting_queue` on the very pass the follower admits
+            # it (scheduler.py removes it after the admission), so withdrawing
+            # on absence deleted the report exactly one lap before PP0 could
+            # read it -- measured: a report emitted on pass N became None on
+            # pass N+1, and `peers_reporting_contradiction` stayed empty.
+            #
+            # Keeping it is safe in the DANGEROUS direction. The worst case is
+            # a STOP on a rid whose follower has since moved on: loud, once, at
+            # the authority, with the peer named -- never a silent licensed
+            # recompute (#939, raenge-nie-uneins).
+            if merged.get(key, (None, None, None))[1] == PREFETCH_CONTRADICTION:
+                continue
             merged.pop(key, None)
     for rid, completed, rank in own:
         merged[(rid, int(rank))] = (rid, completed, int(rank))

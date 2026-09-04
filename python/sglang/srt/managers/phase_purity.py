@@ -1470,35 +1470,37 @@ def _witness_from_outcome(
     bounded re-prefill, reported as a disagreement. Same class the #841
     comment names for ``loaded`` at unified_radix_cache.py:4136-4139.
 
-    WHAT THE PRESENCE IS COMPARED AGAINST IS THE OUTSTANDING DEMAND, READ AT
-    WITNESS TIME (#1176 review B1). ``matched`` is ``insert_result.prefix_len``:
-    the prefix of the FETCHED SPAN that the tree already held, not this
-    request's whole device-resident prefix. The span itself EXCLUDES what was
-    already matched when the prefetch was registered -- scheduler.py:5322
-    computes ``_matched_len = len(req.prefix_indices) + req.host_hit_length``
-    and :5350 slices ``_new_input_tokens = full_untruncated_fill_ids[
-    _matched_len:_match_end]`` -- while the stamp is the WHOLE prompt prefix
-    (schedule_batch.py:2593). So ``matched + loaded <= stamp - _matched_len``
-    BY CONSTRUCTION, and comparing the presence against the whole stamp charges
-    the prefetch for tokens nobody asked it to fetch: a request with stamp
-    20000 that matched 10000 at readmit and whose 9999-token span completed IN
-    FULL read as a shortfall of 10016 on a prefix that was 19984/20000 present.
+    WHAT THE PRESENCE IS COMPARED AGAINST IS THE WHOLE STAMPED PREFIX, AND
+    NOTHING IS NETTED OFF IT (#1176 review r3). ``matched`` is
+    ``insert_result.prefix_len`` -- the tree match measured by the very
+    operation that inserted ``loaded`` -- so ``matched + loaded`` is a
+    WHOLE-PREFIX reading from ONE source, not a delta on a span. Boot weg1b6
+    measured exactly that identity on every line (PP1/PP2 5966+42=6008 against
+    stamp 6008; PP0 3456+0=3456, shortfall 2552, inside the allowance).
 
-    The demand is therefore ``max(0, stamp - resident)`` with ``resident``
-    computed from THIS request's CURRENT match, by the same expression the
-    registration site uses. It is deliberately NOT the registration-time
-    snapshot ``req._prefetch_span_tokens``: that field has one writer and no
-    clearer, and ``Req.truncate_prefix_to`` empties ``prefix_indices`` and
-    ``host_hit_length`` without touching it, so beside a truncated request the
-    span reads STALE-SMALLER and shrinks the demand to a number the prefetch
-    has already met -- a "hit" on a prefix that is gone, i.e. an unbounded
-    licensed recompute. Reading the live match instead makes the record
-    self-invalidating: the demand returns to the full stamp the moment the
-    match does. See the block comment at the computation for the worked
-    breaking input and for why the sum cannot double-count.
+    TWO EARLIER READINGS ARE DELETED, both because they netted a SECOND
+    quantity off the stamp and both because that second quantity overlaps the
+    first:
+
+      * ``req._prefetch_span_tokens`` (be3ec1760b) was stamped once at
+        registration and never cleared, so beside a truncated request it read
+        STALE-SMALLER and shrank the demand to a number the prefetch had
+        already met.
+      * ``len(prefix_indices) + host_hit_length`` (1634bc3d28) reads the CURRENT
+        match, which fixes the staleness and introduces two over-credits
+        instead: it is the same tree match ``matched`` already reports (so the
+        request's own prefix is subtracted twice), and its two terms overlap
+        each other once ``init_load_back`` has run (schedule_batch.py:3637-3645
+        states the identity; nothing clears ``host_hit_length``).
+
+    No field at this site distinguishes the overlapping case from the disjoint
+    one, so the witness uses the single self-consistent reading. The error it
+    can still make is UNDER-reading (the tree may have grown since the
+    prefetch's insert), and that direction is a loud STOP, never a licensed
+    recompute -- the direction #939 requires.
 
     The witness is therefore 'hit' only if something is MATERIALIZED and the
-    shortfall ``demand - materialized`` is within the one-chunk ``allowance``;
+    shortfall ``stamp - materialized`` is within the one-chunk ``allowance``;
     nothing materialized beside a stamp, and a shortfall larger than the
     allowance, are contradictions. A record without the annotation (a bare int
     from another tree) keeps the old reading, where loaded and hit are the
@@ -1548,72 +1550,73 @@ def _witness_from_outcome(
         return "unprobed" if not probed else "cold"
     if not probed and hit == 0:
         return "unprobed"
-    # #1176 (review B1): WHAT THIS PREFETCH STILL OWES, DERIVED FROM THE
-    # CURRENT MATCH -- never from a registration-time snapshot.
+    # #1176 (review r3, B1/B2/B3-successors): THE PRESENCE IS ONE NUMBER FROM
+    # ONE READER, AND NOTHING IS NETTED OFF IT.
     #
-    # `resident` is the SAME EXPRESSION the registration site computes when it
-    # decides the span (scheduler.py:5322 `_matched_len = len(req.prefix_
-    # indices) + req.host_hit_length`), read HERE instead of stamped once. The
-    # demand is the stamped prefix minus what this request already holds on
-    # its own account, so what remains is exactly what the store had to
-    # deliver.
+    # `materialized` (= `matched + loaded`) is the PREFETCH'S OWN reading of
+    # how much of THIS request's prefix exists after its insert: `matched` is
+    # `insert_result.prefix_len`, the tree match measured by the same operation
+    # that inserted `loaded` (unified_radix_cache.py:4156). It is a WHOLE-PREFIX
+    # quantity, not a delta -- boot weg1b6 measured `matched + loaded ==
+    # completed_local` on every line (PP1/PP2 5966+42=6008; PP0 3456+0=3456).
     #
-    # WHY NOT `req._prefetch_span_tokens` (the be3ec1760b reading, deleted):
-    # that field is written ONCE at registration (scheduler.py:5355) and is
-    # never cleared. `Req.truncate_prefix_to` (schedule_batch.py:2357, called
-    # from scheduler.py:11495 and :10975 under the #791/#930 PP-told rule)
-    # empties `prefix_indices` AND `host_hit_length` -- so after a truncation
-    # the span is a STALE-SMALLER number describing a match this rank no
-    # longer holds. Worked breaking input: stamp 80009, registration match
-    # 79000 -> span 1008; the prefetch delivers 1008; PP0 then tells told=0
-    # and the device-resident prefix is gone; the next pass read
-    # demand=min(80009, 1008)=1008 against presence 1008 and called it a
-    # "hit", licensing a P=0 re-prefill of 79,001 tokens on a stamp -- the
-    # exact kein-doppel-prefill violation this witness exists to prevent.
-    # The commit that introduced the span reasoned only about a stale-LARGER
-    # one ("cannot widen the demand past the stamp") and never about this
-    # direction. Deriving from the CURRENT match makes the record
-    # SELF-INVALIDATING: a truncation restores the full demand by
-    # construction, with no new state, no clearer and no lifecycle to keep in
-    # step (upstream-minimal). `_prefetch_span_tokens` keeps its ONE other
-    # reader (`_apply_prefetch_deferral`, scheduler.py:6150); the witness
-    # simply stops being a second, lifecycle-blind consumer of it.
+    # WHY NO `resident` TERM (the 1634bc3d28 reading, deleted). That commit
+    # subtracted `len(prefix_indices) + host_hit_length` from the stamp first
+    # and THEN subtracted the presence, on the premise that the two describe
+    # disjoint spans. They do not, and the tree says so at two separate sites:
     #
-    # THE READ IS NOT DOUBLE-COUNTED. `presence` is relative to the span,
-    # whose start is the registration-time match; adding it to a `resident`
-    # that ALREADY covered it would over-credit. It cannot: both live writers
-    # of `prefix_indices`/`host_hit_length` (`init_next_round_input` and
-    # `match_prefix_for_req`) run STRICTLY AFTER `pop_prefetch_loaded_tokens`
-    # consumes the record in the same admission-loop iteration
-    # (scheduler.py:11292 pops, :11380 re-derives), so a record the witness
-    # can still see was never re-matched since it terminated.
-    resident = len(getattr(req, "prefix_indices", None) or ()) + int(
-        getattr(req, "host_hit_length", 0) or 0
-    )
-    demand = max(0, int(stamp) - resident)
-    shortfall = demand - presence
-    # A demand of zero is not a contradiction: the request's own current match
-    # already covers the stamped prefix, so nothing is left to re-prefill and
-    # there is nothing for the store to have delivered.
-    if demand <= 0:
-        return "hit"
+    #   * `matched` and `len(prefix_indices)` are the SAME tree match read by
+    #     two readers, so netting both charges the request's own prefix twice
+    #     in its own favour. Breaking input: stamp 80009, prefix_indices 40000
+    #     (the span the prefetch had just inserted), matched 0, loaded 40000 ->
+    #     demand 40009, presence 40000, shortfall 9 -> "hit", licensing a
+    #     40009-token re-prefill on a stamp. `match_prefix_for_req` writes
+    #     `prefix_indices` from `calc_priority` (schedule_policy.py:262-277,
+    #     :391/:470) at scheduler.py:10524 -- ~800 lines BEFORE the pop and the
+    #     witness in the SAME `_get_new_batch_prefill_raw`, so the match has
+    #     already absorbed the completed prefetch by the time the witness runs.
+    #
+    #   * `len(prefix_indices)` and `host_hit_length` also overlap once
+    #     `init_load_back` has run (schedule_policy.py:2272): schedule_batch.py
+    #     :3637-3645 states it verbatim -- "len(prefix_indices) = device_
+    #     original + host_loaded ... device_portion = len(prefix_indices) -
+    #     host_total" -- and nothing clears `host_hit_length`. Breaking input:
+    #     prefix_indices 15000 + host_hit_length 15000 against stamp 30000 read
+    #     as a fully covered prefix while 15000 tokens were really owed.
+    #
+    # There is no field at this site that says which of the two spans a given
+    # record covers, so the only reading that cannot over-credit is the one
+    # taken from a SINGLE source that already covers the whole prefix. That is
+    # `presence`. Under-reading is possible in the other direction (the tree may
+    # have grown since the prefetch's insert), and that direction is a LOUD stop,
+    # never a licensed recompute (#939).
+    shortfall = int(stamp) - presence
+    resident = len(getattr(req, "prefix_indices", None) or ())
+    # THE `presence > 0` REQUIREMENT IS PART OF THE GATE, not a branch above it.
+    # 1634bc3d28 put a `demand <= 0 -> "hit"` short-circuit ABOVE this test, so
+    # a request whose credited residency reached the stamp was called a hit with
+    # NOTHING materialized at all -- the very arm this witness's docstring calls
+    # a contradiction, bypassed. There is no short-circuit here: a stamp with a
+    # probed record and zero presence is a contradiction on every input.
     if presence > 0 and shortfall <= int(allowance):
         return "hit"
     requested = len(getattr(req, "origin_input_ids", None) or ())
     message = (
         f"#1157 STORE WITNESS CONTRADICTION rid={getattr(req, 'rid', None)} "
-        f"stamped={stamp} resident={resident} demand={demand} probed_hit={hit} "
+        f"stamped={stamp} probed_hit={hit} "
         f"loaded={loaded} allowance={int(allowance)} shortfall={shortfall} "
-        f"requested={requested} matched={matched} materialized={presence}: "
+        f"requested={requested} matched={matched} materialized={presence} "
+        f"device_resident={resident}: "
         f"the retract stamp says the prompt was computed and fenced to the "
         f"canonical store in the previous window, and the measured presence of "
         f"this re-admission -- what the tree already held (matched) plus what "
-        f"this prefetch loaded, against the demand this rank still owes after "
-        f"its CURRENT match (stamped - resident) -- "
+        f"this prefetch loaded, both read from the SAME prefetch record and "
+        f"compared against the WHOLE stamped prefix (device_resident is printed "
+        f"as a diagnostic and is deliberately NOT netted off, review r3) -- "
         + (
             "shows nothing materialized"
             if presence <= 0
-            else "fell short of that demand by more than one chunk"
+            else "fell short of the stamped prefix by more than one chunk"
         )
         + ". Two measurements of one span disagree; re-admitting at "
         f"P={presence} would be a recompute licensed by a stamp "
