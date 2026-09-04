@@ -421,8 +421,18 @@ class TheDiscriminatorMustBeBoundedAndNameTheSlot(CustomTestCase):
             mamba_alloc.note_924d("free", rid="probe-A", slot=torch.tensor([7]))
             mamba_alloc.note_924d("alloc", rid="probe-B", slot=torch.tensor([9]))
 
+            # No rid: the subject falls back to the node, so two different
+            # nodes are two lines -- `write_backup` carries no request.
+            mamba_alloc.note_924d("backup", node_id=41, slot=torch.tensor([3]))
+            mamba_alloc.note_924d("backup", node_id=41, slot=torch.tensor([3]))
+            mamba_alloc.note_924d("backup", node_id=42, slot=torch.tensor([4]))
+
         lines = [line for line in captured.output if "#924D" in line]
-        self.assertEqual(len(lines), 3, lines)
+        self.assertEqual(len(lines), 5, lines)
+        self.assertEqual(
+            len([line for line in lines if "station=backup" in line]), 2, lines
+        )
+        self.assertTrue(any("rid=node41" in line for line in lines))
         self.assertTrue(any("station=alloc" in line and "probe-A" in line for line in lines))
         self.assertTrue(any("station=free" in line and "probe-A" in line for line in lines))
         self.assertTrue(any("mamba_slot=[7]" in line for line in lines))

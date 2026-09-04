@@ -51,10 +51,19 @@ _924D_SUPPRESSED = 0
 
 
 def note_924d(station: str, *, rid=None, slot=None, node_id=None, extra: str = "") -> None:
-    """One ``#924D`` line per (rid, station). Never raises."""
+    """One ``#924D`` line per (subject, station). Never raises.
+
+    THE SUBJECT IS THE RID WHERE THERE IS ONE AND THE NODE OTHERWISE, and that
+    is not a convenience: ``write_backup`` carries no request (it is driven off
+    the tree, not off a batch), so keying the backup station on the rid would
+    collapse EVERY backup in the process into a single ``rid=None`` line and
+    the trail would silently lose the station that names which node holds which
+    slot -- the very join #1190 needs.
+    """
     global _924D_SUPPRESSED
     try:
-        key = (str(rid)[:12], station)
+        subject = str(rid)[:12] if rid is not None else f"node{node_id}"
+        key = (subject, station)
         if key in _924D_SEEN:
             return
         if len(_924D_SEEN) >= _924D_CAP:
@@ -74,7 +83,7 @@ def note_924d(station: str, *, rid=None, slot=None, node_id=None, extra: str = "
         logger.info(
             "#924D station=%s rid=%s mamba_slot=%s node=%s%s",
             station,
-            key[0],
+            subject,
             slot,
             node_id,
             f" {extra}" if extra else "",
