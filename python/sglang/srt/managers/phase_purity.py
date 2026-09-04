@@ -957,11 +957,41 @@ def _spend_tp_compute_chunk(scheduler) -> None:
 def prefill_blocked_here(scheduler, running_bs: int = -1) -> bool:
     """True when a prefill batch must NOT be built this iteration.
 
-    Rank-uniform by construction, which is the load-bearing property: the
-    purity rule is static boot config and the active layout is replicated
-    (a cutover commits on every rank or on none). A rank-local input here
-    would split the group across branches with mismatched collectives --
-    the failure family documented at ``_update_uniform_pool_budget``.
+    RANK UNIFORMITY IS THE LOAD-BEARING PROPERTY HERE, and this docstring used
+    to assert it flat: "rank-uniform by construction ... a rank-local input
+    here would split the group across branches with mismatched collectives".
+    The claim was made here and repeated at the consumer in ``scheduler.py``,
+    and NOTHING ENFORCED IT (#1203, family A). Thirty-five lines below, this
+    function calls ``seam_transport_premise_holds``, whose entire read set was
+    this rank's own -- the store witness reads the tree cache's prefetch
+    records, and their reduced half exists only under
+    ``UnifiedRadixCache.tp_world_size > 1``, a field written once at cache
+    construction and never rebound at the cutover, so on the shipping form
+    (``--tp-size 1 --pp-size 3``) it is 1 in both phases. Measured divergence
+    at boot_855_weg1b9_1116175f6d_0904_164023 log:1900 vs :1977/:2067.
+
+    WHAT IS TRUE NOW, exactly:
+
+      * the SEAM-TRANSPORT term is a group fact whenever the TP-group reduce
+        ran this pass -- every rank contributes an AND-slot to
+        ``_update_uniform_pool_budget``'s packed MIN and this branch reads the
+        reduced value (#1203, A1);
+      * the purity rule is static boot config, and the active phase is the
+        replicated layout (a cutover commits on every rank or on none).
+
+    WHAT IS STILL UNENFORCED, said plainly rather than left to be discovered:
+
+      * where no reduce runs (the PP loop, a single-rank TP group, the
+        kv-session-offload branch that takes no reduce of its own) the seam
+        term falls back to the rank-local answer. That is correct for the
+        single-rank case and a NAMED GAP for the offload branch;
+      * ``seam_transport_exempt`` and ``running_bs`` are still read locally.
+        They are believed replicated -- the stamp is written at the cutover on
+        every rank and the queue is the replicated one -- but believed is not
+        checked, and this docstring is not a check;
+      * nothing walks the input set and asserts it. The failure family is
+        documented at ``_update_uniform_pool_budget``; the assertion that would
+        end it does not exist yet.
     """
     from sglang.srt.managers.phase_policy import (
         PHASE_TP,
@@ -1135,6 +1165,14 @@ SEAM_TRANSPORT_ROUND_ATTR = "_seam_transport_round"
 #: entry that makes it one -- set where the exempt admission happens, cleared
 #: only by a fresh cutover stamp.
 SEAM_GRANT_CONSUMED_ATTR = "seam_grant_consumed"
+
+#: #1203 (family A1): the GROUP's answer to `seam_transport_premise_holds`,
+#: published by `Scheduler._update_uniform_pool_budget` as one AND-slot of the
+#: packed MIN it already takes once per TP-loop iteration. `None` means no
+#: reduce ran this pass (PP loop, single-rank group, the kv-session-offload
+#: branch that takes no reduce of its own), and then the local answer IS the
+#: group answer.
+UNIFORM_SEAM_PREMISE_ATTR = "_uniform_seam_premise"
 
 
 def seam_grant_is_open(req) -> bool:
@@ -1754,16 +1792,27 @@ def store_witness(scheduler, req) -> str:
     the acceptance instrument (accept_weg1_1068.py check A14). See
     `_witness_from_outcome` for the full record of the six attempts.
 
-    RANK UNIFORMITY of the inputs (review N3): ``ongoing_prefetch`` is
-    removed only after the group MIN in `check_prefetch_progress`, under the
-    barrier of `drain_retired_prefetch`, or at the cutover sweep -- lockstep
-    on the replicated queue; ``prefetch_loaded_tokens_by_reqid`` is written
-    from the SAME reduced vector (loaded, probed, hit_tokens all MIN-reduced
-    in one packed all_reduce, review N1) or on the revoke path whose enqueue
-    the prefetch thread's own MIN precedes; ``prefetch_deferred`` is set from
-    a rank-local counter but its clear and its retry are gated on the group
-    (#1068 slice 3 fix). The remaining rank-local read is the request's own
-    replicated fields.
+    RANK UNIFORMITY OF THE INPUTS -- RETRACTED (#1203, family A1). The review-N3
+    paragraph this replaces claimed the read set was group-agreed, and it was
+    FALSE ON THE SHIPPING FORM. It rested on "``prefetch_loaded_tokens_by_reqid``
+    is written from the SAME reduced vector (loaded, probed, hit_tokens all
+    MIN-reduced in one packed all_reduce, review N1)". That packed MIN is taken
+    under ``if self.tp_world_size > 1:`` in `check_prefetch_progress`, and
+    ``UnifiedRadixCache.tp_world_size`` is written once at cache construction
+    and never rebound at the cutover -- while the SCHEDULER's group is rebound
+    to world N when the TP phase is entered. On the shipping form
+    (``--tp-size 1 --pp-size 3``) the cache's world is 1 in BOTH phases, the
+    `else` branch builds the vector un-reduced, and every reading below is this
+    rank's own. Measured, same commit, one second before the cutover:
+    boot_855_weg1b9_1116175f6d_0904_164023 log:1900 (PP0 `absent=67`) against
+    :1977 / :2067 (PP1, PP2 `assembling=67`) -- same 67 stems, same second.
+
+    WHAT THIS FUNCTION IS, therefore: a RANK-LOCAL reading, and nothing above
+    it may branch on it alone. Its one control-flow consumer, the seam-transport
+    premise, now votes this reading into the group's packed MIN and reads the
+    reduced answer (`seam_transport_premise_holds`). ``ongoing_prefetch`` and
+    ``prefetch_deferred`` are as the old paragraph described them -- lockstep
+    removal, group-gated clear -- but that was never the term that broke.
     """
     tree = getattr(scheduler, "tree_cache", None)
     rid = getattr(req, "rid", None)
@@ -1824,7 +1873,77 @@ def store_witness_census(scheduler) -> str:
 
 
 def seam_transport_premise_holds(scheduler) -> bool:
+    """The GROUP's answer to the premise, never one rank's. #1203, family A1.
+
+    THE DEFECT, and it is the #1158/#1176 root on its last unvisited consumer.
+    The check below (`seam_transport_premise_holds_locally`) is rank-local end
+    to end: `store_witness` reads `prefetch_loaded_tokens_by_reqid`, whose
+    reduced half exists only under `UnifiedRadixCache.tp_world_size > 1` -- and
+    that field is written once at construction and never rebound at the
+    cutover, while `Scheduler.tp_cpu_group` IS rebound to world N by
+    `phase_flip_runtime` when the TP phase is entered. On the shipping form
+    (`--tp-size 1 --pp-size 3`) the cache's world is therefore 1 in BOTH
+    phases and every term of this premise is this rank's own reading.
+
+    THE TWO BRANCHES CARRY DIFFERENT COLLECTIVES, which is what makes a
+    divergence fatal rather than untidy: True builds a transport extend batch,
+    False refuses and -- under strict:3 with drain mode -- yields no batch at
+    all. `prefill_blocked_here`, the caller thirty-five lines up from here,
+    has claimed rank-uniformity in its docstring since it was written.
+
+    THE DIVERGENT INPUT IS ON METAL AT THIS COMMIT, one second before the
+    cutover of boot_855_weg1b9_1116175f6d_0904_164023 (log:1900 / :1977 /
+    :2067): three ranks, the same 67 stems, the same second, PP0 reporting
+    `absent=67` while PP1 and PP2 report `assembling=67`. It did not split the
+    group in that boot only because the boot died fifteen seconds later.
+
+    THE CUT IS ONE AND-SLOT, NO NEW COLLECTIVE. Every rank contributes its own
+    verdict to the packed MIN `_update_uniform_pool_budget` already takes once
+    per TP-loop iteration; MIN over {0, 1} is AND, so the group admits only
+    what every rank admits.
+
+    LOCAL *AND* GROUP, in that order, and the order is the safety argument. A
+    published verdict can only ever REFUSE here: a stale or wrong 1 cannot
+    license a rank whose own reading says no, and a stale 0 is still a value
+    every rank read from the same reduce, so it refuses uniformly. That is why
+    the local check is evaluated twice per pass (once for the vote, once here)
+    rather than memoised -- a memoised verdict is a thing that can be consumed,
+    destroyed or outlive its pass, which is the #823 W9b failure exactly.
+
+    NO PUBLICATION MEANS NO GROUP, not a group of zero: `None` is the PP loop,
+    the single-rank group and the kv-session-offload branch that takes no
+    reduce of its own. There the local answer IS the group answer and this
+    function is byte-identical to the pre-#1203 path.
+    """
+    if not seam_transport_premise_holds_locally(scheduler):
+        return False
+    group = getattr(scheduler, UNIFORM_SEAM_PREMISE_ATTR, None)
+    if group is None:
+        return True
+    return int(group) != 0
+
+
+def local_seam_premise_vote(scheduler) -> int:
+    """This rank's 0/1 vote for the packed MIN. #1203, family A1.
+
+    UNKNOWN VOTES YES, deliberately. An exception here is rank-local, so a
+    vote of 0 on it would let one rank's error refuse the flip transport for
+    the whole group with no way back -- a wedge traded for a recompute, the
+    worse of the two. Voting 1 cannot license anything: the read site above
+    ANDs this group verdict with its own live local check, so an errored
+    rank degrades to exactly the pre-#1203 behaviour and no further.
+    """
+    try:
+        return 1 if seam_transport_premise_holds_locally(scheduler) else 0
+    except Exception:  # noqa: BLE001 - a vote may never break the reduce
+        return 1
+
+
+def seam_transport_premise_holds_locally(scheduler) -> bool:
     """Is the re-admission actually a RESTORE? Checked, not asserted. #861d.
+
+    RANK-LOCAL BY CONSTRUCTION, and named so since #1203: every term below is
+    this rank's own reading. The group verdict is formed by the wrapper above.
 
     THE EXEMPTION RESTS ON A FACTUAL CLAIM, AND THE CLAIM IS FALSIFIABLE.
     ``seam_transport_exempt`` permits prefill in the TP layout on the ground

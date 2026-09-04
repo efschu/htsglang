@@ -204,6 +204,7 @@ from sglang.srt.managers.phase_purity import (
     decode_blocked_here as phase_decode_blocked_here,
 )
 from sglang.srt.managers.phase_purity import (
+    UNIFORM_SEAM_PREMISE_ATTR,
     observe_store_witness,
     prefill_blocked_here as phase_prefill_blocked_here,
 )
@@ -6394,6 +6395,27 @@ class Scheduler(
         more, so the next pass's progress drain -- not this pass's stale
         one -- decides its admission. The landed-once flag is consumed on
         every rank; a follower's landing is not held either.
+
+        THAT MECHANISM DOES NOT EXIST IN THE TP PHASE, and the paragraph above
+        is true only of the PP one (#1203, family A3 -- VERIFIED AT THIS TREE,
+        NOT FIXED HERE). `phase_flip_runtime` replaces `scheduler.ps` with
+        `pp_size=1, pp_rank=0` on EVERY rank when the TP phase is entered, so
+        the exemption below is inert there: all N ranks reach `return True` and
+        each withholds admission on its OWN mark. The mark is rank-local at
+        both ends -- it is set from `_prefetch_capacity_limit_or_none()`, this
+        rank's prefetch budget, and timed off this rank's `time.monotonic()` --
+        so an asymmetric budget instant holds a request on one TP rank and
+        admits it on another, and the two ranks then build different batches.
+
+        NOT CLOSED IN #1203 BECAUSE THE FIX IS NOT LOCAL. The hold is a
+        per-request predicate over the whole waiting queue; the group machinery
+        that exists is the prefetch BALLOT, which covers only the queue head
+        (`PREFETCH_BALLOT_SLOTS`) and answers a different question ("has the
+        prefetch made progress"), not this one ("is this request rate-limited
+        out of this pass"). Conflating the two would make a wrong predicate
+        uniform, which is the failure mode #1203 records for A2. The honest
+        close is either a group-uniform defer budget or a second per-rid ballot
+        arm; both are larger than this commit and neither is a comment.
         """
         landed_once = bool(getattr(req, "_prefetch_landed_hold_once", False))
         if landed_once:
@@ -6880,6 +6902,13 @@ class Scheduler(
             # `update_dcp_admission_state`'s packed reduce, where it already
             # lives.
             self._uniform_corridor_width = None
+            # #1203: NAMED GAP, same shape as the #639 host floor above. This
+            # branch takes no reduce of its own, so the seam-transport premise
+            # stays unreduced and its read site decides on this rank's own
+            # answer -- byte-identical to the pre-#1203 path under
+            # --enable-kv-session-offload. The right close is one more term in
+            # `update_dcp_admission_state`'s packed reduce, where it lives.
+            setattr(self, UNIFORM_SEAM_PREMISE_ATTR, None)
             return
 
         alloc = self.token_to_kv_pool_allocator
@@ -6940,6 +6969,12 @@ class Scheduler(
             # #794: one rank in this group -- the local corridor decision IS
             # the group decision, taken at the call site.
             self._uniform_corridor_width = None
+            # #1203: one rank -- nothing to diverge from, and the read site's
+            # local answer IS the group answer. CLEARED rather than left
+            # standing, so a flip back into PP cannot decide the seam on the
+            # TP phase's last verdict (#823 W9b's rule for `_uniform_head_
+            # inputs`, and it is why this is None and not the local vote).
+            setattr(self, UNIFORM_SEAM_PREMISE_ATTR, None)
             return
         # #824: the ON side had no report at all, so coverage COMING BACK --
         # every pp_to_tp cutover -- was invisible. Same call, same predicate.
@@ -7075,6 +7110,7 @@ class Scheduler(
         # Payload order, in full, after this block:
         #   [avail, (admission,) -avail, host, -host, mamba, -mamba,
         #    corridor, head_match[0..TP_HEAD_SLOTS-1], admit_limit,
+        #    seam_premise,
         #    ballot_digest, -ballot_digest, ballot_v0..v{K-1}]
         #
         # WHY THE LOCAL INPUTS ARE COMPUTED HERE. The sort key
@@ -7104,6 +7140,36 @@ class Scheduler(
         vals = vals + tp_head_congruence.build_admit_limit_payload(
             self._local_admit_limit()
         )
+        # #1203 (family A1): THE SEAM-TRANSPORT PREMISE rides this reduce too,
+        # as ONE AND-slot, and it is placed HERE for the reason the corridor
+        # width and the head block above are -- everything before this point is
+        # indexed from the HEAD and the ballot below is indexed from the TAIL
+        # (`len(vals) - (PREFETCH_BALLOT_SLOTS + 2)`), so an insertion at this
+        # seam leaves both readings intact. Its own explicit index is captured
+        # BEFORE the append, like every block above it.
+        #
+        # WHAT IT CLOSES. `phase_purity.seam_transport_premise_holds` decides
+        # whether the TP layout may build a seam-transport prefill batch, and
+        # its whole read set was rank-local: the store witness reads the tree
+        # cache's prefetch records, whose reduced half exists only under
+        # `UnifiedRadixCache.tp_world_size > 1`, and THAT field is written once
+        # at cache construction and never rebound at the cutover -- while THIS
+        # group is rebound to world N when the TP phase is entered. On the
+        # shipping form (--tp-size 1 --pp-size 3) the cache's world is 1 in
+        # both phases, so three ranks weighed three different readings of the
+        # same store and branched into different collectives: True builds a
+        # transport extend batch, False yields no batch at all under strict:3
+        # with drain mode. Measured divergence at this commit, one second
+        # before the cutover of boot_855_weg1b9_1116175f6d_0904_164023
+        # (log:1900 vs :1977/:2067): PP0 `absent=67`, PP1 and PP2
+        # `assembling=67`, same 67 stems, same second.
+        #
+        # MIN OVER {0, 1} IS AND -- the same argument prefetch_ballot.py makes
+        # for its own slots -- so the group transports only what every rank
+        # agrees is a restore. No new collective: one more int on a reduce
+        # that already runs, which is the close #794 and #823 W9 both used.
+        _seam_premise_at = len(vals)
+        vals = vals + [self._local_seam_premise_vote()]
         _ballot_verdicts = self._drain_prefetch_progress()
         self._pass_prefetch_verdicts = _ballot_verdicts
         _ballot_rids = [
@@ -7128,6 +7194,9 @@ class Scheduler(
             _head_at : _head_at + tp_head_congruence.TP_HEAD_SLOTS
         ].tolist()
         _admit_limit = int(t[_limit_at])
+        # #1203: read back by its captured head index, before the ballot, under
+        # the same discipline as the corridor width and the head block.
+        setattr(self, UNIFORM_SEAM_PREMISE_ATTR, int(t[_seam_premise_at]))
         _ballot_at = len(vals) - (prefetch_ballot.PREFETCH_BALLOT_SLOTS + 2)
         # #1158 / raenge-nie-uneins: A DIGEST MISMATCH IS A GROUP STOP. The
         # (x, -x) pair makes the group's min and max digest visible to EVERY
@@ -7190,6 +7259,25 @@ class Scheduler(
         self._publish_uniform_mamba_floor(
             int(t[mamba_at].item()), max_mamba_avail=-int(t[mamba_at + 1].item())
         )
+
+    def _local_seam_premise_vote(self) -> int:
+        """#1203 (family A1): this rank's vote on the seam-transport premise.
+
+        THE PULL-FORWARD, the same one #791b made for the prefetch verdicts
+        and #823 W9 for the head matches: the quantity is rank-local and takes
+        no collective of its own, this site runs exactly once per TP-loop
+        iteration, and the reduce it rides already runs.
+
+        NOT MEMOISED FOR THE READ SITE. `seam_transport_premise_holds` runs its
+        own local check again and ANDs it with the reduced value, so this vote
+        can only ever tighten the group's answer, never license one. That costs
+        a second walk of the seam candidates per pass and buys immunity to the
+        #823 W9b failure -- a published verdict consumed, destroyed or outliving
+        its pass while every log line still said "group".
+        """
+        from sglang.srt.managers.phase_purity import local_seam_premise_vote
+
+        return int(local_seam_premise_vote(self))
 
     def _local_head_prefix_matches(self):
         """#823 W9: this rank's vote for the head's prefix lengths.
@@ -8945,10 +9033,19 @@ class Scheduler(
             # 1681 tok/s against PP's 7245 on this rig, so this defers work
             # rather than losing it.
             #
-            # Same rank-uniformity argument as the congruent lane below:
-            # every input (static purity config, the replicated active
-            # layout) is identical on every rank, so the group never splits
-            # across branches with mismatched collectives.
+            # RANK UNIFORMITY, CORRECTED (#1203, family A). This comment used
+            # to assert "every input (static purity config, the replicated
+            # active layout) is identical on every rank, so the group never
+            # splits across branches with mismatched collectives" -- the same
+            # claim `prefill_blocked_here` makes in its own docstring. It was
+            # claimed twice and enforced nowhere: the gate also consults
+            # `seam_transport_premise_holds`, whose read set was rank-local end
+            # to end. Since #1203 that term is voted into the packed MIN of
+            # `_update_uniform_pool_budget` and read back reduced, so THIS
+            # branch is group-agreed wherever that reduce runs. The remaining
+            # locally-read inputs, and the fact that nothing asserts over the
+            # set, are enumerated in `prefill_blocked_here`'s docstring rather
+            # than papered over here.
             new_batch = None
         elif (
             self.congruent_prefill_lane is not None

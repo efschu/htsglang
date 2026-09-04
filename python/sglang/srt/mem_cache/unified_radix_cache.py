@@ -4199,7 +4199,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # weg1b6 call a reaped-but-fully-resident re-admission a contradiction.
         self.prefetch_loaded_tokens_by_reqid[req_id] = PrefetchOutcome(
             loaded_from_storage,
-            hit_tokens=_hit_tokens,  # N1: the reduced value, never the local stamp
+            # #1203 (A1): NOT NECESSARILY THE REDUCED VALUE. The N1 comment
+            # this replaces said "the reduced value, never the local stamp",
+            # and that is false on the shipping form: the packed MIN above runs
+            # only under `if self.tp_world_size > 1:`, and that field is bound
+            # once at construction and never rebound at the cutover, so under
+            # `--tp-size 1 --pp-size 3` it is 1 in both phases and `_hit_tokens`
+            # is this rank's own reading. The consumer that branches on it
+            # reduces it itself now (`seam_transport_premise_holds`); the same
+            # correction is recorded at `_synced_world` below, which reports
+            # over which world `completed_synced` was agreed.
+            hit_tokens=_hit_tokens,
             probed=_probed,
             matched=insert_result.prefix_len,
         )
@@ -4223,7 +4233,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # #1175: the rank-local completion, kept for the ring report that
         # carries this fact to PP0 (`pp_prefetch_completion`). Written here,
         # at the ONE site that terminates a prefetch and knows the span.
-        self._prefetch_completed_tokens[req_id] = int(completed_tokens)
+        #
+        # #1203 (family A4): WHAT IS PUBLISHED IS THE RETENTION, NOT THE
+        # TRANSFER, and the difference is not cosmetic. PP0 MINs these peer
+        # readings into a group floor and then CLAMPS the told prefix to it
+        # (`pp_prefetch_completion.group_completion_verdict` ->
+        # `note_observed_coverage`), so the number has to answer "how much of
+        # this prefix does that rank HOLD", not "how many tokens did it move".
+        # `completed_tokens` is the transfer: when the insert declines the
+        # fetched tail (`insert_result.host_span_unclaimed`, #841's
+        # contiguous-backup law) the rank moved the bytes and retained none of
+        # them, and a floor built from the transfer licenses a told prefix no
+        # rank can serve -- the corrupting direction, since the clamp is what
+        # the admission then trusts. The retention is `prefix_len` (what the
+        # tree already held on device) plus `loaded_from_storage` (what this
+        # insert actually adopted), both computed a few lines up and both
+        # already the terms the success line prints as `matched=` / `loaded=`.
+        # PP0's own `want` reads this same accessor, so both sides of the
+        # comparison move together and stay in one unit.
+        self._prefetch_completed_tokens[req_id] = int(
+            insert_result.prefix_len
+        ) + int(loaded_from_storage)
         # BOUNDED BY CONSTRUCTION. `release_aborted_request` drops the
         # ordinary case; this cap covers rids that finish without ever
         # reaching that site, so a long boot cannot grow the dict without

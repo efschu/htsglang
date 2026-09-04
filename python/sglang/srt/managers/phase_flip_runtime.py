@@ -11387,9 +11387,22 @@ class PhaseFlipRuntime:
         # paying for. After `_WRITEBACK_DEFER_LIMIT` consecutive defers the
         # flip proceeds and the recompute is ACCEPTED OUT LOUD, which is the
         # honest version of what the code did silently before.
+        # #1203 (family A5): THE BUDGET IS SPENT IN THE GROUP'S CURRENCY.
+        # The bound below used to count on a RANK-LOCAL counter while the thing
+        # it bounds -- the abandon -- is group-unanimous: the flip is abandoned
+        # if ANY rank objects, and each rank resets its own counter the moment
+        # its own objection clears. Three ranks taking turns objecting then
+        # never spend a budget between them and the direction defers for ever,
+        # which is the 411-abandon decode wedge reached through the mechanism
+        # that exists to prevent it. `_seam_abandons_in_a_row` is booked from
+        # the already-reduced fit verdict, so every rank reads the same number;
+        # the seam-margin term twelve hundred lines up has been spending that
+        # currency since it was written, and this is the same argument applied
+        # to the three siblings it was never copied to. The local counter stays
+        # as the per-rank instrument it always was -- it is no longer a bound.
         if writeback_detail is not None:
             _wb_defers = int(getattr(self, "_writeback_defers", 0) or 0)
-            if _wb_defers < _WRITEBACK_DEFER_LIMIT:
+            if self._seam_abandons_in_a_row.get(direction, 0) < _WRITEBACK_DEFER_LIMIT:
                 self._writeback_defers = _wb_defers + 1
                 too_small.append(
                     f"{writeback_detail} -- deferring this flip "
@@ -11454,8 +11467,10 @@ class PhaseFlipRuntime:
             )
 
             _host_total, _host_avail = pinned_host_memory_bytes()
+            # #1203 (family A5): the group's abandon book, not this rank's
+            # counter -- see the writeback bound above for the argument.
             allow_host, escalated, host_detail = flip_host_headroom_verdict(
-                _host_avail, 0, int(getattr(self, "_host_ram_defers", 0))
+                _host_avail, 0, self._seam_abandons_in_a_row.get(direction, 0)
             )
             logger.info("%s HOST HEADROOM %s: %s", LOG_PREFIX, direction, host_detail)
             if not allow_host:
@@ -11511,8 +11526,10 @@ class PhaseFlipRuntime:
         # refusal, which is #721's rule and it applies unchanged here.
         try:
             projected_drain = getattr(self, "_seam_drain_ms", None)
+            # #1203 (family A5): the group's abandon book, not this rank's
+            # counter -- see the writeback bound above for the argument.
             allow_seam, seam_escalated, seam_detail = flip_seam_budget_verdict(
-                projected_drain, int(getattr(self, "_seam_budget_defers", 0))
+                projected_drain, self._seam_abandons_in_a_row.get(direction, 0)
             )
             logger.info("%s SEAM BUDGET %s: %s", LOG_PREFIX, direction, seam_detail)
             if not allow_seam:

@@ -363,7 +363,15 @@ class B1TheRecordSurvivesSerialization(CustomTestCase):
 
 class TheStampIsNoLongerReadByThePremise(CustomTestCase):
     def test_the_premise_source_consults_the_witness_not_the_stamp(self):
-        src = inspect.getsource(phase_purity.seam_transport_premise_holds)
+        # #1203 (A1) SPLIT THE FUNCTION IN TWO, and this pin follows the half
+        # that still holds the check. `seam_transport_premise_holds` is now the
+        # GROUP wrapper (local AND the reduced verdict); the rank-local check
+        # this test was written for lives in
+        # `seam_transport_premise_holds_locally`. Both halves are asserted here
+        # so the pin cannot be evaded by dropping the delegation.
+        wrapper = inspect.getsource(phase_purity.seam_transport_premise_holds)
+        self.assertIn("seam_transport_premise_holds_locally(scheduler)", wrapper)
+        src = inspect.getsource(phase_purity.seam_transport_premise_holds_locally)
         self.assertIn("store_witness(scheduler, req)", src)
         self.assertNotIn("SEAM RESTORE", inspect.getsource(phase_purity), "B3: the token trips the #1068 zombie gate")
         body = src.split('"""', 2)[2]  # past the docstring
