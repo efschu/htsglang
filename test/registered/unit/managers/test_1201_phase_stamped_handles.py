@@ -356,5 +356,59 @@ class TestTheRegistryNamesThePhaseStampedHandles(CustomTestCase):
         self.assertNotIn("future_map_req_pool_holder", gaps)
 
 
+class TestEveryTreeCacheClassTheFlipCanRunUnderHasTheHook(CustomTestCase):
+    """REPAIR: the property was added to one tree cache, the probe to both.
+
+    ``mem_cache/registry.py`` picks ``UnifiedRadixCache`` for a hybrid-SSM
+    model under hierarchical cache and ``MambaRadixCache`` for the same model
+    WITHOUT it. #1201 gave the owner property to the first only, so on the
+    second ``_restamp_phase_handles``' ``hasattr(tree_cache,
+    "bind_req_pool_owner")`` guard was False, the cached handle stayed on the
+    outgoing pool -- and ``assert_req_pool_identity``, which was added to both,
+    then raised ``ReqPoolRebindRefused`` at the end of every cutover. The
+    property is the fix; the probe is for holders that have neither.
+    """
+
+    CLASSES = ("UnifiedRadixCache", "MambaRadixCache")
+
+    def _cls(self, name):
+        if name == "UnifiedRadixCache":
+            return UnifiedRadixCache
+        from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
+        return MambaRadixCache
+
+    def test_both_classes_expose_the_rebind_hook(self):
+        for name in self.CLASSES:
+            cls = self._cls(name)
+            self.assertTrue(
+                hasattr(cls, "bind_req_pool_owner"),
+                f"{name} is skipped by _restamp_phase_handles' hasattr guard, "
+                "so its request handle never follows the cutover",
+            )
+
+    def test_the_handle_follows_the_owner_and_falls_back_without_one(self):
+        for name in self.CLASSES:
+            cls = self._cls(name)
+            cache = cls.__new__(cls)
+            cache.req_to_token_pool = "constructor-pool"
+            self.assertEqual("constructor-pool", cache.req_to_token_pool, name)
+            cache.bind_req_pool_owner(
+                types.SimpleNamespace(req_to_token_pool="incoming-pool")
+            )
+            self.assertEqual(
+                "incoming-pool",
+                cache.req_to_token_pool,
+                f"{name} still names the outgoing phase's pool after the "
+                "cutover bound the owner",
+            )
+            cache.bind_req_pool_owner(None)
+            self.assertEqual(
+                "constructor-pool",
+                cache.req_to_token_pool,
+                f"{name}: an unbound cache must be byte-identical to pre-#1201",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

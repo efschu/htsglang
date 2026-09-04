@@ -485,6 +485,49 @@ class LRUList:
 
 
 class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+    #: The scheduler, once the phase flip has claimed ownership of the request
+    #: pool (`bind_req_pool_owner`). None on every boot that never flips.
+    _req_pool_owner = None
+
+    @property
+    def req_to_token_pool(self) -> "HybridReqToTokenPool":
+        """The OWNER's current request pool, read at use (#1201).
+
+        THE SAME PROPERTY ``UnifiedRadixCache`` GOT, AND FOR THE SAME REASON,
+        added here because it was added to only ONE of the two tree caches the
+        flip can be running under.  ``mem_cache/registry.py`` hands back a
+        ``MambaRadixCache`` for a hybrid-SSM model WITHOUT hierarchical cache,
+        and on that form ``_restamp_phase_handles`` skipped this class
+        entirely: its ``hasattr(tree_cache, "bind_req_pool_owner")`` guard was
+        False, so the cached handle went on naming the OUTGOING phase's
+        ``ReqToTokenPool`` after every cutover -- in range, same row count,
+        silently the other phase's rows, which is #1201 exactly.
+
+        The #1201 probe (`assert_req_pool_identity`) was added to BOTH classes
+        while this fix reached only one, so the same boot went from flipping
+        wrongly to raising ``ReqPoolRebindRefused`` at the end of every
+        cutover.  Both halves belong together: the property makes the handle
+        follow the owner, the probe catches the holder that has neither.
+        """
+        owner = self._req_pool_owner
+        if owner is not None:
+            return owner.req_to_token_pool
+        return self._req_to_token_pool
+
+    @req_to_token_pool.setter
+    def req_to_token_pool(self, pool) -> None:
+        self._req_to_token_pool = pool
+
+    def bind_req_pool_owner(self, owner) -> None:
+        """Name the object whose request pool is the truth (the scheduler).
+
+        Called at the cutover rather than at construction: until the first one
+        the owner's pool IS the constructor's pool, so an unbound cache is
+        byte-identical to the pre-#1201 behaviour.  ``None`` restores that
+        fallback.
+        """
+        self._req_pool_owner = owner
+
     def __init__(self, params: CacheInitParams):
         assert (
             isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
@@ -495,7 +538,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 params.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
             )
         )
-        self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
+        # Goes through the setter above: stored as `_req_to_token_pool` and
+        # read back through the owner once the flip binds one.
+        self.req_to_token_pool = params.req_to_token_pool
         # #581: let the pool evict cached checkpoints from its own REQUIRED
         # allocation sites (active state / ping-pong buffers) instead of
         # asserting when the free list is empty.

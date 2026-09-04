@@ -78,9 +78,14 @@ def build_future_map(scheduler: Any) -> "FutureMap":
         forced to NONE (scheduler.py:820-823, #631 -- the PP prefill phase has
         no draft worker), so the boot map's stamp is NONE for the life of the
         process.  ``resolve_forward_inputs`` branches on exactly that field, and
-        the NON-overlap spec path reaches it (scheduler.py:13174-13177, outside
-        the ``if self.enable_overlap:`` above it), so the frozen stamp is read
-        on every decode round of the TP phase.  Nothing raises: the only
+        the NON-overlap spec path reaches it -- the ``elif not
+        batch.spec_algorithm.is_none():`` arm of ``run_batch``, a SIBLING of
+        the ``if self.enable_overlap:`` arm and not nested inside it -- so the
+        frozen stamp is read on every decode round of the TP phase.  (Named by
+        its branch rather than by a line number on purpose: the number that
+        stood here, scheduler.py:13174-13177, had already drifted onto the
+        OVERLAP call INSIDE ``if self.enable_overlap:`` -- onto the line that
+        refutes the sentence instead of the one that proves it.)  Nothing raises: the only
         assertion on that branch is gated on ``SGLANG_IS_IN_CI``.
       * the request pool.  ``req_pool_size``, ``max_context_len`` and
         ``ConfidenceRelay.pool`` all come from the pool that existed when this
@@ -115,7 +120,7 @@ def build_future_map(scheduler: Any) -> "FutureMap":
     )
 
 
-def assert_future_map_identity(scheduler: Any) -> None:
+def assert_future_map_identity(scheduler: Any, previous: Any = None) -> None:
     """The map this phase consults was built BY this phase, or the seam stops.
 
     The registry's second obligation for ``future_map_req_pool_holder``: a probe
@@ -130,10 +135,38 @@ def assert_future_map_identity(scheduler: Any) -> None:
 
     Duck-typed and absence-tolerant, like ``assert_req_pool_identity``: an
     instance that never built a map is not a divergence.
+
+    WHAT THE TWO STAMP ARMS BELOW CAN AND CANNOT CATCH -- WRITTEN OUT BECAUSE
+    THE FIRST CUT SHIPPED WITHOUT IT.  ``build_future_map`` calls
+    ``scheduler.spec_algorithm.create_future_map(...)``, which passes ``self``
+    as ``spec_algo`` (spec_info.py) and ``scheduler.req_to_token_pool`` straight
+    into ``ConfidenceRelay(pool=...)``.  Both stamps are therefore identical to
+    the scheduler's own fields BY CONSTRUCTION, and at the seam -- where this
+    runs immediately after the rebuild -- neither arm can fire.  Measured: four
+    combinations of (algo NONE|EAGLE) x (pool pp|tp), zero fires.  They are
+    live only for a caller that runs them somewhere the map was NOT just
+    rebuilt (a later decode round, the next arm), which is where a fifth holder
+    or a second cached map would actually show.
+
+    ``previous`` IS THE ARM THAT CAN FAIL AT THE SEAM, and it is the one the
+    registry's obligation actually asks for: hand in the map the scheduler held
+    BEFORE the rebuild and this refuses when the rebuild did not replace it.
+    That is the whole content of "a probe proving the rebuild ran" -- a memoised
+    ``build_future_map``, a deleted assignment, or a rebuild moved out of the
+    cutover all land here, and none of them are visible to the stamp arms.
     """
     future_map = getattr(scheduler, "future_map", None)
     if future_map is None:
         return
+
+    if previous is not None and future_map is previous:
+        raise FutureMapPhaseMismatch(
+            "#1201 the cutover did not replace the future map: the scheduler "
+            "still holds the object the OUTGOING phase built. Its stamps "
+            "cannot show this -- they are equal to the scheduler's fields by "
+            "construction whenever the map was built from them -- so the only "
+            "evidence that the rebuild ran is that the object changed."
+        )
 
     algo = getattr(scheduler, "spec_algorithm", None)
     stamped = getattr(future_map, "spec_algo", None)

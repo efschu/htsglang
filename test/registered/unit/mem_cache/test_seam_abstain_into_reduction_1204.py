@@ -200,6 +200,102 @@ class TestD1AbstainIntoTheReduction(CustomTestCase):
         )
 
 
+class _HalfBlindRelief:
+    """Backing readable, floor NOT: the two reads shared one ``try``.
+
+    The relief object is installed and this rank really did measure its own
+    backing. Only the SECOND read fails -- and the two reads sat in one
+    ``try``, so the ``except`` threw the measured backing away and the rank
+    abstained in every slot.
+    """
+
+    def __init__(self, backed):
+        self._backed = int(backed)
+
+    def backed_rows(self):
+        return self._backed
+
+    def live_floor_rows(self):
+        raise RuntimeError("#1204 repair specimen: the FLOOR read failed")
+
+    def level_recovery_to(self, level):  # pragma: no cover - abstainer
+        raise AssertionError("a rank that could not read its floor levels nothing")
+
+
+class TestD1AMeasuredTermIsNeverDiscarded(CustomTestCase):
+    """REPAIR of #1204: abstain PER SLOT, not per rank.
+
+    THE SENTINEL IS CORRECT FOR WHAT IT WAS WRITTEN FOR and wrong for what it
+    was applied to. ``_UNBOUNDED_ROWS`` in slot 0 of a MIN says "I am not the
+    poorest" -- true of a rank with no cap machinery at all, and a CLAIM a
+    rank that just measured a poor backing has no right to make.
+
+    Slot 0's MIN is the group's poorest backing, and it becomes both the level
+    the peers cap to and the ceiling ``book_deferred_grow`` clamps a later grow
+    up to. Erasing a poor rank from that MIN makes the group agree an id level
+    that rank cannot map -- which ``backed_rows``' own docstring calls "a
+    ``cudaErrorIllegalAddress`` that kills every rank rather than raising".
+    The hang the commit removed was traded for a wrong group answer, which is
+    the corrupting direction, not the refusing one.
+    """
+
+    PEERS = (100, 120)
+    POOR = 30
+
+    def _run(self, poor_relief):
+        healthy = [_healthy(b) for b in self.PEERS]
+        channel = _CountingChannel(healthy)
+        schedulers = [
+            _scheduler(healthy[0]),
+            _scheduler(poor_relief),
+            _scheduler(healthy[1]),
+        ]
+        levels = [pfs.level_kv_backing_to_group(s, channel) for s in schedulers]
+        return channel, levels
+
+    def test_a_readable_backing_reaches_the_group_min(self):
+        """THE DEFECT, one assertion. The floor read failed; the BACKING did
+        not, and the group's poorest must still be this rank."""
+        channel, _ = self._run(_HalfBlindRelief(self.POOR))
+        self.assertEqual(3, len(channel.arrivals), "every rank must still arrive")
+        mine = channel.arrivals[1]
+        self.assertEqual(
+            self.POOR,
+            mine[0],
+            "this rank measured its backing and then contributed the MIN "
+            "identity for it -- it told the group it is not the poorest",
+        )
+        group_min = min(a[0] for a in channel.arrivals)
+        self.assertEqual(
+            self.POOR,
+            group_min,
+            "the peers agreed a level above the rows this rank can map",
+        )
+
+    def test_an_unreadable_floor_still_declines_rather_than_agreeing(self):
+        """An unknown floor is not a low one -- the function's own rule for a
+        truncated channel, applied to a locally unreadable one."""
+        _, levels = self._run(_HalfBlindRelief(self.POOR))
+        self.assertIsNone(
+            levels[1],
+            "a rank that could not read its floor may not report a level a "
+            "deferred grow would clamp its exposure to",
+        )
+
+    def test_a_wholly_unreadable_relief_is_still_neutral(self):
+        """The other trigger is unchanged: nothing measured, nothing claimed
+        beyond the neutral the channel already uses for it."""
+        healthy = [_healthy(b) for b in self.PEERS]
+        channel = _CountingChannel(healthy)
+        pfs.level_kv_backing_to_group(_scheduler(_BlindRelief()), channel)
+        self.assertEqual(1, len(channel.arrivals))
+        self.assertEqual(
+            [min(v) for v in zip(channel.arrivals[0], channel.group)],
+            channel.group,
+            "a rank that measured nothing must stay neutral in every slot",
+        )
+
+
 class TestD2PreCutoverMoversAreNamed(CustomTestCase):
     """A mover that fails inside the no-return region says so, by name."""
 

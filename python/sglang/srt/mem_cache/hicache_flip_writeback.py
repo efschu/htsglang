@@ -129,11 +129,21 @@ class FlipWritebackReport:
     # NO-PROGRESS bound. Printed beside elapsed so a fence that ran long
     # because acks kept landing is distinguishable from one that hung.
     ceiling_s: float = 0.0
-    # #1205: of `refused_silently`, the share the FLIP SEAM refused -- the one
-    # path of the seven whose count answers the seam-arm-ordering question,
-    # measured as a delta across this fence run over
-    # `hicache_phase_guard.seam_refusals`. -1 when the guard carries no
-    # counter, which is NOT the same fact as zero and is not printed as one.
+    # #1205: WRITE-direction device-tier operations the FLIP SEAM refused
+    # during this fence run, as a delta over
+    # `hicache_phase_guard.seam_refusals("write")`. -1 when the guard carries
+    # no counter, which is NOT the same fact as zero and is not printed as one.
+    #
+    # IT IS NOT A SUBSET OF `refused_silently` AND MUST NOT BE READ AS ONE.
+    # The counter is a process-wide module global covering every "write"
+    # caller of `device_tier_disarmed` -- the per-node enqueue at
+    # `cache_controller.py:1596`, `consume_gate` (`:435`), which refuses a
+    # whole queue and counts ONE, and `hybrid_cache_controller.py:486` -- and
+    # those run on the controller's own threads alongside this fence. So it can
+    # exceed `refused_silently`, and it can be non-zero while `refused_silently`
+    # is 0. It answers "did the seam refuse device-tier writes while this fence
+    # ran", which is the seam-arm-ordering question; it does not attribute
+    # individual nodes.
     seam_refused: int = -1
 
     @property
@@ -506,15 +516,24 @@ def _hashed_nodes(tree_cache: Any) -> list:
 
 
 def _seam_refusals_or_none() -> Optional[int]:
-    """The guard's monotone seam-refusal total, or None when it carries none.
+    """The guard's monotone WRITE-direction seam-refusal total, or None.
 
     #1205. Same sentinel discipline as ``_mamba_pin_skipped`` directly below:
     an UNMEASURED share must never reach the log line spelled as a zero.
+
+    THE DIRECTION IS THE POPULATION, and asking without one was the #1205
+    defect committed inside the #1205 fix. ``seam_refusals()`` with no argument
+    sums EVERY direction, and the "load" callers
+    (``cache_controller.py:1701``, ``hybrid_cache_controller.py:600``) run on
+    the controller's own background threads, concurrently with this fence. A
+    delta taken across the fence window therefore picked up refusals the fence
+    never caused and reported them as its own -- the label naming a population
+    the number does not measure, which is the class this ticket exists for.
     """
     try:
         from sglang.srt.mem_cache.hicache_phase_guard import seam_refusals
 
-        return int(seam_refusals())
+        return int(seam_refusals("write"))
     except Exception:  # noqa: BLE001 - an instrument never breaks the fence
         return None
 
@@ -700,8 +719,11 @@ def flip_writeback(
             "write-through pin budget: %s. The other refusal paths are the "
             "rank-uniform host floor (unified_radix_cache.py:2210), a short "
             "evict_host (:2215), the staging ring (:2226) and a host write "
-            "that returned None (:2234). Attributable to the flip SEAM guard "
-            "(cache_controller.py:1596, the #1205 sentinel): %s.",
+            "that returned None (:2234). Device-tier WRITES the flip seam "
+            "refused process-wide while this fence ran (#1205; every \"write\" "
+            "caller of device_tier_disarmed, NOT a share of the count above "
+            "and not per-node -- consume_gate refuses a whole queue and counts "
+            "one): %s.",
             LOG_PREFIX,
             refused_silently,
             "unmeasured" if refused_mamba_pin < 0 else refused_mamba_pin,

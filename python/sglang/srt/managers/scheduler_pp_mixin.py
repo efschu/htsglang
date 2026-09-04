@@ -5118,16 +5118,20 @@ class SchedulerPPMixin:
                         # FALSE. The retracted sentence was "it stays in
                         # `mbs[next_mb_id]` (so `_live_reqs`, which enumerates
                         # mbs/running_mbs/last_mbs, still sees it)".
-                        # `_live_reqs` does NOT enumerate `mbs`. Measured by
-                        # AST over its body (`phase_flip_runtime.py:1150-1235`,
-                        # 2026-09-04): the only rows it walks are `running_mbs`
-                        # (:1194), `last_mbs` (:1218), `running_batch`/
-                        # `last_batch` (:1220) and `chunked_req` (:1231). A
-                        # batch reachable ONLY through `mbs[slot]` is therefore
-                        # invisible to the flip's residency authority, whose
-                        # own docstring says un-enumerated rows are "not
-                        # MOVED" and the request's context "would simply be
-                        # wrong, silently". `mbs` IS read by
+                        # That sentence was false WHEN IT WAS WRITTEN and is
+                        # true again since #1202 -- which is why it is recorded
+                        # here as a dated fact rather than as a standing one.
+                        # Measured by AST over `_live_reqs` 2026-09-04, BEFORE
+                        # #1202: it walked `running_mbs`, `last_mbs`,
+                        # `running_batch`/`last_batch` and `chunked_req`, and
+                        # NOT `mbs`, so a batch reachable only through
+                        # `mbs[slot]` was invisible to the flip's residency
+                        # authority. #1202 added the `mbs` route to that
+                        # authority and the repair pass added it to
+                        # `consume_retracted_from_live_universe` as well, so
+                        # the gap this paragraph describes is CLOSED; read the
+                        # two walks, not this comment, for today's route set.
+                        # `mbs` IS also read by
                         # `_pp_microbatches_drained` (`scheduler.py:13698-13703`,
                         # `mb is None or mb.is_empty() for mb in self.mbs`) --
                         # but that is the QUIESCENCE term, not a residency

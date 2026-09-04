@@ -266,6 +266,76 @@ class TestTheIdentityAssertion(CustomTestCase):
         sched.future_map = build_future_map(sched)
         assert_future_map_identity(sched)
 
+    def test_the_stamp_arms_cannot_fire_where_the_probe_actually_runs(self):
+        """RECORDED, not asserted away: at the seam both stamp arms are
+        construction invariants.
+
+        ``build_future_map`` hands ``scheduler.spec_algorithm`` in as the
+        stamp and ``scheduler.req_to_token_pool`` straight into the relay, and
+        the probe runs 57 lines after that rebuild with nothing in between
+        touching either field. The two tests above hand-mutate a map that no
+        code path produces, which is why they are green while the probe fires
+        on nothing. This pins the fact so the next reader does not mistake the
+        green for coverage -- and it is the reason `previous` exists.
+        """
+        from sglang.srt.managers.overlap_utils import (
+            FutureMapPhaseMismatch,
+            assert_future_map_identity,
+            build_future_map,
+        )
+
+        fires = 0
+        for algo in (NONE, EAGLE):
+            for _ in range(2):
+                sched = _scheduler(_pool(), algo)
+                sched.future_map = build_future_map(sched)
+                try:
+                    assert_future_map_identity(sched)
+                except FutureMapPhaseMismatch:  # pragma: no cover - the point
+                    fires += 1
+        self.assertEqual(0, fires)
+
+    def test_a_rebuild_that_did_not_replace_the_map_is_refused(self):
+        """THE ARM THAT CAN FAIL AT THE SEAM.
+
+        A memoised ``build_future_map``, a deleted assignment, or a rebuild
+        moved out of the cutover all leave the OUTGOING phase's object in
+        place -- and the stamp arms cannot see any of them, because a map
+        built from the scheduler's fields always matches the scheduler's
+        fields. The object identity is the only seam-time evidence.
+        """
+        from sglang.srt.managers.overlap_utils import (
+            FutureMapPhaseMismatch,
+            assert_future_map_identity,
+            build_future_map,
+        )
+
+        sched = _scheduler(_pool(), NONE)
+        sched.future_map = build_future_map(sched)
+        stale = sched.future_map
+        sched.spec_algorithm = EAGLE
+        sched.req_to_token_pool = _pool()
+        # the cutover swapped both handles and the rebuild did NOT run
+        with self.assertRaises(FutureMapPhaseMismatch):
+            assert_future_map_identity(sched, previous=stale)
+        # and the real rebuild passes the same probe
+        sched.future_map = build_future_map(sched)
+        assert_future_map_identity(sched, previous=stale)
+
+    def test_the_seam_hands_the_probe_the_outgoing_map(self):
+        """Can-fail anchor: without `previous=_old_map` at the call site the
+        arm above is unreachable in production."""
+        import pathlib
+
+        src = pathlib.Path(
+            "/spinning/wt-weg1/python/sglang/srt/managers/phase_flip_runtime.py"
+        ).read_text()
+        self.assertIn(
+            "assert_future_map_identity(scheduler, previous=_old_map)",
+            src,
+            "the seam calls the probe without the only argument that can fail",
+        )
+
     def test_a_scheduler_without_a_future_map_is_not_an_error(self):
         """Default-path parity, duck-typed like assert_req_pool_identity: an
         instance that never built one is not a divergence."""

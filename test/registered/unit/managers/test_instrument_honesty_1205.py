@@ -293,6 +293,31 @@ class TestSeamRefusalSentinel(CustomTestCase):
         hicache_phase_guard.reset_seam_refusals()
         hicache_phase_guard._WARNED.clear()
 
+    def test_the_fence_reads_the_write_direction_only(self):
+        """REPAIR: the fence asked for a total and labelled it a write share.
+
+        `device_tier_disarmed("load")` is called from the controller's own
+        background load threads (`cache_controller.py:1701`,
+        `hybrid_cache_controller.py:600`), which run WHILE the fence runs. A
+        direction-less read therefore counted refusals the fence had no part
+        in and printed them beside `refused_silently` -- the #1205 defect
+        class, committed inside the #1205 fix.
+        """
+        from sglang.srt.mem_cache import hicache_flip_writeback as hfw
+
+        hicache_phase_guard.reset_seam_refusals()
+        runtime = _Runtime(hicache_seam_active=True, phase="pp")
+        hicache_phase_guard.register_flip_phase_authority(runtime)
+        hicache_phase_guard.device_tier_disarmed("write")
+        hicache_phase_guard.device_tier_disarmed("load")
+        hicache_phase_guard.device_tier_disarmed("load")
+        self.assertEqual(
+            1,
+            hfw._seam_refusals_or_none(),
+            "the fence's own reading must exclude the load path, which runs "
+            "concurrently on the controller's threads",
+        )
+
     def test_every_seam_refusal_is_counted_not_just_the_first_logged_one(self):
         runtime = _Runtime(hicache_seam_active=True, phase="pp")
         hicache_phase_guard.register_flip_phase_authority(runtime)

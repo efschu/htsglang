@@ -1983,8 +1983,9 @@ def consume_retracted_from_live_universe(scheduler, reqs) -> int:
     THE W27 DEFECT, and it is the root the crash exposed. `retract_all`
     releases a request's KV rows, its mamba slot and its tree lock ref -- but
     the scheduler's batch structures keep REFERENCING the `Req`. `_live_reqs`
-    is the one authority for "who is resident", and it reads exactly four
-    places: every `running_mbs` slot, `running_batch`, `last_batch`, and the
+    is the one authority for "who is resident", and this function must clear
+    every container that authority walks -- today: every `running_mbs`,
+    `last_mbs` and `mbs` slot, `running_batch`, `last_batch`, and the
     out-of-batch `chunked_req`. None of them are touched by retraction, so
     every seam consumer that asks "who is live" still gets a request whose
     resources are gone.
@@ -2051,6 +2052,26 @@ def consume_retracted_from_live_universe(scheduler, reqs) -> int:
     # freeing the resource and retiring the reference are two jobs, and this
     # route needs both.
     for mb in getattr(scheduler, "last_mbs", []) or []:
+        _consume(mb)
+    # #1202 REPAIR: `mbs` IS A ROUTE OF THE AUTHORITY, SO IT IS A ROUTE HERE.
+    #
+    # #1202 added `mbs` to `_live_reqs` and stopped there. That is the exact
+    # asymmetry W30 closed for `last_mbs` -- and W30 closed it by adding the
+    # route to BOTH walks, because freeing a resource and retiring the
+    # reference to it are two jobs. Widened here alone, the retraction frees a
+    # request the authority then re-enumerates: `resident_mamba_slots`
+    # (gdn_flip_mover.py:620) sees a live request with `mamba_pool_idx is
+    # None` and raises `KvReshardError`, which is the W27 death this function
+    # exists to prevent, reached from inside the no-return region where the
+    # only outcome is a dead rank.
+    #
+    # The shape is ordinary, not exotic: under `event_loop_pp` a freshly
+    # planned prefill batch lands in `mbs[mb_id]` while `running_mbs[mb_id]`
+    # still holds the decode set, so an mbs-only resident is the common
+    # `pp_to_tp` case rather than a corner. The `id()` dedup in `_live_reqs`
+    # and the no-op `_consume` on an unchanged keep-list make the aliased slot
+    # free.
+    for mb in getattr(scheduler, "mbs", []) or []:
         _consume(mb)
     for name in ("running_batch", "last_batch"):
         _consume(getattr(scheduler, name, None))
@@ -2448,6 +2469,46 @@ FLIP_HOST_RAM_MAX_DEFERS: int = 3
 #: PINNED_HOST_RESERVE_BYTES: that reserve protects PERMANENT pins, and a
 #: staging transient is by definition returned.
 FLIP_HOST_RAM_FLOOR_BYTES: int = 4 * (1024**3)
+
+def flip_defer_budget_after(*, objected: bool, escalated: bool, prior: int) -> int:
+    """One arm-gate verdict's effect on ONE guard's own defer budget (#1203 A5).
+
+    THE WHOLE RESET POLICY, in one pure function, because the three guards that
+    share it were three copies and the copies disagreed.
+
+    ``objected``  -- this guard voted the flip down this round.
+    ``escalated`` -- this guard stood aside at its limit and let the flip
+                     through; the budget has been SPENT and starts over.
+
+    A GUARD THAT MERELY CLEARED KEEPS ITS COUNT. That is the whole of #1203's
+    A5 premise and it is the line most likely to be "simplified" back: the
+    abandon is GROUP-unanimous, so this rank clearing while a peer objects
+    tells this rank nothing. Zeroing here is what let three ranks take turns
+    objecting without any of them ever reaching the limit -- the direction
+    then defers for ever, which is the 411-abandon decode wedge reached
+    through the mechanism that exists to prevent it.
+
+    THE BUDGET IS STILL THIS GUARD'S OWN, though, which is where A5 itself
+    went wrong: it spent the budget in ``_seam_abandons_in_a_row``, the book of
+    EVERY abandon whatever caused it. Two of the three consumers escalate at
+    their limit -- ``flip_host_headroom_verdict`` returns "PROCEEDING WITH EYES
+    OPEN" under a failed #721 host floor, ``flip_seam_budget_verdict`` past the
+    #830 F4 ceiling, and the writeback arm proceeds with an incomplete #703
+    fence -- so three abandons for unrelated reasons disarmed all three guards
+    and the next GENUINE shortfall proceeded on its first firing, having
+    deferred zero times. A bound may be widened to the group's currency; an
+    escalation that permits the hazard may not.
+
+    The one legitimate refund is a COMPLETED flip, and that is booked at the
+    group's own reset point in ``_execute_body`` rather than here, beside the
+    abandon book it belongs with.
+    """
+    if objected:
+        return int(prior) + 1
+    if escalated:
+        return 0
+    return int(prior)
+
 
 #: The defer reason, spelled once. #696 accounting must see a host-RAM defer as
 #: THIS, not absorb it into the generic unfunded bucket -- a flip that did not
@@ -3903,7 +3964,11 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # rather than a wrong decode input three rounds later.
         from sglang.srt.managers.overlap_utils import assert_future_map_identity
 
-        assert_future_map_identity(scheduler)
+        # `_old_map` is what makes this probe able to fail here: the two stamp
+        # arms are construction invariants immediately after a rebuild (see the
+        # function's docstring), so the only seam-time evidence that the
+        # rebuild ran is that the object is no longer the outgoing phase's.
+        assert_future_map_identity(scheduler, previous=_old_map)
         # #1066: the #1025b re-issue that stood here is DELETED. Re-admission
         # itself now runs after this cutover (deferred by
         # `_release_residents_for_cutover`, executed by
@@ -11228,7 +11293,8 @@ class PhaseFlipRuntime:
         """
         self._host_ram_defer_total = int(getattr(self, "_host_ram_defer_total", 0)) + 1
         logger.warning(
-            "%s [#721] HOST-RAM DEFER %s: consecutive=%d of %d, lifetime=%d. "
+            "%s [#721] HOST-RAM DEFER %s: defer %d of %d in this abandon run, "
+            "lifetime=%d. "
             "This rank votes the flip unfit, so its armed window ends early "
             "and RANK-LOCALLY -- peers that saw ample host RAM do not abandon "
             "for this reason. %s",
@@ -11624,8 +11690,10 @@ class PhaseFlipRuntime:
         # as the per-rank instrument it always was -- it is no longer a bound.
         if writeback_detail is not None:
             _wb_defers = int(getattr(self, "_writeback_defers", 0) or 0)
-            if self._seam_abandons_in_a_row.get(direction, 0) < _WRITEBACK_DEFER_LIMIT:
-                self._writeback_defers = _wb_defers + 1
+            if _wb_defers < _WRITEBACK_DEFER_LIMIT:
+                self._writeback_defers = flip_defer_budget_after(
+                    objected=True, escalated=False, prior=_wb_defers
+                )
                 too_small.append(
                     f"{writeback_detail} -- deferring this flip "
                     f"({self._writeback_defers}/{_WRITEBACK_DEFER_LIMIT}); the "
@@ -11633,7 +11701,8 @@ class PhaseFlipRuntime:
                 )
             else:
                 logger.error(
-                    "%s #1028 WRITEBACK DEFER LIMIT reached (%d consecutive): "
+                    "%s #1028 WRITEBACK DEFER LIMIT reached (%d defers in this "
+                    "abandon run): "
                     "proceeding with the flip although the fence is incomplete. "
                     "The affected prefixes WILL miss and their requests WILL "
                     "recompute in full -- accepted here deliberately, because a "
@@ -11643,7 +11712,9 @@ class PhaseFlipRuntime:
                     _wb_defers,
                     writeback_detail,
                 )
-                self._writeback_defers = 0
+                self._writeback_defers = flip_defer_budget_after(
+                    objected=False, escalated=True, prior=_wb_defers
+                )
                 # #1068 (G9): the proceed is a LOSS TERM of the wave this
                 # cutover re-admits, carried on the #939 census line
                 # (`fence_proceeds`, L10) so a `within_bound=false` can be
@@ -11664,7 +11735,14 @@ class PhaseFlipRuntime:
                         exc_info=True,
                     )
         else:
-            self._writeback_defers = 0
+            # NOTHING TO FENCE THIS ROUND IS NOT A CLEARED OBJECTION. The
+            # budget is untouched here for the same reason the gate no longer
+            # refunds it on a cleared vote: the abandon is group-unanimous.
+            self._writeback_defers = flip_defer_budget_after(
+                objected=False,
+                escalated=False,
+                prior=int(getattr(self, "_writeback_defers", 0) or 0),
+            )
 
         # #721: HOST RAM, measured at the flip, every flip.
         #
@@ -11689,21 +11767,32 @@ class PhaseFlipRuntime:
             )
 
             _host_total, _host_avail = pinned_host_memory_bytes()
-            # #1203 (family A5): the group's abandon book, not this rank's
-            # counter -- see the writeback bound above for the argument.
+            # #1203 (family A5), REPAIRED: THIS GUARD'S OWN defer count, not
+            # the group's abandon book. The verdict below does not merely stop
+            # deferring at its limit, it ESCALATES -- proceeds under a failed
+            # host floor -- so a budget spendable by corridor, staging and
+            # frame-divergence abandons would let the first genuine shortfall
+            # through having deferred zero times. The count no longer refunds
+            # itself when this rank's own reading clears, which is what A5
+            # reached for the group's currency to fix; see
+            # `flip_defer_budget_after`.
+            _host_defers = int(getattr(self, "_host_ram_defers", 0) or 0)
             allow_host, escalated, host_detail = flip_host_headroom_verdict(
-                _host_avail, 0, self._seam_abandons_in_a_row.get(direction, 0)
+                _host_avail, 0, _host_defers
             )
             logger.info("%s HOST HEADROOM %s: %s", LOG_PREFIX, direction, host_detail)
+            # Booked BEFORE the instruments, because `record_host_ram_defer`
+            # prints this counter and a probe that reports the pre-verdict
+            # number while claiming the post-verdict one is the #1205 defect.
+            self._host_ram_defers = flip_defer_budget_after(
+                objected=not allow_host, escalated=escalated, prior=_host_defers
+            )
             if not allow_host:
-                self._host_ram_defers = int(getattr(self, "_host_ram_defers", 0)) + 1
                 # #830 F6: counted, at warning, with a stable token -- O1.
                 self.record_host_ram_defer(direction, host_detail)
                 too_small.append(host_detail)
-            else:
-                if escalated:
-                    self.record_host_ram_escalation(direction, host_detail)
-                self._host_ram_defers = 0
+            elif escalated:
+                self.record_host_ram_escalation(direction, host_detail)
         except Exception as exc:  # noqa: BLE001 - a guard must not break a flip
             logger.warning(
                 "%s host-headroom guard could not run (%r); the flip proceeds "
@@ -11748,44 +11837,44 @@ class PhaseFlipRuntime:
         # refusal, which is #721's rule and it applies unchanged here.
         try:
             projected_drain = getattr(self, "_seam_drain_ms", None)
-            # #1203 (family A5): the group's abandon book, not this rank's
-            # counter -- see the writeback bound above for the argument.
+            # #1203 (family A5), REPAIRED: this guard's own defer count -- same
+            # argument as the host-RAM bound above, same escalating verdict.
+            _sb_defers = int(getattr(self, "_seam_budget_defers", 0) or 0)
             allow_seam, seam_escalated, seam_detail = flip_seam_budget_verdict(
-                projected_drain, self._seam_abandons_in_a_row.get(direction, 0)
+                projected_drain, _sb_defers
             )
             logger.info("%s SEAM BUDGET %s: %s", LOG_PREFIX, direction, seam_detail)
             if not allow_seam:
-                self._seam_budget_defers = (
-                    int(getattr(self, "_seam_budget_defers", 0)) + 1
-                )
                 self._seam_budget_refusals = (
                     int(getattr(self, "_seam_budget_refusals", 0)) + 1
                 )
                 logger.warning(
-                    "%s [#830] %s %s: consecutive=%d of %d, lifetime=%d. %s",
+                    "%s [#830] %s %s: defer %d of %d in this abandon run, "
+                    "lifetime=%d. %s",
                     LOG_PREFIX,
                     SEAM_BUDGET_REFUSED,
                     direction,
-                    self._seam_budget_defers,
+                    _sb_defers + 1,
                     FLIP_SEAM_BUDGET_MAX_DEFERS,
                     self._seam_budget_refusals,
                     seam_detail,
                 )
                 too_small.append(seam_detail)
-            else:
-                if seam_escalated:
-                    self._seam_budget_escalations = (
-                        int(getattr(self, "_seam_budget_escalations", 0)) + 1
-                    )
-                    logger.warning(
-                        "%s [#830] %s ESCALATION %s: lifetime=%d. %s",
-                        LOG_PREFIX,
-                        SEAM_BUDGET_REFUSED,
-                        direction,
-                        self._seam_budget_escalations,
-                        seam_detail,
-                    )
-                self._seam_budget_defers = 0
+            elif seam_escalated:
+                self._seam_budget_escalations = (
+                    int(getattr(self, "_seam_budget_escalations", 0)) + 1
+                )
+                logger.warning(
+                    "%s [#830] %s ESCALATION %s: lifetime=%d. %s",
+                    LOG_PREFIX,
+                    SEAM_BUDGET_REFUSED,
+                    direction,
+                    self._seam_budget_escalations,
+                    seam_detail,
+                )
+            self._seam_budget_defers = flip_defer_budget_after(
+                objected=not allow_seam, escalated=seam_escalated, prior=_sb_defers
+            )
         except Exception as exc:  # noqa: BLE001 - a guard must not break a flip
             logger.warning(
                 "%s seam-budget guard could not run (%r); the flip proceeds "
@@ -12052,6 +12141,15 @@ class PhaseFlipRuntime:
         if not hasattr(self, "_seam_abandons_in_a_row"):
             self._seam_abandons_in_a_row = {}
         self._seam_abandons_in_a_row[direction] = 0
+        # #1203 A5 (repaired): AND SO ARE THE THREE GUARDS' OWN BUDGETS, and
+        # this is the ONLY place they are refunded short of their own
+        # escalation. The sentence above is the whole argument -- it was
+        # written for the abandon book and applies word for word to the
+        # writeback, host-RAM and seam-budget counters, which is why they now
+        # live beside it instead of refunding themselves in the gate.
+        self._writeback_defers = 0
+        self._host_ram_defers = 0
+        self._seam_budget_defers = 0
         # #485: and so is the backoff. A seam that went through has proved the
         # demand fundable, so the next refusal starts its damping from zero
         # rather than inheriting a streak the group has already broken.

@@ -348,3 +348,99 @@ class TestTheCitationNamesAModuleThatExists(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FilterableBatch:
+    """A batch double that honours ``filter_batch(keep_indices=...)``.
+
+    ``consume_retracted_from_live_universe`` swallows any exception from
+    ``filter_batch`` and only logs, so a double without the method would make
+    a missing route indistinguishable from a broken one. This one really
+    filters, so a route that is walked retires its reference and a route that
+    is not walked leaves it in place.
+    """
+
+    def __init__(self, reqs):
+        self.reqs = list(reqs)
+
+    def filter_batch(self, keep_indices):
+        self.reqs = [self.reqs[i] for i in keep_indices]
+
+
+class TestTheRetirerWalksEveryRouteTheAuthorityWalks(CustomTestCase):
+    """#1202 repair: `mbs` was added to `_live_reqs` and NOT to the retirer.
+
+    THE ASYMMETRY IS THE DEFECT CLASS W30 ALREADY CLOSED ONCE, for `last_mbs`,
+    and it was closed by adding the route to BOTH. `_live_reqs` is the
+    residency authority and `consume_retracted_from_live_universe` is the
+    retirer for the same universe; a route present in one and absent from the
+    other means a retracted request keeps its resources freed and its
+    reference live, which is the W27 death (`resident_mamba_slots` raising
+    `KvReshardError` on a live request with no mamba slot) inside the
+    no-return region.
+
+    Pinned as a PROPERTY over the two functions rather than as one route, so
+    the next route added to the authority cannot reintroduce this.
+    """
+
+    def _routes_walked_by(self, fn_name):
+        """The scheduler container names the named walk reads, by execution.
+
+        Behavioural, not AST: a request parked in exactly one container at a
+        time, and the answer is whether that container is a route.
+        """
+        walked = set()
+        for container in ("running_mbs", "last_mbs", "mbs"):
+            pool = _pool()
+            r = _req(f"{container}-only")
+            pool.alloc([r])
+            batch = _FilterableBatch([r])
+            sched = _scheduler(pool, **{container: [batch]})
+            if fn_name == "_live_reqs":
+                if [x.rid for x in pfr._live_reqs(sched)] == [r.rid]:
+                    walked.add(container)
+            else:
+                pfr.consume_retracted_from_live_universe(sched, [r])
+                if batch.reqs == []:
+                    walked.add(container)
+        return walked
+
+    def test_the_authority_and_the_retirer_walk_the_same_containers(self):
+        authority = self._routes_walked_by("_live_reqs")
+        retirer = self._routes_walked_by("consume")
+        self.assertEqual(
+            authority,
+            retirer,
+            "a residency route the authority enumerates but the retirer does "
+            "not clear leaves a retracted request live with freed resources "
+            "(#1202 / W27): authority-only routes are "
+            f"{sorted(authority - retirer)}",
+        )
+
+    def test_an_mbs_only_resident_is_retired_by_the_retraction(self):
+        """The concrete shape: `mbs[slot]` holds the batch a slot is planning
+        while `running_mbs[slot]` holds the decode set, which is the ordinary
+        `event_loop_pp` prefill shape and the case #1202 added the route for.
+        """
+        pool = _pool()
+        planning = _req("mbs-only")
+        decoding = _req("running")
+        pool.alloc([planning, decoding])
+        mbs_batch = _FilterableBatch([planning])
+        run_batch = _FilterableBatch([decoding])
+        sched = _scheduler(pool, mbs=[mbs_batch], running_mbs=[run_batch])
+
+        self.assertIn("mbs-only", [r.rid for r in pfr._live_reqs(sched)])
+        retired = pfr.consume_retracted_from_live_universe(sched, [planning])
+        self.assertEqual(retired, 1, "the mbs route retired no reference")
+        self.assertNotIn(
+            "mbs-only",
+            [r.rid for r in pfr._live_reqs(sched)],
+            "the retracted request is still enumerable as resident, which is "
+            "exactly what resident_mamba_slots raises KvReshardError on",
+        )
+        self.assertEqual(
+            [r.rid for r in run_batch.reqs],
+            ["running"],
+            "the retirer removed a request it was not asked to retire",
+        )

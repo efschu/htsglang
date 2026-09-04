@@ -237,9 +237,86 @@ class A4_TheGroupFloorMeasuresRetentionNotTransfer(CustomTestCase):
         self.assertNotIn("min_completed_tokens", names)
 
 
-class A5_TheDeferBudgetIsSpentInGroupCurrency(CustomTestCase):
-    """The three bounds must read the reduced abandon book, exactly as the
-    seam-margin term already does."""
+class A1_TheVoteIsPure(CustomTestCase):
+    """REPAIR: the group vote runs on a cadence the instrument was not written
+    for.
+
+    ``_update_uniform_pool_budget`` builds its payload once per loop
+    iteration, unconditionally. The CONSUMER of this premise returns at
+    ``_active_phase(scheduler) != PHASE_TP`` before it asks. So a vote that
+    announces drives the edge-triggered ``_seam_premise_refused_announced``
+    latch from iterations the gate never reaches -- swallowing the gate's own
+    first engagement in TP and emitting ``SEAM TRANSPORT REFUSED`` where no
+    transport decision was being made.
+    """
+
+    def _sched_that_refuses(self):
+        """A queued candidate with NO restore witness: the refusing branch,
+        the one that announces."""
+        return _sched([_req(stamp=0)])
+
+    def test_the_vote_leaves_the_announcement_latch_alone(self):
+        sched = self._sched_that_refuses()
+        sched._seam_premise_refused_announced = False
+        phase_purity.local_seam_premise_vote(sched)
+        self.assertFalse(
+            getattr(sched, "_seam_premise_refused_announced", False),
+            "the vote latched the gate's announcement from an iteration the "
+            "gate itself never reaches",
+        )
+
+    def test_the_vote_does_not_clear_a_latch_the_gate_set(self):
+        sched = self._sched_that_refuses()
+        sched._seam_premise_refused_announced = True
+        phase_purity.local_seam_premise_vote(sched)
+        self.assertTrue(
+            getattr(sched, "_seam_premise_refused_announced", False),
+            "the vote cleared a latch it did not set, so the gate's next real "
+            "engagement would be announced as if it were the first",
+        )
+
+    def test_the_gate_still_announces(self):
+        """Can-fail anchor: `announce=False` must be the VOTE's choice, not a
+        new default that silences the consumer too."""
+        sched = self._sched_that_refuses()
+        sched._seam_premise_refused_announced = False
+        phase_purity.seam_transport_premise_holds_locally(sched)
+        self.assertTrue(
+            getattr(sched, "_seam_premise_refused_announced", False),
+            "the gate's own read must still announce exactly once per edge",
+        )
+
+
+class A5_TheDeferBudgetIsSpentByItsOwnCause(CustomTestCase):
+    """REPAIR of #1203 A5. The premise was right, the currency was wrong.
+
+    A5's premise stands and is not re-litigated here: a rank-local counter
+    that ZEROES ITSELF the moment this rank's own objection clears can never
+    reach its limit while three ranks take turns objecting, so the direction
+    defers for ever -- the 411-abandon decode wedge reached through the
+    mechanism that exists to prevent it.
+
+    WHAT A5 SHIPPED INSTEAD WAS NOT A BOUND, IT WAS AN ESCALATION GATE.
+    ``flip_host_headroom_verdict`` and ``flip_seam_budget_verdict`` do not
+    merely stop deferring at the limit: they return ``(allow=True,
+    escalated=True)`` -- "PROCEEDING WITH EYES OPEN" -- and the writeback arm
+    proceeds with an incomplete #703 fence. Spending that budget in
+    ``_seam_abandons_in_a_row``, which is incremented on EVERY reduced-fit
+    abandon or frame divergence whatever caused it, means three unrelated
+    abandons disarm all three guards: the next genuine host-RAM shortfall
+    escalates past the #721 floor on its FIRST firing, having deferred zero
+    times. That converts a refusal into the kernel-OOM kill #721 exists to
+    defend against -- the corrupting direction, bought to avoid a wedge.
+
+    THE REPAIR KEEPS BOTH. Each guard is bounded by ITS OWN consecutive
+    objection count again, and that count is no longer zeroed when this rank's
+    own objection clears -- only when the flip COMPLETES (the group's own
+    reset point, whose comment already states the rule: "a rank that cleared
+    while a peer did not has learnt nothing about the group") or when the
+    guard's own escalation has spent it. Ranks taking turns therefore still
+    accumulate to the limit and still escalate; an unrelated abandon still
+    spends nothing.
+    """
 
     BOOK = "self._seam_abandons_in_a_row.get(direction, 0)"
 
@@ -260,13 +337,31 @@ class A5_TheDeferBudgetIsSpentInGroupCurrency(CustomTestCase):
                 return ast.unparse(node.args[index])
         self.fail(f"{fn_name} is not called in _execute_body any more")
 
-    def test_the_host_headroom_bound_reads_the_group_book(self):
-        self.assertEqual(self._call_arg("flip_host_headroom_verdict", 2), self.BOOK)
+    def test_the_host_headroom_bound_reads_its_own_defer_count(self):
+        arg = self._call_arg("flip_host_headroom_verdict", 2)
+        self.assertNotEqual(
+            arg,
+            self.BOOK,
+            "the #721 host-RAM guard escalates at its limit; spending that "
+            "limit on unrelated abandons makes the first genuine shortfall "
+            "proceed into the OOM the guard exists to defend against",
+        )
+        self.assertIn(
+            f"{arg} = int(getattr(self, '_host_ram_defers', 0) or 0)",
+            ast.unparse(self._body()),
+            "the bound reads a local that is not this guard's own counter",
+        )
 
-    def test_the_seam_budget_bound_reads_the_group_book(self):
-        self.assertEqual(self._call_arg("flip_seam_budget_verdict", 1), self.BOOK)
+    def test_the_seam_budget_bound_reads_its_own_defer_count(self):
+        arg = self._call_arg("flip_seam_budget_verdict", 1)
+        self.assertNotEqual(arg, self.BOOK)
+        self.assertIn(
+            f"{arg} = int(getattr(self, '_seam_budget_defers', 0) or 0)",
+            ast.unparse(self._body()),
+            "the bound reads a local that is not this guard's own counter",
+        )
 
-    def test_the_writeback_bound_reads_the_group_book(self):
+    def test_the_writeback_bound_reads_its_own_defer_count(self):
         found = []
         for node in ast.walk(self._body()):
             if isinstance(node, ast.Compare) and any(
@@ -276,13 +371,111 @@ class A5_TheDeferBudgetIsSpentInGroupCurrency(CustomTestCase):
                 found.append(ast.unparse(node.left))
         self.assertTrue(found, "the writeback defer bound is gone")
         for left in found:
-            self.assertEqual(left, self.BOOK)
+            self.assertNotEqual(
+                left,
+                self.BOOK,
+                "past three unrelated abandons the FIRST writeback shortfall "
+                "would proceed with an incomplete #703 fence",
+            )
+            self.assertIn(
+                f"{left} = int(getattr(self, '_writeback_defers', 0) or 0)",
+                ast.unparse(self._body()),
+                "the bound reads a local that is not this guard's own counter",
+            )
 
     def test_the_correct_form_is_still_where_it_was_copied_from(self):
-        """Can-fail anchor: if the seam-margin term stops reading the book,
-        the three tests above are copying a form that no longer exists."""
+        """Can-fail anchor: the seam-margin term is the one place where the
+        group's abandon book IS the right currency (it bounds the abandon
+        itself, not an escalation past a physical floor)."""
         src = inspect.getsource(phase_flip_runtime)
         self.assertIn("spent = " + self.BOOK, src)
+
+
+class A5_ADeferBudgetIsNotZeroedByThisRankClearing(CustomTestCase):
+    """The half of A5's premise that must survive the repair.
+
+    ``flip_defer_budget_after`` is the whole reset policy, extracted so it can
+    be exercised without a scheduler. Three ranks taking turns objecting must
+    still accumulate; an unrelated abandon must still spend nothing.
+    """
+
+    def _after(self, **kw):
+        return phase_flip_runtime.flip_defer_budget_after(**kw)
+
+    def test_an_objection_spends_one(self):
+        self.assertEqual(self._after(objected=True, escalated=False, prior=0), 1)
+        self.assertEqual(self._after(objected=True, escalated=False, prior=2), 3)
+
+    def test_this_rank_clearing_does_not_refund_the_budget(self):
+        """THE A5 DEFECT, in one line. If this returns 0, three ranks taking
+        turns objecting never reach the limit and the direction defers for
+        ever -- which is what made A5 reach for the group's currency."""
+        self.assertEqual(
+            self._after(objected=False, escalated=False, prior=2),
+            2,
+            "a rank that cleared while a peer did not has learnt nothing "
+            "about the group, so it may not refund its own budget",
+        )
+
+    def test_an_escalation_spends_the_whole_budget(self):
+        self.assertEqual(self._after(objected=False, escalated=True, prior=3), 0)
+
+    def test_a_taking_turns_run_still_reaches_the_limit(self):
+        """Rank A objects on every other abandon; the budget still fills."""
+        n = 0
+        for lap in range(6):
+            n = self._after(objected=(lap % 2 == 0), escalated=False, prior=n)
+        self.assertGreaterEqual(
+            n,
+            phase_flip_runtime.FLIP_HOST_RAM_MAX_DEFERS,
+            "the guard would never escalate and the direction would wedge",
+        )
+
+    def test_an_unrelated_abandon_run_spends_nothing(self):
+        """THE REPAIRED PROPERTY. Six abandons this guard did not cause leave
+        its budget whole, so the next genuine shortfall DEFERS."""
+        n = 0
+        for _ in range(6):
+            n = self._after(objected=False, escalated=False, prior=n)
+        self.assertEqual(n, 0)
+        allow, escalated, _ = phase_flip_runtime.flip_host_headroom_verdict(0, 0, n)
+        self.assertFalse(allow)
+        self.assertFalse(escalated)
+
+    def test_a_completed_flip_returns_every_budget_beside_the_abandon_book(self):
+        """The group's own reset point clears all three, and that is the ONLY
+        legitimate refund short of a guard's own escalation.
+
+        Pinned by ADJACENCY to `self._seam_abandons_in_a_row[direction] = 0`,
+        because the argument for refunding there is the argument already
+        written at that line -- "a rank that cleared while a peer did not has
+        learnt nothing about the group". A refund anywhere else is the defect.
+        """
+        src = inspect.getsource(phase_flip_runtime).splitlines()
+        book = [
+            i
+            for i, ln in enumerate(src)
+            if ln.strip() == "self._seam_abandons_in_a_row[direction] = 0"
+        ]
+        self.assertTrue(book, "the abandon book's own reset point is gone")
+        for counter in (
+            "_writeback_defers",
+            "_host_ram_defers",
+            "_seam_budget_defers",
+        ):
+            zeroes = [
+                i
+                for i, ln in enumerate(src)
+                if ln.strip() == f"self.{counter} = 0"
+            ]
+            self.assertTrue(zeroes, f"{counter} is never refunded; it will wedge")
+            for z in zeroes:
+                self.assertTrue(
+                    any(abs(z - b) <= 12 for b in book),
+                    f"phase_flip_runtime.py:{z + 1} refunds {counter} away "
+                    "from the completed-flip reset point -- a rank refunding "
+                    "its own budget on a cleared vote is #1203 A5's wedge",
+                )
 
 
 def _fake_reduce_scheduler(vote):

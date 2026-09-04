@@ -1379,21 +1379,35 @@ def level_kv_backing_to_group(scheduler: Any, reduce_fn) -> Optional[int]:
     # channel; it is imported rather than restated so the two cannot drift.
     neutral = int(kbr._UNBOUNDED_ROWS)
     backed = floor = neutral
+    # #1204 REPAIR: ABSTAIN PER SLOT, NOT PER RANK.
+    #
+    # The two reads shared one ``try``, so a rank whose ``backed_rows()``
+    # SUCCEEDED and whose ``live_floor_rows()`` then raised threw away a number
+    # it had already measured and contributed the MIN identity for it.
+    #
+    # THAT IS A CLAIM, NOT AN ABSTENTION. Slot 0 is an element-wise MIN over
+    # row counts, so ``_UNBOUNDED_ROWS`` there says "I am not the poorest" --
+    # true of a rank with no cap machinery at all, and false of one that just
+    # measured a poor backing. The MIN becomes the level the peers cap to AND
+    # the ceiling ``book_deferred_grow`` clamps a later grow up to, so erasing
+    # a poor rank from it makes the group agree an id level that rank cannot
+    # map: ``backed_rows``' own docstring calls that "a cudaErrorIllegalAddress
+    # that kills every rank rather than raising". The hang the abstention
+    # removed would have been traded for a wrong group answer -- the corrupting
+    # direction bought to avoid the refusing one.
+    #
+    # Each slot therefore carries either this rank's own measurement or the
+    # channel's neutral for THAT slot, and the neutral per slot is unchanged
+    # from what a wholly unreadable relief already contributes.
+    backing_known = False
+    floor_local_known = False
     if relief is not None:
         try:
             backed = int(relief.backed_rows())
-            # #792: THE FLOOR RIDES ALONG, because the level this decides is
-            # applied to the ID SPACE and the live set is what the id space
-            # owes. The payload was [backed, -backed] -- how many rows each
-            # rank has mapped, and nothing about the rows already in use -- so
-            # the group could and did agree a level BELOW its own live
-            # high-water mark. Sent negated, so the same MIN channel yields the
-            # group's MAX floor: the most-loaded rank sets the limit, exactly
-            # as it does for ``collective_cap_target``.
-            floor = int(relief.live_floor_rows())
+            backing_known = True
         except Exception as e:
             logger.error(
-                "%s could not read this rank's KV backing for the levelling "
+                "%s could not read this rank's KV BACKING for the levelling "
                 "(%s); ABSTAINING INTO the reduction rather than skipping it. "
                 "This rank levels nothing and reports no level, but it still "
                 "enters the group's MIN channel, because the peers are already "
@@ -1401,20 +1415,56 @@ def level_kv_backing_to_group(scheduler: Any, reduce_fn) -> Optional[int]:
                 LOG_PREFIX,
                 e,
             )
-            relief = None
-            backed = floor = neutral
+            backed = neutral
+        if backing_known:
+            # The floor read is attempted only once the backing is known: a
+            # rank that cannot read its backing has nothing to level and no
+            # decision its own floor could inform, and leaving that path
+            # byte-identical keeps the repair to the one shape it was measured
+            # on.
+            try:
+                # #792: THE FLOOR RIDES ALONG, because the level this decides
+                # is applied to the ID SPACE and the live set is what the id
+                # space owes. The payload was [backed, -backed] -- how many
+                # rows each rank has mapped, and nothing about the rows already
+                # in use -- so the group could and did agree a level BELOW its
+                # own live high-water mark. Sent negated, so the same MIN
+                # channel yields the group's MAX floor: the most-loaded rank
+                # sets the limit, exactly as it does for
+                # ``collective_cap_target``.
+                floor = int(relief.live_floor_rows())
+                floor_local_known = True
+            except Exception as e:
+                logger.error(
+                    "%s could not read this rank's KV LIVE FLOOR for the "
+                    "levelling (%s); this rank abstains from the FLOOR slot "
+                    "alone and still contributes the backing it did measure, "
+                    "because erasing a measured backing from the group MIN "
+                    "would have the peers agree a level this rank cannot map "
+                    "(#1204)",
+                    LOG_PREFIX,
+                    e,
+                )
+                floor = neutral
     try:
-        payload = (
-            [neutral, neutral, neutral] if relief is None else [backed, -backed, -floor]
-        )
-        reduced = list(reduce_fn(payload))
         if relief is None:
-            # ARRIVED, AGREED TO NOTHING. There is no cap to engage and no
-            # level this rank could clamp a deferred grow back to, so reporting
-            # one would hand a caller a number it must not expose to. The peers
-            # decide the level among themselves; the neutral payload above is
-            # what makes that decision identical to the one they would have
-            # reached alone.
+            payload = [neutral, neutral, neutral]
+        else:
+            payload = [
+                backed if backing_known else neutral,
+                -backed if backing_known else neutral,
+                -floor if floor_local_known else neutral,
+            ]
+        reduced = list(reduce_fn(payload))
+        if relief is None or not (backing_known and floor_local_known):
+            # ARRIVED, AGREED TO NOTHING IT CAN APPLY. There is no cap to
+            # engage and no level this rank could clamp a deferred grow back
+            # to, so reporting one would hand a caller a number it must not
+            # expose to. The peers decide the level among themselves -- but
+            # they decide it WITH whatever this rank did manage to measure,
+            # which is the whole of the #1204 repair: arriving neutral in a
+            # slot is an abstention, arriving neutral in a slot whose value
+            # this rank knows is a false claim.
             return None
         group_min = int(reduced[0])
         group_max = -int(reduced[1])

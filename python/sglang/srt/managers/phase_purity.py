@@ -1932,15 +1932,33 @@ def local_seam_premise_vote(scheduler) -> int:
     worse of the two. Voting 1 cannot license anything: the read site above
     ANDs this group verdict with its own live local check, so an errored
     rank degrades to exactly the pre-#1203 behaviour and no further.
+
+    SILENT, BECAUSE IT RUNS ON A DIFFERENT CADENCE FROM THE GATE.
+    ``_update_uniform_pool_budget`` builds this payload once per loop
+    iteration, unconditionally; the CONSUMER
+    (``seam_transport_premise_holds``, reached from ``prefill_blocked_here``)
+    returns at ``_active_phase(scheduler) != PHASE_TP`` before it ever asks.
+    Letting the vote announce would drive the edge-triggered
+    ``_seam_premise_refused_announced`` latch from iterations the gate never
+    reaches -- setting it in the PP phase so the gate's own first engagement
+    in TP is swallowed, and emitting ``SEAM TRANSPORT REFUSED`` where no
+    transport decision was being made. A probe moved onto a new cadence must
+    not carry the old cadence's instrument with it (#1205's class).
     """
     try:
-        return 1 if seam_transport_premise_holds_locally(scheduler) else 0
+        return 1 if seam_transport_premise_holds_locally(scheduler, announce=False) else 0
     except Exception:  # noqa: BLE001 - a vote may never break the reduce
         return 1
 
 
-def seam_transport_premise_holds_locally(scheduler) -> bool:
+def seam_transport_premise_holds_locally(scheduler, *, announce: bool = True) -> bool:
     """Is the re-admission actually a RESTORE? Checked, not asserted. #861d.
+
+    ``announce=False`` makes the read PURE: no log line, and the edge-triggered
+    ``_seam_premise_refused_announced`` latch is left exactly as it was. The
+    #1203 A1 group vote uses it, because that vote runs once per loop iteration
+    while the gate this instrument belongs to asks only inside the TP phase --
+    see ``local_seam_premise_vote``.
 
     RANK-LOCAL BY CONSTRUCTION, and named so since #1203: every term below is
     this rank's own reading. The group verdict is formed by the wrapper above.
@@ -2069,7 +2087,9 @@ def seam_transport_premise_holds_locally(scheduler) -> bool:
         # exactly the unprobed hole (see seam_store_presence_refuted).
         refuted, tiers = seam_store_presence_refuted(scheduler)
         if refuted:
-            if not getattr(scheduler, "_seam_premise_refused_announced", False):
+            if announce and not getattr(
+                scheduler, "_seam_premise_refused_announced", False
+            ):
                 scheduler._seam_premise_refused_announced = True
                 logger.error(
                     "%s SEAM TRANSPORT REFUSED (store presence): %d stamped "
@@ -2090,10 +2110,12 @@ def seam_transport_premise_holds_locally(scheduler) -> bool:
         # The refusal below latched instead -- which would have made the
         # revocation this fix installs observable exactly once per process, and
         # a revocation nobody can see recur is a revocation nobody can measure.
-        if getattr(scheduler, "_seam_premise_refused_announced", False):
+        if announce and getattr(scheduler, "_seam_premise_refused_announced", False):
             scheduler._seam_premise_refused_announced = False
         return True
-    if not getattr(scheduler, "_seam_premise_refused_announced", False):
+    if announce and not getattr(
+        scheduler, "_seam_premise_refused_announced", False
+    ):
         scheduler._seam_premise_refused_announced = True
         logger.error(
             "%s SEAM TRANSPORT REFUSED: the exemption's premise does not hold. "
