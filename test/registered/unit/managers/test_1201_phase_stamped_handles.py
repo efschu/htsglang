@@ -335,16 +335,25 @@ class TestTheRegistryNamesThePhaseStampedHandles(CustomTestCase):
         self.assertIn("req_pool_back_references", named)
         self.assertTrue(named["req_pool_back_references"].hook)
 
-    def test_the_future_map_holder_is_registered_as_an_open_gap(self):
+    def test_the_future_map_holder_is_registered_and_no_longer_a_gap(self):
         """FutureMap caches the pool OBJECT (overlap_utils.py:339), built once
-        in ``init_overlap``.  Nothing in this cut rebinds it, so it is on the
-        backlog BY NAME rather than in institutional memory."""
+        in ``init_overlap``.  THIS cut did not rebind it and filed it on the
+        backlog by name; the B3 cut that followed built the rebuild and its
+        probe, so the entry now names both obligations.  The gap assertion that
+        stood here is RETRACTED rather than deleted, so the sequence is
+        readable: filed here, closed one commit later.  See
+        ``test_1201_future_map_phase.py`` for the closure's own suite."""
         from sglang.srt.managers.cutover_participants import (
+            REGISTRY,
             participants_with_gaps,
         )
 
+        named = {p.name: p for p in REGISTRY}
+        self.assertIn("future_map_req_pool_holder", named)
+        entry = named["future_map_req_pool_holder"]
+        self.assertTrue(entry.hook and entry.probe, entry)
         gaps = {p.name for p in participants_with_gaps()}
-        self.assertIn("future_map_req_pool_holder", gaps)
+        self.assertNotIn("future_map_req_pool_holder", gaps)
 
 
 if __name__ == "__main__":

@@ -268,17 +268,15 @@ REGISTRY: Tuple[Participant, ...] = (
     ),
     Participant(
         name="future_map_req_pool_holder",
-        what="FutureMap caches the request pool OBJECT (overlap_utils.py, "
-        "`pool=req_to_token_pool`), built once in Scheduler.init_overlap and "
-        "never rebuilt. It is the fourth phase-stamped holder and the one "
-        "#1201 did NOT move",
-        hook=None,
-        probe=None,
+        what="FutureMap carries TWO boot stamps, not one: the request pool "
+        "object (overlap_utils.py, `pool=req_to_token_pool`) and `spec_algo`, "
+        "which a phase-flip instance parks at NONE for the PP phase (#631). "
+        "Built once in Scheduler.init_overlap; its consumer "
+        "resolve_forward_inputs branches on the stamp, on the LIVE non-overlap "
+        "spec path, and the frozen NONE relays input ids the spec worker owns",
+        hook="sglang.srt.managers.overlap_utils.build_future_map",
+        probe="sglang.srt.managers.overlap_utils.assert_future_map_identity",
         ticket="#1201",
-        gap="no rebind built: the overlap future map is constructed from the "
-        "boot pool and the spec path reads through it, so moving it needs the "
-        "spec half's own arming order settled first. Named here rather than "
-        "left to institutional memory",
         found_by="desk",
     ),
     Participant(
@@ -363,6 +361,11 @@ MUTATED_STATE = {
     # the seam is as wrong as a term that reads `running_bs` inside it, and
     # more quietly -- the replacement has the same row count as the original.
     "req_to_token_pool": ReadWindow.OUTSIDE_CUTOVER,
+    # #1201 B3. The second member of the HANDLE axis, and the one that carries
+    # a stamp the pool does not: `spec_algo`. Replaced at the cutover, so a term
+    # that cached the map -- or that reads a field the map copied at boot -- is
+    # reading the outgoing phase.
+    "future_map": ReadWindow.OUTSIDE_CUTOVER,
     "batch_is_full": ReadWindow.OUTSIDE_CUTOVER,
     "spec_algorithm": ReadWindow.OUTSIDE_CUTOVER,
     "spec_info": ReadWindow.OUTSIDE_CUTOVER,

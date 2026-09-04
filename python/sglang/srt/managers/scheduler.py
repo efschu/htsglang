@@ -196,8 +196,8 @@ from sglang.srt.managers.min_free_slots_delayer import (
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
+    build_future_map,
     decide_needs_confidence_relay,
-    decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
 from sglang.srt.managers.phase_purity import (
@@ -2241,25 +2241,14 @@ class Scheduler(
         self.device_module = torch.get_device_module(self.device)
 
         # FutureMap is always-on: input_ids relay used in both modes.
-        # Workers without the spec_v2_attn_backends override fall back to
-        # target-only so the helper still produces a safe decision (no
-        # accidental opt-out for unaudited shapes).
-        if self.draft_worker is not None:
-            attn_backends = getattr(
-                self.draft_worker,
-                "spec_v2_attn_backends",
-                (self.tp_worker.model_runner.attn_backend,),
-            )
-        else:
-            attn_backends = (self.tp_worker.model_runner.attn_backend,)
-        needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
+        #
+        # #1201 B3: the construction lives in `build_future_map` rather than
+        # here because it stamps the map with two things a phase flip replaces
+        # -- the speculative algorithm (parked at NONE for the PP boot phase,
+        # :820-823) and the request pool -- so the cutover has to run the same
+        # construction again for the phase it is entering. See that helper.
+        self.future_map = build_future_map(self)
         needs_confidence_relay = decide_needs_confidence_relay(self.server_args)
-        self.future_map = self.spec_algorithm.create_future_map(
-            self.device,
-            self.req_to_token_pool,
-            needs_cpu_seq_lens=needs_cpu_seq_lens,
-            needs_confidence_relay=needs_confidence_relay,
-        )
 
         self._confidence_budget_prepare = None
         if (

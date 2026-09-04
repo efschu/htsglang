@@ -3744,6 +3744,44 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         )
 
         rebind_req_pool_for_cutover(scheduler, "tp" if tp_phase else "pp")
+        # #1201 B3: rebuild the cross-iter relay for the phase being entered.
+        #
+        # HERE, and not at the stack swap 300 lines up, because the FutureMap is
+        # stamped with BOTH of the things this seam replaces: the speculative
+        # algorithm (swapped at `scheduler.spec_algorithm = want_spec_algo`) and
+        # the request pool (rebound on the line above). Built between the two it
+        # would carry the incoming algorithm and the OUTGOING pool -- half a fix
+        # that still addresses the other phase's rows.
+        #
+        # The stamp that matters on the standing boot form is `spec_algo`. A
+        # phase-flip instance parks speculation at NONE for the PP phase (#631),
+        # `Scheduler.init_overlap` builds the map out of that NONE, and until now
+        # nothing rebuilt it -- so `resolve_forward_inputs` read a NONE stamp on
+        # every TP decode round and gathered last iteration's sampled token into
+        # `batch.input_ids` on a batch whose input ids the spec worker owns. It
+        # is on the LIVE path with `--disable-overlap-schedule`: the non-overlap
+        # spec branch calls `resolve_forward_inputs(batch, self.future_map)`
+        # outside the `if self.enable_overlap:` above it. Silent, because the
+        # only assertion on that branch is gated on SGLANG_IS_IN_CI.
+        from sglang.srt.managers.overlap_utils import build_future_map
+
+        _old_map = getattr(scheduler, "future_map", None)
+        scheduler.future_map = build_future_map(scheduler)
+        logger.info(
+            "%s #1201 future map rebuilt for the incoming phase: "
+            "spec_algo %s -> %s, req_pool binding %s -> %s. The boot map is "
+            "stamped with the PP phase's parked NONE and its consumer "
+            "(resolve_forward_inputs) branches on that stamp.",
+            LOG_PREFIX,
+            getattr(_old_map, "spec_algo", None),
+            scheduler.future_map.spec_algo,
+            getattr(
+                getattr(getattr(_old_map, "confidence_relay", None), "pool", None),
+                "binding_tag",
+                "<untagged>",
+            ),
+            getattr(scheduler.req_to_token_pool, "binding_tag", "<untagged>"),
+        )
         # #719: move the HiCache pool bindings to the phase that is now active.
         # Runs AFTER the stack swap, because the incoming pools are what it
         # binds to -- the mirror of #703's writeback, which runs BEFORE
@@ -3778,6 +3816,14 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         )
 
         assert_req_pool_identity(scheduler)
+        # #1201 B3: and the relay must name this phase too. Same argument as the
+        # line above -- neither divergence fails on its own, so the check is the
+        # only thing standing between a stale stamp and a phase that answers
+        # wrongly. Placed here so a fifth holder is a loud stop at the seam
+        # rather than a wrong decode input three rounds later.
+        from sglang.srt.managers.overlap_utils import assert_future_map_identity
+
+        assert_future_map_identity(scheduler)
         # #1066: the #1025b re-issue that stood here is DELETED. Re-admission
         # itself now runs after this cutover (deferred by
         # `_release_residents_for_cutover`, executed by

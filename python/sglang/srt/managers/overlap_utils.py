@@ -62,6 +62,103 @@ def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
 
 
+class FutureMapPhaseMismatch(RuntimeError):
+    """A FutureMap consulted by a phase that did not build it (#1201 B3)."""
+
+
+def build_future_map(scheduler: Any) -> "FutureMap":
+    """Build the cross-iter relay for the phase the scheduler is in RIGHT NOW.
+
+    Extracted from ``Scheduler.init_overlap`` for one reason (#1201 B3): the map
+    is stamped with two things the phase flip REPLACES, and until this was
+    callable a second time the TP decode phase consulted the map the PP prefill
+    phase had built.
+
+      * ``spec_algo``.  A phase-flip instance boots with ``spec_algorithm``
+        forced to NONE (scheduler.py:820-823, #631 -- the PP prefill phase has
+        no draft worker), so the boot map's stamp is NONE for the life of the
+        process.  ``resolve_forward_inputs`` branches on exactly that field, and
+        the NON-overlap spec path reaches it (scheduler.py:13174-13177, outside
+        the ``if self.enable_overlap:`` above it), so the frozen stamp is read
+        on every decode round of the TP phase.  Nothing raises: the only
+        assertion on that branch is gated on ``SGLANG_IS_IN_CI``.
+      * the request pool.  ``req_pool_size``, ``max_context_len`` and
+        ``ConfidenceRelay.pool`` all come from the pool that existed when this
+        ran.  This is the fourth holder of the #1201 request-pool class; the
+        other three are re-stamped by ``phase_req_pool_binding``.
+
+    Duck-typed on the scheduler on purpose: it needs five attributes, and typing
+    it to ``Scheduler`` would make the cutover import that module to call it.
+
+    CALL ORDER AT THE SEAM.  Both stamps must already be settled, so this runs
+    after the algorithm swap AND after the request-pool rebind.  Called between
+    them it would carry the incoming algorithm and the OUTGOING pool.
+    """
+    # Workers without the spec_v2_attn_backends override fall back to
+    # target-only so the helper still produces a safe decision (no accidental
+    # opt-out for unaudited shapes).
+    if scheduler.draft_worker is not None:
+        attn_backends = getattr(
+            scheduler.draft_worker,
+            "spec_v2_attn_backends",
+            (scheduler.tp_worker.model_runner.attn_backend,),
+        )
+    else:
+        attn_backends = (scheduler.tp_worker.model_runner.attn_backend,)
+    return scheduler.spec_algorithm.create_future_map(
+        scheduler.device,
+        scheduler.req_to_token_pool,
+        needs_cpu_seq_lens=decide_needs_cpu_seq_lens(
+            scheduler.server_args, attn_backends
+        ),
+        needs_confidence_relay=decide_needs_confidence_relay(scheduler.server_args),
+    )
+
+
+def assert_future_map_identity(scheduler: Any) -> None:
+    """The map this phase consults was built BY this phase, or the seam stops.
+
+    The registry's second obligation for ``future_map_req_pool_holder``: a probe
+    proving the rebuild ran.  It is not a re-implementation of the rebuild -- it
+    refuses when a stamp is still the outgoing phase's, whatever the reason (a
+    rebuild placed too early, a second map cached somewhere else, a future field
+    stamped at construction that nobody moved).
+
+    Loud on purpose, because neither divergence fails on its own.  A stale
+    ``spec_algo`` silently relays input ids the spec worker owns; a stale pool
+    reads a tensor of the same shape belonging to the other phase.
+
+    Duck-typed and absence-tolerant, like ``assert_req_pool_identity``: an
+    instance that never built a map is not a divergence.
+    """
+    future_map = getattr(scheduler, "future_map", None)
+    if future_map is None:
+        return
+
+    algo = getattr(scheduler, "spec_algorithm", None)
+    stamped = getattr(future_map, "spec_algo", None)
+    if algo is not None and stamped is not algo:
+        raise FutureMapPhaseMismatch(
+            f"#1201 the future map is stamped spec_algo={stamped}, but this "
+            f"phase runs spec_algorithm={algo}. resolve_forward_inputs branches "
+            "on the map's stamp, so a NONE stamp under a speculative phase "
+            "gathers last iteration's sampled token into batch.input_ids -- "
+            "silently, since _assert_nonneg_and_invalidate is CI-gated."
+        )
+
+    pool = getattr(scheduler, "req_to_token_pool", None)
+    relay = getattr(future_map, "confidence_relay", None)
+    held = getattr(relay, "pool", None) if relay is not None else None
+    if pool is not None and held is not None and held is not pool:
+        raise FutureMapPhaseMismatch(
+            "#1201 the future map still names the outgoing phase's request "
+            f"pool (map binding={getattr(held, 'binding_tag', '<untagged>')}, "
+            f"scheduler binding={getattr(pool, 'binding_tag', '<untagged>')}). "
+            "Both pools hold the same row count, so this does not fail on its "
+            "own: the relay would address another phase's rows in range."
+        )
+
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
