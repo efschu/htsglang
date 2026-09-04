@@ -15,7 +15,8 @@ THE FOUR RED-FIRST CASES the operator named, plus the propagation of the STOP:
 
  (i)   pending store read       -> held (exemption open, admission waits)
  (ii)  probed hit > 0           -> admitted with P = hit
- (iii) probed 0, stamp > 0      -> `StoreWitnessContradiction` (group STOP)
+ (iii) probed 0, stamp > 0      -> 'cold'; the premise refuses, nothing raises
+       (#1176 round 6: the STOP is DELETED -- see the class-III note below)
  (iv)  probed 0, stamp 0        -> cold, admitted at P=0 as today
 
 REVIEW FIX (operator decisions, 2026-09-03):
@@ -41,14 +42,14 @@ import re
 import types
 import unittest
 
-from sglang.srt.managers import phase_purity, scheduler as scheduler_mod
+from sglang.srt.managers import phase_purity
 from sglang.srt.managers.phase_purity import (
     SEAM_GRANT_CONSUMED_ATTR,
     SEAM_READMIT_ATTR,
-    StoreWitnessContradiction,
-    assert_store_witness_at_admission,
+    observe_store_witness,
     store_witness,
     seam_transport_premise_holds,
+    witness_readings,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.hicache_storage import PrefetchOutcome
@@ -143,144 +144,125 @@ class II_AProbedHitIsAdmittedWithItsPrefix(CustomTestCase):
         r = _req()
         s = _sched([r], outcomes={r.rid: PrefetchOutcome(80_000, hit_tokens=80_000, probed=True)})
         loaded = s.tree_cache.prefetch_loaded_tokens_by_reqid.pop(r.rid, 0)
-        assert_store_witness_at_admission(r, loaded, s.tree_cache)  # no raise
+        observe_store_witness(s, r, loaded, s.tree_cache)  # #1176 r6: observes
         if loaded > 0:
             r.storage_hit_length = int(loaded)
         self.assertEqual(r.storage_hit_length, 80_000)
         # B1: the credit is a bare int, never the annotated record.
         self.assertIs(type(r.storage_hit_length), int)
 
-    def test_the_admission_sites_consult_the_witness_right_after_the_pop(self):
+    def test_the_admission_sites_observe_right_after_the_pop(self):
         src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
-        # #1176 (review r5): the STOP is back on ONE rank, but NOT through a
-        # parameter the two sites could drift on -- both arms pass the SAME
-        # expression, `may_stop=witness_stop_authority(self)`, which reads the
-        # pipeline rank. A site that omitted it would silently claim authority
-        # it does not have, so the pin demands the argument literally.
+        # #1176 (round 6): the witness is an OBSERVATION. Both admission arms
+        # call the same emitter with the same arguments and bind NOTHING --
+        # a bound return value would be the first step back to a verdict.
         hits = re.findall(
             r"loaded_tokens = self\.tree_cache\.pop_prefetch_loaded_tokens\(req\.rid\)"
             r"(?:\s*\n\s*#[^\n]*)*"
-            r"\s*\n\s*assert_store_witness_at_admission\(\s*\n"
-            r"\s*req,\s*\n\s*loaded_tokens,\s*\n\s*self\.tree_cache,\s*\n"
-            r"\s*may_stop=witness_stop_authority\(self\),\s*\n\s*\)"
+            r"\s*\n\s*observe_store_witness\(self, req, loaded_tokens, self\.tree_cache\)"
             r"\s*\n\s*if loaded_tokens > 0:\s*\n\s*req\.storage_hit_length = int\(loaded_tokens\)",
             src,
         )
         self.assertEqual(
             len(hits),
             2,
-            "both admission arms (PP0 and TP) must assert with the tree, the "
-            "authority gate, and store the credit as int(...) (B1)",
+            "both admission arms (PP0 and TP) must OBSERVE with the tree and "
+            "store the credit as int(...) (B1)",
+        )
+        self.assertNotIn(
+            "may_stop",
+            src,
+            "the r5 authority gate is deleted; a rank-local reading may not "
+            "own a group-wide STOP (#1176 round 6)",
         )
         self.assertNotIn(
             "is_authority",
             src,
-            "the follower->PP0 CONTRADICTION CARRIER stays deleted (r4); the "
-            "r5 authority gate is a rank read, not a carried report",
+            "the follower->PP0 CONTRADICTION CARRIER stays deleted (r4)",
         )
 
 
-class III_AProbedMissBesideAStampStopsTheGroup(CustomTestCase):
-    """#1176 (review r5): WHERE the STOP lives, restated.
+class III_AProbedMissBesideAStampIsReadAndMeasured(CustomTestCase):
+    """#1176 (round 6): WHERE the STOP lived, and why there is none any more.
 
-    r4 let EVERY reader raise on its own record. That is measurably wrong on
-    the shipping form (`--tp-size 1 --pp-size 3`): the packed MIN all_reduce
-    is not taken (unified_radix_cache.py:3879-3907 gates on
-    `tp_world_size > 1`), so every input to the witness is RANK-LOCAL, and
-    boot weg1b6 measured the split -- PP0 raised on rid 1e95e023 while PP1 and
-    PP2 read "hit" on the same rid. A raise on a census or premise reader
-    therefore kills one rank while its peers carry on: raenge-nie-uneins
-    broken by the guard that exists to keep the ranks honest.
+    r4 let EVERY reader raise on its own record; r5 moved the raise onto one
+    authority rank. Both were measurably wrong on the shipping form
+    (`--tp-size 1 --pp-size 3`): the packed MIN all_reduce is not taken
+    (unified_radix_cache.py gates it on `tp_world_size > 1`), so every input
+    to the witness is RANK-LOCAL. weg1b6 measured the consequence -- PP0 was
+    REAPED at its 7.87 s budget with matched=3456 loaded=0 against stamp 6008
+    while its peers read the same rid as a hit, and the group-MIN of `loaded`
+    alone raised: a FALSE STOP on a prefix whose shortfall (2552) was well
+    inside the 4096 one-chunk allowance.
 
-    THE r5 SPLIT, and it is the whole class:
-      * `store_witness` and `seam_transport_premise_holds` are READERS. They
-        run on every rank, they pass `may_stop=False`, and a contradiction
-        comes back as the string "contradiction" -- which is NOT in the
-        restored set, so the premise refuses and the flip demand rises the
-        normal way. Loud, never fatal.
-      * `assert_store_witness_at_admission` on the AUTHORITY rank is the one
-        call site that owns a state-changing verdict (#968/#969Z), and it is
-        the only path in this file that may raise.
+    Six rank-local formulations were falsified by execution (4b277fff25,
+    be3ec1760b, 1634bc3d28, 8e73b2a9cc, c6fccf75f0, ac4b1d4bf8), each either
+    raising on a present prefix or licensing a re-prefill an ancestor had
+    refused. THE ATTEMPT IS ABANDONED. The witness now MEASURES: one WARNING
+    line per witnessed rid carrying every disputed term and all four candidate
+    readings, and #939 is enforced on that measurement by the acceptance
+    instrument (/spinning/gpu-arb/accept_weg1_1068.py, check A14).
 
-    Every raise-expecting test below therefore goes through the admission
-    assert. A test that wrapped a reader in `assertRaises` would pass on r4
-    and prove nothing on r5 -- it would be asserting against a function that
-    structurally cannot raise.
+    The tests below are therefore READER pins, and two of them are DELIBERATE
+    INVERSIONS of r5 pins -- the trade is named, not hidden: a record that r5
+    called a contradiction is now merely a reading in the log, and an
+    acceptance run is what fails on it.
     """
 
     def _contradiction(self):
         r = _req()
         return r, _sched([r], outcomes={r.rid: PrefetchOutcome(0, hit_tokens=0, probed=True)})
 
-    def _admit(self, req, outcome, tree):
-        return assert_store_witness_at_admission(req, outcome, tree)
-
-    def test_the_authority_raises_the_named_line(self):
-        """THE RED-FIRST CASE. On the parent this returned True (the stamp)."""
-        r, s = self._contradiction()
-        out = s.tree_cache.prefetch_loaded_tokens_by_reqid[r.rid]
-        with self.assertRaises(StoreWitnessContradiction) as cm:
-            self._admit(r, out, s.tree_cache)
-        msg = str(cm.exception)
-        # #1176 (review r3): the line carries the stamp and the presence and
-        # nothing netted off either. `device_resident` is a printed diagnostic
-        # at the END of the field list; the `demand=` term of 1634bc3d28 is
-        # deleted (it double-subtracted this request's own match).
-        self.assertIn(
-            f"#1157 STORE WITNESS CONTRADICTION rid={r.rid} stamped={STAMP} "
-            f"probed_hit=0 loaded=0 "
-            f"allowance={CHUNK} shortfall={STAMP} requested={LONG}",
-            msg,
-        )
-        self.assertIn("device_resident=0", msg)
-        # #1176 (review r5): the raise says whose verdict it is.
-        self.assertIn("owns the verdict", msg)
-        self.assertNotIn("demand=", msg)
-        self.assertNotIn("SEAM RESTORE", msg)
-        self.assertIsInstance(cm.exception, RuntimeError)
-
-    def test_the_premise_refuses_the_same_record_without_raising(self):
-        """THE r5 INVERSION of the old `test_the_premise_raises_the_named_
-        line`, and the reason the inversion is not a weakening: the premise
-        still REFUSES -- 'contradiction' is not in the restored set -- so the
-        exemption that would license a P=0 re-admission stays shut. What
-        changed is that one rank no longer dies for a record every rank reads
-        differently."""
+    def test_the_premise_refuses_the_probed_miss_without_raising(self):
+        """THE r6 SHAPE. A probed miss beside a stamp is a "cold" reading:
+        not in the restored set, so the exemption that would license a P=0
+        re-admission stays shut -- and no rank dies for a record every rank
+        reads differently."""
         r, s = self._contradiction()
         self.assertIs(seam_transport_premise_holds(s), False)
-        self.assertEqual(store_witness(s, r), "contradiction")
+        self.assertEqual(store_witness(s, r), "cold")
 
-    def test_a_revoke_on_the_chat_header_beside_a_stamp_raises(self):
-        """THE ADVERSARIAL RED CASE (review B2): every probe answers the
-        ~40-token chat-template header, so a revoked re-admission
-        (loaded=0, hit_tokens=40) beside stamp=80009 used to read 'hit' and
-        license P=0. It is a contradiction."""
+    def test_a_revoke_on_the_chat_header_beside_a_stamp_is_a_hit_and_measured(self):
+        """INVERSION of the r5 raise, with the trade named. Every probe
+        answers the ~40-token chat-template header, so a revoked re-admission
+        (loaded=0, hit_tokens=40) beside stamp=80009 reads "hit" again. That
+        is the LICENSING direction r5 tried to close with a raise and closed
+        wrong. It is now closed by MEASUREMENT: the observation prints the
+        shortfall under every candidate reading, and A14 fails the acceptance
+        because 79969 exceeds the 4096 allowance."""
         r = _req()
         out = PrefetchOutcome(0, hit_tokens=HEADER, probed=True)
         s = _sched([r], outcomes={r.rid: out})
-        self.assertEqual(store_witness(s, r), "contradiction")
-        with self.assertRaises(StoreWitnessContradiction) as cm:
-            self._admit(r, out, s.tree_cache)
-        self.assertIn(f"probed_hit={HEADER} loaded=0 allowance={CHUNK}", str(cm.exception))
+        self.assertEqual(store_witness(s, r), "hit")
+        rd = witness_readings(r, out, STAMP, CHUNK)["readings"]
+        for name, (_presence, shortfall, verdict) in rd.items():
+            with self.subTest(name):
+                self.assertEqual(shortfall, STAMP)
+                self.assertEqual(verdict, f"short-by-{STAMP}")
 
-    def test_a_probed_shortfall_beyond_one_chunk_beside_a_stamp_raises(self):
-        """4096 loaded and probed beside 80009: shortfall 75913 > allowance."""
+    def test_a_probed_shortfall_beyond_one_chunk_is_measured_not_raised(self):
+        """4096 loaded and probed beside 80009: every reading is short by
+        75913, far beyond the allowance. Loud in the log, fatal to the
+        acceptance, harmless to the serving group."""
         r = _req()
         out = PrefetchOutcome(4096, hit_tokens=4096, probed=True)
-        s = _sched([r], outcomes={r.rid: out})
-        with self.assertRaises(StoreWitnessContradiction) as cm:
-            self._admit(r, out, s.tree_cache)
-        self.assertIn(f"shortfall={STAMP - 4096}", str(cm.exception))
+        rd = witness_readings(r, out, STAMP, CHUNK)["readings"]
+        self.assertEqual(rd["p_span"], (4096, STAMP - 4096, f"short-by-{STAMP - 4096}"))
 
-    def test_a_shortfall_within_one_chunk_is_a_hit(self):
-        """stamp - hit_tokens <= allowance, loaded > 0 -> 'hit' (boundary)."""
+    def test_a_shortfall_within_one_chunk_is_a_hit_under_every_reading(self):
+        """stamp - presence <= allowance -> the verdict word is "hit"; one
+        token LESS present crosses the boundary and the verdict names the
+        whole shortfall, not the overrun."""
         r = _req()
-        out = PrefetchOutcome(STAMP - CHUNK, hit_tokens=STAMP - CHUNK, probed=True)
-        self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
+        inside = PrefetchOutcome(STAMP - CHUNK, hit_tokens=STAMP - CHUNK, probed=True)
+        self.assertEqual(
+            witness_readings(r, inside, STAMP, CHUNK)["readings"]["p_span"][2], "hit"
+        )
         over = PrefetchOutcome(STAMP - CHUNK - 1, hit_tokens=STAMP - CHUNK - 1, probed=True)
-        s = _sched([r], outcomes={r.rid: over})
-        with self.assertRaises(StoreWitnessContradiction):
-            self._admit(r, over, s.tree_cache)
+        self.assertEqual(
+            witness_readings(r, over, STAMP, CHUNK)["readings"]["p_span"][2],
+            f"short-by-{CHUNK + 1}",
+        )
 
     def test_the_allowance_is_the_trees_one_chunk_term(self):
         """The allowance is `_prefetch_chunk_tokens` (chunked_prefill_size);
@@ -293,58 +275,24 @@ class III_AProbedMissBesideAStampStopsTheGroup(CustomTestCase):
         disabled = types.SimpleNamespace(_prefetch_chunk_tokens=-1, prefetch_threshold=256)
         self.assertEqual(_store_witness_allowance(disabled), 256)
 
-    def test_the_admission_site_raises_on_the_popped_record(self):
+    def test_the_admission_site_observes_the_popped_record(self):
         r, s = self._contradiction()
         loaded = s.tree_cache.prefetch_loaded_tokens_by_reqid.pop(r.rid, 0)
-        with self.assertRaises(StoreWitnessContradiction):
-            assert_store_witness_at_admission(r, loaded, s.tree_cache)
-
-    def test_a_follower_never_raises_on_the_same_record(self):
-        """THE RANK-DIVERGENCE PIN (review finding d, weg1b6-measured). Same
-        record, same call, `may_stop=False`: reported, returned, never raised.
-        Without this the r4 shape returns -- three ranks, three verdicts, one
-        of them fatal."""
-        r, s = self._contradiction()
-        loaded = s.tree_cache.prefetch_loaded_tokens_by_reqid.pop(r.rid, 0)
-        self.assertEqual(
-            assert_store_witness_at_admission(
-                r, loaded, s.tree_cache, may_stop=False
-            ),
-            "contradiction",
-        )
+        observe_store_witness(s, r, loaded, s.tree_cache)
 
     def test_the_fail_open_arm_probe_gets_a_verdict_not_an_exception(self):
-        """INVERTED from r4's `test_the_stop_passes_through_the_fail_open_arm
-        probe`. `_1040_seam_readmit_ready` is fail-open (`except Exception:
-        return True`), which is exactly why the STOP must not travel through
-        it: a swallowed raise would arm the flip on a contradicting record.
-        Under r5 nothing to swallow reaches it -- the premise it calls returns
-        a verdict, and the verdict is False."""
+        """`_1040_seam_readmit_ready` is fail-open (`except Exception: return
+        True`), which is exactly why no STOP may travel through it: a
+        swallowed raise would arm the flip on a refusing record. Under r6
+        there is nothing to swallow -- the premise returns a verdict, False."""
         r, s = self._contradiction()
         ready = Scheduler._1040_seam_readmit_ready.__get__(s)
         self.assertIs(ready(), False)
 
-    def test_every_fail_open_probe_on_the_path_still_re_raises(self):
-        """RATCHET, kept deliberately after the r5 split made it inert on
-        today's tree: the three fail-open probes each carry
-        `except StoreWitnessContradiction: raise`, so if a future reader on
-        that path regains a raise, it surfaces instead of being swallowed into
-        a 'ready' verdict that arms the flip. The clause costs nothing and is
-        the only thing standing between a re-introduced raise and a silent
-        arm."""
-        src = inspect.getsource(scheduler_mod)
-        self.assertEqual(
-            len(re.findall(r"except StoreWitnessContradiction:\s*\n\s*raise", src)),
-            3,
-            "the three fail-open probes (_purity_allows, _1040_seam_readmit_ready, "
-            "the policy-input premise read) must each re-raise the STOP",
-        )
-
-    def test_an_unannotated_zero_is_not_a_contradiction(self):
+    def test_an_unannotated_zero_is_not_a_hit(self):
         """A tree that records only the loaded count (hiradix, flexkv) says
-        nothing about the probe: no raise, no false STOP."""
+        nothing about the probe: "unprobed", no false claim either way."""
         r = _req()
-        assert_store_witness_at_admission(r, 0, _sched([r]).tree_cache)
         self.assertEqual(store_witness(_sched([r], outcomes={r.rid: 0}), r), "unprobed")
 
 
@@ -354,7 +302,7 @@ class IV_AGenuinelyColdRequestIsAdmittedAtZeroAsToday(CustomTestCase):
         s = _sched([r], outcomes={r.rid: PrefetchOutcome(0, hit_tokens=0, probed=True)})
         self.assertEqual(store_witness(s, r), "cold")
         loaded = s.tree_cache.prefetch_loaded_tokens_by_reqid.pop(r.rid, 0)
-        assert_store_witness_at_admission(r, loaded, s.tree_cache)  # no raise
+        observe_store_witness(s, r, loaded, s.tree_cache)  # #1176 r6: observes
         self.assertEqual(loaded, 0)
         self.assertFalse(seam_transport_premise_holds(s))
 

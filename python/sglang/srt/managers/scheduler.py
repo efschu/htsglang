@@ -204,9 +204,7 @@ from sglang.srt.managers.phase_purity import (
     decode_blocked_here as phase_decode_blocked_here,
 )
 from sglang.srt.managers.phase_purity import (
-    StoreWitnessContradiction,
-    assert_store_witness_at_admission,
-    witness_stop_authority,
+    observe_store_witness,
     prefill_blocked_here as phase_prefill_blocked_here,
 )
 # #791b: imported AS A MODULE, not from-imported: the admission loop resolves
@@ -4314,8 +4312,6 @@ class Scheduler(
                 )
             if what == "decode_in_pp":
                 return bool(purity.decode_allowed_in_pp(running_bs))
-        except StoreWitnessContradiction:
-            raise  # #1157: a detected contradiction is the STOP, not a probe error
         except Exception:  # noqa: BLE001 - a probe must not break the round
             return False
         return False
@@ -5366,8 +5362,10 @@ class Scheduler(
         # min_completed_tokens - insert_result.prefix_len`, and the insert is
         # rooted at `last_host_node` so `prefix_len` is span-relative).
         # Comparing that against the whole retract stamp under-reads the prefix
-        # by exactly this head, and a false `StoreWitnessContradiction` is a
-        # group STOP -- the weg1b6 boot killer. Reading the CURRENT match at
+        # by exactly this head. #1176 round 6: the witness no longer decides
+        # anything -- this stamp is now one of the four candidate readings
+        # printed side by side by `observe_store_witness`. Reading the
+        # CURRENT match at
         # the witness instead cannot work: after `init_load_back` the two
         # halves overlap (schedule_batch.py:3637-3645) and nothing clears
         # `host_hit_length`, so the sum would over-credit; this value is
@@ -6454,8 +6452,6 @@ class Scheduler(
             if not candidates:
                 return True
             return bool(seam_transport_premise_holds(self))
-        except StoreWitnessContradiction:
-            raise  # #1157: the STOP passes through the fail-open probe
         except Exception:  # noqa: BLE001 - never wedge the arming path
             return True
 
@@ -11318,30 +11314,21 @@ class Scheduler(
                 # never a P=0 admission. The credit is stored as a bare int:
                 # `storage_hit_length` rides into `cached_tokens_storage` and
                 # the pickled detokenizer output (review B1).
-                # #1176 (review r5): THIS BRANCH RUNS ON EVERY RANK OF THE PP
-                # GROUP, AND EXACTLY ONE OF THEM MAY STOP THE GROUP. Every
-                # input to the witness is rank-LOCAL on the shipping form
-                # (--tp-size 1: the packed MIN all_reduce that would make
-                # `matched`/`loaded` uniform runs only under tp_world_size > 1;
-                # `host_hit_length` is documented as NOT rank-uniform under a
-                # layer-partitioned host tier, schedule_policy.py:2244-2246).
-                # Round 4 let every rank raise on its own reading and weg1b6
-                # measured the consequence: PP0 raised on one rid while PP1/PP2
-                # read 'hit' and admitted it -- one rank dead, its peers in a
-                # collective one short. `witness_stop_authority` restores the
-                # single point of verdict (#968: PP0 decides, followers credit
-                # and decide nothing, #969Z below). A follower still MEASURES;
-                # it reports and admits, exactly as it does for every other
-                # prefetch fact on this branch.
-                #
-                # The follower->PP0 report CARRIER stays deleted: three tree
-                # facts proved it could not deliver a STOP.
-                assert_store_witness_at_admission(
-                    req,
-                    loaded_tokens,
-                    self.tree_cache,
-                    may_stop=witness_stop_authority(self),
-                )
+                # #1176 (round 6): THE WITNESS OBSERVES AND NEVER STOPS THE
+                # GROUP. Six rank-local presence formulations were falsified by
+                # execution -- each either raising on a genuinely present
+                # prefix (a false PP0 group STOP that kills the boot, weg1b6
+                # 16:08:22) or licensing a re-prefill an ancestor had refused.
+                # Every input is rank-LOCAL on the shipping form (--tp-size 1:
+                # the packed MIN all_reduce that would make `matched`/`loaded`
+                # uniform runs only under tp_world_size > 1; `host_hit_length`
+                # is documented as NOT rank-uniform under a layer-partitioned
+                # host tier, schedule_policy.py:2244-2246), so no arithmetic
+                # over them can be a group verdict. The line below is DATA:
+                # every term plus all four candidate presence readings, and
+                # law #939 is enforced on that measurement by the acceptance
+                # instrument (accept_weg1_1068.py check A14).
+                observe_store_witness(self, req, loaded_tokens, self.tree_cache)
                 if loaded_tokens > 0:
                     req.storage_hit_length = int(loaded_tokens)
                 # Counted, never a skip: this rank ADMITS here. The census key
@@ -11392,21 +11379,11 @@ class Scheduler(
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
-                # #1157: see the PP branch above -- the same witness, the
-                # same STOP, the same bare-int credit (review B1). This branch
-                # is the non-PP path, where the record is either the only one
-                # or MIN-reduced across the prefetch group, so
-                # `witness_stop_authority` answers True by construction
-                # (pp_size <= 1). It is passed anyway rather than hardcoded:
-                # the two sites must resolve the authority the same way or they
-                # drift, and this branch is reachable under pp_size > 1 for a
-                # request that took the non-PP arm.
-                assert_store_witness_at_admission(
-                    req,
-                    loaded_tokens,
-                    self.tree_cache,
-                    may_stop=witness_stop_authority(self),
-                )
+                # #1176 (round 6): see the PP branch above -- the same
+                # observation, no verdict, the same bare-int credit (review
+                # B1). This is the non-PP path; the emitter is identical so the
+                # two sites cannot drift in what they measure.
+                observe_store_witness(self, req, loaded_tokens, self.tree_cache)
                 if loaded_tokens > 0:
                     req.storage_hit_length = int(loaded_tokens)
 
@@ -15103,8 +15080,6 @@ class Scheduler(
                 )
 
                 _seam_premise_now = bool(seam_transport_premise_holds(self))
-            except StoreWitnessContradiction:
-                raise  # #1157: the STOP passes through the fail-open probe
             except Exception:  # noqa: BLE001 - an input probe never breaks arming
                 _seam_premise_now = False
         from sglang.srt.managers.phase_purity import seam_transport_deduction
