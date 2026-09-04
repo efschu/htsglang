@@ -1365,6 +1365,12 @@ class Req(ReqDllmMixin):
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
+        # Which pool minted `req_pool_idx`. Under the phase flip two request
+        # pools of IDENTICAL size exist, so the id alone cannot say whose row
+        # it names: a stale id lands in range, on another request's row, and
+        # the wrong-row write is silent. `ReqToTokenPool.alloc` stamps this and
+        # refuses a row presented to a pool that did not mint it (#1040).
+        self.req_pool_binding: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
         self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
         self.mamba_next_track_idx: Optional[int] = None  # 0 or 1

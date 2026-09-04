@@ -1868,14 +1868,27 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
                     f"--rank-gpu-memory-mib) until it is >= {pp_capacity}."
                 )
 
-            # 5a. Share the REQUEST MAPPINGS by tensor rebind: both stacks
-            # must read the same request->token rows and request->mamba
-            # slot mapping (the scheduler writes them ONCE, into the
-            # primary pool's tensors; slot ids are the cross-layout keys).
-            # The pools themselves stay layout-specific; only the mapping
-            # tensors alias. The slot SPACES agree by construction (same
-            # max_num_reqs / max_mamba_cache_size in the args copy) --
-            # asserted here, loudly.
+            # 5a. Each phase OWNS its request-index space (#1040).
+            #
+            # The two stacks used to ALIAS these tensors -- the TP pool was
+            # pointed at the PP pool's `req_to_token` and mamba index map --
+            # so every row id the TP phase used had been minted by the PP
+            # allocator, and a row freed in one phase was silently still
+            # named by the other. That is gone: the pools stay separate, and
+            # the scheduler is rebound to the incoming phase's own pool at
+            # every cutover (`phase_req_pool_binding.rebind_req_pool_for_cutover`).
+            #
+            # The three checks below SURVIVE the deletion, and they are more
+            # load-bearing after it than before. Three consumers read the
+            # SHAPE of `req_to_token` ONCE, at construction, and keep it for
+            # the life of the process -- `hisparse_coordinator.py:109` and
+            # `overlap_utils.py:296/:299`. They are built against one phase's
+            # pool and then see the other's after a rebind, so the two shapes
+            # (and the mamba slot space, which the flip uses as a
+            # cross-layout key) must agree. They do agree by construction
+            # (same max_num_reqs / max_mamba_cache_size in the args copy) --
+            # asserted here, loudly, because a silent divergence would make
+            # those cached bounds wrong rather than merely stale.
             pp_req_pool = primary_runner.req_to_token_pool
             tp_req_pool = tp_worker.model_runner.req_to_token_pool
             if tp_req_pool.req_to_token.shape != pp_req_pool.req_to_token.shape:
@@ -1884,7 +1897,6 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
                     f"{tuple(pp_req_pool.req_to_token.shape)} vs TP "
                     f"{tuple(tp_req_pool.req_to_token.shape)}"
                 )
-            tp_req_pool.req_to_token = pp_req_pool.req_to_token
             if hasattr(pp_req_pool, "req_index_to_mamba_index_mapping"):
                 pp_map = pp_req_pool.req_index_to_mamba_index_mapping
                 tp_map = tp_req_pool.req_index_to_mamba_index_mapping
@@ -1893,7 +1905,6 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
                         f"mamba index mapping shapes diverge: PP "
                         f"{tuple(pp_map.shape)} vs TP {tuple(tp_map.shape)}"
                     )
-                tp_req_pool.req_index_to_mamba_index_mapping = pp_map
                 if pp_req_pool.mamba_pool.size != tp_req_pool.mamba_pool.size:
                     raise PhaseFlipBootError(
                         f"mamba slot spaces diverge: PP "

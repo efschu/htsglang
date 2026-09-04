@@ -355,6 +355,28 @@ def readers_of(scheduler: Any) -> dict:
     }
 
 
+def runner_for_phase(scheduler: Any, phase: str) -> Any:
+    """The model runner that OWNS the named phase's pools.
+
+    One resolver, because the two phases are not symmetric in where their
+    worker lives and the asymmetry is easy to get backwards: the cutover
+    swaps ``scheduler.model_worker`` but NOT ``scheduler.tp_worker``
+    (``phase_flip_runtime`` step 7), so ``scheduler.tp_worker`` is always the
+    PP/boot stack and ``stacks.tp_worker`` is always the TP stack, whichever
+    phase happens to be live. Callers that need a phase's own request pool
+    (#1040) and callers that need its KV pools read the same walk from here.
+
+    Returns None when the stack is absent -- the caller decides whether that
+    is a refusal, because the two callers refuse for different reasons.
+    """
+    stacks = getattr(scheduler, "phase_flip_stacks", None)
+    if phase == "tp":
+        worker = getattr(stacks, "tp_worker", None)
+    else:
+        worker = getattr(scheduler, "tp_worker", None)
+    return getattr(worker, "model_runner", None)
+
+
 def phase_pools_for(scheduler: Any, phase: str) -> PhasePools:
     """The incoming phase's triple, assembled from what the boot built.
 
@@ -365,12 +387,7 @@ def phase_pools_for(scheduler: Any, phase: str) -> PhasePools:
     allocation is the binding constraint (DESIGN_706 C1). Its absence is the
     honest reason a rebind cannot arm yet, and it is reported as such.
     """
-    stacks = getattr(scheduler, "phase_flip_stacks", None)
-    if phase == "tp":
-        worker = getattr(stacks, "tp_worker", None)
-    else:
-        worker = getattr(scheduler, "tp_worker", None)
-    runner = getattr(worker, "model_runner", None)
+    runner = runner_for_phase(scheduler, phase)
     device_pool = getattr(runner, "token_to_kv_pool", None)
     allocator = getattr(runner, "token_to_kv_pool_allocator", None) or getattr(
         scheduler, "token_to_kv_pool_allocator", None

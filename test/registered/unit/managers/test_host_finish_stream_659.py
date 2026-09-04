@@ -155,7 +155,9 @@ def _make_manager(batch):
     def _free(r):
         r.req_pool_idx = None
 
-    mgr.req_to_token_pool = MagicMock()
+    # #1040 C1.5: the manager reads `scheduler.req_to_token_pool` at use,
+    # so the pool lives on the scheduler stand-in, not on the manager.
+    mgr.scheduler.req_to_token_pool = MagicMock()
     mgr.req_to_token_pool.free.side_effect = _free
     return mgr
 

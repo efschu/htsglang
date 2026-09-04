@@ -102,7 +102,9 @@ def _manager(*, region_tokens=4096, budget_armed=False):
     mgr.region_tokens = region_tokens
     mgr.allocator = MagicMock()
     row = torch.arange(POOL_COLS, dtype=torch.int32) + 1000
-    mgr.req_to_token_pool = SimpleNamespace(
+    # #1040 C1.5: the manager reads `scheduler.req_to_token_pool` at use,
+    # so the pool lives on the scheduler stand-in, not on the manager.
+    mgr.scheduler.req_to_token_pool = SimpleNamespace(
         req_to_token=row.unsqueeze(0).repeat(POOL_ROWS, 1).contiguous()
     )
     return mgr

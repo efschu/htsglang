@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import abc
 import dataclasses
+import itertools
 import logging
 import math
 import os
@@ -347,6 +348,19 @@ def _set_kv_buffer_prefix_valid_impl(
     )
 
 
+_REQ_POOL_BINDING_SEQ = itertools.count(1)
+
+
+def _next_req_pool_binding_tag() -> int:
+    """Mint the next request-index-space binding tag (process-monotone).
+
+    See ``ReqToTokenPool.__init__`` for why the tag exists: it names the pool a
+    ``req_pool_idx`` was minted by, which is the only thing that distinguishes
+    two same-sized pools under the phase flip (#1040).
+    """
+    return next(_REQ_POOL_BINDING_SEQ)
+
+
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -369,6 +383,20 @@ class ReqToTokenPool:
         self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
+        # #1040: WHICH POOL MINTED A ROW.
+        #
+        # Under the phase flip two of these pools exist -- one per phase -- and
+        # the scheduler is rebound from one to the other at every cutover. Both
+        # are built from the same `server_args` copy, so `_alloc_size` is
+        # IDENTICAL: a stale `req_pool_idx` carried across the seam therefore
+        # lands IN RANGE, on another request's row. That is a silent wrong-row
+        # write, not a device-side assert -- out-of-range would need different
+        # row counts, which is the KV axis, not this one.
+        #
+        # The tag is what makes the two rows distinguishable. It is minted here
+        # and re-minted by `clear()`, so a row that survived a flush is refused
+        # exactly like a row that survived a rebind.
+        self.binding_tag = _next_req_pool_binding_tag()
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
@@ -397,6 +425,29 @@ class ReqToTokenPool:
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
+        # #1040 WRONG-ROW GUARD. ONE COMPARISON, ONE CHOKEPOINT.
+        #
+        # This is the only place a carried `Req` can re-present a row it was
+        # given earlier, so it is the only place the row's PROVENANCE has to be
+        # checked. A request whose row was minted by the other phase's pool (or
+        # by this pool before a `clear()`) names a row that exists here and
+        # belongs to somebody else -- the write would succeed and corrupt.
+        # Detected disagreement is a stop, never a repair (`raenge-nie-uneins`).
+        for i in reusing:
+            r = reqs[i]
+            carried = getattr(r, "req_pool_binding", None)
+            if carried != self.binding_tag:
+                raise ValueError(
+                    f"request {getattr(r, 'rid', '<unknown>')} re-presents "
+                    f"req_pool_idx={r.req_pool_idx} minted under request-pool "
+                    f"binding {carried!r}, but this pool is binding "
+                    f"{self.binding_tag!r}. Both pools hold "
+                    f"{self._alloc_size} rows, so the id is IN RANGE and the "
+                    "write would land on another request's row instead of "
+                    "failing -- refused here rather than corrupting silently "
+                    "(#1040)."
+                )
+
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
             return None
@@ -406,6 +457,10 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                # The row and the pool that minted it travel together: the id
+                # alone is ambiguous once a second pool of the same size
+                # exists (#1040).
+                r.req_pool_binding = self.binding_tag
                 self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
@@ -454,6 +509,11 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
+        # A flush retires every row this pool handed out, so it retires the
+        # binding too: a request that kept an id across the flush names a row
+        # that now belongs to nobody, and re-presenting it must be refused
+        # exactly like a row carried across a phase rebind (#1040).
+        self.binding_tag = _next_req_pool_binding_tag()
         # Flush invariant: post-flush state must equal a fresh boot. The
         # token table starts zeroed at init; stale mappings would otherwise
         # survive a flush (including the padding row 0, which CUDA-graph

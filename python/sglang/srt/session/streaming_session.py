@@ -44,6 +44,10 @@ class SessionSlot:
 
     # KV pool state (None means no KV is currently held by this slot)
     req_pool_idx: Optional[int] = None
+    # The pool that minted `req_pool_idx`. It parks here with the row: on the
+    # next turn the row is handed back to a request, and the pool refuses a row
+    # it did not mint (#1040), so the binding has to travel with it.
+    req_pool_binding: Optional[int] = None
     kv_committed_len: int = 0
     kv_allocated_len: int = 0
 
@@ -70,6 +74,7 @@ class SessionSlot:
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
         self.req_pool_idx = req.req_pool_idx
+        self.req_pool_binding = req.req_pool_binding
         self.kv_committed_len = req.kv_committed_len
         self.kv_allocated_len = req.kv_allocated_len
         self.swa_evicted_seqlen = req.swa_evicted_seqlen
@@ -94,6 +99,7 @@ class SessionSlot:
         # the slot's tensor to be reused by a new req and leaked when
         # the slot is later freed.
         req.req_pool_idx = None
+        req.req_pool_binding = None
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
@@ -103,6 +109,7 @@ class SessionSlot:
     def restore_to_req(self, req: Req):
         """Restore KV state from this slot into an incoming request."""
         req.req_pool_idx = self.req_pool_idx
+        req.req_pool_binding = self.req_pool_binding
         req.kv_committed_len = self.kv_committed_len
         req.kv_allocated_len = self.kv_allocated_len
         req.swa_evicted_seqlen = self.swa_evicted_seqlen

@@ -389,7 +389,9 @@ def _back_only_manager(log_sink):
     mgr.region_tokens = 4  # forces the LATE decline (owned tail > one region)
     mgr.allocator = MagicMock()
     row = torch.arange(256, dtype=torch.int32) + 1000
-    mgr.req_to_token_pool = SimpleNamespace(
+    # #1040 C1.5: the manager reads `scheduler.req_to_token_pool` at use,
+    # so the pool lives on the scheduler stand-in, not on the manager.
+    mgr.scheduler.req_to_token_pool = SimpleNamespace(
         req_to_token=row.unsqueeze(0).repeat(4, 1).contiguous()
     )
     return mgr
@@ -1114,7 +1116,9 @@ def test_release_on_host_finish_resets_admission_gate_and_frees_region():
     def _free(r):
         r.req_pool_idx = None
 
-    mgr.req_to_token_pool = MagicMock()
+    # #1040 C1.5: the manager reads `scheduler.req_to_token_pool` at use,
+    # so the pool lives on the scheduler stand-in, not on the manager.
+    mgr.scheduler.req_to_token_pool = MagicMock()
     mgr.req_to_token_pool.free.side_effect = _free
 
     mgr.release_finished_spilled_req(req)
@@ -2647,7 +2651,10 @@ def test_restore_readiness_counts_radix_evictable_not_just_the_free_list():
         m.host_base = 100000
         row = torch.arange(L, dtype=torch.int64)
         row[boundary:] += m.host_base  # tail rows are host sentinels
-        m.req_to_token_pool = types.SimpleNamespace(req_to_token=row.unsqueeze(0))
+        # #1040 C1.5: the pool is read off the scheduler at use.
+        m.scheduler.req_to_token_pool = types.SimpleNamespace(
+            req_to_token=row.unsqueeze(0)
+        )
         m.allocator = types.SimpleNamespace(available_size=lambda: avail)
         m.tree_cache = types.SimpleNamespace(evictable_size=lambda: evictable)
         m.restore_margin_tokens = margin
@@ -2714,7 +2721,10 @@ def _restore_gate_opens(pool_tokens: int, margin: int) -> bool:
     m.host_base = 100000
     row = torch.arange(L, dtype=torch.int64)
     row[boundary:] += m.host_base
-    m.req_to_token_pool = types.SimpleNamespace(req_to_token=row.unsqueeze(0))
+    # #1040 C1.5: the pool is read off the scheduler at use.
+    m.scheduler.req_to_token_pool = types.SimpleNamespace(
+        req_to_token=row.unsqueeze(0)
+    )
     m.allocator = types.SimpleNamespace(
         available_size=lambda: pool_tokens, size=pool_tokens
     )

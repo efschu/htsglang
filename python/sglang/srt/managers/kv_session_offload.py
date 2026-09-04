@@ -2536,7 +2536,7 @@ class KVSessionOffloadManager:
         self.host_pool = backend._sess_host_pool
         self.full_pool = backend._sess_full_pool
 
-        self.req_to_token_pool = scheduler.req_to_token_pool
+        # NOT cached: see the `req_to_token_pool` property below (#1040).
         self.allocator = scheduler.token_to_kv_pool_allocator
         self.tree_cache = scheduler.tree_cache
 
@@ -2917,6 +2917,20 @@ class KVSessionOffloadManager:
                 self._regulator_spec_server,
             )
 
+
+    @property
+    def req_to_token_pool(self):
+        """The scheduler's CURRENT request pool, read at use (#1040).
+
+        This was a cached object reference. Since the phase flip gives each
+        phase its own ``ReqToTokenPool`` and rebinds the scheduler at every
+        cutover, a cached reference goes on naming the OUTGOING phase's tensor
+        -- and because both pools hold the same number of rows, the writes in
+        this file (``req_to_token[req.req_pool_idx, ...]``, ~20 sites) would
+        land in range on the wrong pool instead of failing. Reading the
+        scheduler here costs one attribute lookup and cannot go stale.
+        """
+        return self.scheduler.req_to_token_pool
     def _carve_out_draft_scratch(self) -> None:
         """Take the reserved draft-read scratch slots OUT of the allocator's
         accounted size -- and PROVE the write took effect.

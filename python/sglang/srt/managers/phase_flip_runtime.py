@@ -3556,6 +3556,27 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # sit between a failed completeness check and the exception.
         from sglang.srt.managers.phase_flip_output_trace import trace_cutover
 
+        # #1040: point the scheduler at the incoming phase's OWN request pool.
+        #
+        # Deliberately OUTSIDE the #719 try/except below, and deliberately NOT
+        # gated on --phase-flip-rebind-hicache. The #719 argument -- "a refused
+        # rebind is SAFE, the binding just does not move" -- is true of HiCache
+        # because a stale HiCache binding has a disarmed state (#718 turns
+        # device-tier I/O off and the phase behaves as it did before the
+        # feature existed). A request pool has no such state: since the boot no
+        # longer aliases the two stacks' `req_to_token`, a scheduler left on the
+        # outgoing pool reads and writes a tensor the running phase never
+        # touches, and every row id it hands out was minted by the wrong
+        # allocator. So this runs on EVERY cutover and RAISES when it cannot.
+        #
+        # It also censuses the OUTGOING pool first (#919 on the request axis)
+        # and clears the incoming one, so a row carried across the seam is
+        # refused by the wrong-row guard rather than landing in range.
+        from sglang.srt.managers.phase_req_pool_binding import (
+            rebind_req_pool_for_cutover,
+        )
+
+        rebind_req_pool_for_cutover(scheduler, "tp" if tp_phase else "pp")
         # #719: move the HiCache pool bindings to the phase that is now active.
         # Runs AFTER the stack swap, because the incoming pools are what it
         # binds to -- the mirror of #703's writeback, which runs BEFORE
