@@ -1385,7 +1385,74 @@ def _store_witness_allowance(tree) -> int:
     return int(getattr(tree, "prefetch_threshold", 256) or 256)
 
 
-def _witness_from_outcome(req, outcome, stamp: int, allowance: int) -> str:
+#: #1176 (review r5): how often a contradiction was reported by a reader that
+#: does not own the STOP. Rate-limits the log line; never a decision.
+_WITNESS_REPORTS_WITHOUT_AUTHORITY = 0
+
+#: #1176 (review r5): how often the witness had to fall back to the unframed
+#: reading. Expected to stay 0 -- `_prefetch_kvcache` stamps the registration
+#: head on every registration that can produce an annotated record.
+_WITNESS_UNFRAMED_READS = 0
+
+
+def _note_unframed_witness(req) -> int:
+    """#1176 (review r5): an annotated record arrived with no registration head.
+
+    The frame the presence arithmetic rests on is missing, so the witness falls
+    back to `max(resident, matched + loaded)` -- correct in the licensing
+    direction (never adds, never invents), potentially loud in the other. That
+    fallback must never be silent: if it ever fires, either a second registrar
+    grew that does not stamp the head (scheduler.py:5377), or the attribute was
+    cleared between registration and admission. Counted and spoken, never
+    raised -- a diagnostic gap is not a reason to stop a group.
+    """
+    global _WITNESS_UNFRAMED_READS
+    _WITNESS_UNFRAMED_READS += 1
+    n = _WITNESS_UNFRAMED_READS
+    if n == 1 or n % 256 == 0:
+        logger.warning(
+            "%s STORE WITNESS UNFRAMED READ (n=%d): rid=%s carries an annotated "
+            "prefetch record but no `_prefetch_registered_prefix_len`; the "
+            "presence is read as max(device_resident, matched + loaded) "
+            "instead of registered_head + (matched + loaded). Every registrar "
+            "that produces such a record is expected to stamp the head "
+            "(scheduler.py:5377) -- find the one that did not.",
+            LOG_PREFIX,
+            n,
+            getattr(req, "rid", None),
+        )
+    return n
+
+
+def witness_stop_authority(scheduler) -> bool:
+    """#1176 (review r5): may THIS rank turn a store-witness contradiction into
+    a group STOP?
+
+    Yes on any world that is not a pipeline group -- there the record is either
+    the only one, or MIN-reduced across the prefetch group by the packed
+    all_reduce that runs under ``tp_world_size > 1`` -- and on PP0, the rank
+    that already owns the admission verdict for the whole group (#968 PP0
+    authority; scheduler.py:11264 `if self.ps.pp_rank == 0` and the #969Z note
+    beside it, "followers credit only and decide nothing").
+
+    A stand-in without a pipeline identity is its own authority: absence of
+    ``ps`` must never silence the witness, which is the direction a defect
+    would take.
+    """
+    ps = getattr(scheduler, "ps", None)
+    try:
+        pp_size = int(getattr(ps, "pp_size", 1) or 1)
+        pp_rank = int(getattr(ps, "pp_rank", 0) or 0)
+    except (TypeError, ValueError):
+        return True
+    if pp_size <= 1:
+        return True
+    return pp_rank == 0
+
+
+def _witness_from_outcome(
+    req, outcome, stamp: int, allowance: int, may_stop: bool = True
+) -> str:
     """Classify one terminated prefetch's outcome for the store witness.
 
     ``outcome`` is the value the tree keeps in ``prefetch_loaded_tokens_by_
@@ -1398,86 +1465,122 @@ def _witness_from_outcome(req, outcome, stamp: int, allowance: int) -> str:
     re-admission (loaded=0, hit_tokens=40) beside stamp=80009 as a restore and
     license a P=0 recompute of 79,969 tokens.
 
-    THE PRESENCE HAS TWO PARTS, AND THE PREFETCH RECORD ONLY CARRIES ONE OF
-    THEM (#1176 review r4). This is the arithmetic round 3 got wrong, in the
-    boot-killing direction, and the tree states the frame at three sites:
+    THE SPAN IS NOT THE PREFIX, AND THE HEAD IT WAS CHOSEN AGAINST IS THE
+    MISSING TERM (#1176 review r5). Three tree facts, re-verified before this
+    was written:
 
       * the prefetch's SPAN is chosen at REGISTRATION out of the match this
-        request already held -- ``_matched_len = len(req.prefix_indices) +
-        req.host_hit_length`` and ``full_untruncated_fill_ids[_matched_len:
-        _match_end]`` (scheduler.py:5323, :5350);
+        request held at that moment -- ``_matched_len = len(req.prefix_indices)
+        + req.host_hit_length`` and ``full_untruncated_fill_ids[_matched_len:
+        _match_end]`` (scheduler.py:5321, :5349), the match having just been
+        re-derived by ``init_next_round_input`` at :5297;
       * the insert is rooted at that same walk's ``last_host_node``
-        (unified_radix_cache.py:4022), so ``insert_result.prefix_len`` ->
+        (unified_radix_cache.py:4025), so ``insert_result.prefix_len`` ->
         ``matched`` is the part of THE SPAN the tree already held;
       * ``loaded = min_completed_tokens - insert_result.prefix_len``
         (:4140-4145) is the rest of THE SPAN.
 
     ``matched + loaded == min_completed_tokens`` is therefore an ALGEBRAIC
-    IDENTITY OVER THE SPAN, not a whole-prefix reading. Comparing it against
-    the whole stamp under-reads the prefix by exactly the registration-time
-    resident -- measured by the round-3 reviewer on 8e73b2a9cc: stamp 6008,
-    ``prefix_indices`` 5966, loaded 42, matched 0 RAISED "shortfall=5966" for a
-    request whose prefix was ENTIRELY present. A false
-    ``StoreWitnessContradiction`` is a PP0 group STOP and kills the boot, so
-    the residency term is added back:
+    IDENTITY OVER THE SPAN. The head below the span is ``_matched_len`` --
+    DEVICE **AND** HOST -- and the two are disjoint by construction, because
+    the span literally starts where the head ends.
 
-        presence  = len(req.prefix_indices) + matched + loaded
+    THE HEAD IS READ FROM THE REGISTRATION, NOT FROM THE CURRENT MATCH.
+    ``req._prefetch_registered_prefix_len`` is stamped beside
+    ``_prefetch_span_tokens`` by the one registration that also produced this
+    record. Reading ``len(prefix_indices)`` here instead under-reads by the
+    whole host half (round 4: stamp 6008, ``prefix_indices`` 0,
+    ``host_hit_length`` 6008 RAISED "shortfall=6008" for a request whose entire
+    prefix was in the host tier -- a false STOP, the #1176 boot-killer class);
+    adding ``len(prefix_indices) + host_hit_length`` here instead OVER-reads
+    after ``init_load_back`` has run, because the loaded host tokens then live
+    inside ``prefix_indices`` while ``host_hit_length`` still reports them
+    (schedule_batch.py:3637-3645) and nothing clears it -- and an over-read
+    under-reports the shortfall, which is the #939 licensing direction. The
+    registration stamp has neither hazard: it is taken once, before any
+    load-back, from one ``match_result``.
 
-    ``host_hit_length`` IS NEVER ADDED, and that is a deliberate under-read.
-    The two halves are disjoint at the match (``match_prefix_for_req`` unpacks
-    ``device_indices`` and ``host_hit_length`` from ONE ``match_result``,
-    schedule_policy.py:262-278) and OVERLAP once ``init_load_back`` has run --
-    schedule_batch.py:3637-3645 states the identity verbatim ("len(prefix_
-    indices) = device_original + host_loaded ... device_portion =
-    len(prefix_indices) - host_total") and nothing clears ``host_hit_length``.
-    No field at this site says which regime the request is in, so crediting the
-    host half would OVER-credit in the load-back regime, and over-credit is the
-    #939 direction (a licensed recompute). Under-credit is a loud STOP.
+        head      = min(registered_head, len(prefix_indices) + host_hit_length)
+        presence  = max(len(prefix_indices), head + matched + loaded)
+        shortfall = stamp - presence
+
+    The ``min`` is a CAP, not a credit: it lets a WITHDRAWN match collapse a
+    head the registration stamp would otherwise still claim (``truncate_
+    prefix_to`` slices ``prefix_indices`` and zeroes ``host_hit_length`` in one
+    block, so a PP-told clamp to 0 takes the head to 0 and the presence back to
+    what the prefetch itself delivered). Because the sum is only ever an upper
+    bound, the post-load-back overlap between the two halves can loosen it but
+    never inflate the credit. The outer ``max`` adds a SECOND independent lower
+    bound -- the device rows held right now -- which matters when the span was
+    registered at head 0 (covering the whole prompt) and the device tree grew
+    into it afterwards; adding those rows to the span reading would be the
+    round-4 double count, taking the larger of the two is honest.
+
+    THIS ALSO REMOVES THE ROUND-4 DOUBLE COUNT. ``len(prefix_indices) +
+    matched`` could count the same tokens twice whenever another writer grew
+    the device tree into the registered span between registration and insert,
+    and a double count of real presence UNDER-reports the shortfall -- i.e.
+    licenses exactly the recompute #939 forbids (round 4 measured it:
+    prefix_indices 40000, matched 40000, stamp 80009 returned 'hit' while only
+    40000 tokens were present). Against the registration head the span term can
+    never overlap the head term, whatever the tree did in between.
+
+    IF THE REGISTRATION STAMP IS ABSENT the frame cannot be built, so the two
+    readings are taken as independent LOWER BOUNDS and the larger is used --
+    ``max(len(prefix_indices), matched + loaded)``, which can never double
+    count and never invents presence. That branch is unreachable through
+    ``_prefetch_kvcache`` (the only registrar that produces an annotated
+    record on this tree) and says so out loud rather than passing silently.
 
     THE RESIDENCY READ SELF-INVALIDATES WHEN THE PREFIX IS WITHDRAWN.
     ``truncate_prefix_to`` (schedule_batch.py:2357) slices ``prefix_indices``
     AND zeroes ``host_hit_length`` plus the rest of the #965 co-derived group
     in one block, and ``reset_for_retract`` empties ``prefix_indices``
-    outright -- so a request whose premise was dropped is measured on what the
-    prefetch actually delivered, never on a stale claim.
+    outright. Those clears do not touch the registration stamp, which is
+    correct: the stamp describes what the PREFETCH was framed against, and the
+    span reading beside it describes what that prefetch delivered. A request
+    whose match is withdrawn re-enters intake and re-registers, which rewrites
+    both halves together.
 
-    CAN ``matched`` OVERLAP ``len(prefix_indices)``? Round 2 argued they are
-    disjoint because the admission loop pops the prefetch record before
-    ``init_next_round_input`` re-derives the match. That argument does NOT
-    hold as stated: the match the witness reads was written earlier in the
-    same pass by ``calc_priority`` (scheduler.py:10524, ~800 lines above the
-    pop), and between the prefetch's REGISTRATION and its INSERT another
-    writer can grow the device tree into the span -- which would make
-    ``matched`` and the current ``prefix_indices`` describe some of the same
-    tokens. The overlap is bounded by ``min(resident, matched)`` and both
-    terms then describe tokens that ARE present, so the error is a double
-    COUNT of real presence, never invented presence. The alternative reading
-    ``max(resident, matched + loaded)`` cannot double count but falsely raises
-    on the ordinary reaped-partial-fetch shape (device 3000, span
-    [3000, 10000) delivering 3000, stamp 10000: sum -> shortfall 4000, inside
-    the allowance; max -> 7000, a STOP) -- and that shape is exactly what
-    #1176 itself is an instance of. The sum is chosen, and the residual is
-    named rather than hidden.
+    WHO MAY TURN A CONTRADICTION INTO A STOP (#1176 review r5). ``may_stop``.
+    Round 4 let EVERY rank raise on its own reading, and every input to that
+    reading is rank-LOCAL: ``matched`` and ``loaded`` are MIN-reduced only
+    under ``tp_world_size > 1`` (the shipping form runs --tp-size 1 --pp-size
+    3), ``len(prefix_indices)`` is this rank's own match, and
+    ``host_hit_length`` is "NOT rank-uniform by construction" under a
+    layer-partitioned host tier (schedule_policy.py:2244-2246). Measured on
+    the weg1b6 records for ONE rid: PP1/PP2 returned 'hit' while PP0 raised --
+    one rank killing the group while its peers admit. That is the opposite of
+    raenge-nie-uneins, and it takes the verdict OUT of PP0 against the #968
+    order. So exactly one caller may stop: the admission assert on the
+    authority rank (`witness_stop_authority`). Everywhere else -- the census,
+    the seam premise -- the contradiction is REPORTED and returned as
+    "contradiction", which no caller counts as restored, so the premise
+    refuses instead of crashing one rank inside a group-uniform gate
+    (scheduler.py:8926).
 
     The witness is therefore 'hit' only if something is PRESENT and the
     shortfall ``stamp - presence`` is within the one-chunk ``allowance``;
     nothing present beside a stamp, and a shortfall larger than the allowance,
-    are contradictions -- raised by WHATEVER RANK MEASURES THEM (#1176 review
-    r4: the follower-reports-to-PP0 carrier is deleted, see
-    ``store_witness``). A record without the annotation (a bare int from
-    another tree) keeps the old reading, where loaded and hit are the same
-    number. A cold request (stamp 0) keeps the plain reading: hit if the probe
-    answered, cold otherwise.
+    are contradictions. A record without the annotation (a bare int from
+    another tree) keeps the reading those writers have always had -- the count
+    itself, with no head credited (hiradix_cache.py:1937,
+    hi_mamba_radix_cache.py:2364); this function must not silently change
+    those trees' verdicts, and the admission assert returns early for them in
+    any case. A cold request (stamp 0) keeps the plain reading: hit if the
+    probe answered, cold otherwise.
 
     HAZARD NAMED AT THE READ SITE (#1176 review r4, non-blocking):
     ``cached_prompt_tokens_at_retract`` (schedule_batch.py:2593) has exactly
     ONE writer -- ``reset_for_retract`` -- and NO clearer anywhere in the
-    tree. It is monotone by design (#1040 reads it the same way), but the
-    whole comparison below rests on it, so a stamp that outlives the state it
-    described can only ever make this witness LOUDER, never quieter.
+    tree. It is monotone by design (#1040 reads it the same way). A stamp that
+    outlives the state it described makes this witness LOUDER on its own; it
+    is no longer able to be cancelled by a double count, because the frame
+    above cannot double count.
     """
     loaded = int(outcome or 0)
-    if hasattr(outcome, "hit_tokens"):
+    annotated = hasattr(outcome, "hit_tokens")
+    if annotated:
         probed = bool(getattr(outcome, "probed", False))
         hit = int(getattr(outcome, "hit_tokens", 0) or 0)
         matched = int(getattr(outcome, "matched", 0) or 0)
@@ -1498,14 +1601,58 @@ def _witness_from_outcome(req, outcome, stamp: int, allowance: int) -> str:
             return "hit"
         return "unprobed" if not probed else "cold"
     if not probed and hit == 0:
+        # The `hit == 0` conjunct is the DISCRIMINATOR, not decoration: an
+        # unprobed operation that nonetheless carries a positive probe answer
+        # is a record whose probe DID run (the reap annotation rides the same
+        # packed reduction), and it must fall through to the presence gate
+        # below rather than withhold the premise. Dropping the conjunct would
+        # send every reaped-with-answer record to "unprobed" and make the
+        # contradiction unreachable on exactly the shape #1176 is about.
         return "unprobed"
-    # #1176 (review r4): THE SPAN READING PLUS THE RESIDENT HEAD IT WAS CHOSEN
-    # AGAINST. `span_present` covers only [registration_match, ...) by
-    # construction (see the docstring's three tree sites); the head below it is
-    # `len(prefix_indices)`, and `host_hit_length` is deliberately excluded
-    # because it overlaps that read after `init_load_back`.
+    # #1176 (review r5): THE SPAN READING ON THE HEAD IT WAS REGISTERED
+    # AGAINST. `span_present` covers only [registered_head, ...) by
+    # construction (the docstring's three tree sites), so the two terms are
+    # disjoint and may be added. `registered_head` is device+host at the
+    # registration match -- reading the CURRENT match here would under-read by
+    # the host half (false STOP) or over-read after load-back (a #939 licence).
     resident = len(getattr(req, "prefix_indices", None) or ())
-    presence = resident + span_present
+    # CAP ONLY, never a credit. `truncate_prefix_to` (schedule_batch.py:2357)
+    # slices `prefix_indices` AND zeroes `host_hit_length` together, and
+    # `reset_for_retract` empties the prefix outright, so a match that was
+    # WITHDRAWN after registration collapses this sum -- and with it the head
+    # the stale registration stamp would otherwise still claim. Used as an
+    # upper bound rather than an addend precisely because the two halves
+    # OVERLAP after `init_load_back` (schedule_batch.py:3637-3645): as a cap
+    # the overlap only makes the bound looser, never the credit larger.
+    current_match = resident + int(getattr(req, "host_hit_length", 0) or 0)
+    registered = getattr(req, "_prefetch_registered_prefix_len", None)
+    if annotated and registered is not None:
+        head = min(max(0, int(registered)), current_match)
+        # `resident` alone is a SECOND, independent lower bound: device rows
+        # this request holds right now, which cannot double count anything.
+        # It matters when the span was registered at head 0 (the whole prompt)
+        # and the device tree grew into that span afterwards -- there
+        # `head + span_present` is the smaller of the two honest readings.
+        presence = max(resident, head + span_present)
+        frame = "registration"
+    elif annotated:
+        # UNFRAMED. No registration stamp, so the span cannot be placed in the
+        # prompt: the two readings are independent lower bounds and the larger
+        # is taken. Never adds, so it can never over-credit; it can under-read,
+        # which is the loud direction. Unreachable via `_prefetch_kvcache`
+        # (scheduler.py:5377 stamps the head on every registration that can
+        # produce an annotated record) -- said out loud so the absence is
+        # visible instead of silently changing the verdict.
+        head = 0
+        presence = max(resident, span_present)
+        frame = "unframed"
+        _note_unframed_witness(req)
+    else:
+        # A bare int from another tree: the pre-#1176 reading, unchanged.
+        # There is no matched half and no frame; the count is the presence.
+        head = 0
+        presence = span_present
+        frame = "count"
     shortfall = int(stamp) - presence
     # THE `presence > 0` REQUIREMENT IS PART OF THE GATE, not a branch above
     # it. 1634bc3d28 put a `demand <= 0 -> "hit"` short-circuit ABOVE this
@@ -1519,26 +1666,51 @@ def _witness_from_outcome(req, outcome, stamp: int, allowance: int) -> str:
         f"stamped={stamp} probed_hit={hit} "
         f"loaded={loaded} allowance={int(allowance)} shortfall={shortfall} "
         f"requested={requested} matched={matched} materialized={span_present} "
-        f"device_resident={resident} presence={presence}: "
+        f"registered_head={head} frame={frame} device_resident={resident} "
+        f"presence={presence}: "
         f"the retract stamp says the prompt was computed and fenced to the "
         f"canonical store in the previous window, and the measured presence of "
-        f"this re-admission -- the device-resident head this request still "
-        f"holds (device_resident) plus what the prefetch found and fetched over "
-        f"the span it was registered for (matched + loaded), the host-tier hit "
-        f"deliberately NOT credited because it overlaps the head after "
-        f"load-back (review r4) -- "
+        f"this re-admission -- the head the prefetch was REGISTERED against "
+        f"(registered_head, device plus host at that match) plus what the "
+        f"prefetch found and fetched over the span below it (matched + "
+        f"loaded), two disjoint reads that never double count -- "
         + (
             "shows nothing present at all -- nothing materialized by the "
-            "prefetch and nothing resident on this device"
+            "prefetch and nothing below the span it was registered for"
             if presence <= 0
             else "fell short of the stamped prefix by more than one chunk"
         )
-        + ". Two measurements of one span disagree; re-admitting at "
+        + ". Two measurements of one prefix disagree; re-admitting at "
         f"P={presence} would be a recompute licensed by a stamp "
-        f"(kein-doppel-prefill), so the group STOPs here instead "
-        f"(raenge-nie-uneins)."
+        f"(kein-doppel-prefill)."
     )
-    raise StoreWitnessContradiction(message)
+    if not may_stop:
+        # #1176 (review r5): this caller does not own the STOP. Reported and
+        # returned, never raised: every input above is rank-local, so a raise
+        # here would kill one rank while its peers admit the same rid -- the
+        # divergence measured on weg1b6 -- and it would take a state-changing
+        # verdict out of PP0 (#968). Rate-limited because a contradicting
+        # record repeats on every pass until the authority acts on it.
+        global _WITNESS_REPORTS_WITHOUT_AUTHORITY
+        _WITNESS_REPORTS_WITHOUT_AUTHORITY += 1
+        _n = _WITNESS_REPORTS_WITHOUT_AUTHORITY
+        if _n == 1 or _n % 64 == 0:
+            logger.warning(
+                "%s STORE WITNESS CONTRADICTION REPORTED, NOT RAISED (n=%d): "
+                "%s This reader holds no STOP authority (census / seam premise "
+                "/ PP follower); the state is returned as 'contradiction', "
+                "which no caller counts as restored, so the premise refuses "
+                "instead of splitting the group.",
+                LOG_PREFIX,
+                _n,
+                message,
+            )
+        return "contradiction"
+    raise StoreWitnessContradiction(
+        message
+        + " This rank owns the verdict for the group (#968 PP0 authority), so "
+        "the group STOPs here instead (raenge-nie-uneins)."
+    )
 
 
 def store_witness(scheduler, req) -> str:
@@ -1624,8 +1796,17 @@ def store_witness(scheduler, req) -> str:
     records = getattr(tree, "prefetch_loaded_tokens_by_reqid", None)
     outcome = records.get(rid) if records else None
     if outcome is not None:
+        # #1176 (review r5): THIS READER NEVER STOPS THE GROUP. `store_witness`
+        # is consulted by the census ("Reported only: this NEVER decides") and
+        # by `seam_transport_premise_holds`, which catches only (TypeError,
+        # ValueError) -- a raise from here escaped through `prefill_blocked_
+        # here` into scheduler.py:8926, the gate whose own comment asserts that
+        # every input is identical on every rank. A contradiction found here
+        # returns "contradiction", which is not in the restored set, so the
+        # premise refuses; the STOP belongs to the admission assert on the
+        # authority rank alone.
         return _witness_from_outcome(
-            req, outcome, stamp, _store_witness_allowance(tree)
+            req, outcome, stamp, _store_witness_allowance(tree), may_stop=False
         )
     n = len(getattr(req, "origin_input_ids", None) or ())
     threshold = int(getattr(tree, "prefetch_threshold", 256) or 0)
@@ -1634,22 +1815,42 @@ def store_witness(scheduler, req) -> str:
     return "cold"
 
 
-def assert_store_witness_at_admission(req, outcome, tree=None) -> None:
+def assert_store_witness_at_admission(
+    req, outcome, tree=None, *, may_stop: bool = True
+) -> Optional[str]:
     """#1157: the admission-loop half of the witness. Called with the value
     `pop_prefetch_loaded_tokens` returned for ``req`` (and the tree, for the
     one-chunk allowance); raises on a probed miss / revoke / over-allowance
     shortfall of the measured PRESENCE (#1176) beside a restore stamp, is a
     no-op for an unannotated count.
 
-    NO AUTHORITY PARAMETER (#1176 review r4). The `is_authority` split that
-    stood here let a PP follower admit on a contradiction and report it to
-    PP0 instead; the carrier is deleted -- see `store_witness` for the three
-    tree facts that proved it could not deliver the STOP. Every rank now
-    raises on its own true contradiction."""
+    ``may_stop`` (#1176 review r5) is the ONE place a contradiction becomes a
+    raise, and only on the rank that owns the verdict for the group
+    (`witness_stop_authority`). Every input to the reading is rank-local --
+    `matched`/`loaded` are MIN-reduced only under tp_world_size > 1,
+    `prefix_indices` is this rank's own match, `host_hit_length` is documented
+    as not rank-uniform under a layer-partitioned host tier -- so letting each
+    rank raise on its own reading killed one rank while its peers admitted the
+    same rid (weg1b6, measured). A follower credits and decides nothing
+    (#969Z); it reports and admits, and PP0's raise is the group's STOP.
+
+    NO CARRIER. The deleted follower -> PP0 report channel is NOT restored:
+    three tree facts proved it could not deliver a STOP (one-lap table
+    lifetime, first-pass unreachability, and the premise counting
+    'contradiction' as restored). A follower simply does not stop; that is
+    what #968 prescribes."""
     if outcome is None or not hasattr(outcome, "hit_tokens"):
-        return
+        return None
     stamp = int(getattr(req, "cached_prompt_tokens_at_retract", 0) or 0)
-    _witness_from_outcome(req, outcome, stamp, _store_witness_allowance(tree))
+    # #1176 (review r5): the state is RETURNED, not swallowed. On the
+    # authority a contradiction never reaches this line (it raised); on a
+    # follower it comes back as "contradiction", and a caller that wants to
+    # count or log the follower's reading now can. The admission sites ignore
+    # it -- deliberately: a follower credits and decides nothing (#969Z), so
+    # there is nothing for it to do with the value except report.
+    return _witness_from_outcome(
+        req, outcome, stamp, _store_witness_allowance(tree), may_stop=may_stop
+    )
 
 
 def store_witness_census(scheduler) -> str:
@@ -1791,8 +1992,17 @@ def seam_transport_premise_holds(scheduler) -> bool:
             # 6 recomputed TP chunks at 23:56:21. The premise now reads the
             # re-admission's OWN prefetch state (`store_witness`): a
             # registered-and-pending or hit prefetch is a restore; a probed
-            # miss beside the stamp raises (`StoreWitnessContradiction`, not
-            # caught here -- it is the group STOP).
+            # miss beside the stamp yields "contradiction".
+            # #1176 (review r5): "contradiction" IS NOT IN THE RESTORED SET,
+            # so the premise refuses and the flip demand is raised the normal
+            # way. It does not RAISE here, and that is deliberate: this reader
+            # runs on every rank (the census at scheduler.py:8926 is a
+            # group-uniform gate) while every input to the witness is
+            # rank-local, so a raise on this path would kill one rank while
+            # its peers hold -- the divergence measured on weg1b6. The STOP
+            # belongs to the admission assert on the authority rank
+            # (`witness_stop_authority`), which is the one call site that owns
+            # a state-changing verdict (#968/#969Z).
             _state = store_witness(scheduler, req)
             if _state in ("pending", "hit", "bounded"):
                 restored += 1

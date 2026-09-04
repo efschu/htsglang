@@ -85,6 +85,7 @@ def _req(
     seam_epoch=3,
     prefix_indices=0,
     host_hit_length=0,
+    registered=None,
 ):
     """A re-admitted request.
 
@@ -93,6 +94,13 @@ def _req(
     the pair the witness reads at witness time (review B1). Zero on both is
     the shape every pre-#1176 stand-in had: nothing matched, so the whole
     stamp is still owed.
+
+    `registered` is the REGISTRATION-TIME match, stamped beside the span by
+    `_prefetch_kvcache` (scheduler.py:5377) as
+    `_prefetch_registered_prefix_len`. Under the r5 frame it is the head the
+    span sits on; the CURRENT match above caps it but never adds to it. `None`
+    reproduces a record that carries no stamp -- the "unframed" reading, which
+    can under-read but never over-credit.
     """
     r = types.SimpleNamespace(
         rid=rid,
@@ -105,6 +113,8 @@ def _req(
     )
     setattr(r, SEAM_READMIT_ATTR, seam_epoch)
     setattr(r, SEAM_GRANT_CONSUMED_ATTR, False)
+    if registered is not None:
+        r._prefetch_registered_prefix_len = int(registered)
     return r
 
 
@@ -121,6 +131,22 @@ def _sched(reqs, *, outcomes=None, allowance=B6_ALLOWANCE):
         _prefetch_chunk_tokens=allowance,
     )
     return types.SimpleNamespace(tree_cache=tree, waiting_queue=list(reqs))
+
+
+def _admit(req, outcome, *, allowance=B6_ALLOWANCE):
+    """The ONLY path in this file that may raise.
+
+    #1176 (review r5): `store_witness` is the CENSUS reader and the
+    `seam_transport_premise_holds` reader; both run on every rank, and both
+    now pass `may_stop=False`, so a contradiction there is REPORTED and
+    returned as "contradiction". The admission assert is the one call site
+    that owns the STOP (scheduler.py, both admission sites, gated on
+    `witness_stop_authority`). Every expectation of a raise in this file goes
+    through here, or it is asserting against a reader that structurally cannot
+    raise -- which is how a suite passes while proving nothing.
+    """
+    s = _sched([req], allowance=allowance)
+    return assert_store_witness_at_admission(req, outcome, s.tree_cache)
 
 
 # ---------------------------------------------------------------------------
@@ -166,26 +192,45 @@ SPAN_DEMAND = SPAN_STAMP - SPAN_RESIDENT  # what the store still owes: 10000
 SPAN_LOADED = 9_984  # what the completed prefetch materialized of that demand
 
 
-class G_PresenceIsTheResidentHeadPlusTheSpanReading(CustomTestCase):
-    """#1176 (review r4): THE FRAME, CORRECTED -- AND THE r3 PINS INVERTED.
+class G_PresenceIsTheRegisteredHeadPlusTheSpanReading(CustomTestCase):
+    """#1176 (review r5): THE FRAME, CORRECTED AGAIN -- AND FOUR r4 PINS
+    INVERTED.
 
-    Round 3 made ``presence = matched + loaded`` and compared it with the WHOLE
-    retract stamp. That reads a SPAN-RELATIVE quantity as an absolute one:
-    ``matched + loaded == min_completed_tokens`` is an algebraic identity over
-    the span the prefetch was REGISTERED for (unified_radix_cache.py:4022 and
-    :4140-4145), and that span starts at the match the registration saw --
-    everything below it is device-resident and invisible to the record. Boot
-    weg1b6 measured the consequence: a rank holding 5966 resident rows with a
-    42-token top-up against a 6008 stamp read shortfall 6008-42 and STOPped the
-    group on a prefix that was fully present.
+    Round 3 made ``presence = matched + loaded`` and compared it with the
+    WHOLE retract stamp. That reads a SPAN-RELATIVE quantity as an absolute
+    one: ``matched + loaded == min_completed_tokens`` is an algebraic identity
+    over the span the prefetch was REGISTERED for
+    (unified_radix_cache.py:4022, :4140-4145), and that span starts at the
+    match the registration saw -- everything below it is invisible to the
+    record.
 
-    The frame is ``presence = len(req.prefix_indices) + matched + loaded``,
-    with ``host_hit_length`` deliberately NOT added (it overlaps the device
-    read after ``init_load_back``, schedule_batch.py:3637-3645, and is never
-    cleared).
+    Round 4 added ``len(req.prefix_indices)`` and deliberately EXCLUDED
+    ``host_hit_length``. Both halves of that were wrong, in opposite
+    directions, and they are the two fatal directions of #939:
 
-    Four tests below are the r3 pins INVERTED -- they asserted the defect and
-    now assert the fix; each is annotated with what it used to claim.
+      * EXCLUDING the host half is a FALSE STOP. The registration head is
+        ``len(prefix_indices) + host_hit_length`` (scheduler.py:5322) and the
+        span starts ABOVE it (:5350), so a request whose match was mostly in
+        the host tier reads short by exactly the host half and the group dies
+        on a prefix that was present.
+      * ADDING the CURRENT ``len(prefix_indices)`` to the span is a LICENCE.
+        After ``init_load_back`` (schedule_batch.py:3637-3645) the device
+        prefix already contains what the host half named, and
+        ``host_hit_length`` is never cleared, so summing the two double counts
+        and can call a P=0 re-admission a hit.
+
+    The r5 frame reads the head the span was registered against and adds the
+    span to it::
+
+        head     = min(registered_head, len(prefix_indices) + host_hit_length)
+        presence = max(len(prefix_indices), head + matched + loaded)
+
+    The current match is a CAP, never a credit -- ``truncate_prefix_to``
+    (schedule_batch.py:2357) slices ``prefix_indices`` AND zeroes
+    ``host_hit_length`` in one block, so a WITHDRAWN match collapses the head
+    a stale registration stamp would otherwise still claim (#1157 B1). The
+    outer ``max`` is a second, independent lower bound: device rows held right
+    now, which cannot double count anything.
     """
 
     def _delivered(self):
@@ -199,105 +244,156 @@ class G_PresenceIsTheResidentHeadPlusTheSpanReading(CustomTestCase):
             stamp=SPAN_STAMP,
             tokens=SPAN_STAMP,
             prefix_indices=SPAN_RESIDENT,
+            registered=SPAN_RESIDENT,
         )
 
-    def test_the_resident_head_counts_as_presence(self):
-        """INVERTED r3 pin ``test_the_current_match_is_not_netted_off_the
-        stamp``, which demanded a RAISE here. This is the weg1b6 metal shape
-        scaled up: 10000 resident rows plus a 9984-token top-up against a
-        20000 stamp is 19984 present, shortfall 16, well inside one chunk."""
+    def test_the_registered_head_counts_as_presence(self):
+        """The weg1b6 metal shape scaled up: 10000 rows below the span plus a
+        9984-token span reading against a 20000 stamp is 19984 present,
+        shortfall 16, well inside one chunk."""
         r = self._req_with_match()
         s = _sched([r], outcomes={r.rid: self._delivered()})
         self.assertEqual(store_witness(s, r), "hit")
 
     def test_the_admission_site_agrees(self):
-        """INVERTED with its sibling: the two sites read ONE function, so the
-        admission arm must reach the same verdict on the same record."""
-        r = self._req_with_match()
-        s = _sched([r])
-        assert_store_witness_at_admission(r, self._delivered(), s.tree_cache)
+        """The two sites read ONE function, so the admission arm -- the arm
+        that may actually raise -- must reach the same verdict."""
+        _admit(self._req_with_match(), self._delivered())
 
-    def test_the_host_hit_half_is_not_credited_either(self):
-        """UNCHANGED from r3 and still the load-bearing exclusion.
-        ``len(prefix_indices)`` and ``host_hit_length`` OVERLAP once
-        ``init_load_back`` has run (schedule_batch.py:3637-3645 states the
-        identity; nothing clears ``host_hit_length``), so crediting both reads
-        STALE-LARGER. Only the device head is credited: 4000 + 9984 = 13984
-        against 20000 is a 6016 shortfall, beyond one chunk."""
+    def test_the_host_hit_half_is_credited_at_the_registration_head(self):
+        """INVERTED r4 pin ``test_the_host_hit_half_is_not_credited_either``,
+        which demanded a RAISE here and is review finding B1 verbatim.
+
+        The registration head is device PLUS host (scheduler.py:5322) and the
+        span was cut ABOVE it, so 4000 device rows and 6000 host rows are one
+        10000-token head with a 9984-token span on top: 19984 present against
+        a 20000 stamp. Excluding the host half read 13984 and STOPped the
+        group on a prefix that was 19984/20000 there -- the boot-killer
+        direction of #939."""
         r = _req(
             rid="hosthalf",
             stamp=SPAN_STAMP,
             tokens=SPAN_STAMP,
             prefix_indices=4_000,
             host_hit_length=6_000,
+            registered=10_000,
         )
         s = _sched([r], outcomes={r.rid: self._delivered()})
+        self.assertEqual(store_witness(s, r), "hit")
+
+    def test_a_withdrawn_match_caps_the_registration_head(self):
+        """The CAN-FAIL companion of the test above, and the reason the
+        current match is read at all: same 10000-token registration stamp,
+        but the match SHRANK to 4000 device rows with the host half gone --
+        the state ``truncate_prefix_to`` leaves behind (it slices
+        ``prefix_indices`` and zeroes ``host_hit_length`` in one block,
+        schedule_batch.py:2357). The head is capped at 4000, presence reads
+        13984, and the shortfall of 6016 raises. These are the exact numbers
+        the r4 pin asserted -- they are still reachable, just no longer on a
+        record whose match is intact."""
+        r = _req(
+            rid="withdrawn",
+            stamp=SPAN_STAMP,
+            tokens=SPAN_STAMP,
+            prefix_indices=4_000,
+            host_hit_length=0,
+            registered=10_000,
+        )
         with self.assertRaises(StoreWitnessContradiction) as cm:
-            store_witness(s, r)
+            _admit(r, self._delivered())
         msg = str(cm.exception)
+        self.assertIn("registered_head=4000", msg)
         self.assertIn("device_resident=4000", msg)
         self.assertIn("presence=13984", msg)
         self.assertIn(f"shortfall={SPAN_STAMP - 13984}", msg)
 
     def test_a_presence_short_by_more_than_one_chunk_still_raises(self):
-        """The gate still bites: 10000 resident + 1000 loaded = 11000 against
-        a 20000 stamp is a 9000 shortfall, twice the one-chunk allowance."""
+        """The gate still bites: a 10000-token head plus 1000 loaded is 11000
+        against a 20000 stamp -- a 9000 shortfall, twice the allowance."""
         r = self._req_with_match()
         out = PrefetchOutcome(1000, hit_tokens=SPAN_DEMAND, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
-            store_witness(_sched([r], outcomes={r.rid: out}), r)
+            _admit(r, out)
         msg = str(cm.exception)
         self.assertIn(f"stamped={SPAN_STAMP}", msg)
         self.assertIn(f"shortfall={SPAN_STAMP - 11_000}", msg)
 
-    def test_without_a_resident_head_the_span_reading_is_the_whole_measure(self):
-        """A request holding nothing device-side keeps the stamp as the
-        measure -- the conservative reading, unchanged from r3."""
-        r = _req(rid="nomatch", stamp=SPAN_STAMP, tokens=SPAN_STAMP)
-        out = PrefetchOutcome(SPAN_LOADED, hit_tokens=SPAN_LOADED, probed=True, matched=0)
+    def test_without_a_head_the_span_reading_is_the_whole_measure(self):
+        """A request registered at head 0 keeps the stamp as the measure --
+        the conservative reading, unchanged from r3 and r4."""
+        r = _req(rid="nomatch", stamp=SPAN_STAMP, tokens=SPAN_STAMP, registered=0)
+        out = PrefetchOutcome(
+            SPAN_LOADED, hit_tokens=SPAN_LOADED, probed=True, matched=0
+        )
         with self.assertRaises(StoreWitnessContradiction) as cm:
-            store_witness(_sched([r], outcomes={r.rid: out}), r)
-        self.assertIn(f"stamped={SPAN_STAMP}", str(cm.exception))
+            _admit(r, out)
+        msg = str(cm.exception)
+        self.assertIn(f"stamped={SPAN_STAMP}", msg)
+        self.assertIn("registered_head=0", msg)
 
     def test_a_presence_that_covers_the_stamp_owes_nothing(self):
         """The weg1b6 sibling line verbatim (PP1/PP2 matched=5966 loaded=42
-        against stamp 6008): a hit, and it must stay one."""
-        r = _req(rid="covered", stamp=6008, tokens=6008, prefix_indices=5966)
+        against stamp 6008). Boot 6 reset the tree at the cutover, so the
+        registration head was 0 and the whole 6008 arrived through the span:
+        a hit, and it must stay one."""
+        r = _req(rid="covered", stamp=6008, tokens=6008, registered=0)
         out = PrefetchOutcome(42, hit_tokens=6008, probed=True, matched=5966)
         self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
 
     def test_the_reaped_pp0_record_stays_a_sanctioned_bounded_reprefill(self):
-        """The #1176 metal killer, with the resident head deliberately at 0 so
-        the arithmetic the docstring names is the arithmetic that runs: PP0 was
-        REAPED with matched=3456 loaded=0 against stamp 6008 -- presence 3456,
-        shortfall 2552 <= allowance 4096, a SANCTIONED one-chunk re-prefill
-        (#939), never a STOP."""
-        r = _req(rid="reaped", stamp=6008, tokens=6008)
+        """The #1176 metal killer: PP0 was REAPED at its 7.87 s budget with
+        matched=3456 loaded=0 against stamp 6008 -- presence 3456, shortfall
+        2552 <= allowance 4096, a SANCTIONED one-chunk re-prefill (#939),
+        never a STOP."""
+        r = _req(rid="reaped", stamp=6008, tokens=6008, registered=0)
         out = PrefetchOutcome(0, hit_tokens=3456, probed=True, matched=3456)
         self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
 
-    def test_nothing_present_at_all_raises_even_with_a_host_tier_hit(self):
-        """UNCHANGED from r3 and the reason ``presence > 0`` stays INSIDE the
-        gate rather than short-circuiting above it: a request whose whole
-        credit is ``host_hit_length`` -- a HOST-tier hit that may never have
-        reached the device -- has nothing present on this device."""
-        r = _req(rid="hostonly", stamp=30_000, tokens=30_000, host_hit_length=30_000)
+    def test_a_host_tier_hit_at_the_registration_head_is_presence(self):
+        """INVERTED r4 pin
+        ``test_nothing_present_at_all_raises_even_with_a_host_tier_hit``.
+
+        The r4 argument was that a host-tier hit "may never have reached the
+        device". That is backwards under the corrected frame: the registrar
+        counted this host hit INTO the head (scheduler.py:5322) and cut the
+        span above it, so refusing to credit it means the tokens are in no
+        term at all -- they were subtracted from the demand and never added to
+        the supply. 30000 stamped, 30000 in the head: nothing is owed and
+        nothing would be recomputed."""
+        r = _req(
+            rid="hostonly",
+            stamp=30_000,
+            tokens=30_000,
+            host_hit_length=30_000,
+            registered=30_000,
+        )
+        out = PrefetchOutcome(0, hit_tokens=40, probed=True, matched=0)
+        self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
+
+    def test_an_unstamped_host_only_record_still_raises(self):
+        """The CAN-FAIL companion, and the reason ``presence > 0`` stays
+        INSIDE the gate rather than short-circuiting above it: WITHOUT a
+        registration stamp the span cannot be placed in the prompt, the
+        unframed reading takes the larger of two independent lower bounds
+        (never a sum, so it can never over-credit), and a record whose only
+        credit is an unplaceable host number has nothing present."""
+        r = _req(rid="hostonly-unframed", stamp=30_000, tokens=30_000,
+                 host_hit_length=30_000)
         out = PrefetchOutcome(0, hit_tokens=40, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
-            store_witness(_sched([r], outcomes={r.rid: out}), r)
+            _admit(r, out)
         msg = str(cm.exception)
         self.assertIn("shows nothing present", msg)
         self.assertIn("presence=0", msg)
+        self.assertIn("frame=unframed", msg)
 
     def test_device_residency_that_covers_the_stamp_is_a_hit(self):
-        """INVERTED r3 pin ``test_device_residency_alone_never_short_circuits
-        the_gate``, which demanded a RAISE when the device head alone covered
-        the stamp. That is exactly backwards under the corrected frame: rows
-        held in ``prefix_indices`` ARE present, so nothing is recomputed and
-        there is nothing for #939 to forbid. The host-tier half above keeps the
-        ``presence > 0`` requirement honest."""
+        """INVERTED at r4 and unchanged at r5: rows held in ``prefix_indices``
+        ARE present, so nothing is recomputed and there is nothing for #939 to
+        forbid. The unframed host-only case above keeps the ``presence > 0``
+        requirement honest."""
         r = _req(rid="deviceonly", stamp=30_000, tokens=30_000,
-                 prefix_indices=30_000)
+                 prefix_indices=30_000, registered=30_000)
         out = PrefetchOutcome(0, hit_tokens=40, probed=True, matched=0)
         self.assertEqual(store_witness(_sched([r], outcomes={r.rid: out}), r), "hit")
 
@@ -310,10 +406,10 @@ class H_TheProbeAnsweringIsNotThePrefixBeingPresent(CustomTestCase):
     would admit at P=100 against a 6008-token stamp."""
 
     def test_a_full_probe_answer_over_an_empty_prefix_still_raises(self):
-        r = _req(rid="probe-vs-presence")
+        r = _req(rid="probe-vs-presence", registered=0)
         out = PrefetchOutcome(100, hit_tokens=B6_STAMP, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
-            store_witness(_sched([r], outcomes={r.rid: out}), r)
+            _admit(r, out)
         msg = str(cm.exception)
         self.assertIn("probed_hit=6008", msg)
         self.assertIn("materialized=100", msg)
@@ -328,10 +424,10 @@ class I_NothingMaterializedIsItsOwnContradiction(CustomTestCase):
     'nothing materialized' term."""
 
     def test_a_stamp_inside_the_allowance_with_zero_presence_raises(self):
-        r = _req(rid="tiny-stamp", stamp=100, tokens=100)
+        r = _req(rid="tiny-stamp", stamp=100, tokens=100, registered=0)
         out = PrefetchOutcome(0, hit_tokens=40, probed=True, matched=0)
         with self.assertRaises(StoreWitnessContradiction) as cm:
-            store_witness(_sched([r], outcomes={r.rid: out}), r)
+            _admit(r, out)
         msg = str(cm.exception)
         self.assertIn("nothing materialized", msg)
         # The shortfall arm cannot be what raised here.
@@ -393,6 +489,10 @@ class K_ATruncatedMatchRestoresTheWholeDemand(CustomTestCase):
             tokens=TRUNC_STAMP,
             prefix_indices=0,  # truncate_prefix_to(0) emptied it
             host_hit_length=0,  # ... and the #965 co-derived group with it
+            # The registration stamp SURVIVES the truncation -- nothing clears
+            # it either. Under r5 the current match CAPS it to 0, which is the
+            # whole point of reading a cap instead of trusting the stamp.
+            registered=TRUNC_REGISTRATION_MATCH,
         )
         if span_field:
             # The stale registration-time stamp the parent trusted.
@@ -406,10 +506,12 @@ class K_ATruncatedMatchRestoresTheWholeDemand(CustomTestCase):
         """RED-FIRST. On the parent this returned 'hit'."""
         r, out = self._truncated(span_field=True)
         with self.assertRaises(StoreWitnessContradiction) as cm:
-            store_witness(_sched([r], outcomes={r.rid: out}), r)
+            _admit(r, out)
         msg = str(cm.exception)
         self.assertIn(f"stamped={TRUNC_STAMP}", msg)
         self.assertIn("device_resident=0", msg)
+        # The cap collapsed the surviving registration stamp to zero.
+        self.assertIn("registered_head=0", msg)
         self.assertIn(f"shortfall={TRUNC_STAMP - TRUNC_DELIVERED}", msg)
 
     def test_the_admission_site_raises_on_the_same_record(self):
@@ -427,7 +529,7 @@ class K_ATruncatedMatchRestoresTheWholeDemand(CustomTestCase):
         msgs = []
         for req in (r_with, r_without):
             with self.assertRaises(StoreWitnessContradiction) as cm:
-                store_witness(_sched([req], outcomes={req.rid: out}), req)
+                _admit(req, out)
             msgs.append(str(cm.exception).split("rid=")[1].split(" ", 1)[1])
         self.assertEqual(msgs[0], msgs[1])
 

@@ -206,6 +206,7 @@ from sglang.srt.managers.phase_purity import (
 from sglang.srt.managers.phase_purity import (
     StoreWitnessContradiction,
     assert_store_witness_at_admission,
+    witness_stop_authority,
     prefill_blocked_here as phase_prefill_blocked_here,
 )
 # #791b: imported AS A MODULE, not from-imported: the admission loop resolves
@@ -5352,6 +5353,28 @@ class Scheduler(
         # deferral can price it against the budget without re-deriving the
         # walk. Read by `_apply_prefetch_deferral`; never a decision here.
         req._prefetch_span_tokens = len(_new_input_tokens)
+        # #1176 (review r5): THE HEAD THE SPAN WAS CHOSEN AGAINST, recorded by
+        # the SAME registration that chose the span. `_matched_len` is device
+        # PLUS host at the match `init_next_round_input` re-derived a few dozen
+        # lines above, so it is the exact complement of the span in this
+        # prompt: `[0, _matched_len)` head, `[_matched_len, _match_end)` span,
+        # disjoint by construction.
+        #
+        # WHY THE WITNESS NEEDS IT. `matched + loaded == min_completed_tokens`
+        # is an algebraic identity over the SPAN alone
+        # (unified_radix_cache.py:4140-4145 computes `loaded =
+        # min_completed_tokens - insert_result.prefix_len`, and the insert is
+        # rooted at `last_host_node` so `prefix_len` is span-relative).
+        # Comparing that against the whole retract stamp under-reads the prefix
+        # by exactly this head, and a false `StoreWitnessContradiction` is a
+        # group STOP -- the weg1b6 boot killer. Reading the CURRENT match at
+        # the witness instead cannot work: after `init_load_back` the two
+        # halves overlap (schedule_batch.py:3637-3645) and nothing clears
+        # `host_hit_length`, so the sum would over-credit; this value is
+        # stamped BEFORE any load-back and never revised.
+        #
+        # Never a decision here. Read by `phase_purity._witness_from_outcome`.
+        req._prefetch_registered_prefix_len = int(_matched_len)
         _prefix_keys = (
             last_host_node.get_prefix_hash_values(last_host_node.parent)
             if self.tree_cache.hicache_storage_pass_prefix_keys
@@ -11295,20 +11318,29 @@ class Scheduler(
                 # never a P=0 admission. The credit is stored as a bare int:
                 # `storage_hit_length` rides into `cached_tokens_storage` and
                 # the pickled detokenizer output (review B1).
-                # #1176 (review r4): THIS BRANCH RUNS ON EVERY RANK OF THE PP
-                # GROUP AND EVERY RANK RAISES ON ITS OWN TRUE CONTRADICTION.
-                # The follower->PP0 report channel that stood here is DELETED:
-                # three tree facts proved it could not deliver the STOP it was
-                # traded for (see `phase_purity.store_witness`), and while it
-                # stood the reporting rank ADMITTED at P=0 against its own
-                # stamp. A raise is a crash, not a state-changing verdict, so
-                # it takes no admission authority from PP0 (#968) and it is
-                # what raenge-nie-uneins prescribes for a measured
-                # disagreement. The corrected arithmetic (presence = device
-                # residency + matched + loaded) is what makes a raise here
-                # RARE: the weg1b6 false STOP could not happen under it.
+                # #1176 (review r5): THIS BRANCH RUNS ON EVERY RANK OF THE PP
+                # GROUP, AND EXACTLY ONE OF THEM MAY STOP THE GROUP. Every
+                # input to the witness is rank-LOCAL on the shipping form
+                # (--tp-size 1: the packed MIN all_reduce that would make
+                # `matched`/`loaded` uniform runs only under tp_world_size > 1;
+                # `host_hit_length` is documented as NOT rank-uniform under a
+                # layer-partitioned host tier, schedule_policy.py:2244-2246).
+                # Round 4 let every rank raise on its own reading and weg1b6
+                # measured the consequence: PP0 raised on one rid while PP1/PP2
+                # read 'hit' and admitted it -- one rank dead, its peers in a
+                # collective one short. `witness_stop_authority` restores the
+                # single point of verdict (#968: PP0 decides, followers credit
+                # and decide nothing, #969Z below). A follower still MEASURES;
+                # it reports and admits, exactly as it does for every other
+                # prefetch fact on this branch.
+                #
+                # The follower->PP0 report CARRIER stays deleted: three tree
+                # facts proved it could not deliver a STOP.
                 assert_store_witness_at_admission(
-                    req, loaded_tokens, self.tree_cache
+                    req,
+                    loaded_tokens,
+                    self.tree_cache,
+                    may_stop=witness_stop_authority(self),
                 )
                 if loaded_tokens > 0:
                     req.storage_hit_length = int(loaded_tokens)
@@ -11363,11 +11395,17 @@ class Scheduler(
                 # #1157: see the PP branch above -- the same witness, the
                 # same STOP, the same bare-int credit (review B1). This branch
                 # is the non-PP path, where the record is either the only one
-                # or MIN-reduced across the prefetch group; there is no
-                # authority parameter any more (#1176 review r4), so the two
-                # sites cannot drift by construction.
+                # or MIN-reduced across the prefetch group, so
+                # `witness_stop_authority` answers True by construction
+                # (pp_size <= 1). It is passed anyway rather than hardcoded:
+                # the two sites must resolve the authority the same way or they
+                # drift, and this branch is reachable under pp_size > 1 for a
+                # request that took the non-PP arm.
                 assert_store_witness_at_admission(
-                    req, loaded_tokens, self.tree_cache
+                    req,
+                    loaded_tokens,
+                    self.tree_cache,
+                    may_stop=witness_stop_authority(self),
                 )
                 if loaded_tokens > 0:
                     req.storage_hit_length = int(loaded_tokens)
