@@ -1341,22 +1341,81 @@ def level_kv_backing_to_group(scheduler: Any, reduce_fn) -> Optional[int]:
     cutover" is approximately synchronized, and approximately is what that
     wedge punished.
     """
+    from sglang.srt.managers import kv_backing_relief as kbr
+
     relief = getattr(scheduler, KV_BACKING_RELIEF_ATTR, None)
-    if relief is None or reduce_fn is None:
+    if reduce_fn is None:
+        # THE ONE EARLY RETURN THAT IS SAFE, and it is safe for a reason that
+        # does not generalise to the others: no channel means no peer is
+        # blocked anywhere, because there is no collective to be blocked in.
+        # Single-rank shapes take this and one rank is level with itself.
         return None
     applied: Optional[int] = None
+    # #1204: ABSTAIN INTO THE REDUCTION, NEVER BEFORE IT.
+    #
+    # Both reads below are RANK-LOCAL and both can fail on one rank alone. The
+    # relief object is installed rank-locally (``kv_backing_provider`` under a
+    # ``try``/``except`` that sets it to None on ANY per-device failure), and
+    # this rig is heterogeneous, so "one card failed, two did not" is the
+    # ordinary shape of that except rather than an exotic one.
+    #
+    # Returning here does not degrade this rank's flip, it HANGS THE OTHER
+    # TWO: they are already inside a blocking all-reduce and nothing but this
+    # rank's arrival releases them. It also raises nothing anywhere -- the
+    # leaver did not raise and the peers are blocked in a collective, not in
+    # Python -- so it is the one failure in the no-return region that leaves
+    # no traceback on any rank to read afterwards.
+    #
+    # The sibling ``collective_kv_backing_relief`` already answers this
+    # exactly: "Abstain -- but still reduce, because a rank that returns early
+    # here hangs the ones that did not."
+    #
+    # THE SENTINEL IS THE CHANNEL'S OWN NEUTRAL, not a zero. This is an
+    # element-wise MIN over three row counts, so an abstainer contributing 0
+    # (or its unread backing) would drag the group minimum down and the whole
+    # fleet would agree a level it must then cap itself to -- corrupting where
+    # the hang merely stopped. ``kbr._UNBOUNDED_ROWS`` is the value
+    # ``ABSTAIN``/``SLOT_ABSTAIN`` already use for exactly this in exactly this
+    # channel; it is imported rather than restated so the two cannot drift.
+    neutral = int(kbr._UNBOUNDED_ROWS)
+    backed = floor = neutral
+    if relief is not None:
+        try:
+            backed = int(relief.backed_rows())
+            # #792: THE FLOOR RIDES ALONG, because the level this decides is
+            # applied to the ID SPACE and the live set is what the id space
+            # owes. The payload was [backed, -backed] -- how many rows each
+            # rank has mapped, and nothing about the rows already in use -- so
+            # the group could and did agree a level BELOW its own live
+            # high-water mark. Sent negated, so the same MIN channel yields the
+            # group's MAX floor: the most-loaded rank sets the limit, exactly
+            # as it does for ``collective_cap_target``.
+            floor = int(relief.live_floor_rows())
+        except Exception as e:
+            logger.error(
+                "%s could not read this rank's KV backing for the levelling "
+                "(%s); ABSTAINING INTO the reduction rather than skipping it. "
+                "This rank levels nothing and reports no level, but it still "
+                "enters the group's MIN channel, because the peers are already "
+                "blocked in it and only this rank's arrival releases them",
+                LOG_PREFIX,
+                e,
+            )
+            relief = None
+            backed = floor = neutral
     try:
-        backed = int(relief.backed_rows())
-        # #792: THE FLOOR RIDES ALONG, because the level this decides is
-        # applied to the ID SPACE and the live set is what the id space owes.
-        # The payload was [backed, -backed] -- how many rows each rank has
-        # mapped, and nothing about the rows already in use -- so the group
-        # could and did agree a level BELOW its own live high-water mark.
-        # Sent negated, so the same MIN channel yields the group's MAX floor:
-        # the most-loaded rank sets the limit, exactly as it does for
-        # ``collective_cap_target``.
-        floor = int(relief.live_floor_rows())
-        reduced = list(reduce_fn([backed, -backed, -floor]))
+        payload = (
+            [neutral, neutral, neutral] if relief is None else [backed, -backed, -floor]
+        )
+        reduced = list(reduce_fn(payload))
+        if relief is None:
+            # ARRIVED, AGREED TO NOTHING. There is no cap to engage and no
+            # level this rank could clamp a deferred grow back to, so reporting
+            # one would hand a caller a number it must not expose to. The peers
+            # decide the level among themselves; the neutral payload above is
+            # what makes that decision identical to the one they would have
+            # reached alone.
+            return None
         group_min = int(reduced[0])
         group_max = -int(reduced[1])
         # A channel that truncated (or a peer on an older tree) leaves the
@@ -1431,10 +1490,28 @@ def level_kv_backing_to_group(scheduler: Any, reduce_fn) -> Optional[int]:
                 moved,
             )
     except Exception as e:
+        # #1204: WHAT THIS ARM MAY AND MAY NOT CLAIM.
+        #
+        # It used to say "a lost flip, never a half-flipped group" for
+        # everything it caught. That is true of the DECLINE above -- a declined
+        # level leaves the id spaces apart and the seam's frame ballot refuses
+        # the flip -- and it was exactly wrong for the pre-reduce reads, which
+        # now abstain into the channel above instead of landing here. What is
+        # left in this try is the reduction itself and the cap engage after it.
+        #
+        # A reduction that RAISES has already left the channel, so the peers
+        # are not blocked on this rank; a cap engage that raises leaves this
+        # rank's exposure where it was. Both are a lost level, and the honest
+        # claim is that the id spaces may now differ and the ballot must
+        # refuse -- not that the group is intact.
         logger.error(
-            "%s could not level the recovery to the group (%s). The ranks may "
-            "now expose different id spaces, which the seam's frame ballot "
-            "refuses -- a lost flip, never a half-flipped group",
+            "%s could not level the recovery to the group (%s). This rank "
+            "applied no level, so the ranks may now expose different id "
+            "spaces, which the seam's frame ballot refuses. That is a lost "
+            "flip and not a half-flipped group -- but ONLY because the reads "
+            "before the reduction abstain into the channel instead of "
+            "returning (#1204); a return there would have been a group hang, "
+            "not a lost flip",
             LOG_PREFIX,
             e,
         )

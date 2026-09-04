@@ -1492,6 +1492,78 @@ class SeamOrderError(RuntimeError):
     """A seam step ran before the step it depends on (#856)."""
 
 
+class SeamMoverError(RuntimeError):
+    """A pre-cutover mover failed INSIDE the no-return region (#1204)."""
+
+
+def run_pre_cutover_movers(fns, direction: str, mark, note_failure=None) -> None:
+    """Run the extra movers (weights arena, GDN state) before the cutover.
+
+    #1204. This loop sits inside the seam's no-return region: the outgoing
+    layout's backing is already on its way out and the arena refill is already
+    rewriting weight pages. It never swallowed -- a raise here climbs out of
+    ``_execute`` through a bare ``finally`` and kills the rank, which is the
+    right answer under ``raenge-nie-uneins-crash-stop``: a rank that cannot
+    complete the movers must not go on to serve from a half-refilled arena,
+    which is the wrong-answer failure ``weights_arena.verify_boot_anchor``
+    exists to refuse.
+
+    WHAT WAS MISSING WAS THE NAME. What climbed out was whatever the mover
+    raised -- a ``RuntimeError`` from ``cuMemMap``, say -- with nothing saying
+    which leg it was or that it happened after the region closed. The weights
+    refill and the GDN state leg have different sizes and opposite fixes (the
+    same reason the census labels them separately one line below), and from a
+    boot log the two are indistinguishable without this.
+
+    So: wrap, name the leg, record it where a post-mortem can read it BEFORE
+    the raise, and re-raise. Never continue -- the movers behind a failed one
+    would run over an arena that is already wrong -- and never mark a census
+    label for a leg that did not finish.
+
+    WHY THE GROUP IS NOT TOLD. The obvious wish is to reduce a failure flag so
+    all three ranks refuse together, but there is no collective between this
+    loop and ``self._cutover_fn`` to carry it: the seam's consensus MIN is
+    upstream of the no-return point, ``_reconcile_trees_if_diverged`` only
+    reads a verdict that reduction already produced, and the levelling's
+    reduction runs on the tp->pp POST-cutover hook. A flag reduced there would
+    announce the failure after the cutover it was supposed to prevent, on one
+    leg of two. Opening a NEW collective inside the no-return region is the
+    2026-08-08 boots 9/10 wedge shape and is not worth a message this rank can
+    deliver by dying. So this stays a rank-local, loud, named death.
+    """
+    for fn in fns:
+        label = str(getattr(fn, "census_label", "pre_cutover_fn"))
+        try:
+            fn(direction)
+        except Exception as e:
+            if note_failure is not None:
+                try:
+                    note_failure(label, e)
+                except Exception:  # noqa: BLE001 -- a recorder, never a gate
+                    logger.debug(
+                        "%s #1204 mover-failure note failed", LOG_PREFIX, exc_info=True
+                    )
+            logger.error(
+                "%s #1204 pre-cutover mover %r FAILED on %s, INSIDE the "
+                "no-return region: the outgoing backing is already going and "
+                "the arena refill is already rewriting weight pages, so this "
+                "rank cannot serve and must not reach the cutover. The movers "
+                "behind it are not run",
+                LOG_PREFIX,
+                label,
+                direction,
+                exc_info=True,
+            )
+            raise SeamMoverError(
+                f"#1204 pre-cutover mover {label!r} failed on {direction} "
+                f"inside the no-return region: {e}"
+            ) from e
+        # Labelled per mover: the GDN state leg and the weights refill have
+        # different sizes AND different fixes, so one combined "pre_cutover"
+        # bar would be unattributable. Marked only once the leg FINISHED.
+        mark(label)
+
+
 def release_residents_for_cutover(reqs, *, retract, reset_tree):
     """RETRACT STRICTLY BEFORE RESET. The order is the law (#856).
 
@@ -12185,12 +12257,15 @@ class PhaseFlipRuntime:
         # leading explanation for the flatness; the cutover is the group step.
         t_movers0 = self._clock()
         self._pool_census("pre-cutover", direction)
-        for fn in self._pre_cutover_fns:
-            fn(direction)
-            # Labelled per mover: the GDN state leg and the weights refill
-            # have different sizes AND different fixes, so one combined
-            # "pre_cutover" bar would be unattributable.
-            seam_census.mark(getattr(fn, "census_label", "pre_cutover_fn"))
+        # #1204: named, recorded, never swallowed -- see run_pre_cutover_movers.
+        run_pre_cutover_movers(
+            self._pre_cutover_fns,
+            direction,
+            seam_census.mark,
+            note_failure=lambda label, exc: setattr(
+                self, "_seam_mover_failed", (direction, label, repr(exc))
+            ),
+        )
         movers_ms = (self._clock() - t_movers0) * 1000.0
         t_cutover0 = self._clock()
         self._reconcile_trees_if_diverged(direction)
