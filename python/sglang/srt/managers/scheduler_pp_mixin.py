@@ -52,9 +52,9 @@ from sglang.srt.managers.pp_admission_congruence import (
     reconcile_pp_admission_decision,
     void_pp_admission_decision,
 )
-from sglang.srt.managers.pp_row_defer_horizon import (
-    PpRowDeferHorizonLapsed,
-    RowDeferHorizon,
+from sglang.srt.managers.pp_row_defer_cap import (
+    PpRowDeferCapExceeded,
+    RowDeferCap,
 )
 from sglang.srt.managers.pp_stash_disposition import (
     PP_LOOP_ONLY,
@@ -8926,11 +8926,17 @@ class SchedulerPPMixin:
         by the row probe's defer on an INFERENCE ("an unlocatable rid means a
         hop is in flight"), which boot weg1b7 measured false for a retracted
         rid and for a rank-locally requeued resident. That arm therefore
-        returns True without proving availability, and the receive it opens is
-        bounded not by transfer time but by the defer site's own horizon:
-        the disagreement that armed it is named and raised there before it can
-        be re-armed indefinitely. Do not read this method's True as uniform
-        evidence of a posted message.
+        returns True without proving availability.
+
+        THE RECEIVE IT OPENS IS NOT BOUNDED. `SGLANG_PP_CHAIN_RECV_STALL_S`
+        defaults to "0" (`pp_chain_receiver._default_stall_timeout_s`), so a
+        chain receive opened by this arm can block for ever. What #1180 bounds
+        is NOT that receive -- it is the RE-ARMING: the defer site arms this
+        hedge only on the FIRST sighting of a missing set, so a second probe
+        of the same unsatisfiable row cycles the loop instead of blocking, and
+        the defer's own lap cap is reached from this rank alone. Do not read
+        this method's True as uniform evidence of a posted message, and do not
+        read the hedge as a bounded wait.
         """
         receiver = getattr(self, "pp_chain_receiver", None)
         counters = getattr(self, "pp_flip_counters", None)
@@ -9212,60 +9218,75 @@ class SchedulerPPMixin:
                     # ring by construction. A CHANGING missing set is a hop
                     # landing and keeps the boot 631row15 hot-defer world
                     # free; only an UNCHANGING one ages toward the bound.
-                    _horizon = getattr(self, "_pp_row_defer_horizon", None)
-                    if _horizon is None:
-                        _horizon = RowDeferHorizon()
-                        self._pp_row_defer_horizon = _horizon
-                    _now_fn = getattr(self, "_pp_row_defer_now", None)
-                    _verdict = _horizon.observe(
-                        mb_id,
-                        _missing,
-                        token=stamp,
-                        now=(_now_fn() if _now_fn is not None else None),
-                    )
+                    _cap = getattr(self, "_pp_row_defer_cap", None)
+                    if _cap is None:
+                        _cap = RowDeferCap()
+                        self._pp_row_defer_cap = _cap
+                    _verdict = _cap.observe(mb_id, _missing, token=stamp)
                     if not _verdict.defer:
                         # RAENGE-NIE-UNEINS: a detected disagreement is a
                         # bounded, named stop -- never a compensation. This
                         # deliberately does NOT consume the frame (that
                         # revives boot 631row14: plan finds nothing, ring
                         # dies upstream-waiting) and does NOT emit a void
-                        # (that revives the #801 reverse corpse).
-                        _horizon.clear(mb_id)
-                        _trace("defer_rid_horizon")
-                        raise PpRowDeferHorizonLapsed(_verdict.message)
+                        # (that revives the #801 reverse corpse). The lap
+                        # count is deliberately NOT cleared here: if any
+                        # future caller ever swallows this exception, the
+                        # next probe of the same identity must raise again
+                        # at once rather than start a fresh count.
+                        _trace("defer_rid_cap")
+                        raise PpRowDeferCapExceeded(_verdict.message)
                     if _dr <= 8 or _dr % 1024 == 0:
                         logger.info(
                             "#631 ROW-PROBE DEFER slot=%s: frame's row names "
                             "%d rid(s) not yet locatable here (first=%s) -- "
                             "the chain hop is still in flight; frame left in "
-                            "the inbox (occurrence=%d, held=%.1fs of the "
-                            "#1180 horizon).",
+                            "the inbox (lap %d of %d for THIS (frame, "
+                            "missing-set); scheduler-wide defer_rid=%d).",
                             mb_id,
                             len(_missing),
                             str(_missing[0])[:8],
+                            _verdict.occurrence,
+                            _verdict.cap,
                             _dr,
-                            _verdict.waited_s,
                         )
                     # THE DEFERRED FRAME IS THE ATTEMPTED-COUNTER OF THE
                     # CHAIN (boot 631row15, 43k hot defers): PP0 queues the
                     # request hop BEFORE it plans the pass, so a frame whose
-                    # row names an unlocatable rid PROVES a chain send is in
-                    # flight -- and the chain wire has no attempted counter
-                    # (shm carries only .s/.c for req), so the sender's
-                    # rendezvous-blocked isend is invisible to the gate:
-                    # sent bumps only after this rank enters the receive
-                    # (the instr7/instr8 cycle, chain edition). Entering the
-                    # blocking chain receive is what completes it, bounded
-                    # by rendezvous+transfer.
-                    self._pp_row_chain_owed = True
+                    # row names an unlocatable rid SUGGESTS a chain send is
+                    # in flight -- and the chain wire has no attempted
+                    # counter (shm carries only .s/.c for req), so the
+                    # sender's rendezvous-blocked isend is invisible to the
+                    # gate: sent bumps only after this rank enters the
+                    # receive (the instr7/instr8 cycle, chain edition).
+                    # Entering the blocking chain receive is what completes
+                    # it.
+                    #
+                    # #1180 -- ARMED ONLY ON THE FIRST SIGHTING, AND THAT IS
+                    # WHAT MAKES THE CAP REACHABLE. The receive this opens is
+                    # NOT bounded (`SGLANG_PP_CHAIN_RECV_STALL_S` defaults to
+                    # "0" by design), so re-arming it on every defer would
+                    # park this rank in a blocking receive after each probe
+                    # and the lap count could only advance if the peer moved
+                    # -- exactly the peer that is not moving in boot weg1b7.
+                    # Coming BACK here with the SAME missing set means a
+                    # chain receive already completed and did not deliver the
+                    # rid: the inference is falsified, so it is not renewed.
+                    # With the hedge unarmed, `_pp_row_chain_pending` reads
+                    # False (nothing in the inbox, counters balanced) and the
+                    # loop takes the #1071 occupant arm -- a 2 ms sleep, not
+                    # a receive -- and returns to this probe from this rank
+                    # alone. That is the reachability the cap depends on.
+                    if _verdict.occurrence <= 1:
+                        self._pp_row_chain_owed = True
                     _trace("defer_rid")
                     return False
             # The row is satisfied (or unreadable): this slot has no
-            # outstanding disagreement, so its #1180 clock must not survive
-            # into the next frame.
-            _horizon = getattr(self, "_pp_row_defer_horizon", None)
-            if _horizon is not None:
-                _horizon.clear(mb_id)
+            # outstanding disagreement, so its #1180 lap count must not
+            # survive into the next frame.
+            _cap = getattr(self, "_pp_row_defer_cap", None)
+            if _cap is not None:
+                _cap.clear(mb_id)
             stats["head_this"] += 1
             _trace("head_this")
             return True
