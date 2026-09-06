@@ -1246,6 +1246,42 @@ def _live_reqs(scheduler) -> List:
     # `running_mbs[i]` are the same object) costs exactly nothing.
     for mb in getattr(scheduler, "mbs", []) or []:
         _take(mb)
+    # #1225: THE LAUNCHED-BUT-UNDELIVERED BATCH IS THE SEVENTH ROUTE, and it
+    # is the one no container can carry.
+    #
+    # MEASURED, boot weg1b12s1f4 (S1 tip, no G1, no abandon), 15th cutover
+    # under load: at ONE seam in ONE second PP0 read `live_reqs=6
+    # resident_slot_entries=6` and retracted 6, while PP1 and PP2 read
+    # `live_reqs=0` and retracted 0 -- and then refused the rebind with
+    # `6 of 8 rows are still held ... rows=[1,2,3,4,5,6], rids=[], unnamed=6`.
+    # Each of those six had a LAUNCH record on the follower and no delivery
+    # record before the arm.
+    #
+    # A microbatch this rank launched and has not had returned is reachable
+    # only through `mbs[slot]`, and `scheduler_pp_mixin.py:5159-5177` states
+    # in the tree's own words that nothing keeps it there: "the held batch's
+    # last reference is destroyed at the next visit to this slot ... #1009
+    # owns making it true, and no line in this arm establishes it". So the
+    # requests fall out of every container above while still owning their
+    # request-pool rows, their mamba pages and their KV.
+    #
+    # #1173 REPAIRED THIS PREMISE ON PP0 ONLY. It made `arm()` defer while
+    # `_pp_launched_pending` is non-empty, and then dismissed the rest --
+    # `phase_flip_runtime.py:860-868`: "(a) a FOLLOWER ... may legitimately
+    # still hold an in-flight slot ... Both drain on their own". The boot
+    # above refutes "both drain on their own": they are overwritten, not
+    # drained. This adds the same fact to the ranks #1173 left out.
+    #
+    # THE ROUTE GOES IN THE AUTHORITY, NEVER IN THE CONSUMERS -- the rule this
+    # function already applied for `last_mbs` (W30) and `mbs` (#1202). And it
+    # reuses the EXISTING `_pp_launched_pending` lifecycle rather than
+    # inventing a second notion of "outstanding": the batch is retained where
+    # the slot is marked pending and released where it is discarded
+    # (`scheduler_pp_mixin.py:5036-5049` and `:5210-5219`), so the two can
+    # never disagree. Dedup is by `id()` above, so a request that is both
+    # launched and resident costs nothing.
+    for mb in (getattr(scheduler, "_pp_launched_batches", None) or {}).values():
+        _take(mb)
     for name in ("running_batch", "last_batch"):
         _take(getattr(scheduler, name, None))
     # THE CHUNKED PREFILL IS RESIDENT AND IS IN NO BATCH (#631 defect O).

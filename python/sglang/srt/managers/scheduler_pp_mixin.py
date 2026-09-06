@@ -1485,6 +1485,11 @@ def pp_flip_forget_ring_scoped_slots(holder) -> None:
     # #1020 void guard) does a membership test, and an empty set is the
     # truth on a ring that has just been rebuilt from zero.
     holder._pp_launched_pending = set()
+    # #1225: and the BATCHES those slots owe, keyed by slot. Same
+    # lifecycle as the set above and reset here for the same reason --
+    # an entry that outlived a ring rebuild would name a slot of the
+    # previous topology.
+    holder._pp_launched_batches = {}
 
 
 def pp_proxy_stamp_names_pass(stamp, mb_id: int, epoch: Optional[int]) -> bool:
@@ -5029,6 +5034,19 @@ class SchedulerPPMixin:
                         self, "_pp_launched_pending", set()
                     )
                     self._pp_launched_pending.add(mb_id)
+                    # #1225: RETAIN THE BATCH, not just the slot id. A slot id
+                    # cannot be walked back to its requests once `mbs[mb_id]`
+                    # has been overwritten by the next visit -- which is
+                    # exactly what strands the rows (scheduler_pp_mixin.py
+                    # :5159-5177, "#1009 owns making it true, and no line in
+                    # this arm establishes it"). Written at the SAME site that
+                    # marks the slot pending and released at the SAME site
+                    # that discards it, so the two can never disagree about
+                    # what is outstanding.
+                    self._pp_launched_batches = getattr(
+                        self, "_pp_launched_batches", {}
+                    )
+                    self._pp_launched_batches[mb_id] = cur_batch
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,
@@ -5188,6 +5206,15 @@ class SchedulerPPMixin:
                         # slot is ordinary again and may be voided.
                         getattr(self, "_pp_launched_pending", set()).discard(
                             next_mb_id
+                        )
+                        # #1225: the batch has DELIVERED, so it is no longer
+                        # owed and must leave the register in the same step.
+                        # A delivered batch left here would be retracted a
+                        # second time at the next cutover, which frees a row
+                        # its owner still holds -- the one direction that
+                        # corrupts silently instead of stopping.
+                        getattr(self, "_pp_launched_batches", {}).pop(
+                            next_mb_id, None
                         )
                         # #969 CUT L: PUBLISH THE SLOT'S last_batch ONLY WHEN
                         # ITS RESULT WAS ACTUALLY APPLIED -- upstream's rule,
