@@ -38,10 +38,16 @@ WHAT IS PINNED HERE:
 * T-G1-5 with the env unset there is no buffer, no post and no change to the
   refill path;
 * T-G1-6 a second arm for the same image starts no second reader, and an
-  abandoned arm stops the reader while keeping what it already read.
+  abandoned arm stops the reader while keeping what it already read;
+* T-G1-7 the ``refill_s`` term of the ``#809 FLIP IMAGE PREFETCH complete=``
+  line COVERS the transfer, on the ``pin`` arm as well as the ``pin+file``
+  one -- see ``TestFlipImagePinLegClock`` for the defect that motivates it;
+* T-G1-8 a re-arm publishes the new identity with a ZEROED count, never with
+  the previous fill's.
 """
 
 import os
+import re
 import tempfile
 import threading
 import time
@@ -568,6 +574,269 @@ class TestFlipImagePinReader(_FlipImagePinBase):
             self._wait_complete(pin, image_tp.numel())
             self.assertEqual(pin.buffer.data_ptr(), before)
             self.assertEqual(pin.identity.layout, "tp")
+
+
+class TestFlipImagePinLegClock(_FlipImagePinBase):
+    """T-G1-7: ``refill_s`` measures the TRANSFER, not the issue of it.
+
+    THE DEFECT THIS CLOSES, and it is a measurement defect with a boot-log
+    consequence rather than a content one. The pinned prefix is copied with
+    ``non_blocking=True`` onto the current stream; on the ``source=pin`` arm
+    the file leg is not entered at all, so nothing between that copy and the
+    clock read blocks the HOST. The leg's own bytes would then be billed to
+    the ``uint8_checksum`` one frame up in ``arena_refill`` -- the first host
+    synchronisation after it -- and this line would print ``refill_s=0.00x``
+    for a transfer that took seconds. The ``pin+file`` arm does NOT have the
+    defect (``_staged_file_refill`` host-blocks on its own drain events), so
+    without the wait ONE field means two different things depending on the
+    arm, which is exactly the hazard ``refill_bound_phrase``'s #851/#1082
+    docstring in this module exists to keep out.
+    """
+
+    _REFILL_S = re.compile(r"refill_s=([0-9.]+)")
+
+    def _logged_refill_s(self, records):
+        lines = [r for r in records if "#809 FLIP IMAGE PREFETCH complete=" in r]
+        self.assertEqual(len(lines), 1, records)
+        match = self._REFILL_S.search(lines[0])
+        self.assertIsNotNone(match, lines[0])
+        return float(match.group(1))
+
+    def test_t_g1_7_refill_s_covers_the_pinned_copy(self):
+        """The wait for the pinned copy is INSIDE the interval this reports.
+
+        Can-fail three ways, all asserted: no wait at all (the call count),
+        a wait placed after the clock is read (the reported seconds), and a
+        wait handed a different buffer than the leg wrote (the identity of
+        the argument). The stand-in sleeps, so the seconds are a real
+        measurement of the interval rather than a mock's say-so.
+        """
+        payload = os.urandom(2 * _CHUNK)
+        spy = _FileLegSpy()
+        waited = []
+        held_s = 0.05
+
+        def _slow_await(dst):
+            waited.append(dst)
+            time.sleep(held_s)
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as d:
+            image, layout = self._image(d, "tp.img", payload, "tp")
+            pin = self._install(
+                weights_arena.FlipImagePin(
+                    torch.zeros(image.numel(), dtype=torch.uint8)
+                )
+            )
+            self.assertTrue(pin.start_prefetch(image))
+            self._wait_complete(pin, image.numel())
+            dst = torch.zeros(layout.total_bytes, dtype=torch.uint8)
+            with mock.patch.object(weights_arena, "_staged_file_refill", spy):
+                with mock.patch.object(
+                    weights_arena, "_await_pin_copy", _slow_await, create=True
+                ):
+                    with self.assertLogs(_LOGGER, level="INFO") as cap:
+                        source = weights_arena._refill_from_pin_and_file(
+                            dst,
+                            weights_arena._file_backed_meta(image),
+                            layout.total_bytes,
+                            image,
+                        )
+        self.assertEqual(source, "pin")
+        self.assertEqual(
+            len(waited),
+            1,
+            "the leg never waited for the pinned copy, so refill_s is the "
+            "time to ISSUE the DMA and not the time to move the bytes",
+        )
+        self.assertIs(waited[0], dst)
+        self.assertGreaterEqual(
+            self._logged_refill_s(cap.output),
+            held_s,
+            "the wait for the pinned copy fell OUTSIDE the interval refill_s "
+            "reports; the acceptance would read a win that did not happen",
+        )
+
+    def test_t_g1_7_the_pin_and_file_arm_waits_too(self):
+        """The remainder leg's own drain does not cover the pinned prefix.
+
+        ``_staged_file_refill`` host-blocks on ITS events; the pinned copy
+        rides the current stream and is not one of them. An arm that skipped
+        the wait here would leave the same field measuring two things.
+        """
+        payload = os.urandom(3 * _CHUNK)
+        spy = _FileLegSpy()
+        waited = []
+        with tempfile.TemporaryDirectory(dir="/tmp") as d:
+            image, layout = self._image(d, "tp.img", payload, "tp")
+            pin = self._install(
+                _GatedPin(torch.zeros(image.numel(), dtype=torch.uint8), gate_after=1)
+            )
+            self.assertTrue(pin.start_prefetch(image))
+            deadline = time.monotonic() + 30.0
+            while pin.bytes_valid < _CHUNK and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual(pin.bytes_valid, _CHUNK)
+            dst = torch.zeros(layout.total_bytes, dtype=torch.uint8)
+            with mock.patch.object(weights_arena, "_staged_file_refill", spy):
+                with mock.patch.object(
+                    weights_arena, "_await_pin_copy", waited.append, create=True
+                ):
+                    source = weights_arena._refill_from_pin_and_file(
+                        dst,
+                        weights_arena._file_backed_meta(image),
+                        layout.total_bytes,
+                        image,
+                    )
+        self.assertEqual(source, "pin+file")
+        self.assertEqual(len(waited), 1)
+        self.assertEqual(bytes(dst.numpy()), payload)
+
+    def test_t_g1_7_a_leg_the_pin_did_not_serve_never_waits(self):
+        """No pinned bytes, no pinned copy, so nothing to wait for.
+
+        The pre-#809 path stays exactly what it was: the file leg blocks on
+        its own events and this leg adds no second synchronisation to a
+        stream it never wrote to. Kills the "wait unconditionally" mutant.
+        """
+        payload_pp = bytes([0xAB]) * (2 * _CHUNK)
+        payload_tp = os.urandom(2 * _CHUNK)
+        spy = _FileLegSpy()
+        waited = []
+        with tempfile.TemporaryDirectory(dir="/tmp") as d:
+            image_pp, _ = self._image(d, "pp.img", payload_pp, "pp")
+            image_tp, layout_tp = self._image(d, "tp.img", payload_tp, "tp")
+            pin = self._install(
+                weights_arena.FlipImagePin(
+                    torch.zeros(
+                        max(image_pp.numel(), image_tp.numel()), dtype=torch.uint8
+                    )
+                )
+            )
+            self.assertTrue(pin.start_prefetch(image_pp))
+            self._wait_complete(pin, image_pp.numel())
+            dst = torch.zeros(layout_tp.total_bytes, dtype=torch.uint8)
+            with mock.patch.object(weights_arena, "_staged_file_refill", spy):
+                with mock.patch.object(
+                    weights_arena, "_await_pin_copy", waited.append, create=True
+                ):
+                    source = weights_arena._refill_from_pin_and_file(
+                        dst,
+                        weights_arena._file_backed_meta(image_tp),
+                        layout_tp.total_bytes,
+                        image_tp,
+                    )
+        self.assertEqual(source, "file")
+        self.assertEqual(waited, [], "a leg with no pinned prefix waited anyway")
+
+    def test_t_g1_7_the_wait_is_a_host_block_on_the_current_stream(self):
+        """The seam's BODY, so patching it in the tests above proves something.
+
+        A device destination blocks the host on the stream the copy was
+        issued on; a host destination has no stream to wait for and must not
+        reach into ``torch.cuda`` at all (this module is imported on CPU-only
+        ranks and by every test in this file).
+        """
+        seen = []
+
+        class _Stream:
+            def synchronize(self):
+                seen.append("synchronize")
+
+        class _Dst:
+            def __init__(self, is_cuda):
+                self.is_cuda = is_cuda
+
+        with mock.patch.object(torch.cuda, "current_stream", lambda: _Stream()):
+            weights_arena._await_pin_copy(_Dst(True))
+            self.assertEqual(seen, ["synchronize"])
+            weights_arena._await_pin_copy(_Dst(False))
+        self.assertEqual(
+            seen,
+            ["synchronize"],
+            "a host destination reached for a CUDA stream that need not exist",
+        )
+
+
+class TestFlipImagePinReArm(_FlipImagePinBase):
+    """T-G1-8: a new identity is never published with the old fill's count.
+
+    THE HAZARD, named by ``start_prefetch``'s own comment. A reader that sees
+    ``identity=B`` beside ``bytes_valid`` still carrying A's count is told
+    that A's bytes are B's prefix. ``consume`` would hand that prefix out,
+    ``_refill_from_pin_and_file`` would DMA the wrong layout into the arena,
+    and ``arena_refill``'s post-copy checksum would abort the flip INSIDE
+    the no-return window -- loud, so not silent corruption, but a flip
+    killer.
+
+    Why the suite could not see it before: the existing re-arm test uses two
+    payloads of the SAME size, so a retained count equals the correct one.
+    This one holds the second reader before its first chunk, which makes the
+    window the comment describes observable rather than incidental.
+    """
+
+    def _holdable(self, buffer):
+        class _Held(weights_arena.FlipImagePin):
+            def __init__(self, buf):
+                super().__init__(buf)
+                self.hold = threading.Event()
+                self.entered = threading.Event()
+                self.arm_gate = False
+
+            def _read_chunk(self, meta, view, offset, length):
+                if self.arm_gate and offset == 0:
+                    self.entered.set()
+                    self.hold.wait(30.0)
+                return super()._read_chunk(meta, view, offset, length)
+
+            def stop_prefetch(self):
+                # Release the held reader BEFORE joining it, or the join
+                # burns its whole bound on a thread parked in this test.
+                self._stop.set()
+                self.hold.set()
+                return super().stop_prefetch()
+
+        return _Held(buffer)
+
+    def test_t_g1_8_a_re_arm_publishes_a_zeroed_count(self):
+        payload_pp = os.urandom(2 * _CHUNK)
+        payload_tp = os.urandom(2 * _CHUNK)
+        with tempfile.TemporaryDirectory(dir="/tmp") as d:
+            image_pp, _ = self._image(d, "pp.img", payload_pp, "pp")
+            image_tp, _ = self._image(d, "tp.img", payload_tp, "tp")
+            pin = self._install(
+                self._holdable(
+                    torch.zeros(
+                        max(image_pp.numel(), image_tp.numel()), dtype=torch.uint8
+                    )
+                )
+            )
+            self.assertTrue(pin.start_prefetch(image_pp))
+            self._wait_complete(pin, image_pp.numel())
+            self.assertEqual(pin.identity.layout, "pp")
+            filled = pin.bytes_valid
+            self.assertGreater(filled, 0)
+
+            pin.arm_gate = True
+            self.assertTrue(pin.start_prefetch(image_tp))
+            self.assertTrue(
+                pin.entered.wait(30.0),
+                "the second reader never reached its first chunk",
+            )
+            # The window the comment names: the identity already says tp.
+            self.assertEqual(pin.identity.layout, "tp")
+            self.assertEqual(
+                pin.bytes_valid,
+                0,
+                "the new identity was published beside the PREVIOUS fill's "
+                "count, which offers the pp layout's bytes as the tp "
+                "layout's prefix",
+            )
+            pin.hold.set()
+            self._wait_complete(pin, image_tp.numel())
+            self.assertEqual(
+                bytes(pin.buffer[: image_tp.numel()].numpy()),
+                bytes(image_tp.numpy()),
+            )
 
 
 if __name__ == "__main__":

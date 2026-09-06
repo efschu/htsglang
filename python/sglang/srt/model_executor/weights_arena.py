@@ -2019,6 +2019,24 @@ def create_flip_image_pin(nbytes: int) -> "FlipImagePin":
     return pin
 
 
+def _await_pin_copy(dst: torch.Tensor) -> None:
+    """Block the HOST until the pinned prefix copy has landed in ``dst``.
+
+    A NAMED SEAM rather than an inline ``synchronize``, for the same reason
+    ``_alloc_with_host_register`` and ``FlipImagePin._read_chunk`` are: what
+    it waits on is a CUDA transfer, and a CPU unit test has to be able to
+    prove the wait happens INSIDE the interval the leg reports (T-G1-7).
+
+    IT COSTS NOTHING REAL. ``arena_refill`` runs ``uint8_checksum(dst)`` on
+    the same stream immediately after this leg returns, and that reduction
+    ends in an ``.item()`` -- a host block on the very bytes waited for here.
+    The wait is not added work; it is the same wait, moved to the side of
+    the clock where the leg it belongs to can see it.
+    """
+    if dst.is_cuda:
+        torch.cuda.current_stream().synchronize()
+
+
 def _refill_from_pin_and_file(
     dst: torch.Tensor,
     meta: _FileBackedImage,
@@ -2054,12 +2072,29 @@ def _refill_from_pin_and_file(
             # 8 304 MiB/s measured on this pool).
             from_pin -= from_pin % _DIRECT_ALIGN
     if from_pin > 0:
-        # Pinned source, current stream: the checksum in `arena_refill` runs
-        # on that same stream afterwards, so the copy is ordered ahead of it
-        # without a synchronize of its own.
+        # Pinned source, current stream: ORDERED ahead of the checksum in
+        # `arena_refill`, which runs on that same stream. Correctness needs
+        # no synchronize of its own here; the leg CLOCK does, and that is
+        # what `_await_pin_copy` below is for.
         dst[:from_pin].copy_(pin.buffer[:from_pin], non_blocking=True)
     if from_pin < int(nbytes):
         _staged_file_refill(dst, meta, int(nbytes), timing=timing, start=from_pin)
+    if from_pin > 0:
+        # THE CLOCK BELOW MUST COVER THE DMA. The copy above is issued
+        # non_blocking and nothing between it and the log line blocks the
+        # host, so without this wait `refill_s` would be the time to ISSUE
+        # the transfer on the `pin` arm -- while the `pin+file` arm, whose
+        # file leg host-blocks on its own drain events, bills the same field
+        # for the time to MOVE it. One field naming two quantities depending
+        # on the arm is the #851/#1082 hazard `refill_bound_phrase` in this
+        # module was written to keep out, and §4's acceptance grades exactly
+        # this number: a leg billed to the checksum one frame up would read
+        # as a thousandfold win that did not happen.
+        #
+        # Only when the pin actually served bytes. With `from_pin == 0` no
+        # copy was issued from here and the file leg has already blocked on
+        # its own events, so the pre-#809 path takes no second wait.
+        _await_pin_copy(dst)
     if pin is None:
         return "file"
     if from_pin >= int(nbytes):
