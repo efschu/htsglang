@@ -48,7 +48,19 @@ WHAT THIS RUNNER REFUSES TO DO SILENTLY
    the one direction repeated parallel runs cannot see, so it is checked
    arithmetically on every run.
 
-4. **Hand an UNRECORDED failure to the reader unclassified** (#895).  Check 3
+4. **Report a lane that never ran as a lane that answered** (#1207).  A single
+   unimportable module makes pytest print ``Interrupted: N error(s) during
+   collection`` and stop, and the log it leaves behind TALLIES: zero names
+   failed against zero summary failed, one name error against one summary
+   error.  Measured 2026-09-04: the serial lane died at
+   ``test_quiescence_no_carry_858.py`` and the gate printed a one-element
+   failure set for a lane in which not one test ran.  Every check the runner
+   had was arithmetic, and no arithmetic can see this.  An interrupted lane is
+   INCONCLUSIVE, and the modules that could not be collected are named on
+   every run whether the lane was interrupted or not -- their absence from a
+   failure set is not a pass.
+
+5. **Hand an UNRECORDED failure to the reader unclassified** (#895).  Check 3
    is one-way: it asks only whether a recorded failure came back.  On this tree
    every recorded failure belongs to an EXCLUDED module, so check 3 can never
    fire at the desk and EVERY desk failure is unrecorded.  Such a failure has
@@ -75,10 +87,28 @@ reference set, not merely contain it.  It is a separate flag because in normal
 gate use an added failure is the gate doing its job, while during acceptance an
 added failure means the partition changed the answer.
 
+SCOPE: MORE THAN ONE GATE PATH, EACH WITH ITS OWN TABLE
+-------------------------------------------------------
+``--gate-path`` and ``--table`` are repeatable and PAIRED in order, and the
+default scope is both directories the WEG-1 work lands in::
+
+    test/registered/unit/managers   scripts/gate_partition.tsv
+    test/registered/unit/mem_cache  scripts/gate_partition_mem_cache.tsv
+
+``unit/mem_cache`` was outside every gate run until #1207, so the #1204 cut
+and every test written under that directory were invisible to a gate the
+build spec signs against.  The tables are NOT merged into one file: a table is
+the record of ONE ``gate_partition_build.py --gate-path`` measurement, and a
+module must never be handed a verdict proved in another path's run.  A
+``--gate-path`` without the ``--table`` beside it is refused rather than
+silently given the managers table.
+
 EXIT CODES
 ----------
-    0  green            1  failing test(s)               2  refused (loadscope)
-    3  inconclusive: an extraction, or a solo re-run, could not answer
+    0  green            1  failing test(s)
+    2  refused: --dist loadscope, or a --gate-path/--table set that does not pair
+    3  inconclusive: an extraction, a lane cut short during collection, or a
+       solo re-run, could not answer
     4  PARTITION VIOLATION -- a recorded failure vanished (false green)
     5  --prove: the partitioned answer differs from the serial reference
     6  every failure in the run is unrecorded AND did NOT reproduce when its
@@ -103,8 +133,159 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gate_partition_lib import module_of, parse_log  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_TABLE = ROOT / "scripts" / "gate_partition.tsv"
 PY = os.environ.get("GATE_PY", "/spinning/htsglang-gpu/.venv/bin/python3")
+
+#: (gate path, its table). One table per path, in the order they run.
+DEFAULT_SCOPE = (
+    ("test/registered/unit/managers", "scripts/gate_partition.tsv"),
+    ("test/registered/unit/mem_cache", "scripts/gate_partition_mem_cache.tsv"),
+)
+
+
+class ScopeRefused(ValueError):
+    """The gate paths and the tables do not pair, or two tables claim one module."""
+
+
+def resolve_scope(gate_paths, tables) -> list[tuple[str, Path]]:
+    """Pair each gate path with the table its verdicts were measured against.
+
+    THE HAZARD: a ``--gate-path`` with no ``--table`` beside it used to fall
+    back to the managers table, which would hand every module of the new path
+    the verdict ``unclassified: not in the partition table`` -- a real answer,
+    from the wrong document, about modules that were never measured. Refused
+    by name instead of guessed.
+
+    WHAT THE ORDER CARRIES, and the bound on it, so the refusal's own sentence
+    ("a table proved on one path says nothing about a module in another") is
+    not read as resting on the pairing: it does not. ``merge_tables`` keys the
+    merged verdicts by TREE-RELATIVE module path and unions both paths into one
+    flat ``present`` list, so the classification, the lane assignment and the
+    exit code are byte-identical under a reversed pairing. What the order
+    decides is the two PROVENANCE lines -- ``# verify {table} against
+    {gate_path}`` and ``# scope {gate_path}  <-  {table}`` -- which are the
+    header of the artifact a window is signed against. A header that names the
+    wrong proof for a path is the same wrong-document failure as above, one
+    level out.
+    """
+    if gate_paths is None and tables is None:
+        return [(p, ROOT / t) for p, t in DEFAULT_SCOPE]
+    gate_paths = list(gate_paths or [])
+    tables = list(tables or [])
+    if not gate_paths or len(gate_paths) != len(tables):
+        raise ScopeRefused(
+            f"--gate-path given {len(gate_paths)} time(s) and --table given "
+            f"{len(tables)} time(s). Each --gate-path needs the --table its "
+            f"verdicts were proved against, in the same order; a table proved "
+            f"on one path says nothing about a module in another. Give both, "
+            f"or neither for the default scope "
+            f"({', '.join(p for p, _ in DEFAULT_SCOPE)})."
+        )
+    return [(p, Path(t)) for p, t in zip(gate_paths, tables)]
+
+
+def merge_tables(scope: list[tuple[str, Path]]) -> tuple[dict[str, dict], list[str]]:
+    """The merged verdict table and the modules present, over the whole scope.
+
+    Module keys are tree-relative paths, so two paths cannot collide by
+    construction -- but two tables naming the same module WOULD be two records
+    of one fact with no rule for which wins, so it is refused rather than
+    resolved by dict order.
+
+    A path that yields NO module is refused too, and that guard is aimed at
+    ``DEFAULT_SCOPE``: it hard-codes two directory names, and ``glob`` on a
+    directory that was renamed returns an empty list without complaint. The
+    gate would go back to gating one path silently -- the very defect #1207
+    repairs, re-created by a rename.
+    """
+    table: dict[str, dict] = {}
+    owner: dict[str, Path] = {}
+    present: list[str] = []
+    for gate_path, table_path in scope:
+        for mod, row in load_table(table_path).items():
+            if mod in table:
+                raise ScopeRefused(
+                    f"{mod} carries a verdict in two tables ({owner[mod]} and "
+                    f"{table_path}). One module, one proof, one table."
+                )
+            table[mod] = row
+            owner[mod] = table_path
+        here = [p.relative_to(ROOT).as_posix()
+                for p in (ROOT / gate_path).glob("test_*.py")]
+        if not here:
+            raise ScopeRefused(
+                f"gate path {gate_path} holds 0 test_*.py module(s) under "
+                f"{ROOT}. A gate path that gates nothing is a narrower gate "
+                f"reported as the full one; name a path that exists."
+            )
+        present += here
+    return table, sorted(set(present))
+
+
+def lane_verdict(res, n_modules: int) -> tuple[bool, str]:
+    """Is this lane's log an ANSWER at all?  ``(ok, note)``.
+
+    Four ways it is not, and only the last two are arithmetic:
+
+    * pytest was INTERRUPTED during collection. Nothing it had collected ran,
+      and the log still tallies -- that is #1207's serial lane, whose perfect
+      0-vs-0 and 1-vs-1 covered a lane of 120 modules that never started.
+    * a module could not be collected and the extraction found no ERROR name
+      for it. The two terms come from different parts of the log (the
+      ``ERROR collecting`` banner and the short summary), so this can fire.
+    * the lane was handed modules and the log reports no test outcome at all.
+      "no tests ran" and "everything passed" are the same log to a count, so
+      emptiness is asked about separately.
+    * names and summary disagree (#868's own rule, repaired by #1207).
+    """
+    if res.interrupted:
+        named = ", ".join(sorted(res.collection_errors)) or "not named in the log"
+        return False, (
+            f"pytest was INTERRUPTED during collection, so the "
+            f"{n_modules - len(res.collection_errors)} other module(s) this "
+            f"lane holds never ran; uncollectable: {named}"
+        )
+    if res.collection_errors and res.error_lines == 0:
+        return False, (
+            f"{len(res.collection_errors)} module(s) could not be collected "
+            f"({', '.join(sorted(res.collection_errors))}) but the extraction "
+            f"found 0 ERROR name(s) in {n_modules} module(s) of lane log"
+        )
+    ran_something = sum(res.counts.get(k, 0) for k in
+                        ("failed", "passed", "skipped", "error", "xfailed",
+                         "xpassed", "subtests")) > 0
+    if res.collected_nothing or not ran_something:
+        return False, (
+            f"lane holds {n_modules} module(s) but the log reports no test "
+            f"outcome at all -- collected nothing, or the summary was not "
+            f"understood"
+        )
+    if not res.tally_ok:
+        return False, res.tally_note
+    return True, res.tally_note
+
+
+def uncollectable_modules(res: dict) -> list[str]:
+    """Every module a lane's log says pytest could not import, sorted.
+
+    THE HAZARD this census answers, and why it is INDEPENDENT of the lane
+    verdict: a module that could not be imported ran NOTHING, and a reader
+    scanning the failure set of an otherwise healthy lane has no way to tell
+    "this module passed" from "this module never started". ``lane_verdict``
+    cannot stand in for it -- its collection-error branch reads
+    ``res.error_lines``, which counts the WHOLE lane's short-summary ERROR
+    lines, so it says something about the lane and nothing about the module.
+    The census is therefore taken on every run, whatever any lane voted.
+
+    A REPORT, NOT A SECOND VOTE. The vote on these modules already exists and
+    is the ERROR name the extraction pulled from the same log: measured on the
+    branch's own full gate run of 2026-09-06 (``wide.log``), four banner
+    modules against four distinct ERROR names in the failure set, so the gate
+    was red for every one of them. Naming them a second time in a verdict
+    would be a second record of a fact that already votes -- and the two
+    records would not even share a name space, since a banner path is
+    rootdir-relative and a node id is tree-relative.
+    """
+    return sorted({m for r in res.values() for m in r.collection_errors})
 
 
 def sha(path: Path) -> str:
@@ -146,8 +327,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-n", "--wide", type=int, default=8, help="workers for the wide lane")
     ap.add_argument("--narrow", type=int, default=4, help="workers for the rank-spawning lane")
-    ap.add_argument("--table", default=str(DEFAULT_TABLE))
-    ap.add_argument("--gate-path", default="test/registered/unit/managers")
+    ap.add_argument("--table", action="append", default=None,
+                    help="partition table; repeatable, paired IN ORDER with "
+                         "--gate-path. Omit both for the default scope.")
+    ap.add_argument("--gate-path", action="append", default=None,
+                    help="directory of test_*.py to gate; repeatable, and each "
+                         "one needs its own --table")
     ap.add_argument("--outdir", default=None)
     ap.add_argument("--serial-only", action="store_true",
                     help="canary form: every lane collapsed into one process, one order")
@@ -177,9 +362,12 @@ def main() -> int:
     outdir = Path(args.outdir or f"/tmp/gate868_{stamp}")
     outdir.mkdir(parents=True, exist_ok=True)
 
-    table = load_table(Path(args.table))
-    present = sorted(p.relative_to(ROOT).as_posix()
-                     for p in (ROOT / args.gate_path).glob("test_*.py"))
+    try:
+        scope = resolve_scope(args.gate_path, args.table)
+        table, present = merge_tables(scope)
+    except ScopeRefused as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
 
     wide: list[str] = []
     narrow: list[str] = []
@@ -219,7 +407,8 @@ def main() -> int:
     stale_gone = [m for m in table if m not in present]
 
     if args.verify:
-        print(f"# verify {args.table} against {args.gate_path}")
+        for gate_path, table_path in scope:
+            print(f"# verify {table_path} against {gate_path}")
         problems = 0
         for mod, reason in demoted:
             print(f"  UNPROVEN  {mod}\n            {reason}")
@@ -247,7 +436,8 @@ def main() -> int:
     print(f"# gate_tier2_partitioned {stamp}")
     print(f"# tree     {ROOT}")
     print(f"# commit   {subprocess.getoutput('git -C %s rev-parse --short HEAD' % ROOT)}")
-    print(f"# table    {args.table}")
+    for gate_path, table_path in scope:
+        print(f"# scope    {gate_path}  <-  {table_path}")
     print('# hermetic CUDA_VISIBLE_DEVICES="" forced on every lane')
     print(f"# lanes    wide={len(wide)} (-n {args.wide} --dist loadfile) | "
           f"narrow={len(narrow)} (-n {args.narrow} --dist loadfile) | "
@@ -288,25 +478,25 @@ def main() -> int:
             print(f"  {name:7s}: empty lane, skipped")
             continue
         r = res[name]
-        # A lane that was HANDED modules and collected nothing passes the
-        # name-vs-count tally trivially: zero names, zero counts. "no tests
-        # ran" and "everything passed" are the same log to the arithmetic,
-        # so the emptiness is asked about separately.
-        ran_something = sum(r.counts.get(k, 0) for k in
-                            ("failed", "passed", "skipped", "error", "xfailed",
-                             "xpassed", "subtests")) > 0
-        empty = r.collected_nothing or not ran_something
-        ok = r.tally_ok and not empty
-        note = r.tally_note
-        if empty:
-            note = (f"lane holds {len(mods)} module(s) but the log reports no "
-                    f"test outcome at all -- collected nothing, or the summary "
-                    f"was not understood")
+        ok, note = lane_verdict(r, len(mods))
         print(f"  {name:7s}: {'OK' if ok else 'BROKEN'}  counts={r.counts} "
-              f"names={len(r.all_names)} {note}")
+              f"name lines={r.failure_lines + r.error_lines} "
+              f"distinct={len(r.all_names)} unnamed={r.unnamed_lines} {note}")
         broken = broken or not ok
+
+    # A module that could not be imported ran NOTHING, whatever the lane did
+    # afterwards. It is named on every run, before any verdict, so its absence
+    # from the failure set below is never read as a pass.
+    uncollectable = uncollectable_modules(res)
+    if uncollectable:
+        print(f"\n=== DID NOT RUN: {len(uncollectable)} module(s) could not be "
+              f"collected ===")
+        print("  Paths are as pytest's own banner gives them (rootdir-relative).")
+        for mod in uncollectable:
+            print(f"  UNCOLLECTABLE {mod}")
+
     if broken:
-        print("\nVERDICT: INCONCLUSIVE -- the extraction is broken, not the run.")
+        print("\nVERDICT: INCONCLUSIVE -- a lane's log is not an answer.")
         return 3
 
     union = set().union(*(r.all_names for r in res.values()))

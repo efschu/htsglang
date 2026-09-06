@@ -83,6 +83,89 @@ def test_the_runnability_oracle_is_gone():
     assert not hasattr(pfr, "prefill_runnable_in_current_layout")
 
 
+# -- #856/#858: the orphan gate stays gone, and its replacement enumerates --
+#
+# RE-HOMED, not new. Both assertions were `TestTheOrphanGateIsGone` in
+# test/registered/unit/managers/test_quiescence_no_carry_858.py, which
+# b7076b649c deleted with the rest of that module. That deletion is right --
+# the module's other classes call `chunk_blocks_quiescence(..., strict=)` and
+# `prefill_runnable_in_current_layout`, the two contracts the falsifiers above
+# pin as DELETED, so re-adapting them would contradict a live falsifier -- but
+# these two contracts are LIVE at the tip and belong to the same #856 family
+# this file already owns, so they land here instead of dying with the module.
+
+
+def test_quiescence_does_not_consult_the_carry_orphan_query():
+    """The ORPHAN gate (#631 defect L) blocked a flip on requests "not yet
+    merged into the resident set the carry harvests". #856 deleted the harvest
+    and de4f541b41 gave `_live_reqs` the identical population, so the gate
+    refused for a reason that no longer exists.
+
+    Structural, and NOT because the name is live: nothing in this tree defines
+    `orphan_resident_reqs` any more (`phase_flip_runtime.py:1211-1213`,
+    #1202/#969; the two surviving occurrences, `parked_decode_set.py:45` and
+    `phase_flip_runtime.py:1207`, are past-tense prose). The gate can therefore
+    only come back as helper AND call together, and the call site is the one
+    place that catches that pair -- an ImportError would only catch the
+    helper."""
+    import inspect
+
+    from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
+
+    src = inspect.getsource(build_flip_quiescence_fn)
+    assert "orphan_resident_reqs(" not in src, (
+        "the orphan gate blocked for a harvest that #856 deleted; "
+        "de4f541b41 gave _live_reqs the identical population"
+    )
+
+
+def test_live_reqs_still_reads_last_mbs_and_last_batch():
+    """THE OTHER HALF, and the reason the deletion above is safe: the
+    enumeration MOVED, it did not vanish. If `_live_reqs` ever stops reading
+    `last_mbs`/`last_batch`, the orphan gate's removal becomes a real hole and
+    this reddens. The nearest surviving pin on this function,
+    test_carry_parked_extent_interaction_731_744.py:180-196, asserts
+    `running_mbs` present and `waiting_queue` absent -- neither of these two
+    terms -- so without this arm the trigger the removal was justified by is
+    unguarded.
+
+    THE HAZARD IN THE OBVIOUS FORM OF THIS TEST, which is why it parses
+    instead of matching a substring: `_live_reqs`' own docstring and its W30
+    comment both spell `last_mbs` and `last_batch` out at length, so
+    `"last_mbs" in inspect.getsource(...)` stays true after the getattr that
+    reads it is renamed away. The names are read as STRING ARGUMENTS
+    (`getattr(scheduler, "last_mbs", [])`, `for name in ("running_batch",
+    "last_batch")`), not as attribute syntax, so the code half of the source
+    is what is searched: the docstring is dropped and comments never survive
+    `ast.parse`."""
+    import ast
+    import inspect
+    import textwrap
+
+    from sglang.srt.managers.phase_flip_runtime import _live_reqs
+
+    fn = ast.parse(textwrap.dedent(inspect.getsource(_live_reqs))).body[0]
+    body = fn.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]  # the docstring is prose about the routes, not a route
+    names = set()
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Attribute):
+                names.add(node.attr)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                names.add(node.value)
+
+    assert "running_mbs" in names, "the parser must actually see the routes"
+    assert "last_mbs" in names
+    assert "last_batch" in names
+
+
 # -- Slice B (c): the post-cutover fresh-fetch sweep ----------------------
 
 
