@@ -80,7 +80,7 @@ class _EvictorHarness(CustomTestCase):
             self.tmp,
             "_suffix",
             tp_rank=tp_rank,
-            is_mla_model=is_mla,
+            writes_shared_keys=is_mla,
             extra_config=extra,
         )
 

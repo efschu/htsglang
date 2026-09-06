@@ -238,7 +238,7 @@ def require_canonical_store(tree_cache: Any) -> None:
             "page format, so its keys carry this phase's geometry "
             "(_{tp_rank}_{tp_size} and _{pp_size}_{pp_rank}). Pages written at "
             "the flip seam would be unreadable in the phase they were written "
-            "for. Enable --phase-flip-canonical-kv-page, or leave the "
+            "for. Enable --hicache-canonical-kv-page, or leave the "
             "writeback off; spending the IO for keys the other phase cannot "
             "name is the one outcome worth refusing."
         )

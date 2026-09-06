@@ -7,7 +7,11 @@ one gap found and fixed red-first.
 
 Not dark, but flag-gated:
 
-* `server_args.py:5550` `phase_flip_canonical_kv_page`, default **off**;
+* `server_args.py:5550` `phase_flip_canonical_kv_page`, default **off**
+  (RENAMED 2026-09-06 by Weg 2 S5 / F1 to `hicache_canonical_kv_page` /
+  `--hicache-canonical-kv-page`; the old CLI name is refused by name, and
+  the `--enable-phase-flip` precondition described below is GONE -- the
+  format is a store-format choice, see `_handle_hicache_canonical_kv_page`);
 * `server_args.py:8075-8090` refuses it without
   `--hicache-storage-backend file` ("no other backend implements" the partial
   writes a page assembled across stages needs);

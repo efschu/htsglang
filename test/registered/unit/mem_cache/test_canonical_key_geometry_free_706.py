@@ -1,6 +1,6 @@
 """#706 remainder: the canonical key must be geometry-FREE, hash included.
 
-Under ``--phase-flip-canonical-kv-page`` the stored page holds EVERY attention
+Under ``--hicache-canonical-kv-page`` the stored page holds EVERY attention
 layer at full width, so no parallel split can change its bytes. The key drops
 the tp and pp suffixes for exactly that reason
 (``hicache_storage.py``: "the pp suffix is honest ONLY while a stage's page

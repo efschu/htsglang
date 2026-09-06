@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     compute_model_identity_hash,
 )
+from sglang.srt.mem_cache.weg2_store_gates import check_mamba_blob_present
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -379,7 +380,7 @@ class StorageStopResult(NamedTuple):
 def canonical_identity_hash_for(server_args, canonical_page: bool) -> str:
     """#706 remainder: the identity hash for a key that must be geometry-FREE.
 
-    Under ``--phase-flip-canonical-kv-page`` the stored page holds EVERY
+    Under ``--hicache-canonical-kv-page`` the stored page holds EVERY
     attention layer at full width, so no parallel split can change its bytes.
     The key already drops the tp and pp suffixes for exactly that reason. The
     identity hash was not given the same treatment: its
@@ -1251,7 +1252,7 @@ class HiCacheController:
         model_identity_hash = (
             canonical_identity_hash_for(
                 server_args,
-                bool(getattr(server_args, "phase_flip_canonical_kv_page", False)),
+                bool(getattr(server_args, "hicache_canonical_kv_page", False)),
             )
             if server_args is not None
             else None
@@ -1264,7 +1265,7 @@ class HiCacheController:
         canonical_kv_page = None
         canonical_mamba_blob = None
         if server_args is not None and getattr(
-            server_args, "phase_flip_canonical_kv_page", False
+            server_args, "hicache_canonical_kv_page", False
         ):
             from sglang.srt.mem_cache.canonical_page_store import (
                 build_page_window,
@@ -1297,6 +1298,23 @@ class HiCacheController:
             )
             canonical_mamba_blob = self._canonical_mamba_window(
                 server_args, model_config
+            )
+            # W7 (Weg2MambaBlobAbsent). `_canonical_mamba_window` returns None
+            # only on a POSITIVE dense proof from `resolve_linear_layer_ids`.
+            # The bound pool is the second witness to the same question, and
+            # when the two disagree the resolver was wrong about the model --
+            # the measured #931 shape, where every boot logged "#706 canonical
+            # KV page active" x3 and the GDN blob line zero times, with zero
+            # refusals. Under Weg 2 the store is the sole carrier between the
+            # groups, so a KV-only prefix is not a degraded hit rate: the
+            # mamba pool is registered TRAILING_PAGES and `batch_exists_v2`
+            # takes the MINIMUM across pools, which truncates the whole KV
+            # prefix to zero.
+            check_mamba_blob_present(
+                canonical_page_on=True,
+                has_mamba_pool=getattr(self.mem_pool_device_hybrid, "mamba_pool", None)
+                is not None,
+                mamba_blob=canonical_mamba_blob,
             )
 
         return HiCacheStorageConfig(

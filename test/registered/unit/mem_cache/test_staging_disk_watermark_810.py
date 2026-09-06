@@ -54,7 +54,7 @@ def _evictor(tmpdir, *, require_watermark=False, extra_config=None):
         tmpdir,
         "_test_suffix",
         tp_rank=0,
-        is_mla_model=False,
+        writes_shared_keys=False,
         extra_config=extra_config,
         require_watermark=require_watermark,
     )
@@ -143,7 +143,7 @@ class StagingRequiresABoundedFileTierTest(CustomTestCase):
             self.tmpdir,
             "_test_suffix",
             tp_rank=1,
-            is_mla_model=True,
+            writes_shared_keys=True,
             extra_config={"max_size": "1G"},
             require_watermark=True,
         )
@@ -254,7 +254,7 @@ class TheControllerCarriesTheRoleTest(CustomTestCase):
 
         config = self._generate(
             types.SimpleNamespace(
-                hicache_host_role="staging", phase_flip_canonical_kv_page=False
+                hicache_host_role="staging", hicache_canonical_kv_page=False
             )
         )
         self.assertEqual(
@@ -269,7 +269,7 @@ class TheControllerCarriesTheRoleTest(CustomTestCase):
 
         config = self._generate(
             types.SimpleNamespace(
-                hicache_host_role="retention", phase_flip_canonical_kv_page=False
+                hicache_host_role="retention", hicache_canonical_kv_page=False
             )
         )
         self.assertEqual(config.host_role, "retention")

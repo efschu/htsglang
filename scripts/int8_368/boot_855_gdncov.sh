@@ -185,7 +185,7 @@ setsid choom -n 1000 -- "$VENV/bin/python" -m sglang.launch_server \
   --phase-policy-decode-contention 1.0 \
   --uneven-token-vector 29,19,16 \
   --uneven-token-vector-role seed \
-  --phase-flip-canonical-kv-page \
+  --hicache-canonical-kv-page \
   --phase-flip-writeback \
   --phase-flip-rebind-hicache \
   >> "$LOG" 2>&1 &

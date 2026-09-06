@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
+from sglang.srt.mem_cache.weg2_store_gates import writes_shared_keys
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.canonical_page_store import (
@@ -1086,10 +1087,22 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-        # Every non-MLA rank writes its own files into this one directory, so
-        # they share the configured byte budget; under MLA / dcp owner mode only
-        # rank 0 writes, so it gets the whole budget.
-        writer_count = 1 if is_mla_model else max(1, tp_size)
+        # F7: ONE definition of "do the ranks of this group write the same
+        # physical files", used for BOTH the eviction owner and the cap split.
+        # It was ``is_mla_model`` in two places, a proxy that stopped being
+        # true once the #706 canonical page let a GQA model's ranks deposit
+        # into one page under one key. Left alone under Weg 2 it splits the
+        # operator's single cap by tp_size -- 1 in the prefill group, 3 in the
+        # decode group -- giving two different caps over one directory.
+        shared_keys = writes_shared_keys(
+            is_mla_model=is_mla_model,
+            dcp_owner_mode=self.dcp_owner_mode,
+            canonical_kv_page=self.canonical_kv_page,
+        )
+        # A rank that writes its own suffixed files spends the cap once per
+        # rank, so the budget is split; ranks writing one shared set of files
+        # spend it once between them.
+        writer_count = 1 if shared_keys else max(1, tp_size)
         # #410: the pin ledger, built BEFORE the evictor because the evictor
         # must never run a single pass without it -- a checkpoint's pages are
         # protected from the first eviction or the protection is a promise with
@@ -1105,7 +1118,12 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             self.config_suffix,
             tp_rank=tp_rank,
-            is_mla_model=is_mla_model,
+            writes_shared_keys=shared_keys,
+            # F7 / W8b: the canonical KV pages and GDN blobs end with the KV
+            # suffix, not this rank's config_suffix. Without it the eviction
+            # index cannot see them at all and the byte cap bounds only the
+            # draft files -- measured 83.7 % of the store of record invisible.
+            kv_config_suffix=self.kv_config_suffix,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
@@ -1545,6 +1563,17 @@ class HiCacheFile(HiCacheStorage):
             if reserved:
                 self._evictor.abort(suffixed)
             return False
+
+    def rescan_eviction_index(self) -> dict:
+        """Re-read the store directory into the LRU index (Weg 2 wake path).
+
+        Called when this group wakes. Two groups share one directory and only
+        one of them is awake at a time, so the sibling's writes accumulated
+        entirely outside this process's index while it slept; evicting against
+        that index would evict against a snapshot of the past. A no-op for a
+        non-owner or an unbounded store.
+        """
+        return self._evictor.rescan()
 
     def install_canonical_windows(self, kv_page, mamba_blob) -> None:
         """#706 x #719 (0828): swap this backend's read/write-time cut.

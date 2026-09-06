@@ -50,6 +50,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
     LoRAPathAction,
+    RemovedFlagAction,
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -6114,7 +6115,7 @@ class ServerArgs:
         ),
     ] = None
 
-    phase_flip_canonical_kv_page: A[
+    hicache_canonical_kv_page: A[
         bool,
         Arg(
             help="#706: persist HiCache KV pages in the GEOMETRY-NEUTRAL "
@@ -6134,9 +6135,18 @@ class ServerArgs:
             "excluded by name (head-sharded and token-complete, so no suffix "
             "rule can neutralise them: the draft pool starts cold after a flip "
             "and a cross-phase hit is PARTIAL by design), and component "
-            "(mamba/SWA) pools keep their per-rank keys. Requires "
-            "--enable-phase-flip, the 'file' storage backend and page_size 1. "
-            "Default off = keys and bytes byte-identical to today.",
+            "(mamba/SWA) pools keep their per-rank keys. THIS IS A STORE "
+            "FORMAT CHOICE, NOT A FLIP KNOB (Weg 2 F1): the stored bytes "
+            "depend on the model geometry alone, so the format is valid "
+            "wherever a reader may have a different parallel cut from the "
+            "writer -- two independently launched groups over one store are "
+            "exactly that, and the phase flip was only one instance of it. It "
+            "therefore requires the 'file' storage backend and page_size 1, "
+            "and nothing else; in particular NOT --enable-phase-flip, which "
+            "would also force pp_size > 1 and tp_size == 1 and so exclude "
+            "every decode-shaped reader. The flag changes the KEY and the "
+            "stored LAYOUT only; it enables no eviction, no sizing and no "
+            "writeback. Default off = keys and bytes byte-identical to today.",
         ),
     ] = False
     phase_flip_writeback: A[
@@ -6157,7 +6167,7 @@ class ServerArgs:
             "acknowledgements under a deadline "
             "(--phase-flip-writeback-deadline-s), never unbounded: it runs "
             "with requests parked, where an unbounded wait is a wedge. "
-            "REFUSES LOUDLY without --phase-flip-canonical-kv-page, because "
+            "REFUSES LOUDLY without --hicache-canonical-kv-page, because "
             "pages keyed by the geometry of one phase cannot be read by the "
             "other and the IO would buy nothing. Requires --enable-phase-flip. "
             "Default off.",
@@ -7119,6 +7129,13 @@ class ServerArgs:
         # water marks and the asymmetric windows at argument time (a typo
         # fails the boot, not the first pressure boundary).
         self._handle_kv_pressure_ladder()
+
+        # #706 x Weg 2 F1: the canonical page's own preconditions, validated
+        # on EVERY launch shape. Deliberately not inside _handle_phase_flip:
+        # the format is a store-format choice, and gating it on the flip made
+        # it unreachable for the decode-shaped group that has to read the
+        # pages the prefill-shaped group wrote.
+        self._handle_hicache_canonical_kv_page()
 
         # #410 session checkpoints: HiCache dependency and age ladder.
         self._handle_hicache_host_role()
@@ -8592,15 +8609,13 @@ class ServerArgs:
                     "--phase-flip-writeback requires --enable-phase-flip: "
                     "with one layout there is no flip to write back before."
                 )
-            if self.phase_flip_canonical_kv_page:
-                raise ValueError(
-                    "--phase-flip-canonical-kv-page requires "
-                    "--enable-phase-flip: the geometry-neutral page exists so "
-                    "the two phases can name the same bytes, and with one "
-                    "layout there is no second geometry to be neutral "
-                    "towards. Refused rather than ignored -- silently "
-                    "accepting it would move every KV key for nothing."
-                )
+            # The canonical KV page used to be refused here, on the argument
+            # that "with one layout there is no second geometry to be neutral
+            # towards". Weg 2 F1 removes that clause: the second geometry does
+            # not have to be a second PHASE of this process, it can be another
+            # LAUNCH reading the same store. The format's real preconditions
+            # (page_size 1, the 'file' backend) now live in
+            # _handle_hicache_canonical_kv_page, which runs unconditionally.
             if self.phase_flip_spill_depth is not None:
                 raise ValueError(
                     "--phase-flip-spill-depth requires --enable-phase-flip: "
@@ -8799,10 +8814,10 @@ class ServerArgs:
                 )
         if blockers:
             raise ValueError(f"--enable-phase-flip V1 refuses: {', '.join(blockers)}.")
-        if self.phase_flip_writeback and not self.phase_flip_canonical_kv_page:
+        if self.phase_flip_writeback and not self.hicache_canonical_kv_page:
             raise ValueError(
                 "--phase-flip-writeback requires "
-                "--phase-flip-canonical-kv-page: the writeback exists to get "
+                "--hicache-canonical-kv-page: the writeback exists to get "
                 "a prefix into a store the OTHER phase can name, and without "
                 "the geometry-neutral format the pages it writes still carry "
                 "the tp/pp suffixes of the phase that wrote them. Refused "
@@ -8823,30 +8838,51 @@ class ServerArgs:
                 )
         self._validate_direct_io()
 
-        if self.phase_flip_canonical_kv_page:
-            # #706: the two conditions the whole-page protocol is defined on.
-            # Both are checkable here, and both are silent corruption if left
-            # to be discovered later -- a backend that cannot do a partial
-            # write has no way to assemble a page across stages, and a
-            # multi-token page would span token owners, which is why
-            # dcp_owner_mode already requires page_size 1.
-            if self.hicache_storage_backend != "file":
-                raise ValueError(
-                    "--phase-flip-canonical-kv-page needs "
-                    "--hicache-storage-backend file, got "
-                    f"{self.hicache_storage_backend!r}. The whole-page format "
-                    "assembles one page from several stages by writing byte "
-                    "ranges into it; no other backend implements that, and the "
-                    "disk tier is where the format has to live anyway for "
-                    "context to survive a reboot."
-                )
-            if self.page_size != 1:
-                raise ValueError(
-                    "--phase-flip-canonical-kv-page requires --page-size 1, "
-                    f"got {self.page_size}. A canonical page is ONE token's "
-                    "attention layers; a multi-token page would span token "
-                    "owners, the same limit weighted uneven-DCP already sets."
-                )
+    def _handle_hicache_canonical_kv_page(self):
+        """#706 x Weg 2 F1: validate the canonical page's OWN preconditions.
+
+        THE CUT THIS HANDLER MAKES. The two checks below were reachable only
+        under ``--enable-phase-flip``, which additionally demands
+        ``pp_size > 1`` and ``tp_size == 1``. Weg 2 boots two independent
+        groups -- P at ``pp_size=3, tp_size=1`` and D at ``tp_size=3,
+        pp_size=1`` -- over ONE store, and group D can never satisfy the flip's
+        shape. Keeping the format behind the flip therefore did not merely
+        inconvenience the design, it made the store's key spaces disjoint: the
+        KV suffix block re-appends ``_{tp_rank}_{tp_size}`` and
+        ``_{pp_size}_{pp_rank}``, so P writes ``..._3_{r}`` and D reads
+        ``..._{r}_3`` -- a 100 % miss that raises nothing.
+
+        WHY THESE TWO SURVIVE AND THE FLIP CLAUSE DOES NOT. The canonical page
+        is a STORE FORMAT choice: the stored bytes depend on the model geometry
+        alone, so the format is valid wherever a reader may have a different
+        parallel cut from the writer -- the two-launch case, of which the flip
+        was one instance. What the FORMAT itself needs is unchanged: a backend
+        that can write byte ranges into one file (only 'file' assembles a page
+        across stages) and a page that is one token wide (a multi-token page
+        would span token owners, the limit weighted uneven-DCP already sets).
+
+        Both are silent corruption if discovered later, so both stay
+        argument-time refusals -- now on every launch shape rather than one.
+        """
+        if not self.hicache_canonical_kv_page:
+            return
+        if self.hicache_storage_backend != "file":
+            raise ValueError(
+                "--hicache-canonical-kv-page needs "
+                "--hicache-storage-backend file, got "
+                f"{self.hicache_storage_backend!r}. The whole-page format "
+                "assembles one page from several stages by writing byte "
+                "ranges into it; no other backend implements that, and the "
+                "disk tier is where the format has to live anyway for "
+                "context to survive a reboot."
+            )
+        if self.page_size != 1:
+            raise ValueError(
+                "--hicache-canonical-kv-page requires --page-size 1, "
+                f"got {self.page_size}. A canonical page is ONE token's "
+                "attention layers; a multi-token page would span token "
+                "owners, the same limit weighted uneven-DCP already sets."
+            )
 
     def _handle_regime_controller(self):
         """#363: validate the mode and, for 'act', the entry gate.
@@ -19672,6 +19708,32 @@ class ServerArgs:
             "--config",
             type=str,
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
+        )
+
+        # --- Removed argument registrations (refused by name, never ignored) ---
+        # Weg 2 F1 renamed this flag because its MEANING changed: it is a store
+        # format, not a phase-flip knob. A launch line still carrying the old
+        # spelling must fail loudly -- argparse's own "unrecognized argument"
+        # would be enough for a shell, but a config file or a programmatic
+        # caller could drop it silently, and the failure mode of running with
+        # the format off is a 100 % store miss that looks like a cold cache.
+        parser.add_argument(
+            "--phase-flip-canonical-kv-page",
+            dest="hicache_canonical_kv_page",
+            action=RemovedFlagAction,
+            new_flag="--hicache-canonical-kv-page",
+            reason=(
+                "The canonical KV page is a STORE FORMAT choice, not a "
+                "phase-flip knob (Weg 2 spec 3.2 / F1): it is valid wherever a "
+                "reader may have a different parallel cut from the writer, and "
+                "the flip was only one instance of that. The old name also "
+                "carried the flip's --enable-phase-flip precondition, which "
+                "forces pp_size > 1 and tp_size == 1 and therefore excluded "
+                "every decode-shaped reader. No silent alias is provided: "
+                "accepting it here would leave the format OFF on a launch that "
+                "asked for it, and the store would miss 100 % without raising."
+            ),
+            help=argparse.SUPPRESS,
         )
 
         # --- Deprecated argument registrations ---
