@@ -4065,7 +4065,10 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # edits. A local import collides with nothing.
         from sglang.srt.managers import debug_hold
 
-        debug_hold.maybe_inject("cutover")
+        # `world_rank` is the cutover's own boot-constant rank (the same value
+        # the ps rebind above writes into tp_rank); `scheduler.ps.pp_rank` is 0
+        # on every rank by this point, so it must NOT be used for the filter.
+        debug_hold.maybe_inject("cutover", pp_rank=world_rank)
 
     return _cutover
 
@@ -12217,6 +12220,23 @@ class PhaseFlipRuntime:
                 f"enumerate, and that count IS the payload-length mismatch"
             )
         if reduced_fit[0] == 0 or not frames_agree:
+            # #1225 INJECT-2 ("abandon"). AT BRANCH ENTRY, deliberately BEFORE
+            # `self._armed_residents = {}` and the rest of the teardown a few
+            # lines down: the whole question this hold answers is what the
+            # resident ledger and the req pool hold at the MOMENT the abandon
+            # is decided. Holding after the clear would inspect the state the
+            # clear produced and prove nothing about C1 vs C2.
+            # Local import: keeps this cherry-pickable onto the slice tips
+            # whose own hunks are elsewhere in this file.
+            from sglang.srt.managers import debug_hold as _1223_dh
+
+            # `self._rank` is `world.rank_in_group`, bound once when the runtime
+            # is built and never rebound -- unlike `scheduler.ps`, which the
+            # cutover replaces with pp_rank=0 on every rank. On this form
+            # (pp=3, tp=1) the world rank IS the pp rank. PhaseFlipRuntime
+            # holds no scheduler reference, so this is also the only rank
+            # available here.
+            _1223_dh.maybe_inject("abandon", pp_rank=self._rank)
             # THE BUDGET'S CURRENCY, BOOKED WHERE EVERY RANK AGREES. This is
             # the reduced verdict, so all three ranks increment together and
             # a delay budget means the same thing on each of them.

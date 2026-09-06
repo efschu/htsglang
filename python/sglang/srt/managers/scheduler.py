@@ -9813,12 +9813,24 @@ class Scheduler(
         cross-rank payload diff usable -- see
         ``pp_admission_verdict_is_vacuous``.
         """
+        # #1225 INJECT-1 ("last_chunk"). Set inside the try, ACTED ON AFTER IT:
+        # this whole body is wrapped in an `except Exception` whose job is to
+        # stop an instrument killing the scheduler, and a `raise` in here would
+        # be swallowed by it -- the wall would silently never happen and the
+        # window would be spent learning nothing. Set BEFORE the rate-limit
+        # gate below, too: `collapse.emit` suppresses log lines, and an inject
+        # that inherited that suppression would fire on an arbitrary subset of
+        # admissions (the denominator law, as a boot-killer).
+        _1223_last_chunk = False
         try:
             alloc = self.token_to_kv_pool_allocator
             n_reqs = 0 if ret is None else len(ret.reqs)
             queue = len(self.waiting_queue)
             running = len(self.running_batch.reqs) if self.running_batch else 0
             chunked = 1 if self.chunked_req is not None else 0
+            # The #1225 point: this request was ADMITTED and nothing is left
+            # chunked, i.e. its LAST prefill chunk just went in.
+            _1223_last_chunk = ret is not None and chunked == 0
 
             # #788: drop the VACUOUS verdicts, keep every informative one.
             # Boot instr11 ran this instrument for three hours against an
@@ -10056,6 +10068,20 @@ class Scheduler(
                 "#788 PP-ADMISSION trace unavailable: %s: %s",
                 type(e).__name__,
                 e,
+            )
+        # #1225 INJECT-1, OUTSIDE the swallowing except above (see the comment
+        # where the flag is set). Local import so this stays cherry-pickable
+        # onto every slice tip. No-op unless SGLANG_DEBUG_HOLD_INJECT=last_chunk
+        # AND SGLANG_DEBUG_HOLD=1; SGLANG_DEBUG_HOLD_INJECT_RANK picks ONE
+        # follower so the other ranks stay free for their own later holds.
+        if _1223_last_chunk:
+            from sglang.srt.managers import debug_hold as _1223_dh
+
+            _1223_dh.maybe_inject(
+                "last_chunk",
+                self,
+                pp_rank=getattr(self.ps, "pp_rank", None),
+                tp_rank=getattr(self.ps, "tp_rank", None),
             )
 
     def _drain_prefetch_progress(self) -> Dict[str, bool]:
@@ -16905,10 +16931,34 @@ def run_scheduler_process(
             _fr.dump_trace("scheduler_exception", rank=tp_rank)
         except Exception:  # noqa: BLE001 - diagnostics may not mask the death
             logger.warning("#1054: could not dump the allocation snapshot")
-        parent_process.send_signal(signal.SIGQUIT)
+        # #1223: IN HOLD MODE THIS RANK NEVER SIGNALS THE GROUP DOWN.
+        # Measured (weg1holdg1 run 1): two ranks failed to bind their debug
+        # port, did not hold, and reached exactly this line -- the SIGQUIT then
+        # tore down the third rank, which was holding correctly 67 s in, and
+        # the operator lost every rank including the healthy hold. On a debug
+        # boot the peers are the evidence: a rank that is finished holding
+        # exits quietly and leaves the others inspectable. The operator ends
+        # the boot; the dying rank does not. Off-path is untouched -- with the
+        # flag unset `hold_enabled()` is False and the SIGQUIT goes as before.
+        _1223_hold_on = False
+        try:
+            from sglang.srt.managers import debug_hold as _1223
+
+            _1223_hold_on = _1223.hold_enabled()
+        except Exception:  # noqa: BLE001 - diagnostics may not mask the death
+            _1223_hold_on = False
+        if _1223_hold_on:
+            logger.error(
+                "#1223 DEBUG-HOLD: SUPPRESSING the SIGQUIT to the parent and the "
+                "killpg on this rank -- a debug boot must not let one rank's "
+                "death end the peers the operator is still inspecting. This "
+                "process now exits alone; tear the boot down yourself when done."
+            )
+        else:
+            parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
-        if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
+        if not _1223_hold_on and envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
             try:
                 # A process group is inherited, so it is only ours if nothing
                 # else joined it. Two servers launched from the same shell share

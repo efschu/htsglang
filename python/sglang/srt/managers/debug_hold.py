@@ -57,6 +57,7 @@ HOLD_ENV = "SGLANG_DEBUG_HOLD"
 HOLD_S_ENV = "SGLANG_DEBUG_HOLD_S"
 HOLD_PORT_BASE_ENV = "SGLANG_DEBUG_HOLD_PORT_BASE"
 HOLD_INJECT_ENV = "SGLANG_DEBUG_HOLD_INJECT"
+HOLD_INJECT_RANK_ENV = "SGLANG_DEBUG_HOLD_INJECT_RANK"
 HOLD_DIR_ENV = "SGLANG_DEBUG_HOLD_DIR"
 TAG_ENV = "SGLANG_DEBUG_HOLD_TAG"
 
@@ -104,30 +105,65 @@ def _port_base() -> int:
         return DEFAULT_PORT_BASE
 
 
-def resolve_rank(scheduler, fallback_pp=None, fallback_tp=None) -> int:
-    """The rank this hold is for, read the way the Scheduler actually stores it.
+def resolve_rank_and_source(scheduler, fallback_pp=None, fallback_tp=None):
+    """(rank, source) -- PROCESS IDENTITY, not the active phase's topology.
 
-    ``scheduler.pp_rank`` DOES NOT EXIST -- the Scheduler keeps its ranks on
-    the ParallelState namespace (``scheduler.ps.pp_rank`` /
-    ``scheduler.ps.tp_rank``). Commit ba2e88fe is the precedent: a debug
-    instrument read the flat attribute, got ``rank=-1`` on every line, and the
-    three ranks' dumps were indistinguishable in a merged log. Under this
-    topology (pp_size=3, tp_size=1) the PP rank is the one that separates the
-    three processes, so it is read first.
+    MEASURED DEFECT, weg1holdg1 run 1 (2026-09-06). The first version read
+    ``scheduler.ps.pp_rank`` first. All three ranks resolved to 0, all three
+    went for port 5000, two lost the bind and did not hold, and their normal
+    death path took the one rank that WAS holding down with it.
 
-    ``scheduler`` is ``None`` whenever the exception fired before the Scheduler
-    was built, which is exactly the early-boot case; the caller's own
-    ``pp_rank``/``tp_rank`` locals carry the answer then.
+    THE CAUSE IS NOT IN THIS FILE, and that is why it has to be written down
+    here. ``scheduler.ps`` IS PHASE STATE, NOT PROCESS IDENTITY: on a flip
+    boot the cutover rebinds it at
+    ``phase_flip_runtime.py:3329`` (step 3, "Scheduler topology snapshot")::
+
+        scheduler.ps = _dc.replace(boot_ps, tp_rank=world_rank, tp_size=n,
+                                   pp_rank=0, pp_size=1, ...)
+
+    ``pp_rank=0`` is hardcoded there, on EVERY rank, because in the TP phase
+    there is no PP axis. Run 1's wall (``ReqPoolRebindRefused``) was raised
+    later inside that same ``_cutover``, so by then ``ps.pp_rank`` was 0 on
+    all three ranks -- a correct read of the wrong authority. Run 2's wall
+    (a #924 pool-leak check) was NOT inside a cutover, ``ps`` was still
+    ``boot_ps``, and the identical code resolved 0/1/2 correctly. That is the
+    whole difference between the two runs.
+
+    COROLLARY, recorded so it is not re-learned: the boot driver's local patch
+    (order ``ps.pp_rank`` -> caller pp -> ``ps.tp_rank`` -> caller tp) does NOT
+    fix this. ``ps.pp_rank`` still answers 0 first at a cutover wall, so that
+    order collapses exactly as run 1 did; it passed run 2 only because run 2's
+    wall was outside a cutover.
+
+    THE AUTHORITY IS THE CALLER'S PARAMETER. ``run_scheduler_process``'s own
+    ``pp_rank``/``tp_rank`` arguments are bound once at process start and are
+    never reassigned (verified over the whole function body), so they are
+    phase-independent by construction -- which is exactly what a port number
+    and a dump filename need. ``ps`` is consulted only when the caller could
+    not supply one, which is no longer possible from the scheduler hook but
+    remains true for any other caller.
+
+    (ba2e88fe -- "read tp_rank from Scheduler.ps, not the flat attribute" --
+    is still correct about ``scheduler.pp_rank`` not existing. It was measured
+    on a TP boot, where ``ps`` is not rebound. It is not an identity rule for
+    a flip boot, and citing it as one was the error.)
     """
     ps = getattr(scheduler, "ps", None)
-    for attr in ("pp_rank", "tp_rank"):
-        value = getattr(ps, attr, None)
-        if isinstance(value, int):
-            return value
-    for value in (fallback_pp, fallback_tp):
-        if isinstance(value, int):
-            return value
-    return 0
+    candidates = (
+        ("caller.pp_rank", fallback_pp),
+        ("caller.tp_rank", fallback_tp),
+        ("ps.pp_rank", getattr(ps, "pp_rank", None)),
+        ("ps.tp_rank", getattr(ps, "tp_rank", None)),
+    )
+    for source, value in candidates:
+        # bool is an int subclass and would silently pass as rank 0/1.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value, source
+    return 0, "default"
+
+
+def resolve_rank(scheduler, fallback_pp=None, fallback_tp=None) -> int:
+    return resolve_rank_and_source(scheduler, fallback_pp, fallback_tp)[0]
 
 
 def _summarise(value) -> str:
@@ -233,17 +269,59 @@ def write_dump(exc: BaseException, rank: int, path: str) -> str:
     return path
 
 
-def dump_path_for(rank: int) -> str:
+def dump_path_for(rank: int, port=None) -> str:
+    """A name that cannot collide between two ranks of the same boot.
+
+    MEASURED (weg1holdg1 run 1): with only ``<TAG>_rank<N>_<UTC-seconds>`` two
+    ranks that resolved the same N in the same second produced the SAME path,
+    and PP2's dump silently overwrote PP1's -- the evidence from one of the
+    three ranks was destroyed by the tool that exists to preserve it. The pid
+    makes it unique per process even when the rank resolution is wrong again,
+    which is the case that matters: a naming scheme must not depend on the
+    correctness of the thing it is naming.
+    """
     import datetime
 
-    tag = os.environ.get(TAG_ENV) or f"pid{os.getpid()}"
+    tag = os.environ.get(TAG_ENV) or "hold"
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     directory = os.environ.get(HOLD_DIR_ENV) or DEFAULT_DUMP_DIR
-    return os.path.join(directory, f"{tag}_rank{rank}_{stamp}.txt")
+    port_part = f"port{port}" if port is not None else "portnone"
+    return os.path.join(
+        directory,
+        f"{tag}_rank{rank}_pid{os.getpid()}_{port_part}_{stamp}.txt",
+    )
 
 
-def _serve_pdb(sock, exc: BaseException) -> None:
-    """One pdb console on one accepted connection, over the socket.
+def _make_hold_pdb(conn_in, conn_out):
+    """A pdb whose EXIT REASON is recoverable by the caller.
+
+    MEASURED (weg1holdg1 run 1/2): the first version left the accept loop
+    whenever ``interaction`` returned, and it returns on ``q``, on ``c`` AND on
+    EOF alike. A scripted ``printf '...' | nc`` therefore released the rank the
+    instant the pipe closed, which is the normal way to script an attach; the
+    boot driver had to work around it with a FIFO-backed connection. A
+    disconnect is not a decision -- only an explicit ``q``/``quit`` is.
+    """
+    import pdb
+
+    class _HoldPdb(pdb.Pdb):
+        release_requested = False
+
+        def do_quit(self, arg):
+            self.release_requested = True
+            return super().do_quit(arg)
+
+        do_q = do_quit
+        do_exit = do_quit
+
+    debugger = _HoldPdb(stdin=conn_in, stdout=conn_out)
+    debugger.use_rawinput = False
+    debugger.prompt = "(hold-pdb) "
+    return debugger
+
+
+def _serve_pdb(sock, exc: BaseException) -> bool:
+    """One pdb console on one accepted connection. True iff ``q`` was typed.
 
     ``pdb.Pdb(stdin=..., stdout=...)`` is the stdlib way to put a console on a
     file-like object; this venv is Python 3.12, which has no ``pdb -p``
@@ -252,21 +330,19 @@ def _serve_pdb(sock, exc: BaseException) -> None:
     frame that raised, so ``w`` / ``up`` / ``down`` walk the real stack rather
     than this helper's.
     """
-    import pdb
-
     conn_in = sock.makefile("r")
     conn_out = sock.makefile("w")
     try:
-        debugger = pdb.Pdb(stdin=conn_in, stdout=conn_out)
-        debugger.use_rawinput = False
-        debugger.prompt = "(hold-pdb) "
+        debugger = _make_hold_pdb(conn_in, conn_out)
         conn_out.write(
             f"{MARKER}: post-mortem console on {type(exc).__name__}: {exc}\n"
-            "  w / up / down / l / p <expr> / pp <expr> ; q releases the hold\n"
+            "  w / up / down / l / p <expr> / pp <expr>\n"
+            "  ONLY q (or quit) releases this rank; disconnecting keeps it held.\n"
         )
         conn_out.flush()
         debugger.reset()
         debugger.interaction(None, exc.__traceback__)
+        return bool(debugger.release_requested)
     finally:
         for handle in (conn_in, conn_out):
             try:
@@ -295,45 +371,86 @@ def _hold(exc: BaseException, scheduler, pp_rank, tp_rank) -> bool:
     import time
 
     logger = logging.getLogger(__name__)
-    rank = resolve_rank(scheduler, pp_rank, tp_rank)
+    rank, rank_source = resolve_rank_and_source(scheduler, pp_rank, tp_rank)
     hold_s = _hold_seconds()
-    port = _port_base() + rank
+    wanted_port = _port_base() + rank
+
+    # BIND FIRST, DUMP SECOND -- the dump filename carries the real port, and
+    # the real port is only known after the bind (it may be ephemeral).
+    #
+    # A BIND FAILURE MUST NEVER COST THE HOLD (measured, weg1holdg1 run 1): two
+    # ranks lost the race for port 5000, returned False, and fell through to
+    # the normal death path -- whose SIGQUIT to the parent then tore down the
+    # third rank, which was holding correctly 67 s in. The operator lost all
+    # three. A port collision is a naming problem; it is not a reason to
+    # destroy the state the operator came for. So: fall back to an ephemeral
+    # port and hold anyway, and say loudly which port that turned out to be.
+    listener = None
+    port = None
+    for attempt_port in (wanted_port, 0):
+        try:
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # 127.0.0.1 ONLY. This is an unauthenticated Python console on a
+            # process holding the model; it must never be reachable off-box.
+            listener.bind(("127.0.0.1", attempt_port))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            if attempt_port == 0:
+                logger.error(
+                    "%s rank=%d could not bind its assigned port %d -- HOLDING "
+                    "ANYWAY on EPHEMERAL port %d. Attach there: nc 127.0.0.1 %d",
+                    MARKER,
+                    rank,
+                    wanted_port,
+                    port,
+                    port,
+                )
+            break
+        except Exception as bind_exc:  # noqa: BLE001
+            if listener is not None:
+                try:
+                    listener.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                listener = None
+            logger.warning(
+                "%s rank=%d bind on port %d failed (%s: %s)",
+                MARKER,
+                rank,
+                attempt_port,
+                type(bind_exc).__name__,
+                bind_exc,
+            )
 
     try:
-        path = write_dump(exc, rank, dump_path_for(rank))
+        path = write_dump(exc, rank, dump_path_for(rank, port))
     except Exception as dump_exc:  # noqa: BLE001 - the hold matters more
         path = f"<dump failed: {type(dump_exc).__name__}: {dump_exc}>"
 
-    listener = None
-    try:
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # 127.0.0.1 ONLY. This is an unauthenticated Python console on a
-        # process holding the model; it must never be reachable off-box.
-        listener.bind(("127.0.0.1", port))
-        listener.listen(1)
-    except Exception as bind_exc:  # noqa: BLE001
+    if listener is None:
+        # Even with no port at all the dump is written and we still WAIT, so
+        # the peers that did get a port are not torn down by this rank racing
+        # ahead into the death path.
         logger.error(
-            "%s rank=%d could not open the debug port %d (%s: %s) -- NOT holding, "
-            "the rank dies as it would without the flag; dump: %s",
+            "%s rank=%d holding on %s: %s — NO PORT (both the assigned port %d "
+            "and an ephemeral port failed to bind); dump: %s ; hold ends in %.0f s",
             MARKER,
             rank,
-            port,
-            type(bind_exc).__name__,
-            bind_exc,
+            type(exc).__name__,
+            str(exc)[:120],
+            wanted_port,
             path,
+            hold_s,
         )
-        if listener is not None:
-            try:
-                listener.close()
-            except Exception:  # noqa: BLE001
-                pass
-        return False
+        time.sleep(hold_s)
+        logger.error("%s rank=%d released: timeout (never had a port)", MARKER, rank)
+        return True
 
     message = str(exc)[:120]
     logger.error(
         "%s rank=%d holding on %s: %s — attach: nc 127.0.0.1 %d ; dump: %s ; "
-        "hold ends in %.0f s",
+        "hold ends in %.0f s (rank source: %s; pid %d)",
         MARKER,
         rank,
         type(exc).__name__,
@@ -341,6 +458,8 @@ def _hold(exc: BaseException, scheduler, pp_rank, tp_rank) -> bool:
         port,
         path,
         hold_s,
+        rank_source,
+        os.getpid(),
     )
 
     deadline = time.monotonic() + hold_s
@@ -363,22 +482,29 @@ def _hold(exc: BaseException, scheduler, pp_rank, tp_rank) -> bool:
                 break
             attached = True
             try:
-                _serve_pdb(conn, exc)
-                # A pdb session that returns normally ended with q / c / EOF.
-                # None of the three can resume the event loop (it is already
-                # unwound), so all three mean the same thing here: release.
-                outcome = "quit"
-                break
+                # ONLY an explicit q/quit ends the hold. A closed pipe is not a
+                # decision: `printf 'w\np x\n' | nc` is the normal way to script
+                # an attach, and treating its EOF as "released" ended the hold
+                # after one scripted block (measured, weg1holdg1). We loop back
+                # to accept() instead, so the operator can attach again.
+                if _serve_pdb(conn, exc):
+                    outcome = "quit"
+                    break
+                logger.warning(
+                    "%s rank=%d session ended without q -- STILL HOLDING, "
+                    "attach again on port %d",
+                    MARKER,
+                    rank,
+                    port,
+                )
             except Exception as session_exc:  # noqa: BLE001
                 logger.warning(
-                    "%s rank=%d pdb session ended abnormally (%s: %s)",
+                    "%s rank=%d pdb session ended abnormally (%s: %s) -- still holding",
                     MARKER,
                     rank,
                     type(session_exc).__name__,
                     session_exc,
                 )
-                outcome = "attached"
-                break
             finally:
                 try:
                     conn.close()
@@ -396,14 +522,43 @@ def _hold(exc: BaseException, scheduler, pp_rank, tp_rank) -> bool:
     return True
 
 
-def maybe_inject(marker: str) -> None:
-    """Raise the injected wall at a named phase point, for the metal proof.
+#: The inject sites this build knows. Named here so a typo in the env is a
+#: loud refusal at the first site reached rather than a boot that quietly
+#: never holds -- an absent wall and a misspelled marker look identical
+#: otherwise, and that is a whole wasted window.
+KNOWN_INJECT_MARKERS = ("cutover", "last_chunk", "abandon")
+
+
+def inject_rank_filter():
+    """Which rank the inject is for, or None for every rank.
+
+    #1225 INJECT-1 needs ONE follower held at its last prefill chunk while the
+    other two ranks stay free -- they have to reach their own, later holds for
+    the cross-rank diff the analysis is built on. Holding all three at the
+    first site would destroy exactly the comparison the boot exists to make.
+    """
+    raw = os.environ.get(HOLD_INJECT_RANK_ENV)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def maybe_inject(marker: str, scheduler=None, pp_rank=None, tp_rank=None) -> None:
+    """Raise the injected wall at a named phase point.
 
     REFUSES WITHOUT THE HOLD FLAG. An inject env that fires on a boot with no
     hold behind it is a boot-killer wearing a debug label: it would take the
     group down and leave nothing to attach to. The refusal is loud, not
     silent, so a mistyped launcher does not read as "the inject site was never
     reached".
+
+    CALLERS MUST PLACE THIS OUTSIDE ANY `except Exception` THAT SWALLOWS.
+    Two of the three sites sit next to instrument guards whose whole job is to
+    never let a diagnostic kill the scheduler; a `raise` inside one of those is
+    eaten and the wall silently never happens. See the #788 admission site.
     """
     wanted = os.environ.get(HOLD_INJECT_ENV)
     if not wanted or wanted != marker:
@@ -421,4 +576,9 @@ def maybe_inject(marker: str) -> None:
             HOLD_ENV,
         )
         return
+    only = inject_rank_filter()
+    if only is not None:
+        rank, _source = resolve_rank_and_source(scheduler, pp_rank, tp_rank)
+        if rank != only:
+            return
     raise RuntimeError(f"{INJECT_MESSAGE} (marker={marker})")

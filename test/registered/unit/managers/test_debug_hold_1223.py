@@ -84,6 +84,7 @@ def _clean_env(monkeypatch, tmp_path):
         debug_hold.HOLD_S_ENV,
         debug_hold.HOLD_PORT_BASE_ENV,
         debug_hold.HOLD_INJECT_ENV,
+        debug_hold.HOLD_INJECT_RANK_ENV,
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(debug_hold.HOLD_DIR_ENV, str(tmp_path))
@@ -236,9 +237,80 @@ class _Sched:
         self.ps = ps
 
 
-def test_rank_comes_from_ps_pp_rank_first_then_ps_tp_rank():
+def test_rank_comes_from_ps_when_the_caller_supplied_nothing():
     assert debug_hold.resolve_rank(_Sched(_PS(pp_rank=2, tp_rank=0))) == 2
     assert debug_hold.resolve_rank(_Sched(_PS(tp_rank=1))) == 1
+
+
+# --- (1) the run-1 defect, as a regression test ----------------------------
+
+
+def test_cutover_rebound_ps_must_not_override_the_callers_pp_rank():
+    """THE weg1holdg1 RUN-1 WALL, reproduced exactly.
+
+    During a pp->tp cutover, phase_flip_runtime.py:3329 rebinds
+    `scheduler.ps = replace(boot_ps, tp_rank=world_rank, pp_rank=0, pp_size=1)`
+    -- pp_rank is hardcoded 0 on EVERY rank. A wall raised later inside that
+    same _cutover (run 1: ReqPoolRebindRefused) therefore sees ps.pp_rank == 0
+    on all three ranks. Reading ps first collapsed all three to rank 0, all
+    three raced for port 5000, and two lost and died.
+    """
+    for world_rank, caller_pp in ((0, 0), (1, 1), (2, 2)):
+        cutover_ps = _PS(pp_rank=0, pp_size=1, tp_rank=world_rank, tp_size=3)
+        rank, source = debug_hold.resolve_rank_and_source(
+            _Sched(cutover_ps), caller_pp, 0
+        )
+        assert rank == caller_pp, (
+            f"rank collapsed to {rank} for PP{caller_pp} -- this is run 1"
+        )
+        assert source == "caller.pp_rank"
+
+    # And the ports must therefore be distinct, which is the property that
+    # actually failed on the metal.
+    ranks = {
+        debug_hold.resolve_rank(
+            _Sched(_PS(pp_rank=0, pp_size=1, tp_rank=w, tp_size=3)), w, 0
+        )
+        for w in range(3)
+    }
+    assert ranks == {0, 1, 2}
+
+
+def test_the_boot_drivers_local_patch_order_would_still_collapse():
+    """Recorded so the rejected fix is not re-proposed: the driver's order
+    (ps.pp_rank -> caller pp -> ps.tp_rank -> caller tp) still lets ps.pp_rank
+    answer 0 first at a cutover wall. It passed run 2 only because run 2's wall
+    was outside a cutover."""
+
+    def driver_order(ps, caller_pp, caller_tp):
+        for v in (
+            getattr(ps, "pp_rank", None),
+            caller_pp,
+            getattr(ps, "tp_rank", None),
+            caller_tp,
+        ):
+            if isinstance(v, int):
+                return v
+        return 0
+
+    cutover_ps = _PS(pp_rank=0, pp_size=1, tp_rank=1, tp_size=3)
+    assert driver_order(cutover_ps, 1, 0) == 0  # the defect, still present
+    assert debug_hold.resolve_rank(_Sched(cutover_ps), 1, 0) == 1  # ours is fixed
+
+
+def test_rank_source_is_reported():
+    assert debug_hold.resolve_rank_and_source(None, 2, 0)[1] == "caller.pp_rank"
+    assert debug_hold.resolve_rank_and_source(None, None, 1)[1] == "caller.tp_rank"
+    assert (
+        debug_hold.resolve_rank_and_source(_Sched(_PS(pp_rank=2)), None, None)[1]
+        == "ps.pp_rank"
+    )
+    assert debug_hold.resolve_rank_and_source(None, None, None) == (0, "default")
+
+
+def test_a_bool_is_not_a_rank():
+    """bool is an int subclass; True would silently pass as rank 1."""
+    assert debug_hold.resolve_rank_and_source(None, True, 2) == (2, "caller.tp_rank")
 
 
 def test_rank_never_reads_the_flat_scheduler_attribute():
@@ -259,6 +331,156 @@ def test_rank_never_reads_the_flat_scheduler_attribute():
 def test_rank_falls_back_to_the_callers_locals_when_scheduler_is_none():
     assert debug_hold.resolve_rank(None, 2, 0) == 2
     assert debug_hold.resolve_rank(None, None, 1) == 1
+
+
+# --- (2) a bind failure must never cost the hold ---------------------------
+
+
+def test_port_collision_falls_back_to_an_ephemeral_port_and_still_holds(monkeypatch):
+    """weg1holdg1 run 1: two ranks lost the race for port 5000, did NOT hold,
+    and their death path tore down the rank that was holding correctly."""
+    busy = socket.socket()
+    busy.bind(("127.0.0.1", 0))
+    busy.listen(1)
+    taken = busy.getsockname()[1]
+
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_PORT_BASE_ENV, str(taken))
+    monkeypatch.setenv(debug_hold.HOLD_S_ENV, "20")
+    exc = _make_exception()
+
+    bound = []
+    real_bind = socket.socket.bind
+
+    def spy_bind(self, address):
+        real_bind(self, address)
+        bound.append(self.getsockname())
+
+    monkeypatch.setattr(socket.socket, "bind", spy_bind)
+
+    result = {}
+
+    def run():
+        result["held"] = debug_hold.maybe_hold(exc, scheduler=None, pp_rank=0)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    time.sleep(2)
+    # It must have bound SOMETHING despite the collision, and not the busy port.
+    assert bound, "no successful bind at all"
+    actual_port = bound[-1][1]
+    assert actual_port != taken
+    transcript = _attach(actual_port, "p inner_only_local\nq\n")
+    thread.join(timeout=30)
+    busy.close()
+
+    assert result["held"] is True, "a port collision must not cancel the hold"
+    assert "INNER_MARKER" in transcript
+
+
+def test_hold_mode_suppresses_the_sigquit_in_the_scheduler_except():
+    """The other half of run 1's damage: a non-holding rank reaching the normal
+    death path SIGQUITs the parent, which ends the peers that ARE held.
+
+    Pins the guard's shape in the source rather than booting a scheduler."""
+    import pathlib
+
+    src = pathlib.Path(debug_hold.__file__).parent / "scheduler.py"
+    text = src.read_text()
+    idx = text.index("parent_process.send_signal(signal.SIGQUIT)", text.index("#1223"))
+    window = text[idx - 2000 : idx + 400]
+    assert "_1223_hold_on" in window, "the SIGQUIT is not guarded by the hold flag"
+    assert "if _1223_hold_on:" in window
+    assert "else:\n            parent_process.send_signal(signal.SIGQUIT)" in window
+    assert "if not _1223_hold_on and envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION" in text
+
+
+# --- (3) the dump filename must not collide --------------------------------
+
+
+def test_dump_filenames_of_two_ranks_in_the_same_second_differ(monkeypatch, tmp_path):
+    """weg1holdg1 run 1: PP2's dump silently OVERWROTE PP1's, because both
+    resolved rank 0 in the same second. The name must be unique even when the
+    rank resolution is wrong -- that is precisely the case that matters."""
+    monkeypatch.setenv(debug_hold.HOLD_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(debug_hold.TAG_ENV, "weg1holdg1")
+
+    real_pid = os.getpid()
+    a = debug_hold.dump_path_for(0, port=5000)
+    # A second PROCESS, same (wrongly resolved) rank, same second.
+    monkeypatch.setattr(os, "getpid", lambda: real_pid + 1)
+    b = debug_hold.dump_path_for(0, port=5000)
+    assert a != b, "two processes, same rank, same second -> same file"
+    assert f"pid{real_pid}" in a
+    assert f"pid{real_pid + 1}" in b
+    assert "port5000" in a
+
+
+def test_dump_filename_carries_pid_and_port(monkeypatch, tmp_path):
+    monkeypatch.setenv(debug_hold.HOLD_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(debug_hold.TAG_ENV, "weg1hold1223")
+    name = os.path.basename(debug_hold.dump_path_for(2, port=5002))
+    assert name.startswith("weg1hold1223_rank2_")
+    assert f"_pid{os.getpid()}_" in name
+    assert "_port5002_" in name
+    assert name.endswith(".txt")
+
+
+# --- (4) sessions: only q releases; EOF keeps holding ----------------------
+
+
+def test_disconnect_without_q_keeps_the_rank_held(monkeypatch):
+    """A scripted `printf 'w\\np x\\n' | nc` closes the pipe when it is done.
+    That EOF used to release the rank after ONE block, which is why the boot
+    driver needed a FIFO. A disconnect is not a decision."""
+    port_base = _free_port()
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_PORT_BASE_ENV, str(port_base))
+    monkeypatch.setenv(debug_hold.HOLD_S_ENV, "45")
+    exc = _make_exception()
+
+    result = {}
+
+    def run():
+        result["held"] = debug_hold.maybe_hold(exc, scheduler=None, pp_rank=0)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+    # Session 1: no q, just a query and a disconnect.
+    first = _attach(port_base, "p inner_only_local\n")
+    assert "INNER_MARKER" in first
+    thread.join(timeout=5)
+    assert thread.is_alive(), "EOF released the hold -- it must keep holding"
+
+    # Session 2 proves it is still accepting, and q ends it.
+    second = _attach(port_base, "up\np outer_marker\nq\n")
+    assert "OUTER_MARKER" in second
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "q did not release the hold"
+    assert result["held"] is True
+
+
+def test_scripted_one_shot_attach_pattern_works_repeatedly(monkeypatch):
+    """The documented scripted pattern: several independent piped sessions,
+    then a final one carrying q."""
+    port_base = _free_port()
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_PORT_BASE_ENV, str(port_base))
+    monkeypatch.setenv(debug_hold.HOLD_S_ENV, "60")
+    exc = _make_exception()
+
+    thread = threading.Thread(
+        target=lambda: debug_hold.maybe_hold(exc, scheduler=None, pp_rank=0),
+        daemon=True,
+    )
+    thread.start()
+    for _ in range(3):
+        assert "INNER_MARKER" in _attach(port_base, "p inner_only_local\n")
+        assert thread.is_alive()
+    _attach(port_base, "q\n")
+    thread.join(timeout=30)
+    assert not thread.is_alive()
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +547,86 @@ def test_inject_is_a_noop_with_no_env():
     debug_hold.maybe_inject("cutover")
 
 
+# --- #1225: the two new inject markers -------------------------------------
+
+
+@pytest.mark.parametrize("marker", ["cutover", "last_chunk", "abandon"])
+def test_each_marker_fires_only_for_itself(monkeypatch, marker):
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, marker)
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject(marker, pp_rank=1)
+    for other in debug_hold.KNOWN_INJECT_MARKERS:
+        if other != marker:
+            debug_hold.maybe_inject(other, pp_rank=1)  # must not raise
+
+
+@pytest.mark.parametrize("marker", ["last_chunk", "abandon"])
+def test_new_markers_refuse_without_the_hold_flag(monkeypatch, marker):
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, marker)
+    debug_hold.maybe_inject(marker, pp_rank=1)  # must NOT raise
+
+
+def test_inject_rank_filter_selects_one_follower(monkeypatch):
+    """#1225 INJECT-1 must hold ONE follower and leave the others running --
+    the analysis is a cross-rank diff, so holding all three at the first site
+    would destroy the comparison the boot exists to make."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "last_chunk")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_RANK_ENV, "1")
+
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject("last_chunk", pp_rank=1)
+    for free_rank in (0, 2):
+        debug_hold.maybe_inject("last_chunk", pp_rank=free_rank)  # must not raise
+
+
+def test_inject_rank_unset_means_every_rank(monkeypatch):
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+    monkeypatch.delenv(debug_hold.HOLD_INJECT_RANK_ENV, raising=False)
+    for rank in (0, 1, 2):
+        with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+            debug_hold.maybe_inject("abandon", pp_rank=rank)
+
+
+def test_inject_rank_filter_uses_the_boot_rank_not_the_rebound_ps(monkeypatch):
+    """The filter must not be fooled by the cutover's ps rebind either: with
+    ps.pp_rank == 0 on every rank, a filter reading ps would hold rank 0 and
+    silently never fire for the follower that was asked for."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_RANK_ENV, "2")
+    cutover_ps = _PS(pp_rank=0, pp_size=1, tp_rank=2, tp_size=3)
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject("abandon", _Sched(cutover_ps), pp_rank=2)
+
+
+def test_inject_sites_are_wired_at_the_named_places():
+    """Delivery is code presence PLUS a caller: pin that both sites exist and,
+    for INJECT-1, that it sits OUTSIDE the instrument's swallowing except --
+    a raise inside it is eaten and the wall silently never happens."""
+    import pathlib
+
+    mgr = pathlib.Path(debug_hold.__file__).parent
+    pfr = (mgr / "phase_flip_runtime.py").read_text()
+    sched = (mgr / "scheduler.py").read_text()
+
+    # INJECT-2 at the abandon branch ENTRY, before the ledger clear.
+    entry = pfr.index("if reduced_fit[0] == 0 or not frames_agree:")
+    clear = pfr.index("self._armed_residents = {}  # #1202: and so is the ledger")
+    inject2 = pfr.index('maybe_inject("abandon"', entry)
+    assert entry < inject2 < clear, "INJECT-2 is not before the ledger clear"
+
+    # INJECT-1 outside the swallowing except of _trace_pp_admission_verdict.
+    swallow = sched.index('"#788 PP-ADMISSION trace unavailable: %s: %s"')
+    inject1 = sched.index('maybe_inject(\n                "last_chunk"')
+    assert inject1 > swallow, "INJECT-1 is inside the except that swallows it"
+    assert "_1223_last_chunk = ret is not None and chunked == 0" in sched
+
+    assert 'maybe_inject("cutover", pp_rank=world_rank)' in pfr
+
+
 # ---------------------------------------------------------------------------
 # CAN-FAIL PROOFS -- one per direction. These assert that the two tests above
 # that carry the load would actually go red against a broken helper, rather
@@ -333,7 +635,12 @@ def test_inject_is_a_noop_with_no_env():
 
 
 def test_canfail_helper_that_never_opens_the_port_fails_the_socket_test(monkeypatch):
-    """Direction 1: no port -> the attach test must fail, not hang forever."""
+    """Direction 1: no port -> every attach test must FAIL rather than hang.
+
+    Note the contract change from the pre-metal version: a helper that cannot
+    bind now still HOLDS (run 1 proved that returning early kills the peers),
+    so the can-fail is about the ATTACH being impossible, not about the return
+    value."""
     port_base = _free_port()
     monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
     monkeypatch.setenv(debug_hold.HOLD_PORT_BASE_ENV, str(port_base))
@@ -343,9 +650,12 @@ def test_canfail_helper_that_never_opens_the_port_fails_the_socket_test(monkeypa
         raise OSError("simulated: this helper never opens the port")
 
     monkeypatch.setattr(socket.socket, "bind", deaf_bind)
-    # The helper reports honestly instead of pretending to hold ...
-    assert debug_hold.maybe_hold(_make_exception(), scheduler=None, pp_rank=0) is False
-    # ... and the attach the real test performs cannot succeed.
+    started = time.monotonic()
+    # It still holds (the peers must survive) ...
+    assert debug_hold.maybe_hold(_make_exception(), scheduler=None, pp_rank=0) is True
+    # ... for the full deadline, and then returns on its own.
+    assert 2 < time.monotonic() - started < 25
+    # ... and the attach that every socket test performs cannot succeed.
     with pytest.raises(AssertionError, match="never accepted a connection"):
         _attach(port_base + 0, "q\n", timeout=2)
 
@@ -403,7 +713,7 @@ def test_canfail_dump_that_prints_tensors_fails_the_dump_test(tmp_path, monkeypa
     assert "<tensor shape=" not in text
 
 
-def test_dump_path_layout(monkeypatch, tmp_path):
+def test_dump_path_layout_legacy(monkeypatch, tmp_path):
     monkeypatch.setenv(debug_hold.HOLD_DIR_ENV, str(tmp_path))
     monkeypatch.setenv(debug_hold.TAG_ENV, "weg1hold1223")
     path = debug_hold.dump_path_for(2)
