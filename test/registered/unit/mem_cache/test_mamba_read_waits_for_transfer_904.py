@@ -14,15 +14,16 @@ cache is ``UnifiedRadixCache`` (``registry.py:107-110`` states outright that
   * ``full_layer_mapping = hybrid_kv.full_attention_layer_id_mapping`` and
     ``mamba_layer_mapping = req_to_token_pool.mamba_map`` -- both keyed by
     GLOBAL layer id (``hybrid_pool_assembler.py:1556-1558``).
-  * ``transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)``
-    (``:858``), i.e. the layer count of the WHOLE model.
+  * the transfer domain is ``HostPoolGroup.transfer_layer_domain``,
+    ``1 + max(key)`` over the entries' own GLOBAL keys (#1206). It replaced a
+    boot-frozen COUNT, which on a stage whose keys start above that count
+    bounded every one of them away.
   * ``HybridCacheController.start_loading`` then runs
-    ``for i in range(self.layer_num)`` over exactly that frame and calls
-    ``producer_event.complete(i)`` after each step
-    (``hybrid_cache_controller.py:636-660``). ``_make_layer_mapper``
-    (``hybrid_pool_assembler.py:43-52``) makes step ``i`` the step that
-    moves GLOBAL layer ``i`` -- so THE TRANSFER INDEX IS THE GLOBAL LAYER ID,
-    for the mamba entry exactly as for the KV entry.
+    ``for i in range(self.mem_pool_host.transfer_layer_domain)`` over exactly
+    that domain and calls ``producer_event.complete(i)`` after each step.
+    Each entry keeps its own GLOBAL-keyed mapping, so step ``i`` is the step
+    that moves GLOBAL layer ``i`` -- THE TRANSFER INDEX IS THE GLOBAL LAYER
+    ID, for the mamba entry exactly as for the KV entry.
 
 The copies ride ``load_stream``. The only join back to the compute stream is
 ``LayerLoadingEvent.wait`` -> ``current_stream().wait_event(load_events[idx])``

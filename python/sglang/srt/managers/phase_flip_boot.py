@@ -2170,8 +2170,10 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
     """#871: the KV+MAMBA entry pair for the 'tp' staging pin, or None.
 
     MIRRORS ``build_hybrid_mamba_stack`` (hybrid_pool_assembler.py) rather than
-    re-deriving it: same primitives, same layer mappings, same
-    ``transfer_layer_num`` rule. That assembler is the contract for what a
+    re-deriving it: same primitives, same layer mappings, and since #1206 no
+    layer COUNT at all -- the transfer domain is derived from the entries'
+    GLOBAL key space by ``HostPoolGroup.transfer_layer_domain``, so the pin
+    cannot carry a different opinion of it. That assembler is the contract for what a
     kv+mamba ``HostPoolGroup`` looks like, and a second hand-rolled opinion
     about it is exactly the drift #847 warned about when it refused to clone
     ``type(pp_host)``.
@@ -2239,8 +2241,6 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
             "collide with. Keeping the KV-only pin."
         )
         return None
-    transfer_layer_num = len(full_map | mamba_map)
-
     mamba_host = MambaPoolHost(
         mamba_pool,
         1.0,  # host_to_device_ratio: the fallback below the MiB knob
@@ -2257,7 +2257,6 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
             host_pool=kv_host,
             device_pool=inner_pool,
             layer_mapping=full_map,
-            transfer_layer_num=transfer_layer_num,
             is_anchor=True,
         ),
         build_pool_entry(
@@ -2265,7 +2264,6 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
             host_pool=mamba_host,
             device_pool=mamba_pool,
             layer_mapping=mamba_map,
-            transfer_layer_num=transfer_layer_num,
             device_alloc_fn=mamba_allocator.alloc,
             device_free_fn=mamba_allocator.free,
         ),
@@ -2511,16 +2509,15 @@ def build_phase_flip_host_pools(scheduler):
                 # Identity: this pool carries the TP phase's own layers,
                 # so transfer index i IS device layer i.
                 layer_mapping={i: i for i in range(layers)},
-                transfer_layer_num=layers,
                 is_anchor=True,
             )
         ]
         mamba_host = None
         if PoolName.MAMBA in _extra:
             # REBUILDS BOTH ENTRIES, and the reason is the transfer index.
-            # `build_hybrid_mamba_stack` sets `transfer_layer_num =
-            # len(full_layer_mapping | mamba_layer_mapping)` and gives each
-            # entry the pool's OWN mapping. The KV-only pin above uses an
+            # `build_hybrid_mamba_stack` gives each entry the pool's OWN
+            # GLOBAL-keyed mapping, which is what the domain is derived
+            # from (#1206). The KV-only pin above uses an
             # identity map over `range(layers)`, which is right while KV is the
             # only entry and wrong the moment a second pool shares the transfer
             # index space -- the two maps would collide at index 0. So the

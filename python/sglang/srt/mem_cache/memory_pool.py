@@ -1969,10 +1969,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         #904. Storing the counter is not the same as being able to wait on it:
         the threshold is an index into ONE producer's step sequence, and only
         the stack that actually moves mamba state has a step per mamba layer.
-        `mamba_transfer_frame` is that stack's `transfer_layer_num` -- the
-        controller's own `layer_num`, handed over by the assembler that built
-        both -- and `None` means "this counter has no mamba step", which is
-        the historic no-wait behaviour, unchanged.
+        `mamba_transfer_frame` is the PRESENCE test only: `None` means "this
+        counter has no mamba step", the historic no-wait behaviour, unchanged.
+        Since #1206 it is no longer the BOUND -- `_wait_for_mamba_layer` reads
+        the counter's own live width, because a value captured here is a
+        boot-frozen copy that the cutover's resize leaves behind.
         """
         self.layer_transfer_counter = layer_transfer_counter
         self._mamba_transfer_frame = mamba_transfer_frame
@@ -1981,22 +1982,31 @@ class HybridReqToTokenPool(ReqToTokenPool):
         """Join the load stream at the step that filled THIS mamba layer.
 
         #904. `HybridCacheController.start_loading` walks
-        `for i in range(transfer_layer_num)` and calls
+        `for i in range(HostPoolGroup.transfer_layer_domain)` and calls
         `producer_event.complete(i)` after step i's copies are enqueued on
-        `load_stream`; `_make_layer_mapper` makes step i the step that moves
-        GLOBAL layer i. So the threshold is the global layer id -- the same
-        frame the KV half waits in, NOT the mamba slot and NOT `local_slot`
-        (the KV pool's indexing half, which is what #752 crashed on).
+        `load_stream`; the entries are keyed by GLOBAL layer id, so step i is
+        the step that moves GLOBAL layer i.
 
-        Refuses rather than guesses outside the frame: a counter that has no
-        step for this layer cannot be waited on meaningfully, and indexing
-        past its events would raise inside a forward.
+        So the threshold is the global layer id -- the same frame the KV half
+        waits in, NOT the mamba slot and NOT `local_slot` (the KV pool's
+        indexing half, which is what #752 crashed on). THAT SENTENCE WAS FALSE
+        WHEN IT WAS FIRST WRITTEN and is true only since #1206 (2026-09-05):
+        `HybridLinearKVPool._wait_for_layer` waited on `self.local_slot(...)`,
+        two index spaces on one counter, and was moved to the global id in the
+        same change that widened this loop's domain.
+
+        Refuses rather than guesses outside the counter's own width: a counter
+        that has no step for this layer cannot be waited on meaningfully, and
+        indexing past its events would raise inside a forward. The BOUND is
+        the counter's live width, never a boot-frozen count -- with a frozen
+        18 on a stage whose GDN ids are 32..49 every recurrent read skipped
+        its join silently.
         """
         counter = self.layer_transfer_counter
         frame = self._mamba_transfer_frame
         if counter is None or frame is None:
             return
-        if not 0 <= layer_id < frame:
+        if not 0 <= layer_id < counter.num_layers:
             return
         counter.wait_until(layer_id)
 
@@ -5000,8 +5010,14 @@ class HybridLinearKVPool(KVCache):
         self.full_kv_pool.register_layer_transfer_counter(None)
 
     def _wait_for_layer(self, layer_id: int):
+        # #1206: the counter's threshold is the GLOBAL layer id, the frame the
+        # producer completes in and the frame the mamba half already waits in.
+        # HAZARD this closes: `local_slot(35) = 3` on a stage starting at 32,
+        # so this half joined the copy of a DIFFERENT layer -- one counter,
+        # two index spaces. `local_slot` stays the pool's own addressing
+        # translation for the buffer reads below; only the THRESHOLD moved.
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(self.local_slot(layer_id))
+            self.layer_transfer_counter.wait_until(layer_id)
 
     def get_key_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)

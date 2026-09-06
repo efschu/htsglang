@@ -19,9 +19,6 @@ from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
 )
 from sglang.srt.managers.cache_controller import (
-    LayerDoneCounter,
-)
-from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
 from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
@@ -41,6 +38,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+
+def _host_pool_covers_layer(host_pool, layer_id: int) -> bool:
+    """Does this host tier hold GLOBAL layer `layer_id`? Membership, not a count.
+
+    HAZARD this replaces (#1206): a COUNT compared against a GLOBAL layer id
+    skips every mapped id at or above the count and visits unmapped ids below
+    it. A COMPOSITE tier answers from its entries' own mappings; a plain tier's
+    key space is dense from 0, so `range(layer_num)` is that same membership
+    written out and the conversion is byte-identical there.
+    """
+    entries = getattr(host_pool, "entries", None)
+    if entries:
+        return any(layer_id in entry.layer_mapping for entry in entries)
+    return 0 <= layer_id < host_pool.layer_num
 
 
 class CacheOperation(BaseCacheOperation):
@@ -176,7 +188,6 @@ class HybridCacheController(BaseHiCacheController):
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
-        transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
     ):
         startup_storage_backend = storage_backend
@@ -198,11 +209,13 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
-        # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
-        # not just the full attention layers reported by full_kv_pool.
-        if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
-            self.layer_num = transfer_layer_num
-            self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        # #1206: the counter's index space IS the driven domain -- the
+        # entries' GLOBAL key space, read from the group. RESIZED in place,
+        # never replaced: `layer_done_counter` is registered into the device
+        # and req pools by the assembler, so a fresh object would be a rebind
+        # nobody enumerates. `self.layer_num` keeps the base's meaning (the
+        # device pool's own layer count) and is no longer a transfer domain.
+        self.layer_done_counter.resize(self.mem_pool_host.transfer_layer_domain)
 
         if startup_storage_backend is not None:
             self.attach_storage_backend(
@@ -667,7 +680,7 @@ class HybridCacheController(BaseHiCacheController):
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            for i in range(self.layer_num):
+            for i in range(self.mem_pool_host.transfer_layer_domain):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
                     kv_host_indices,
@@ -679,7 +692,7 @@ class HybridCacheController(BaseHiCacheController):
                 if (
                     self.draft_tier_armed("load")
                     and host_indices.numel() > 0
-                    and i < self.mem_pool_host_draft.layer_num
+                    and _host_pool_covers_layer(self.mem_pool_host_draft, i)
                 ):
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
@@ -1066,8 +1079,11 @@ class HybridCacheController(BaseHiCacheController):
                 # one recompute, which is merely slow.
                 #
                 # This is reachable because a phase rebind REPLACES
-                # `mem_pool_host` (hicache_phase_binding._stamp), and the TP
-                # tier built at phase_flip_boot.py:2019-2032 carries KV alone.
+                # `mem_pool_host` (hicache_phase_binding._stamp), and a bound
+                # tier can be narrower than the transfers built against it.
+                # (The TP pin at phase_flip_boot.py:2244-2273 carries KV AND
+                # MAMBA; the earlier text here named a KV-only pin and a line
+                # range that no longer exists.)
                 # `check_pool_coverage` refuses that rebind now; this stays as
                 # the class guard for every other way a tier can be narrower
                 # than the transfers built against it.

@@ -56,6 +56,17 @@ class LayerLoadingEvent:
         self.load_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
 
+    def resize(self, num_layers: int):
+        """Rebuild this event's load list to EXACTLY `num_layers`, in place.
+
+        HAZARD this must not reintroduce (#1206): `_num_layers` is a SECOND
+        record of the width and `complete()` asserts against THAT, not against
+        `len(self.load_events)`, so rebuilding the list alone raises inside the
+        load stream on the first step past the old width.
+        """
+        self._num_layers = num_layers
+        self.load_events = [device_module.Event() for _ in range(num_layers)]
+
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
@@ -76,6 +87,22 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+
+    def resize(self, num_layers: int):
+        """Set the counter's width to EXACTLY the driven domain, in place.
+
+        Same objects throughout -- this counter and its `LayerLoadingEvent`s
+        are already registered into the device and req pools, so replacing any
+        of them is a rebind nobody enumerates.
+
+        NEVER GROW-ONLY. `finish_event` is `load_events[-1]` and an unrecorded
+        event queries True, so a counter WIDER than the domain the loop drives
+        hands the ACK an event that was never recorded: the load is acked
+        before its copies land.
+        """
+        self.num_layers = num_layers
+        for event in self.events:
+            event.resize(num_layers)
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters

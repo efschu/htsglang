@@ -114,7 +114,11 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         self.assertIs(result.cache_controller, cache_controller)
         self.assertIs(result.component_host_pools[FULL], kv_host_pool)
         self.assertEqual(result.pools_desc, "KV + INDEXER(k-only)")
-        self.assertEqual(result.transfer_layer_num, 8)
+        # #1206: the count is GONE from the result. The transfer domain is
+        # derived from `host_pool_group.transfer_layer_domain`; a count carried
+        # beside the group it is derived from is the second record this slice
+        # deleted, and this assertion is what keeps it deleted.
+        self.assertFalse(hasattr(result, "transfer_layer_num"))
         self.assertEqual(len(result.sidecars), 1)
         self.assertEqual(result.sidecars[0].pool_name, PoolName.INDEXER)
         self.assertEqual(result.sidecars[0].indices_from_pool, PoolName.KV)
@@ -196,7 +200,6 @@ class TestApplyStackResult(unittest.TestCase):
             component_host_pools={FULL: full_host, SWA: swa_host, MAMBA: mamba_host},
             sidecars=[sidecar],
             register_req_to_token_counter=True,
-            transfer_layer_num=8,
             pools_desc="KV + SWA + MAMBA",
         )
 
@@ -217,12 +220,13 @@ class TestApplyStackResult(unittest.TestCase):
         # #904: the frame travels WITH the counter. Registering the counter
         # alone leaves the mamba read unable to name a threshold, so the wait
         # it is supposed to perform is silently inert -- the
-        # PRESENT-BUT-UNWIRED state. `transfer_layer_num` is the controller's
-        # own step count, so the pool waits in the index space the producer
-        # counts in.
+        # PRESENT-BUT-UNWIRED state. #1206: the frame is now READ from the
+        # bound group's own key space (`transfer_layer_domain`) rather than
+        # from a count carried beside it, so the pool waits in the index space
+        # the producer counts in even after a rebind moves the group.
         params.req_to_token_pool.register_layer_transfer_counter.assert_called_once_with(
             controller.layer_done_counter,
-            mamba_transfer_frame=result.transfer_layer_num,
+            mamba_transfer_frame=result.host_pool_group.transfer_layer_domain,
         )
 
     def test_skips_req_to_token_counter_when_flag_false(self):
@@ -235,7 +239,6 @@ class TestApplyStackResult(unittest.TestCase):
             component_host_pools={FULL: MagicMock()},
             sidecars=[],
             register_req_to_token_counter=False,
-            transfer_layer_num=1,
             pools_desc="KV",
         )
 

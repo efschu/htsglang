@@ -67,7 +67,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 
 
 def _entry(name, *, anchor=False, alloc_result=None):
@@ -85,7 +85,11 @@ def _entry(name, *, anchor=False, alloc_result=None):
     entry.device_free_fn = MagicMock()
     entry.device_evict_fn = None
     entry.host_evict_fn = None
-    entry.layer_mapper = lambda layer_id: layer_id
+    # #1206: the entry carries its MAPPING, and the stand-in answers through
+    # the REAL `PoolEntry.local_layer` bound to it, so this fixture cannot
+    # drift from the method the group actually calls.
+    entry.layer_mapping = {layer_id: layer_id for layer_id in range(4)}
+    entry.local_layer = types.MethodType(PoolEntry.local_layer, entry)
     return entry
 
 
@@ -372,7 +376,7 @@ class TestExecutorRefusesUnknownPool(unittest.TestCase):
         and must stay one."""
         anchor = _entry(PoolName.KV, anchor=True)
         extra = _entry(PoolName.MAMBA)
-        extra.layer_mapper = lambda layer_id: None
+        extra.layer_mapping = {}
         group = HostPoolGroup([anchor, extra])
         group.load_to_device_per_layer(
             MagicMock(),

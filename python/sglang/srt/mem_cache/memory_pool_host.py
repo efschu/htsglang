@@ -1878,7 +1878,12 @@ class PoolEntry:
     name: PoolName
     host_pool: Any
     device_pool: Any
-    layer_mapper: Callable[[int], Optional[int]]
+    # #1206: the MAPPING, not a closure over it. GLOBAL layer id -> this
+    # pool's own local index. The closure this replaced bounded a GLOBAL id
+    # by a boot-frozen COUNT, so on a stage whose ids start above that count
+    # it answered None for every key it held and the restore was silently
+    # skipped while the tree called the prefix resident.
+    layer_mapping: dict[int, int]
     is_primary_index_anchor: bool = False
     # Optional eviction callbacks for auto-alloc in HybridCacheController.
     # host_evict_fn(n): evict n slots from the host pool (used by write()).
@@ -1893,8 +1898,20 @@ class PoolEntry:
     device_alloc_fn: Optional[Callable] = None
     device_free_fn: Optional[Callable] = None
 
+    def local_layer(self, layer_id: int) -> Optional[int]:
+        """This pool's local index for a GLOBAL layer id, or None if it does
+        not cover that layer. The mapping already answers None for every
+        unmapped id, negative and huge ones included; no second bound."""
+        return self.layer_mapping.get(layer_id)
+
 
 class HostPoolGroup:
+    # #1206: declared here with their neutral values because the boot bus
+    # reads them by NAME in this same batch; a read against a name that does
+    # not exist is an AttributeError on the first scheduler pass.
+    host_ring_discard_ok = 1
+    d_backup_width = 0
+
     def __init__(self, entries: list[PoolEntry]):
         if not entries:
             raise ValueError("HostPoolGroup requires at least one pool entry.")
@@ -1963,6 +1980,27 @@ class HostPoolGroup:
         as its anchor, which is the property `check_shapes` needs.
         """
         return self.anchor_entry.host_pool.layer_num
+
+    @property
+    def transfer_layer_domain(self) -> int:
+        """#1206: the domain the host->device loop must drive, READ from the
+        entries' own key space.
+
+        `1 + max(key)`, deliberately NOT `len(keys)`: the counter's finish
+        sentinel is `load_events[-1]`, so the loop has to reach the HIGHEST
+        mapped id. With `len(keys)` = 18 on a stage whose keys are 32..49 the
+        loop would drive ids 0..17 and restore nothing at all.
+
+        HAZARD this property exists to remove: a construction-time COUNT is a
+        boot-frozen copy of a fact the entries already hold, and the rebind
+        swaps the group without re-deriving it. No cache and no memo -- the
+        property IS the record, and a stored copy would be the second one.
+        """
+        return (
+            1 + max(k for e in self.entries for k in e.layer_mapping)
+            if any(e.layer_mapping for e in self.entries)
+            else 0
+        )
 
     def get_ksize_per_token(self):
         return self.anchor_entry.host_pool.get_ksize_per_token()
@@ -2073,7 +2111,7 @@ class HostPoolGroup:
     ) -> None:
         # 1. Anchor (KV) transfer
         anchor = self.anchor_entry
-        local_layer_id = anchor.layer_mapper(layer_id)
+        local_layer_id = anchor.local_layer(layer_id)
         if local_layer_id is not None and host_indices.numel() > 0:
             anchor.host_pool.load_to_device_per_layer(
                 anchor.device_pool,
@@ -2086,7 +2124,7 @@ class HostPoolGroup:
         # 2. Extra pool transfers
         for transfer in pool_transfers or []:
             entry = self._entry_for_transfer(transfer, "load")
-            local_layer_id = entry.layer_mapper(layer_id)
+            local_layer_id = entry.local_layer(layer_id)
             if local_layer_id is None:
                 # A layer this pool does not cover. The ONLY legitimate skip
                 # here, and it is per-layer, not per-pool.

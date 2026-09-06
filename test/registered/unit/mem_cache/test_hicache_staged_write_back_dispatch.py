@@ -663,7 +663,7 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
                     name=PoolName.KV,
                     host_pool=logical_host_pool,
                     device_pool=None,
-                    layer_mapper=lambda _: 0,
+                    layer_mapping={0: 0},
                     is_primary_index_anchor=True,
                 )
             ]
