@@ -2100,6 +2100,23 @@ class Scheduler(
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
+        if self.server_args.enable_memory_saver:
+            # Imported here, not at module scope: this file's import block is
+            # already after module-level code (98 pre-existing E402), and the
+            # refusal is only reachable on the memory-saver path anyway.
+            from sglang.srt.managers.weg2_memory_saver import (
+                assert_memory_saver_active,
+            )
+
+            # W12 Weg2MemorySaverInactive, launch half. `create(enable=True)`
+            # only raises on ImportError; a library that imported but is not
+            # armed (wrong hook mode, disabled at runtime) still reports
+            # `enabled=False`, and then every release_memory_occupation is a
+            # `pass` that returns success. Refuse here, before the first
+            # request, rather than at the first silent sleep.
+            assert_memory_saver_active(
+                self.memory_saver_adapter, context="launch (scheduler init)"
+            )
 
         # Init recv skipper and input blocker
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(self.server_args)

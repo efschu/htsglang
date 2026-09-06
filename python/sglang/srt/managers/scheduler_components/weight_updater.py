@@ -39,6 +39,13 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.weg2_memory_saver import (
+    Weg2PcieLockTimeout,
+    Weg2WakeRefused,
+    assert_memory_saver_active,
+    pcie_transfer_lock,
+    sleep_acceptance_census,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +188,108 @@ class SchedulerWeightUpdaterManager:
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter=parameter)
 
+    # ------------------------------------------------------------------
+    # Weg-2 slice S1 helpers.  See srt/managers/weg2_memory_saver.py for why
+    # each exists and what upstream mechanism it reuses.
+    # ------------------------------------------------------------------
+
+    def _weg2_server_args(self):
+        return getattr(self.scheduler, "server_args", None)
+
+    @contextmanager
+    def _weg2_pcie_lock(self, label: str) -> Iterator[None]:
+        """Serialise this card's host<->device transfer against its sibling.
+
+        Two failure modes, kept apart on purpose:
+
+        * the card's NVML UUID cannot be resolved -- there is no key to
+          serialise on.  Reported and the transfer proceeds unserialised: this
+          lock is a throughput guard (an overlap halves both legs on the
+          x4-linked 3080), and the correctness guards on this path are W12, W4
+          and the barriers, not this lock.
+        * the lock is still held at the deadline -- that is a bounded wait
+          whose expiry is a named refusal (``Weg2PcieLockTimeout``) and it
+          PROPAGATES.  Never a longer wait, never a silent overlap.
+        """
+        try:
+            lock = pcie_transfer_lock(label=label)
+            lock.__enter__()
+        except Weg2PcieLockTimeout:
+            # A bounded wait that expired is a refusal, not a reason to
+            # overlap the link.  It propagates to the caller of the RPC.
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[weg2 pcie] no PCIe serialisation for %s (card key "
+                "unresolved): %s -- proceeding unserialised",
+                label,
+                exc,
+            )
+            yield
+            return
+        try:
+            yield
+        finally:
+            lock.__exit__(None, None, None)
+
+    def _weg2_log_sleep_acceptance(self) -> None:
+        """Design (S) 2.4 step 11, EXECUTED on the flip path, not declared."""
+        census = sleep_acceptance_census()
+        if census.accepted:
+            logger.info("%s", census.format_line())
+        else:
+            logger.warning("%s", census.format_line())
+
+    def _weg2_wake_reload_weights(self) -> None:
+        """The backup-OFF half of the wake, behind the per-group launcher flag.
+
+        With ``--enable-weights-cpu-backup`` the TMS restore already carried
+        the bytes (measured 2.08 s / 27 GiB, campaign (a)) and this is a no-op.
+        Without it, ``resume(GPU_MEMORY_TYPE_WEIGHTS)`` recommitted VMM pages
+        whose CONTENT IS UNDEFINED, so the weights are refilled through the
+        upstream ``update_weights_from_disk`` endpoint from the page-cached
+        checkpoint.  No fork loader: the upstream path is the path.
+        """
+        server_args = self._weg2_server_args()
+        if server_args is None:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: the weight wake path is undecidable -- no "
+                "server_args reachable from the weight updater, so whether the "
+                "cpu backup carried the bytes cannot be determined. VRAM has "
+                "already been mutated; refusing rather than serving undefined "
+                "weights."
+            )
+        if getattr(server_args, "enable_weights_cpu_backup", False):
+            return
+
+        # flush_cache MUST stay False here: at this point in the resume the KV
+        # tag is still paused, and flush_cache() -> MambaPool.reset_state()
+        # would write into unmapped pages -- the CAMPAIGN (a) fault, mirrored
+        # onto the wake path.  torch_empty_cache likewise: the KV pool is about
+        # to be recommitted.
+        out = self.update_weights_from_disk(
+            UpdateWeightFromDiskReqInput(
+                model_path=server_args.model_path,
+                load_format=getattr(server_args, "load_format", None),
+                flush_cache=False,
+                torch_empty_cache=False,
+            )
+        )
+        if not getattr(out, "success", False):
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: the backup-OFF wake could not refill the "
+                f"weights from {server_args.model_path!r}: "
+                f"{getattr(out, 'message', '')!r}. The VMM pages are committed "
+                "but their content is undefined; this group is fatal."
+            )
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        # W12 Weg2MemorySaverInactive, BEFORE anything is mutated: with the
+        # no-op adapter every pause() below is `pass` and this RPC returns
+        # success having released nothing.  A refusal that has already paused
+        # a tag is not a refusal, so this is the first statement.
+        assert_memory_saver_active(self.memory_saver_adapter, context="first sleep")
+
         assert (
             self.is_fully_idle()
         ), "release_memory_occupation should be called only when server is idle."
@@ -209,8 +317,21 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            # CAMPAIGN (a) MUST_FIX, measured 2026-09-06 on Qwen3.8-27B-INT8
+            # (hybrid mamba/GDN), boot a3: flush_cache() must run BEFORE the
+            # pause, not after.  flush_cache() -> HybridReqToTokenPool.clear()
+            # -> MambaPool.reset_state() ZEROES the mamba conv/temporal tensors
+            # and then synchronizes; those tensors are allocated under
+            # region(GPU_MEMORY_TYPE_KV_CACHE) (memory_pool.py:1017), so the
+            # pause has already unmapped their pages and the zero_() is a write
+            # to unmapped memory -> "CUDA error: an illegal memory access was
+            # encountered" inside MambaPool._sync_device, killing the scheduler
+            # on the FIRST sleep.  Flushing first is strictly more correct: the
+            # reset runs while the pages are still mapped, and the pause then
+            # releases an already-quiesced pool.  Nothing that touches the
+            # device may be appended after the pause in this block.
             self.flush_cache()
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             # #89 hibernate: destination="disk" parks the FINAL post-transform
@@ -223,12 +344,23 @@ class SchedulerWeightUpdaterManager:
                 self.tp_worker.model_runner.model
             )
             torch.distributed.barrier(self.tp_cpu_group)
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            # The PCIe serialisation lock is taken AFTER the barrier and around
+            # the D2H leg only: with --enable-weights-cpu-backup this pause
+            # copies the whole shard to host (~2.1 s / 27 GiB measured), and a
+            # co-located rank's wake-H2D on the same card would halve both.
+            # Never held across a collective.
+            with self._weg2_pcie_lock("sleep-D2H weights"):
+                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
+        # Upstream's release does not empty the allocator cache, so the freed
+        # pages sit in torch's reserve and NVML free does not move -- the
+        # dormant group would look resident to every host-side instrument.
+        torch.get_device_module().empty_cache()
+        self._weg2_log_sleep_acceptance()
 
         return ReleaseMemoryOccupationReqOutput()
 
@@ -245,8 +377,16 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
-            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+            # Wake-H2D: with the cpu backup this recommit refills from the host
+            # buffer.  Same lock, same reason as the sleep leg above.
+            with self._weg2_pcie_lock("wake-H2D weights"):
+                self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
+            # Wake path (ii): without --enable-weights-cpu-backup the recommit
+            # above restored PAGES, not CONTENT.  Refill from disk BEFORE the
+            # static-state import, so the stash exported from the live model at
+            # sleep stays the last writer for the buffers.
+            self._weg2_wake_reload_weights()
             _import_static_state(
                 self.tp_worker.model_runner.model,
                 self.stashed_model_static_state,
