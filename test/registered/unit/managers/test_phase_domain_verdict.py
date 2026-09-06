@@ -914,37 +914,51 @@ class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
         return found.group(1)
 
     def test_arm_ten_the_census_carries_each_ranks_own_flag_to_the_stop_line(self):
-        """Rank 1 refuses; ranks 0 and 2 do not. The group STOP names which.
+        """EVERY rank refuses in turn, and the group STOP names which one.
 
         `census[r]` reduces to exactly rank r's own flag because every OTHER
         rank wrote the MIN-neutral 1 there. That is what makes `0` unambiguous
         and what a shared slot, a `0` sentinel or a value-derived `?` each
         destroy in its own direction.
+
+        THE REFUSING RANK IS A LOOP VARIABLE, NOT THE LITERAL 1. With rank 1 as
+        the only refuser the census write's own rank guard
+        (`phase_domain_verdict.py:574`) survives an off-by-one -- `0 <= rank`
+        narrowed to `0 < rank` still writes slot 1, so rank 0's refusal turns
+        into a healthy `1` and the STOP names NO refusing rank while still
+        stopping the group. Rank 0 is the boundary the guard has, so it is the
+        one the arm has to drive.
         """
         from sglang.srt.managers import phase_domain_verdict as pdv
 
-        payloads = [
-            pdv.build_phase_domain_payload(self._rank(0)),
-            pdv.build_phase_domain_payload(self._rank(1, incomplete=True)),
-            pdv.build_phase_domain_payload(self._rank(2)),
-        ]
-        reduced = _reduce_min(payloads)
-
-        for rank in range(3):
-            with self.subTest(rank=rank):
-                with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
-                    pdv.unpack_phase_domain(
-                        reduced, rank=rank, local={}, world_size=3
-                    )
-                message = str(caught.exception)
-                self.assertIn("term=loadback_coverage_complete", message)
-                # Three rules in one string: rank 1's own 0, ranks 0 and 2's
-                # own 1, and `?` for the five slots no rank owns -- decided by
-                # the world size, never by the value 1 a healthy rank writes.
-                self.assertEqual(self._per_rank_field(message), "1,0,1,?,?,?,?,?")
-                self.assertIn(
-                    "census_width=%d" % pdv.PHASE_DOMAIN_CENSUS_SLOTS, message
+        for refuser in range(3):
+            payloads = [
+                pdv.build_phase_domain_payload(
+                    self._rank(r, incomplete=(r == refuser))
                 )
+                for r in range(3)
+            ]
+            reduced = _reduce_min(payloads)
+            expected = ",".join(
+                ["0" if r == refuser else "1" for r in range(3)] + ["?"] * 5
+            )
+
+            for rank in range(3):
+                with self.subTest(refuser=refuser, rank=rank):
+                    with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+                        pdv.unpack_phase_domain(
+                            reduced, rank=rank, local={}, world_size=3
+                        )
+                    message = str(caught.exception)
+                    self.assertIn("term=loadback_coverage_complete", message)
+                    # Three rules in one string: the refuser's own 0, the other
+                    # two ranks' own 1, and `?` for the five slots no rank owns
+                    # -- decided by the world size, never by the value 1 a
+                    # healthy rank also writes.
+                    self.assertEqual(self._per_rank_field(message), expected)
+                    self.assertIn(
+                        "census_width=%d" % pdv.PHASE_DOMAIN_CENSUS_SLOTS, message
+                    )
 
         # The healthy group renders 1 where a rank voted well, `?` where no
         # rank owns the slot -- so a `?` derived from the value would blank the
@@ -1295,18 +1309,30 @@ class TheBootReduceLayoutIsDeclaredOnceAndDerived(unittest.TestCase):
 class _ReduceCarryingSchedulerStandIn:
     """Enough of a Scheduler for `_update_uniform_pool_budget` to run.
 
-    The read set is the twenty-two `self.<name>` references between
-    `scheduler.py:6817` and `:7261`, enumerated rather than guessed.
+    The read set is the twenty-three DISTINCT `self.<name>` references between
+    `scheduler.py:6817` and `:7273`, enumerated rather than guessed. Twenty-two
+    are declared here; the twenty-third, `_phase_domain_layout_announced`, is
+    the emitter's own bookmark, created by the method on its first pass and
+    deliberately absent so the first call takes the announcing branch. Two
+    further names are read through `getattr` and so are not `self.<name>`
+    references at all -- `tp_cpu_group` (`scheduler.py:6916`) and
+    `phase_flip_active_stack` (`:7204`) -- and both are declared below.
+
+    `tp_rank` and `phase` ARE ARGUMENTS, not constants: they are the two seam
+    inputs `unpack_phase_domain` is handed (`scheduler.py:7262`, `:7265`), and
+    a fixture that can only be built at rank 0 with no phase satisfies a seam
+    that types both of them in.
     """
 
-    def __init__(self):
+    def __init__(self, *, tp_rank=0, phase=None):
         self.kv_session_offload = None
         self.tp_cpu_group = object()
         self.token_to_kv_pool_allocator = mock.Mock(available_size=lambda: 4096)
         self.server_args = mock.Mock(dcp_size=1)
         self.tree_cache = None
         self.waiting_queue = []
-        self.ps = _StandInPS(0)
+        self.phase_flip_active_stack = phase
+        self.ps = _StandInPS(tp_rank)
         self._pass_prefetch_verdicts = None
         self._uniform_min_avail = None
         self._uniform_budget_deficit = None
@@ -1450,7 +1476,11 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
         from sglang.srt.managers import scheduler as scheduler_mod
 
         refused = pdv.pack_phase_domain_payload({"loadback_coverage_complete": 0})
-        standin = _ReduceCarryingSchedulerStandIn()
+        # RANK 2, NOT RANK 0, AND A NAMED PHASE. At rank 0 with no phase every
+        # assertion below is satisfied by a typed-in literal, which is what let
+        # `rank=0` and `local=None` be hard-coded into the seam and survive the
+        # whole suite.
+        standin = _ReduceCarryingSchedulerStandIn(tp_rank=2, phase="tp_decode")
 
         with mock.patch.object(
             torch.distributed, "all_reduce", side_effect=lambda *a, **k: None
@@ -1469,16 +1499,90 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("term=loadback_coverage_complete", message)
         self.assertIn("#1206 LOADBACK COVERAGE INCOMPLETE", message)
-        # ALL FOUR ARGUMENTS THE SEAM SUPPLIES, not only the term. The unpack's
-        # own arms call it directly with `world_size=3`, so nothing above this
-        # line reads the seam's argument list -- and `world_size` is the one
-        # the census's `?` is decided by. Dropped, every rank at or above the
-        # width renders `1` and the STOP names five phantom healthy ranks
-        # instead of saying it does not know: the module's own docstring calls
-        # that deriving `?` from the value 1, which a healthy rank also writes.
-        self.assertIn("rank=0", message)
+        # ALL FOUR ARGUMENTS THE SEAM SUPPLIES, one assertion each, and each
+        # one driven to a value no literal at the seam can produce. Every arm
+        # above this class calls `unpack_phase_domain` DIRECTLY with a
+        # hand-built argument list, so this is the only row that reads what
+        # `scheduler.py:7262-7265` actually passes.
+        #
+        # `rank` (`:7262`) is the term slot 18's S7 constant interpolates
+        # (`phase_domain_verdict.py:140`), so a hard-coded rank makes every
+        # rank of the group print the same rank number on the one STOP this
+        # bus exists for -- invisible until S7 lands its producer at B6.
+        self.assertIn("rank=2", message)
+        # `local` (`:7263`) is THIS rank's own contribution, decoded back out
+        # of the slice it packed. Dropped, the STOP prints `local=None` and the
+        # reader cannot tell a rank that refused from one that was outvoted.
+        self.assertIn("local=0", message)
+        # `phase` (`:7265`) says which half of the cutover the group stopped
+        # in. Dropped, it reads `phase=None`, which is also what a boot with no
+        # phase flip prints -- the two absence classes collapsed into one.
+        self.assertIn("phase=tp_decode", message)
+        # `world_size` (`:7264`) is what the census's `?` is decided by.
+        # Dropped, every rank at or above the width renders `1` and the STOP
+        # names five phantom healthy ranks instead of saying it does not know:
+        # the module's own docstring calls that deriving `?` from the value 1,
+        # which a healthy rank also writes.
         self.assertIn("census_width=8", message)
         self.assertIn("per_rank=[1,1,1,?,?,?,?,?]", message)
+
+    def test_arm_three_a_wrong_width_slice_stops_at_the_seam(self):
+        """The layout STOP's one can-fail arm.
+
+        `unpack_phase_domain` returns None ONLY for a slice of the wrong width,
+        and at the live seam the slice and the width it is measured against
+        both derive from `PHASE_DOMAIN_SLOTS` -- so no payload can reach this
+        branch, and deleting it whole left the suite green. The hazard it
+        guards is a FUTURE seam that slices by a typed-in head or width, which
+        is exactly the shape `#791b PREFETCH-BALLOT LAYOUT STOP`
+        (`scheduler.py:7292-7297`, pre-existing) guards twenty-five lines
+        below -- `:7267` here against `:7292` there.
+
+        The neutering is the affordance the seam's own comment names
+        (`scheduler.py:7197-7198`: the module is resolved at call time "so a
+        test can still neuter exactly one of its functions"), and the arm pins
+        all three denominators, because a STOP that names none is a STOP whose
+        reader cannot tell WHICH width was wrong.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+        from sglang.srt.managers import scheduler as scheduler_mod
+
+        standin = _ReduceCarryingSchedulerStandIn(tp_rank=1, phase="tp_decode")
+
+        with mock.patch.object(
+            torch.distributed, "all_reduce", side_effect=lambda *a, **k: None
+        ), mock.patch.object(
+            torch.distributed, "get_world_size", side_effect=lambda *a, **k: 3
+        ), mock.patch.object(
+            scheduler_mod.uniform_floor_scope, "report_scope", lambda *a, **k: None
+        ), mock.patch(
+            "sglang.srt.distributed.utils.uneven_dcp_active",
+            lambda *a, **k: False,
+        ), mock.patch.object(
+            pdv, "unpack_phase_domain", lambda *a, **k: None
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                scheduler_mod.Scheduler._update_uniform_pool_budget(standin)
+        message = str(caught.exception)
+        self.assertIn("#1068 PHASE-DOMAIN LAYOUT STOP", message)
+        self.assertNotIn("#791b", message)
+
+        head = re.search(r"head=(\d+)", message)
+        expected = re.search(r"expected=(\d+)", message)
+        available = re.search(r"available=(\d+)", message)
+        for name, found in (
+            ("head", head),
+            ("expected", expected),
+            ("available", available),
+        ):
+            self.assertIsNotNone(found, "the STOP names no %s: %s" % (name, message))
+        self.assertEqual(int(expected.group(1)), pdv.PHASE_DOMAIN_SLOTS)
+        # AND THE MEASUREMENT THAT SAYS THIS BRANCH CANNOT FIRE ON A REAL
+        # PAYLOAD, asserted rather than argued: at the live seam the slice is
+        # always at least as wide as the constant it is checked against, so the
+        # only way here is the neutering above.
+        self.assertGreaterEqual(int(available.group(1)), pdv.PHASE_DOMAIN_SLOTS)
+        self.assertGreater(int(head.group(1)), 0)
 
 
 if __name__ == "__main__":

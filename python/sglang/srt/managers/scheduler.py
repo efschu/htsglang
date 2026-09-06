@@ -7185,7 +7185,7 @@ class Scheduler(
         #
         # THE PER-PASS COUNTERS ARE READ AND CLEARED INSIDE THIS BUILD, not once
         # per scheduler pass: this site sits after the world-size guard's return
-        # at :6984, so it runs exactly as often as the reduce. A per-pass reset
+        # at :6978, so it runs exactly as often as the reduce. A per-pass reset
         # would erase every PP-phase detection before the next TP reduce could
         # vote it -- a group STOP deleted by a reset rather than by a missing
         # vote.
@@ -7202,6 +7202,16 @@ class Scheduler(
         _phase_domain_local = phase_domain_verdict.build_phase_domain_payload(self)
         vals = vals + _phase_domain_local
         _phase_domain_phase = getattr(self, "phase_flip_active_stack", None)
+        # `_phase_domain_layout_announced` IS THIS EMITTER'S OWN BOOKMARK of the
+        # phase it last logged the layout for, and it cannot be recomputed where
+        # it is read: nothing else in the process records whether THIS process
+        # already emitted the line, so the alternative to the field is a line on
+        # every reduce -- the once-per-process latch #824 replaced, read from the
+        # other end. It is not a second record of a fact another object owns:
+        # the phase itself is read live from `phase_flip_active_stack` on the
+        # line above and is never copied here. The tree's own precedent for this
+        # shape is `uniform_floor_scope.py:135-137`, the say-it-once-per-change
+        # bookmark the world-size guard above already keeps on this same object.
         if getattr(self, "_phase_domain_layout_announced", None) != _phase_domain_phase:
             self._phase_domain_layout_announced = _phase_domain_phase
             logger.info(
