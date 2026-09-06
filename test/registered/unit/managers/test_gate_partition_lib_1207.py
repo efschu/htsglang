@@ -300,6 +300,55 @@ def test_g0_t10c_a_lane_that_collected_nothing_is_still_refused(tmp_path):
     assert "no test outcome" in note
 
 
+def test_g0_t10h_a_lane_whose_every_test_was_deselected_is_refused(tmp_path):
+    """THE ``ran_something`` TERM ON ITS OWN -- refusal 4 of the runner's
+    docstring, in the shape whose summary line the parser UNDERSTANDS.
+
+    THE HAZARD: G0-T-10c is the only other arm in this file that reaches this
+    branch, and its log (``no tests ran in 0.01s``) carries no summary at all, so
+    ``parse_log`` sets ``collected_nothing`` at `gate_partition_lib.py:186`
+    and the refusal is already decided before the ``ran_something`` term is
+    read. A ``lane_verdict`` narrowed to ``res.collected_nothing``, or with
+    that term's own comparison widened to ``>= 0``, satisfies G0-T-10c, every
+    other arm in this file, and every arm of
+    ``scripts/mutants_895_gate_exits.py`` -- its A5 stages the same
+    collected_nothing shape -- while a lane of 120 modules in which not one
+    test ran votes OK and ``main()``'s ``broken = broken or not ok`` folds it
+    into a green. That is *"report a lane that never ran as a lane that
+    answered"*, the runner's own numbered refusal 4, going silent.
+
+    THE SHAPE IS REACHABLE IN THIS RUNNER, not composed: a ``-k``/``-m``/
+    ``--deselect`` expression matching nothing arrives through the runner's
+    ``extra`` positional and is appended at ``run_lane``'s ``cmd += extra``,
+    and pytest then reports every collected test as deselected. THE ROUTE
+    NEEDS THE ``--`` SEPARATOR, named here because a reader who tries a bare
+    ``-k`` gets ``unrecognized arguments`` and would read this arm as guarding
+    an unreachable shape: ``argparse`` hands a leading-dash token to a
+    ``nargs="*"`` positional only after ``--``, so the invocation is
+    ``gate_tier2_partitioned.py ... -- -k <expr>`` (measured 2026-09-06).
+    The summary line below is MEASURED too, with this tree's interpreter over
+    the two G0 modules (``-k zzz_matches_nothing``), which printed
+    ``61 deselected, 17 warnings in 7.94s`` verbatim.
+
+    WHY THE FIRST FOUR ASSERTIONS ARE HERE and not implied: that line MATCHES
+    ``SUMMARY_LINE``, so the lane is NOT ``collected_nothing``, it is not
+    interrupted, it names no uncollectable module, and its tally is perfect --
+    0 names failed against 0 summary failed. Every other refusal branch of
+    ``lane_verdict`` is therefore proven inert on this log before the verdict
+    is asked for, which is what makes the arm gate the one term no arithmetic
+    in the gate can see -- the same false-pass class as G0-T-10 and G0-T-10d.
+    """
+    log = _write(tmp_path, "61 deselected, 17 warnings in 7.94s\n")
+    res = lib.parse_log(log)
+    assert res.collected_nothing is False, "the summary line WAS understood"
+    assert res.interrupted is False
+    assert res.collection_errors == set()
+    assert res.tally_ok is True, "the tally alone cannot see this"
+    ok, note = runner.lane_verdict(res, n_modules=120)
+    assert ok is False, f"a lane in which no test ran is not an answer: {note}"
+    assert "no test outcome" in note
+
+
 def test_g0_t10d_an_uncollectable_module_with_no_error_name_is_refused(tmp_path):
     """THE SECOND REFUSAL BRANCH of `lane_verdict`, which had no arm at all.
 
