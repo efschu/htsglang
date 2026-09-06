@@ -118,6 +118,20 @@ class _DevicePool:
         return self._cell
 
 
+#: #1206 (2026-09-05): the mapping this writer returns now carries the boot
+#: verdict terms beside the phase pools -- `owned_equals_driven`,
+#: `layer_mapping_non_empty`, `host_pool_build_ok` and its message -- because
+#: the boot reduce at `scheduler.py:961-968` reads them from the RETURN rather
+#: than off a group that some exits never build. The production consumer is a
+#: keyed lookup (`hicache_phase_binding.py:396-397`), so nothing collides; a
+#: test that compared the WHOLE mapping was reading two facts as one.
+_POOL_KEYS = ("pp", "tp")
+
+
+def _pools_only(mapping):
+    return sorted(k for k in mapping if k in _POOL_KEYS)
+
+
 def _sched(*, rebind=True, host=True, tp_pool=True, cell=8192, pp_host=None,
            max_running_requests=8, chunked_prefill_size=4096, mamba_mib=0):
     sa = types.SimpleNamespace(
@@ -251,7 +265,14 @@ def _build_hybrid(sched, mamba=None):
 class TestTheDefaultBootIsUntouched(CustomTestCase):
     def test_the_flag_off_allocates_nothing(self):
         # Every boot that does not ask for the rebind must be byte-identical.
-        self.assertEqual(build_phase_flip_host_pools(_sched(rebind=False)), {})
+        pools = build_phase_flip_host_pools(_sched(rebind=False))
+        self.assertEqual(_pools_only(pools), [])
+        # #1206: NOT-APPLICABLE votes the MIN-neutral, which the old `== {}`
+        # could not see -- and voting the refusing value here would kill a
+        # configuration the tree supports.
+        self.assertEqual(pools["host_pool_build_ok"], 1)
+        self.assertEqual(pools["owned_equals_driven"], 1)
+        self.assertEqual(pools["layer_mapping_non_empty"], 1)
 
 
 class TestTheWriterBuildsBothPhases(CustomTestCase):
@@ -261,7 +282,7 @@ class TestTheWriterBuildsBothPhases(CustomTestCase):
 
     def test_both_phases_are_registered(self):
         pools = self._patched(_sched())
-        self.assertEqual(sorted(pools), ["pp", "tp"])
+        self.assertEqual(_pools_only(pools), ["pp", "tp"])
 
     def test_the_pp_entry_is_the_tier_the_boot_already_built(self):
         # The rebind needs a HANDLE per phase, not a second pp pool.
@@ -331,9 +352,12 @@ class TestTheTpPinIsRowCoupledToThePpPool(CustomTestCase):
         # T2. A builder that lands one row short is a phase pin that would
         # disagree with its peers' pp pool: refuse the BOOT, never log-and-go.
         builder = _FakeBuildKVHostPool(force_size=PP_ROWS - 1)
-        with self.assertRaises(RuntimeError) as cm:
-            _build_patched(_sched(), builder=builder)
-        msg = str(cm.exception)
+        # #1206: ROUTED, not deleted. The rank-local raise left the two peers
+        # blocked in the boot reduce; the refusal is now a term on it, and the
+        # message it carries is unchanged.
+        pools, _ = _build_patched(_sched(), builder=builder)
+        self.assertEqual(pools["host_pool_build_ok"], 0)
+        msg = pools["host_pool_build_msg"]
         self.assertIn("#1068 TP PIN ROW MISMATCH", msg)
         self.assertIn(f"tp_rows={PP_ROWS - 1}", msg)
         self.assertIn(f"pp_rows={PP_ROWS}", msg)
@@ -344,9 +368,11 @@ class TestTheTpPinIsRowCoupledToThePpPool(CustomTestCase):
         # T3 (G10). 30518 rows cannot hold max_running_requests x chunk =
         # 8 x 4096 = 32768 in flight; the old max(1, ...) built it silently.
         s = _sched(pp_host=_PPHost(_PPKVHost(size=30518)))
-        with self.assertRaises(ValueError) as cm:
-            _build_patched(s)
-        msg = str(cm.exception)
+        # #1206 / B-17 (alpha): the pre-`try` raise is routed into the vote.
+        pools, _ = _build_patched(s)
+        self.assertEqual(pools["owned_equals_driven"], 0)
+        msg = pools["host_pool_build_msg"]
+        self.assertIn("#1068 HOST POOL BELOW ONE WAVE", msg)
         self.assertIn("pp_rows=30518", msg)
         self.assertIn("max_running_requests=8", msg)
         self.assertIn("chunked_prefill_size=4096", msg)
@@ -375,16 +401,17 @@ class TestTheTpPinIsRowCoupledToThePpPool(CustomTestCase):
         # per_layer * layer_num must reproduce the pp cell exactly, or the
         # tp cell derived from it is a guess (R7 of the spec).
         s = _sched(pp_host=_PPHost(_PPKVHost(size_per_token=16383)))
-        with self.assertRaises(ValueError) as cm:
-            _build_patched(s)
-        self.assertIn("16383", str(cm.exception))
+        pools, _ = _build_patched(s)
+        self.assertEqual(pools["owned_equals_driven"], 0)
+        self.assertIn("#1068 TP PIN CELL UNDERIVABLE", pools["host_pool_build_msg"])
+        self.assertIn("16383", pools["host_pool_build_msg"])
 
     def test_a_pp_tier_without_a_readable_shape_refuses_softly(self):
         # A stand-in with no rows/cell is not a live composite; the rebind
         # refuses at the first cutover exactly as before (#847 contract).
         s = _sched(pp_host=types.SimpleNamespace())
         pools, _ = _build_patched(s)
-        self.assertEqual(sorted(pools), ["pp"])
+        self.assertEqual(_pools_only(pools), ["pp"])
 
 
 class TestTheTpPinAnchorHalfIsCoupledToThePpAnchor(CustomTestCase):
@@ -420,9 +447,11 @@ class TestTheTpPinAnchorHalfIsCoupledToThePpAnchor(CustomTestCase):
     def test_anchor_slot_mismatch_is_a_raise_not_a_soft_refusal(self):
         # R1. tp anchor 129 slots against pp anchor 65: the two phases would
         # hold different ceilings -- refuse the BOOT, never log-and-go.
-        with self.assertRaises(RuntimeError) as cm:
-            _build_hybrid(_hybrid_sched(), mamba=_FakeMambaPoolHost(size=129))
-        msg = str(cm.exception)
+        pools, _, _ = _build_hybrid(
+            _hybrid_sched(), mamba=_FakeMambaPoolHost(size=129)
+        )
+        self.assertEqual(pools["host_pool_build_ok"], 0)
+        msg = pools["host_pool_build_msg"]
         self.assertIn("#1068 TP PIN ANCHOR SLOT MISMATCH", msg)
         self.assertIn("tp_slots=129", msg)
         self.assertIn(f"pp_slots={ANCHOR_SLOTS}", msg)
@@ -431,9 +460,9 @@ class TestTheTpPinAnchorHalfIsCoupledToThePpAnchor(CustomTestCase):
 
     def test_an_anchor_pool_below_the_floor_is_refused(self):
         # 65 == 65 agrees, but 60 device slots + 8 in flight + 1 = 69 > 65.
-        with self.assertRaises(ValueError) as cm:
-            _build_hybrid(_hybrid_sched(device_slots=60))
-        msg = str(cm.exception)
+        pools, _, _ = _build_hybrid(_hybrid_sched(device_slots=60))
+        self.assertEqual(pools["host_pool_build_ok"], 0)
+        msg = pools["host_pool_build_msg"]
         self.assertIn("--hicache-mamba-host-mib too small", msg)
         self.assertIn(f"{ANCHOR_SLOTS} slots", msg)
         self.assertIn("device_slots 60", msg)
@@ -448,9 +477,18 @@ class TestTheTpPinAnchorHalfIsCoupledToThePpAnchor(CustomTestCase):
     def test_the_mismatch_is_named_before_the_floor(self):
         # 10 slots is BOTH a mismatch (vs 65) and below the floor (20+8+1=29):
         # the disagreement is the graver refusal (RAENGE-NIE-UNEINS) and wins.
-        with self.assertRaises(RuntimeError) as cm:
-            _build_hybrid(_hybrid_sched(), mamba=_FakeMambaPoolHost(size=10))
-        self.assertIn("#1068 TP PIN ANCHOR SLOT MISMATCH", str(cm.exception))
+        # #1206: FIRST failing check wins, so the recorded reason names the
+        # disagreement and not the floor it also violates.
+        pools, _, _ = _build_hybrid(
+            _hybrid_sched(), mamba=_FakeMambaPoolHost(size=10)
+        )
+        self.assertEqual(pools["host_pool_build_ok"], 0)
+        self.assertIn(
+            "#1068 TP PIN ANCHOR SLOT MISMATCH", pools["host_pool_build_msg"]
+        )
+        self.assertNotIn(
+            "--hicache-mamba-host-mib too small", pools["host_pool_build_msg"]
+        )
 
     def test_a_tp_stack_without_mamba_handles_keeps_the_kv_only_pin(self):
         # #871 contract: the hybrid half cannot be mirrored -> named reason,
@@ -465,11 +503,16 @@ class TestTheRefusalIsCONVERTEDNotDeleted(CustomTestCase):
     """CAN-FAIL. A genuinely absent or mis-shaped pool must STILL refuse."""
 
     def test_no_host_tier_at_all_yields_nothing_to_bind(self):
-        self.assertEqual(build_phase_flip_host_pools(_sched(host=False)), {})
+        pools = build_phase_flip_host_pools(_sched(host=False))
+        self.assertEqual(_pools_only(pools), [])
+        # #1206 / D-82: this exit returns before any HostPoolGroup exists, so
+        # the neutral must come from the RETURN. A row read off a group here
+        # would be an AttributeError on a supported configuration.
+        self.assertEqual(pools["host_pool_build_ok"], 1)
 
     def test_no_tp_device_pool_leaves_the_tp_phase_unbound(self):
         pools = build_phase_flip_host_pools(_sched(tp_pool=False))
-        self.assertEqual(sorted(pools), ["pp"])
+        self.assertEqual(_pools_only(pools), ["pp"])
         self.assertNotIn("tp", pools, "and the cutover must then refuse")
 
     def test_the_guard_still_raises_when_the_phase_is_unbound(self):
@@ -495,7 +538,7 @@ class TestTheRefusalIsCONVERTEDNotDeleted(CustomTestCase):
                 raise RuntimeError("mis-shaped pool")
 
         pools, _ = _build_patched(_sched(), builder=_Boom())
-        self.assertEqual(sorted(pools), ["pp"], "refuse loudly, boot anyway")
+        self.assertEqual(_pools_only(pools), ["pp"], "refuse loudly, boot anyway")
 
 
 class TestTheBootWiresIt(CustomTestCase):

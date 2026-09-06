@@ -270,6 +270,7 @@ def rebind(readers: dict, incoming: PhasePools) -> int:
                 f"{LOG_PREFIX} rebinding reader '{name}' failed ({e}); the "
                 "reader set is now split and device-tier I/O must stay off."
             ) from e
+    _log_rebind_domain_outside_driven(readers, incoming, generation)
     logger.info(
         "%s rebound %d reader(s) to the '%s' pools (generation %d, %s layers).",
         LOG_PREFIX,
@@ -279,6 +280,53 @@ def rebind(readers: dict, incoming: PhasePools) -> int:
         incoming.layer_num(),
     )
     return generation
+
+
+def _log_rebind_domain_outside_driven(readers: dict, incoming, generation) -> None:
+    """#1206 S1-C16, LOCAL half: did the counter follow the group?
+
+    TWO OBJECTS, DELIBERATELY. The left term is the counter's LIVE width and
+    the right term is the incoming group's own expected domain, read through
+    the named accessor. A version taking both from the group -- or from the
+    property the counter was last resized FROM -- is a refusal whose two terms
+    are one object and its echo, and it can never fire.
+
+    HAZARD it names: a `_stamp` that moved the readers onto the incoming tier
+    while the counter kept the outgoing phase's width. The loop then drives
+    the new domain against a counter that has no step for its upper ids, and
+    the recurrent read joins a copy that never lands.
+
+    It does NOT raise. The rebind runs inside a cutover, which is neither a
+    boot-time invariant nor before the first collective, so the STOP is the
+    group's -- S0's slot 15, computed on read from these same two objects at
+    the next packed reduce. This line only says WHEN it was detected.
+    """
+    group = getattr(incoming, "host_pool", None)
+    accessor = getattr(group, "expected_transfer_layer_domain", None)
+    if accessor is None:
+        return
+    expected = accessor(getattr(incoming, "phase", None))
+    if expected is None:
+        return
+    for name, obj in readers.items():
+        counter = getattr(obj, "layer_done_counter", None)
+        if counter is None:
+            continue
+        width = getattr(counter, "num_layers", None)
+        if width is None or int(width) == int(expected):
+            continue
+        logger.error(
+            "%s #1206 REBIND DOMAIN OUTSIDE DRIVEN reader=%s generation=%d "
+            "driven=%d counter_width=%d: the readers moved onto the '%s' "
+            "pools while the transfer counter kept the outgoing width, so the "
+            "restore loop drives layer ids the counter has no step for",
+            LOG_PREFIX,
+            name,
+            int(generation),
+            int(expected),
+            int(width),
+            getattr(incoming, "phase", None),
+        )
 
 
 def _stamp(obj: Any, incoming: PhasePools, generation: int) -> None:

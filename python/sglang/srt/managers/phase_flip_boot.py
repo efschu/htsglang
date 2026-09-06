@@ -2271,6 +2271,279 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
     return entries, mamba_host
 
 
+#: The two waiters whose threshold IS the producer's global layer id. Any
+#: other class registered under this counter waits in an index space nobody
+#: has shown to be the producer's, which is a silent wrong answer rather than
+#: a crash -- so it is named, voted and STOPped rather than assumed.
+_GLOBAL_ID_SAFE_WAITERS = ("HybridLinearKVPool", "HybridReqToTokenPool")
+
+
+def _counter_index_space_known(scheduler, logger, rank: int) -> int:
+    """Row 2. Classify the pool registered under the transfer counter.
+
+    COMPUTED ON READ, never recorded. The chain is the one the Scheduler
+    already holds: `scheduler.token_to_kv_pool_allocator.get_kvcache()` is the
+    same object `_apply_stack_result` registers the counter into
+    (`allocator/base.py:193-194` returns a stored attribute, so two calls
+    answer with one object).
+
+    An absent allocator is not a bad vote -- it is a configuration with no
+    device pool to classify -- so it reads the MIN-neutral.
+    """
+    allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    getter = getattr(allocator, "get_kvcache", None)
+    if getter is None:
+        return 1
+    kvcache = getter()
+    if kvcache is None:
+        return 1
+    name = type(kvcache).__name__
+    if name in _GLOBAL_ID_SAFE_WAITERS:
+        return 1
+    logger.error(
+        "#1206 COUNTER INDEX SPACE UNKNOWN rank=%d class=%s: this pool is "
+        "registered under a counter whose producer completes at the GLOBAL "
+        "layer id, and its wait threshold has not been shown to be in that "
+        "frame; a local-index waiter joins another layer's step and reads "
+        "state nothing wrote",
+        rank,
+        name,
+    )
+    return 0
+
+
+def phase_flip_boot_terms(scheduler, result: dict, logger, rank: int) -> dict:
+    """This rank's `BOOT_REDUCE_LAYOUT` terms, read at their one home each.
+
+    Rows 0, 1 and 12 travel in the mapping `build_phase_flip_host_pools`
+    RETURNS -- read with NO default, because a `.get(..., 1)` on a boot-bus
+    term converts a missing key into a healthy vote on the row whose only job
+    is to STOP the group. Row 2 is computed here, from `scheduler`, because
+    the object it classifies is not reachable from the return.
+    """
+    return {
+        "owned_equals_driven": result["owned_equals_driven"],
+        "layer_mapping_non_empty": result["layer_mapping_non_empty"],
+        "counter_index_space_known": _counter_index_space_known(
+            scheduler, logger, rank
+        ),
+        "host_pool_build_ok": result["host_pool_build_ok"],
+    }
+
+
+def _log_tp_pin_attach(result: dict, logger, rank: int) -> None:
+    """#1206 S1-C15: the TP pin's own attach line, at the vote site.
+
+    The pin is unlogged today, which is why a domain/key-space mismatch on it
+    is invisible: the pp stacks printed a COUNT and the pin printed nothing.
+    """
+    tp_host = result.get("tp")
+    if tp_host is None:
+        return
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _log_transfer_domain_attach,
+    )
+
+    _log_transfer_domain_attach(
+        tp_host,
+        "tp",
+        ", ".join(
+            sorted(str(n) for n in (getattr(tp_host, "entry_map", None) or ()))
+        )
+        or "unknown",
+        rank,
+    )
+
+
+def vote_phase_flip_boot_verdict(scheduler, result: dict) -> None:
+    """THE ONE BOOT REDUCE. Called from `scheduler.py:961-968`, outside
+    `build_phase_flip_host_pools` and after it has returned on every path.
+
+    WHY IT IS NOT INSIDE THE BUILDER: every abrupt exit of that function --
+    five returns and, before this change, five raises -- lies upstream of this
+    line, so a collective sited inside it was one a raising rank would skip
+    while its two peers blocked in it forever. Siting it here makes the
+    collective count rank-uniform by construction rather than by enumerating
+    branches, and it survives the builder's deletion at B6.
+
+    It RAISES on every rank from the reduced value. Boot reduces raise; the
+    boot is outside every no-return region.
+    """
+    import logging
+
+    import torch
+
+    from sglang.srt.managers import phase_domain_verdict as pdv
+
+    logger = logging.getLogger(__name__)
+    rank = int(getattr(scheduler, "pp_rank", getattr(scheduler, "tp_rank", 0)) or 0)
+    terms = phase_flip_boot_terms(scheduler, result, logger, rank)
+    payload = pdv.build_boot_reduce_payload(terms)
+
+    world_group = getattr(scheduler, "world_group", None)
+    cpu_group = getattr(world_group, "cpu_group", None)
+    # NOT `tp_cpu_group`: it is world size 1 at boot on this configuration, so
+    # a reduce on it would be a no-op and the raise below rank-local -- D-20's
+    # violation produced by the handle rather than by the code shape.
+    if cpu_group is not None:
+        tensor = torch.tensor(payload, dtype=torch.int64)
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
+        )
+        reduced = tensor.tolist()
+    else:
+        # NAMED, NOT SILENT: with no world group in hand this degrades to a
+        # rank-local verdict, which is the shape D-20 refuses. It is not
+        # reachable on the boot path -- `world_group` is taken in
+        # `init_model_worker()` at `scheduler.py:911`, above this site -- and
+        # it exists so a stand-in harness reads the local terms rather than
+        # dying on a collective it never joined.
+        logger.warning(
+            "#1206 BOOT REDUCE LOCAL-ONLY rank=%d: no world group handle, so "
+            "this rank's boot verdict is not a group verdict",
+            rank,
+        )
+        reduced = list(payload)
+
+    _log_tp_pin_attach(result, logger, rank)
+
+    local = dict(terms)
+    local["host_pool_build_msg"] = result["host_pool_build_msg"]
+    verdict = pdv.unpack_boot_reduce(reduced, rank=rank, local=local)
+    if verdict is None:
+        raise RuntimeError(
+            "#1068 BOOT-REDUCE LAYOUT STOP rank=%d: the reduced payload "
+            "carries %d slot(s), expected %d"
+            % (rank, len(reduced), pdv.PHASE_BOOT_REDUCE_SLOTS)
+        )
+
+
+def _failed_to_build(result: dict, pp_host, reason: str = None) -> dict:
+    """A FAILED-TO-BUILD exit: keep the pp handle, vote rows 0-1 REFUSING.
+
+    The split against the two NOT-APPLICABLE exits is the whole point: a flip
+    boot that never asked for a rebind must not die at the boot reduce, while
+    a boot that asked for one and could not build it must not reach a cutover
+    with a pin its peers do not have.
+    """
+    result["owned_equals_driven"] = 0
+    result["layer_mapping_non_empty"] = 0
+    if reason is not None and result.get("host_pool_build_msg") is None:
+        result["host_pool_build_msg"] = reason
+    result["pp"] = pp_host
+    return result
+
+
+def _record_build_failure(result: dict, msg: str) -> None:
+    """Row 12, FIRST failing check wins.
+
+    The later checks read quantities the first has already contradicted, so
+    recording the first and continuing is what names a CAUSE rather than a
+    cascade. The message travels in the return with the value -- one record of
+    one fact -- because the STOP's per-rank line is the only reader and an
+    int64 MIN carries no string.
+    """
+    if not result["host_pool_build_ok"]:
+        return
+    result["host_pool_build_ok"] = 0
+    result["host_pool_build_msg"] = msg
+
+
+def _device_layer_keys(owner, pool_name):
+    """The DEVICE side's key set for one pool of one stack, or None.
+
+    THE OWNER IS THE STACK'S OWN DEVICE SIDE, NOT `PoolEntry.device_pool`.
+    That field holds the INNER dense pool (`kvcache.full_kv_pool`) and the raw
+    `MambaPool`, and neither carries a GLOBAL-id map: the two maps this tree
+    builds are `HybridReqToTokenPool.mamba_map` (`memory_pool.py:1932`) and
+    `HybridLinearKVPool.full_attention_layer_id_mapping` (`:4857`), which live
+    one object out. Reading the entry's own field instead answers None on
+    every real boot, which would leave row 0 permanently neutral -- a guard
+    that cannot fire, dressed as a comparison.
+    """
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+
+    if owner is None:
+        return None
+    if pool_name == PoolName.MAMBA:
+        mapping = getattr(getattr(owner, "req_to_token_pool", None), "mamba_map", None)
+        return set(mapping) if isinstance(mapping, dict) else None
+    kv = getattr(owner, "token_to_kv_pool", None)
+    if kv is None:
+        getter = getattr(
+            getattr(owner, "token_to_kv_pool_allocator", None), "get_kvcache", None
+        )
+        kv = getter() if getter is not None else None
+    mapping = getattr(kv, "full_attention_layer_id_mapping", None)
+    return set(mapping) if isinstance(mapping, dict) else None
+
+
+def _vote_transfer_domain_terms(result: dict, logger, rank: int, stacks) -> None:
+    """Rows 0 and 1 for every entry of every built group.
+
+    Row 0 `owned_equals_driven` is the SHORTFALL predicate under its one name:
+    per POOL, the device map's key set against that host entry's own
+    `layer_mapping` keys. Reading `driven` as the GROUP's scalar domain
+    instead would compare 24 against 32 on a correct tree and refuse every
+    boot -- the guard that cannot NOT fire.
+
+    Row 1 `layer_mapping_non_empty` is a SECOND term on the same reduce and is
+    not folded into row 0: a pool that maps nothing while its device half maps
+    nothing satisfies `owned == driven` and stays silent, which is exactly the
+    state row 1 exists to name.
+
+    `stacks` is (name, group, device_owner) per built stack: the pp stack is
+    measured against the Scheduler's own device objects and the pin against
+    the TP runner's, because those are the two device sides the two host
+    tiers mirror.
+    """
+    for stack, group, owner in stacks:
+        if group is None:
+            continue
+        for entry in getattr(group, "entries", ()) or ():
+            driven = set(getattr(entry, "layer_mapping", {}) or {})
+            if not driven:
+                result["layer_mapping_non_empty"] = 0
+                logger.error(
+                    "#1206 EMPTY LAYER MAPPING rank=%d stack=%s pool=%s: this "
+                    "pool is an entry of this host tier but maps no layer, so "
+                    "every transfer built for it would be silently skipped "
+                    "while the tree still calls the prefix resident",
+                    rank,
+                    stack,
+                    entry.name,
+                )
+                continue
+            owned = _device_layer_keys(owner, entry.name)
+            if owned is None:
+                # NOT COMPARABLE is not a mismatch: naming it keeps the term
+                # honest instead of voting a refusal on an unreadable pool.
+                logger.warning(
+                    "#1206 TRANSFER DOMAIN NOT COMPARABLE rank=%d stack=%s "
+                    "pool=%s: the device pool exposes neither mamba_map nor "
+                    "full_attention_layer_id_mapping, so owned==driven cannot "
+                    "be evaluated for it and row 0 is left at its neutral",
+                    rank,
+                    stack,
+                    entry.name,
+                )
+                continue
+            if owned != driven:
+                result["owned_equals_driven"] = 0
+                logger.error(
+                    "#1206 TRANSFER DOMAIN SHORTFALL rank=%d stack=%s pool=%s "
+                    "driven=%s owned=%s missing=%s: the host entry does not "
+                    "map every layer its device pool owns, so those layers are "
+                    "never restored while the tree calls the prefix resident",
+                    rank,
+                    stack,
+                    entry.name,
+                    sorted(driven),
+                    sorted(owned),
+                    sorted(owned - driven),
+                )
+
+
 def build_phase_flip_host_pools(scheduler):
     """#847: the WRITER for ``scheduler.phase_flip_host_pools``.
 
@@ -2314,12 +2587,30 @@ def build_phase_flip_host_pools(scheduler):
     contract for a pp tier whose shape cannot be read or a pin that cannot be
     allocated: logged, and the rebind refuses at the first cutover.
     """
+    # #1206 S1-C14: THE BOOT-VERDICT KEYS ARE ASSEMBLED HERE, ABOVE EVERY
+    # EXIT, AND NEVER PER-RETURN. The boot reduce at `scheduler.py:961-968`
+    # reads them with NO default, so a `.get(..., 1)` there -- or a mapping
+    # assembled at one return and forgotten at another -- would turn a missing
+    # key into a healthy vote on the one row whose job is to STOP the group.
+    # Initialising once makes the key set a property of the function rather
+    # than of the branch, so a missing key is a KeyError identical on every
+    # rank instead of a silent pass on one.
+    result = {
+        "owned_equals_driven": 1,
+        "layer_mapping_non_empty": 1,
+        "host_pool_build_ok": 1,
+        "host_pool_build_msg": None,
+    }
     import logging
 
     logger = logging.getLogger(__name__)
     sa = getattr(scheduler, "server_args", None)
     if not getattr(sa, "phase_flip_rebind_hicache", False):
-        return {}
+        # NOT-APPLICABLE, not refusing: a flip boot without the rebind sub-flag
+        # is a supported configuration (`phase_flip_runtime.py:3931-3935`), and
+        # voting the refusing value here would kill it at the boot reduce with
+        # a message about a pin nobody asked for.
+        return result
 
     tree = getattr(scheduler, "tree_cache", None)
     pp_host = host_tier_of(tree)
@@ -2333,7 +2624,9 @@ def build_phase_flip_host_pools(scheduler):
             "a phase-matched pin from. The rebind will refuse at the first "
             "cutover. Enable hierarchical cache, or drop the flag."
         )
-        return {}
+        # NOT-APPLICABLE. This exit returns BEFORE any `HostPoolGroup` exists,
+        # which is why row 12 travels in the return and never off a group.
+        return result
 
     stacks = getattr(scheduler, "phase_flip_stacks", None)
     tp_worker = getattr(stacks, "tp_worker", None)
@@ -2346,7 +2639,7 @@ def build_phase_flip_host_pools(scheduler):
             "pool is allocated from its device pool -- DESIGN_706 C1). The "
             "rebind will refuse at the first cutover."
         )
-        return {"pp": pp_host}
+        return _failed_to_build(result, pp_host)
 
     from sglang.srt.mem_cache.hicache_storage import PoolName
 
@@ -2382,15 +2675,22 @@ def build_phase_flip_host_pools(scheduler):
             cell_pp,
             pp_layers,
         )
-        return {"pp": pp_host}
+        return _failed_to_build(result, pp_host)
     per_layer, _rem = divmod(cell_pp, pp_layers)
     if _rem != 0 or per_layer <= 0:
-        raise ValueError(
+        # #1206 S1-C14 / B-17 (alpha): ROUTED, not raised. This predicate is
+        # rank-divergent by construction (`cell_pp` and `pp_layers` are this
+        # rank's own reads), so a raise here left the two peers blocked in the
+        # boot reduce nobody would join -- a hang with no message. The message
+        # is preserved verbatim and the refusal becomes a group verdict.
+        _msg = (
             "#1068 TP PIN CELL UNDERIVABLE rank=%d: the pp cell %d B does not "
             "divide by the pp layer count %d, so the per-layer bytes the tp "
             "cell is built from would be a guess (spec R7: both phases must "
             "share per-layer KV bytes)" % (rank, cell_pp, pp_layers)
         )
+        logger.error(_msg)
+        return _failed_to_build(result, pp_host, reason=_msg)
     # G10 BOOT FLOOR, replacing the old silent max(1, ...): the pool must hold
     # one wave of in-flight prefill, or the first wave is refused/truncated.
     if max_running <= 0 or chunk <= 0:
@@ -2407,13 +2707,18 @@ def build_phase_flip_host_pools(scheduler):
             pp_rows,
         )
     elif pp_rows < max_running * chunk:
-        raise ValueError(
+        # ROUTED for the same reason as CELL UNDERIVABLE above, and with the
+        # same message: `pp_rows` rests on a comment-only MIN claim, so no
+        # anchored uniformity argument covers this predicate either.
+        _msg = (
             "#1068 HOST POOL BELOW ONE WAVE rank=%d pp_rows=%d < "
             "max_running_requests=%d x chunked_prefill_size=%d = %d rows: "
             "raise --hicache-size (GB, absolute; both phase pools are "
             "row-coupled to it), currently %d"
             % (rank, pp_rows, max_running, chunk, max_running * chunk, hicache_size_gb)
         )
+        logger.error(_msg)
+        return _failed_to_build(result, pp_host, reason=_msg)
     try:
         # W34: BUILT WITH THE ASSEMBLER'S OWN NAMED PRIMITIVES, not by cloning
         # `type(pp_host)`. The clone was W34 arm 1's defect: the live host tier
@@ -2558,7 +2863,7 @@ def build_phase_flip_host_pools(scheduler):
             pp_rows,
             exc,
         )
-        return {"pp": pp_host}
+        return _failed_to_build(result, pp_host)
 
     # #1068 POST-BUILD REFUSALS (L12), OUTSIDE the try on purpose: an
     # allocation failure above is the #847 soft refusal, but a pin that
@@ -2574,7 +2879,7 @@ def build_phase_flip_host_pools(scheduler):
             "prefetch its peers register" % (rank, tp_rows, pp_rows, cell_tp, cell_pp)
         )
         logger.error(_msg)
-        raise RuntimeError(_msg)
+        _record_build_failure(result, _msg)
     mamba_slots = -1
     mamba_per_slot_mib = 0.0
     if mamba_host is not None:
@@ -2590,16 +2895,22 @@ def build_phase_flip_host_pools(scheduler):
                 % (rank, mamba_slots, pp_slots)
             )
             logger.error(_msg)
-            raise RuntimeError(_msg)
+            _record_build_failure(result, _msg)
         _req_pool = getattr(tp_runner, "req_to_token_pool", None)
         device_slots = int(getattr(getattr(_req_pool, "mamba_pool", None), "size", 0) or 0)
         _need = device_slots + max_running + 1
         if mamba_slots < _need:
-            raise ValueError(
+            _msg = (
                 "--hicache-mamba-host-mib too small: %d slots, need >= "
                 "device_slots %d + max_running_requests %d + 1 = %d (rank=%d)"
                 % (mamba_slots, device_slots, max_running, _need, rank)
             )
+            # This predicate mixes a MIN-synced slot count with a RANK-LOCAL
+            # device read, so it is the one of the three that genuinely
+            # diverges across ranks. It had no log line of its own; the
+            # routing adds one, or the rank that hit it names itself nowhere.
+            logger.error(_msg)
+            _record_build_failure(result, _msg)
 
     # #721 HOST-LEDGER: the pin is a NAMED POST, and the floor never yields to
     # it. Printed here, at the allocation, so the number in the ledger is the
@@ -2687,4 +2998,12 @@ def build_phase_flip_host_pools(scheduler):
         _weg1_floor_text(),
         spans_at_prompt_max,
     )
-    return {"pp": pp_host, "tp": tp_host}
+    _vote_transfer_domain_terms(
+        result,
+        logger,
+        rank,
+        [("pp", pp_host, scheduler), ("tp", tp_host, tp_runner)],
+    )
+    result["pp"] = pp_host
+    result["tp"] = tp_host
+    return result

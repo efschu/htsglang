@@ -2203,6 +2203,34 @@ class HiCacheController:
             drafter_identity,
         )
 
+        # #1206 S1-C12, LOCAL half. The draft tier rides the SAME per-layer
+        # loop as the target tier, so a draft pool that covers fewer layers
+        # than the loop drives restores a prefix the tree then calls resident.
+        # This line says WHEN the mismatch was detected; S0's slot 10 says
+        # WHETHER it holds now, computed on read from these same two objects,
+        # and only that is voted. No flag is stored here: a stored copy would
+        # be a third record of a fact both objects already carry (D-12), and
+        # it would have to be initialised in the negative sense by hand.
+        # It does NOT raise -- this site re-runs at every pp->tp cutover, as
+        # the docstring above says, and a rank-local raise inside a cutover is
+        # not the boot-time exception D-20 allows.
+        _draft_layers = int(getattr(draft_host_pool, "layer_num", 0) or 0)
+        _driven = getattr(
+            getattr(self, "mem_pool_host", None), "transfer_layer_domain", None
+        )
+        if _driven is not None and _draft_layers != int(_driven):
+            logger.error(
+                "#1206 DRAFT TIER DOMAIN MISMATCH: the draft host tier covers "
+                "%d layer(s) while the restore loop drives a domain of %d, so "
+                "every driven layer outside the draft tier's own key space is "
+                "silently skipped on the draft half (owner_phase=%s, "
+                "binding_generation=%s)",
+                _draft_layers,
+                int(_driven),
+                owner_phase,
+                binding_generation,
+            )
+
         # If storage is already attached, wire up the draft I/O path now.
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()

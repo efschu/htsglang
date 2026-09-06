@@ -1974,6 +1974,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         Since #1206 it is no longer the BOUND -- `_wait_for_mamba_layer` reads
         the counter's own live width, because a value captured here is a
         boot-frozen copy that the cutover's resize leaves behind.
+
+        THE COUNTER CONTRACT WIDENED WITH THAT CHANGE: a counter registered
+        here must answer `wait_until(threshold)` AND `num_layers`. Only
+        `LayerDoneCounter` is ever registered in the tree, so this is a
+        stand-in obligation rather than a runtime one -- named because it is
+        the half a test double gets wrong silently.
         """
         self.layer_transfer_counter = layer_transfer_counter
         self._mamba_transfer_frame = mamba_transfer_frame

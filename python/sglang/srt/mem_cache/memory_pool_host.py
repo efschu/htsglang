@@ -1912,6 +1912,23 @@ class HostPoolGroup:
     host_ring_discard_ok = 1
     d_backup_width = 0
 
+    def expected_transfer_layer_domain(self, bound_phase):
+        """The domain this group is EXPECTED to drive in ``bound_phase``.
+
+        #1206 slot 15 reads its right-hand term through this NAME so that the
+        two terms of that refusal stay on two objects: the left term is the
+        counter's live width, this one is the group's own driven domain.
+        HAZARD it closes: a term read straight off the counter's own source
+        would be one object compared with its own copy.
+
+        B1: the group's own driven domain -- a READ over the entries, never a
+        stored copy (D-12), so it follows a re-pointed entry set.
+        B6: S7 fills this body from its phase-keyed device table, keyed by
+        ``bound_phase``; the parameter is declared here so that filling it is
+        a body edit rather than a signature widening.
+        """
+        return self.transfer_layer_domain
+
     def __init__(self, entries: list[PoolEntry]):
         if not entries:
             raise ValueError("HostPoolGroup requires at least one pool entry.")

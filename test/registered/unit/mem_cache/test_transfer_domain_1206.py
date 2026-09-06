@@ -392,5 +392,539 @@ class TestCounterResize(unittest.TestCase):
             self.assertTrue(event.finish_event.query())
 
 
+# ---------------------------------------------------------------------------
+# S1 FIX 1. The four holes the fixer round measured in this file: the attach
+# instrument had no test at all, the loop's own body was never driven (T-2b
+# and T-10's producer half were fixture arithmetic), and the two lines that
+# WIRE the derived domain -- the counter resize in ``__init__`` and the draft
+# guard's third conjunct -- could each be deleted with the suite still green.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingProducerEvent:
+    """Stands in for ``LayerLoadingEvent`` without a device.
+
+    ``record()``/``wait()`` are the two calls that need a CUDA context; the
+    only thing under test here is the SEQUENCE handed to ``complete``.
+    """
+
+    def __init__(self):
+        self.completed = []
+        self.start_event = types.SimpleNamespace(
+            record=lambda: None, wait=lambda _stream: None
+        )
+        self.finish_event = types.SimpleNamespace()
+
+    def complete(self, layer_index):
+        self.completed.append(layer_index)
+
+
+class _StubDeviceModule:
+    """``device_module.stream(...)`` as a no-op context manager."""
+
+    class _Ctx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            return False
+
+    def stream(self, _stream):
+        return self._Ctx()
+
+
+class _LoopDriver:
+    """Drive ``HybridCacheController.start_loading``'s BODY hermetically.
+
+    HAZARD this closes: the loop is the one place where the domain, the draft
+    guard and the producer index meet, and every earlier test in this file
+    drove a re-implementation of it from the test side. A re-implementation
+    cannot fail when the tree's own composition changes.
+    """
+
+    def __init__(self, group, draft_host=None, draft_armed=False):
+        self.controller = object.__new__(HybridCacheController)
+        c = self.controller
+        c.load_queue = [MagicMock()]
+        c.ack_load_queue = []
+        c.load_stream = None
+        c.mem_pool_host = group
+        c.mem_pool_device = MagicMock()
+        c.mem_pool_host_draft = draft_host
+        c.mem_pool_device_draft = MagicMock()
+        c.io_backend = "direct"
+        c.layer_done_counter = MagicMock()
+        c.layer_done_counter.update_producer.return_value = 0
+        self.producer_event = _RecordingProducerEvent()
+        c.layer_done_counter.events = [self.producer_event]
+        self.host_indices = torch.arange(4)
+        self.device_indices = torch.arange(4)
+        c.move_hybrid_indices = lambda op: (
+            self.host_indices,
+            self.device_indices,
+            [],
+        )
+        c._dcp_kv_transfer_pairs = lambda h, d: (h, d)
+        c.draft_tier_armed = lambda _direction: draft_armed
+        self.draft_visited = []
+        if draft_host is not None:
+            draft_host.load_to_device_per_layer = (
+                lambda *a, **kw: self.draft_visited.append(a[3])
+            )
+
+    def run(self):
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
+
+        saved_dm = hcc.device_module
+        saved_gate = hcc.consume_gate
+        hcc.device_module = _StubDeviceModule()
+        # The phase gate is S2/#760's question, not this one; neutered so the
+        # loop's own composition is what the assertion reads.
+        hcc.consume_gate = lambda _c, _q, _d: True
+        try:
+            HybridCacheController.start_loading(self.controller)
+        finally:
+            hcc.device_module = saved_dm
+            hcc.consume_gate = saved_gate
+
+
+class _CountingHostGroup:
+    """A group with a real domain whose per-layer load only records.
+
+    It carries `entries` as well as the domain, because the two numbers a PP
+    stage keeps apart are exactly `len(keys)` and `1 + max(key)`: a stand-in
+    that only knows the domain cannot tell a loop driving the right COUNT of
+    layers from one driving the right ONES.
+    """
+
+    def __init__(self, domain, keys=None):
+        self.transfer_layer_domain = domain
+        keys = range(domain) if keys is None else keys
+        self.entries = [
+            types.SimpleNamespace(layer_mapping={k: i for i, k in enumerate(keys)})
+        ]
+        self.visited = []
+
+    def load_to_device_per_layer(self, _dev, _h, _d, layer_id, _backend, **kw):
+        self.visited.append(layer_id)
+
+
+class _SparseDraftHostPool:
+    """A draft host tier whose covered ids are NOT ``range(layer_num)``."""
+
+    def __init__(self, covered):
+        self.entries = [
+            types.SimpleNamespace(
+                layer_mapping={key: i for i, key in enumerate(covered)}
+            )
+        ]
+        self.layer_num = len(covered)
+
+
+class TestTheLoopBodyItself(unittest.TestCase):
+    """T-2b (the LOOP, not the predicate) and T-10's producer half."""
+
+    def test_the_producer_completes_every_global_id_of_the_domain_in_order(self):
+        """E-1's producer contract, driven through the tree's own loop.
+
+        DANGER DIRECTION: feeding ``step`` (or ``i - start_layer``) to
+        ``producer_event.complete`` looks identical in a coverage line -- the
+        right COUNT of layers is completed -- while the mamba waiter, which
+        waits on the GLOBAL id, joins an index the producer never records.
+        """
+        # PP1's key space: 18 keys spanning 32..49, so `len(keys)` and the
+        # domain are 18 and 50 -- the two numbers a step-indexed loop confuses.
+        group = _CountingHostGroup(50, keys=range(32, 50))
+        driver = _LoopDriver(group)
+        driver.run()
+
+        self.assertEqual(group.visited, list(range(50)))
+        self.assertEqual(driver.producer_event.completed, list(range(50)))
+
+    def test_the_draft_load_visits_exactly_the_covered_global_ids(self):
+        """T-2b as the spec states it: every covered draft layer visited, no
+        uncovered one -- through the loop's own guard composition."""
+        group = _CountingHostGroup(50)
+        draft = _SparseDraftHostPool([32, 35, 40, 49])
+        driver = _LoopDriver(group, draft_host=draft, draft_armed=True)
+        driver.run()
+
+        self.assertEqual(driver.draft_visited, [32, 35, 40, 49])
+
+    def test_a_disarmed_draft_tier_is_not_loaded_at_all(self):
+        group = _CountingHostGroup(8)
+        draft = _SparseDraftHostPool([0, 1])
+        driver = _LoopDriver(group, draft_host=draft, draft_armed=False)
+        driver.run()
+
+        self.assertEqual(driver.draft_visited, [])
+
+
+def _conjuncts(node):
+    out = []
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+        for value in node.values:
+            out.extend(_conjuncts(value))
+    else:
+        out.append(node)
+    return out
+
+
+class TestTheTwoWiringLines(unittest.TestCase):
+    """The two lines that connect the derived domain to its consumers.
+
+    HAZARD these close: each is a single statement whose deletion leaves every
+    behavioural test in this file green -- the counter keeps the base's narrow
+    width, and ``_host_pool_covers_layer`` becomes dead code beside a restored
+    frozen bound. A numbered change with no kill relation is a numbered change
+    a later edit can drop silently.
+    """
+
+    def test_the_controller_sizes_the_counter_from_the_group(self):
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(HybridCacheController.__init__))
+        )
+        resizes = [
+            call
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "resize"
+        ]
+        self.assertEqual(len(resizes), 1, "exactly one resize call in __init__")
+        self.assertEqual(ast.unparse(resizes[0].func), "self.layer_done_counter.resize")
+        self.assertEqual(
+            ast.unparse(resizes[0].args[0]),
+            "self.mem_pool_host.transfer_layer_domain",
+        )
+
+    def test_a_constructed_controller_carries_the_groups_domain_on_its_counter(self):
+        """The same wiring as BEHAVIOUR, through the real ``__init__``.
+
+        HAZARD the AST pin above cannot close: a statement that is written is
+        not a statement that RUNS, and neither pin alone shows that the counter
+        the pools were already handed is the one that widens. The identity
+        assertion is the second half -- a fresh ``LayerDoneCounter`` would
+        satisfy the width and leave the device and req pools holding the narrow
+        object nobody rebinds.
+        """
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hcc
+
+        group = _CountingHostGroup(50, keys=range(32, 50))
+        # 18 = the base's own `mem_pool_device.layer_num` meaning: this PP
+        # stage's layer COUNT, the number the domain must replace.
+        counter = LayerDoneCounter(18)
+
+        def _base_init(self, **kwargs):
+            # The two attributes the real base sets that the line under test
+            # reads: `cache_controller.py:657` and `:732`. Nothing else of the
+            # base is needed, and standing in for the rest is what keeps this
+            # hermetic.
+            self.mem_pool_host = kwargs["mem_pool_host"]
+            self.layer_done_counter = counter
+
+        saved = hcc.BaseHiCacheController.__init__
+        hcc.BaseHiCacheController.__init__ = _base_init
+        try:
+            controller = hcc.HybridCacheController(
+                token_to_kv_pool_allocator=MagicMock(),
+                mem_pool_host=group,
+                page_size=1,
+                tp_group=MagicMock(),
+                load_cache_event=MagicMock(),
+            )
+        finally:
+            hcc.BaseHiCacheController.__init__ = saved
+
+        self.assertIs(controller.layer_done_counter, counter)
+        self.assertEqual(counter.num_layers, 50)
+        for event in counter.events:
+            self.assertEqual(len(event.load_events), 50)
+            self.assertEqual(event._num_layers, 50)
+
+    def test_the_draft_guard_reads_the_membership_predicate(self):
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(HybridCacheController.start_loading))
+        )
+        guards = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If) and "draft_tier_armed" in ast.unparse(node.test)
+        ]
+        self.assertEqual(len(guards), 1, "one draft guard in start_loading")
+        terms = [ast.unparse(t) for t in _conjuncts(guards[0].test)]
+        self.assertIn(
+            "_host_pool_covers_layer(self.mem_pool_host_draft, i)",
+            terms,
+            "the call site must read the membership predicate, not a count",
+        )
+        self.assertNotIn("i < self.mem_pool_host_draft.layer_num", terms)
+
+
+class TestTheExpectedDomainAccessor(unittest.TestCase):
+    """S1-C18 / D-74. Slot 15's right-hand term is read through this NAME.
+
+    HAZARD this closes: S0's reader treats a MISSING accessor as healthy
+    (``phase_domain_verdict.py`` returns the MIN-neutral 1 when the name is
+    absent), so an omitted method is a STOP that can never fire rather than a
+    crash anyone would see.
+    """
+
+    def test_the_accessor_is_a_method_returning_the_groups_own_driven_domain(self):
+        group, _full, _mamba = _group_for_stage(32, 50)
+        self.assertTrue(callable(group.expected_transfer_layer_domain))
+        self.assertEqual(group.expected_transfer_layer_domain("tp"), 50)
+        self.assertEqual(
+            group.expected_transfer_layer_domain("pp"), group.transfer_layer_domain
+        )
+        # D-12: a READ over the entries, not a stored copy -- so it follows a
+        # group whose entries name a different key space.
+        other, _f, _m = _group_for_stage(0, 32)
+        self.assertEqual(other.expected_transfer_layer_domain("pp"), 32)
+
+    def test_the_accessor_takes_the_bound_phase_parameter(self):
+        """B6 fills the body from a phase-keyed table; a B1 signature without
+        the parameter forces S7 to widen a signature it may not touch."""
+        sig = inspect.signature(HostPoolGroup.expected_transfer_layer_domain)
+        self.assertEqual(list(sig.parameters), ["self", "bound_phase"])
+
+
+class TestTheAttachInstrument(unittest.TestCase):
+    """T-43, the PP half. S1-C15's line is the ONLY instrument that can show
+    a domain/key-space mismatch, and it had no test at all: the whole call
+    could be deleted with this file still green.
+    """
+
+    def _attach_records(self, group, pp_rank=2):
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
+
+        cache = MagicMock()
+        cache.components = {}
+        kvcache = MagicMock()
+        params = MagicMock()
+        params.pp_rank = pp_rank
+        result = hpa.StackBuildResult(
+            host_pool_group=group,
+            cache_controller=MagicMock(),
+            component_host_pools={},
+            sidecars=[],
+            register_req_to_token_counter=False,
+            pools_desc="KV + MAMBA",
+        )
+        with self.assertLogs(hpa.logger, level="INFO") as captured:
+            hpa._apply_stack_result(cache, kvcache, params, result)
+        return [
+            line for line in captured.output if "#1206 TRANSFER DOMAIN attach" in line
+        ]
+
+    def test_attach_line_names_the_domain_and_the_per_pool_key_ranges(self):
+        group, full_map, mamba_map = _group_for_stage(32, 50)
+        lines = self._attach_records(group, pp_rank=2)
+
+        self.assertEqual(len(lines), 1, "exactly ONE attach line per stack")
+        line = lines[0]
+        self.assertIn("rank=2", line)
+        self.assertIn("stack=pp", line)
+        # The GROUP property, printed as an integer -- not the count that
+        # could not show the mismatch.
+        self.assertIn("domain=50", line)
+        # Each pool's OWN key set, named by the pool -- so a reader cannot
+        # take the domain for a key range or one pool's span for another's.
+        self.assertIn(
+            "%s: keys[%d..%d] n=%d"
+            % (PoolName.KV, min(full_map), max(full_map), len(full_map)),
+            line,
+        )
+        self.assertIn(
+            "%s: keys[%d..%d] n=%d"
+            % (PoolName.MAMBA, min(mamba_map), max(mamba_map), len(mamba_map)),
+            line,
+        )
+
+    def test_the_attach_line_prints_this_ranks_own_number(self):
+        group, _f, _m = _group_for_stage(0, 32)
+        lines = self._attach_records(group, pp_rank=0)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("rank=0", lines[0])
+        self.assertIn("domain=32", lines[0])
+
+
+class _DraftHostPool:
+    def __init__(self, layer_num, size=8):
+        self.layer_num = layer_num
+        self.size = size
+
+
+class TestTheDraftTierDomainTerm(unittest.TestCase):
+    """T-36, S1-C12's LOCAL half.
+
+    The line says WHEN the mismatch was detected; S0's slot 10 says WHETHER
+    it holds now, and only that is voted. Two instruments of one fact, not
+    two records of it -- so a builder cannot store the flag here (mutant 19).
+    """
+
+    def _controller(self, domain):
+        from sglang.srt.managers import cache_controller as cc
+
+        controller = object.__new__(cc.HiCacheController)
+        controller.has_draft = False
+        controller.mem_pool_device_draft = None
+        controller.mem_pool_host_draft = None
+        controller.mem_pool_host = types.SimpleNamespace(transfer_layer_domain=domain)
+        controller.draft_owner_phase = None
+        controller.draft_binding_generation = None
+        controller.draft_identity = None
+        controller._maybe_register_draft_with_storage = lambda: None
+        return controller
+
+    def test_arm_0_the_pre_event_term_is_the_min_neutral(self):
+        """CAN-NOT-FIRE PIN (excluded from the red-first total). Before
+        ``set_draft_kv_pool`` has ever run the term is the AND-neutral 1, with
+        no ``AttributeError`` on the ``None`` pool -- the danger direction a
+        stored, falsily-initialised flag would turn into a group STOP."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        controller = self._controller(64)
+        self.assertEqual(pdv._draft_tier_domain_matches(controller), 1)
+
+    def test_arm_1_a_mismatch_logs_once_at_error_and_votes_zero(self):
+        from sglang.srt.managers import cache_controller as cc
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        controller = self._controller(64)
+        with self.assertLogs(cc.logger, level="ERROR") as captured:
+            cc.HiCacheController.set_draft_kv_pool(
+                controller, MagicMock(), _DraftHostPool(18)
+            )
+        lines = [
+            line
+            for line in captured.output
+            if "#1206 DRAFT TIER DOMAIN MISMATCH" in line
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("18", lines[0])
+        self.assertIn("64", lines[0])
+        self.assertEqual(pdv._draft_tier_domain_matches(controller), 0)
+
+    def test_a_matching_draft_tier_logs_nothing_and_votes_one(self):
+        from sglang.srt.managers import cache_controller as cc
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        controller = self._controller(64)
+        with self.assertLogs(cc.logger, level="INFO") as captured:
+            cc.HiCacheController.set_draft_kv_pool(
+                controller, MagicMock(), _DraftHostPool(64)
+            )
+        self.assertEqual(
+            [
+                line
+                for line in captured.output
+                if "#1206 DRAFT TIER DOMAIN MISMATCH" in line
+            ],
+            [],
+        )
+        self.assertEqual(pdv._draft_tier_domain_matches(controller), 1)
+
+
+class TestTheRebindDomainTerm(unittest.TestCase):
+    """T-48, S1-C16's LOCAL half, arms (0), (1) and (2).
+
+    TWO OBJECTS IN BOTH ARMS: the counter's live width against the bound
+    group's own expected domain. A version reading both from one object is
+    the guard-that-cannot-fire this refusal exists to avoid.
+    """
+
+    def _readers(self, counter_width, group):
+        controller = types.SimpleNamespace(
+            layer_done_counter=types.SimpleNamespace(num_layers=counter_width),
+            mem_pool_host=None,
+            mem_pool_device=None,
+            mem_pool_device_hybrid=None,
+            token_to_kv_pool_allocator=None,
+            hicache_binding_generation=None,
+        )
+        return controller
+
+    def _incoming(self, group):
+        pools = MagicMock(spec=PhasePools)
+        pools.phase = "tp"
+        pools.host_pool = group
+        pools.device_pool = MagicMock()
+        pools.device_pool_hybrid = None
+        pools.allocator = MagicMock()
+        pools.layer_num = lambda: group.transfer_layer_domain
+        return pools
+
+    def _rebind(self, counter_width, group):
+        from sglang.srt.mem_cache import hicache_phase_binding as hpb
+
+        controller = self._readers(counter_width, group)
+        incoming = self._incoming(group)
+        # The two shape guards are S2's subject and refuse a stand-in tier;
+        # neutered so what this assertion reads is the domain term alone.
+        saved = (hpb.check_shapes, hpb.check_pool_coverage)
+        hpb.check_shapes = lambda _i: None
+        hpb.check_pool_coverage = lambda _r, _i: None
+        # `rebind` ADVANCES THE PROCESS-WIDE BINDING STATE, and leaving it
+        # advanced moves `bound_phase()` for every later test in the same
+        # pytest process -- measured: 204 unrelated hicache cases in
+        # `test_unified_radix_cache_unittest.py` stopped skipping and went
+        # red on a whole-directory run while passing in isolation. The state
+        # is restored here, not "expected to be reset by the next test".
+        state = hpb.binding_state()
+        before = (state.phase, state.generation)
+        try:
+            with self.assertLogs(hpb.logger, level="INFO") as captured:
+                hpb.rebind({"controller": controller}, incoming)
+        finally:
+            hpb.check_shapes, hpb.check_pool_coverage = saved
+            # Restore EXACTLY what was there, private fields included:
+            # `reset()` returns the BOOT phase and generation 0, which is
+            # right in a clean process and wrong if anything upstream had
+            # already advanced it.
+            state._phase, state._generation = before
+        self.assertEqual((state.phase, state.generation), before)
+        return controller, [
+            line
+            for line in captured.output
+            if "#1206 REBIND DOMAIN OUTSIDE DRIVEN" in line
+        ]
+
+    def test_arm_2_a_stamp_without_a_resize_logs_both_numbers_and_votes_zero(self):
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        tp_group, _f, _m = _group_for_stage(0, 64)
+        self.assertEqual(tp_group.transfer_layer_domain, 64)
+        controller, lines = self._rebind(50, tp_group)
+
+        self.assertEqual(len(lines), 1, "exactly one line at ERROR")
+        self.assertIn("64", lines[0])
+        self.assertIn("50", lines[0])
+        self.assertIn("generation=", lines[0])
+        self.assertEqual(
+            pdv._rebind_domain_within_driven(controller, tp_group, "tp"), 0
+        )
+
+    def test_arm_1_a_counter_that_followed_logs_nothing_and_votes_one(self):
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        tp_group, _f, _m = _group_for_stage(0, 64)
+        controller, lines = self._rebind(64, tp_group)
+
+        self.assertEqual(lines, [])
+        self.assertEqual(
+            pdv._rebind_domain_within_driven(controller, tp_group, "tp"), 1
+        )
+
+    def test_arm_0_before_any_rebind_the_term_is_the_min_neutral(self):
+        """CAN-NOT-FIRE PIN. A controller with no counter votes the neutral
+        rather than dereferencing one."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        group, _f, _m = _group_for_stage(32, 50)
+        controller = types.SimpleNamespace(layer_done_counter=None)
+        self.assertEqual(pdv._rebind_domain_within_driven(controller, group, "pp"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
