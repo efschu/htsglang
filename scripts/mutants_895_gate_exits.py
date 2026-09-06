@@ -24,7 +24,7 @@ whether the arms pass or fail.
     | A9 | the solo re-run itself cannot answer          | rc 3, INCONCLUSIVE |
     |A10 | the solo re-run collects nothing but parses   | rc 3, INCONCLUSIVE |
     |A11 | a module that cannot be imported at all       | named UNCOLLECTABLE|
-    |A12 | the same census, on an INTERRUPTED lane       | named BEFORE rc 3  |
+    |A12 | the same census, on an INTERRUPTED lane       | lane-side rc 3     |
     |A13 | --gate-path with no --table beside it        | rc 2, REFUSED      |
     |A14 | a gate path that holds no test module        | rc 2, REFUSED      |
     +----+-----------------------------------------------+--------------------+
@@ -44,14 +44,23 @@ a unit arm on ``uncollectable_modules`` proves the list and not the report, and
 deleting the block that prints it would still leave that arm green.
 
 A12 is A11's other half, and the difference is the LANE, not the assertion.
-The census earns its keep by standing BEFORE the ``VERDICT: INCONCLUSIVE``
-return, which is the only path an interrupted lane takes -- and A11's probe
-modules are PARALLEL, so its lane runs under xdist workers, is never
-interrupted, and prints the census on either side of a move. A12 stages the
-same two modules SERIAL: workers=0, one process, pytest stops at
-``Interrupted: 1 error during collection``, and the run reaches the return.
-That is the run in which the reader's ONLY signal that a module never started
-is this banner, so it is the run the arm asserts on.
+The census earns its keep by standing BEFORE the LANE-SIDE ``VERDICT:
+INCONCLUSIVE -- a lane's log is not an answer.`` return, which is the only
+path an interrupted lane takes -- and A11's probe modules are PARALLEL, so its
+lane runs under xdist workers, is never interrupted, and prints the census on
+either side of a move. A12 stages the same two modules SERIAL: workers=0, one
+process, pytest stops at ``Interrupted: 1 error during collection``, and the
+run reaches that return. That is the run in which the reader's ONLY signal
+that a module never started is this banner, so it is the run the arm asserts
+on.
+
+A12 is ALSO the only arm at any level that sees ``main()`` still CONSUME
+``lane_verdict``: every unit arm calls the function directly and so proves the
+function, not the call. It can only carry that weight if it names WHICH of the
+runner's two ``VERDICT: INCONCLUSIVE`` returns it reached -- the lane-side one
+above, or the #895 one a solo re-run that could not answer prints on a run
+whose lanes all voted OK. It names the lane-side sentence in full, plus the
+interrupted branch's own note, for that reason.
 
 A13 and A14 are the arm for ``main()``'s ``except ScopeRefused``, the single
 consumer of all three of the runner's scope refusals. The hazard is the one
@@ -397,13 +406,24 @@ def main() -> int:
                      "RERUN INCONCLUSIVE"],
                     ["NOT REPRODUCED", "GENUINE"])
 
-        # A12 -- the census on the run that needs it: an INTERRUPTED lane.
-        # The banner stands ahead of the INCONCLUSIVE return, and only a lane
-        # that pytest cut short during collection reaches that return. Both
+        # A12 -- the census on the run that needs it: an INTERRUPTED lane,
+        # AND the only arm that sees `main()` consume `lane_verdict`. Both
         # modules go SERIAL, so the lane runs with workers=0 in one process and
         # pytest stops at `Interrupted: 1 error during collection` -- the exact
         # #1207 shape, where every count the runner has still tallies and the
         # name of the module that never started is the only thing left to say.
+        #
+        # THE HAZARD THE EXPECTED STRINGS ARE SHAPED AGAINST: the runner prints
+        # `VERDICT: INCONCLUSIVE` from TWO returns, and only one of them is
+        # #1207's. The lane-side return is reached ONLY through `lane_verdict`;
+        # the #895 return is reached on a run whose lanes all voted OK, because
+        # the solo re-run of an uncollectable module cannot answer either. So
+        # this arm names the lane-side sentence in full and the interrupted
+        # branch's own note WITH its arithmetic (2 modules staged, 1
+        # uncollectable, so 1 never ran). Asserting the bare substring instead
+        # was measured to be satisfied by the #895 return, which leaves
+        # `main()` free to go back to the pre-#1207 inline tally -- deleting
+        # both refusals this slice added -- with every arm still green.
         stage(["test_p_ok.py", "test_p_uncollectable.py"])
         write_table(table, [(mod("test_p_ok.py"), "SERIAL", "probe", []),
                             (mod("test_p_uncollectable.py"), "SERIAL",
@@ -412,7 +432,9 @@ def main() -> int:
         ok &= check("A12 census speaks on an INTERRUPTED run", 3, rc, out,
                     ["=== DID NOT RUN: 1 module(s) could not be collected ===",
                      f"UNCOLLECTABLE {PROBE_REL}/test_p_uncollectable.py",
-                     "VERDICT: INCONCLUSIVE"],
+                     "pytest was INTERRUPTED during collection, so the 1 other "
+                     "module(s) this lane holds never ran",
+                     "VERDICT: INCONCLUSIVE -- a lane's log is not an answer."],
                     ["NOT REPRODUCED", "GENUINE"])
 
         # A13 -- a --gate-path with no --table. Answering it from the default
