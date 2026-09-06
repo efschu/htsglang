@@ -1725,11 +1725,16 @@ class FlipImagePin:
             fd = meta.fd_direct
         return os.preadv(fd, [memoryview(view)[offset : offset + length]], offset)
 
-    def _read_loop(self, meta: _FileBackedImage) -> None:
+    def _read_loop(self, meta: _FileBackedImage, start: int = 0) -> None:
+        """Fill ``[start, meta.nbytes)`` of the buffer from ``meta``'s file.
+
+        ``start`` is non-zero only when an arm RESUMED a prefix an earlier
+        arm for the same identity had already read -- see ``start_prefetch``.
+        """
         view = self._buffer.numpy()
         chunk = max(_DIRECT_ALIGN, _refill_chunk_bytes())
         nbytes = int(meta.nbytes)
-        off = 0
+        off = int(start)
         try:
             while off < nbytes and not self._stop.is_set():
                 n = min(chunk, nbytes - off)
@@ -1743,7 +1748,12 @@ class FlipImagePin:
                     break
                 off += r
                 with self._lock:
-                    self._bytes_valid = off
+                    # NEVER PUBLISH A SMALLER PREFIX THAN THE PIN HOLDS. A
+                    # resumed reader starts at the retained count floored to
+                    # the block, and a short read there would otherwise land
+                    # the cursor below what is already valid -- offering the
+                    # refill fewer bytes than the buffer actually carries.
+                    self._bytes_valid = max(self._bytes_valid, off)
         except Exception as exc:  # noqa: BLE001 - a read-ahead never kills a flip
             # The bytes already read stay valid; the refusal is the prefix
             # being short, which the refill reports as ratio < 1.
@@ -1810,14 +1820,27 @@ class FlipImagePin:
                 return False
         with self._lock:
             self._stop = threading.Event()
-            # ZERO BEFORE THE IDENTITY. A reader of this object must never see
-            # the new identity paired with the old count, which would present
-            # the previous layout's bytes as this layout's prefix.
-            self._bytes_valid = 0
-            self._identity = want
+            if self._identity != want:
+                # ZERO BEFORE THE IDENTITY. A reader of this object must never
+                # see the new identity paired with the old count, which would
+                # present the previous layout's bytes as this layout's prefix.
+                self._bytes_valid = 0
+                self._identity = want
+            # RESUME AN ABANDONED PREFIX, do not restart it. The identity is
+            # (path, layout, generation), so an equal one means the same file
+            # contents behind the same prefix -- a path re-registered under
+            # the pin bumps the generation and lands in the zeroing above.
+            # The #834 park deadline abandons and re-arms the same direction
+            # repeatedly, and a restart there would leave the pin holding
+            # strictly LESS than it held a moment before the re-arm, which is
+            # worse than not re-arming at all. Floored to the block because a
+            # short read can leave the count off a boundary and every read
+            # from an unaligned offset falls back to the buffered fd; the few
+            # bytes re-read are bytes the pin already holds correctly.
+            resume = int(self._bytes_valid) - int(self._bytes_valid) % _DIRECT_ALIGN
             self._reader = threading.Thread(
                 target=self._read_loop,
-                args=(meta,),
+                args=(meta, resume),
                 name="flip-image-pin",
                 daemon=True,
             )
@@ -1827,6 +1850,14 @@ class FlipImagePin:
             want.layout,
             int(meta.nbytes),
         )
+        if resume > 0:
+            logger.info(
+                "#809 flip image read-ahead RESUMES at %d/%d bytes: an "
+                "abandoned arm already read that prefix of this same image, "
+                "so only the remainder is read.",
+                resume,
+                int(meta.nbytes),
+            )
         return True
 
     def stop_prefetch(self) -> bool:
@@ -1947,6 +1978,51 @@ def release_flip_image_pin() -> None:
     _unregister_image_post(pin.post_name)
 
 
+def _pin_admission_is_group_wide(local_ok: bool) -> bool:
+    """MIN ``local_ok`` across the world group: every rank refuses, or none.
+
+    THE HAZARD IS A HANG, NOT A REFUSAL. ``check_and_register_pinned_post``
+    weighs this post against LIVE availability, and ``pinned_host_budget``'s
+    module docstring names what that costs across ranks, verbatim:
+    "``available`` shrinks as each rank pins its share, so a check against
+    live availability run inside every TP worker can pass on rank 0 and raise
+    on rank 2: a rank-divergent boot decision, which is an NCCL hang rather
+    than an error". The pin is created from ``Scheduler.init_model_worker``
+    after ``init_tp_model_worker`` has brought the distributed environment up,
+    so a rank raising alone here does not fail the boot -- it parks its peers
+    in the next collective for ever.
+
+    MIN AND NOT MAX. The admission is an AND over the ranks. A MAX would
+    admit a configuration the weakest rank had just refused, and that rank
+    would then allocate exactly the bytes its own ledger denied it.
+
+    EVERY RANK REACHES THIS, on the refusing path as well as the fitting one.
+    That is why the caller catches its local failure instead of raising on it.
+
+    Degrades to the local verdict wherever no peer can disagree: no process
+    group (every unit test, and a single-process boot) or a world of one.
+    """
+    if not torch.distributed.is_available():
+        return bool(local_ok)
+    if not torch.distributed.is_initialized():
+        return bool(local_ok)
+    try:
+        from sglang.srt.distributed.parallel_state import get_world_group
+
+        world_group = get_world_group()
+    except (AssertionError, ImportError):
+        # The world group is asserted, not returned as None, when it has not
+        # been built. No group, no divergence.
+        return bool(local_ok)
+    if world_group.world_size <= 1:
+        return bool(local_ok)
+    flag = torch.tensor(1 if local_ok else 0, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        flag, op=torch.distributed.ReduceOp.MIN, group=world_group.cpu_group
+    )
+    return bool(int(flag.item()))
+
+
 def create_flip_image_pin(nbytes: int) -> "FlipImagePin":
     """Admit ``nbytes`` against the #721 ledger, then allocate and publish.
 
@@ -1956,6 +2032,12 @@ def create_flip_image_pin(nbytes: int) -> "FlipImagePin":
     (#729/#550), because a post that never allocated is credited back to the
     next admission as though its bytes were resident and the registry waves
     through the very over-commit it exists to refuse.
+
+    ONE VERDICT FOR THE GROUP. The ledger's answer depends on live host
+    availability, which every co-booting rank is shrinking as it goes, so the
+    answer is not rank-invariant. It is reduced before anyone acts on it --
+    see ``_pin_admission_is_group_wide`` for why a lone raise at this site is
+    a hang and not a refusal.
     """
     from sglang.srt.mem_cache.pinned_host_budget import (
         PINNED_HOST_RESERVE_BYTES,
@@ -1966,11 +2048,27 @@ def create_flip_image_pin(nbytes: int) -> "FlipImagePin":
     )
 
     total = int(nbytes)
+    local_exc: Optional[BaseException] = None
     try:
         check_and_register_pinned_post(
             FLIP_IMAGE_PIN_POST_NAME, FLIP_IMAGE_PIN_FLAG, total
         )
-    except ValueError as exc:
+    except Exception as exc:  # noqa: BLE001 -- held, not swallowed; see below
+        # HELD UNTIL THE GROUP HAS SPOKEN. Raising here would be the
+        # rank-divergent boot decision `_pin_admission_is_group_wide` exists
+        # to prevent: this site is past the distributed init, so the rank
+        # that refuses alone hangs the ones that did not.
+        local_exc = exc
+    if not _pin_admission_is_group_wide(local_exc is None):
+        # #729/#550: a post with no allocation behind it is credited back to
+        # the next admission as though its bytes were resident, so a rank
+        # that registered before the group refused hands its post back.
+        unregister_pinned_post(FLIP_IMAGE_PIN_POST_NAME)
+        ledger_said = (
+            str(local_exc)
+            if local_exc is not None
+            else "this rank fits; a peer rank does not"
+        )
         machine_total, available = pinned_host_memory_bytes()
         others = "; ".join(
             f"{p.name} {p.nbytes / 1e9:.2f} GB ({p.flag})"
@@ -1983,15 +2081,18 @@ def create_flip_image_pin(nbytes: int) -> "FlipImagePin":
         # "the prefetch was never there".
         raise WeightsArenaError(
             f"#809 FLIP IMAGE PIN REFUSED: {FLIP_IMAGE_PIN_POST_NAME} needs "
-            f"{total / 1e9:.2f} GB of pinned host RAM and it does not fit. "
+            f"{total / 1e9:.2f} GB of pinned host RAM and the rank group does "
+            f"not admit it (this rank "
+            f"{'does not fit' if local_exc is not None else 'fits'}; the "
+            f"verdict is reduced so the ranks cannot disagree about a boot). "
             f"posts already registered: [{others or 'none'}]; host total "
             f"{(machine_total or 0) / 1e9:.2f} GB, available "
             f"{(available or 0) / 1e9:.2f} GB, reserve floor "
             f"{PINNED_HOST_RESERVE_BYTES / 1e9:.2f} GB. Lower one of the named "
             f"flags or set {FLIP_IMAGE_PIN_FLAG} and boot without the "
             f"read-ahead; the file-backed image is unchanged either way. "
-            f"Ledger said: {exc}"
-        ) from exc
+            f"Ledger said: {ledger_said}"
+        ) from local_exc
     try:
         buffer = _alloc_pinned_pin_buffer(total)
         if int(buffer.numel()) != total:
