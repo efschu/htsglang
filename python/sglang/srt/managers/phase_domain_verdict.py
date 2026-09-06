@@ -325,12 +325,64 @@ def _read_or_neutral(obj: Any, name: str, neutral: Any) -> Any:
     """Read a term whose producer may land in a LATER batch.
 
     The absence handled here is the DECLARED B1 state of a slot whose producer
-    has not landed, and every call site names the batch it lands in.
+    has not landed, and every call site names the batch it lands in. It is NOT
+    the absence ``_require`` handles: an object that IS the declared holder and
+    does not carry the declaration.
     """
     if obj is None:
         return neutral
     value = getattr(obj, name, _ABSENT)
     return neutral if value is _ABSENT else value
+
+
+#: Where S1-C18 declares the four attributes the bound-group route reads, named
+#: in the refusal so the line points at the writer rather than at the reader.
+_GROUP_DECLARED_AT = "S1-C18, memory_pool_host.py:1897 class HostPoolGroup"
+
+
+def _is_pool_group(obj: Any) -> bool:
+    """Is this bound object the ``HostPoolGroup`` the route names?
+
+    ``cache_controller.mem_pool_host`` is NOT always a group: the non-hybrid
+    controller binds whatever it was built with at ``cache_controller.py:630``
+    ``        self.mem_pool_host = mem_pool_host``, and on that path it is a
+    plain host pool. That configuration has no host-pool group and must stay
+    neutral -- a supported boot may not gain a STOP it never had.
+
+    ``entry_map`` is the group's own discriminator: ``HostPoolGroup.__init__``
+    sets it at ``memory_pool_host.py:1902`` and no host pool in that module
+    carries one. Tested for PRESENCE, not truth -- an empty map is still a
+    group.
+    """
+    return getattr(obj, "entry_map", None) is not None
+
+
+def _require(obj: Any, name: str, *, route: str) -> Any:
+    """Read a term off the object that IS its declared holder.
+
+    THE HAZARD THIS EXISTS FOR, and it is the one the route table rejects by
+    name: answering a MIN-neutral for a missing attribute turns a missing
+    declaration into a silently healthy vote on the one term that exists to
+    STOP the group -- the getattr-default-on-a-ledger-path shape (#606), on a
+    bus term. ``_read_or_neutral`` is the right reader for a producer that has
+    not landed; this one is for a holder that has.
+
+    THE RAISE IS GROUP-UNIFORM BY CONSTRUCTION, so it is not the rank-local
+    raise the ranks-never-disagree law forbids: the predicate is a
+    class-shape fact -- the declaration is either in the class body on every
+    rank or in none -- and it is evaluated at the payload-build site, which
+    runs BEFORE this pass's reduce, so every rank raises on the same pass
+    without a collective.
+    """
+    value = getattr(obj, name, _ABSENT)
+    if value is _ABSENT:
+        raise RuntimeError(
+            "#1068 PHASE-DOMAIN ROUTE STOP route=%s holder=%s missing=%s "
+            "declared_at=%s -- the bound object is the declared holder and the "
+            "attribute is not on it. A missing declaration is a deleted group "
+            "STOP, not a healthy vote." % (route, type(obj).__name__, name, _GROUP_DECLARED_AT)
+        )
+    return value
 
 
 def _take_per_pass_count(obj: Any, name: str) -> int:
@@ -391,7 +443,9 @@ def _draft_tier_domain_matches(controller: Any) -> int:
     if draft is None:
         return 1
     group = getattr(controller, "mem_pool_host", None)
-    driven = _read_or_neutral(group, "transfer_layer_domain", None)
+    if not _is_pool_group(group):
+        return 1
+    driven = _require(group, "transfer_layer_domain", route="slot 10 draft_tier_domain_matches")
     if driven is None:
         return 1
     return 1 if int(getattr(draft, "layer_num", 0) or 0) == int(driven) else 0
@@ -411,9 +465,13 @@ def _rebind_domain_within_driven(controller: Any, group: Any, bound_phase: Any) 
     counter = getattr(controller, "layer_done_counter", None)
     if counter is None:
         return 1
-    accessor = getattr(group, "expected_transfer_layer_domain", None)
-    if accessor is None:
+    if not _is_pool_group(group):
         return 1
+    accessor = _require(
+        group,
+        "expected_transfer_layer_domain",
+        route="slot 15 rebind_domain_within_driven",
+    )
     expected = accessor(bound_phase)
     if expected is None:
         return 1
@@ -428,10 +486,14 @@ def _mamba_host_pool(group: Any) -> Any:
     entry_map = getattr(group, "entry_map", None)
     if not entry_map:
         return None
-    try:
-        from sglang.srt.mem_cache.hicache_storage import PoolName
-    except Exception:  # pragma: no cover - import shape, not behaviour
-        return None
+    # HARD DEPENDENCY, IMPORTED WITHOUT A SWALLOW. `PoolName` is the KEY TYPE of
+    # the dict on the line above, so an import that does not resolve is a route
+    # that cannot be walked -- not an optional feature. Swallowing it would
+    # answer the same neutral a healthy pass answers, which is a detection with
+    # no vote wearing a log line. The failure is a class-shape fact, identical
+    # on every rank and raised before this pass's reduce.
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+
     entry = entry_map.get(PoolName.MAMBA)
     if entry is None:
         return None
@@ -439,27 +501,39 @@ def _mamba_host_pool(group: Any) -> Any:
 
 
 def _mamba_component(scheduler: Any) -> Any:
+    """The MAMBA tree component -- slots 3-4's home, MAMBA-only because the
+    #928 host-provenance branch is a mamba-only site."""
     tree = getattr(scheduler, "tree_cache", None)
     components = getattr(tree, "components", None) if tree is not None else None
     if not components:
         return None
-    try:
-        from sglang.srt.mem_cache.registry import ComponentType
-    except Exception:  # pragma: no cover - import shape, not behaviour
-        return None
+    # HARD DEPENDENCY, IMPORTED WITHOUT A SWALLOW, AND FROM THE PACKAGE THAT
+    # EXPORTS IT. `ComponentType` is the KEY TYPE of the dict on the line above
+    # -- it is defined at `unified_cache_components/tree_component.py:31` and
+    # re-exported by the package, which is where `registry.py:173` itself reads
+    # it from; `mem_cache.registry` does not export it at all. An import that
+    # does not resolve is a route that cannot be walked, and a swallow here
+    # answers the same neutral a healthy pass answers, so slots 3-4 would carry
+    # a detection with no vote for as long as nobody drove the counter.
+    from sglang.srt.mem_cache.unified_cache_components import ComponentType
+
     return components.get(ComponentType.MAMBA)
 
 
 def _bound_phase() -> Any:
     """The phase whose pools the readers currently name. Imported locally, the
     way ``scheduler.py:5515`` already imports it, so this module keeps the
-    dependency-free import surface ``prefetch_ballot.py`` has."""
-    try:
-        from sglang.srt.mem_cache.hicache_phase_binding import bound_phase
+    dependency-free import surface ``prefetch_ballot.py`` has.
 
-        return bound_phase()
-    except Exception:  # pragma: no cover - a read for a term may not break the reduce
-        return None
+    NO SWALLOW, for the reason its two sibling route imports have none: at B6
+    this value SELECTS the phase row the slot-15 accessor answers from, so an
+    import quietly resolving to ``None`` would pick a row nobody asked for.
+    ``bound_phase()`` itself cannot fail -- it returns ``BindingState.phase``,
+    a plain string attribute behind a property.
+    """
+    from sglang.srt.mem_cache.hicache_phase_binding import bound_phase
+
+    return bound_phase()
 
 
 def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
@@ -536,21 +610,26 @@ def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
     # Slot 18 and slots 19-20 -- S7's two values (B6), read BY NAME off the
     # bound group with NO default. At B1 they answer S1-C18's class-attribute
     # neutrals, so the payload is byte-for-byte the neutral one.
-    discard_ok = _ABSENT if group is None else getattr(
-        group, HOST_RING_DISCARD_OK_ATTR, _ABSENT
-    )
-    if discard_ok is not _ABSENT:
-        terms["host_ring_discarded"] = int(discard_ok)
+    #
+    # TWO ABSENCES, AND THEY ARE NOT ONE. "No bound HostPoolGroup" is a
+    # configuration with no host tier and stays NEUTRAL. "The bound object IS
+    # the group and does not declare the attribute" is a ROUTE DEFECT, and
+    # answering the neutral there is the getattr-default-on-a-ledger-path shape
+    # this route rejects by name: it would turn a missing S1-C18 declaration
+    # into a silently healthy vote on the one term that exists to STOP the
+    # group.
+    if _is_pool_group(group):
+        terms["host_ring_discarded"] = int(
+            _require(group, HOST_RING_DISCARD_OK_ATTR, route="slot 18 host_ring_discarded")
+        )
         # READ AND RESTORED TO 1, through the SAME object the read named: a
         # read through the bound group paired with a reset through anything
         # else is a flag that never clears or clears someone else's.
         setattr(group, HOST_RING_DISCARD_OK_ATTR, 1)
 
-    backup_width = _ABSENT if group is None else getattr(
-        group, D_BACKUP_WIDTH_ATTR, _ABSENT
-    )
-    if backup_width is not _ABSENT:
-        current = int(backup_width or 0)
+        current = int(
+            _require(group, D_BACKUP_WIDTH_ATTR, route="slots 19-20 d_backup_width") or 0
+        )
         last_seen = int(
             _read_or_neutral(scheduler, D_BACKUP_WIDTH_LAST_SEEN_ATTR, 0) or 0
         )

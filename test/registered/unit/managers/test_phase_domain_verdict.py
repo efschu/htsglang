@@ -34,6 +34,16 @@ from unittest import mock
 import torch
 
 from sglang.srt.managers import prefetch_ballot
+
+# THE REAL KEY TYPES, not stand-ins for them. Two of this module's routes cross
+# a package boundary to reach the dict key they index with, and an import that
+# resolves to nothing is invisible to a test that keys its fixture with a
+# stand-in: the fixture and the module would then agree on a symbol neither of
+# them got from the tree. Driving the real `ComponentType.MAMBA` and
+# `PoolName.MAMBA` is what makes "the route resolves" an assertion instead of
+# an assumption.
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8)
@@ -102,6 +112,82 @@ class _RacingGroup:
     @property
     def transfer_layer_domain(self):
         return self._domain
+
+
+class _PartialGroup:
+    """Group-shaped, declaring exactly the attributes it is NOT told to withhold.
+
+    Group-shaped means it carries the `entry_map` `HostPoolGroup.__init__` sets
+    at `memory_pool_host.py:1902` -- the discriminator the route uses, because
+    `cache_controller.mem_pool_host` is NOT always a group (the non-hybrid
+    controller assigns a plain host pool at `cache_controller.py:630`).
+
+    So this object IS the declared holder, and a withheld attribute is a ROUTE
+    DEFECT rather than an absent producer: S1-C18 declares all of them on
+    `HostPoolGroup` at B1.
+    """
+
+    def __init__(self, *, withhold=(), domain=4):
+        self.entry_map = {}
+        self._domain = domain
+        if "host_ring_discard_ok" not in withhold:
+            self.host_ring_discard_ok = 1
+        if "d_backup_width" not in withhold:
+            self.d_backup_width = 0
+        if "expected_transfer_layer_domain" not in withhold:
+            self.expected_transfer_layer_domain = lambda bound_phase: self._domain
+        if "transfer_layer_domain" not in withhold:
+            self.transfer_layer_domain = self._domain
+
+
+class _PlainHostPool:
+    """What `cache_controller.mem_pool_host` holds on a NON-hybrid boot.
+
+    `cache_controller.py:630` `        self.mem_pool_host = mem_pool_host` binds
+    whatever the controller was built with, and on that path it is a host pool,
+    not a `HostPoolGroup`. It carries no `entry_map`, declares none of S1-C18's
+    attributes, and is not a rank that voted badly -- it is a configuration
+    with no host-pool group, so every term behind that hop stays NEUTRAL.
+    """
+
+
+class _StandInDraftPool:
+    def __init__(self, layer_num=4):
+        self.layer_num = layer_num
+
+
+class _StandInComponent:
+    """A built tree component, carrying the two per-pass counters the route
+    reads off it: S4-C5's host-provenance refusals (MAMBA only) and S3-C9's
+    unresolvable-pool count (declared on three component classes and SUMMED)."""
+
+    def __init__(self, *, host_prov=0, unresolvable=0):
+        self._host_prov_refusals = host_prov
+        self._host_unresolvable_count = unresolvable
+
+
+class _StandInHostPool:
+    """The MAMBA entry's `host_pool` -- S4-C6's geometry-mismatch counter."""
+
+    def __init__(self, *, geom=0):
+        self._geom_mismatch_count = geom
+
+
+class _StandInEntry:
+    def __init__(self, host_pool):
+        self.host_pool = host_pool
+
+
+class _StandInAllocator:
+    def __init__(self, *, slot_ownership=0):
+        self._slot_ownership_refusals = slot_ownership
+
+
+class _StandInReqToTokenPool:
+    def __init__(self, *, ownership=0, state_src=0, allocator=None):
+        self._ownership_split_count = ownership
+        self._state_src_contradictions = state_src
+        self.mamba_allocator = allocator
 
 
 class _StandInCounter:
@@ -404,6 +490,148 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         # ever writes it, so the total the writer thread reached survives.
         self.assertEqual(group.total, 2)
 
+    def test_arm_six_every_per_pass_count_is_read_and_then_cleared(self):
+        """T-46 arm 6 -- arm 4's discipline applied to the OTHER SIX terms.
+
+        Arm 4 tells a READ from a hard-coded neutral for slots 18 and 19-20 by
+        driving their home to a NON-neutral value. The six per-pass COUNT terms
+        had no such arm, so two one-line defects were invisible: a builder who
+        never reads the counter at all, and one who reads it and never clears
+        it. Both leave every other assertion in this file satisfied, because
+        every other fixture leaves all six counters at zero.
+
+        Two of the six cross a package boundary to reach their home
+        (`ComponentType.MAMBA` for slots 3-4, `PoolName.MAMBA` for slots
+        16-17), so this arm is also what makes a route import that resolves to
+        nothing fail: a swallowed ImportError answers the same neutral a
+        healthy pass does.
+
+        Six DISTINCT values, so a term wired to the wrong slot cannot pass by
+        reading its neighbour's count.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        host_pool = _StandInHostPool(geom=6)
+        group = _StandInGroup(entry_map={PoolName.MAMBA: _StandInEntry(host_pool)})
+        mamba = _StandInComponent(host_prov=2, unresolvable=1)
+        swa = _StandInComponent(unresolvable=3)
+        allocator = _StandInAllocator(slot_ownership=5)
+        pool = _StandInReqToTokenPool(ownership=3, state_src=7, allocator=allocator)
+        scheduler = _StandInScheduler(
+            tree_cache=_StandInTreeCache(
+                _StandInController(group),
+                components={ComponentType.MAMBA: mamba, ComponentType.SWA: swa},
+            ),
+            req_to_token_pool=pool,
+        )
+
+        expected = {
+            "d_host_prov": 2,
+            # SUMMED over the built components -- 1 on MAMBA plus 3 on SWA. A
+            # single-component read would leave two of the three a detection
+            # with no vote, and would read 1 here.
+            "d_host_unresolvable": 4,
+            "d_ownership": 3,
+            "d_state_src": 7,
+            "d_slot_ownership": 5,
+            "d_geom": 6,
+        }
+        first = pdv.build_phase_domain_payload(scheduler)
+        for name, value in expected.items():
+            with self.subTest(term=name):
+                self.assertEqual(pdv.pair_of(first, name), (value, -value))
+
+        # READ AND CLEARED at this site, not once per scheduler pass: the
+        # packed reduce does not run in the PP phase at all, so a per-pass
+        # reset erases every PP-phase detection before the next TP reduce can
+        # vote it.
+        self.assertEqual(mamba._host_prov_refusals, 0)
+        self.assertEqual(mamba._host_unresolvable_count, 0)
+        self.assertEqual(swa._host_unresolvable_count, 0)
+        self.assertEqual(pool._ownership_split_count, 0)
+        self.assertEqual(pool._state_src_contradictions, 0)
+        self.assertEqual(allocator._slot_ownership_refusals, 0)
+        self.assertEqual(host_pool._geom_mismatch_count, 0)
+
+        second = pdv.build_phase_domain_payload(scheduler)
+        for name in expected:
+            with self.subTest(term=name, build="second"):
+                self.assertEqual(pdv.pair_of(second, name), (0, 0))
+
+        # A count that has moved and been read is not a divergence on its own:
+        # three ranks reporting the SAME count agree, and the MAX-consumed
+        # pairs are the two exceptions that stop the group anyway.
+        agreeing = _reduce_min([list(first) for _ in range(3)])
+        with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+            pdv.unpack_phase_domain(agreeing, rank=0, local={}, world_size=3)
+        self.assertIn("d_geom", str(caught.exception))
+
+    def test_arm_seven_a_missing_declaration_is_a_route_stop(self):
+        """T-46 arm 7 -- the absence the neutral rule does NOT cover.
+
+        The neutral-value rule is scoped to a term whose PRODUCER has not
+        landed. It says nothing about a holder that IS the declared one and
+        does not carry the declaration: answering the MIN-neutral there turns a
+        missing S1-C18 declaration into a silently healthy vote on the very
+        terms that exist to STOP the group -- the getattr-default-on-a-ledger-
+        path shape the route table rejects by name.
+
+        Both directions are driven, because the refusal is only correct if the
+        NON-holder stays neutral: a boot with no host-pool group must not gain
+        a STOP it never had.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        withheld = (
+            ("host_ring_discard_ok", {}),
+            ("d_backup_width", {}),
+            ("expected_transfer_layer_domain", {}),
+            (
+                "transfer_layer_domain",
+                {"has_draft": True, "draft_pool": _StandInDraftPool(4)},
+            ),
+        )
+        for name, controller_kwargs in withheld:
+            with self.subTest(missing=name):
+                scheduler = _with_group(
+                    _PartialGroup(withhold=(name,)), **controller_kwargs
+                )
+                with self.assertRaises(RuntimeError) as caught:
+                    pdv.build_phase_domain_payload(scheduler)
+                msg = str(caught.exception)
+                self.assertIn("#1068 PHASE-DOMAIN ROUTE STOP", msg)
+                self.assertIn("missing=%s" % name, msg)
+                self.assertIn("memory_pool_host.py:1897", msg)
+                self.assertIn("_PartialGroup", msg)
+
+        # The complete declaration set raises nothing and votes healthy.
+        whole = _with_group(
+            _PartialGroup(), has_draft=True, draft_pool=_StandInDraftPool(4)
+        )
+        payload = pdv.build_phase_domain_payload(whole)
+        self.assertEqual(pdv.slot_of(payload, "host_ring_discarded"), 1)
+        self.assertEqual(pdv.pair_of(payload, "d_backup_width"), (0, 0))
+        self.assertEqual(pdv.slot_of(payload, "rebind_domain_within_driven"), 1)
+        self.assertEqual(pdv.slot_of(payload, "draft_tier_domain_matches"), 1)
+
+        # AND THE OTHER DIRECTION: a bound object that is NOT the declared
+        # holder is a configuration with no host-pool group, not a rank that
+        # voted badly. It raises nothing and every term behind the hop reads
+        # its neutral.
+        plain = _with_group(
+            _PlainHostPool(), has_draft=True, draft_pool=_StandInDraftPool(4)
+        )
+        neutral = pdv.build_phase_domain_payload(plain)
+        self.assertEqual(pdv.slot_of(neutral, "host_ring_discarded"), 1)
+        self.assertEqual(pdv.pair_of(neutral, "d_backup_width"), (0, 0))
+        self.assertEqual(pdv.slot_of(neutral, "rebind_domain_within_driven"), 1)
+        self.assertEqual(pdv.slot_of(neutral, "draft_tier_domain_matches"), 1)
+        self.assertIsNotNone(
+            pdv.unpack_phase_domain(
+                _reduce_min([neutral] * 3), rank=0, local={}, world_size=3
+            )
+        )
+
 
 class TheBootReduceLayoutIsDeclaredOnceAndDerived(unittest.TestCase):
     """T-53 -- the boot bus's T-45 and T-46 in one."""
@@ -447,6 +675,52 @@ class TheBootReduceLayoutIsDeclaredOnceAndDerived(unittest.TestCase):
         for wrong in (good[:-1], good + [0]):
             with self.subTest(width=len(wrong)):
                 self.assertIsNone(pdv.unpack_boot_reduce(wrong, rank=0, local={}))
+
+    def test_arm_five_the_boot_digest_pairs_carry_a_verdict(self):
+        """T-53 arm 5 -- the boot bus's copy of the packed bus's shape #1.
+
+        The packed bus pins its digest pair from both sides. The boot bus's two
+        pairs were exercised at their neutral `(0, 0)` only, and at zero a
+        dropped negation and a live one read alike -- so the one-character edit
+        that makes `group_min != group_max` unreachable, and the predicate
+        being disabled outright, were both invisible on this bus.
+
+        Both directions, because either alone is satisfied by a defect:
+        AGREEMENT on a NON-ZERO digest must raise nothing (a dropped negation
+        makes it raise, since `min != -max` for any nonzero digest), and a
+        DISAGREEMENT must raise on every rank (a disabled predicate makes it
+        silent).
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        agree = pdv.phase_domain_digest(["kv", "mamba"])
+        odd = pdv.phase_domain_digest(["kv"])
+        self.assertNotEqual(agree, odd)
+        self.assertGreater(min(agree, odd), 0)
+
+        for row in ("d_ring_format", "d_entry_map"):
+            # AGREEMENT on a nonzero digest: no STOP.
+            uniform = [{row: agree} for _ in range(3)]
+            reduced = _reduce_min([pdv.build_boot_reduce_payload(t) for t in uniform])
+            for rank, local in enumerate(uniform):
+                with self.subTest(row=row, rank=rank, arm="agree"):
+                    verdict = pdv.unpack_boot_reduce(reduced, rank=rank, local=local)
+                    self.assertIsNotNone(verdict)
+                    self.assertEqual(verdict.pairs[row], (agree, agree))
+
+            # DISAGREEMENT: every rank of the reduce holds the same min and
+            # max, so every rank raises on the SAME pass.
+            locals_ = [{row: agree}, {row: agree}, {row: odd}]
+            reduced = _reduce_min([pdv.build_boot_reduce_payload(t) for t in locals_])
+            for rank, local in enumerate(locals_):
+                with self.subTest(row=row, rank=rank, arm="diverge"):
+                    with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+                        pdv.unpack_boot_reduce(reduced, rank=rank, local=local)
+                    msg = str(caught.exception)
+                    self.assertIn("row=%s" % row, msg)
+                    self.assertIn("local=%d" % local[row], msg)
+                    self.assertIn("group_min=%d" % min(agree, odd), msg)
+                    self.assertIn("group_max=%d" % max(agree, odd), msg)
 
     def test_a_rank_that_could_not_build_its_host_pools_stops_the_group(self):
         """T-53 arm 4 -- the FILLED path of row 12.
@@ -570,6 +844,24 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
             torch.distributed, "get_world_size", side_effect=lambda *a, **k: world["size"]
         ), mock.patch.object(
             scheduler_mod.uniform_floor_scope, "report_scope", lambda *a, **k: None
+        ), mock.patch(
+            # PINNED, NOT INHERITED. `_update_uniform_pool_budget` re-imports
+            # this symbol on every call, and a sibling suite in the same
+            # process leaves it permanently replaced: measured, running
+            # `test_collective_family_siblings_610.py` first turns
+            # `sglang.srt.distributed.utils.uneven_dcp_active` from the
+            # function into a `lambda *a: True` that outlives the test (its
+            # `mock.patch` runs inside `run_ranks`' THREADS, and overlapping
+            # patch/restore pairs on one global restore a mock rather than the
+            # original). This pin's subject is the BUILD CADENCE -- how often
+            # the payload is built relative to the reduce -- and the
+            # uneven-DCP admission arm is another family's branch. Reading it
+            # off a neighbour's leaked global makes this row measure the
+            # neighbour: it goes RED with an AttributeError on the stand-in's
+            # `tree_cache`, and S0 mutants 4 and 6 lose their named killer at
+            # exactly the moment the desk gate runs the suites together.
+            "sglang.srt.distributed.utils.uneven_dcp_active",
+            lambda *a, **k: False,
         ), mock.patch.object(
             pdv,
             "build_phase_domain_payload",
