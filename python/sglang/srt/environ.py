@@ -350,6 +350,35 @@ class Envs:
     # File-backed they are reclaimable page cache: +27.15 GiB of DISK against
     # 501 GiB free, and no locked RAM.
     SGLANG_PHASE_FLIP_IMAGE_TWO_FILE = EnvBool(False)
+    # #809: hold ONE page-locked host buffer per rank, sized to the LARGER of
+    # this rank's two layout images, and fill it with the INCOMING layout's
+    # image file while the flip drains. At the cutover the refill takes the
+    # leading `[0, bytes_valid)` bytes from that buffer as a real DMA and
+    # falls through to the file for the rest, so the content is identical by
+    # construction and only the TIMING moves (weights_arena.py, FlipImagePin).
+    #
+    # WHAT THIS SUPERSEDES, and only in part. The 2026-08-18 rationale above
+    # (:255-263) moved the images off pinned RAM because PINNED LIFETIME
+    # IMAGES FOR BOTH LAYOUTS were 55.99 GiB and W26 OOM-killed under them
+    # (#721). That verdict stands: the images stay file-backed and the file
+    # stays the carrier. What this adds is ONE buffer per rank -- the larger
+    # image, not both, ~28 GiB summed over this rig's three ranks against the
+    # #810 host ledger's 60.10 GB of posts in 115.97 GB minus a 10.74 GB
+    # reserve -- and it is a READ-AHEAD, not a second copy of the truth.
+    #
+    # GATED BY THE #721 LEDGER, not by this flag: the buffer is declared to
+    # `pinned_host_budget` before it is allocated and the boot REFUSES BY NAME
+    # if it does not fit, because a pin that silently did not happen is the
+    # #742 silently-inert-flag class. Measured Boot 10/11: refill legs 11.0-
+    # 12.7 s at 1.3-1.4 GB/s (STORAGE-BOUND) against ~1.5 s for 7 GiB on the
+    # x4 link alone (#690: 4.93 GB/s H2D on rank 1), which is the whole gap
+    # this buys.
+    #
+    # VALID ONLY WITH FILE_BACKED + TWO_FILE, and that is a refusal in
+    # `require_pin_preconditions` (weights_arena.py), not a note: the pin
+    # reads the incoming layout's OWN image file, and under one rotating
+    # image there is no such file to read ahead of.
+    SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING = EnvBool(False)
     # #1159: how long the #1033c post-cutover forward warmup may stay OPEN
     # before the scheduler says so in ONE named line. It is a REPORTING bound,
     # not a stop: the group stop for a one-sided cutover belongs to #1158

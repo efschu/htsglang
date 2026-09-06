@@ -83,6 +83,7 @@ from sglang.srt.managers.kv_reshard import (
 from sglang.srt.managers.warmup_latency import WarmupLatencyLedger
 from sglang.srt.model_executor.weights_arena import (
     checksum_is_representable,
+    flip_image_pin,
     uint8_checksum,
 )
 from sglang.srt.utils.common import ceil_align
@@ -6022,6 +6023,25 @@ class PhaseFlipRuntime:
         # arms while its peers do not and parks at the entry for ever. This
         # corrects the id space and reports; it does not vote.
         self._enforce_exposure_at_seam(f"{direction} arm")
+        # #809: START THE READ-AHEAD NOW, because "now" is the drain. The
+        # incoming layout's image is read from the ZFS pool at 1.3-1.4 GB/s
+        # (Boot 10/11, 39/39 legs storage-bound), and today that read happens
+        # at the CUTOVER, inside the no-return window, while the seconds of
+        # drain before it leave the storage idle. Overlapping it costs nothing
+        # that is not already spent and changes no content: the file remains
+        # the carrier and every unusable prefetch falls back to it.
+        #
+        # RANK-LOCAL ON PURPOSE, and it is not a verdict. Nothing here is
+        # voted, compared across ranks or allowed to refuse an arm; a rank
+        # whose read-ahead does not start simply reads the file at the
+        # cutover as it does today, so the ranks cannot end up disagreeing
+        # about anything -- only about how fast they got there.
+        stacks = getattr(
+            getattr(self, "_census_scheduler", None), "phase_flip_stacks", None
+        )
+        starter = getattr(stacks, "start_incoming_image_prefetch", None)
+        if starter is not None:
+            starter(direction)
 
     # -- the per-round hook ---------------------------------------------------
     def on_round(self, require_armed_and_parked: bool = False) -> Optional[dict]:
@@ -7838,6 +7858,13 @@ class PhaseFlipRuntime:
         self._parked_extent = None  # #746: a snapshot never outlives its flip
         self._armed_residents = {}  # #1202: nor does the resident ledger
         self._last_hold_reason = None
+        # #809: the flip is off, so the read-ahead stops competing with
+        # serving for the pool. What it already read STAYS VALID -- the image
+        # file did not change because the arm was abandoned, and the next arm
+        # for the same direction finds the prefix and its identity intact.
+        _pin = flip_image_pin()
+        if _pin is not None:
+            _pin.stop_prefetch()
         self.park_deadline_aborts += 1
         logger.error(
             "%s FLIP ABANDONED: %s was armed for %.1fs without the group "
