@@ -58,6 +58,26 @@ re-mints at every rebind: a carry may only ever be resumed into the same pool
 generation it was parked from.  A carry that survives a cutover is dropped,
 not applied.
 
+ATTRIBUTION, DOWNGRADED BY THE DEBUG_HOLD BOOT (weg1holdg1r2, 2026-09-06).
+What this file pins is a REAL ledger-scope defect and the hold corroborated
+every mechanical step of it: ``_armed_residents`` is ``{}`` on ALL THREE ranks
+at the hold (so the deleters fire as described and the ledger has no
+decider-only writer), and ``cutover_resident_set`` does retract an absent-from-
+live snapshot entry BY ROW rather than filtering it out (:1389-1408 -- ``if
+id(req) in seen: continue`` skips entries that ARE live; absence is the
+trigger, and the ledger holds strong references by design, :1296-1300).
+
+But it is NOT established as the root of the orphaned row itself. Run 2 of the
+hold boot never reached ``rebind_req_pool_for_cutover`` at all --
+``ReqPoolRebindRefused`` is 0/0 trap-safe over the whole log -- it died 5 s
+earlier on the #924 ``on_idle`` leak STOP, on the KV axis, before any re-arm.
+And the orphan did not exist at the arm (PP1 at-arm 14:17:07 reads
+``live_reqs=1 unaccounted=0``) yet was present at the abandon 3 s later, so
+something in that window drops the request without returning its row, its
+mamba page or its KV. Three candidates and the pdb expressions that separate
+them are in ``/spinning/gpu-arb/WEG1_1225_ROOT_0906.md``. Merge this as the
+ledger-scope repair it is; #1225 stays open on the orphan.
+
 Hermetic: CPU tensors, real ``ReqToTokenPool``, real
 ``rebind_req_pool_for_cutover``, no accelerator, no scheduler, no GPU.
 """
