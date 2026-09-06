@@ -9296,11 +9296,28 @@ class ServerArgs:
         # #721 registry before it allocates, and reduces the verdict across
         # the ranks so they cannot disagree about a boot.
         #
-        # WHAT THE LINE OWES THE OPERATOR IS THEREFORE THE NAME AND THE
-        # HEADROOM the boot-time gate will be left with. Boot 12 pinned
-        # 30.96 GB across three ranks and this line named none of it, which is
-        # how a host tier goes missing (#721) -- the cgroup's own OOM counter
-        # moved in that window.
+        # WHAT THE LINE OWES THE OPERATOR IS THEREFORE THE NAME, THE HEADROOM
+        # the boot-time gate will be left with, AND WHERE THE BYTES ARE
+        # PRINTED. Boot 12 pinned 30.96 GB across three ranks and this line
+        # named none of it, which is how a host tier goes missing (#721) --
+        # the cgroup's own OOM counter moved in that window.
+        #
+        # THE HAZARD THE POINTER CLOSES. An unpriced term whose figure the
+        # reader cannot locate is read as no term at all -- the same silence
+        # #721 was filed for, wearing a disclaimer. The bytes are already in
+        # the log twice per rank, so what was missing was never a third
+        # emitter, only the sentence that says which line to read:
+        #   * `#809 FLIP IMAGE PIN post`, emitted by
+        #     `weights_arena.create_flip_image_pin` as the post is registered;
+        #   * the always-on `HOST-SHMEM ... declared=` census, which sums this
+        #     same #721 registry (`mem_ledger/host_shmem.py`:
+        #     `posts = registered_posts()`) and is reached from
+        #     `Scheduler.init_model_worker` AFTER `build_phase_flip_tp_stack`
+        #     has created the pin, in the same straight-line block.
+        # The census carrying the pin post is not assumed here; it is pinned
+        # by `TestTheBootLineThePointerNamesCarriesThePin`, because a pointer
+        # to a figure that omits what it was read for states an under-count
+        # in the voice of a measurement.
         pin_note = ""
         if flip_image_pin_enabled():
             priced_bytes = sum(int(p.nbytes) for p in posts)
@@ -9316,7 +9333,10 @@ class ServerArgs:
                 "the model is loaded; weights_arena.create_flip_image_pin "
                 "weighs it against this same #721 ledger before it allocates "
                 "and refuses for the whole rank group. Headroom left for it "
-                "here: %s."
+                "here: %s. Read the bytes at boot, per rank, in the "
+                "'#809 FLIP IMAGE PIN post' line and in the 'declared=' term "
+                "of the always-on HOST-SHMEM census, which sums this same "
+                "#721 registry once the pin is in it."
                 % (
                     FLIP_IMAGE_PIN_POST_NAME,
                     FLIP_IMAGE_PIN_FLAG,

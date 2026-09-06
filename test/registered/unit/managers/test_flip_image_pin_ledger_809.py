@@ -225,5 +225,126 @@ class TestTheLedgerLineCarriesThePinPost(CustomTestCase):
         )
 
 
+class TestTheLineSaysWhereTheBootPriceIsRead(CustomTestCase):
+    """The unpriced term names the lines that DO carry its bytes.
+
+    THE GAP THIS CLOSES. The class above pins what the parse-time line may
+    not do -- invent a figure for bytes it cannot know. That leaves the
+    operator holding a line that says a multi-GiB post is "priced at boot"
+    and does not say WHERE the boot prints the price. An unpriced term whose
+    number cannot be found is read as no term at all, which is the same
+    silence #721 was filed for; the difference between a disclaimer and a
+    pointer is whether the reader can finish the sum.
+
+    THE TWO LINES ARE REAL AND THE SECOND ONE IS ALSO TESTED HERE. The pin's
+    bytes reach the log twice per rank at boot:
+    ``#809 FLIP IMAGE PIN post`` at the moment they are registered
+    (``weights_arena.create_flip_image_pin``), and the always-on
+    ``HOST-SHMEM ... declared=`` census, which sums this same #721 registry
+    (``mem_ledger/host_shmem.py``: ``posts = registered_posts()``) at the
+    at-rest point -- reached from ``Scheduler.init_model_worker`` AFTER
+    ``build_phase_flip_tp_stack`` has created the pin, in the same
+    straight-line block. So no third emitter is added for a fact the boot
+    already states twice; the parse-time line is taught to point at it.
+    """
+
+    def _one(self, **kw):
+        lines = _emit(**kw)
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0]
+
+    def test_the_armed_line_names_both_boot_lines_that_carry_the_bytes(self):
+        """Can-fail: each pointer is asserted on its own, not as one string."""
+        line = self._one(armed=True, rebind=True)
+        self.assertIn(
+            "#809 FLIP IMAGE PIN post",
+            line,
+            "the line disclaims a price it does not name a source for",
+        )
+        self.assertIn("HOST-SHMEM", line)
+        self.assertIn("declared=", line)
+
+    def test_the_pointers_are_absent_when_nothing_will_be_pinned(self):
+        """THE DANGER DIRECTION for a pointer: sending the reader to nothing.
+
+        On an unarmed boot no ``#809 FLIP IMAGE PIN post`` line is ever
+        emitted. A ledger that told that operator to go read one would have
+        them hunting for a missing line and concluding the log lost it --
+        worse than saying nothing, because it manufactures a fault.
+        """
+        for rebind in (True, False):
+            with self.subTest(rebind=rebind):
+                line = self._one(armed=False, rebind=rebind)
+                self.assertNotIn("#809 FLIP IMAGE PIN post", line)
+                self.assertNotIn("HOST-SHMEM", line)
+
+
+class TestTheBootLineThePointerNamesCarriesThePin(CustomTestCase):
+    """The census the note sends the operator to really sums the pin post.
+
+    THIS IS WHAT KEEPS THE POINTER HONEST. A pointer is only worth the line
+    it names: if the pin's post were ever invisible to the host-shmem census
+    -- a filter on the post name, a census that read a different registry,
+    an ordering that ran it before the pin exists -- the parse-time line
+    would send the operator to a figure that omits exactly the bytes it was
+    sent to find, and the omission would read as a measurement.
+    """
+
+    def setUp(self):
+        from sglang.srt.mem_cache.pinned_host_budget import registered_posts
+
+        self._saved = registered_posts()
+
+    def tearDown(self):
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            clear_registered_posts,
+            register_pinned_post,
+        )
+
+        clear_registered_posts()
+        for post in self._saved:
+            register_pinned_post(post)
+
+    def test_the_declared_figure_moves_by_the_pin_it_was_given(self):
+        from sglang.srt.mem_cache.pinned_host_budget import (
+            PinnedHostPost,
+            clear_registered_posts,
+            register_pinned_post,
+        )
+        from sglang.srt.mem_ledger.host_shmem import (
+            collect_host_shmem_census,
+            render_host_shmem_line,
+        )
+
+        clear_registered_posts()
+        before = collect_host_shmem_census().declared_bytes
+        nbytes = 7 * GB + 780 * (10**6)  # PP1's pin on Boot 12, to the MB
+        register_pinned_post(
+            PinnedHostPost(
+                name=FLIP_IMAGE_PIN_POST_NAME,
+                flag=FLIP_IMAGE_PIN_FLAG,
+                nbytes=nbytes,
+            )
+        )
+        census = collect_host_shmem_census()
+        self.assertEqual(
+            census.declared_bytes - before,
+            nbytes,
+            "the census the ledger line points at does not carry the pin's "
+            "bytes, so the pointer sends the operator to an under-count",
+        )
+        self.assertIn(
+            (FLIP_IMAGE_PIN_POST_NAME, nbytes),
+            census.declared_posts,
+            "the pin is summed but not named, so the reader cannot tell "
+            "which term of declared= is the read-ahead",
+        )
+        self.assertIn(
+            f"declared={nbytes / GIB:.2f}GiB",
+            render_host_shmem_line(census, rank=0),
+            "the rendered line does not show the figure the sum produced",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
