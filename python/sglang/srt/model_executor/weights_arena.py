@@ -1580,6 +1580,13 @@ FLIP_IMAGE_PIN_FLAG = "SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING=0"
 #: This runs inside the no-return window, so it is a BOUND and not a join: one
 #: 32 MiB chunk at the slowest rate this pool has ever shown (1 108 MiB/s, the
 #: fault path) is 0.03 s, so five seconds is margin, not patience.
+#:
+#: THAT ARGUMENT COVERS THE CUTOVER AND NOTHING ELSE. `consume` is about to
+#: hand the buffer's prefix to a DMA, so it may not proceed beside a live
+#: writer and spends the bound here. The ARM and the ABANDON reach the pin
+#: from the scheduler's own round, where nothing downstream depends on the
+#: reader being gone -- only on it having been told to go -- and they use
+#: `request_stop` instead, which signals and returns.
 _PIN_STOP_JOIN_S = 5.0
 
 #: Process-wide, because there is one rank per process and one buffer per
@@ -1764,6 +1771,18 @@ class FlipImagePin:
                 meta.path,
                 exc,
             )
+        finally:
+            # THE LOOP RELEASES ITS OWN SLOT. `Thread.is_alive()` stays True
+            # after this function has left the buffer, for as long as the
+            # interpreter takes to tear the thread down, and the fact an arm
+            # needs is whether a LOOP is still writing -- not whether a Thread
+            # object still exists. An arm landing in that window would
+            # otherwise be refused for a reader that is already done. Only
+            # THIS thread's own registration is cleared, so a reader that a
+            # later arm has already replaced never unpublishes its successor.
+            with self._lock:
+                if self._reader is threading.current_thread():
+                    self._reader = None
 
     def start_prefetch(self, image: torch.Tensor) -> bool:
         """Begin filling this pin from ``image``'s file. True if a read started.
@@ -1806,18 +1825,33 @@ class FlipImagePin:
             busy = reader is not None and reader.is_alive()
             same = self._identity == want
         if busy and same:
+            # A STOP REQUESTED A MOMENT AGO IS WITHDRAWN, NOT WAITED OUT. The
+            # live reader is filling this very identity, so letting it run IS
+            # the resume the block below argues for; an abandon that signalled
+            # it and a re-arm for the same direction that arrived before it
+            # noticed would otherwise freeze the prefix where the abandon
+            # caught it, which is the loss the resume exists to prevent.
+            with self._lock:
+                if self._stop.is_set():
+                    self._stop = threading.Event()
             return False
         if busy:
-            self.stop_prefetch()
-            if self.reader_alive():
-                logger.warning(
-                    "#809 flip image read-ahead SKIPPED: the previous reader "
-                    "did not leave its chunk within %.1fs, and starting a "
-                    "second writer on one buffer would corrupt the prefix the "
-                    "first one is still filling.",
-                    _PIN_STOP_JOIN_S,
-                )
-                return False
+            # NO JOIN HERE: this runs on the scheduler's round, exactly like
+            # the abandon, and a round that waits out a read-ahead is a stall
+            # the flip does not need. A second writer on one buffer would
+            # corrupt the prefix the first one is still filling -- so the
+            # read-ahead for the new layout is REFUSED and this leg reads the
+            # file exactly as it did before #809, while the previous reader is
+            # told to stop and the next arm for this direction reads ahead.
+            self.request_stop()
+            logger.warning(
+                "#809 flip image read-ahead SKIPPED: the previous reader is "
+                "still inside its chunk, and starting a second writer on one "
+                "buffer would corrupt the prefix it is filling. It has been "
+                "told to stop; this leg reads the file and the next arm reads "
+                "ahead."
+            )
+            return False
         with self._lock:
             self._stop = threading.Event()
             if self._identity != want:
@@ -1860,17 +1894,34 @@ class FlipImagePin:
             )
         return True
 
-    def stop_prefetch(self) -> bool:
-        """Stop the reader, keeping the prefix and the identity it filled.
+    def request_stop(self) -> None:
+        """Tell the reader to leave, and RETURN. Never waits for it.
 
-        Returns whether the reader is actually gone. An ABANDONED arm calls
-        this: the flip did not happen, but what was read is still the truth
-        about that image, so the next arm for the same direction finds it.
+        THE FORM EVERY SCHEDULER-THREAD CALLER USES. An ABANDONED arm and an
+        arm that finds the buffer busy both reach the pin from the scheduler's
+        round, and neither needs the reader GONE -- only told to go. What was
+        already read stays the truth about that image, so the next arm for the
+        same direction finds the prefix and its identity intact.
+
+        The reader re-reads ``self._stop`` on every iteration, so the signal is
+        seen at the end of the chunk in flight; ``consume`` is the one caller
+        that may not proceed beside a live writer and joins instead.
+        """
+        with self._lock:
+            stop = self._stop
+        stop.set()
+
+    def stop_prefetch(self) -> bool:
+        """Stop the reader and WAIT for it, up to ``_PIN_STOP_JOIN_S``.
+
+        Returns whether the reader is actually gone. The CUTOVER's form: the
+        refill is about to DMA the buffer's prefix, so a writer still in it is
+        not a timing question but a content one. Every caller on the scheduler
+        round uses ``request_stop`` instead -- see the constant's comment.
         """
         with self._lock:
             reader = self._reader
-            stop = self._stop
-        stop.set()
+        self.request_stop()
         if reader is None or not reader.is_alive():
             return True
         reader.join(_PIN_STOP_JOIN_S)

@@ -7862,9 +7862,17 @@ class PhaseFlipRuntime:
         # serving for the pool. What it already read STAYS VALID -- the image
         # file did not change because the arm was abandoned, and the next arm
         # for the same direction finds the prefix and its identity intact.
+        #
+        # SIGNAL, NEVER JOIN. This runs on the scheduler's own round (`on_round`
+        # -> `_round_as_decider`/`_round_as_follower` -> here), and nothing
+        # below depends on the reader being GONE -- only on it having been told
+        # to go. The joining form's 5 s bound is argued for the cutover's
+        # no-return window (`weights_arena.py:_PIN_STOP_JOIN_S`), where the
+        # refill is about to DMA the buffer; spending it here would stall the
+        # round that serving runs in while the abandon puts the flip back.
         _pin = flip_image_pin()
         if _pin is not None:
-            _pin.stop_prefetch()
+            _pin.request_stop()
         self.park_deadline_aborts += 1
         logger.error(
             "%s FLIP ABANDONED: %s was armed for %.1fs without the group "

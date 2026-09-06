@@ -15,8 +15,10 @@ mutations of them each left that suite fully green:
   and its post registered;
 * ``PhaseFlipRuntime._enter_armed_state``'s call to the starter removed -- the
   read-ahead never begins, and the drain it exists to overlap stays idle;
-* ``PhaseFlipRuntime._abandon_parked_flip``'s ``stop_prefetch`` removed -- an
-  abandoned arm leaves a reader competing with serving for the pool.
+* ``PhaseFlipRuntime._abandon_parked_flip``'s ``request_stop`` removed -- an
+  abandoned arm leaves a reader competing with serving for the pool -- and,
+  since round 3, that same call turned back into the JOINING ``stop_prefetch``,
+  which parks the scheduler round on a reader nothing there needs gone.
 
 That is the #742 silently-inert-flag class, which this slice's own code cites
 three times as the reason for other decisions (``weights_arena.py:1980-1983``
@@ -51,8 +53,12 @@ class _StubPin:
     """A pin recording what it was armed with. No buffer, no reader.
 
     ``install_flip_image_pin`` publishes whatever it is given, and the two
-    sites under test call exactly ``start_prefetch`` and ``stop_prefetch``,
+    sites under test call exactly ``start_prefetch`` and ``request_stop``,
     so a real ``FlipImagePin`` would only add a thread to the assertions.
+
+    The two stop forms are counted SEPARATELY because they are not
+    interchangeable at these sites: ``stop_prefetch`` joins the reader for up
+    to ``_PIN_STOP_JOIN_S``, and both sites run on the scheduler's round.
     """
 
     post_name = None
@@ -60,11 +66,15 @@ class _StubPin:
     def __init__(self, started=True):
         self.started = []
         self.stopped = 0
+        self.requested = 0
         self._answer = started
 
     def start_prefetch(self, image):
         self.started.append(image)
         return self._answer
+
+    def request_stop(self):
+        self.requested += 1
 
     def stop_prefetch(self):
         self.stopped += 1
@@ -340,12 +350,36 @@ class TestTheAbandonStopsTheReadAhead(CustomTestCase):
         rt = self._parked()
         rt._abandon_parked_flip(0)
         self.assertEqual(
-            pin.stopped,
+            pin.requested,
             1,
             "the abandoned arm left the reader running, so it goes on "
             "pulling the image file while serving resumes on the same pool",
         )
         self.assertIsNone(rt._pending)
+
+    def test_the_abandon_signals_the_reader_and_never_joins_it(self):
+        """The abandon runs on the scheduler round; the join belongs to the
+        cutover.
+
+        ``_abandon_parked_flip`` is reached from ``on_round`` through
+        ``_round_as_decider``/``_round_as_follower``, i.e. the scheduler event
+        loop. ``stop_prefetch`` ends in ``reader.join(_PIN_STOP_JOIN_S)``, a
+        bound argued in the constant's own comment for the cutover's no-return
+        window and for nothing else, so an abandon that reached for it would
+        park the round -- and serving with it -- on a read-ahead whose result
+        nothing below this line uses.
+        """
+        pin = _StubPin()
+        weights_arena.install_flip_image_pin(pin)
+        rt = self._parked()
+        rt._abandon_parked_flip(0)
+        self.assertEqual(
+            pin.stopped,
+            0,
+            "the abandon took the JOINING form, so the scheduler round waits "
+            "up to _PIN_STOP_JOIN_S for a reader nothing here needs gone",
+        )
+        self.assertEqual(pin.requested, 1)
 
     def test_an_abandon_without_a_pin_is_still_an_abandon(self):
         self.assertIsNone(weights_arena.flip_image_pin())
