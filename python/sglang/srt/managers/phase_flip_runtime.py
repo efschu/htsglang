@@ -5138,6 +5138,14 @@ class PhaseFlipRuntime:
         #: ``_parked_extent`` -- a ledger that outlives its flip would
         #: hand the NEXT cutover a stale object naming a reused row.
         self._armed_residents: Dict[int, object] = {}
+        #: #1225: the half of that ledger an ABANDON may not throw away.
+        #: An abandon ends the arm without a cutover, so the pool is not
+        #: rebound and every row keeps its owner; entries that still hold a
+        #: row are parked here and resumed by the next arm, gated on the
+        #: request-pool binding tag they were parked under. Empty except
+        #: between an abandon and the arm that follows it.
+        self._carried_residents: Dict[int, object] = {}
+        self._carried_residents_binding: Optional[int] = None
         #: Flips abandoned because the park deadline expired. A counter, so
         #: "this never happens in practice" stops being an assumption.
         self.park_deadline_aborts = 0
@@ -5989,8 +5997,11 @@ class PhaseFlipRuntime:
         # later enumerated afresh and retracted a different set (boot 9,
         # quoted with that boot's pre-#1205 label -- now `live_reqs`:
         # cur_slot_reqs=1 on all three ranks at arm, 1/0/0 retracted at
-        # the release). A fresh arm starts a fresh ledger.
-        self._armed_residents = {}
+        # the release). A fresh arm starts a fresh ledger -- EXCEPT for what
+        # an abandon parked (#1225): an abandoned arm ends without a cutover,
+        # so its residents keep the rows they held and the next arm resumes
+        # them, gated on the request-pool binding they were parked under.
+        self._resume_armed_residents()
         note_armed_residents(
             self._armed_residents, getattr(self, "_census_scheduler", None)
         )
@@ -7773,6 +7784,165 @@ class PhaseFlipRuntime:
             why,
         )
 
+    # -- #1225: the armed-window ledger across an ABANDON ---------------------
+    def _park_armed_residents(self, why: str) -> None:
+        """Retire the armed ledger WITHOUT losing the rows it named (#1225).
+
+        MEASURED, boot 12, 4 of 4 runs across two tips: ``cutover 1 committed
+        -> cutover 2 committed -> arm 3 -> FLIP ABANDONED (pool too small for
+        the live set) x3 -> re-arm -> PP0 rebinds and commits while BOTH
+        followers raise ``ReqPoolRebindRefused: 1 of 8 rows are still held ...
+        (free=7, rows=[1], rids=[], unnamed=1)``.
+
+        THE ROOT, AND IT IS A SCOPE MISMATCH. ``_armed_residents`` is scoped to
+        an ARM. The fact it records -- which request object holds which
+        request-pool row -- is scoped to the request-pool BINDING. An abandon
+        ends the arm WITHOUT a cutover: no pool is rebound, no ``binding_tag``
+        is re-minted, every row keeps its owner. Both abandon exits
+        nevertheless dropped the ledger outright, so a request that went
+        invisible to ``_live_reqs`` between the abandon and the next cutover
+        was in NO ledger -- not the discarded one, and not the fresh one the
+        re-arm built from an already-invisible live set. ``cutover_resident_
+        set`` then had nothing to carry and the row was refused as an escapee
+        that no rid names. That is boot 9's shape re-entered by another door.
+
+        RANK-UNIFORM BY CONSTRUCTION, which is the point. This runs on decider
+        and follower alike, from the same exits, off the same six-container
+        authority (``_live_reqs``). Nothing here is voted, compared across
+        ranks, or allowed to refuse anything. Only the WINDOW in which a
+        request stays visible differs between PP0 and its followers -- PP0
+        holds ``mbs[slot]`` until that microbatch's output has come back around
+        the ring -- which is why the decider survived the same defect the
+        followers died of. The cure is not a rank verdict; it is making the
+        fact outlive the exit that never invalidated it.
+
+        THE CARRY IS NARROWED HERE, NEVER WIDENED. Over-retraction is the
+        corrupting direction (``cutover_resident_set``: retracting too little
+        stops the boot loudly, retracting too much frees a row its owner still
+        holds and nothing raises). So only entries that STILL HOLD A ROW at
+        this instant are carried, and each carries the pool generation it was
+        taken from. An unreadable pool carries NOTHING rather than carrying
+        blind -- the same abstention rule the reconciliation is built on.
+        """
+        ledger = getattr(self, "_armed_residents", None) or {}
+        self._armed_residents = {}
+        self._carried_residents = {}
+        self._carried_residents_binding = None
+        if not ledger:
+            return
+        pool = getattr(
+            getattr(self, "_census_scheduler", None), "req_to_token_pool", None
+        )
+        tag = getattr(pool, "binding_tag", None)
+        try:
+            free_rows = {int(x) for x in (getattr(pool, "free_slots", None) or ())}
+        except (TypeError, ValueError):
+            free_rows = None
+        if tag is None or free_rows is None:
+            # UNKNOWN IS NOT CARRIED. Without a binding the carry could not be
+            # gated against a later pool generation, and without a free list
+            # it could not be narrowed to rows that are actually still held --
+            # either way the resume would be retracting on the strength of a
+            # measurement that failed.
+            logger.warning(
+                "%s #1225 ARMED-RESIDENT CARRY ABSTAINED at the abandon (%s): "
+                "the outgoing request pool answered binding=%r free_slots=%s, "
+                "so %d ledger entr(ies) are dropped rather than carried "
+                "blind. A row that is still held will be refused at the next "
+                "cutover, loudly, which is the recoverable direction.",
+                LOG_PREFIX,
+                why,
+                tag,
+                "unreadable" if free_rows is None else "readable",
+                len(ledger),
+            )
+            return
+        carried = {}
+        for key, req in ledger.items():
+            idx = getattr(req, "req_pool_idx", None)
+            if idx is None:
+                continue
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                continue
+            if idx in free_rows:
+                # Finished cleanly before the abandon; its row is already back
+                # and freeing it again is "the row was returned twice".
+                continue
+            if getattr(req, "req_pool_binding", None) != tag:
+                continue
+            carried[key] = req
+        self._carried_residents = carried
+        self._carried_residents_binding = tag
+        logger.warning(
+            "%s #1225 ARMED-RESIDENT CARRY at the abandon (%s): %d of %d "
+            "armed-window resident(s) still hold a request-pool row and are "
+            "carried to the next arm under binding %r (rows=%s). No cutover "
+            "happened, so the pool was not rebound and these rows kept their "
+            "owners; dropping them here is what left a row nobody's rid names "
+            "in the outgoing pool at the next cutover (#1225).",
+            LOG_PREFIX,
+            why,
+            len(carried),
+            len(ledger),
+            tag,
+            sorted(int(getattr(r, "req_pool_idx", -1)) for r in carried.values()),
+        )
+
+    def _resume_armed_residents(self) -> None:
+        """Start this arm's ledger from a carry parked by an abandon (#1225).
+
+        GATED ON THE POOL GENERATION, and that gate is the whole safety
+        argument. ``ReqToTokenPool.clear()`` re-mints ``binding_tag`` at every
+        rebind and both phases' pools hold the same number of rows, so a carry
+        parked before a cutover names a row that is IN RANGE in the pool that
+        exists now and belongs to somebody else. Applying it would free that
+        row under its live owner -- two requests then share one
+        ``req_to_token`` row and a mamba mapping entry, and nothing raises.
+        A carry whose binding has moved is therefore DROPPED, never applied.
+
+        The three-way filter in ``cutover_resident_set`` still runs over
+        whatever is resumed here (row named / row not free / row not
+        reallocated to a live request), so this widens the SET the release
+        reconciles, never the rule it reconciles by.
+        """
+        carry = getattr(self, "_carried_residents", None) or {}
+        parked_under = getattr(self, "_carried_residents_binding", None)
+        self._carried_residents = {}
+        self._carried_residents_binding = None
+        self._armed_residents = {}
+        if not carry:
+            return
+        pool = getattr(
+            getattr(self, "_census_scheduler", None), "req_to_token_pool", None
+        )
+        tag = getattr(pool, "binding_tag", None)
+        if tag is None or tag != parked_under:
+            logger.warning(
+                "%s #1225 ARMED-RESIDENT CARRY DROPPED at the arm: %d entr(ies) "
+                "were parked under request-pool binding %r and this pool is "
+                "%r. A cutover has rebound the pool since, so those ids name "
+                "rows this generation may already have re-minted -- carrying "
+                "them would free a row somebody else owns, which is the one "
+                "direction that corrupts silently instead of stopping.",
+                LOG_PREFIX,
+                len(carry),
+                parked_under,
+                tag,
+            )
+            return
+        self._armed_residents = dict(carry)
+        logger.warning(
+            "%s #1225 ARMED-RESIDENT CARRY RESUMED at the arm: %d resident(s) "
+            "from the abandoned arm still hold a request-pool row under the "
+            "same binding %r and re-enter this arm's ledger, so the cutover "
+            "can retract them even though nothing can see them any more.",
+            LOG_PREFIX,
+            len(carry),
+            tag,
+        )
+
     def _snapshot_parked_extent(self) -> Optional[Tuple[int, int]]:
         """#746: ``(req_rows, req_max)`` of the resident set, measured NOW.
 
@@ -7856,7 +8026,11 @@ class PhaseFlipRuntime:
         # step the flip ends in, not one round later.
         release_prearm_quiesce(self, "nothing pending")
         self._parked_extent = None  # #746: a snapshot never outlives its flip
-        self._armed_residents = {}  # #1202: nor does the resident ledger
+        # #1225: the resident ledger is RETIRED, not discarded. No cutover
+        # happened here, so the rows it names kept their owners; see
+        # `_park_armed_residents` for why dropping them left a row nobody's
+        # rid names in the outgoing pool at the next cutover.
+        self._park_armed_residents("park deadline")
         self._last_hold_reason = None
         # #809: the flip is off, so the read-ahead stops competing with
         # serving for the pool. What it already read STAYS VALID -- the image
@@ -12011,7 +12185,12 @@ class PhaseFlipRuntime:
             # step the flip ends in, not one round later.
             release_prearm_quiesce(self, "nothing pending")
             self._parked_extent = None  # #746: cleared on EVERY exit
-            self._armed_residents = {}  # #1202: and so is the ledger
+            # #1225: and the ledger is RETIRED here, not cleared. This is the
+            # exit measured on metal in every failing run of boot 12 ("pool
+            # too small for the live set", 4 of 4 across two tips): it ends
+            # the arm without a cutover, so the pool is not rebound and the
+            # rows the ledger names still have their owners.
+            self._park_armed_residents("pool too small for the live set")
             self._last_hold_reason = None
             # Which of the two conditions THIS rank hit, so a boot that is
             # short of staging room is not read as a pool-sizing problem.
@@ -12622,6 +12801,15 @@ class PhaseFlipRuntime:
         # next phase may legally re-mint. Holding it past the commit is
         # the M5 failure mode on the request axis.
         self._armed_residents = {}
+        # #1225: AND THE CARRY, for the same reason and more sharply. The
+        # carry exists only across an abandon, which by definition had no
+        # cutover; a commit DID rebind the pool and re-mint its ids, so any
+        # surviving carry names rows this phase may legally hand to somebody
+        # else. The binding gate in `_resume_armed_residents` would refuse it
+        # anyway -- this drops the strong references as well, so an abandon
+        # that is never followed by another arm cannot pin them for ever.
+        self._carried_residents = {}
+        self._carried_residents_binding = None
         self._epoch += 1
         self.completed += 1
         total_ms = (self._clock() - t0) * 1000.0
