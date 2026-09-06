@@ -48,6 +48,13 @@ def _code_lines(fn):
 
 
 class _CounterSpy:
+    # #1206 (2026-09-05): a registered counter must answer `num_layers` as
+    # well as `wait_until`. `_wait_for_mamba_layer` bounds the global id by
+    # the counter's LIVE width instead of a boot-frozen frame, so a stand-in
+    # without the attribute no longer models a counter this pool can be
+    # registered with.
+    num_layers = 64
+
     def __init__(self):
         self.waits = []
 

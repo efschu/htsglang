@@ -962,9 +962,18 @@ class Scheduler(
         if self.server_args.enable_phase_flip:
             from sglang.srt.managers.phase_flip_boot import (
                 build_phase_flip_host_pools,
+                vote_phase_flip_boot_verdict,
             )
 
             self.phase_flip_host_pools = build_phase_flip_host_pools(self)
+            # #1206 S1-C14: THE ONE BOOT REDUCE, HERE AND NOT INSIDE THE
+            # BUILDER. Every abrupt exit of that function lies upstream of
+            # this line, so the collective count is rank-uniform whichever
+            # branch a rank took -- and S7's deletion of the builder at B6
+            # moves no vote site. Gated on flip AND hicache, the two flags the
+            # verdicts exist for, so a boot with neither gains no collective.
+            if self.enable_hierarchical_cache:
+                vote_phase_flip_boot_verdict(self, self.phase_flip_host_pools)
         self._pool_phase_probe("flip_host_pools")
 
         # #677 PHASE 1: HERE, AND NOT BESIDE init_admission_limiter.

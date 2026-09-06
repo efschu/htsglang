@@ -84,11 +84,19 @@ class TestTheCrashSites(CustomTestCase):
     which is exactly the bypass-the-init state the wrappers are in."""
 
     def test_hybrid_counter_gated_read_does_not_raise(self):
+        """#1206 (2026-09-05) RE-BASED THE THRESHOLD, NOT THE BUFFER INDEX.
+
+        The crash this pins is unchanged: `local_slot` still resolves without
+        `KVCache.__init__` having run, and the BUFFER is still addressed by
+        `id - start_layer` (`k6`). What moved is the COUNTER threshold: the
+        producer completes at the GLOBAL layer id, so a wait on `local_slot`
+        joined another layer's step -- two index spaces on one counter.
+        """
         spy = _CounterSpy()
         pool = _hybrid(spy, start_layer=24)
         out = pool.get_kv_buffer(30)
-        self.assertEqual(out, ("k6", "v6"))
-        self.assertEqual(spy.waits, [6], "contiguous default: id - start_layer")
+        self.assertEqual(out, ("k6", "v6"), "the BUFFER is still local")
+        self.assertEqual(spy.waits, [30], "the THRESHOLD is the global id")
 
     def test_minimax_counter_gated_read_does_not_raise(self):
         spy = _CounterSpy()
@@ -103,7 +111,8 @@ class TestTheCrashSites(CustomTestCase):
         pool = _hybrid(spy)
         pool.get_key_buffer(24)
         pool.get_value_buffer(25)
-        self.assertEqual(spy.waits, [0, 1])
+        # #1206: global ids, the frame the producer completes in.
+        self.assertEqual(spy.waits, [24, 25])
 
     def test_no_counter_stays_inert(self):
         self.assertEqual(_hybrid(None).get_key_buffer(24), "k0")

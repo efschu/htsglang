@@ -270,6 +270,8 @@ def rebind(readers: dict, incoming: PhasePools) -> int:
                 f"{LOG_PREFIX} rebinding reader '{name}' failed ({e}); the "
                 "reader set is now split and device-tier I/O must stay off."
             ) from e
+    _resize_counters_to_driven(readers, incoming)
+    _log_rebind_domain_outside_driven(readers, incoming, generation)
     logger.info(
         "%s rebound %d reader(s) to the '%s' pools (generation %d, %s layers).",
         LOG_PREFIX,
@@ -279,6 +281,146 @@ def rebind(readers: dict, incoming: PhasePools) -> int:
         incoming.layer_num(),
     )
     return generation
+
+
+def _driven_domain_of(incoming) -> Optional[int]:
+    """The domain ``incoming`` expects to drive, read through the group's own
+    named accessor -- the same term slot 15 votes, so the actuator below and
+    the detector after it can never disagree about what "driven" means."""
+    group = getattr(incoming, "host_pool", None)
+    accessor = getattr(group, "expected_transfer_layer_domain", None)
+    if accessor is None:
+        return None
+    expected = accessor(getattr(incoming, "phase", None))
+    return None if expected is None else int(expected)
+
+
+def _resize_counters_to_driven(readers: dict, incoming) -> None:
+    """THE ACTUATOR the detector below was reporting the absence of.
+
+    The transfer counter's width was set ONCE, in
+    ``HybridCacheController.__init__``, and nothing moved it afterwards. So a
+    cutover that re-pointed every reader onto a wider tier left the restore
+    loop driving global ids the counter had no step for -- measured on the
+    metal, ``driven=64`` against ``counter_width=32`` on PP0 and ``50`` on
+    PP1. Detecting that and not repairing it is a boot the group stops on
+    every time.
+
+    RESIZED IN PLACE, never replaced: the counter and its ``LayerLoadingEvent``s
+    are already registered into the device and req pools, so a fresh object
+    would be a rebind nobody enumerates.
+
+    THE PRECONDITION IS NOT DECORATION. ``resize`` rebuilds every event list,
+    and an event that was never recorded queries True -- so a resize taken
+    while a load is in flight hands the ACK a finish event for copies that
+    have not landed, which is a wrong answer rather than a crash. The
+    precondition is the ONE term that states that hazard: the reader's
+    ``ack_load_queue`` is EMPTY. An ack is appended the instant the copies are
+    enqueued (``hybrid_cache_controller.py:714-720``,
+    ``cache_controller.py:1985``) and is popped only after its finish event has
+    queried True (``unified_radix_cache.py:5328-5332`` counts the leading ready
+    entries, ``:5392-5393`` pops exactly those; the mamba and hiradix drains do
+    the same). Both the append and the pop run on the scheduler thread, which
+    is the thread this cutover runs on, so an empty queue here is proof that no
+    load's events are mid-record. When it is not empty the resize is DECLINED
+    and named; the group STOP is then carried by slot 15 at the next packed
+    reduce, because a rank-local raise inside a cutover is not the boot-time
+    exception D-20 allows.
+
+    ``consumer_index`` IS NOT A SECOND TERM, and the round-3 version that made
+    it one was a boot killer. It is the event-slot pointer the last forwarded
+    batch left on the counter (``tp_worker.py:553`` ->
+    ``:487-489`` -> ``LayerDoneCounter.set_consumer``), and it stays >= 0 until
+    a batch without a load or a ``reset()`` moves it -- i.e. it says a consumer
+    has begun stepping, never that a load is recording. Measured, boot
+    boot_855_weg1b12s1f3_6d78227979_0906_134543.log at generation=5 on all
+    three ranks: ``ack_load_queue=0 consumer_index=1``, so the consumer term
+    ALONE declined a resize on a normal long-context leg, the counter kept
+    32/50 against driven=64, and slot 15 stopped the group at the fifth
+    cutover. A device wait already issued by ``wait_until``
+    (``cache_controller.py:119-122``) names the event object live at that call
+    and a later resize cannot reach back into it; a wait issued AFTER the
+    resize lands on a rebuilt event that queries True, which is correct
+    precisely because the empty queue proved those copies had landed. The
+    index is still PRINTED on the refusal line, as a diagnostic and not as a
+    term.
+
+    Only readers that ALREADY hold a counter are touched -- inventing one on a
+    reader that never had it would be a fourth, silent binding.
+    """
+    expected = _driven_domain_of(incoming)
+    if expected is None:
+        return
+    for name, obj in readers.items():
+        counter = getattr(obj, "layer_done_counter", None)
+        if counter is None:
+            continue
+        width = getattr(counter, "num_layers", None)
+        if width is None or int(width) == expected:
+            continue
+        pending = len(getattr(obj, "ack_load_queue", None) or ())
+        consumer = int(getattr(counter, "consumer_index", -1))
+        if pending:
+            logger.error(
+                "%s #1206 REBIND COUNTER RESIZE REFUSED reader=%s driven=%d "
+                "counter_width=%d ack_load_queue=%d consumer_index=%d: a "
+                "resize rebuilds the per-layer events an in-flight load has "
+                "already recorded into, and an unrecorded event queries True, "
+                "so the acknowledgement would fire for copies that never "
+                "landed. The counter keeps the outgoing width and the group "
+                "STOPs on slot 15 instead",
+                LOG_PREFIX,
+                name,
+                expected,
+                int(width),
+                pending,
+                consumer,
+            )
+            continue
+        counter.resize(expected)
+
+
+def _log_rebind_domain_outside_driven(readers: dict, incoming, generation) -> None:
+    """#1206 S1-C16, LOCAL half: did the counter follow the group?
+
+    TWO OBJECTS, DELIBERATELY. The left term is the counter's LIVE width and
+    the right term is the incoming group's own expected domain, read through
+    the named accessor. A version taking both from the group -- or from the
+    property the counter was last resized FROM -- is a refusal whose two terms
+    are one object and its echo, and it can never fire.
+
+    HAZARD it names: a `_stamp` that moved the readers onto the incoming tier
+    while the counter kept the outgoing phase's width. The loop then drives
+    the new domain against a counter that has no step for its upper ids, and
+    the recurrent read joins a copy that never lands.
+
+    It does NOT raise. The rebind runs inside a cutover, which is neither a
+    boot-time invariant nor before the first collective, so the STOP is the
+    group's -- S0's slot 15, computed on read from these same two objects at
+    the next packed reduce. This line only says WHEN it was detected.
+    """
+    expected = _driven_domain_of(incoming)
+    if expected is None:
+        return
+    for name, obj in readers.items():
+        counter = getattr(obj, "layer_done_counter", None)
+        if counter is None:
+            continue
+        width = getattr(counter, "num_layers", None)
+        if width is None or int(width) == expected:
+            continue
+        logger.error(
+            "%s #1206 REBIND DOMAIN OUTSIDE DRIVEN reader=%s generation=%d "
+            "driven=%d counter_width=%d: the readers moved onto the '%s' "
+            "pools while the transfer counter kept the outgoing width, so the "
+            "restore loop drives layer ids the counter has no step for",
+            LOG_PREFIX,
+            name,
+            int(generation),
+            int(expected),
+            int(width),
+            getattr(incoming, "phase", None),
+        )
 
 
 def _stamp(obj: Any, incoming: PhasePools, generation: int) -> None:

@@ -373,6 +373,202 @@ class TheDigestPairIsTheUniformityCheck(unittest.TestCase):
                 self.assertIn("per_rank=[none] census_width=0", msg)
 
 
+class AnAndSlotStopCarriesTheRanksOwnNumbers(unittest.TestCase):
+    """THE STOP LINE MUST NOT LIE ABOUT THE VOTE IT DIED ON.
+
+    Measured, boot_855_weg1b12s1f3_6d78227979_0906_134543.log, slot 15, the
+    three ranks deduplicated:
+
+        STOP rank=0 ... local=0 group_min=0 group_max=0 per_rank=[1,1,1,...]
+        STOP rank=1 ... local=0 group_min=0 group_max=0 per_rank=[1,1,1,...]
+        STOP rank=2 ... local=1 group_min=0 group_max=0 per_rank=[1,1,1,...]
+
+    Two numbers on that line are not the group's. `group_max` was a COPY of
+    `group_min` -- a 1-wide AND slot on a MIN reduce carries no maximum, so the
+    line read as a unanimous refusal when a genuine MAX over {0,0,1} is 1 and
+    the refusal was 2-of-3. And `per_rank` was the LOADBACK census, another
+    term's per-rank row, rendered under the failing term's name where it
+    contradicted the two `local=0` votes beside it. Instrument-Text-luegt
+    class A, on the one line a reader has after a group STOP.
+    """
+
+    def _rebind_votes(self, votes):
+        """One local-terms mapping per rank: this rank's slot-15 vote, and the
+        same vote written into ITS OWN position of slot 15's census."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        mappings = []
+        for rank, vote in enumerate(votes):
+            census = [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS
+            if rank < pdv.PHASE_DOMAIN_CENSUS_SLOTS:
+                census[rank] = vote
+            mappings.append(
+                {
+                    "rebind_domain_within_driven": vote,
+                    "census_rebind": census,
+                }
+            )
+        return mappings
+
+    def _fields(self, exc):
+        """The RENDERED half of the STOP line, cut off before the law sentence.
+
+        MEASURED, this round: an assertion for `group_max=1` over the WHOLE
+        message passed under a mutant that restored `group_max=group_min`,
+        because the law sentence beside it spelled the same token in prose.
+        Every assertion below reads this side of the `--` only.
+        """
+        head = str(exc).split(" -- ")[0]
+        self.assertNotIn("RAENGE", head)
+        return head
+
+    def test_a_two_of_three_refusal_prints_a_group_max_of_one(self):
+        """The MAX is packed as its own slot, so it is a real MAX over the
+        ranks and not the minimum wearing a second name."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        locals_ = self._rebind_votes([0, 0, 1])
+        reduced = _reduce_min([pdv.pack_phase_domain_payload(t) for t in locals_])
+
+        for rank, local in enumerate(locals_):
+            with self.subTest(rank=rank):
+                with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+                    pdv.unpack_phase_domain(
+                        reduced, rank=rank, local=local, world_size=3
+                    )
+                msg = self._fields(caught.exception)
+                self.assertIn("#1206 REBIND DOMAIN OUTSIDE DRIVEN", msg)
+                self.assertIn("group_min=0 group_max=1 phase=", msg)
+
+    def test_a_unanimous_refusal_still_prints_a_group_max_of_zero(self):
+        """MUST-NOT-FIRE PARTNER. A max that is always 1 would be as useless
+        as a max that is always the min: the number has to MOVE with the
+        votes, so the unanimous case is driven too."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        locals_ = self._rebind_votes([0, 0, 0])
+        reduced = _reduce_min([pdv.pack_phase_domain_payload(t) for t in locals_])
+
+        with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+            pdv.unpack_phase_domain(reduced, rank=0, local=locals_[0], world_size=3)
+        msg = self._fields(caught.exception)
+        self.assertIn("group_min=0 group_max=0 phase=", msg)
+
+    def test_the_stop_prints_the_failing_terms_own_per_rank_row(self):
+        """`per_rank` is slot 15's census, so it agrees with the `local=`
+        values the three ranks print -- [0,0,1], not the loadback row."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        locals_ = self._rebind_votes([0, 0, 1])
+        reduced = _reduce_min([pdv.pack_phase_domain_payload(t) for t in locals_])
+
+        with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+            pdv.unpack_phase_domain(reduced, rank=2, local=locals_[2], world_size=3)
+        msg = self._fields(caught.exception)
+        # Positions at or above the world size are `?`, never the healthy 1 a
+        # real rank also writes.
+        self.assertIn("per_rank=[0,0,1,?,?,?,?,?]", msg)
+        self.assertIn("census_width=%d" % pdv.PHASE_DOMAIN_CENSUS_SLOTS, msg)
+        self.assertIn("local=1", msg)
+
+    def test_a_term_with_no_census_does_not_borrow_another_terms_row(self):
+        """The loader-coverage slot has no per-rank census on this bus. Its
+        STOP line says so instead of printing the loadback census under its
+        own name, which is the shape the metal line had."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        locals_ = [
+            {"loader_covers_own_layers": 1},
+            {"loader_covers_own_layers": 0},
+            {"loader_covers_own_layers": 1},
+        ]
+        reduced = _reduce_min([pdv.pack_phase_domain_payload(t) for t in locals_])
+
+        with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+            pdv.unpack_phase_domain(reduced, rank=0, local=locals_[0], world_size=3)
+        msg = self._fields(caught.exception)
+        self.assertIn("#1206 LOADER COVERAGE REFUSED", msg)
+        self.assertIn("per_rank=[none]", msg)
+        self.assertIn("census_width=0", msg)
+        self.assertNotIn("per_rank=[1,1,1", msg)
+
+    def test_the_loadback_term_still_prints_its_own_census(self):
+        """MUST-NOT-FIRE PARTNER for the row above: the term the census
+        BELONGS to keeps printing it, so the fix removes a borrowed row rather
+        than the mechanism."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        locals_ = []
+        for rank, vote in enumerate([1, 1, 0]):
+            census = [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS
+            census[rank] = vote
+            locals_.append(
+                {"loadback_coverage_complete": vote, "census_loadback": census}
+            )
+        reduced = _reduce_min([pdv.pack_phase_domain_payload(t) for t in locals_])
+
+        with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+            pdv.unpack_phase_domain(reduced, rank=0, local=locals_[0], world_size=3)
+        msg = self._fields(caught.exception)
+        self.assertIn("#1206 LOADBACK COVERAGE INCOMPLETE", msg)
+        self.assertIn("per_rank=[1,1,0,?,?,?,?,?]", msg)
+        self.assertIn("group_min=0 group_max=1 phase=", msg)
+
+    def test_the_builder_fills_slot_fifteens_census_at_this_ranks_position(self):
+        """THE PRODUCER, not only the rendering: a census nobody fills renders
+        the neutral row on every rank and is indistinguishable from a healthy
+        group -- the absence that made the metal line unreadable."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        # domain 4 against a counter of 9: this rank's slot-15 vote is 0.
+        refusing = pdv.build_phase_domain_payload(
+            _with_group(_StandInGroup(domain=4), tp_rank=2, layers=9)
+        )
+        at = pdv.index_of("census_rebind")
+        row = refusing[at : at + pdv.PHASE_DOMAIN_CENSUS_SLOTS]
+        self.assertEqual(row, [1, 1, 0, 1, 1, 1, 1, 1])
+        self.assertEqual(pdv.slot_of(refusing, "rebind_domain_within_driven"), 0)
+
+        healthy = pdv.build_phase_domain_payload(
+            _with_group(_StandInGroup(domain=4), tp_rank=2, layers=4)
+        )
+        self.assertEqual(
+            healthy[at : at + pdv.PHASE_DOMAIN_CENSUS_SLOTS],
+            [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS,
+        )
+        self.assertEqual(pdv.slot_of(healthy, "rebind_domain_within_driven"), 1)
+
+    def test_the_builder_fills_the_loadback_census_from_the_loadback_vote(self):
+        """THE OTHER census's producer, on the same helper. A census filled
+        with a CONSTANT instead of its term's vote is indistinguishable from a
+        healthy group for as long as the term never refuses, which on this bus
+        is the whole of B1 -- the same never-actually-read shape T-46 arm 4
+        exists for."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        scheduler = _with_group(_StandInGroup(domain=4), tp_rank=1, layers=4)
+        setattr(
+            scheduler.tree_cache.cache_controller, pdv.LOADBACK_INCOMPLETE_ATTR, True
+        )
+        payload = pdv.build_phase_domain_payload(scheduler)
+
+        at = pdv.index_of("census_loadback")
+        self.assertEqual(
+            payload[at : at + pdv.PHASE_DOMAIN_CENSUS_SLOTS],
+            [1, 0, 1, 1, 1, 1, 1, 1],
+        )
+        self.assertEqual(pdv.slot_of(payload, "loadback_coverage_complete"), 0)
+        # Slot 15 is healthy in the same payload, so the two censuses cannot be
+        # one row read twice.
+        self.assertEqual(
+            payload[
+                pdv.index_of("census_rebind") : pdv.index_of("census_rebind")
+                + pdv.PHASE_DOMAIN_CENSUS_SLOTS
+            ],
+            [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS,
+        )
+
+
 class ThePayloadRidesTheSeamWithoutMovingTheBallot(unittest.TestCase):
     """GREEN REGRESSION LOCK, not a red-first row.
 
@@ -590,7 +786,7 @@ class TheWidthIsDerivedAndCheckedBothWays(unittest.TestCase):
 class APayloadWithNoProducersIsSilent(unittest.TestCase):
     """T-46 -- the NEUTRAL-VALUE invariant. THE BOOT-KILLER PIN.
 
-    Nineteen of the twenty-one scalar terms have no producer until B2..B6. A
+    Eleven of the thirteen scalar terms have no producer until B2..B6. A
     builder who packs an unproduced AND-slot with the falsy `0` makes every
     rank raise from the first scheduler iteration after B1.
     """

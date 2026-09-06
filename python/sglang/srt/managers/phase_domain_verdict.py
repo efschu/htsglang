@@ -137,25 +137,39 @@ class _Term:
         self.terse_stop = terse_stop
 
 
-#: THE PACKED-BUS LAYOUT. Twenty-one scalar terms plus the census block, in
+#: THE PACKED-BUS LAYOUT. Twenty-six scalar slots plus TWO census blocks, in
 #: order. A term added later adds a ROW here and re-derives the constant below;
 #: it never appends silently.
 #:
+#: EVERY AND TERM IS TWO SLOTS, `(v, -v)`. The scalar count was 21 while an AND
+#: slot was one slot wide; the MAX half added here is what lets a STOP line say
+#: whether the refusal was unanimous (see `_Term.__init__`).
+#:
+#: A CENSUS BLOCK NAMES THE TERM IT CENSUSES. There is one per AND term whose
+#: STOP line has to say WHICH rank refused, and only those: a census is eight
+#: slots, and the other three AND terms have no measured need for one, so they
+#: render `per_rank=[none]` rather than borrowing a row that is not theirs.
+#:
 #: | slot(s) | term | produced by | the refusal it carries |
-#: | 0       | loader_covers_own_layers    | S2-C3      | #1206 LOADER COVERAGE REFUSED |
-#: | 1-2     | d_domain                    | S2-C3      | #1206 TRANSFER DOMAIN DIVERGENT |
-#: | 3-4     | d_host_prov                 | S4-C5      | [#928 anchor/host] REFUSING resume |
-#: | 5-6     | d_ownership                 | S5-C4c     | #924 MAMBA OWNERSHIP SPLIT AT DONATION |
-#: | 7-8     | d_state_src                 | S5-C6      | #924 STATE SOURCE CONTRADICTION |
-#: | 9       | loadback_coverage_complete  | S2-C2      | #1206 LOADBACK COVERAGE INCOMPLETE |
-#: | 10      | draft_tier_domain_matches   | S1-C12     | #1206 DRAFT TIER DOMAIN MISMATCH |
-#: | 11-12   | d_host_unresolvable         | S3-C9      | #1206 HOST POOL UNRESOLVABLE |
-#: | 13-14   | d_slot_ownership            | S5-C4b/d   | #924 SLOT OWNERSHIP REFUSED |
-#: | 15      | rebind_domain_within_driven | S1-C16     | #1206 REBIND DOMAIN OUTSIDE DRIVEN |
-#: | 16-17   | d_geom                      | S4-C6      | the host->device geometry condition |
-#: | 18      | host_ring_discarded         | S7-C10     | #1206 HOST RING NOT DISCARDED |
-#: | 19-20   | d_backup_width              | S7 F-E(b)  | the host backup-width condition |
-#: | 21..    | census[0 .. N-1]            | S2-C2      | the per_rank=[...] census in the message |
+#: | 0-1     | loader_covers_own_layers    | S2-C3      | #1206 LOADER COVERAGE REFUSED |
+#: | 2-3     | d_domain                    | S2-C3      | #1206 TRANSFER DOMAIN DIVERGENT |
+#: | 4-5     | d_host_prov                 | S4-C5      | [#928 anchor/host] REFUSING resume |
+#: | 6-7     | d_ownership                 | S5-C4c     | #924 MAMBA OWNERSHIP SPLIT AT DONATION |
+#: | 8-9     | d_state_src                 | S5-C6      | #924 STATE SOURCE CONTRADICTION |
+#: | 10-11   | loadback_coverage_complete  | S2-C2      | #1206 LOADBACK COVERAGE INCOMPLETE |
+#: | 12-13   | draft_tier_domain_matches   | NO PRODUCER| #1206 DRAFT TIER DOMAIN MISMATCH |
+#: | 14-15   | d_host_unresolvable         | S3-C9      | #1206 HOST POOL UNRESOLVABLE |
+#: | 16-17   | d_slot_ownership            | S5-C4b/d   | #924 SLOT OWNERSHIP REFUSED |
+#: | 18-19   | rebind_domain_within_driven | S1-C16     | #1206 REBIND DOMAIN OUTSIDE DRIVEN |
+#: | 20-21   | d_geom                      | S4-C6      | the host->device geometry condition |
+#: | 22-23   | host_ring_discarded         | S7-C10     | #1206 HOST RING NOT DISCARDED |
+#: | 24-25   | d_backup_width              | S7 F-E(b)  | the host backup-width condition |
+#: | 26..    | census_loadback[0 .. N-1]   | S2-C2      | loadback_coverage_complete's per_rank row |
+#: | ..      | census_rebind[0 .. N-1]     | S1-C16     | rebind_domain_within_driven's per_rank row |
+#:
+#: THE SLOT NUMBERS ABOVE ARE DOCUMENTATION AND HAVE MOVED ONCE ALREADY. Every
+#: reader indexes through `index_of(name)`; a consumer that types a number is
+#: the defect this comment exists to make visible, not to enable.
 PHASE_DOMAIN_LAYOUT: Tuple[_Term, ...] = (
     _Term("loader_covers_own_layers", AND_SLOT, "#1206 LOADER COVERAGE REFUSED"),
     _Term("d_domain", DIVERGENCE_PAIR, "#1206 TRANSFER DOMAIN DIVERGENT"),
@@ -441,26 +455,6 @@ def _bound_controller(scheduler: Any) -> Any:
     return getattr(tree, "cache_controller", None)
 
 
-def _draft_tier_domain_matches(controller: Any) -> int:
-    """Slot 10, COMPUTED ON READ and already POSITIVE -- 1 is good, and there
-    is NO inversion step. Before ``set_draft_kv_pool`` has ever run the first
-    two disjuncts answer 1 with no third read evaluated, so an un-fired draft
-    registration votes the MIN-neutral value by construction and never
-    dereferences a ``None`` pool."""
-    if controller is None:
-        return 1
-    if not getattr(controller, "has_draft", False):
-        return 1
-    draft = getattr(controller, "mem_pool_host_draft", None)
-    if draft is None:
-        return 1
-    group = getattr(controller, "mem_pool_host", None)
-    driven = _read_or_neutral(group, "transfer_layer_domain", None)
-    if driven is None:
-        return 1
-    return 1 if int(getattr(draft, "layer_num", 0) or 0) == int(driven) else 0
-
-
 def _rebind_domain_within_driven(controller: Any, group: Any, bound_phase: Any) -> int:
     """Slot 15, COMPUTED ON READ and already POSITIVE -- ``num_layers ==
     expected domain`` is True when GOOD, so it must not be inverted again.
@@ -542,6 +536,20 @@ def _bound_phase() -> Any:
     return bound_phase()
 
 
+def _own_census_slot(rank: int, vote: int) -> List[int]:
+    """This rank's census row for one term: its own vote at its own position,
+    the MIN-neutral 1 everywhere else, so the reduce leaves each position
+    holding exactly the rank that owns it.
+
+    A rank whose index is at or beyond the block width owns no slot and writes
+    the neutral row -- the BOUNDED LIMIT the unpack prints as `?` from the
+    world size rather than as the healthy `1` a real rank also writes."""
+    census = [1] * PHASE_DOMAIN_CENSUS_SLOTS
+    if 0 <= rank < PHASE_DOMAIN_CENSUS_SLOTS:
+        census[rank] = 1 if int(vote) else 0
+    return census
+
+
 def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
     """This rank's value for every term, read at its ONE declared home.
 
@@ -585,13 +593,27 @@ def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
         setattr(controller, LOADBACK_INCOMPLETE_ATTR, False)
 
     rank = int(getattr(getattr(scheduler, "ps", None), "tp_rank", 0) or 0)
-    census = [1] * PHASE_DOMAIN_CENSUS_SLOTS
-    if 0 <= rank < PHASE_DOMAIN_CENSUS_SLOTS:
-        census[rank] = loadback_complete
-    terms["census"] = census
+    terms["census_loadback"] = _own_census_slot(rank, loadback_complete)
 
-    # Slot 10 -- S1-C12 (B1), computed on read.
-    terms["draft_tier_domain_matches"] = _draft_tier_domain_matches(controller)
+    # Slot 10 -- NO PRODUCER, and this absence is the fix rather than an
+    # omission. The term compared the DRAFT host tier's layer count against
+    # the TARGET tier's `transfer_layer_domain`: 1 against 64 on every
+    # speculative config, on an AND slot, i.e. a deterministic group STOP at
+    # the first cutover (measured, six PhaseDomainDivergence raises in
+    # boot_855_weg1b12s1_6917f46dd5_0906_115410.log).
+    #
+    # HAZARD THE TERM CLAIMED TO NAME, and why nothing is left to vote: "one
+    # loop is driven over two domains, so the narrower one is silently
+    # truncated". The draft half of that loop is bounded by the DRAFT tier's
+    # own count -- `cache_controller.py` `start_loading`, `and i <
+    # self.mem_pool_host_draft.layer_num` -- so the layers the draft does not
+    # cover are skipped by construction, not silently. Comparing the draft
+    # tier against its OWN domain instead is a tautology on a dense-from-0
+    # tier and a NEW false STOP on a composite one, where `layer_num` (the
+    # anchor's count) and `transfer_layer_domain` (1 + max key) legitimately
+    # differ on a PP stage. So the producer is deleted rather than repaired.
+    # The slot keeps its declaration and reads the MIN-neutral 1, which is the
+    # same shape boot row 3 already has on this rig.
 
     # Slots 11-12 -- S3-C9 (B3), SUMMED over the built components.
     tree = getattr(scheduler, "tree_cache", None)
@@ -605,10 +627,16 @@ def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
     # Slots 13-14 -- S5-C4b/S5-C4d (B5), all four allocator transitions summed.
     terms["d_slot_ownership"] = _take_per_pass_count(allocator, SLOT_OWNERSHIP_ATTR)
 
-    # Slot 15 -- S1-C16 (B1), computed on read through the named accessor.
-    terms["rebind_domain_within_driven"] = _rebind_domain_within_driven(
+    # Slot 15 -- S1-C16 (B1), computed on read through the named accessor. Its
+    # census carries the SAME value at this rank's own position; a census with
+    # no producer renders the neutral row on every rank, which is what made the
+    # slot-15 death line unreadable (measured: `per_rank=[1,1,1]` beside two
+    # `local=0` votes).
+    rebind_within_driven = _rebind_domain_within_driven(
         controller, group, _bound_phase()
     )
+    terms["rebind_domain_within_driven"] = rebind_within_driven
+    terms["census_rebind"] = _own_census_slot(rank, rebind_within_driven)
 
     # Slots 16-17 -- S4-C6 (B4), MAX-consumed.
     terms["d_geom"] = _take_per_pass_count(_mamba_host_pool(group), GEOM_MISMATCH_ATTR)
@@ -1036,6 +1064,20 @@ HOST_POOL_BUILD_OK_PEER_LINE = (
     "failure, see its log"
 )
 
+#: The same statement for every OTHER boot row. Kept separate from the row-12
+#: line above because that one names its row in prose and is asserted verbatim.
+BOOT_PEER_REFUSED_LINE = (
+    "peer refused: this row is healthy on this rank; the rank that recorded "
+    "the failure prints it in its own log"
+)
+
+#: This rank refused and recorded no string. Named rather than rendered as the
+#: peer line, which would claim this rank was healthy -- the instrument-text
+#: hazard the row-12-only rendering already produced once.
+BOOT_REFUSED_NO_REASON_LINE = (
+    "this rank refused this row and recorded no reason string"
+)
+
 
 def boot_index_of(row_name: str) -> int:
     """The head index of a boot row, DERIVED from ``BOOT_REDUCE_LAYOUT``."""
@@ -1108,20 +1150,32 @@ def unpack_boot_reduce(
 
 
 def _boot_stop_message(row, rank, local) -> str:
-    reason = None
-    if row.name == "host_pool_build_ok":
-        # The rank that RECORDED the failure prints its own recorded reason; a
-        # healthy rank says so and points at the peer's log. A MIN cannot say
-        # WHICH rank voted 0, and this document adds no second collective, so
-        # no rank can print a peer's string.
-        if not int(local.get(row.name, 1) or 0):
-            reason = local.get("host_pool_build_msg")
-        if reason is None:
+    """The boot STOP line, ONE per rank, carrying THIS rank's reason.
+
+    The rank that RECORDED the failure prints its own recorded reason; a
+    healthy rank says a peer refused and points at that peer's log. A MIN
+    cannot say WHICH rank voted 0, and this bus adds no second collective, so
+    no rank can print a peer's string.
+
+    HAZARD THIS SHAPE CLOSES: the reason used to be rendered for row 12 alone,
+    so a routed `#1068 TP PIN CELL UNDERIVABLE` or a `#1206 TRANSFER DOMAIN
+    SHORTFALL` -- both of which refuse on ROW 0, which `unpack_boot_reduce`
+    reaches first -- killed all three ranks with `reason=None` and named
+    neither the refusing rank nor the cause anywhere on the STOP path.
+    """
+    own_refusal = not int(local.get(row.name, 1) or 0)
+    reason = local.get("host_pool_build_msg") if own_refusal else None
+    if reason is None:
+        if own_refusal:
+            reason = BOOT_REFUSED_NO_REASON_LINE
+        elif row.name == "host_pool_build_ok":
             reason = HOST_POOL_BUILD_OK_PEER_LINE
+        else:
+            reason = BOOT_PEER_REFUSED_LINE
     return (
         "#1206 PHASE DOMAIN DIVERGENCE STOP (boot) rank=%d row=%s local=%s "
         "group_min=0 reason=%s -- %s"
-        % (int(rank), row.name, local.get(row.name), reason, _RAENGE)
+        % (int(rank), row.name, local.get(row.name), reason, _RAENGE_REFUSED)
     )
 
 
