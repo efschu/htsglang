@@ -28,6 +28,7 @@ test is arithmetic over a list of ints, and the reduce that carries it is
 already proven elsewhere.
 """
 
+import re
 import unittest
 from unittest import mock
 
@@ -43,6 +44,7 @@ from sglang.srt.managers import prefetch_ballot
 # `PoolName.MAMBA` is what makes "the route resolves" an assertion instead of
 # an assumption.
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -149,6 +151,20 @@ class _PlainHostPool:
     attributes, and is not a rank that voted badly -- it is a configuration
     with no host-pool group, so every term behind that hop stays NEUTRAL.
     """
+
+
+class _RealEntryHostPool:
+    """The five attributes the real ``HostPoolGroup.__init__`` reads off an
+    entry's host pool (``memory_pool_host.py:1898-1915``). Enough to build the
+    tree's own group object, which is the point: the group under test is the
+    class the route names, not a stand-in that agrees with the reader.
+    """
+
+    layout = "layer_first"
+    page_size = 1
+    device = "cpu"
+    size = 8
+    can_use_write_back_jit = False
 
 
 class _StandInDraftPool:
@@ -566,43 +582,95 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
             pdv.unpack_phase_domain(agreeing, rank=0, local={}, world_size=3)
         self.assertIn("d_geom", str(caught.exception))
 
-    def test_arm_seven_a_missing_declaration_is_a_route_stop(self):
-        """T-46 arm 7 -- the absence the neutral rule does NOT cover.
+    def test_arm_seven_the_two_absence_classes_are_not_one(self):
+        """T-46 arm 7 -- TWO absences, and the layout answers them differently.
 
-        The neutral-value rule is scoped to a term whose PRODUCER has not
-        landed. It says nothing about a holder that IS the declared one and
-        does not carry the declaration: answering the MIN-neutral there turns a
-        missing S1-C18 declaration into a silently healthy vote on the very
-        terms that exist to STOP the group -- the getattr-default-on-a-ledger-
-        path shape the route table rejects by name.
+        (a) A term whose PRODUCER has not landed reads its MIN-neutral. That is
+        the rule S0-C1's neutral-value list states for the whole table
+        ("An AND-slot with no producer is packed `1`") and it is what T-46
+        pins for slots 10 and 15: their numbered changes are S1-C12 and S1-C16
+        and the payload builder answers the neutral when the route hands it
+        nothing.
 
-        Both directions are driven, because the refusal is only correct if the
-        NON-holder stays neutral: a boot with no host-pool group must not gain
-        a STOP it never had.
+        (b) The two D-68 attributes are the ONE exception the spec writes out,
+        and it names the shape it rejects rather than a slot number:
+        "`getattr(group, \"host_ring_discard_ok\", 1)` IS REJECTED BY NAME ...
+        on a bus term it would turn a missing declaration into a silently
+        healthy vote". So those two are read with NO default -- the bare
+        attribute reads S0-C2 itself writes ("slot 18 <- `group.host_ring_
+        discard_ok`", "`delta = group.d_backup_width - last_seen`") -- and a
+        missing declaration dies naming the holder and the attribute.
+
+        THE DEATH IS AN `AttributeError` FROM THE READ, NOT A REFUSAL THIS
+        MODULE INVENTS. D-20 admits no new rank-local raise and no numbered
+        change owns one here, so the no-default read carries the group-uniform
+        death without adding a `raise` statement of its own -- which is what
+        the next arm asserts over the module's own source.
         """
         from sglang.srt.managers import phase_domain_verdict as pdv
 
-        withheld = (
-            ("host_ring_discard_ok", {}),
-            ("d_backup_width", {}),
-            ("expected_transfer_layer_domain", {}),
+        # (b) THE TWO D-68 ATTRIBUTES -- no default, so a group-shaped holder
+        # that does not declare them dies naming both facts.
+        for name in ("host_ring_discard_ok", "d_backup_width"):
+            with self.subTest(no_default=name):
+                scheduler = _with_group(_PartialGroup(withhold=(name,)))
+                with self.assertRaises(AttributeError) as caught:
+                    pdv.build_phase_domain_payload(scheduler)
+                msg = str(caught.exception)
+                self.assertIn(name, msg)
+                self.assertIn("_PartialGroup", msg)
+
+        # (a) THE TWO ROUTE READS THE NEUTRAL RULE DOES COVER. Withholding
+        # them is the B1 state of a slot whose producer has not landed, and
+        # the payload answers the MIN-neutral 1 rather than stopping a boot.
+        neutral_arms = (
+            ("expected_transfer_layer_domain", {}, "rebind_domain_within_driven"),
             (
                 "transfer_layer_domain",
                 {"has_draft": True, "draft_pool": _StandInDraftPool(4)},
+                "draft_tier_domain_matches",
             ),
         )
-        for name, controller_kwargs in withheld:
-            with self.subTest(missing=name):
+        for name, controller_kwargs, term in neutral_arms:
+            with self.subTest(neutral=name):
                 scheduler = _with_group(
                     _PartialGroup(withhold=(name,)), **controller_kwargs
                 )
-                with self.assertRaises(RuntimeError) as caught:
-                    pdv.build_phase_domain_payload(scheduler)
-                msg = str(caught.exception)
-                self.assertIn("#1068 PHASE-DOMAIN ROUTE STOP", msg)
-                self.assertIn("missing=%s" % name, msg)
-                self.assertIn("memory_pool_host.py:1897", msg)
-                self.assertIn("_PartialGroup", msg)
+                payload = pdv.build_phase_domain_payload(scheduler)
+                self.assertEqual(pdv.slot_of(payload, term), 1)
+                self.assertIsNotNone(
+                    pdv.unpack_phase_domain(
+                        _reduce_min([payload] * 3), rank=0, local={}, world_size=3
+                    )
+                )
+
+        # (c) THE TREE'S OWN `HostPoolGroup`, not a stand-in. It carries the
+        # `entry_map` the route discriminates on and NONE of S1's four
+        # attributes, which is exactly what a boot sees if S1-C3/S1-C16/S1-C18
+        # do not land. Slots 10 and 15 must not stop that boot; the two
+        # no-default reads are the only terms that may.
+        real = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=_RealEntryHostPool(),
+                    device_pool=None,
+                    layer_mapper=lambda layer_id: layer_id,
+                )
+            ]
+        )
+        for attribute in (
+            "transfer_layer_domain",
+            "expected_transfer_layer_domain",
+            "host_ring_discard_ok",
+            "d_backup_width",
+        ):
+            self.assertFalse(hasattr(real, attribute), attribute)
+        with self.assertRaises(AttributeError) as caught:
+            pdv.build_phase_domain_payload(
+                _with_group(real, has_draft=True, draft_pool=_StandInDraftPool(4))
+            )
+        self.assertIn("host_ring_discard_ok", str(caught.exception))
 
         # The complete declaration set raises nothing and votes healthy.
         whole = _with_group(
@@ -630,6 +698,77 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
             pdv.unpack_phase_domain(
                 _reduce_min([neutral] * 3), rank=0, local={}, world_size=3
             )
+        )
+
+    def test_arm_eight_a_class_declared_counter_is_cleared_on_the_class(self):
+        """T-46 arm 8 -- the clear lands where the PRODUCER wrote it.
+
+        The spec declares two of the six per-pass counters as CLASS attributes
+        in a class body -- S5-C6's is "a CLASS ATTRIBUTE
+        `_state_src_contradictions = 0` in the body of class
+        `HybridReqToTokenPool` (`memory_pool.py:1835-1837`)" -- and a producer
+        that increments the CLASS is the shape that declaration invites.
+
+        THE HAZARD: a clear written to the INSTANCE creates a shadowing
+        instance attribute. The class value goes on climbing, the instance
+        reads 0 for the life of that object, and the term votes 0 for ever
+        while the detection keeps firing -- a group STOP deleted by a reset,
+        with no failing assertion anywhere else in this file, because every
+        other fixture declares its counters on the instance.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        class _ClassCounterPool:
+            """S5-C6's declaration form: the counter lives in the class body."""
+
+            _state_src_contradictions = 0
+
+        pool = _ClassCounterPool()
+        scheduler = _StandInScheduler(req_to_token_pool=pool)
+
+        type(pool)._state_src_contradictions += 3
+        first = pdv.build_phase_domain_payload(scheduler)
+        self.assertEqual(pdv.pair_of(first, "d_state_src"), (3, -3))
+        self.assertEqual(type(pool)._state_src_contradictions, 0)
+        # THE KILL, stated directly: nothing was written to the instance, so
+        # nothing shadows the class the producer keeps writing to.
+        self.assertNotIn("_state_src_contradictions", vars(pool))
+
+        # The producer increments the CLASS again. A shadowed instance value
+        # would hide it for ever; the class read sees it on the next build.
+        type(pool)._state_src_contradictions += 4
+        second = pdv.build_phase_domain_payload(scheduler)
+        self.assertEqual(pdv.pair_of(second, "d_state_src"), (4, -4))
+
+        third = pdv.build_phase_domain_payload(scheduler)
+        self.assertEqual(pdv.pair_of(third, "d_state_src"), (0, 0))
+
+    def test_arm_nine_the_module_names_no_refusal_of_its_own(self):
+        """The one refusal this slice owns is `PhaseDomainDivergence`.
+
+        D-20 admits a new rank-local raise only for a boot-time invariant
+        before the first collective, and this module's reads run per pass at
+        `scheduler.py:7171`. `PhaseDomainDivergence` is not that shape -- it is
+        raised off the REDUCED payload, so every rank holds the same min and
+        max and raises on the same pass -- and it is the single row of S0's
+        Refusals table. A second named marker minted here would be a refusal
+        with no numbered change, no graded acceptance row and no count on
+        Boot 12.
+        """
+        import inspect
+
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        source = inspect.getsource(pdv)
+        self.assertNotIn("PHASE-DOMAIN ROUTE STOP", source)
+        markers = sorted(
+            {m.strip() for m in re.findall(r"#1(?:068|206|924)[A-Z -]*", source)}
+        )
+        self.assertEqual(
+            [m for m in markers if "STOP" in m],
+            ["#1206 PHASE DOMAIN DIVERGENCE STOP"],
+            "the only named STOP this module may mint is its own divergence: "
+            "%s" % (markers,),
         )
 
 

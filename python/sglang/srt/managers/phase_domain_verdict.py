@@ -325,19 +325,14 @@ def _read_or_neutral(obj: Any, name: str, neutral: Any) -> Any:
     """Read a term whose producer may land in a LATER batch.
 
     The absence handled here is the DECLARED B1 state of a slot whose producer
-    has not landed, and every call site names the batch it lands in. It is NOT
-    the absence ``_require`` handles: an object that IS the declared holder and
-    does not carry the declaration.
+    has not landed, and every call site names the batch it lands in. It is the
+    reader for every term EXCEPT the two D-68 attributes, which the route table
+    rejects a default for by name and which are therefore read bare.
     """
     if obj is None:
         return neutral
     value = getattr(obj, name, _ABSENT)
     return neutral if value is _ABSENT else value
-
-
-#: Where S1-C18 declares the four attributes the bound-group route reads, named
-#: in the refusal so the line points at the writer rather than at the reader.
-_GROUP_DECLARED_AT = "S1-C18, memory_pool_host.py:1897 class HostPoolGroup"
 
 
 def _is_pool_group(obj: Any) -> bool:
@@ -355,34 +350,6 @@ def _is_pool_group(obj: Any) -> bool:
     group.
     """
     return getattr(obj, "entry_map", None) is not None
-
-
-def _require(obj: Any, name: str, *, route: str) -> Any:
-    """Read a term off the object that IS its declared holder.
-
-    THE HAZARD THIS EXISTS FOR, and it is the one the route table rejects by
-    name: answering a MIN-neutral for a missing attribute turns a missing
-    declaration into a silently healthy vote on the one term that exists to
-    STOP the group -- the getattr-default-on-a-ledger-path shape (#606), on a
-    bus term. ``_read_or_neutral`` is the right reader for a producer that has
-    not landed; this one is for a holder that has.
-
-    THE RAISE IS GROUP-UNIFORM BY CONSTRUCTION, so it is not the rank-local
-    raise the ranks-never-disagree law forbids: the predicate is a
-    class-shape fact -- the declaration is either in the class body on every
-    rank or in none -- and it is evaluated at the payload-build site, which
-    runs BEFORE this pass's reduce, so every rank raises on the same pass
-    without a collective.
-    """
-    value = getattr(obj, name, _ABSENT)
-    if value is _ABSENT:
-        raise RuntimeError(
-            "#1068 PHASE-DOMAIN ROUTE STOP route=%s holder=%s missing=%s "
-            "declared_at=%s -- the bound object is the declared holder and the "
-            "attribute is not on it. A missing declaration is a deleted group "
-            "STOP, not a healthy vote." % (route, type(obj).__name__, name, _GROUP_DECLARED_AT)
-        )
-    return value
 
 
 def _take_per_pass_count(obj: Any, name: str) -> int:
@@ -443,9 +410,7 @@ def _draft_tier_domain_matches(controller: Any) -> int:
     if draft is None:
         return 1
     group = getattr(controller, "mem_pool_host", None)
-    if not _is_pool_group(group):
-        return 1
-    driven = _require(group, "transfer_layer_domain", route="slot 10 draft_tier_domain_matches")
+    driven = _read_or_neutral(group, "transfer_layer_domain", None)
     if driven is None:
         return 1
     return 1 if int(getattr(draft, "layer_num", 0) or 0) == int(driven) else 0
@@ -465,13 +430,9 @@ def _rebind_domain_within_driven(controller: Any, group: Any, bound_phase: Any) 
     counter = getattr(controller, "layer_done_counter", None)
     if counter is None:
         return 1
-    if not _is_pool_group(group):
+    accessor = getattr(group, "expected_transfer_layer_domain", None)
+    if accessor is None:
         return 1
-    accessor = _require(
-        group,
-        "expected_transfer_layer_domain",
-        route="slot 15 rebind_domain_within_driven",
-    )
     expected = accessor(bound_phase)
     if expected is None:
         return 1
@@ -618,18 +579,25 @@ def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
     # this route rejects by name: it would turn a missing S1-C18 declaration
     # into a silently healthy vote on the one term that exists to STOP the
     # group.
+    #
+    # SO THESE TWO READS CARRY NO DEFAULT -- and no refusal of this module's own
+    # either. The bare attribute read IS the expression S0-C2 writes, and a
+    # missing declaration dies out of the read itself, naming the holder and the
+    # attribute. A named RuntimeError here would be a NEW rank-local refusal at
+    # a per-pass site: D-20 admits one only for a boot-time invariant before the
+    # first collective, and no numbered change owns one.
+    #
+    # THE SCOPE IS THESE TWO ATTRIBUTES AND NOTHING ELSE. Slots 10 and 15 read
+    # terms whose neutral the layout pins (S0-C1's neutral-value list, T-46),
+    # so they answer 1 when the route hands them nothing.
     if _is_pool_group(group):
-        terms["host_ring_discarded"] = int(
-            _require(group, HOST_RING_DISCARD_OK_ATTR, route="slot 18 host_ring_discarded")
-        )
+        terms["host_ring_discarded"] = int(getattr(group, HOST_RING_DISCARD_OK_ATTR))
         # READ AND RESTORED TO 1, through the SAME object the read named: a
         # read through the bound group paired with a reset through anything
         # else is a flag that never clears or clears someone else's.
         setattr(group, HOST_RING_DISCARD_OK_ATTR, 1)
 
-        current = int(
-            _require(group, D_BACKUP_WIDTH_ATTR, route="slots 19-20 d_backup_width") or 0
-        )
+        current = int(getattr(group, D_BACKUP_WIDTH_ATTR) or 0)
         last_seen = int(
             _read_or_neutral(scheduler, D_BACKUP_WIDTH_LAST_SEEN_ATTR, 0) or 0
         )
