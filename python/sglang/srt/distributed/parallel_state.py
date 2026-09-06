@@ -794,83 +794,11 @@ class GroupCoordinator:
                 qr_rocm_arch_available,
             )
 
-        # barlink (task #117): vendor-neutral host-staged collectives, for TP
-        # groups that span GPUs without a common device collective library
-        # (NCCL and RCCL cannot form a joint communicator). Constructed
-        # BEFORE pynccl and consulted FIRST in every dispatch, so that when
-        # the flag is on no collective reaches NCCL.
-        #
-        # Flag OFF (the default) leaves barlink_comm as None and every dispatch
-        # seam falls through a single `is not None` check -- behavior is
-        # byte-identical to stock sglang.
-        #
-        # It attaches to self.cpu_group (gloo), which sglang already builds
-        # for every group, so this adds no process group and no new
-        # collective beyond barlink's own startup calibration.
-        self.barlink_comm: Optional[Any] = None
-        if should_build_barlink(self.world_size):
-            from sglang.srt.distributed.device_communicators.barlink import (
-                BarlinkCommunicator,
-            )
-
-            # The CPU transports host-stage every collective: shm calls
-            # cudaStreamSynchronize twice per op and spins on shm counters,
-            # the gloo plane calls cudaEventSynchronize plus a gloo CPU
-            # collective per chunk. All of that is ILLEGAL inside a CUDA-graph
-            # capture. Until now that constraint lived only in the log line
-            # below, so violating it surfaced as a bare
-            # `cudaErrorStreamCaptureUnsupported` in the middle of capture --
-            # the exact shape of the arm-E crash. Fail at startup, naming the
-            # cause, instead.
-            _enforce_cpu_transport_needs_eager(envs.SGLANG_BARLINK_TRANSPORT.get())
-            # Through a LOCAL variable, and so is the state query further
-            # down: `self.barlink_comm` may only be touched behind an
-            # `is not None` (test_dispatch_seams_are_all_none_guarded pins
-            # that, and rightly so -- it is what keeps the flag-off path
-            # byte-identical).
-            _comm = BarlinkCommunicator(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                group=self.unique_name,
-            )
-            self.barlink_comm = _comm
-            # What was REQUESTED and what was ACHIEVED -- kept apart.
-            #
-            # Until now this line named the requested transport, whatever had
-            # actually come of it. On the real model with SGLANG_UNEVEN_DCP
-            # that meant: 'tp' brought the direct path up in 27 ms, 'dcp'
-            # failed at the holder with ENOMEM and fell back to gloo -- and
-            # both lines said "transport=bar1". Half of the number won from
-            # that run was not a bar1 number at all. So the failure is now a
-            # WARNING carrying the group name and the reason, and the success
-            # says explicitly what is really running.
-            requested = envs.SGLANG_BARLINK_TRANSPORT.get()
-            state = getattr(_comm, "state", {}) or {}
-            achieved = state.get("achieved", requested)
-            if state.get("direct", True):
-                logger.info(
-                    "barlink enabled for group '%s': requested=%s, "
-                    "ACHIEVED=%s. Every SGLANG_BARLINK* env must be identical "
-                    "on all ranks; the host-staged transports (shm/gloo/ucx) "
-                    "additionally require --disable-cuda-graph.",
-                    self.unique_name,
-                    requested,
-                    achieved,
-                )
-            else:
-                logger.warning(
-                    "barlink group '%s': requested=%s, ACHIEVED=%s (%s: %s). "
-                    "This group does NOT run over %s. A measurement from "
-                    "this run is mixed and must not be reported as a "
-                    "%s value.",
-                    self.unique_name,
-                    requested,
-                    achieved,
-                    state.get("stage", "?"),
-                    state.get("reason", "?"),
-                    requested,
-                    requested,
-                )
+        # barlink (task #117): constructed here, at exactly the point in the
+        # sequence it has always been constructed at. The block itself lives in
+        # _build_barlink() so that a WAKE can reach it a second time (weg2 S2 /
+        # BI-1) without a second copy of it.
+        self._build_barlink()
 
         # When barlink is active the pynccl communicator is NOT CONSTRUCTED --
         # not merely left unused.
@@ -1036,6 +964,145 @@ class GroupCoordinator:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
+
+    def _build_barlink(self) -> None:
+        """Construct this group's barlink communicator, or leave it None.
+
+        ONE definition, two call sites: `__init__` at boot and
+        `barlink_reopen()` at wake (weg2 S2 / BI-1). A second copy of this
+        block would drift -- only the boot path would keep the abort-gate
+        registration, the BAR1 ledger credit and the achieved-vs-requested
+        log line -- which is the second-bookkeeping shape the
+        upstream-minimal law targets.
+
+        Reads `self.world_size`, `self.cpu_group`, `self.device` and
+        `self.unique_name`; all four are assigned earlier in `__init__` than
+        the call site below, so the extraction changes no ordering.
+        """
+        # barlink (task #117): vendor-neutral host-staged collectives, for TP
+        # groups that span GPUs without a common device collective library
+        # (NCCL and RCCL cannot form a joint communicator). Constructed
+        # BEFORE pynccl and consulted FIRST in every dispatch, so that when
+        # the flag is on no collective reaches NCCL.
+        #
+        # Flag OFF (the default) leaves barlink_comm as None and every dispatch
+        # seam falls through a single `is not None` check -- behavior is
+        # byte-identical to stock sglang.
+        #
+        # It attaches to self.cpu_group (gloo), which sglang already builds
+        # for every group, so this adds no process group and no new
+        # collective beyond barlink's own startup calibration.
+        self.barlink_comm: Optional[Any] = None
+        if should_build_barlink(self.world_size):
+            from sglang.srt.distributed.device_communicators.barlink import (
+                BarlinkCommunicator,
+            )
+
+            # The CPU transports host-stage every collective: shm calls
+            # cudaStreamSynchronize twice per op and spins on shm counters,
+            # the gloo plane calls cudaEventSynchronize plus a gloo CPU
+            # collective per chunk. All of that is ILLEGAL inside a CUDA-graph
+            # capture. Until now that constraint lived only in the log line
+            # below, so violating it surfaced as a bare
+            # `cudaErrorStreamCaptureUnsupported` in the middle of capture --
+            # the exact shape of the arm-E crash. Fail at startup, naming the
+            # cause, instead.
+            _enforce_cpu_transport_needs_eager(envs.SGLANG_BARLINK_TRANSPORT.get())
+            # Through a LOCAL variable, and so is the state query further
+            # down: `self.barlink_comm` may only be touched behind an
+            # `is not None` (test_dispatch_seams_are_all_none_guarded pins
+            # that, and rightly so -- it is what keeps the flag-off path
+            # byte-identical).
+            _comm = BarlinkCommunicator(
+                cpu_group=self.cpu_group,
+                device=self.device,
+                group=self.unique_name,
+            )
+            self.barlink_comm = _comm
+            # What was REQUESTED and what was ACHIEVED -- kept apart.
+            #
+            # Until now this line named the requested transport, whatever had
+            # actually come of it. On the real model with SGLANG_UNEVEN_DCP
+            # that meant: 'tp' brought the direct path up in 27 ms, 'dcp'
+            # failed at the holder with ENOMEM and fell back to gloo -- and
+            # both lines said "transport=bar1". Half of the number won from
+            # that run was not a bar1 number at all. So the failure is now a
+            # WARNING carrying the group name and the reason, and the success
+            # says explicitly what is really running.
+            requested = envs.SGLANG_BARLINK_TRANSPORT.get()
+            state = getattr(_comm, "state", {}) or {}
+            achieved = state.get("achieved", requested)
+            if state.get("direct", True):
+                logger.info(
+                    "barlink enabled for group '%s': requested=%s, "
+                    "ACHIEVED=%s. Every SGLANG_BARLINK* env must be identical "
+                    "on all ranks; the host-staged transports (shm/gloo/ucx) "
+                    "additionally require --disable-cuda-graph.",
+                    self.unique_name,
+                    requested,
+                    achieved,
+                )
+            else:
+                logger.warning(
+                    "barlink group '%s': requested=%s, ACHIEVED=%s (%s: %s). "
+                    "This group does NOT run over %s. A measurement from "
+                    "this run is mixed and must not be reported as a "
+                    "%s value.",
+                    self.unique_name,
+                    requested,
+                    achieved,
+                    state.get("stage", "?"),
+                    state.get("reason", "?"),
+                    requested,
+                    requested,
+                )
+
+    def barlink_reopen(self) -> None:
+        """Rebuild this group's barlink transports after a sleep closed them.
+
+        weg2 S2 / BI-1. Sleep closes the transports
+        (`BarlinkBar1Transport.close()`, which is collective-free and hands
+        the BAR1 aperture and the abort-gate registration back); until now
+        `__init__` was the only build site, so a woken group had no
+        transports and no abort poller.
+
+        NEVER USE `destroy()` AS A SLEEP. It also destroys the gloo
+        `cpu_group` (`destroy`, below), and every barlink bring-up runs
+        collectives on that group -- the fd exchange, the liveness install,
+        the window minimum. That case is refused here by name rather than
+        faulting somewhere inside the fd exchange, where the cause is no
+        longer on hand.
+
+        This is a BUILD, and the fork's rule is that a flip pays COPY time
+        and never BUILD time. The deviation is taken with its bound: the
+        rebuild is a collective fd exchange plus a cuMemMap, and the caller
+        (the sleep/wake RPC) owns the deadline -- this method has none of its
+        own and must not grow one.
+
+        NO NEW REFUSAL IS ADDED. If a sibling group still holds the card's
+        aperture, the existing `window_for` raises `Bar1WindowRefused` with
+        its arithmetic instead of clipping, and it propagates from here
+        untouched. Flag off, this is a no-op that leaves `barlink_comm` None,
+        exactly as at boot.
+        """
+        if self.cpu_group is None:
+            raise RuntimeError(
+                f"barlink group {self.unique_name!r}: cannot reopen, this "
+                "group's gloo cpu_group is gone. GroupCoordinator.destroy() "
+                "was used where a sleep was meant -- it tears down the "
+                "cpu_group that every barlink bring-up needs (fd exchange, "
+                "liveness install, window minimum). A sleep closes the "
+                "transports only (barlink_comm.close()) and leaves the "
+                "process groups standing."
+            )
+        # A live communicator still holds its BAR1 ledger credit, so building a
+        # second one would price the new window against space this process has
+        # not returned. Close first: close() is idempotent and collective-free,
+        # which also makes this the safe path when the sleep already closed it.
+        if self.barlink_comm is not None:
+            self.barlink_comm.close()
+            self.barlink_comm = None
+        self._build_barlink()
 
     def __repr__(self):
         return (

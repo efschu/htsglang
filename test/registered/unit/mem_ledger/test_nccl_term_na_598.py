@@ -362,14 +362,25 @@ class TestTheVerdictComesFromTheConstructionPredicate(unittest.TestCase):
 
     def test_the_construction_site_uses_the_same_predicate(self):
         """The other half of "cannot drift": GroupCoordinator must branch on
-        should_build_barlink too, not on an inline copy of its body."""
+        should_build_barlink too, not on an inline copy of its body.
+
+        The construction site moved out of `__init__` into `_build_barlink`
+        (weg2 S2 / BI-1), so that a wake can reach it a second time. What this
+        test is about is the PREDICATE, so it follows the block to where the
+        block now lives -- and it pins the call from `__init__` too, because a
+        construction block that is present but unreached would satisfy the
+        first half alone.
+        """
         import inspect
 
         from sglang.srt.distributed.parallel_state import GroupCoordinator
 
-        src = inspect.getsource(GroupCoordinator.__init__)
+        src = inspect.getsource(GroupCoordinator._build_barlink)
         self.assertIn("should_build_barlink(self.world_size)", src)
         self.assertNotIn("envs.SGLANG_BARLINK.get() and self.world_size", src)
+        init_src = inspect.getsource(GroupCoordinator.__init__)
+        self.assertIn("self._build_barlink()", init_src)
+        self.assertNotIn("should_build_barlink(self.world_size)", init_src)
 
     def test_the_ledger_does_not_read_the_barlink_switch_itself(self):
         """Reading the switch here -- through sglang.environ or through
