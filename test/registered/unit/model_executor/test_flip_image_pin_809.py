@@ -516,8 +516,13 @@ class TestFlipImagePinBudget(_FlipImagePinBase):
 
         with self._budget(64.0, 40.0):
             with mock.patch.object(weights_arena, "_alloc_pinned_pin_buffer", _boom):
-                with self.assertRaises(RuntimeError):
+                with self.assertRaises(weights_arena.WeightsArenaError) as ctx:
                     weights_arena.create_flip_image_pin(1 << 20)
+        # The refusal is the GROUP-uniform one (T-G1-12f), not a bare
+        # allocator raise: this site is past the distributed init, so a lone
+        # raise here parks the peers in the next collective.
+        self.assertIn("#809 FLIP IMAGE PIN REFUSED", str(ctx.exception))
+        self.assertIn("cudaHostRegister refused", str(ctx.exception))
         self.assertEqual([p.name for p in pinned_host_budget.registered_posts()], [])
         self.assertIsNone(weights_arena.flip_image_pin())
 
@@ -1218,6 +1223,41 @@ class TestFlipImagePinGroupAdmission(_FlipImagePinBase):
 
         return mock.patch.object(weights_arena, "_pin_admission_is_group_wide", _reduce)
 
+    def _scripted_seam(self, seen, answers):
+        """A seam that answers a SEQUENCE, so a second verdict is visible.
+
+        A single-answer stub cannot tell "the pin votes once" from "the pin
+        votes twice"; this one records every local verdict it was handed and
+        refuses to invent an answer the script does not have, so a vote that
+        should not exist fails loudly instead of reading the previous one.
+        """
+        queue = list(answers)
+
+        def _reduce(local_ok):
+            seen.append(bool(local_ok))
+            if not queue:
+                raise AssertionError(
+                    f"the pin took more group verdicts than the script has: {seen}"
+                )
+            return queue.pop(0)
+
+        return mock.patch.object(weights_arena, "_pin_admission_is_group_wide", _reduce)
+
+    def _unregister_spy(self, freed):
+        """Watch the real seam a refused rank must use to hand its pages back.
+
+        ``cudaHostRegister`` is a process-wide fact about an ADDRESS RANGE
+        (``release_host_image``), so a buffer abandoned still registered is
+        not merely leaked host RAM -- it is the rc=712 the next large host
+        allocation dies on.
+        """
+        from sglang.srt.mem_cache.pool_host import common as pool_host_common
+
+        def _spy(buffer):
+            freed.append(int(buffer.numel()))
+
+        return mock.patch.object(pool_host_common, "_cuda_host_unregister", _spy)
+
     def test_t_g1_12_a_peer_refusal_refuses_this_rank_too(self):
         """THE DANGER DIRECTION: this rank fits, a peer does not.
 
@@ -1264,7 +1304,13 @@ class TestFlipImagePinGroupAdmission(_FlipImagePinBase):
         self.assertEqual([p.name for p in pinned_host_budget.registered_posts()], [])
 
     def test_t_g1_12c_a_group_that_agrees_admits_the_pin(self):
-        """GREEN arm: the reduce is consulted on the success path too."""
+        """GREEN arm: BOTH reduces are consulted on the success path too.
+
+        Two verdicts and not one, because the two stages decide different
+        facts: the ledger says the bytes were available, the allocator says
+        this rank got them. A success that consulted only one of them would
+        mean the other stage still has an unreduced exit somewhere.
+        """
         calls = []
         seen = []
         want = 1 << 20
@@ -1272,7 +1318,12 @@ class TestFlipImagePinGroupAdmission(_FlipImagePinBase):
             with self._seam(seen, True):
                 with self._allocator(calls):
                     pin = weights_arena.create_flip_image_pin(want)
-        self.assertEqual(seen, [True])
+        self.assertEqual(
+            seen,
+            [True, True],
+            "the ledger verdict and the allocation verdict are both reduced, "
+            "so a rank that got through says so twice",
+        )
         self.assertEqual(calls, [want])
         self.assertIs(pin, weights_arena.flip_image_pin())
         posts = {p.name: p for p in pinned_host_budget.registered_posts()}
@@ -1350,6 +1401,101 @@ class TestFlipImagePinGroupAdmission(_FlipImagePinBase):
                         self.assertFalse(
                             weights_arena._pin_admission_is_group_wide(False)
                         )
+
+    def test_t_g1_12f_a_failed_allocation_refuses_with_the_group(self):
+        """The ALLOCATOR's failure rides the same bus as the ledger's.
+
+        ``_alloc_pinned_pin_buffer`` states its own design verbatim: *"NO
+        FALLBACK, unlike ``_alloc_host_image_inner``."* It reaches
+        ``pool_host/common.py:65-71``, which RAISES on a non-zero
+        ``cudaHostRegister`` return, and the mmap under it can raise ENOMEM on
+        a swapless box. That failure is MORE rank-divergent than the ledger's,
+        not less: the ledger is weighed against LIVE availability BEFORE any
+        rank has pinned its share, so three ranks can all read the same
+        pre-pin figure and all admit -- and it is the LAST rank's multi-GiB
+        registration that then fails, alone, past the ledger vote. A raise
+        there parks the peers in the next collective for ever, which is a
+        hang and not a refusal.
+        """
+        seen = []
+        freed = []
+
+        def _boom(nbytes):
+            raise RuntimeError("cudaHostRegister failed (rc=2)")
+
+        with self._budget(64.0, 40.0):
+            with self._scripted_seam(seen, [True, False]):
+                with mock.patch.object(
+                    weights_arena, "_alloc_pinned_pin_buffer", _boom
+                ):
+                    with self._unregister_spy(freed):
+                        with self.assertRaises(weights_arena.WeightsArenaError) as ctx:
+                            weights_arena.create_flip_image_pin(1 << 20)
+        self.assertEqual(
+            seen,
+            [True, False],
+            "the allocation failure never reached a group verdict; this rank "
+            "raised alone past the reduce",
+        )
+        msg = str(ctx.exception)
+        self.assertIn("#809 FLIP IMAGE PIN REFUSED", msg)
+        self.assertIn(
+            "cudaHostRegister failed (rc=2)",
+            msg,
+            "the group-uniform refusal dropped this rank's own reason",
+        )
+        self.assertIn(
+            "allocator",
+            msg,
+            "the refusal does not say which of the two stages refused",
+        )
+        self.assertEqual([p.name for p in pinned_host_budget.registered_posts()], [])
+        self.assertIsNone(weights_arena.flip_image_pin())
+        self.assertEqual(
+            freed, [], "nothing was allocated, so there are no pages to hand back"
+        )
+
+    def test_t_g1_12g_a_peer_allocation_failure_refuses_this_fitting_rank(self):
+        """THE DANGER DIRECTION: this rank allocated, a peer could not.
+
+        This is the arm a rank-local raise cannot express at all. This rank
+        succeeded, so nothing local tells it to stop; only the reduced verdict
+        does. It must refuse anyway, and it must hand back BOTH the post
+        (#729/#550: a post with no allocation behind it is credited to the
+        next admission) and the pages (the registration is process-wide, so a
+        buffer left registered is the next allocation's rc=712).
+        """
+        seen = []
+        freed = []
+        calls = []
+        want = 1 << 20
+        with self._budget(64.0, 40.0):
+            with self._scripted_seam(seen, [True, False]):
+                with self._allocator(calls):
+                    with self._unregister_spy(freed):
+                        with self.assertRaises(weights_arena.WeightsArenaError) as ctx:
+                            weights_arena.create_flip_image_pin(want)
+        self.assertEqual(
+            seen,
+            [True, True],
+            "this rank's own allocation verdict was never reduced, so a peer "
+            "that failed to allocate could not stop it",
+        )
+        self.assertEqual(calls, [want])
+        msg = str(ctx.exception)
+        self.assertIn("#809 FLIP IMAGE PIN REFUSED", msg)
+        self.assertIn(
+            "a peer rank",
+            msg,
+            "the refusal does not say the group, not this rank, refused",
+        )
+        self.assertEqual(
+            freed,
+            [want],
+            "this rank sailed on holding pages the group had just refused",
+        )
+        self.assertEqual([p.name for p in pinned_host_budget.registered_posts()], [])
+        self.assertIsNone(weights_arena.flip_image_pin())
 
 
 if __name__ == "__main__":

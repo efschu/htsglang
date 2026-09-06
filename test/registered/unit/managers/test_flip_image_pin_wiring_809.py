@@ -33,6 +33,9 @@ pin that serves every leg and a pin that serves none. It is checked against
 ``refill``'s own direction handling, which is the consumer of the same fact.
 """
 
+import ast
+import inspect
+import textwrap
 import unittest
 
 import torch
@@ -303,6 +306,164 @@ class TestTheAbandonStopsTheReadAhead(CustomTestCase):
         rt._abandon_parked_flip(0)
         self.assertIsNone(rt._pending)
         self.assertIsNone(rt._parked_extent)
+
+
+def _boot_stack_tree():
+    """The AST of ``build_phase_flip_tp_stack``, dedented so it parses alone."""
+    from sglang.srt.managers import phase_flip_boot
+
+    body = textwrap.dedent(inspect.getsource(phase_flip_boot.build_phase_flip_tp_stack))
+    return ast.parse(body).body[0]
+
+
+def _calls_named(tree, name):
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == name
+    ]
+
+
+class TestTheBootCreatesThePin(CustomTestCase):
+    """The BOOT half of the wiring, which the arm-site tests do not reach.
+
+    THE SAME GAP, ONE STEP EARLIER. The class docstring above records four
+    mutations of the ARM sites that left the slice suite green; three more at
+    the CREATION site do the same, and one of them makes the whole slice inert
+    in a boot without changing a single string the log prints:
+
+    * ``if flip_image_pin_enabled():`` short-circuited (``if False and ...``)
+      -- no pin is ever created, ``flip_image_pin()`` is ``None`` on every
+      leg, and every refill falls through to ``source=file`` with no #809
+      line at all;
+    * ``max(...)`` over the two layout images turned into ``min(...)`` -- the
+      buffer is sized to the SMALLER image, so exactly one of the two flip
+      directions silently never fits (``weights_arena.py``'s
+      ``if int(meta.nbytes) > self.nbytes:``) while the boot still logs the
+      post as registered;
+    * ``require_pin_preconditions()`` dropped -- the FILE_BACKED/TWO_FILE
+      refusal never runs at boot, so an armed pin without its carrier is
+      discovered at the first flip instead of at the boot.
+
+    WHY THIS IS STRUCTURAL AND NOT A STRING MATCH. A substring pin would
+    survive the first mutation, because ``if False and
+    flip_image_pin_enabled():`` still contains every name the pin looks for.
+    The guard is therefore read as a TREE: the call must be the whole
+    condition, not one term of a wider one.
+    """
+
+    def test_the_pin_is_created_under_its_own_flag_and_nothing_wider(self):
+        tree = _boot_stack_tree()
+        guards = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and _calls_named(node.test, "flip_image_pin_enabled")
+        ]
+        self.assertEqual(
+            len(guards),
+            1,
+            "#809's creation site is not exactly one guarded block",
+        )
+        guard = guards[0]
+        self.assertIsInstance(
+            guard.test,
+            ast.Call,
+            "the guard is not the flag call ITSELF but a wider expression, so "
+            "a term beside it can make the whole slice inert while every name "
+            "the log and a grep look for is still present",
+        )
+        self.assertEqual(ast.unparse(guard.test), "flip_image_pin_enabled()")
+        self.assertEqual(
+            guard.orelse,
+            [],
+            "the creation site grew an else the slice has no shape for",
+        )
+
+    def test_the_buffer_is_sized_to_the_larger_of_the_two_layout_images(self):
+        """ONE buffer serves BOTH directions, so the size is a MAX.
+
+        A MIN fits one direction and silently refuses the other: the leg for
+        the larger layout finds ``meta.nbytes > self.nbytes`` and reads the
+        file, while the boot log still shows the post registered and the
+        acceptance reads it as "the prefetch did not help".
+        """
+        tree = _boot_stack_tree()
+        made = _calls_named(tree, "create_flip_image_pin")
+        self.assertEqual(len(made), 1, "the pin is created somewhere else as well")
+        self.assertEqual(len(made[0].args), 1)
+        self.assertEqual(
+            ast.unparse(made[0].args[0]),
+            "max(int(image_pp.numel()), int(image_tp.numel()))",
+            "the pin is not sized to the larger of the two layout images",
+        )
+
+    def test_the_creation_sits_inside_the_flag_and_inside_the_two_file_arm(self):
+        """The call is REACHED only under the flag, and only with two files.
+
+        Both containments are load-bearing: outside the flag the default tree
+        stops being byte-identical, and outside the two-file arm there is no
+        per-layout image file for the read-ahead to read.
+        """
+        tree = _boot_stack_tree()
+        guards = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and _calls_named(node.test, "flip_image_pin_enabled")
+        ]
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(
+            len(_calls_named(guards[0], "create_flip_image_pin")),
+            1,
+            "the creation escaped its own flag",
+        )
+        two_file = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "two_file"
+        ]
+        self.assertTrue(
+            any(_calls_named(node, "create_flip_image_pin") for node in two_file),
+            "the pin is created outside the two-file arm, which is the only "
+            "arm that has a per-layout image file to read ahead from",
+        )
+
+    def test_the_boot_asks_the_precondition_beside_the_two_file_one(self):
+        """#1078's refusal and #809's run at the same instant, unguarded.
+
+        Dropped, the FILE_BACKED/TWO_FILE refusal never runs at boot and a
+        misconfigured pin is discovered at the first flip instead -- inside
+        the no-return window rather than in a boot message.
+        """
+        tree = _boot_stack_tree()
+        asked = _calls_named(tree, "require_pin_preconditions")
+        self.assertEqual(
+            len(asked), 1, "the #809 precondition is not asked at boot exactly once"
+        )
+        top = [
+            node.value.func.id
+            for node in tree.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+        ]
+        self.assertIn(
+            "require_pin_preconditions",
+            top,
+            "the precondition moved under a branch, so a configuration that "
+            "does not take that branch is never refused",
+        )
+        self.assertIn("require_two_file_preconditions", top)
+        self.assertLess(
+            top.index("require_two_file_preconditions"),
+            top.index("require_pin_preconditions"),
+            "#1078's carrier is refused before #809's read-ahead of it",
+        )
 
 
 if __name__ == "__main__":

@@ -1585,7 +1585,7 @@ _PIN_STOP_JOIN_S = 5.0
 #: Process-wide, because there is one rank per process and one buffer per
 #: rank -- the same reason `_FILE_BACKED_IMAGES` and `_LAYOUT_IMAGE_PHASE`
 #: above are module state rather than fields on a stack object.
-_FLIP_IMAGE_PIN: Optional["FlipImagePin"] = None
+_FLIP_IMAGE_PIN: Optional[FlipImagePin] = None
 
 
 def flip_image_pin_enabled() -> bool:
@@ -1939,14 +1939,14 @@ def _alloc_pinned_pin_buffer(nbytes: int) -> torch.Tensor:
     return _alloc_with_host_register((int(nbytes),), torch.uint8, "cpu", True, None)
 
 
-def install_flip_image_pin(pin: Optional["FlipImagePin"]) -> None:
+def install_flip_image_pin(pin: Optional[FlipImagePin]) -> None:
     """Publish ``pin`` as this process's read-ahead buffer."""
     global _FLIP_IMAGE_PIN
 
     _FLIP_IMAGE_PIN = pin
 
 
-def flip_image_pin() -> Optional["FlipImagePin"]:
+def flip_image_pin() -> Optional[FlipImagePin]:
     return _FLIP_IMAGE_PIN
 
 
@@ -1969,13 +1969,28 @@ def release_flip_image_pin() -> None:
         # Not ours to unregister or unmap: a pin built around a buffer this
         # module did not allocate (unit tests) has no post and no mapping.
         return
+    _release_pin_pages(pin.buffer)
+    _unregister_image_post(pin.post_name)
+
+
+def _release_pin_pages(buffer: Optional[torch.Tensor]) -> None:
+    """Give the pin's pages back to CUDA. Never raises.
+
+    ONE HAND-BACK FOR TWO CALLERS. ``release_flip_image_pin`` unwinds a pin
+    that lived; ``create_flip_image_pin`` unwinds one the GROUP refused after
+    this rank had already allocated it. Both owe CUDA the same thing, and the
+    hazard is the same in both: ``cudaHostRegister`` is a process-wide fact
+    about an ADDRESS RANGE, so pages returned to the allocator while CUDA
+    still maps them fail the next large host allocation with rc=712.
+    """
+    if buffer is None:
+        return
     try:
         from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
 
-        _cuda_host_unregister(pin.buffer)
+        _cuda_host_unregister(buffer)
     except Exception as exc:  # noqa: BLE001 -- cleanup never kills a boot
         logger.warning("#809 could not cudaHostUnregister the flip image pin: %s", exc)
-    _unregister_image_post(pin.post_name)
 
 
 def _pin_admission_is_group_wide(local_ok: bool) -> bool:
@@ -2023,7 +2038,59 @@ def _pin_admission_is_group_wide(local_ok: bool) -> bool:
     return bool(int(flag.item()))
 
 
-def create_flip_image_pin(nbytes: int) -> "FlipImagePin":
+def _pin_refusal(
+    total: int, local_exc: Optional[BaseException], stage: str
+) -> WeightsArenaError:
+    """The one group-uniform refusal both admission stages raise.
+
+    ONE MESSAGE, TWO STAGES, so an operator reading the boot log cannot be
+    told "the ledger refused" by a rank whose ALLOCATOR refused -- the two
+    have different remedies (lower a post vs. free host RAM), and a refusal
+    that names the wrong one sends the operator at the wrong knob.
+
+    EVERY RANK PRINTS IT, so the reason is this rank's own where it has one
+    and "a peer rank" where it does not; the numbers are always this rank's,
+    because they are what this rank measured.
+
+    REFUSES, never falls back to file-only. A pin the operator armed and that
+    silently did not happen is the #742 class, and it would be read off the
+    acceptance as "the prefetch did not help" rather than as "the prefetch was
+    never there".
+    """
+    from sglang.srt.mem_cache.pinned_host_budget import (
+        PINNED_HOST_RESERVE_BYTES,
+        pinned_host_memory_bytes,
+        registered_posts,
+    )
+
+    said = (
+        str(local_exc)
+        if local_exc is not None
+        else "this rank got through; a peer rank did not"
+    )
+    machine_total, available = pinned_host_memory_bytes()
+    others = "; ".join(
+        f"{p.name} {p.nbytes / 1e9:.2f} GB ({p.flag})"
+        for p in registered_posts()
+        if p.nbytes > 0
+    )
+    return WeightsArenaError(
+        f"#809 FLIP IMAGE PIN REFUSED: {FLIP_IMAGE_PIN_POST_NAME} needs "
+        f"{total / 1e9:.2f} GB of pinned host RAM and the rank group does "
+        f"not admit it at {stage} (this rank "
+        f"{'did not get through' if local_exc is not None else 'did'}; the "
+        f"verdict is reduced so the ranks cannot disagree about a boot). "
+        f"posts already registered: [{others or 'none'}]; host total "
+        f"{(machine_total or 0) / 1e9:.2f} GB, available "
+        f"{(available or 0) / 1e9:.2f} GB, reserve floor "
+        f"{PINNED_HOST_RESERVE_BYTES / 1e9:.2f} GB. Lower one of the named "
+        f"flags or set {FLIP_IMAGE_PIN_FLAG} and boot without the "
+        f"read-ahead; the file-backed image is unchanged either way. "
+        f"{stage} said: {said}"
+    )
+
+
+def create_flip_image_pin(nbytes: int) -> FlipImagePin:
     """Admit ``nbytes`` against the #721 ledger, then allocate and publish.
 
     ORDER IS THE CONTENT: the post is DECLARED before the buffer exists, so an
@@ -2033,17 +2100,28 @@ def create_flip_image_pin(nbytes: int) -> "FlipImagePin":
     next admission as though its bytes were resident and the registry waves
     through the very over-commit it exists to refuse.
 
-    ONE VERDICT FOR THE GROUP. The ledger's answer depends on live host
-    availability, which every co-booting rank is shrinking as it goes, so the
-    answer is not rank-invariant. It is reduced before anyone acts on it --
-    see ``_pin_admission_is_group_wide`` for why a lone raise at this site is
-    a hang and not a refusal.
+    ONE VERDICT FOR THE GROUP, PER STAGE, AND NO EXIT PAST ONE. The ledger's
+    answer depends on live host availability, which every co-booting rank is
+    shrinking as it goes, so the answer is not rank-invariant -- and neither
+    is the ALLOCATION that follows it, for the stronger reason that every rank
+    weighs the ledger against the same pre-pin availability and only the last
+    rank to register the bytes discovers they are gone. Both are therefore
+    HELD and reduced, and every failure this function can express leaves it
+    through one of the two reduced exits. See ``_pin_admission_is_group_wide``
+    for why a lone raise at this site is a hang and not a refusal.
+
+    TWO REDUCES AND NOT ONE, deliberately. Folding both into a single vote
+    after the allocation would let a rank whose peer's LEDGER had already
+    refused pin its own multi-GiB share first and hand it back afterwards --
+    the exact over-commitment on a swapless box that the #721 gate exists to
+    refuse. The first reduce is the barrier that keeps the gate's answer
+    binding. Both are unconditional on every rank, so the collective count is
+    rank-uniform on every path.
     """
     from sglang.srt.mem_cache.pinned_host_budget import (
         PINNED_HOST_RESERVE_BYTES,
         check_and_register_pinned_post,
         pinned_host_memory_bytes,
-        registered_posts,
         unregister_pinned_post,
     )
 
@@ -2064,35 +2142,19 @@ def create_flip_image_pin(nbytes: int) -> "FlipImagePin":
         # the next admission as though its bytes were resident, so a rank
         # that registered before the group refused hands its post back.
         unregister_pinned_post(FLIP_IMAGE_PIN_POST_NAME)
-        ledger_said = (
-            str(local_exc)
-            if local_exc is not None
-            else "this rank fits; a peer rank does not"
-        )
-        machine_total, available = pinned_host_memory_bytes()
-        others = "; ".join(
-            f"{p.name} {p.nbytes / 1e9:.2f} GB ({p.flag})"
-            for p in registered_posts()
-            if p.nbytes > 0
-        )
-        # REFUSES, never falls back to file-only. A pin the operator armed and
-        # that silently did not happen is the #742 class, and it would be read
-        # off the acceptance as "the prefetch did not help" rather than as
-        # "the prefetch was never there".
-        raise WeightsArenaError(
-            f"#809 FLIP IMAGE PIN REFUSED: {FLIP_IMAGE_PIN_POST_NAME} needs "
-            f"{total / 1e9:.2f} GB of pinned host RAM and the rank group does "
-            f"not admit it (this rank "
-            f"{'does not fit' if local_exc is not None else 'fits'}; the "
-            f"verdict is reduced so the ranks cannot disagree about a boot). "
-            f"posts already registered: [{others or 'none'}]; host total "
-            f"{(machine_total or 0) / 1e9:.2f} GB, available "
-            f"{(available or 0) / 1e9:.2f} GB, reserve floor "
-            f"{PINNED_HOST_RESERVE_BYTES / 1e9:.2f} GB. Lower one of the named "
-            f"flags or set {FLIP_IMAGE_PIN_FLAG} and boot without the "
-            f"read-ahead; the file-backed image is unchanged either way. "
-            f"Ledger said: {ledger_said}"
-        ) from local_exc
+        raise _pin_refusal(total, local_exc, "the #721 ledger") from local_exc
+
+    # STAGE TWO, AND IT NEEDS ITS OWN VERDICT. The ledger's answer says the
+    # bytes were AVAILABLE, not that this rank got them: the allocator has no
+    # fallback (`_alloc_pinned_pin_buffer`), `cudaHostRegister` raises on a
+    # non-zero return (`pool_host/common.py:65-71`) and the mapping under it
+    # can raise ENOMEM on a swapless box. That failure is MORE rank-divergent
+    # than the ledger's, not less -- every rank weighs the ledger against the
+    # same PRE-PIN availability, so all of them can admit and only the last
+    # one to actually register the bytes fails. Raising on it here, past the
+    # first reduce, is the very hang `_pin_admission_is_group_wide` exists to
+    # prevent, so the failure is HELD and reduced exactly like the ledger's.
+    buffer: Optional[torch.Tensor] = None
     try:
         buffer = _alloc_pinned_pin_buffer(total)
         if int(buffer.numel()) != total:
@@ -2101,9 +2163,18 @@ def create_flip_image_pin(nbytes: int) -> "FlipImagePin":
                 f"bytes for a {total}-byte post; the ledger and the buffer "
                 f"must describe the same memory."
             )
-    except BaseException:
+    except BaseException as exc:  # noqa: BLE001 -- held, not swallowed
+        # BaseException AND NOT Exception, as the pre-#809 shape caught it:
+        # an interrupt that escaped here would leave the post registered
+        # (#729) AND skip the collective the peers are entering.
+        local_exc = exc
+    if not _pin_admission_is_group_wide(local_exc is None):
+        # EVERY RANK UNWINDS, including the ones that succeeded -- that is the
+        # arm a rank-local raise cannot express, because nothing local tells a
+        # rank that fitted to stop.
+        _release_pin_pages(buffer)
         unregister_pinned_post(FLIP_IMAGE_PIN_POST_NAME)
-        raise
+        raise _pin_refusal(total, local_exc, "the pinned-host allocator") from local_exc
     pin = FlipImagePin(buffer, post_name=FLIP_IMAGE_PIN_POST_NAME)
     install_flip_image_pin(pin)
     _, available = pinned_host_memory_bytes()
@@ -2143,7 +2214,7 @@ def _refill_from_pin_and_file(
     meta: _FileBackedImage,
     nbytes: int,
     image: torch.Tensor,
-    timing: Optional["RefillLegTiming"] = None,
+    timing: Optional[RefillLegTiming] = None,
 ) -> str:
     """Fill ``dst[0:nbytes]``: the pin's prefix, then the file's remainder.
 
