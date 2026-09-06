@@ -23,10 +23,11 @@ whether the arms pass or fail.
     | A8 | serial lane: an ordinary red                  | rc 1, GENUINE      |
     | A9 | the solo re-run itself cannot answer          | rc 3, INCONCLUSIVE |
     |A10 | the solo re-run collects nothing but parses   | rc 3, INCONCLUSIVE |
-    |A11 | a module that cannot be imported at all       | named UNCOLLECTABLE|
+    |A11 | TWO modules that cannot be imported at all    | both UNCOLLECTABLE |
     |A12 | the same census, on an INTERRUPTED lane       | lane-side rc 3     |
     |A13 | --gate-path with no --table beside it        | rc 2, REFUSED      |
     |A14 | a gate path that holds no test module        | rc 2, REFUSED      |
+    |A15 | a broken lane BEFORE a healthy one            | rc 3, still refuses|
     +----+-----------------------------------------------+--------------------+
 
 A2 is the arm #895 exists for. Its probe module fails only when it runs under
@@ -41,7 +42,19 @@ be filed under the flake's name.
 A11 is the arm for the runner's fourth numbered refusal (#1207), and it is
 END TO END on purpose: the DID NOT RUN census is a print inside ``main()``, so
 a unit arm on ``uncollectable_modules`` proves the list and not the report, and
-deleting the block that prints it would still leave that arm green.
+deleting the block that prints it would still leave that arm green.  It stages
+TWO uncollectable modules because a one-module census cannot distinguish a
+counted denominator from a constant ``1``, nor a loop over the list from a
+print of its first name -- and the real gate run this refusal was written for
+had four such modules, not one.
+
+A15 is the arm for the FOLD those lane verdicts feed, which is a separate term
+from any of them.  Every other arm here stages its broken lane last among the
+non-empty lanes, so all of them pass equally on a fold that keeps only the last
+lane's answer -- and under such a fold a broken wide lane followed by a healthy
+serial one exits GREEN, which is this slice's headline refusal going silent.
+A15 breaks the FIRST lane and leaves the LAST healthy, so carrying and
+forgetting are measurably different runs.
 
 A12 is A11's other half, and the difference is the LANE, not the assertion.
 The census earns its keep by standing BEFORE the LANE-SIDE ``VERDICT:
@@ -168,6 +181,17 @@ class UncollectableAlone(unittest.TestCase):
     "test_p_uncollectable.py": """
 raise ImportError("stand-in for a module the gate path holds but pytest "
                   "cannot import")
+""",
+    # A SECOND module uncollectable in ANY process, and the reason it is a
+    # separate module rather than a second turn for `test_p_uncollectable_alone.py`:
+    # that one raises only OUTSIDE an xdist worker, so in a PARALLEL lane it
+    # imports, runs and merely FAILS -- measured, it leaves the census at 1.
+    # The hazard a second genuinely-uncollectable module covers is that a
+    # census of exactly one cannot tell a counted denominator from a pinned
+    # `1`, nor a loop over the whole list from one that prints its first entry.
+    "test_p_uncollectable_two.py": """
+raise ImportError("stand-in for a SECOND module the gate path holds but "
+                  "pytest cannot import")
 """,
     # The serial lane's shape, in two modules. The marker is PROCESS state,
     # not a file: the serial lane runs one process in one order, so the second
@@ -395,14 +419,26 @@ def main() -> int:
         # gate's scope never started is its name under this banner. `must_not`
         # keeps it honest in the other direction -- the module must not be
         # classified as a passing-alone flake, since it never ran alone either.
-        stage(["test_p_ok.py", "test_p_uncollectable.py"])
+        #
+        # TWO uncollectable modules, not one, and the hazard is the census's
+        # own arithmetic: on a one-module census the printed count and a
+        # hard-coded `1` are the same string, and a loop over the list and a
+        # print of its first entry are the same output -- so a census pinned to
+        # one module would report the branch's own full gate run of 2026-09-06,
+        # whose wide lane held FOUR banner modules, as a single name. Both the
+        # denominator and every name are asserted for that reason.
+        stage(["test_p_ok.py", "test_p_uncollectable.py",
+               "test_p_uncollectable_two.py"])
         write_table(table, [(mod("test_p_ok.py"), "PARALLEL", "probe", []),
                             (mod("test_p_uncollectable.py"), "PARALLEL",
+                             "probe", []),
+                            (mod("test_p_uncollectable_two.py"), "PARALLEL",
                              "probe", [])])
         rc, out = run_gate(table)
-        ok &= check("A11 uncollectable module named", 3, rc, out,
-                    ["=== DID NOT RUN: 1 module(s) could not be collected ===",
+        ok &= check("A11 uncollectable modules named, all of them", 3, rc, out,
+                    ["=== DID NOT RUN: 2 module(s) could not be collected ===",
                      f"UNCOLLECTABLE {PROBE_REL}/test_p_uncollectable.py",
+                     f"UNCOLLECTABLE {PROBE_REL}/test_p_uncollectable_two.py",
                      "RERUN INCONCLUSIVE"],
                     ["NOT REPRODUCED", "GENUINE"])
 
@@ -436,6 +472,29 @@ def main() -> int:
                      "module(s) this lane holds never ran",
                      "VERDICT: INCONCLUSIVE -- a lane's log is not an answer."],
                     ["NOT REPRODUCED", "GENUINE"])
+
+        # A15 -- the ACCUMULATION of the lane verdicts, which is a different
+        # term from the verdict itself. `main()` folds one `ok` per lane into
+        # a single `broken`, and every arm above stages its broken lane LAST
+        # among the non-empty lanes, so all of them are equally satisfied by a
+        # fold that simply keeps the last lane's answer. The hazard that leaves
+        # open is the whole slice's headline refusal going silent: a wide lane
+        # whose log is not an answer, followed by any lane that voted OK, would
+        # be reported with the OK lane's verdict and the run would exit green.
+        #
+        # So this arm breaks the FIRST lane and leaves the LAST one healthy:
+        # the empty module goes PARALLEL (wide, no test outcome at all) and the
+        # green one goes SERIAL. The lanes are visited wide, narrow, serial, so
+        # a fold that forgets is measurably not the same as one that carries.
+        stage(["test_p_no_tests.py", "test_p_ok.py"])
+        write_table(table, [(mod("test_p_no_tests.py"), "PARALLEL", "probe", []),
+                            (mod("test_p_ok.py"), "SERIAL", "probe", [])])
+        rc, out = run_gate(table)
+        ok &= check("A15 a broken lane before a healthy one still refuses",
+                    3, rc, out,
+                    ["no test outcome at all",
+                     "VERDICT: INCONCLUSIVE -- a lane's log is not an answer."],
+                    ["(0 failing test(s))"])
 
         # A13 -- a --gate-path with no --table. Answering it from the default
         # table would hand every module of the named path a verdict measured on
