@@ -2452,10 +2452,27 @@ def _failed_to_build(result: dict, pp_host, reason: str = None) -> dict:
     """
     result["owned_equals_driven"] = 0
     result["layer_mapping_non_empty"] = 0
-    if reason is not None and result.get("host_pool_build_msg") is None:
-        result["host_pool_build_msg"] = reason
+    if reason is not None:
+        _record_refusal_reason(result, reason)
     result["pp"] = pp_host
     return result
+
+
+def _record_refusal_reason(result: dict, msg: str) -> None:
+    """THE ONE reason string this rank carries into the boot STOP.
+
+    ONE FIELD FOR EVERY ROW, not one per row: the STOP renders a single line
+    per rank, so a second reason field would be a second record of one fact
+    with no reader for it. FIRST REFUSAL WINS, for `_record_build_failure`'s
+    reason -- the later checks read quantities the first has already
+    contradicted, so keeping the first names a CAUSE rather than a cascade.
+
+    HAZARD it closes: rows 0 and 1 refused with no string at all, and
+    `unpack_boot_reduce` reaches row 0 before row 12, so a SHORTFALL or a
+    routed CELL UNDERIVABLE killed all three ranks with `reason=None`.
+    """
+    if result.get("host_pool_build_msg") is None:
+        result["host_pool_build_msg"] = msg
 
 
 def _record_build_failure(result: dict, msg: str) -> None:
@@ -2470,7 +2487,7 @@ def _record_build_failure(result: dict, msg: str) -> None:
     if not result["host_pool_build_ok"]:
         return
     result["host_pool_build_ok"] = 0
-    result["host_pool_build_msg"] = msg
+    _record_refusal_reason(result, msg)
 
 
 def _device_layer_keys(owner, pool_name):
@@ -2528,15 +2545,18 @@ def _vote_transfer_domain_terms(result: dict, logger, rank: int, stacks) -> None
             driven = set(getattr(entry, "layer_mapping", {}) or {})
             if not driven:
                 result["layer_mapping_non_empty"] = 0
-                logger.error(
+                _msg = (
                     "#1206 EMPTY LAYER MAPPING rank=%d stack=%s pool=%s: this "
                     "pool is an entry of this host tier but maps no layer, so "
                     "every transfer built for it would be silently skipped "
-                    "while the tree still calls the prefix resident",
-                    rank,
-                    stack,
-                    entry.name,
+                    "while the tree still calls the prefix resident"
+                    % (rank, stack, entry.name)
                 )
+                logger.error(_msg)
+                # The same string on the STOP the row raises: the log line and
+                # the raise are two instruments of one refusal, and only the
+                # raise survives into the death path.
+                _record_refusal_reason(result, _msg)
                 continue
             owned = _device_layer_keys(owner, entry.name)
             if owned is None:
@@ -2554,18 +2574,26 @@ def _vote_transfer_domain_terms(result: dict, logger, rank: int, stacks) -> None
                 continue
             if owned != driven:
                 result["owned_equals_driven"] = 0
-                logger.error(
+                _msg = (
                     "#1206 TRANSFER DOMAIN SHORTFALL rank=%d stack=%s pool=%s "
                     "driven=%s owned=%s missing=%s: the host entry does not "
                     "map every layer its device pool owns, so those layers are "
-                    "never restored while the tree calls the prefix resident",
-                    rank,
-                    stack,
-                    entry.name,
-                    sorted(driven),
-                    sorted(owned),
-                    sorted(owned - driven),
+                    "never restored while the tree calls the prefix resident"
+                    % (
+                        rank,
+                        stack,
+                        entry.name,
+                        sorted(driven),
+                        sorted(owned),
+                        sorted(owned - driven),
+                    )
                 )
+                logger.error(_msg)
+                # Carried onto the raise as well: the boot dies with the STOP,
+                # not with this line, and a STOP that names neither the rank
+                # nor the missing layers sends the reader to a fourth
+                # instrument to learn what the third already knew.
+                _record_refusal_reason(result, _msg)
 
 
 def build_phase_flip_host_pools(scheduler):

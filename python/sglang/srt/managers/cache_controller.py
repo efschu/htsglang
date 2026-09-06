@@ -2203,33 +2203,21 @@ class HiCacheController:
             drafter_identity,
         )
 
-        # #1206 S1-C12, LOCAL half. The draft tier rides the SAME per-layer
-        # loop as the target tier, so a draft pool that covers fewer layers
-        # than the loop drives restores a prefix the tree then calls resident.
-        # This line says WHEN the mismatch was detected; S0's slot 10 says
-        # WHETHER it holds now, computed on read from these same two objects,
-        # and only that is voted. No flag is stored here: a stored copy would
-        # be a third record of a fact both objects already carry (D-12), and
-        # it would have to be initialised in the negative sense by hand.
-        # It does NOT raise -- this site re-runs at every pp->tp cutover, as
-        # the docstring above says, and a rank-local raise inside a cutover is
-        # not the boot-time exception D-20 allows.
-        _draft_layers = int(getattr(draft_host_pool, "layer_num", 0) or 0)
-        _driven = getattr(
-            getattr(self, "mem_pool_host", None), "transfer_layer_domain", None
-        )
-        if _driven is not None and _draft_layers != int(_driven):
-            logger.error(
-                "#1206 DRAFT TIER DOMAIN MISMATCH: the draft host tier covers "
-                "%d layer(s) while the restore loop drives a domain of %d, so "
-                "every driven layer outside the draft tier's own key space is "
-                "silently skipped on the draft half (owner_phase=%s, "
-                "binding_generation=%s)",
-                _draft_layers,
-                int(_driven),
-                owner_phase,
-                binding_generation,
-            )
+        # #1206: NO DRAFT-TIER DOMAIN COMPARISON HERE, deliberately. This site
+        # used to compare `draft_host_pool.layer_num` against
+        # `self.mem_pool_host.transfer_layer_domain` -- the 1-layer MTP draft
+        # tier against the 64-layer TARGET domain -- and its group half on
+        # S0's slot 10 killed the first cutover of every speculative boot.
+        #
+        # HAZARD THE COMPARISON CLAIMED, and why there is nothing left to
+        # compare: `start_loading` drives `range(self.layer_num)` and admits
+        # the draft half only while `i < self.mem_pool_host_draft.layer_num`,
+        # so the draft tier is covered over exactly its own key space and the
+        # layers outside it are skipped BY CONSTRUCTION, not silently. The
+        # remaining alternative -- the draft tier against its OWN domain -- is
+        # a tautology on a dense-from-0 tier and a new false refusal on a
+        # composite one, where the anchor's `layer_num` and `1 + max(key)`
+        # legitimately differ on a PP stage.
 
         # If storage is already attached, wire up the draft I/O path now.
         # Otherwise this will be deferred until attach_storage_backend().

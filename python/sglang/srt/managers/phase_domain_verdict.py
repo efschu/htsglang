@@ -126,7 +126,7 @@ class _Term:
 #: | 5-6     | d_ownership                 | S5-C4c     | #924 MAMBA OWNERSHIP SPLIT AT DONATION |
 #: | 7-8     | d_state_src                 | S5-C6      | #924 STATE SOURCE CONTRADICTION |
 #: | 9       | loadback_coverage_complete  | S2-C2      | #1206 LOADBACK COVERAGE INCOMPLETE |
-#: | 10      | draft_tier_domain_matches   | S1-C12     | #1206 DRAFT TIER DOMAIN MISMATCH |
+#: | 10      | draft_tier_domain_matches   | NO PRODUCER| #1206 DRAFT TIER DOMAIN MISMATCH |
 #: | 11-12   | d_host_unresolvable         | S3-C9      | #1206 HOST POOL UNRESOLVABLE |
 #: | 13-14   | d_slot_ownership            | S5-C4b/d   | #924 SLOT OWNERSHIP REFUSED |
 #: | 15      | rebind_domain_within_driven | S1-C16     | #1206 REBIND DOMAIN OUTSIDE DRIVEN |
@@ -377,26 +377,6 @@ def _bound_controller(scheduler: Any) -> Any:
     return getattr(tree, "cache_controller", None)
 
 
-def _draft_tier_domain_matches(controller: Any) -> int:
-    """Slot 10, COMPUTED ON READ and already POSITIVE -- 1 is good, and there
-    is NO inversion step. Before ``set_draft_kv_pool`` has ever run the first
-    two disjuncts answer 1 with no third read evaluated, so an un-fired draft
-    registration votes the MIN-neutral value by construction and never
-    dereferences a ``None`` pool."""
-    if controller is None:
-        return 1
-    if not getattr(controller, "has_draft", False):
-        return 1
-    draft = getattr(controller, "mem_pool_host_draft", None)
-    if draft is None:
-        return 1
-    group = getattr(controller, "mem_pool_host", None)
-    driven = _read_or_neutral(group, "transfer_layer_domain", None)
-    if driven is None:
-        return 1
-    return 1 if int(getattr(draft, "layer_num", 0) or 0) == int(driven) else 0
-
-
 def _rebind_domain_within_driven(controller: Any, group: Any, bound_phase: Any) -> int:
     """Slot 15, COMPUTED ON READ and already POSITIVE -- ``num_layers ==
     expected domain`` is True when GOOD, so it must not be inverted again.
@@ -510,8 +490,25 @@ def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
         census[rank] = loadback_complete
     terms["census"] = census
 
-    # Slot 10 -- S1-C12 (B1), computed on read.
-    terms["draft_tier_domain_matches"] = _draft_tier_domain_matches(controller)
+    # Slot 10 -- NO PRODUCER, and this absence is the fix rather than an
+    # omission. The term compared the DRAFT host tier's layer count against
+    # the TARGET tier's `transfer_layer_domain`: 1 against 64 on every
+    # speculative config, on an AND slot, i.e. a deterministic group STOP at
+    # the first cutover (measured, six PhaseDomainDivergence raises in
+    # boot_855_weg1b12s1_6917f46dd5_0906_115410.log).
+    #
+    # HAZARD THE TERM CLAIMED TO NAME, and why nothing is left to vote: "one
+    # loop is driven over two domains, so the narrower one is silently
+    # truncated". The draft half of that loop is bounded by the DRAFT tier's
+    # own count -- `cache_controller.py` `start_loading`, `and i <
+    # self.mem_pool_host_draft.layer_num` -- so the layers the draft does not
+    # cover are skipped by construction, not silently. Comparing the draft
+    # tier against its OWN domain instead is a tautology on a dense-from-0
+    # tier and a NEW false STOP on a composite one, where `layer_num` (the
+    # anchor's count) and `transfer_layer_domain` (1 + max key) legitimately
+    # differ on a PP stage. So the producer is deleted rather than repaired.
+    # The slot keeps its declaration and reads the MIN-neutral 1, which is the
+    # same shape boot row 3 already has on this rig.
 
     # Slots 11-12 -- S3-C9 (B3), SUMMED over the built components.
     tree = getattr(scheduler, "tree_cache", None)
@@ -593,6 +590,21 @@ class PhaseDomainDivergence(RuntimeError):
 _RAENGE = (
     "RAENGE-NIE-UNEINS: the ranks do not agree on a fact that decides state "
     "reuse. No compensation exists for this; the group stops."
+)
+
+#: THE SAME LAW, THE OTHER SHAPE, and the two must not be told in one sentence.
+#: An AND slot at 0 and a MAX pair above 0 say "at least one rank refused" --
+#: a MIN carries no count, so neither can distinguish one refusing rank from
+#: all of them, and a UNANIMOUS refusal rendered as "the ranks do not agree"
+#: sends the reader hunting for a divergence that is not there. Measured: the
+#: first cutover of boot_855_weg1b12s1 printed
+#: `local=0 group_min=0 group_max=0 per_rank=[1,1,1]` under the divergence
+#: sentence. Only the min != max pairs are DISAGREEMENT; these are REFUSALS.
+_RAENGE_REFUSED = (
+    "RAENGE-NIE-UNEINS: at least one rank refused a fact that decides state "
+    "reuse. A MIN carries no count, so this line does not say whether the "
+    "refusal was unanimous; `local=` above is this rank's own vote. No "
+    "compensation exists for either shape; the group stops."
 )
 
 
@@ -721,6 +733,10 @@ def unpack_phase_domain(
 
 
 def _stop_message(term, *, rank, local, group_min, group_max, phase, per_rank) -> str:
+    # WHICH LAW SENTENCE, decided by the KIND of the term and not by its
+    # values: a divergence pair really did disagree (min != max), while an AND
+    # slot and a MAX pair say only that at least one rank refused.
+    law = _RAENGE if term.kind == DIVERGENCE_PAIR else _RAENGE_REFUSED
     if term.terse_stop:
         # The B1 consumer renders rank, group_min and the flag only -- the
         # phase term and the census are deliberately not on this line.
@@ -729,7 +745,7 @@ def _stop_message(term, *, rank, local, group_min, group_max, phase, per_rank) -
             int(rank),
             int(group_min),
             local,
-            _RAENGE,
+            law,
         )
     return (
         "#1206 PHASE DOMAIN DIVERGENCE STOP rank=%d term=%s refusal=%s local=%s "
@@ -744,7 +760,7 @@ def _stop_message(term, *, rank, local, group_min, group_max, phase, per_rank) -
             phase,
             per_rank,
             PHASE_DOMAIN_CENSUS_SLOTS,
-            _RAENGE,
+            law,
         )
     )
 
@@ -844,6 +860,20 @@ HOST_POOL_BUILD_OK_PEER_LINE = (
     "failure, see its log"
 )
 
+#: The same statement for every OTHER boot row. Kept separate from the row-12
+#: line above because that one names its row in prose and is asserted verbatim.
+BOOT_PEER_REFUSED_LINE = (
+    "peer refused: this row is healthy on this rank; the rank that recorded "
+    "the failure prints it in its own log"
+)
+
+#: This rank refused and recorded no string. Named rather than rendered as the
+#: peer line, which would claim this rank was healthy -- the instrument-text
+#: hazard the row-12-only rendering already produced once.
+BOOT_REFUSED_NO_REASON_LINE = (
+    "this rank refused this row and recorded no reason string"
+)
+
 
 def boot_index_of(row_name: str) -> int:
     """The head index of a boot row, DERIVED from ``BOOT_REDUCE_LAYOUT``."""
@@ -916,20 +946,32 @@ def unpack_boot_reduce(
 
 
 def _boot_stop_message(row, rank, local) -> str:
-    reason = None
-    if row.name == "host_pool_build_ok":
-        # The rank that RECORDED the failure prints its own recorded reason; a
-        # healthy rank says so and points at the peer's log. A MIN cannot say
-        # WHICH rank voted 0, and this document adds no second collective, so
-        # no rank can print a peer's string.
-        if not int(local.get(row.name, 1) or 0):
-            reason = local.get("host_pool_build_msg")
-        if reason is None:
+    """The boot STOP line, ONE per rank, carrying THIS rank's reason.
+
+    The rank that RECORDED the failure prints its own recorded reason; a
+    healthy rank says a peer refused and points at that peer's log. A MIN
+    cannot say WHICH rank voted 0, and this bus adds no second collective, so
+    no rank can print a peer's string.
+
+    HAZARD THIS SHAPE CLOSES: the reason used to be rendered for row 12 alone,
+    so a routed `#1068 TP PIN CELL UNDERIVABLE` or a `#1206 TRANSFER DOMAIN
+    SHORTFALL` -- both of which refuse on ROW 0, which `unpack_boot_reduce`
+    reaches first -- killed all three ranks with `reason=None` and named
+    neither the refusing rank nor the cause anywhere on the STOP path.
+    """
+    own_refusal = not int(local.get(row.name, 1) or 0)
+    reason = local.get("host_pool_build_msg") if own_refusal else None
+    if reason is None:
+        if own_refusal:
+            reason = BOOT_REFUSED_NO_REASON_LINE
+        elif row.name == "host_pool_build_ok":
             reason = HOST_POOL_BUILD_OK_PEER_LINE
+        else:
+            reason = BOOT_PEER_REFUSED_LINE
     return (
         "#1206 PHASE DOMAIN DIVERGENCE STOP (boot) rank=%d row=%s local=%s "
         "group_min=0 reason=%s -- %s"
-        % (int(rank), row.name, local.get(row.name), reason, _RAENGE)
+        % (int(rank), row.name, local.get(row.name), reason, _RAENGE_REFUSED)
     )
 
 

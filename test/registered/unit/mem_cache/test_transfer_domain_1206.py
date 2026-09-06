@@ -756,11 +756,23 @@ class _DraftHostPool:
 
 
 class TestTheDraftTierDomainTerm(unittest.TestCase):
-    """T-36, S1-C12's LOCAL half.
+    """T-36, S1-C12's LOCAL half -- WITHDRAWN, and this class is what is left.
 
-    The line says WHEN the mismatch was detected; S0's slot 10 says WHETHER
-    it holds now, and only that is voted. Two instruments of one fact, not
-    two records of it -- so a builder cannot store the flag here (mutant 19).
+    THE COMPARISON WAS WRONG, AND IT KILLED A BOOT. It read the DRAFT tier's
+    layer count against the TARGET tier's ``transfer_layer_domain``, i.e. 1
+    against 64 on every speculative config, and slot 10 is an AND slot. The
+    premise behind it -- "one loop is driven over two domains, so whichever is
+    narrower is silently truncated" -- is false of this loop: the draft half
+    is bounded by the draft tier's OWN count at ``cache_controller.py:1961-1963``
+    (``and i < self.mem_pool_host_draft.layer_num``), so the layers the draft
+    does not cover are skipped BY CONSTRUCTION and not silently.
+
+    The record's remaining alternative -- compare the draft tier against its
+    OWN domain -- is a tautology on a plain dense-from-0 draft tier and a NEW
+    false STOP on a composite one (a PP-sharded group legitimately has
+    ``layer_num`` 18 and ``transfer_layer_domain`` 50). So the term is deleted
+    with that reason, slot 10 keeps its declaration and reads its MIN-neutral
+    1, and these arms pin the silence.
     """
 
     def _controller(self, domain):
@@ -777,53 +789,202 @@ class TestTheDraftTierDomainTerm(unittest.TestCase):
         controller._maybe_register_draft_with_storage = lambda: None
         return controller
 
-    def test_arm_0_the_pre_event_term_is_the_min_neutral(self):
-        """CAN-NOT-FIRE PIN (excluded from the red-first total). Before
-        ``set_draft_kv_pool`` has ever run the term is the AND-neutral 1, with
-        no ``AttributeError`` on the ``None`` pool -- the danger direction a
-        stored, falsily-initialised flag would turn into a group STOP."""
-        from sglang.srt.managers import phase_domain_verdict as pdv
+    def test_registering_a_narrower_draft_tier_is_silent(self):
+        """RED BEFORE THE FIX: a 1-layer MTP draft tier under a 64-layer
+        target domain emitted one ERROR line and voted the group down."""
+        from sglang.srt.managers import cache_controller as cc
 
-        controller = self._controller(64)
-        self.assertEqual(pdv._draft_tier_domain_matches(controller), 1)
+        for draft_layers in (1, 18, 64):
+            with self.subTest(draft_layers=draft_layers):
+                controller = self._controller(64)
+                with self.assertLogs(cc.logger, level="INFO") as captured:
+                    cc.HiCacheController.set_draft_kv_pool(
+                        controller, MagicMock(), _DraftHostPool(draft_layers)
+                    )
+                self.assertEqual(
+                    [
+                        line
+                        for line in captured.output
+                        if "#1206 DRAFT TIER DOMAIN MISMATCH" in line
+                    ],
+                    [],
+                )
 
-    def test_arm_1_a_mismatch_logs_once_at_error_and_votes_zero(self):
+    def test_the_wrong_comparison_is_gone_from_both_halves(self):
+        """The DELETION, read off the modules themselves, so a reader who
+        re-introduces either half is red rather than merely un-pinned. Both
+        halves computed the SAME wrong predicate, and a fix to one alone
+        leaves the other voting or logging it."""
+        import inspect
+
         from sglang.srt.managers import cache_controller as cc
         from sglang.srt.managers import phase_domain_verdict as pdv
 
-        controller = self._controller(64)
-        with self.assertLogs(cc.logger, level="ERROR") as captured:
-            cc.HiCacheController.set_draft_kv_pool(
-                controller, MagicMock(), _DraftHostPool(18)
-            )
-        lines = [
-            line
-            for line in captured.output
-            if "#1206 DRAFT TIER DOMAIN MISMATCH" in line
-        ]
-        self.assertEqual(len(lines), 1)
-        self.assertIn("18", lines[0])
-        self.assertIn("64", lines[0])
-        self.assertEqual(pdv._draft_tier_domain_matches(controller), 0)
-
-    def test_a_matching_draft_tier_logs_nothing_and_votes_one(self):
-        from sglang.srt.managers import cache_controller as cc
-        from sglang.srt.managers import phase_domain_verdict as pdv
-
-        controller = self._controller(64)
-        with self.assertLogs(cc.logger, level="INFO") as captured:
-            cc.HiCacheController.set_draft_kv_pool(
-                controller, MagicMock(), _DraftHostPool(64)
-            )
-        self.assertEqual(
-            [
-                line
-                for line in captured.output
-                if "#1206 DRAFT TIER DOMAIN MISMATCH" in line
-            ],
-            [],
+        self.assertFalse(hasattr(pdv, "_draft_tier_domain_matches"))
+        self.assertNotIn(
+            "DRAFT TIER DOMAIN MISMATCH",
+            inspect.getsource(cc.HiCacheController.set_draft_kv_pool),
         )
-        self.assertEqual(pdv._draft_tier_domain_matches(controller), 1)
+
+    def test_the_draft_half_of_the_restore_loop_bounds_itself(self):
+        """WHY the term is gone rather than repaired: the loop already bounds
+        the draft half by the draft tier's own count, so there is no second
+        domain for it to be truncated against."""
+        import inspect
+
+        from sglang.srt.managers import cache_controller as cc
+
+        src = inspect.getsource(cc.HiCacheController.start_loading)
+        self.assertIn("i < self.mem_pool_host_draft.layer_num", src)
+
+
+class _CounterSpy:
+    """A ``LayerDoneCounter`` stand-in that records resizes.
+
+    Carries ``consumer_index`` because that, with the controller's
+    ``ack_load_queue``, is the quiescence the resize is conditioned on: a
+    resize rebuilds the very ``load_events`` an in-flight load already
+    recorded into, and an unrecorded event queries True, so a resize taken
+    mid-load acks copies that never landed.
+    """
+
+    def __init__(self, num_layers, *, quiescent=True):
+        self.num_layers = num_layers
+        self.consumer_index = -1 if quiescent else 0
+        self.resized_to = []
+
+    def resize(self, num_layers):
+        self.resized_to.append(num_layers)
+        self.num_layers = num_layers
+
+
+class TestTheCounterFollowsTheRebind(unittest.TestCase):
+    """The rebind's own half of slot 15: the counter is RESIZED to the
+    incoming group's driven domain, in place, at the one site that moves the
+    readers.
+
+    WHAT WAS BROKEN. ``HybridCacheController.__init__`` resized the counter
+    once, at boot, and nothing resized it again -- so after the pp->tp cutover
+    the restore loop drove a 64-wide domain against a counter of width 32
+    (PP0) / 50 (PP1). Measured on the metal at
+    ``boot_855_weg1b12s1_6917f46dd5_0906_115410.log``: two
+    ``#1206 REBIND DOMAIN OUTSIDE DRIVEN`` lines, ``driven=64
+    counter_width=32`` and ``counter_width=50``. The detector was S1's own and
+    it was right; the actuator was missing.
+    """
+
+    def _rebind_with(self, controller, group):
+        from sglang.srt.mem_cache import hicache_phase_binding as hpb
+
+        incoming = MagicMock(spec=PhasePools)
+        incoming.phase = "tp"
+        incoming.host_pool = group
+        incoming.device_pool = MagicMock()
+        incoming.device_pool_hybrid = None
+        incoming.allocator = MagicMock()
+        incoming.layer_num = lambda: group.transfer_layer_domain
+        saved = (hpb.check_shapes, hpb.check_pool_coverage)
+        hpb.check_shapes = lambda _i: None
+        hpb.check_pool_coverage = lambda _r, _i: None
+        state = hpb.binding_state()
+        before = (state.phase, state.generation)
+        try:
+            with self.assertLogs(hpb.logger, level="INFO") as captured:
+                hpb.rebind({"cache_controller": controller}, incoming)
+        finally:
+            hpb.check_shapes, hpb.check_pool_coverage = saved
+            state._phase, state._generation = before
+        return captured.output
+
+    def _controller(self, counter, *, quiescent=True):
+        return types.SimpleNamespace(
+            layer_done_counter=counter,
+            ack_load_queue=[] if quiescent else [object()],
+            mem_pool_host=None,
+            mem_pool_device=None,
+            mem_pool_device_hybrid=None,
+            token_to_kv_pool_allocator=None,
+            hicache_binding_generation=None,
+        )
+
+    def test_a_quiescent_rebind_resizes_the_counter_and_is_silent(self):
+        """RED BEFORE THE FIX: the counter kept its boot width, the detector
+        fired, and slot 15 voted the group down at the next packed reduce."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        tp_group, _f, _m = _group_for_stage(0, 64)
+        self.assertEqual(tp_group.transfer_layer_domain, 64)
+        counter = _CounterSpy(50)
+        controller = self._controller(counter)
+        lines = self._rebind_with(controller, tp_group)
+
+        self.assertEqual(counter.resized_to, [64])
+        self.assertEqual(counter.num_layers, 64)
+        self.assertEqual(
+            [x for x in lines if "#1206 REBIND DOMAIN OUTSIDE DRIVEN" in x], []
+        )
+        self.assertEqual(
+            pdv._rebind_domain_within_driven(controller, tp_group, "tp"), 1
+        )
+
+    def test_the_real_counter_class_is_the_one_that_follows(self):
+        """The spy above proves the CALL; this proves the tree's own class
+        answers it -- ``LayerDoneCounter.resize`` rebuilds every event list,
+        not only the scalar the term reads."""
+        from sglang.srt.managers.cache_controller import LayerDoneCounter
+
+        tp_group, _f, _m = _group_for_stage(0, 64)
+        counter = LayerDoneCounter(50)
+        controller = self._controller(counter)
+        self._rebind_with(controller, tp_group)
+
+        self.assertEqual(counter.num_layers, 64)
+        for event in counter.events:
+            self.assertEqual(len(event.load_events), 64)
+
+    def test_a_load_in_flight_refuses_the_resize_and_names_both_numbers(self):
+        """THE PRECONDITION, and it is not decoration: rebuilding the event
+        list under an in-flight load hands the ACK an event nothing recorded.
+        The resize is declined, ONE line names the reason, and the detector
+        still fires so slot 15 carries the group STOP."""
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        tp_group, _f, _m = _group_for_stage(0, 64)
+        counter = _CounterSpy(50, quiescent=False)
+        controller = self._controller(counter, quiescent=False)
+        lines = self._rebind_with(controller, tp_group)
+
+        self.assertEqual(counter.resized_to, [])
+        self.assertEqual(counter.num_layers, 50)
+        refusals = [
+            x for x in lines if "#1206 REBIND COUNTER RESIZE REFUSED" in x
+        ]
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("driven=64", refusals[0])
+        self.assertIn("counter_width=50", refusals[0])
+        self.assertEqual(
+            len([x for x in lines if "#1206 REBIND DOMAIN OUTSIDE DRIVEN" in x]),
+            1,
+            "the detector still fires, so slot 15 carries the STOP",
+        )
+        self.assertEqual(
+            pdv._rebind_domain_within_driven(controller, tp_group, "tp"), 0
+        )
+
+    def test_a_reader_without_a_counter_is_not_given_one(self):
+        """CAN-NOT-FIRE PIN. The three readers hold different subsets; a
+        rebind that invented a counter on one that never had one would be a
+        fourth, silent binding."""
+        controller = types.SimpleNamespace(
+            mem_pool_host=None,
+            mem_pool_device=None,
+            mem_pool_device_hybrid=None,
+            token_to_kv_pool_allocator=None,
+            hicache_binding_generation=None,
+        )
+        tp_group, _f, _m = _group_for_stage(0, 64)
+        self._rebind_with(controller, tp_group)
+        self.assertFalse(hasattr(controller, "layer_done_counter"))
 
 
 class TestTheRebindDomainTerm(unittest.TestCase):
@@ -834,9 +995,12 @@ class TestTheRebindDomainTerm(unittest.TestCase):
     the guard-that-cannot-fire this refusal exists to avoid.
     """
 
-    def _readers(self, counter_width, group):
+    def _readers(self, counter_width, group, *, quiescent=True, counter=None):
+        if counter is None:
+            counter = _CounterSpy(counter_width, quiescent=quiescent)
         controller = types.SimpleNamespace(
-            layer_done_counter=types.SimpleNamespace(num_layers=counter_width),
+            layer_done_counter=counter,
+            ack_load_queue=[] if quiescent else [object()],
             mem_pool_host=None,
             mem_pool_device=None,
             mem_pool_device_hybrid=None,
@@ -855,10 +1019,10 @@ class TestTheRebindDomainTerm(unittest.TestCase):
         pools.layer_num = lambda: group.transfer_layer_domain
         return pools
 
-    def _rebind(self, counter_width, group):
+    def _rebind(self, counter_width, group, *, quiescent=True):
         from sglang.srt.mem_cache import hicache_phase_binding as hpb
 
-        controller = self._readers(counter_width, group)
+        controller = self._readers(counter_width, group, quiescent=quiescent)
         incoming = self._incoming(group)
         # The two shape guards are S2's subject and refuse a stand-in tier;
         # neutered so what this assertion reads is the domain term alone.
@@ -891,11 +1055,15 @@ class TestTheRebindDomainTerm(unittest.TestCase):
         ]
 
     def test_arm_2_a_stamp_without_a_resize_logs_both_numbers_and_votes_zero(self):
+        """The counter is now RESIZED at the rebind, so the one way it can
+        still lag is a resize the quiescence precondition declined -- which is
+        the state this arm drives. The detector's subject is unchanged: the
+        readers moved and the counter did not follow."""
         from sglang.srt.managers import phase_domain_verdict as pdv
 
         tp_group, _f, _m = _group_for_stage(0, 64)
         self.assertEqual(tp_group.transfer_layer_domain, 64)
-        controller, lines = self._rebind(50, tp_group)
+        controller, lines = self._rebind(50, tp_group, quiescent=False)
 
         self.assertEqual(len(lines), 1, "exactly one line at ERROR")
         self.assertIn("64", lines[0])

@@ -200,6 +200,18 @@ class _BootFabric:
         #: cases: list of (scheduler, result)
         self.cases = cases
         self.voted = []
+        #: The REDUCTION OPERATOR and the payload DTYPE the code under test
+        #: actually passed, one entry per rank. Recorded rather than ignored:
+        #: a fabric that accepts `op` and throws it away, then hand-computes a
+        #: MIN, pins nothing about the operator -- and the operator IS the
+        #: rank-uniformity mechanism of this bus (one rank's 0 becomes every
+        #: rank's raise only under MIN). Measured before this was added: the
+        #: mutant `ReduceOp.MIN` -> `ReduceOp.MAX` left every test in this
+        #: file passing while all three ranks proceeded past a pin one of
+        #: them had refused.
+        self.ops = []
+        self.dtypes = []
+        self._reduced = None
 
     def _group_min(self):
         payloads = []
@@ -208,13 +220,32 @@ class _BootFabric:
             payloads.append(pdv.build_boot_reduce_payload(terms))
         return [min(col) for col in zip(*payloads)]
 
+    def reply(self, tensor, op=None, group=None):
+        """The stand-in for ``torch.distributed.all_reduce``.
+
+        A METHOD, not a closure, so the refusal below can be driven directly:
+        an assertion on a value this object merely recorded is not a pin
+        unless the recorder can also fail.
+        """
+        self.voted.append(group)
+        self.ops.append(op)
+        self.dtypes.append(tensor.dtype)
+        if op is not torch.distributed.ReduceOp.MIN:
+            raise AssertionError(
+                "#1068 the boot ballot is a MIN reduction; this call passed "
+                "%r. Under any other operator a rank that voted 0 stops being "
+                "every rank's raise, and the group proceeds past a fact one "
+                "of them refused." % (op,)
+            )
+        # The reply is built in the CALLER'S dtype, never in a dtype of this
+        # fabric's own choosing: `copy_` casts silently, so a narrowed payload
+        # would truncate inside the copy where no assertion can see it.
+        tensor.copy_(torch.tensor(self._reduced, dtype=tensor.dtype))
+
     def run(self):
         """Returns, per rank: (raised exception or None, ERROR/INFO lines)."""
-        reduced = self._group_min()
-
-        def _fake_all_reduce(tensor, op=None, group=None):
-            self.voted.append(group)
-            tensor.copy_(torch.tensor(reduced, dtype=torch.int64))
+        self._reduced = self._group_min()
+        _fake_all_reduce = self.reply
 
         out = []
         for rank, (sched, result) in enumerate(self.cases):
@@ -296,6 +327,68 @@ class TestTheBootReduceLayout(CustomTestCase):
         )
 
 
+class TestTheBallotIsAMinOnTheWorldGroup(CustomTestCase):
+    """The three properties of the boot collective that no other test reads.
+
+    Every arm above asserts what the REDUCED VALUE does. None of them asserted
+    anything about the CALL that produced it, so three one-token edits at
+    ``phase_flip_boot.py`` were free: the operator (MIN -> MAX deletes the
+    group STOP while every detection stays intact), the payload dtype (a
+    narrowing truncates the S7 digest rows at B6 and reads agreement where
+    there is divergence), and the group handle (``tp_cpu_group`` is world size
+    1 at boot on this configuration, so the reduce is a no-op and the raise
+    below it rank-local -- the D-20 violation produced by the handle rather
+    than by the code shape, which the site's own comment names).
+    """
+
+    def _healthy_cases(self):
+        return [(_sched(rank=r), _fresh_result()) for r in range(3)]
+
+    def test_the_boot_reduce_is_a_min(self):
+        fabric = _BootFabric(self._healthy_cases())
+        fabric.run()
+        self.assertEqual(len(fabric.ops), 3)
+        for rank, op in enumerate(fabric.ops):
+            self.assertIs(
+                op, torch.distributed.ReduceOp.MIN, f"rank {rank} did not vote a MIN"
+            )
+
+    def test_the_payload_is_int64(self):
+        """The bus carries a ``(x, -x)`` digest pair from B6 on. int8 wraps at
+        128, so two ranks whose digests differ by a multiple of 256 truncate
+        to the same value and the pair reads agreement where there is none --
+        a deleted STOP on the divergence detector itself."""
+        fabric = _BootFabric(self._healthy_cases())
+        fabric.run()
+        self.assertEqual(len(fabric.dtypes), 3)
+        for rank, dtype in enumerate(fabric.dtypes):
+            self.assertIs(dtype, torch.int64, f"rank {rank} packed {dtype}")
+
+    def test_the_reduce_is_taken_on_the_world_group(self):
+        cases = self._healthy_cases()
+        fabric = _BootFabric(cases)
+        fabric.run()
+        self.assertEqual(
+            fabric.voted,
+            [sched.world_group.cpu_group for sched, _result in cases],
+            "the handle passed is the world group's cpu group, by identity",
+        )
+
+    def test_the_fabric_itself_refuses_a_non_min_operator(self):
+        """CAN-FAIL PROOF for the three assertions above. Asserting on a
+        recorded value proves nothing unless the recorder can also refuse, so
+        the fabric's OWN reply path is driven here with a MAX and must raise.
+        Without this arm, a fabric that recorded the op and never looked at it
+        would read identically to one that pins it."""
+        fabric = _BootFabric(self._healthy_cases())
+        reduced = fabric._group_min()
+        tensor = torch.tensor(reduced, dtype=torch.int64)
+        with self.assertRaises(AssertionError) as cm:
+            fabric.reply(tensor, op=torch.distributed.ReduceOp.MAX, group="g")
+        self.assertIn("MIN reduction", str(cm.exception))
+        self.assertEqual(fabric.ops, [torch.distributed.ReduceOp.MAX])
+
+
 class TestTheShortfallTermStopsTheGroup(CustomTestCase):
     """T-38 (row 0) and T-38b (the can-not-fire counterpart)."""
 
@@ -327,6 +420,36 @@ class TestTheShortfallTermStopsTheGroup(CustomTestCase):
                 raised, pdv.PhaseDomainDivergence, f"rank {rank} must raise"
             )
             self.assertIn("owned_equals_driven", str(raised))
+
+    def test_the_shortfall_stop_carries_the_reason_on_the_raise(self):
+        """T-38, second half: *the message names ``driven``, ``owned`` and
+        ``missing=[...]`` with their denominators*.
+
+        The log line already named them; the RAISE did not, and the raise is
+        what the boot dies with. A STOP that says only ``reason=None`` on all
+        three ranks cannot say which rank refused or why -- the operator then
+        reads three identical lines and has to go find a fourth instrument.
+        Rank 1 carries its OWN recorded reason; ranks 0 and 2 say a peer
+        refused, because an int64 MIN carries no string.
+        """
+        cases = []
+        for rank, (start, end) in enumerate([(0, 32), (32, 50), (50, 64)]):
+            drop = (33,) if rank == 1 else ()
+            stack = self._pp_stack("pp", start, end, drop=drop)
+            cases.append((_sched(rank=rank), _result_from_groups(rank, [stack])))
+        outcomes = _BootFabric(cases).run()
+
+        refusing = str(outcomes[1][0])
+        self.assertIn("#1206 TRANSFER DOMAIN SHORTFALL rank=1", refusing)
+        self.assertIn("missing=[33]", refusing)
+        self.assertIn("driven=", refusing)
+        self.assertIn("owned=", refusing)
+        self.assertIn("at least one rank refused", refusing)
+        self.assertNotIn("the ranks do not agree", refusing)
+        for rank in (0, 2):
+            healthy = str(outcomes[rank][0])
+            self.assertIn("peer refused", healthy)
+            self.assertNotIn("missing=[33]", healthy)
 
     def test_the_shortfall_names_the_missing_layers_on_the_rank_that_has_them(self):
         stack = self._pp_stack("pp", 32, 50, drop=(33,))
@@ -624,6 +747,41 @@ class TestTheRoutedExits(CustomTestCase):
                     self.assertIsInstance(
                         raised, pdv.PhaseDomainDivergence, f"rank {rank}"
                     )
+                # D-45 (ii), the half that was specified and not built: the
+                # vote raises group-uniformly CARRYING THIS RANK'S REASON, so
+                # the log still says CELL UNDERIVABLE / BELOW ONE WAVE on the
+                # rank that hit it and `peer refused` on the others. Without
+                # it all three ranks die with `reason=None` and the boot's
+                # cause lives only in a log line nothing on the STOP path
+                # points at.
+                named = (
+                    "#1068 TP PIN CELL UNDERIVABLE rank=1"
+                    if arm == "cell"
+                    else "#1068 HOST POOL BELOW ONE WAVE rank=1"
+                )
+                self.assertIn(named, str(outcomes[1][0]))
+                # WHAT THIS FIXTURE CAN AND CANNOT SHOW, stated rather than
+                # implied. Ranks 0 and 2 do not satisfy rank 1's predicate,
+                # but they are NOT healthy either: their stand-in tp device
+                # pool cannot be shape-matched, so they take the `#847` soft
+                # refusal and vote row 0 = 0 with no reason of their own. So
+                # the only claim available here is that no rank prints a
+                # PEER'S string -- an int64 MIN carries none -- and that a
+                # rank refusing without a recorded reason says exactly that
+                # rather than claiming to be healthy. The healthy-peer half
+                # ("peer refused") is driven where the fixture supports it,
+                # in `test_the_shortfall_stop_carries_the_reason_on_the_raise`.
+                for rank in (0, 2):
+                    self.assertEqual(cases[rank][1]["owned_equals_driven"], 0)
+                    self.assertIsNone(cases[rank][1]["host_pool_build_msg"])
+                    self.assertNotIn(named, str(outcomes[rank][0]))
+                    self.assertIn(
+                        pdv.BOOT_REFUSED_NO_REASON_LINE, str(outcomes[rank][0])
+                    )
+                # A ROUTING, not a downgrade to the soft-refusal shape: no
+                # rank returns a pin mapping.
+                for rank in range(3):
+                    self.assertNotIn("tp", cases[rank][1])
 
     def test_the_not_applicable_exits_vote_the_neutral_and_the_boot_proceeds(self):
         """T-38d. ``:2324`` (rebind sub-flag off) and ``:2338`` (no host tier)
@@ -757,6 +915,30 @@ class TestThePackedBusTermsStopTheGroup(CustomTestCase):
         for line in self._stop_on_every_rank("draft_tier_domain_matches"):
             self.assertIn("draft_tier_domain_matches", line)
 
+    def test_an_and_slot_stop_does_not_claim_the_ranks_disagreed(self):
+        """INSTRUMENT-TEXT, class A: the line said what the code does not do.
+
+        An AND slot at 0 and a MAX pair above 0 say *at least one rank
+        refused*; a MIN carries no count, so neither can tell one refusing
+        rank from all of them. Rendering that as *the ranks do not agree*
+        sends the reader hunting for a divergence -- measured on the metal,
+        `local=0 group_min=0 group_max=0 per_rank=[1,1,1]` under the
+        divergence sentence."""
+        for line in self._stop_on_every_rank("rebind_domain_within_driven"):
+            self.assertIn("at least one rank refused", line)
+            self.assertNotIn("the ranks do not agree", line)
+
+    def test_a_divergence_pair_still_says_the_ranks_disagreed(self):
+        """The must-not-fire partner: `min != max` really IS a disagreement,
+        so the sweep above must not have flattened both sentences into one."""
+        payloads = [
+            pdv.pack_phase_domain_payload({"d_domain": v}) for v in (32, 64, 64)
+        ]
+        reduced = [min(col) for col in zip(*payloads)]
+        with self.assertRaises(pdv.PhaseDomainDivergence) as cm:
+            pdv.unpack_phase_domain(reduced, rank=0, local={}, world_size=3)
+        self.assertIn("the ranks do not agree", str(cm.exception))
+
     def test_rebind_domain_term_fires_when_the_counter_did_not_follow(self):
         for line in self._stop_on_every_rank("rebind_domain_within_driven"):
             self.assertIn("rebind_domain_within_driven", line)
@@ -877,16 +1059,51 @@ class TestThePackedPayloadCarriesTheTerms(CustomTestCase):
             req_to_token_pool=None,
         )
 
-    def test_slot_10_reaches_the_payload(self):
-        controller = types.SimpleNamespace(
-            has_draft=True,
-            mem_pool_host_draft=types.SimpleNamespace(layer_num=18),
-            mem_pool_host=types.SimpleNamespace(transfer_layer_domain=64),
-            layer_done_counter=None,
+    def test_slot_10_is_neutral_on_a_speculative_config(self):
+        """THE BOOT-KILLER, pinned in the direction it fired.
+
+        A 1-layer MTP draft tier under a 64-layer target domain is the
+        ordinary shape of every speculative config on this rig. Slot 10 is an
+        AND slot, so a 0 here is a deterministic group STOP at the FIRST
+        cutover -- measured on the metal at
+        ``boot_855_weg1b12s1_6917f46dd5_0906_115410.log`` (six
+        ``DRAFT TIER DOMAIN MISMATCH`` lines, six ``PhaseDomainDivergence``).
+        The term compared the DRAFT tier's layer count against the TARGET
+        tier's key-space domain, which is false by construction whenever the
+        two tiers legitimately differ in width, i.e. always under MTP.
+        """
+        for draft_layers in (1, 18, 64):
+            with self.subTest(draft_layers=draft_layers):
+                controller = types.SimpleNamespace(
+                    has_draft=True,
+                    mem_pool_host_draft=types.SimpleNamespace(
+                        layer_num=draft_layers
+                    ),
+                    mem_pool_host=types.SimpleNamespace(transfer_layer_domain=64),
+                    layer_done_counter=None,
+                )
+                sched = self._sched_with_controller(controller, None)
+                payload = pdv.build_phase_domain_payload(sched)
+                self.assertEqual(
+                    pdv.slot_of(payload, "draft_tier_domain_matches"), 1
+                )
+
+    def test_slot_10_has_no_producer_left_in_the_payload_builder(self):
+        """The DELETION itself, not only its effect. A term left computed but
+        pinned to 1 would read identically above while still carrying the
+        wrong comparison for a later reader to re-enable."""
+        terms = pdv.read_phase_domain_terms(
+            self._sched_with_controller(
+                types.SimpleNamespace(
+                    has_draft=True,
+                    mem_pool_host_draft=types.SimpleNamespace(layer_num=1),
+                    mem_pool_host=types.SimpleNamespace(transfer_layer_domain=64),
+                    layer_done_counter=None,
+                ),
+                None,
+            )
         )
-        sched = self._sched_with_controller(controller, None)
-        payload = pdv.build_phase_domain_payload(sched)
-        self.assertEqual(pdv.slot_of(payload, "draft_tier_domain_matches"), 0)
+        self.assertNotIn("draft_tier_domain_matches", terms)
 
     def test_slot_15_reaches_the_payload(self):
         full, mamba = _stage(0, 64)
