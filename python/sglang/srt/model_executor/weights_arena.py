@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Set, Tuple
@@ -449,6 +450,13 @@ class _FileBackedImage:
     nbytes: int
     path: str
     fd_direct: Optional[int] = None
+    #: #809: which REGISTRATION of this path the fds belong to, from a
+    #: process-monotonic counter. The #809 read-ahead stamps it into the pin's
+    #: identity, and it is the only term that can see an image released and
+    #: re-created underneath a filled buffer -- the path and the layout would
+    #: both still match, and the buffer would serve bytes from a file nobody
+    #: is reading any more.
+    generation: int = 0
 
 
 #: Keyed by the image tensor's ``data_ptr()``. These images are allocated once
@@ -458,6 +466,12 @@ _FILE_BACKED_IMAGES: Dict[int, _FileBackedImage] = {}
 
 _staged_pool = None
 
+#: #809: monotonic registration serial. Never reset, including by
+#: ``_FILE_BACKED_IMAGES.clear()`` -- a counter that restarted would let a
+#: re-registered image reuse a generation the #809 pin still holds, which is
+#: the one thing the generation exists to make impossible.
+_file_backed_generation_seq = 0
+
 
 def _register_file_backed_image(
     image: torch.Tensor,
@@ -466,8 +480,15 @@ def _register_file_backed_image(
     path: str,
     fd_direct: Optional[int] = None,
 ) -> None:
+    global _file_backed_generation_seq
+
+    _file_backed_generation_seq += 1
     _FILE_BACKED_IMAGES[image.data_ptr()] = _FileBackedImage(
-        fd=fd, nbytes=total, path=path, fd_direct=fd_direct
+        fd=fd,
+        nbytes=total,
+        path=path,
+        fd_direct=fd_direct,
+        generation=_file_backed_generation_seq,
     )
 
 
@@ -655,8 +676,12 @@ def _staged_file_refill(
     meta: _FileBackedImage,
     nbytes: int,
     timing: Optional["RefillLegTiming"] = None,
+    start: int = 0,
 ) -> None:
-    """Move ``nbytes`` of the image file into ``dst`` as READS, not faults.
+    """Move ``[start, nbytes)`` of the image file into ``dst`` as READS.
+
+    ``start`` is #809's remainder leg and defaults to 0, which is every
+    caller that existed before it: the whole image, from the top, unchanged.
 
     WHY THIS EXISTS (#802, measured on this rig 2026-08-22). The previous path
     was one ``dst.copy_`` over the whole file-backed mapping. That takes one
@@ -725,7 +750,13 @@ def _staged_file_refill(
         events = [torch.cuda.Event() for _ in range(depth)]
         inflight = [False] * depth
         views = [b.numpy() for b in bufs]
-        off = 0
+        # #809: the leading bytes may already be in the pin, in which case
+        # this leg starts where that copy ended. `use_direct` below is decided
+        # per absolute offset, so a resume point that is block-aligned keeps
+        # the O_DIRECT fd for the whole remainder; an unaligned one would push
+        # every read onto the buffered fd, which is why the caller floors the
+        # pin prefix to `_DIRECT_ALIGN` before it gets here.
+        off = int(start)
         i = 0
         while off < nbytes:
             n = min(chunk, nbytes - off)
@@ -1315,7 +1346,11 @@ def arena_refill(
     # it and the original copy_ below runs unchanged, byte for byte.
     meta = _file_backed_meta(image) if _staged_refill_enabled() else None
     if meta is not None and dst.is_cuda:
-        _staged_file_refill(dst, meta, layout.total_bytes, timing=timing)
+        # #809: with a pin armed and filled for THIS image the leading bytes
+        # come out of page-locked RAM at link rate and only the remainder is
+        # read from the file. With no pin the call is the same read this line
+        # has always made, from offset 0 (T-G1-5).
+        _refill_from_pin_and_file(dst, meta, layout.total_bytes, image, timing=timing)
     else:
         dst.copy_(payload)
     have = uint8_checksum(dst)
@@ -1510,3 +1545,793 @@ def two_file_leg(
     )
     if phases is not None:
         phases["read"] = time.perf_counter() - _t
+
+
+# --------------------------------------------------------------------------
+# #809: the INCOMING layout's image, pinned and read ahead during the drain.
+# --------------------------------------------------------------------------
+#
+# THE GAP THIS CLOSES, measured Boot 10/11. Under the two-file arm a flip leg
+# is a `preadv` of the incoming layout's image file, and it runs INSIDE the
+# no-return window: 11.0-12.7 s per leg at 1.3-1.4 GB/s, storage-bound (W26:
+# 39/39 legs storage-bound, link 21-35 % busy), while the x4 link alone would
+# carry the same 7 GiB in ~1.5 s (#690: 4.93 GB/s H2D on rank 1). The drain
+# that precedes the cutover is seconds long and spends all of them with the
+# storage idle.
+#
+# WHY THIS IS NOT A SECOND BOOKKEEPING OF THE WEIGHTS. The file remains the
+# carrier and the only durable image; the pin is a read-ahead OF that file
+# with an identity saying which file, which layout and which registration it
+# was filled from. Every arm the pin cannot vouch for falls through to the
+# existing read, so the bytes are identical on every path by construction --
+# what moves is when they were fetched, not what they are.
+
+#: The registry post the #721 gate weighs this buffer under. ONE name per
+#: process, because there is one buffer per rank and the registry is keyed by
+#: name -- a second name would let two buffers hide from each other.
+FLIP_IMAGE_PIN_POST_NAME = "phase-flip incoming image pin"
+
+#: What an operator lowers to make this post go away. `PinnedHostPost.flag`'s
+#: contract is that the refusal be ACTIONABLE, not that the string start with
+#: "--", and the knob the launcher actually sets is this env.
+FLIP_IMAGE_PIN_FLAG = "SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING=0"
+
+#: How long `stop_prefetch` waits for the reader to leave the chunk it is in.
+#: This runs inside the no-return window, so it is a BOUND and not a join: one
+#: 32 MiB chunk at the slowest rate this pool has ever shown (1 108 MiB/s, the
+#: fault path) is 0.03 s, so five seconds is margin, not patience.
+#:
+#: THAT ARGUMENT COVERS THE CUTOVER AND NOTHING ELSE. `consume` is about to
+#: hand the buffer's prefix to a DMA, so it may not proceed beside a live
+#: writer and spends the bound here. The ARM and the ABANDON reach the pin
+#: from the scheduler's own round, where nothing downstream depends on the
+#: reader being gone -- only on it having been told to go -- and they use
+#: `request_stop` instead, which signals and returns.
+_PIN_STOP_JOIN_S = 5.0
+
+#: Process-wide, because there is one rank per process and one buffer per
+#: rank -- the same reason `_FILE_BACKED_IMAGES` and `_LAYOUT_IMAGE_PHASE`
+#: above are module state rather than fields on a stack object.
+_FLIP_IMAGE_PIN: Optional[FlipImagePin] = None
+
+
+def flip_image_pin_enabled() -> bool:
+    """Read per call, never frozen at import (see ``_staged_refill_enabled``)."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING.get())
+
+
+def require_pin_preconditions() -> None:
+    """The pin may not exist without the two-file file-backed images.
+
+    Same shape and the same reason as ``require_two_file_preconditions``: the
+    read-ahead reads the INCOMING LAYOUT'S OWN image file, and under the
+    single rotating image there is no such file -- the one buffer holds
+    whichever layout is resting and is rewritten by every leg. Arming the pin
+    there would read a file that does not exist for a layout the buffer does
+    not hold, so this refuses rather than quietly doing nothing (#742).
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING.get():
+        return
+    if not envs.SGLANG_PHASE_FLIP_IMAGE_TWO_FILE.get():
+        raise WeightsArenaError(
+            "SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING=1 requires "
+            "SGLANG_PHASE_FLIP_IMAGE_TWO_FILE=1. The pin reads the INCOMING "
+            "layout's own image file during the drain; under the single "
+            "rotating image there is no per-layout file to read, and the one "
+            "buffer that exists is rewritten by every leg. Refusing rather "
+            "than arming a read-ahead with nothing to read."
+        )
+    if not envs.SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED.get():
+        raise WeightsArenaError(
+            "SGLANG_PHASE_FLIP_IMAGE_PIN_INCOMING=1 requires "
+            "SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED=1. Without it the images are "
+            "already pinned host RAM, so a pinned read-ahead of them would be "
+            "a second copy of the same bytes -- 55.99 GiB of lifetime images "
+            "on this rig's three ranks is the dual pin W26 OOM-killed."
+        )
+
+
+@dataclass(frozen=True)
+class FlipImagePinIdentity:
+    """WHICH image filled the pin. All three terms are load-bearing.
+
+    ``path`` and ``layout`` catch the wrong file and the wrong layout;
+    ``generation`` catches the same path re-registered underneath a filled
+    buffer, which the other two cannot see. Without the identity the pin is a
+    silent weight-corruption path: the checksum trailer TRAVELS WITH the image
+    it describes, so bytes served out of the wrong layout's read-ahead verify
+    GREEN against their own trailer whenever the two layouts happen to be the
+    same size -- the same hazard ``_LAYOUT_IMAGE_PHASE`` was introduced for.
+    """
+
+    path: str
+    layout: str
+    generation: int
+
+
+class FlipImagePin:
+    """One page-locked host buffer per rank, read ahead of the flip.
+
+    THE BUFFER IS ALLOCATED ONCE, AT BOOT, and that is a requirement rather
+    than a preference: ``cudaHostRegister`` over ~8 GiB costs seconds, and the
+    whole point of this class is to move work OUT of the drain window. See
+    ``create_flip_image_pin``, which is the only producer.
+
+    ``bytes_valid`` is MONOTONIC within one identity. That is what makes a
+    read that is still running safe to reason about: the reader only ever
+    writes at or beyond ``bytes_valid``, so the prefix below it is stable for
+    anyone reading it, and a partial fill is a usable answer rather than a
+    discarded one.
+    """
+
+    def __init__(self, buffer: torch.Tensor, post_name: Optional[str] = None):
+        self._buffer = buffer
+        self._post_name = post_name
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._reader: Optional[threading.Thread] = None
+        self._identity: Optional[FlipImagePinIdentity] = None
+        self._bytes_valid = 0
+        # O_DIRECT needs the destination address block-aligned as well as the
+        # offset and the length. The exact-size allocator hands out page
+        # mappings, so this holds in production; a test buffer may not, and a
+        # misaligned O_DIRECT read fails with EINVAL rather than degrading.
+        self._direct_ok = int(buffer.data_ptr()) % _DIRECT_ALIGN == 0
+
+    @property
+    def buffer(self) -> torch.Tensor:
+        return self._buffer
+
+    @property
+    def nbytes(self) -> int:
+        return int(self._buffer.numel())
+
+    @property
+    def post_name(self) -> Optional[str]:
+        return self._post_name
+
+    @property
+    def bytes_valid(self) -> int:
+        with self._lock:
+            return int(self._bytes_valid)
+
+    @property
+    def identity(self) -> Optional[FlipImagePinIdentity]:
+        with self._lock:
+            return self._identity
+
+    def reader_thread(self) -> Optional[threading.Thread]:
+        with self._lock:
+            return self._reader
+
+    def reader_alive(self) -> bool:
+        reader = self.reader_thread()
+        return reader is not None and reader.is_alive()
+
+    def _read_chunk(
+        self, meta: _FileBackedImage, view, offset: int, length: int
+    ) -> int:
+        """One ``preadv`` of at most ``length`` bytes at ``offset``.
+
+        A METHOD rather than an inline call so a CPU unit test can hold the
+        reader inside a chunk without reaching into its state -- the same
+        reason ``_alloc_with_host_register`` exists as an indirection. The
+        body is the read the refill itself uses.
+        """
+        fd = meta.fd
+        if (
+            meta.fd_direct is not None
+            and self._direct_ok
+            and offset % _DIRECT_ALIGN == 0
+            and length % _DIRECT_ALIGN == 0
+        ):
+            fd = meta.fd_direct
+        return os.preadv(fd, [memoryview(view)[offset : offset + length]], offset)
+
+    def _read_loop(self, meta: _FileBackedImage, start: int = 0) -> None:
+        """Fill ``[start, meta.nbytes)`` of the buffer from ``meta``'s file.
+
+        ``start`` is non-zero only when an arm RESUMED a prefix an earlier
+        arm for the same identity had already read -- see ``start_prefetch``.
+        """
+        view = self._buffer.numpy()
+        chunk = max(_DIRECT_ALIGN, _refill_chunk_bytes())
+        nbytes = int(meta.nbytes)
+        off = int(start)
+        try:
+            while off < nbytes and not self._stop.is_set():
+                n = min(chunk, nbytes - off)
+                r = self._read_chunk(meta, view, off, n)
+                if r <= 0:
+                    # A reader that cannot make progress STOPS, and does not
+                    # raise. The file is still the carrier: the refill reads
+                    # `[off, nbytes)` itself and the leg costs exactly what it
+                    # costs today. Retrying here would burn the drain window
+                    # on a file that is not answering.
+                    break
+                off += r
+                with self._lock:
+                    # NEVER PUBLISH A SMALLER PREFIX THAN THE PIN HOLDS. A
+                    # resumed reader starts at the retained count floored to
+                    # the block, and a short read there would otherwise land
+                    # the cursor below what is already valid -- offering the
+                    # refill fewer bytes than the buffer actually carries.
+                    self._bytes_valid = max(self._bytes_valid, off)
+        except Exception as exc:  # noqa: BLE001 - a read-ahead never kills a flip
+            # The bytes already read stay valid; the refusal is the prefix
+            # being short, which the refill reports as ratio < 1.
+            logger.warning(
+                "#809 flip image read-ahead stopped at %d/%d bytes of %s: %s",
+                off,
+                nbytes,
+                meta.path,
+                exc,
+            )
+        finally:
+            # THE LOOP RELEASES ITS OWN SLOT. `Thread.is_alive()` stays True
+            # after this function has left the buffer, for as long as the
+            # interpreter takes to tear the thread down, and the fact an arm
+            # needs is whether a LOOP is still writing -- not whether a Thread
+            # object still exists. An arm landing in that window would
+            # otherwise be refused for a reader that is already done. Only
+            # THIS thread's own registration is cleared, so a reader that a
+            # later arm has already replaced never unpublishes its successor.
+            with self._lock:
+                if self._reader is threading.current_thread():
+                    self._reader = None
+
+    def start_prefetch(self, image: torch.Tensor) -> bool:
+        """Begin filling this pin from ``image``'s file. True if a read started.
+
+        A second arm for the SAME image while a read is in flight is a no-op
+        (False) rather than a restart: restarting would throw away the prefix
+        already read and start the clock again inside a drain that is by then
+        partly spent.
+        """
+        meta = _file_backed_meta(image)
+        if meta is None:
+            logger.warning(
+                "#809 flip image read-ahead SKIPPED: the incoming image is "
+                "not file-backed, so there is no file to read ahead of."
+            )
+            return False
+        layout = _LAYOUT_IMAGE_PHASE.get(int(image.data_ptr()))
+        if layout is None:
+            logger.warning(
+                "#809 flip image read-ahead SKIPPED: the incoming image %s is "
+                "UNTAGGED, so the pin could not say which layout it holds.",
+                meta.path,
+            )
+            return False
+        if int(meta.nbytes) > self.nbytes:
+            logger.warning(
+                "#809 flip image read-ahead SKIPPED: image %s is %d bytes and "
+                "the pin holds %d. The pin is sized to the LARGER of the two "
+                "layouts at boot, so this means the layouts changed under it.",
+                meta.path,
+                int(meta.nbytes),
+                self.nbytes,
+            )
+            return False
+        want = FlipImagePinIdentity(
+            path=meta.path, layout=str(layout), generation=int(meta.generation)
+        )
+        with self._lock:
+            reader = self._reader
+            busy = reader is not None and reader.is_alive()
+            same = self._identity == want
+        if busy and same:
+            # A STOP REQUESTED A MOMENT AGO IS WITHDRAWN, NOT WAITED OUT. The
+            # live reader is filling this very identity, so letting it run IS
+            # the resume the block below argues for; an abandon that signalled
+            # it and a re-arm for the same direction that arrived before it
+            # noticed would otherwise freeze the prefix where the abandon
+            # caught it, which is the loss the resume exists to prevent.
+            with self._lock:
+                if self._stop.is_set():
+                    self._stop = threading.Event()
+            return False
+        if busy:
+            # NO JOIN HERE: this runs on the scheduler's round, exactly like
+            # the abandon, and a round that waits out a read-ahead is a stall
+            # the flip does not need. A second writer on one buffer would
+            # corrupt the prefix the first one is still filling -- so the
+            # read-ahead for the new layout is REFUSED and this leg reads the
+            # file exactly as it did before #809, while the previous reader is
+            # told to stop and the next arm for this direction reads ahead.
+            self.request_stop()
+            logger.warning(
+                "#809 flip image read-ahead SKIPPED: the previous reader is "
+                "still inside its chunk, and starting a second writer on one "
+                "buffer would corrupt the prefix it is filling. It has been "
+                "told to stop; this leg reads the file and the next arm reads "
+                "ahead."
+            )
+            return False
+        with self._lock:
+            self._stop = threading.Event()
+            if self._identity != want:
+                # ZERO BEFORE THE IDENTITY. A reader of this object must never
+                # see the new identity paired with the old count, which would
+                # present the previous layout's bytes as this layout's prefix.
+                self._bytes_valid = 0
+                self._identity = want
+            # RESUME AN ABANDONED PREFIX, do not restart it. The identity is
+            # (path, layout, generation), so an equal one means the same file
+            # contents behind the same prefix -- a path re-registered under
+            # the pin bumps the generation and lands in the zeroing above.
+            # The #834 park deadline abandons and re-arms the same direction
+            # repeatedly, and a restart there would leave the pin holding
+            # strictly LESS than it held a moment before the re-arm, which is
+            # worse than not re-arming at all. Floored to the block because a
+            # short read can leave the count off a boundary and every read
+            # from an unaligned offset falls back to the buffered fd; the few
+            # bytes re-read are bytes the pin already holds correctly.
+            resume = int(self._bytes_valid) - int(self._bytes_valid) % _DIRECT_ALIGN
+            self._reader = threading.Thread(
+                target=self._read_loop,
+                args=(meta, resume),
+                name="flip-image-pin",
+                daemon=True,
+            )
+            self._reader.start()
+        logger.info(
+            "#809 FLIP IMAGE PREFETCH start layout=%s bytes=%d",
+            want.layout,
+            int(meta.nbytes),
+        )
+        if resume > 0:
+            logger.info(
+                "#809 flip image read-ahead RESUMES at %d/%d bytes: an "
+                "abandoned arm already read that prefix of this same image, "
+                "so only the remainder is read.",
+                resume,
+                int(meta.nbytes),
+            )
+        return True
+
+    def request_stop(self) -> None:
+        """Tell the reader to leave, and RETURN. Never waits for it.
+
+        THE FORM EVERY SCHEDULER-THREAD CALLER USES. An ABANDONED arm and an
+        arm that finds the buffer busy both reach the pin from the scheduler's
+        round, and neither needs the reader GONE -- only told to go. What was
+        already read stays the truth about that image, so the next arm for the
+        same direction finds the prefix and its identity intact.
+
+        The reader re-reads ``self._stop`` on every iteration, so the signal is
+        seen at the end of the chunk in flight; ``consume`` is the one caller
+        that may not proceed beside a live writer and joins instead.
+        """
+        with self._lock:
+            stop = self._stop
+        stop.set()
+
+    def stop_prefetch(self) -> bool:
+        """Stop the reader and WAIT for it, up to ``_PIN_STOP_JOIN_S``.
+
+        Returns whether the reader is actually gone. The CUTOVER's form: the
+        refill is about to DMA the buffer's prefix, so a writer still in it is
+        not a timing question but a content one. Every caller on the scheduler
+        round uses ``request_stop`` instead -- see the constant's comment.
+        """
+        with self._lock:
+            reader = self._reader
+        self.request_stop()
+        if reader is None or not reader.is_alive():
+            return True
+        reader.join(_PIN_STOP_JOIN_S)
+        return not reader.is_alive()
+
+    def consume(self, image: torch.Tensor) -> Tuple[int, Optional[str]]:
+        """``(bytes this pin may serve for ``image``, stale reason or None)``.
+
+        STOPS THE READER FIRST, and that is deliberate: by the time a refill
+        asks, the drain is over. A reader still going would be pulling the
+        same file the remainder leg is about to pull -- two streams competing
+        for one device for bytes that only have to arrive once.
+
+        The second element is a stale reason ONLY for a real identity
+        mismatch. A pin that was never filled is COLD, not stale, and the
+        difference matters in the log: one is a window too short, the other is
+        a buffer holding the wrong layout.
+        """
+        meta = _file_backed_meta(image)
+        if meta is None:
+            return 0, None
+        layout = _LAYOUT_IMAGE_PHASE.get(int(image.data_ptr()))
+        if layout is None:
+            return 0, None
+        want = FlipImagePinIdentity(
+            path=meta.path, layout=str(layout), generation=int(meta.generation)
+        )
+        stopped = self.stop_prefetch()
+        with self._lock:
+            have = self._identity
+            valid = int(self._bytes_valid)
+        if have is None:
+            return 0, None
+        if have != want:
+            return 0, (
+                f"the pin holds layout={have.layout!r} generation="
+                f"{have.generation} from {have.path!r}, but this leg streams "
+                f"layout={want.layout!r} generation={want.generation} from "
+                f"{want.path!r}"
+            )
+        if not stopped:
+            logger.warning(
+                "#809 flip image pin NOT USED: the reader did not leave its "
+                "chunk within %.1fs, so its prefix is still being written and "
+                "the leg reads the file instead.",
+                _PIN_STOP_JOIN_S,
+            )
+            return 0, None
+        return min(valid, int(meta.nbytes)), None
+
+
+def _alloc_pinned_pin_buffer(nbytes: int) -> torch.Tensor:
+    """The pin's page-locked host buffer, EXACTLY sized.
+
+    Same allocator as the exact-size images (#695): an anonymous MAP_SHARED
+    mapping plus ``cudaHostRegister``, so the size is decided in PAGES rather
+    than rounded up to the next power of two. That rounding is not cosmetic
+    here -- an 8.8 GB image would round to 16 GiB of locked RAM on a swapless
+    box, which is the ledger this buffer has just been admitted against.
+
+    NO FALLBACK, unlike ``_alloc_host_image_inner``. A refused registration
+    there costs the rounding; here it would cost either the rounding or a
+    silently absent pin, and an armed flag that quietly did nothing is the
+    #742 class. The operator turns the env off instead.
+    """
+    return _alloc_with_host_register((int(nbytes),), torch.uint8, "cpu", True, None)
+
+
+def install_flip_image_pin(pin: Optional[FlipImagePin]) -> None:
+    """Publish ``pin`` as this process's read-ahead buffer."""
+    global _FLIP_IMAGE_PIN
+
+    _FLIP_IMAGE_PIN = pin
+
+
+def flip_image_pin() -> Optional[FlipImagePin]:
+    return _FLIP_IMAGE_PIN
+
+
+def release_flip_image_pin() -> None:
+    """Drop the pin: stop its reader, give the post back, unregister the pages.
+
+    UNREGISTER BEFORE THE REFERENCE GOES, for the reason ``release_host_image``
+    states: the ``cudaHostRegister`` is a process-wide fact about an ADDRESS
+    RANGE, so returning the pages to the allocator while CUDA still maps them
+    leaves the next large host allocation to fail with rc=712.
+    """
+    global _FLIP_IMAGE_PIN
+
+    pin = _FLIP_IMAGE_PIN
+    _FLIP_IMAGE_PIN = None
+    if pin is None:
+        return
+    pin.stop_prefetch()
+    if not pin.post_name:
+        # Not ours to unregister or unmap: a pin built around a buffer this
+        # module did not allocate (unit tests) has no post and no mapping.
+        return
+    _release_pin_pages(pin.buffer)
+    _unregister_image_post(pin.post_name)
+
+
+def _release_pin_pages(buffer: Optional[torch.Tensor]) -> None:
+    """Give the pin's pages back to CUDA. Never raises.
+
+    ONE HAND-BACK FOR TWO CALLERS. ``release_flip_image_pin`` unwinds a pin
+    that lived; ``create_flip_image_pin`` unwinds one the GROUP refused after
+    this rank had already allocated it. Both owe CUDA the same thing, and the
+    hazard is the same in both: ``cudaHostRegister`` is a process-wide fact
+    about an ADDRESS RANGE, so pages returned to the allocator while CUDA
+    still maps them fail the next large host allocation with rc=712.
+    """
+    if buffer is None:
+        return
+    try:
+        from sglang.srt.mem_cache.pool_host.common import _cuda_host_unregister
+
+        _cuda_host_unregister(buffer)
+    except Exception as exc:  # noqa: BLE001 -- cleanup never kills a boot
+        logger.warning("#809 could not cudaHostUnregister the flip image pin: %s", exc)
+
+
+def _pin_admission_is_group_wide(local_ok: bool) -> bool:
+    """MIN ``local_ok`` across the world group: every rank refuses, or none.
+
+    THE HAZARD IS A HANG, NOT A REFUSAL. ``check_and_register_pinned_post``
+    weighs this post against LIVE availability, and ``pinned_host_budget``'s
+    module docstring names what that costs across ranks, verbatim:
+    "``available`` shrinks as each rank pins its share, so a check against
+    live availability run inside every TP worker can pass on rank 0 and raise
+    on rank 2: a rank-divergent boot decision, which is an NCCL hang rather
+    than an error". The pin is created from ``Scheduler.init_model_worker``
+    after ``init_tp_model_worker`` has brought the distributed environment up,
+    so a rank raising alone here does not fail the boot -- it parks its peers
+    in the next collective for ever.
+
+    MIN AND NOT MAX. The admission is an AND over the ranks. A MAX would
+    admit a configuration the weakest rank had just refused, and that rank
+    would then allocate exactly the bytes its own ledger denied it.
+
+    EVERY RANK REACHES THIS, on the refusing path as well as the fitting one.
+    That is why the caller catches its local failure instead of raising on it.
+
+    Degrades to the local verdict wherever no peer can disagree: no process
+    group (every unit test, and a single-process boot) or a world of one.
+    """
+    if not torch.distributed.is_available():
+        return bool(local_ok)
+    if not torch.distributed.is_initialized():
+        return bool(local_ok)
+    try:
+        from sglang.srt.distributed.parallel_state import get_world_group
+
+        world_group = get_world_group()
+    except (AssertionError, ImportError):
+        # The world group is asserted, not returned as None, when it has not
+        # been built. No group, no divergence.
+        return bool(local_ok)
+    if world_group.world_size <= 1:
+        return bool(local_ok)
+    flag = torch.tensor(1 if local_ok else 0, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        flag, op=torch.distributed.ReduceOp.MIN, group=world_group.cpu_group
+    )
+    return bool(int(flag.item()))
+
+
+def _pin_refusal(
+    total: int, local_exc: Optional[BaseException], stage: str
+) -> WeightsArenaError:
+    """The one group-uniform refusal both admission stages raise.
+
+    ONE MESSAGE, TWO STAGES, so an operator reading the boot log cannot be
+    told "the ledger refused" by a rank whose ALLOCATOR refused -- the two
+    have different remedies (lower a post vs. free host RAM), and a refusal
+    that names the wrong one sends the operator at the wrong knob.
+
+    EVERY RANK PRINTS IT, so the reason is this rank's own where it has one
+    and "a peer rank" where it does not; the numbers are always this rank's,
+    because they are what this rank measured.
+
+    REFUSES, never falls back to file-only. A pin the operator armed and that
+    silently did not happen is the #742 class, and it would be read off the
+    acceptance as "the prefetch did not help" rather than as "the prefetch was
+    never there".
+    """
+    from sglang.srt.mem_cache.pinned_host_budget import (
+        PINNED_HOST_RESERVE_BYTES,
+        pinned_host_memory_bytes,
+        registered_posts,
+    )
+
+    said = (
+        str(local_exc)
+        if local_exc is not None
+        else "this rank got through; a peer rank did not"
+    )
+    machine_total, available = pinned_host_memory_bytes()
+    others = "; ".join(
+        f"{p.name} {p.nbytes / 1e9:.2f} GB ({p.flag})"
+        for p in registered_posts()
+        if p.nbytes > 0
+    )
+    return WeightsArenaError(
+        f"#809 FLIP IMAGE PIN REFUSED: {FLIP_IMAGE_PIN_POST_NAME} needs "
+        f"{total / 1e9:.2f} GB of pinned host RAM and the rank group does "
+        f"not admit it at {stage} (this rank "
+        f"{'did not get through' if local_exc is not None else 'did'}; the "
+        f"verdict is reduced so the ranks cannot disagree about a boot). "
+        f"posts already registered: [{others or 'none'}]; host total "
+        f"{(machine_total or 0) / 1e9:.2f} GB, available "
+        f"{(available or 0) / 1e9:.2f} GB, reserve floor "
+        f"{PINNED_HOST_RESERVE_BYTES / 1e9:.2f} GB. Lower one of the named "
+        f"flags or set {FLIP_IMAGE_PIN_FLAG} and boot without the "
+        f"read-ahead; the file-backed image is unchanged either way. "
+        f"{stage} said: {said}"
+    )
+
+
+def create_flip_image_pin(nbytes: int) -> FlipImagePin:
+    """Admit ``nbytes`` against the #721 ledger, then allocate and publish.
+
+    ORDER IS THE CONTENT: the post is DECLARED before the buffer exists, so an
+    over-commitment is refused at the declaration rather than discovered at
+    the allocation -- and if the allocation then fails, the post is taken back
+    (#729/#550), because a post that never allocated is credited back to the
+    next admission as though its bytes were resident and the registry waves
+    through the very over-commit it exists to refuse.
+
+    ONE VERDICT FOR THE GROUP, PER STAGE, AND NO EXIT PAST ONE. The ledger's
+    answer depends on live host availability, which every co-booting rank is
+    shrinking as it goes, so the answer is not rank-invariant -- and neither
+    is the ALLOCATION that follows it, for the stronger reason that every rank
+    weighs the ledger against the same pre-pin availability and only the last
+    rank to register the bytes discovers they are gone. Both are therefore
+    HELD and reduced, and every failure this function can express leaves it
+    through one of the two reduced exits. See ``_pin_admission_is_group_wide``
+    for why a lone raise at this site is a hang and not a refusal.
+
+    TWO REDUCES AND NOT ONE, deliberately. Folding both into a single vote
+    after the allocation would let a rank whose peer's LEDGER had already
+    refused pin its own multi-GiB share first and hand it back afterwards --
+    the exact over-commitment on a swapless box that the #721 gate exists to
+    refuse. The first reduce is the barrier that keeps the gate's answer
+    binding. Both are unconditional on every rank, so the collective count is
+    rank-uniform on every path.
+    """
+    from sglang.srt.mem_cache.pinned_host_budget import (
+        PINNED_HOST_RESERVE_BYTES,
+        check_and_register_pinned_post,
+        pinned_host_memory_bytes,
+        unregister_pinned_post,
+    )
+
+    total = int(nbytes)
+    local_exc: Optional[BaseException] = None
+    try:
+        check_and_register_pinned_post(
+            FLIP_IMAGE_PIN_POST_NAME, FLIP_IMAGE_PIN_FLAG, total
+        )
+    except Exception as exc:  # noqa: BLE001 -- held, not swallowed; see below
+        # HELD UNTIL THE GROUP HAS SPOKEN. Raising here would be the
+        # rank-divergent boot decision `_pin_admission_is_group_wide` exists
+        # to prevent: this site is past the distributed init, so the rank
+        # that refuses alone hangs the ones that did not.
+        local_exc = exc
+    if not _pin_admission_is_group_wide(local_exc is None):
+        # #729/#550: a post with no allocation behind it is credited back to
+        # the next admission as though its bytes were resident, so a rank
+        # that registered before the group refused hands its post back.
+        unregister_pinned_post(FLIP_IMAGE_PIN_POST_NAME)
+        raise _pin_refusal(total, local_exc, "the #721 ledger") from local_exc
+
+    # STAGE TWO, AND IT NEEDS ITS OWN VERDICT. The ledger's answer says the
+    # bytes were AVAILABLE, not that this rank got them: the allocator has no
+    # fallback (`_alloc_pinned_pin_buffer`), `cudaHostRegister` raises on a
+    # non-zero return (`pool_host/common.py:65-71`) and the mapping under it
+    # can raise ENOMEM on a swapless box. That failure is MORE rank-divergent
+    # than the ledger's, not less -- every rank weighs the ledger against the
+    # same PRE-PIN availability, so all of them can admit and only the last
+    # one to actually register the bytes fails. Raising on it here, past the
+    # first reduce, is the very hang `_pin_admission_is_group_wide` exists to
+    # prevent, so the failure is HELD and reduced exactly like the ledger's.
+    buffer: Optional[torch.Tensor] = None
+    try:
+        buffer = _alloc_pinned_pin_buffer(total)
+        if int(buffer.numel()) != total:
+            raise WeightsArenaError(
+                f"#809 flip image pin allocator returned {int(buffer.numel())} "
+                f"bytes for a {total}-byte post; the ledger and the buffer "
+                f"must describe the same memory."
+            )
+    except BaseException as exc:  # noqa: BLE001 -- held, not swallowed
+        # BaseException AND NOT Exception, as the pre-#809 shape caught it:
+        # an interrupt that escaped here would leave the post registered
+        # (#729) AND skip the collective the peers are entering.
+        local_exc = exc
+    if not _pin_admission_is_group_wide(local_exc is None):
+        # EVERY RANK UNWINDS, including the ones that succeeded -- that is the
+        # arm a rank-local raise cannot express, because nothing local tells a
+        # rank that fitted to stop.
+        _release_pin_pages(buffer)
+        unregister_pinned_post(FLIP_IMAGE_PIN_POST_NAME)
+        raise _pin_refusal(total, local_exc, "the pinned-host allocator") from local_exc
+    pin = FlipImagePin(buffer, post_name=FLIP_IMAGE_PIN_POST_NAME)
+    install_flip_image_pin(pin)
+    _, available = pinned_host_memory_bytes()
+    logger.info(
+        "#809 FLIP IMAGE PIN post %r: %.2f GB page-locked, registered against "
+        "the #721 ledger (available %.2f GB, reserve %.2f GB). It is a "
+        "READ-AHEAD of the file-backed image, not a second image: the file "
+        "stays the carrier.",
+        FLIP_IMAGE_PIN_POST_NAME,
+        total / 1e9,
+        (available or 0) / 1e9,
+        PINNED_HOST_RESERVE_BYTES / 1e9,
+    )
+    return pin
+
+
+def _await_pin_copy(dst: torch.Tensor) -> None:
+    """Block the HOST until the pinned prefix copy has landed in ``dst``.
+
+    A NAMED SEAM rather than an inline ``synchronize``, for the same reason
+    ``_alloc_with_host_register`` and ``FlipImagePin._read_chunk`` are: what
+    it waits on is a CUDA transfer, and a CPU unit test has to be able to
+    prove the wait happens INSIDE the interval the leg reports (T-G1-7).
+
+    IT COSTS NOTHING REAL. ``arena_refill`` runs ``uint8_checksum(dst)`` on
+    the same stream immediately after this leg returns, and that reduction
+    ends in an ``.item()`` -- a host block on the very bytes waited for here.
+    The wait is not added work; it is the same wait, moved to the side of
+    the clock where the leg it belongs to can see it.
+    """
+    if dst.is_cuda:
+        torch.cuda.current_stream().synchronize()
+
+
+def _refill_from_pin_and_file(
+    dst: torch.Tensor,
+    meta: _FileBackedImage,
+    nbytes: int,
+    image: torch.Tensor,
+    timing: Optional[RefillLegTiming] = None,
+) -> str:
+    """Fill ``dst[0:nbytes]``: the pin's prefix, then the file's remainder.
+
+    Returns which source(s) served the leg -- ``pin``, ``pin+file`` or
+    ``file``. With no pin installed this is exactly the pre-#809 call: the
+    whole image, read from offset 0.
+    """
+    pin = flip_image_pin()
+    started = time.monotonic()
+    from_pin = 0
+    if pin is not None:
+        available, stale = pin.consume(image)
+        if stale is not None:
+            # REFUSES THE PIN, NEVER THE FLIP. The file is the carrier and it
+            # is intact; what is wrong is the read-ahead's provenance, and
+            # serving those bytes would be a silent weight substitution.
+            logger.error(
+                "#809 FLIP IMAGE PIN STALE: %s. The leg reads the file "
+                "instead; the arena content is unaffected.",
+                stale,
+            )
+        from_pin = min(int(available), int(nbytes))
+        if from_pin < int(nbytes):
+            # Floor the hand-off to the block size: the remainder leg picks
+            # O_DIRECT per absolute offset, so an unaligned resume point would
+            # push every one of its reads onto the buffered fd (2 595 vs
+            # 8 304 MiB/s measured on this pool).
+            from_pin -= from_pin % _DIRECT_ALIGN
+    if from_pin > 0:
+        # Pinned source, current stream: ORDERED ahead of the checksum in
+        # `arena_refill`, which runs on that same stream. Correctness needs
+        # no synchronize of its own here; the leg CLOCK does, and that is
+        # what `_await_pin_copy` below is for.
+        dst[:from_pin].copy_(pin.buffer[:from_pin], non_blocking=True)
+    if from_pin < int(nbytes):
+        _staged_file_refill(dst, meta, int(nbytes), timing=timing, start=from_pin)
+    if from_pin > 0:
+        # THE CLOCK BELOW MUST COVER THE DMA. The copy above is issued
+        # non_blocking and nothing between it and the log line blocks the
+        # host, so without this wait `refill_s` would be the time to ISSUE
+        # the transfer on the `pin` arm -- while the `pin+file` arm, whose
+        # file leg host-blocks on its own drain events, bills the same field
+        # for the time to MOVE it. One field naming two quantities depending
+        # on the arm is the #851/#1082 hazard `refill_bound_phrase` in this
+        # module was written to keep out, and §4's acceptance grades exactly
+        # this number: a leg billed to the checksum one frame up would read
+        # as a thousandfold win that did not happen.
+        #
+        # Only when the pin actually served bytes. With `from_pin == 0` no
+        # copy was issued from here and the file leg has already blocked on
+        # its own events, so the pre-#809 path takes no second wait.
+        _await_pin_copy(dst)
+    if pin is None:
+        return "file"
+    if from_pin >= int(nbytes):
+        source = "pin"
+    elif from_pin > 0:
+        source = "pin+file"
+    else:
+        source = "file"
+    logger.info(
+        "#809 FLIP IMAGE PREFETCH complete=%d/%d ratio=%.3f source=%s " "refill_s=%.3f",
+        from_pin,
+        int(nbytes),
+        (from_pin / float(nbytes)) if nbytes else 0.0,
+        source,
+        time.monotonic() - started,
+    )
+    return source

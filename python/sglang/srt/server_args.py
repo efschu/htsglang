@@ -9198,10 +9198,22 @@ class ServerArgs:
         post in the launcher for bytes the launcher never pins.
         """
         from sglang.srt.mem_cache.pinned_host_budget import (
+            PINNED_HOST_RESERVE_BYTES,
             PinnedHostPost,
             hicache_configured_host_bytes,
             joint_pinned_host_error,
             pinned_host_memory_bytes,
+        )
+
+        # ONE READER OF THE #809 FLAG AND OF THE POST'S NAME. The pin's own
+        # module owns both, so this line cannot come to disagree with the
+        # registry entry the worker actually makes -- the same reason the
+        # rotation ledger above reads its two sizing accessors from
+        # `weights_arena` instead of re-deriving them from the envs.
+        from sglang.srt.model_executor.weights_arena import (
+            FLIP_IMAGE_PIN_FLAG,
+            FLIP_IMAGE_PIN_POST_NAME,
+            flip_image_pin_enabled,
         )
 
         per_rank_bytes = hicache_configured_host_bytes(self.hicache_size, 0)
@@ -9257,19 +9269,89 @@ class ServerArgs:
         err = joint_pinned_host_error(posts, total_bytes, available_bytes)
         if err is not None:
             raise ValueError(err)
+        # #809 G1-C6: the incoming-image pin is NAMED on this line, and the
+        # split between naming it here and PRICING it at boot is the honest
+        # division rather than a gap.
+        #
+        # WHAT THIS PARSE CANNOT KNOW. The pin is one page-locked buffer per
+        # rank sized to the LARGER of that rank's two arena images
+        # (`phase_flip_boot`: `create_flip_image_pin(max(int(image_pp.numel()),
+        # int(image_tp.numel())))`), and those bytes exist only once the model
+        # is loaded and both layouts are planned. The sibling helper above
+        # says the same of its own asymmetry term, verbatim: "Only the second
+        # is knowable at parse time -- the asymmetry needs the arena layouts,
+        # which need the model".
+        #
+        # WHY NO CEILING IS SUMMED IN ITS PLACE, measured rather than argued.
+        # The tightest TRUE parse-time bound on the pin is the rank's own
+        # device budget, because the image is a host copy of a device-resident
+        # arena: on the acceptance boot that is --rank-gpu-memory-mib
+        # 31800,18800,19800 = 73.82 GB, against Boot 11's ledger of 60.10 GB
+        # of posts in 115.97 GB available minus a 10.74 GB reserve = 105.23 GB
+        # usable. That ceiling REFUSES a configuration whose real demand
+        # (30.96 GB, Boot 12) fits with room to spare -- a gate that turns
+        # away the boot it exists to guard is worse than one that names what
+        # it cannot weigh. So the bytes are weighed where they are known:
+        # `weights_arena.create_flip_image_pin` declares this same post to the
+        # #721 registry before it allocates, and reduces the verdict across
+        # the ranks so they cannot disagree about a boot.
+        #
+        # WHAT THE LINE OWES THE OPERATOR IS THEREFORE THE NAME, THE HEADROOM
+        # the boot-time gate will be left with, AND WHERE THE BYTES ARE
+        # PRINTED. Boot 12 pinned 30.96 GB across three ranks and this line
+        # named none of it, which is how a host tier goes missing (#721) --
+        # the cgroup's own OOM counter moved in that window.
+        #
+        # THE HAZARD THE POINTER CLOSES. An unpriced term whose figure the
+        # reader cannot locate is read as no term at all -- the same silence
+        # #721 was filed for, wearing a disclaimer. The bytes are already in
+        # the log twice per rank, so what was missing was never a third
+        # emitter, only the sentence that says which line to read:
+        #   * `#809 FLIP IMAGE PIN post`, emitted by
+        #     `weights_arena.create_flip_image_pin` as the post is registered;
+        #   * the always-on `HOST-SHMEM ... declared=` census, which sums this
+        #     same #721 registry (`mem_ledger/host_shmem.py`:
+        #     `posts = registered_posts()`) and is reached from
+        #     `Scheduler.init_model_worker` AFTER `build_phase_flip_tp_stack`
+        #     has created the pin, in the same straight-line block.
+        # The census carrying the pin post is not assumed here; it is pinned
+        # by `TestTheBootLineThePointerNamesCarriesThePin`, because a pointer
+        # to a figure that omits what it was read for states an under-count
+        # in the voice of a measurement.
+        pin_note = ""
+        if flip_image_pin_enabled():
+            priced_bytes = sum(int(p.nbytes) for p in posts)
+            headroom = (
+                None
+                if available_bytes is None
+                else int(available_bytes) - PINNED_HOST_RESERVE_BYTES - priced_bytes
+            )
+            pin_note = (
+                " + %s ARMED, PRICED AT BOOT AND NOT HERE (off with %s): one "
+                "page-locked buffer per rank, sized to the LARGER of that "
+                "rank's two arena images, which this parse cannot know before "
+                "the model is loaded; weights_arena.create_flip_image_pin "
+                "weighs it against this same #721 ledger before it allocates "
+                "and refuses for the whole rank group. Headroom left for it "
+                "here: %s. Read the bytes at boot, per rank, in the "
+                "'#809 FLIP IMAGE PIN post' line and in the 'declared=' term "
+                "of the always-on HOST-SHMEM census, which sums this same "
+                "#721 registry once the pin is in it."
+                % (
+                    FLIP_IMAGE_PIN_POST_NAME,
+                    FLIP_IMAGE_PIN_FLAG,
+                    "unknown" if headroom is None else f"{headroom / 1e9:.2f} GB",
+                )
+            )
         # The ledger entry itself. Without a line the operator can read, a
         # tier that got smaller is invisible in exactly the same way it was
         # when it was large.
         if rebind:
-            from sglang.srt.mem_cache.pinned_host_budget import (
-                PINNED_HOST_RESERVE_BYTES,
-            )
-
             logger.info(
                 "#810 host ledger: staging tier %.2f GB x %d rank(s) + phase-flip "
                 "tp pin ceiling %.2f GB (2x) + mamba anchor pools %.2f GB (x%d "
                 "ranks x2 phases) = %.2f GB against available %.2f GB minus "
-                "reserve %.2f GB",
+                "reserve %.2f GB%s",
                 per_rank_bytes / 1e9,
                 ranks,
                 tp_pin_bytes / 1e9,
@@ -9278,11 +9360,12 @@ class ServerArgs:
                 (per_rank_bytes * ranks + tp_pin_bytes + anchor_bytes) / 1e9,
                 (int(available_bytes) / 1e9) if available_bytes is not None else -1.0,
                 PINNED_HOST_RESERVE_BYTES / 1e9,
+                pin_note,
             )
             return
         logger.info(
             "#810 host ledger: staging tier %.2f GB x %d rank(s) = %.2f GB "
-            "pinned host RAM (%s).",
+            "pinned host RAM (%s).%s",
             per_rank_bytes / 1e9,
             ranks,
             per_rank_bytes * ranks / 1e9,
@@ -9291,6 +9374,7 @@ class ServerArgs:
                 if available_bytes is not None
                 else "host availability unknown, unguarded"
             ),
+            pin_note,
         )
 
     def _handle_session_checkpoints(self):

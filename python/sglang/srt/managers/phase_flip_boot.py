@@ -54,11 +54,15 @@ from sglang.srt.model_executor.weights_arena import (
     RefillLegTiming,
     refill_bound_phrase,
     bind_arena_views,
+    create_flip_image_pin,
+    flip_image_pin,
+    flip_image_pin_enabled,
     host_image_mode,
     image_from_tensors,
     release_host_image,
     pack_into_arena,
     plan_arena_layout,
+    require_pin_preconditions,
     require_two_file_preconditions,
     tag_layout_image,
     two_file_images_enabled,
@@ -863,6 +867,54 @@ class PhaseFlipStacks:
         """
         return self.image_pp is not None and self.image_tp is not None
 
+    def image_for_phase(self, phase: str) -> Optional[torch.Tensor]:
+        """The two-file image holding the ``"pp"``/``"tp"`` layout, or None.
+
+        ONE reader of that mapping, used by the leg and by the #809 arm-time
+        read-ahead alike: a second copy of it would be free to drift into
+        handing one of them the other layout's file.
+        """
+        return self.image_tp if phase == "tp" else self.image_pp
+
+    def incoming_image(self, direction: str) -> Optional[torch.Tensor]:
+        """The image the leg for ``direction`` will stream INTO the arena."""
+        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+
+        if direction == PP_TO_TP:
+            return self.image_for_phase("tp")
+        if direction == TP_TO_PP:
+            return self.image_for_phase("pp")
+        return None
+
+    def start_incoming_image_prefetch(self, direction: str) -> bool:
+        """#809: read the incoming layout's image into the pin during the drain.
+
+        NEVER RAISES, and that is not a swallow. The pin is a read-ahead of a
+        file that stays the carrier: every way this can fail leaves the leg on
+        the existing path, reading the same bytes at the same rate it does
+        today. There is no hazardous action to let proceed -- the failure mode
+        this could hide is "the flip was not faster", and the refill's own
+        `#809 FLIP IMAGE PREFETCH complete=` line reports exactly that with
+        its denominators.
+        """
+        pin = flip_image_pin()
+        if pin is None or not self.two_file_arm():
+            return False
+        image = self.incoming_image(direction)
+        if image is None:
+            return False
+        try:
+            return bool(pin.start_prefetch(image))
+        except Exception as exc:  # noqa: BLE001 - a read-ahead never kills an arm
+            logger.warning(
+                "%s #809 flip image read-ahead could not start for %s (%s); "
+                "the leg reads the file as it does today.",
+                LOG_PREFIX,
+                direction,
+                exc,
+            )
+            return False
+
     def refill(self, direction: str) -> None:
         """The weights leg of a flip: a chunk ROTATION of the arena (#809/W28).
 
@@ -1214,9 +1266,9 @@ class PhaseFlipStacks:
 
         from sglang.srt.managers import phase_flip_seam_census as seam_census
 
-        incoming_image = self.image_tp if wants == "tp" else self.image_pp
-        outgoing_image = self.image_pp if wants == "tp" else self.image_tp
         outgoing_phase = "pp" if wants == "tp" else "tp"
+        incoming_image = self.image_for_phase(wants)
+        outgoing_image = self.image_for_phase(outgoing_phase)
         phases: Dict[str, float] = {}
         two_file_leg(
             arena=self.arena,
@@ -1605,6 +1657,9 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     # here means a misconfiguration costs a boot message, not the OOM kill W26
     # took in the LAUNCH phase.
     require_two_file_preconditions()
+    # #809: same instant and the same reason -- the read-ahead reads the
+    # incoming layout's OWN image file, which only the two-file arm has.
+    require_pin_preconditions()
     two_file = two_file_images_enabled()
 
     # 2. Snapshot the PP checkpoint weights to host, free device originals
@@ -1709,6 +1764,17 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
                 image_tp = snapshot_and_free(tp_named, layout_tp, pin=True)
                 tag_layout_image(image_tp, "tp")
                 rotation_image = image_tp
+                # #809: AT BOOT, NOT AT ARM. This is the first instant both
+                # image sizes are known, and it is also the last instant a
+                # multi-GiB `cudaHostRegister` is free -- at arm it would sit
+                # inside the drain window this buffer exists to fill. Sized to
+                # the LARGER of the two images so ONE buffer serves both
+                # directions. The #721 gate is asked before a byte is
+                # allocated and the boot REFUSES BY NAME if it does not fit.
+                if flip_image_pin_enabled():
+                    create_flip_image_pin(
+                        max(int(image_pp.numel()), int(image_tp.numel()))
+                    )
             else:
                 rotation_image = allocate_rotation_image(
                     layout_pp.total_bytes, layout_tp.total_bytes, pin=True
