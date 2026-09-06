@@ -396,6 +396,111 @@ class TheWidthIsDerivedAndCheckedBothWays(unittest.TestCase):
                     pdv.unpack_phase_domain(wrong, rank=0, local={}, world_size=3)
                 )
 
+    def test_arm_two_the_census_offset_is_the_expression_both_documents_pin(self):
+        """T-45 arm 2 -- S0 mutant 7, the DERIVED-CONSTANT half.
+
+        The census offset has moved four times (15 -> 16 -> 18 -> 21) and a
+        hard-coded offset reads a count pair as a per-rank flag without saying
+        anything. The offset is pinned here as the EXPRESSION
+        `PHASE_DOMAIN_SLOTS - PHASE_DOMAIN_CENSUS_SLOTS`, which is the same
+        expression the S7 spec's T-S7-8 demands at B6, so the two documents
+        pin ONE offset rather than two literals that can disagree.
+
+        The width beside it is the per-KIND arithmetic off the declared table,
+        never the total typed out: the enumerated kinds are the assertion and
+        the total is derived from them, so a row added to the table moves both
+        halves together.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        self.assertEqual(
+            pdv.index_of("census"),
+            pdv.PHASE_DOMAIN_SLOTS - pdv.PHASE_DOMAIN_CENSUS_SLOTS,
+        )
+        kinds = [term.kind for term in pdv.PHASE_DOMAIN_LAYOUT]
+        self.assertEqual(kinds.count(pdv.AND_SLOT), 5)
+        self.assertEqual(kinds.count(pdv.DIVERGENCE_PAIR), 6)
+        self.assertEqual(kinds.count(pdv.MAX_PAIR), 2)
+        self.assertEqual(kinds.count(pdv.CENSUS_BLOCK), 1)
+        self.assertEqual(len(kinds), 14)
+        self.assertEqual(
+            pdv.PHASE_DOMAIN_SLOTS,
+            kinds.count(pdv.AND_SLOT)
+            + 2 * (kinds.count(pdv.DIVERGENCE_PAIR) + kinds.count(pdv.MAX_PAIR))
+            + pdv.PHASE_DOMAIN_CENSUS_SLOTS,
+        )
+
+    def test_arm_three_neither_width_nor_offset_is_typed_as_a_literal(self):
+        """T-45 arm 3 -- S0 mutant 7 read STRUCTURALLY, because the VALUE of a
+        literal that is right today is indistinguishable from the derivation.
+
+        `PHASE_DOMAIN_SLOTS = 29` and `at = 21` in `_render_census` both pass
+        every value assertion in this file at this tip, and both go silently
+        wrong on the next row added to the table -- which has happened four
+        times. A value assertion therefore cannot reach this mutant while the
+        table stands still, so this arm asserts the SHAPE the spec mandates:
+        each width is a sum over its OWN declared layout, and `_render_census`
+        reaches its head index through `index_of`, never through a number.
+        """
+        import ast
+
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        with open(pdv.__file__) as handle:
+            module = ast.parse(handle.read())
+
+        assigned = {}
+        for node in module.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name):
+                    assigned[target.id] = node.value
+
+        for constant, layout in (
+            ("PHASE_DOMAIN_SLOTS", "PHASE_DOMAIN_LAYOUT"),
+            ("PHASE_BOOT_REDUCE_SLOTS", "BOOT_REDUCE_LAYOUT"),
+        ):
+            with self.subTest(constant=constant):
+                value = assigned.get(constant)
+                self.assertIsNotNone(
+                    value, "%s is not assigned at module level" % constant
+                )
+                self.assertNotIsInstance(
+                    value,
+                    ast.Constant,
+                    "%s is typed as a literal instead of derived from %s"
+                    % (constant, layout),
+                )
+                names = {n.id for n in ast.walk(value) if isinstance(n, ast.Name)}
+                self.assertIn(
+                    layout,
+                    names,
+                    "%s does not derive from %s" % (constant, layout),
+                )
+
+        render = [
+            n
+            for n in ast.walk(module)
+            if isinstance(n, ast.FunctionDef) and n.name == "_render_census"
+        ]
+        self.assertEqual(len(render), 1)
+        heads = [
+            n.value
+            for n in ast.walk(render[0])
+            if isinstance(n, ast.Assign)
+            and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id == "at"
+        ]
+        self.assertEqual(len(heads), 1, "_render_census has no single head index")
+        self.assertIsInstance(
+            heads[0],
+            ast.Call,
+            "the census head index is typed in rather than derived",
+        )
+        self.assertIsInstance(heads[0].func, ast.Name)
+        self.assertEqual(heads[0].func.id, "index_of")
+
 
 class APayloadWithNoProducersIsSilent(unittest.TestCase):
     """T-46 -- the NEUTRAL-VALUE invariant. THE BOOT-KILLER PIN.
@@ -772,6 +877,145 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         )
 
 
+class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
+    """T-46 arms TEN, ELEVEN and TWELVE -- D-15's per-rank census, end to end.
+
+    The census block had no assertion of any kind: its width was fed in as an
+    INPUT by T-45's every-term-present fixture and read back by T-46's
+    neutral-value arms, and nothing anywhere read `verdict.per_rank`, the
+    `per_rank=[...]` field of a STOP line, or which slot a rank writes. Four
+    one-line edits therefore passed the whole suite -- the `?` derived from
+    the VALUE 1 instead of from the world size, every rank writing `census[0]`,
+    the MIN-neutral sentinel packed `0`, and the head index typed in.
+
+    All three rendering cases live in one fixture, because they cannot be
+    separated: under MIN a slot reduces to 1 both when rank r voted GOOD and
+    when no rank r exists, so only the world size the caller supplies tells
+    them apart, and an arm that pins one case without the others is satisfied
+    by the rule that contradicts it.
+    """
+
+    def _rank(self, tp_rank, *, incomplete=False):
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        controller = _StandInController(None)
+        if incomplete:
+            setattr(controller, pdv.LOADBACK_INCOMPLETE_ATTR, True)
+        return _StandInScheduler(
+            tree_cache=_StandInTreeCache(controller), tp_rank=tp_rank
+        )
+
+    @staticmethod
+    def _per_rank_field(message):
+        found = re.search(r"per_rank=\[([^\]]*)\]", message)
+        assert found is not None, "the STOP line carries no per_rank field: %s" % (
+            message,
+        )
+        return found.group(1)
+
+    def test_arm_ten_the_census_carries_each_ranks_own_flag_to_the_stop_line(self):
+        """Rank 1 refuses; ranks 0 and 2 do not. The group STOP names which.
+
+        `census[r]` reduces to exactly rank r's own flag because every OTHER
+        rank wrote the MIN-neutral 1 there. That is what makes `0` unambiguous
+        and what a shared slot, a `0` sentinel or a value-derived `?` each
+        destroy in its own direction.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        payloads = [
+            pdv.build_phase_domain_payload(self._rank(0)),
+            pdv.build_phase_domain_payload(self._rank(1, incomplete=True)),
+            pdv.build_phase_domain_payload(self._rank(2)),
+        ]
+        reduced = _reduce_min(payloads)
+
+        for rank in range(3):
+            with self.subTest(rank=rank):
+                with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+                    pdv.unpack_phase_domain(
+                        reduced, rank=rank, local={}, world_size=3
+                    )
+                message = str(caught.exception)
+                self.assertIn("term=loadback_coverage_complete", message)
+                # Three rules in one string: rank 1's own 0, ranks 0 and 2's
+                # own 1, and `?` for the five slots no rank owns -- decided by
+                # the world size, never by the value 1 a healthy rank writes.
+                self.assertEqual(self._per_rank_field(message), "1,0,1,?,?,?,?,?")
+                self.assertIn(
+                    "census_width=%d" % pdv.PHASE_DOMAIN_CENSUS_SLOTS, message
+                )
+
+        # The healthy group renders 1 where a rank voted well, `?` where no
+        # rank owns the slot -- so a `?` derived from the value would blank the
+        # whole list and a `0` sentinel would report three refusals that never
+        # happened.
+        healthy = _reduce_min(
+            [pdv.build_phase_domain_payload(self._rank(r)) for r in range(3)]
+        )
+        verdict = pdv.unpack_phase_domain(healthy, rank=0, local={}, world_size=3)
+        self.assertIsNotNone(verdict)
+        self.assertEqual(verdict.per_rank, "1,1,1,?,?,?,?,?")
+        self.assertEqual(verdict.census, [1, 1, 1, None, None, None, None, None])
+        self.assertEqual(verdict.census_width, pdv.PHASE_DOMAIN_CENSUS_SLOTS)
+
+    def test_arm_eleven_a_typed_in_offset_reads_a_count_pair_as_a_flag(self):
+        """S0 mutant 7's hazard in the message it corrupts, not in a constant.
+
+        The three literals the mutant names are all offsets the census HAD, so
+        the wrong slice starts inside the pairs that precede it: at 18 the
+        first three census positions render `host_ring_discarded` and both
+        halves of `d_backup_width`. This arm drives the two apart by giving
+        the count pair a value no census slot can hold, so the corrupted
+        rendering is legible in the STOP line itself.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        payload = pdv.pack_phase_domain_payload(
+            {"census": [1, 0, 1, 1, 1, 1, 1, 1], "d_backup_width": 5}
+        )
+        with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+            pdv.unpack_phase_domain(payload, rank=0, local={}, world_size=3)
+        field = self._per_rank_field(str(caught.exception))
+        self.assertEqual(field, "1,0,1,?,?,?,?,?")
+        self.assertNotIn("5", field)
+
+    def test_arm_twelve_the_loadback_flag_is_read_and_cleared_not_typed(self):
+        """Slot 9 is the SEVENTH route read and the only one nothing pinned.
+
+        Arm 4 pins slots 18 and 19-20 and arm 6 pins the six per-pass counts;
+        slot 9 fell between them, so replacing its read with the MIN-neutral
+        left the suite green -- a term declared and never read, which is
+        indistinguishable from a real read until the value first moves and
+        which deletes `#1206 LOADBACK COVERAGE INCOMPLETE` and every census
+        value with it.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        controller = _StandInController(None)
+        setattr(controller, pdv.LOADBACK_INCOMPLETE_ATTR, True)
+        scheduler = _StandInScheduler(
+            tree_cache=_StandInTreeCache(controller), tp_rank=1
+        )
+
+        payload = pdv.build_phase_domain_payload(scheduler)
+        self.assertEqual(pdv.slot_of(payload, "loadback_coverage_complete"), 0)
+        self.assertEqual(
+            pdv.local_terms_from_payload(payload)["census"],
+            [1, 0, 1, 1, 1, 1, 1, 1],
+        )
+        # Read AND cleared at the payload-build site, in the same block, so the
+        # next reduce reads the next pass's detection and not this one again.
+        self.assertIs(getattr(controller, pdv.LOADBACK_INCOMPLETE_ATTR), False)
+
+        again = pdv.build_phase_domain_payload(scheduler)
+        self.assertEqual(pdv.slot_of(again, "loadback_coverage_complete"), 1)
+        self.assertEqual(
+            pdv.local_terms_from_payload(again)["census"],
+            [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS,
+        )
+
+
 class TheBootReduceLayoutIsDeclaredOnceAndDerived(unittest.TestCase):
     """T-53 -- the boot bus's T-45 and T-46 in one."""
 
@@ -968,11 +1212,17 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
 
         reduces = []
         builds = []
+        unpacks = []
         real_build = pdv.build_phase_domain_payload
+        real_unpack = pdv.unpack_phase_domain
 
         def _record_build(scheduler):
             builds.append(1)
             return real_build(scheduler)
+
+        def _record_unpack(*args, **kwargs):
+            unpacks.append(1)
+            return real_unpack(*args, **kwargs)
 
         world = {"size": 3}
         standin = _ReduceCarryingSchedulerStandIn()
@@ -1005,11 +1255,23 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
             pdv,
             "build_phase_domain_payload",
             _record_build,
+        ), mock.patch.object(
+            pdv,
+            "unpack_phase_domain",
+            _record_unpack,
         ):
             for _ in range(2):
                 scheduler_mod.Scheduler._update_uniform_pool_budget(standin)
             self.assertEqual(len(reduces), 2)
             self.assertEqual(len(builds), 2)
+            # THE CONSUMER IS COUNTED BESIDE THE BUILDER. A payload that is
+            # built and reduced but never unpacked is a vote with no reader --
+            # the same deletion as a detection with no vote, arrived at from
+            # the other end, and it passes every assertion this file makes
+            # about the module itself.
+            self.assertEqual(
+                len(unpacks), 2, "the reduced slice must be read back at the seam"
+            )
 
             world["size"] = 1
             for _ in range(2):
@@ -1018,6 +1280,41 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
             self.assertEqual(
                 len(builds), 2, "the payload must be built with the reduce, not the pass"
             )
+            self.assertEqual(len(unpacks), 2, "the PP phase reads nothing back")
+
+    def test_arm_two_a_refused_term_stops_the_group_at_the_live_seam(self):
+        """The STOP is at the SEAM, not only inside the module.
+
+        Deleting the unpack call and its layout STOP from `scheduler.py`
+        leaves the module, its layout and every arm above untouched and
+        silently removes EVERY group STOP this bus exists for. That is
+        Section 5.6 rule 3's "a deleted STOP wearing a log line" read from the
+        other end: a vote whose consumer does not exist. This arm drives one
+        refusing term through the real `_update_uniform_pool_budget` and
+        asserts the raise leaves the method.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+        from sglang.srt.managers import scheduler as scheduler_mod
+
+        refused = pdv.pack_phase_domain_payload({"loadback_coverage_complete": 0})
+        standin = _ReduceCarryingSchedulerStandIn()
+
+        with mock.patch.object(
+            torch.distributed, "all_reduce", side_effect=lambda *a, **k: None
+        ), mock.patch.object(
+            torch.distributed, "get_world_size", side_effect=lambda *a, **k: 3
+        ), mock.patch.object(
+            scheduler_mod.uniform_floor_scope, "report_scope", lambda *a, **k: None
+        ), mock.patch(
+            "sglang.srt.distributed.utils.uneven_dcp_active",
+            lambda *a, **k: False,
+        ), mock.patch.object(
+            pdv, "build_phase_domain_payload", lambda scheduler: list(refused)
+        ):
+            with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+                scheduler_mod.Scheduler._update_uniform_pool_budget(standin)
+        self.assertIn("term=loadback_coverage_complete", str(caught.exception))
+        self.assertIn("#1206 LOADBACK COVERAGE INCOMPLETE", str(caught.exception))
 
 
 if __name__ == "__main__":
