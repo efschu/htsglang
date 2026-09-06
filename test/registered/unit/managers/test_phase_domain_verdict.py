@@ -116,6 +116,35 @@ class _RacingGroup:
         return self._domain
 
 
+class _PhaseKeyedGroup:
+    """A bound group whose expected domain DIFFERS PER PHASE.
+
+    Every other group stand-in in this file ignores the `bound_phase` argument
+    and answers one domain, so all of them are satisfied by a builder who hands
+    the accessor a literal. This one answers a DIFFERENT row per phase, which
+    is the shape S7-C36's phase-keyed device table has at B6: the argument
+    selects the row, and a literal picks the row nobody asked for.
+
+    An unnamed phase answers `_absent` rather than raising, so the mutant is
+    caught by the VALUE slot 15 reports and not by an exception the fixture
+    happened to throw.
+    """
+
+    def __init__(self, *, per_phase, absent=0):
+        self.host_ring_discard_ok = 1
+        self.d_backup_width = 0
+        self.entry_map = {}
+        self._per_phase = dict(per_phase)
+        self._absent = absent
+
+    def expected_transfer_layer_domain(self, bound_phase):
+        return self._per_phase.get(bound_phase, self._absent)
+
+    @property
+    def transfer_layer_domain(self):
+        return self._absent
+
+
 class _PartialGroup:
     """Group-shaped, declaring exactly the attributes it is NOT told to withhold.
 
@@ -292,7 +321,16 @@ class TheDigestPairIsTheUniformityCheck(unittest.TestCase):
                 self.assertIn("group_max=%d" % max(agree, odd), msg)
 
     def test_and_slot_zero_refuses_on_every_rank(self):
-        """One rank votes 0 on the loader-coverage AND-slot; all three refuse."""
+        """One rank votes 0 on the loader-coverage AND-slot; all three refuse.
+
+        AND the line's own denominators are read back. A MIN reduce carries ONE
+        scalar per AND slot and no negated twin, so the group's MAX is not on
+        the wire at all. A renderer that fills the `group_max` field with the
+        MIN reports one refusing rank of three as a group-wide refusal, and
+        contradicts the `local=1` it prints on the same line for the two ranks
+        that voted yes -- the Instrument-Text-luegt shape, in the one line this
+        slice exists to produce.
+        """
         from sglang.srt.managers import phase_domain_verdict as pdv
 
         locals_ = [
@@ -308,7 +346,15 @@ class TheDigestPairIsTheUniformityCheck(unittest.TestCase):
                     pdv.unpack_phase_domain(
                         reduced, rank=rank, local=local, world_size=3
                     )
-                self.assertIn("#1206 LOADER COVERAGE REFUSED", str(caught.exception))
+                msg = str(caught.exception)
+                self.assertIn("#1206 LOADER COVERAGE REFUSED", msg)
+                self.assertIn("local=%d" % local["loader_covers_own_layers"], msg)
+                self.assertIn("group_min=0", msg)
+                # `?` is this module's own symbol for a value the payload
+                # cannot supply (`_render_census` renders the census slots
+                # beyond the world size with it). Any digit here is invented.
+                self.assertIn("group_max=?", msg)
+                self.assertNotIn("group_max=0", msg)
 
 
 class ThePayloadRidesTheSeamWithoutMovingTheBallot(unittest.TestCase):
@@ -610,6 +656,41 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         # And the counter itself is MONOTONIC: nothing in the payload builder
         # ever writes it, so the total the writer thread reached survives.
         self.assertEqual(group.total, 2)
+
+    def test_arm_thirteen_the_bound_phase_selects_the_slot_fifteen_row(self):
+        """T-46 arm 13 -- arm 4's read-vs-literal discipline, one ARGUMENT on.
+
+        Arm 4 proves the two S7 terms are read rather than typed. Slot 15 has
+        the same shape one hop further along: its accessor takes the BOUND
+        PHASE, and a builder who passes a literal `None` there satisfies every
+        other stand-in in this file, because all of them ignore the argument.
+        The module states the hazard in its own words at
+        `phase_domain_verdict.py:519-523` -- at B6 this value SELECTS the phase
+        row the slot-15 accessor answers from, so a wrong argument picks a row
+        nobody asked for -- and until this arm nothing drove it.
+
+        Read as a bound: on THIS branch the mutant changes no behaviour, since
+        `HostPoolGroup.expected_transfer_layer_domain` is S1-C18's and does not
+        exist yet. It becomes wrong-answer-bearing at B6.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+        from sglang.srt.mem_cache import hicache_phase_binding as hpb
+
+        # The counter's width is 4, so the phase whose row is 4 is GOOD and the
+        # phase whose row is 9 is a mismatch. Both rows are non-neutral, so a
+        # literal argument cannot land on either by accident.
+        group = _PhaseKeyedGroup(per_phase={"pp_prefill": 4, "tp_decode": 9})
+        scheduler = _with_group(group, layers=4)
+
+        for phase, expected in (("pp_prefill", 1), ("tp_decode", 0)):
+            with self.subTest(phase=phase):
+                with mock.patch.object(hpb, "bound_phase", lambda: phase):
+                    payload = pdv.build_phase_domain_payload(scheduler)
+                self.assertEqual(
+                    pdv.slot_of(payload, "rebind_domain_within_driven"),
+                    expected,
+                    "slot 15 must answer from the row the BOUND PHASE names",
+                )
 
     def test_arm_six_every_per_pass_count_is_read_and_then_cleared(self):
         """T-46 arm 6 -- arm 4's discipline applied to the OTHER SIX terms.
@@ -1460,6 +1541,79 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
                 len(builds), 2, "the payload must be built with the reduce, not the pass"
             )
             self.assertEqual(len(unpacks), 2, "the PP phase reads nothing back")
+
+    def test_arm_four_the_layout_line_is_once_per_phase_not_once_per_reduce(self):
+        """The layout instrument's BOOKMARK, driven rather than argued.
+
+        S0's Instruments bullet asks for *one INFO line at the first
+        publication per phase naming the slot layout and its head index, so a
+        future layout change is legible instead of silent*. The bookmark that
+        delivers "first publication per phase" is a new state field on the
+        Scheduler (`scheduler.py:7215-7216`), and its comparison is one
+        character away from its own inverse: `==` in place of `!=` is SILENT on
+        the first publication of every phase and emits one INFO line per reduce
+        on the scheduler hot path thereafter. Nothing drove either branch.
+
+        The count is what this arm reads, so the assertion is 2 lines over 4
+        passes -- not 1 (silent) and not 4 (per reduce).
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+        from sglang.srt.managers import scheduler as scheduler_mod
+
+        infos = []
+
+        def _record_info(fmt, *args):
+            try:
+                infos.append(fmt % args if args else str(fmt))
+            except TypeError:  # pragma: no cover - a line this arm does not read
+                infos.append(str(fmt))
+
+        standin = _ReduceCarryingSchedulerStandIn(phase="tp_decode")
+        tensors = []
+
+        with mock.patch.object(
+            torch.distributed,
+            "all_reduce",
+            side_effect=lambda t, *a, **k: tensors.append(list(t.tolist())),
+        ), mock.patch.object(
+            torch.distributed, "get_world_size", side_effect=lambda *a, **k: 3
+        ), mock.patch.object(
+            scheduler_mod.uniform_floor_scope, "report_scope", lambda *a, **k: None
+        ), mock.patch(
+            # PINNED, NOT INHERITED -- for the reason the sibling arm above
+            # states at length: a neighbour suite in the same process leaves
+            # this global permanently replaced.
+            "sglang.srt.distributed.utils.uneven_dcp_active",
+            lambda *a, **k: False,
+        ), mock.patch.object(
+            scheduler_mod.logger, "info", _record_info
+        ):
+            for _ in range(3):
+                scheduler_mod.Scheduler._update_uniform_pool_budget(standin)
+            bus = [m for m in infos if "#1068 PHASE-DOMAIN BUS" in m]
+            self.assertEqual(
+                len(bus), 1, "one line at the FIRST publication of a phase, not three"
+            )
+            # And the head index it names IS where the payload sits on the
+            # wire, read back off the reduced tensor rather than asserted
+            # against a number this file types in. A `head` that names some
+            # other offset makes the line legible and wrong, which is the
+            # instrument-text hazard one step past the silent one.
+            self.assertIn("phase=tp_decode", bus[0])
+            self.assertIn("slots=%d" % pdv.PHASE_DOMAIN_SLOTS, bus[0])
+            head = int(re.search(r"head=(\d+)", bus[0]).group(1))
+            self.assertEqual(
+                tensors[0][head : head + pdv.PHASE_DOMAIN_SLOTS],
+                pdv.build_phase_domain_payload(standin),
+            )
+
+            standin.phase_flip_active_stack = "pp_prefill"
+            scheduler_mod.Scheduler._update_uniform_pool_budget(standin)
+            bus = [m for m in infos if "#1068 PHASE-DOMAIN BUS" in m]
+            self.assertEqual(
+                len(bus), 2, "the NEXT phase announces its layout exactly once"
+            )
+            self.assertIn("phase=pp_prefill", bus[1])
 
     def test_arm_two_a_refused_term_stops_the_group_at_the_live_seam(self):
         """The STOP is at the SEAM, not only inside the module.

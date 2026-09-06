@@ -758,7 +758,14 @@ def unpack_phase_domain(
                         rank=rank,
                         local=local.get(term.name),
                         group_min=group_min,
-                        group_max=group_min,
+                        # NO MAX IS ON THE WIRE FOR AN AND SLOT. The MIN reduce
+                        # carries ONE scalar here and no negated twin, so the
+                        # group's max is a fact this line does not have.
+                        # Echoing the min under the name `group_max` reports a
+                        # SINGLE refusing rank as a group-wide refusal, and
+                        # contradicts the `local=1` the same line prints on
+                        # every rank that voted yes.
+                        group_max=None,
                         phase=phase,
                         per_rank=per_rank,
                     )
@@ -805,16 +812,21 @@ def _stop_message(term, *, rank, local, group_min, group_max, phase, per_rank) -
         # off this line, so a renderer that appends its own tail here ships a
         # string the slice that owns the refusal cannot correct.
         return term.stop_template % {"rank": int(rank), "group_min": int(group_min)}
+    # `group_max` is `%s`, not `%d`, for ONE reason: an AND slot has no max on
+    # the wire and passes None, which renders `?` -- the same symbol
+    # `_render_census` already uses for a slot the payload cannot speak for. The
+    # pair kinds keep passing real ints and `%s` renders those with identical
+    # digits, so the field a reader parses is unchanged wherever a max exists.
     return (
         "#1206 PHASE DOMAIN DIVERGENCE STOP rank=%d term=%s refusal=%s local=%s "
-        "group_min=%d group_max=%d phase=%s per_rank=[%s] census_width=%d -- %s"
+        "group_min=%d group_max=%s phase=%s per_rank=[%s] census_width=%d -- %s"
         % (
             int(rank),
             term.name,
             term.refusal,
             local,
             int(group_min),
-            int(group_max),
+            "?" if group_max is None else int(group_max),
             phase,
             per_rank,
             PHASE_DOMAIN_CENSUS_SLOTS,
