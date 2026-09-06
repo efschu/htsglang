@@ -126,15 +126,22 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
         about a different program.
         """
         sets, clears = _writes(self.tree)
-        # RE-BASED, NOT WEAKENED. The third writer moved 6851/6944/7239 ->
-        # 6851/6944/7313 because #1068 weg1 S0 inserts the phase-domain verdict
-        # bus at the #1203 seam in two hunks above it -- `scheduler.py`
-        # :7173-7222 and :7250-7273, 50 + 24 = 74 lines.
-        # The writer SET is what this row pins and it is unchanged: three
-        # statements, byte-identical, re-read in the tree at the new lines.
+        # RE-BASED TWICE, NEVER WEAKENED. First 6851/6944/7239 ->
+        # 6851/6944/7313, because #1068 weg1 S0 inserts the phase-domain verdict
+        # bus at the #1203 seam in two hunks above the third writer --
+        # `scheduler.py` :7173-7222 and :7250-7273, 50 + 24 = 74 lines.
+        # Then 6851/6944/7313 -> 6860/6953/7322 at the B1 merge: S1's
+        # `scheduler.py` hunks land ABOVE all three and shift every one of them
+        # by the same +9.
+        # The writer SET is what this row pins and it is unchanged across both:
+        # three statements, byte-identical, re-read in the tree at the new
+        # lines. A pin of literal line numbers is a Landmarken-Format row -- it
+        # is re-anchored by measurement at each merge, never deleted, because
+        # the day the SET changes is the day every claim below is about a
+        # different program.
         self.assertEqual(
             sets,
-            [6851, 6944, 7313],
+            [6860, 6953, 7322],
             f"the three writers of self.{ATTR} moved: {sets}",
         )
 
