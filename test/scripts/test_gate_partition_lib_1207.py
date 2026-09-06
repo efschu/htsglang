@@ -180,11 +180,47 @@ def test_g0_t8_an_interrupted_collection_is_flagged_and_named(tmp_path):
 
 def test_g0_t8b_a_complete_run_is_not_flagged_as_interrupted(tmp_path):
     """The control that makes G0-T-8 mean something: the captured WIDE lane
-    carries eleven collection errors and was NOT interrupted -- xdist keeps
-    going -- so a flag that fired on any collection error would fire here and
-    would gate nothing."""
+    reports eleven ERRORs in its own summary and was NOT interrupted -- xdist
+    keeps going -- so a flag that fired on any ERROR line would fire here and
+    would gate nothing.
+
+    THE BOUND OF THIS ARM, named because it was once claimed wider than it is:
+    the fixture holds ELEVEN ERROR short-summary lines and ZERO ``ERROR
+    collecting`` banners, so ``collection_errors`` is empty here and this arm
+    cannot see a flag derived from the BANNERS. That direction is a separate
+    arm, G0-T-8c below, and it is the one an implementation is likeliest to
+    get wrong."""
     res = lib.parse_log(WIDE)
     assert res.interrupted is False
+    assert res.error_lines == WIDE_SUMMARY_ERRORS
+    assert res.collection_errors == set(), (
+        "this arm does not gate the banner direction; G0-T-8c does"
+    )
+
+
+def test_g0_t8c_a_collection_error_without_the_marker_is_not_interrupted(tmp_path):
+    """THE DANGER DIRECTION: ``interrupted`` must come from pytest's OWN
+    ``Interrupted:`` marker, never from the presence of a collection error.
+
+    THE HAZARD, measured: xdist collects around a bad module and keeps going,
+    and the branch's own full gate run of 2026-09-06 held FOUR uncollectable
+    modules in the wide lane (the ``*_631`` family, named under DID NOT RUN).
+    An ``interrupted`` derived from ``collection_errors`` therefore turns that
+    healthy 415-module lane into ``BROKEN ... INTERRUPTED during collection``
+    and puts the gate back to ``VERDICT: INCONCLUSIVE`` -- #1207's symptom,
+    restored on the very run cited as proof of its repair, with a reason that
+    is false. Both terms of the distinction are asserted here, because a flag
+    read off the banner is invisible to an arm that only checks the flag."""
+    log = _write(
+        tmp_path,
+        "__ ERROR collecting registered/unit/managers/test_a.py ___\n"
+        "ERROR test/registered/unit/managers/test_a.py - ImportError\n"
+        "1 error in 1.00s\n",
+    )
+    res = lib.parse_log(log)
+    assert res.interrupted is False
+    assert res.collection_errors == {"registered/unit/managers/test_a.py"}
+    assert res.tally_ok, res.tally_note
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +260,30 @@ def test_g0_t10c_a_lane_that_collected_nothing_is_still_refused(tmp_path):
     ok, note = runner.lane_verdict(lib.parse_log(log), n_modules=3)
     assert ok is False
     assert "no test outcome" in note
+
+
+def test_g0_t10d_an_uncollectable_module_with_no_error_name_is_refused(tmp_path):
+    """THE SECOND REFUSAL BRANCH of `lane_verdict`, which had no arm at all.
+
+    THE HAZARD: the banner and the short summary are two different parts of
+    the log, so a run can name a module it could not import and still extract
+    no ERROR name for it -- and the TALLY cannot catch that, because 0 names
+    against a summary that counts 0 errors is a perfect tally. Asserted here
+    (`tally_ok is True`) so the arm is known to gate something the arithmetic
+    does not, which is the same false-pass class as the interrupted lane."""
+    log = _write(
+        tmp_path,
+        "____ ERROR collecting registered/unit/mem_cache/test_x.py ____\n"
+        "ImportError: no module named nope\n"
+        "3 passed in 1.00s\n",
+    )
+    res = lib.parse_log(log)
+    assert res.tally_ok is True, "the tally alone cannot see this"
+    assert res.interrupted is False
+    ok, note = runner.lane_verdict(res, n_modules=4)
+    assert ok is False
+    assert "could not be collected" in note
+    assert "registered/unit/mem_cache/test_x.py" in note
 
 
 # ---------------------------------------------------------------------------
@@ -365,3 +425,25 @@ def test_g0_t11_a_broken_extraction_is_still_refused(tmp_path):
     assert res.tally_ok is False
     assert "names failed=1" in res.tally_note
     assert "summary failed=3" in res.tally_note
+
+
+def test_g0_t11b_a_broken_error_extraction_is_also_refused(tmp_path):
+    """THE ERROR HALF of §5.3 rule 1, which is the half #1207 actually broke
+    (`names error=5 vs summary error=11`) and the half G0-T-11 does not reach:
+    it asserts only the FAILED terms, so an ERROR comparison replaced by a
+    self-comparison (`want_e = res.error_lines`) passes every other arm.
+
+    THE HAZARD that shape carries: both terms would come from the SAME object,
+    a guard that cannot fire, and it produces a FALSE PASS on exactly the
+    xdist collection-error shape below -- four extracted names against a
+    summary counting eight reports, one per worker."""
+    name = "test/registered/unit/managers/test_pp_proxy_stamp_631.py"
+    log = _write(
+        tmp_path,
+        "".join(f"ERROR {name} - AttributeErr...\n" for _ in range(4))
+        + "8 errors in 1.00s\n",
+    )
+    res = lib.parse_log(log)
+    assert res.tally_ok is False
+    assert "names error=4" in res.tally_note
+    assert "summary error=8" in res.tally_note
