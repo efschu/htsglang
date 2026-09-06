@@ -48,9 +48,17 @@ named in the NEGATIVE (``MISMATCH``, ``INCOMPLETE``). This is the polarity
      73	# veto anything.
 
 A term whose producer has not landed yet reads its NEUTRAL, never the falsy
-default: an AND-slot reads ``1``, a pair reads ``(0, 0)``, a census slot reads
-``1``. Packing an unproduced AND-slot with ``0`` makes every rank raise from the
-first scheduler iteration and kills every boot until that producer's batch.
+default: an AND-slot reads ``1`` (packed ``(1, -1)``), a pair reads ``(0, 0)``,
+a census slot reads ``1``. Packing an unproduced AND-slot with ``0`` makes every
+rank raise from the first scheduler iteration and kills every boot until that
+producer's batch.
+
+AN AND TERM RIDES AS A PAIR TOO, ``(v, -v)``. A one-slot AND term gives the
+unpack a minimum and nothing else, so the STOP line printed the minimum under
+both names and could not tell a unanimous refusal from a partial one -- which
+is the whole question on a death path, because a partial refusal names
+something rank-local as the cause. The negated half is exact at any world size;
+the per-rank census below is the finer statement and is bounded by its width.
 
 WHAT A COUNT PAIR DOES AND DOES NOT CATCH -- A NAMED LIMIT, NOT AN OMISSION.
 The ``(x, -x)`` pair makes ``group_min`` and ``group_max`` visible on every rank,
@@ -95,14 +103,28 @@ PHASE_DOMAIN_CENSUS_SLOTS = 8
 class _Term:
     """One voted term of the packed bus. ONE ENTRY PER VOTED TERM."""
 
-    __slots__ = ("name", "kind", "width", "neutral", "refusal", "terse_stop")
+    __slots__ = ("name", "kind", "width", "neutral", "refusal", "terse_stop", "of")
 
-    def __init__(self, name, kind, refusal, *, width=None, neutral=None, terse_stop=False):
+    def __init__(
+        self, name, kind, refusal, *, width=None, neutral=None, terse_stop=False, of=None
+    ):
         self.name = name
         self.kind = kind
         self.refusal = refusal
+        #: For a CENSUS_BLOCK: the AND term whose per-rank votes it carries. A
+        #: census that names no term is a row any STOP line can print as its
+        #: own, which is how a slot-15 death printed the loadback census under
+        #: slot 15's name and contradicted the votes beside it.
+        self.of = of
         if kind == AND_SLOT:
-            self.width = 1
+            # TWO SLOTS, `(v, -v)`, exactly as a pair. A 1-wide AND slot on a
+            # MIN reduce carries no MAXIMUM, so the unpack had nothing to print
+            # beside `group_min` and printed the minimum twice -- a line that
+            # reads as a unanimous refusal whether the refusal was unanimous or
+            # 2-of-3. The negated half is what makes "at least one rank was
+            # healthy" visible on EVERY rank of the reduce, and it is exact at
+            # any world size, unlike the census, which is bounded.
+            self.width = 2
             self.neutral = 1
         elif kind in (DIVERGENCE_PAIR, MAX_PAIR):
             self.width = 2
@@ -115,25 +137,39 @@ class _Term:
         self.terse_stop = terse_stop
 
 
-#: THE PACKED-BUS LAYOUT. Twenty-one scalar terms plus the census block, in
+#: THE PACKED-BUS LAYOUT. Twenty-six scalar slots plus TWO census blocks, in
 #: order. A term added later adds a ROW here and re-derives the constant below;
 #: it never appends silently.
 #:
+#: EVERY AND TERM IS TWO SLOTS, `(v, -v)`. The scalar count was 21 while an AND
+#: slot was one slot wide; the MAX half added here is what lets a STOP line say
+#: whether the refusal was unanimous (see `_Term.__init__`).
+#:
+#: A CENSUS BLOCK NAMES THE TERM IT CENSUSES. There is one per AND term whose
+#: STOP line has to say WHICH rank refused, and only those: a census is eight
+#: slots, and the other three AND terms have no measured need for one, so they
+#: render `per_rank=[none]` rather than borrowing a row that is not theirs.
+#:
 #: | slot(s) | term | produced by | the refusal it carries |
-#: | 0       | loader_covers_own_layers    | S2-C3      | #1206 LOADER COVERAGE REFUSED |
-#: | 1-2     | d_domain                    | S2-C3      | #1206 TRANSFER DOMAIN DIVERGENT |
-#: | 3-4     | d_host_prov                 | S4-C5      | [#928 anchor/host] REFUSING resume |
-#: | 5-6     | d_ownership                 | S5-C4c     | #924 MAMBA OWNERSHIP SPLIT AT DONATION |
-#: | 7-8     | d_state_src                 | S5-C6      | #924 STATE SOURCE CONTRADICTION |
-#: | 9       | loadback_coverage_complete  | S2-C2      | #1206 LOADBACK COVERAGE INCOMPLETE |
-#: | 10      | draft_tier_domain_matches   | NO PRODUCER| #1206 DRAFT TIER DOMAIN MISMATCH |
-#: | 11-12   | d_host_unresolvable         | S3-C9      | #1206 HOST POOL UNRESOLVABLE |
-#: | 13-14   | d_slot_ownership            | S5-C4b/d   | #924 SLOT OWNERSHIP REFUSED |
-#: | 15      | rebind_domain_within_driven | S1-C16     | #1206 REBIND DOMAIN OUTSIDE DRIVEN |
-#: | 16-17   | d_geom                      | S4-C6      | the host->device geometry condition |
-#: | 18      | host_ring_discarded         | S7-C10     | #1206 HOST RING NOT DISCARDED |
-#: | 19-20   | d_backup_width              | S7 F-E(b)  | the host backup-width condition |
-#: | 21..    | census[0 .. N-1]            | S2-C2      | the per_rank=[...] census in the message |
+#: | 0-1     | loader_covers_own_layers    | S2-C3      | #1206 LOADER COVERAGE REFUSED |
+#: | 2-3     | d_domain                    | S2-C3      | #1206 TRANSFER DOMAIN DIVERGENT |
+#: | 4-5     | d_host_prov                 | S4-C5      | [#928 anchor/host] REFUSING resume |
+#: | 6-7     | d_ownership                 | S5-C4c     | #924 MAMBA OWNERSHIP SPLIT AT DONATION |
+#: | 8-9     | d_state_src                 | S5-C6      | #924 STATE SOURCE CONTRADICTION |
+#: | 10-11   | loadback_coverage_complete  | S2-C2      | #1206 LOADBACK COVERAGE INCOMPLETE |
+#: | 12-13   | draft_tier_domain_matches   | NO PRODUCER| #1206 DRAFT TIER DOMAIN MISMATCH |
+#: | 14-15   | d_host_unresolvable         | S3-C9      | #1206 HOST POOL UNRESOLVABLE |
+#: | 16-17   | d_slot_ownership            | S5-C4b/d   | #924 SLOT OWNERSHIP REFUSED |
+#: | 18-19   | rebind_domain_within_driven | S1-C16     | #1206 REBIND DOMAIN OUTSIDE DRIVEN |
+#: | 20-21   | d_geom                      | S4-C6      | the host->device geometry condition |
+#: | 22-23   | host_ring_discarded         | S7-C10     | #1206 HOST RING NOT DISCARDED |
+#: | 24-25   | d_backup_width              | S7 F-E(b)  | the host backup-width condition |
+#: | 26..    | census_loadback[0 .. N-1]   | S2-C2      | loadback_coverage_complete's per_rank row |
+#: | ..      | census_rebind[0 .. N-1]     | S1-C16     | rebind_domain_within_driven's per_rank row |
+#:
+#: THE SLOT NUMBERS ABOVE ARE DOCUMENTATION AND HAVE MOVED ONCE ALREADY. Every
+#: reader indexes through `index_of(name)`; a consumer that types a number is
+#: the defect this comment exists to make visible, not to enable.
 PHASE_DOMAIN_LAYOUT: Tuple[_Term, ...] = (
     _Term("loader_covers_own_layers", AND_SLOT, "#1206 LOADER COVERAGE REFUSED"),
     _Term("d_domain", DIVERGENCE_PAIR, "#1206 TRANSFER DOMAIN DIVERGENT"),
@@ -154,11 +190,20 @@ PHASE_DOMAIN_LAYOUT: Tuple[_Term, ...] = (
     ),
     _Term("d_backup_width", MAX_PAIR, "host backup width mismatch count"),
     _Term(
-        "census",
+        "census_loadback",
         CENSUS_BLOCK,
         "the per-rank census (never a STOP condition)",
         width=PHASE_DOMAIN_CENSUS_SLOTS,
         neutral=1,
+        of="loadback_coverage_complete",
+    ),
+    _Term(
+        "census_rebind",
+        CENSUS_BLOCK,
+        "the per-rank census (never a STOP condition)",
+        width=PHASE_DOMAIN_CENSUS_SLOTS,
+        neutral=1,
+        of="rebind_domain_within_driven",
     ),
 )
 
@@ -174,6 +219,13 @@ for _term in PHASE_DOMAIN_LAYOUT:
     _PHASE_DOMAIN_INDEX[_term.name] = _at
     _at += _term.width
 del _at, _term
+
+#: The census block belonging to each censused term, DERIVED from the table.
+#: A STOP line renders THIS mapping and nothing else, so no term can print a
+#: row that was voted for a different question.
+_CENSUS_OF: Dict[str, _Term] = {
+    _c.of: _c for _c in PHASE_DOMAIN_LAYOUT if _c.kind == CENSUS_BLOCK and _c.of
+}
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +305,11 @@ def index_of(term_name: str) -> int:
 
 
 def slot_of(payload: Sequence[int], term_name: str) -> int:
-    """The single scalar of an AND term, read by name."""
+    """The VOTE half of an AND term, read by name.
+
+    An AND term is packed `(v, -v)` like a pair; this returns `v`, which is
+    what a caller reading its own contribution wants. The negated half is for
+    the unpack's MAX and is never read through here."""
     return int(payload[index_of(term_name)])
 
 
@@ -286,17 +342,20 @@ def pack_phase_domain_payload(terms: Optional[Dict[str, Any]] = None) -> List[in
     """This rank's contribution, packed in declared order.
 
     ``terms`` maps a term name to this rank's value. A term ABSENT from the
-    mapping has no producer yet and contributes its NEUTRAL -- 1 for an
-    AND-slot, ``(0, 0)`` for a pair, 1 for each census slot. Each ``(x, -x)``
-    pair is built exactly as ``prefetch_ballot.py:99-100`` builds its digest
-    pair, which is what makes the group's min AND max visible on every rank.
+    mapping has no producer yet and contributes its NEUTRAL -- ``(1, -1)`` for
+    an AND-slot, ``(0, 0)`` for a pair, 1 for each census slot. Each
+    ``(x, -x)`` pair is built exactly as ``prefetch_ballot.py:99-100`` builds
+    its digest pair, which is what makes the group's min AND max visible on
+    every rank -- AND-slots included, since the round-3 line could not say
+    whether a refusal was unanimous.
     """
     terms = {} if terms is None else terms
     payload: List[int] = []
     for term in PHASE_DOMAIN_LAYOUT:
         if term.kind == AND_SLOT:
-            value = terms.get(term.name, term.neutral)
-            payload.append(1 if int(value) else 0)
+            vote = 1 if int(terms.get(term.name, term.neutral)) else 0
+            payload.append(vote)
+            payload.append(-vote)
         elif term.kind in (DIVERGENCE_PAIR, MAX_PAIR):
             value = int(terms.get(term.name, term.neutral))
             payload.append(value)
@@ -442,6 +501,20 @@ def _bound_phase() -> Any:
         return None
 
 
+def _own_census_slot(rank: int, vote: int) -> List[int]:
+    """This rank's census row for one term: its own vote at its own position,
+    the MIN-neutral 1 everywhere else, so the reduce leaves each position
+    holding exactly the rank that owns it.
+
+    A rank whose index is at or beyond the block width owns no slot and writes
+    the neutral row -- the BOUNDED LIMIT the unpack prints as `?` from the
+    world size rather than as the healthy `1` a real rank also writes."""
+    census = [1] * PHASE_DOMAIN_CENSUS_SLOTS
+    if 0 <= rank < PHASE_DOMAIN_CENSUS_SLOTS:
+        census[rank] = 1 if int(vote) else 0
+    return census
+
+
 def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
     """This rank's value for every term, read at its ONE declared home.
 
@@ -485,10 +558,7 @@ def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
         setattr(controller, LOADBACK_INCOMPLETE_ATTR, False)
 
     rank = int(getattr(getattr(scheduler, "ps", None), "tp_rank", 0) or 0)
-    census = [1] * PHASE_DOMAIN_CENSUS_SLOTS
-    if 0 <= rank < PHASE_DOMAIN_CENSUS_SLOTS:
-        census[rank] = loadback_complete
-    terms["census"] = census
+    terms["census_loadback"] = _own_census_slot(rank, loadback_complete)
 
     # Slot 10 -- NO PRODUCER, and this absence is the fix rather than an
     # omission. The term compared the DRAFT host tier's layer count against
@@ -522,10 +592,16 @@ def read_phase_domain_terms(scheduler: Any) -> Dict[str, Any]:
     # Slots 13-14 -- S5-C4b/S5-C4d (B5), all four allocator transitions summed.
     terms["d_slot_ownership"] = _take_per_pass_count(allocator, SLOT_OWNERSHIP_ATTR)
 
-    # Slot 15 -- S1-C16 (B1), computed on read through the named accessor.
-    terms["rebind_domain_within_driven"] = _rebind_domain_within_driven(
+    # Slot 15 -- S1-C16 (B1), computed on read through the named accessor. Its
+    # census carries the SAME value at this rank's own position; a census with
+    # no producer renders the neutral row on every rank, which is what made the
+    # slot-15 death line unreadable (measured: `per_rank=[1,1,1]` beside two
+    # `local=0` votes).
+    rebind_within_driven = _rebind_domain_within_driven(
         controller, group, _bound_phase()
     )
+    terms["rebind_domain_within_driven"] = rebind_within_driven
+    terms["census_rebind"] = _own_census_slot(rank, rebind_within_driven)
 
     # Slots 16-17 -- S4-C6 (B4), MAX-consumed.
     terms["d_geom"] = _take_per_pass_count(_mamba_host_pool(group), GEOM_MISMATCH_ATTR)
@@ -593,36 +669,75 @@ _RAENGE = (
 )
 
 #: THE SAME LAW, THE OTHER SHAPE, and the two must not be told in one sentence.
-#: An AND slot at 0 and a MAX pair above 0 say "at least one rank refused" --
-#: a MIN carries no count, so neither can distinguish one refusing rank from
-#: all of them, and a UNANIMOUS refusal rendered as "the ranks do not agree"
-#: sends the reader hunting for a divergence that is not there. Measured: the
-#: first cutover of boot_855_weg1b12s1 printed
-#: `local=0 group_min=0 group_max=0 per_rank=[1,1,1]` under the divergence
-#: sentence. Only the min != max pairs are DISAGREEMENT; these are REFUSALS.
+#: An AND slot at 0 and a MAX pair above 0 say "at least one rank refused", and
+#: a UNANIMOUS refusal rendered as "the ranks do not agree" sends the reader
+#: hunting for a divergence that is not there. Measured: the first cutover of
+#: boot_855_weg1b12s1 printed `local=0 group_min=0 group_max=0 per_rank=[1,1,1]`
+#: under the divergence sentence. Only the min != max pairs are DISAGREEMENT;
+#: these are REFUSALS.
+#:
+#: THIS SENTENCE WAS ITSELF WRONG IN THE ROUND-3 SHAPE and is corrected here:
+#: it said "a MIN carries no count, so this line does not say whether the
+#: refusal was unanimous", which was true only while an AND slot was one slot
+#: wide and `group_max` was a copy of `group_min`. Both halves of the AND term
+#: now ride the reduce, so `group_max` is a real maximum and the line DOES
+#: separate a unanimous refusal from a partial one.
+#:
+#: THE PROSE MUST NOT SPELL A FIELD THE LINE ALSO RENDERS. An earlier draft of
+#: this sentence wrote the two cases as `group_max=1` and `group_max=0`, and
+#: two mutation probes then SURVIVED because an assertion looking for the
+#: rendered value found the law text instead -- a guard that cannot fail,
+#: manufactured by the instrument's own explanatory sentence. The cases are
+#: named in words here for that reason.
 _RAENGE_REFUSED = (
     "RAENGE-NIE-UNEINS: at least one rank refused a fact that decides state "
-    "reuse. A MIN carries no count, so this line does not say whether the "
-    "refusal was unanimous; `local=` above is this rank's own vote. No "
-    "compensation exists for either shape; the group stops."
+    "reuse. A group max of one means at least one rank was HEALTHY, i.e. the "
+    "refusal was partial and depends on something rank-local; a group max of "
+    "zero means every rank refused. The `local=` field is this rank's own "
+    "vote. No compensation exists for either shape; the group stops."
 )
 
 
 class PhaseDomainVerdict:
     """What the group said, per term. A message field, never a second record."""
 
-    __slots__ = ("and_slots", "pairs", "census", "per_rank", "census_width", "world_size")
+    __slots__ = (
+        "and_slots",
+        "and_maxima",
+        "pairs",
+        "census",
+        "per_rank",
+        "census_width",
+        "world_size",
+    )
 
-    def __init__(self, and_slots, pairs, census, per_rank, census_width, world_size):
+    def __init__(
+        self, and_slots, and_maxima, pairs, census, per_rank, census_width, world_size
+    ):
         self.and_slots = and_slots
+        #: The group MAX of each AND term, from the negated half of its pair.
+        #: `and_slots[name] == 0 and and_maxima[name] == 1` is the 2-of-3 shape
+        #: the one-slot layout could not express.
+        self.and_maxima = and_maxima
         self.pairs = pairs
+        #: Per CENSUSED term name, not per bus: a census belongs to the term it
+        #: was voted for.
         self.census = census
         self.per_rank = per_rank
         self.census_width = census_width
         self.world_size = world_size
 
 
-def _render_census(reduced: Sequence[int], world_size: Optional[int]) -> Tuple[List[Any], str]:
+#: What a STOP line prints where the failing term has no per-rank census. NOT
+#: an empty list and NOT another term's row: a reader who sees a bracketed row
+#: of numbers reads them as this term's votes, which is exactly how a slot-15
+#: death came to print `per_rank=[1,1,1]` beside two `local=0` votes.
+CENSUS_ABSENT_ROW = "none"
+
+
+def _render_census(
+    reduced: Sequence[int], world_size: Optional[int], term_name: str
+) -> Tuple[Optional[List[Any]], str, int]:
     """THREE CASES, and the third is decided by the WORLD SIZE, never by a value.
 
     * ``census[r]`` reduces to exactly rank r's own flag for every r below the
@@ -632,17 +747,24 @@ def _render_census(reduced: Sequence[int], world_size: Optional[int]) -> Tuple[L
       indistinguishable from a healthy rank ON THE PAYLOAD ALONE. The caller
       knows the world size, so those positions render ``?``.
     * The rendering is a message field. Nothing about the census is ever a STOP
-      condition -- that stays the loadback AND-slot.
+      condition -- that stays the term's own AND-slot.
+
+    KEYED BY THE CENSUSED TERM. A term with no census of its own gets no row at
+    all rather than the first block in the table; the group MAX above it is the
+    exact statement for those terms, and it is not bounded by the census width.
     """
-    at = index_of("census")
+    block = _CENSUS_OF.get(term_name)
+    if block is None:
+        return None, CENSUS_ABSENT_ROW, 0
+    at = index_of(block.name)
     values: List[Any] = []
-    for offset in range(PHASE_DOMAIN_CENSUS_SLOTS):
+    for offset in range(block.width):
         if world_size is not None and offset >= int(world_size):
             values.append(None)
         else:
             values.append(int(reduced[at + offset]))
     rendered = ",".join("?" if v is None else str(v) for v in values)
-    return values, rendered
+    return values, rendered, block.width
 
 
 def unpack_phase_domain(
@@ -670,37 +792,64 @@ def unpack_phase_domain(
     local = {} if local is None else local
 
     and_slots: Dict[str, int] = {}
+    and_maxima: Dict[str, int] = {}
     pairs: Dict[str, Tuple[int, int]] = {}
+    census: Dict[str, List[Any]] = {}
+    per_rank: Dict[str, str] = {}
     for term in PHASE_DOMAIN_LAYOUT:
         at = index_of(term.name)
         if term.kind == AND_SLOT:
             and_slots[term.name] = int(reduced[at])
+            and_maxima[term.name] = -int(reduced[at + 1])
         elif term.kind in (DIVERGENCE_PAIR, MAX_PAIR):
             pairs[term.name] = (int(reduced[at]), -int(reduced[at + 1]))
 
-    census, per_rank = _render_census(reduced, world_size)
+    for censused in _CENSUS_OF:
+        values, rendered, _width = _render_census(reduced, world_size, censused)
+        census[censused] = values
+        per_rank[censused] = rendered
+
     verdict = PhaseDomainVerdict(
-        and_slots, pairs, census, per_rank, PHASE_DOMAIN_CENSUS_SLOTS, world_size
+        and_slots,
+        and_maxima,
+        pairs,
+        census,
+        per_rank,
+        PHASE_DOMAIN_CENSUS_SLOTS,
+        world_size,
     )
+
+    def _row(term_name):
+        """THE ROW THIS TERM VOTED, never the first census in the table. A
+        borrowed row contradicts the `local=` value printed beside it and sends
+        the reader after a divergence that is not there.
+
+        Called only on the raise path: this unpack runs once per scheduler pass
+        in the TP phase, and rendering every term's row on the healthy path
+        would be thirteen list builds per pass for a message nobody prints."""
+        return _render_census(reduced, world_size, term_name)[1:]
 
     for term in PHASE_DOMAIN_LAYOUT:
         if term.kind == AND_SLOT:
             group_min = and_slots[term.name]
             if group_min == 0:
+                _rendered, _width = _row(term.name)
                 raise PhaseDomainDivergence(
                     _stop_message(
                         term,
                         rank=rank,
                         local=local.get(term.name),
                         group_min=group_min,
-                        group_max=group_min,
+                        group_max=and_maxima[term.name],
                         phase=phase,
-                        per_rank=per_rank,
+                        per_rank=_rendered,
+                        census_width=_width,
                     )
                 )
         elif term.kind == DIVERGENCE_PAIR:
             group_min, group_max = pairs[term.name]
             if group_min != group_max:
+                _rendered, _width = _row(term.name)
                 raise PhaseDomainDivergence(
                     _stop_message(
                         term,
@@ -709,7 +858,8 @@ def unpack_phase_domain(
                         group_min=group_min,
                         group_max=group_max,
                         phase=phase,
-                        per_rank=per_rank,
+                        per_rank=_rendered,
+                        census_width=_width,
                     )
                 )
         elif term.kind == MAX_PAIR:
@@ -718,6 +868,7 @@ def unpack_phase_domain(
             # condition is a wrong answer on ANY rank, so a nonzero count that
             # is UNIFORM must stop the group too.
             if group_max > 0:
+                _rendered, _width = _row(term.name)
                 raise PhaseDomainDivergence(
                     _stop_message(
                         term,
@@ -726,13 +877,16 @@ def unpack_phase_domain(
                         group_min=group_min,
                         group_max=group_max,
                         phase=phase,
-                        per_rank=per_rank,
+                        per_rank=_rendered,
+                        census_width=_width,
                     )
                 )
     return verdict
 
 
-def _stop_message(term, *, rank, local, group_min, group_max, phase, per_rank) -> str:
+def _stop_message(
+    term, *, rank, local, group_min, group_max, phase, per_rank, census_width
+) -> str:
     # WHICH LAW SENTENCE, decided by the KIND of the term and not by its
     # values: a divergence pair really did disagree (min != max), while an AND
     # slot and a MAX pair say only that at least one rank refused.
@@ -759,7 +913,10 @@ def _stop_message(term, *, rank, local, group_min, group_max, phase, per_rank) -
             int(group_max),
             phase,
             per_rank,
-            PHASE_DOMAIN_CENSUS_SLOTS,
+            # THIS TERM'S census width, 0 when it has none -- not the module
+            # constant, which would claim eight per-rank slots on a line whose
+            # `per_rank` says there are none.
+            int(census_width),
             law,
         )
     )

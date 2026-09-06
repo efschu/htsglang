@@ -841,16 +841,18 @@ class TestTheDraftTierDomainTerm(unittest.TestCase):
 class _CounterSpy:
     """A ``LayerDoneCounter`` stand-in that records resizes.
 
-    Carries ``consumer_index`` because that, with the controller's
-    ``ack_load_queue``, is the quiescence the resize is conditioned on: a
-    resize rebuilds the very ``load_events`` an in-flight load already
-    recorded into, and an unrecorded event queries True, so a resize taken
-    mid-load acks copies that never landed.
+    ``consumer_index`` IS ITS OWN KNOB, and it is separate from the
+    controller's ``ack_load_queue`` on purpose. A single ``quiescent`` flag
+    setting both at once is what let an off-by-one on the consumer arm survive
+    the whole slice: the queue alone carried every refusal, so no assertion
+    ever read the consumer term. The two states this counter can be in --
+    "a load's events are mid-record" and "a forward pass was pointed at an
+    event slot" -- are different facts and are driven separately.
     """
 
-    def __init__(self, num_layers, *, quiescent=True):
+    def __init__(self, num_layers, *, consumer_index=-1):
         self.num_layers = num_layers
-        self.consumer_index = -1 if quiescent else 0
+        self.consumer_index = consumer_index
         self.resized_to = []
 
     def resize(self, num_layers):
@@ -896,10 +898,14 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
             state._phase, state._generation = before
         return captured.output
 
-    def _controller(self, counter, *, quiescent=True):
+    def _controller(self, counter, *, loads_in_flight=0):
+        """``loads_in_flight`` is the ack queue's DEPTH, and it is the only
+        knob this helper owns -- the counter's ``consumer_index`` is set on the
+        counter itself, so the two arms of the precondition can be driven one
+        at a time."""
         return types.SimpleNamespace(
             layer_done_counter=counter,
-            ack_load_queue=[] if quiescent else [object()],
+            ack_load_queue=[object() for _ in range(loads_in_flight)],
             mem_pool_host=None,
             mem_pool_device=None,
             mem_pool_device_hybrid=None,
@@ -946,12 +952,17 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
         """THE PRECONDITION, and it is not decoration: rebuilding the event
         list under an in-flight load hands the ACK an event nothing recorded.
         The resize is declined, ONE line names the reason, and the detector
-        still fires so slot 15 carries the group STOP."""
+        still fires so slot 15 carries the group STOP.
+
+        THE ACK QUEUE ARM ALONE, with the consumer arm parked at -1. The two
+        were driven together until this round, so a change to the consumer arm
+        moved no assertion at all.
+        """
         from sglang.srt.managers import phase_domain_verdict as pdv
 
         tp_group, _f, _m = _group_for_stage(0, 64)
-        counter = _CounterSpy(50, quiescent=False)
-        controller = self._controller(counter, quiescent=False)
+        counter = _CounterSpy(50, consumer_index=-1)
+        controller = self._controller(counter, loads_in_flight=1)
         lines = self._rebind_with(controller, tp_group)
 
         self.assertEqual(counter.resized_to, [])
@@ -962,6 +973,8 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
         self.assertEqual(len(refusals), 1)
         self.assertIn("driven=64", refusals[0])
         self.assertIn("counter_width=50", refusals[0])
+        self.assertIn("ack_load_queue=1", refusals[0])
+        self.assertIn("consumer_index=-1", refusals[0])
         self.assertEqual(
             len([x for x in lines if "#1206 REBIND DOMAIN OUTSIDE DRIVEN" in x]),
             1,
@@ -970,6 +983,90 @@ class TestTheCounterFollowsTheRebind(unittest.TestCase):
         self.assertEqual(
             pdv._rebind_domain_within_driven(controller, tp_group, "tp"), 0
         )
+
+    def test_a_consumer_index_alone_does_not_decline_the_resize(self):
+        """THE FIFTH-CUTOVER BOOT KILLER, driven at the state the metal was in.
+
+        boot_855_weg1b12s1f3_6d78227979_0906_134543.log, generation=5, all
+        three ranks: ``#1206 REBIND COUNTER RESIZE REFUSED reader=cache_controller
+        driven=64 counter_width=32 ack_load_queue=0 consumer_index=1`` on PP0
+        and the same with ``counter_width=50`` on PP1. The ack queue was EMPTY;
+        the consumer term alone declined the resize, the counter kept the
+        outgoing width, the detector fired, and slot 15 stopped the group.
+
+        WHY THE EMPTY QUEUE IS ALREADY THE PROOF. An ack is appended the
+        instant the copies are enqueued (`hybrid_cache_controller.py:714-720`,
+        `cache_controller.py:1985`) and is popped only after its finish event
+        has queried True (`unified_radix_cache.py:5328-5332` counts the leading
+        ready entries, `:5392-5393` pops exactly those). An empty queue is
+        therefore proof that no load's events are mid-record.
+        ``consumer_index`` is not that fact: it is the event-slot pointer the
+        last forwarded batch left on the counter (`tp_worker.py:553` ->
+        `:487-489`), and it stays >= 0 until a batch without a load or a
+        ``reset()`` moves it.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        tp_group, _f, _m = _group_for_stage(0, 64)
+        counter = _CounterSpy(50, consumer_index=1)
+        controller = self._controller(counter, loads_in_flight=0)
+        lines = self._rebind_with(controller, tp_group)
+
+        self.assertEqual(counter.resized_to, [64])
+        self.assertEqual(counter.num_layers, 64)
+        self.assertEqual(
+            [x for x in lines if "#1206 REBIND COUNTER RESIZE REFUSED" in x],
+            [],
+            "an empty ack queue is quiescent; the consumer pointer is not a "
+            "load in flight",
+        )
+        self.assertEqual(
+            [x for x in lines if "#1206 REBIND DOMAIN OUTSIDE DRIVEN" in x], []
+        )
+        self.assertEqual(
+            pdv._rebind_domain_within_driven(controller, tp_group, "tp"),
+            1,
+            "slot 15 votes healthy, so no group STOP at the fifth cutover",
+        )
+
+    def test_the_counter_narrows_when_the_incoming_domain_is_smaller(self):
+        """THE NARROWING DIRECTION -- the danger direction the spec names.
+
+        `WEG1_BUILD_SPEC_0905.md:406-410`: a counter WIDER than the domain the
+        loop drives hands the ACK a `load_events[63]` that was never recorded
+        and queries True immediately, so the load is acked before its copies
+        land. Every other actuator arm here widens 50 -> 64, and a grow-only
+        actuator passes all of them.
+        """
+        tp_group, _f, _m = _group_for_stage(0, 32)
+        self.assertEqual(tp_group.transfer_layer_domain, 32)
+        counter = _CounterSpy(64)
+        controller = self._controller(counter)
+        lines = self._rebind_with(controller, tp_group)
+
+        self.assertEqual(counter.resized_to, [32])
+        self.assertEqual(counter.num_layers, 32)
+        self.assertEqual(
+            [x for x in lines if "#1206 REBIND DOMAIN OUTSIDE DRIVEN" in x], []
+        )
+
+    def test_the_real_counter_class_narrows_its_event_lists_too(self):
+        """The narrowing arm on the tree's own class, and the assertion a
+        grow-only actuator cannot pass: ``finish_event`` is ``load_events[-1]``
+        (`cache_controller.py:77-79`), so after narrowing to 32 the ACK's
+        finish event must BE the 32nd event and not a 64th nothing records."""
+        from sglang.srt.managers.cache_controller import LayerDoneCounter
+
+        tp_group, _f, _m = _group_for_stage(0, 32)
+        counter = LayerDoneCounter(64)
+        controller = self._controller(counter)
+        self._rebind_with(controller, tp_group)
+
+        self.assertEqual(counter.num_layers, 32)
+        for event in counter.events:
+            self.assertEqual(len(event.load_events), 32)
+            self.assertEqual(event._num_layers, 32)
+            self.assertIs(event.finish_event, event.load_events[31])
 
     def test_a_reader_without_a_counter_is_not_given_one(self):
         """CAN-NOT-FIRE PIN. The three readers hold different subsets; a
@@ -995,12 +1092,20 @@ class TestTheRebindDomainTerm(unittest.TestCase):
     the guard-that-cannot-fire this refusal exists to avoid.
     """
 
-    def _readers(self, counter_width, group, *, quiescent=True, counter=None):
+    def _readers(
+        self,
+        counter_width,
+        group,
+        *,
+        loads_in_flight=0,
+        consumer_index=-1,
+        counter=None,
+    ):
         if counter is None:
-            counter = _CounterSpy(counter_width, quiescent=quiescent)
+            counter = _CounterSpy(counter_width, consumer_index=consumer_index)
         controller = types.SimpleNamespace(
             layer_done_counter=counter,
-            ack_load_queue=[] if quiescent else [object()],
+            ack_load_queue=[object() for _ in range(loads_in_flight)],
             mem_pool_host=None,
             mem_pool_device=None,
             mem_pool_device_hybrid=None,
@@ -1019,10 +1124,12 @@ class TestTheRebindDomainTerm(unittest.TestCase):
         pools.layer_num = lambda: group.transfer_layer_domain
         return pools
 
-    def _rebind(self, counter_width, group, *, quiescent=True):
+    def _rebind(self, counter_width, group, *, loads_in_flight=0):
         from sglang.srt.mem_cache import hicache_phase_binding as hpb
 
-        controller = self._readers(counter_width, group, quiescent=quiescent)
+        controller = self._readers(
+            counter_width, group, loads_in_flight=loads_in_flight
+        )
         incoming = self._incoming(group)
         # The two shape guards are S2's subject and refuse a stand-in tier;
         # neutered so what this assertion reads is the domain term alone.
@@ -1063,7 +1170,7 @@ class TestTheRebindDomainTerm(unittest.TestCase):
 
         tp_group, _f, _m = _group_for_stage(0, 64)
         self.assertEqual(tp_group.transfer_layer_domain, 64)
-        controller, lines = self._rebind(50, tp_group, quiescent=False)
+        controller, lines = self._rebind(50, tp_group, loads_in_flight=1)
 
         self.assertEqual(len(lines), 1, "exactly one line at ERROR")
         self.assertIn("64", lines[0])
@@ -1071,6 +1178,29 @@ class TestTheRebindDomainTerm(unittest.TestCase):
         self.assertIn("generation=", lines[0])
         self.assertEqual(
             pdv._rebind_domain_within_driven(controller, tp_group, "tp"), 0
+        )
+
+    def test_arm_2b_a_counter_WIDER_than_driven_is_named_too(self):
+        """THE DETECTOR'S OTHER DIRECTION, and it is the wrong-answer one.
+
+        Arm 2 above drives 50 against a driven 64 -- the counter too NARROW.
+        A detector written `width >= driven` is silent on the opposite state,
+        which is the one `WEG1_BUILD_SPEC_0905.md:406-410` calls a wrong answer:
+        a counter WIDER than the domain the loop drives hands the ACK an event
+        nothing recorded. Reached whenever the resize is declined across a
+        tp->pp cutover, where the outgoing width is the larger one.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        pp_group, _f, _m = _group_for_stage(0, 32)
+        self.assertEqual(pp_group.transfer_layer_domain, 32)
+        controller, lines = self._rebind(64, pp_group, loads_in_flight=1)
+
+        self.assertEqual(len(lines), 1, "exactly one line at ERROR")
+        self.assertIn("driven=32", lines[0])
+        self.assertIn("counter_width=64", lines[0])
+        self.assertEqual(
+            pdv._rebind_domain_within_driven(controller, pp_group, "pp"), 0
         )
 
     def test_arm_1_a_counter_that_followed_logs_nothing_and_votes_one(self):

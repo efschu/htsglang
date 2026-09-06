@@ -313,13 +313,37 @@ def _resize_counters_to_driven(readers: dict, incoming) -> None:
     THE PRECONDITION IS NOT DECORATION. ``resize`` rebuilds every event list,
     and an event that was never recorded queries True -- so a resize taken
     while a load is in flight hands the ACK a finish event for copies that
-    have not landed, which is a wrong answer rather than a crash. The two
-    terms of the quiescence check are the consume authority's own state: the
-    reader's ``ack_load_queue`` (nothing awaiting acknowledgement) and the
-    counter's ``consumer_index`` (nobody waiting on a step). When either says
-    otherwise the resize is DECLINED and named; the group STOP is then carried
-    by slot 15 at the next packed reduce, because a rank-local raise inside a
-    cutover is not the boot-time exception D-20 allows.
+    have not landed, which is a wrong answer rather than a crash. The
+    precondition is the ONE term that states that hazard: the reader's
+    ``ack_load_queue`` is EMPTY. An ack is appended the instant the copies are
+    enqueued (``hybrid_cache_controller.py:714-720``,
+    ``cache_controller.py:1985``) and is popped only after its finish event has
+    queried True (``unified_radix_cache.py:5328-5332`` counts the leading ready
+    entries, ``:5392-5393`` pops exactly those; the mamba and hiradix drains do
+    the same). Both the append and the pop run on the scheduler thread, which
+    is the thread this cutover runs on, so an empty queue here is proof that no
+    load's events are mid-record. When it is not empty the resize is DECLINED
+    and named; the group STOP is then carried by slot 15 at the next packed
+    reduce, because a rank-local raise inside a cutover is not the boot-time
+    exception D-20 allows.
+
+    ``consumer_index`` IS NOT A SECOND TERM, and the round-3 version that made
+    it one was a boot killer. It is the event-slot pointer the last forwarded
+    batch left on the counter (``tp_worker.py:553`` ->
+    ``:487-489`` -> ``LayerDoneCounter.set_consumer``), and it stays >= 0 until
+    a batch without a load or a ``reset()`` moves it -- i.e. it says a consumer
+    has begun stepping, never that a load is recording. Measured, boot
+    boot_855_weg1b12s1f3_6d78227979_0906_134543.log at generation=5 on all
+    three ranks: ``ack_load_queue=0 consumer_index=1``, so the consumer term
+    ALONE declined a resize on a normal long-context leg, the counter kept
+    32/50 against driven=64, and slot 15 stopped the group at the fifth
+    cutover. A device wait already issued by ``wait_until``
+    (``cache_controller.py:119-122``) names the event object live at that call
+    and a later resize cannot reach back into it; a wait issued AFTER the
+    resize lands on a rebuilt event that queries True, which is correct
+    precisely because the empty queue proved those copies had landed. The
+    index is still PRINTED on the refusal line, as a diagnostic and not as a
+    term.
 
     Only readers that ALREADY hold a counter are touched -- inventing one on a
     reader that never had it would be a fourth, silent binding.
@@ -336,7 +360,7 @@ def _resize_counters_to_driven(readers: dict, incoming) -> None:
             continue
         pending = len(getattr(obj, "ack_load_queue", None) or ())
         consumer = int(getattr(counter, "consumer_index", -1))
-        if pending or consumer >= 0:
+        if pending:
             logger.error(
                 "%s #1206 REBIND COUNTER RESIZE REFUSED reader=%s driven=%d "
                 "counter_width=%d ack_load_queue=%d consumer_index=%d: a "
