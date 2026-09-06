@@ -1,0 +1,133 @@
+ERROR    sglang.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289 PHASE-FLIP SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (pp_to_tp). 8 consecutive group abandons reached the cap; this rank: staging 4881 MiB needed. The staging ask is a property of the layer map and the live set, so retrying cannot change it and retrying is what kills the instance: each attempt runs the spill ladder while the armed window withholds admissions, and an unbounded loop starves the detokenizer heartbeat until the server stops answering /health while every stack sits IDLE. THE INSTANCE STAYS IN THE pp PHASE AND KEEPS SERVING -- degraded, because the other phase is now unreachable, but alive and saying so. To make the seam fundable, lower --max-total-tokens, raise this rank's --rank-gpu-memory-mib, or choose a layer cut whose seam fits; see SGLANG_SEAM_ABANDON_CAP to change or disable this bound.
+ERROR    sglang.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289 PHASE-FLIP SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (pp_to_tp). 8 consecutive group abandons reached the cap; this rank: rank0 short by 567 MiB. The staging ask is a property of the layer map and the live set, so retrying cannot change it and retrying is what kills the instance: each attempt runs the spill ladder while the armed window withholds admissions, and an unbounded loop starves the detokenizer heartbeat until the server stops answering /health while every stack sits IDLE. THE INSTANCE STAYS IN THE pp PHASE AND KEEPS SERVING -- degraded, because the other phase is now unreachable, but alive and saying so. To make the seam fundable, lower --max-total-tokens, raise this rank's --rank-gpu-memory-mib, or choose a layer cut whose seam fits; see SGLANG_SEAM_ABANDON_CAP to change or disable this bound.
+ERROR    sglang.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289 PHASE-FLIP SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (pp_to_tp). 8 consecutive group abandons reached the cap; this rank: rank0 short by 567 MiB. The staging ask is a property of the layer map and the live set, so retrying cannot change it and retrying is what kills the instance: each attempt runs the spill ladder while the armed window withholds admissions, and an unbounded loop starves the detokenizer heartbeat until the server stops answering /health while every stack sits IDLE. THE INSTANCE STAYS IN THE pp PHASE AND KEEPS SERVING -- degraded, because the other phase is now unreachable, but alive and saying so. To make the seam fundable, lower --max-total-tokens, raise this rank's --rank-gpu-memory-mib, or choose a layer cut whose seam fits; see SGLANG_SEAM_ABANDON_CAP to change or disable this bound.
+ERROR    sglang.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289 PHASE-FLIP SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (pp_to_tp). 8 consecutive group abandons reached the cap; this rank: rank0 short by 567 MiB. The staging ask is a property of the layer map and the live set, so retrying cannot change it and retrying is what kills the instance: each attempt runs the spill ladder while the armed window withholds admissions, and an unbounded loop starves the detokenizer heartbeat until the server stops answering /health while every stack sits IDLE. THE INSTANCE STAYS IN THE pp PHASE AND KEEPS SERVING -- degraded, because the other phase is now unreachable, but alive and saying so. To make the seam fundable, lower --max-total-tokens, raise this rank's --rank-gpu-memory-mib, or choose a layer cut whose seam fits; see SGLANG_SEAM_ABANDON_CAP to change or disable this bound.
+ERROR    sglang.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289 PHASE-FLIP SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (pp_to_tp). 8 consecutive group abandons reached the cap; this rank: rank0 short by 567 MiB. The staging ask is a property of the layer map and the live set, so retrying cannot change it and retrying is what kills the instance: each attempt runs the spill ladder while the armed window withholds admissions, and an unbounded loop starves the detokenizer heartbeat until the server stops answering /health while every stack sits IDLE. THE INSTANCE STAYS IN THE pp PHASE AND KEEPS SERVING -- degraded, because the other phase is now unreachable, but alive and saying so. To make the seam fundable, lower --max-total-tokens, raise this rank's --rank-gpu-memory-mib, or choose a layer cut whose seam fits; see SGLANG_SEAM_ABANDON_CAP to change or disable this bound.
+ERROR    sglang.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289 PHASE-FLIP SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (pp_to_tp). 8 consecutive group abandons reached the cap; this rank: rank0 short by 567 MiB. The staging ask is a property of the layer map and the live set, so retrying cannot change it and retrying is what kills the instance: each attempt runs the spill ladder while the armed window withholds admissions, and an unbounded loop starves the detokenizer heartbeat until the server stops answering /health while every stack sits IDLE. THE INSTANCE STAYS IN THE pp PHASE AND KEEPS SERVING -- degraded, because the other phase is now unreachable, but alive and saying so. To make the seam fundable, lower --max-total-tokens, raise this rank's --rank-gpu-memory-mib, or choose a layer cut whose seam fits; see SGLANG_SEAM_ABANDON_CAP to change or disable this bound.
+ERROR    sglang.srt.managers.phase_flip_runtime:phase_flip_runtime.py:8289 PHASE-FLIP SEAM UNFUNDABLE -- PHASE FLIP STOOD DOWN (pp_to_tp). 8 consecutive group abandons reached the cap; this rank: rank0 short by 567 MiB. The staging ask is a property of the layer map and the live set, so retrying cannot change it and retrying is what kills the instance: each attempt runs the spill ladder while the armed window withholds admissions, and an unbounded loop starves the detokenizer heartbeat until the server stops answering /health while every stack sits IDLE. THE INSTANCE STAYS IN THE pp PHASE AND KEEPS SERVING -- degraded, because the other phase is now unreachable, but alive and saying so. To make the seam fundable, lower --max-total-tokens, raise this rank's --rank-gpu-memory-mib, or choose a layer cut whose seam fits; see SGLANG_SEAM_ABANDON_CAP to change or disable this bound.
+=========================== short test summary info ============================
+FAILED test/registered/unit/managers/test_phase_policy.py::test_batching_small_residual_prefill_does_not_pin_the_server_in_pp
+FAILED test/registered/unit/managers/test_phase_policy.py::test_rest_state_decode_inverts_the_idle_return
+FAILED test/registered/unit/managers/test_arming_floor_funding_662.py::TheOrderIsTheConstraintTest::test_arm_consults_the_relief_before_it_commits_the_direction
+FAILED test/registered/unit/managers/test_phase_policy_flip_reachability.py::TestThePpPhaseIsGovernedByDrainNotAStopwatch::test_the_cap_still_protects_decode_from_starving
+FAILED test/registered/unit/managers/test_phase_policy.py::test_a_request_decoding_in_another_slot_still_arms_the_flip
+FAILED test/registered/unit/managers/test_phase_flip_corridor_gate_631.py::TheGateIsActuallyConsultedTest::test_execute_calls_the_gate
+FAILED test/registered/unit/managers/test_phase_flip_corridor_gate_631.py::TheGateIsActuallyConsultedTest::test_the_gate_runs_before_the_affordability_check
+FAILED test/registered/unit/managers/test_phase_flip_corridor_gate_631.py::TheGateIsActuallyConsultedTest::test_the_refusal_is_folded_into_too_small
+FAILED test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py::test_the_gate_announces_with_an_admission_decision_stashed
+FAILED test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py::test_can_fail_the_gate_still_withholds_with_an_output_stashed
+FAILED test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py::test_the_gate_recovers_as_soon_as_the_output_is_taken
+FAILED test/registered/unit/managers/test_phase_policy.py::test_no_resident_request_anywhere_does_not_arm_the_flip
+FAILED test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py::test_the_shipped_service_turn_runs_the_escape
+FAILED test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py::test_a_raising_channel_probe_withholds_instead_of_announcing
+FAILED test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py::test_a_raising_channel_probe_still_abandons_on_the_deadline
+FAILED test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py::test_a_raising_entry_probe_abandons_before_entering
+FAILED test/registered/unit/managers/test_pp_presence_withholding_deadlock_800.py::test_the_abandonment_names_this_rank_s_own_withhold
+FAILED test/registered/unit/managers/test_phase_policy.py::test_a_chunked_prefill_is_visible_to_the_policy
+FAILED test/registered/unit/managers/test_phase_policy.py::test_a_nearly_finished_chunked_prefill_does_not_move_the_layout
+FAILED test/registered/unit/managers/test_phase_policy.py::test_policy_emits_the_same_request_the_rpc_path_produces
+FAILED test/registered/unit/managers/test_phase_policy.py::test_policy_emits_nothing_below_the_threshold
+FAILED test/registered/unit/managers/test_phase_policy.py::test_gate_holds_the_caller_until_the_group_arrives
+FAILED test/registered/unit/managers/test_phase_policy.py::test_pre_entry_timeout_disarms_loudly_and_keeps_serving
+FAILED test/registered/unit/managers/test_phase_policy.py::test_gate_pumps_the_arm_forward_while_it_waits
+FAILED test/registered/unit/managers/test_phase_policy.py::test_a_failing_pump_never_breaks_the_gate
+FAILED test/registered/unit/managers/test_phase_policy.py::test_park_clock_is_rebased_when_the_group_assembles
+FAILED test/registered/unit/managers/test_phase_policy.py::test_presence_wait_does_not_count_toward_the_park_deadline
+FAILED test/registered/unit/managers/test_phase_policy.py::test_park_clock_is_rebased_once_per_arm_not_once_per_round
+FAILED test/registered/unit/managers/test_phase_policy.py::test_can_fail_presence_is_withheld_while_this_rank_owes_a_send
+FAILED test/registered/unit/managers/test_phase_policy.py::test_can_fail_armed_round_consumes_the_chain_before_it_announces
+FAILED test/registered/unit/managers/test_phase_policy.py::test_a_failing_drain_never_breaks_the_gate
+FAILED test/registered/unit/managers/test_phase_policy.py::test_can_fail_a_rank_that_never_flushes_abandons_instead_of_wedging
+FAILED test/registered/unit/managers/test_phase_policy.py::test_armed_forward_path_services_and_issues_no_new_forward
+FAILED test/registered/unit/managers/test_phase_policy.py::test_can_fail_a_completed_round_does_not_open_the_next_one
+FAILED test/registered/unit/managers/test_phase_policy.py::test_pre_entry_bound_is_per_round_not_per_arm
+FAILED test/registered/unit/managers/test_phase_policy.py::test_can_fail_a_non_quiescent_rank_does_not_announce
+FAILED test/registered/unit/managers/test_phase_policy.py::test_a_quiescent_rank_announces_and_the_gate_opens_on_live_evidence
+FAILED test/registered/unit/managers/test_phase_policy.py::test_can_fail_mid_drain_skew_abandons_within_the_bound_and_keeps_serving
+FAILED test/registered/unit/managers/test_phase_policy.py::test_spin_does_not_return_to_the_caller_between_polls
+FAILED test/registered/unit/managers/test_phase_policy.py::test_can_fail_entering_rank_waits_out_a_withdrawal_then_enters
+FAILED test/registered/unit/managers/test_phase_policy.py::test_the_gate_takes_a_service_turn_on_every_iteration
+FAILED test/registered/unit/managers/test_phase_policy.py::test_a_failing_service_turn_never_breaks_the_gate
+FAILED test/registered/unit/managers/test_phase_policy.py::test_presence_is_withheld_while_a_channel_is_not_empty
+FAILED test/registered/unit/managers/test_phase_policy.py::test_can_fail_a_non_empty_channel_at_entry_abandons_before_entering
+FAILED test/registered/unit/managers/test_pp_idle_void_streak_801.py::TheStreakCountsOneStateOnly::test_a_launched_upstream_clears_the_streak
+FAILED test/registered/unit/managers/test_pp_idle_void_streak_801.py::ThreeRetractionsMayNotBecomeAnEndlessLoop::test_MUTANT_with_the_bound_disabled_the_spin_is_unbounded
+FAILED test/registered/unit/managers/test_phase_policy.py::test_a_rank_that_can_never_empty_its_channels_abandons_instead_of_wedging
+FAILED test/registered/unit/managers/test_pp_idle_void_streak_801.py::ThreeRetractionsMayNotBecomeAnEndlessLoop::test_the_specimen_shape_is_refused_by_name
+FAILED test/registered/unit/managers/test_pp_idle_void_streak_801.py::TheRecordVolumeIsLogarithmicInPractice::test_five_hundred_voids_cost_nine_records
+FAILED test/registered/unit/managers/test_pp_idle_void_streak_801.py::TheRecordVolumeIsLogarithmicInPractice::test_the_reported_record_names_the_streak
+FAILED test/registered/unit/managers/test_pp_idle_void_streak_801.py::TheTwinRecordIsSuppressedInStep::test_a_suppressed_pass_marks_the_twin
+FAILED test/registered/unit/managers/test_pp_idle_void_streak_801.py::TheTwinRecordIsSuppressedInStep::test_the_flag_is_per_pass_and_never_latches
+FAILED test/registered/unit/managers/test_seam_entry_margin_631.py::TestTheBudgetPreventsAWedge::test_a_cleared_gate_does_not_refund_the_budget_by_itself
+FAILED test/registered/unit/managers/test_phase_policy.py::test_the_policy_does_not_arm_a_flip_that_cannot_become_ready
+FAILED test/registered/unit/managers/test_seam_entry_margin_631.py::TestTheDecisionIsGroupUniform::test_a_pure_margin_abandon_is_logged_as_a_DELAY_not_an_ABANDON
+FAILED test/registered/unit/managers/test_seam_entry_margin_631.py::TestTheDecisionIsGroupUniform::test_the_verdict_travels_by_the_existing_collective_min
+FAILED test/registered/unit/managers/test_phase_policy.py::test_without_speculation_the_same_state_does_arm
+FAILED test/registered/unit/managers/test_phase_policy.py::test_the_idle_return_leg_is_untouched_by_the_decline
+FAILED test/registered/unit/managers/test_phase_flip_counters.py::test_the_armed_intake_services_and_never_blocks_on_any_rank[0]
+FAILED test/registered/unit/managers/test_phase_flip_counters.py::test_the_armed_intake_services_and_never_blocks_on_any_rank[1]
+FAILED test/registered/unit/managers/test_phase_flip_counters.py::test_the_armed_intake_services_and_never_blocks_on_any_rank[2]
+FAILED test/registered/unit/managers/test_seam_abandon_cap_631.py::TestTheDampingActuallyDeclines::test_arm_is_declined_inside_the_backoff_window
+FAILED test/registered/unit/managers/test_seam_abandon_cap_631.py::TestTheDampingActuallyDeclines::test_arm_goes_through_once_the_window_passes
+FAILED test/registered/unit/managers/test_seam_abandon_cap_631.py::TestTheDampingActuallyDeclines::test_the_clock_advances_on_declined_arms_too
+FAILED test/registered/unit/managers/test_seam_abandon_cap_631.py::TestTheDampingActuallyDeclines::test_without_a_backoff_window_arm_is_untouched
+FAILED test/registered/unit/managers/test_seam_abandon_cap_631.py::TestTheTerminalVerdict::test_the_cap_installs_a_guard_that_arm_honours
+FAILED test/registered/unit/managers/test_seam_abandon_cap_631.py::TestTheDecisionIsGroupUniform::test_two_ranks_with_the_same_history_decide_the_same_way
+FAILED test/registered/unit/managers/test_seam_abandon_cap_631.py::TestTheDecisionIsGroupUniform::test_a_margin_delay_is_not_damped_by_the_backoff
+FAILED test/registered/unit/managers/test_flip_arm_snapshot_746.py::TestTheSnapshotIsMeasuredAtArm::test_an_idle_arm_snapshots_exactly_nothing
+FAILED test/registered/unit/managers/test_flip_arm_snapshot_746.py::TestTheSnapshotIsMeasuredAtArm::test_arm_captures_the_extent_from_a_fresh_enumeration
+SUBFAILED(abandon="'no_quorum'") test/registered/unit/managers/test_flip_arm_snapshot_746.py::TestTheSnapshotCannotOutliveItsFlip::test_abandon_paths_clear_behaviorally
+SUBFAILED(abandon="'unjoined'") test/registered/unit/managers/test_flip_arm_snapshot_746.py::TestTheSnapshotCannotOutliveItsFlip::test_abandon_paths_clear_behaviorally
+FAILED test/registered/unit/managers/test_flip_arm_snapshot_746.py::TestTheSnapshotCannotOutliveItsFlip::test_every_disarm_site_clears_the_snapshot
+FAILED test/registered/unit/managers/test_seam_cap_retire_485.py::TestTheAbsorbingState::test_the_guard_is_installed_and_blocks_arming
+FAILED test/registered/unit/managers/test_seam_cap_retire_485.py::TestTheAbsorbingState::test_a_resolved_shortage_retires_the_guard_and_arming_resumes
+FAILED test/registered/unit/managers/test_seam_cap_retire_485.py::TestTheRetireLimitClosesTheBackDoor::test_the_limit_is_reachable_and_the_last_verdict_is_permanent
+FAILED test/registered/unit/managers/test_seam_cap_retire_485.py::TestUnrelatedGuardsAreUntouched::test_retiring_the_cap_leaves_other_guards_in_place
+FAILED test/registered/unit/managers/test_pp_wedge_watchdog_is_honest_821.py::TheMarkerIsActuallySetByTheReceive::test_the_marker_is_set_during_the_receive_and_cleared_after
+FAILED test/registered/unit/managers/test_takeable_cache_856.py::TestTheWiringIsLiveAndInertInTheRightPlaces::test_without_cuda_it_is_byte_identical_to_the_old_figure
+FAILED test/registered/unit/managers/test_release_outlives_binding_w35.py::TestItRunsBeforeTheSwap::test_the_settle_precedes_the_rebind
+FAILED test/registered/unit/managers/test_release_outlives_binding_w35.py::TestAgainstTheRealClasses::test_the_real_drain_path_frees_through_mem_pool_host
+FAILED test/registered/unit/managers/test_release_outlives_binding_w35.py::TestAgainstTheRealClasses::test_the_real_host_group_refuses_unowned_frees
+FAILED test/registered/unit/managers/test_tree_congruence_wiring_825.py::test_payload_grew_by_exactly_one_field_and_indices_still_align
+FAILED test/registered/unit/managers/test_tree_congruence_wiring_825.py::test_a_scheduler_without_a_tree_still_contributes_uniform_width
+FAILED test/registered/unit/managers/test_tree_congruence_wiring_825.py::test_congruent_trees_produce_no_onset_and_no_reconcile
+FAILED test/registered/unit/managers/test_tree_congruence_wiring_825.py::test_divergent_trees_are_counted_and_do_not_raise
+FAILED test/registered/unit/managers/test_tree_congruence_wiring_825.py::test_every_rank_reaches_the_same_verdict
+FAILED test/registered/unit/managers/test_tree_congruence_wiring_825.py::test_reconcile_is_off_by_default_after_the_metal_falsification
+FAILED test/registered/unit/managers/test_tree_congruence_wiring_825.py::test_reconcile_fires_on_pp_to_tp_and_resets_every_rank
+FAILED test/registered/unit/managers/test_tree_congruence_wiring_825.py::test_recovery_edge_is_reported_not_only_the_onset
+FAILED test/registered/unit/managers/test_flip_tail_timing_690.py::TheTailIsTimed::test_the_cutover_clock_wraps_the_cutover
+FAILED test/registered/unit/managers/test_flip_tail_timing_690.py::TheTailIsTimed::test_the_movers_clock_closes_after_the_mover_loop
+FAILED test/registered/unit/managers/test_flip_tail_timing_690.py::TheTailIsTimed::test_the_movers_clock_opens_before_the_pre_cutover_census
+FAILED test/registered/unit/managers/test_flip_tail_timing_690.py::TheTailIsTimed::test_the_three_original_timers_are_untouched
+FAILED test/registered/unit/managers/test_flip_tail_timing_690.py::TheNumbersAreReported::test_the_done_line_names_both
+FAILED test/registered/unit/managers/test_flip_tail_timing_690.py::TheNumbersAreReported::test_the_stats_dict_carries_both
+FAILED test/registered/unit/managers/test_pp_arm_slot_outlives_ring_829.py::test_the_leftover_drain_still_runs_on_a_committed_falling_edge
+FAILED test/registered/unit/managers/test_phase_flip_mover_streaming_631.py::TestMoverLiveSetIsBounded::test_outgoing_is_released_before_the_local_leg_is_read
+FAILED test/registered/unit/managers/test_phase_flip_mover_streaming_631.py::TestMoverLiveSetIsBounded::test_pp_to_tp_live_set_is_bounded_by_the_plan
+FAILED test/registered/unit/managers/test_phase_flip_mover_streaming_631.py::TestMoverLiveSetIsBounded::test_tp_to_pp_live_set_is_bounded_by_the_plan
+FAILED test/registered/unit/managers/test_phase_flip_mover_streaming_631.py::TestTheFlipCarriesNoKv::test_the_prefix_tree_is_dropped_once_per_flip_on_every_rank
+FAILED test/registered/unit/managers/test_pp_presence_futile_wait_850.py::TestFutileWaitIsCutShort::test_futile_reason_abandons_at_the_short_bound
+FAILED test/registered/unit/managers/test_pp_presence_futile_wait_850.py::TestFutileWaitIsCutShort::test_mixed_reason_keeps_waiting
+FAILED test/registered/unit/managers/test_pp_presence_futile_wait_850.py::TestFutileWaitIsCutShort::test_self_clearing_reason_is_not_shortened
+FAILED test/registered/unit/managers/test_pp_presence_futile_wait_850.py::TestFutileWaitIsCutShort::test_the_bound_is_disableable_but_detection_continues
+FAILED test/registered/unit/managers/test_pp_presence_futile_wait_850.py::TestFutileWaitIsCutShort::test_the_full_deadline_still_abandons
+FAILED test/registered/unit/managers/test_pp_presence_futile_wait_850.py::TestTheClockIsPerEpisode::test_a_second_arm_gets_its_own_full_bound
+FAILED test/registered/unit/managers/test_pp_presence_futile_wait_850.py::TestTheGrepKeyIsStable::test_the_emitted_line_carries_the_literal
+FAILED test/registered/unit/managers/test_carry_parked_extent_interaction_731_744.py::TestConsumeDoesNotNarrowTheParkedExtent::test_the_real_consume_helper_produces_that_state
+FAILED test/registered/unit/managers/test_exposure_enforcement_reachability_853.py::TheExposureLawIsReachableWhenNoFlipCompletes::test_enforcement_is_not_reachable_from_the_cutover_alone
+FAILED test/registered/unit/managers/test_exposure_enforcement_reachability_853.py::TheExposureLawIsReachableWhenNoFlipCompletes::test_the_arm_enforces_exposure
+FAILED test/registered/unit/managers/test_exposure_enforcement_reachability_853.py::TheExposureLawIsReachableWhenNoFlipCompletes::test_the_arm_names_its_own_seam_event
+FAILED test/registered/unit/managers/test_scheduler_decision_batch_params.py::TestDecisionMethodsHaveNoHiddenBatchChannel::test_decision_methods_take_batches_as_params_not_self
+ERROR test/registered/unit/managers/test_phase_flip_decode_relay_631.py - ImportError while importing test module '/spinning/wt-weg1/test/registered/unit/managers/test_phase_flip_decode_relay_631.py'.
+ERROR test/registered/unit/managers/test_phase_flip_draft_bootstrap_631.py - ImportError while importing test module '/spinning/wt-weg1/test/registered/unit/managers/test_phase_flip_draft_bootstrap_631.py'.
+ERROR test/registered/unit/managers/test_phase_flip_spec_seam_631.py - ImportError while importing test module '/spinning/wt-weg1/test/registered/unit/managers/test_phase_flip_spec_seam_631.py'.
+ERROR test/registered/unit/managers/test_pp_proxy_stamp_631.py - AttributeErr...
+ERROR test/registered/unit/managers/test_pp_proxy_stamp_631.py - AttributeErr...
+ERROR test/registered/unit/managers/test_pp_proxy_stamp_631.py - AttributeErr...
+ERROR test/registered/unit/managers/test_pp_proxy_stamp_631.py - AttributeErr...
+ERROR test/registered/unit/managers/test_pp_proxy_stamp_631.py - AttributeErr...
+ERROR test/registered/unit/managers/test_pp_proxy_stamp_631.py - AttributeErr...
+ERROR test/registered/unit/managers/test_pp_proxy_stamp_631.py - AttributeErr...
+ERROR test/registered/unit/managers/test_pp_proxy_stamp_631.py - AttributeErr...
+113 failed, 3380 passed, 7 skipped, 147 warnings, 11 errors, 337 subtests passed in 191.61s (0:03:11)

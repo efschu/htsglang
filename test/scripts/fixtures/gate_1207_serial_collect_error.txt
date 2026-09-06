@@ -1,0 +1,35 @@
+
+==================================== ERRORS ====================================
+__ ERROR collecting registered/unit/managers/test_quiescence_no_carry_858.py ___
+ImportError while importing test module '/spinning/wt-weg1/test/registered/unit/managers/test_quiescence_no_carry_858.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test/registered/unit/managers/test_quiescence_no_carry_858.py:157: in <module>
+    from sglang.srt.managers.phase_flip_runtime import (  # noqa: E402
+E   ImportError: cannot import name 'prefill_runnable_in_current_layout' from 'sglang.srt.managers.phase_flip_runtime' (/spinning/wt-weg1/python/sglang/srt/managers/phase_flip_runtime.py)
+=============================== warnings summary ===============================
+../htsglang-gpu/.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1464
+  /spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1464: PytestConfigWarning: Unknown config option: asyncio_mode
+  
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../htsglang-gpu/.venv/lib/python3.12/site-packages/torch/jit/_script.py:365: 14 warnings
+  /spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+python/sglang/srt/layers/quantization/awq/awq.py:54
+  /spinning/wt-weg1/python/sglang/srt/layers/quantization/awq/awq.py:54: UserWarning: Only CUDA, HIP and XPU support AWQ currently.
+    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+
+python/sglang/srt/layers/quantization/gguf.py:80
+  /spinning/wt-weg1/python/sglang/srt/layers/quantization/gguf.py:80: UserWarning: Only CUDA, MUSA and NPU support GGUF quantization currently.
+    warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+ERROR test/registered/unit/managers/test_quiescence_no_carry_858.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+17 warnings, 1 error in 13.88s
