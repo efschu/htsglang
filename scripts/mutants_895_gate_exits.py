@@ -23,6 +23,7 @@ whether the arms pass or fail.
     | A8 | serial lane: an ordinary red                  | rc 1, GENUINE      |
     | A9 | the solo re-run itself cannot answer          | rc 3, INCONCLUSIVE |
     |A10 | the solo re-run collects nothing but parses   | rc 3, INCONCLUSIVE |
+    |A11 | a module that cannot be imported at all       | named UNCOLLECTABLE|
     +----+-----------------------------------------------+--------------------+
 
 A2 is the arm #895 exists for. Its probe module fails only when it runs under
@@ -33,6 +34,11 @@ solo re-run does not, and the runner must say so and STILL not report green.
 A4 is the arm that keeps A2 honest. A real red and a crowding artefact in one
 run must exit with the ordinary red code, or a load-sensitive regression could
 be filed under the flake's name.
+
+A11 is the arm for the runner's fourth numbered refusal (#1207), and it is
+END TO END on purpose: the DID NOT RUN census is a print inside ``main()``, so
+a unit arm on ``uncollectable_modules`` proves the list and not the report, and
+deleting the block that prints it would still leave that arm green.
 
 Run:  CUDA_VISIBLE_DEVICES="" <venv>/bin/python3 scripts/mutants_895_gate_exits.py
 """
@@ -125,6 +131,12 @@ if not os.environ.get("PYTEST_XDIST_WORKER"):
 class UncollectableAlone(unittest.TestCase):
     def test_fails_in_the_lane(self):
         self.fail("stand-in for a lane failure whose re-run never runs it")
+""",
+    # cannot be imported in ANY process: the lane names it under DID NOT RUN
+    # and not one of its tests ever runs, in either the lane or the re-run
+    "test_p_uncollectable.py": """
+raise ImportError("stand-in for a module the gate path holds but pytest "
+                  "cannot import")
 """,
     # The serial lane's shape, in two modules. The marker is PROCESS state,
     # not a file: the serial lane runs one process in one order, so the second
@@ -328,6 +340,25 @@ def main() -> int:
         rc, out = run_gate(table)
         ok &= check("A10 re-run could not collect", 3, rc, out,
                     ["RERUN INCONCLUSIVE", "pytest rc 2", "1 inconclusive"],
+                    ["NOT REPRODUCED", "GENUINE"])
+
+        # A11 -- the DID NOT RUN census. A module that cannot be imported ran
+        # NOTHING, and the lane it sat in still tallies and still votes OK, so
+        # nothing else in this harness or in the gate's own suite can see the
+        # census disappear. The assertion is on the REPORT, because the report
+        # is the whole mechanism: the reader's only signal that a module of the
+        # gate's scope never started is its name under this banner. `must_not`
+        # keeps it honest in the other direction -- the module must not be
+        # classified as a passing-alone flake, since it never ran alone either.
+        stage(["test_p_ok.py", "test_p_uncollectable.py"])
+        write_table(table, [(mod("test_p_ok.py"), "PARALLEL", "probe", []),
+                            (mod("test_p_uncollectable.py"), "PARALLEL",
+                             "probe", [])])
+        rc, out = run_gate(table)
+        ok &= check("A11 uncollectable module named", 3, rc, out,
+                    ["=== DID NOT RUN: 1 module(s) could not be collected ===",
+                     f"UNCOLLECTABLE {PROBE_REL}/test_p_uncollectable.py",
+                     "RERUN INCONCLUSIVE"],
                     ["NOT REPRODUCED", "GENUINE"])
 
         # A6 -- a verdict the runner does not know is named, not swallowed.

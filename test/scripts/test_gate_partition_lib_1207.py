@@ -286,6 +286,114 @@ def test_g0_t10d_an_uncollectable_module_with_no_error_name_is_refused(tmp_path)
     assert "registered/unit/mem_cache/test_x.py" in note
 
 
+def test_g0_t10e_a_short_failed_extraction_is_refused_by_the_lane_check(tmp_path):
+    """THE DANGER DIRECTION, and the site that actually votes SS5.3 rule 1.
+
+    THE HAZARD: this slice MOVED the tally refusal out of `main()` into
+    `lane_verdict`, and no arm followed it. G0-T-11 and G0-T-11b assert
+    `parse_log(...).tally_ok is False` and stop there, so a `lane_verdict` that
+    drops the term returns `(True, "extraction mismatch: ...")` -- the runner
+    prints `wide   : OK ... names failed=1 vs summary failed=113` and hands the
+    SHORT failure set on as the verdict. That is #1207's own headline defect
+    (its captured case was `names failed=111 vs summary failed=113`) reported
+    as a pass, so the refusal is asserted THROUGH `lane_verdict`, not only
+    through the extractor. The must-not-fire arm is G0-T-10b."""
+    log = _write(
+        tmp_path,
+        "FAILED test/registered/unit/managers/test_x.py::T::t\n"
+        "3 failed, 4000 passed in 700.00s\n",
+    )
+    res = lib.parse_log(log)
+    assert res.tally_ok is False, "the extractor half of the rule"
+    assert res.interrupted is False
+    assert res.collection_errors == set()
+    ok, note = runner.lane_verdict(res, n_modules=2)
+    assert ok is False, f"a lane whose extraction is short is not reportable: {note}"
+    assert "names failed=1" in note
+    assert "summary failed=3" in note
+
+
+def test_g0_t10f_a_short_error_extraction_alone_is_refused_by_the_lane_check(tmp_path):
+    """THE ERROR HALF of the same site -- the half #1207 actually broke
+    (`names error=5 vs summary error=11`), and the half G0-T-10e cannot reach.
+
+    THE HAZARD this arm and no other catches: a `lane_verdict` that re-derives
+    the rule from the FAILED terms only (`res.failure_lines != summary failed`)
+    passes G0-T-10e and every other arm, while a lane whose ERROR extraction is
+    short -- the xdist collection-error shape, four names against eight
+    reported -- votes OK. The FAILED terms agree here on purpose, so only the
+    ERROR half can produce the refusal."""
+    name = "test/registered/unit/managers/test_pp_proxy_stamp_631.py"
+    log = _write(
+        tmp_path,
+        "FAILED test/registered/unit/managers/test_x.py::T::t\n"
+        + "".join(f"ERROR {name} - AttributeErr...\n" for _ in range(4))
+        + "1 failed, 8 errors in 1.00s\n",
+    )
+    res = lib.parse_log(log)
+    assert res.failure_lines == res.counts["failed"], "the FAILED half agrees"
+    assert res.tally_ok is False
+    ok, note = runner.lane_verdict(res, n_modules=2)
+    assert ok is False, f"the ERROR half of the rule votes too: {note}"
+    assert "names error=4" in note
+    assert "summary error=8" in note
+
+
+# ---------------------------------------------------------------------------
+# G0-T-15  the DID NOT RUN census -- a module that never started is named
+# ---------------------------------------------------------------------------
+def test_g0_t15_the_uncollectable_census_names_every_lane_and_ignores_the_verdict(
+    tmp_path,
+):
+    """THE DANGER DIRECTION for the runner's fourth numbered refusal, which
+    promises the modules that could not be collected are *"named on every run
+    whether the lane was interrupted or not -- their absence from a failure set
+    is not a pass"* (`gate_tier2_partitioned.py`'s docstring, rule 4).
+
+    THE HAZARD: the census is the only thing keeping that promise, and it is a
+    print. Deleting it leaves every suite green. Both terms it must not be
+    reduced to are asserted here: it spans ALL lanes, not the interrupted one,
+    and it reports even when that lane's own `lane_verdict` is True -- a census
+    gated on the verdict would go silent on exactly the healthy-lane case, the
+    branch's own full gate run of 2026-09-06 (four uncollectable `*_631`
+    modules in a wide lane that tallied OK).
+
+    The must-not-fire arm is G0-T-15b."""
+    wide = tmp_path / "wide.log"
+    wide.write_text(
+        "____ ERROR collecting registered/unit/managers/test_wide_bad.py ____\n"
+        "ERROR test/registered/unit/managers/test_wide_bad.py - ImportError\n"
+        "1 error, 12 passed in 3.00s\n"
+    )
+    res = {"wide": lib.parse_log(wide), "serial": lib.parse_log(SERIAL)}
+
+    assert res["wide"].interrupted is False
+    ok, _note = runner.lane_verdict(res["wide"], n_modules=8)
+    assert ok is True, "the census must not need a BROKEN lane to speak"
+    assert res["serial"].interrupted is True
+
+    named = runner.uncollectable_modules(res)
+    assert named == [
+        "registered/unit/managers/test_quiescence_no_carry_858.py",
+        "registered/unit/managers/test_wide_bad.py",
+    ], named
+
+
+def test_g0_t15b_a_run_with_nothing_uncollectable_names_nothing(tmp_path):
+    """The arm that must NOT fire: a census that reported on every run would
+    print a DID NOT RUN block for a clean gate and name nothing real."""
+    clean = tmp_path / "clean.log"
+    clean.write_text(
+        "FAILED test/registered/unit/managers/test_x.py::T::t\n"
+        "1 failed, 3 passed in 1.00s\n"
+    )
+    res = {"wide": lib.parse_log(clean), "serial": lib.parse_log(WIDE)}
+    assert res["serial"].error_lines == WIDE_SUMMARY_ERRORS, (
+        "the captured fixture's ERRORs are short-summary lines, not banners"
+    )
+    assert runner.uncollectable_modules(res) == []
+
+
 # ---------------------------------------------------------------------------
 # GREEN PINS -- what must not change
 # ---------------------------------------------------------------------------
@@ -387,13 +495,48 @@ def test_g0_t13b_a_gate_path_that_holds_no_test_module_is_refused(tmp_path):
         raise AssertionError("an empty gate path was not refused")
 
 
+def test_g0_t13d_one_module_in_two_tables_is_refused(tmp_path):
+    """`merge_tables`' OTHER refusal, which had no arm at all.
+
+    THE HAZARD: two tables carrying a row for the same module are two records
+    of one fact with no rule for which wins, and without the refusal the second
+    silently overwrites the first -- the module is then handed a verdict proved
+    in ANOTHER gate path's run, which is the wrong-document failure `--table`
+    pairing exists to prevent. Dict order decides, so nothing in the report
+    says which proof was used. Both table paths and the module must be named,
+    or the reader cannot tell which two documents disagree.
+
+    The arm that must NOT fire is G0-T-13c."""
+    # The two REAL gate paths, so the module-count refusal beside this one
+    # cannot be what fires; only the tables are synthetic.
+    a, b = (p for p, _ in runner.DEFAULT_SCOPE)
+    t1 = tmp_path / "t1.tsv"
+    t2 = tmp_path / "t2.tsv"
+    shared = f"{a}/test_m.py"
+    t1.write_text(f"{shared}\tSERIAL\tproved on path A\tdeadbeefdeadbeef\t\n")
+    t2.write_text(f"{shared}\tPARALLEL\tproved on path B\tdeadbeefdeadbeef\t\n")
+    try:
+        runner.merge_tables([(a, t1), (b, t2)])
+    except runner.ScopeRefused as exc:
+        message = str(exc)
+        assert shared in message
+        assert str(t1) in message, message
+        assert str(t2) in message, message
+    else:
+        raise AssertionError("one module in two tables was not refused")
+
+
 def test_g0_t13c_the_default_scope_paths_all_hold_modules():
-    """The arm that must NOT fire: both hard-coded directories exist and hold
-    test modules in this tree, so the refusal above gates something real."""
+    """The arm that must NOT fire, for BOTH of `merge_tables`' refusals: both
+    hard-coded directories exist and hold test modules in this tree, and the
+    two real tables share no module, so neither refusal above fires on the
+    scope the gate actually runs. Without this a refusal that fired on
+    everything would pass G0-T-13b and G0-T-13d and gate nothing."""
     table, present = runner.merge_tables(runner.resolve_scope(None, None))
     assert len(present) > 500, len(present)
     assert any(p.startswith("test/registered/unit/mem_cache/") for p in present)
     assert any(p.startswith("test/registered/unit/managers/") for p in present)
+    assert table, "the merged table is the thing the refusals guard"
 
 
 def test_g0_t14_the_1204_cut_is_inside_the_default_scope():

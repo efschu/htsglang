@@ -252,6 +252,30 @@ def lane_verdict(res, n_modules: int) -> tuple[bool, str]:
     return True, res.tally_note
 
 
+def uncollectable_modules(res: dict) -> list[str]:
+    """Every module a lane's log says pytest could not import, sorted.
+
+    THE HAZARD this census answers, and why it is INDEPENDENT of the lane
+    verdict: a module that could not be imported ran NOTHING, and a reader
+    scanning the failure set of an otherwise healthy lane has no way to tell
+    "this module passed" from "this module never started". ``lane_verdict``
+    cannot stand in for it -- its collection-error branch reads
+    ``res.error_lines``, which counts the WHOLE lane's short-summary ERROR
+    lines, so it says something about the lane and nothing about the module.
+    The census is therefore taken on every run, whatever any lane voted.
+
+    A REPORT, NOT A SECOND VOTE. The vote on these modules already exists and
+    is the ERROR name the extraction pulled from the same log: measured on the
+    branch's own full gate run of 2026-09-06 (``wide.log``), four banner
+    modules against four distinct ERROR names in the failure set, so the gate
+    was red for every one of them. Naming them a second time in a verdict
+    would be a second record of a fact that already votes -- and the two
+    records would not even share a name space, since a banner path is
+    rootdir-relative and a node id is tree-relative.
+    """
+    return sorted({m for r in res.values() for m in r.collection_errors})
+
+
 def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
@@ -451,12 +475,12 @@ def main() -> int:
     # A module that could not be imported ran NOTHING, whatever the lane did
     # afterwards. It is named on every run, before any verdict, so its absence
     # from the failure set below is never read as a pass.
-    uncollectable = {m for r in res.values() for m in r.collection_errors}
+    uncollectable = uncollectable_modules(res)
     if uncollectable:
         print(f"\n=== DID NOT RUN: {len(uncollectable)} module(s) could not be "
               f"collected ===")
         print("  Paths are as pytest's own banner gives them (rootdir-relative).")
-        for mod in sorted(uncollectable):
+        for mod in uncollectable:
             print(f"  UNCOLLECTABLE {mod}")
 
     if broken:
