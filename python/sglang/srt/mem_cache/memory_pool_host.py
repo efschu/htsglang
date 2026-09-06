@@ -1895,6 +1895,12 @@ class PoolEntry:
 
 
 class HostPoolGroup:
+    # #1206: declared here with their neutral values because the boot bus
+    # reads them by NAME in this same batch; a read against a name that does
+    # not exist is an AttributeError on the first scheduler pass.
+    host_ring_discard_ok = 1
+    d_backup_width = 0
+
     def __init__(self, entries: list[PoolEntry]):
         if not entries:
             raise ValueError("HostPoolGroup requires at least one pool entry.")

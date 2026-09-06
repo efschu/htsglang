@@ -831,10 +831,13 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
                 )
 
         # (c) THE TREE'S OWN `HostPoolGroup`, not a stand-in. It carries the
-        # `entry_map` the route discriminates on and NONE of S1's four
-        # attributes, which is exactly what a boot sees if S1-C3/S1-C16/S1-C18
-        # do not land. Slots 10 and 15 must not stop that boot; the two
-        # no-default reads are the only terms that may.
+        # `entry_map` the route discriminates on, it carries the two D-68
+        # attributes -- DECLARED IN THIS SLICE since fix 7, because the bus
+        # reads them with no default and a tree without S1 has no other
+        # declarer -- and it carries NEITHER of S1-C3's/S1-C16's two, which is
+        # what a boot sees if those do not land. Slots 10 and 15 must not stop
+        # that boot, and with the declaration in place nothing else may either:
+        # the payload the tree's own group builds is the NEUTRAL one.
         real = HostPoolGroup(
             [
                 PoolEntry(
@@ -848,15 +851,20 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
         for attribute in (
             "transfer_layer_domain",
             "expected_transfer_layer_domain",
-            "host_ring_discard_ok",
-            "d_backup_width",
         ):
             self.assertFalse(hasattr(real, attribute), attribute)
-        with self.assertRaises(AttributeError) as caught:
-            pdv.build_phase_domain_payload(
-                _with_group(real, has_draft=True, draft_pool=_StandInDraftPool(4))
-            )
-        self.assertIn("host_ring_discard_ok", str(caught.exception))
+        for attribute, neutral in (
+            ("host_ring_discard_ok", 1),
+            ("d_backup_width", 0),
+        ):
+            self.assertEqual(getattr(real, attribute), neutral, attribute)
+        real_payload = pdv.build_phase_domain_payload(
+            _with_group(real, has_draft=True, draft_pool=_StandInDraftPool(4))
+        )
+        self.assertEqual(pdv.slot_of(real_payload, "host_ring_discarded"), 1)
+        self.assertEqual(pdv.pair_of(real_payload, "d_backup_width"), (0, 0))
+        self.assertEqual(pdv.slot_of(real_payload, "rebind_domain_within_driven"), 1)
+        self.assertEqual(pdv.slot_of(real_payload, "draft_tier_domain_matches"), 1)
 
         # The complete declaration set raises nothing and votes healthy.
         whole = _with_group(
