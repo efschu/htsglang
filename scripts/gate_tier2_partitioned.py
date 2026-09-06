@@ -154,6 +154,18 @@ def resolve_scope(gate_paths, tables) -> list[tuple[str, Path]]:
     the verdict ``unclassified: not in the partition table`` -- a real answer,
     from the wrong document, about modules that were never measured. Refused
     by name instead of guessed.
+
+    WHAT THE ORDER CARRIES, and the bound on it, so the refusal's own sentence
+    ("a table proved on one path says nothing about a module in another") is
+    not read as resting on the pairing: it does not. ``merge_tables`` keys the
+    merged verdicts by TREE-RELATIVE module path and unions both paths into one
+    flat ``present`` list, so the classification, the lane assignment and the
+    exit code are byte-identical under a reversed pairing. What the order
+    decides is the two PROVENANCE lines -- ``# verify {table} against
+    {gate_path}`` and ``# scope {gate_path}  <-  {table}`` -- which are the
+    header of the artifact a window is signed against. A header that names the
+    wrong proof for a path is the same wrong-document failure as above, one
+    level out.
     """
     if gate_paths is None and tables is None:
         return [(p, ROOT / t) for p, t in DEFAULT_SCOPE]

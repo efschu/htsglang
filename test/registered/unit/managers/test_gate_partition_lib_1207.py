@@ -225,6 +225,42 @@ def test_g0_t8c_a_collection_error_without_the_marker_is_not_interrupted(tmp_pat
     assert res.tally_ok, res.tally_note
 
 
+def test_g0_t8d_a_lane_that_only_quotes_the_marker_is_not_interrupted(tmp_path):
+    """THE FLAG'S OTHER DANGER DIRECTION -- its SHAPE, which nothing armed.
+
+    ``interrupted`` is read off pytest's own banner, and the only thing that
+    tells that banner from the words ``Interrupted:`` inside a failure MESSAGE
+    is the anchoring: bangs on both sides, at the START of the line.
+
+    THE HAZARD, and it is #1207's symptom restored with a reason that is false
+    -- the same hazard G0-T-8c names for the flag's OTHER derivation: a
+    de-anchored pattern reads this fully healthy 40-module lane as INTERRUPTED,
+    so ``lane_verdict`` votes BROKEN, ``main()`` prints ``VERDICT:
+    INCONCLUSIVE -- a lane's log is not an answer.`` and the gate exits 3 on a
+    run in which everything collected ran and the tally is perfect. G0-T-8c
+    guards the derivation (a collection error must not raise the flag); this
+    arm guards the shape.
+
+    The message quotes the banner IN FULL, bangs included, because a message
+    quoting only the words is invisible to a widening that keeps the trailing
+    ``!+$``."""
+    log = _write(
+        tmp_path,
+        "FAILED test/registered/unit/managers/test_x.py::T::t - AssertionError: "
+        "the log must quote the banner "
+        "!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection "
+        "!!!!!!!!!!!!!!!!!!!!\n"
+        "1 failed, 400 passed in 60.00s\n",
+    )
+    res = lib.parse_log(log)
+    assert res.interrupted is False
+    assert res.collection_errors == set()
+    assert res.failures == {"test/registered/unit/managers/test_x.py::T::t"}
+    assert res.tally_ok is True, res.tally_note
+    ok, note = runner.lane_verdict(res, n_modules=40)
+    assert ok is True, f"a lane that merely quotes the marker answered: {note}"
+
+
 # ---------------------------------------------------------------------------
 # G0-T-10  the runner refuses an interrupted lane
 # ---------------------------------------------------------------------------
@@ -339,6 +375,43 @@ def test_g0_t10f_a_short_error_extraction_alone_is_refused_by_the_lane_check(tmp
     assert ok is False, f"the ERROR half of the rule votes too: {note}"
     assert "names error=4" in note
     assert "summary error=8" in note
+
+
+def test_g0_t10g_an_interruption_with_no_collect_banner_is_still_refused(tmp_path):
+    """THE INTERRUPTED TERM ON ITS OWN -- refusal 4 of the runner's docstring,
+    in the shape that carries no collection error at all.
+
+    THE HAZARD: every other arm for this branch stages a lane pytest stopped
+    DURING collection, so each one carries ``interrupted`` AND a non-empty
+    ``collection_errors`` -- G0-T-10 uses the captured serial fixture, and
+    `scripts/mutants_895_gate_exits.py`'s A12 stages an uncollectable module.
+    A `lane_verdict` narrowed to ``res.interrupted and res.collection_errors``
+    satisfies all of them. pytest ALSO stops early for ``--maxfail``/``-x``,
+    which reach this runner through ``args.extra`` at `run_lane`'s
+    ``cmd += extra``: the log then holds the marker, no banner, and a PERFECT
+    tally -- 1 name failed against 1 summary failed -- so no arithmetic in the
+    gate can see that 108 of this lane's 120 modules never started. Under the
+    narrowed term the lane votes OK and `main()` folds a green, which is
+    *"report a lane that never ran as a lane that answered"* going silent.
+
+    THE BOUND OF THIS ARM, so it is not read as more than it is: it asserts the
+    VERDICT, not the note. The note hard-codes *"INTERRUPTED during
+    collection"* and the count ``n_modules - len(collection_errors)`` for every
+    interruption, and neither is true of this log; pinning that sentence here
+    would pin a false one."""
+    log = _write(
+        tmp_path,
+        "FAILED test/registered/unit/managers/test_x.py::T::t\n"
+        "!!!!!!!!!!!!!!!!!!!!!! Interrupted: stopping after 1 failures "
+        "!!!!!!!!!!!!!!!!!!!!!!\n"
+        "1 failed, 12 passed in 3.00s\n",
+    )
+    res = lib.parse_log(log)
+    assert res.interrupted is True
+    assert res.collection_errors == set(), "this shape carries no banner"
+    assert res.tally_ok is True, "the tally alone cannot see this"
+    ok, note = runner.lane_verdict(res, n_modules=120)
+    assert ok is False, f"an interrupted lane is not an answer: {note}"
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +599,25 @@ def test_g0_t13d_one_module_in_two_tables_is_refused(tmp_path):
         assert str(t2) in message, message
     else:
         raise AssertionError("one module in two tables was not refused")
+
+
+def test_g0_t13e_gate_paths_and_tables_pair_in_the_order_given():
+    """`resolve_scope`'s SUCCESS shape, which no arm exercised: G0-T-12 takes
+    the both-None default and returns one line earlier, and G0-T-13 provokes
+    only the refusals.
+
+    THE HAZARD, with the bound it actually has at this head: a reversed pairing
+    survives every other arm, because `merge_tables` unions the tables into one
+    flat dict keyed by tree-relative module path and the paths into one flat
+    `present` list -- so classification, lane assignment and exit code are
+    byte-identical either way. What it changes is the two PROVENANCE lines the
+    gate prints, ``# verify {table} against {gate_path}`` and
+    ``# scope {gate_path}  <-  {table}``, which are the header of the artifact
+    a window is signed against. A header naming the wrong proof for a path is
+    the same wrong-document failure the refusals above exist for, one level
+    out."""
+    scope = runner.resolve_scope(["a/b", "c/d"], ["t1.tsv", "t2.tsv"])
+    assert scope == [("a/b", Path("t1.tsv")), ("c/d", Path("t2.tsv"))]
 
 
 def test_g0_t13c_the_default_scope_paths_all_hold_modules():
