@@ -4068,7 +4068,9 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # `world_rank` is the cutover's own boot-constant rank (the same value
         # the ps rebind above writes into tp_rank); `scheduler.ps.pp_rank` is 0
         # on every rank by this point, so it must NOT be used for the filter.
-        debug_hold.maybe_inject("cutover", pp_rank=world_rank)
+        # `direction` is filterable here too: a cutover has the same two legs
+        # an abandon has, and holding the wrong one costs the same window.
+        debug_hold.maybe_inject("cutover", pp_rank=world_rank, direction=direction)
 
     return _cutover
 
@@ -12236,7 +12238,10 @@ class PhaseFlipRuntime:
             # (pp=3, tp=1) the world rank IS the pp rank. PhaseFlipRuntime
             # holds no scheduler reference, so this is also the only rank
             # available here.
-            _1223_dh.maybe_inject("abandon", pp_rank=self._rank)
+            # `direction` is the leg this abandon belongs to. Boot A2 held at a
+            # `tp_to_pp` abandon while the sequence under investigation lives on
+            # `pp_to_tp` -- a good hold on the wrong event, and a whole window.
+            _1223_dh.maybe_inject("abandon", pp_rank=self._rank, direction=direction)
             # THE BUDGET'S CURRENCY, BOOKED WHERE EVERY RANK AGREES. This is
             # the reduced verdict, so all three ranks increment together and
             # a delay budget means the same thing on each of them.

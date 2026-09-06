@@ -85,6 +85,9 @@ def _clean_env(monkeypatch, tmp_path):
         debug_hold.HOLD_PORT_BASE_ENV,
         debug_hold.HOLD_INJECT_ENV,
         debug_hold.HOLD_INJECT_RANK_ENV,
+        debug_hold.HOLD_INJECT_DIR_ENV,
+        debug_hold.HOLD_INJECT_NTH_ENV,
+        debug_hold.HOLD_INJECT_MIN_FILL_ENV,
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(debug_hold.HOLD_DIR_ENV, str(tmp_path))
@@ -550,7 +553,9 @@ def test_inject_is_a_noop_with_no_env():
 # --- #1225: the two new inject markers -------------------------------------
 
 
-@pytest.mark.parametrize("marker", ["cutover", "last_chunk", "abandon"])
+@pytest.mark.parametrize(
+    "marker", ["cutover", "last_chunk", "last_chunk_done", "abandon"]
+)
 def test_each_marker_fires_only_for_itself(monkeypatch, marker):
     monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
     monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, marker)
@@ -561,7 +566,7 @@ def test_each_marker_fires_only_for_itself(monkeypatch, marker):
             debug_hold.maybe_inject(other, pp_rank=1)  # must not raise
 
 
-@pytest.mark.parametrize("marker", ["last_chunk", "abandon"])
+@pytest.mark.parametrize("marker", ["last_chunk", "last_chunk_done", "abandon"])
 def test_new_markers_refuse_without_the_hold_flag(monkeypatch, marker):
     monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, marker)
     debug_hold.maybe_inject(marker, pp_rank=1)  # must NOT raise
@@ -602,6 +607,217 @@ def test_inject_rank_filter_uses_the_boot_rank_not_the_rebound_ps(monkeypatch):
         debug_hold.maybe_inject("abandon", _Sched(cutover_ps), pp_rank=2)
 
 
+# --- round 3: direction filter, nth filter, boot-constant rank -------------
+
+
+def test_abandon_direction_filter_selects_one_leg(monkeypatch):
+    """Boot A2 held at a `tp_to_pp` abandon while the #1225 orphan sequence
+    lives on the `pp_to_tp` leg -- a good hold on the wrong event."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_DIR_ENV, "pp_to_tp")
+
+    debug_hold.maybe_inject("abandon", pp_rank=1, direction="tp_to_pp")  # wrong leg
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject("abandon", pp_rank=1, direction="pp_to_tp")
+
+
+def test_direction_unset_fires_on_either_leg(monkeypatch):
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+    monkeypatch.delenv(debug_hold.HOLD_INJECT_DIR_ENV, raising=False)
+    for leg in ("pp_to_tp", "tp_to_pp"):
+        with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+            debug_hold.maybe_inject("abandon", pp_rank=1, direction=leg)
+
+
+def test_direction_named_in_the_wall_message(monkeypatch):
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+    with pytest.raises(RuntimeError, match="direction=pp_to_tp"):
+        debug_hold.maybe_inject("abandon", pp_rank=0, direction="pp_to_tp")
+
+
+def test_nth_filter_skips_the_earlier_firings(monkeypatch):
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_NTH_ENV, "3")
+    debug_hold._INJECT_FIRINGS.clear()
+
+    debug_hold.maybe_inject("abandon", pp_rank=0)  # 1st: skipped
+    debug_hold.maybe_inject("abandon", pp_rank=0)  # 2nd: skipped
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject("abandon", pp_rank=0)  # 3rd: fires
+    debug_hold._INJECT_FIRINGS.clear()
+
+
+def test_nth_counts_only_firings_that_passed_the_other_filters(monkeypatch):
+    """A skipped-by-direction event must not consume an nth slot, or the
+    counter measures a different population than the operator asked for."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_DIR_ENV, "pp_to_tp")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_NTH_ENV, "2")
+    debug_hold._INJECT_FIRINGS.clear()
+
+    for _ in range(5):
+        debug_hold.maybe_inject("abandon", pp_rank=0, direction="tp_to_pp")
+    assert debug_hold._INJECT_FIRINGS.get("abandon", 0) == 0
+
+    debug_hold.maybe_inject("abandon", pp_rank=0, direction="pp_to_tp")  # 1st
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject("abandon", pp_rank=0, direction="pp_to_tp")  # 2nd
+    debug_hold._INJECT_FIRINGS.clear()
+
+
+def test_inject_rank_filter_never_consults_ps(monkeypatch):
+    """`last_chunk` passes NO rank; the filter must reach the world-group boot
+    constant, never `scheduler.ps` (pp_rank=0 on every rank in TP phase)."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "last_chunk")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_RANK_ENV, "2")
+    monkeypatch.setattr(debug_hold, "boot_world_rank", lambda: 2)
+
+    trap = _Sched(_PS(pp_rank=0, pp_size=1, tp_rank=2, tp_size=3))
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject("last_chunk", trap)
+
+    # And with the world rank saying 0, the same ps must not make it fire.
+    monkeypatch.setattr(debug_hold, "boot_world_rank", lambda: 0)
+    debug_hold.maybe_inject("last_chunk", trap)
+
+
+def test_unresolvable_rank_does_not_fire_everywhere(monkeypatch):
+    """If the rank cannot be resolved while a filter is set, the inject must
+    stay silent -- firing everywhere is how three ranks get held when one was
+    asked for."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "last_chunk")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_RANK_ENV, "1")
+    monkeypatch.setattr(debug_hold, "boot_world_rank", lambda: None)
+    debug_hold.maybe_inject("last_chunk")  # must NOT raise
+
+
+def test_inject_rank_helper_prefers_explicit_boot_constants(monkeypatch):
+    monkeypatch.setattr(debug_hold, "boot_world_rank", lambda: 9)
+    assert debug_hold._inject_rank(2, 0) == 2
+    assert debug_hold._inject_rank(None, 1) == 1
+    assert debug_hold._inject_rank(None, None) == 9
+    assert debug_hold._inject_rank(True, 1) == 1  # bool is not a rank
+
+
+# --- round 3 addendum: rank LIST, payload gate ------------------------------
+
+
+class _Req:
+    def __init__(self, n):
+        self.full_untruncated_fill_ids = list(range(n))
+
+
+def test_rank_filter_accepts_a_list_and_never_holds_pp0(monkeypatch):
+    """The third boot holds BOTH followers and never PP0 -- a held PP0 stalls
+    the ring and manufactures run-2's teardown."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "last_chunk_done")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_RANK_ENV, "1,2")
+
+    debug_hold.maybe_inject("last_chunk_done", pp_rank=0)  # control: must NOT fire
+    for follower in (1, 2):
+        with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+            debug_hold.maybe_inject("last_chunk_done", pp_rank=follower)
+
+
+def test_rank_list_tolerates_spaces_and_junk(monkeypatch):
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_RANK_ENV, " 1 , 2 ,")
+    assert debug_hold.inject_rank_filter() == {1, 2}
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_RANK_ENV, "nonsense")
+    assert debug_hold.inject_rank_filter() is None
+
+
+def test_min_fill_gate_skips_the_acceptance_probe(monkeypatch):
+    """Both earlier holds caught the 95-token acceptance probe; the orphan
+    needs the 13225-token B-probe."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "last_chunk_done")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_MIN_FILL_ENV, "4096")
+    debug_hold._MAX_FILL_SEEN[0] = 0
+
+    debug_hold.maybe_inject("last_chunk_done", pp_rank=1, fill=95)  # probe
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject("last_chunk_done", pp_rank=1, fill=13225)
+    debug_hold._MAX_FILL_SEEN[0] = 0
+
+
+def test_max_fill_tokens_reads_the_fill_lens_field():
+    """Same field the #788 line prints as fill_lens, so the gate is in the
+    units the operator reads in the log."""
+    assert debug_hold.max_fill_tokens([_Req(95), _Req(13225)]) == 13225
+    assert debug_hold.max_fill_tokens([]) == 0
+    assert debug_hold.max_fill_tokens(None) == 0
+    assert debug_hold.max_fill_tokens([object()]) == 0  # missing field is 0
+
+
+def test_abandon_inherits_the_payload_precondition_via_the_latch(monkeypatch):
+    """`abandon` sees no request of its own, so its payload gate is "a long
+    request has ALREADY been seen by this process"."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_MIN_FILL_ENV, "4096")
+    debug_hold._MAX_FILL_SEEN[0] = 0
+
+    # `abandon` is the armed marker throughout -- the chunk sites still run on
+    # this boot, they just do not fire; their only job here is to latch.
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+
+    # Before any big request: the abandon must NOT fire.
+    debug_hold.maybe_inject("abandon", pp_rank=1, direction="pp_to_tp")
+
+    # The acceptance probe goes through a chunk site: too small to latch past
+    # the gate.
+    debug_hold.maybe_inject("last_chunk", pp_rank=1, fill=95)
+    debug_hold.maybe_inject("abandon", pp_rank=1, direction="pp_to_tp")
+
+    # Then the B-probe arrives at a chunk site and latches ...
+    debug_hold.maybe_inject("last_chunk", pp_rank=1, fill=13225)
+    assert debug_hold._MAX_FILL_SEEN[0] == 13225
+
+    # ... and now the abandon's precondition holds.
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject("abandon", pp_rank=1, direction="pp_to_tp")
+    debug_hold._MAX_FILL_SEEN[0] = 0
+
+
+def test_latch_records_fill_even_for_a_marker_that_is_not_armed(monkeypatch):
+    """The latch must be fed by every chunk site the process reaches, not only
+    by the armed marker -- otherwise the abandon's precondition can never
+    become true on a boot injecting `abandon`."""
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "abandon")
+    debug_hold._MAX_FILL_SEEN[0] = 0
+    debug_hold.maybe_inject("last_chunk_done", pp_rank=1, fill=13225)
+    assert debug_hold._MAX_FILL_SEEN[0] == 13225
+    debug_hold._MAX_FILL_SEEN[0] = 0
+
+
+def test_min_fill_unset_fires_on_any_size(monkeypatch):
+    monkeypatch.setenv(debug_hold.HOLD_ENV, "1")
+    monkeypatch.setenv(debug_hold.HOLD_INJECT_ENV, "last_chunk")
+    monkeypatch.delenv(debug_hold.HOLD_INJECT_MIN_FILL_ENV, raising=False)
+    with pytest.raises(RuntimeError, match="#1223 INJECTED WALL"):
+        debug_hold.maybe_inject("last_chunk", pp_rank=1, fill=95)
+
+
+def test_chunk_sites_pass_their_payload():
+    """Delivery: the gate is useless unless the sites actually feed it."""
+    import pathlib
+
+    sched = (pathlib.Path(debug_hold.__file__).parent / "scheduler.py").read_text()
+    assert '_1223_dh.maybe_inject("last_chunk", fill=_1223_fill)' in sched
+    assert "_1223_fill = _1223_dh_fill.max_fill_tokens(ret.reqs)" in sched
+    assert "fill=_1223_dh.max_fill_tokens(batch.reqs)" in sched
+
+
 def test_inject_sites_are_wired_at_the_named_places():
     """Delivery is code presence PLUS a caller: pin that both sites exist and,
     for INJECT-1, that it sits OUTSIDE the instrument's swallowing except --
@@ -620,11 +836,26 @@ def test_inject_sites_are_wired_at_the_named_places():
 
     # INJECT-1 outside the swallowing except of _trace_pp_admission_verdict.
     swallow = sched.index('"#788 PP-ADMISSION trace unavailable: %s: %s"')
-    inject1 = sched.index('maybe_inject(\n                "last_chunk"')
+    inject1 = sched.index('_1223_dh.maybe_inject("last_chunk", fill=_1223_fill)')
     assert inject1 > swallow, "INJECT-1 is inside the except that swallows it"
     assert "_1223_last_chunk = ret is not None and chunked == 0" in sched
 
-    assert 'maybe_inject("cutover", pp_rank=world_rank)' in pfr
+    assert 'maybe_inject("cutover", pp_rank=world_rank, direction=direction)' in pfr
+    assert 'maybe_inject("abandon", pp_rank=self._rank, direction=direction)' in pfr, (
+        "the abandon site does not pass its direction"
+    )
+
+    # last_chunk must pass NO ps-derived rank (round-3 item 3).
+    assert '_1223_dh.maybe_inject("last_chunk", fill=_1223_fill)' in sched
+    assert "pp_rank=getattr(self.ps" not in sched
+
+    # INJECT-3 at the END of process_batch_result, gated on the flag.
+    pbr = sched.index("def process_batch_result(")
+    nxt = sched.index("def maybe_send_health_check_signal", pbr)
+    body = sched[pbr:nxt]
+    assert '"last_chunk_done"' in body, "INJECT-3 not in the method"
+    assert "contains_last_prefill_chunk" in body
+    assert "last_chunk_done" in debug_hold.KNOWN_INJECT_MARKERS
 
 
 # ---------------------------------------------------------------------------

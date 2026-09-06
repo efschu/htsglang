@@ -9822,6 +9822,7 @@ class Scheduler(
         # that inherited that suppression would fire on an arbitrary subset of
         # admissions (the denominator law, as a boot-killer).
         _1223_last_chunk = False
+        _1223_fill = 0
         try:
             alloc = self.token_to_kv_pool_allocator
             n_reqs = 0 if ret is None else len(ret.reqs)
@@ -9831,6 +9832,13 @@ class Scheduler(
             # The #1225 point: this request was ADMITTED and nothing is left
             # chunked, i.e. its LAST prefill chunk just went in.
             _1223_last_chunk = ret is not None and chunked == 0
+            if _1223_last_chunk:
+                # The payload gate's input, in the same units the #788 line
+                # prints as fill_lens. Both earlier holds caught the 95-token
+                # acceptance probe; the orphan needs the 13225-token B-probe.
+                from sglang.srt.managers import debug_hold as _1223_dh_fill
+
+                _1223_fill = _1223_dh_fill.max_fill_tokens(ret.reqs)
 
             # #788: drop the VACUOUS verdicts, keep every informative one.
             # Boot instr11 ran this instrument for three hours against an
@@ -10077,12 +10085,14 @@ class Scheduler(
         if _1223_last_chunk:
             from sglang.srt.managers import debug_hold as _1223_dh
 
-            _1223_dh.maybe_inject(
-                "last_chunk",
-                self,
-                pp_rank=getattr(self.ps, "pp_rank", None),
-                tp_rank=getattr(self.ps, "tp_rank", None),
-            )
+            # NO ps HERE. The first version passed ps.pp_rank/ps.tp_rank, which
+            # is right in the PP phase and wrong in the TP phase for exactly
+            # the reason fix 1 exists: the cutover rebinds ps with pp_rank=0 on
+            # every rank, so a TP-phase admission would filter every rank as 0
+            # and never fire for the follower that was asked for. Passing
+            # nothing routes the filter through the world group's rank_in_group,
+            # a boot constant (see debug_hold.boot_world_rank).
+            _1223_dh.maybe_inject("last_chunk", fill=_1223_fill)
 
     def _drain_prefetch_progress(self) -> Dict[str, bool]:
         """Advance EVERY queued request's HiCache storage prefetch, and return
@@ -13655,6 +13665,31 @@ class Scheduler(
                         fi_mod.zero_flashinfer_workspaces()
                 else:
                     fi_mod.zero_flashinfer_workspaces()
+
+        # #1225 INJECT-3 ("last_chunk_done"): the last prefill chunk's forward
+        # has completed AND its result has been processed. This is candidate
+        # C2's PREDICTED DROP POINT -- `last_chunk` (admission) fires a whole
+        # forward earlier, so a request that still owns its row at admission
+        # and has lost it here brackets the drop between the two. The pair is
+        # the measurement; neither marker alone answers C1 vs C2.
+        #
+        # Placed at the very end of the method, outside every branch above, so
+        # it fires once per processed extend batch regardless of which
+        # processor handled it. Nothing here swallows, so the raise reaches
+        # run_scheduler_process. Local import keeps this cherry-pickable.
+        if batch.forward_mode.is_extend() and getattr(
+            batch, "contains_last_prefill_chunk", False
+        ):
+            from sglang.srt.managers import debug_hold as _1223_dh
+
+            # No ps: the filter goes through the world group's boot constant.
+            # `fill` is the payload gate's input AND the latch a later
+            # `abandon` inject reads as its "a long request was in flight"
+            # precondition.
+            _1223_dh.maybe_inject(
+                "last_chunk_done",
+                fill=_1223_dh.max_fill_tokens(batch.reqs),
+            )
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

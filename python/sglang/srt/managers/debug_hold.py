@@ -58,6 +58,9 @@ HOLD_S_ENV = "SGLANG_DEBUG_HOLD_S"
 HOLD_PORT_BASE_ENV = "SGLANG_DEBUG_HOLD_PORT_BASE"
 HOLD_INJECT_ENV = "SGLANG_DEBUG_HOLD_INJECT"
 HOLD_INJECT_RANK_ENV = "SGLANG_DEBUG_HOLD_INJECT_RANK"
+HOLD_INJECT_DIR_ENV = "SGLANG_DEBUG_HOLD_INJECT_DIR"
+HOLD_INJECT_NTH_ENV = "SGLANG_DEBUG_HOLD_INJECT_NTH"
+HOLD_INJECT_MIN_FILL_ENV = "SGLANG_DEBUG_HOLD_INJECT_MIN_FILL"
 HOLD_DIR_ENV = "SGLANG_DEBUG_HOLD_DIR"
 TAG_ENV = "SGLANG_DEBUG_HOLD_TAG"
 
@@ -526,18 +529,15 @@ def _hold(exc: BaseException, scheduler, pp_rank, tp_rank) -> bool:
 #: loud refusal at the first site reached rather than a boot that quietly
 #: never holds -- an absent wall and a misspelled marker look identical
 #: otherwise, and that is a whole wasted window.
-KNOWN_INJECT_MARKERS = ("cutover", "last_chunk", "abandon")
+KNOWN_INJECT_MARKERS = ("cutover", "last_chunk", "last_chunk_done", "abandon")
+
+#: How many times each marker has passed every filter. Module state, because
+#: the nth-filter has to count firings across event-loop rounds.
+_INJECT_FIRINGS = {}
 
 
-def inject_rank_filter():
-    """Which rank the inject is for, or None for every rank.
-
-    #1225 INJECT-1 needs ONE follower held at its last prefill chunk while the
-    other two ranks stay free -- they have to reach their own, later holds for
-    the cross-rank diff the analysis is built on. Holding all three at the
-    first site would destroy exactly the comparison the boot exists to make.
-    """
-    raw = os.environ.get(HOLD_INJECT_RANK_ENV)
+def _int_env(name):
+    raw = os.environ.get(name)
     if raw is None or raw == "":
         return None
     try:
@@ -546,7 +546,124 @@ def inject_rank_filter():
         return None
 
 
-def maybe_inject(marker: str, scheduler=None, pp_rank=None, tp_rank=None) -> None:
+#: The largest fill seen so far by any chunk site this process reached. The
+#: payload gate for a site that cannot see a request (``abandon``) reads this
+#: LATCH, which is what "the precondition must already hold" means.
+_MAX_FILL_SEEN = [0]
+
+
+def inject_rank_filter():
+    """Which ranks the inject is for (a set), or None for every rank.
+
+    A LIST, not a scalar: the third boot's plan holds BOTH followers and never
+    PP0 -- a held PP0 stalls the ring and manufactures exactly the teardown
+    that ended run 2. `SGLANG_DEBUG_HOLD_INJECT_RANK=1,2`.
+    """
+    raw = os.environ.get(HOLD_INJECT_RANK_ENV)
+    if raw is None or raw == "":
+        return None
+    ranks = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ranks.add(int(part))
+        except ValueError:
+            continue
+    return ranks or None
+
+
+def inject_min_fill():
+    """Minimum request size (tokens) the inject requires, or None."""
+    return _int_env(HOLD_INJECT_MIN_FILL_ENV)
+
+
+def max_fill_tokens(reqs):
+    """Largest ``full_untruncated_fill_ids`` length among these requests.
+
+    Same field the #788 admission line prints as ``fill_lens``, so the gate is
+    expressed in the units the operator reads in the log.
+    """
+    best = 0
+    for req in reqs or ():
+        try:
+            n = len(getattr(req, "full_untruncated_fill_ids", ()) or ())
+        except Exception:  # noqa: BLE001 - a filter may not raise
+            n = 0
+        if n > best:
+            best = n
+    return best
+
+
+def note_fill(n):
+    """Record the largest payload this process has seen (the gate's latch)."""
+    try:
+        if int(n) > _MAX_FILL_SEEN[0]:
+            _MAX_FILL_SEEN[0] = int(n)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def inject_direction_filter():
+    """Which flip direction the inject is for, or None for either.
+
+    MEASURED (boot A2, weg1holdg1i2b): `abandon` fires on the FIRST abandon the
+    rank reaches, and that was a `tp_to_pp` one -- while the #1225 orphan
+    sequence lives on the `pp_to_tp` leg. The hold was perfectly good and
+    inspected the wrong leg, which costs a whole window. A flip site has two
+    directions and they are different events; the filter says which.
+    """
+    raw = os.environ.get(HOLD_INJECT_DIR_ENV)
+    return raw or None
+
+
+def boot_world_rank():
+    """This process's rank from the WORLD group -- a BOOT CONSTANT.
+
+    THE ONLY IDENTITY THAT SURVIVES A CUTOVER. `_WORLD` is set once at
+    `init_world_group` and never rebound, so `rank_in_group` is fixed for the
+    life of the process. `scheduler.ps` is NOT: the cutover replaces it with
+    `pp_rank=0` on every rank (`phase_flip_runtime.py:3329`), which is exactly
+    how run 1 collapsed three ranks onto one port -- and Block E of boot A2
+    then measured `scheduler.ps.pp_rank == 0` on all three ranks at the abandon
+    wall, confirming it on metal.
+
+    Used for the inject RANK FILTER so no site has to have a boot-constant
+    rank in scope to be filterable. Returns None if the group is not up yet,
+    in which case the filter cannot select and the caller keeps its own value.
+    """
+    try:
+        from sglang.srt.distributed import parallel_state as _ps
+
+        return int(_ps.get_world_group().rank_in_group)
+    except Exception:  # noqa: BLE001 - a filter may not raise
+        return None
+
+
+def _inject_rank(pp_rank, tp_rank):
+    """The rank the FILTER compares against. NEVER ps-derived.
+
+    Explicit boot constants from the call site win (the cutover's `world_rank`,
+    `PhaseFlipRuntime._rank`); otherwise the world group answers. `scheduler.ps`
+    is deliberately not consulted at all here -- a filter that reads it selects
+    rank 0 on every rank inside a cutover and silently never fires for the
+    follower that was asked for.
+    """
+    for value in (pp_rank, tp_rank):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return boot_world_rank()
+
+
+def maybe_inject(
+    marker: str,
+    scheduler=None,
+    pp_rank=None,
+    tp_rank=None,
+    direction=None,
+    fill=None,
+) -> None:
     """Raise the injected wall at a named phase point.
 
     REFUSES WITHOUT THE HOLD FLAG. An inject env that fires on a boot with no
@@ -556,10 +673,25 @@ def maybe_inject(marker: str, scheduler=None, pp_rank=None, tp_rank=None) -> Non
     reached".
 
     CALLERS MUST PLACE THIS OUTSIDE ANY `except Exception` THAT SWALLOWS.
-    Two of the three sites sit next to instrument guards whose whole job is to
-    never let a diagnostic kill the scheduler; a `raise` inside one of those is
-    eaten and the wall silently never happens. See the #788 admission site.
+    Two of the sites sit next to instrument guards whose whole job is to never
+    let a diagnostic kill the scheduler; a `raise` inside one of those is eaten
+    and the wall silently never happens. See the #788 admission site.
+
+    THE FILTERS, in the order they are applied -- each one exists because a
+    hold without it landed on the wrong event and cost a window:
+      * marker   -- which site.
+      * direction -- which flip LEG (boot A2 held at a `tp_to_pp` abandon while
+        the sequence under investigation lives on `pp_to_tp`).
+      * rank     -- which process(es), from a BOOT CONSTANT, never from `ps`.
+      * min-fill -- how BIG the request must be. Both earlier holds caught the
+        95-token acceptance probe; the #1225 orphan needs the 13225-token
+        B-probe. A site with no request of its own (`abandon`) reads the latch
+        instead, which is what "the precondition must already hold" means.
+      * nth      -- skip the first n-1 firings, for a site that is reached many
+        times before the interesting one.
     """
+    if fill is not None:
+        note_fill(fill)
     wanted = os.environ.get(HOLD_INJECT_ENV)
     if not wanted or wanted != marker:
         return
@@ -576,9 +708,46 @@ def maybe_inject(marker: str, scheduler=None, pp_rank=None, tp_rank=None) -> Non
             HOLD_ENV,
         )
         return
+
+    want_dir = inject_direction_filter()
+    if want_dir is not None and direction is not None and direction != want_dir:
+        return
+
     only = inject_rank_filter()
     if only is not None:
-        rank, _source = resolve_rank_and_source(scheduler, pp_rank, tp_rank)
-        if rank != only:
+        rank = _inject_rank(pp_rank, tp_rank)
+        # An unresolvable rank must NOT fire: firing everywhere is how three
+        # ranks end up held when one was asked for -- and a held PP0 stalls the
+        # ring, which is how run 2 was torn down.
+        if rank is None or rank not in only:
             return
-    raise RuntimeError(f"{INJECT_MESSAGE} (marker={marker})")
+
+    min_fill = inject_min_fill()
+    if min_fill is not None:
+        # `fill` when the site sees a request; the latch when it does not.
+        seen = fill if fill is not None else _MAX_FILL_SEEN[0]
+        if seen < min_fill:
+            return
+
+    nth = _int_env(HOLD_INJECT_NTH_ENV)
+    if nth is not None and nth > 1:
+        seen = _INJECT_FIRINGS.get(marker, 0) + 1
+        _INJECT_FIRINGS[marker] = seen
+        if seen < nth:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "%s inject %s: firing %d of %d skipped (%s=%d)",
+                MARKER,
+                marker,
+                seen,
+                nth,
+                HOLD_INJECT_NTH_ENV,
+                nth,
+            )
+            return
+
+    detail = f"marker={marker}"
+    if direction is not None:
+        detail += f", direction={direction}"
+    raise RuntimeError(f"{INJECT_MESSAGE} ({detail})")
