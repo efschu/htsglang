@@ -7170,6 +7170,46 @@ class Scheduler(
         # that already runs, which is the close #794 and #823 W9 both used.
         _seam_premise_at = len(vals)
         vals = vals + [self._local_seam_premise_vote()]
+        # #1068 weg1 S0: THE PHASE-DOMAIN VERDICT BUS rides this same reduce,
+        # as ONE block, and it is placed HERE for the reason the #1203 seam
+        # above is: everything before this point is indexed from the HEAD and
+        # the ballot below is indexed from the TAIL, so an insertion at this
+        # seam leaves both readings intact. Its head index is captured BEFORE
+        # the append, like every block above it.
+        #
+        # ONE CARRIER, NOT N: four separate verdicts at this seam would be four
+        # hand-rolled head indices and four chances to get the layout wrong,
+        # which on a MIN reduce reads as agreement. The whole slot table --
+        # including the slots whose producers land in later batches, which read
+        # their MIN-neutral values until then -- is declared in one place.
+        #
+        # THE PER-PASS COUNTERS ARE READ AND CLEARED INSIDE THIS BUILD, not once
+        # per scheduler pass: this site sits after the world-size guard's return
+        # at :6984, so it runs exactly as often as the reduce. A per-pass reset
+        # would erase every PP-phase detection before the next TP reduce could
+        # vote it -- a group STOP deleted by a reset rather than by a missing
+        # vote.
+        #
+        # IMPORTED LOCALLY, the way this same method already imports
+        # `uneven_dcp_active` and the way `:5515` imports `bound_phase`: the
+        # module is referenced only from this seam, and the two statements the
+        # bus adds live inside the one range this slice owns in this file.
+        # Resolved through the module object at call time, so a test can still
+        # neuter exactly one of its functions.
+        from sglang.srt.managers import phase_domain_verdict
+
+        _phase_domain_at = len(vals)
+        _phase_domain_local = phase_domain_verdict.build_phase_domain_payload(self)
+        vals = vals + _phase_domain_local
+        _phase_domain_phase = getattr(self, "phase_flip_active_stack", None)
+        if getattr(self, "_phase_domain_layout_announced", None) != _phase_domain_phase:
+            self._phase_domain_layout_announced = _phase_domain_phase
+            logger.info(
+                "%s",
+                phase_domain_verdict.layout_instrument_line(
+                    _phase_domain_at, _phase_domain_phase
+                ),
+            )
         _ballot_verdicts = self._drain_prefetch_progress()
         self._pass_prefetch_verdicts = _ballot_verdicts
         _ballot_rids = [
@@ -7197,6 +7237,30 @@ class Scheduler(
         # #1203: read back by its captured head index, before the ballot, under
         # the same discipline as the corridor width and the head block.
         setattr(self, UNIFORM_SEAM_PREMISE_ATTR, int(t[_seam_premise_at]))
+        # #1068 weg1 S0: read back by its captured head index, BEFORE the ballot
+        # slice, under the same discipline as the corridor width, the head block
+        # and the seam premise. `unpack_phase_domain` RAISES on a disagreement
+        # -- the (x, -x) pairs make the group's min and max visible to every
+        # rank of this reduce, so all of them raise on the same pass -- and
+        # returns None only for a slice of the WRONG WIDTH, which is a layout
+        # defect and stops here too.
+        _phase_domain_verdict = phase_domain_verdict.unpack_phase_domain(
+            t[
+                _phase_domain_at : _phase_domain_at
+                + phase_domain_verdict.PHASE_DOMAIN_SLOTS
+            ].tolist(),
+            rank=int(self.ps.tp_rank),
+            local=phase_domain_verdict.local_terms_from_payload(_phase_domain_local),
+            world_size=int(torch.distributed.get_world_size(grp)),
+            phase=_phase_domain_phase,
+        )
+        if _phase_domain_verdict is None:
+            raise RuntimeError(
+                "#1068 PHASE-DOMAIN LAYOUT STOP: the reduced payload carries no "
+                f"phase-domain slice (head={_phase_domain_at}, "
+                f"expected={phase_domain_verdict.PHASE_DOMAIN_SLOTS}, "
+                f"available={len(vals) - _phase_domain_at})"
+            )
         _ballot_at = len(vals) - (prefetch_ballot.PREFETCH_BALLOT_SLOTS + 2)
         # #1158 / raenge-nie-uneins: A DIGEST MISMATCH IS A GROUP STOP. The
         # (x, -x) pair makes the group's min and max digest visible to EVERY
