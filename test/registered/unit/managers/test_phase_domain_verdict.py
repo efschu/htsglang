@@ -28,6 +28,7 @@ test is arithmetic over a list of ints, and the reduce that carries it is
 already proven elsewhere.
 """
 
+import dataclasses
 import re
 import unittest
 from unittest import mock
@@ -323,13 +324,20 @@ class TheDigestPairIsTheUniformityCheck(unittest.TestCase):
     def test_and_slot_zero_refuses_on_every_rank(self):
         """One rank votes 0 on the loader-coverage AND-slot; all three refuse.
 
-        AND the line's own denominators are read back. A MIN reduce carries ONE
-        scalar per AND slot and no negated twin, so the group's MAX is not on
-        the wire at all. A renderer that fills the `group_max` field with the
-        MIN reports one refusing rank of three as a group-wide refusal, and
-        contradicts the `local=1` it prints on the same line for the two ranks
-        that voted yes -- the Instrument-Text-luegt shape, in the one line this
-        slice exists to produce.
+        AND the line's own denominators are read back. The hazard is the same
+        one S0 fix 6 named -- a `group_max` field that reports ONE refusing
+        rank of three as a group-wide refusal, contradicting the `local=1` the
+        same line prints for the two ranks that voted yes, the
+        Instrument-Text-luegt shape in the one line this slice exists to
+        produce -- but the REMEDY pinned here is S1 fix 4's, by operator ruling
+        R-B1-5: an AND term rides the reduce as the pair `(v, -v)` like every
+        count pair, so a real group MAX is on the wire and this 1-of-3 refusal
+        renders `group_max=1`. S0's earlier answer (refuse to print a max that
+        is not on the wire, render `?`) is withdrawn; B1 ships ONE renderer.
+
+        `loader_covers_own_layers` has no census block of its own, so the same
+        line renders `per_rank=[none] census_width=0`: the failing term's own
+        row or none at all, never another term's row under this term's name.
         """
         from sglang.srt.managers import phase_domain_verdict as pdv
 
@@ -346,15 +354,23 @@ class TheDigestPairIsTheUniformityCheck(unittest.TestCase):
                     pdv.unpack_phase_domain(
                         reduced, rank=rank, local=local, world_size=3
                     )
-                msg = str(caught.exception)
+                # THE RENDERED HALF ONLY, cut off before the law sentence. That
+                # sentence names both group-max cases in prose, so an assertion
+                # taken over the whole message can be satisfied by the
+                # instrument's own explanation instead of by the field it
+                # claims to read -- measured on this bus in S1's round 4, where
+                # two mutants survived exactly that way.
+                msg = str(caught.exception).split(" -- ")[0]
+                self.assertNotIn("RAENGE", msg)
                 self.assertIn("#1206 LOADER COVERAGE REFUSED", msg)
                 self.assertIn("local=%d" % local["loader_covers_own_layers"], msg)
-                self.assertIn("group_min=0", msg)
-                # `?` is this module's own symbol for a value the payload
-                # cannot supply (`_render_census` renders the census slots
-                # beyond the world size with it). Any digit here is invented.
-                self.assertIn("group_max=?", msg)
+                # A REAL maximum over {1, 0, 1}, not the minimum wearing a
+                # second name: the line separates this partial refusal from a
+                # unanimous one, which is the whole question on a death path.
+                self.assertIn("group_min=0 group_max=1 phase=", msg)
                 self.assertNotIn("group_max=0", msg)
+                # No census block names this term, so no row is borrowed.
+                self.assertIn("per_rank=[none] census_width=0", msg)
 
 
 class ThePayloadRidesTheSeamWithoutMovingTheBallot(unittest.TestCase):
@@ -404,8 +420,15 @@ class TheWidthIsDerivedAndCheckedBothWays(unittest.TestCase):
         # a literal that would have to be edited beside it (mutant 7).
         derived = sum(term.width for term in pdv.PHASE_DOMAIN_LAYOUT)
         self.assertEqual(pdv.PHASE_DOMAIN_SLOTS, derived)
+        # 13 scalar terms, EVERY ONE of them two slots wide -- the five AND
+        # terms carry `(v, -v)` like the pairs since round 4, so the STOP line
+        # has a real maximum -- plus TWO census blocks, one per censused term.
         self.assertEqual(
-            pdv.PHASE_DOMAIN_SLOTS, 21 + pdv.PHASE_DOMAIN_CENSUS_SLOTS
+            pdv.PHASE_DOMAIN_SLOTS, 26 + 2 * pdv.PHASE_DOMAIN_CENSUS_SLOTS
+        )
+        self.assertEqual(
+            [t.name for t in pdv.PHASE_DOMAIN_LAYOUT if t.kind == pdv.CENSUS_BLOCK],
+            ["census_loadback", "census_rebind"],
         )
 
         every_term_present = {
@@ -422,7 +445,8 @@ class TheWidthIsDerivedAndCheckedBothWays(unittest.TestCase):
             "d_geom": 6,
             "host_ring_discarded": 1,
             "d_backup_width": 8,
-            "census": [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS,
+            "census_loadback": [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS,
+            "census_rebind": [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS,
         }
         self.assertEqual(
             len(pdv.pack_phase_domain_payload(every_term_present)),
@@ -445,12 +469,16 @@ class TheWidthIsDerivedAndCheckedBothWays(unittest.TestCase):
     def test_arm_two_the_census_offset_is_the_expression_both_documents_pin(self):
         """T-45 arm 2 -- S0 mutant 7, the DERIVED-CONSTANT half.
 
-        The census offset has moved four times (15 -> 16 -> 18 -> 21) and a
-        hard-coded offset reads a count pair as a per-rank flag without saying
-        anything. The offset is pinned here as the EXPRESSION
+        The census offset has moved five times (15 -> 16 -> 18 -> 21 -> 26,
+        the last move being S1 fix 4's widening of every AND slot to a pair)
+        and a hard-coded offset reads a count pair as a per-rank flag without
+        saying anything. There are TWO blocks since that widening, so the
+        expression is pinned for BOTH: the LAST block ends the payload and is
         `PHASE_DOMAIN_SLOTS - PHASE_DOMAIN_CENSUS_SLOTS`, which is the same
-        expression the S7 spec's T-S7-8 demands at B6, so the two documents
-        pin ONE offset rather than two literals that can disagree.
+        expression the S7 spec's T-S7-8 demands at B6, and the first sits one
+        block-width earlier. So the two documents pin ONE offset rather than
+        two literals that can disagree, and a block added or dropped moves
+        both halves together instead of silently renumbering the other.
 
         The width beside it is the per-KIND arithmetic off the declared table,
         never the total typed out: the enumerated kinds are the assertion and
@@ -460,20 +488,31 @@ class TheWidthIsDerivedAndCheckedBothWays(unittest.TestCase):
         from sglang.srt.managers import phase_domain_verdict as pdv
 
         self.assertEqual(
-            pdv.index_of("census"),
+            pdv.index_of("census_rebind"),
             pdv.PHASE_DOMAIN_SLOTS - pdv.PHASE_DOMAIN_CENSUS_SLOTS,
+        )
+        self.assertEqual(
+            pdv.index_of("census_loadback"),
+            pdv.PHASE_DOMAIN_SLOTS - 2 * pdv.PHASE_DOMAIN_CENSUS_SLOTS,
         )
         kinds = [term.kind for term in pdv.PHASE_DOMAIN_LAYOUT]
         self.assertEqual(kinds.count(pdv.AND_SLOT), 5)
         self.assertEqual(kinds.count(pdv.DIVERGENCE_PAIR), 6)
         self.assertEqual(kinds.count(pdv.MAX_PAIR), 2)
-        self.assertEqual(kinds.count(pdv.CENSUS_BLOCK), 1)
-        self.assertEqual(len(kinds), 14)
+        self.assertEqual(kinds.count(pdv.CENSUS_BLOCK), 2)
+        self.assertEqual(len(kinds), 15)
+        # EVERY scalar kind is two slots wide since S1 fix 4 -- the AND terms
+        # no longer count once -- and the census term is multiplied by its
+        # OWN count rather than added as a single block.
         self.assertEqual(
             pdv.PHASE_DOMAIN_SLOTS,
-            kinds.count(pdv.AND_SLOT)
-            + 2 * (kinds.count(pdv.DIVERGENCE_PAIR) + kinds.count(pdv.MAX_PAIR))
-            + pdv.PHASE_DOMAIN_CENSUS_SLOTS,
+            2
+            * (
+                kinds.count(pdv.AND_SLOT)
+                + kinds.count(pdv.DIVERGENCE_PAIR)
+                + kinds.count(pdv.MAX_PAIR)
+            )
+            + kinds.count(pdv.CENSUS_BLOCK) * pdv.PHASE_DOMAIN_CENSUS_SLOTS,
         )
 
     def test_arm_three_neither_width_nor_offset_is_typed_as_a_literal(self):
@@ -831,28 +870,45 @@ class APayloadWithNoProducersIsSilent(unittest.TestCase):
                 )
 
         # (c) THE TREE'S OWN `HostPoolGroup`, not a stand-in. It carries the
-        # `entry_map` the route discriminates on, it carries the two D-68
+        # `entry_map` the route discriminates on and it carries the two D-68
         # attributes -- DECLARED IN THIS SLICE since fix 7, because the bus
         # reads them with no default and a tree without S1 has no other
-        # declarer -- and it carries NEITHER of S1-C3's/S1-C16's two, which is
-        # what a boot sees if those do not land. Slots 10 and 15 must not stop
-        # that boot, and with the declaration in place nothing else may either:
+        # declarer. With the declaration in place nothing may stop the boot:
         # the payload the tree's own group builds is the NEUTRAL one.
-        real = HostPoolGroup(
-            [
-                PoolEntry(
-                    name=PoolName.KV,
-                    host_pool=_RealEntryHostPool(),
-                    device_pool=None,
-                    layer_mapper=lambda layer_id: layer_id,
-                )
-            ]
-        )
-        for attribute in (
-            "transfer_layer_domain",
-            "expected_transfer_layer_domain",
-        ):
-            self.assertFalse(hasattr(real, attribute), attribute)
+        #
+        # WHAT THIS ARM NO LONGER ASSERTS, and why the removal is the fix and
+        # not a weakening: fix 7 also asserted that the real group carries
+        # NEITHER of S1-C3's/S1-C16's two attributes. That is a statement about
+        # WHICH SLICES HAVE MERGED, not about this slice's behaviour -- it goes
+        # red the moment S1 lands and declares `expected_transfer_layer_domain`
+        # on this very class, which is exactly the "pin the defect as the
+        # expected state" shape the operator record already struck off this arm
+        # once. The neutral payload below is the claim that survives the merge,
+        # and it is the claim the boot-killer was about.
+        # THE LAYER FIELD IS READ OFF THE DATACLASS, not named, for the reason
+        # `test_s0_bus_neutrals_declared_1068.py::_pool_entry` already gives:
+        # S1 renames `PoolEntry.layer_mapper` (a closure) to `layer_mapping`
+        # (a dict) in the same batch. This arm asserts nothing about that field
+        # and never calls it; naming one of the two turns the arm into a
+        # `TypeError` on whichever side of the merge it is not built for.
+        entry_kwargs = {
+            "name": PoolName.KV,
+            "host_pool": _RealEntryHostPool(),
+            "device_pool": None,
+        }
+        if "layer_mapping" in {f.name for f in dataclasses.fields(PoolEntry)}:
+            # THE WIDTH MATTERS ONCE S1 LANDS, and only then: with S1's
+            # accessor present slot 15 compares the counter's live width
+            # against `1 + max(key)` over these entries, so a one-key mapping
+            # would make the tree's own group vote 0 for the fixture's own
+            # arithmetic and say nothing about the D-68 declaration this arm is
+            # for. Keyed off the stand-in counter so the two move together.
+            entry_kwargs["layer_mapping"] = {
+                layer: layer for layer in range(_StandInCounter().num_layers)
+            }
+        else:
+            entry_kwargs["layer_mapper"] = lambda layer_id: layer_id
+        real = HostPoolGroup([PoolEntry(**entry_kwargs)])
         for attribute, neutral in (
             ("host_ring_discard_ok", 1),
             ("d_backup_width", 0),
@@ -1010,20 +1066,36 @@ class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
         and what a shared slot, a `0` sentinel or a value-derived `?` each
         destroy in its own direction.
 
-        THE REFUSING RANK IS A LOOP VARIABLE, NOT THE LITERAL 1. With rank 1 as
-        the only refuser the census write's own rank guard
-        (`phase_domain_verdict.py:574`) survives an off-by-one -- `0 <= rank`
-        narrowed to `0 < rank` still writes slot 1, so rank 0's refusal turns
-        into a healthy `1` and the STOP names NO refusing rank while still
-        stopping the group. Rank 0 is the boundary the guard has, so it is the
-        one the arm has to drive.
+        THE REFUSING RANK IS A LOOP VARIABLE, NOT THE LITERAL 1: rank 0 is the
+        boundary any rank guard has, so it is the one the arm has to drive.
+
+        DRIVEN THROUGH THE PACKER, NOT THE BUILDER, since S0 fix 8. The
+        builder's census producer (`_own_census_slot` and its two call sites)
+        is the ONE part of S1 fix 4 this branch deliberately does not carry --
+        a second definition of that helper at the same anchor is what the B1
+        merge silently duplicates, measured -- so it arrives with S1 at the
+        merge, defined exactly once. The write-side guard it contains is
+        pinned there by S1's own
+        `test_the_builder_fills_the_loadback_census_from_the_loadback_vote`.
+        Everything DOWNSTREAM of the row is pinned here and is the same code
+        on both branches: the reduce, the three rendering cases, and the STOP
+        field itself.
         """
         from sglang.srt.managers import phase_domain_verdict as pdv
 
+        def _own_row(rank, vote):
+            row = [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS
+            if 0 <= rank < pdv.PHASE_DOMAIN_CENSUS_SLOTS:
+                row[rank] = vote
+            return row
+
         for refuser in range(3):
             payloads = [
-                pdv.build_phase_domain_payload(
-                    self._rank(r, incomplete=(r == refuser))
+                pdv.pack_phase_domain_payload(
+                    {
+                        "loadback_coverage_complete": 0 if r == refuser else 1,
+                        "census_loadback": _own_row(r, 0 if r == refuser else 1),
+                    }
                 )
                 for r in range(3)
             ]
@@ -1054,32 +1126,56 @@ class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
         # whole list and a `0` sentinel would report three refusals that never
         # happened.
         healthy = _reduce_min(
-            [pdv.build_phase_domain_payload(self._rank(r)) for r in range(3)]
+            [
+                pdv.pack_phase_domain_payload({"census_loadback": _own_row(r, 1)})
+                for r in range(3)
+            ]
         )
         verdict = pdv.unpack_phase_domain(healthy, rank=0, local={}, world_size=3)
         self.assertIsNotNone(verdict)
-        self.assertEqual(verdict.per_rank, "1,1,1,?,?,?,?,?")
-        self.assertEqual(verdict.census, [1, 1, 1, None, None, None, None, None])
+        # KEYED BY THE CENSUSED TERM since S1 fix 4: a census belongs to the
+        # term it was voted for, so reading it by bus position again would be
+        # the borrowed-row defect this keying exists to make impossible.
+        self.assertEqual(
+            verdict.per_rank["loadback_coverage_complete"], "1,1,1,?,?,?,?,?"
+        )
+        self.assertEqual(
+            verdict.census["loadback_coverage_complete"],
+            [1, 1, 1, None, None, None, None, None],
+        )
         self.assertEqual(verdict.census_width, pdv.PHASE_DOMAIN_CENSUS_SLOTS)
 
     def test_arm_eleven_a_typed_in_offset_reads_a_count_pair_as_a_flag(self):
         """S0 mutant 7's hazard in the message it corrupts, not in a constant.
 
-        The three literals the mutant names are all offsets the census HAD, so
-        the wrong slice starts inside the pairs that precede it: at 18 the
-        first three census positions render `host_ring_discarded` and both
-        halves of `d_backup_width`. This arm drives the two apart by giving
-        the count pair a value no census slot can hold, so the corrupted
-        rendering is legible in the STOP line itself.
+        The four literals the mutant names are all offsets a census block HAD,
+        so the wrong slice starts inside the pairs that precede it: at 21 the
+        first census positions render halves of `d_geom`, `host_ring_discarded`
+        and `d_backup_width`. This arm drives the two apart by giving a count
+        pair a value no census slot can hold, so the corrupted rendering is
+        legible in the STOP line itself.
+
+        THE RAISING TERM MUST BE A CENSUSED ONE since S1 fix 4: a term with no
+        census of its own renders `[none]`, so driving the count pair alone
+        would assert nothing about any offset. The loadback AND slot both
+        carries the census under test and raises before the count pair, and
+        the poisoned pair rides the same payload as the thing a wrong offset
+        would read instead.
         """
         from sglang.srt.managers import phase_domain_verdict as pdv
 
         payload = pdv.pack_phase_domain_payload(
-            {"census": [1, 0, 1, 1, 1, 1, 1, 1], "d_backup_width": 5}
+            {
+                "loadback_coverage_complete": 0,
+                "census_loadback": [1, 0, 1, 1, 1, 1, 1, 1],
+                "d_backup_width": 5,
+            }
         )
         with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
             pdv.unpack_phase_domain(payload, rank=0, local={}, world_size=3)
-        field = self._per_rank_field(str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("term=loadback_coverage_complete", message)
+        field = self._per_rank_field(message)
         self.assertEqual(field, "1,0,1,?,?,?,?,?")
         self.assertNotIn("5", field)
 
@@ -1103,36 +1199,37 @@ class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
 
         payload = pdv.build_phase_domain_payload(scheduler)
         self.assertEqual(pdv.slot_of(payload, "loadback_coverage_complete"), 0)
-        self.assertEqual(
-            pdv.local_terms_from_payload(payload)["census"],
-            [1, 0, 1, 1, 1, 1, 1, 1],
-        )
-        # Read AND cleared at the payload-build site, in the same block, so the
-        # next reduce reads the next pass's detection and not this one again.
+        # THE VOTE ONLY, not the census row beside it. Slot 9's census producer
+        # is S1 fix 4's `_own_census_slot`, which this branch leaves to the
+        # merge (arm ten says why); asserting the row here would pin whichever
+        # half of that producer happens to be present, which is the opposite of
+        # what this arm is for. The vote and its CLEAR are the read this arm
+        # was written to catch, and both are this branch's own code.
         self.assertIs(getattr(controller, pdv.LOADBACK_INCOMPLETE_ATTR), False)
 
         again = pdv.build_phase_domain_payload(scheduler)
         self.assertEqual(pdv.slot_of(again, "loadback_coverage_complete"), 1)
-        self.assertEqual(
-            pdv.local_terms_from_payload(again)["census"],
-            [1] * pdv.PHASE_DOMAIN_CENSUS_SLOTS,
-        )
 
 
-#: S7's OWN group-STOP text for slot 18, typed out here as the independent
-#: witness. `WEG1_S7_HOST_RING_SPEC_0905.md`'s group-STOP line is the source and
-#: the build spec's S0-C3 says the consumer written at B1 "carries as a
-#: constant" that text -- so a test that imported the module's own constant
-#: would assert the module agrees with itself and would pass against any
-#: sentence a B1 builder invented. TWO rendered terms, `rank` and `group_min`:
-#: the phase and the per-ring occupancy have NO producer on this bus at B1 and
-#: are S7's own observation line at the clear.
-S7_SLOT_18_STOP = (
-    "#1206 HOST RING NOT DISCARDED: rank %(rank)d observed a non-empty host "
-    "ring at a cutover (group_min=%(group_min)d); the rings are the "
-    "phase-neutral carrier only because they are EMPTY at every cutover and "
-    "refilled from L3. The phase and the per-ring occupancy are on that rank's "
-    "own '#1206 HOST RING NOT DISCARDED (observation)' line at the clear."
+#: SLOT 18's WHOLE RENDERED STOP LINE, typed out here as the independent
+#: witness rather than imported. A test that built the expected string from the
+#: module's own format would assert the module agrees with itself and would
+#: pass against any line a builder invented.
+#:
+#: S0's earlier answer to S0-C3 -- S7's sentence carried on the term as a
+#: `stop_template` constant and interpolated by the renderer -- is WITHDRAWN by
+#: operator ruling R-B1-5: B1 ships S1 fix 4's single renderer, in which slot 18
+#: declares `terse_stop=True` and the line is the term's own refusal string plus
+#: the three fields this bus actually carries for it. The schedule argument that
+#: put the arm at B1 is unchanged: S7 supplies slot 18's VALUE at B6 and edits
+#: nothing in this file, so a defect in this consumer can only be caught here.
+#:
+#: THREE rendered terms and no fourth: `rank`, `group_min` and this rank's own
+#: `local`. The phase and the per-ring occupancy have NO producer on this bus at
+#: B1 and live on S7's own observation line at the clear.
+S7_SLOT_18_STOP_HEAD = (
+    "#1206 HOST RING NOT DISCARDED STOP rank=%(rank)d group_min=%(group_min)d "
+    "local=%(local)d"
 )
 
 
@@ -1151,16 +1248,21 @@ class TheTwoS7ConsumersAreWrittenAtB1(unittest.TestCase):
     T-46 cannot reach them and why they need driven arms of their own.
     """
 
-    def test_the_slot_eighteen_stop_is_s7s_own_constant(self):
-        """One rank votes 0, two vote 1: every rank STOPs with S7's text.
+    def test_the_slot_eighteen_stop_is_the_terse_line_the_term_declares(self):
+        """One rank votes 0, two vote 1: every rank STOPs on slot 18's line.
 
         TWO defects live here and neither is visible anywhere else in this
         file. (a) The AND-slot loop can be made to SKIP this term -- the
         payload, the reduce and the verdict object all stay correct and the
-        group STOP is simply gone. (b) The message can be an invented sentence
-        rendering terms the bus does not carry, which is the refusal-string
-        form of the Instrument-Text-luegt hazard and which S7's own record
-        struck twice before it reached this shape.
+        group STOP is simply gone. (b) The message can grow terms the bus does
+        not carry, which is the refusal-string form of the
+        Instrument-Text-luegt hazard and which S7's own record struck twice
+        before it reached this shape.
+
+        The renderer is S1 fix 4's `terse_stop` branch (R-B1-5), so the third
+        thing driven here is the LAW SENTENCE: an AND slot at 0 is a REFUSAL,
+        and printing the divergence sentence would send a reader after a
+        disagreement that is not there.
         """
         from sglang.srt.managers import phase_domain_verdict as pdv
 
@@ -1173,34 +1275,45 @@ class TheTwoS7ConsumersAreWrittenAtB1(unittest.TestCase):
 
         for rank in range(3):
             with self.subTest(rank=rank):
+                local = pdv.local_terms_from_payload(payloads[rank])
                 with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
                     pdv.unpack_phase_domain(
                         reduced,
                         rank=rank,
-                        local=pdv.local_terms_from_payload(payloads[rank]),
+                        local=local,
                         world_size=3,
                         phase="tp",
                     )
-                message = str(caught.exception)
+                # THE RENDERED HALF AND THE LAW HALF, SPLIT. The refusal law
+                # sentence spells `local=` in prose, so an absence asserted
+                # over the whole message would be answered by the instrument's
+                # own explanation instead of by the line -- the same trap that
+                # let two group-max mutants survive in S1's round 4.
+                head, _, law = str(caught.exception).partition(" -- ")
                 self.assertEqual(
-                    message,
-                    S7_SLOT_18_STOP % {"rank": rank, "group_min": 0},
+                    head,
+                    S7_SLOT_18_STOP_HEAD
+                    % {
+                        "rank": rank,
+                        "group_min": 0,
+                        "local": local["host_ring_discarded"],
+                    },
                 )
+                self.assertIn("at least one rank refused", law)
+                self.assertNotIn("the ranks do not agree", law)
                 # The three absences T-S7-8 arm 1 asserts at B6, plus the two
-                # this consumer's own B1 draft rendered: a term whose value
+                # the generic renderer would have added: a term whose value
                 # comes from somewhere other than this bus has no place on a
-                # group STOP, and `local=`/`term=` are the two the generic
-                # renderer would have added.
+                # group STOP.
                 for absent in (
                     "per_rank=",
                     "kv=",
                     "gdn=",
                     "phase=",
-                    "local=",
                     "term=",
                     "census_width=",
                 ):
-                    self.assertNotIn(absent, message, absent)
+                    self.assertNotIn(absent, head, absent)
 
     def test_a_max_pair_stops_on_one_ranks_count_and_on_a_uniform_one(self):
         """The MAX pairs' predicate is `group_max > 0`, in BOTH directions.
