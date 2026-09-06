@@ -143,12 +143,20 @@ def _device_owner(kv_keys=(), mamba_keys=(), kvcache_class=None):
 
 
 def _sched(kvcache_class=_SafeWaiter, rank=0, world=True):
+    """A stand-in with the ATTRIBUTE SURFACE THE REAL `Scheduler` HAS.
+
+    The parallel identity is on `ParallelState` (`scheduler.py:860`
+    `        self.ps = ParallelState(`) and NOWHERE ELSE -- the #583 fact,
+    still pinned by `test_census_attribute_surface_583.py`. A stand-in that
+    grants a bare `pp_rank` proves only that the stand-in has it, and every
+    #1206 boot line would label itself `rank=0` on the metal while this
+    harness read the rank back correctly.
+    """
     allocator = types.SimpleNamespace(
         get_kvcache=lambda: (None if kvcache_class is None else kvcache_class())
     )
     return types.SimpleNamespace(
-        pp_rank=rank,
-        tp_rank=rank,
+        ps=types.SimpleNamespace(pp_rank=rank, tp_rank=rank),
         token_to_kv_pool_allocator=allocator,
         world_group=(types.SimpleNamespace(cpu_group="cpu-group") if world else None),
     )
@@ -330,6 +338,71 @@ class TestTheShortfallTermStopsTheGroup(CustomTestCase):
         self.assertIn("missing=[33]", lines[0])
         self.assertEqual(result["owned_equals_driven"], 0)
 
+    def test_the_shortfall_fires_on_the_kv_pool_as_well_as_the_mamba_one(self):
+        """PIN (not red-first): the KV arm of the ``owned`` read.
+
+        WHY IT EXISTS. Both other SHORTFALL drives above drop layer ``33``,
+        and for stage ``[32, 50)`` the split is
+        ``full == [35, 39, 43, 47]`` / ``33 in mamba`` -- so ``owned !=
+        driven`` was only ever made true on the MAMBA entry and the KV branch
+        of ``_device_layer_keys`` was only ever driven on its equal, silent
+        arm. A branch no drive can disturb is not established, and this branch
+        is the one that carries row 0's ``owned`` term for
+        ``PoolName.KV``. Dropping ``35`` -- a FULL-ATTENTION key of that same
+        stage -- drives it.
+        """
+        stack = self._pp_stack("pp", 32, 50, drop=(35,))
+        result = _fresh_result()
+        with self.assertLogs(_LOGGER, level="ERROR") as captured:
+            pfb._vote_transfer_domain_terms(result, _LOGGER, 1, [stack])
+        lines = [x for x in captured.output if "TRANSFER DOMAIN SHORTFALL" in x]
+        self.assertEqual(len(lines), 1)
+        self.assertIn(str(PoolName.KV), lines[0])
+        self.assertIn("missing=[35]", lines[0])
+        self.assertEqual(result["owned_equals_driven"], 0)
+
+    def test_the_kv_map_is_reached_through_the_allocator_on_the_pp_stack(self):
+        """PIN (not red-first): the OWNER SHAPE the live pp stack has.
+
+        ``build_phase_flip_host_pools`` passes ``("pp", pp_host, scheduler)``
+        into the vote, and the ``Scheduler`` has NO ``token_to_kv_pool``
+        (``scheduler.py:944`` keeps only
+        ``self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator``;
+        ``model_runner_kv_cache_mixin.py:2933`` is where the direct attribute
+        is set, on the TP side). So on every real boot the pp stack's row-0
+        ``owned`` term can only come from the allocator route -- the one arm
+        no other test drives, because the stand-in owner sets
+        ``token_to_kv_pool`` directly, which is the TP shape.
+        """
+        full, mamba = _stage(0, 32)
+        kv = _kv_device(full)
+        pp_owner = types.SimpleNamespace(
+            token_to_kv_pool_allocator=types.SimpleNamespace(get_kvcache=lambda: kv),
+            req_to_token_pool=types.SimpleNamespace(
+                mamba_map={k: i for i, k in enumerate(mamba)}
+            ),
+        )
+        self.assertEqual(pfb._device_layer_keys(pp_owner, PoolName.KV), set(full))
+        self.assertEqual(pfb._device_layer_keys(pp_owner, PoolName.MAMBA), set(mamba))
+
+    def test_the_owner_field_the_docstring_forbids_is_not_the_one_read(self):
+        """DANGER DIRECTION for the KV arm, and the one the docstring names:
+        reading ``PoolEntry.device_pool`` / an owner-side ``device_pool``
+        answers ``None`` on every real boot, which leaves row 0 permanently
+        neutral -- a guard that cannot fire, dressed as a comparison. An owner
+        that carries ONLY that field must therefore read NOT COMPARABLE, and
+        one that carries the real map must not.
+        """
+        full, _mamba = _stage(0, 32)
+        decoy = types.SimpleNamespace(device_pool=_kv_device(full))
+        self.assertIsNone(pfb._device_layer_keys(decoy, PoolName.KV))
+        self.assertEqual(
+            pfb._device_layer_keys(
+                types.SimpleNamespace(token_to_kv_pool=_kv_device(full)), PoolName.KV
+            ),
+            set(full),
+        )
+
     def test_boot_reduce_is_silent_on_a_correct_domain(self):
         """T-38b. CAN-NOT-FIRE PIN (excluded from the red-first total).
 
@@ -451,7 +524,7 @@ class TestTheCounterIndexSpaceTerm(CustomTestCase):
                 )
 
     def test_an_absent_allocator_votes_the_min_neutral(self):
-        sched = types.SimpleNamespace(pp_rank=0, tp_rank=0)
+        sched = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=0, tp_rank=0))
         self.assertEqual(pfb._counter_index_space_known(sched, _LOGGER, 0), 1)
 
     def test_one_ranks_unknown_index_space_stops_the_group(self):
@@ -528,8 +601,7 @@ class TestTheRoutedExits(CustomTestCase):
                 cases = []
                 for rank in range(3):
                     sched = self._builder_sched(**(over if rank == 1 else {}))
-                    sched.pp_rank = rank
-                    sched.tp_rank = rank
+                    sched.ps = types.SimpleNamespace(pp_rank=rank, tp_rank=rank)
                     result = pfb.build_phase_flip_host_pools(sched)
                     cases.append((sched, result))
                 # The refusing rank RETURNED rather than raising -- that is
@@ -571,8 +643,7 @@ class TestTheRoutedExits(CustomTestCase):
                 cases = []
                 for rank in range(3):
                     sched = self._builder_sched()
-                    sched.pp_rank = rank
-                    sched.tp_rank = rank
+                    sched.ps = types.SimpleNamespace(pp_rank=rank, tp_rank=rank)
                     mutate(sched)
                     result = pfb.build_phase_flip_host_pools(sched)
                     # NO DEFAULT anywhere: a missing key must be a KeyError,
@@ -594,8 +665,7 @@ class TestTheRoutedExits(CustomTestCase):
         cases = []
         for rank in range(3):
             sched = self._builder_sched()
-            sched.pp_rank = rank
-            sched.tp_rank = rank
+            sched.ps = types.SimpleNamespace(pp_rank=rank, tp_rank=rank)
             result = pfb.build_phase_flip_host_pools(sched)
             del result["host_pool_build_ok"]
             cases.append((sched, result))
@@ -844,6 +914,116 @@ class TestThePackedPayloadCarriesTheTerms(CustomTestCase):
         payload = pdv.build_phase_domain_payload(sched)
         self.assertEqual(pdv.slot_of(payload, "draft_tier_domain_matches"), 1)
         self.assertEqual(pdv.slot_of(payload, "rebind_domain_within_driven"), 1)
+
+
+class TestTheRankLabelIsReadWhereTheSchedulerKeepsIt(CustomTestCase):
+    """Every #1206 boot line must name the rank it was emitted on.
+
+    THE HAZARD. ``Scheduler`` has no ``pp_rank`` and no ``tp_rank``: it keeps
+    its parallel identity on ``ParallelState``, ``self.ps``
+    (``scheduler.py:860`` ``        self.ps = ParallelState(``). The tree has
+    paid for that fact twice already and says so in its own comments --
+    ``scheduler.py:1678-1680`` (*"The first version read `self.tp_rank`, which
+    the Scheduler does not have"*) and ``:8185-8186`` (*"The first cut of this
+    used `self.tp_rank`, which does not exist"*) -- and
+    ``test_census_attribute_surface_583.py`` pins it against the real class.
+
+    A boot reader taking the bare names answers 0 on EVERY rank. Nothing
+    crashes: the attach lines, the SHORTFALL and EMPTY-LAYER-MAPPING lines and
+    the boot STOP all render, all labelled ``rank=0``. So a correct 3-rank
+    boot emits six attach lines that split 4/1/1 by their own label, a grader
+    reading the per-rank count fails a passing boot, and no line on the boot
+    can say which rank refused. A wrong ANSWER, not a traceback, which is why
+    it needs a pin.
+    """
+
+    def test_the_scheduler_has_no_rank_of_its_own(self):
+        """THE FALSIFIER, in the #583 form: if this ever becomes false the
+        reader below is over-built; while it is true, a bare read is a bug."""
+        from sglang.srt.managers.scheduler import Scheduler
+
+        self.assertFalse(hasattr(Scheduler, "pp_rank"))
+        self.assertFalse(hasattr(Scheduler, "tp_rank"))
+
+    def test_the_parallel_state_is_where_the_identity_lives(self):
+        from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+
+        for field in ("pp_rank", "tp_rank"):
+            with self.subTest(field=field):
+                self.assertIn(field, ParallelState.__annotations__)
+
+    def test_the_boot_rank_comes_off_the_parallel_state(self):
+        for rank in range(3):
+            with self.subTest(rank=rank):
+                sched = types.SimpleNamespace(
+                    ps=types.SimpleNamespace(pp_rank=rank, tp_rank=0)
+                )
+                self.assertEqual(pfb._boot_rank(sched), rank)
+
+    def test_pp_rank_is_the_name_that_separates_the_three_ranks(self):
+        """The boot topology is ``pp_size=3, tp_size=1``, so ``tp_rank`` is 0
+        on all three and only ``pp_rank`` distinguishes them. A reader that
+        preferred ``tp_rank`` would relabel every line 0 again."""
+        sched = types.SimpleNamespace(ps=types.SimpleNamespace(pp_rank=2, tp_rank=0))
+        self.assertEqual(pfb._boot_rank(sched), 2)
+
+    def test_a_bare_attribute_is_not_a_second_home_for_the_rank(self):
+        """DANGER DIRECTION. A fallback to the bare name keeps every stand-in
+        green while the metal reads 0 -- one fact with two homes and the wrong
+        one live on the boot."""
+        self.assertEqual(pfb._boot_rank(types.SimpleNamespace(pp_rank=2)), 0)
+        self.assertEqual(pfb._boot_rank(types.SimpleNamespace(tp_rank=2)), 0)
+
+    def test_a_scheduler_without_a_parallel_state_reads_zero(self):
+        """An instrument may never be the thing that breaks a boot."""
+        self.assertEqual(pfb._boot_rank(types.SimpleNamespace()), 0)
+        self.assertEqual(pfb._boot_rank(types.SimpleNamespace(ps=None)), 0)
+
+    def test_each_ranks_pin_attach_line_names_that_rank(self):
+        """§2.2 grades the attach rows PER RANK. Three ranks, three distinct
+        labels -- the count is only gradeable if the labels differ."""
+        pin_full, pin_mamba = _stage(0, 64)
+        cases = []
+        for rank in range(3):
+            pin = _group(pin_full, pin_mamba)
+            result = _result_from_groups(rank, [_stack("tp", pin, pin_full, pin_mamba)])
+            result["tp"] = pin
+            cases.append((_sched(rank=rank), result))
+        outcomes = _BootFabric(cases).run()
+
+        labels = []
+        for rank, (raised, lines) in enumerate(outcomes):
+            self.assertIsNone(raised, f"rank {rank} raised: {raised}")
+            attach = [x for x in lines if "#1206 TRANSFER DOMAIN attach" in x]
+            self.assertEqual(len(attach), 1)
+            self.assertIn(f"rank={rank}", attach[0])
+            labels.append(attach[0])
+        self.assertEqual(len(set(labels)), 3, "three ranks, three labels")
+
+    def test_the_boot_stop_names_the_rank_it_is_raised_on(self):
+        """One rank's tier maps fewer layers than its device pool owns; all
+        three STOP, and each STOP carries ITS OWN rank rather than 0."""
+        cases = []
+        for rank, (start, end) in enumerate([(0, 32), (32, 50), (50, 64)]):
+            full, mamba = _stage(start, end)
+            drop = (33,) if rank == 1 else ()
+            group = _group(
+                [k for k in full if k not in drop],
+                [k for k in mamba if k not in drop],
+                kv_owned=full,
+                mamba_owned=mamba,
+            )
+            cases.append(
+                (
+                    _sched(rank=rank),
+                    _result_from_groups(rank, [_stack("pp", group, full, mamba)]),
+                )
+            )
+        outcomes = _BootFabric(cases).run()
+
+        for rank, (raised, _lines) in enumerate(outcomes):
+            self.assertIsInstance(raised, pdv.PhaseDomainDivergence)
+            self.assertIn(f"rank={rank}", str(raised))
 
 
 if __name__ == "__main__":

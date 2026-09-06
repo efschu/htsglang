@@ -2278,6 +2278,30 @@ def _hybrid_pin_entries(*, tp_runner, sa, kv_host, inner_pool, tp_device_pool, l
 _GLOBAL_ID_SAFE_WAITERS = ("HybridLinearKVPool", "HybridReqToTokenPool")
 
 
+def _boot_rank(scheduler) -> int:
+    """This rank's identity for every #1206 boot line, read where it LIVES.
+
+    THE SCHEDULER HAS NO `pp_rank` AND NO `tp_rank`. It keeps its parallel
+    identity on the `ParallelState` wrapper, `self.ps` (`scheduler.py:860`),
+    and this tree has already paid for the bare read twice -- the census tick
+    (`scheduler.py:8184-8186`) and the host-shmem census
+    (`scheduler.py:1679-1681`), both of which carry the note in their own
+    comments, with `test_census_attribute_surface_583.py` pinning the fact
+    against the real class.
+
+    The hazard is a WRONG ANSWER, not a crash: a bare read answers 0 on every
+    rank, so the attach lines, the SHORTFALL and EMPTY-LAYER-MAPPING lines and
+    the boot STOP all render, all labelled `rank=0`, and no #1206 line on the
+    boot can say which rank refused. `pp_rank` is taken first because the boot
+    topology is `pp_size=3, tp_size=1`, so it is the name that separates the
+    three ranks; `tp_rank` follows it for a TP-shaped stand-in. The bare names
+    are deliberately NOT a fallback -- a second home for the rank would keep
+    every stand-in green while the metal read 0.
+    """
+    ps = getattr(scheduler, "ps", None)
+    return int(getattr(ps, "pp_rank", getattr(ps, "tp_rank", 0)) or 0)
+
+
 def _counter_index_space_known(scheduler, logger, rank: int) -> int:
     """Row 2. Classify the pool registered under the transfer counter.
 
@@ -2376,7 +2400,7 @@ def vote_phase_flip_boot_verdict(scheduler, result: dict) -> None:
     from sglang.srt.managers import phase_domain_verdict as pdv
 
     logger = logging.getLogger(__name__)
-    rank = int(getattr(scheduler, "pp_rank", getattr(scheduler, "tp_rank", 0)) or 0)
+    rank = _boot_rank(scheduler)
     terms = phase_flip_boot_terms(scheduler, result, logger, rank)
     payload = pdv.build_boot_reduce_payload(terms)
 
@@ -2643,7 +2667,7 @@ def build_phase_flip_host_pools(scheduler):
 
     from sglang.srt.mem_cache.hicache_storage import PoolName
 
-    rank = int(getattr(scheduler, "pp_rank", getattr(scheduler, "tp_rank", 0)) or 0)
+    rank = _boot_rank(scheduler)
     max_running = int(getattr(sa, "max_running_requests", 0) or 0)
     chunk = int(getattr(sa, "chunked_prefill_size", 0) or 0)
     hicache_size_gb = int(getattr(sa, "hicache_size", 0) or 0)
