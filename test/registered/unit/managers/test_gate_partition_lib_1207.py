@@ -46,7 +46,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+# The depth counts from THIS file's home, so it is re-derived whenever the
+# module moves: test/registered/unit/managers -> the tree root is four up.
+_SCRIPTS = Path(__file__).resolve().parents[4] / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 

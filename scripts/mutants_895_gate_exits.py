@@ -24,6 +24,9 @@ whether the arms pass or fail.
     | A9 | the solo re-run itself cannot answer          | rc 3, INCONCLUSIVE |
     |A10 | the solo re-run collects nothing but parses   | rc 3, INCONCLUSIVE |
     |A11 | a module that cannot be imported at all       | named UNCOLLECTABLE|
+    |A12 | the same census, on an INTERRUPTED lane       | named BEFORE rc 3  |
+    |A13 | --gate-path with no --table beside it        | rc 2, REFUSED      |
+    |A14 | a gate path that holds no test module        | rc 2, REFUSED      |
     +----+-----------------------------------------------+--------------------+
 
 A2 is the arm #895 exists for. Its probe module fails only when it runs under
@@ -39,6 +42,25 @@ A11 is the arm for the runner's fourth numbered refusal (#1207), and it is
 END TO END on purpose: the DID NOT RUN census is a print inside ``main()``, so
 a unit arm on ``uncollectable_modules`` proves the list and not the report, and
 deleting the block that prints it would still leave that arm green.
+
+A12 is A11's other half, and the difference is the LANE, not the assertion.
+The census earns its keep by standing BEFORE the ``VERDICT: INCONCLUSIVE``
+return, which is the only path an interrupted lane takes -- and A11's probe
+modules are PARALLEL, so its lane runs under xdist workers, is never
+interrupted, and prints the census on either side of a move. A12 stages the
+same two modules SERIAL: workers=0, one process, pytest stops at
+``Interrupted: 1 error during collection``, and the run reaches the return.
+That is the run in which the reader's ONLY signal that a module never started
+is this banner, so it is the run the arm asserts on.
+
+A13 and A14 are the arm for ``main()``'s ``except ScopeRefused``, the single
+consumer of all three of the runner's scope refusals. The hazard is the one
+``resolve_scope``'s docstring names: a ``--gate-path`` without its ``--table``
+answered from the DEFAULT table is a real verdict, from the wrong document,
+about modules that were never measured -- and it exits 1 like any other verify,
+so nothing downstream can tell it from an answer. No other arm here reaches
+exit code 2. Both arms pass ``--verify`` so that a refusal turned back into a
+guess terminates instead of gating the whole default scope.
 
 Run:  CUDA_VISIBLE_DEVICES="" <venv>/bin/python3 scripts/mutants_895_gate_exits.py
 """
@@ -205,6 +227,20 @@ def run_gate(table: Path, extra: list[str] | None = None) -> tuple[int, str]:
     return p.returncode, p.stdout + p.stderr
 
 
+def run_raw(argv: list[str]) -> tuple[int, str]:
+    """The runner with EXACTLY these arguments, plus an outdir.
+
+    ``run_gate`` always supplies a matched ``--gate-path``/``--table`` pair,
+    which is precisely the shape the scope refusals cannot fire on, so the arms
+    that provoke them build the command line themselves.
+    """
+    cmd = [PY, str(RUNNER), *argv, "--outdir", str(PROBE_DIR / "out")]
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    p = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
+    return p.returncode, p.stdout + p.stderr
+
+
 def mod(name: str) -> str:
     return f"{PROBE_REL}/{name}"
 
@@ -360,6 +396,47 @@ def main() -> int:
                      f"UNCOLLECTABLE {PROBE_REL}/test_p_uncollectable.py",
                      "RERUN INCONCLUSIVE"],
                     ["NOT REPRODUCED", "GENUINE"])
+
+        # A12 -- the census on the run that needs it: an INTERRUPTED lane.
+        # The banner stands ahead of the INCONCLUSIVE return, and only a lane
+        # that pytest cut short during collection reaches that return. Both
+        # modules go SERIAL, so the lane runs with workers=0 in one process and
+        # pytest stops at `Interrupted: 1 error during collection` -- the exact
+        # #1207 shape, where every count the runner has still tallies and the
+        # name of the module that never started is the only thing left to say.
+        stage(["test_p_ok.py", "test_p_uncollectable.py"])
+        write_table(table, [(mod("test_p_ok.py"), "SERIAL", "probe", []),
+                            (mod("test_p_uncollectable.py"), "SERIAL",
+                             "probe", [])])
+        rc, out = run_gate(table)
+        ok &= check("A12 census speaks on an INTERRUPTED run", 3, rc, out,
+                    ["=== DID NOT RUN: 1 module(s) could not be collected ===",
+                     f"UNCOLLECTABLE {PROBE_REL}/test_p_uncollectable.py",
+                     "VERDICT: INCONCLUSIVE"],
+                    ["NOT REPRODUCED", "GENUINE"])
+
+        # A13 -- a --gate-path with no --table. Answering it from the default
+        # table would hand every module of the named path a verdict measured on
+        # another path, and exit 1 like any ordinary verify. Refused by name.
+        stage(["test_p_ok.py"])
+        write_table(table, [(mod("test_p_ok.py"), "PARALLEL", "probe", [])])
+        rc, out = run_raw(["--gate-path", PROBE_REL, "--verify"])
+        ok &= check("A13 gate path without its table refused", 2, rc, out,
+                    ["REFUSED:", "--gate-path given 1 time(s) and --table "
+                     "given 0 time(s)"],
+                    ["# verify"])
+
+        # A14 -- the same consumer, reached by the other raise: a gate path
+        # that holds no test module at all. A renamed directory glob-matches
+        # nothing and raises nothing on its own, so the gate would silently
+        # narrow to the paths that still exist and report that as the full run.
+        empty = PROBE_DIR / "empty"
+        empty.mkdir(exist_ok=True)
+        rc, out = run_raw(["--gate-path", empty.relative_to(ROOT).as_posix(),
+                           "--table", str(table), "--verify"])
+        ok &= check("A14 gate path that gates nothing refused", 2, rc, out,
+                    ["REFUSED:", "holds 0 test_*.py module(s)"],
+                    ["# verify"])
 
         # A6 -- a verdict the runner does not know is named, not swallowed.
         stage(["test_p_ok.py"])

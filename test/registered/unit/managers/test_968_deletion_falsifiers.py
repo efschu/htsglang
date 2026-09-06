@@ -99,10 +99,15 @@ def test_quiescence_does_not_consult_the_carry_orphan_query():
     """The ORPHAN gate (#631 defect L) blocked a flip on requests "not yet
     merged into the resident set the carry harvests". #856 deleted the harvest
     and de4f541b41 gave `_live_reqs` the identical population, so the gate
-    refused for a reason that no longer exists. Structural, because the name is
-    what would come back: `orphan_resident_reqs` still exists in the product
-    (`parked_decode_set.py:45`, `phase_flip_runtime.py:1207`), so a
-    re-introduced call would read as ordinary use of a live symbol."""
+    refused for a reason that no longer exists.
+
+    Structural, and NOT because the name is live: nothing in this tree defines
+    `orphan_resident_reqs` any more (`phase_flip_runtime.py:1211-1213`,
+    #1202/#969; the two surviving occurrences, `parked_decode_set.py:45` and
+    `phase_flip_runtime.py:1207`, are past-tense prose). The gate can therefore
+    only come back as helper AND call together, and the call site is the one
+    place that catches that pair -- an ImportError would only catch the
+    helper."""
     import inspect
 
     from sglang.srt.managers.phase_flip_runtime import build_flip_quiescence_fn
