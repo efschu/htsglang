@@ -16833,9 +16833,27 @@ def run_scheduler_process(
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 
-    except Exception:
+    except Exception as scheduler_exc:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        # #1223 HOLD AT THE WALL (env-gated, default OFF, no-op without
+        # SGLANG_DEBUG_HOLD=1). Placed HERE -- after the traceback is logged,
+        # before every census and before `parent_process.send_signal(SIGQUIT)`
+        # a few lines down -- for one reason: that SIGQUIT is what ends the
+        # group, so a hold placed after it would be holding a rank whose peers
+        # are already being torn down, and the state the operator came to
+        # inspect would be gone on two of three ranks. Nothing below is
+        # skipped: `maybe_hold` RETURNS (at `q` or at the
+        # SGLANG_DEBUG_HOLD_S deadline, default 1800 s) and the rank then dies
+        # down exactly the path it would have taken without the flag.
+        try:
+            from sglang.srt.managers import debug_hold
+
+            debug_hold.maybe_hold(
+                scheduler_exc, scheduler, pp_rank=pp_rank, tp_rank=tp_rank
+            )
+        except Exception:  # noqa: BLE001 - diagnostics may not mask the death
+            logger.warning("#1223: debug hold unavailable")
         # #1058b: the census goes out HERE, ahead of every signal, not only in
         # the `finally` below. `parent_process.send_signal(SIGQUIT)` and the
         # opt-in `os.killpg(..., SIGKILL)` a few lines down can both end this

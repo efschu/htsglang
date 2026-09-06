@@ -4051,6 +4051,22 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
             scheduler.ps.pp_size,
         )
 
+        # #1223: the injected wall for the hold-mode metal proof. No-op unless
+        # SGLANG_DEBUG_HOLD_INJECT=cutover AND SGLANG_DEBUG_HOLD=1 (the inject
+        # refuses without the hold rather than killing the group). This site is
+        # chosen because a cutover completes on ALL THREE ranks within the same
+        # flip, so the injected wall is group-wide -- the shape the hold exists
+        # for -- and it is reached about a minute after READY rather than at
+        # boot, so the proof exercises a live serving rank.
+        #
+        # Imported HERE rather than at module top on purpose: this branch must
+        # stay cherry-pickable onto every S0..S7 slice tip, and the import
+        # block at the top of this file is a hunk the flip-image slice already
+        # edits. A local import collides with nothing.
+        from sglang.srt.managers import debug_hold
+
+        debug_hold.maybe_inject("cutover")
+
     return _cutover
 
 
