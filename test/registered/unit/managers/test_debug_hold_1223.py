@@ -828,11 +828,19 @@ def test_inject_sites_are_wired_at_the_named_places():
     pfr = (mgr / "phase_flip_runtime.py").read_text()
     sched = (mgr / "scheduler.py").read_text()
 
-    # INJECT-2 at the abandon branch ENTRY, before the ledger clear.
+    # INJECT-2 at the abandon branch ENTRY, before the ledger disposal.
     entry = pfr.index("if reduced_fit[0] == 0 or not frames_agree:")
-    clear = pfr.index("self._armed_residents = {}  # #1202: and so is the ledger")
+    # RE-ANCHORED AT THE B1 MERGE, same place in the same branch: #1225's
+    # ledger-scope repair (24685ebf92) replaced this branch's clear
+    # `self._armed_residents = {}  # #1202: and so is the ledger` with the
+    # RETIRE-to-a-carry call, because the arm ends here WITHOUT a cutover and
+    # the rows the ledger names still have their owners. The property this row
+    # pins is unchanged -- the hold must land BEFORE the ledger is disposed of,
+    # or it inspects the state the disposal produced and proves nothing about
+    # C1 vs C2. Only the statement being anchored on changed.
+    clear = pfr.index('self._park_armed_residents("pool too small for the live set")')
     inject2 = pfr.index('maybe_inject("abandon"', entry)
-    assert entry < inject2 < clear, "INJECT-2 is not before the ledger clear"
+    assert entry < inject2 < clear, "INJECT-2 is not before the ledger disposal"
 
     # INJECT-1 outside the swallowing except of _trace_pp_admission_verdict.
     swallow = sched.index('"#788 PP-ADMISSION trace unavailable: %s: %s"')
