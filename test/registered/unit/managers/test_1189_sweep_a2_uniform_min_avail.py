@@ -126,9 +126,15 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
         about a different program.
         """
         sets, clears = _writes(self.tree)
+        # RE-BASED, NOT WEAKENED. The third writer moved 6851/6944/7239 ->
+        # 6851/6944/7313 because #1068 weg1 S0 inserts the phase-domain verdict
+        # bus at the #1203 seam in two hunks above it -- `scheduler.py`
+        # :7173-7222 and :7250-7273, 50 + 24 = 74 lines.
+        # The writer SET is what this row pins and it is unchanged: three
+        # statements, byte-identical, re-read in the tree at the new lines.
         self.assertEqual(
             sets,
-            [6851, 6944, 7239],
+            [6851, 6944, 7313],
             f"the three writers of self.{ATTR} moved: {sets}",
         )
 
