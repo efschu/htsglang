@@ -136,24 +136,71 @@ class TestTheIncomingLayoutIsTheOneReadAhead(CustomTestCase):
         """``incoming_image`` names the same layout ``refill`` streams.
 
         Two readers of one fact, so the pin cannot be filled from the image
-        the leg does not use. ``refill``'s own source is quoted here rather
-        than restated: it is the consumer, and it is what a boot obeys.
-        """
-        import inspect
+        the leg does not use. ``refill`` is READ here rather than restated:
+        it is the consumer, and it is what a boot obeys.
 
+        READ AS A TREE, NOT AS TEXT, and that is the repair this test is.
+        Until now the consumer half was two substring assertions
+        (``'"pp_to_tp"' in src``), and both SURVIVE the mutation they exist
+        to catch: swapping the incoming and outgoing arguments of
+        ``refill``'s ``_timed_arena_refill`` call for one direction leaves
+        every string in the source, and the whole slice suite stayed green
+        under it with a byte-identical tally (45 passed, 2 subtests). Under
+        that swap the arm fills the pin with the layout the leg does NOT
+        stream, so every leg logs ``#809 FLIP IMAGE PIN STALE``, falls back
+        to the file, and the boot still holds the multi-GiB post and still
+        spends the drain on a read nobody uses -- the #742 silently-inert
+        class this file exists for, one level below the four mutations its
+        module docstring lists.
+
+        THE TWO READERS ARE JOINED THROUGH ``image_for_phase``, not through
+        a pair of literals: for each direction the image the accessor hands
+        the pin must be the image of the phase ``refill`` passes as the
+        incoming one, and the layout it refills must be that phase's layout.
+        A swap of either argument breaks the identity.
+        """
         from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
         from sglang.srt.managers import phase_flip_boot as boot
 
-        src = inspect.getsource(boot.PhaseFlipStacks.refill)
         img_pp, img_tp = _image(), _image()
         stacks = _stacks(image_pp=img_pp, image_tp=img_tp)
         self.assertIs(stacks.incoming_image(PP_TO_TP), img_tp)
         self.assertIs(stacks.incoming_image(TP_TO_PP), img_pp)
-        # `refill` names its incoming layout as the last argument of each
-        # `_timed_arena_refill` call; both spellings must be present, or the
-        # assertions above are being checked against a leg that moved.
-        self.assertIn('"pp_to_tp"', src)
-        self.assertIn('"tp_to_pp"', src)
+        refill = _dedented_tree(boot.PhaseFlipStacks.refill)
+        for direction, const in ((PP_TO_TP, "PP_TO_TP"), (TP_TO_PP, "TP_TO_PP")):
+            with self.subTest(direction=direction):
+                branch = _direction_branch(refill, const)
+                self.assertIsNotNone(
+                    branch,
+                    f"`refill` has no `direction == {const}` branch, so the "
+                    f"accessor above is checked against a leg that moved",
+                )
+                # The branch's OWN body only: an `elif` hangs off this node's
+                # `orelse`, and reading the whole node would let the other
+                # direction's call answer for this one.
+                calls = _method_calls_named(branch.body, "_timed_arena_refill")
+                self.assertEqual(
+                    len(calls),
+                    1,
+                    f"the {const} leg does not refill exactly once",
+                )
+                args = calls[0].args
+                self.assertEqual(len(args), 4, ast.unparse(calls[0]))
+                phase = ast.literal_eval(args[3])
+                self.assertIs(
+                    stacks.image_for_phase(phase),
+                    stacks.incoming_image(direction),
+                    f"the {const} leg streams the {phase!r} layout, but the "
+                    f"read-ahead accessor hands the pin the other image: the "
+                    f"pin is filled with the layout the arena is LEAVING and "
+                    f"every leg refuses it as stale",
+                )
+                self.assertEqual(
+                    ast.unparse(args[1]),
+                    f"self.layout_{phase}",
+                    f"the {const} leg refills a layout that is not the "
+                    f"{phase!r} phase's own",
+                )
 
     def test_an_unknown_direction_reads_nothing_ahead(self):
         pin = _StubPin()
@@ -308,12 +355,52 @@ class TestTheAbandonStopsTheReadAhead(CustomTestCase):
         self.assertIsNone(rt._parked_extent)
 
 
+def _dedented_tree(func):
+    """The AST of ``func``, dedented so a method body parses on its own."""
+    return ast.parse(textwrap.dedent(inspect.getsource(func))).body[0]
+
+
 def _boot_stack_tree():
     """The AST of ``build_phase_flip_tp_stack``, dedented so it parses alone."""
     from sglang.srt.managers import phase_flip_boot
 
-    body = textwrap.dedent(inspect.getsource(phase_flip_boot.build_phase_flip_tp_stack))
-    return ast.parse(body).body[0]
+    return _dedented_tree(phase_flip_boot.build_phase_flip_tp_stack)
+
+
+def _direction_branch(tree, const_name):
+    """The ``if``/``elif`` node testing ``direction == <const_name>``.
+
+    ``elif`` is an ``ast.If`` in the previous node's ``orelse``, so both
+    directions are reached by walking; what a caller must NOT do is read a
+    node's ``orelse``, which belongs to the other direction.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            continue
+        test = node.test
+        if (
+            isinstance(test.left, ast.Name)
+            and test.left.id == "direction"
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Name)
+            and test.comparators[0].id == const_name
+        ):
+            return node
+    return None
+
+
+def _method_calls_named(nodes, name):
+    """``self.<name>(...)`` calls under ``nodes`` (a list of statements)."""
+    found = []
+    for stmt in nodes:
+        found.extend(
+            node
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == name
+        )
+    return found
 
 
 def _calls_named(tree, name):

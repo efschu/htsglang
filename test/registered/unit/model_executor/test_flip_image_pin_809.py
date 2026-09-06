@@ -83,6 +83,35 @@ _LOGGER = "sglang.srt.model_executor.weights_arena"
 _CHUNK = 1 << 20
 
 
+def _open_direct(path):
+    """The boot's own O_DIRECT fd for ``path``, or None where it is refused.
+
+    ``weights_arena.py:939`` opens exactly this in production. It is a
+    filesystem property (measured OK on this rig's ``/tmp`` and ``/spinning``),
+    so a tree that runs elsewhere skips rather than fails.
+    """
+    try:
+        return os.open(path, os.O_RDONLY | os.O_DIRECT)
+    except OSError:
+        return None
+
+
+def _aligned_buffer(nbytes: int, aligned: bool = True):
+    """A host buffer whose address is (or deliberately is not) block-aligned.
+
+    The production allocator hands out page mappings, so ``_direct_ok`` is
+    True in a boot; ``torch.zeros`` in a test is aligned only by luck, and a
+    test that asserts an O_DIRECT read must not be able to pass by having
+    silently fallen back to the buffered fd.
+    """
+    align = weights_arena._DIRECT_ALIGN
+    raw = torch.zeros(nbytes + 2 * align, dtype=torch.uint8)
+    off = (-int(raw.data_ptr())) % align
+    if not aligned:
+        off += 8
+    return raw[off : off + nbytes]
+
+
 def _make_layout(nbytes: int):
     """A one-slot layout of ``nbytes``, which is all a refill needs."""
     from sglang.srt.model_executor.weights_arena import ArenaLayout, ArenaSlot
@@ -187,8 +216,15 @@ class _FlipImagePinBase(CustomTestCase):
         self._chunk.__exit__(None, None, None)
         super().tearDown()
 
-    def _image(self, d, name, payload: bytes, phase: str):
-        """A file-backed layout image on disk, registered and tagged as at boot."""
+    def _image(self, d, name, payload: bytes, phase: str, direct: bool = False):
+        """A file-backed layout image on disk, registered and tagged as at boot.
+
+        ``direct`` registers the SECOND fd a boot registers
+        (``weights_arena.py:939``: ``os.open(path, os.O_RDONLY | os.O_DIRECT)``).
+        Every other test in this file passes ``None`` there, which is why the
+        four terms of ``_read_chunk``'s O_DIRECT guard were unreachable from
+        this suite until ``TestFlipImagePinDirectRead``.
+        """
         body = bytearray(payload)
         csum = weights_arena.uint8_checksum(torch.frombuffer(body, dtype=torch.uint8))
         blob = bytes(body) + int(csum).to_bytes(8, "little", signed=True)
@@ -201,7 +237,16 @@ class _FlipImagePinBase(CustomTestCase):
         image = torch.from_file(path, shared=True, size=total, dtype=torch.uint8)
         fd = os.open(path, os.O_RDONLY)
         self._fds.append(fd)
-        weights_arena._register_file_backed_image(image, fd, total, path, None)
+        fd_direct = None
+        if direct:
+            fd_direct = _open_direct(path)
+            if fd_direct is None:
+                self.skipTest(
+                    f"O_DIRECT is refused on {d}; this test is about the fd "
+                    f"choice and has nothing to assert without it"
+                )
+            self._fds.append(fd_direct)
+        weights_arena._register_file_backed_image(image, fd, total, path, fd_direct)
         weights_arena.tag_layout_image(image, phase)
         return image, _make_layout(len(payload))
 
@@ -1496,6 +1541,106 @@ class TestFlipImagePinGroupAdmission(_FlipImagePinBase):
         )
         self.assertEqual([p.name for p in pinned_host_budget.registered_posts()], [])
         self.assertIsNone(weights_arena.flip_image_pin())
+
+
+class TestFlipImagePinDirectRead(_FlipImagePinBase):
+    """T-G1-13: the read-ahead's O_DIRECT guard, on a REAL O_DIRECT fd.
+
+    THE GAP THIS CLOSES, measured rather than argued. ``_read_chunk``'s fd
+    choice has four terms (``weights_arena.py``, verbatim: ``meta.fd_direct is
+    not None and self._direct_ok and offset % _DIRECT_ALIGN == 0 and length %
+    _DIRECT_ALIGN == 0``), and NONE of them was reachable from this suite:
+    every other image here is registered with ``fd_direct=None``, so the
+    branch was never entered on any of the 45 tests. Replacing the whole
+    guard with ``if meta.fd_direct is not None:`` left the slice suite fully
+    green.
+
+    IT IS NOT BEHAVIOUR-NEUTRAL, and the acceptance boot is exactly where it
+    bites. The launcher arms the two-file file-backed images and the boot
+    registers a real O_DIRECT fd beside the buffered one
+    (``weights_arena.py:939``), so the branch runs on every chunk of every
+    arm; the image is payload + an 8-byte checksum trailer, so its LENGTH is
+    never block-aligned. Without the modulo terms the tail read goes to the
+    O_DIRECT fd and fails EINVAL, ``_read_loop`` catches it and only WARNs,
+    and the boot proceeds with an incomplete pin -- ``source=file``,
+    ``ratio<1`` -- while the flag is still armed and the multi-GiB post is
+    still registered. That is the #742 silently-inert-flag class, and a
+    TIMING acceptance cannot tell it from "the prefetch did not help".
+    """
+
+    def test_the_whole_image_is_read_through_a_real_o_direct_fd(self):
+        """The fill COMPLETES over an unaligned total, as at boot.
+
+        Can-fail: the payload is a whole number of reader chunks plus the
+        8-byte trailer, so the last read is the aligned-length term's own
+        case. With the guard removed that read EINVALs and the fill stops one
+        trailer short of the image (measured: 4194304 of 4194312).
+        """
+        payload = os.urandom(2 * _CHUNK)
+        with tempfile.TemporaryDirectory(dir="/tmp") as d:
+            image, _ = self._image(d, "tp.img", payload, "tp", direct=True)
+            self.assertEqual(int(image.numel()) % weights_arena._DIRECT_ALIGN, 8)
+            buffer = _aligned_buffer(int(image.numel()))
+            pin = self._install(weights_arena.FlipImagePin(buffer))
+            self.assertEqual(
+                int(buffer.data_ptr()) % weights_arena._DIRECT_ALIGN,
+                0,
+                "the destination address is not block-aligned, so this test "
+                "would prove nothing about the O_DIRECT path",
+            )
+            self.assertTrue(pin.start_prefetch(image))
+            self._wait_complete(pin, int(image.numel()))
+            self.assertEqual(
+                bytes(pin.buffer.numpy()),
+                bytes(image.numpy()),
+                "the pin holds bytes the file does not",
+            )
+
+    def test_which_fd_a_chunk_is_read_on_is_the_guard_itself(self):
+        """Each of the four terms decides, and each is asserted on its own.
+
+        The DANGER direction is the aligned case: a chunk that COULD be read
+        at device rate silently taken on the buffered fd is the whole gain of
+        #809 given away with no line in the log, since both fds return the
+        same bytes.
+        """
+        payload = os.urandom(2 * _CHUNK)
+        align = weights_arena._DIRECT_ALIGN
+        with tempfile.TemporaryDirectory(dir="/tmp") as d:
+            image, _ = self._image(d, "tp.img", payload, "tp", direct=True)
+            meta = weights_arena._file_backed_meta(image)
+            self.assertIsNotNone(meta.fd_direct)
+            for offset, length, aligned_buf, want_direct, why in (
+                (0, align, True, True, "block-aligned offset, length and buffer"),
+                (0, 8, True, False, "the 8-byte checksum trailer's length"),
+                (8, align, True, False, "an offset inside a block"),
+                (0, align, False, False, "a destination address off the block"),
+            ):
+                with self.subTest(why=why):
+                    buffer = _aligned_buffer(int(image.numel()), aligned=aligned_buf)
+                    pin = weights_arena.FlipImagePin(buffer)
+                    seen = []
+                    real = os.preadv
+
+                    def spy(fd, buffers, off, _real=real, _seen=seen):
+                        _seen.append(fd)
+                        return _real(fd, buffers, off)
+
+                    with mock.patch.object(weights_arena.os, "preadv", spy):
+                        got = pin._read_chunk(meta, buffer.numpy(), offset, length)
+                    self.assertEqual(got, length, "the chunk was not read at all")
+                    want = meta.fd_direct if want_direct else meta.fd
+                    self.assertEqual(
+                        seen,
+                        [want],
+                        f"{why}: the chunk went to the "
+                        f"{'buffered' if want_direct else 'O_DIRECT'} fd",
+                    )
+                    self.assertEqual(
+                        bytes(memoryview(buffer.numpy())[offset : offset + length]),
+                        bytes(image.numpy()[offset : offset + length]),
+                        "the chunk landed with the wrong bytes",
+                    )
 
 
 if __name__ == "__main__":
