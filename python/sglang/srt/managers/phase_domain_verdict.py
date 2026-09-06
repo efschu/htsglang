@@ -95,9 +95,11 @@ PHASE_DOMAIN_CENSUS_SLOTS = 8
 class _Term:
     """One voted term of the packed bus. ONE ENTRY PER VOTED TERM."""
 
-    __slots__ = ("name", "kind", "width", "neutral", "refusal", "terse_stop")
+    __slots__ = ("name", "kind", "width", "neutral", "refusal", "stop_template")
 
-    def __init__(self, name, kind, refusal, *, width=None, neutral=None, terse_stop=False):
+    def __init__(
+        self, name, kind, refusal, *, width=None, neutral=None, stop_template=None
+    ):
         self.name = name
         self.kind = kind
         self.refusal = refusal
@@ -112,7 +114,35 @@ class _Term:
             self.neutral = neutral
         else:  # pragma: no cover - a typo in the table, not a runtime state
             raise ValueError(f"unknown term kind {kind!r} for {name!r}")
-        self.terse_stop = terse_stop
+        #: The OWNING slice's own refusal text, carried here as data. A term
+        #: whose refusal is written in another document cannot have its message
+        #: repaired in the slice that supplies its value -- that slice edits
+        #: nothing in this file -- so the string arrives with the row and the
+        #: renderer interpolates it rather than composing a sentence of its own.
+        self.stop_template = stop_template
+
+
+#: SLOT 18's GROUP STOP, WORD FOR WORD FROM S7's OWN SPECIFICATION
+#: (`WEG1_S7_HOST_RING_SPEC_0905.md`, the group-STOP line under S7-C10). It is
+#: a CONSTANT here because S7 supplies slot 18's VALUE at B6 and edits nothing
+#: in this file: a string invented at B1 could never be corrected in the slice
+#: that first drives it.
+#:
+#: TWO interpolated terms and no third. The hazard a third one carries is this
+#: document's own -- a refusal string may render only terms its own bus carries,
+#: and what reaches slot 18 is ONE AND-accumulated flag. The phase and the
+#: per-ring occupancy have a producer and a moment only at the clear, on S7's
+#: rank-local `#1206 HOST RING NOT DISCARDED (observation)` line; rendering them
+#: here would mean reading live occupancy at the unpack, which is legitimately
+#: non-zero and would print a healthy number under a verdict about a different
+#: moment.
+HOST_RING_NOT_DISCARDED_STOP = (
+    "#1206 HOST RING NOT DISCARDED: rank %(rank)d observed a non-empty host "
+    "ring at a cutover (group_min=%(group_min)d); the rings are the "
+    "phase-neutral carrier only because they are EMPTY at every cutover and "
+    "refilled from L3. The phase and the per-ring occupancy are on that rank's "
+    "own '#1206 HOST RING NOT DISCARDED (observation)' line at the clear."
+)
 
 
 #: THE PACKED-BUS LAYOUT. Twenty-one scalar terms plus the census block, in
@@ -150,7 +180,7 @@ PHASE_DOMAIN_LAYOUT: Tuple[_Term, ...] = (
         "host_ring_discarded",
         AND_SLOT,
         "#1206 HOST RING NOT DISCARDED",
-        terse_stop=True,
+        stop_template=HOST_RING_NOT_DISCARDED_STOP,
     ),
     _Term("d_backup_width", MAX_PAIR, "host backup width mismatch count"),
     _Term(
@@ -768,16 +798,13 @@ def unpack_phase_domain(
 
 
 def _stop_message(term, *, rank, local, group_min, group_max, phase, per_rank) -> str:
-    if term.terse_stop:
-        # The B1 consumer renders rank, group_min and the flag only -- the
-        # phase term and the census are deliberately not on this line.
-        return "%s STOP rank=%d group_min=%d local=%s -- %s" % (
-            term.refusal,
-            int(rank),
-            int(group_min),
-            local,
-            _RAENGE,
-        )
+    if term.stop_template is not None:
+        # THE OWNING SLICE'S OWN TEXT, interpolated and not extended. Every
+        # further term this renderer could add -- the phase, the census, this
+        # rank's own value -- is a term the owning document deliberately moved
+        # off this line, so a renderer that appends its own tail here ships a
+        # string the slice that owns the refusal cannot correct.
+        return term.stop_template % {"rank": int(rank), "group_min": int(group_min)}
     return (
         "#1206 PHASE DOMAIN DIVERGENCE STOP rank=%d term=%s refusal=%s local=%s "
         "group_min=%d group_max=%d phase=%s per_rank=[%s] census_width=%d -- %s"

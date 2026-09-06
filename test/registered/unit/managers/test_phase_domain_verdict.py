@@ -1016,6 +1016,159 @@ class ThePerRankCensusIsWhatTheStopPrints(unittest.TestCase):
         )
 
 
+#: S7's OWN group-STOP text for slot 18, typed out here as the independent
+#: witness. `WEG1_S7_HOST_RING_SPEC_0905.md`'s group-STOP line is the source and
+#: the build spec's S0-C3 says the consumer written at B1 "carries as a
+#: constant" that text -- so a test that imported the module's own constant
+#: would assert the module agrees with itself and would pass against any
+#: sentence a B1 builder invented. TWO rendered terms, `rank` and `group_min`:
+#: the phase and the per-ring occupancy have NO producer on this bus at B1 and
+#: are S7's own observation line at the clear.
+S7_SLOT_18_STOP = (
+    "#1206 HOST RING NOT DISCARDED: rank %(rank)d observed a non-empty host "
+    "ring at a cutover (group_min=%(group_min)d); the rings are the "
+    "phase-neutral carrier only because they are EMPTY at every cutover and "
+    "refilled from L3. The phase and the per-ring occupancy are on that rank's "
+    "own '#1206 HOST RING NOT DISCARDED (observation)' line at the clear."
+)
+
+
+class TheTwoS7ConsumersAreWrittenAtB1(unittest.TestCase):
+    """S0-C3's second half -- the consumers for slot 18 and pair 19-20.
+
+    Both terms are DECLARED at B1 and both producers land at B6, and S7 "edits
+    nothing in scheduler.py 7171/7199 or phase_domain_verdict.py". So a defect
+    in either consumer cannot be repaired in the slice that first drives it:
+    the only lawful place is here, four to six batches before anything can
+    observe it. That is why these arms exist at B1 rather than at B6, and it is
+    the same schedule argument S0-C1 makes for declaring the slots themselves.
+
+    Neither consumer can FIRE on a healthy B1 payload -- with the neutrals the
+    reduce yields `group_min == 1` and `group_max == 0` -- which is exactly why
+    T-46 cannot reach them and why they need driven arms of their own.
+    """
+
+    def test_the_slot_eighteen_stop_is_s7s_own_constant(self):
+        """One rank votes 0, two vote 1: every rank STOPs with S7's text.
+
+        TWO defects live here and neither is visible anywhere else in this
+        file. (a) The AND-slot loop can be made to SKIP this term -- the
+        payload, the reduce and the verdict object all stay correct and the
+        group STOP is simply gone. (b) The message can be an invented sentence
+        rendering terms the bus does not carry, which is the refusal-string
+        form of the Instrument-Text-luegt hazard and which S7's own record
+        struck twice before it reached this shape.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        payloads = [
+            pdv.pack_phase_domain_payload({"host_ring_discarded": 0} if r == 1 else {})
+            for r in range(3)
+        ]
+        reduced = _reduce_min(payloads)
+        self.assertEqual(pdv.slot_of(reduced, "host_ring_discarded"), 0)
+
+        for rank in range(3):
+            with self.subTest(rank=rank):
+                with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+                    pdv.unpack_phase_domain(
+                        reduced,
+                        rank=rank,
+                        local=pdv.local_terms_from_payload(payloads[rank]),
+                        world_size=3,
+                        phase="tp",
+                    )
+                message = str(caught.exception)
+                self.assertEqual(
+                    message,
+                    S7_SLOT_18_STOP % {"rank": rank, "group_min": 0},
+                )
+                # The three absences T-S7-8 arm 1 asserts at B6, plus the two
+                # this consumer's own B1 draft rendered: a term whose value
+                # comes from somewhere other than this bus has no place on a
+                # group STOP, and `local=`/`term=` are the two the generic
+                # renderer would have added.
+                for absent in (
+                    "per_rank=",
+                    "kv=",
+                    "gdn=",
+                    "phase=",
+                    "local=",
+                    "term=",
+                    "census_width=",
+                ):
+                    self.assertNotIn(absent, message, absent)
+
+    def test_a_max_pair_stops_on_one_ranks_count_and_on_a_uniform_one(self):
+        """The MAX pairs' predicate is `group_max > 0`, in BOTH directions.
+
+        Slots 16-17 and 19-20 are packed exactly like the five divergence
+        pairs and consumed differently, so the predicate is one character away
+        from each of the two silent forms, and each form is silent on a
+        DIFFERENT case:
+
+        * `group_min > 0` is silent on the realistic case -- ONE rank counting
+          and the others at zero -- and fires only when every rank counted;
+        * the `min != max` consumer the other five pairs use is silent on a
+          count that is nonzero and UNIFORM, which for a wrong-answer
+          condition must stop the group too.
+
+        Both cases are driven for both pairs, because a pair is wired
+        term-by-term and a consumer copied onto the second one is not caught by
+        an arm that drives the first.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        for name in ("d_geom", "d_backup_width"):
+            for label, counts in (
+                ("one rank counted", (6, 0, 0)),
+                ("every rank counted", (6, 6, 6)),
+            ):
+                with self.subTest(term=name, case=label):
+                    payloads = [
+                        pdv.pack_phase_domain_payload({name: c} if c else {})
+                        for c in counts
+                    ]
+                    reduced = _reduce_min(payloads)
+                    for rank in range(3):
+                        with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
+                            pdv.unpack_phase_domain(
+                                reduced, rank=rank, local={}, world_size=3
+                            )
+                        message = str(caught.exception)
+                        self.assertIn(f"term={name}", message)
+                        self.assertIn(f"group_min={min(counts)}", message)
+                        self.assertIn("group_max=6", message)
+
+    def test_local_terms_read_the_positive_half_of_every_pair(self):
+        """`local=` on a STOP is THIS rank's contribution, not its negation.
+
+        The pair is packed `(x, -x)`, so a reader off by one slot answers `-x`
+        and every count STOP at the live seam then prints a negative number for
+        a rank that counted. Nothing else in this file reaches the pair branch
+        of `local_terms_from_payload`: the two arms that assert `local=` in a
+        message build that dict by hand, and the two calls at the seam read
+        only the census.
+        """
+        from sglang.srt.managers import phase_domain_verdict as pdv
+
+        # Six DISTINCT values, so a reader that lands on a neighbouring slot
+        # cannot pass by answering the neighbour's count.
+        counts = {
+            "d_host_prov": 2,
+            "d_ownership": 3,
+            "d_state_src": 7,
+            "d_host_unresolvable": 4,
+            "d_slot_ownership": 5,
+            "d_geom": 6,
+        }
+        payload = pdv.pack_phase_domain_payload(counts)
+        local = pdv.local_terms_from_payload(payload)
+        for name, value in counts.items():
+            with self.subTest(term=name):
+                self.assertEqual(local[name], value)
+
+
 class TheBootReduceLayoutIsDeclaredOnceAndDerived(unittest.TestCase):
     """T-53 -- the boot bus's T-45 and T-46 in one."""
 
@@ -1313,8 +1466,19 @@ class ThePayloadIsBuiltWithTheReduceAndNotWithThePass(unittest.TestCase):
         ):
             with self.assertRaises(pdv.PhaseDomainDivergence) as caught:
                 scheduler_mod.Scheduler._update_uniform_pool_budget(standin)
-        self.assertIn("term=loadback_coverage_complete", str(caught.exception))
-        self.assertIn("#1206 LOADBACK COVERAGE INCOMPLETE", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("term=loadback_coverage_complete", message)
+        self.assertIn("#1206 LOADBACK COVERAGE INCOMPLETE", message)
+        # ALL FOUR ARGUMENTS THE SEAM SUPPLIES, not only the term. The unpack's
+        # own arms call it directly with `world_size=3`, so nothing above this
+        # line reads the seam's argument list -- and `world_size` is the one
+        # the census's `?` is decided by. Dropped, every rank at or above the
+        # width renders `1` and the STOP names five phantom healthy ranks
+        # instead of saying it does not know: the module's own docstring calls
+        # that deriving `?` from the value 1, which a healthy rank also writes.
+        self.assertIn("rank=0", message)
+        self.assertIn("census_width=8", message)
+        self.assertIn("per_rank=[1,1,1,?,?,?,?,?]", message)
 
 
 if __name__ == "__main__":
