@@ -105,13 +105,47 @@ class TestTheOldNameHardRemoves(CustomTestCase):
     fail loudly, not start with the format quietly off."""
 
     def test_the_old_cli_flag_is_refused_by_name(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
+        """MERGE BATCH 1: the refusal moved, the invariant did not.
+
+        S5 registered the old spelling on the parser with a
+        ``RemovedFlagAction``.  S0's un-weave removed ELEVEN flip flags and
+        refuses all of them from one list, on argv, BEFORE ``parse_args`` --
+        and its own test requires that argparse REJECT every removed flag, so
+        a registration for one of them is a direct contradiction as well as a
+        second bookkeeping of the same list.  S0's gate is the surviving
+        authority; it is strictly broader and it keeps the property S5 was
+        protecting, because it runs AFTER the ``--config`` merge, so a flag
+        arriving from a config file is refused on the same terms as one typed
+        on the command line.  What this test pins is unchanged: the old
+        spelling fails loudly, and the message names BOTH the old flag and its
+        replacement, so no launch line silently boots with the format off.
+        """
+        from sglang.srt.removed_cli_flags import refuse_removed_flip_flags
+
         with self.assertRaises(ValueError) as cm:
-            parser.parse_args(["--model-path", "m", "--phase-flip-canonical-kv-page"])
+            refuse_removed_flip_flags(
+                ["--model-path", "m", "--phase-flip-canonical-kv-page"]
+            )
         msg = str(cm.exception)
         self.assertIn("--hicache-canonical-kv-page", msg)
         self.assertIn("--phase-flip-canonical-kv-page", msg)
+
+    def test_the_old_cli_flag_is_refused_from_a_config_file_too(self):
+        """The property S5's parser-side action was bought for.
+
+        A shell gets argparse's "unrecognized arguments" for free; a config
+        file or a programmatic caller does not.  The gate runs on the merged
+        argv, so the joined ``--flag=value`` form a config merger emits is
+        refused as well -- can-fail proof: matching only the bare token would
+        walk past this.
+        """
+        from sglang.srt.removed_cli_flags import refuse_removed_flip_flags
+
+        with self.assertRaises(ValueError) as cm:
+            refuse_removed_flip_flags(
+                ["--model-path", "m", "--phase-flip-canonical-kv-page=true"]
+            )
+        self.assertIn("--hicache-canonical-kv-page", str(cm.exception))
 
     def test_the_old_field_name_is_gone(self):
         self.assertFalse(

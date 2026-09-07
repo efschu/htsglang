@@ -50,7 +50,6 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
     LoRAPathAction,
-    RemovedFlagAction,
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -18970,31 +18969,17 @@ class ServerArgs:
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
         )
 
-        # --- Removed argument registrations (refused by name, never ignored) ---
-        # Weg 2 F1 renamed this flag because its MEANING changed: it is a store
-        # format, not a phase-flip knob. A launch line still carrying the old
-        # spelling must fail loudly -- argparse's own "unrecognized argument"
-        # would be enough for a shell, but a config file or a programmatic
-        # caller could drop it silently, and the failure mode of running with
-        # the format off is a 100 % store miss that looks like a cold cache.
-        parser.add_argument(
-            "--phase-flip-canonical-kv-page",
-            dest="hicache_canonical_kv_page",
-            action=RemovedFlagAction,
-            new_flag="--hicache-canonical-kv-page",
-            reason=(
-                "The canonical KV page is a STORE FORMAT choice, not a "
-                "phase-flip knob (Weg 2 spec 3.2 / F1): it is valid wherever a "
-                "reader may have a different parallel cut from the writer, and "
-                "the flip was only one instance of that. The old name also "
-                "carried the flip's --enable-phase-flip precondition, which "
-                "forces pp_size > 1 and tp_size == 1 and therefore excluded "
-                "every decode-shaped reader. No silent alias is provided: "
-                "accepting it here would leave the format OFF on a launch that "
-                "asked for it, and the store would miss 100 % without raising."
-            ),
-            help=argparse.SUPPRESS,
-        )
+        # --- Removed argument registrations ---
+        # There are none, deliberately.  #1233 (WEG 2, S0) removed the flip
+        # flags -- including the RENAMED --phase-flip-canonical-kv-page -- and
+        # refuses them BY NAME in `refuse_removed_flip_flags`, which runs on
+        # argv before `parse_args` and after the `--config` merge, so a flag
+        # arriving from a config file or a programmatic caller is refused on
+        # the same terms as one typed on the command line (the concern Weg 2
+        # F1 / S5 raised).  Registering them here as well would be a second
+        # bookkeeping of the same list, and would make argparse ACCEPT a flag
+        # the un-weave requires it to reject.  ONE authority: REMOVED_FLIP_FLAGS
+        # in sglang/srt/removed_cli_flags.py.
 
         # --- Deprecated argument registrations ---
         parser.add_argument(

@@ -41,40 +41,15 @@ class DeprecatedAction(argparse.Action):
         )
 
 
-class RemovedFlagAction(argparse.Action):
-    """A flag that is GONE, refused by name rather than silently unknown.
-
-    Different from every Deprecated* action above on purpose: those keep
-    working and warn. This one raises, because the flags it guards changed
-    MEANING, not just spelling -- a launch line that still carries the old
-    name would otherwise start with the feature quietly off, which is the
-    silent-shim failure the CLI policy refuses (Weg 2 spec 11.5).
-
-    ``ValueError`` rather than ``parser.error()``: the caller may be a
-    ServerArgs construction rather than a shell, and every other refusal in
-    ``server_args`` is a ValueError carrying its own reason.
-    """
-
-    def __init__(
-        self, option_strings, dest, new_flag=None, reason="", nargs=0, **kwargs
-    ):
-        self.new_flag = new_flag
-        self.reason = reason
-        kwargs.pop("default", None)
-        super().__init__(
-            option_strings, dest, nargs=nargs, default=argparse.SUPPRESS, **kwargs
-        )
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        replacement = (
-            f" Use '{self.new_flag}' instead."
-            if self.new_flag
-            else " It has no replacement."
-        )
-        raise ValueError(
-            f"'{option_string}' has been REMOVED.{replacement} "
-            f"{self.reason}".strip()
-        )
+# NOTE (#1233 merge batch 1): S5 added a ``RemovedFlagAction`` here, to
+# register the renamed ``--phase-flip-canonical-kv-page`` on the parser and
+# raise from it.  It is deleted, not kept unused: S0's un-weave refuses all
+# ELEVEN removed flip flags from one list on argv, before ``parse_args``, and
+# its own test requires argparse to REJECT every removed flag -- so a parser
+# registration for one of them is both a second bookkeeping of that list and a
+# direct contradiction of it.  The single authority is ``REMOVED_FLIP_FLAGS``
+# in ``sglang/srt/removed_cli_flags.py``; re-adding an action class here means
+# re-opening that contradiction.
 
 
 class DeprecatedStoreTrueAction(argparse.Action):

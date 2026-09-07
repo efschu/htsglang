@@ -1810,9 +1810,16 @@ class TestTheRemovalRefusesLoudlyAtParseTime(unittest.TestCase):
 #:   that boot ran, which is why it does not appear below.
 #: * ``cert_485/certify_485.py`` no longer ASKS the parser for the flag; the one
 #:   mention is the comment saying why the entry left.
+#: * ``int8_368/boot_855_gdncov.sh`` counted EIGHT on the S0 branch and counts
+#:   SEVEN here: merge batch 1 brought S5, which renamed that recipe's
+#:   ``--phase-flip-canonical-kv-page`` line to ``--hicache-canonical-kv-page``.
+#:   The new spelling is a LIVE flag, not a removed one, so it leaves this
+#:   census by construction -- the shrink this map's own failure message asks
+#:   for when a sweep lands.  The recipe still refuses before argv (the sibling
+#:   test below), so the seven that remain stay unreachable.
 _SCRIPT_FLAG_MENTIONS = {
     "scripts/cert_485/certify_485.py": 1,
-    "scripts/int8_368/boot_855_gdncov.sh": 8,
+    "scripts/int8_368/boot_855_gdncov.sh": 7,
     "scripts/route_a_631_flip_boot.sh": 3,
     "scripts/route_a_631_prod_boot.sh": 8,
     "scripts/s29_reboot_depth_draft.sh": 3,
