@@ -41,12 +41,14 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.weg2_memory_saver import (
     WEG2_SLEEP_MIN_RELEASED_FRACTION,
+    WEG2_SLEEP_TAGS,
     Weg2WakeRefused,
     assert_backup_off_wake_refill_is_defined,
     assert_memory_saver_active,
     checkpoint_quantization,
     pcie_transfer_lock,
     resolve_pcie_lock_key,
+    is_weights_family_tag,
     sleep_acceptance_census,
 )
 
@@ -92,6 +94,11 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    #: #1233: the pre-pause census of the sleep in progress (taken at the
+    #: first release RPC of a sleep, graded at the RPC that completes the
+    #: WEG2_SLEEP_TAGS population).  A slots dataclass: a field, not an
+    #: ad-hoc attribute.
+    weg2_sleep_before: Any = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -198,6 +205,20 @@ class SchedulerWeightUpdaterManager:
 
     def _weg2_server_args(self):
         return getattr(self.scheduler, "server_args", None)
+
+    @staticmethod
+    def _weg2_rss_shmem_mib() -> float:
+        """This process's RssShmem (/proc/self/status), the instrument that
+        sees the torch_memory_saver cpu backup (cudaMallocHost pages are
+        shared file-backed; RssAnon is blind to them -- boot weg2s1 N5)."""
+        try:
+            with open("/proc/self/status") as f:
+                for ln in f:
+                    if ln.startswith("RssShmem:"):
+                        return int(ln.split()[1]) / 1024.0
+        except OSError:
+            pass
+        return -1.0
 
     @contextmanager
     def _weg2_pcie_lock(self, label: str) -> Iterator[None]:
@@ -503,17 +524,31 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        # #1233 one-backup flip: the weights are a FAMILY of tags (the base
+        # GPU_MEMORY_TYPE_WEIGHTS plus weights_<k> per layer chunk, see
+        # weg2_memory_saver.weights_family_tags) and one sleep may arrive as
+        # several RPCs, one tag each, interleaved by the front with the other
+        # group's wake.  Upstream's own offload_tags set is the ledger of what
+        # is paused: the FIRST family tag of a sleep exports the static state
+        # (buffers are read while every page is still mapped), and the sleep
+        # is graded when the whole WEG2_SLEEP_TAGS population is paused.
+        weights_tags = [t for t in tags if is_weights_family_tag(t)]
+        family_paused_before = any(is_weights_family_tag(t) for t in self.offload_tags)
+        sleep_begins = len(self.offload_tags) == 0
+
         for tag in tags:
             self.offload_tags.add(tag)
 
         # The PRE-PAUSE reading, on the same instrument the acceptance census
         # reads after.  Without it the census has no criterion and grades
-        # nothing (see _weg2_log_sleep_acceptance).  Taken here, after the idle
-        # assert and before any pause, so the difference is exactly what this
-        # RPC released.  Weg-2 path only: a stock release must stay upstream.
-        weg2_before_census = (
-            sleep_acceptance_census(tags=tags) if weg2_memory_saver_on else None
-        )
+        # nothing (see _weg2_log_sleep_acceptance).  Taken at the FIRST RPC of
+        # a sleep (nothing paused yet), after the idle assert and before any
+        # pause, so the difference is exactly what the whole sleep released.
+        # Weg-2 path only: a stock release must stay upstream.
+        if weg2_memory_saver_on and sleep_begins:
+            self.weg2_sleep_before = sleep_acceptance_census(tags=tags)
+        weg2_before_census = self.weg2_sleep_before
+        t_rpc0 = time.perf_counter()
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             scheduler = self.scheduler
@@ -559,16 +594,20 @@ class SchedulerWeightUpdaterManager:
                     "W25 Weg2DormantRefused",
                 )
 
-        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+        if weights_tags:
             # #89 hibernate: destination="disk" parks the FINAL post-transform
             # weights to hibernate_dir before the normal release/pause, so a
             # later boot can restore them fast (LoadFormat.HIBERNATE). The
             # default path (destination None/"gpu") is unchanged.
-            if getattr(recv_req, "destination", None) == "disk":
+            if (
+                GPU_MEMORY_TYPE_WEIGHTS in tags
+                and getattr(recv_req, "destination", None) == "disk"
+            ):
                 self._hibernate_park_weights(recv_req)
-            self.stashed_model_static_state = _export_static_state(
-                self.tp_worker.model_runner.model
-            )
+            if not family_paused_before:
+                self.stashed_model_static_state = _export_static_state(
+                    self.tp_worker.model_runner.model
+                )
             torch.distributed.barrier(self.tp_cpu_group)
             # The PCIe serialisation lock is taken AFTER the barrier and around
             # the D2H leg only: with --enable-weights-cpu-backup this pause
@@ -584,14 +623,32 @@ class SchedulerWeightUpdaterManager:
             # _export_static_state, a checksum, a .clone() -- is a read of
             # unmapped pages, which is the campaign (a) fault on the sibling
             # tag.  Pinned by test_weights_block_pause_is_the_last_statement.
-            with self._weg2_pcie_lock("sleep-D2H weights"):
-                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            shm0 = self._weg2_rss_shmem_mib()
+            with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags)):
+                for tag in weights_tags:
+                    self.memory_saver_adapter.pause(tag)
+            # The MEASURED bytes of this tag set's host image (the ledger's
+            # chunk term is image / N, derived; this is the instrument).
+            logger.info(
+                "WEG2-CHUNK-BYTES sleep tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, /proc/self/status)",
+                weights_tags, self._weg2_rss_shmem_mib() - shm0, shm0, self._weg2_rss_shmem_mib(),
+            )
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
-        if weg2_memory_saver_on:
+        sleep_complete = WEG2_SLEEP_TAGS.issubset(self.offload_tags)
+        if weg2_memory_saver_on and not sleep_complete:
+            # A chunk RPC of an interleaved sleep: the census (whole-process
+            # residency) is graded once the population is complete, below.
+            logger.info(
+                "WEG2-SLEEP-CHUNK tags=%s paused in %.0f ms (offload_tags now %s)",
+                tags,
+                (time.perf_counter() - t_rpc0) * 1000,
+                sorted(self.offload_tags),
+            )
+        if weg2_memory_saver_on and sleep_complete:
             # PROVENANCE, because the obvious justification for this call is
             # MEASURED FALSE on this rig: campaign (a) measured, WITHOUT it,
             # NVML free 1870.8 -> 30730.8 MiB and per-process 30,154 -> 1,294
@@ -612,7 +669,10 @@ class SchedulerWeightUpdaterManager:
             # byte the upstream path, and an extra post-pause device call plus
             # two NVML reads on it is not that.
             torch.get_device_module().empty_cache()
-            self._weg2_log_sleep_acceptance(weg2_before_census, tags)
+            self._weg2_log_sleep_acceptance(
+                weg2_before_census, sorted(self.offload_tags)
+            )
+            self.weg2_sleep_before = None
 
         return ReleaseMemoryOccupationReqOutput()
 
@@ -628,22 +688,43 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
-        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+        weights_tags = [t for t in tags if is_weights_family_tag(t)]
+        if weights_tags:
             # Wake-H2D: with the cpu backup this recommit refills from the host
-            # buffer.  Same lock, same reason as the sleep leg above.
-            with self._weg2_pcie_lock("wake-H2D weights"):
-                self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-            torch.distributed.barrier(self.tp_cpu_group)
-            # Wake path (ii): without --enable-weights-cpu-backup the recommit
-            # above restored PAGES, not CONTENT.  Refill from disk BEFORE the
-            # static-state import, so the stash exported from the live model at
-            # sleep stays the last writer for the buffers.
-            self._weg2_wake_reload_weights()
-            _import_static_state(
-                self.tp_worker.model_runner.model,
-                self.stashed_model_static_state,
+            # buffer (and, with the #1233 patched hook, frees that buffer).
+            # Same lock, same reason as the sleep leg above.
+            t_w0 = time.perf_counter()
+            shm0 = self._weg2_rss_shmem_mib()
+            with self._weg2_pcie_lock("wake-H2D " + ",".join(weights_tags)):
+                for tag in weights_tags:
+                    self.memory_saver_adapter.resume(tag)
+            logger.info(
+                "WEG2-CHUNK-BYTES wake tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, /proc/self/status; negative = the patched saver freed it)",
+                weights_tags, self._weg2_rss_shmem_mib() - shm0, shm0, self._weg2_rss_shmem_mib(),
             )
-            del self.stashed_model_static_state
+            torch.distributed.barrier(self.tp_cpu_group)
+            family_complete = not any(
+                is_weights_family_tag(t) for t in self.offload_tags
+            )
+            logger.info(
+                "WEG2-WAKE-CHUNK tags=%s resumed in %.0f ms (offload_tags now %s, weights family %s)",
+                tags,
+                (time.perf_counter() - t_w0) * 1000,
+                sorted(self.offload_tags),
+                "COMPLETE" if family_complete else "partial",
+            )
+            if family_complete:
+                # Wake path (ii): without --enable-weights-cpu-backup the
+                # recommit above restored PAGES, not CONTENT.  Refill from
+                # disk BEFORE the static-state import, so the stash exported
+                # from the live model at sleep stays the last writer for the
+                # buffers.  Both only once the WHOLE family is mapped again.
+                self._weg2_wake_reload_weights()
+                _import_static_state(
+                    self.tp_worker.model_runner.model,
+                    self.stashed_model_static_state,
+                )
+                del self.stashed_model_static_state
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)

@@ -919,7 +919,18 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
-        for _, module in model.named_modules():
+        # #1233 Weg-2 one-backup flip: a post-load pass that ALLOCATES (a
+        # repack, a requantise, a new Parameter) must land in the chunk tag of
+        # its layer, not in the base weights tag -- the chunk is what the
+        # front pauses and resumes per leg.  The layer id comes from the
+        # module name; modules outside a layer keep the base tag.  No-op
+        # unless the launcher set the chunk envs (weg2_memory_saver.py).
+        from sglang.srt.managers.weg2_memory_saver import (
+            layer_id_from_module_name,
+            weight_chunk_scope,
+        )
+
+        for name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading
@@ -927,8 +938,9 @@ class DefaultModelLoader(BaseModelLoader):
                 # to be on the global target device. This scope is for the
                 # case where cpu offloading is used, where we will move the
                 # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+                with weight_chunk_scope(layer_id_from_module_name(name)):
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
 
 
 class LayeredModelLoader(DefaultModelLoader):
