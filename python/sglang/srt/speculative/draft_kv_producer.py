@@ -62,6 +62,13 @@ class DraftKvProducer:
         self._chunks = 0
         self._rows = 0
         self._peak_mib = 0.0
+        # Section 6 / W11: the resident cost of this producer on the stage,
+        # MEASURED (NVML-free delta from before the build to after the
+        # embedding load and the release of the head's own lm_head), not
+        # budgeted. -1 until load_resident_embedding ran, or without CUDA.
+        self._free_before_mib = _cuda_free_mib()
+        self.resident_mib = -1.0
+        self.embed_dtype = "?"
 
         # The draft build sees a pp_size-1 world: its one layer would fail
         # `make_layers`' `num_hidden_layers >= pp_size` assert under the
@@ -126,17 +133,35 @@ class DraftKvProducer:
                 "draft-KV producer: the draft model built no embed_tokens of its "
                 "own (PPMissingLayer) -- the build did not run under draft_pp_scope."
             )
+        # Placement A pays the embedding ONCE: the checkpoint rows go INTO
+        # the tensors the MTP build materialised (`named_parameters` of the
+        # built module; no second table). A checkpoint that does not match
+        # the built parameters is refused by name -- int8 codes cast into a
+        # bf16 table without their scale, or a scale with no parameter to
+        # land in, would both load "successfully" as token soup.
         params = dict(embed.named_parameters())
         wanted = {f"embed_tokens.{n}" for n in params}
         loaded = set()
         for name, tensor in _iter_checkpoint_tensors(model_path, "embed_tokens."):
             leaf = name[name.rindex("embed_tokens.") :]
             if leaf not in wanted:
-                continue
+                raise RuntimeError(
+                    f"draft-KV producer: checkpoint tensor {name} has no parameter "
+                    f"on the built embedding (built: {sorted(wanted)}); a "
+                    f"{leaf} with nowhere to go means the built table and the "
+                    "checkpoint disagree on the vocab quantization (#727)."
+                )
             param = params[leaf[len("embed_tokens.") :]]
             loader = getattr(param, "weight_loader", None)
             if loader is None:
-                param.data.copy_(tensor.to(param.dtype))
+                if tensor.dtype != param.dtype:
+                    raise RuntimeError(
+                        f"draft-KV producer: checkpoint tensor {name} is "
+                        f"{tensor.dtype} but the built embedding parameter is "
+                        f"{param.dtype} and has no weight_loader -- refusing the "
+                        "silent dtype cast (int8 codes without their scale)."
+                    )
+                param.data.copy_(tensor)
             else:
                 loader(param, tensor)
             loaded.add(leaf)
@@ -147,11 +172,25 @@ class DraftKvProducer:
                 f"not found in the checkpoint at {model_path} (placement A needs "
                 "a resident embedding on the last stage)."
             )
+        # The head's OWN lm_head: `Qwen3_5ForCausalLMMTP.__init__` builds it
+        # on `is_last_rank` (true inside the scope) and never loads it; the
+        # target's is shared instead. Boot weg2dk2 measured the build at
+        # 3994 MiB (mtp + int8 embed + this bf16 table, 2426 MiB) -- release
+        # it HERE and hand the pages back to the driver, not to a GC the
+        # target's KV profiler may run before.
         target_model = self.draft_worker.target_worker.model_runner.model
         head = getattr(target_model, "lm_head", None)
+        own_head = getattr(draft_model, "lm_head", None)
         if head is not None and hasattr(draft_model, "set_lm_head_from_target"):
             draft_model.set_lm_head_from_target(head)
+        if own_head is not None and own_head is not draft_model.lm_head:
+            del own_head
+        torch.cuda.empty_cache()
         mib = sum(p.numel() * p.element_size() for p in params.values()) / float(2**20)
+        self.embed_dtype = str(params["weight"].dtype) if "weight" in params else "?"
+        after = _cuda_free_mib()
+        if after >= 0 and self._free_before_mib >= 0:
+            self.resident_mib = self._free_before_mib - after
         return mib
 
     # -- the per-chunk primitive ---------------------------------------------
@@ -182,6 +221,17 @@ class DraftKvProducer:
         self._rows += rows
         self._peak_mib = max(self._peak_mib, peak)
         return {"rows": rows, "ms": ms, "peak_mib": peak}
+
+
+def _cuda_free_mib() -> float:
+    """NVML-visible free MiB of this process's device after the caching
+    allocator handed its free blocks back; -1 without CUDA."""
+    if not torch.cuda.is_available():
+        return -1.0
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    free, _total = torch.cuda.mem_get_info(torch.cuda.current_device())
+    return free / float(2**20)
 
 
 def _iter_checkpoint_tensors(model_path: str, needle: str):

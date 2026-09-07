@@ -203,15 +203,45 @@ MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdn
 #: #1233 draft KV across the flip (spec section 6, Q17): group P's token
 #: capacity is EXPLICIT, never left to the profiler, because the last stage
 #: now carries the MTP head (405.2 MiB) plus a resident INT8 embed_tokens
-#: (1213.0 MiB) = 1618.2 MiB, and a draft device pool at target-token parity
-#: (2048 B/token beside the 8192 B/token target cell). Measured weg2zr2 on
-#: the last stage: KV pool 5584.4 MiB (714,788 tokens), NVML free minimum
-#: 1450 MiB. Target: idle NVML free at the corridor TOP (1229 MiB) so the
-#: draft-extend transient lands inside 819-1229:
+#: (1213.0 MiB) = 1618.2 MiB RESIDENT, and a draft device pool at
+#: target-token parity (2048 B/token beside the 8192 B/token target cell).
+#: Measured weg2zr2 on the last stage: KV pool 5584.4 MiB (714,788 tokens),
+#: NVML free minimum 1450 MiB. Target: idle NVML free at the corridor TOP
+#: (1229 MiB) so the draft-extend transient lands inside 819-1229:
 #:   pool_new = 1450 + 5584.4 - 1618.2 - 1229 = 4187 MiB
-#:   T_P      = 4187 x 2^20 / (8192 + 2048) = 428,750 -> 428,000 (uniform over
+#:   T_P      = 4187 x 2^20 / (8192 + 2048) = 428,769 -> 428,000 (uniform over
 #:              the stages; demand bound 8 x 27,466 = 219,728, 1.95x slack).
-P_MAX_TOTAL_TOKENS = 428000
+#: BOOT weg2dk2 (35bdc9e310, 2026-09-07 18:22:15, PP2 log): the MTP head's
+#: "Load weight end" delta was 3.90 GB = 3994 MiB -- 2376 MiB more than the
+#: resident post. That figure is the BUILD, not the residue: it holds the
+#: head's OWN never-loaded lm_head, a bf16 [248320 x 5120] table (2426 MiB;
+#: "lm_head" is in the checkpoint's quantization ignore list, so it is not
+#: int8), which `Qwen3_5ForCausalLMMTP.__init__` materialises on the scope's
+#: single-rank is_last_rank and which the producer drops when it shares the
+#: target's head (405.2 + 1213.0 + 2426.0 = 4044, 50 MiB from the reading).
+#: No second embedding is budgeted: `load_resident_embedding` loads INTO the
+#: built int8 tensors. Fix 2 releases that table explicitly (empty_cache) and
+#: the L2 line now carries `resident_mib=` MEASURED (NVML free before the
+#: build minus after the load); the W11 gate below refuses the boot when the
+#: measured residue exceeds this budget by more than the tolerance, so the
+#: corridor claim of this derivation is checked at readiness, never assumed.
+#: The next boot's L2 value replaces 1618.2 here, with its tag.
+P_DRAFT_RESIDENT_BUDGET_MIB = 405.2 + 1213.0
+P_DRAFT_RESIDENT_TOL_MIB = 256.0
+P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB = 1450.0
+P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB = 5584.4
+P_CORRIDOR_TOP_MIB = 1229.0
+P_BYTES_PER_TOKEN = 8192 + 2048
+
+
+def derive_p_max_total_tokens() -> int:
+    pool_new = (P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB + P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB
+                - P_DRAFT_RESIDENT_BUDGET_MIB - P_CORRIDOR_TOP_MIB)
+    return int(pool_new * 2**20 / P_BYTES_PER_TOKEN) // 1000 * 1000
+
+
+P_MAX_TOTAL_TOKENS = derive_p_max_total_tokens()
+assert P_MAX_TOTAL_TOKENS == 428000, P_MAX_TOTAL_TOKENS
 VENV_DEFAULT = "/spinning/htsglang-gpu/.venv"
 
 
@@ -1243,6 +1273,33 @@ def check_drafter_identity(log_p: str, log_d: str) -> Dict[str, object]:
     return out
 
 
+_RESIDENT_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*resident_mib=(-?\d+(?:\.\d+)?)")
+
+
+def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = None) -> Dict[str, object]:
+    """W11 (#1233 fix 2): the producer's MEASURED resident MiB on P's last
+    stage (L2 `resident_mib=`) against the budget T_P was derived from.
+    ``ok`` is False on absence, on an unmeasured value (-1) and above
+    budget + tolerance -- the corridor derivation is then refuted by the
+    boot itself and the front must not open on it."""
+    budget = P_DRAFT_RESIDENT_BUDGET_MIB if budget_mib is None else float(budget_mib)
+    tol = P_DRAFT_RESIDENT_TOL_MIB if tol_mib is None else float(tol_mib)
+    out: Dict[str, object] = {"resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None, "ok": False}
+    try:
+        with open(log_p, errors="replace") as f:
+            for line in f:
+                m = _RESIDENT_RE.search(line)
+                if m:
+                    out["resident_mib"] = float(m.group(1))
+    except OSError:
+        pass
+    r = out["resident_mib"]
+    if r is not None:
+        out["over_mib"] = r - budget
+        out["ok"] = r >= 0 and r <= budget + tol
+    return out
+
+
 def count_marker(path: str, marker: str) -> int:
     n = 0
     try:
@@ -1615,6 +1672,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise Weg2LaunchRefused(f"W10 Weg2DrafterIdentityMismatch: P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} "
                                 f"layout_D={w10['layout_D']} -- the decode group would ask the carrier for draft pages under "
                                 f"an identity the prefill group never writes")
+    # #1233 fix 2: W11 DRAFT-RESIDENT gate. T_P (P_MAX_TOTAL_TOKENS) is derived
+    # from a budgeted residue on P's last stage; the L2 line carries the
+    # MEASURED one. Over budget = the corridor derivation is refuted by this
+    # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
+    w11 = check_draft_resident(spec_p.log)
+    log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
+        f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} ok={w11['ok']} (T_P={P_MAX_TOTAL_TOKENS})")
+    if not w11["ok"]:
+        raise Weg2LaunchRefused(f"W11 Weg2DraftResidentOverBudget: measured resident_mib={w11['resident_mib']} vs budget "
+                                f"{w11['budget_mib']:.1f}+{w11['tol_mib']:.0f} MiB -- T_P={P_MAX_TOTAL_TOKENS} was derived for the "
+                                f"budget and the last stage's corridor target (idle NVML free at {P_CORRIDOR_TOP_MIB:.0f}) cannot hold")
     # #1233 zero-remainder: the carrier bound the front routes by -- group D's
     # smallest host staging pool (tokens) x 0.9 (the prefetch rate bound that
     # refused the 84k prompt on boot weg2ls4b2: limit=27466 of pool 30518).

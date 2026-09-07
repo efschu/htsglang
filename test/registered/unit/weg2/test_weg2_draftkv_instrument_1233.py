@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Weg 2 draft KV across the flip (#1233, fix 2): the instruments the
+acceptance letter reads -- the front's leg-2 draft terms (C16/L12) and the
+launcher's W11 resident-VRAM gate for the producer's last stage."""
+
+import asyncio
+import os
+import tempfile
+import types
+import unittest
+
+from sglang.srt.weg2.front import Front
+from sglang.srt.weg2.launcher import P_DRAFT_RESIDENT_BUDGET_MIB, check_draft_resident
+from sglang.test.test_utils import CustomTestCase
+
+
+class _Resp:
+    def __init__(self, payload):
+        self.status = 200
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _Session:
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.urls = []
+
+    def get(self, url):
+        self.urls.append(url)
+        return _Resp(self.payloads.pop(0))
+
+
+def _server_info(hits, misses, accept=2.4):
+    # the exact shape of /server_info (http_server.py:1086-1101): server_args
+    # fields at the top level, the scheduler's counters ONE LEVEL DOWN
+    return {
+        "model_path": "/m",
+        "speculative_algorithm": "NEXTN",
+        "internal_states": [
+            {
+                "draft_l3_hits": hits,
+                "draft_l3_misses": misses,
+                "avg_spec_accept_length": accept,
+                "memory_usage": {},
+            }
+        ],
+        "version": "x",
+    }
+
+
+class TestFrontDraftTerms(CustomTestCase):
+    def test_fix2_terms_are_read_from_internal_states(self):
+        session = _Session([_server_info(12, 3), _server_info(20, 3)])
+        me = types.SimpleNamespace(session=session)
+        g = types.SimpleNamespace(url="http://127.0.0.1:30032")
+        out = asyncio.run(Front._draft_terms(me, g, None))
+        self.assertEqual((out["draft_pages"], out["draft_miss"]), (12, 3), out)
+        self.assertEqual(out["accept_src"], "server_info_avg", out)
+        self.assertAlmostEqual(out["accept_len"], 2.4)
+        out2 = asyncio.run(Front._draft_terms(me, g, {"meta_info": {"spec_accept_length": 2.75}}))
+        self.assertEqual((out2["draft_pages"], out2["draft_miss"]), (8, 0), out2)
+        self.assertEqual((out2["accept_src"], out2["accept_len"]), ("meta", 2.75))
+
+    def test_fix2_a_body_without_the_counters_reads_none_not_zero(self):
+        session = _Session([{"model_path": "/m", "internal_states": [{"memory_usage": {}}]}])
+        me = types.SimpleNamespace(session=session)
+        out = asyncio.run(Front._draft_terms(me, types.SimpleNamespace(url="u"), None))
+        self.assertEqual(out["accept_src"], "none")
+
+
+class TestLauncherW11(CustomTestCase):
+    L2 = ("WEG2 DRAFT-KV-PRODUCER armed stage=2/3 drafter=a30db4b7c362c786 layout=v1 heads=4 head_dim=256 "
+          "page_bytes=2048 embed=resident mtp_mib=405.2 embed_mib=1213.0 resident_mib={} embed_dtype=torch.int8 build_s=9.1\n")
+
+    def _check(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "P.log")
+            with open(p, "w") as f:
+                f.write(text)
+            return check_draft_resident(p)
+
+    def test_fix2_resident_within_budget_passes_and_over_refuses(self):
+        self.assertGreater(P_DRAFT_RESIDENT_BUDGET_MIB, 1600)
+        ok = self._check(self.L2.format(1650.0))
+        self.assertTrue(ok["ok"], ok)
+        self.assertAlmostEqual(ok["resident_mib"], 1650.0)
+        over = self._check(self.L2.format(3994.0))  # boot weg2dk2's Load-weight-end delta
+        self.assertFalse(over["ok"], over)
+        self.assertGreater(over["over_mib"], 2000)
+        absent = self._check("nothing armed\n")
+        self.assertFalse(absent["ok"], absent)
+        unmeasured = self._check(self.L2.format(-1.0))
+        self.assertFalse(unmeasured["ok"], unmeasured)
+
+
+if __name__ == "__main__":
+    unittest.main()

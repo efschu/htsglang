@@ -781,7 +781,7 @@ class Front:
         body carries it (``/generate``), else from the ``/get_server_info``
         ``avg_spec_accept_length`` (cumulative average, named as such);
         ``draft_pages``/``draft_miss`` are the DELTA of D's L3 draft read
-        counters between this call and the previous one (one request in
+        counters (``internal_states[0]`` of the body) between this call and the previous one (one request in
         flight at a time on the leg-2 route, so the delta is this request's).
         Never raises: a missing instrument is ``accept_src=none``.
         """
@@ -797,6 +797,13 @@ class Front:
                 info = info[0]
             if not isinstance(info, dict):
                 return out
+            # /server_info (http_server.py) puts the server_args at the top
+            # level and the SCHEDULER's counters -- these -- one level down
+            # under `internal_states[0]` (fix 2: read at the top level, the
+            # terms were always 0 and accept_len never reached its fallback).
+            st = info.get("internal_states") or []
+            if isinstance(st, list) and st and isinstance(st[0], dict):
+                info = st[0]
             hits = int(info.get("draft_l3_hits", 0) or 0)
             miss = int(info.get("draft_l3_misses", 0) or 0)
             prev = getattr(self, "_draft_prev", (0, 0))

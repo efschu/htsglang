@@ -2861,6 +2861,11 @@ _WORLD: Optional[GroupCoordinator] = None
 
 
 def get_world_group() -> GroupCoordinator:
+    if _DRAFT_PP_ACTIVE:
+        # #1233 draft_pp_scope(): the producer's build sees a one-rank world
+        # (boot weg2dk2 -- see _DRAFT_WORLD).
+        assert _DRAFT_WORLD is not None, "draft pp scope is active but the world twin is None"
+        return _DRAFT_WORLD
     assert _WORLD is not None, "world group is not initialized"
     return _WORLD
 
@@ -3167,6 +3172,16 @@ _PP: Optional[GroupCoordinator] = None
 # `get_pp_group()` for exactly the duration of `draft_pp_scope()` -- the
 # `_FLIP_PP` hook shape, not a second accessor.
 _DRAFT_PP: Optional[GroupCoordinator] = None
+#: Boot weg2dk2: the draft build reaches WORLD-group collectives too --
+#: `TpModelWorker.__init__` broadcasts its seed over `get_world_group()`
+#: (tp_worker.py:316) and `_profile_available_bytes` barriers on it
+#: (model_runner_kv_cache_mixin.py:775) -- while only the last stage builds.
+#: The scope therefore publishes a single-rank WORLD twin for the same
+#: duration, built collectively beside the pp twin. The tp axis needs no
+#: twin: `--speculative-draft-kv-only` refuses tp_size != 1 (server_args),
+#: so `get_tp_group()` is single-rank on every P rank already; a third
+#: group there would be a second bookkeeping of that refusal.
+_DRAFT_WORLD: Optional[GroupCoordinator] = None
 _DRAFT_PP_ACTIVE: bool = False
 
 
@@ -3180,9 +3195,16 @@ def initialize_draft_pp_group(
     point, whether or not it will ever enter the scope. Defaults come from
     the world group already built by `init_distributed_environment`.
     """
-    global _DRAFT_PP
+    global _DRAFT_PP, _DRAFT_WORLD
     assert _DRAFT_PP is None, "the draft pp group is already initialized"
     world = get_world_group()
+    if _TP is not None and _TP.world_size != 1:
+        # The scope masks pp and world only; a multi-rank tp axis would be
+        # the dk2 shape on a third axis. server_args refuses it first.
+        raise RuntimeError(
+            "draft-KV producer needs a single-rank tp axis (got tp world_size "
+            f"{_TP.world_size}); --speculative-draft-kv-only refuses tp_size != 1"
+        )
     if local_rank is None:
         local_rank = world.local_rank
     if backend is None:
@@ -3195,11 +3217,33 @@ def initialize_draft_pp_group(
         use_custom_allreduce=False,
         group_name="draft_pp",
     )
+    # The WORLD twin in the world group's own shape (`init_world_group`:
+    # no pynccl, no custom allreduce), one single-rank list per rank so the
+    # `new_group` calls match on every rank.
+    _DRAFT_WORLD = GroupCoordinator(
+        group_ranks=[[r] for r in range(world_size)],
+        local_rank=local_rank,
+        torch_distributed_backend=backend,
+        use_pynccl=False,
+        use_pymscclpp=False,
+        use_custom_allreduce=False,
+        use_torch_symm_mem_all_reduce=False,
+        use_hpu_communicator=False,
+        use_xpu_communicator=False,
+        use_npu_communicator=False,
+        group_name="draft_world",
+    )
     logger.info(
-        "draft pp group built: %d single-rank group(s) (#1233 draft-KV producer)",
+        "draft pp group built: %d single-rank group(s) on the pp AND world "
+        "axes (#1233 draft-KV producer; boot weg2dk2: the build's world "
+        "collectives degenerate on the one building rank)",
         world_size,
     )
     return _DRAFT_PP
+
+
+def get_draft_world_group_no_assert() -> Optional[GroupCoordinator]:
+    return _DRAFT_WORLD
 
 
 def get_draft_pp_group_no_assert() -> Optional[GroupCoordinator]:
@@ -3217,8 +3261,9 @@ _DRAFT_PP_MASKED_ENV = ("SGLANG_PP_LAYER_PARTITION", "SGLANG_PP_LAYER_SET")
 
 @contextmanager
 def draft_pp_scope():
-    """Publish the single-rank draft pp group through `get_pp_group()`, and
-    hide the primary pipeline's layer-split environment for the duration.
+    """Publish the single-rank draft pp group through `get_pp_group()` and
+    its world twin through `get_world_group()`, and hide the primary
+    pipeline's layer-split environment for the duration.
 
     S7: entering on a rank whose group was never built raises. The flag and
     the env vars are restored in `finally`, so an exception inside the scope
@@ -3226,10 +3271,12 @@ def draft_pp_scope():
     string back in place; nested entry restores in order.
     """
     global _DRAFT_PP_ACTIVE
-    if _DRAFT_PP is None:
+    if _DRAFT_PP is None or _DRAFT_WORLD is None:
         raise RuntimeError(
-            "draft_pp_scope entered without a built draft pp group (S7): "
-            "initialize_draft_pp_group must run on every rank at boot."
+            "draft_pp_scope entered without a built draft pp/world group (S7): "
+            "initialize_draft_pp_group must run on every rank at boot "
+            f"(pp={'built' if _DRAFT_PP is not None else 'None'}, "
+            f"world={'built' if _DRAFT_WORLD is not None else 'None'})."
         )
     prev = _DRAFT_PP_ACTIVE
     saved_env = {k: os.environ.pop(k, None) for k in _DRAFT_PP_MASKED_ENV}

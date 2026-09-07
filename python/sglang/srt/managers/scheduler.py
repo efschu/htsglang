@@ -1450,7 +1450,8 @@ class Scheduler(
         cfg = self.draft_kv_producer.draft_runner.model_config
         logger.info(
             "WEG2 DRAFT-KV-PRODUCER armed stage=%d/%d drafter=%s layout=v%d heads=%d "
-            "head_dim=%d page_bytes=%d embed=resident mtp_mib=%.1f embed_mib=%.1f build_s=%.1f",
+            "head_dim=%d page_bytes=%d embed=resident mtp_mib=%.1f embed_mib=%.1f "
+            "resident_mib=%.1f embed_dtype=%s build_s=%.1f",
             self.draft_kv_producer.stage,
             self.draft_kv_producer.stages,
             kv_cache_builder.drafter_identity_hash(self.server_args),
@@ -1460,6 +1461,10 @@ class Scheduler(
             2 * int(cfg.get_total_num_kv_heads()) * int(cfg.head_dim),
             mtp_mib,
             embed_mib,
+            # measured: NVML free before the build minus after the load +
+            # release (W11 reads it; -1 = unmeasured, which W11 refuses)
+            self.draft_kv_producer.resident_mib,
+            self.draft_kv_producer.embed_dtype,
             self.draft_kv_producer.build_s,
         )
 

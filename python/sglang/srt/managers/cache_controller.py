@@ -14,12 +14,15 @@ limitations under the License.
 """
 
 import logging
+import os
+import signal
 import sys
 import threading
 import time
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
+import psutil
 import torch
 
 from sglang.srt.mem_cache.hicache_phase_guard import device_tier_disarmed
@@ -3111,6 +3114,37 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _stop_group_from_thread(self, exc: BaseException) -> None:
+        """S5 (#1233): a group STOP raised on a storage DAEMON thread.
+
+        A bare raise here ends the thread and nothing else: the process
+        keeps serving with a dead prefetch path (the wedge, not the STOP).
+        The fork's crash path is the scheduler's own (`run_scheduler_process`
+        except): SIGQUIT to the parent, whose handler kills the process tree
+        -- every rank of the group -- then the signal on this process, as
+        `multi_ended_allocator._signal_handler` does from a non-main thread.
+        Under the #1223 DEBUG-HOLD the parent is not signalled (the operator
+        is inspecting the peers); this process still exits.
+        """
+        logger.error(
+            "%s -- STOP from the prefetch thread: signalling the parent (SIGQUIT "
+            "-> kill_process_tree, the scheduler's crash path) and this process",
+            exc,
+            exc_info=True,
+        )
+        try:
+            from sglang.srt.managers import debug_hold as _1223_dh
+
+            hold = bool(_1223_dh.hold_enabled())
+        except Exception:  # noqa: BLE001 - diagnostics may not mask the stop
+            hold = False
+        if not hold:
+            try:
+                psutil.Process().parent().send_signal(signal.SIGQUIT)
+            except Exception as e:  # noqa: BLE001
+                logger.error("could not signal the parent: %s: %s", type(e).__name__, e)
+        os.kill(os.getpid(), signal.SIGQUIT)
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -3225,6 +3259,10 @@ class HiCacheController:
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
+            except Weg2DraftDisagree as e:
+                # S5: group STOP, never a dead thread under a live server.
+                self._stop_group_from_thread(e)
+                return
             finally:
                 self._prefetch_current = None
 
