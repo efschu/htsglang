@@ -299,6 +299,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.moe_ep_rank = moe_ep_rank
         self.nccl_port = nccl_port
         self.target_worker = target_worker
+        # #1233 producer mode (Weg 2 prefill group's last stage): this worker
+        # writes draft KV only and never proposes; the target's embed_tokens
+        # on that stage is a PPMissingLayer, so the early embed/head share
+        # below is skipped and `draft_kv_producer` loads the embedding
+        # resident (placement A) and shares lm_head itself.
+        self.draft_kv_only = bool(getattr(server_args, "speculative_draft_kv_only", False))
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
 
@@ -411,6 +417,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # shadow ranks and would desync the collective.
             self.init_token_map()
             self._solo_init_lm_head()
+            self._embed_head_shared_early = True
+        elif self.draft_kv_only:
+            self.init_token_map()
             self._embed_head_shared_early = True
         elif not self.speculative_algorithm.is_eagle3():
             self.init_token_map()
