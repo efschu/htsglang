@@ -29,7 +29,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Callable, Iterable, Optional, Set, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.weg2_store_gates import (
@@ -93,6 +93,7 @@ class LRUFileEvictor:
         pp_rank: int = 0,
         attn_cp_rank: int = 0,
         kv_config_suffix: Optional[str] = None,
+        scan_suffixes: Optional[Iterable[str]] = None,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
         writer_count: int = 1,
@@ -116,9 +117,30 @@ class LRUFileEvictor:
         # of 124,610 files (83.7 %) matched no rank's config_suffix and were
         # therefore outside every byte bound this process can apply.
         self.kv_config_suffix = kv_config_suffix
-        self._scan_suffixes: Tuple[str, ...] = tuple(
-            dict.fromkeys(s for s in (config_suffix, kv_config_suffix) if s)
-        )
+        # WHOSE FILES DOES THIS INDEX BOUND -- THIS RANK'S, OR THE GROUP'S?
+        # When exactly one rank of a group evicts (``writes_shared_keys``), the
+        # pair above is the WRONG population: it is this rank's own tail, so
+        # the sole owner indexes its own suffixed files and nobody indexes
+        # anyone else's. Measured on the production classes at 69447a36 (group
+        # D, tp_size=3, canonical page on, 40 own draft pages per rank): 120
+        # files on disk, 40 in the owner's index, 80 outside every byte bound
+        # any process in the group can apply -- a NEW unbounded-disk class, on
+        # the sole carrier's filesystem, introduced by electing one owner
+        # without widening what that owner may see. The caller that knows the
+        # geometry therefore injects the GROUP's full suffix set
+        # (``HiCacheStorage._group_scan_suffixes``); a caller that does not
+        # keeps the per-rank pair, which is the correct population exactly when
+        # every rank is its own owner.
+        if scan_suffixes is not None:
+            self._scan_suffixes: Tuple[str, ...] = tuple(
+                dict.fromkeys(s for s in scan_suffixes if s)
+            )
+            self._scan_population_is_group_wide = True
+        else:
+            self._scan_suffixes = tuple(
+                dict.fromkeys(s for s in (config_suffix, kv_config_suffix) if s)
+            )
+            self._scan_population_is_group_wide = False
         self._tp_rank = tp_rank
         self._pp_rank = pp_rank
         self._attn_cp_rank = attn_cp_rank
@@ -244,36 +266,44 @@ class LRUFileEvictor:
         # §0: "Ranks never disagree ... STOP, never compensation"). The three
         # inputs here are rank-invariant by construction -- the same
         # extra_config/env numbers and the same filesystem -- so every rank
-        # computes the same verdict and they refuse together. W8b cannot move
-        # with it: its census is filtered by ``_scan_suffixes``, which carries
-        # THIS rank's ``config_suffix``, so a non-owner would grade a different
-        # population and could disagree with the owner about coverage. It stays
-        # the owner's single verdict; the wake-path escalation that makes it
-        # group-fatal is named in ``HiCacheFile.rescan_eviction_index``.
+        # computes the same verdict and they refuse together.
+        #
+        # W8b MOVES WITH IT ONLY WHERE THE POPULATION IT GRADES IS THE GROUP'S.
+        # Its census is filtered by ``_scan_suffixes``. While that was this
+        # rank's own tail, a non-owner walking the same directory graded a
+        # DIFFERENT population, so a shared verdict was not available and the
+        # gate had to stay the owner's alone -- at the cost of a lone-rank raise
+        # at attach (measured at 69447a36 over a store this group had used once:
+        # rank 0 raised Weg2StoreIndexBlind at 33.3 % while ranks 1 and 2
+        # constructed and walked on). With the group's suffix set injected, the
+        # numerator, the denominator and the filter are all properties of the
+        # DIRECTORY and the group geometry, so every rank computes one census
+        # and they refuse together. Where no group set was injected the old
+        # asymmetry is still real, so the gate stays below the return there.
+        scanned: Optional[List[Tuple[float, str, int]]] = None
         if self._eviction_configured and self._writes_shared_keys:
             check_store_cap_fundable(
                 self.file_path, self.max_size_bytes, self.min_free_bytes
             )
+            if self._scan_population_is_group_wide:
+                scanned = self._census_existing_files()
+                self._check_index_coverage()
 
         if not self._eviction_enabled:
             return
 
         self._clamp_max_size_to_fs()
 
-        self._scan_existing_files()
+        if scanned is None:
+            scanned = self._census_existing_files()
+        self._install_census(scanned)
         # W8b: the index is what the cap is enforced against, so a cap over a
         # fraction of the directory is not a cap. Armed only for a shared-key
         # store: where every rank legitimately owns its own suffixed files,
-        # seeing a third of the directory is correct, not blind.
-        if self._writes_shared_keys:
-            census = self.index_coverage()
-            check_index_coverage(
-                store_path=self.file_path,
-                indexed_bytes=census["indexed_bytes"],
-                seen_bytes=census["seen_bytes"],
-                indexed_entries=census["indexed_entries"],
-                seen_entries=census["seen_entries"],
-            )
+        # seeing a third of the directory is correct, not blind. Already graded
+        # above when the population was the group's.
+        if self._writes_shared_keys and not self._scan_population_is_group_wide:
+            self._check_index_coverage()
         with self._lock:
             if self.max_size_bytes > 0 and self._total_bytes > self.max_size_bytes:
                 self._evict_locked(0)
@@ -546,11 +576,21 @@ class LRUFileEvictor:
                 )
                 return False
             # This rank holds bytes nobody else writes. Admitted, and
-            # deliberately NOT indexed: the LRU index for this directory has
-            # one owner, and a second index over the same files is exactly the
-            # twin bookkeeping F7 removes -- it would evict pages the owner
+            # deliberately NOT indexed HERE: the LRU index for this directory
+            # has one owner, and a second index over the same files is exactly
+            # the twin bookkeeping F7 removes -- it would evict pages the owner
             # still counts. ``commit``/``abort``/``touch`` are already no-ops
             # on a non-owner, so nothing here needs unwinding.
+            #
+            # THE BYTES ARE STILL BOUNDED, just not at this instant: the
+            # owner's scan filter is the GROUP's suffix set
+            # (``HiCacheStorage._group_scan_suffixes``), so these files enter
+            # its index and its cap at the next ``_scan_existing_files`` --
+            # attach, or ``rescan`` on wake. The residual is STALENESS inside
+            # one awake period, the same class the two groups' owners already
+            # carry between them and with the same remedy; before that filter
+            # existed the residual was unbounded growth, because no scan on any
+            # rank ever named these suffixes.
             #
             # The free-space watermark still applies, because it is a statvfs
             # fact any process can read rather than a second index. Checked
@@ -833,28 +873,36 @@ class LRUFileEvictor:
         times, and mtime is the only recency fact they both can read. That is
         also why ``touch`` writes it (see there).
 
-        The filter accepts EVERY suffix this rank may legitimately own, not
-        just its per-rank ``config_suffix`` -- see ``_scan_suffixes``. The
-        denominators of what was seen versus indexed are recorded so the
-        coverage gate has a population to report, rather than a bare count.
+        The filter accepts EVERY suffix this index is responsible for -- see
+        ``_scan_suffixes``, which is the GROUP's set wherever one rank evicts
+        for the group. The denominators of what was seen versus indexed are
+        recorded so the coverage gate has a population to report, rather than a
+        bare count.
         """
-        entries = []
+        self._install_census(self._census_existing_files())
+
+    def _census_existing_files(self) -> List[Tuple[float, str, int]]:
+        """Walk the directory, record the census, return the sorted entries.
+
+        SPLIT FROM THE INSTALL so a rank that must GRADE the directory need not
+        INDEX it. Every rank of a shared-key group grades W8b (one census, one
+        verdict, they refuse together); only the elected owner installs an
+        index, because a second index over one directory is exactly the twin
+        bookkeeping F7 removes.
+        """
+        entries: List[Tuple[float, str, int]] = []
         seen_bytes = 0
         seen_entries = 0
         for stem, st in self._iter_existing():
             size = self._allocated_size(st)
             seen_bytes += size
             seen_entries += 1
-            # Only files belonging to this rank/model.
+            # Only files this index is responsible for.
             if not self._scan_suffixes or not stem.endswith(self._scan_suffixes):
                 continue
             entries.append((st.st_mtime, stem, size))
         entries.sort(key=lambda e: e[0])  # oldest first
-        indexed_bytes = 0
-        for _, stem, size in entries:
-            self._lru[stem] = size
-            self._total_bytes += size
-            indexed_bytes += size
+        indexed_bytes = sum(size for _, _, size in entries)
         self._scan_census = {
             "indexed_bytes": indexed_bytes,
             "seen_bytes": seen_bytes,
@@ -862,6 +910,24 @@ class LRUFileEvictor:
             "seen_entries": seen_entries,
             "fraction": (indexed_bytes / seen_bytes) if seen_bytes > 0 else 1.0,
         }
+        return entries
+
+    def _install_census(self, entries: List[Tuple[float, str, int]]) -> None:
+        """Seed the LRU index from a census, oldest first."""
+        for _, stem, size in entries:
+            self._lru[stem] = size
+            self._total_bytes += size
+
+    def _check_index_coverage(self) -> None:
+        """Grade W8b against the census this evictor just took."""
+        census = self.index_coverage()
+        check_index_coverage(
+            store_path=self.file_path,
+            indexed_bytes=census["indexed_bytes"],
+            seen_bytes=census["seen_bytes"],
+            indexed_entries=census["indexed_entries"],
+            seen_entries=census["seen_entries"],
+        )
 
     def index_coverage(self) -> dict:
         """How much of the directory this evictor's byte cap actually bounds.
@@ -870,6 +936,12 @@ class LRUFileEvictor:
         indexed count alone reads as a full store no matter how small the
         fraction it covers -- which is exactly how the 83.7 %-invisible defect
         stayed latent.
+
+        DENOMINATOR NOTE: on a non-owner of a shared-key group this reports the
+        census that graded W8b -- the group's population over the whole
+        directory -- with NO index behind it. ``indexed_bytes`` there is what
+        the group's elected owner bounds, not what this rank bounds; this rank
+        bounds nothing (see ``enabled``).
         """
         return dict(getattr(self, "_scan_census", None) or _EMPTY_CENSUS)
 

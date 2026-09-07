@@ -79,7 +79,13 @@ def _stage_window(stage: int):
     return CanonicalPageWindow(spec=SPEC, first_slot=first, num_slots=count)
 
 
-def _p_config(stage: int, *, canonical: bool = True, is_mla_model: bool = False):
+def _p_config(
+    stage: int,
+    *,
+    canonical: bool = True,
+    is_mla_model: bool = False,
+    dcp_owner_mode: bool = False,
+):
     """Group P, rank ``stage``: pp_size=3, tp_size=1."""
     return HiCacheStorageConfig(
         tp_rank=0,
@@ -89,6 +95,7 @@ def _p_config(stage: int, *, canonical: bool = True, is_mla_model: bool = False)
         attn_cp_rank=0,
         attn_cp_size=1,
         is_mla_model=is_mla_model,
+        dcp_owner_mode=dcp_owner_mode,
         enable_storage_metrics=False,
         is_page_first_layout=False,
         model_name=MODEL_NAME,
@@ -545,6 +552,77 @@ class TestF7ExactlyOneEvictionOwnerPerGroup(CustomTestCase):
                 f"{len(owners)} of 3 group-P stages own eviction over one directory",
             )
 
+    def test_exactly_one_attn_cp_rank_of_a_shared_key_group_evicts(self):
+        """THE THIRD AXIS OF THE ELECTION, ungraded until now.
+
+        The election was deliberately widened from ``tp_rank == 0`` to the
+        group's full rank identity, and the suite graded the tp axis (group D)
+        and the pp axis (group P) but not attn_cp. Dropping ``and
+        attn_cp_rank == 0`` left the whole slice suite green while restoring
+        multi-owner-over-one-directory on that axis: two private LRU indices
+        over one directory, each carrying the whole cap and each unlinking
+        victims the other still counts.
+
+        REACHABILITY, stated honestly: not the Weg-2 P/D shapes, both of which
+        are ``attn_cp_size=1``. Reachable on any shared-key file store with
+        ``attn_cp_size > 1``, which ``writes_shared_keys`` admits through MLA
+        and through dcp owner mode -- shipping, non-Weg-2 shapes.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"] = "1G"
+            try:
+                evictors = [
+                    HiCacheFile(_cp_config(r), file_path=d)._evictor for r in range(2)
+                ]
+            finally:
+                os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
+            self.assertTrue(
+                all(e._writes_shared_keys for e in evictors),
+                "the premise of this row is a shared-key group",
+            )
+            owners = [e for e in evictors if e._eviction_enabled]
+            self.assertEqual(
+                len(owners),
+                1,
+                f"{len(owners)} of 2 attn-cp ranks own eviction over one directory",
+            )
+
+    def test_a_per_rank_key_store_still_splits_the_cap(self):
+        """THE OTHER HALF OF THE ONE PREDICATE ``writer_count`` NOW READS.
+
+        F7 rewrote ``1 if is_mla_model else max(1, tp_size)`` to
+        ``1 if shared_keys else max(1, tp_size)``. The only row grading it
+        compares group P against group D, and BOTH are shared-key, so it pins
+        'P == D' and never 'the split still happens where keys are not
+        shared'. MEASURED: collapsing the expression to a constant ``1`` left
+        the whole slice suite green, and three TP ranks then each enforce the
+        operator's WHOLE cap over one directory -- up to 3x the configured
+        budget on disk, with no log line and no refusal.
+        """
+        cap = 1_000_000_000
+        with tempfile.TemporaryDirectory() as d:
+            per_rank = HiCacheFile(
+                _d_config(0, canonical=False, extra_config={"max_size": str(cap)}),
+                file_path=os.path.join(d, "per_rank"),
+            )
+            shared = HiCacheFile(
+                _d_config(0, extra_config={"max_size": str(cap)}),
+                file_path=os.path.join(d, "shared"),
+            )
+            self.assertFalse(per_rank._evictor._writes_shared_keys)
+            self.assertTrue(shared._evictor._writes_shared_keys)
+            self.assertEqual(
+                per_rank._evictor.max_size_bytes,
+                cap // 3,
+                "a store whose ranks write their own files must still split "
+                "the operator's cap by tp_size",
+            )
+            self.assertEqual(
+                shared._evictor.max_size_bytes,
+                cap,
+                "a shared-key group spends the cap once between its ranks",
+            )
+
     def test_a_non_canonical_non_mla_store_still_has_every_rank_as_owner(self):
         """GREEN PIN / CAN-FAIL: without the canonical page each rank really
         does write its own files, so the base behaviour must survive."""
@@ -577,6 +655,23 @@ def _dir_allocated_bytes(d):
             continue
         st = os.stat(os.path.join(d, fn))
         total += max(st.st_blocks * 512, st.st_size)
+    return total
+
+
+def _store_allocated_bytes(d):
+    """``_dir_allocated_bytes`` over the SHARDED layout a real store writes.
+
+    ``HiCacheFile`` shards its files into subdirectories, so the flat helper
+    above answers 0 for a directory a real backend filled -- which would let a
+    coverage assertion pass by comparing zero with zero.
+    """
+    total = 0
+    for root, _dirs, files in os.walk(d):
+        for fn in files:
+            if not fn.endswith(".bin"):
+                continue
+            st = os.stat(os.path.join(root, fn))
+            total += max(st.st_blocks * 512, st.st_size)
     return total
 
 
@@ -616,6 +711,139 @@ class TestW8bTheIndexCanSeeTheCanonicalPages(CustomTestCase):
                 f"{coverage['seen_entries']} files",
             )
             self.assertGreaterEqual(coverage["fraction"], 0.95)
+
+    def test_the_owner_indexes_every_rank_of_the_groups_files(self):
+        """THE SOLE OWNER'S POPULATION IS THE GROUP'S, NOT ITS OWN.
+
+        The row above seeds the fixture from ONE rank's two suffixes, so by
+        construction it contains no other rank's file and the 95 % acceptance
+        is measured over the one population where the defect is absent. Here
+        all three ranks of group D write their own draft pages through the real
+        backend, and a fresh owner must bound every byte on disk.
+
+        MEASURED at 69447a36 (fix 2): 120 files on disk, 40 in the owner's
+        index -- 80 files outside every byte bound any process in the group can
+        apply, because the owner's scan filter was its own ``_0_3`` tail and
+        ``reserve`` admits a non-owner's own-suffix write without indexing it.
+        """
+        draft = f"{KEY[:-1]}%x.draft-a30db4b7c362c786"
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"] = "1G"
+            try:
+                stores = [HiCacheFile(_d_config(r), file_path=d) for r in range(3)]
+                for r, store in enumerate(stores):
+                    for i in range(4):
+                        self.assertTrue(
+                            store.set(
+                                draft % (r * 16 + i),
+                                torch.zeros(4096, dtype=torch.uint8),
+                            )
+                        )
+                owner = HiCacheFile(_d_config(0), file_path=d)
+            finally:
+                os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
+            on_disk = _store_allocated_bytes(d)
+            self.assertGreater(on_disk, 0, "the fixture wrote nothing")
+            coverage = owner._evictor.index_coverage()
+            self.assertEqual(
+                coverage["indexed_entries"],
+                12,
+                "3 ranks x 4 drafts must all be in the one index",
+            )
+            self.assertEqual(
+                coverage["indexed_bytes"],
+                on_disk,
+                f"the sole owner bounds {coverage['indexed_bytes']} of "
+                f"{on_disk} B: another rank's files are outside every bound",
+            )
+
+    def test_every_rank_of_a_shared_key_group_refuses_a_blind_store(self):
+        """W8b IS A GROUP VERDICT AT ATTACH, exactly as W8 is.
+
+        MEASURED at 69447a36 over a store this very group had used once: rank 0
+        raised ``Weg2StoreIndexBlind`` at 33.3 % coverage while ranks 1 and 2
+        constructed and walked into the next collective -- one rank dead, five
+        alive, which is the disagreement user law §0 forbids rather than the
+        stop it asks for. It is reachable in normal operation because the
+        unindexed non-owner files grow until the fraction crosses the floor.
+
+        The gate can only be a group verdict because the census now is one: the
+        filter is the GROUP's suffix set, so numerator, denominator and filter
+        are properties of the directory and the geometry, not of the reading
+        rank. CAN-IT-FAIL: put the gate back below the owner-only early return
+        and ranks 1 and 2 construct, turning this row red.
+        """
+        from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
+
+        with tempfile.TemporaryDirectory() as d:
+            # Foreign bytes: a suffix no rank of this group can ever name, so
+            # the whole group is blind to them and every rank agrees it is.
+            for i in range(8):
+                with open(
+                    os.path.join(d, f"{i:064x}_someone-elses-model.bin"), "wb"
+                ) as f:
+                    f.write(b"\x03" * 4096)
+            os.environ["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"] = "1G"
+            try:
+                for rank in range(3):
+                    with self.assertRaises(
+                        Weg2StoreIndexBlind, msg=f"rank {rank} did not refuse"
+                    ):
+                        HiCacheFile(_d_config(rank), file_path=d)
+                # CAN-FAIL COMPANION: the same three ranks over a directory
+                # their group's suffixes do name construct, so the rows above
+                # grade the coverage and not the constructor.
+                for fn in os.listdir(d):
+                    os.unlink(os.path.join(d, fn))
+                probe = HiCacheFile(_d_config(0), file_path=d)
+                _seed_store(
+                    d,
+                    kv_suffix=probe.kv_config_suffix,
+                    cfg_suffix=probe.config_suffix,
+                    n_pages=4,
+                    n_drafts=2,
+                )
+                for rank in range(3):
+                    HiCacheFile(_d_config(rank), file_path=d)
+            finally:
+                os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
+
+    def test_the_floor_refuses_the_store_of_record(self):
+        """The THRESHOLD, pinned at the population it was chosen for.
+
+        ``INDEX_COVERAGE_FLOOR`` is 0.5 because the store of record measured
+        16.3 % coverage (104,267 of 124,610 files invisible). The blind-index
+        row below seeds 40 pages + 1 draft, i.e. ~2.4 % coverage, so any floor
+        above ~0.025 keeps it green: a floor of 0.10 -- a plausible edit --
+        lets the exact measured defect through while the gate still looks
+        armed. This row grades the number between the measured defect and a
+        healthy store instead.
+        """
+        from sglang.srt.mem_cache.weg2_store_gates import (
+            Weg2StoreIndexBlind,
+            check_index_coverage,
+        )
+
+        with self.assertRaises(Weg2StoreIndexBlind):
+            check_index_coverage(
+                store_path="/store-of-record",
+                indexed_bytes=163,
+                seen_bytes=1000,
+                indexed_entries=20343,
+                seen_entries=124610,
+            )
+        # CAN-FAIL COMPANION: a store whose owner sees most of it passes, so
+        # the row above grades the floor and not the gate's mere existence.
+        self.assertAlmostEqual(
+            check_index_coverage(
+                store_path="/healthy",
+                indexed_bytes=600,
+                seen_bytes=1000,
+                indexed_entries=600,
+                seen_entries=1000,
+            ),
+            0.6,
+        )
 
     def test_a_blind_index_refuses_the_launch(self):
         """CAN-IT-FAIL: an owner that indexes under half the directory must
@@ -1142,6 +1370,68 @@ class TestF7WriteAdmissionIsPerFileNotPerRank(CustomTestCase):
                 wrote,
                 [True, True, True],
                 "an MLA PP stage was refused the file only it names",
+            )
+            found = [f for _, _, fs in os.walk(d) for f in fs if f.endswith(".bin")]
+            self.assertEqual(
+                len(found), 3, f"3 per-stage files expected, found {found}"
+            )
+
+    def test_an_mla_dcp_stage_writes_the_shared_kv_file_only_it_names(self):
+        """THE KV HALF of the pair fix 2 created, ungraded until now.
+
+        ``_suffix_for_key`` returns two group-wide answers -- one for
+        ``config_suffix``, one for ``kv_config_suffix`` -- and every existing
+        write-admission row exercises shapes that fall through to the CONFIG
+        branch (the MLA rows are ``canonical=False`` with dcp off). MEASURED:
+        hard-wiring ``_kv_config_suffix_is_group_wide`` to True left the slice
+        suite green while re-opening exactly the regression fix 2 closed, on
+        the untested half: MLA + dcp owner mode + pp_size=3 admitted all three
+        stages (3 files) at HEAD and refused two of them under the mutant --
+        silent, no raise, reading as a cold cache.
+
+        REACHABILITY, stated honestly: this needs MLA (the group-wide term is
+        inert for a GQA model, because ``owner_write_covers_whole_file``
+        answers ``bool(is_mla_model)`` last), i.e. an MLA deployment with dcp
+        owner mode or the canonical page and pp_size > 1. NOT the Weg-2 shape.
+        """
+
+        def body(d):
+            stores = [
+                HiCacheFile(
+                    _p_config(
+                        st, canonical=False, is_mla_model=True, dcp_owner_mode=True
+                    ),
+                    file_path=d,
+                )
+                for st in range(3)
+            ]
+            # Stages 1 and 2 first: on a key already on disk the
+            # already-exists fast path answers before admission is asked.
+            return stores, [
+                stores[1].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+                stores[2].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+                stores[0].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+            ]
+
+        with tempfile.TemporaryDirectory() as d:
+            stores, wrote = self._bounded(lambda: body(d))
+            self.assertEqual(
+                sorted({s.kv_config_suffix for s in stores}),
+                [
+                    "_Qwen3.8-27B_520526c68d6530e9_3_0",
+                    "_Qwen3.8-27B_520526c68d6530e9_3_1",
+                    "_Qwen3.8-27B_520526c68d6530e9_3_2",
+                ],
+                "the premise of this row is that the KV suffix is per-stage here",
+            )
+            self.assertTrue(
+                all(s._is_shared_kv_key(KEY) for s in stores),
+                "the premise of this row is that KEY takes the KV branch",
+            )
+            self.assertEqual(
+                wrote,
+                [True, True, True],
+                "an MLA dcp stage was refused the shared-KV file only it names",
             )
             found = [f for _, _, fs in os.walk(d) for f in fs if f.endswith(".bin")]
             self.assertEqual(

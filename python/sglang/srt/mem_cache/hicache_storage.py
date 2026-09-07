@@ -1134,6 +1134,12 @@ class HiCacheFile(HiCacheStorage):
             # index cannot see them at all and the byte cap bounds only the
             # draft files -- measured 83.7 % of the store of record invisible.
             kv_config_suffix=self.kv_config_suffix,
+            # ONE OWNER MEANS ONE INDEX OVER THE WHOLE GROUP'S FILES. Injected
+            # only where the election actually produces a sole owner: with
+            # per-rank keys every rank is its own owner, and handing each of
+            # them the group's set would give N indices over one directory,
+            # each carrying a cap already divided by N.
+            scan_suffixes=(self._group_scan_suffixes() if shared_keys else None),
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
@@ -1333,6 +1339,48 @@ class HiCacheFile(HiCacheStorage):
         self._kv_config_suffix_is_group_wide = (
             self.kv_config_suffix == rank0_kv_config_suffix
         )
+
+    def _group_scan_suffixes(self) -> Tuple[str, ...]:
+        """Every suffix ANY rank of this group can write into the directory.
+
+        THE EVICTION POPULATION OF A SOLE OWNER IS THE GROUP'S, NOT ITS OWN.
+        F7 elects exactly one evictor per shared-key group; that owner's scan
+        filter was still its own ``(config_suffix, kv_config_suffix)`` pair, so
+        every OTHER rank's suffixed bytes -- its draft/NEXTN pages, its
+        component/SWA pages, and every key falling to the default branch of
+        ``_suffix_for_key`` -- were admitted by ``reserve`` and then indexed by
+        nobody. Measured at 69447a36 on group D (tp_size=3, canonical page on,
+        40 own draft pages per rank): 120 files on disk, 40 in the owner's
+        index. Only ``min_free_space`` still acted, and it stops the whole
+        carrier rather than the drafts.
+
+        DERIVED, NOT LISTED. The same pure ``_build_key_suffixes`` runs once
+        per rank triple of the three axes the geometry already carries, so an
+        axis added later is covered the day it is added -- the same reason
+        ``_derive_key_suffixes`` answers the group-wide question by comparison
+        rather than by a list of shapes. The product is the group's world size
+        (3 under Weg 2's P and D shapes), walked once at construction.
+
+        Stable for the life of the store: ``install_canonical_windows`` refuses
+        to switch the canonical format on or off, and the geometry terms never
+        move, so the re-derivation at the cutover cannot change these strings.
+        """
+        g = self._key_geom
+        suffixes = []
+        for tp_rank in range(max(1, int(g["tp_size"]))):
+            for pp_rank in range(max(1, int(g["pp_size"]))):
+                for cp_rank in range(max(1, int(g["attn_cp_size"]))):
+                    cfg, kv = self._build_key_suffixes(
+                        dict(
+                            g,
+                            tp_rank=tp_rank,
+                            pp_rank=pp_rank,
+                            attn_cp_rank=cp_rank,
+                        )
+                    )
+                    suffixes.append(cfg)
+                    suffixes.append(kv)
+        return tuple(dict.fromkeys(s for s in suffixes if s))
 
     def _build_key_suffixes(self, g: dict) -> Tuple[str, str]:
         """(config_suffix, kv_config_suffix) for the geometry ``g``.
@@ -1646,12 +1694,19 @@ class HiCacheFile(HiCacheStorage):
         AND MUST ESCALATE IT GROUP-FATALLY: the wake caller turns this raise
         into W4 ``Weg2WakeRefused`` -- a group-fatal STOP with no retry (spec
         §5, which places the wake refusal at the launcher for exactly this
-        reason). The verdict is the eviction owner's alone and cannot be
-        moved: the census is filtered by that rank's scan suffixes, so a
-        non-owner grading the same directory grades a different population.
-        A rank that dies here alone while its siblings wake on is the
-        disagreement §0 forbids ("STOP, never compensation"). Wiring this
-        escalation is S1/S3's obligation, recorded as such in
+        reason). The raise is still the eviction owner's alone, but no longer
+        for the reason recorded at fix 2 ("a non-owner grades a different
+        population"): the scan filter is now the GROUP's suffix set, so the
+        census is a property of the directory and the geometry and every rank
+        would grade it identically -- which is why the ATTACH-time grading has
+        moved above the owner-only early return in ``LRUFileEvictor.__init__``
+        and the ranks refuse together there. What keeps the WAKE verdict
+        single is that only the owner holds an index to rebuild; the others
+        return without walking the directory, and giving them a walk on every
+        wake would buy nothing but the walk. So a rank that dies HERE alone
+        while its siblings wake on is still the disagreement §0 forbids
+        ("STOP, never compensation"), and the escalation above is what closes
+        it. Wiring that escalation is S1/S3's obligation, recorded as such in
         WEG2_BUILD_DECISIONS_0906.md; S5 owns only the one definition.
         """
         return self._evictor.rescan()
