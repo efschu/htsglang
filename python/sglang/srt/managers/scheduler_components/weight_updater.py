@@ -206,6 +206,20 @@ class SchedulerWeightUpdaterManager:
     def _weg2_server_args(self):
         return getattr(self.scheduler, "server_args", None)
 
+    @staticmethod
+    def _weg2_rss_shmem_mib() -> float:
+        """This process's RssShmem (/proc/self/status), the instrument that
+        sees the torch_memory_saver cpu backup (cudaMallocHost pages are
+        shared file-backed; RssAnon is blind to them -- boot weg2s1 N5)."""
+        try:
+            with open("/proc/self/status") as f:
+                for ln in f:
+                    if ln.startswith("RssShmem:"):
+                        return int(ln.split()[1]) / 1024.0
+        except OSError:
+            pass
+        return -1.0
+
     @contextmanager
     def _weg2_pcie_lock(self, label: str) -> Iterator[None]:
         """Serialise this card's host<->device transfer against its sibling.
@@ -609,9 +623,16 @@ class SchedulerWeightUpdaterManager:
             # _export_static_state, a checksum, a .clone() -- is a read of
             # unmapped pages, which is the campaign (a) fault on the sibling
             # tag.  Pinned by test_weights_block_pause_is_the_last_statement.
+            shm0 = self._weg2_rss_shmem_mib()
             with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags)):
                 for tag in weights_tags:
                     self.memory_saver_adapter.pause(tag)
+            # The MEASURED bytes of this tag set's host image (the ledger's
+            # chunk term is image / N, derived; this is the instrument).
+            logger.info(
+                "WEG2-CHUNK-BYTES sleep tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, /proc/self/status)",
+                weights_tags, self._weg2_rss_shmem_mib() - shm0, shm0, self._weg2_rss_shmem_mib(),
+            )
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
@@ -673,9 +694,14 @@ class SchedulerWeightUpdaterManager:
             # buffer (and, with the #1233 patched hook, frees that buffer).
             # Same lock, same reason as the sleep leg above.
             t_w0 = time.perf_counter()
+            shm0 = self._weg2_rss_shmem_mib()
             with self._weg2_pcie_lock("wake-H2D " + ",".join(weights_tags)):
                 for tag in weights_tags:
                     self.memory_saver_adapter.resume(tag)
+            logger.info(
+                "WEG2-CHUNK-BYTES wake tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, /proc/self/status; negative = the patched saver freed it)",
+                weights_tags, self._weg2_rss_shmem_mib() - shm0, shm0, self._weg2_rss_shmem_mib(),
+            )
             torch.distributed.barrier(self.tp_cpu_group)
             family_complete = not any(
                 is_weights_family_tag(t) for t in self.offload_tags
