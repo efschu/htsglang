@@ -1527,6 +1527,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
+        if getattr(self, "draft_kv_only", False):
+            # #1233 producer mode (C21): the draft KV rows are written by the
+            # forward above; everything below seeds a draft round this group
+            # never runs. Return before any pick/broadcast.
+            return None
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 

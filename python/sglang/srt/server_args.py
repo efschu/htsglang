@@ -3647,6 +3647,23 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_draft_kv_only: A[
+        bool,
+        Arg(
+            help="#1233 (Weg 2 draft KV across the flip): run the drafter as a "
+            "draft-KV PRODUCER only (no proposal, no verify): every prefill "
+            "chunk on the LAST pipeline stage writes the draft layer's KV rows "
+            "so HiCache can persist them in the canonical draft page that the "
+            "decode group reads. Requires the full speculative flag set "
+            "(--speculative-algorithm/--speculative-num-steps/"
+            "--speculative-eagle-topk/--speculative-num-draft-tokens, carried "
+            "byte-for-byte from the decode group so both compute the same "
+            "drafter identity); valid only under pp_size>1, tp_size==1, "
+            "page_size==1, --hicache-canonical-kv-page, and no dp/ep. "
+            "Deliberately NOT part of the drafter identity hash: it decides "
+            "whether the drafter PROPOSES, not what a draft KV byte MEANS.",
+        ),
+    ] = False
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
@@ -8161,6 +8178,61 @@ class ServerArgs:
                     canonical,
                     canonical,
                 )
+
+    def _refuse_proposing_drafter_under_pp(self):
+        """C2 (#1233): under pp_size>1 a drafter may exist only as the
+        draft-KV producer of ``--speculative-draft-kv-only``."""
+        if self.pp_size <= 1:
+            return
+        assert self.speculative_algorithm is None or self.speculative_draft_kv_only, (
+            "Pipeline parallelism is not compatible with speculative decoding "
+            "(a PROPOSING drafter). Weg 2's prefill group may carry a draft-KV "
+            "producer instead: --speculative-draft-kv-only."
+        )
+
+    def _handle_speculative_draft_kv_only(self):
+        """C1 (#1233): the producer mode's scope, refused by name at parse time.
+
+        The producer is the Weg-2 prefill group's last PP stage writing the
+        draft layer's KV rows into the canonical draft page. Everything the
+        page format and the identity need is checked here so an unusable
+        shape fails the boot, not the first store write.
+        """
+        if not self.speculative_draft_kv_only:
+            return
+        flag = "--speculative-draft-kv-only"
+
+        def refuse(what):
+            raise ValueError(f"{flag} {what}")
+
+        if self.pp_size <= 1:
+            refuse(f"is the PP prefill group's producer mode and needs pp_size > 1 (got pp_size={self.pp_size})")
+        if self.tp_size != 1:
+            refuse(f"needs tp_size == 1 (got tp_size={self.tp_size}): the producer writes the WHOLE canonical draft page from one rank")
+        if self.dp_size > 1:
+            refuse(f"does not support data parallelism (dp_size={self.dp_size})")
+        if self.ep_size > 1:
+            refuse(f"does not support expert parallelism (ep_size={self.ep_size})")
+        if self.page_size != 1:
+            refuse(f"needs page_size == 1 (got page_size={self.page_size}): a canonical draft page is ONE token's draft layer")
+        if not self.hicache_canonical_kv_page:
+            refuse("needs --hicache-canonical-kv-page: the draft page rides the canonical page format's geometry-free key")
+        for name in (
+            "speculative_algorithm",
+            "speculative_num_steps",
+            "speculative_eagle_topk",
+            "speculative_num_draft_tokens",
+        ):
+            if getattr(self, name, None) is None:
+                refuse(
+                    f"needs --{name.replace('_', '-')} (the decode group's value, byte-for-byte): "
+                    "the drafter identity is hashed from the full speculative flag set and "
+                    "the producer must compute the decode group's identity"
+                )
+        if getattr(self, "speculative_draft_placement", "split") == "solo":
+            refuse("does not support --speculative-draft-placement solo")
+        if getattr(self, "speculative_cross_algorithm", None):
+            refuse("does not support --speculative-cross-algorithm")
 
     def _handle_speculative_algorithm_name(self):
         """Resolve and validate --speculative-algorithm at parse time (#379).
@@ -19494,18 +19566,13 @@ class ServerArgs:
             assert self.disable_overlap_schedule, (
                 "Pipeline parallelism is not compatible with overlap schedule"
             )
-            # #1233 (WEG 2, S0): back to the plain upstream refusal. The
-            # waiver that used to sit here existed because ONE process was
-            # both the PP prefill stack and the TP decode stack, and
-            # speculation was armed on the second one. Weg 2 splits those
-            # into two process groups: the prefill group is pure PP and
-            # carries no draft worker (no constructor here takes a pp_rank),
-            # and the decode group is TP with pp_size 1, so it never reaches
-            # this branch at all.
-            assert self.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with speculative "
-                "decoding."
-            )
+            # #1233 (Weg 2 draft KV across the flip): Weg 2's prefill group
+            # may carry a draft-KV PRODUCER on its last stage
+            # (--speculative-draft-kv-only); a PROPOSING drafter under PP is
+            # still refused -- no draft worker takes a pp_rank, and the
+            # decode group is TP with pp_size 1, so it never reaches here.
+            self._refuse_proposing_drafter_under_pp()
+        self._handle_speculative_draft_kv_only()
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

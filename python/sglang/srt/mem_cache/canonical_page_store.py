@@ -726,6 +726,91 @@ def _merge_sequential(
     return tuple((off, length) for off, length in out)
 
 
+def build_draft_window(
+    host_draft_pool,
+    total_kv_heads: int,
+    head_offset: int,
+    head_count: int,
+    *,
+    tp_size: Optional[int] = None,
+    tp_rank: Optional[int] = None,
+) -> CanonicalExtentWindow:
+    """This rank's window in the canonical ``{hash}.draft-{drafter}`` page (#1233).
+
+    The canonical DRAFT page is the WHOLE token page of the draft layer(s):
+    ``CanonicalPageSpec(num_draft_layers, 2 * total_kv_heads * head_dim *
+    itemsize)`` -- K half-cells of every slot, then V half-cells, every kv
+    head (2048 B on the NEXTN head of Qwen3.8-27B: 1 layer, 4 heads, 256
+    head_dim, fp8). Group P (tp_size 1) writes it whole; a group-D rank
+    (tp_size 3, head shares 2/1/1) reads the byte sub-range of ITS heads out
+    of each half-cell -- the head cut ``CanonicalExtentWindow`` already names
+    in its docstring, applied inside a slot instead of across slots. Two
+    extents per draft layer, in payload order, exactly the flat host page
+    order ``(2, layer, page, head, head_dim)`` of ``pool_host/mha.py``.
+
+    Three refusals, all boot-blockers and never a silent wrong-head read:
+
+    * the window's payload must equal the pool's own ``get_size_per_token``
+      (the bytes this rank actually holds per token);
+    * ``(head_offset, head_count)`` must equal ``local_head_window(total,
+      tp_size, tp_rank)`` (W1: the canonical head ORDER is the largest-
+      remainder-first dealing of ``disaggregation/draft_kv_canonical``, and
+      a pool cut in another order would read the wrong heads under the
+      same key);
+    * ``head_count`` must be the pool's own head count.
+    """
+    from sglang.srt.disaggregation.draft_kv_canonical import local_head_window
+
+    head_dim = int(host_draft_pool.head_dim)
+    itemsize = int(host_draft_pool.dtype.itemsize)
+    layers = int(getattr(host_draft_pool, "layer_num", 1) or 1)
+    total = int(total_kv_heads)
+    off, n = int(head_offset), int(head_count)
+    if total <= 0 or n <= 0 or off < 0 or off + n > total:
+        raise CanonicalPageError(
+            f"draft head window [{off}, {off + n}) is not inside the "
+            f"{total} kv heads of the canonical draft page."
+        )
+    if int(host_draft_pool.head_num) != n:
+        raise CanonicalPageError(
+            f"draft head window mismatch: the draft host pool holds "
+            f"{host_draft_pool.head_num} kv head(s) but this rank's window "
+            f"claims {n}."
+        )
+    if tp_size is not None and tp_rank is not None:
+        want = local_head_window(total, int(tp_size), int(tp_rank))
+        if want != (off, off + n):
+            raise CanonicalPageError(
+                f"draft head window mismatch (W1): tp_rank {tp_rank} of "
+                f"{tp_size} owns canonical heads [{want[0]}, {want[1]}) by "
+                f"local_head_window, but the pool cut is [{off}, {off + n}). "
+                "Refusing at registration: a page read under the same key "
+                "with another head order is a silently wrong draft KV."
+            )
+    spec = CanonicalPageSpec(
+        num_attn_layers=layers,
+        kv_bytes_per_token_per_attn_layer=2 * total * head_dim * itemsize,
+    )
+    k = off * head_dim * itemsize
+    length = n * head_dim * itemsize
+    half = spec.half_cell_bytes
+    extents = [(slot * half + k, length) for slot in range(layers)]
+    extents += [(spec.half_page_bytes + slot * half + k, length) for slot in range(layers)]
+    window = CanonicalExtentWindow(
+        total_bytes=spec.page_bytes,
+        extents=_merge_sequential(extents),
+        label="draft page",
+    )
+    have = int(host_draft_pool.get_size_per_token())
+    if window.payload_bytes != have:
+        raise CanonicalPageError(
+            f"draft window cuts {window.payload_bytes} bytes per token but the "
+            f"draft host pool holds {have}: the window and the pool disagree "
+            "about this rank's draft bytes, so neither can be trusted."
+        )
+    return window
+
+
 def build_mamba_window(
     spec, *, ratios: Sequence[int], rank: int, layer_lo: int, layer_hi: int
 ) -> CanonicalExtentWindow:

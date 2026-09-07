@@ -731,6 +731,16 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # #1233 draft KV across the flip (C6): under --speculative-draft-kv-only
+        # the configured algorithm names the PRODUCER's head, not a proposing
+        # drafter. The scheduler runs as a non-speculating PP process -- every
+        # spec-keyed branch takes today's path -- and the producer is a
+        # separate handle built in maybe_init_draft_worker.
+        self.draft_kv_producer = None
+        self.draft_kv_producer_algorithm = SpeculativeAlgorithm.from_string(None)
+        if getattr(server_args, "speculative_draft_kv_only", False):
+            self.draft_kv_producer_algorithm = self.spec_algorithm
+            self.spec_algorithm = SpeculativeAlgorithm.from_string(None)
         # #631 Route A: speculation is a property of the TP DECODE phase.
         # A phase-flip instance boots in the PP prefill phase, where no
         # draft worker exists -- the draft workers take no pp_rank and
@@ -923,10 +933,16 @@ class Scheduler(
             self.decode_offload_manager = None
 
         # Register draft KV pool (when spec + HiCache co-enabled).
+        # #1233 (C6): the draft-KV producer registers through the SAME boot
+        # route with owner_phase=None -- only `has_draft` changes (Q3).
         kv_cache_builder.maybe_register_hicache_draft(
             tree_cache=self.tree_cache,
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
+            draft_worker=self.draft_worker or self.draft_kv_producer,
+            spec_algorithm=(
+                self.spec_algorithm
+                if self.draft_worker is not None
+                else self.draft_kv_producer_algorithm
+            ),
             server_args=self.server_args,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
             page_size=self.page_size,
@@ -1366,6 +1382,7 @@ class Scheduler(
         if self.spec_algorithm.is_none():
             self.draft_worker = None
             self.external_corpus_manager = None
+            self._maybe_init_draft_kv_producer()
             return
 
         # Launch a draft worker for speculative decoding
@@ -1405,6 +1422,47 @@ class Scheduler(
         else:
             self.external_corpus_manager = None
 
+    def _maybe_init_draft_kv_producer(self):
+        """#1233 (C6): the draft-KV producer of Weg 2's prefill group.
+
+        The single-rank pp group is built on EVERY rank (collective); the
+        producer itself only on the stage `get_pp_group().is_last_rank`
+        names -- derived from --pp-attn-stage-ratio, never "PP2".
+        """
+        if not getattr(self.server_args, "speculative_draft_kv_only", False):
+            return
+        from sglang.srt.distributed.parallel_state import (
+            get_pp_group,
+            initialize_draft_pp_group,
+        )
+        from sglang.srt.speculative.draft_kv_producer import DraftKvProducer
+
+        initialize_draft_pp_group()
+        if not get_pp_group().is_last_rank:
+            return
+        self.draft_kv_producer = DraftKvProducer(self, self.draft_kv_producer_algorithm)
+        embed_mib = self.draft_kv_producer.load_resident_embedding(self.server_args.model_path)
+        draft_model = self.draft_kv_producer.draft_runner.model
+        mtp_mib = sum(
+            p.numel() * p.element_size() for n, p in draft_model.named_parameters()
+            if "embed_tokens" not in n and "lm_head" not in n
+        ) / float(2**20)
+        cfg = self.draft_kv_producer.draft_runner.model_config
+        logger.info(
+            "WEG2 DRAFT-KV-PRODUCER armed stage=%d/%d drafter=%s layout=v%d heads=%d "
+            "head_dim=%d page_bytes=%d embed=resident mtp_mib=%.1f embed_mib=%.1f build_s=%.1f",
+            self.draft_kv_producer.stage,
+            self.draft_kv_producer.stages,
+            kv_cache_builder.drafter_identity_hash(self.server_args),
+            1,
+            int(cfg.get_total_num_kv_heads()),
+            int(cfg.head_dim),
+            2 * int(cfg.get_total_num_kv_heads()) * int(cfg.head_dim),
+            mtp_mib,
+            embed_mib,
+            self.draft_kv_producer.build_s,
+        )
+
     def init_target_memory_pool(self):
         """Allocate target KV cache pools if they have not been allocated yet."""
         if (
@@ -1421,6 +1479,15 @@ class Scheduler(
         if self.draft_worker is not None:
             pool, allocator = self.tp_worker.get_memory_pool()
             self.draft_worker.alloc_memory_pool(
+                memory_pool_config=self.tp_worker.model_runner.memory_pool_config,
+                req_to_token_pool=pool,
+                token_to_kv_pool_allocator=allocator,
+            )
+        if self.draft_kv_producer is not None:
+            # #1233: the producer's draft pool at target-token parity, forced
+            # by the shared allocator (the draft write reuses out_cache_loc).
+            pool, allocator = self.tp_worker.get_memory_pool()
+            self.draft_kv_producer.alloc_memory_pool(
                 memory_pool_config=self.tp_worker.model_runner.memory_pool_config,
                 req_to_token_pool=pool,
                 token_to_kv_pool_allocator=allocator,
@@ -1497,6 +1564,8 @@ class Scheduler(
         self.tp_worker.init_attention_backends()
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()
+        if self.draft_kv_producer is not None:
+            self.draft_kv_producer.init_attention_backends()
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
@@ -12623,6 +12692,17 @@ class Scheduler(
         # layout change, because it was built on the other stack. Weg 2's
         # decode group builds its draft worker at boot and keeps it, so
         # there is no cold-arming moment to detect here.
+        # #1233 draft KV across the flip (C14): what DOES need arming is a
+        # request admitted on a store-served prefix whose draft pages the
+        # presence probe found missing beyond one chunk -- cold BY NAME over
+        # [d, k). The admission arming is the one funnel that stamps it; it
+        # is a no-op for every request the probe answered "full" or "trim".
+        if self.draft_worker is not None and batch.forward_mode.is_extend():
+            from sglang.srt.managers.phase_flip_draft_bootstrap import (
+                arm_draft_cold_for_admission,
+            )
+
+            arm_draft_cold_for_admission(self, batch)
         # Pairing objective (#274 slice D): publish this batch's grain shape
         # for the lane's pairing policy. Read-only for the policy, one tuple
         # store here; None on every default path. Publishing must not alter
@@ -12789,9 +12869,20 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                produce = self._draft_kv_producer_wants(batch)
+                if produce:
+                    from sglang.srt.model_executor.forward_batch_info import (
+                        CaptureHiddenMode,
+                    )
+
+                    saved_capture_mode = batch.capture_hidden_mode
+                    batch.capture_hidden_mode = CaptureHiddenMode.FULL
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                if produce:
+                    self._draft_kv_produce(batch, batch_result)
+                    batch.capture_hidden_mode = saved_capture_mode
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
@@ -12837,6 +12928,50 @@ class Scheduler(
         self._maybe_report_active_ranks()
 
         return ret
+
+    def _draft_kv_producer_wants(self, batch: ScheduleBatch) -> bool:
+        """#1233 (C7): the last stage's extend chunk, and nothing else."""
+        return (
+            self.draft_kv_producer is not None
+            and batch.forward_mode.is_extend()
+            and not batch.forward_mode.is_idle()
+        )
+
+    def _draft_kv_produce(self, batch: ScheduleBatch, batch_result) -> None:
+        """Run the draft-extend of this chunk on the producer and emit L1."""
+        hidden = getattr(batch_result.logits_output, "hidden_states", None)
+        next_ids = batch_result.next_token_ids
+        if hidden is None or next_ids is None:
+            raise RuntimeError(
+                "WEG2 DRAFT-KV-PRODUCE: the target chunk returned no FULL hidden "
+                "states or no sampled ids; the producer cannot write draft rows "
+                "for this chunk (never silently skipped)."
+            )
+        saved_algo, saved_spec = batch.spec_algorithm, batch.spec_info
+        batch.spec_algorithm = self.draft_kv_producer_algorithm
+        try:
+            terms = self.draft_kv_producer.produce(batch, hidden, next_ids)
+        finally:
+            batch.spec_algorithm = saved_algo
+            batch.spec_info = saved_spec
+        rid = batch.reqs[0].rid if batch.reqs else "?"
+        chunked = batch.chunked_req is not None
+        n = self.draft_kv_producer._chunks
+        if n <= 64 or n % 64 == 0 or not chunked:
+            logger.info(
+                "WEG2 DRAFT-KV-PRODUCE rid=%s chunk=%d/%s tokens=%d rows=[%d,%d) tail=%s "
+                "ms=%.1f peak_mib=%.1f (n=%d)",
+                rid,
+                n,
+                "?",
+                terms["rows"],
+                self.draft_kv_producer._rows - terms["rows"],
+                self.draft_kv_producer._rows,
+                "next_prompt" if chunked else "sampled",
+                terms["ms"],
+                terms["peak_mib"],
+                n,
+            )
 
     def _dispatch_concurrent_spill(self, spill_batch: ScheduleBatch) -> None:
         """DECOUPLE S4b: issue a due spill tick CONCURRENTLY with the device
@@ -13985,6 +14120,17 @@ class Scheduler(
             info_record = self.draft_worker.dump_info_records()
             if info_record is not None:
                 ret["dspark_info_record"] = info_record
+
+        # #1233 (C20): the draft tier's denominators for the front's leg-2 line.
+        cc = getattr(getattr(self, "tree_cache", None), "cache_controller", None)
+        if cc is not None and getattr(cc, "has_draft", False):
+            ret["draft_l3_hits"] = int(getattr(cc, "_draft_l3_hits", 0))
+            ret["draft_l3_misses"] = int(getattr(cc, "_draft_l3_misses", 0))
+            ret["draft_l3_write_issued"] = int(getattr(cc, "_draft_l3_write_issued", 0))
+            ret["draft_l3_write_refused"] = int(getattr(cc, "_draft_l3_write_refused", 0))
+            ret["draft_cold_requests"] = int(getattr(cc, "_draft_cold_requests", 0))
+            ret["draft_trim_requests"] = int(getattr(cc, "_draft_trim_requests", 0))
+            ret["drafter_identity"] = getattr(cc, "draft_identity", None)
 
         # Multi-group runtime (#274): lane state + timings (rank 0 carries
         # the lanes; other ranks report an empty list).

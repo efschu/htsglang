@@ -31,6 +31,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -76,6 +77,14 @@ def build_mtp_fc(hidden_size: int, quant_config, prefix: str):
         quant_config=quant_config,
         prefix=add_prefix(MTP_FC_LAYER_NAME, prefix),
     )
+
+
+class Qwen3_5MtpEmbeddingAbsent(RuntimeError):
+    """S3 (#1233): the MTP head was asked to run on a pipeline stage whose
+    embedding is a ``PPMissingLayer``. That layer is an ``nn.Identity``, so
+    without this refusal the forward would hand the int64 token ids on as
+    if they were a ``[T, hidden]`` embedding and write garbage draft KV
+    with a successful-looking forward."""
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
@@ -232,6 +241,15 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             )
 
         try:
+            if isinstance(self.model.embed_tokens, PPMissingLayer):
+                raise Qwen3_5MtpEmbeddingAbsent(
+                    "the MTP head's embed_tokens is a PPMissingLayer on this "
+                    f"pipeline stage (pp_rank {getattr(getattr(self, 'pp_group', None), 'rank_in_group', '?')}): "
+                    "never an Identity -- int64 ids as a [T,"
+                    f"{getattr(getattr(self, 'config', None), 'hidden_size', '?')}] embedding would be "
+                    "garbage draft KV. The draft-KV producer must load a resident "
+                    "embed_tokens on its stage (#1233 placement A)."
+                )
             assert input_embeds is None
             input_embeds = forward_batch.mm_input_embeds
             if (

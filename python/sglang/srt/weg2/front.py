@@ -712,9 +712,11 @@ class Front:
                     if pt:
                         self.spans.record(text, pt)
                         self._note_exact(text, pt)
+                    dterms = await self._draft_terms(g, None)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
-                                "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d", rid, r.status, pt, ct, comp, max(0, pt - ct),
-                                verdict, priced, time.time() - t0, self.epoch)
+                                "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
+                                rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
+                                dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
                     if pending is not None and ct > 0:
                         self.counters["cross_group_prefix_hits"] += 1
                     return resp
@@ -732,9 +734,11 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
+                dterms = await self._draft_terms(g, js)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
-                            "uncached=%d verdict=%s wall=%.2fs epoch=%d", rid, r.status, pt, ct, comp, max(0, pt - ct),
-                            verdict, time.time() - t0, self.epoch)
+                            "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
+                            rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
+                            dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
                 if pt:
                     self.spans.record(text, pt)
                     self._note_exact(text, pt)
@@ -770,20 +774,80 @@ class Front:
         finally:
             g.outstanding.pop(rid, None)
 
-    def check_identity(self) -> None:
-        """W9 from the store directory: exactly ONE identity suffix on disk."""
-        self.identity_checked = True
+    async def _draft_terms(self, g, body) -> dict:
+        """#1233 (C16, L12): the draft terms of one served request.
+
+        ``accept_len`` comes from ``meta_info.spec_accept_length`` when the
+        body carries it (``/generate``), else from the ``/get_server_info``
+        ``avg_spec_accept_length`` (cumulative average, named as such);
+        ``draft_pages``/``draft_miss`` are the DELTA of D's L3 draft read
+        counters between this call and the previous one (one request in
+        flight at a time on the leg-2 route, so the delta is this request's).
+        Never raises: a missing instrument is ``accept_src=none``.
+        """
+        out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none"}
         try:
-            names = [n for n in os.listdir(self.store_dir) if n.endswith(".bin")][:20000]
+            mi = (body or {}).get("meta_info") if isinstance(body, dict) else None
+            if isinstance(mi, dict) and mi.get("spec_accept_length") is not None:
+                out["accept_len"] = float(mi["spec_accept_length"])
+                out["accept_src"] = "meta"
+            async with self.session.get(f"{g.url}/get_server_info") as r:
+                info = await r.json() if r.status == 200 else {}
+            if isinstance(info, list) and info:
+                info = info[0]
+            if not isinstance(info, dict):
+                return out
+            hits = int(info.get("draft_l3_hits", 0) or 0)
+            miss = int(info.get("draft_l3_misses", 0) or 0)
+            prev = getattr(self, "_draft_prev", (0, 0))
+            self._draft_prev = (hits, miss)
+            out["draft_pages"] = max(0, hits - prev[0])
+            out["draft_miss"] = max(0, miss - prev[1])
+            if out["accept_src"] == "none" and info.get("avg_spec_accept_length") is not None:
+                out["accept_len"] = float(info["avg_spec_accept_length"])
+                out["accept_src"] = "server_info_avg"
+        except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
+            logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
+        return out
+
+    def check_identity(self) -> None:
+        """W9 from the store directory: exactly ONE identity suffix on disk.
+
+        #1233 draft KV across the flip (C16): walks the ``page_shard``
+        subdirectories (``hicache_storage.page_shard``: the first two hex
+        characters of the key) instead of the flat listdir that saw no page
+        at all, and censuses kv / mamba / draft files by name (L11).
+        """
+        self.identity_checked = True
+        names = []
+        try:
+            for root, _dirs, files in os.walk(self.store_dir):
+                for n in files:
+                    if n.endswith(".bin"):
+                        names.append(n)
+                        if len(names) >= 200000:
+                            break
+                if len(names) >= 200000:
+                    break
         except OSError:
             return
-        ids = set()
+        ids, suffixes = set(), set()
+        kv = mamba = draft = 0
         for n in names:
             stem = n[:-4]
+            head, _, tail = stem.partition("_")
+            if ".draft" in head:
+                draft += 1
+            elif ".mamba" in head:
+                mamba += 1
+            elif "." not in head:
+                kv += 1
             parts = stem.split("_")
             if len(parts) >= 3:
                 ids.add(parts[-1])
-        logger.info("W9 identity check from store dir %s: %d files, identity suffixes %s", self.store_dir, len(names), sorted(ids))
+            suffixes.add("_" + tail if tail else "")
+        logger.info("W9 store census (shard-walked) files=%d kv=%d mamba=%d draft=%d suffixes=%s identity suffixes %s (store dir %s)",
+                    len(names), kv, mamba, draft, sorted(suffixes)[:8], sorted(ids), self.store_dir)
         if len(ids) > 1:
             self.do_stop("W9 Weg2StoreIdentityMismatch", f"identity suffixes on the sole carrier: {sorted(ids)}")
 

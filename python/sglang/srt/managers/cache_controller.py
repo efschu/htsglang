@@ -336,6 +336,58 @@ HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
 #: ``mem_pool_host`` needs no re-derivation pass and no floor.
 HICACHE_CACHE_MODE_LOAD_FRACTION = 0.5
 
+
+class Weg2DraftDisagree(RuntimeError):
+    """S5 (#1233 draft KV across the flip): a D rank's prefetch claim differs
+    from the group's. Every rank reads the same atomically published files,
+    so the claims are equal by construction; an inequality is a store
+    mutated between two ranks' probes, and the law is STOP, never a
+    compensation (spec section 3.4: do NOT invent a vote)."""
+
+
+def assert_draft_claims_agree(min_claim: int, max_claim: int, rid) -> None:
+    """L8. ``min_claim``/``max_claim`` come from ONE MIN all_reduce over the
+    packed vector ``[claim, -claim]`` (no second collective)."""
+    if int(min_claim) != int(max_claim):
+        raise Weg2DraftDisagree(
+            f"WEG2 DRAFT-DISAGREE STOP rid={rid} per_rank_claim=[{min_claim}, "
+            f"{max_claim}] (min, max over the group): the ranks' storage "
+            "claims differ. Ranks never disagree; stopping the group instead "
+            "of compensating."
+        )
+
+
+def resolve_draft_claim(kv_pages: int, draft_pages: int, chunk_pages: int, reprobe):
+    """Q10 (#1233): the D-side claim from the presence probe's two numbers.
+
+    ``kv_pages`` = the KV claim after every capping pool (mamba anchor);
+    ``draft_pages`` = the longest draft prefix present (ALL_PAGES);
+    ``chunk_pages`` = ``chunked_prefill_size / page_size``, the #939 bound on
+    re-prefill; ``reprobe(d)`` = the largest claim ``<= d`` that also
+    satisfies the capping pools (the mamba anchor must sit at the trim
+    point -- a claim that ends where no anchor is would be refused by the
+    match walk, the #873 shape).
+
+    Returns ``(claim, draft_claim, mode, cold_span)``:
+
+    * ``full``  -- the draft prefix covers the claim.
+    * ``trim``  -- ``kv - draft`` fits one chunk: claim the draft-covered
+      prefix (re-prefill at most one chunk, #939), never re-prefill more.
+    * ``cold``  -- the gap exceeds one chunk (or the nearest anchor pushes
+      the trim past it): claim the KV prefix and name the span ``[d, k)``
+      whose draft rows the #993 zero fill will hold. Never silent, never a
+      D-side draft recompute (Q-G5: K/V do not invert to hidden states).
+    """
+    k, d = int(kv_pages), int(draft_pages)
+    if d >= k:
+        return k, k, "full", None
+    if k - d <= chunk_pages:
+        c = int(reprobe(d))
+        c = max(0, min(c, d))
+        if k - c <= chunk_pages:
+            return c, c, "trim", None
+    return k, d, "cold", (d, k)
+
 #: #1068 (WEG 1 slice 2 fix 3 + fix 4, spec A12.4 and its amendment): the
 #: bound, in seconds, that ``HiCacheController._stop_storage_threads`` gives
 #: EACH storage thread to leave its loop AFTER every in-flight prefetch
@@ -734,6 +786,24 @@ class HiCacheController:
         # here, reported by `_log_draft_l3_progress`.
         self._draft_l3_hits = 0
         self._draft_l3_misses = 0
+        # #1233 draft KV across the flip: the L3 WRITE side (issued/refused
+        # per `_draft_page_set` batch, cumulative) and the admission-side
+        # verdicts. Read by `/server_info` (C20) and the PUBLISH-SWEEP line.
+        self._draft_l3_write_issued = 0
+        self._draft_l3_write_refused = 0
+        self._draft_set_warned_at = 0
+        self._draft_get_warned_at = 0
+        self._draft_cold_requests = 0
+        self._draft_trim_requests = 0
+        self._draft_presence_n = 0
+        #: request_id -> (draft_pages, kv_pages) in TOKENS for a claim made
+        #: cold BY NAME (Q10); consumed once by
+        #: `phase_flip_draft_bootstrap.draft_cold_reason` at admission.
+        self.draft_cold_spans: dict = {}
+        #: this rank's head window in the canonical draft page (C11), None
+        #: until the draft pool is registered under the canonical format.
+        self.canonical_draft_page_window = None
+        self.draft_canonical_layout = None
         self._draft_l3_logged_at = -1
 
         # Default storage page IO functions (may be overridden by attach).
@@ -2336,6 +2406,99 @@ class HiCacheController:
         # Generic backends.
         self.draft_page_get_func = self._draft_page_get_generic
         self.draft_page_set_func = self._draft_page_set_generic
+        self._install_canonical_draft_window()
+
+    def _draft_head_window(self, total_kv_heads: int):
+        """``(head_offset, head_count)`` of this rank in the checkpoint's kv
+        heads, from the SAME dealing the pools use (``partition_sizes`` under
+        an uneven-TP plan, the even split otherwise; replicated KV = whole)."""
+        from sglang.srt.distributed.utils import (
+            attn_kv_replicated,
+            get_tp_partition_ratios,
+            partition_sizes,
+            tp_plan_active,
+        )
+
+        total, tp_size, tp_rank = int(total_kv_heads), int(self.tp_size), int(self.tp_rank)
+        if tp_size <= 1 or attn_kv_replicated(tp_size, total):
+            return 0, total
+        if tp_plan_active(tp_size):
+            sizes = partition_sizes(total, weights=get_tp_partition_ratios(), units=total)
+        else:
+            sizes = [total // tp_size] * tp_size
+        if sum(int(x) for x in sizes) != total:
+            from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
+
+            raise CanonicalPageError(
+                f"draft head partition {list(sizes)} does not sum to the "
+                f"{total} kv heads of the checkpoint (S2)."
+            )
+        return int(sum(sizes[:tp_rank])), int(sizes[tp_rank])
+
+    def _install_canonical_draft_window(self) -> None:
+        """C11 (#1233): the third canonical slot, installed from the pool that
+        now exists. Only under the canonical page format (the backend holds a
+        KV window); otherwise the draft key keeps its per-rank suffix and the
+        store's bytes are byte-identical to today's."""
+        backend = self.storage_backend
+        if getattr(backend, "canonical_kv_page", None) is None or not hasattr(
+            backend, "install_canonical_windows"
+        ):
+            return
+        from sglang.srt.disaggregation.draft_kv_canonical import (
+            CANONICAL_LAYOUT_VERSION,
+            DraftKvCanonicalLayout,
+            check_full_head_shipment_is_justified,
+        )
+        from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
+        from sglang.srt.mem_cache.canonical_page_store import build_draft_window
+
+        model_config = getattr(self, "_canonical_model_config", None)
+        if model_config is None:
+            raise CanonicalPageError(
+                "canonical draft window: the storage attach recorded no model "
+                "config, so the checkpoint's total kv-head count is unknown (S2)."
+            )
+        total = int(model_config.get_total_num_kv_heads())
+        pool = self.mem_pool_host_draft
+        pool.get_size_per_token()  # binds head_num/head_dim/layer_num
+        off, n = self._draft_head_window(total)
+        window = build_draft_window(
+            pool, total, off, n, tp_size=self.tp_size, tp_rank=self.tp_rank
+        )
+        layout = DraftKvCanonicalLayout(
+            version=CANONICAL_LAYOUT_VERSION,
+            num_kv_heads=total,
+            head_dim=int(pool.head_dim),
+            element_size=int(pool.dtype.itemsize),
+            num_draft_layers=int(pool.layer_num),
+            draft_kv_layout=str(
+                getattr(getattr(self, "_canonical_server_args", None), "draft_kv_layout", "replicated")
+                or "replicated"
+            ),
+        )
+        hidden = int(getattr(model_config, "hidden_size", 0) or 0)
+        if hidden > 0:
+            check_full_head_shipment_is_justified(layout, hidden, 2)
+        backend.install_canonical_windows(
+            backend.canonical_kv_page, backend.canonical_mamba_blob, draft_page=window
+        )
+        self.canonical_draft_page_window = window
+        self.draft_canonical_layout = layout
+        logger.info(
+            "#706 canonical DRAFT page active: %d slot, %d B; heads [%d,%d) of %d; "
+            "extents %s; draft keys carry content+drafter only (suffix=%s) "
+            "layout=v%d drafter=%s",
+            int(pool.layer_num),
+            window.total_bytes,
+            off,
+            off + n,
+            total,
+            list(window.extents),
+            getattr(backend, "draft_config_suffix", "?"),
+            layout.version,
+            self.draft_identity,
+        )
 
     def prefetch(
         self,
@@ -2520,7 +2683,12 @@ class HiCacheController:
             # Otherwise wait_complete can race and load back target KV before
             # draft KV reaches host memory.
             if self.draft_tier_armed("l3-load"):
-                self._draft_page_get(batch_hashes, batch_host_indices)
+                flags = self._draft_page_get_flags(batch_hashes, batch_host_indices)
+                if flags is not None and self._draft_read_broke_the_claim(
+                    operation, i, flags
+                ):
+                    operation.mark_terminate()
+                    break
 
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
@@ -2536,6 +2704,38 @@ class HiCacheController:
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
+
+    def _draft_read_broke_the_claim(self, operation, page_start: int, flags) -> bool:
+        """C12 (#1233): account the draft read of one batch against the claim.
+
+        A miss INSIDE the claimed draft prefix (the probe said present, the
+        read says absent = the store mutated between probe and read) takes
+        the SAME path as a target miss: terminate at this batch boundary.
+        Misses at or beyond ``draft_claim_pages`` are the named cold span
+        (Q10) and are expected. Counts land on the operation for the reap
+        line; the zero fill (#993) has already happened in the read itself.
+        """
+        hits = sum(1 for f in flags if f)
+        misses = len(flags) - hits
+        operation.draft_hits = getattr(operation, "draft_hits", 0) + hits
+        operation.draft_misses = getattr(operation, "draft_misses", 0) + misses
+        claim = getattr(operation, "draft_claim_pages", None)
+        if claim is None or misses == 0:
+            return False
+        first_miss = page_start + next(i for i, f in enumerate(flags) if not f)
+        if getattr(operation, "draft_first_miss", None) is None:
+            operation.draft_first_miss = first_miss
+        if first_miss >= int(claim):
+            return False
+        logger.warning(
+            "WEG2 DRAFT-READ BROKE CLAIM rid=%s: page %d missed but the probe "
+            "claimed draft pages [0,%d) -- the store mutated mid-prefetch; "
+            "terminating the fetch at this batch like a target miss.",
+            getattr(operation, "request_id", "?"),
+            first_miss,
+            int(claim),
+        )
+        return True
 
     def prefetch_io_aux_func(self):
         """
@@ -2940,13 +3140,26 @@ class HiCacheController:
                     operation.mark_terminate()
                     self._prefetch_drained_after_stop += 1
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
-                storage_hit_count_tensor = torch.tensor(
-                    storage_hit_count, dtype=torch.int
-                )
-                self._all_reduce_prefetch_groups(
-                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
-                )
-                storage_hit_count = storage_hit_count_tensor.item()
+                if self.draft_tier_armed("admission"):
+                    # #1233 L8: ONE collective carries min and max -- MIN over
+                    # [count, -count] -- so a rank whose claim differs from
+                    # the group's is a named STOP, not a silent MIN (Q11).
+                    packed = torch.tensor(
+                        [storage_hit_count, -storage_hit_count], dtype=torch.int
+                    )
+                    self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
+                    assert_draft_claims_agree(
+                        int(packed[0].item()), -int(packed[1].item()), operation.request_id
+                    )
+                    storage_hit_count = int(packed[0].item())
+                else:
+                    storage_hit_count_tensor = torch.tensor(
+                        storage_hit_count, dtype=torch.int
+                    )
+                    self._all_reduce_prefetch_groups(
+                        storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+                    )
+                    storage_hit_count = storage_hit_count_tensor.item()
                 # #1157: the probe has ANSWERED (rank-uniform after the MIN).
                 # Stamped before the threshold branch so a revoke and a
                 # transfer both carry it; a reap that finds None was ahead of
@@ -2955,6 +3168,7 @@ class HiCacheController:
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
+                    self.draft_cold_spans.pop(operation.request_id, None)
                     self.prefetch_revoke_queue.put(operation.request_id)
                     # #1068 (A12.5 addition, decided in the slice 4 fix): the
                     # LOST-REVOKE-AT-QUIESCE candidate is MOOT on every
@@ -3045,26 +3259,87 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
-    def _draft_page_set(self, hash_values, host_indices) -> None:
-        """Best-effort write draft KV pages to L3 alongside the target backup."""
-        if self.draft_page_set_func is None:
-            return
-        try:
-            self.draft_page_set_func(hash_values, host_indices)
-        except Exception:
-            logger.debug(
-                "Draft L3 write failed (best-effort), skipping.", exc_info=True
-            )
+    def _draft_page_set(self, hash_values, host_indices) -> bool:
+        """Write draft KV pages to L3 alongside the target backup (C19).
 
-    def _draft_page_get(self, hash_values, host_indices) -> None:
-        """Best-effort read draft KV pages from L3 (mirrors `_draft_page_set`)."""
-        if self.draft_page_get_func is None:
-            return
+        Returns whether the batch was written. A refusal (space floor, an
+        exception) is COUNTED and printed once per doubling with the
+        exception name -- the old DEBUG line swallowed a store-full refusal
+        silently, which is how a draft tier can be write-only for a boot.
+        """
+        if self.draft_page_set_func is None:
+            return False
+        ok = False
+        reason = "-"
         try:
-            self.draft_page_get_func(hash_values, host_indices)
-        except Exception:
-            logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
+            ok = bool(self.draft_page_set_func(hash_values, host_indices))
+            if not ok:
+                reason = "backend refused (space floor or existing partial)"
+        except Exception as e:  # noqa: BLE001 - the backup thread must not die
+            reason = f"{type(e).__name__}: {e}"
+        n = len(hash_values)
+        if ok:
+            self._draft_l3_write_issued += n
+        else:
+            self._draft_l3_write_refused += n
+        total = self._draft_l3_write_issued + self._draft_l3_write_refused
+        if (not ok and total >= 2 * self._draft_set_warned_at) or total == n:
+            self._draft_set_warned_at = total
+            logger.log(
+                logging.WARNING if not ok else logging.INFO,
+                "#706 draft page write: n=%d bytes=%d extents=%s complete=%d "
+                "already=- refused=%d reason=%s (cumulative issued=%d refused=%d)",
+                n,
+                n * int(getattr(self.mem_pool_host_draft, "get_size_per_token", lambda: 0)() or 0),
+                list(self.canonical_draft_page_window.extents)
+                if self.canonical_draft_page_window is not None
+                else "per-rank",
+                n if ok else 0,
+                0 if ok else n,
+                reason,
+                self._draft_l3_write_issued,
+                self._draft_l3_write_refused,
+            )
+        return ok
+
+    def _draft_page_get_flags(self, hash_values, host_indices):
+        """Per-page hit flags of one draft L3 read, or None when no reader
+        is installed. A failed read counts every page as a miss (the rows
+        were zero-filled by the generic reader where it got that far)."""
+        if self.draft_page_get_func is None:
+            return None
+        try:
+            flags = list(self.draft_page_get_func(hash_values, host_indices))
+        except Exception as e:  # noqa: BLE001 - the prefetch thread must not die
+            flags = [False] * len(hash_values)
+            self._draft_l3_misses += len(hash_values)
+            total = self._draft_l3_hits + self._draft_l3_misses
+            if total >= 2 * self._draft_get_warned_at:
+                self._draft_get_warned_at = total
+                logger.warning(
+                    "Draft L3 read failed: %s: %s (%d page(s) counted as "
+                    "misses; cumulative hit=%d miss=%d)",
+                    type(e).__name__,
+                    e,
+                    len(hash_values),
+                    self._draft_l3_hits,
+                    self._draft_l3_misses,
+                )
         self._log_draft_l3_progress()
+        return flags
+
+    def _draft_page_get(self, hash_values, host_indices) -> int:
+        """Read draft KV pages from L3; returns the HIT COUNT (C12).
+
+        -1 when no reader is installed, 0 when the read failed. The count
+        used to be discarded here (#1047's "per-page validity bit" question):
+        `read_extents` is all-or-nothing, so a hit IS a complete canonical
+        page and the count is the validity signal admission needs.
+        """
+        flags = self._draft_page_get_flags(hash_values, host_indices)
+        if flags is None:
+            return -1
+        return sum(1 for f in flags if f)
 
     def _log_draft_l3_progress(self) -> None:
         """#993: one line per doubling of the pages this read path has seen.
@@ -3164,8 +3439,8 @@ class HiCacheController:
         ]
         self.storage_backend.batch_set(draft_keys, draft_data)
 
-    def _draft_page_get_generic(self, hash_values, host_indices) -> int:
-        """Fill the draft host rows for these pages. Returns the number HIT.
+    def _draft_page_get_generic(self, hash_values, host_indices) -> list:
+        """Fill the draft host rows for these pages. Returns per-page HIT flags.
 
         #993: A MISS NOW WRITES ZEROS RATHER THAN LEAVING THE ROW ALONE.
 
@@ -3198,18 +3473,21 @@ class HiCacheController:
             # the admission scrub existed to clean up after.
             draft_pages = [None] * len(draft_keys)
         hits = 0
+        flags = []
         for i, p in enumerate(draft_pages):
             if p is None:
                 # `draft_dummy[i]` is untouched zeros for a miss.
                 p = draft_dummy[i]
+                flags.append(False)
             else:
                 hits += 1
+                flags.append(True)
             self.mem_pool_host_draft.set_from_flat_data_page(
                 host_indices[i * self.page_size], p
             )
         self._draft_l3_hits += hits
         self._draft_l3_misses += len(draft_keys) - hits
-        return hits
+        return flags
 
     # Backup batch by batch
     def _page_backup(self, operation):

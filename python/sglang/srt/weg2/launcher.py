@@ -200,6 +200,18 @@ D_OVERSHOOT_MIB = [489, 0, 0]
 D_WINDOWS_MIB = 16 + 32 + 24
 P_WINDOWS_MIB = 24 + 96
 MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+#: #1233 draft KV across the flip (spec section 6, Q17): group P's token
+#: capacity is EXPLICIT, never left to the profiler, because the last stage
+#: now carries the MTP head (405.2 MiB) plus a resident INT8 embed_tokens
+#: (1213.0 MiB) = 1618.2 MiB, and a draft device pool at target-token parity
+#: (2048 B/token beside the 8192 B/token target cell). Measured weg2zr2 on
+#: the last stage: KV pool 5584.4 MiB (714,788 tokens), NVML free minimum
+#: 1450 MiB. Target: idle NVML free at the corridor TOP (1229 MiB) so the
+#: draft-extend transient lands inside 819-1229:
+#:   pool_new = 1450 + 5584.4 - 1618.2 - 1229 = 4187 MiB
+#:   T_P      = 4187 x 2^20 / (8192 + 2048) = 428,750 -> 428,000 (uniform over
+#:              the stages; demand bound 8 x 27,466 = 219,728, 1.95x slack).
+P_MAX_TOTAL_TOKENS = 428000
 VENV_DEFAULT = "/spinning/htsglang-gpu/.venv"
 
 
@@ -550,6 +562,13 @@ def argv_p(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
         "--pp-stage-ratio", "32,18,14", "--pp-attn-stage-ratio", "8,4,4",
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         "--barlink-bar1-window-mib", "24,PP_0=96",
+        # #1233 draft KV across the flip (C15): P carries D's four speculative
+        # flags BYTE-FOR-BYTE (they hash into the drafter identity, W5) and is
+        # silenced by the producer flag, which is deliberately not hashed.
+        "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
+        "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
+        "--speculative-draft-kv-only",
+        "--max-total-tokens", str(P_MAX_TOTAL_TOKENS),
         "--port", str(PORT_P),
     ] + extra
 
@@ -1190,6 +1209,40 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     return env
 
 
+_DRAFTER_RE = re.compile(r"HiCache draft KV registered: .*drafter=([0-9a-f]{16}|None)")
+_LAYOUT_RE = re.compile(r"#706 canonical DRAFT page active: .*layout=v(\d+) drafter=([0-9a-f]{16}|None)")
+
+
+def check_drafter_identity(log_p: str, log_d: str) -> Dict[str, object]:
+    """W10 (#1233): the drafter identity and canonical draft layout of both
+    groups, read from their logs. ``match`` is False on ANY disagreement or
+    absence -- a group that registered no drafter at all is the pre-fix
+    shape, not a pass."""
+    out: Dict[str, object] = {}
+    for name, path in (("P", log_p), ("D", log_d)):
+        ids, layouts, n = set(), set(), 0
+        try:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    m = _DRAFTER_RE.search(line)
+                    if m:
+                        ids.add(m.group(1))
+                        n += 1
+                    m = _LAYOUT_RE.search(line)
+                    if m:
+                        layouts.add(f"v{m.group(1)}")
+        except OSError:
+            pass
+        out[name] = ",".join(sorted(ids)) if ids else None
+        out[f"layout_{name}"] = ",".join(sorted(layouts)) if layouts else None
+        out[f"n_{name}"] = n
+    out["match"] = bool(
+        out["P"] and out["D"] and out["P"] == out["D"] and "," not in str(out["P"])
+        and out["layout_P"] and out["layout_P"] == out["layout_D"]
+    )
+    return out
+
+
 def count_marker(path: str, marker: str) -> int:
     n = 0
     try:
@@ -1548,6 +1601,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if _p_bigram != _d_bigram:
         raise Weg2LaunchRefused(f"W9 Weg2StoreIdentityMismatch (launch-time key scheme): P bigram={_p_bigram} D bigram={_d_bigram} -- "
                                 f"the two groups would key the sole carrier by different page-hash schemes")
+    # #1233 draft KV across the flip: W10 DRAFTER-IDENTITY GATE. Both groups
+    # register a drafter (P: the producer on its last stage, D: the NEXTN
+    # worker on every rank); the identity in their `HiCache draft KV
+    # registered` lines and the canonical draft layout in their `#706
+    # canonical DRAFT page active` lines must agree, or D fetches
+    # `{hash}.draft-<Pid>` pages P never wrote (the weg2zr2 shape, 194,088
+    # failed draft fetches). Refused before the front opens.
+    w10 = check_drafter_identity(spec_p.log, spec_d.log)
+    log(f"W10 DRAFTER-IDENTITY P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} layout_D={w10['layout_D']} "
+        f"match={w10['match']} (P lines {w10['n_P']}, D lines {w10['n_D']})")
+    if not w10["match"]:
+        raise Weg2LaunchRefused(f"W10 Weg2DrafterIdentityMismatch: P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} "
+                                f"layout_D={w10['layout_D']} -- the decode group would ask the carrier for draft pages under "
+                                f"an identity the prefill group never writes")
     # #1233 zero-remainder: the carrier bound the front routes by -- group D's
     # smallest host staging pool (tokens) x 0.9 (the prefetch rate bound that
     # refused the 84k prompt on boot weg2ls4b2: limit=27466 of pool 30518).

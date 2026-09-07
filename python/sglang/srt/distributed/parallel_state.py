@@ -3160,8 +3160,78 @@ get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
 
+# #1233 (Weg 2 draft KV across the flip): the single-rank pp group the
+# draft-KV PRODUCER on the prefill group's last stage builds and runs the
+# MTP head under. Built on EVERY rank of the group at boot (the create is a
+# collective), entered only on the last stage, and published through
+# `get_pp_group()` for exactly the duration of `draft_pp_scope()` -- the
+# `_FLIP_PP` hook shape, not a second accessor.
+_DRAFT_PP: Optional[GroupCoordinator] = None
+_DRAFT_PP_ACTIVE: bool = False
+
+
+def initialize_draft_pp_group(
+    local_rank: Optional[int] = None, backend: Optional[str] = None
+) -> GroupCoordinator:
+    """Build the single-rank pp group for the draft-KV producer (C4).
+
+    COLLECTIVE: `init_model_parallel_group` creates one torch group per
+    single-rank list, so every rank of the world must call this at the same
+    point, whether or not it will ever enter the scope. Defaults come from
+    the world group already built by `init_distributed_environment`.
+    """
+    global _DRAFT_PP
+    assert _DRAFT_PP is None, "the draft pp group is already initialized"
+    world = get_world_group()
+    if local_rank is None:
+        local_rank = world.local_rank
+    if backend is None:
+        backend = torch.distributed.get_backend(world.device_group)
+    world_size = world.world_size
+    _DRAFT_PP = init_model_parallel_group(
+        [[r] for r in range(world_size)],
+        local_rank,
+        backend,
+        use_custom_allreduce=False,
+        group_name="draft_pp",
+    )
+    logger.info(
+        "draft pp group built: %d single-rank group(s) (#1233 draft-KV producer)",
+        world_size,
+    )
+    return _DRAFT_PP
+
+
+def get_draft_pp_group_no_assert() -> Optional[GroupCoordinator]:
+    return _DRAFT_PP
+
+
+@contextmanager
+def draft_pp_scope():
+    """Publish the single-rank draft pp group through `get_pp_group()`.
+
+    S7: entering on a rank whose group was never built raises. The flag is
+    restored in `finally`, so an exception inside the scope leaves the
+    primary pipeline group published.
+    """
+    global _DRAFT_PP_ACTIVE
+    if _DRAFT_PP is None:
+        raise RuntimeError(
+            "draft_pp_scope entered without a built draft pp group (S7): "
+            "initialize_draft_pp_group must run on every rank at boot."
+        )
+    prev = _DRAFT_PP_ACTIVE
+    _DRAFT_PP_ACTIVE = True
+    try:
+        yield _DRAFT_PP
+    finally:
+        _DRAFT_PP_ACTIVE = prev
+
 
 def get_pp_group() -> GroupCoordinator:
+    if _DRAFT_PP_ACTIVE:
+        assert _DRAFT_PP is not None, "draft pp scope is active but the group is None"
+        return _DRAFT_PP
     # #631: under flip TP routing the pp axis is trivial (pp_size=1); the
     # flip pp group keeps is_first_rank/is_last_rank and any send/recv
     # bookkeeping consistent with that geometry instead of the primary

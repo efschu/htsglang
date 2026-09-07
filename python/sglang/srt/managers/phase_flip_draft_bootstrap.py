@@ -802,6 +802,23 @@ def draft_cold_reason(scheduler, req, tier_armed: bool) -> Optional[str]:
             f"the draft half of the HiCache tier is disarmed, so this "
             f"{n_prefix}-token cached prefix was restored target-only (#861)"
         )
+    # 3. A CLAIM MADE COLD BY NAME (#1233 Q10). The presence probe found the
+    #    KV prefix but not the draft prefix, and the gap exceeded one HiCache
+    #    chunk, so the fetch claimed the KV pages and named the span whose
+    #    draft rows the #993 zero fill holds. Consumed ONCE, here, by rid.
+    spans = getattr(
+        getattr(getattr(scheduler, "tree_cache", None), "cache_controller", None),
+        "draft_cold_spans",
+        None,
+    )
+    if spans:
+        span = spans.pop(getattr(req, "rid", None), None)
+        if span is not None:
+            d, k = int(span[0]), int(span[1])
+            return (
+                f"{k - d} of {k} prefix draft pages not in the store (span "
+                f"[{d}, {k})); cold by name, zeros are the fill (#993)"
+            )
     return None
 
 

@@ -128,6 +128,26 @@ RING_D_MULT_GB_PER_S = 6.0
 #: host-pool posts (rings + anchors).  Charged as +4 % on those posts.
 HOST_POOL_OVERHEAD = 0.04
 
+#: #1233 draft KV across the flip (C17). Pinned host DRAFT pools, one row per
+#: target host slot (``kv_cache_builder._build_draft_host_pool``: "same slot
+#: count as the target host pool"), 2048 B/token for the NEXTN head (1 layer
+#: x 4 kv heads x 256 head_dim x 2 (K,V) x 1 B fp8).  Group P: the producer
+#: on the last stage, 61,037 slots (P log weg2zr2: host KV pool 61,036 + the
+#: page-alignment slot) -> 119.2 MiB.  Group D: 30,519 slots x this rank's
+#: head share {1024, 512, 512} B (2/1/1 heads over the three ranks) -> 59.6
+#: MiB in total.  Both are pinned at launch and charged at BOTH moments; D's
+#: term used to sit implicitly inside RING_D_MULT_GB_PER_S and is explicit
+#: from here on.
+DRAFT_PAGE_BYTES = 2048
+DRAFT_HOST_SLOTS_P = 61037
+DRAFT_HOST_SLOTS_D = 30519
+DRAFT_HOST_P_MIB = DRAFT_HOST_SLOTS_P * DRAFT_PAGE_BYTES / float(2**20)
+DRAFT_HOST_D_MIB = DRAFT_HOST_SLOTS_D * (1024 + 512 + 512) / float(2**20)
+#: The draft tier of the STORE: 2048 B per token beside the 32768 B canonical
+#: KV page (16 attention layers x 2048 B) = 1/16.  Unchanged in bytes versus
+#: the three per-rank shards it replaces (1024+512+512 = 2048), inodes / 3.
+STORE_DRAFT_FRACTION = DRAFT_PAGE_BYTES / 32768.0
+
 #: The arm ladder: (S GB per --hicache-size, M MiB per --hicache-mamba-host-mib).
 DEFAULT_ARMS: Tuple[Tuple[int, int], ...] = ((1, 2400), (1, 1200), (1, 600))
 
@@ -241,7 +261,17 @@ def price(
     overhead_gib = HOST_POOL_OVERHEAD * (anchors_gib + rings_gib)
     host_ring_gib = ring_bytes / GIB
     host_ring_span1_gib = ring_span1_bytes / GIB
-    common = base_gib - FLOOR_GIB - HOST_HEADROOM_GIB - heaps_gib - anchors_gib - rings_gib - overhead_gib
+    # #1233: the draft tier is a HOST tier of its own, one budget per group, and
+    # it is charged at BOTH moments -- it is allocated at load and outlives every
+    # flip (that is the point of carrying draft KV across the flip).  It is NOT
+    # part of the flip image: the ring carries the weights, this carries the
+    # draft pages, and the two are never the same bytes.
+    draft_host_p_gib = DRAFT_HOST_P_MIB / 1024.0
+    draft_host_d_gib = DRAFT_HOST_D_MIB / 1024.0
+    common = (
+        base_gib - FLOOR_GIB - HOST_HEADROOM_GIB - heaps_gib - anchors_gib - rings_gib
+        - overhead_gib - draft_host_p_gib - draft_host_d_gib
+    )
     # R7: at the launch moment only span 1 is registered (P's first pause is the
     # launcher's sleep(P)); span 2 lands at D's first pause, when D's load
     # transient is gone.  Charging Sigma H at launch is what turns the M=1200
@@ -269,6 +299,9 @@ def price(
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
         "overhead_gib": overhead_gib,
+        "draft_host_p_gib": draft_host_p_gib,
+        "draft_host_d_gib": draft_host_d_gib,
+        "store_draft_fraction": STORE_DRAFT_FRACTION,
     }
     arm.launch_leftover_gib = launch
     arm.run_leftover_gib = run
@@ -324,7 +357,10 @@ def choose(
         f"ring provenance: {ring_provenance or 'NOT NAMED -- caller passed none'} "
         f"anchors@2400={ANCHORS_AT_2400_BYTES / GIB:.2f} GiB (b0 measured, scaled by M) "
         f"rings=({RING_P_MULT_GB_PER_S:.0f}+{RING_D_MULT_GB_PER_S:.0f})xS GB (b0) "
-        f"overhead={HOST_POOL_OVERHEAD:.0%} of host-pool posts (b0 U14)"
+        f"overhead={HOST_POOL_OVERHEAD:.0%} of host-pool posts (b0 U14) "
+        f"draft_host_P={DRAFT_HOST_P_MIB:.1f} MiB draft_host_D={DRAFT_HOST_D_MIB:.1f} MiB "
+        f"(#1233 pinned draft host pools, both moments) "
+        f"store_draft_fraction={STORE_DRAFT_FRACTION:.4f} (2048 of 32768 B per token)"
     )
     chosen: Optional[Arm] = None
     store_gib = 0.0
