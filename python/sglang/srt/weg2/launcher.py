@@ -55,7 +55,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import host_ledger, ring_table
 
 MIB = 1024 * 1024
 PORT_FRONT = 30030
@@ -68,6 +68,10 @@ MEMTS = f"{GPU_ARB}/devtools/mem_timeseries.sh"
 HOST_PREFLIGHT = f"{GPU_ARB}/devtools/host_ledger_preflight.sh"
 PRESENCE_DIR = "/dev/shm/sglang-phase-flip-presence"
 STORE_MOUNT = "/spinning/hicache-weg2-ram"
+#: C18: where the per-card host-ring files live under the MAP_SHARED form.  A
+#: tmpfs, because the granules must be shared PAGES (both co-located rank
+#: processes map the same file), not a disk-backed file.
+HOST_RING_DIR = "/dev/shm/weg2-hostring"
 #: The corridor law is 819-1229 MiB NVML-free per card under the awake
 #: group's load.  MEASURED 2026-09-07 boot weg2onebackup2 with this constant
 #: at 1024: the 5090's continuous minimum under group D was 620-684 MiB
@@ -216,6 +220,10 @@ class GroupSpec:
     env: Dict[str, str]
     pid: int = 0
     proc: Optional[subprocess.Popen] = None
+    #: C18, MEMFD form only: the inherited ring fds.  ``memfd_create`` without
+    #: ``MFD_CLOEXEC`` survives exec, and ``pass_fds`` is what keeps Popen's
+    #: ``close_fds`` from shutting them.
+    pass_fds: Tuple[int, ...] = ()
 
 
 @dataclass
@@ -235,6 +243,9 @@ class BootState:
     dc_measured_p: Dict[str, int] = field(default_factory=dict)
     dc_expect_d: Dict[str, int] = field(default_factory=dict)
     ledger_lines: List[str] = field(default_factory=list)
+    ring_lines: List[str] = field(default_factory=list)
+    ring_form: str = ""
+    ring_dir: str = ""
     argv: Dict[str, str] = field(default_factory=dict)
     t_ready: Dict[str, float] = field(default_factory=dict)
     sleep_p_ms: float = 0.0
@@ -602,10 +613,165 @@ def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
     ] + extra
 
 
+@dataclass
+class HostRingPlan:
+    """What C18 publishes, and why it may publish nothing.
+
+    ``armed`` False means the ring is NOT in this boot: either no proven
+    registration form (W33) or no measured table (R22).  Both keep the OLD flip
+    form, and both are PRINTED -- the fallback is never silent.
+    """
+
+    form: str = ""
+    dir: str = ""
+    env_map: str = ""
+    epoch: int = 0
+    armed: bool = False
+    fds: Tuple[int, ...] = ()
+    table: Optional["ring_table.RingTable"] = None
+    lines: List[str] = field(default_factory=list)
+
+    @property
+    def host_weights_bytes(self) -> int:
+        """The RUN-moment host weights charge, from the same measured table for
+        both forms -- the ring's ``Sigma H``, or the old form's ``Sigma H +
+        Sigma max_tag`` (one image resident plus one chunk in flight)."""
+        if self.table is None:
+            return 0
+        total = self.table.total_h_bytes
+        if not self.armed:
+            total += sum(
+                max(c.max_tag_p_mib, c.max_tag_d_mib) for c in self.table.cards
+            ) * ring_table.MIB
+        return total
+
+    @property
+    def host_weights_span1_bytes(self) -> int:
+        return 0 if self.table is None else self.table.total_span1_bytes
+
+    @property
+    def provenance(self) -> str:
+        if self.table is None:
+            return "no measured table"
+        form = f"ring form {self.form}" if self.armed else "OLD flip form (no ring)"
+        return f"{self.table.provenance()}; charged for the {form}"
+
+
+def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
+                      evidence_dir: str, boot_stem: str, dry: bool) -> HostRingPlan:
+    """C20 + C18: solve the table, print L6, REFUSE by name, then arm the region.
+
+    Order is load-bearing: the R5 inequality is checked and the per-card files
+    are created BEFORE either group starts, so a configuration that cannot walk
+    the corridor never reaches a rank (W32 rather than a mid-flip W31).
+    """
+    plan = HostRingPlan(form=form)
+    table, reason = ring_table.solve(cards, evidence_dir, boot_stem or None)
+    if table is None:
+        plan.lines.append(
+            "WEG2-HOST-RING R22: no measured per-card byte table -- " + reason +
+            ".  The planner REFUSES to guess H, and the OLD flip form runs "
+            "(TMS_HOST_RING_* unpublished, stock cudaMallocHost)."
+        )
+        for ln in plan.lines:
+            log(ln)
+        return plan
+    plan.table = table
+    plan.lines.extend(table.format_l6())          # L6
+    refusals = table.refusals()
+    plan.lines.extend(refusals)
+    for ln in plan.lines:
+        log(ln)
+    if refusals:
+        raise ring_table.Weg2RingCreditRefused(
+            "W32 Weg2RingCreditRefused: the R5 corridor inequality fails on "
+            f"{len(refusals)} (card x direction) case(s) BEFORE either group starts.  "
+            "H(c) >= image_W(c) - device_credit(c) + max_tag_S(c) + max_tag_W(c) is "
+            "what makes the blocking ring deadlock-free; a negative slack is a flip "
+            "that would wedge, not one that would be slow.\n" + "\n".join(refusals)
+        )
+    if form not in ("MAP_SHARED", "MEMFD"):
+        plan.lines.append(
+            "W33 Weg2RingFormUnproven: no registration form proven for this rig, so "
+            "the host ring is NOT armed and the OLD flip form runs.  Whether the "
+            "driver page-locks a cross-process shared mapping (cudaHostRegister on a "
+            "/dev/shm MAP_SHARED file, or on a memfd) is a METAL fact (spec R16); "
+            "both forms are built and either is selected with --ring-form once the "
+            "step-0 probe records its verdict in WEG2_BUILD_DECISIONS_0906 section 1p."
+        )
+        log(plan.lines[-1])
+        return plan
+    plan.epoch = int(time.time())
+    fds: Dict[str, int] = {}
+    if form == "MAP_SHARED":
+        plan.dir = f"{HOST_RING_DIR}-{tag}"
+        if not dry:
+            os.makedirs(plan.dir, exist_ok=True)
+        for c in table.cards:
+            path = os.path.join(plan.dir, f"{c.uuid}.ring")
+            size = ring_table.MIB * 2 + c.h_mib * ring_table.MIB  # header granule + data
+            if not dry:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    os.ftruncate(fd, size)
+                finally:
+                    os.close(fd)
+            plan.lines.append(
+                f"WEG2-HOST-RING file {path} size={size // ring_table.MIB} MiB "
+                f"(2 MiB header granule + H {c.h_mib} MiB) "
+                + ("DRY-RUN: would be" if dry else "")
+                + " created and ftruncated BEFORE either group starts"
+            )
+    else:
+        plan.dir = f"{HOST_RING_DIR}-{tag}"
+        for c in table.cards:
+            size = ring_table.MIB * 2 + c.h_mib * ring_table.MIB
+            if not dry:
+                fd = os.memfd_create(f"weg2-ring-{c.uuid}", 0)  # no MFD_CLOEXEC: inherited
+                os.ftruncate(fd, size)
+                fds[c.uuid] = fd
+            else:
+                fds[c.uuid] = -1
+            plan.lines.append(
+                f"WEG2-HOST-RING memfd for {c.uuid} size={size // ring_table.MIB} MiB "
+                f"fd={fds[c.uuid]} ("
+                + ("DRY-RUN: would be " if dry else "")
+                + "created and ftruncated BEFORE either group starts, "
+                "inherited by both groups)"
+            )
+    plan.env_map = table.env_map(fds if form == "MEMFD" else None)
+    plan.fds = tuple(fd for fd in fds.values() if fd >= 0)
+    plan.armed = True
+    plan.lines.append(
+        f"WEG2-HOST-RING ARMED form={form} epoch={plan.epoch} dir={plan.dir} "
+        f"Sigma H={table.total_h_bytes // ring_table.MIB} MiB "
+        f"Sigma span1={table.total_span1_bytes // ring_table.MIB} MiB granule=2 MiB "
+        f"-- provenance: {table.provenance()}"
+    )
+    for ln in plan.lines[-(len(table.cards) + 1):]:
+        log(ln)
+    return plan
+
+
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
               chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "",
-              transport: str = "bar1") -> Dict[str, str]:
+              transport: str = "bar1", ring: Optional["HostRingPlan"] = None) -> Dict[str, str]:
     env = dict(os.environ)
+    # C18: the shared host granule ring (spec C1-C8).  These four variables are
+    # LAUNCHER OUTPUT, never operator input (R19): every size in them is solved
+    # by ring_table from the previous boot's own lines, and the whole family is
+    # absent when no form is proven -- which is the ONE boot-level fallback, and
+    # makes the stock cudaMallocHost path plus the OLD serial flip form run
+    # (spec section 10.4 / R22).
+    if ring is not None and ring.armed:
+        env["TMS_HOST_RING_DIR"] = ring.dir
+        env["TMS_HOST_RING_MAP"] = ring.env_map
+        env["TMS_HOST_RING_EPOCH"] = str(ring.epoch)
+        env["TMS_HOST_RING_FORM"] = ring.form
+    else:
+        for key in ("TMS_HOST_RING_DIR", "TMS_HOST_RING_MAP", "TMS_HOST_RING_EPOCH",
+                    "TMS_HOST_RING_FORM"):
+            env.pop(key, None)
     # #1233 one-backup flip: chunked weights tags (weg2_memory_saver.py) and
     # the patched torch_memory_saver preload hook (tms_csrc/PATCH.md).
     if chunk_layers > 0 and chunk_count > 0:
@@ -689,7 +855,8 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     fh = open(spec.log, "ab")
     fh.write(f"=== WEG2 group {spec.name} launched {_now()} ===\nargv: {' '.join(shlex.quote(a) for a in spec.argv)}\n".encode())
     fh.flush()
-    p = subprocess.Popen(spec.argv, env=spec.env, stdout=fh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
+    p = subprocess.Popen(spec.argv, env=spec.env, stdout=fh, stderr=subprocess.STDOUT, cwd=tree,
+                         start_new_session=True, pass_fds=spec.pass_fds)
     spec.pid = p.pid
     spec.proc = p
     log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log}")
@@ -791,6 +958,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "(measured 2230 -> 2310 MiB on the 5090, boot weg2ab0). Under "
              "'bar1' nothing about the flip path changes.",
     )
+    ap.add_argument(
+        "--ring-form", choices=["none", "MAP_SHARED", "MEMFD"], default="none",
+        help="C18/R16: the PROVEN cross-process registration form for the shared "
+             "host granule ring. 'none' (the default) is not a disable switch, it "
+             "is the honest state before the step-0 metal probe has spoken: the "
+             "launcher then prints W33 Weg2RingFormUnproven and runs the OLD flip "
+             "form. The boot agent passes the verdict recorded in "
+             "WEG2_BUILD_DECISIONS_0906 section 1p. Never a size, never a knob: "
+             "H and both spans are solved from the previous boot's own lines.",
+    )
+    ap.add_argument("--evidence-dir", default=EVIDENCE_DIR,
+                    help="where ring_table reads the previous boot's logs from")
+    ap.add_argument("--ring-table-boot", default="",
+                    help="pin the ring table to ONE boot stem instead of the newest usable one")
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
     ns = ap.parse_args(argv)
     if ns.teardown:
@@ -836,9 +1017,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.weight_chunks = chunk_count
     state.tms_so = tms_so
 
+    # 1b. C20: the R5 corridor inequality per card per direction, and C18: the
+    # per-card region, both BEFORE either group starts.  The table it is solved
+    # from also carries the ledger's host weights term, so this runs first.
+    ring_plan = prepare_host_ring(cards, log, ns.tag, ns.ring_form, ns.evidence_dir,
+                                  ns.ring_table_boot, dry)
+    state.ring_lines = ring_plan.lines
+    state.ring_form = ring_plan.form if ring_plan.armed else "none (OLD flip form)"
+    state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
+
     # 2. host ledger
     mi = host_ledger.read_meminfo()
-    arm, store_gib, lines = host_ledger.choose(mi["MemTotal"], mi["MemAvailable"], store_min_gib=ns.store_min_gib, weight_chunks=chunk_count)
+    arm, store_gib, lines = host_ledger.choose(
+        mi["MemTotal"], mi["MemAvailable"], store_min_gib=ns.store_min_gib,
+        ring_bytes=ring_plan.host_weights_bytes,
+        ring_span1_bytes=ring_plan.host_weights_span1_bytes,
+        ring_provenance=ring_plan.provenance,
+    )
     for ln in lines:
         log(ln)
     state.ledger_lines = lines
@@ -882,13 +1077,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls2b2"
     )
     state.budgets["P"] = budgets_p
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
     # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
     # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
-    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), ns.transport), state.logs["P"], env_p)
+    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), ns.transport), state.logs["P"], env_p, pass_fds=ring_plan.fds)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     state.deviations = [
         "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
@@ -913,8 +1108,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_p, tree, log, dry)
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport)
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d, pass_fds=ring_plan.fds)
         launch_group(spec_d, tree, log, dry)
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
@@ -949,8 +1144,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1"
     )
     state.budgets["D"] = budgets_d
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport)
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d, pass_fds=ring_plan.fds)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
@@ -1074,6 +1269,22 @@ def teardown(path: str) -> int:
     if f" {mount} " in open("/proc/mounts").read():
         subprocess.run(["umount", mount], check=False)
         print(f"store tmpfs {mount} unmounted")
+    # C18: the per-card ring files are tmpfs pages charged to this boot's host
+    # ledger.  Leaving them behind would carry Sigma H of RAM into the NEXT
+    # boot's baseline, where nothing names it.  (A MEMFD-form ring has no file
+    # to unlink: it dies with the last fd.)
+    ring_dir = st.get("ring_dir", "")
+    if ring_dir and os.path.isdir(ring_dir):
+        for name in os.listdir(ring_dir):
+            try:
+                os.unlink(os.path.join(ring_dir, name))
+            except OSError:
+                pass
+        try:
+            os.rmdir(ring_dir)
+        except OSError:
+            pass
+        print(f"host ring dir {ring_dir} removed")
     print(subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader"], capture_output=True, text=True).stdout)
     return 0
 
@@ -1082,6 +1293,9 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Weg2LaunchRefused as e:
+        print(f"[{_now()}] WEG2-LAUNCH REFUSED: {e}", flush=True)
+        raise SystemExit(2)
+    except ring_table.Weg2RingCreditRefused as e:
         print(f"[{_now()}] WEG2-LAUNCH REFUSED: {e}", flush=True)
         raise SystemExit(2)
     except host_ledger.Weg2HostLedgerRefused as e:

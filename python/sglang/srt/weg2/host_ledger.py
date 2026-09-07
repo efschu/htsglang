@@ -14,9 +14,30 @@ Two moments (record section 1c B2, spec section 4.2.3):
   the awake group runs at its serving heap.  With the #1233 one-backup flip
   (record 1h: the patched torch_memory_saver frees a chunk's host image on
   resume, and the front interleaves ``src.pause(weights_k)`` with
-  ``dst.resume(weights_k)``) the run moment is charged ONE image plus ONE
-  chunk (``weight_chunks`` > 0); with ``weight_chunks`` = 0 it is the round-1
-  shape, two persistent images (DR-1), which this box cannot fund.
+  ``dst.resume(weights_k)``) the run moment used to be charged ONE image plus
+  ONE chunk.  C19 (2026-09-07, WEG2_FLIPCOST_SPEC_0907 R7/section 7) REPLACES
+  that with the SHARED HOST RING, and the replacement is what deletes three
+  terms rather than adding a fourth:
+
+  * ``BACKUP_P_BYTES`` / ``BACKUP_D_BYTES`` -- two #809-census constants,
+    measured stale by ~3.4 GiB against the per-card table the boots actually
+    log, and encoding a model (one private pinned image per group) that the
+    ring removes.  DELETED.
+  * ``chunk_gib`` (``image / N``) -- the residency proxy for "one chunk in
+    flight".  With one shared region there is no chunk beside the image: the
+    region IS the whole host weights cost and it is charged once.  DELETED.
+
+  What is charged instead, per :mod:`sglang.srt.weg2.ring_table`:
+
+  * launch = ``Sigma span1`` = ``Sigma image_P(c)``, because the launcher's
+    ``sleep(P)`` is the first pause and only span 1 is registered then (R7:
+    registering ``Sigma H`` at the launch moment costs the M=1200 arm 2.98 GiB
+    it does not have and the ladder falls to M=600).
+  * run = ``Sigma H`` = ``Sigma max_g image_g(c)``.
+
+  Both come from the PREVIOUS boot's own lines with a provenance string; there
+  is no fallback constant, because a constant is exactly what the campaign
+  measured wrong twice.
 
 The arm ladder (record section 1c B2: "if the ledger refuses at S=2 the
 launcher sizes S=1 and prints why; if it refuses at S=1 the boot REFUSES") is
@@ -63,11 +84,16 @@ CLI_RESERVE_GIB = 10.0
 HEAP_AWAKE_GIB = 3.385
 #: Campaign (a): RssAnon "flat at 2.36 GiB" on the dormant tp=1 rank.
 HEAP_DORMANT_GIB = 2.36
-#: Spec section 2.6, #809 FLIP IMAGE PREFETCH census: PP image 30.96 GB,
-#: TP image 29.15 GB per group.  Campaign (a) / S1 boot: the cpu backup is
-#: shm-backed, 1x the image, persistent (DR-1) -- charged 1x per group.
-BACKUP_P_BYTES = 30.96 * GB
-BACKUP_D_BYTES = 29.15 * GB
+#: BACKUP_P_BYTES / BACKUP_D_BYTES ARE DELETED HERE (C19), and the deletion is
+#: the fix.  They were #809-census constants for a model -- one private pinned
+#: image per group -- that the shared host ring removes; they were also stale by
+#: ~3.4 GiB against the per-card table every boot logs for itself.  The host
+#: weights cost now enters :func:`price` as ``ring_bytes`` / ``ring_span1_bytes``,
+#: solved by :mod:`sglang.srt.weg2.ring_table` from the previous boot's own
+#: WEG2-CHUNK-BYTES / WEG2-FLIP-TAG lines and printed with its provenance.
+#: There is deliberately NO fallback constant: a boot with no measured table
+#: refuses (W20) rather than pricing the flip from a number nobody measured.
+
 #: The loader's transient while group D loads next to dormant P, charged at
 #: the launch moment only.  #721's constant is 27 GiB
 #: (weg1_host_sizing.LOAD_TRANSIENT_BYTES, page cache + staging); on THIS
@@ -137,36 +163,49 @@ def price(
     m_mib: int,
     *,
     ranks_per_group: int = 3,
-    weight_chunks: int = 0,
+    ring_bytes: int = 0,
+    ring_span1_bytes: int = 0,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
-    ``weight_chunks`` = N > 0 is the #1233 one-backup flip: the run moment
-    holds the larger of the two images (whichever group is dormant) plus one
-    chunk of the other (image / N, in flight between ``src.pause(w_k)`` and
-    ``dst.resume(w_k)``).  The chunk term is DERIVED (image / N) and the boot
-    postmortem carries the MEASURED per-chunk RssShmem delta beside it.
+    ``ring_bytes`` = ``Sigma_c H(c)`` and ``ring_span1_bytes`` = ``Sigma_c
+    image_P(c)`` are C19's replacement for the deleted backup constants, solved
+    from the previous boot by :func:`sglang.srt.weg2.ring_table.solve`.  Both
+    must be positive: a zero is not "a free flip", it is a missing measurement,
+    and pricing it as zero is the shape that made boot weg2ls1b2 look fundable.
     """
     if s_gb < 1 or m_mib < 1:
         raise ValueError(f"arm terms must be >= 1: S={s_gb} M={m_mib}")
-    if weight_chunks < 0:
-        raise ValueError(f"weight_chunks must be >= 0: {weight_chunks}")
+    if ring_bytes <= 0 or ring_span1_bytes <= 0:
+        raise Weg2HostLedgerRefused(
+            "W20 Weg2HostLedgerRefused: the host weights term has no measured source "
+            f"(ring_bytes={ring_bytes}, ring_span1_bytes={ring_span1_bytes}).  C19 "
+            "deleted BACKUP_P_BYTES / BACKUP_D_BYTES because they were stale "
+            "constants; the replacement is the previous boot's own per-card table "
+            "(ring_table.solve), and there is no third option.  A boot whose "
+            "predecessor logged no WEG2-CHUNK-BYTES / WEG2-FLIP-TAG lines cannot be "
+            "priced -- the planner REFUSES to guess (R22) rather than inventing a "
+            "number, and the OLD flip form is what would run."
+        )
+    if ring_span1_bytes > ring_bytes:
+        raise ValueError(
+            f"span1 {ring_span1_bytes} > ring {ring_bytes}: span 1 is a PREFIX of the "
+            "region (image_P(c) <= H(c) by construction)"
+        )
     base_gib = min(memavail_bytes / GIB, memtotal_bytes / GIB - CLI_RESERVE_GIB)
     heaps_gib = ranks_per_group * (HEAP_AWAKE_GIB + HEAP_DORMANT_GIB)
     anchors_gib = (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
     rings_gib = (RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S) * s_gb * GB / GIB
     overhead_gib = HOST_POOL_OVERHEAD * (anchors_gib + rings_gib)
-    backup_p_gib = BACKUP_P_BYTES / GIB
-    backup_d_gib = BACKUP_D_BYTES / GIB
+    host_ring_gib = ring_bytes / GIB
+    host_ring_span1_gib = ring_span1_bytes / GIB
     common = base_gib - FLOOR_GIB - HOST_HEADROOM_GIB - heaps_gib - anchors_gib - rings_gib - overhead_gib
-    launch = common - backup_p_gib - LOAD_TRANSIENT_GIB
-    if weight_chunks > 0:
-        backup_resident_gib = max(backup_p_gib, backup_d_gib)
-        chunk_gib = backup_resident_gib / weight_chunks
-    else:
-        backup_resident_gib = backup_p_gib
-        chunk_gib = backup_d_gib
-    run = common - backup_resident_gib - chunk_gib
+    # R7: at the launch moment only span 1 is registered (P's first pause is the
+    # launcher's sleep(P)); span 2 lands at D's first pause, when D's load
+    # transient is gone.  Charging Sigma H at launch is what turns the M=1200
+    # arm's leftover from +1.05 into -1.93 GiB.
+    launch = common - host_ring_span1_gib - LOAD_TRANSIENT_GIB
+    run = common - host_ring_gib
     arm = Arm(
         s_gb=s_gb,
         m_mib=m_mib,
@@ -182,11 +221,8 @@ def price(
         "floor_gib": FLOOR_GIB,
         "host_headroom_gib": HOST_HEADROOM_GIB,
         "heaps_gib": heaps_gib,
-        "backup_p_gib": backup_p_gib,
-        "backup_d_gib": backup_d_gib,
-        "weight_chunks": weight_chunks,
-        "backup_resident_gib": backup_resident_gib,
-        "chunk_gib": chunk_gib,
+        "host_ring_gib": host_ring_gib,
+        "host_ring_span1_gib": host_ring_span1_gib,
         "load_transient_gib": LOAD_TRANSIENT_GIB,
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
@@ -204,7 +240,9 @@ def choose(
     store_min_gib: float,
     arms: Sequence[Tuple[int, int]] = DEFAULT_ARMS,
     ranks_per_group: int = 3,
-    weight_chunks: int = 0,
+    ring_bytes: int = 0,
+    ring_span1_bytes: int = 0,
+    ring_provenance: str = "",
 ) -> Tuple[Arm, float, List[str]]:
     """Walk the ladder; return (arm, store_gib, printed lines) or raise W20.
 
@@ -216,7 +254,15 @@ def choose(
     """
     lines: List[str] = []
     priced = [
-        price(memtotal_bytes, memavail_bytes, s, m, ranks_per_group=ranks_per_group, weight_chunks=weight_chunks)
+        price(
+            memtotal_bytes,
+            memavail_bytes,
+            s,
+            m,
+            ranks_per_group=ranks_per_group,
+            ring_bytes=ring_bytes,
+            ring_span1_bytes=ring_span1_bytes,
+        )
         for s, m in arms
     ]
     t = priced[0].terms
@@ -229,17 +275,11 @@ def choose(
         f"host_headroom={HOST_HEADROOM_GIB:.0f} GiB (#1232, boot weg2ls1b2 OOM at ~18 GiB lxcfs-available) "
         f"heaps={t['heaps_gib']:.2f} GiB ({ranks_per_group}x{HEAP_AWAKE_GIB} awake b0 + "
         f"{ranks_per_group}x{HEAP_DORMANT_GIB} dormant campaign (a)) "
-        f"backup_P={t['backup_p_gib']:.2f} GiB backup_D={t['backup_d_gib']:.2f} GiB "
-        "(#809 census images) "
-        + (
-            f"RUN MOMENT = one image {t['backup_resident_gib']:.2f} GiB (the dormant group) + one chunk "
-            f"{t['chunk_gib']:.2f} GiB (image / {weight_chunks} weights_<k> tags in flight, #1233 one-backup flip; "
-            "the patched saver frees a chunk's host image on resume) "
-            if weight_chunks > 0
-            else "RUN MOMENT = both images resident (DR-1, the round-1 two-backup shape) "
-        )
-        + f"launch_moment = P image + "
+        f"RUN MOMENT = the host weights term {t['host_ring_gib']:.2f} GiB "
+        f"(C19; BACKUP_P_BYTES / BACKUP_D_BYTES / chunk_gib are DELETED, not shrunk) "
+        f"LAUNCH MOMENT = ring span 1, Sigma image_P = {t['host_ring_span1_gib']:.2f} GiB (R7) + "
         f"load_transient={LOAD_TRANSIENT_GIB:.0f} GiB (MEASURED residual of boot weg2ls1b2, #721 constant was 27; D loading while P is dormant) "
+        f"ring provenance: {ring_provenance or 'NOT NAMED -- caller passed none'} "
         f"anchors@2400={ANCHORS_AT_2400_BYTES / GIB:.2f} GiB (b0 measured, scaled by M) "
         f"rings=({RING_P_MULT_GB_PER_S:.0f}+{RING_D_MULT_GB_PER_S:.0f})xS GB (b0) "
         f"overhead={HOST_POOL_OVERHEAD:.0%} of host-pool posts (b0 U14)"
@@ -265,9 +305,10 @@ def choose(
         raise Weg2HostLedgerRefused(
             "W20 Weg2HostLedgerRefused: no arm of the ladder funds both moments "
             f"plus a {store_min_gib:.0f} GiB store floor on this box "
-            f"(weight_chunks={weight_chunks}: "
-            + ("one image + one chunk at the run moment" if weight_chunks > 0 else "two persistent images at the run moment")
-            + "). The INT8 checkpoint has only the cpu-backup wake path (W4), and "
+            f"(host weights term = {priced[0].terms['host_ring_gib']:.2f} GiB at the run "
+            f"moment, span 1 = {priced[0].terms['host_ring_span1_gib']:.2f} GiB at the launch "
+            f"moment; {ring_provenance or 'no provenance passed'}). "
+            "The INT8 checkpoint has only the cpu-backup wake path (W4), and "
             "the ledger will not shrink another term silently.\n"
             + table
         )
@@ -289,11 +330,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--store-min-gib", type=float, default=4.0)
     ap.add_argument("--meminfo", default="/proc/meminfo")
+    ap.add_argument("--ring-bytes", type=int, default=0, help="Sigma H, from ring_table.solve")
+    ap.add_argument("--ring-span1-bytes", type=int, default=0, help="Sigma image_P")
+    ap.add_argument("--ring-provenance", default="")
     ns = ap.parse_args(argv)
     mi = read_meminfo(ns.meminfo)
     try:
         arm, store, lines = choose(
-            mi["MemTotal"], mi["MemAvailable"], store_min_gib=ns.store_min_gib
+            mi["MemTotal"],
+            mi["MemAvailable"],
+            store_min_gib=ns.store_min_gib,
+            ring_bytes=ns.ring_bytes,
+            ring_span1_bytes=ns.ring_span1_bytes,
+            ring_provenance=ns.ring_provenance,
         )
     except Weg2HostLedgerRefused as e:
         print(str(e))

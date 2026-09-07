@@ -27,13 +27,14 @@ for d in /usr/local/cuda/lib64/stubs /usr/local/cuda-12.9/lib64/stubs "$CU13/lib
   [ -f "$d/libcuda.so" ] && { STUBS=$d; break; }
 done
 [ -n "$STUBS" ] || { echo "no libcuda.so stub found for linking" >&2; exit 1; }
-SHA=$(cat "$SRC"/core.cpp "$SRC"/core.h "$SRC"/entrypoint.cpp "$SRC"/api_forwarder.cpp "$SRC"/api_forwarder.h "$SRC"/utils.h "$SRC"/macro.h | sha256sum | cut -c1-12)
+SHA=$(cat "$SRC"/core.cpp "$SRC"/core.h "$SRC"/entrypoint.cpp "$SRC"/api_forwarder.cpp "$SRC"/api_forwarder.h "$SRC"/host_ring.cpp "$SRC"/host_ring.h "$SRC"/utils.h "$SRC"/macro.h | sha256sum | cut -c1-12)
 mkdir -p "$OUT_DIR"
-OUT="$OUT_DIR/torch_memory_saver_hook_mode_preload_cu13_onebackup_$SHA.so"
+OUT="$OUT_DIR/torch_memory_saver_hook_mode_preload_cu13_ring_$SHA.so"
 if [ -f "$OUT" ]; then echo "$OUT"; exit 0; fi
 TMP=$(mktemp -d)
 g++ -std=c++17 -O3 -fPIC -shared -DUSE_CUDA=1 -DTMS_HOOK_MODE_PRELOAD=1 \
   -I"$CU13/include" "$SRC/api_forwarder.cpp" "$SRC/core.cpp" "$SRC/entrypoint.cpp" \
-  -L"$CU13/lib" -L"$STUBS" -lcudart -lcuda -ldl -o "$TMP/out.so"
+  "$SRC/host_ring.cpp" \
+  -L"$CU13/lib" -L"$STUBS" -lcudart -lcuda -ldl -lpthread -o "$TMP/out.so"
 mv "$TMP/out.so" "$OUT"; rmdir "$TMP"
 echo "$OUT"

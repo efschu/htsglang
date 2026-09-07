@@ -14,6 +14,23 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 
+def _weg2_ring_symbol(name: str):
+    """Look one of the Weg-2 C entrypoints up in the ALREADY-LOADED preload hook.
+
+    The patched ``torch_memory_saver`` hook is on ``LD_PRELOAD``
+    (``configure_subprocess`` below), so its symbols are in the global dynamic
+    namespace and ``CDLL(None)`` finds them without opening a second handle on
+    the same object.  Returns None -- never a fabricated value -- when the
+    running hook is the stock wheel's, which has no such symbol.
+    """
+    import ctypes
+
+    try:
+        return getattr(ctypes.CDLL(None), name)
+    except (OSError, AttributeError):
+        return None
+
+
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
     def create(enable: bool):
@@ -51,6 +68,12 @@ class TorchMemorySaverAdapter(ABC):
         raise NotImplementedError
 
     def resume(self, tag: str):
+        raise NotImplementedError
+
+    def tag_bytes(self, tag: str):
+        raise NotImplementedError
+
+    def ring_stats(self):
         raise NotImplementedError
 
     @property
@@ -111,6 +134,57 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def resume(self, tag: str):
         return _memory_saver.resume(tag=tag)
 
+    def tag_bytes(self, tag: str):
+        """C8/C7: the saver's OWN byte sum for ``tag``, or None.
+
+        This is the per-tag instrument the Weg-2 flip cost planner sizes from.
+        It exists because the previous instrument is dead by construction (spec
+        R8): with the shared host ring a tag's backup lives in tmpfs pages
+        mapped by BOTH co-located rank processes, so the RssShmem delta around
+        a pause collapses to ~0 and a per-process sum double-counts.  Never
+        fall back to RssShmem when this returns None -- report the absence.
+        """
+        fn = _weg2_ring_symbol("tms_tag_bytes")
+        if fn is None:
+            return None
+        import ctypes
+
+        fn.restype = ctypes.c_uint64
+        fn.argtypes = [ctypes.c_char_p]
+        return int(fn(tag.encode()))
+
+    def ring_stats(self):
+        """C8/C7: the live per-card host-ring counters, or None when this boot
+        published no ring (then the stock ``cudaMallocHost`` path is running and
+        there is nothing to report -- that is not a zero, it is an absence)."""
+        import ctypes
+
+        fn = _weg2_ring_symbol("tms_ring_stats")
+        if fn is None:
+            return None
+        buf = ctypes.create_string_buffer(96)
+        out = {k: ctypes.c_uint64(0) for k in (
+            "granule_bytes", "granules_total", "granules_free", "granules_free_min",
+            "granules_peak_taken", "acquires", "releases", "swept_stale",
+            "spans_registered",
+        )}
+        blocked = ctypes.c_double(0.0)
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t] + [
+            ctypes.POINTER(ctypes.c_uint64)
+        ] * len(out) + [ctypes.POINTER(ctypes.c_double)]
+        rc = fn(
+            buf, ctypes.c_size_t(len(buf)),
+            *[ctypes.byref(v) for v in out.values()],
+            ctypes.byref(blocked),
+        )
+        if rc != 1:
+            return None
+        res = {k: int(v.value) for k, v in out.items()}
+        res["card_uuid"] = buf.value.decode()
+        res["blocked_ms"] = float(blocked.value)
+        return res
+
     @property
     def enabled(self):
         return _memory_saver is not None and _memory_saver.enabled
@@ -136,6 +210,12 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
     @contextmanager
     def disable(self):
         yield
+
+    def tag_bytes(self, tag: str):
+        return None
+
+    def ring_stats(self):
+        return None
 
     def pause(self, tag: str):
         pass

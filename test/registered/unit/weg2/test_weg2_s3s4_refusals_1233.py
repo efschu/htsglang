@@ -71,39 +71,87 @@ def test_w17_http_200_alone_is_not_a_serving_fact():
 
 
 # ---------------------------------------------------------------- W20
+#: C19 (2026-09-07): the ledger's host weights term is no longer a constant in
+#: the module -- it is the previous boot's own per-card table, so every caller
+#: passes it in.  These are boot weg2zr2's numbers (WEG2_FLIPCOST_SPEC_0907
+#: section 2, reproduced from that boot's lines by
+#: test_weg2_ring_ledger_1235.RealBootProvenanceTest): Sigma H 32 964 MiB,
+#: Sigma image_P 29 912 MiB.  This file tests the LEDGER; the provenance claim
+#: itself is that other file's job.
+RING_BYTES = 32964 * 1024 * 1024
+RING_SPAN1_BYTES = 29912 * 1024 * 1024
+RING = dict(ring_bytes=RING_BYTES, ring_span1_bytes=RING_SPAN1_BYTES,
+            ring_provenance="boot weg2zr2 (spec section 2 table)")
+
+
 def test_w20_refuses_when_no_arm_funds_the_store():
     memtotal = 118 * GIB
-    memavail = 60 * GIB  # a box with 60 GiB available cannot fund two backups
+    memavail = 60 * GIB  # a box with 60 GiB available cannot fund the ring
     with pytest.raises(host_ledger.Weg2HostLedgerRefused) as ei:
-        host_ledger.choose(memtotal, memavail, store_min_gib=4.0)
+        host_ledger.choose(memtotal, memavail, store_min_gib=4.0, **RING)
     assert "W20 Weg2HostLedgerRefused" in str(ei.value)
     assert "ARM S=1 M=600" in str(ei.value)  # the whole ladder is printed
 
 
-def test_w20_refuses_the_live_box_shape_with_the_1232_headroom_and_prints_every_term():
+def test_w20_refuses_a_boot_with_no_measured_ring_table_rather_than_guessing():
+    """C19/R22: with BACKUP_P_BYTES and BACKUP_D_BYTES deleted there is no
+    constant left to price the flip with, and the planner does not invent one."""
+    with pytest.raises(host_ledger.Weg2HostLedgerRefused) as ei:
+        host_ledger.choose(160 * GIB, 150 * GIB, store_min_gib=4.0)
+    assert "no measured source" in str(ei.value)
+
+
+#: The DR-1 shape this test was written against, now priced from the SAME
+#: measured table instead of from the deleted constants: BOTH full images
+#: host-resident at one instant, Sigma image_P + Sigma image_D = 29 912 +
+#: 32 964 MiB = 61.4 GiB (spec R10, "the DR-1 shape refused in record 1h").
+#: The old ledger expressed it as ``weight_chunks=0`` -> backup_P + backup_D.
+DR1_BYTES = (29912 + 32964) * 1024 * 1024
+
+
+def test_w20_still_refuses_the_live_box_shape_under_the_DR1_two_image_shape():
     """boot weg2ls1b2 (2026-09-07): with the #721 floor alone the ledger funded
     S=1/M=1200/store 5 GiB and the box OOM-killed at group D's first sleep.
-    With the #1232 headroom charged the same box REFUSES by name."""
+    With the #1232 headroom charged the same box REFUSES by name.
+
+    C19 keeps this regression intact by pricing the same shape from the
+    measured table rather than from the deleted constants: two resident images
+    = 61.4 GiB, which this box does not fund at any arm."""
     memtotal = 118 * GIB
     memavail = 107 * GIB
     with pytest.raises(host_ledger.Weg2HostLedgerRefused) as ei:
-        host_ledger.choose(memtotal, memavail, store_min_gib=4.0)
+        host_ledger.choose(memtotal, memavail, store_min_gib=4.0,
+                           ring_bytes=DR1_BYTES,
+                           ring_span1_bytes=RING_SPAN1_BYTES,
+                           ring_provenance="boot weg2zr2, DR-1 two-image shape")
     text = str(ei.value)
-    for term in ("heaps=", "backup_P=", "backup_D=", "load_transient=", "anchors@2400=", "rings=", "floor=", "host_headroom="):
+    for term in ("heaps=", "RUN MOMENT = the host weights term", "LAUNCH MOMENT = ring span 1",
+                 "load_transient=", "anchors@2400=", "rings=", "floor=", "host_headroom="):
         assert term in text
+    # And the deleted constants may not come back through the printed line.
+    assert "backup_P=" not in text and "backup_D=" not in text
+
+
+def test_the_ring_is_what_makes_that_same_box_fundable():
+    """The whole point of C1-C8, priced: the shared region charges Sigma H once
+    (32.19 GiB) where DR-1 charged both images (61.4)."""
+    arm, store, lines = host_ledger.choose(118 * GIB, 107 * GIB, store_min_gib=4.0, **RING)
+    assert arm.launch_leftover_gib >= 0 and arm.run_leftover_gib >= 0 and store >= 4
+    assert round(arm.terms["host_ring_gib"], 2) == 32.19
 
 
 def test_w20_funds_a_box_with_enough_ram_and_prints_every_term():
     memtotal = 160 * GIB
     memavail = 150 * GIB
-    arm, store, lines = host_ledger.choose(memtotal, memavail, store_min_gib=4.0)
+    arm, store, lines = host_ledger.choose(memtotal, memavail, store_min_gib=4.0, **RING)
     assert arm.s_gb == 1 and store >= 4
     assert arm.launch_leftover_gib >= 0 and arm.run_leftover_gib >= 0
 
 
 def test_w20_both_moments_are_priced_differently():
-    arm = host_ledger.price(118 * GIB, 107 * GIB, 1, 1200)
-    # launch charges LOAD_TRANSIENT without D's backup; run charges both backups
+    arm = host_ledger.price(118 * GIB, 107 * GIB, 1, 1200,
+                            ring_bytes=RING_BYTES, ring_span1_bytes=RING_SPAN1_BYTES)
+    # launch charges span 1 plus LOAD_TRANSIENT (R7); run charges the whole ring
     assert arm.launch_leftover_gib != arm.run_leftover_gib
 
 
