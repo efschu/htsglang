@@ -24,7 +24,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from sglang.srt.managers.weg2_memory_saver import chunk_tag_cards, weights_family_tags
 from sglang.srt.weg2 import front as front_mod
 from sglang.srt.weg2.front import Front, interleave_pause_order
-from sglang.srt.weg2.launcher import P_PP_STAGE_RATIO, carrier_bound_from_lines
+from sglang.srt.weg2 import launcher as launcher_mod
+from sglang.srt.weg2.launcher import carrier_bound_from_lines
 from sglang.test.test_utils import CustomTestCase
 
 # ---------------------------------------------------------------- MEASURED
@@ -36,6 +37,42 @@ N_LAYERS = 64
 LAYERS_PER_CHUNK = 8
 CHUNK_COUNT = 8
 NVML_OF_STAGE = [1, 0, 2]
+
+#: The reference checkpoint's layer families, written out rather than read from
+#: disk so this file stays hermetic: 64 layers, ``full_attention_interval`` 4,
+#: so every 4th layer (index 3, 7, 11, ...) is full attention -- 16 of 64,
+#: exactly what ``Qwen3.8-27B-INT8-gdncov-vocabembed/config.json``'s
+#: ``text_config.layer_types`` lists.
+LAYER_KINDS = [(i % 4) == 3 for i in range(N_LAYERS)]
+
+
+def launcher_stage_layers(scores=None, attn_scores=None, kinds=None):
+    """The vector the launcher hands ``chunk_tag_cards`` as ``stage_layers``.
+
+    #1233 fix 5.  BOTH trees are asked through this one seam so the red/green
+    is behavioural rather than an ImportError: before the fix the launcher had
+    only ``P_PP_STAGE_RATIO`` and handed THAT vector to the map, with a comment
+    calling it "the pipeline layer split"; it is the per-stage capability SCORE
+    vector, and the split is whatever ``derive_pp_layer_split`` makes of it.
+    """
+    from unittest import mock
+
+    if hasattr(launcher_mod, "p_stage_layers"):
+        with mock.patch.object(
+            launcher_mod, "P_PP_STAGE_RATIO_SCORES",
+            tuple(scores if scores is not None else (32, 18, 14)),
+        ), mock.patch.object(
+            launcher_mod, "P_PP_ATTN_STAGE_RATIO_SCORES",
+            tuple(attn_scores if attn_scores is not None else (8, 4, 4)),
+        ):
+            return list(launcher_mod.p_stage_layers(kinds or LAYER_KINDS))
+    return list(scores if scores is not None else launcher_mod.P_PP_STAGE_RATIO)
+
+
+#: P's real layer split under the flags ``argv_p`` passes.  It equals the score
+#: vector for exactly this (checkpoint, 32/18/14, 8/4/4) triple -- which is why
+#: the old map was right by coincidence -- so every number below is unchanged.
+P_STAGE_LAYERS = launcher_stage_layers()
 
 #: The driver_free instants per card at the start of the epoch-1 interleave,
 #: MiB (D.log #1028c BOUND driver_free, 20:24:17Z: TP0=nvml1 14252.8,
@@ -64,7 +101,7 @@ def _layers_per_tag_per_card():
     test with the code under test."""
     out = {}
     layer = 0
-    for stage, n in enumerate(P_PP_STAGE_RATIO):
+    for stage, n in enumerate(P_STAGE_LAYERS):
         for _ in range(n):
             tag = f"weights_{min(layer // LAYERS_PER_CHUNK, CHUNK_COUNT - 1)}"
             out[(tag, NVML_OF_STAGE[stage])] = out.get((tag, NVML_OF_STAGE[stage]), 0) + 1
@@ -96,7 +133,7 @@ def simulate_interleave(pause_order, resume_tags):
 
 class TestChunkTagCards(CustomTestCase):
     def test_pp_bands_land_on_one_stage_and_the_last_chunks_on_the_last_stage(self):
-        m = chunk_tag_cards(P_PP_STAGE_RATIO, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE)
+        m = chunk_tag_cards(P_STAGE_LAYERS, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE)
         self.assertEqual(
             m,
             {
@@ -110,11 +147,11 @@ class TestChunkTagCards(CustomTestCase):
         # P bytes in the LAST two tags only, so the first six pauses of the
         # natural order are free of charge there.
         self.assertEqual([t for t, cards in m.items() if 2 in cards], ["weights_6", "weights_7"])
-        self.assertEqual(sum(P_PP_STAGE_RATIO), N_LAYERS)
+        self.assertEqual(sum(P_STAGE_LAYERS), N_LAYERS)
 
     def test_no_map_when_chunking_is_off_or_the_group_has_no_layer_split(self):
-        self.assertEqual(chunk_tag_cards(P_PP_STAGE_RATIO, 0, CHUNK_COUNT), {})
-        self.assertEqual(chunk_tag_cards(P_PP_STAGE_RATIO, LAYERS_PER_CHUNK, 0), {})
+        self.assertEqual(chunk_tag_cards(P_STAGE_LAYERS, 0, CHUNK_COUNT), {})
+        self.assertEqual(chunk_tag_cards(P_STAGE_LAYERS, LAYERS_PER_CHUNK, 0), {})
         self.assertEqual(chunk_tag_cards([], LAYERS_PER_CHUNK, CHUNK_COUNT), {})
 
     def test_a_layer_beyond_the_family_clamps_to_the_last_chunk(self):
@@ -123,7 +160,94 @@ class TestChunkTagCards(CustomTestCase):
 
     def test_card_list_that_does_not_match_the_stages_is_refused(self):
         with self.assertRaises(ValueError):
-            chunk_tag_cards(P_PP_STAGE_RATIO, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=[0, 1])
+            chunk_tag_cards(P_STAGE_LAYERS, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=[0, 1])
+
+
+class TestTheMapIsBuiltFromTheDerivedSplit(CustomTestCase):
+    """#1233 fix 5: the map's ``stage_layers`` must be the DERIVED layer split.
+
+    ``--pp-stage-ratio`` takes per-stage capability SCORES;
+    ``server_args._handle_pp_stage_ratio`` feeds them to
+    ``derive_pp_layer_split(scores, is_full_attention=kinds,
+    attn_scores=...)`` and its hybrid snap decides the real per-stage layer
+    counts.  Restating the score vector as the split is a second bookkeeping of
+    a value the tree already derives, and it is UNGUARDED by construction:
+    ``interleave_pause_order`` refuses only an INCOMPLETE map (missing tag,
+    card absent from the NVML sample), so a map that is complete but wrong
+    produces a confident ``why="tightest-card-first"`` order against the wrong
+    card -- the wrong-per-card-accounting class that killed weg2dk4, now
+    wearing an instrument that says it is fine.
+    """
+
+    #: MEASURED hermetically (CUDA_VISIBLE_DEVICES="", the checkpoint's own
+    #: layer_types): (scores, attn_scores) -> derived split.  The first row is
+    #: the boot form, where flag and truth agree; the other three are its
+    #: NEIGHBOURS, where they do not.
+    CASES = [
+        ((32, 18, 14), (8, 4, 4), [32, 18, 14]),
+        ((32, 18, 14), (7, 5, 4), [31, 19, 14]),
+        ((31, 17, 16), (8, 4, 4), [32, 16, 16]),
+        ((30, 20, 14), (8, 4, 4), [32, 18, 14]),
+    ]
+
+    def test_the_launcher_hands_the_map_the_derived_split_for_every_neighbour(self):
+        for scores, attn, want in self.CASES:
+            with self.subTest(scores=scores, attn=attn):
+                self.assertEqual(launcher_stage_layers(scores, attn), want)
+
+    def test_the_boot_form_is_unchanged_so_this_fix_moves_no_boot_number(self):
+        scores, attn, want = self.CASES[0]
+        self.assertEqual(launcher_stage_layers(scores, attn), want)
+        self.assertEqual(
+            chunk_tag_cards(want, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE),
+            chunk_tag_cards(list(scores), LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE),
+        )
+
+    def test_a_neighbour_puts_a_tag_on_the_wrong_card_when_the_flag_is_restated(self):
+        # weights_3 is the discriminating tag in all three diverging rows: the
+        # restated flag and the derived truth disagree about which card holds it,
+        # and the pause order is built from exactly that.
+        for scores, attn, want in self.CASES[1:]:
+            with self.subTest(scores=scores, attn=attn):
+                flag = chunk_tag_cards(list(scores), LAYERS_PER_CHUNK, CHUNK_COUNT,
+                                       card_of_stage=NVML_OF_STAGE)
+                truth = chunk_tag_cards(want, LAYERS_PER_CHUNK, CHUNK_COUNT,
+                                        card_of_stage=NVML_OF_STAGE)
+                self.assertNotEqual(flag["weights_3"], truth["weights_3"])
+                self.assertEqual(launcher_stage_layers(scores, attn), want)
+
+    def test_the_two_score_vectors_have_one_definition_each(self):
+        # argv_p and the map must read the SAME two constants; a second literal
+        # is how "8,4,4" and the map drifted apart in the first place.
+        argv = launcher_mod.argv_p("py", "/m", [1, 2, 3], 1, 600, 1.0, [])
+        i = argv.index("--pp-stage-ratio")
+        self.assertEqual(
+            argv[i + 1], ",".join(str(n) for n in launcher_mod.P_PP_STAGE_RATIO_SCORES)
+        )
+        j = argv.index("--pp-attn-stage-ratio")
+        self.assertEqual(
+            argv[j + 1],
+            ",".join(str(n) for n in launcher_mod.P_PP_ATTN_STAGE_RATIO_SCORES),
+        )
+
+    def test_layer_kinds_are_read_from_the_checkpoint_and_refused_by_name(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w") as f:
+                json.dump({"text_config": {"num_hidden_layers": 4,
+                                           "layer_types": ["linear_attention"] * 3
+                                           + ["full_attention"]}}, f)
+            self.assertEqual(
+                launcher_mod.model_layer_kinds(d), [False, False, False, True]
+            )
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w") as f:
+                json.dump({"text_config": {"num_hidden_layers": 4}}, f)
+            with self.assertRaises(launcher_mod.Weg2LaunchRefused) as ei:
+                launcher_mod.model_layer_kinds(d)
+            self.assertIn("layer_types", str(ei.exception))
 
 
 class TestInterleavePauseOrder(CustomTestCase):
@@ -132,7 +256,7 @@ class TestInterleavePauseOrder(CustomTestCase):
         self.map = {
             t: list(v)
             for t, v in chunk_tag_cards(
-                P_PP_STAGE_RATIO, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE
+                P_STAGE_LAYERS, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE
             ).items()
         }
 
@@ -192,7 +316,7 @@ class TestTheMeasuredPeak(CustomTestCase):
         self.map = {
             t: list(v)
             for t, v in chunk_tag_cards(
-                P_PP_STAGE_RATIO, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE
+                P_STAGE_LAYERS, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE
             ).items()
         }
 
@@ -261,7 +385,7 @@ class TestFlipUsesTheOrder(CustomTestCase):
 
     def test_p_as_source_pauses_tightest_card_first_and_d_resumes_naturally(self):
         m = {t: list(v) for t, v in chunk_tag_cards(
-            P_PP_STAGE_RATIO, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE).items()}
+            P_STAGE_LAYERS, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE).items()}
         f = self._front({"P": m})
         self._run(f)
         self.assertIsNone(f.stop, f.stop)

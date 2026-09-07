@@ -248,10 +248,21 @@ P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB = 1450.0
 P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB = 5584.4
 P_CORRIDOR_TOP_MIB = 1229.0
 P_BYTES_PER_TOKEN = 8192 + 2048
-#: Group P's pipeline layer split, in STAGE order (ordinal 0 = the 5090).  Read
-#: twice on purpose and therefore defined once: by ``argv_p`` (the flag) and by
-#: the weg2dk4 flip-order map (which cards a weights_<k> chunk tag lives on).
-P_PP_STAGE_RATIO = (32, 18, 14)
+#: Group P's per-stage CAPABILITY SCORES, in stage order (ordinal 0 = the
+#: 5090) -- what ``--pp-stage-ratio`` takes.  NOT a layer split: fix 5, after
+#: the map below was found to restate this vector as one.  ``server_args``
+#: hands these to ``derive_pp_layer_split(scores, is_full_attention=kinds,
+#: attn_scores=...)`` and its hybrid snap decides the real per-stage layer
+#: counts, which agree with the scores for exactly the current (checkpoint,
+#: 32/18/14, 8/4/4) triple and diverge for its neighbours -- measured:
+#: attn_scores 7,5,4 -> [31,19,14]; scores 31,17,16 -> [32,16,16]; scores
+#: 30,20,14 -> [32,18,14].  Anything that needs the SPLIT calls
+#: :func:`p_stage_layers`; nothing reads these as layer counts.
+P_PP_STAGE_RATIO_SCORES = (32, 18, 14)
+#: Group P's per-stage FULL-ATTENTION scores (#485 ``--pp-attn-stage-ratio``),
+#: read twice for the same reason and therefore defined once: by ``argv_p``
+#: (the flag) and by :func:`p_stage_layers` (the split the flag produces).
+P_PP_ATTN_STAGE_RATIO_SCORES = (8, 4, 4)
 
 
 def derive_p_max_total_tokens() -> int:
@@ -315,6 +326,11 @@ class BootState:
     carrier_max_tokens: int = 0
     weight_chunks: int = 0
     tms_so: str = ""
+    #: #1233 fix 5: the pre-boot cgroup sample, oom_kill baseline included, so
+    #: a later death can be attributed by diff instead of retroactively.
+    cgroup: Dict[str, Optional[int]] = field(default_factory=dict)
+    #: P's DERIVED PP layer split (empty = refused, reason in the log line).
+    p_stage_layers: List[int] = field(default_factory=list)
 
 
 def _now() -> str:
@@ -609,7 +625,8 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float) -> List[st
 def argv_p(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float, extra: List[str]) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib) + [
         "--tp-size", "1", "--pp-size", "3",
-        "--pp-stage-ratio", ",".join(str(n) for n in P_PP_STAGE_RATIO), "--pp-attn-stage-ratio", "8,4,4",
+        "--pp-stage-ratio", ",".join(str(n) for n in P_PP_STAGE_RATIO_SCORES),
+        "--pp-attn-stage-ratio", ",".join(str(n) for n in P_PP_ATTN_STAGE_RATIO_SCORES),
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         "--barlink-bar1-window-mib", "24,PP_0=96",
         # #1233 draft KV across the flip (C15): P carries D's four speculative
@@ -1386,6 +1403,59 @@ def model_num_layers(model: str) -> int:
     return n
 
 
+def model_layer_kinds(model: str) -> List[bool]:
+    """One flag per layer: True = full attention, False = linear/GDN.
+
+    The same ``layer_types`` list ``server_args._handle_pp_stage_ratio`` reads
+    before deriving the split, read from the same file, so the launcher's map
+    and the server's split cannot disagree about the checkpoint.  Refuses by
+    name when the key is missing or the wrong length -- a hybrid split guessed
+    from ``num_hidden_layers`` alone mis-sizes every hybrid (#201 slice 2).
+    """
+    with open(os.path.join(model, "config.json")) as f:
+        cfg = json.load(f)
+    text = cfg.get("text_config", cfg)
+    types = text.get("layer_types") or cfg.get("layer_types")
+    n = model_num_layers(model)
+    if not isinstance(types, list) or len(types) != n:
+        raise Weg2LaunchRefused(
+            f"layer_types in {model}/config.json is {type(types).__name__} of "
+            f"length {len(types) if isinstance(types, list) else 'n/a'}, expected a "
+            f"list of {n}: the PP layer split of a hybrid cannot be derived without it."
+        )
+    return [str(t) == "full_attention" for t in types]
+
+
+def p_stage_layers(is_full_attention: Sequence[bool]) -> List[int]:
+    """Group P's per-stage LAYER COUNTS -- derived, never restated.
+
+    #1233 fix 5.  The flip-order map used to be built from
+    ``P_PP_STAGE_RATIO_SCORES`` directly, with a comment calling that vector
+    "the pipeline layer split".  It is not: it is the per-stage capability
+    score vector, and the layer counts are what
+    ``derive_pp_layer_split`` makes of it under the hybrid snap.  The two
+    agree for exactly the current (checkpoint, 32/18/14, 8/4/4) triple and
+    diverge for its neighbours, so the old map was right by coincidence and
+    unguarded by construction: ``interleave_pause_order`` refuses only an
+    INCOMPLETE map, and a map that is complete but wrong yields a confident
+    ``why="tightest-card-first"`` order that pauses the wrong card first --
+    the wrong-per-card-accounting class that killed weg2dk4, wearing an
+    instrument that says it is fine.
+
+    This calls the SAME function ``server_args._handle_pp_stage_ratio`` calls
+    (``distributed.utils.derive_pp_layer_split``) with the SAME two score
+    vectors ``argv_p`` passes, so there is one authority for the split and the
+    launcher reads it rather than keeping a second copy.
+    """
+    from sglang.srt.distributed.utils import derive_pp_layer_split
+
+    return derive_pp_layer_split(
+        list(P_PP_STAGE_RATIO_SCORES),
+        is_full_attention=list(is_full_attention),
+        attn_scores=list(P_PP_ATTN_STAGE_RATIO_SCORES),
+    )
+
+
 def build_tms_preload(tree: str, venv: str, log: Log) -> str:
     """Build (or reuse) the patched torch_memory_saver preload hook."""
     script = os.path.join(tree, "scripts", "weg2", "tms", "build_tms_preload.sh")
@@ -1550,6 +1620,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "flip (C9, gathered legs) = src.pause(kv) -> ONE src.release(family) and ONE dst.resume(family) "
         "in flight together -> dst.resume(kv); the host holds ONE image per card (H(c) = max_g image_g(c)) "
         "and dst's per-tag releases fund src's acquires inside it")
+
+    # 1b'. #1233 fix 5 -- P's PP LAYER SPLIT, derived from the two score vectors
+    # argv_p passes, by the SAME function server_args calls.  Named refusal
+    # instead of a guess: a split that does not sum to the checkpoint's depth
+    # publishes NO map, and the flip falls back to the identity pause order
+    # with the reason printed, rather than to a confident wrong one.
+    p_split: List[int] = []
+    p_kinds: List[bool] = []
+    p_split_note = ""
+    try:
+        p_kinds = model_layer_kinds(ns.model)
+        p_split = p_stage_layers(p_kinds)
+        if sum(p_split) != n_layers:
+            p_split_note = (
+                f"derived split {p_split} sums to {sum(p_split)}, not {n_layers}"
+            )
+            p_split = []
+    except (Weg2LaunchRefused, ValueError, OSError) as e:
+        p_split_note = f"{type(e).__name__}: {e}"
+    log(
+        f"WEG2-PP-SPLIT group=P scores --pp-stage-ratio {list(P_PP_STAGE_RATIO_SCORES)} "
+        f"--pp-attn-stage-ratio {list(P_PP_ATTN_STAGE_RATIO_SCORES)} over {n_layers} layers "
+        f"({sum(p_kinds) if p_split else '?'} full-attention) -> DERIVED layer split "
+        f"{p_split if p_split else 'REFUSED (' + p_split_note + ')'} "
+        "(derive_pp_layer_split, the same authority server_args._handle_pp_stage_ratio "
+        "uses; fix 5: the flip-order map used to restate the SCORE vector as the split, "
+        "which is right only for this checkpoint and this pair of vectors)"
+    )
+    state.p_stage_layers = list(p_split)
     tms_so = "" if dry else build_tms_preload(tree, ns.venv, log)
     state.weight_chunks = chunk_count
     state.tms_so = tms_so
@@ -1565,11 +1664,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # 2. host ledger
     mi = host_ledger.read_meminfo()
+    # #1233 fix 5: the reaper watches the CGROUP, so the ledger reads it.  The
+    # oom_kill value goes in as the boot's PRE-BOOT BASELINE of a cumulative,
+    # timestamp-free counter -- no boot starts without one.
+    cg = host_ledger.read_cgroup()
+    cg_ceiling, cg_ceiling_source = host_ledger.resolve_cg_ceiling(cg, mi["MemTotal"])
+    state.cgroup = dict(cg)
     arm, store_gib, lines = host_ledger.choose(
-        mi["MemTotal"], mi["MemAvailable"], store_min_gib=ns.store_min_gib,
+        mi["MemTotal"],
+        mi["MemAvailable"],
+        store_min_gib=ns.store_min_gib,
         ring_bytes=ring_plan.host_weights_bytes,
         ring_span1_bytes=ring_plan.host_weights_span1_bytes,
         ring_provenance=ring_plan.provenance,
+        cg_current_bytes=cg["current"],
+        cg_ceiling_bytes=cg_ceiling,
+        cg_ceiling_source=cg_ceiling_source,
+        cg_oom_kill=cg["oom_kill"],
     )
     for ln in lines:
         log(ln)
@@ -1764,12 +1875,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # order, exactly as before.  Derived here from the SAME stage ratio argv_p
     # passes and the SAME chunk geometry both groups were built with; the front
     # picks the pause order from it per flip, against a live NVML free sample.
+    # fix 5: from the DERIVED layer split (section 1b'), never from the score
+    # vector.  No split -> no map -> the front pauses in the identity order and
+    # prints why, which is the honest degradation; a complete-but-wrong map is
+    # not, because interleave_pause_order only refuses an INCOMPLETE one.
     p_chunk_cards = chunk_tag_cards(
-        P_PP_STAGE_RATIO, chunk_layers, chunk_count, card_of_stage=[c.nvml_index for c in cards]
-    )
+        p_split, chunk_layers, chunk_count, card_of_stage=[c.nvml_index for c in cards]
+    ) if p_split else {}
     src_chunk_cards = {"P": {t: list(v) for t, v in p_chunk_cards.items()}}
-    log(f"WEG2-FLIP-ORDER MAP group=P (pp stage ratio {list(P_PP_STAGE_RATIO)} over {n_layers} layers, "
-        f"{chunk_layers} layers per chunk, nvml {[c.nvml_index for c in cards]} in stage order): {src_chunk_cards['P']}; "
+    log(f"WEG2-FLIP-ORDER MAP group=P (scores {list(P_PP_STAGE_RATIO_SCORES)}/"
+        f"{list(P_PP_ATTN_STAGE_RATIO_SCORES)} -> DERIVED layer split "
+        f"{p_split if p_split else 'REFUSED (' + p_split_note + ') -> NO MAP, identity order'} "
+        f"over {n_layers} layers, {chunk_layers} layers per chunk, "
+        f"nvml {[c.nvml_index for c in cards]} in stage order): {src_chunk_cards['P']}; "
         f"group=D TP -> no map (uniform across cards). Boot weg2dk4 died because the interleave paused P's tag k "
         f"against D's tag k while P's bytes for k=0..5 were on OTHER cards than the one D was allocating on.")
     front_argv = [

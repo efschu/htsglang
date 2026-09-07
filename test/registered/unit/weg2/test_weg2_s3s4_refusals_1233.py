@@ -130,10 +130,29 @@ def test_w20_still_refuses_the_live_box_shape_under_the_DR1_two_image_shape():
                            ring_provenance="boot weg2zr2, DR-1 two-image shape")
     text = str(ei.value)
     for term in ("heaps=", "RUN MOMENT = the host weights term", "LAUNCH MOMENT = ring span 1",
-                 "load_transient=", "anchors@2400=", "rings=", "floor=", "host_headroom="):
+                 "load_transient=", "anchors@2400=", "rings=", "floor="):
         assert term in text
     # And the deleted constants may not come back through the printed line.
     assert "backup_P=" not in text and "backup_D=" not in text
+    # fix 5's deletions are deletions on this branch too: the #1232 headroom is
+    # not a charged term (it survives only as the prose naming its own removal),
+    # and the flip transient is not a term beside Sigma H.
+    assert "host_headroom=" not in text
+    assert "flip_transient=" not in text
+
+
+def test_the_cgroup_denominator_binds_and_names_itself(capsys):
+    """fix 5 (boot weg2dk5), carried onto the ring: the reaper watches
+    memory.current, so a cgroup sample tighter than meminfo must BIND and the
+    printed line must say which reading bound it."""
+    arm, _store, lines = host_ledger.choose(
+        118 * GIB, 107 * GIB, store_min_gib=4.0,
+        cg_current_bytes=int(60 * GIB), cg_ceiling_bytes=int(118 * GIB),
+        cg_ceiling_source="memory.max", cg_oom_kill=18, **RING)
+    text = "\n".join(lines)
+    assert "memory.current=" in text and "base_cgroup=" in text
+    assert "oom_kill_baseline=18" in text
+    assert arm.terms["base_source"].startswith("cgroup")
 
 
 def test_the_ring_is_what_makes_that_same_box_fundable():
