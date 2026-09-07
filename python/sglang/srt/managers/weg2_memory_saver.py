@@ -36,7 +36,9 @@ import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple, Union
+
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,17 @@ DEFAULT_PCIE_LOCK_TIMEOUT_S = 120.0
 #: passes ``expected_max_resident_bytes`` and the ceiling form takes over --
 #: both forms may be supplied, and then both must hold.
 WEG2_SLEEP_MIN_RELEASED_FRACTION = 0.5
+
+#: The tag set a Weg-2 sleep releases, and therefore the only request shape the
+#: DELTA form's denominator is the right one for.  The floor is a fraction of
+#: this process's WHOLE device residency (NVML per-process bytes), so it may
+#: only grade a release that actually targets the whole of it: the weights
+#: image AND the KV pool (which carries the mamba/GDN anchors under the same
+#: tag -- memory_pool.py:1017, there is no separate mamba tag).  Anything less
+#: -- the #89 park's ``tags=["weights"]``, a kv-only release -- releases a
+#: PROPER SUBSET and cannot be graded against the whole; see
+#: :func:`sleep_acceptance_census`.
+WEG2_SLEEP_TAGS = frozenset((GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS))
 
 
 class Weg2MemorySaverInactive(RuntimeError):
@@ -116,6 +129,82 @@ def assert_memory_saver_active(adapter: Any, *, context: str) -> None:
         f"return success and no VRAM is ever released. Launch this group with "
         f"--enable-memory-saver (and check that torch_memory_saver imported "
         f"and its hook mode is 'preload'). Refusing rather than sleeping."
+    )
+
+
+def checkpoint_quantization(model_config: Any, server_args: Any) -> Optional[str]:
+    """The quantization actually in force for this process's checkpoint.
+
+    ONE definition, two users (the launch arm and the wake), so a launcher edit
+    cannot make the two disagree.  ``ModelConfig.quantization`` is the merged
+    value -- the CLI flag AND the config.json ``quantization_config`` the loader
+    auto-detects -- so a checkpoint that carries its own quant config without
+    ``--quantization`` is covered; ``server_args`` is the fallback for the
+    moments where no model config is reachable yet.
+    """
+    for holder in (model_config, server_args):
+        if holder is None:
+            continue
+        value = getattr(holder, "quantization", None)
+        if value:
+            return str(value)
+    return None
+
+
+def assert_backup_off_wake_refill_is_defined(
+    *, quantization: Optional[str], context: str
+) -> None:
+    """W4: refuse a backup-OFF wake whose refill would re-run a repacking pass.
+
+    The backup-OFF arm (record 1b round-2 Q2, option (ii)) refills the weights
+    with ``update_weights_from_disk``, which ends in
+    ``loader.load_weights_and_postprocess`` -- ``model.load_weights(iter)``
+    followed by ``quant_method.process_weights_after_loading(module)`` for every
+    module (``model_loader/loader.py:921-931``).  Neither half is idempotent on
+    a quantized checkpoint, and the FIRST half is the one that breaks:
+
+    * the post-load pass REPLACES the parameter rather than writing into it --
+      ``layer.weight = Parameter(weight.t(), requires_grad=False)``
+      (``compressed_tensors_w8a8_int8.py:151,159``, and the same shape in the
+      AWQ/FP8 schemes).  DESK-MEASURED on this tree with the reference
+      checkpoint's own scheme: a ``ModelWeightParameter`` of shape ``(4, 8)``
+      carrying a ``weight_loader`` comes back a plain ``Parameter`` of shape
+      ``(8, 4)`` with no ``weight_loader``
+      (``test_quantized_post_load_replaces_the_weight_parameter``).
+    * so the wake's ``model.load_weights(iter)`` resolves
+      ``getattr(param, "weight_loader", default_weight_loader)`` to the DEFAULT
+      loader, which asserts ``param.size() == loaded_weight.size()``
+      (``weight_utils.py:1709``) against a transposed parameter and raises.
+      ``model_runner.py:2857-2865`` then re-runs the same failing load as its
+      rollback, OUTSIDE any ``try``.
+
+    There is no second lane in this tree: #89's ``HibernateModelLoader`` is a
+    ``BaseModelLoader``, which ``update_weights_from_disk`` rejects outright
+    (``model_runner.py:2827-2829``), and it supports GGUF only.
+
+    So this arm is UNDEFINED for a quantized checkpoint, and the honest form is
+    a named refusal at the earliest decidable moment rather than a wake that
+    commits the VMM pages and then fails inside the loader.  The two lanes that
+    ARE defined, both named in the message: launch the group with
+    ``--enable-weights-cpu-backup`` (the TMS restore carries the post-transform
+    bytes and no reload runs at all), or serve an unquantized checkpoint.
+    """
+    if not quantization:
+        return
+    raise Weg2WakeRefused(
+        f"W4 Weg2WakeRefused at {context}: this group runs the backup-OFF wake "
+        f"arm (--enable-memory-saver without --enable-weights-cpu-backup) on a "
+        f"{quantization!r} checkpoint. That arm refills the weights with "
+        f"update_weights_from_disk, whose load_weights_and_postprocess writes "
+        f"the checkpoint tensors into parameters a previous "
+        f"process_weights_after_loading has already REPLACED with transposed, "
+        f"weight_loader-less ones (loader.py:921-931; "
+        f"compressed_tensors_w8a8_int8.py:151,159), so the refill raises inside "
+        f"the loader and the model_runner rollback re-runs the same failing "
+        f"load. Weights would be left committed and undefined. Launch this "
+        f"group with --enable-weights-cpu-backup (the TMS restore carries the "
+        f"post-transform bytes and no reload runs), or serve an unquantized "
+        f"checkpoint. Refusing rather than waking into undefined weights."
     )
 
 
@@ -255,6 +344,11 @@ class SleepAcceptanceCensus:
 
     pid: int
     nvml_uuid: Optional[str]
+    #: The tag set the graded release declared, as the caller resolved it.
+    #: ``None`` means the caller declared none, i.e. the population is this
+    #: process's whole device residency.  Printed on the line: a verdict that
+    #: cannot be attributed to the request that produced it is not one.
+    tags: Optional[Tuple[str, ...]]
     #: NVML ``nvmlDeviceGetComputeRunningProcesses`` for THIS pid, in bytes.
     proc_used_bytes: Optional[int]
     nvml_free_bytes: Optional[int]
@@ -266,6 +360,12 @@ class SleepAcceptanceCensus:
     before_bytes: Optional[int]
     released_bytes: Optional[int]
     min_released_fraction: Optional[float]
+    #: False when ``min_released_fraction`` was supplied but the declared tag
+    #: set is a PROPER SUBSET of :data:`WEG2_SLEEP_TAGS`, so the whole-process
+    #: floor is not the criterion in force.  The line then prints the supplied
+    #: value together with the reason it does not grade, never a bare number
+    #: that reads as a criterion that ran.
+    delta_form_in_force: bool
     expected_max_resident_bytes: Optional[int]
     #: Sums over ``kv_vmm_backing.arena_census()`` rows for this process.
     arena_reserved_bytes: int
@@ -322,13 +422,23 @@ class SleepAcceptanceCensus:
             if self.expected_max_resident_bytes is None
             else f"{self.expected_max_resident_bytes / MIB:.1f}"
         )
-        floor = (
-            "n/a"
-            if self.min_released_fraction is None
-            else f"{self.min_released_fraction:.2f}"
+        if self.min_released_fraction is None:
+            floor = "n/a"
+        elif self.delta_form_in_force:
+            floor = f"{self.min_released_fraction:.2f}"
+        else:
+            floor = (
+                f"n/a (partial tag set: {list(self.tags or ())}; the floor is a "
+                f"fraction of this process's whole device residency)"
+            )
+        tags = (
+            "n/a (whole-process residency)"
+            if self.tags is None
+            else f"{list(self.tags)}"
         )
         return (
             f"[weg2 sleep-acceptance] uuid={self.nvml_uuid} pid={self.pid} "
+            f"tags={tags} "
             f"proc_used={used} MiB nvml_free={free} MiB "
             f"proc_used_before={before} MiB released={released} MiB "
             f"min_released_fraction={floor} ceiling={ceiling} MiB "
@@ -343,6 +453,7 @@ _ProcessBytes = Union[Dict[int, int], Callable[[str], Dict[int, int]], None]
 def sleep_acceptance_census(
     *,
     nvml_uuid: Optional[str] = None,
+    tags: Optional[Sequence[str]] = None,
     before_bytes: Optional[int] = None,
     min_released_fraction: Optional[float] = None,
     expected_max_resident_bytes: Optional[int] = None,
@@ -367,6 +478,21 @@ def sleep_acceptance_census(
     * the CEILING form -- ``expected_max_resident_bytes``, the declared dormant
       ceiling.  S3's launcher supplies it once D_c is measured.
 
+    ``tags`` is the POPULATION the verdict is about, and it is printed.  The
+    delta floor is a fraction of this process's WHOLE device residency, so it
+    may only grade a release that targets the whole of it
+    (:data:`WEG2_SLEEP_TAGS`: weights AND kv_cache, the latter carrying the
+    mamba/GDN anchors under the same tag).  A declared PROPER SUBSET -- the #89
+    park's ``tags=["weights"]``, or a kv-only release -- suppresses the delta
+    form, because both errors are reachable on this one endpoint: a weights-only
+    park need not clear half of an awake residency that also carries KV, graphs,
+    activations and the CUDA context (false FAIL), and a kv-only release on a
+    rank whose KV exceeds half its residency clears the floor with the entire
+    weights shard still resident (false PASS).  With the delta form suppressed
+    the verdict rests on the ceiling form, or -- with no ceiling either -- on an
+    explicit refusal.  ``tags=None`` means the caller declared no restriction,
+    and then the whole-process denominator is the right one.
+
     Supplying NEITHER is itself refused: with no criterion the function would
     report ``accepted=True`` for a rank still holding its entire shard, i.e.
     for the exact silent-no-op condition it exists to catch, and a boot
@@ -387,6 +513,12 @@ def sleep_acceptance_census(
     """
     pid = os.getpid() if _pid is None else int(_pid)
     reasons = []
+    declared_tags: Optional[Tuple[str, ...]] = (
+        None if tags is None else tuple(str(tag) for tag in tags)
+    )
+    partial_tag_set = declared_tags is not None and not WEG2_SLEEP_TAGS.issubset(
+        set(declared_tags)
+    )
 
     uuid = nvml_uuid
     if uuid is None:
@@ -466,15 +598,28 @@ def sleep_acceptance_census(
     # printer: it reported accepted=True at 30,154 MiB and accepted=True at
     # 1,294 MiB -- the two ends of campaign (a)'s own 28.9 GiB swing -- and the
     # number in its test was decorative.
-    delta_form = before_bytes is not None and min_released_fraction is not None
+    delta_supplied = before_bytes is not None and min_released_fraction is not None
+    # The floor's denominator is the WHOLE process residency, so a release that
+    # declared a proper subset of the sleep tags is not gradeable by it -- in
+    # either direction (see the docstring).  Suppressed, never silently applied.
+    delta_form = delta_supplied and not partial_tag_set
     ceiling_form = expected_max_resident_bytes is not None
     released_bytes: Optional[int] = None
     if not delta_form and not ceiling_form:
-        reasons.append(
-            "no residency criterion supplied (neither before_bytes + "
-            "min_released_fraction nor expected_max_resident_bytes) -- this "
-            "reading is a number, not a verdict"
-        )
+        if delta_supplied and partial_tag_set:
+            reasons.append(
+                "no residency criterion in force: this release declared the "
+                f"partial tag set {list(declared_tags or ())}, and the delta "
+                "floor is a fraction of this process's WHOLE device residency, "
+                "which a release of only those tags need neither clear nor be "
+                "graded by -- this reading is a number, not a verdict"
+            )
+        else:
+            reasons.append(
+                "no residency criterion supplied (neither before_bytes + "
+                "min_released_fraction nor expected_max_resident_bytes) -- this "
+                "reading is a number, not a verdict"
+            )
     elif proc_used is not None:
         if delta_form:
             released_bytes = int(before_bytes) - proc_used
@@ -497,7 +642,12 @@ def sleep_acceptance_census(
 
     accepted = proc_used is not None and not reasons
     criterion_denominator = (
-        "no criterion"
+        (
+            "delta form SUPPRESSED (partial tag set "
+            f"{list(declared_tags or ())}), no other criterion"
+            if delta_supplied and partial_tag_set
+            else "no criterion"
+        )
         if not delta_form and not ceiling_form
         else ", ".join(
             part
@@ -524,14 +674,22 @@ def sleep_acceptance_census(
         if arena_rows == 0
         else f"{arena_rows} live arena row(s)"
     )
+    tag_denominator = (
+        "no tag set declared, so the population is this process's whole device "
+        "residency"
+        if declared_tags is None
+        else f"declared tags {list(declared_tags)}"
+    )
     denominator = (
         f"NVML per-process bytes for pid={pid} on uuid={uuid} over "
-        f"{proc_count} compute process(es); arena_rows={arena_rows} "
+        f"{proc_count} compute process(es); {tag_denominator}; "
+        f"arena_rows={arena_rows} "
         f"({arena_denominator}); criterion: {criterion_denominator}"
     )
     return SleepAcceptanceCensus(
         pid=pid,
         nvml_uuid=uuid,
+        tags=declared_tags,
         proc_used_bytes=proc_used,
         nvml_free_bytes=free_bytes,
         nvml_total_bytes=total_bytes,
@@ -540,6 +698,7 @@ def sleep_acceptance_census(
         min_released_fraction=(
             None if min_released_fraction is None else float(min_released_fraction)
         ),
+        delta_form_in_force=delta_form,
         expected_max_resident_bytes=(
             None
             if expected_max_resident_bytes is None

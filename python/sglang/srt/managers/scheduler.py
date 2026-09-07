@@ -2105,7 +2105,9 @@ class Scheduler(
             # already after module-level code (98 pre-existing E402), and the
             # refusal is only reachable on the memory-saver path anyway.
             from sglang.srt.managers.weg2_memory_saver import (
+                assert_backup_off_wake_refill_is_defined,
                 assert_memory_saver_active,
+                checkpoint_quantization,
             )
 
             # W12 Weg2MemorySaverInactive, launch half. `create(enable=True)`
@@ -2117,6 +2119,21 @@ class Scheduler(
             assert_memory_saver_active(
                 self.memory_saver_adapter, context="launch (scheduler init)"
             )
+
+            # W4, launch half. Without --enable-weights-cpu-backup the wake
+            # refills the weights with update_weights_from_disk, which is not a
+            # defined operation on a quantized checkpoint (the post-load pass
+            # already replaced the parameters it would write into). Refuse at
+            # launch, where nothing is committed yet, rather than at the first
+            # wake, where the VMM pages are already recommitted and the group
+            # is fatal. Same function the wake calls, so the two cannot drift.
+            if not self.server_args.enable_weights_cpu_backup:
+                assert_backup_off_wake_refill_is_defined(
+                    quantization=checkpoint_quantization(
+                        getattr(self, "model_config", None), self.server_args
+                    ),
+                    context="launch (scheduler init)",
+                )
 
         # Init recv skipper and input blocker
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(self.server_args)

@@ -6,7 +6,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -42,7 +42,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.weg2_memory_saver import (
     WEG2_SLEEP_MIN_RELEASED_FRACTION,
     Weg2WakeRefused,
+    assert_backup_off_wake_refill_is_defined,
     assert_memory_saver_active,
+    checkpoint_quantization,
     pcie_transfer_lock,
     resolve_pcie_lock_key,
     sleep_acceptance_census,
@@ -236,8 +238,17 @@ class SchedulerWeightUpdaterManager:
         with pcie_transfer_lock(nvml_uuid=uuid_key, label=label):
             yield
 
-    def _weg2_log_sleep_acceptance(self, before: Optional[Any] = None) -> None:
+    def _weg2_log_sleep_acceptance(
+        self, before: Optional[Any] = None, tags: Optional[List[str]] = None
+    ) -> None:
         """Design (S) 2.4 step 11, EXECUTED on the flip path, not declared.
+
+        ``tags`` is the RESOLVED tag list of the request being graded -- the
+        population the verdict is about.  It is printed on the line, so a boot
+        postmortem can attribute a verdict to the request that produced it, and
+        it decides whether the delta floor (a fraction of the WHOLE process
+        residency) is the criterion in force at all: a #89 park's
+        ``tags=["weights"]`` is a proper subset and is not gradeable by it.
 
         ``before`` is the PRE-PAUSE census this same RPC took, and it is what
         turns the reading into a verdict: without a criterion the census
@@ -251,6 +262,7 @@ class SchedulerWeightUpdaterManager:
         the honest outcome -- a blind pre-reading cannot grade an after-reading.
         """
         census = sleep_acceptance_census(
+            tags=tags,
             before_bytes=None if before is None else before.proc_used_bytes,
             min_released_fraction=(
                 None if before is None else WEG2_SLEEP_MIN_RELEASED_FRACTION
@@ -342,6 +354,25 @@ class SchedulerWeightUpdaterManager:
         if main_carried:
             return
 
+        # W4, BEFORE anything is locked, entered or mutated: on a quantized
+        # checkpoint the refill below is not a defined operation, because
+        # load_weights_and_postprocess writes into parameters an earlier
+        # process_weights_after_loading already replaced.  One definition,
+        # shared with the launch arm (scheduler.py), so the boot refuses before
+        # the first request and this call is the backstop for a process whose
+        # launch check could not read the model config.
+        assert_backup_off_wake_refill_is_defined(
+            quantization=checkpoint_quantization(
+                getattr(
+                    getattr(self.tp_worker, "model_runner", None),
+                    "model_config",
+                    None,
+                ),
+                server_args,
+            ),
+            context="backup-OFF wake refill",
+        )
+
         # flush_cache MUST stay False here: at this point in the resume the KV
         # tag is still paused, and flush_cache() -> MambaPool.reset_state()
         # would write into unmapped pages -- the CAMPAIGN (a) fault, mirrored
@@ -357,15 +388,59 @@ class SchedulerWeightUpdaterManager:
         # after the caller's barrier(tp_cpu_group): update_weights_from_disk
         # holds no collective (weight_updater.py:115-128 -> tp_worker.py:103-109
         # -> model_runner.update_weights_from_disk, none of them collective).
-        with self._weg2_pcie_lock("wake-H2D weights reload"):
-            out = self.update_weights_from_disk(
-                UpdateWeightFromDiskReqInput(
-                    model_path=server_args.model_path,
-                    load_format=getattr(server_args, "load_format", None),
-                    flush_cache=False,
-                    torch_empty_cache=False,
-                )
-            )
+        # THE REGION IS THE POINT OF THIS BLOCK, not decoration.  The refill
+        # ALLOCATES: load_weights_and_postprocess ends in
+        # `quant_method.process_weights_after_loading(module)`, which for every
+        # repacking scheme replaces the parameter with a FRESH device
+        # allocation (loader.py:921-931).  An allocation made with no region
+        # active is not under the TMS weights tag, so after the first such wake
+        # the live weights are no longer what `pause(GPU_MEMORY_TYPE_WEIGHTS)`
+        # releases: the next sleep unmaps a region the model no longer points
+        # at, the shard stays resident, and the RPC returns success -- the
+        # silent-no-op class W12 and the sleep census exist to catch, re-entered
+        # one level down and invisible until the SECOND sleep.
+        #
+        # Same region, same tag and the same `enable_cpu_backup` expression the
+        # boot load uses (model_runner.py:2342-2348), so the repacked
+        # parameters land exactly where the boot's did.  `enable_cpu_backup` is
+        # False by the two guards above: `main_carried` is False (we returned
+        # otherwise) and `draft_carried != main_carried` already raised, so
+        # model_runner's `enable_weights_cpu_backup or (is_draft_worker and
+        # enable_draft_weights_cpu_backup)` is False for BOTH shards here.
+        #
+        # Region outside, PCIe lock inside: the region must cover every
+        # allocation the loader makes, the lock only the link.
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_WEIGHTS,
+            enable_cpu_backup=False,
+        ):
+            with self._weg2_pcie_lock("wake-H2D weights reload"):
+                try:
+                    out = self.update_weights_from_disk(
+                        UpdateWeightFromDiskReqInput(
+                            model_path=server_args.model_path,
+                            load_format=getattr(server_args, "load_format", None),
+                            flush_cache=False,
+                            torch_empty_cache=False,
+                        )
+                    )
+                except Weg2WakeRefused:
+                    raise
+                except Exception as exc:
+                    # model_runner.update_weights_from_disk catches the FIRST
+                    # load failure and then re-runs `model_load_weights`
+                    # OUTSIDE any try as its rollback (model_runner.py:2857-
+                    # 2865), so a raw exception reaches here instead of the
+                    # (False, message) tuple.  A wake leg that ends in an
+                    # unnamed RuntimeError is the same undefined state as one
+                    # that returns success=False; name it identically.
+                    raise Weg2WakeRefused(
+                        "W4 Weg2WakeRefused: the backup-OFF wake raised while "
+                        f"refilling the weights from {server_args.model_path!r}: "
+                        f"{type(exc).__name__}: {exc}. The VMM pages are "
+                        "committed but their content is undefined; this group "
+                        "is fatal."
+                    ) from exc
         if not getattr(out, "success", False):
             raise Weg2WakeRefused(
                 "W4 Weg2WakeRefused: the backup-OFF wake could not refill the "
@@ -436,7 +511,9 @@ class SchedulerWeightUpdaterManager:
         # nothing (see _weg2_log_sleep_acceptance).  Taken here, after the idle
         # assert and before any pause, so the difference is exactly what this
         # RPC released.  Weg-2 path only: a stock release must stay upstream.
-        weg2_before_census = sleep_acceptance_census() if weg2_memory_saver_on else None
+        weg2_before_census = (
+            sleep_acceptance_census(tags=tags) if weg2_memory_saver_on else None
+        )
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             scheduler = self.scheduler
@@ -522,7 +599,7 @@ class SchedulerWeightUpdaterManager:
             # byte the upstream path, and an extra post-pause device call plus
             # two NVML reads on it is not that.
             torch.get_device_module().empty_cache()
-            self._weg2_log_sleep_acceptance(weg2_before_census)
+            self._weg2_log_sleep_acceptance(weg2_before_census, tags)
 
         return ReleaseMemoryOccupationReqOutput()
 

@@ -99,12 +99,22 @@ def _call_index(body: List[ast.stmt], needle: str) -> int:
 
 
 class FakeAdapter:
-    """Stands in for ``TorchMemorySaverAdapter``; records the tag order."""
+    """Stands in for ``TorchMemorySaverAdapter``; records the tag order.
+
+    ``events`` is ONE ordered list shared with the manager's injected
+    ``flush_cache`` (see :func:`_make_manager`).  Two separate lists cannot pin
+    an ORDER between a call recorded in one and a call recorded in the other,
+    which is how own mutant RB-M6 (``flush_cache()`` wrapped in an
+    always-false guard) survived the whole suite: the AST gates read a
+    STATEMENT INDEX and no test recorded that the call ever happened.
+    """
 
     def __init__(self, enabled: bool = True):
         self._enabled = enabled
         self.paused: List[str] = []
         self.resumed: List[str] = []
+        self.regions: List[dict] = []
+        self.events: List[str] = []
 
     @property
     def enabled(self) -> bool:
@@ -112,9 +122,29 @@ class FakeAdapter:
 
     def pause(self, tag: str) -> None:
         self.paused.append(tag)
+        self.events.append(f"pause:{tag}")
 
     def resume(self, tag: str) -> None:
         self.resumed.append(tag)
+        self.events.append(f"resume:{tag}")
+
+    @contextmanager
+    def region(self, tag: str, enable_cpu_backup: bool = False):
+        """Records which TMS tag is ACTIVE while the body allocates."""
+        entry = {"tag": tag, "enable_cpu_backup": enable_cpu_backup, "closed": False}
+        self.regions.append(entry)
+        self.events.append(f"region-enter:{tag}")
+        try:
+            yield tag
+        finally:
+            entry["closed"] = True
+            self.events.append(f"region-exit:{tag}")
+
+    def active_region_tag(self) -> Optional[str]:
+        for entry in reversed(self.regions):
+            if not entry["closed"]:
+                return entry["tag"]
+        return None
 
 
 class FakeDeviceModule:
@@ -155,11 +185,17 @@ class FakeScheduler:
         self.disaggregation_mode = None
 
 
+class FakeModelConfig:
+    def __init__(self, quantization: Optional[str] = None):
+        self.quantization = quantization
+
+
 class FakeTpWorker:
     """Just enough of ``self.tp_worker.model_runner.model`` for the sleep RPC."""
 
     class _Runner:
         model = object()
+        model_config = FakeModelConfig()
 
     model_runner = _Runner()
 
@@ -173,12 +209,19 @@ def _make_manager(
     tp_worker: Any = None,
 ) -> Any:
     scheduler = FakeScheduler(server_args) if server_args is not None else None
+
+    def _flush_cache(*a, **k):
+        # Recorded into the ADAPTER's list, so `flush` and `pause:<tag>` are
+        # entries in ONE ordered sequence and their order is assertable.
+        adapter.events.append("flush")
+        return True
+
     return wu.SchedulerWeightUpdaterManager(
         tp_worker=tp_worker,
         draft_worker=draft_worker,
         tp_cpu_group=None,
         memory_saver_adapter=adapter,
-        flush_cache=lambda *a, **k: True,
+        flush_cache=_flush_cache,
         is_fully_idle=lambda *a, **k: idle,
         scheduler=scheduler,
     )
@@ -267,6 +310,20 @@ def test_kv_block_flushes_before_pause():
     assert flush_at >= 0, "flush_cache() not called in the kv_cache block"
     assert pause_at >= 0, "pause(kv_cache) not called in the kv_cache block"
     assert flush_at < pause_at, "flush_cache still runs AFTER pause(kv_cache)"
+    # `_call_index` matches a Call nested ANYWHERE inside a top-level
+    # statement, so an index comparison alone is satisfied by a flush wrapped
+    # in a guard that is never true (own mutant RB-M6, which the whole suite
+    # survived).  Require the UNCONDITIONAL form: a bare expression statement
+    # of this block, not a call inside an If/Try/comprehension.  The matching
+    # behavioural pin is test_kv_block_flush_actually_runs_before_the_pause.
+    flush_stmt = body[flush_at]
+    assert isinstance(flush_stmt, ast.Expr) and isinstance(
+        flush_stmt.value, ast.Call
+    ), (
+        f"flush_cache() is not an unconditional statement of the kv_cache "
+        f"block; it sits inside a {type(flush_stmt).__name__}, so the pool may "
+        "never be quiesced before the pause unmaps its pages"
+    )
 
 
 def test_kv_block_pause_is_the_last_statement():
@@ -545,15 +602,23 @@ def test_pcie_lock_wait_is_bounded(tmp_path):
 
 
 def _with_items_around(body: List[ast.stmt], needle: str) -> List[str]:
-    """``with`` context expressions whose body contains a call to ``needle``."""
+    """Context expressions of EVERY enclosing ``with`` around a ``needle`` call.
+
+    Nested ``with`` statements are collected too -- the wake refill now sits
+    inside ``region(GPU_MEMORY_TYPE_WEIGHTS)`` AND inside ``_weg2_pcie_lock``,
+    and a helper that reads only the outermost one would report the inner guard
+    as absent.
+    """
     found: List[str] = []
     for stmt in body:
-        if not isinstance(stmt, ast.With):
-            continue
         for sub in ast.walk(stmt):
-            if isinstance(sub, ast.Call) and needle in ast.unparse(sub):
-                found.extend(ast.unparse(item.context_expr) for item in stmt.items)
-                break
+            if not isinstance(sub, ast.With):
+                continue
+            if any(
+                isinstance(call, ast.Call) and needle in ast.unparse(call)
+                for call in ast.walk(sub)
+            ):
+                found.extend(ast.unparse(item.context_expr) for item in sub.items)
     return found
 
 
@@ -794,7 +859,7 @@ def stock_boot_stubs(monkeypatch):
     monkeypatch.setattr(
         wu.SchedulerWeightUpdaterManager,
         "_weg2_log_sleep_acceptance",
-        lambda self, before=None: None,
+        lambda self, before=None, tags=None: None,
     )
     monkeypatch.setattr(wu, "resolve_pcie_lock_key", lambda: "GPU-hermetic")
 
@@ -1276,11 +1341,21 @@ def test_sleep_rpc_grades_the_census_against_a_pre_pause_reading(
         f"expected a pre-pause reading and a post-pause verdict, saw {len(seen)} "
         "census call(s); an ungraded reading is a number, not a verdict"
     )
-    assert seen[0] == {}, "the pre-pause reading must not be graded against itself"
+    assert (
+        seen[0].get("before_bytes") is None
+        and seen[0].get("min_released_fraction") is None
+    ), "the pre-pause reading must not be graded against itself"
     assert seen[1].get("before_bytes") == AWAKE_MIB * MIB_
-    assert seen[1].get("min_released_fraction") == (
-        wms.WEG2_SLEEP_MIN_RELEASED_FRACTION
-    )
+    # LITERAL, not `== wms.WEG2_SLEEP_MIN_RELEASED_FRACTION`: that comparison
+    # is a tautology -- it holds for whatever the constant is detuned to, and
+    # own mutant RB-M1 (0.5 -> 0.005) survived the whole suite because of it.
+    # The shipped value is pinned here and again in
+    # test_shipped_min_released_fraction_is_the_recorded_number.
+    assert seen[1].get("min_released_fraction") == 0.5
+    # Both calls must declare the POPULATION they read, or the printed verdict
+    # cannot be attributed to the request that produced it.
+    assert seen[0].get("tags") == [GPU_MEMORY_TYPE_KV_CACHE]
+    assert seen[1].get("tags") == [GPU_MEMORY_TYPE_KV_CACHE]
 
 
 def test_first_sleep_refuses_a_genuine_sleep_on_a_flagless_boot(fake_device):
@@ -1464,3 +1539,493 @@ def test_the_card_pin_guard_has_exactly_one_definition():
     # users rather than two definitions.
     fr_src = open(_inspect.getsourcefile(fr), "r", encoding="utf-8").read()
     assert fr_src.count("refusing to create a context") == 1
+
+
+# ---------------------------------------------------------------------------
+# 7. ROUND-3 FINDINGS
+# ---------------------------------------------------------------------------
+
+# --- finding 4: the MUST_FIX release order had no BEHAVIOURAL pin -----------
+
+
+def test_kv_block_flush_actually_runs_before_the_pause(fake_device):
+    """The campaign (a) MUST_FIX, pinned by what RUNS, not by a statement index.
+
+    Own mutant RB-M6 wrapped ``self.flush_cache()`` in ``if not
+    self.offload_tags:`` -- always false, because ``offload_tags.add(tag)`` runs
+    for every tag before this block is entered -- and the whole 59-test suite
+    stayed green: both existing gates read an AST index, ``_call_index``
+    matches a Call nested anywhere inside a statement, and the injected
+    ``flush_cache`` was never recorded.  On metal that mutant leaves the radix
+    tree / HybridReqToTokenPool / MambaPool unreset while the pause unmaps
+    their pages, and (S) 2.4 says the same call is what clears the L2 ring at
+    every sleep -- the premise (S) 4.2.2 rests on.
+    """
+    adapter = FakeAdapter(enabled=True)
+    manager = _make_manager(adapter=adapter)
+    manager.release_memory_occupation(
+        wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+    )
+    assert adapter.events == ["flush", f"pause:{GPU_MEMORY_TYPE_KV_CACHE}"], (
+        "expected exactly one flush_cache() and then pause(kv_cache); saw "
+        f"{adapter.events}. A flush that does not run leaves the mamba pool "
+        "live while the pause unmaps its pages (CAMPAIGN (a), boot-fatal)."
+    )
+
+
+# --- finding 5: the criterion constant shipped untested ---------------------
+
+
+def test_shipped_min_released_fraction_is_the_recorded_number():
+    """A constant nothing compares to a LITERAL can be detuned freely.
+
+    Own mutant RB-M1 (0.5 -> 0.005) survived the whole suite: every census test
+    passed its own local ``0.5`` and the only reference to the constant was
+    ``seen[1][...] == wms.WEG2_SLEEP_MIN_RELEASED_FRACTION``, which holds for
+    any value.  Provenance of the number is in the module docstring: campaign
+    (a) measured 95.7 % released / 4.3 % retained (30,154 -> 1,294 MiB, n=9,
+    two cold boots); a no-op releases 0 %.
+    """
+    from sglang.srt.managers import weg2_memory_saver as wms
+
+    assert wms.WEG2_SLEEP_MIN_RELEASED_FRACTION == 0.5
+
+
+def test_shipped_criterion_refuses_a_one_percent_release():
+    """The SHIPPED constant, not a local literal, must refuse a no-op sleep."""
+    from sglang.srt.managers import weg2_memory_saver as wms
+
+    census = _census(
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=wms.WEG2_SLEEP_MIN_RELEASED_FRACTION,
+        _process_bytes={4242: int(AWAKE_MIB * MIB_ * 0.99)},
+    )
+    assert census.accepted is False, (
+        "a sleep that released 1 % of the shard is a no-op sleep; the shipped "
+        f"criterion {wms.WEG2_SLEEP_MIN_RELEASED_FRACTION} accepted it"
+    )
+    assert "below the required" in (census.refusal_reason or "")
+
+
+def test_shipped_criterion_still_accepts_the_measured_sleep():
+    """And it is not a wall: campaign (a)'s own genuine sleep must pass."""
+    from sglang.srt.managers import weg2_memory_saver as wms
+
+    census = _census(
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=wms.WEG2_SLEEP_MIN_RELEASED_FRACTION,
+        _process_bytes={4242: ASLEEP_MIB * MIB_},
+    )
+    assert census.accepted is True, (
+        "the measured 95.7 % release must pass, or the criterion is a gate "
+        f"that refuses the working case: {census.refusal_reason}"
+    )
+
+
+# --- finding 2: the census graded a population it never named ---------------
+
+
+def test_census_prints_its_tag_population():
+    census = _census(
+        tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS],
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=0.5,
+        _process_bytes={4242: ASLEEP_MIB * MIB_},
+    )
+    line = census.format_line()
+    assert "tags=['kv_cache', 'weights']" in line, line
+    assert "declared tags" in census.denominator
+    assert census.accepted is True
+
+
+def test_census_line_says_when_no_tag_set_was_declared():
+    census = _census(
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=0.5,
+        _process_bytes={4242: ASLEEP_MIB * MIB_},
+    )
+    assert "tags=n/a (whole-process residency)" in census.format_line()
+
+
+def test_weights_only_release_is_not_graded_against_the_whole_process_floor():
+    """The #89 park's request shape, and the false FAIL it used to produce.
+
+    ``/hibernate`` posts ``destination="disk", tags=["weights"]``
+    (http_server.py:2034-2035).  On a Weg-2 boot the census runs for it too,
+    and the delta floor is 50 % of everything this process holds -- an awake
+    residency that also carries KV, graphs, activations and the CUDA context.
+    A weights-only release need not clear it (per-rank weight images 13,724.7 /
+    7,422.5 / 8,382.4 MiB, spec section 2.6), so a correct park printed
+    ``accepted=False``.
+    """
+    census = _census(
+        tags=[GPU_MEMORY_TYPE_WEIGHTS],
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=0.5,
+        # A genuine weights-only park: the shard is gone, the rest stays.
+        _process_bytes={4242: int(AWAKE_MIB * MIB_ * 0.55)},
+    )
+    assert census.delta_form_in_force is False
+    assert "below the required" not in (census.refusal_reason or ""), (
+        "a weights-only release was graded against a fraction of the WHOLE "
+        f"process residency: {census.refusal_reason}"
+    )
+    assert "partial tag set" in (census.refusal_reason or "")
+    line = census.format_line()
+    assert "min_released_fraction=n/a (partial tag set: ['weights']" in line, line
+
+
+def test_kv_only_release_never_passes_with_the_weights_shard_still_resident():
+    """The mirror error: a false PASS on the request the suite itself drives.
+
+    A ``tags=["kv_cache"]`` release on a rank whose KV exceeds half its
+    residency clears the whole-process floor with the entire weights image
+    still on the card.  That is not a hypothetical shape -- it is exactly what
+    ``test_release_rpc_wires_the_census_between_two_readings`` posts.
+    """
+    weights_image_bytes = 13_725 * MIB_
+    census = _census(
+        tags=[GPU_MEMORY_TYPE_KV_CACHE],
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=0.5,
+        # 47 % of the awake residency left: 53 % released, so the 50 % floor
+        # is CLEARED -- and what stays is still more than the whole weights
+        # image, which a kv-only release does not touch at all.
+        _process_bytes={4242: int(AWAKE_MIB * MIB_ * 0.47)},
+    )
+    assert census.proc_used_bytes > weights_image_bytes
+    assert census.accepted is False, (
+        "the census accepted a kv-only release while this process still holds "
+        f"{census.proc_used_mib:.1f} MiB, more than the whole weights image"
+    )
+    assert "partial tag set" in (census.refusal_reason or "")
+
+
+def test_partial_tag_set_still_grades_against_a_supplied_ceiling():
+    """Suppressing the delta form must not disarm the S3 ceiling form."""
+    census = _census(
+        tags=[GPU_MEMORY_TYPE_WEIGHTS],
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=0.5,
+        expected_max_resident_bytes=2_000 * MIB_,
+        _process_bytes={4242: 1_500 * MIB_},
+    )
+    assert census.delta_form_in_force is False
+    assert census.accepted is True, census.refusal_reason
+    assert "ceiling form" in census.denominator
+
+
+# --- finding 1: the backup-OFF wake refilled OUTSIDE the weights region -----
+
+
+def test_wake_reload_is_lexically_inside_the_weights_region():
+    """AST gate, same shape as test_sleep_d2h_is_serialised_on_the_card."""
+    reload_body = _func_ast("_weg2_wake_reload_weights").body
+    guards = _with_items_around(reload_body, "update_weights_from_disk")
+    assert any("region" in g and "GPU_MEMORY_TYPE_WEIGHTS" in g for g in guards), (
+        "the backup-OFF refill runs OUTSIDE region(GPU_MEMORY_TYPE_WEIGHTS); "
+        "the repacked parameters it allocates are then untagged and the next "
+        f"pause(weights) releases a region the model no longer points at. "
+        f"guards seen: {guards}"
+    )
+
+
+def test_wake_reload_allocates_under_the_weights_tag(monkeypatch, noop_pcie_lock):
+    """BEHAVIOURAL: which TMS tag is ACTIVE while the loader allocates.
+
+    ``load_weights_and_postprocess`` ends in
+    ``quant_method.process_weights_after_loading(module)``, which for every
+    repacking scheme REPLACES the parameter with a fresh device allocation
+    (loader.py:921-931).  An allocation made with no region active is not under
+    the weights tag, so after the first such wake ``pause(weights)`` releases a
+    region the live weights are no longer in -- the silent-no-op class one level
+    down, invisible until the SECOND sleep.
+    """
+    adapter = FakeAdapter(enabled=True)
+    manager = _make_manager(
+        adapter=adapter,
+        server_args=FakeServerArgs(enable_weights_cpu_backup=False),
+    )
+    seen: List[Optional[str]] = []
+
+    def _stub(self, req):
+        seen.append(adapter.active_region_tag())
+        return _ok()
+
+    monkeypatch.setattr(
+        wu.SchedulerWeightUpdaterManager, "update_weights_from_disk", _stub
+    )
+    manager._weg2_wake_reload_weights()
+
+    assert seen == [GPU_MEMORY_TYPE_WEIGHTS], (
+        f"the refill ran under region tag {seen!r}; the boot load runs under "
+        "GPU_MEMORY_TYPE_WEIGHTS (model_runner.py:2345-2348) and the wake must "
+        "put the repacked parameters in the same place"
+    )
+    assert adapter.regions[0]["enable_cpu_backup"] is False, (
+        "model_runner.py:2342-2344's expression is False for both shards on "
+        "this path (main_carried False, draft_carried == main_carried)"
+    )
+    assert adapter.regions[0]["closed"] is True, "the region was left open"
+
+
+def test_wake_reload_raise_becomes_a_named_refusal(monkeypatch, noop_pcie_lock):
+    """model_runner re-runs the failing load as its rollback OUTSIDE any try.
+
+    ``model_runner.py:2857-2865`` catches the first ``model_load_weights``
+    failure and then calls it again, unguarded, so a raw exception escapes
+    instead of the ``(False, message)`` tuple.  A wake leg that ends in an
+    unnamed RuntimeError is the same undefined state as one that returns
+    ``success=False`` and must carry the same name.
+    """
+    from sglang.srt.managers.weg2_memory_saver import Weg2WakeRefused
+
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(enable_weights_cpu_backup=False),
+    )
+
+    def _boom(self, req):
+        raise RuntimeError("Attempted to load weight into parameter")
+
+    monkeypatch.setattr(
+        wu.SchedulerWeightUpdaterManager, "update_weights_from_disk", _boom
+    )
+    with pytest.raises(Weg2WakeRefused) as excinfo:
+        manager._weg2_wake_reload_weights()
+    assert "RuntimeError" in str(excinfo.value)
+
+
+def test_quantized_post_load_replaces_the_weight_parameter():
+    """DESK PROOF of the hazard the W4 refusal below is built on.
+
+    The reference line's own scheme.  ``process_weights_after_loading`` does
+    ``layer.weight = Parameter(weight.t(), requires_grad=False)``
+    (compressed_tensors_w8a8_int8.py:159), which drops the ``weight_loader``
+    attribute and transposes the shape.  A LATER ``model.load_weights(iter)``
+    therefore resolves the DEFAULT loader, whose
+    ``assert param.size() == loaded_weight.size()`` (weight_utils.py:1709)
+    cannot hold against a transposed parameter -- so the backup-OFF wake's
+    refill raises on the FIRST wake, not the second.
+    """
+    torch = pytest.importorskip("torch")
+    quantization = pytest.importorskip("compressed_tensors.quantization")
+    from sglang.srt.layers.parameter import ModelWeightParameter
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (  # noqa: E501
+        CompressedTensorsW8A8Int8,
+    )
+
+    class _Layer(torch.nn.Module):
+        pass
+
+    layer = _Layer()
+    layer.logical_widths = [4]
+    layer.register_parameter(
+        "weight",
+        ModelWeightParameter(
+            data=torch.zeros(4, 8, dtype=torch.int8),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=lambda *a, **k: None,
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale", torch.nn.Parameter(torch.zeros(4, 1), requires_grad=False)
+    )
+
+    scheme = CompressedTensorsW8A8Int8.__new__(CompressedTensorsW8A8Int8)
+    scheme.strategy = quantization.QuantizationStrategy.CHANNEL
+    scheme.is_static_input_scheme = False
+    scheme.input_symmetric = True
+
+    assert hasattr(layer.weight, "weight_loader")
+    before_shape = tuple(layer.weight.shape)
+    scheme.process_weights_after_loading(layer)
+
+    assert not hasattr(layer.weight, "weight_loader"), (
+        "the repack kept the weight_loader, so a second load_weights would be "
+        "defined and the W4 refusal below is over-broad"
+    )
+    assert tuple(layer.weight.shape) == before_shape[::-1], (
+        f"expected a transpose, got {tuple(layer.weight.shape)} from " f"{before_shape}"
+    )
+
+
+def test_wake_refuses_the_backup_off_arm_on_a_quantized_checkpoint(
+    monkeypatch, noop_pcie_lock
+):
+    from sglang.srt.managers.weg2_memory_saver import Weg2WakeRefused
+
+    class _Worker:
+        class _Runner:
+            model = object()
+            model_config = FakeModelConfig(quantization="compressed-tensors")
+
+        model_runner = _Runner()
+
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(enable_weights_cpu_backup=False),
+        tp_worker=_Worker(),
+    )
+    calls = _record_disk_reload(monkeypatch)
+    with pytest.raises(Weg2WakeRefused) as excinfo:
+        manager._weg2_wake_reload_weights()
+    assert calls == [], "the refusal must fire BEFORE anything is refilled"
+    assert "compressed-tensors" in str(excinfo.value)
+    assert "--enable-weights-cpu-backup" in str(excinfo.value)
+
+
+def test_wake_still_reloads_an_unquantized_checkpoint(monkeypatch, noop_pcie_lock):
+    """Can-it-pass: the refusal is not a wall on the arm that IS defined."""
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(enable_weights_cpu_backup=False),
+        tp_worker=FakeTpWorker(),
+    )
+    calls = _record_disk_reload(monkeypatch)
+    manager._weg2_wake_reload_weights()
+    assert len(calls) == 1
+
+
+def test_backup_off_refusal_reads_the_config_when_the_flag_is_unset():
+    """An auto-detected quant config without --quantization is covered too."""
+    from sglang.srt.managers.weg2_memory_saver import (
+        Weg2WakeRefused,
+        assert_backup_off_wake_refill_is_defined,
+        checkpoint_quantization,
+    )
+
+    class _ServerArgs:
+        quantization = None
+
+    assert (
+        checkpoint_quantization(FakeModelConfig("awq_marlin"), _ServerArgs())
+        == "awq_marlin"
+    )
+    assert checkpoint_quantization(FakeModelConfig(None), _ServerArgs()) is None
+    assert (
+        assert_backup_off_wake_refill_is_defined(quantization=None, context="t") is None
+    )
+    with pytest.raises(Weg2WakeRefused):
+        assert_backup_off_wake_refill_is_defined(quantization="fp8", context="t")
+
+
+def test_launch_arm_refuses_the_backup_off_quantized_combination():
+    """The refusal is at LAUNCH too, where nothing is committed yet.
+
+    Source gate: ``scheduler.py``'s memory-saver block must call the SAME
+    function, gated on ``enable_weights_cpu_backup`` being off.
+    """
+    from sglang.srt.managers import scheduler as sched
+
+    source = inspect.getsource(
+        sched.Scheduler.init_watch_dog_memory_saver_input_blocker
+    )
+    assert "assert_backup_off_wake_refill_is_defined" in source, (
+        "the launch arm does not refuse the undefined backup-OFF/quantized "
+        "combination; the first wake would then commit the VMM pages and fail "
+        "inside the loader"
+    )
+    assert "enable_weights_cpu_backup" in source
+    assert "checkpoint_quantization" in source
+
+
+# --- finding 3: two flocks on one physical link -----------------------------
+
+
+def test_hibernate_park_takes_the_one_pcie_lock():
+    """(S) 2.7 'adopt the lock, not the module' -- one lock per physical link.
+
+    #89's park used to open its own ``<hibernate_dir>/.park_lock_<uuid>``.  An
+    flock on that file and one on ``/dev/shm/.weg2-pcie-serialize-<uuid>`` are
+    independent, so a park's D2H and a co-located sibling's wake-H2D overlapped
+    freely -- the exact halving the S1 lock exists to prevent.
+    """
+    from sglang.srt.model_loader import hibernate
+
+    source = inspect.getsource(hibernate.park_weights_to_disk)
+    assert "pcie_transfer_lock" in source, "the park does not take the S1 lock"
+    # AST, not a substring: own mutant F3-M2 replaced the CALL
+    # (`lock_uuid = resolve_pcie_lock_key()`) with `lock_uuid = nvml_uuid` and
+    # the substring gate stayed green on the import line and this comment.
+    called = {
+        node.func.id
+        for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "resolve_pcie_lock_key" in called, (
+        "the park keys the lock with a second resolver; two co-located ranks "
+        "that disagree about the card's name hold two files and exclude "
+        f"nothing. calls seen: {sorted(called)}"
+    )
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "park_lock" not in code, "the second lock file is still opened"
+    assert "fcntl" not in code, "the park still takes an flock of its own"
+
+
+def test_no_second_flock_keys_the_same_physical_gpu():
+    """Tree-wide sibling gate: exactly ONE flock is keyed on a GPU uuid.
+
+    Grep-shaped on purpose -- the defect is not in any one file but in the
+    EXISTENCE of a second call site keying the same physical link.  The other
+    ``fcntl.flock`` users in the tree key on a ledger path, an IPC handle, a
+    store shard or a snapshot, never on a card.
+    """
+    import subprocess
+
+    root = os.path.dirname(inspect.getsourcefile(wu))
+    srt = os.path.abspath(os.path.join(root, "..", ".."))
+    out = subprocess.run(
+        ["grep", "-rln", "fcntl.flock", srt],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.split()
+    gpu_keyed = []
+    for path in out:
+        text = open(path, "r", encoding="utf-8").read()
+        if "nvml_uuid" in text or "current_device_uuid" in text:
+            gpu_keyed.append(os.path.relpath(path, srt))
+    assert gpu_keyed == ["managers/weg2_memory_saver.py"], (
+        "more than one flock call site keys a physical GPU; two files on one "
+        f"link exclude nothing: {gpu_keyed}"
+    )
+
+
+def test_pcie_lock_is_not_reentrant_so_the_park_is_locked_exactly_once(tmp_path):
+    """Why the park leg is NOT ALSO wrapped at the weight_updater call site.
+
+    ``flock`` is held per OPEN FILE DESCRIPTION, so the same process taking the
+    same lock through two ``open()`` calls does not recurse -- it contends with
+    itself.  Wrapping ``_hibernate_park_weights`` in ``_weg2_pcie_lock`` on top
+    of the park's own take (the round-3 finding's second edit) would therefore
+    burn the whole deadline and end in ``Weg2PcieLockTimeout`` on every park.
+    One take, inside ``park_weights_to_disk``, is the covered form.
+    """
+    from sglang.srt.managers.weg2_memory_saver import (
+        Weg2PcieLockTimeout,
+        pcie_transfer_lock,
+    )
+
+    with pcie_transfer_lock(
+        nvml_uuid="GPU-reentrancy", lock_dir=str(tmp_path), timeout_s=0.2
+    ):
+        with pytest.raises(Weg2PcieLockTimeout):
+            with pcie_transfer_lock(
+                nvml_uuid="GPU-reentrancy", lock_dir=str(tmp_path), timeout_s=0.2
+            ):
+                pass
+
+
+def test_release_rpc_leaves_the_hibernate_park_to_the_park_s_own_lock():
+    """The park call must NOT be double-wrapped (see the reentrancy test)."""
+    body = _tag_block(_func_ast("release_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
+    guards = _with_items_around(body, "_hibernate_park_weights")
+    assert not any("_weg2_pcie_lock" in g for g in guards), (
+        "the #89 park is wrapped in the PCIe lock AND takes it inside "
+        "park_weights_to_disk; flock does not recurse, so every park would "
+        "burn the deadline and refuse"
+    )
