@@ -58,6 +58,23 @@ PCIE_LOCK_PREFIX = "weg2-pcie-serialize"
 #: plus slack; the caller may shorten it.
 DEFAULT_PCIE_LOCK_TIMEOUT_S = 120.0
 
+#: The S1 sleep-acceptance criterion in its DELTA form: how much of what this
+#: process held before the pause must be gone after it.
+#:
+#: PROVENANCE, and it is a chosen number, not a measured one.  Campaign (a)
+#: measured, on this rig, a genuine sleep going 30,154 -> 1,294 MiB per-process
+#: (CAMPAIGN_a_0906.md §2 arm 1, n=9 steady cycles over two cold boots): the
+#: sleep RELEASED 95.7 % and RETAINED 4.3 %.  A no-op sleep -- the exact
+#: condition W12 and this census exist to catch -- releases 0 %.  Half is the
+#: midpoint between those two, i.e. ~11x the measured retained margin, so the
+#: criterion cannot be tripped by allocator noise and cannot be passed by a
+#: no-op.  It is deliberately NOT a ceiling on residency: the dormant floor
+#: D_c is UNMEASURED until S3 (register U2), and inventing a MiB ceiling here
+#: would be a number the tree cannot defend.  When S3 measures D_c its launcher
+#: passes ``expected_max_resident_bytes`` and the ceiling form takes over --
+#: both forms may be supplied, and then both must hold.
+WEG2_SLEEP_MIN_RELEASED_FRACTION = 0.5
+
 
 class Weg2MemorySaverInactive(RuntimeError):
     """W12: the memory-saver adapter is a no-op, so every sleep is a lie."""
@@ -118,8 +135,28 @@ def pcie_lock_path(nvml_uuid: str, *, lock_dir: Optional[str] = None) -> str:
 
 
 def _resolve_uuid(nvml_uuid: Optional[str]) -> str:
+    """The card key, or a refusal -- never a CUDA context bought to answer.
+
+    ``current_device_uuid()`` falls back to torch when the pin is not readable
+    from the environment, and that fallback INITIALISES CUDA.  The canonical
+    holder of that guard is the flight recorder
+    (``srt/mem_ledger/flight_recorder.card_pin_unresolvable_without_cuda``);
+    this call is a USE of it, not a copy.  On the sleep path the context always
+    exists, so the guard never fires there -- it exists because
+    :func:`sleep_acceptance_census` is public and the S3 launcher calls it
+    PRE-LAUNCH per rank, which is exactly the moment where a context created by
+    the instrument would corrupt the very number the instrument reports.
+    """
     if nvml_uuid is not None:
         return nvml_uuid
+    from sglang.srt.mem_ledger.flight_recorder import (
+        card_pin_unresolvable_without_cuda,
+    )
+
+    unresolved = card_pin_unresolvable_without_cuda()
+    if unresolved is not None:
+        raise RuntimeError(unresolved)
+
     from sglang.srt.registry import nvml as nvml_registry
 
     return nvml_registry.current_device_uuid()
@@ -222,6 +259,14 @@ class SleepAcceptanceCensus:
     proc_used_bytes: Optional[int]
     nvml_free_bytes: Optional[int]
     nvml_total_bytes: Optional[int]
+    #: The caller's pre-pause reading of the SAME instrument, and the two
+    #: criteria it may grade against.  ``None`` everywhere means the caller
+    #: supplied no criterion, and then ``accepted`` is False by construction:
+    #: a reading without a criterion is a number, not a verdict.
+    before_bytes: Optional[int]
+    released_bytes: Optional[int]
+    min_released_fraction: Optional[float]
+    expected_max_resident_bytes: Optional[int]
     #: Sums over ``kv_vmm_backing.arena_census()`` rows for this process.
     arena_reserved_bytes: int
     arena_backed_bytes: int
@@ -266,9 +311,27 @@ class SleepAcceptanceCensus:
                 f"arena_retained={self.arena_retained_bytes / MIB:.1f} MiB "
                 f"retain_handles={self.retain_handles_asserted}"
             )
+        before = (
+            "n/a" if self.before_bytes is None else f"{self.before_bytes / MIB:.1f}"
+        )
+        released = (
+            "n/a" if self.released_bytes is None else f"{self.released_bytes / MIB:.1f}"
+        )
+        ceiling = (
+            "n/a"
+            if self.expected_max_resident_bytes is None
+            else f"{self.expected_max_resident_bytes / MIB:.1f}"
+        )
+        floor = (
+            "n/a"
+            if self.min_released_fraction is None
+            else f"{self.min_released_fraction:.2f}"
+        )
         return (
             f"[weg2 sleep-acceptance] uuid={self.nvml_uuid} pid={self.pid} "
             f"proc_used={used} MiB nvml_free={free} MiB "
+            f"proc_used_before={before} MiB released={released} MiB "
+            f"min_released_fraction={floor} ceiling={ceiling} MiB "
             f"rows={self.arena_rows} {arena} accepted={self.accepted} "
             f"reason={self.refusal_reason or '-'} denominator={self.denominator}"
         )
@@ -280,16 +343,44 @@ _ProcessBytes = Union[Dict[int, int], Callable[[str], Dict[int, int]], None]
 def sleep_acceptance_census(
     *,
     nvml_uuid: Optional[str] = None,
+    before_bytes: Optional[int] = None,
+    min_released_fraction: Optional[float] = None,
+    expected_max_resident_bytes: Optional[int] = None,
     _process_bytes: _ProcessBytes = None,
     _memory_info: Optional[Tuple[int, int]] = None,
     _arena_census: Optional[Dict[int, Dict[str, int]]] = None,
     _pid: Optional[int] = None,
 ) -> SleepAcceptanceCensus:
-    """Read what this rank still holds on its card after ``pause()``.
+    """Read what this rank still holds on its card after ``pause()``, and GRADE it.
 
     Read-only and never raises: an instrument that can fail a boot is not an
     instrument (same contract as ``arena_census()``).  Every failure to read
     lands in ``refusal_reason`` and forces ``accepted=False``.
+
+    The NVML half carries the verdict, and therefore it needs a criterion.  Two
+    are accepted and both, if supplied, must hold:
+
+    * the DELTA form -- ``before_bytes`` (the caller's pre-pause reading of this
+      same instrument) plus ``min_released_fraction``.  This is the S1 form:
+      the dormant floor D_c is unmeasured until S3, so there is no honest
+      ceiling yet, but "the sleep released nothing" is decidable without one.
+    * the CEILING form -- ``expected_max_resident_bytes``, the declared dormant
+      ceiling.  S3's launcher supplies it once D_c is measured.
+
+    Supplying NEITHER is itself refused: with no criterion the function would
+    report ``accepted=True`` for a rank still holding its entire shard, i.e.
+    for the exact silent-no-op condition it exists to catch, and a boot
+    postmortem would quote that pass.  A gate that cannot fail is not a gate.
+
+    The payload it reads -- NVML per-process bytes, card free/total, and the KV
+    arena's own counters -- has a canonical holder in this tree:
+    ``srt/mem_ledger/flight_recorder`` (``_nvml_view`` / ``_kv_arena_view``).
+    This function is a VERDICT WRAPPER over that same payload, not a second
+    collector: it shares the recorder's card-pin guard (see
+    :func:`_resolve_uuid`) and adds only ``accepted`` / ``refusal_reason`` /
+    ``denominator``.  A boot postmortem grades residency off the recorder's
+    field names; the ``[weg2 sleep-acceptance]`` line is the flip path's
+    verdict, not a second set of numbers to reconcile.
 
     The leading-underscore parameters are injection seams for the hermetic
     tests; production calls pass none of them.
@@ -371,7 +462,62 @@ def sleep_acceptance_census(
     if backed:
         reasons.append(f"arena still backs {backed / MIB:.1f} MiB of device memory")
 
+    # --- the NVML half's criterion.  Without one this whole function is a
+    # printer: it reported accepted=True at 30,154 MiB and accepted=True at
+    # 1,294 MiB -- the two ends of campaign (a)'s own 28.9 GiB swing -- and the
+    # number in its test was decorative.
+    delta_form = before_bytes is not None and min_released_fraction is not None
+    ceiling_form = expected_max_resident_bytes is not None
+    released_bytes: Optional[int] = None
+    if not delta_form and not ceiling_form:
+        reasons.append(
+            "no residency criterion supplied (neither before_bytes + "
+            "min_released_fraction nor expected_max_resident_bytes) -- this "
+            "reading is a number, not a verdict"
+        )
+    elif proc_used is not None:
+        if delta_form:
+            released_bytes = int(before_bytes) - proc_used
+            floor = int(float(min_released_fraction) * int(before_bytes))
+            if released_bytes < floor:
+                reasons.append(
+                    f"the sleep released {released_bytes / MIB:.1f} MiB of the "
+                    f"{int(before_bytes) / MIB:.1f} MiB this process held "
+                    f"before the pause, below the required "
+                    f"{float(min_released_fraction):.0%} "
+                    f"({floor / MIB:.1f} MiB) -- a sleep that frees nothing "
+                    f"returns success and holds the whole shard"
+                )
+        if ceiling_form and proc_used > int(expected_max_resident_bytes):
+            reasons.append(
+                f"this process still holds {proc_used / MIB:.1f} MiB, above "
+                f"the declared dormant ceiling "
+                f"{int(expected_max_resident_bytes) / MIB:.1f} MiB"
+            )
+
     accepted = proc_used is not None and not reasons
+    criterion_denominator = (
+        "no criterion"
+        if not delta_form and not ceiling_form
+        else ", ".join(
+            part
+            for part in (
+                (
+                    f"delta form (>= {float(min_released_fraction):.0%} of "
+                    f"{int(before_bytes) / MIB:.1f} MiB released)"
+                    if delta_form
+                    else ""
+                ),
+                (
+                    f"ceiling form (<= "
+                    f"{int(expected_max_resident_bytes) / MIB:.1f} MiB)"
+                    if ceiling_form
+                    else ""
+                ),
+            )
+            if part
+        )
+    )
     arena_denominator = (
         "no live KvVmmArena, so the arena half is n/a and acceptance rests on "
         "the NVML half alone"
@@ -381,7 +527,7 @@ def sleep_acceptance_census(
     denominator = (
         f"NVML per-process bytes for pid={pid} on uuid={uuid} over "
         f"{proc_count} compute process(es); arena_rows={arena_rows} "
-        f"({arena_denominator})"
+        f"({arena_denominator}); criterion: {criterion_denominator}"
     )
     return SleepAcceptanceCensus(
         pid=pid,
@@ -389,6 +535,16 @@ def sleep_acceptance_census(
         proc_used_bytes=proc_used,
         nvml_free_bytes=free_bytes,
         nvml_total_bytes=total_bytes,
+        before_bytes=None if before_bytes is None else int(before_bytes),
+        released_bytes=released_bytes,
+        min_released_fraction=(
+            None if min_released_fraction is None else float(min_released_fraction)
+        ),
+        expected_max_resident_bytes=(
+            None
+            if expected_max_resident_bytes is None
+            else int(expected_max_resident_bytes)
+        ),
         arena_reserved_bytes=reserved,
         arena_backed_bytes=backed,
         arena_retained_bytes=retained,

@@ -40,6 +40,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.weg2_memory_saver import (
+    WEG2_SLEEP_MIN_RELEASED_FRACTION,
     Weg2WakeRefused,
     assert_memory_saver_active,
     pcie_transfer_lock,
@@ -235,9 +236,26 @@ class SchedulerWeightUpdaterManager:
         with pcie_transfer_lock(nvml_uuid=uuid_key, label=label):
             yield
 
-    def _weg2_log_sleep_acceptance(self) -> None:
-        """Design (S) 2.4 step 11, EXECUTED on the flip path, not declared."""
-        census = sleep_acceptance_census()
+    def _weg2_log_sleep_acceptance(self, before: Optional[Any] = None) -> None:
+        """Design (S) 2.4 step 11, EXECUTED on the flip path, not declared.
+
+        ``before`` is the PRE-PAUSE census this same RPC took, and it is what
+        turns the reading into a verdict: without a criterion the census
+        reported ``accepted=True`` for a rank still holding its entire 30 GiB
+        shard, which is the silent-no-op condition the instrument exists to
+        catch.  Graded on the SAME instrument at both ends, so the delta is a
+        difference of two readings and not of two definitions.
+
+        A ``before`` whose own NVML read failed carries ``proc_used_bytes``
+        None; the census then finds no usable criterion and refuses, which is
+        the honest outcome -- a blind pre-reading cannot grade an after-reading.
+        """
+        census = sleep_acceptance_census(
+            before_bytes=None if before is None else before.proc_used_bytes,
+            min_released_fraction=(
+                None if before is None else WEG2_SLEEP_MIN_RELEASED_FRACTION
+            ),
+        )
         if census.accepted:
             logger.info("%s", census.format_line())
         else:
@@ -362,26 +380,43 @@ class SchedulerWeightUpdaterManager:
         # success having released nothing.  A refusal that has already paused
         # a tag is not a refusal, so this is the first statement.
         #
-        # GATED on --enable-memory-saver, exactly like the launch arm in
-        # Scheduler.__init__.  This RPC is SHARED with the fork's #89
-        # hibernate: /hibernate sets destination="disk", tags=["weights"] and
-        # posts it (http_server.py:2034-2036), and hibernate is not gated on
-        # the memory saver (server_args.py:18214-18222 requires only
-        # --hibernate-dir).  Ungated, a stock boot's POST /hibernate raised
-        # here before _hibernate_park_weights ever ran; the dispatcher does not
-        # catch it (scheduler.py:2963), so it reached
-        # parent_process.send_signal(SIGQUIT) and killed the server -- and the
-        # registry's Class-1 adapter swallows the HTTP error
-        # (registry/adapters/class1_srt.py:401-408), so the feature died
-        # silently on every engine stop.  (S) 2.1's stated hazard -- "a
-        # launcher edit that drops the flag makes every sleep a no-op" -- stays
-        # covered: a Weg-2 group always carries the flag, and the launch arm
-        # already refuses the flag-on/adapter-dead boot before the first
-        # request.  Undecidable (no server_args reachable) -> refuse: a Weg-2
-        # group always has one, and a sleep whose gate cannot be read is not a
-        # sleep.
+        # GATED ON THE REQUEST SHAPE, not on --enable-memory-saver.  This RPC
+        # is SHARED with the fork's #89 hibernate: /hibernate sets
+        # destination="disk", tags=["weights"] and posts it
+        # (http_server.py:2034-2036), and hibernate is not gated on the memory
+        # saver (server_args.py:18214-18222 requires only --hibernate-dir).
+        # Refusing there deleted the feature on every stock engine stop: the
+        # raise fired before _hibernate_park_weights ever ran, the dispatcher
+        # does not catch it (scheduler.py:2963), so it reached
+        # parent_process.send_signal(SIGQUIT), and the registry's Class-1
+        # adapter swallows the resulting HTTP error
+        # (registry/adapters/class1_srt.py:401-408) -- a silent death.
+        #
+        # Gating on the FLAG instead was the over-correction: it made the one
+        # hazard (S) 2.1 names -- "a launcher edit that drops the flag makes
+        # every sleep a no-op that returns success" -- unreachable, i.e. spec
+        # (S) 10 S1 mutant M1 unsatisfiable, because the launch arm is gated on
+        # the same flag and therefore also silent.  The request object already
+        # carries the discriminator the two cases actually differ by
+        # (io_struct.py:1964 `destination: Optional[str] = None`), and the
+        # weights block below already branches on it.
+        #
+        # So: destination="disk" is the #89 park and is exempt; every OTHER
+        # release is a genuine sleep, and a genuine sleep on a no-op adapter
+        # frees nothing while returning success.  Upstream only warns about
+        # that (check_validity, never called from this path); the fork's own
+        # launcher comment states the same fact and calls the opt-out valid
+        # "only for an engine that will never leave HOT"
+        # (registry/adapters/class1_srt.py:318-324).  Refusing makes an
+        # already-broken call loud instead of silent; it is a DELIBERATE
+        # narrowing of stock behaviour on this endpoint, recorded as such.
+        # Undecidable (no server_args reachable) -> refuse: a Weg-2 group
+        # always has one, and a sleep whose gate cannot be read is not a sleep.
         server_args = self._weg2_server_args()
-        if server_args is None or getattr(server_args, "enable_memory_saver", False):
+        weg2_memory_saver_on = server_args is None or bool(
+            getattr(server_args, "enable_memory_saver", False)
+        )
+        if weg2_memory_saver_on or getattr(recv_req, "destination", None) != "disk":
             assert_memory_saver_active(self.memory_saver_adapter, context="first sleep")
 
         assert (
@@ -395,6 +430,13 @@ class SchedulerWeightUpdaterManager:
 
         for tag in tags:
             self.offload_tags.add(tag)
+
+        # The PRE-PAUSE reading, on the same instrument the acceptance census
+        # reads after.  Without it the census has no criterion and grades
+        # nothing (see _weg2_log_sleep_acceptance).  Taken here, after the idle
+        # assert and before any pause, so the difference is exactly what this
+        # RPC released.  Weg-2 path only: a stock release must stay upstream.
+        weg2_before_census = sleep_acceptance_census() if weg2_memory_saver_on else None
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             scheduler = self.scheduler
@@ -443,6 +485,15 @@ class SchedulerWeightUpdaterManager:
             # copies the whole shard to host (~2.1 s / 27 GiB measured), and a
             # co-located rank's wake-H2D on the same card would halve both.
             # Never held across a collective.
+            #
+            # SAME PROHIBITION AS THE kv_cache BLOCK ABOVE, and for the same
+            # measured reason: nothing that touches the device may be appended
+            # after this pause.  The model's parameters and buffers are
+            # allocated inside region(GPU_MEMORY_TYPE_WEIGHTS)
+            # (model_runner.py:2344-2348), so a later read of them -- a second
+            # _export_static_state, a checksum, a .clone() -- is a read of
+            # unmapped pages, which is the campaign (a) fault on the sibling
+            # tag.  Pinned by test_weights_block_pause_is_the_last_statement.
             with self._weg2_pcie_lock("sleep-D2H weights"):
                 self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
@@ -450,11 +501,28 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
-        # Upstream's release does not empty the allocator cache, so the freed
-        # pages sit in torch's reserve and NVML free does not move -- the
-        # dormant group would look resident to every host-side instrument.
-        torch.get_device_module().empty_cache()
-        self._weg2_log_sleep_acceptance()
+        if weg2_memory_saver_on:
+            # PROVENANCE, because the obvious justification for this call is
+            # MEASURED FALSE on this rig: campaign (a) measured, WITHOUT it,
+            # NVML free 1870.8 -> 30730.8 MiB and per-process 30,154 -> 1,294
+            # MiB, identically in 9/9 steady cycles across two cold boots
+            # (CAMPAIGN_a_0906.md §2 arm 1; carried into
+            # WEG2_BUILD_DECISIONS_0906.md §1d).  TMS unmaps the TAGGED
+            # segments' physical pages directly, so their release is already
+            # visible to NVML and empty_cache() buys nothing there -- spec
+            # (S) 2.4 step 10's premise is refuted for the tagged regions and
+            # the record outranks the spec.  What it is kept for is the
+            # UNTAGGED remainder torch still holds in its reserve, whose
+            # benefit is unmeasured; the S1 slice boot re-checks it.  The S1
+            # acceptance line "NVML free rises by weights+KV bytes" must NOT
+            # be attributed to this call in the postmortem.
+            #
+            # Gated with the census below, for the same reason W12 is gated on
+            # the request shape: a stock POST /hibernate must stay byte-for-
+            # byte the upstream path, and an extra post-pause device call plus
+            # two NVML reads on it is not that.
+            torch.get_device_module().empty_cache()
+            self._weg2_log_sleep_acceptance(weg2_before_census)
 
         return ReleaseMemoryOccupationReqOutput()
 

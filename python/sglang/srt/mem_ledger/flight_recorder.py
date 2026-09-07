@@ -628,6 +628,33 @@ def _torch_view(device_index: Optional[int]) -> Dict[str, Any]:
     }
 
 
+def card_pin_unresolvable_without_cuda() -> Optional[str]:
+    """Why naming this process's card would cost a CUDA context, or ``None``.
+
+    Resolving WHICH card this process is pinned to falls back to torch when the
+    pin cannot be read from the environment, and that fallback initialises
+    CUDA. Before the context exists, decline instead: an unnamed card is an
+    honest absence, a context created by the instrument is a corrupted
+    measurement.
+
+    ONE definition, because there is now more than one instrument that must not
+    pay that price: this module's own :func:`_nvml_view`, and the Weg-2
+    sleep-acceptance census (``srt/managers/weg2_memory_saver.py``), which the
+    S3 launcher calls PRE-LAUNCH per rank -- exactly the moment where the
+    context does not exist yet. A second copy of the guard would drift from
+    this one; a second copy of its reason string would make two boot logs say
+    the same absence in two ways.
+    """
+    from sglang.srt.registry import nvml as registry_nvml
+
+    if cuda_initialized() or registry_nvml.pin_resolvable_without_cuda():
+        return None
+    return (
+        "no CUDA context yet and the pin is not readable from the "
+        "environment; refusing to create a context in order to name the card"
+    )
+
+
 def _nvml_view() -> Dict[str, Any]:
     """This rank's card as the DRIVER sees it, plus who else is on it.
 
@@ -637,17 +664,9 @@ def _nvml_view() -> Dict[str, Any]:
     try:
         from sglang.srt.registry import nvml as registry_nvml
 
-        # Resolving WHICH card this process is pinned to falls back to torch
-        # when the pin cannot be read from the environment, and that fallback
-        # initialises CUDA. Before the context exists, decline instead: an
-        # unnamed card is an honest absence, a context created by the
-        # instrument is a corrupted measurement.
-        if not cuda_initialized() and not registry_nvml.pin_resolvable_without_cuda():
-            return {
-                "nvml_card_unresolved": "no CUDA context yet and the pin is "
-                "not readable from the environment; refusing to create a "
-                "context in order to name the card"
-            }
+        unresolved = card_pin_unresolvable_without_cuda()
+        if unresolved is not None:
+            return {"nvml_card_unresolved": unresolved}
         uuid = registry_nvml.current_device_uuid()
         info = registry_nvml.memory_info_for_uuid(uuid)
         procs = registry_nvml.process_bytes_on_uuid(uuid)

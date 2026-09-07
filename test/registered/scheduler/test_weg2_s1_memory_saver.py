@@ -398,6 +398,8 @@ def test_census_reports_per_process_bytes_and_its_denominator():
 
     census = sleep_acceptance_census(
         nvml_uuid="GPU-fake",
+        before_bytes=30_154 * 1024 * 1024,
+        min_released_fraction=0.5,
         _process_bytes={4242: 1294 * 1024 * 1024},
         _memory_info=(32_088 * 1024 * 1024, 30_730 * 1024 * 1024),
         _arena_census={},
@@ -786,7 +788,7 @@ def stock_boot_stubs(monkeypatch):
     monkeypatch.setattr(
         wu.SchedulerWeightUpdaterManager,
         "_weg2_log_sleep_acceptance",
-        lambda self: None,
+        lambda self, before=None: None,
     )
     monkeypatch.setattr(wu, "resolve_pcie_lock_key", lambda: "GPU-hermetic")
 
@@ -984,6 +986,8 @@ def test_census_asserts_retain_handles_only_on_a_row_bearing_read():
 
     census = sleep_acceptance_census(
         nvml_uuid="GPU-fake",
+        before_bytes=30_154 * 1024 * 1024,
+        min_released_fraction=0.5,
         _process_bytes={4242: 1294 * 1024 * 1024},
         _memory_info=(32_088 * 1024 * 1024, 30_730 * 1024 * 1024),
         _arena_census={
@@ -1003,8 +1007,24 @@ def test_sleep_rpc_runs_the_acceptance_census():
     every sibling wiring claim in this slice is pinned by an AST gate.
     """
     func = _func_ast("release_memory_occupation")
-    idx = _call_index(func.body, "_weg2_log_sleep_acceptance")
-    empty_at = _call_index(func.body, "empty_cache")
+    # Both calls now sit inside the SAME `if weg2_memory_saver_on:` block (the
+    # stock hibernate path must stay byte-for-byte upstream), so the ordering
+    # has to be read inside that block -- at the function's top level the two
+    # would resolve to one and the same `if` statement and the assertion below
+    # would compare an index with itself.
+    block: List[ast.stmt] = []
+    for stmt in func.body:
+        if isinstance(stmt, ast.If) and "_weg2_log_sleep_acceptance" in ast.unparse(
+            stmt
+        ):
+            block = stmt.body
+            break
+    assert block, (
+        "the sleep-acceptance census is not inside a guarded block of "
+        "release_memory_occupation"
+    )
+    idx = _call_index(block, "_weg2_log_sleep_acceptance")
+    empty_at = _call_index(block, "empty_cache")
     assert idx >= 0, "the sleep-acceptance census is never executed on the sleep path"
     assert empty_at >= 0
     assert empty_at < idx, "the census must read AFTER the allocator cache is emptied"
@@ -1107,3 +1127,334 @@ def _fail(message: str):
 
 # keep the linters honest about the imports the AST tests reference by name
 _ = (GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_WEIGHTS, textwrap)
+
+
+# ---------------------------------------------------------------------------
+# 9. FIX ROUND 2 -- the census gets a criterion, W12 gets its hazard back,
+#    the card-pin guard gets one definition, and the weights block gets the
+#    kv block's prohibition.
+# ---------------------------------------------------------------------------
+
+MIB_ = 1024 * 1024
+#: The two ends of campaign (a)'s own swing, per-process, in MiB
+#: (CAMPAIGN_a_0906.md section 2 arm 1, n=9 over two cold boots).
+AWAKE_MIB = 30_154
+ASLEEP_MIB = 1_294
+
+
+def _census(**kwargs):
+    from sglang.srt.managers.weg2_memory_saver import sleep_acceptance_census
+
+    base = dict(
+        nvml_uuid="GPU-fake",
+        _memory_info=(32_088 * MIB_, 30_730 * MIB_),
+        _arena_census={},
+        _pid=4242,
+    )
+    base.update(kwargs)
+    return sleep_acceptance_census(**base)
+
+
+def test_census_refuses_a_sleep_that_released_nothing():
+    """The condition the instrument exists to catch, at the number it happens at.
+
+    A no-op ``pause()`` returns success and leaves the whole shard resident.
+    Before this round the census reported ``accepted=True`` for BOTH ends of
+    campaign (a)'s 28.9 GiB swing -- the same verdict at 30,154 MiB and at
+    1,294 MiB -- so the number it printed was decorative.
+    """
+    census = _census(
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=0.5,
+        _process_bytes={4242: AWAKE_MIB * MIB_},
+    )
+    assert census.proc_used_bytes == AWAKE_MIB * MIB_
+    assert census.released_bytes == 0
+    assert census.accepted is False, (
+        "the census accepted a rank that released nothing -- a gate that "
+        "cannot fail is not a gate"
+    )
+    assert "released" in (census.refusal_reason or "")
+
+
+def test_census_accepts_the_measured_asleep_reading():
+    """The other end of the same swing must still pass, or the gate is a wall."""
+    census = _census(
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=0.5,
+        _process_bytes={4242: ASLEEP_MIB * MIB_},
+    )
+    assert census.accepted is True
+    assert census.released_bytes == (AWAKE_MIB - ASLEEP_MIB) * MIB_
+    line = census.format_line()
+    assert "released=" in line and "min_released_fraction=" in line
+
+
+def test_census_refuses_when_no_residency_criterion_is_supplied():
+    """No criterion is not a pass; it is a reading."""
+    census = _census(_process_bytes={4242: ASLEEP_MIB * MIB_})
+    assert census.accepted is False
+    assert "criterion" in (census.refusal_reason or "")
+    assert "no criterion" in census.denominator
+
+
+def test_census_refuses_residency_above_the_declared_ceiling():
+    """The S3 form: a measured D_c ceiling, graded on the same instrument."""
+    census = _census(
+        expected_max_resident_bytes=2_048 * MIB_,
+        _process_bytes={4242: AWAKE_MIB * MIB_},
+    )
+    assert census.accepted is False
+    assert "ceiling" in (census.refusal_reason or "")
+
+    ok = _census(
+        expected_max_resident_bytes=2_048 * MIB_,
+        _process_bytes={4242: ASLEEP_MIB * MIB_},
+    )
+    assert ok.accepted is True
+
+
+def test_census_refuses_when_the_pre_pause_reading_was_blind():
+    """A ``before`` whose own NVML read failed cannot grade an ``after``."""
+    census = _census(
+        before_bytes=None,
+        min_released_fraction=0.5,
+        _process_bytes={4242: ASLEEP_MIB * MIB_},
+    )
+    assert census.accepted is False
+    assert "criterion" in (census.refusal_reason or "")
+
+
+def test_sleep_rpc_grades_the_census_against_a_pre_pause_reading(
+    monkeypatch, fake_device, stock_boot_stubs
+):
+    """The wiring: the RPC must take a BEFORE reading and hand it to the census.
+
+    Recorded on the real entry point, not on prose: the sleep path takes two
+    readings of the same instrument, and the second one is graded against the
+    first.  Without the ``before`` the census has no criterion and refuses.
+    """
+    from sglang.srt.managers import weg2_memory_saver as wms
+
+    seen: List[dict] = []
+    answers = [AWAKE_MIB * MIB_, ASLEEP_MIB * MIB_]
+
+    def _fake_census(**kwargs):
+        seen.append(dict(kwargs))
+        return wms.sleep_acceptance_census(
+            nvml_uuid="GPU-fake",
+            _memory_info=(32_088 * MIB_, 30_730 * MIB_),
+            _arena_census={},
+            _pid=4242,
+            _process_bytes={4242: answers[min(len(seen) - 1, 1)]},
+            **kwargs,
+        )
+
+    monkeypatch.undo()  # drop the stubbed-out _weg2_log_sleep_acceptance
+    monkeypatch.setattr(wu, "_export_static_state", lambda model: {"stub": True})
+    monkeypatch.setattr(wu.torch.distributed, "barrier", lambda *a, **k: None)
+    monkeypatch.setattr(wu.torch, "get_device_module", lambda *a, **k: fake_device)
+    monkeypatch.setattr(wu, "sleep_acceptance_census", _fake_census)
+
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False, enable_memory_saver=True
+        ),
+    )
+    manager.release_memory_occupation(
+        wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+    )
+
+    assert len(seen) == 2, (
+        f"expected a pre-pause reading and a post-pause verdict, saw {len(seen)} "
+        "census call(s); an ungraded reading is a number, not a verdict"
+    )
+    assert seen[0] == {}, "the pre-pause reading must not be graded against itself"
+    assert seen[1].get("before_bytes") == AWAKE_MIB * MIB_
+    assert seen[1].get("min_released_fraction") == (
+        wms.WEG2_SLEEP_MIN_RELEASED_FRACTION
+    )
+
+
+def test_first_sleep_refuses_a_genuine_sleep_on_a_flagless_boot(fake_device):
+    """Spec section 10 S1 mutant M1: drop --enable-memory-saver -> W12 fires.
+
+    The hazard section 2.1 names is a LAUNCHER EDIT that drops the flag.  A
+    gate keyed on that same flag can never see it -- the launch arm is gated on
+    it too, so both arms go silent together.  The request object carries the
+    discriminator that actually separates the two cases
+    (io_struct.py:1964 ``destination``), and the #89 hibernate park is the only
+    caller that sets it.
+    """
+    from sglang.srt.managers.weg2_memory_saver import Weg2MemorySaverInactive
+
+    adapter = FakeAdapter(enabled=False)
+    manager = _make_manager(
+        adapter=adapter,
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False, enable_memory_saver=False
+        ),
+        tp_worker=FakeTpWorker(),
+    )
+    req = wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+    assert getattr(req, "destination", None) is None
+
+    with pytest.raises(Weg2MemorySaverInactive):
+        manager.release_memory_occupation(req)
+    assert adapter.paused == [], "a refusal that already paused a tag is not a refusal"
+
+
+def test_stock_hibernate_touches_no_device_call_after_the_pauses(
+    monkeypatch, fake_device, stock_boot_stubs
+):
+    """The #89 park must stay byte-for-byte upstream, on the tail too.
+
+    ``empty_cache()`` and the acceptance census are Weg-2 additions.  Left
+    ungated they added a post-pause device call and two NVML reads to a stock
+    ``POST /hibernate`` -- a path that has never been executed on metal in that
+    shape, and the one thing the round-1 gating exercise was for.
+    """
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=False),
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False, enable_memory_saver=False
+        ),
+        tp_worker=FakeTpWorker(),
+    )
+    _record_hibernate_park(monkeypatch)
+    req = wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+    req.destination = "disk"
+
+    manager.release_memory_occupation(req)
+
+    assert "empty_cache" not in fake_device.calls, (
+        "a stock POST /hibernate ran the Weg-2 empty_cache(); that path is "
+        "upstream's and has never been executed on metal with this call in it"
+    )
+    assert fake_device.calls == [
+        "synchronize"
+    ], f"the stock tail is not upstream's: {fake_device.calls}"
+
+
+def test_weg2_sleep_still_empties_the_cache_and_censuses(fake_device, stock_boot_stubs):
+    """The gate must narrow the addition, never delete it."""
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False, enable_memory_saver=True
+        ),
+        tp_worker=FakeTpWorker(),
+    )
+    manager.release_memory_occupation(
+        wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+    )
+    assert "empty_cache" in fake_device.calls
+
+
+def test_weights_block_pause_is_the_last_statement():
+    """The kv block's gate, mirrored onto its sibling tag (own mutant RB-M1).
+
+    ``_export_static_state`` clones every named buffer of a model allocated
+    inside ``region(GPU_MEMORY_TYPE_WEIGHTS)`` (model_runner.py:2344-2348), so
+    a second export appended after the pause reads unmapped pages -- the
+    campaign (a) fault on the weights tag.  The existing order gate uses the
+    FIRST matching statement and stays green under exactly that duplicate.
+    """
+    body = _tag_block(_func_ast("release_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
+    pause_at = _call_index(body, "pause(GPU_MEMORY_TYPE_WEIGHTS)")
+    assert pause_at >= 0, "pause(weights) not called in the weights block"
+    assert pause_at == len(body) - 1, (
+        f"pause(weights) is statement [{pause_at}] of {len(body)}; every later "
+        "statement in this block touches unmapped weight pages"
+    )
+
+
+def test_census_reads_this_pid_not_the_colocated_sibling():
+    """Weg 2 puts TWO ranks on every card, so the pid key is load-bearing.
+
+    ``process_bytes_on_uuid`` returns ``{pid: bytes}`` for EVERY compute
+    process on the card (registry/nvml.py:402-425).  Reading the first value
+    instead of this pid's would print the awake sibling's residency as the
+    dormant rank's verdict -- own mutant RB-M4, which the whole suite survived
+    green because every fixture passed a single-entry table.
+    """
+    census = _census(
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=0.5,
+        _process_bytes={9999: 27 << 30, 4242: ASLEEP_MIB * MIB_},
+    )
+    assert census.proc_used_bytes == ASLEEP_MIB * MIB_
+    assert census.accepted is True
+    assert "over 2 compute process(es)" in census.denominator
+
+
+def test_census_refuses_when_this_pid_is_absent_from_nvml():
+    """The pid-miss branch, which no test reached."""
+    census = _census(
+        before_bytes=AWAKE_MIB * MIB_,
+        min_released_fraction=0.5,
+        _process_bytes={9999: 27 << 30},
+    )
+    assert census.proc_used_bytes is None
+    assert census.accepted is False
+    assert "not among" in (census.refusal_reason or "")
+
+
+def test_census_declines_to_create_a_cuda_context_to_name_the_card(monkeypatch):
+    """The canonical instrument's guard, which this one had dropped.
+
+    ``sleep_acceptance_census()`` is public and the S3 launcher calls it
+    PRE-LAUNCH per rank -- the exact moment where ``current_device_uuid()``
+    would fall back to torch and buy a CUDA context, corrupting the very
+    residency number the census reports.
+    """
+    from sglang.srt.mem_ledger import flight_recorder as fr
+    from sglang.srt.registry import nvml as registry_nvml
+
+    monkeypatch.setattr(fr, "cuda_initialized", lambda: False)
+    monkeypatch.setattr(registry_nvml, "pin_resolvable_without_cuda", lambda: False)
+
+    def _must_not_be_called():
+        raise AssertionError(
+            "the census resolved the card through torch and bought a CUDA "
+            "context to describe the state before it"
+        )
+
+    monkeypatch.setattr(registry_nvml, "current_device_uuid", _must_not_be_called)
+
+    from sglang.srt.managers.weg2_memory_saver import sleep_acceptance_census
+
+    census = sleep_acceptance_census()
+    assert census.nvml_uuid is None
+    assert census.accepted is False
+    assert "no CUDA context yet" in (census.refusal_reason or "")
+
+
+def test_the_card_pin_guard_has_exactly_one_definition():
+    """One job, one mover: the guard's reason string lives in one place.
+
+    ``flight_recorder`` is the canonical holder of this payload
+    (``_nvml_view`` / ``_kv_arena_view``); the Weg-2 census is a verdict
+    wrapper over it.  A second copy of the guard drifts from the first, and a
+    second copy of its reason string makes two boot logs say the same absence
+    in two ways.
+    """
+    import inspect as _inspect
+
+    from sglang.srt.managers import weg2_memory_saver as wms
+    from sglang.srt.mem_ledger import flight_recorder as fr
+
+    assert callable(fr.card_pin_unresolvable_without_cuda)
+    weg2_src = open(_inspect.getsourcefile(wms), "r", encoding="utf-8").read()
+    assert (
+        "card_pin_unresolvable_without_cuda" in weg2_src
+    ), "the Weg-2 census does not use the canonical card-pin guard"
+    assert "refusing to create a context" not in weg2_src, (
+        "the guard's reason string was COPIED into weg2_memory_saver.py "
+        "instead of being used from its canonical holder"
+    )
+    # and the recorder still uses it too, so there is one definition and two
+    # users rather than two definitions.
+    fr_src = open(_inspect.getsourcefile(fr), "r", encoding="utf-8").read()
+    assert fr_src.count("refusing to create a context") == 1
