@@ -164,3 +164,17 @@ def test_w25_flag_is_set_after_pause_and_cleared_after_resume():
     i_res = res.index("resume(GPU_MEMORY_TYPE_KV_CACHE)")
     i_clr = res.index("weg2_dormant = False")
     assert i_clr > i_res
+
+
+# ---------------------------------------------------------------- boot weg2ls1b1 killer
+def test_mamba_window_ratio_accepts_the_flag_parsers_list_shape():
+    """weg2ls1b1 07:05:58Z: --rank-tp-ratio auto resolves to a LIST and the
+    window ladder did str(list).split(',') -> int('[3725') ValueError, all
+    three TP ranks dead before READY."""
+    from sglang.srt.managers.cache_controller import parse_tp_ratio_vector
+
+    assert parse_tp_ratio_vector([3725, 2264, 2259]) == [3725, 2264, 2259]
+    assert parse_tp_ratio_vector("2,1,1") == [2, 1, 1]
+    assert parse_tp_ratio_vector("auto") is None
+    assert parse_tp_ratio_vector(None) is None
+    assert parse_tp_ratio_vector([]) is None

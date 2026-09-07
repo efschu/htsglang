@@ -377,6 +377,33 @@ class StorageStopResult(NamedTuple):
     joined_s: float
 
 
+def parse_tp_ratio_vector(raw_ratio) -> Optional[List[int]]:
+    """The head-sharding vector behind ``--rank-tp-ratio``, or None.
+
+    The flag's own parser (``server_args._parse_rank_tp_ratio``) yields a
+    LIST of ints for an explicit vector and the STRING 'auto' /
+    'auto-performance' otherwise, which ``ServerArgs`` then RESOLVES into a
+    list at parse time.  The old ``str(raw).split(",")`` here only ever saw
+    a string: measured 2026-09-07 07:05:58 (boot weg2ls1b1, group D,
+    ``--rank-tp-ratio auto`` -> ``[3725, 2264, 2259]``), ``int('[3725')``
+    raised ValueError inside ``attach_hybrid_pool_to_unified_cache`` and
+    killed all three TP ranks before READY.  Under Weg 1 this branch never
+    ran with a list (the TP head cut came from --phase-flip-tp-vector, since
+    removed), so the shape was latent.
+    """
+    if raw_ratio is None or raw_ratio == "" or raw_ratio is False:
+        return None
+    if isinstance(raw_ratio, (list, tuple)):
+        out = [int(x) for x in raw_ratio]
+        return out or None
+    text = str(raw_ratio).strip()
+    if text in ("auto", "auto-performance"):
+        # Unresolved auto: no explicit vector; the equal-share fallback
+        # candidate below carries the ladder.
+        return None
+    return [int(x) for x in text.split(",") if x.strip()] or None
+
+
 def canonical_identity_hash_for(server_args, canonical_page: bool) -> str:
     """#706 remainder: the identity hash for a key that must be geometry-FREE.
 
@@ -1422,10 +1449,9 @@ class HiCacheController:
         # the window carries full heads, exactly the layer-only cut.
         candidates = []
         raw_ratio = getattr(server_args, "rank_tp_ratio", None)
-        if raw_ratio:
-            candidates.append(
-                ([int(x) for x in str(raw_ratio).split(",")], int(self.tp_rank))
-            )
+        ratio_list = parse_tp_ratio_vector(raw_ratio)
+        if ratio_list:
+            candidates.append((ratio_list, int(self.tp_rank)))
         flip_vector = getattr(server_args, "phase_flip_tp_vector", None)
         if phase == "tp" and flip_vector:
             candidates.insert(
