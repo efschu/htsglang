@@ -498,48 +498,73 @@ def park_weights_to_disk(
 
     # Serialize D2H + write per physical GPU so two co-located ranks do not
     # both hold a full host copy simultaneously.
-    lock_path = os.path.join(
-        hibernate_dir, f".park_lock_{nvml_uuid.replace('/', '_')}"
+    #
+    # ONE LOCK PER PHYSICAL LINK. This used to be an ad-hoc flock of its own on
+    # `<hibernate_dir>/.park_lock_<uuid>`, which is a DIFFERENT file from the
+    # Weg-2 PCIe serialisation lock on `/dev/shm/.weg2-pcie-serialize-<uuid>`.
+    # Two flocks on two paths do not exclude each other, so a park's D2H and a
+    # co-located sibling's wake-H2D overlapped freely and halved both on the
+    # x4-linked 3080 -- exactly the overlap design (S) 2.7 says this lock
+    # prevents, and a fork-owned second bookkeeping next to it. Adopted, not
+    # duplicated: the same key, the same file, the same bounded wait (an expiry
+    # is now a named Weg2PcieLockTimeout instead of an unbounded block).
+    from sglang.srt.managers.weg2_memory_saver import (
+        pcie_transfer_lock,
+        resolve_pcie_lock_key,
     )
-    import fcntl
+
+    # The KEY is resolved by the canonical resolver too, not by a second one:
+    # two co-located ranks that disagree about the card's name hold two
+    # different files and exclude nothing. `resolve_pcie_lock_key()` is the
+    # same call the Weg-2 sleep/wake legs make. It buys no CUDA context (the
+    # flight recorder's card-pin guard), and the park runs with CUDA long since
+    # initialised, so it answers here; if it cannot, this park falls back to the
+    # uuid already resolved above for the image file name -- in exactly the
+    # state where the Weg-2 take would also have failed to resolve and degraded
+    # to unserialised, so the fallback is never a divergence between two keys.
+    try:
+        lock_uuid = resolve_pcie_lock_key()
+    except Exception as exc:  # pragma: no cover - depends on the rig
+        logger.warning(
+            "#89 hibernate: canonical PCIe lock key unresolvable (%s); keying "
+            "the park lock on this module's own NVML uuid instead.",
+            exc,
+        )
+        lock_uuid = nvml_uuid
 
     byte_hash = None
     sparse_stats = None
-    with open(lock_path, "w") as lock_f:
-        fcntl.flock(lock_f, fcntl.LOCK_EX)
-        try:
-            params_cpu = {
-                name: p.detach().to("cpu").contiguous() for name, p in param_items
-            }
-            static_state = export_static_state(model)  # named_buffers (incl RoPE)
-            static_cpu = {
-                "buffers": [
-                    (n, b.detach().to("cpu").contiguous())
-                    for n, b in static_state["buffers"]
-                ]
-            }
-            byte_hash = _byte_hash(param_items)
-            payload = {
-                "version": HIBERNATE_VERSION,
-                "tp_rank": tp_rank,
-                "nvml_uuid": nvml_uuid,
-                "params": params_cpu,
-                "static_state": static_cpu,
-                "gguf_attrs": gguf_attrs,
-                "byte_hash": byte_hash,
-            }
-            tmp = file_path + ".tmp"
-            # #456: skip the image's all-zero 4 KiB pages instead of writing
-            # them. The container format is untouched -- holes read back as
-            # zeros, which is what those pages held -- so no reader, no
-            # manifest field and no version gate changes. #306 measured 12.64 %
-            # zero pages on a real rank image (pre-allocated buffers parked in
-            # full). SGLANG_HIBERNATE_DENSE_WRITE=1 forces the old dense write;
-            # both branches emit bit-identical containers.
-            sparse_stats = torch_save_sparse(payload, tmp)
-            os.replace(tmp, file_path)
-        finally:
-            fcntl.flock(lock_f, fcntl.LOCK_UN)
+    with pcie_transfer_lock(nvml_uuid=lock_uuid, label="#89 hibernate park D2H"):
+        params_cpu = {
+            name: p.detach().to("cpu").contiguous() for name, p in param_items
+        }
+        static_state = export_static_state(model)  # named_buffers (incl RoPE)
+        static_cpu = {
+            "buffers": [
+                (n, b.detach().to("cpu").contiguous())
+                for n, b in static_state["buffers"]
+            ]
+        }
+        byte_hash = _byte_hash(param_items)
+        payload = {
+            "version": HIBERNATE_VERSION,
+            "tp_rank": tp_rank,
+            "nvml_uuid": nvml_uuid,
+            "params": params_cpu,
+            "static_state": static_cpu,
+            "gguf_attrs": gguf_attrs,
+            "byte_hash": byte_hash,
+        }
+        tmp = file_path + ".tmp"
+        # #456: skip the image's all-zero 4 KiB pages instead of writing
+        # them. The container format is untouched -- holes read back as
+        # zeros, which is what those pages held -- so no reader, no
+        # manifest field and no version gate changes. #306 measured 12.64 %
+        # zero pages on a real rank image (pre-allocated buffers parked in
+        # full). SGLANG_HIBERNATE_DENSE_WRITE=1 forces the old dense write;
+        # both branches emit bit-identical containers.
+        sparse_stats = torch_save_sparse(payload, tmp)
+        os.replace(tmp, file_path)
 
     if sparse_stats is None:
         logger.info(
