@@ -134,8 +134,30 @@ def uniform_head_order(
     canonical: Sequence[str],
     group_match_lens: Sequence[int],
     slots: int = TP_HEAD_SLOTS,
+    arrival_seqs: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """The order EVERY rank must form its batch in.
+
+    FIX 3 (round 3) -- THE KEY IS A CHOICE, AND MATCH LENGTH IS THE WRONG
+    ONE UNDER AN FCFS POLICY.  This arm exists to replace the divergence
+    born in ``_sort_by_longest_prefix`` (see the module docstring); under a
+    cache-AGNOSTIC policy that sort never runs, `calc_priority` returns
+    having changed nothing, and re-sorting the head by prefix length here
+    MANUFACTURES an order the policy did not ask for -- measured at the
+    parent: arrival order 1,2,3 came out ``['weg2-1-2','weg2-1-3',
+    'weg2-1-1']``, i.e. the oldest request admitted LAST, which is
+    WEG2_SCHEDULING_SPEC_0907 law 2 ("D admits OLDEST-first") broken at D by
+    the very module that was making D uniform.
+
+    ``arrival_seqs`` is the replacement key: ``Req.kv_arrival_seq``, assigned
+    once in ``_add_request_to_queue`` from a per-rank counter fed by the same
+    broadcast request stream, so it is rank-uniform for the same reason the
+    rid SET is (phase_flip_runtime.py:9689 states it, and kvso already orders
+    victims by it).  It satisfies #823's uniformity requirement exactly as
+    well as the MIN-reduced match does -- what it gives up is a cache-
+    locality heuristic this arm was never asked to provide.  A rid with no
+    arrival seq sorts AFTER every rid that has one, by rid string, so the
+    order stays total and process-independent.
 
     ``group_match_lens`` is the MIN-reduced payload, so entry i is the
     smallest match any rank has for ``canonical[i]``.
@@ -152,7 +174,20 @@ def uniform_head_order(
         for i, rid in enumerate(canonical[:slots])
         if i < len(group_match_lens) and int(group_match_lens[i]) > _ABSENT_MATCH
     ]
-    ranked.sort(key=lambda pair: (-pair[1], pair[0]))
+    if arrival_seqs is None:
+        ranked.sort(key=lambda pair: (-pair[1], pair[0]))
+    else:
+        # ELIGIBILITY still comes from the MIN-reduced payload above (a rid
+        # some rank does not hold is dropped, delay-never-force); only the
+        # ORDER comes from the arrival key.  Two replicated inputs, two
+        # separate jobs, neither of them rank-local.
+        ranked.sort(
+            key=lambda pair: (
+                0 if pair[0] in arrival_seqs else 1,
+                int(arrival_seqs.get(pair[0], 0)),
+                pair[0],
+            )
+        )
     return [rid for rid, _ in ranked]
 
 
@@ -185,6 +220,7 @@ def head_decision(
     digest_agreed: bool,
     enforcer_enabled: bool,
     slots: int = TP_HEAD_SLOTS,
+    arrival_seqs: Optional[Dict[str, int]] = None,
 ):
     """THE SECOND BEHAVIOUR CHANGE, and the one easiest to leave implicit.
 
@@ -212,7 +248,9 @@ def head_decision(
     if not enforcer_enabled:
         return local_head_order(local_rids, local_match_lens), SOURCE_RANK_LOCAL
     return (
-        uniform_head_order(canonical, group_match_lens, slots=slots),
+        uniform_head_order(
+            canonical, group_match_lens, slots=slots, arrival_seqs=arrival_seqs
+        ),
         SOURCE_GROUP,
     )
 

@@ -584,19 +584,44 @@ class Front:
         return max(0, self._seats_in_use() - len(self.groups["D"].outstanding))
 
     def _d_token_budget_blocks(self, rid: str, est_tokens: int) -> bool:
-        """FIX 4a: would admitting this request overcommit D's host pool?
+        """Would admitting this request overcommit D's host staging pool?
+
+        THE AGGREGATE SEATS-VS-POOL COUPLING (FIX 4a, round 1; the L-line and
+        its denominators, round 3).  ``--d-bs`` seats are a COUNT and the
+        store read is a TOKEN budget, so six seats times one prompt can
+        exceed the pool the group has to prefetch into -- and a request whose
+        prefix IS in the store then prices as wholly uncached (`#915 PREFETCH
+        REFUSED reason=vote_negative`, `cached_tokens=0`) and is W31-refused
+        for a reason that is not its own.  EFFECTIVE SEATS ARE THEREFORE
+        ``min(d_bs, what the pool can still prefetch)``: the head of
+        ``_ready_for_d`` WAITS in arrival order (law 2 is "oldest first", not
+        "six at once"), it is never skipped over, and its seat is not taken
+        while its store read cannot be issued.
 
         False whenever the budget is off, whenever nothing is in flight (a
-        sole request is never starved by a bound its own size), or whenever
-        it fits.  Rate-limited to one line per held rid, then every 10 s, so
-        the hold is READABLE without the 20 Hz admitter loop flooding the
-        log -- and the suppressed passes are counted (denominator law).
+        sole request is never starved by a bound its own size -- the truly
+        oversized case is CARRIER-EXCEEDS's, R-3), or whenever it fits.
+
+        L-LINE ``WEG2 D-SEAT-WAIT`` with its three denominators named:
+        ``need`` is this request's own estimate (front pricing, the L10
+        ESTIMATE convention), ``available`` is what is left of the pool right
+        now, ``limit`` is the pool bound itself.  Rate-limited to one line
+        per newly-held rid, then every 200th pass, and the SUPPRESSED count
+        rides on the line (`held_passes`), so an absence of lines is
+        readable as an absence of waits rather than as a silenced emitter.
+
+        THIS IS THE HONEST INTERIM.  The wall itself is the #974 host-pool
+        bound; it lifts when the shared-ring carrier gives D a windowed store
+        read (WEG2_CARRIER_SPEC_0907 Amendment 2), and this gate then reduces
+        to `budget <= 0` -- off, by the same flag, with no code to remove.
         """
         budget = self.d_admit_max_tokens
         if budget <= 0 or self._d_inflight_tokens <= 0:
             self._d_token_hold_rid = None
             return False
-        if self._d_inflight_tokens + max(0, int(est_tokens)) <= budget:
+        need = max(0, int(est_tokens))
+        available = max(0, budget - self._d_inflight_tokens)
+        if self._d_inflight_tokens + need <= budget:
             self._d_token_hold_rid = None
             return False
         self.counters["d_admit_token_held"] += 1
@@ -604,11 +629,13 @@ class Front:
         if self._d_token_hold_rid != rid or held % 200 == 0:
             self._d_token_hold_rid = rid
             logger.info(
-                "WEG2 D-ADMIT-HOLD rid=%s est_tokens=%d inflight_tokens=%d "
-                "budget=%d seats_free=%d held_passes=%d (D host staging pool "
-                "is a TOKEN budget; admitting here is the #915 vote_negative "
-                "shape that mis-prices the X gate)",
-                rid, int(est_tokens), self._d_inflight_tokens, budget,
+                "WEG2 D-SEAT-WAIT rid=%s need=%d available=%d limit=%d "
+                "inflight_tokens=%d seats_free=%d held_passes=%d (the store "
+                "read for this request cannot be issued yet; it keeps the "
+                "head of the arrival queue and takes no seat -- admitting it "
+                "here is the #915 vote_negative shape that mis-prices the X "
+                "gate)",
+                rid, need, available, budget, self._d_inflight_tokens,
                 self.seats_free(), held,
             )
         return True

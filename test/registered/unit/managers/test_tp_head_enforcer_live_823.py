@@ -333,6 +333,13 @@ class _PassHarness:
     """
 
     _apply_uniform_head_order = Scheduler._apply_uniform_head_order
+    # #1234 FIX 3: the ORDER arm now asks for its KEY (arrival seq under a
+    # cache-agnostic policy or under Weg 2's --tp-prefill-max-tokens, the
+    # match length otherwise). Bound here because the arm calls it; the
+    # harness models neither `server_args` nor `policy`, and the method's own
+    # defensive derivation answers None for exactly that case -- which is the
+    # pre-FIX-3 key and therefore the order these tests assert.
+    _head_order_arrival_seqs = Scheduler._head_order_arrival_seqs
     _uniform_allocatable_reqs = Scheduler._uniform_allocatable_reqs
     _take_uniform_head_inputs = Scheduler._take_uniform_head_inputs
     _tp_head_enforcer_gate = Scheduler._tp_head_enforcer_gate

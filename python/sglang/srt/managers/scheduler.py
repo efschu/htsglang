@@ -244,6 +244,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
     truncation_align_admission_error,
@@ -4837,6 +4838,75 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
+    def _carrierless_pp_store_read_refused(self) -> bool:
+        """#1234 W38: is a store READ a rank-local geometry on this boot form?
+
+        THE ROOT OF THE weg2sc1 BOOT KILLER, and it is the third member of a
+        class this tree has already closed twice.  On a PP group WITHOUT the
+        #631 row carrier the followers plan rank-locally ('#631 ROW AUTHORITY
+        DISABLED': `pp_row_carrier_present` is False because the
+        `pp_flip_counters` side channel does not exist on the no-flip PP=3
+        form, which is exactly Weg 2's group P).  Every term that lets one
+        rank decide differently from another has therefore been DISARMED on
+        that form rather than compensated: PP0's #1066 prefetch wait (#973)
+        and PP0's #794 corridor width cut (#1233).  The storage READ is the
+        third, and the one that was left armed.
+
+        WHY IT IS A GEOMETRY AND NOT A CREDIT.  A completed prefetch inserts
+        its KV into THIS rank's radix tree, so from the next
+        `init_next_round_input` on it is indistinguishable from an ordinary
+        device match and it lengthens `prefix_indices` -- the very quantity
+        `ScheduleBatch.prepare_for_extend` sizes the cross-stage tensor from.
+        Storage completion is per-rank and per-pass (each rank's backend
+        finishes at its own speed); on the TP axis the existing MIN reduce
+        makes that uniform (`prefetch_ballot`, and the reduce
+        `weg2_uncached_extent` prices with), on the PP axis there is NOTHING,
+        and #631's wire was reverted twice on metal after deadlocks
+        (d7618425a4, #1015) -- a new PP collective on the admission path is a
+        recorded fatal, not an option.
+
+        MEASURED, boot weg2sc1 (2026-09-07): a W31-refused request was
+        re-queued to P; PP2's prefetch and MAMBA-HOST-RESUME had completed,
+        PP0's and PP1's had not, so PP2 admitted `(8747, 8748)` while its
+        peers admitted `(0, 4096)` -- '#1233 W27 PP WIDTH DIVERGENCE REFUSED:
+        received hidden_states with 4096 rows for a batch of 1 token', the
+        group STOP, on the re-admission path C12 had just created.
+
+        WHAT THIS COSTS, priced rather than waved past: group P forgoes L3
+        prefix reuse.  Its DEVICE tier is untouched and is fed by P's own
+        prefills, which every rank of the group runs identically, so
+        within-epoch prefix sharing is unaffected; what is lost is a hit that
+        would have had to come back from the store, and a re-queued request
+        is re-prefilled instead of read back.  WRITE-THROUGH IS UNTOUCHED --
+        P still publishes everything it prefills, which is what the flip
+        hands to D -- and D is TP-only (`pp_size == 1`), so this predicate is
+        False there and D's store read, the one Weg 2 actually depends on,
+        is unchanged.  The exemption lifts itself the moment a carrier
+        exists: it keys on the same `pp_row_carrier_present` fact as the
+        other two disarmed terms, so all three re-arm together (#1039's
+        lesson: two halves armed off different memos diverge).
+        """
+        ps = getattr(self, "ps", None)
+        if ps is None or int(getattr(ps, "pp_size", 1) or 1) <= 1:
+            return False
+        if pp_row_carrier_present(self):
+            return False
+        n = getattr(self, "_w38_carrierless_store_reads", 0) + 1
+        self._w38_carrierless_store_reads = n
+        if n == 1 or n % 512 == 0:
+            logger.warning(
+                "#1234 W38 Weg2CarrierlessPpStoreRead REFUSED (n=%d, every "
+                "store read this group would have issued): no #631 row "
+                "carrier on this PP form, so a prefetch completing on one "
+                "rank and not another lengthens that rank's prefix_indices "
+                "alone -- the W27 width divergence that killed boot weg2sc1 "
+                "on the C12 re-admission path. Device-tier prefix reuse and "
+                "the write-through are unaffected; the L3 READ returns with "
+                "the carrier.",
+                n,
+            )
+        return True
+
     def _prefetch_kvcache(self, req: Req) -> str:
         """Issue a storage prefetch for ``req``. Returns WHAT ACTUALLY HAPPENED.
 
@@ -4901,6 +4971,9 @@ class Scheduler(
         if not self.enable_hicache_storage:
             _note_prefetch_gate("storage_disabled")
             return "declined:storage_disabled"
+        if self._carrierless_pp_store_read_refused():
+            _note_prefetch_gate("carrierless_pp")
+            return "declined:carrierless_pp"
         req.init_next_round_input(self.tree_cache, cow_mamba=False)
         last_host_node = req.last_host_node
         # RANK-LOCAL: `backuped` means "full KV present in THIS rank's host
@@ -7266,6 +7339,67 @@ class Scheduler(
         self._tp_head_count_degraded_this_pass = False
         return self.__dict__.pop("_uniform_head_inputs", None)
 
+    def _head_order_arrival_seqs(self) -> Optional[Dict[str, int]]:
+        """FIX 3 (round 3): the ORDER arm's key, or None to keep the old one.
+
+        LAW 2 OF WEG2_SCHEDULING_SPEC_0907 ("D admits OLDEST-first ... refills
+        a freed seat from the arrival order") IS BROKEN AT D BY #823's ORDER
+        ARM, and R-14's justification ("append order IS admission order,
+        because calc_priority does not sort under FCFS") missed this method:
+        it runs immediately AFTER `calc_priority` and rewrites the head
+        whatever the policy did.  Measured at the parent commit for arrival
+        order 1,2,3: `['weg2-1-2', 'weg2-1-3', 'weg2-1-1']`.
+
+        THE RULE, and it is general rather than Weg-2 special-casing: the
+        ORDER arm exists to replace the divergence born in
+        `_sort_by_longest_prefix` (schedule_policy.py:225-232, reachable only
+        under a CacheAwarePolicy).  Under a cache-AGNOSTIC policy that sort
+        never runs, so there is nothing to replace and a prefix-length
+        re-sort here is a reordering the policy never asked for.  The key is
+        then `kv_arrival_seq` -- assigned once per request in
+        `_add_request_to_queue` (:5247) off the same broadcast stream on every
+        rank, hence rank-uniform (phase_flip_runtime.py:9689), so #823's
+        uniformity requirement is met exactly as well as by the MIN-reduced
+        match.  What is given up is a cache-locality heuristic that this arm,
+        under this policy, was never asked to provide.
+
+        THE X FLAG FORCES IT TOO, whatever the policy: a group serving Weg 2's
+        law 2 may not have its admission order rewritten by a cache
+        heuristic, and `--tp-prefill-max-tokens` is that group's own marker
+        (it reaches argv_d and never argv_p).
+
+        None -- the pre-FIX-3 match-length key -- under a CacheAwarePolicy on
+        a non-Weg-2 boot, where the sort DID run and this arm is replacing it.
+        """
+        # DEFENSIVE, and for the same reason `_local_admit_limit` is: a KEY
+        # may never break the arm it feeds. Every read is a `getattr` and the
+        # whole derivation is caught, because `_apply_uniform_head_order`
+        # turns any exception below it into the #823 HEAD-ORDER APPLY STOP --
+        # a group STOP that would then name the wrong cause. No key means the
+        # pre-FIX-3 behaviour, which is a valid order, never a divergence.
+        try:
+            server_args = getattr(self, "server_args", None)
+            weg2 = int(getattr(server_args, "tp_prefill_max_tokens", 0) or 0) > 0
+            if not weg2:
+                policy = getattr(getattr(self, "policy", None), "policy", None)
+                if isinstance(policy, CacheAwarePolicy):
+                    return None
+            seqs: Dict[str, int] = {}
+            for req in getattr(self, "waiting_queue", ()) or ():
+                seq = getattr(req, "kv_arrival_seq", None)
+                if seq is not None:
+                    seqs[str(req.rid)] = int(seq)
+            # A VACUOUS KEY IS NOT A KEY. An empty mapping would order the
+            # whole head by rid string (every rid lands in the "no arrival
+            # rank" bucket), which is neither arrival order nor the match
+            # order -- a third order nobody asked for. `kv_arrival_seq` is
+            # assigned unconditionally in `_add_request_to_queue` (:5320) and
+            # survives a retraction, so an empty mapping means a queue of
+            # requests that never entered through it, i.e. a stand-in.
+            return seqs or None
+        except Exception:  # noqa: BLE001 - a key may never break the order arm
+            return None
+
     def _apply_uniform_head_order(
         self, head_inputs: Optional[tp_head_congruence.UniformHeadInputs]
     ) -> None:
@@ -7304,6 +7438,7 @@ class Scheduler(
                     {},
                     digest_agreed=head_inputs.digest_agreed,
                     enforcer_enabled=True,
+                    arrival_seqs=self._head_order_arrival_seqs(),
                 )
                 by_rid = {req.rid: req for req in self.waiting_queue}
                 head = [by_rid[rid] for rid in order if rid in by_rid]
@@ -9087,6 +9222,52 @@ class Scheduler(
         a difference of two REPLICATED quantities, which is what makes the
         verdict a group verdict at all.
 
+        FIX 3 (round 3) -- THE DELTA WAS NOT A GROUP VERDICT AND THE MIN
+        WAS THE PROOF.  ``uncached + max(0, local_match - group_match)``
+        equals ``len(fill_ids) - min(local_match, group_match)``, and ``min``
+        SELECTS THE RANK-LOCAL VALUE whenever ``local <= group`` -- which is
+        the ordinary case, since the group value is a MIN over the ranks.
+        MUST NOT 7 ("no rank-local decision ... a detected disagreement is a
+        group STOP") and C11's own CHECK ("a grep proving no rank-local
+        quantity enters the compared term") were therefore not met, and the
+        residual was reachable: ``local_match`` is re-derived at the gate by
+        ``init_next_round_input``, and its HOST half is mutated between the
+        vote and the gate by the HiCache controller THREADS
+        (``check_prefetch_progress`` -> ``_insert_helper_host``, write-back,
+        eviction), which the scheduler thread does not own.  A host entry
+        lost on one rank between the two reads shrinks that rank's local
+        below the group MIN; the refusal then deletes the request from THAT
+        rank's waiting_queue only, and ``send_to_tokenizer`` is a
+        ``SenderWrapper(None)`` off rank 0 -- silent and permanent, the
+        exact failure this method exists to prevent.  Measured on the parent
+        commit: one rid, one group value, host halves 19,000 and 29,000 ->
+        extents 10,000 and 5,000, i.e. with X=8,000 one rank raises W31 and
+        the other admits.
+
+        SO THE PRICE IS THE GROUP'S ALONE: ``len(full_untruncated_fill_ids)
+        - group_match``.  Both terms are replicated -- the request's own
+        token ids and #823's MIN-reduced match -- so every rank computes the
+        SAME number from the SAME inputs and the verdict is total.  The
+        direction it can be wrong in is the safe one: a group value above
+        this rank's local UNDER-states the extent, i.e. ADMITS, which is the
+        delay-never-force side a REFUSING consumer needs (a group value
+        below it over-states and refuses, but it refuses on EVERY rank, and
+        a request refused by name is re-queued to P by C12 -- served, once,
+        never dropped).
+
+        TWO OBSERVERS RIDE ALONG, and only one of them stops the group.
+        ``group_match > len(fill_ids)`` is a genuine CROSS-RANK split -- the
+        group priced a longer prefix than this rid's own replicated token
+        ids, which can only mean the ranks reduced over different requests
+        under one rid -- and it is a named STOP (MUST NOT 7,
+        raenge-nie-uneins).  ``local_match < group_match`` is NOT a split:
+        the verdict no longer reads ``local_match`` at all, so no rank can
+        decide differently because of it; it is a READING of how stale the
+        same-pass reduce is against this rank's own tree, counted and
+        throttled with its denominator, and deliberately not a boot killer
+        (a host eviction by a controller thread between the vote and the
+        gate is an ordinary event under pressure).
+
         FIX 2 (round 2) -- THE SAFETY CLAIM THIS DOCSTRING USED TO MAKE WAS
         ONE-SIDED, AND THE OTHER SIDE WAS THE LIVE ONE.  It said a stale
         group value "can only ever produce the SMALLER extent"; that covers
@@ -9106,16 +9287,49 @@ class Scheduler(
         snapshot, which is conservative rather than arbitrary.  It is not a
         total property and this docstring no longer claims one.
         """
-        extend_input_len = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+        fill_ids = req.full_untruncated_fill_ids
+        total = len(fill_ids)
         host_hit = int(getattr(req, "host_hit_length", 0) or 0)
-        uncached = max(0, extend_input_len - host_hit)
         group_match = tp_head_congruence.group_match_for(
             head_inputs, str(getattr(req, "rid", "") or "")
         )
         if group_match is None:
-            return uncached
+            # No group opinion: the caller ABSTAINS above this line, so this
+            # value never reaches a verdict on a multi-rank boot. Solo boots
+            # (tp_size == 1) price locally, which is replicated by
+            # construction there.
+            return max(0, (total - len(req.prefix_indices)) - host_hit)
+        gm = int(group_match)
+        if gm > total:
+            raise RuntimeError(
+                f"#1234 W37 X-TERM SPLIT STOP rid={getattr(req, 'rid', '?')}: the "
+                f"group published a prefix match of {gm} tokens for a request "
+                f"whose own token ids are {total} long. Both quantities are "
+                "supposed to be replicated, so the ranks reduced over different "
+                "requests under one rid -- a batch-formation split, not a "
+                "pricing question. The group stops here by name (MUST NOT 7) "
+                "instead of refusing or admitting on a term it cannot trust."
+            )
         local_match = len(req.prefix_indices) + host_hit
-        return uncached + max(0, local_match - int(group_match))
+        if local_match < gm:
+            # A READING, never a verdict: see the docstring. Counted with its
+            # denominator so an absence of lines is readable as an absence of
+            # drift rather than as a silent emitter.
+            self._weg2_x_term_drift = getattr(self, "_weg2_x_term_drift", 0) + 1
+            self._weg2_x_term_priced = getattr(self, "_weg2_x_term_priced", 0)
+            n = self._weg2_x_term_drift
+            if n <= 5 or n % 64 == 0:
+                logger.info(
+                    "WEG2 X-TERM-DRIFT rid=%s local=%d group=%d priced=%d "
+                    "drifted=%d (this rank's own tree fell BELOW the group MIN "
+                    "it voted; the verdict is priced on the group term alone "
+                    "and is therefore unaffected -- no rank-local quantity "
+                    "enters it)",
+                    str(getattr(req, "rid", "?"))[:16], local_match, gm,
+                    self._weg2_x_term_priced, n,
+                )
+        self._weg2_x_term_priced = getattr(self, "_weg2_x_term_priced", 0) + 1
+        return max(0, total - gm)
 
     def _weg2_host_carry_tokens(self) -> int:
         """Longest prefix the store can hand back to THIS group, in tokens.
