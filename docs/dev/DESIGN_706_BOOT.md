@@ -214,7 +214,7 @@ On top of the current serving line (`--enable-phase-flip`,
   --enable-hierarchical-cache
   --hicache-storage-backend file
   --page-size 1                      # canonical page = ONE token; refused otherwise
-  --phase-flip-canonical-kv-page     # geometry-free keys + whole-page protocol
+  --hicache-canonical-kv-page     # geometry-free keys + whole-page protocol
   --phase-flip-writeback             # push warm prefixes before the cutover
   --phase-flip-writeback-deadline-s 2.0
   --hicache-size <= 5.37 GB          # the remainder from 1.2; do NOT ask for 9.01 GB
@@ -443,7 +443,7 @@ here rather than left implicit.
   --enable-hierarchical-cache
   --hicache-storage-backend file
   --page-size 1
-  --phase-flip-canonical-kv-page
+  --hicache-canonical-kv-page
   --phase-flip-writeback
   --phase-flip-writeback-deadline-s 2.0
   --hicache-size 5

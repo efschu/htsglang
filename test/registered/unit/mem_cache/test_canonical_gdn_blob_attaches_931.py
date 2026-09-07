@@ -16,7 +16,7 @@ configs/model_config.py`` is 0. The getattr missed on every model, the list was
 always empty, and the blob has NEVER attached on any boot.
 
 THE MEASUREMENT, boot 2g (2026-08-27, boot_2f_698cd396ce_0827_0704.log). Format
-explicitly armed: ``phase_flip_canonical_kv_page=True``,
+explicitly armed: ``hicache_canonical_kv_page=True``,
 ``phase_flip_writeback=True``, ``hicache_storage_backend='file'``, page_size 1,
 so the pairing guard at server_args.py:8716 held. And yet::
 

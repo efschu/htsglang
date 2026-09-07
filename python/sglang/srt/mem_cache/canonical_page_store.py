@@ -464,7 +464,7 @@ def resolve_linear_layer_ids(model_config) -> list[int]:
 
     WHAT THAT COST, measured on boot 2g (2026-08-27,
     boot_2f_698cd396ce_0827_0704.log): with the format explicitly armed
-    (``phase_flip_canonical_kv_page=True``, writeback on, 'file' backend,
+    (``hicache_canonical_kv_page=True``, writeback on, 'file' backend,
     page_size 1) the log carries "#706 canonical KV page active" three times,
     once per rank -- and "#706 canonical GDN blob active" ZERO times, with zero
     refusals. Exactly the split ``_canonical_mamba_window``'s own docstring

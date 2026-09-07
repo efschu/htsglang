@@ -112,6 +112,21 @@ class TestCanonicalKvPageArgs(CustomTestCase):
         args._handle_hicache_canonical_kv_page()  # no raise
         self.assertTrue(args.hicache_canonical_kv_page)
 
+    def test_accepted_on_a_decode_shaped_launch(self):
+        """WEG 2 F1 (S5), re-expressed on the post-S0 tree.
+
+        The refusal this file used to carry gated the format on the flip, and
+        the flip additionally demanded ``pp_size > 1`` and ``tp_size == 1``.
+        Group D boots the opposite shape (``tp_size=3, pp_size=1``) and could
+        therefore never have carried the format -- which would have made the
+        two groups' key spaces disjoint over one store, a 100 % miss that
+        raises nothing.  The format is a STORE format, so the decode shape
+        must validate exactly like the prefill shape.
+        """
+        args = _args(hicache_canonical_kv_page=True, tp_size=3, pp_size=1)
+        args._handle_hicache_canonical_kv_page()  # no raise
+        self.assertTrue(args.hicache_canonical_kv_page)
+
     def test_off_is_untouched(self):
         """The gate is one-way: a boot that does not ask for the format is not
         validated against it and keeps the geometry-suffixed keys it always

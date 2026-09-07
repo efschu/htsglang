@@ -29,9 +29,13 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Callable, Iterable, Optional, Set, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.weg2_store_gates import (
+    check_index_coverage,
+    check_store_cap_fundable,
+)
 from sglang.srt.utils.common import human_readable_int
 
 logger = logging.getLogger(__name__)
@@ -41,6 +45,15 @@ _FREE_SPACE_PROBE_INTERVAL_S = 5.0
 # Free space must climb this far above min_free before a latched write stop is
 # released, so the backend cannot oscillate between stopped and writing.
 _FREE_SPACE_RECOVERY_FACTOR = 1.05
+
+# What ``index_coverage`` reports before any scan has run (an inert evictor).
+_EMPTY_CENSUS = {
+    "indexed_bytes": 0,
+    "seen_bytes": 0,
+    "indexed_entries": 0,
+    "seen_entries": 0,
+    "fraction": 1.0,
+}
 
 
 def _parse_size_to_bytes(value: Any) -> int:
@@ -76,7 +89,11 @@ class LRUFileEvictor:
         config_suffix: str,
         *,
         tp_rank: int,
-        is_mla_model: bool,
+        writes_shared_keys: bool,
+        pp_rank: int = 0,
+        attn_cp_rank: int = 0,
+        kv_config_suffix: Optional[str] = None,
+        scan_suffixes: Optional[Iterable[str]] = None,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
         writer_count: int = 1,
@@ -93,7 +110,40 @@ class LRUFileEvictor:
         self._pins = pins
         self.file_path = file_path
         self.config_suffix = config_suffix
+        # F7 / W8b: the canonical KV pages and GDN blobs end with the KV
+        # suffix, which drops the geometry terms the per-rank config_suffix
+        # still carries. The scan below must accept BOTH or it indexes only
+        # this rank's draft files -- measured on the store of record: 104,267
+        # of 124,610 files (83.7 %) matched no rank's config_suffix and were
+        # therefore outside every byte bound this process can apply.
+        self.kv_config_suffix = kv_config_suffix
+        # WHOSE FILES DOES THIS INDEX BOUND -- THIS RANK'S, OR THE GROUP'S?
+        # When exactly one rank of a group evicts (``writes_shared_keys``), the
+        # pair above is the WRONG population: it is this rank's own tail, so
+        # the sole owner indexes its own suffixed files and nobody indexes
+        # anyone else's. Measured on the production classes at 69447a36 (group
+        # D, tp_size=3, canonical page on, 40 own draft pages per rank): 120
+        # files on disk, 40 in the owner's index, 80 outside every byte bound
+        # any process in the group can apply -- a NEW unbounded-disk class, on
+        # the sole carrier's filesystem, introduced by electing one owner
+        # without widening what that owner may see. The caller that knows the
+        # geometry therefore injects the GROUP's full suffix set
+        # (``HiCacheStorage._group_scan_suffixes``); a caller that does not
+        # keeps the per-rank pair, which is the correct population exactly when
+        # every rank is its own owner.
+        if scan_suffixes is not None:
+            self._scan_suffixes: Tuple[str, ...] = tuple(
+                dict.fromkeys(s for s in scan_suffixes if s)
+            )
+            self._scan_population_is_group_wide = True
+        else:
+            self._scan_suffixes = tuple(
+                dict.fromkeys(s for s in (config_suffix, kv_config_suffix) if s)
+            )
+            self._scan_population_is_group_wide = False
         self._tp_rank = tp_rank
+        self._pp_rank = pp_rank
+        self._attn_cp_rank = attn_cp_rank
         self._on_evict = on_evict
         # Every rank that writes into this directory shares one filesystem, so
         # by default the configured cap is split between them (see _load_config).
@@ -120,9 +170,32 @@ class LRUFileEvictor:
         # evictor, not a change to how it evicts.
         self._pins = pins
 
-        # MLA ranks share the same physical files, so centralize LRU bookkeeping
-        # on rank 0; non-MLA ranks each own their own files via the suffix.
-        self._is_storage_owner = (not is_mla_model) or (tp_rank == 0)
+        # F7: ranks that write the SAME physical files centralize LRU
+        # bookkeeping on rank 0; ranks that own their files via the suffix each
+        # keep their own index. The predicate used to read ``is_mla_model``,
+        # which was a correct proxy only while MLA was the one way ranks could
+        # share a file. Under the #706 canonical page a GQA model's ranks share
+        # files too, so the proxy made every rank an owner: six private LRU
+        # indices over one directory, each evicting against a cap divided by a
+        # different tp_size. ``writes_shared_keys`` (mem_cache/weg2_store_gates)
+        # is the one definition of that question.
+        # THE ELECTION IS OVER THE GROUP'S FULL RANK IDENTITY, NOT THE TP AXIS.
+        # ``tp_rank == 0`` alone elects a single owner only when the fan-out is
+        # TP. Weg 2's prefill group is pp_size=3, tp_size=1: all three stages
+        # have tp_rank == 0, so a tp-keyed election makes all three owners of
+        # one directory -- three private LRU indices, each carrying the whole
+        # operator cap and each unlinking victims the other two still count,
+        # and the W8b coverage gate graded three times at three moments (a
+        # reading near the floor could refuse one stage and pass the others,
+        # which is a rank disagreement rather than a stop). The tree already
+        # names this exact trap for the directory-creation guard
+        # (hicache_storage.py: "with pure PP every stage has tp_rank == 0 and
+        # attn_cp_rank == 0, so all three ranks elect THEMSELVES"); the same
+        # sentence is true here. One directory, one index, one owner.
+        self._writes_shared_keys = bool(writes_shared_keys)
+        self._is_storage_owner = (not self._writes_shared_keys) or (
+            tp_rank == 0 and pp_rank == 0 and attn_cp_rank == 0
+        )
 
         # suffixed_key -> allocated disk bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -169,16 +242,68 @@ class LRUFileEvictor:
         self._eviction_enabled = self._eviction_configured and self._is_storage_owner
         if self._eviction_configured and not self._is_storage_owner:
             logger.info(
-                f"HiCacheFile rank {self._tp_rank} (MLA): eviction handled by rank 0; "
-                f"this rank skips LRU bookkeeping and will not create new files."
+                f"HiCacheFile rank tp={self._tp_rank} pp={self._pp_rank} "
+                f"cp={self._attn_cp_rank}: this group writes SHARED keys, so the "
+                f"LRU index and eviction for this directory belong to the "
+                f"group's rank 0. This rank keeps no index; it still writes the "
+                f"bytes only it holds (its extent of a shared page, its own "
+                f"suffixed files), untracked here."
             )
+
+        # W8: on a shared-key store the operator's cap is not advisory. The
+        # clamp below silently serves a SMALLER budget than the launch line
+        # asked for, which is the right answer while this tier is a cache in
+        # front of a recomputable prefix and the wrong one when it is the only
+        # carrier between two process groups: the loss then appears weeks later
+        # as a hit-rate decay with the operator's own number still on screen.
+        # Refuse first, clamp only where a clamp is still honest.
+        #
+        # GRADED BY EVERY RANK OF THE GROUP, ABOVE THE OWNER-ONLY RETURN. Once
+        # the election runs over the full rank identity, exactly ONE rank of a
+        # shared-key group reaches the code below; a refusal placed there kills
+        # rank 0 while ranks 1..n-1 build their backend and walk into the next
+        # collective, which is a rank disagreement rather than a stop (user law
+        # §0: "Ranks never disagree ... STOP, never compensation"). The three
+        # inputs here are rank-invariant by construction -- the same
+        # extra_config/env numbers and the same filesystem -- so every rank
+        # computes the same verdict and they refuse together.
+        #
+        # W8b MOVES WITH IT ONLY WHERE THE POPULATION IT GRADES IS THE GROUP'S.
+        # Its census is filtered by ``_scan_suffixes``. While that was this
+        # rank's own tail, a non-owner walking the same directory graded a
+        # DIFFERENT population, so a shared verdict was not available and the
+        # gate had to stay the owner's alone -- at the cost of a lone-rank raise
+        # at attach (measured at 69447a36 over a store this group had used once:
+        # rank 0 raised Weg2StoreIndexBlind at 33.3 % while ranks 1 and 2
+        # constructed and walked on). With the group's suffix set injected, the
+        # numerator, the denominator and the filter are all properties of the
+        # DIRECTORY and the group geometry, so every rank computes one census
+        # and they refuse together. Where no group set was injected the old
+        # asymmetry is still real, so the gate stays below the return there.
+        scanned: Optional[List[Tuple[float, str, int]]] = None
+        if self._eviction_configured and self._writes_shared_keys:
+            check_store_cap_fundable(
+                self.file_path, self.max_size_bytes, self.min_free_bytes
+            )
+            if self._scan_population_is_group_wide:
+                scanned = self._census_existing_files()
+                self._check_index_coverage()
 
         if not self._eviction_enabled:
             return
 
         self._clamp_max_size_to_fs()
 
-        self._scan_existing_files()
+        if scanned is None:
+            scanned = self._census_existing_files()
+        self._install_census(scanned)
+        # W8b: the index is what the cap is enforced against, so a cap over a
+        # fraction of the directory is not a cap. Armed only for a shared-key
+        # store: where every rank legitimately owns its own suffixed files,
+        # seeing a third of the directory is correct, not blind. Already graded
+        # above when the population was the group's.
+        if self._writes_shared_keys and not self._scan_population_is_group_wide:
+            self._check_index_coverage()
         with self._lock:
             if self.max_size_bytes > 0 and self._total_bytes > self.max_size_bytes:
                 self._evict_locked(0)
@@ -339,8 +464,8 @@ class LRUFileEvictor:
         no-ops), so the index is seeded from disk here before the first
         eviction, exactly as ``__init__`` does.
 
-        Non-owner MLA ranks record the new limits but stay inert: rank 0 owns
-        the shared files and does all the evicting.
+        Non-owner ranks of a shared-key group record the new limits but stay
+        inert: rank 0 owns the shared files and does all the evicting.
         """
         with self._lock:
             if max_size_bytes is not None:
@@ -415,25 +540,71 @@ class LRUFileEvictor:
         """True when this rank owns (and may create/evict) the on-disk files."""
         return self._is_storage_owner
 
-    def reserve(self, suffixed_key: str, value_bytes: int, key: str = "") -> bool:
+    def reserve(
+        self,
+        suffixed_key: str,
+        value_bytes: int,
+        key: str = "",
+        *,
+        owner_writes_whole_file: bool = True,
+    ) -> bool:
         """Admit a new write of ``value_bytes``, evicting LRU victims as needed.
 
         On success the key is pre-reserved at MRU and flagged in-flight so a
         concurrent ``reserve`` won't evict it before the file is committed; the
         caller must then call ``commit`` (write landed) or ``abort`` (write
         failed). Returns ``False`` -- reserving nothing -- when the write is
-        refused: this rank is not the storage owner, the value is larger than
-        the cap, there is no evictable space, or the free-space watermark cannot
-        be met. When eviction is not configured the write is always admitted.
+        refused: the value is larger than the cap, there is no evictable space,
+        the free-space watermark cannot be met, or this rank is not the storage
+        owner AND the owner already writes every byte of this file. When
+        eviction is not configured the write is always admitted.
+
+        ``owner_writes_whole_file`` is the caller's answer to
+        ``weg2_store_gates.owner_write_covers_whole_file``. It defaults to True
+        so a caller that does not know keeps the historical refusal, which is
+        the safe direction: a duplicate write is lost cache, an admitted write
+        the owner cannot account for is unbounded disk.
         """
         if not self._eviction_configured:
             return True  # unbounded storage: nothing to enforce
         if not self._is_storage_owner:
-            logger.warning(
-                f"HiCacheFile rank {self._tp_rank} is not the MLA storage owner; "
-                f"not caching new key {key} because file eviction is enabled."
-            )
-            return False
+            if owner_writes_whole_file:
+                logger.warning(
+                    f"HiCacheFile rank {self._tp_rank} is not the shared-key storage "
+                    f"owner and the owner writes this whole file; not caching new "
+                    f"key {key} because file eviction is enabled."
+                )
+                return False
+            # This rank holds bytes nobody else writes. Admitted, and
+            # deliberately NOT indexed HERE: the LRU index for this directory
+            # has one owner, and a second index over the same files is exactly
+            # the twin bookkeeping F7 removes -- it would evict pages the owner
+            # still counts. ``commit``/``abort``/``touch`` are already no-ops
+            # on a non-owner, so nothing here needs unwinding.
+            #
+            # THE BYTES ARE STILL BOUNDED, just not at this instant: the
+            # owner's scan filter is the GROUP's suffix set
+            # (``HiCacheStorage._group_scan_suffixes``), so these files enter
+            # its index and its cap at the next ``_scan_existing_files`` --
+            # attach, or ``rescan`` on wake. The residual is STALENESS inside
+            # one awake period, the same class the two groups' owners already
+            # carry between them and with the same remedy; before that filter
+            # existed the residual was unbounded growth, because no scan on any
+            # rank ever named these suffixes.
+            #
+            # The free-space watermark still applies, because it is a statvfs
+            # fact any process can read rather than a second index. Checked
+            # without eviction: reclaiming space is the owner's act.
+            if self.min_free_bytes > 0:
+                fs = self._fs_stats()
+                if fs is not None and (fs[1] - value_bytes) < self.min_free_bytes:
+                    logger.warning(
+                        f"HiCacheFile: filesystem hosting {self.file_path!r} "
+                        f"would fall below min_free={self.min_free_bytes} B "
+                        f"after writing {value_bytes} B; refusing {key}."
+                    )
+                    return False
+            return True
         if self.max_size_bytes > 0 and value_bytes > self.max_size_bytes:
             logger.warning(
                 f"HiCacheFile: value {value_bytes} B exceeds cap "
@@ -522,6 +693,7 @@ class LRUFileEvictor:
         """Mark key as MRU, adopting an untracked on-disk file if needed."""
         if not self._eviction_enabled:
             return
+        self._touch_mtime(tensor_path)
         with self._lock:
             if suffixed_key in self._lru:
                 self._lru.move_to_end(suffixed_key, last=True)
@@ -539,6 +711,26 @@ class LRUFileEvictor:
             else:
                 self._lru[suffixed_key] = size
                 self._total_bytes += size
+
+    def _touch_mtime(self, tensor_path: str) -> None:
+        """Record the recency where the SIBLING owner can read it (N2).
+
+        The LRU order above lives in one process's memory. Under Weg 2 two
+        eviction owners share one directory -- one per group -- and each
+        rebuilds its order from ``st_mtime`` when it wakes. A touch that never
+        reaches the inode is therefore invisible to the other owner, and the
+        page this group just served is exactly the one the sibling sees as
+        oldest and evicts first: the carrier discards the hottest prefix it
+        has. One ``utime`` per read hit buys the two owners a shared, physical
+        recency fact instead of a protocol between them.
+
+        Best-effort: a missing or read-only file is not a reason to fail a
+        read. The in-memory order still applies for THIS owner either way.
+        """
+        try:
+            os.utime(tensor_path, None)
+        except OSError:
+            pass
 
     def clear(self) -> None:
         """Reset all bookkeeping after the backend has removed the files."""
@@ -674,17 +866,134 @@ class LRUFileEvictor:
             yield fn[:-4], st
 
     def _scan_existing_files(self) -> None:
-        """Seed LRU index from disk on startup (oldest mtime first)."""
-        entries = []
+        """Seed LRU index from disk on startup (oldest mtime first).
+
+        Ordered by ``st_mtime`` deliberately: under Weg 2 two eviction owners
+        (one per group) rebuild this index over ONE directory at different
+        times, and mtime is the only recency fact they both can read. That is
+        also why ``touch`` writes it (see there).
+
+        The filter accepts EVERY suffix this index is responsible for -- see
+        ``_scan_suffixes``, which is the GROUP's set wherever one rank evicts
+        for the group. The denominators of what was seen versus indexed are
+        recorded so the coverage gate has a population to report, rather than a
+        bare count.
+        """
+        self._install_census(self._census_existing_files())
+
+    def _census_existing_files(self) -> List[Tuple[float, str, int]]:
+        """Walk the directory, record the census, return the sorted entries.
+
+        SPLIT FROM THE INSTALL so a rank that must GRADE the directory need not
+        INDEX it. Every rank of a shared-key group grades W8b (one census, one
+        verdict, they refuse together); only the elected owner installs an
+        index, because a second index over one directory is exactly the twin
+        bookkeeping F7 removes.
+        """
+        entries: List[Tuple[float, str, int]] = []
+        seen_bytes = 0
+        seen_entries = 0
         for stem, st in self._iter_existing():
-            # Only files belonging to this rank/model.
-            if not stem.endswith(self.config_suffix):
+            size = self._allocated_size(st)
+            seen_bytes += size
+            seen_entries += 1
+            # Only files this index is responsible for.
+            if not self._scan_suffixes or not stem.endswith(self._scan_suffixes):
                 continue
-            entries.append((st.st_mtime, stem, self._allocated_size(st)))
+            entries.append((st.st_mtime, stem, size))
         entries.sort(key=lambda e: e[0])  # oldest first
+        indexed_bytes = sum(size for _, _, size in entries)
+        self._scan_census = {
+            "indexed_bytes": indexed_bytes,
+            "seen_bytes": seen_bytes,
+            "indexed_entries": len(entries),
+            "seen_entries": seen_entries,
+            "fraction": (indexed_bytes / seen_bytes) if seen_bytes > 0 else 1.0,
+        }
+        return entries
+
+    def _install_census(self, entries: List[Tuple[float, str, int]]) -> None:
+        """Seed the LRU index from a census, oldest first."""
         for _, stem, size in entries:
             self._lru[stem] = size
             self._total_bytes += size
+
+    def _check_index_coverage(self) -> None:
+        """Grade W8b against the census this evictor just took."""
+        census = self.index_coverage()
+        check_index_coverage(
+            store_path=self.file_path,
+            indexed_bytes=census["indexed_bytes"],
+            seen_bytes=census["seen_bytes"],
+            indexed_entries=census["indexed_entries"],
+            seen_entries=census["seen_entries"],
+        )
+
+    def index_coverage(self) -> dict:
+        """How much of the directory this evictor's byte cap actually bounds.
+
+        Always carries BOTH denominators (bytes and entries seen), because the
+        indexed count alone reads as a full store no matter how small the
+        fraction it covers -- which is exactly how the 83.7 %-invisible defect
+        stayed latent.
+
+        DENOMINATOR NOTE: on a non-owner of a shared-key group this reports the
+        census that graded W8b -- the group's population over the whole
+        directory -- with NO index behind it. ``indexed_bytes`` there is what
+        the group's elected owner bounds, not what this rank bounds; this rank
+        bounds nothing (see ``enabled``).
+        """
+        return dict(getattr(self, "_scan_census", None) or _EMPTY_CENSUS)
+
+    def rescan(self) -> dict:
+        """Rebuild the index from the directory as it is NOW (wake path).
+
+        Weg 2's two eviction owners (P0 and D0) never run concurrently -- a
+        sleeping group performs no writes and eviction is triggered on write --
+        so the hazard between them is not a race but STALENESS: an index built
+        once at boot is wrong after hours of the sibling's writes, and the
+        owner would evict against numbers that no longer describe the disk.
+        Each owner therefore re-scans when it wakes, and since both order by
+        ``st_mtime`` their eviction choices converge on one physical fact. No
+        cross-process protocol and no second bookkeeping.
+
+        In-flight writes are preserved: a reservation belongs to this process
+        and is not on disk yet, so re-reading the directory must not drop it.
+        """
+        if not self._eviction_enabled:
+            return self.index_coverage()
+        with self._lock:
+            pending = {k: self._lru.get(k, 0) for k in self._pending_writes}
+            self._lru.clear()
+            self._total_bytes = 0
+            self._scan_existing_files()
+            for key, size in pending.items():
+                if key not in self._lru:
+                    self._lru[key] = size
+                    self._total_bytes += size
+            census = self.index_coverage()
+        # W8b, graded where the number exists. In ``__init__`` this store may
+        # be COLD -- Weg 2's first boot sees an empty directory, and coverage
+        # over zero bytes is 1.0 by definition, a gate with no denominator.
+        # The wake is the populated moment: the sibling group's whole awake
+        # phase has landed in this directory since this index was built, and
+        # this is the scan that has to see it. Same one definition, called
+        # again where the number is born.
+        if self._writes_shared_keys:
+            check_index_coverage(
+                store_path=self.file_path,
+                indexed_bytes=census["indexed_bytes"],
+                seen_bytes=census["seen_bytes"],
+                indexed_entries=census["indexed_entries"],
+                seen_entries=census["seen_entries"],
+            )
+        logger.info(
+            f"HiCacheFile eviction index re-scanned at wake: "
+            f"{census['indexed_entries']} of {census['seen_entries']} files, "
+            f"{census['indexed_bytes']} of {census['seen_bytes']} B "
+            f"({census['fraction']:.1%}) under the cap."
+        )
+        return census
 
     def _path_for_stem(self, stem: str) -> str:
         """The file this stem names. One join, so the evictor, the

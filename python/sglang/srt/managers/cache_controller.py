@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     compute_model_identity_hash,
 )
+from sglang.srt.mem_cache.weg2_store_gates import check_mamba_blob_present
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1297,6 +1298,23 @@ class HiCacheController:
             )
             canonical_mamba_blob = self._canonical_mamba_window(
                 server_args, model_config
+            )
+            # W7 (Weg2MambaBlobAbsent). `_canonical_mamba_window` returns None
+            # only on a POSITIVE dense proof from `resolve_linear_layer_ids`.
+            # The bound pool is the second witness to the same question, and
+            # when the two disagree the resolver was wrong about the model --
+            # the measured #931 shape, where every boot logged "#706 canonical
+            # KV page active" x3 and the GDN blob line zero times, with zero
+            # refusals. Under Weg 2 the store is the sole carrier between the
+            # groups, so a KV-only prefix is not a degraded hit rate: the
+            # mamba pool is registered TRAILING_PAGES and `batch_exists_v2`
+            # takes the MINIMUM across pools, which truncates the whole KV
+            # prefix to zero.
+            check_mamba_blob_present(
+                canonical_page_on=True,
+                has_mamba_pool=getattr(self.mem_pool_device_hybrid, "mamba_pool", None)
+                is not None,
+                mamba_blob=canonical_mamba_blob,
             )
 
         return HiCacheStorageConfig(

@@ -347,7 +347,7 @@ def backend_config_of(backend):
 
 def _server_args():
     return SimpleNamespace(
-        phase_flip_canonical_kv_page=True,
+        hicache_canonical_kv_page=True,
         phase_flip_rebind_hicache=True,
         phase_flip_tp_vector=TP_VECTOR,
         rank_tp_ratio=None,

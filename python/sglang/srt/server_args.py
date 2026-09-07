@@ -50,6 +50,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
     LoRAPathAction,
+    RemovedFlagAction,
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
@@ -5966,7 +5967,9 @@ class ServerArgs:
             "Renamed in #1233 (Weg 2 S0), and the old spelling no longer "
             "parses: the format is a HiCache property, not a property of an "
             "in-process phase change, and the groups that read each other's "
-            "pages are now separate processes. "
+            "pages are now separate processes. The flag changes the KEY and "
+            "the stored LAYOUT only; it enables no eviction, no sizing and no "
+            "writeback (Weg 2 S5). "
             "Default off = keys and bytes byte-identical to today.",
         ),
     ] = False
@@ -6887,9 +6890,12 @@ class ServerArgs:
         # start and quietly observe under an acting flag.
         self._handle_regime_controller()
 
-        # #706: validate the geometry-neutral page format at argument time
-        # (an unusable backend or page size fails the boot, not the first
-        # store write).
+        # #706 x Weg 2 F1: validate the geometry-neutral page format at
+        # argument time (an unusable backend or page size fails the boot, not
+        # the first store write), on EVERY launch shape.  Deliberately not
+        # gated on any flip flag: the format is a store-format choice, and
+        # gating it made it unreachable for the decode-shaped group that has
+        # to read the pages the prefill-shaped group wrote.
         self._handle_hicache_canonical_kv_page()
 
         # Erg. 9/9b KV pressure ladder: validate the step spec, the two
@@ -18962,6 +18968,32 @@ class ServerArgs:
             "--config",
             type=str,
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
+        )
+
+        # --- Removed argument registrations (refused by name, never ignored) ---
+        # Weg 2 F1 renamed this flag because its MEANING changed: it is a store
+        # format, not a phase-flip knob. A launch line still carrying the old
+        # spelling must fail loudly -- argparse's own "unrecognized argument"
+        # would be enough for a shell, but a config file or a programmatic
+        # caller could drop it silently, and the failure mode of running with
+        # the format off is a 100 % store miss that looks like a cold cache.
+        parser.add_argument(
+            "--phase-flip-canonical-kv-page",
+            dest="hicache_canonical_kv_page",
+            action=RemovedFlagAction,
+            new_flag="--hicache-canonical-kv-page",
+            reason=(
+                "The canonical KV page is a STORE FORMAT choice, not a "
+                "phase-flip knob (Weg 2 spec 3.2 / F1): it is valid wherever a "
+                "reader may have a different parallel cut from the writer, and "
+                "the flip was only one instance of that. The old name also "
+                "carried the flip's --enable-phase-flip precondition, which "
+                "forces pp_size > 1 and tp_size == 1 and therefore excluded "
+                "every decode-shaped reader. No silent alias is provided: "
+                "accepting it here would leave the format OFF on a launch that "
+                "asked for it, and the store would miss 100 % without raising."
+            ),
+            help=argparse.SUPPRESS,
         )
 
         # --- Deprecated argument registrations ---
