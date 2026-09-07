@@ -3228,11 +3228,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.write_backup(node)
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
+        # #1233 STORE-WRITE census (boots weg2ls3b1/b2): group P's FIRST
+        # awake epoch wrote zero store files for a 13k-token prefill whose
+        # host publish ran, its later epochs wrote ~13.2k files under a
+        # chain DISJOINT from the one group D writes for the same prompt --
+        # while P's own prefetch matched D's chain 13,224 deep. This is the
+        # one L3 write site of this cache; every exit is counted and the
+        # issued chain prints its ends, so the next boot decides "never
+        # issued" vs "issued under another chain" from the log alone.
+        _calls = getattr(self, "_1233_store_write_calls", 0) + 1
+        self._1233_store_write_calls = _calls
         if (
             not self.enable_storage
             or self.cache_controller is None
             or not node.backuped
         ):
+            _why = (
+                "storage_off" if not self.enable_storage
+                else "no_controller" if self.cache_controller is None
+                else "node_not_backuped"
+            )
+            _skips = getattr(self, "_1233_store_write_skips", {})
+            _skips[_why] = _skips.get(_why, 0) + 1
+            self._1233_store_write_skips = _skips
+            if sum(_skips.values()) <= 8 or sum(_skips.values()) % 64 == 0:
+                logger.warning(
+                    "#1233 STORE-WRITE SKIPPED why=%s node=%s tokens=%d calls=%d "
+                    "skips=%s (denominator: every write_backup_storage call)",
+                    _why, getattr(node, "id", "?"), len(node.key), _calls, _skips,
+                )
             return
 
         # Weighted uneven-DCP owner mode (task #60): each rank's host pool only
@@ -3295,6 +3319,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             extra_pools=aux_xfers or None,
             kv_page_owner_mask=kv_page_owner_mask,
         )
+        _issued = getattr(self, "_1233_store_writes_issued", 0) + 1
+        self._1233_store_writes_issued = _issued
+        if _issued <= 16 or _issued % 64 == 0:
+            try:
+                _hv = node.hash_value or []
+                _par = node.parent
+                _ph = (
+                    str(_par.hash_value[-1])[:12]
+                    if _par is not None and _par.hash_value
+                    else "ROOT/none"
+                )
+                _tid = list(node.key.token_ids[:3])
+                logger.warning(
+                    "#1233 STORE-WRITE-ISSUED n=%d op=%s node=%s tokens=%d pages=%d "
+                    "first_hash=%s last_hash=%s parent_hash=%s first_tokens=%s "
+                    "extra_key=%s prefix_keys=%s aux=%d calls=%d",
+                    _issued, operation_id, getattr(node, "id", "?"), len(node.key),
+                    len(_hv), str(_hv[0])[:12] if _hv else "-",
+                    str(_hv[-1])[:12] if _hv else "-", _ph, _tid,
+                    getattr(node.key, "extra_key", None),
+                    "none" if prefix_keys is None else len(prefix_keys),
+                    len(aux_xfers), _calls,
+                )
+            except Exception as _e:  # noqa: BLE001
+                logger.warning("#1233 STORE-WRITE-ISSUED n=%d (repr failed: %s)", _issued, _e)
         self.ongoing_backup[operation_id] = (
             node,
             self.inc_host_lock_ref(node).to_dec_params(),
