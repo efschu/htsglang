@@ -78,8 +78,21 @@ class TestFrontDraftTerms(CustomTestCase):
 
 
 class TestLauncherW11(CustomTestCase):
+    #: fix 6: the fixture carries ALL THREE instruments the real L2 line
+    #: carries, because W11 now grades two of them -- ``resident_mib`` against
+    #: the budget and the BUILD ACCOUNTING (nvml_delta = resident + released).
+    #: A fixture that omits the other two would grade a line no boot emits.
     L2 = ("WEG2 DRAFT-KV-PRODUCER armed stage=2/3 drafter=a30db4b7c362c786 layout=v1 heads=4 head_dim=256 "
-          "page_bytes=2048 embed=resident mtp_mib=405.2 embed_mib=1213.0 resident_mib={} embed_dtype=torch.int8 build_s=9.1\n")
+          "page_bytes=2048 embed=resident mtp_mib=405.2 embed_mib=1213.0 resident_mib={0} "
+          "head_released_mib=2425.0 nvml_delta_mib={1} embed_dtype=torch.int8 build_s=9.1\n")
+
+    @staticmethod
+    def _line(resident, build=None):
+        # The build is what residue + released add up to unless a test says
+        # otherwise: these cases are about the FIRST instrument.
+        return TestLauncherW11.L2.format(
+            resident, resident + 2425.0 if build is None else build
+        )
 
     def _check(self, text):
         with tempfile.TemporaryDirectory() as d:
@@ -90,15 +103,15 @@ class TestLauncherW11(CustomTestCase):
 
     def test_fix2_resident_within_budget_passes_and_over_refuses(self):
         self.assertGreater(P_DRAFT_RESIDENT_BUDGET_MIB, 1600)
-        ok = self._check(self.L2.format(1650.0))
+        ok = self._check(self._line(1650.0))
         self.assertTrue(ok["ok"], ok)
         self.assertAlmostEqual(ok["resident_mib"], 1650.0)
-        over = self._check(self.L2.format(3994.0))  # boot weg2dk2's Load-weight-end delta
+        over = self._check(self._line(3994.0))  # boot weg2dk2's Load-weight-end delta
         self.assertFalse(over["ok"], over)
         self.assertGreater(over["over_mib"], 2000)
         absent = self._check("nothing armed\n")
         self.assertFalse(absent["ok"], absent)
-        unmeasured = self._check(self.L2.format(-1.0))
+        unmeasured = self._check(self._line(-1.0))
         self.assertFalse(unmeasured["ok"], unmeasured)
 
 

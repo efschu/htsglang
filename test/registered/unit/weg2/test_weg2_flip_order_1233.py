@@ -242,12 +242,24 @@ class TestTheMapIsBuiltFromTheDerivedSplit(CustomTestCase):
             self.assertEqual(
                 launcher_mod.model_layer_kinds(d), [False, False, False, True]
             )
+        # fix 6: a config with NO layer markers is no longer a refusal here.
+        # It was STRICTER than the authority this function claims to mirror
+        # (server_args.declared_layer_kinds_from_config), which reads such a
+        # checkpoint as homogeneous all-attention -- and a launcher refusal
+        # meant NO chunk->card map, i.e. the identity pause order that killed
+        # weg2dk4.  The two now share one derivation.
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "config.json"), "w") as f:
                 json.dump({"text_config": {"num_hidden_layers": 4}}, f)
+            self.assertEqual(launcher_mod.model_layer_kinds(d), [True] * 4)
+        # What IS still a refusal: a config whose depth cannot be read at all,
+        # because there is no authority to defer to for that.
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "config.json"), "w") as f:
+                json.dump({"text_config": {"hidden_size": 5120}}, f)
             with self.assertRaises(launcher_mod.Weg2LaunchRefused) as ei:
                 launcher_mod.model_layer_kinds(d)
-            self.assertIn("layer_types", str(ei.exception))
+            self.assertIn("num_hidden_layers", str(ei.exception))
 
 
 class TestInterleavePauseOrder(CustomTestCase):

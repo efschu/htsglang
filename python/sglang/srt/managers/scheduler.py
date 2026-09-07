@@ -12959,11 +12959,18 @@ class Scheduler(
         return ret
 
     def _draft_kv_producer_wants(self, batch: ScheduleBatch) -> bool:
-        """#1233 (C7): the last stage's extend chunk, and nothing else."""
+        """#1233 (C7): the last stage's extend chunk, and nothing else.
+
+        Fix 6 DELETED a trailing ``and not batch.forward_mode.is_idle()``:
+        ``ForwardMode.IDLE.is_extend()`` is already False
+        (forward_batch_info.py), so the clause could never change an answer.
+        An unfalsifiable term reads as protection that is not there -- the
+        wants-matrix row for IDLE passes with or without it, so the guard was
+        pinning nothing while looking like it did.
+        """
         return (
             self.draft_kv_producer is not None
             and batch.forward_mode.is_extend()
-            and not batch.forward_mode.is_idle()
         )
 
     @contextmanager

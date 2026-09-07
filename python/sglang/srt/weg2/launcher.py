@@ -1311,29 +1311,73 @@ def check_drafter_identity(log_p: str, log_d: str) -> Dict[str, object]:
 
 
 _RESIDENT_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*resident_mib=(-?\d+(?:\.\d+)?)")
+_HEAD_RELEASED_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*head_released_mib=(-?\d+(?:\.\d+)?)")
+_NVML_DELTA_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\d+(?:\.\d+)?)")
+#: W11b (#1233 fix 6): how far the BUILD may stay unexplained by the two terms
+#: that claim to explain it.  MEASURED on boot weg2dk5's own L2 line:
+#: nvml_delta 3998.0 against resident 1682.9 + head_released 2425.0 = 4107.9,
+#: i.e. 109.9 MiB of the build is not attributable at this granularity (the
+#: driver's own allocation rounding, and the fact that the two sides are read
+#: at different instants of the build).  The bound is set at the same 256 MiB
+#: as the residue tolerance -- the next tighter measurement replaces it.
+P_DRAFT_BUILD_ACCOUNTING_TOL_MIB = 256.0
 
 
 def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = None) -> Dict[str, object]:
-    """W11 (#1233 fix 2): the producer's MEASURED resident MiB on P's last
-    stage (L2 `resident_mib=`) against the budget T_P was derived from.
-    ``ok`` is False on absence, on an unmeasured value (-1) and above
-    budget + tolerance -- the corridor derivation is then refuted by the
-    boot itself and the front must not open on it."""
+    """W11 (#1233 fix 2, second instrument added in fix 6): the producer's
+    build on P's last stage, graded by TWO independent readings of the L2 line.
+
+    1. ``resident_mib`` against the budget T_P was derived from.  This is a
+       model-GRAPH quantity (fix 3 made it ``_live_weight_mib``), which is what
+       it must be for the corridor derivation -- and is exactly why it can no
+       longer catch the fix-2 failure it was built for: a table that
+       ``_drop_parameters`` unbinds while a loader, quant method or backup path
+       still holds a reference LEAVES ``model.parameters()`` while staying on
+       the card, and this reading falls even though nothing was freed.
+    2. THE BUILD ACCOUNTING: ``nvml_delta_mib`` -- which under
+       --enable-memory-saver reads the BUILD, not the residue (the weights live
+       in the saver's MemPool, memsaver.md N4) -- must be explained by
+       ``resident_mib + head_released_mib`` within
+       :data:`P_DRAFT_BUILD_ACCOUNTING_TOL_MIB`.  A release that frees nothing
+       shows up here as an unaccounted remainder the size of the table, on a
+       quantity no graph edit can move.
+
+    ``ok`` requires both.  It is False on absence and on an unmeasured value
+    (-1) in either instrument: silence is not a pass, and a build nobody
+    measured is not a build anybody checked.
+    """
     budget = P_DRAFT_RESIDENT_BUDGET_MIB if budget_mib is None else float(budget_mib)
     tol = P_DRAFT_RESIDENT_TOL_MIB if tol_mib is None else float(tol_mib)
-    out: Dict[str, object] = {"resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None, "ok": False}
+    out: Dict[str, object] = {
+        "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
+        "head_released_mib": None, "nvml_delta_mib": None, "unaccounted_mib": None,
+        "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
+        "resident_ok": False, "accounted": False, "ok": False,
+    }
     try:
         with open(log_p, errors="replace") as f:
             for line in f:
-                m = _RESIDENT_RE.search(line)
-                if m:
-                    out["resident_mib"] = float(m.group(1))
+                for key, rx in (
+                    ("resident_mib", _RESIDENT_RE),
+                    ("head_released_mib", _HEAD_RELEASED_RE),
+                    ("nvml_delta_mib", _NVML_DELTA_RE),
+                ):
+                    m = rx.search(line)
+                    if m:
+                        out[key] = float(m.group(1))
     except OSError:
         pass
     r = out["resident_mib"]
     if r is not None:
         out["over_mib"] = r - budget
-        out["ok"] = r >= 0 and r <= budget + tol
+        out["resident_ok"] = r >= 0 and r <= budget + tol
+    released, delta = out["head_released_mib"], out["nvml_delta_mib"]
+    if r is not None and r >= 0 and released is not None and released >= 0 and delta is not None and delta >= 0:
+        # SIGN: positive = build larger than what residue + release explain,
+        # i.e. memory nobody accounted for -- the fix-2 shape.
+        out["unaccounted_mib"] = delta - (r + released)
+        out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
+    out["ok"] = bool(out["resident_ok"] and out["accounted"])
     return out
 
 
@@ -1393,37 +1437,46 @@ def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> floa
     return dt
 
 
-def model_num_layers(model: str) -> int:
+def _model_config(model: str) -> dict:
     with open(os.path.join(model, "config.json")) as f:
-        cfg = json.load(f)
-    text = cfg.get("text_config", cfg)
-    n = int(text.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0)
-    if n <= 0:
+        return json.load(f)
+
+
+def model_num_layers(model: str) -> int:
+    """The backbone depth, through the SERVER's own probe order (fix 6)."""
+    from sglang.srt.server_args import declared_num_hidden_layers_from_config
+
+    n = declared_num_hidden_layers_from_config(_model_config(model))
+    if not n or n <= 0:
         raise Weg2LaunchRefused(f"num_hidden_layers not found in {model}/config.json")
-    return n
+    return int(n)
 
 
 def model_layer_kinds(model: str) -> List[bool]:
     """One flag per layer: True = full attention, False = linear/GDN.
 
-    The same ``layer_types`` list ``server_args._handle_pp_stage_ratio`` reads
-    before deriving the split, read from the same file, so the launcher's map
-    and the server's split cannot disagree about the checkpoint.  Refuses by
-    name when the key is missing or the wrong length -- a hybrid split guessed
-    from ``num_hidden_layers`` alone mis-sizes every hybrid (#201 slice 2).
+    THE SERVER'S OWN DERIVATION, called rather than re-implemented
+    (``server_args.declared_layer_kinds_from_config``, which
+    ``ServerArgs.declared_layer_kinds`` also calls), so the launcher's
+    chunk->card map and the server's PP split cannot disagree about the
+    checkpoint.
+
+    #1233 fix 6: this used to read ``layer_types`` ONLY and refuse otherwise,
+    which is STRICTER than the authority it claimed to mirror -- that one also
+    accepts ``layers_block_type`` and ``full_attention_interval`` (its own
+    docstring names the latter as the Qwen3.5/3.6 GDN hybrid source).  On such
+    a checkpoint the server derived a real hybrid split while this refused and
+    published NO map, and no map means ``front.interleave_pause_order`` returns
+    the IDENTITY order -- the order that killed boot weg2dk4 with a device OOM
+    in ``cu_mem_create``.  A degradation that is honest about its reason is
+    still a degradation into a known boot killer.
+
+    The one refusal left is the one that has no authority to defer to: a
+    config whose depth cannot be read at all.
     """
-    with open(os.path.join(model, "config.json")) as f:
-        cfg = json.load(f)
-    text = cfg.get("text_config", cfg)
-    types = text.get("layer_types") or cfg.get("layer_types")
-    n = model_num_layers(model)
-    if not isinstance(types, list) or len(types) != n:
-        raise Weg2LaunchRefused(
-            f"layer_types in {model}/config.json is {type(types).__name__} of "
-            f"length {len(types) if isinstance(types, list) else 'n/a'}, expected a "
-            f"list of {n}: the PP layer split of a hybrid cannot be derived without it."
-        )
-    return [str(t) == "full_attention" for t in types]
+    from sglang.srt.server_args import declared_layer_kinds_from_config
+
+    return declared_layer_kinds_from_config(_model_config(model), model_num_layers(model))
 
 
 def p_stage_layers(is_full_attention: Sequence[bool]) -> List[int]:
@@ -1678,6 +1731,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ring_span1_bytes=ring_plan.host_weights_span1_bytes,
         ring_provenance=ring_plan.provenance,
         cg_current_bytes=cg["current"],
+        # fix 6: only the NON-reclaimable part of that reading is charged --
+        # page cache is what the kernel hands back instead of killing for.
+        cg_reclaimable_bytes=cg["reclaimable"],
         cg_ceiling_bytes=cg_ceiling,
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
@@ -1838,11 +1894,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
     w11 = check_draft_resident(spec_p.log)
     log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
-        f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} ok={w11['ok']} (T_P={P_MAX_TOTAL_TOKENS})")
-    if not w11["ok"]:
+        f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
+        f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
+        f"head_released_mib={w11['head_released_mib']} + unaccounted_mib={w11['unaccounted_mib']} "
+        f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
+        f"ok={w11['ok']} (T_P={P_MAX_TOTAL_TOKENS})")
+    if not w11["resident_ok"]:
         raise Weg2LaunchRefused(f"W11 Weg2DraftResidentOverBudget: measured resident_mib={w11['resident_mib']} vs budget "
                                 f"{w11['budget_mib']:.1f}+{w11['tol_mib']:.0f} MiB -- T_P={P_MAX_TOTAL_TOKENS} was derived for the "
                                 f"budget and the last stage's corridor target (idle NVML free at {P_CORRIDOR_TOP_MIB:.0f}) cannot hold")
+    if not w11["accounted"]:
+        # #1233 fix 6: the SECOND instrument. resident_mib is a model-graph
+        # quantity, so a table released only from the graph passes it while
+        # still sitting on the card -- the fix-2 failure the W11 gate exists
+        # for. The build must be explained by residue + released.
+        raise Weg2LaunchRefused(f"W11b Weg2DraftBuildUnaccounted: nvml_delta_mib={w11['nvml_delta_mib']} is not explained by "
+                                f"resident_mib={w11['resident_mib']} + head_released_mib={w11['head_released_mib']} "
+                                f"(unaccounted {w11['unaccounted_mib']} MiB, tolerance {w11['accounting_tol_mib']:.0f}) -- either the "
+                                f"never-loaded lm_head was unbound from the graph without being freed (fix 2's shape, invisible to "
+                                f"resident_mib by construction) or one of the three instruments did not measure")
     # #1233 zero-remainder: the carrier bound the front routes by -- group D's
     # smallest host staging pool (tokens) x 0.9 (the prefetch rate bound that
     # refused the 84k prompt on boot weg2ls4b2: limit=27466 of pool 30518).

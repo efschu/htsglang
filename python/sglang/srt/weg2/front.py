@@ -342,9 +342,19 @@ def interleave_pause_order(
         return tags, "identity: the source has no chunk->card map (uniform/TP source, or no map passed)"
     if not free_mib:
         return tags, "identity: no NVML free sample for this flip"
-    missing = [t for t in chunks if t not in tag_cards]
+    # #1233 fix 6: an EMPTY card list is as unusable as an absent tag, and the
+    # difference used to be a crash instead of a refusal -- ``min()`` over an
+    # empty sequence raises ValueError inside ``flip``, i.e. at the one moment
+    # the flip must not fail.  ``chunk_tag_cards`` cannot emit an empty tuple
+    # today (a tag exists only once a layer lands in it), so this is a latent
+    # shape, and a latent shape guarded by nothing is how weg2dk4's order came
+    # to be trusted.
+    missing = [t for t in chunks if not tag_cards.get(t)]
     if missing:
-        return tags, f"identity REFUSED to reorder: chunk tags absent from the map {missing}"
+        return tags, (
+            "identity REFUSED to reorder: chunk tags absent from the map or with "
+            f"no cards {missing}"
+        )
     unknown = sorted({int(c) for t in chunks for c in tag_cards[t]} - set(free_mib))
     if unknown:
         return tags, f"identity REFUSED to reorder: cards {unknown} absent from the NVML free sample {sorted(free_mib)}"

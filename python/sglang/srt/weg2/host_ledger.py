@@ -47,6 +47,19 @@ those deletions' siblings, and both survive the move onto the ring:
   line names which one bound.  The reaper watches ``memory.current``; weg2dk5
   was reaped with ``MemAvailable`` at 23.96 GB, above the #721 floor, so the
   quantity this ledger measured was never the quantity that governs;
+
+  FIX 6 (2026-09-07) repairs that SAME denominator once more, in the other
+  direction: ``memory.current`` counts the page cache, which the kernel hands
+  back under pressure instead of killing for, so charging the whole reading as
+  spent refuses room nobody occupies.  Measured twice on metal: at weg2dk5's
+  OWN launch readings the whole ladder refused (the branch could not launch
+  from the state its last boot launched from), and on the live box the chosen
+  arm moved S=1 M=1200 -> M=600 unannounced.  What is charged now is the
+  NON-RECLAIMABLE part of the reading -- ``memory.current`` minus
+  :func:`cg_reclaimable_bytes` -- with both the reclaimable term and the
+  resulting base printed by name, and the same correction runs inside
+  :meth:`Arm.predicted_run_peak_gib`: an origin that carries cache and a
+  watermark that does not are not comparable quantities;
 * ``HOST_HEADROOM_GIB`` (#1232) is DELETED, not shrunk: it was a constant
   fitted to the gap between the #721 floor and the level at which this box
   actually OOMs, i.e. a compensation layer for the wrong denominator, and the
@@ -162,6 +175,33 @@ FLIP_HOST_TRANSIENT_GIB = 9.97
 #: against.  It is printed beside each arm's PREDICTED run-peak ``cg_current``
 #: so a configuration that is about to repeat weg2dk5 says so BEFORE the boot.
 OBSERVED_REAP_CURRENT_BYTES = 102_998_904_832
+#: The same watermark in the currency fix 6 budgets in: the NON-RECLAIMABLE
+#: part of that reading.  The memts row of the reap (21:15:30Z) carries
+#: ``cached_kb=55,231,500`` and ``shmem_kb=55,202,584``, i.e.
+#: ``pagecache_ex_shmem_kb=28,916`` -- 0.03 GiB.  At the moment of the kill the
+#: box's page cache was ALREADY almost pure shmem (the store tmpfs and the
+#: shm-backed cpu images), so the watermark barely moves; stating that is what
+#: makes the comparison against a non-reclaimable origin legitimate rather than
+#: lucky.  ``slab_reclaimable`` is not in the sampler's columns and is charged
+#: as spent here, which can only make the watermark tighter.
+OBSERVED_REAP_NONRECLAIM_BYTES = OBSERVED_REAP_CURRENT_BYTES - 28_916 * 1024
+#: cgroup-v2 semantics MEASURED on this box (2026-09-07, before fix 6) rather
+#: than recalled -- the two readings a wrong formula would silently invert:
+#:   /sys/fs/cgroup/memory.stat file  = 51,171,528,704 B
+#:   /proc/meminfo Cached  = 49,972,196 kB = 51,171,528,704 B  (equal, to the byte)
+#:   /sys/fs/cgroup/memory.stat shmem = 20,425,609,216 B
+#:   /proc/meminfo Shmem   = 19,946,884 kB = 20,425,609,216 B  (equal, to the byte)
+#:   /proc/meminfo SwapTotal = 0 kB
+#: So v2's ``file`` INCLUDES ``shmem`` exactly as ``Cached`` includes ``Shmem``,
+#: and with no swap shmem cannot be evicted at all -- it can only be deleted.
+#: ``current - file`` would therefore hand back the tmpfs page store, THE
+#: CARRIER, as if it were free memory.
+CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF = (
+    "memory.stat file=51,171,528,704 B == /proc/meminfo Cached 49,972,196 kB; "
+    "memory.stat shmem=20,425,609,216 B == /proc/meminfo Shmem 19,946,884 kB; "
+    "SwapTotal=0 kB (this box, 2026-09-07): v2 `file` includes `shmem`, and "
+    "shmem is unevictable without swap"
+)
 #: The loader's transient while group D loads next to dormant P, charged at
 #: the launch moment only.  #721's constant is 27 GiB
 #: (weg1_host_sizing.LOAD_TRANSIENT_BYTES, page cache + staging); on THIS
@@ -254,8 +294,14 @@ class Arm:
         makes those the same bytes -- the region is preallocated at ``Sigma H``
         and the legs copy through it -- so summing both would double-charge the
         very term this prediction exists to check.
+
+        FIX 6: the origin is the NON-RECLAIMABLE reading, the same denominator
+        :func:`price` budgets against.  Adding this arm's charges to a
+        ``memory.current`` that carries page cache compares an inflated origin
+        with :data:`OBSERVED_REAP_NONRECLAIM_BYTES`, a watermark that carries
+        almost none -- two different quantities wearing one unit.
         """
-        cg = self.terms.get("cg_current_gib")
+        cg = self.terms.get("cg_nonreclaim_gib")
         if cg is None:
             return None
         t = self.terms
@@ -310,6 +356,32 @@ def non_backup_host_bytes(group: str, s_gb: int, m_mib: int) -> int:
     return int(round((anchors + rings) * (1.0 + HOST_POOL_OVERHEAD)))
 
 
+def cg_reclaimable_bytes(stat: Dict[str, int]) -> Optional[int]:
+    """The part of ``memory.current`` the kernel reclaims instead of killing for.
+
+    ``reclaimable = (file - shmem) + slab_reclaimable``, from a parsed
+    ``memory.stat``.  ``None`` -- never a guess and never 0 -- when any of the
+    three terms is absent: a missing reading must reach :func:`price` as an
+    absence so it can charge the WHOLE reading and say so.
+
+    Why not ``current - file``: in cgroup v2 ``file`` INCLUDES ``shmem``, so
+    that form gives back the tmpfs page store -- the canonical carrier -- as if
+    it were free.  Measured on this box rather than recalled, see
+    :data:`CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF`: ``memory.stat file`` equals
+    /proc/meminfo ``Cached`` to the byte and ``memory.stat shmem`` equals
+    ``Shmem`` to the byte, with ``SwapTotal`` 0 -- so shmem cannot be evicted at
+    all here and is charged as spent, while ``slab_reclaimable`` (0.73 GiB at
+    that reading) is reclaimable by the same shrinker path as the page cache.
+    ``anon`` and ``unevictable`` are never subtracted: both are exactly what the
+    reaper kills to recover.
+    """
+    keys = ("file", "shmem", "slab_reclaimable")
+    if any(stat.get(k) is None for k in keys):
+        return None
+    page_cache_ex_shmem = max(0, int(stat["file"]) - int(stat["shmem"]))
+    return page_cache_ex_shmem + int(stat["slab_reclaimable"])
+
+
 def read_cgroup(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[int]]:
     """The cgroup2 memory facts the REAPER acts on, in BYTES.
 
@@ -319,6 +391,11 @@ def read_cgroup(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[int]]:
     finite ceiling.  Inside this LXC container it does say ``max``, and that
     absence is a fact the caller must NAME (:func:`price` falls back to
     MemTotal and says so) rather than paper over with a constant.
+
+    FIX 6 adds the ``memory.stat`` terms (``anon``, ``file``, ``shmem``,
+    ``unevictable``, ``slab_reclaimable``) and the derived ``reclaimable``:
+    ``memory.current`` alone cannot tell memory that is HELD from cache the
+    kernel will hand back, and the ledger must charge only the former.
 
     Every key is ``None`` when its file is unreadable; an unreadable cgroup is
     never silently priced as an empty one.
@@ -344,12 +421,27 @@ def read_cgroup(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[int]]:
         oom = int(m.group(1)) if m else None
     except OSError:
         oom = None
-    return {
+
+    stat: Dict[str, int] = {}
+    try:
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+                    stat[parts[0]] = int(parts[1])
+    except OSError:
+        stat = {}
+
+    out: Dict[str, Optional[int]] = {
         "current": _int("memory.current"),
         "peak": _int("memory.peak"),
         "max": _int("memory.max"),
         "oom_kill": oom,
+        "reclaimable": cg_reclaimable_bytes(stat),
     }
+    for key in ("anon", "file", "shmem", "unevictable", "slab_reclaimable"):
+        out[key] = stat.get(key)
+    return out
 
 
 def price(
@@ -362,6 +454,7 @@ def price(
     ring_bytes: int = 0,
     ring_span1_bytes: int = 0,
     cg_current_bytes: Optional[int] = None,
+    cg_reclaimable_bytes: Optional[int] = None,
     cg_ceiling_bytes: Optional[int] = None,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
@@ -388,6 +481,13 @@ def price(
     readings and ``base_source`` names which one bound.  Both ``None`` (a
     hermetic caller, or an unreadable cgroup) prices the meminfo arm alone and
     says so in ``base_source`` -- it never invents a ceiling.
+
+    ``cg_reclaimable_bytes`` is fix 6: what of that reading is page cache and
+    reclaimable slab (:func:`cg_reclaimable_bytes`).  Only ``current`` MINUS
+    that is charged, because only that is memory the reaper has to kill for.
+    ``None`` means the ``memory.stat`` terms were unreadable: the whole reading
+    is then charged -- the conservative direction -- and ``base_source`` names
+    the absence rather than assuming a cache share.
     """
     if s_gb < 1 or m_mib < 1:
         raise ValueError(f"arm terms must be >= 1: S={s_gb} M={m_mib}")
@@ -413,19 +513,38 @@ def price(
         )
     base_meminfo_gib = min(memavail_bytes / GIB, memtotal_bytes / GIB - CLI_RESERVE_GIB)
     base_cgroup_gib: Optional[float] = None
-    if cg_current_bytes is not None and cg_ceiling_bytes is not None:
+    cg_nonreclaim_bytes: Optional[int] = None
+    stat_note = ""
+    if cg_current_bytes is not None:
+        # FIX 6: page cache inside ``memory.current`` is not spent memory.  The
+        # reclaimable share is CLAMPED into [0, current]: the two files are read
+        # microseconds apart, and a stat that momentarily exceeds the reading
+        # must not turn into free memory this box never had.
+        reclaim = 0
+        if cg_reclaimable_bytes is None:
+            stat_note = (
+                " [memory.stat unreadable: the WHOLE reading is charged, the "
+                "conservative direction]"
+            )
+        else:
+            reclaim = max(0, min(int(cg_reclaimable_bytes), int(cg_current_bytes)))
+        cg_nonreclaim_bytes = int(cg_current_bytes) - reclaim
+    if cg_nonreclaim_bytes is not None and cg_ceiling_bytes is not None:
         # The CLI reserve is charged here too and for the same reason as on the
         # meminfo arm: ``memory.current`` nets out what the CLIs hold RIGHT NOW,
         # this term keeps the room they grow into.
         base_cgroup_gib = (
-            (cg_ceiling_bytes - cg_current_bytes) / GIB - CLI_RESERVE_GIB
+            (cg_ceiling_bytes - cg_nonreclaim_bytes) / GIB - CLI_RESERVE_GIB
         )
     if base_cgroup_gib is None:
         base_gib = base_meminfo_gib
         base_source = "meminfo (no cgroup sample passed)"
     elif base_cgroup_gib <= base_meminfo_gib:
         base_gib = base_cgroup_gib
-        base_source = "cgroup (ceiling - memory.current - cli_reserve)"
+        base_source = (
+            "cgroup (ceiling - non-reclaimable memory.current - cli_reserve)"
+            + stat_note
+        )
     else:
         base_gib = base_meminfo_gib
         base_source = "meminfo (min(memavail, memtotal-cli))"
@@ -471,6 +590,13 @@ def price(
         "base_source": base_source,
         "cg_current_gib": (
             None if cg_current_bytes is None else cg_current_bytes / GIB
+        ),
+        "cg_reclaimable_gib": (
+            None if cg_reclaimable_bytes is None or cg_current_bytes is None
+            else max(0, min(int(cg_reclaimable_bytes), int(cg_current_bytes))) / GIB
+        ),
+        "cg_nonreclaim_gib": (
+            None if cg_nonreclaim_bytes is None else cg_nonreclaim_bytes / GIB
         ),
         "cg_ceiling_gib": (
             None if cg_ceiling_bytes is None else cg_ceiling_bytes / GIB
@@ -531,6 +657,7 @@ def choose(
     ring_span1_bytes: int = 0,
     ring_provenance: str = "",
     cg_current_bytes: Optional[int] = None,
+    cg_reclaimable_bytes: Optional[int] = None,
     cg_ceiling_bytes: Optional[int] = None,
     cg_ceiling_source: str = "",
     cg_oom_kill: Optional[int] = None,
@@ -560,6 +687,7 @@ def choose(
             ring_bytes=ring_bytes,
             ring_span1_bytes=ring_span1_bytes,
             cg_current_bytes=cg_current_bytes,
+            cg_reclaimable_bytes=cg_reclaimable_bytes,
             cg_ceiling_bytes=cg_ceiling_bytes,
         )
         for s, m in arms
@@ -575,6 +703,13 @@ def choose(
         f"oom_kill_baseline={'unreadable' if cg_oom_kill is None else cg_oom_kill} "
         f"(#1233 fix 5, boot weg2dk5: the REAPER watches memory.current, not /proc/meminfo -- "
         "it killed six ranks with MemAvailable still at 23.96 GB) "
+        f"of which reclaimable={_gib_or_none(t['cg_reclaimable_gib'])} "
+        "(memory.stat: (file - shmem) + slab_reclaimable; cgroup-v2 `file` INCLUDES `shmem` "
+        f"-- {CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF} -- so `current - file` would hand back the "
+        "page store's own tmpfs as free) "
+        f"-> non-reclaimable={_gib_or_none(t['cg_nonreclaim_gib'])} charged "
+        "(#1233 fix 6: cache the kernel hands back is not memory the reaper kills for; "
+        "charging it refused weg2dk5's own launch state) "
         f"base_meminfo={t['base_meminfo_gib']:.2f} GiB base_cgroup={_gib_or_none(t['base_cgroup_gib'])} "
         f"-> base={t['base_gib']:.2f} GiB bound by {t['base_source']} "
         f"floor={FLOOR_GIB:.0f} GiB (#721; the #1232 host_headroom term is DELETED, "
@@ -635,7 +770,8 @@ def choose(
         f"heap term ({chosen.terms['heaps_gib']:.2f} GiB measured)"
     )
     predicted = chosen.predicted_run_peak_gib(store_gib)
-    watermark_gib = OBSERVED_REAP_CURRENT_BYTES / GIB
+    # FIX 6: origin and watermark in ONE currency -- both non-reclaimable.
+    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
     if predicted is None:
         lines.append(
             "WEG2-HOST-LEDGER RUN-PEAK ADVISORY: not computed -- no cgroup sample was "
@@ -645,17 +781,22 @@ def choose(
     else:
         verdict = "ABOVE" if predicted > watermark_gib else "below"
         lines.append(
-            "WEG2-HOST-LEDGER RUN-PEAK ADVISORY: this arm predicts memory.current="
-            f"{predicted:.2f} GiB at the run peak (cg_current now "
-            f"{_gib_or_none(chosen.terms['cg_current_gib'])} + heaps + anchors + rings + "
+            "WEG2-HOST-LEDGER RUN-PEAK ADVISORY: this arm predicts non-reclaimable memory.current="
+            f"{predicted:.2f} GiB at the run peak (non-reclaimable cg_current now "
+            f"{_gib_or_none(chosen.terms['cg_nonreclaim_gib'])} + heaps + anchors + rings + "
             f"overhead + draft pools + dormant image + flip_transient + store {store_gib:.0f} "
             f"GiB; the {FLOOR_GIB:.0f} GiB floor is a reserve and is NOT in this sum), "
             f"which is {verdict} the OBSERVED REAP POINT {watermark_gib:.2f} GiB "
-            "(boot weg2dk5 21:15:30Z, memory.current 102,998,904,832 B with oom_kill "
-            "18 -> 24 in the same row). ADVISORY, not a refusal: one boot's death is a "
-            "watermark and this cgroup publishes no finite memory.max to check against. "
-            "weg2dk5's own arm (S=1 M=1200 store=9) prices at 99.05 GiB here, i.e. this "
-            "line would have named that boot ABOVE the watermark before it started."
+            "(boot weg2dk5 21:15:30Z, memory.current 102,998,904,832 B minus the 28,916 kB "
+            "of that row that was still reclaimable, with oom_kill 18 -> 24 in the same row). "
+            "ADVISORY, not a refusal: one boot's death is a watermark and this cgroup "
+            "publishes no finite memory.max to check against. WHAT THIS LINE IS WORTH, "
+            "stated rather than implied: priced in the fix-6 currency, weg2dk5's own arm "
+            "(S=1 M=1200 store=9 at its own launch readings) predicts 92.89 GiB against the "
+            "95.90 GiB it reached -- a 3.01 GiB UNDER-prediction, so this line would have "
+            "called that boot 'below' and it died anyway. It is a ~3 % estimator of the run "
+            "peak, not a margin; the refusal that moved on fix 6 is the STORE FLOOR, and "
+            "that 3.01 GiB residual is the next boot's memts series to close."
         )
     return chosen, store_gib, lines
 
@@ -683,6 +824,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ring_span1_bytes=ns.ring_span1_bytes,
             ring_provenance=ns.ring_provenance,
             cg_current_bytes=cg["current"],
+            cg_reclaimable_bytes=cg["reclaimable"],
             cg_ceiling_bytes=ceiling,
             cg_ceiling_source=ceiling_source,
             cg_oom_kill=cg["oom_kill"],
