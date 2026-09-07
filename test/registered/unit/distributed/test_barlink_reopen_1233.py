@@ -37,8 +37,18 @@ WHAT IS PINNED, AND WHY EACH ONE CAN FAIL
     ledger back at its exact prior value and exactly one abort-gate registration.
     The transports themselves need three cards and are proven on the slice boot;
     what is provable at the desk is the WIRING -- that reopen goes through the
-    same construction, hence re-registers and re-credits, and that a closed
-    transport refuses rather than returning a wrong answer.
+    same construction, hence re-registers and re-credits, and that the ORDER is
+    close-then-build, which the fake models by refusing a second credit for a
+    group that still holds one.
+
+    The refusal in that sequence is the FAKE's, so it proves the sequence, not
+    the tree. The tree's own refusal is pinned separately, on the real class,
+    by ``test_a_closed_communicator_refuses_instead_of_the_gloo_plane``: before
+    this slice ``BarlinkCommunicator.close()`` left ``self.transport`` in place
+    and every collective went on ANSWERING over the host-staged gloo plane
+    (``_select`` returns None for a down transport, and None means gloo), so a
+    group whose wake never called ``barlink_reopen()`` served without one line
+    saying it had left bar1.
 
 (c) The danger direction, which is the reason the spec forbids ``destroy()`` as
     a sleep: ``GroupCoordinator.destroy()`` also tears down the gloo
@@ -104,12 +114,27 @@ class _FakeComm:
     It takes the ledger credit and the abort-gate registration that a real
     bring-up takes, and it refuses collectives once closed. Everything else a
     real communicator does needs cards.
+
+    It also models ONE metal constraint, because without it the close-first
+    order is unobservable: a real build prices its window against
+    ``bar1_free - reserve`` while the old transport's pages are still mapped
+    (``barlink_matrix_transport.py:345``, and the comment above it says NVML
+    free "already includes what this process has pinned"). So a second build
+    for a group whose credit still stands is refused here, and the build/close
+    sequence is recorded in ``events`` for the test that reads it.
     """
 
     built = 0
+    events: list = []
 
     def __init__(self, cpu_group, device, group):
         assert cpu_group is not None, "a barlink build without a cpu_group"
+        assert all(g != group for g, _ in ledger.ledger_balance(device)), (
+            f"a second BAR1 window for group {group!r} while the first credit "
+            "still stands: window_for would price the new window against "
+            "space this process has not handed back"
+        )
+        type(self).events.append("build")
         self.cpu_group = cpu_group
         self.device = device
         self.group = group
@@ -131,6 +156,7 @@ class _FakeComm:
         if self.closed:
             return
         self.closed = True
+        type(self).events.append("close")
         gate.unregister(self)
         ledger.ledger_debit(self.device, self.group)
 
@@ -143,6 +169,7 @@ def coord(monkeypatch):
     monkeypatch.setattr(ps, "should_build_barlink", lambda world_size: True)
     monkeypatch.setattr(barlink_mod, "BarlinkCommunicator", _FakeComm)
     _FakeComm.built = 0
+    _FakeComm.events = []
     gate.reset_for_test()
 
     c = ps.GroupCoordinator.__new__(ps.GroupCoordinator)
@@ -151,6 +178,13 @@ def coord(monkeypatch):
     c.device = torch.device("cuda:0")
     c.unique_name = "tp:0"
     c.barlink_comm = None
+    # The BAR1 ledger is process-global. A credit left on this ordinal by
+    # anything else would make _FakeComm's "no second window for a live
+    # group" assertion fire for the wrong reason, so the fixture starts from
+    # an empty one -- and a leftover credit in a CPU-only run is a leak in
+    # its own right.
+    for _group, _ in ledger.ledger_balance(c.device):
+        ledger.ledger_debit(c.device, _group)
     yield c
     comm = c.barlink_comm
     if comm is not None:
@@ -262,6 +296,14 @@ def test_reopen_on_a_live_comm_does_not_double_charge_the_ledger(coord):
 
     assert first.closed, "reopen must return a still-live transport first"
     assert coord.barlink_comm is not first
+    assert _FakeComm.events == ["build", "close", "build"], (
+        "the ORDER is the property, not the end state: build-then-close "
+        f"reaches the same balance and the same gate list (events: "
+        f"{_FakeComm.events}). On metal it means two mapped BAR1 windows for "
+        "one group at the same instant, so window_for prices the new one "
+        "against space this process has not returned -- a clip, or a W6 with "
+        "the wrong cause on it"
+    )
     assert ledger.ledger_balance(coord.device) == prior_ledger, (
         "two live BAR1 credits for one group: the next window_for would be "
         "priced against space this process has not given back"
@@ -269,6 +311,97 @@ def test_reopen_on_a_live_comm_does_not_double_charge_the_ledger(coord):
     assert gate.registered() == [coord.barlink_comm], (
         "the abort gate must hold exactly one transport per group"
     )
+
+
+def test_a_failing_rebuild_propagates_and_leaves_no_half_woken_group(
+    coord, monkeypatch
+):
+    """(b) A wake that cannot rebuild must raise, and say so by being empty.
+
+    `_build_barlink` genuinely can raise at wake: `Bar1WindowRefused` (W6)
+    when a sibling still holds the aperture, `Bar1Failed` from the holder,
+    `_enforce_cpu_transport_needs_eager` on a host transport under graphs.
+    Swallowing it would leave THIS rank awake with `barlink_comm` None while
+    its peers hold transports -- the dispatch seams then fall through to
+    torch.distributed on `device_group` (pynccl is not built when barlink was
+    active at boot), i.e. NCCL, and the ranks disagree about the plane. That
+    is a hang, not a STOP. The caller (the wake RPC) owns the verdict: W4,
+    group-fatal.
+    """
+    coord._build_barlink()
+    live = coord.barlink_comm
+    assert live is not None
+
+    class _RefusingComm:
+        def __init__(self, cpu_group, device, group):
+            raise RuntimeError("window refused: no BAR1 aperture left")
+
+    monkeypatch.setattr(barlink_mod, "BarlinkCommunicator", _RefusingComm)
+
+    with pytest.raises(RuntimeError, match="window refused"):
+        coord.barlink_reopen()
+
+    assert coord.barlink_comm is None, (
+        "a half-woken group must not look awake: the rebuild failed, so the "
+        "attribute must be None and the caller must refuse (W4), not continue"
+    )
+    assert live.closed, "the old transport is returned before the build"
+    assert ledger.ledger_balance(coord.device) == [], (
+        "a failed wake must not leave a BAR1 credit standing"
+    )
+    assert gate.registered() == [], (
+        "a failed wake must not leave a stale abort-gate registration"
+    )
+
+
+def test_reopen_with_the_flag_off_builds_nothing(coord, monkeypatch):
+    """The docstring's flag-off claim, with a can-fail proof of its own.
+
+    `barlink_reopen()` says it is "a no-op that leaves `barlink_comm` None,
+    exactly as at boot" when the flag is off. Every other behavioural test
+    here runs flag-ON (the fixture pins `should_build_barlink` to True), so
+    without this one a wake that BUILT barlink where boot did not would pass
+    the whole file -- a behaviour change on the default path, which the
+    flag-off byte-identity rule forbids.
+    """
+    monkeypatch.setattr(ps, "should_build_barlink", lambda world_size: False)
+
+    coord.barlink_reopen()
+
+    assert coord.barlink_comm is None, (
+        "flag off: the wake must leave barlink_comm None, exactly as boot does"
+    )
+    assert _FakeComm.built == 0, "flag off: nothing may be constructed"
+    assert gate.registered() == []
+    assert ledger.ledger_balance(coord.device) == []
+
+
+def test_a_closed_communicator_refuses_instead_of_the_gloo_plane():
+    """(b) on the REAL class: closed means refuse, not answer over gloo.
+
+    `_select` returns None for a transport that declines a size, and None
+    means the host-staged gloo plane. For a CLOSED transport that answer is
+    wrong: sleep hands the BAR1 aperture back, so a group whose wake never
+    called `barlink_reopen()` would keep serving over host staging with no
+    log line saying it left bar1 -- the mixed-measurement shape the
+    achieved-vs-requested pair exists to prevent. A carcass is used because a
+    real bring-up needs cards; the two attributes `_select` reads are set by
+    hand.
+    """
+    comm = barlink_mod.BarlinkCommunicator.__new__(barlink_mod.BarlinkCommunicator)
+    comm.transport = None
+    comm.group = "tp:0"
+    comm._closed = False
+
+    # Open, with no transport: None, i.e. "take the gloo plane". This is the
+    # can-fail half -- the refusal below has to be caused by the close.
+    assert comm._select("all_reduce", 4096) is None
+
+    barlink_mod.BarlinkCommunicator.close(comm)
+
+    assert comm._closed is True
+    with pytest.raises(RuntimeError, match="closed"):
+        comm._select("all_reduce", 4096)
 
 
 def test_reopen_refuses_when_the_cpu_group_is_gone(coord):

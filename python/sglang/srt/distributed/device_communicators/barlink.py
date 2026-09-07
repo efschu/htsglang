@@ -181,10 +181,15 @@ def state_summary() -> str:
             "is unaffected; the payload per round is not):"
         )
         for name, c in sorted(clips.items()):
+            # The count is the row's denominator: since weg2 S2 a group's
+            # window is priced again at every wake, so "one row" no longer
+            # means "one clipped build".
+            times = int(c.get("count", 1))
             lines.append(
                 f"    {name}: {c['granted_bytes'] // 2**20} MiB granted of "
                 f"{c['requested_bytes'] // 2**20} MiB requested "
-                f"({c['source']})"
+                f"({c['source']}, {times} clipped "
+                f"build{'s' if times != 1 else ''}; values are the latest)"
             )
     return header + "\n" + "\n".join(lines)
 
@@ -673,6 +678,15 @@ class BarlinkCommunicator:
         self.world_size = dist.get_world_size(cpu_group)
         self.rank = dist.get_rank(cpu_group)
         self.disabled = self.world_size == 1
+        #: Set by ``close()`` and never cleared: this communicator's
+        #: transports are gone and it must not answer another collective.
+        #: weg2 S2 -- sleep closes the transports, and a group that was
+        #: closed but never reopened would otherwise keep ANSWERING over the
+        #: host-staged gloo plane, because ``_select`` returns ``None`` for a
+        #: transport that is down and ``None`` means "gloo". A wrong answer
+        #: is not what a closed transport owes its caller; a refusal is.
+        #: The reopen builds a NEW communicator, so this flag is one-way.
+        self._closed = False
         #: Who the peer PROCESSES of this group are. Published once, here,
         #: before any transport exists -- every gloo call below is bounded
         #: against it, so a SIGKILLed rank ends the wait with a named error
@@ -715,6 +729,10 @@ class BarlinkCommunicator:
     def _select(self, op: str, nbytes: int):
         """The transport for ``op`` at this size, or None for the gloo plane.
 
+        Raises ``RuntimeError`` when ``close()`` has run: a closed group has
+        no transports to select from, and the gloo plane is not a substitute
+        for one -- see the closed check at the top of the body.
+
         One attribute test plus the transport's own `handles` -- the same shape
         at every dispatch site, so op coverage can no longer differ silently
         between ops the way it did when each site hard-coded its own condition.
@@ -753,6 +771,25 @@ class BarlinkCommunicator:
            let through exactly this one case -- the only one where a
            measured decision leads into the gloo layer under capture.
         """
+        # A CLOSED communicator refuses instead of falling back (weg2 S2).
+        # Everywhere else in this method ``None`` means "take the gloo
+        # plane", and for a transport that merely declines this size that is
+        # right. For a transport that has been CLOSED it is not: sleep hands
+        # the BAR1 aperture back, and a group whose wake did not call
+        # ``GroupCoordinator.barlink_reopen()`` would go on serving over host
+        # staging with no line in the log saying it left bar1 -- the same
+        # shape as the mixed measurement the achieved-vs-requested pair
+        # exists to prevent. One flag on the object that already owns the
+        # transport, read defensively because this class also exists as a
+        # ``__new__`` stand-in.
+        if getattr(self, "_closed", False):
+            raise RuntimeError(
+                f"barlink group {getattr(self, 'group', '')!r}: the "
+                f"transports are closed; {op} cannot run until "
+                "GroupCoordinator.barlink_reopen() has rebuilt them. Falling "
+                "back to the gloo plane here would answer over host staging "
+                "without a single line saying this group left bar1."
+            )
         t = self.transport
         chosen = t if (t is not None and t.handles(op, nbytes)) else None
         dispatcher = getattr(self, "_path_dispatcher", None)
@@ -1436,8 +1473,15 @@ class BarlinkCommunicator:
 
         Without this the segment survives the process and leaks a /dev/shm
         entry per run (rank 0 owns the unlink). Called from
-        GroupCoordinator.destroy().
+        GroupCoordinator.destroy() and, since weg2 S2, from
+        GroupCoordinator.barlink_reopen() (sleep closes, wake rebuilds).
+
+        The flag is set BEFORE the early return, and never cleared: after
+        this the communicator refuses collectives (``_select``) rather than
+        answering them over the gloo plane. A wake builds a new
+        communicator; it does not revive this one.
         """
+        self._closed = True
         if self.transport is None:
             return
         try:

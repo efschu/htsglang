@@ -106,12 +106,25 @@ _CLIPS: dict[str, dict] = {}
 
 def record_clip(group: str, requested: int, granted: int, source: str,
                 arithmetic: str) -> None:
-    _CLIPS[group or "<unnamed>"] = {
-        "group": group or "<unnamed>",
+    """Record the LATEST clip for this group, and how many there have been.
+
+    ``count`` is not decoration. Until weg2 S2 a group's window was built
+    exactly once, at boot, so one row per group WAS the whole population.
+    ``GroupCoordinator.barlink_reopen()`` makes the build repeatable: every
+    wake prices a new window, so a wake clip would otherwise overwrite the
+    boot clip and the table could not say whether one window or twelve came
+    up short. The row keeps the last values (they are the ones in force) and
+    names its own denominator beside them.
+    """
+    key = group or "<unnamed>"
+    previous = _CLIPS.get(key)
+    _CLIPS[key] = {
+        "group": key,
         "requested_bytes": int(requested),
         "granted_bytes": int(granted),
         "source": source,
         "arithmetic": arithmetic,
+        "count": int(previous.get("count", 0)) + 1 if previous else 1,
     }
 
 

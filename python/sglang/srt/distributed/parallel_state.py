@@ -1079,11 +1079,26 @@ class GroupCoordinator:
         (the sleep/wake RPC) owns the deadline -- this method has none of its
         own and must not grow one.
 
-        NO NEW REFUSAL IS ADDED. If a sibling group still holds the card's
-        aperture, the existing `window_for` raises `Bar1WindowRefused` with
-        its arithmetic instead of clipping, and it propagates from here
-        untouched. Flag off, this is a no-op that leaves `barlink_comm` None,
-        exactly as at boot.
+        THIS METHOD ADDS NO REFUSAL, AND W6 IS CONDITIONAL ON THE ENVIRONMENT.
+        (S2 does add one refusal, but on the other side of the sleep: a
+        CLOSED `BarlinkCommunicator` now raises from `_select` instead of
+        answering over the gloo plane, so a group whose wake never reached
+        this method refuses rather than serving off-transport in silence.)
+        If a sibling group still holds the card's aperture, `window_for`
+        raises `Bar1WindowRefused` (W6) and it propagates from here
+        untouched -- but ONLY when the window was requested explicitly:
+        the raise sits behind `if source in os.environ`
+        (`barlink_matrix_transport.py:380-381`), and with neither
+        `SGLANG_BARLINK_BAR1_WINDOW_MIB` nor its `_<GROUP>` form set,
+        `_requested()` returns the 96 MiB DEFAULT (`:67`) under a name that
+        is not in the environment. In that state the wake does not refuse:
+        it CLIPS the window to what is left, records the clip
+        (`record_clip`) and warns. Weg 2 must therefore set the variable in
+        the launch if it wants a refusal at wake; that is an S3 launcher
+        prerequisite, not something this method can decide.
+
+        Flag off, this is a no-op that leaves `barlink_comm` None, exactly
+        as at boot.
         """
         if self.cpu_group is None:
             raise RuntimeError(
@@ -1102,6 +1117,27 @@ class GroupCoordinator:
         if self.barlink_comm is not None:
             self.barlink_comm.close()
             self.barlink_comm = None
+        # THE CONTRACT FOR THE CALLER, because this is the first code path in
+        # the fork that takes a LIVE coordinator from a transport to none.
+        # Before weg2, `barlink_comm` went non-None -> None only in
+        # `destroy()`, where the process groups die in the next statements and
+        # nothing dispatches afterwards. Here the group keeps serving.
+        #
+        # A raise from the build below (W6 `Bar1WindowRefused`, `Bar1Failed`,
+        # `_enforce_cpu_transport_needs_eager`) therefore leaves THIS group
+        # with no barlink and no pynccl either -- pynccl is not built when
+        # barlink was active at boot (`_barlink_active`, above) -- so every
+        # dispatch seam's `if self.barlink_comm is not None` falls through to
+        # `torch.distributed` on `device_group`, i.e. NCCL. That is the
+        # fallback the barlink standard forbids, and on a three-rank group a
+        # BAR1 refusal is a PER-CARD fact: one rank can land here while its
+        # siblings rebuild, which is ranks disagreeing about the transport --
+        # a hang, not a STOP.
+        #
+        # So the wake RPC must treat a raise from here as W4
+        # (`Weg2WakeRefused`), group-fatal: never a retry, never a continue.
+        # This method deliberately does not catch it and must not grow a
+        # `try`.
         self._build_barlink()
 
     def __repr__(self):
