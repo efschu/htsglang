@@ -1778,11 +1778,20 @@ class HiCacheFile(HiCacheStorage):
         other rule. Likewise the canonical TOTAL is a model constant: a
         different total is a different page format, not another phase's cut
         of the same one.
+
+        The DRAFT slot has one more legal transition: its FIRST install
+        (None -> window). The draft pool binds after the storage config is
+        built (`HiCacheStorageConfig.canonical_draft_page` has no writer in
+        the tree), so `HiCacheController._install_canonical_draft_window`
+        installs the third slot from `set_draft_kv_pool`, at registration,
+        before this process wrote a single page -- there is no live store to
+        re-key yet (spec G1/Q8; boot weg2dk1 review). Switching the slot OFF
+        over an installed window, and a `total_bytes` change, stay refusals.
         """
         if (
             (kv_page is None) != (self.canonical_kv_page is None)
             or ((mamba_blob is None) != (self.canonical_mamba_blob is None))
-            or ((draft_page is None) != (self.canonical_draft_page is None))
+            or (draft_page is None and self.canonical_draft_page is not None)
         ):
             raise CanonicalPageError(
                 "refusing to switch the canonical format on or off at a "
@@ -1809,8 +1818,10 @@ class HiCacheFile(HiCacheStorage):
                 f"{mamba_blob.total_bytes}-byte blob over a store keyed for "
                 f"{self.canonical_mamba_blob.total_bytes}-byte blobs."
             )
-        if draft_page is not None and int(draft_page.total_bytes) != int(
-            self.canonical_draft_page.total_bytes
+        if (
+            draft_page is not None
+            and self.canonical_draft_page is not None
+            and int(draft_page.total_bytes) != int(self.canonical_draft_page.total_bytes)
         ):
             raise CanonicalPageError(
                 f"refusing to install a draft window of a "

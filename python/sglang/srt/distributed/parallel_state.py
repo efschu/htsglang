@@ -3206,13 +3206,24 @@ def get_draft_pp_group_no_assert() -> Optional[GroupCoordinator]:
     return _DRAFT_PP
 
 
+#: The layer-split env vars the TARGET's arg resolution exports process-wide
+#: (`server_args.py`, `--pp-stage-ratio` -> SGLANG_PP_LAYER_PARTITION) and
+#: `get_pp_indices` / the `SGLANG_PP_LAYER_SET` readers consult at model
+#: build. They describe the primary pipeline; inside the scope the draft
+#: model is built with pp_size=1 and must not see them (boot weg2dk1:
+#: `len(partitions)=3 does not match pp_size=1` on the last stage).
+_DRAFT_PP_MASKED_ENV = ("SGLANG_PP_LAYER_PARTITION", "SGLANG_PP_LAYER_SET")
+
+
 @contextmanager
 def draft_pp_scope():
-    """Publish the single-rank draft pp group through `get_pp_group()`.
+    """Publish the single-rank draft pp group through `get_pp_group()`, and
+    hide the primary pipeline's layer-split environment for the duration.
 
-    S7: entering on a rank whose group was never built raises. The flag is
-    restored in `finally`, so an exception inside the scope leaves the
-    primary pipeline group published.
+    S7: entering on a rank whose group was never built raises. The flag and
+    the env vars are restored in `finally`, so an exception inside the scope
+    leaves the primary pipeline group published and the target's partition
+    string back in place; nested entry restores in order.
     """
     global _DRAFT_PP_ACTIVE
     if _DRAFT_PP is None:
@@ -3221,11 +3232,17 @@ def draft_pp_scope():
             "initialize_draft_pp_group must run on every rank at boot."
         )
     prev = _DRAFT_PP_ACTIVE
+    saved_env = {k: os.environ.pop(k, None) for k in _DRAFT_PP_MASKED_ENV}
     _DRAFT_PP_ACTIVE = True
     try:
         yield _DRAFT_PP
     finally:
         _DRAFT_PP_ACTIVE = prev
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def get_pp_group() -> GroupCoordinator:

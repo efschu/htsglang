@@ -3377,8 +3377,11 @@ class HiCacheController:
     # them until (a) folds the drafter into `compute_model_identity_hash`,
     # where every backend picks it up. Deleting them would make (a) rebuild
     # what already works, for the sake of a dead-code count.
-    def _draft_page_set_v2(self, hash_values, host_indices) -> None:
-        self.storage_backend.batch_set_v2(
+    def _draft_page_set_v2(self, hash_values, host_indices) -> bool:
+        """Returns whether EVERY page of the batch was written (the bool
+        contract `_draft_page_set` counts by, C19). `batch_set_v2` answers
+        per pool as `{name: [flag, ...]}` on the file backend."""
+        results = self.storage_backend.batch_set_v2(
             [
                 PoolTransfer(
                     name=PoolName.DRAFT,
@@ -3387,6 +3390,10 @@ class HiCacheController:
                 )
             ]
         )
+        if isinstance(results, dict):
+            flags = results.get(PoolName.DRAFT)
+            return bool(flags) and all(bool(f) for f in flags)
+        return bool(results)
 
     def _draft_page_get_v2(self, hash_values, host_indices) -> None:
         self.storage_backend.batch_get_v2(
@@ -3427,7 +3434,12 @@ class HiCacheController:
             return str(PoolName.DRAFT)
         return f"{PoolName.DRAFT}-{self.draft_identity}"
 
-    def _draft_page_set_generic(self, hash_values, host_indices) -> None:
+    def _draft_page_set_generic(self, hash_values, host_indices) -> bool:
+        """Returns the backend's own answer (`batch_set` -> bool): True when
+        every page was written, False on a space-floor or existing-partial
+        refusal. `_draft_page_set` counts ISSUED/REFUSED from exactly this
+        value (C19) -- a missing return here counted every successful write
+        as a refusal (boot weg2dk1 review)."""
         # `{hash}.draft-{drafter}` mirrors HiCacheStorage._get_component_key's
         # `{key}.{pool_name}` convention so target/draft pages never collide,
         # and never collide across drafters either (#861).
@@ -3437,7 +3449,7 @@ class HiCacheController:
             self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
             for i in range(len(draft_keys))
         ]
-        self.storage_backend.batch_set(draft_keys, draft_data)
+        return bool(self.storage_backend.batch_set(draft_keys, draft_data))
 
     def _draft_page_get_generic(self, hash_values, host_indices) -> list:
         """Fill the draft host rows for these pages. Returns per-page HIT flags.

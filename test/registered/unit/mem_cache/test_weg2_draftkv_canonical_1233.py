@@ -158,26 +158,108 @@ def _config(draft=None):
 
 
 class TestInstallThirdSlot(CustomTestCase):
-    def test_t7_install_refuses_on_off_and_width_change(self):
+    """T7 (split in FIX 1 of boot weg2dk1's review): the third slot is
+    installed for the FIRST time at draft registration, because the draft
+    pool binds after the storage config is built (spec G1). The on/off
+    refusal guards a CUTOVER re-key of a live store: switching the slot OFF
+    over an installed window and changing its width stay refusals; the one
+    None -> window transition at registration is the tested happy path."""
+
+    def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        whole = build_draft_window(FakeDraftHostPool(4), TOTAL_HEADS, 0, 4, tp_size=1, tp_rank=0)
-        cfg, kv = _config(draft=whole)
-        be = HiCacheFile(cfg, file_path=tmp.name)
-        with self.assertRaises(CanonicalPageError):
+        self.root = tmp.name
+        self.whole = build_draft_window(
+            FakeDraftHostPool(4), TOTAL_HEADS, 0, 4, tp_size=1, tp_rank=0
+        )
+
+    def test_t7_install_refuses_switch_off_and_width_change(self):
+        cfg, kv = _config(draft=self.whole)
+        be = HiCacheFile(cfg, file_path=self.root)
+        with self.assertRaisesRegex(CanonicalPageError, "switch"):
             be.install_canonical_windows(kv, None, draft_page=None)  # switching off
         other = build_draft_window(
             FakeDraftHostPool(8), 8, 0, 8, tp_size=1, tp_rank=0
         )
-        self.assertNotEqual(other.total_bytes, whole.total_bytes)
-        with self.assertRaises(CanonicalPageError):
+        self.assertNotEqual(other.total_bytes, self.whole.total_bytes)
+        with self.assertRaisesRegex(CanonicalPageError, "draft window"):
             be.install_canonical_windows(kv, None, draft_page=other)
         be.install_canonical_windows(kv, None, draft_page=_rank_window(1))  # same width
         self.assertEqual(be.canonical_draft_page.payload_bytes, 512)
-        cfg2, kv2 = _config(draft=None)
-        be2 = HiCacheFile(cfg2, file_path=tmp.name)
-        with self.assertRaises(CanonicalPageError):
-            be2.install_canonical_windows(kv2, None, draft_page=whole)  # switching on
+        # the KV and mamba slots keep the cutover on/off refusal verbatim
+        with self.assertRaisesRegex(CanonicalPageError, "switch"):
+            be.install_canonical_windows(None, None, draft_page=_rank_window(1))
+
+    def test_t7b_first_install_of_the_third_slot_drops_the_geometry_terms(self):
+        # The production shape: HiCacheStorageConfig carries canonical_kv_page
+        # and NO draft window (nothing in the tree writes it); the draft key
+        # therefore still carries this rank's tp/pp terms ...
+        kv = window_for_layers(KV_SPEC, ATTN_LAYER_IDS, ATTN_LAYER_IDS)
+        cfg = HiCacheStorageConfig(
+            tp_rank=0, tp_size=1, pp_rank=2, pp_size=3, attn_cp_rank=0, attn_cp_size=1,
+            is_mla_model=False, enable_storage_metrics=False, is_page_first_layout=True,
+            model_name="Qwen3.8-27B", model_identity_hash="0123456789abcdef",
+            canonical_kv_page=kv, canonical_draft_page=None,
+        )
+        be = HiCacheFile(cfg, file_path=self.root)
+        self.assertIsNone(be.canonical_draft_page)
+        key = "cafe.draft-a30db4b7c362c786"
+        self.assertTrue(be._get_suffixed_key(key).endswith("_0_1_3_2"))
+        # ... until the draft pool binds and the window is installed ONCE.
+        be.install_canonical_windows(kv, None, draft_page=self.whole)
+        self.assertIs(be.canonical_draft_page, self.whole)
+        self.assertEqual(be.draft_config_suffix, "_Qwen3.8-27B_0123456789abcdef")
+        self.assertEqual(
+            be._get_suffixed_key(key), f"{key}_Qwen3.8-27B_0123456789abcdef"
+        )
+        self.assertIn(be.draft_config_suffix, be._group_scan_suffixes())
+        # the KV window is re-passed unchanged and stays installed
+        self.assertIs(be.canonical_kv_page, kv)
+        # after the first install the slot is live: OFF is a re-key, refused
+        with self.assertRaisesRegex(CanonicalPageError, "switch"):
+            be.install_canonical_windows(kv, None, draft_page=None)
+
+    def test_t7c_controller_installs_the_draft_window_end_to_end(self):
+        # The exact call chain of a Weg-2 boot: set_draft_kv_pool ->
+        # _maybe_register_draft_with_storage -> _install_canonical_draft_window
+        # against a REAL HiCacheFile built without a draft window.
+        import types
+
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        kv = window_for_layers(KV_SPEC, ATTN_LAYER_IDS, ATTN_LAYER_IDS)
+        cfg = HiCacheStorageConfig(
+            tp_rank=0, tp_size=1, pp_rank=2, pp_size=3, attn_cp_rank=0, attn_cp_size=1,
+            is_mla_model=False, enable_storage_metrics=False, is_page_first_layout=True,
+            model_name="Qwen3.8-27B", model_identity_hash="0123456789abcdef",
+            canonical_kv_page=kv, canonical_draft_page=None,
+        )
+        be = HiCacheFile(cfg, file_path=self.root)
+        ctrl = HiCacheController.__new__(HiCacheController)
+        ctrl.storage_backend = be
+        ctrl.storage_backend_type = "file"
+        ctrl.has_draft = True
+        ctrl.enable_storage = True
+        ctrl.tp_size, ctrl.tp_rank = 1, 0
+        ctrl.mem_pool_host_draft = FakeDraftHostPool(4)
+        ctrl.draft_identity = "a30db4b7c362c786"
+        ctrl.canonical_draft_page_window = None
+        ctrl.draft_canonical_layout = None
+        ctrl._canonical_model_config = types.SimpleNamespace(
+            get_total_num_kv_heads=lambda: TOTAL_HEADS, hidden_size=5120
+        )
+        ctrl._canonical_server_args = types.SimpleNamespace(draft_kv_layout="replicated")
+        ctrl._maybe_register_draft_with_storage()
+        self.assertIsNotNone(ctrl.draft_page_set_func)
+        self.assertIsNotNone(be.canonical_draft_page)
+        self.assertEqual(be.canonical_draft_page.total_bytes, PAGE_BYTES)
+        self.assertTrue(be.canonical_draft_page.is_whole)
+        self.assertIs(ctrl.canonical_draft_page_window, be.canonical_draft_page)
+        self.assertEqual(ctrl.draft_canonical_layout.num_kv_heads, TOTAL_HEADS)
+        key = "cafe.draft-a30db4b7c362c786"
+        self.assertEqual(
+            be._get_suffixed_key(key), f"{key}_Qwen3.8-27B_0123456789abcdef"
+        )
 
 
 if __name__ == "__main__":
