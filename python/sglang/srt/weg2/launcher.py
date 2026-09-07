@@ -89,6 +89,15 @@ DC_EXPECT_3080_MIB = 1442
 #: ABOVE the spec 1.6 expectations by 380 / 480 MiB.  These carry the
 #: provenance into P's budget until a boot measures them again; the front's
 #: W19 still grades the live measurement against the reserve actually used.
+#: SCOPE OF ALL FOUR NUMBERS ABOVE (FIX 1r/1): every boot behind them -- the
+#: spec 1.6 expectations and these two measurements -- ran group D with
+#: `--disable-overlap-schedule`, hence `no_buffer`, hence ZERO ping-pong mamba
+#: state slots. D now runs the overlap schedule, so its device residue carries
+#: `d_mamba_ping_pong_cost` extra state slots per rank that no boot behind these
+#: constants contained. They are NOT corrected here: a MiB conversion would be a
+#: second accounting of the runtime's own sizing (see `d_overlap_cost_line`).
+#: The term is printed at boot beside the SCHEDULER line, and W19 grades the
+#: live residue rather than these expectations.
 DC_MEASURED_D_5090_MIB = 2228
 DC_MEASURED_D_3080_MIB = 1922
 DC_RESERVE_SLACK_MIB = 64
@@ -617,6 +626,21 @@ def argv_d(
     return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
     ) + [
+        # THE STRATEGY IS STATED, NOT INHERITED (FIX 1r/1). Leaving this at
+        # 'auto' made D's mamba radix-cache strategy a SIDE EFFECT of the
+        # absent disable flag: _mamba_radix_cache_resolution reads
+        # `wants_overlap = not view.disable_overlap_schedule`
+        # (arg_groups/overrides.py:1225-1239), so switching the overlap
+        # schedule on also switched no_buffer -> extra_buffer, and
+        # mamba_pool_floor.mamba_ping_pong_slots then charges 2 state slots
+        # per running request instead of 0 -- DOUBLING D's device mamba floor
+        # (16 -> 32 slots at --max-running-requests 8) out of the FIXED
+        # --rank-gpu-memory-mib budgets. Stated here so the argv is an honest
+        # statement of what D runs, and priced in the SCHEDULER: log line
+        # (d_overlap_cost_line) so the launcher cannot move D's device
+        # residency without the number appearing. The value follows the
+        # overlap choice exactly -- it is not a second knob.
+        "--mamba-radix-cache-strategy", "no_buffer" if disable_overlap else "extra_buffer",
         "--tp-size", "3", "--pp-size", "1",
         # OVERLAP SCHEDULE ON for D -- by ABSENCE of the disable flag, which
         # is the only way to have it: there is no --enable-overlap-schedule.
@@ -857,6 +881,95 @@ def _max_running_requests(model: str) -> int:
     """``--max-running-requests`` as this launcher actually passes it."""
     flags = common_flags(model, 1, 1, 1.0)
     return int(flags[flags.index("--max-running-requests") + 1])
+
+
+def d_mamba_ping_pong_cost(model: str, disable_overlap: bool) -> Tuple[str, int, int, int]:
+    """What D's overlap choice costs in DEVICE mamba state slots (FIX 1r/1).
+
+    Returns ``(strategy, ping_pong_slots_per_running_request, extra_slots_per
+    _rank, max_running_requests)``.
+
+    THE TERM. ``arg_groups/overrides._mamba_radix_cache_resolution`` reads
+    ``wants_overlap = not view.disable_overlap_schedule``, so turning the
+    overlap schedule on for group D ALSO turns its mamba radix-cache strategy
+    from ``no_buffer`` to ``extra_buffer`` -- and
+    ``mem_cache/mamba_pool_floor.mamba_ping_pong_slots`` then charges 2 slots
+    per running request where it charged 0. That is device residency out of
+    D's FIXED ``--rank-gpu-memory-mib`` budgets on a rig whose corridor law is
+    819-1229 MiB NVML-free per card, and the commit that switched the overlap
+    schedule on priced only the overlap benefit. An unpriced term does not
+    read as unknown, it reads as free (#1009).
+
+    NOT A SECOND ACCOUNTING. The slot count is taken from the runtime's own
+    ``mamba_ping_pong_slots`` against a view carrying exactly the three fields
+    it reads, with ``ServerArgs.enable_mamba_extra_buffer`` itself as the
+    predicate -- so a change to either function moves this number too. Only
+    the PING-PONG term is charged, because it is the only term of
+    ``mamba_slots_per_running_req`` that depends on the overlap choice; the
+    active slot and the donation/pin term are identical in both arms and
+    cancel in the delta. The remaining terms are deliberately NOT reproduced
+    here: ``mamba_slot_reorder_active`` reads an environment variable, and the
+    launcher's environment is not the group's (``build_env``), so evaluating
+    it here would answer about the wrong process.
+    """
+    from sglang.srt.mem_cache.mamba_pool_floor import mamba_ping_pong_slots
+    from sglang.srt.server_args import ServerArgs
+
+    flags = common_flags(model, 1, 1, 1.0)
+
+    class _StrategyView:
+        """Exactly the ServerArgs surface ``mamba_ping_pong_slots`` reads."""
+
+        # The upstream predicate itself, not a restatement of it.
+        enable_mamba_extra_buffer = ServerArgs.enable_mamba_extra_buffer
+
+        def __init__(self, strategy: str, disable_overlap_schedule: bool) -> None:
+            self.mamba_radix_cache_strategy = strategy
+            self.disable_overlap_schedule = disable_overlap_schedule
+            # Read off the argv this launcher builds, never asserted: the day
+            # --disable-radix-cache appears in common_flags the price changes
+            # to 0 and this follows it.
+            self.disable_radix_cache = "--disable-radix-cache" in flags
+
+    strategy = "no_buffer" if disable_overlap else "extra_buffer"
+    per_req = mamba_ping_pong_slots(_StrategyView(strategy, disable_overlap))
+    # The arm this replaces: group D as it booted before the overlap schedule
+    # was turned on, i.e. the arm every DC_MEASURED_D_* number was taken on.
+    baseline = mamba_ping_pong_slots(_StrategyView("no_buffer", True))
+    mrr = _max_running_requests(model)
+    return strategy, per_req, (per_req - baseline) * mrr, mrr
+
+
+def d_overlap_cost_line(model: str, disable_overlap: bool) -> str:
+    """The one line that must appear wherever D's overlap choice is announced.
+
+    The launcher must not be able to change D's device residency without the
+    number appearing (FIX 1r/1), so the price is built from
+    :func:`d_mamba_ping_pong_cost` rather than typed, and the MiB conversion
+    it does NOT make is named rather than left as a silent omission.
+    """
+    strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(model, disable_overlap)
+    baseline_per_req = per_req - (extra // max(1, mrr))
+    return (
+        f"DEVICE PRICE OF THAT CHOICE: --mamba-radix-cache-strategy "
+        f"{strategy} is now STATED on D's argv instead of falling out of the "
+        f"absent disable flag (arg_groups/overrides._mamba_radix_cache_"
+        f"resolution reads `wants_overlap = not view.disable_overlap_"
+        f"schedule`). Derived from the runtime's own mamba_pool_floor."
+        f"mamba_ping_pong_slots against the no_buffer arm this replaces: "
+        f"{per_req} - {baseline_per_req} = {per_req - baseline_per_req} extra "
+        f"ping-pong state slots per running request x --max-running-requests "
+        f"{mrr} = {extra} extra device mamba state slots on EVERY D rank, out "
+        f"of the FIXED --rank-gpu-memory-mib budgets and inside the "
+        f"819-1229 MiB corridor. This term is not converted to MiB here and "
+        f"the refusal is named: per-rank slot bytes follow Mamba2StateShape "
+        f"under --rank-tp-ratio auto, and re-deriving that shape in the "
+        f"launcher would be a second accounting of the runtime's own sizing; "
+        f"the boot prints it as 'mamba_cache_per_req=<x> MB' "
+        f"(model_runner_kv_cache_mixin.py:2529) and the front's W19 grades "
+        f"the live residue. DC_EXPECT_*/DC_MEASURED_D_* were measured on "
+        f"no_buffer boots and do NOT contain this term."
+    )
 
 
 def _csv_ints(text: str) -> List[int]:
@@ -1194,7 +1307,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "W41 Weg2OverlapRefused: --d-disable-overlap-schedule was passed, "
             "so group D keeps --disable-overlap-schedule. The gate that "
             "refused must be named in this boot's record; the flag is not a "
-            "tuning knob and no server_args gate is to be weakened to avoid it."
+            "tuning knob and no server_args gate is to be weakened to avoid it. "
+            + d_overlap_cost_line(ns.model, True)
         )
     else:
         log(
@@ -1206,7 +1320,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Qwen3_5ForConditionalGeneration on linear_attn_backend=triton). "
             f"--num-continuous-decode-steps {ns.num_continuous_decode_steps} "
             "on D (1 = the shipped value; the value that pays is measured in "
-            "the boot)."
+            "the boot). " + d_overlap_cost_line(ns.model, False)
         )
     if ns.p_hicache_write_policy != "write_through":
         log(

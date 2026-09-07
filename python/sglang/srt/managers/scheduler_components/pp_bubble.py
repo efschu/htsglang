@@ -33,12 +33,35 @@ idle under an async launch is not the same question. The cost is one
 ``perf_counter`` call per forward boundary.
 
 DENOMINATOR, stated in the line itself (denominator law). ``share`` is
-``gap_total / (gap_total + forward_total)`` over the forwards of ONE window --
-not over wall time, because a rank that is asleep, held at a debug stop, or
-waiting on the very first request of a boot has no forward to be between. The
-first forward after a reset therefore contributes a forward span and NO gap
+``gap_total / (gap_total + forward_total)`` over the forwards of ONE window,
+and the emitted line names exactly that -- ``share=<pct>% of gap+forward``.
+The only wall time this denominator excludes is the time OUTSIDE the
+window's forwards: a rank asleep, at a debug stop, or waiting on the very
+first request of a boot has no PREVIOUS forward to be between, so the first
+forward after a reset contributes a forward span and NO gap
 (``n_gaps == n_forwards - 1`` within a window), which is why both counts are
 printed.
+
+WHAT IS *NOT* EXCLUDED, and why the line has a second numerator (FIX 1r/2).
+A rank that is idle BETWEEN two forwards contributes that whole idle as a
+gap: ``begin`` measures from ``_last_end`` unconditionally, and it must, or
+the term would not be a bubble measure at all. An earlier draft of this
+docstring claimed such idle was exempt; it never was. MEASURED: two real
+100 ms forwards with 30 s of no-work idle between them read
+``share=99.3 %, mean=30000.0 ms, n=2``. So a raw share cannot answer the
+question PP0's 41.7 %% duty poses -- a PIPELINE stall (work admitted, this
+rank held anyway) and QUEUE STARVATION (nothing admitted to run) print the
+same number.
+
+The scheduler is the only thing that knows which, and it knows it at the one
+site that decides: the ``if cur_batch:`` guard around ``_pp_launch_batch``.
+Every event-loop visit that launches no forward calls ``note_no_batch()``, so
+a gap containing at least one such visit is charged to ``starved_ms`` as
+well as to ``bubble_ms``. ``bubble_ms - starved_ms`` is then the part of the
+gap during which this rank had work and was not running it -- the pipeline
+bubble proper. ``max=`` is printed beside ``mean=`` for the same reason: one
+30 s starvation gap must not be able to hide inside a mean over 300 short
+ones.
 """
 
 from __future__ import annotations
@@ -90,8 +113,31 @@ class PPBubbleMeter:
         self._window_start: Optional[float] = None
         # The sample RankPrefillLog picks up: (gap_ms, mb_id).
         self._pending: Optional[Tuple[float, int]] = None
+        # The starvation half of the gap, and the largest single gap. Both
+        # exist because a share alone cannot tell a pipeline stall from
+        # queue starvation, and a mean alone cannot tell one long gap from
+        # many short ones (FIX 1r/2).
+        self._starved_s = 0.0
+        self._max_gap_s = 0.0
+        #: Visits to the event loop since the last forward ended that had
+        #: nothing to launch. Set by ``note_no_batch``, consumed by the next
+        #: ``begin``: it classifies the gap that is closing, never a later one.
+        self._no_batch_visits = 0
 
     # -- boundaries ---------------------------------------------------------
+
+    def note_no_batch(self) -> None:
+        """One event-loop visit on this rank launched no forward.
+
+        Called from the ``else`` of the ``if cur_batch:`` guard around
+        ``_pp_launch_batch`` -- the one place the scheduler decides not to
+        run. It is a CLASSIFIER, not a timer: it carries no duration and only
+        marks the gap currently open as containing queue starvation, so the
+        next ``begin`` can charge that gap to ``starved_ms`` as well as to
+        ``bubble_ms``. A boot that never calls it prints ``starved_ms=0.0``
+        and the bubble total is unchanged.
+        """
+        self._no_batch_visits += 1
 
     def begin(self, mb_id: int) -> Optional[float]:
         now = self._clock()
@@ -106,7 +152,16 @@ class PPBubbleMeter:
             if gap_s >= 0.0:
                 self._gap_s += gap_s
                 self._n_gaps += 1
+                if gap_s > self._max_gap_s:
+                    self._max_gap_s = gap_s
+                if self._no_batch_visits:
+                    # This rank visited the loop with nothing to launch while
+                    # the gap was open: queue starvation, not a pipeline
+                    # stall. Charged to BOTH terms on purpose -- starved_ms
+                    # is a part of bubble_ms, never a rival total.
+                    self._starved_s += gap_s
                 gap_ms = gap_s * 1000.0
+        self._no_batch_visits = 0
         self._begun = now
         self._pending = None if gap_ms is None else (gap_ms, int(mb_id))
         return gap_ms
@@ -152,23 +207,42 @@ class PPBubbleMeter:
             return None
         return self._gap_s * 1000.0 / self._n_gaps
 
+    @property
+    def max_gap_ms(self) -> float:
+        """The largest single gap in the open window."""
+        return self._max_gap_s * 1000.0
+
+    @property
+    def starved_ms(self) -> float:
+        """The part of the gap total that contained a nothing-to-launch visit.
+
+        A SUBSET of the bubble total, not a rival to it: subtract it to get
+        the pipeline stall, the term a PP cut can move.
+        """
+        return self._starved_s * 1000.0
+
     def summary_line(self) -> Optional[str]:
         share = self.share
         mean = self.mean_gap_ms
         if share is None:
             return None
         return (
-            "PP-BUBBLE rank=%d share=%.1f%% of wall, mean=%.1f ms, n=%d "
-            "(n_gaps=%d, forward_ms=%.1f, bubble_ms=%.1f; bubble = host time "
-            "BETWEEN forwards, a different term from the 'wait' inside one)"
+            "PP-BUBBLE rank=%d share=%.1f%% of gap+forward, mean=%.1f ms, "
+            "max=%.1f ms, n=%d (n_gaps=%d, forward_ms=%.1f, bubble_ms=%.1f, "
+            "starved_ms=%.1f; bubble = host time BETWEEN forwards, a "
+            "different term from the 'wait' inside one; starved = the part "
+            "of it in which this rank visited the loop with nothing to "
+            "launch, so bubble_ms - starved_ms is the pipeline stall)"
             % (
                 self.rank,
                 share * 100.0,
                 0.0 if mean is None else mean,
+                self.max_gap_ms,
                 self._n_forwards,
                 self._n_gaps,
                 self._forward_s * 1000.0,
                 self._gap_s * 1000.0,
+                self.starved_ms,
             )
         )
 
@@ -186,4 +260,6 @@ class PPBubbleMeter:
         self._forward_s = 0.0
         self._n_forwards = 0
         self._n_gaps = 0
+        self._starved_s = 0.0
+        self._max_gap_s = 0.0
         self._window_start = now

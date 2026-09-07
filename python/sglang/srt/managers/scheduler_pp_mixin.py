@@ -4961,6 +4961,15 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                else:
+                    # FIX 1r/2: this visit launches NO forward on this
+                    # rank. The gap that is open right now therefore
+                    # contains queue STARVATION, not a pipeline stall,
+                    # and this guard is the only place that knows the
+                    # difference -- the meter sees timestamps only. It
+                    # records no duration; the gap is still measured at
+                    # the next `begin`, this only classifies it.
+                    self._pp_bubble_note_no_batch()
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -5439,6 +5448,15 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                else:
+                    # FIX 1r/2: this visit launches NO forward on this
+                    # rank. The gap that is open right now therefore
+                    # contains queue STARVATION, not a pipeline stall,
+                    # and this guard is the only place that knows the
+                    # difference -- the meter sees timestamps only. It
+                    # records no duration; the gap is still measured at
+                    # the next `begin`, this only classifies it.
+                    self._pp_bubble_note_no_batch()
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -5617,6 +5635,15 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                else:
+                    # FIX 1r/2: this visit launches NO forward on this
+                    # rank. The gap that is open right now therefore
+                    # contains queue STARVATION, not a pipeline stall,
+                    # and this guard is the only place that knows the
+                    # difference -- the meter sees timestamps only. It
+                    # records no duration; the gap is still measured at
+                    # the next `begin`, this only classifies it.
+                    self._pp_bubble_note_no_batch()
 
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -10609,6 +10636,20 @@ class SchedulerPPMixin:
         reporter = getattr(self, "metrics_reporter", None)
         log = getattr(reporter, "rank_prefill_log", None) if reporter else None
         return getattr(log, "bubble", None) if log is not None else None
+
+    def _pp_bubble_note_no_batch(self: Scheduler) -> None:
+        """Classify the open gap as queue starvation (FIX 1r/2).
+
+        The share alone cannot separate a pipeline stall from starvation: a
+        rank idle between two forwards contributes its whole idle as bubble
+        either way (MEASURED: 30 s of no work between two 100 ms forwards
+        printed share 99.3 %). The scheduler knows which, at the
+        ``if cur_batch:`` guard, and nowhere else -- so it says so here, and
+        the printed line carries both numerators against the one denominator.
+        """
+        meter = self._pp_bubble_meter()
+        if meter is not None:
+            meter.note_no_batch()
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group

@@ -136,7 +136,9 @@ class TestBubbleShare(unittest.TestCase):
         self.assertTrue(lines, "a 15 s run at window_s=5 must emit summaries")
         first = lines[0]
         self.assertTrue(first.startswith("PP-BUBBLE rank=2 share="), first)
-        self.assertIn("of wall, mean=", first)
+        # FIX 1r/2: this used to pin "of wall", which was the defect -- the
+        # share is gap/(gap+forward) and the line now says so.
+        self.assertIn("of gap+forward, mean=", first)
         self.assertIn("n=", first)
         # The share is computable from the log: the line carries its own
         # numerator and denominator, so a reader never has to reconstruct
@@ -168,6 +170,184 @@ class TestBubbleShare(unittest.TestCase):
         line = "\n".join(captured.output)
         self.assertIn("Prefill rank batch, #new-token: 17", line)
         self.assertNotIn("bubble_ms=", line)
+
+
+
+class TestBubbleDenominatorAndStarvation(unittest.TestCase):
+    """FIX 1r/2: the line must name the denominator it actually uses, and a
+    starvation gap must not read as a pipeline stall.
+
+    The shipped module docstring asserted that ``share`` is NOT over wall time
+    "because a rank that is asleep, held at a debug stop, or waiting on the
+    very first request of a boot has no forward to be between" -- but ``begin``
+    computes the gap from ``_last_end`` unconditionally, so a rank idle BETWEEN
+    two forwards contributed its whole idle as bubble, and the emitted line
+    said ``share=...% of wall``, the opposite of the docstring. Two different
+    answers to the denominator question from one module, and no way to tell
+    the pipeline stall PP0's 41.7 %% duty poses from queue starvation.
+    """
+
+    def test_line_names_the_denominator_it_uses(self):
+        clock = FakeClock()
+        meter = PPBubbleMeter(rank=0, clock=clock, window_s=1e9)
+        for i in range(2):
+            if i:
+                clock.advance(0.300)
+            meter.begin(i)
+            clock.advance(0.100)
+            meter.end()
+        line = meter.summary_line()
+        # gap/(gap+forward) is what `share` computes; the line must say so.
+        self.assertIn("of gap+forward", line)
+        self.assertNotIn("of wall", line)
+
+    def test_starvation_idle_is_a_separate_numerator(self):
+        """30 s of nothing-to-run between two forwards is NOT a pipeline stall.
+
+        MEASURED before the fix: this shape printed
+        ``share=99.3% of wall, mean=30000.0 ms, n=2`` with no term telling a
+        reader that the 30 s was queue starvation.
+        """
+        clock = FakeClock()
+        meter = PPBubbleMeter(rank=0, clock=clock, window_s=1e9)
+        meter.begin(0)
+        clock.advance(0.100)
+        meter.end()
+        # The scheduler visits the loop with nothing to launch, repeatedly.
+        for _ in range(3):
+            meter.note_no_batch()
+        clock.advance(30.0)
+        meter.begin(1)
+        clock.advance(0.100)
+        meter.end()
+        line = meter.summary_line()
+        self.assertIn("starved_ms=30000.0", line)
+        self.assertAlmostEqual(meter.starved_ms, 30000.0, places=3)
+
+    def test_a_pipeline_stall_is_not_charged_to_starvation(self):
+        """A gap with work admitted throughout carries starved_ms=0."""
+        clock = FakeClock()
+        meter = PPBubbleMeter(rank=0, clock=clock, window_s=1e9)
+        for i in range(3):
+            if i:
+                clock.advance(0.300)
+            meter.begin(i)
+            clock.advance(0.100)
+            meter.end()
+        self.assertEqual(meter.starved_ms, 0.0)
+        self.assertIn("starved_ms=0.0", meter.summary_line())
+
+    def test_max_gap_is_printed_so_one_gap_cannot_hide_in_a_mean(self):
+        clock = FakeClock()
+        meter = PPBubbleMeter(rank=0, clock=clock, window_s=1e9)
+        # 9 short gaps of 10 ms and one long gap of 5 s: the mean is 508 ms,
+        # which describes neither population.
+        for i in range(11):
+            if i:
+                clock.advance(5.0 if i == 5 else 0.010)
+            meter.begin(i)
+            clock.advance(0.100)
+            meter.end()
+        line = meter.summary_line()
+        self.assertIn("max=5000.0 ms", line)
+        self.assertAlmostEqual(meter.max_gap_ms, 5000.0, places=3)
+
+    def test_window_reset_clears_the_new_accumulators(self):
+        clock = FakeClock()
+        meter = PPBubbleMeter(rank=0, clock=clock, window_s=1.0)
+        meter.begin(0)
+        clock.advance(0.100)
+        meter.end()
+        meter.note_no_batch()
+        clock.advance(2.0)
+        meter.begin(1)
+        clock.advance(0.100)
+        first = meter.end()
+        self.assertIn("starved_ms=2000.0", first)
+        # Next window: two clean forwards, no starvation carried forward.
+        for i in range(2, 4):
+            clock.advance(0.010)
+            meter.begin(i)
+            clock.advance(0.600)
+            second = meter.end()
+        self.assertIsNotNone(second)
+        self.assertIn("starved_ms=0.0", second)
+        self.assertIn("max=10.0 ms", second)
+
+
+
+class TestTheClassifierIsWiredAtEveryLaunchGuard(unittest.TestCase):
+    """The meter sees timestamps only; the SCHEDULER knows whether there was
+    work. That knowledge exists at exactly one kind of site -- the
+    ``if cur_batch:`` guard around ``_pp_launch_batch`` -- and there are three
+    of them. A fourth launch site added without the ``else`` would silently
+    reclassify starvation as pipeline stall, which is the defect this fix
+    removes, so the wiring is pinned structurally rather than by inspection.
+    """
+
+    def _guards(self):
+        import ast
+        import pathlib
+
+        import sglang.srt.managers.scheduler_pp_mixin as mixin
+
+        tree = ast.parse(pathlib.Path(mixin.__file__).read_text())
+        out = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            if not (isinstance(node.test, ast.Name) and node.test.id == "cur_batch"):
+                continue
+            body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+            if "_pp_launch_batch" in body:
+                out.append(node)
+        return out
+
+    def test_all_three_launch_guards_classify_the_empty_visit(self):
+        import ast
+
+        guards = self._guards()
+        self.assertEqual(len(guards), 3, "the launch-guard count moved")
+        for node in guards:
+            self.assertTrue(node.orelse, "a launch guard has no else branch")
+            dumped = ast.dump(ast.Module(body=node.orelse, type_ignores=[]))
+            self.assertIn("_pp_bubble_note_no_batch", dumped)
+
+    def test_the_mixin_forwards_to_the_meter_and_tolerates_no_reporter(self):
+        from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+
+        class FakeLog:
+            pass
+
+        class FakeReporter:
+            pass
+
+        clock = FakeClock()
+        meter = PPBubbleMeter(rank=0, clock=clock, window_s=1e9)
+        log = FakeLog()
+        log.bubble = meter
+        reporter = FakeReporter()
+        reporter.rank_prefill_log = log
+
+        class FakeScheduler(SchedulerPPMixin):
+            def __init__(self):
+                self.metrics_reporter = reporter
+
+        sched = FakeScheduler()
+        sched._pp_bubble_note_no_batch()
+        meter.begin(0)
+        clock.advance(0.010)
+        meter.end()
+        clock.advance(1.0)
+        meter.note_no_batch()
+        meter.begin(1)
+        self.assertAlmostEqual(meter.starved_ms, 1000.0, places=3)
+
+        # A scheduler stand-in without a reporter must not grow one.
+        class BareScheduler(SchedulerPPMixin):
+            pass
+
+        BareScheduler()._pp_bubble_note_no_batch()
 
 
 if __name__ == "__main__":

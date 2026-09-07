@@ -16,7 +16,13 @@ import unittest
 import pytest
 
 try:
-    from sglang.srt.weg2.launcher import argv_d, argv_p, common_flags
+    from sglang.srt.weg2.launcher import (
+        argv_d,
+        argv_p,
+        common_flags,
+        d_mamba_ping_pong_cost,
+        d_overlap_cost_line,
+    )
     from sglang.test.ci.ci_register import register_cpu_ci
 except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
     pytest.skip(
@@ -92,6 +98,58 @@ class TestTheStageRatioIsNoLongerAConstantInTheArgv(unittest.TestCase):
         argv = p(stage_ratio="42,11,11", attn_stage_ratio="10,3,3")
         self.assertEqual(argv[argv.index("--pp-stage-ratio") + 1], "42,11,11")
         self.assertEqual(argv[argv.index("--pp-attn-stage-ratio") + 1], "10,3,3")
+
+
+
+class TestTheOverlapChoiceIsPricedAndStated(unittest.TestCase):
+    """FIX 1r/1: turning the overlap schedule ON for D also flips its mamba
+    radix-cache strategy to ``extra_buffer`` and DOUBLES D's device mamba
+    floor -- 16 -> 32 state slots at ``--max-running-requests 8`` -- out of
+    D's FIXED ``--rank-gpu-memory-mib`` budgets. MEASURED with the runtime's
+    own functions against the real argv (``mamba_pool_floor.
+    mamba_ping_pong_slots`` returns 2 instead of 0). The shipped commit
+    announced the resolution and priced only the overlap benefit: an unpriced
+    term does not read as unknown, it reads as free (#1009).
+    """
+
+    def test_D_states_its_strategy_instead_of_inheriting_it(self):
+        argv = d()
+        self.assertIn("--mamba-radix-cache-strategy", argv)
+        self.assertEqual(
+            argv[argv.index("--mamba-radix-cache-strategy") + 1], "extra_buffer"
+        )
+
+    def test_the_escape_hatch_states_the_other_one(self):
+        argv = d(disable_overlap=True)
+        self.assertEqual(
+            argv[argv.index("--mamba-radix-cache-strategy") + 1], "no_buffer"
+        )
+
+    def test_the_slot_delta_is_derived_from_the_runtime_not_typed(self):
+        strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(MODEL, False)
+        self.assertEqual(strategy, "extra_buffer")
+        self.assertEqual(per_req, 2)
+        self.assertEqual(mrr, 8)
+        self.assertEqual(extra, 16)
+        strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(MODEL, True)
+        self.assertEqual(strategy, "no_buffer")
+        self.assertEqual(per_req, 0)
+        self.assertEqual(extra, 0)
+
+    def test_the_number_appears_in_the_line_that_announces_the_change(self):
+        line = d_overlap_cost_line(MODEL, False)
+        self.assertIn("16 extra device mamba state slots", line)
+        self.assertIn("2 extra ping-pong state slots per running request", line)
+        self.assertIn("extra_buffer", line)
+        # The MiB conversion is REFUSED here, and the refusal is named rather
+        # than left as a silent omission.
+        self.assertIn("not converted to MiB", line)
+        self.assertIn("mamba_cache_per_req", line)
+
+    def test_the_hatch_line_charges_nothing(self):
+        line = d_overlap_cost_line(MODEL, True)
+        self.assertIn("no_buffer", line)
+        self.assertIn("0 extra device mamba state slots", line)
 
 
 if __name__ == "__main__":
