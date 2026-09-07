@@ -166,6 +166,19 @@ def note_second_continuation_refused(req, site: str) -> int:
 import os
 import random
 from collections import Counter, defaultdict
+
+# #1233 zero-remainder (weg2/zero-remainder-0907), END-OF-PREFILL ANCHOR.
+# A reader of a finished prompt of N tokens may claim at most N-1 of them
+# (`Req._compute_max_prefix_len`: the last token is always recomputed for its
+# logits / draft hidden state), so on a GDN hybrid the recurrent state it can
+# resume from must exist at N-1. The finish-time anchor sits at N and is one
+# token too deep for an identical re-run (measured boot weg2ls4b2: D claimed
+# 12,287 of 13,223 units, anchors at the 4096-chunk boundaries only, the 937
+# token tail recomputed). Armed, the LAST prefill chunk of every request ends
+# at N-1 and the final token forms its own 1-token chunk, so the existing
+# chunk-publish path (`UnifiedRadixCache._inc_hit_count`, #1028) writes the
+# N-1 anchor with no second bookkeeping. Set by the Weg-2 launcher on group P.
+_WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -1473,6 +1486,30 @@ class PrefillAdder:
             return None
         return self.scheduled_extents.get(req.rid)
 
+    def _weg2_end_anchor_split(self, req: Req, start: int, length: int):
+        """#1233 END-OF-PREFILL ANCHOR: (length, forced_chunked).
+
+        When the extend [start, start+length) would reach the END of the
+        prompt with two or more tokens, hold the last token back so that a
+        chunk boundary -- and therefore a published recurrent anchor -- lands
+        at N-1, the deepest position a later reader can claim. Identity when
+        disarmed, when chunked prefill is off (no continuation machinery to
+        schedule the held token), or when the extend does not reach the end.
+        """
+        if not _WEG2_END_ANCHOR or self.rem_chunk_tokens is None or length < 2:
+            return length, False
+        if start + length != len(req.full_untruncated_fill_ids):
+            return length, False
+        n = getattr(PrefillAdder, "_weg2_end_anchor_splits", 0) + 1
+        PrefillAdder._weg2_end_anchor_splits = n
+        if n <= 8 or n % 64 == 0:
+            logger.info(
+                "WEG2 END-ANCHOR SPLIT n=%d rid=%s: last chunk ends at %d of %d "
+                "tokens, the final token is its own chunk (anchor at N-1)",
+                n, getattr(req, "rid", "?"), start + length - 1, start + length,
+            )
+        return length - 1, True
+
     def _mint_chunked(self, req: Req, site: str) -> None:
         """#996 RATCHET: announce `req` as THIS pass's new chunked request.
 
@@ -1897,6 +1934,11 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        # #1233 END-OF-PREFILL ANCHOR: hold the last token back (see helper).
+        new_len, _forced = self._weg2_end_anchor_split(
+            req, len(req.prefix_indices), new_len
+        )
+        truncated = truncated or _forced
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -2513,16 +2555,34 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
+                # #1233 END-OF-PREFILL ANCHOR: a whole-fit prompt still holds
+                # its last token back so the N-1 anchor is published; the
+                # held token is scheduled by the chunked-request machinery,
+                # which admits ONE continuation per pass (#996 ratchet).
+                _ea_start = len(req.prefix_indices)
+                _ea_len, _ea_forced = self._weg2_end_anchor_split(
+                    req, _ea_start, len(req.full_untruncated_fill_ids) - _ea_start
+                )
+                # ONE chunked request per pass: the resident continuation
+                # (`chunked_req_outstanding`) AND a mint earlier in this pass
+                # (`new_chunked_req`, the #996 assert) both refuse the split; the
+                # request waits a pass rather than tripping the ratchet.
+                if _ea_forced and (self.chunked_req_outstanding or self.new_chunked_req is not None):
+                    note_second_continuation_refused(req, "add_one_req/end-anchor")
+                    return AddReqResult.OTHER
                 req.set_extend_range(
-                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+                    _ea_start,
+                    (_ea_start + _ea_len) if _ea_forced else len(req.full_untruncated_fill_ids),
                 )
                 self.can_run_list.append(req)
+                if _ea_forced:
+                    self._mint_chunked(req, "add_one_req/end-anchor")
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
-                    input_tokens,
-                    min(
+                    _ea_len if _ea_forced else input_tokens,
+                    0 if _ea_forced else min(
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),

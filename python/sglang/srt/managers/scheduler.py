@@ -13467,6 +13467,22 @@ class Scheduler(
         # the origin (SchedulerRequestReceiver._dispose_health_checks_at_origin)
         # the queues are replicated again and this reads the same on every
         # rank; a second origin-side gate for it would be second bookkeeping.
+        # #1233 zero-remainder: the flush is the hand-back seam of a Weg-2
+        # group. With nothing running or waiting, publish every un-backed
+        # device node before the idle witness is consulted, so the store holds
+        # what this group computed before its tiers are cleared (see
+        # UnifiedRadixCache.publish_unbacked_sweep). The witness then reports
+        # the in-flight backups and the front keeps polling until they drain.
+        if (
+            self.enable_hierarchical_cache
+            and os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "0") == "1"
+            and self.running_batch.is_empty()
+            and self.chunked_req is None
+            and len(self.waiting_queue) == 0
+        ):
+            _sweep = getattr(self.tree_cache, "publish_unbacked_sweep", None)
+            if _sweep is not None:
+                _sweep()
         if self.is_fully_idle():
             self.cur_batch_for_debug = None
             self.last_batch = None

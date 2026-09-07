@@ -43,6 +43,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -167,6 +168,7 @@ class BootState:
     t_ready: Dict[str, float] = field(default_factory=dict)
     sleep_p_ms: float = 0.0
     deviations: List[str] = field(default_factory=list)
+    carrier_max_tokens: int = 0
     weight_chunks: int = 0
     tms_so: str = ""
 
@@ -509,6 +511,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # prompt, D never read P's pages. One key scheme for both groups; a
     # no-op on D (already bigram), forces bigram on P.
     env["SGLANG_HICACHE_BIGRAM_KEYS"] = "1"
+    # #1233 zero-remainder: /flush_cache (the front's quiesce before a sleep)
+    # first publishes every un-backed device node to the store, so a chain
+    # the write-through pin budget declined mid-prefill is not lost at the
+    # flip (UnifiedRadixCache.publish_unbacked_sweep). Both groups.
+    env["SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP"] = "1"
     env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     env["SGLANG_UNEVEN_DCP"] = "1"
     env["SGLANG_UNEVEN_DCP_WEIGHTED"] = "1"
@@ -735,6 +742,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     state.budgets["P"] = budgets_p
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so)
+    # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
+    # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
+    # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
+    # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
+    env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
     spec_p = GroupSpec("P", PORT_P, argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     state.deviations = [
@@ -746,6 +758,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "torch_memory_saver 0.0.9.post1 preload hook rebuilt from the vendored csrc with ONE patch (cpu backup freed after resume, "
         "python/sglang/srt/weg2/tms_csrc/PATCH.md); the stock wheel is untouched and used when SGLANG_WEG2_TMS_PRELOAD_SO is unset",
         f"weights paused/resumed as {chunk_count} weights_<k> chunk tags + the base tag (#1233 one-backup flip); cuda_graph stays resident (not in the sleep tag set, as in round 1)",
+        "zero-remainder: group P holds the last token of every prefill back into its own chunk (SGLANG_WEG2_END_ANCHOR=1) so the GDN anchor D resumes from sits at N-1; "
+        "costs P one 1-token pass per request and serialises whole-fit prompts behind the one chunked request per pass",
+        "zero-remainder: /flush_cache publishes un-backed nodes before the idle witness on both groups (SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=1); the quiesce then waits for those backups",
+        "zero-remainder: a BATCH prompt longer than group D's host staging pool can carry (launcher-measured from D's log, x0.9 prefetch bound) is served by ONE prefill on D "
+        "(front route CARRIER-EXCEEDS, no leg 1) -- served and single-prefill, but NOT a zero-remainder leg 2; the windowed prefetch that would lift it is the next round",
+        "zero-remainder: BATCH streams are priced post hoc via stream_options.include_usage (one standard trailing usage chunk reaches the client)",
     ]
     for d in state.deviations:
         log(f"DEVIATION (declared): {d}")
@@ -800,6 +818,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}")
     if n_kv < 3 or n_blob < 3:
         raise Weg2LaunchRefused(f"W7/W10 (launcher half): D logged kv x{n_kv} blob x{n_blob}, need 3 each")
+    # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
+    # store is one carrier; a spec-less group keys pages by unigram unless
+    # SGLANG_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE
+    # group keys by bigram natively. Divergent schemes wrote disjoint chains
+    # for the same prompt once (boots weg2ls3b1-b3); the identity-suffix
+    # check in the front cannot see it. Refuse the boot before any traffic.
+    _forced = "#1233 HICACHE BIGRAM KEYS FORCED"
+    _p_bigram = ("--speculative-algorithm" in spec_p.argv) or count_marker(spec_p.log, _forced) >= 1
+    _d_bigram = ("--speculative-algorithm" in spec_d.argv) or count_marker(spec_d.log, _forced) >= 1
+    log(f"W9 launch-time key-scheme gate: P bigram={_p_bigram} (forced lines {count_marker(spec_p.log, _forced)}) "
+        f"D bigram={_d_bigram} (forced lines {count_marker(spec_d.log, _forced)})")
+    if _p_bigram != _d_bigram:
+        raise Weg2LaunchRefused(f"W9 Weg2StoreIdentityMismatch (launch-time key scheme): P bigram={_p_bigram} D bigram={_d_bigram} -- "
+                                f"the two groups would key the sole carrier by different page-hash schemes")
+    # #1233 zero-remainder: the carrier bound the front routes by -- group D's
+    # smallest host staging pool (tokens) x 0.9 (the prefetch rate bound that
+    # refused the 84k prompt on boot weg2ls4b2: limit=27466 of pool 30518).
+    _pools = []
+    try:
+        with open(spec_d.log, errors="replace") as _f:
+            for _ln in _f:
+                _m = re.search(r"HiCache host KV pool \((\d+) tokens\)", _ln)
+                if _m:
+                    _pools.append(int(_m.group(1)))
+    except OSError:
+        pass
+    carrier_max_tokens = int(0.9 * min(_pools)) if _pools else 0
+    state.carrier_max_tokens = carrier_max_tokens
+    log(f"CARRIER BOUND: group D host KV pools (tokens) = {_pools} -> front --carrier-max-tokens {carrier_max_tokens} "
+        f"(0 = not found in D's log, route disabled); prompts above it are served by ONE prefill on D")
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
 
@@ -813,6 +861,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d[c.uuid]}" for c in cards),
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
+        "--carrier-max-tokens", str(carrier_max_tokens),
     ]
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"

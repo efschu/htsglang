@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -386,6 +387,10 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 }
 
 logger = logging.getLogger(__name__)
+
+# #1233 zero-remainder: END-OF-PREFILL ANCHOR instrument, armed by the Weg-2
+# launcher on group P together with the schedule_policy split (same env).
+_WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
 
 
 class _OngoingWriteThrough(NamedTuple):
@@ -1555,6 +1560,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            if _WEG2_END_ANCHOR:
+                self._weg2_note_end_anchor(req, token_ids)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
@@ -2956,6 +2963,102 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # suffix; the prefix fragment must be persisted as well.
             for node in publish_nodes:
                 self.write_backup_storage(node)
+
+    def _weg2_note_end_anchor(self, req, token_ids) -> None:
+        """#1233 END-OF-PREFILL ANCHOR instrument, one line per finished request.
+
+        Answers the question a reader of this prompt will ask: how deep is
+        the deepest resume anchor at or below N-1 tokens? `match_prefix` on
+        the key of the first N-1 tokens runs the MAMBA validator exactly as a
+        later admission would (`cache_unfinished_req` calls the same method
+        after its insert), so `anchor` is what `#1028B FETCH CAP` will claim.
+        Denominator: `n` counts every finished insert on this rank.
+        """
+        n = getattr(UnifiedRadixCache, "_weg2_end_anchor_n", 0) + 1
+        UnifiedRadixCache._weg2_end_anchor_n = n
+        tokens = len(token_ids)
+        try:
+            probe = RadixKey(
+                list(token_ids[:-1]), req.extra_key, is_bigram=self.is_eagle
+            ).page_aligned(self.page_size)
+            target_units = len(probe)
+            mr = self.match_prefix(MatchPrefixParams(key=probe))
+            usable_units = len(mr.device_indices)
+        except Exception as e:  # noqa: BLE001 -- an instrument never kills a rank
+            logger.warning("WEG2 END-ANCHOR n=%d rid=%s tokens=%d PROBE RAISED %s: %s",
+                           n, str(getattr(req, "rid", "?"))[:12], tokens, type(e).__name__, e)
+            return
+        # raw-token position of a key-unit depth: bigram units span one more
+        # token than their count (`MambaComponent._raw_token_pos`).
+        anchor = usable_units + 1 if (self.is_eagle and usable_units > 0) else usable_units
+        ok = usable_units >= target_units
+        if not ok:
+            UnifiedRadixCache._weg2_end_anchor_short = getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0) + 1
+        logger.warning(
+            "WEG2 END-ANCHOR n=%d rid=%s tokens=%d anchor=%d target=%d units=%d/%d ok=%s short=%d",
+            n, str(getattr(req, "rid", "?"))[:12], tokens, anchor, tokens - 1,
+            usable_units, target_units, ok, getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0),
+        )
+
+    def publish_unbacked_sweep(self, max_issue: int = 64) -> dict:
+        """#1233 zero-remainder: back every un-backed device node up before a flush.
+
+        The hand-back seam. The Weg-2 front quiesces a group through
+        `/flush_cache` before it sleeps, and the flush clears device AND host
+        tiers; whatever the write-through pin budget (#581/#773) declined
+        during the prefill -- measured boot weg2ls4b2: `mamba write-through
+        pin budget reached (4 in flight, budget=4, pool=20)` three times per
+        rank inside one 84k-token prefill, and `write_backup` drops the
+        WHOLE chain below a refused ancestor -- is then lost to the store for
+        good, and the next group recomputes it. Upstream has no equivalent
+        because upstream never publishes chunked nodes (its chunked skip is
+        the #1028 deviation this tree carries). No new bookkeeping: this is a
+        walk over upstream's own `backuped` / `write_through_pending_id`
+        flags calling upstream's own `write_backup`, parents first. The
+        budget still applies per call; the front polls `/flush_cache` every
+        0.5 s until it answers 200 (in-flight terms zero), so successive calls
+        drain what each earlier call could not pin. Called by the scheduler
+        only when nothing is running or waiting (`SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=1`).
+        """
+        stats = {"unbacked": 0, "issued": 0, "refused": 0, "pending": 0, "skipped_pending": 0}
+        if self.cache_controller is None or self.disable:
+            return stats
+        queue = [self.root_node]
+        while queue:
+            node = queue.pop(0)
+            for child in list(node.children.values()):
+                queue.append(child)
+            if node is self.root_node or node.evicted or node.backuped:
+                continue
+            if node.component_data[BASE_COMPONENT_TYPE].value is None:
+                continue
+            if node.write_through_pending_id is not None:
+                stats["skipped_pending"] += 1
+                continue
+            stats["unbacked"] += 1
+            if stats["issued"] >= max_issue:
+                continue
+            try:
+                got = self.write_backup(node)
+            except Exception as e:  # noqa: BLE001 -- the sweep must not kill the flush
+                logger.warning("WEG2 PUBLISH-SWEEP write_backup raised on node %s: %s: %s",
+                               getattr(node, "id", "?"), type(e).__name__, e)
+                got = 0
+            if got > 0:
+                stats["issued"] += 1
+            else:
+                stats["refused"] += 1
+        stats["pending"] = len(self.ongoing_write_through) + len(getattr(self, "ongoing_backup", {}) or {})
+        n = getattr(UnifiedRadixCache, "_weg2_sweep_n", 0) + 1
+        UnifiedRadixCache._weg2_sweep_n = n
+        if stats["unbacked"] or n <= 4 or n % 64 == 0:
+            logger.warning(
+                "WEG2 PUBLISH-SWEEP n=%d unbacked=%d issued=%d refused=%d skipped_pending=%d "
+                "in_flight_after=%d pins=%d/%d (denominator: un-backed device nodes at this flush poll)",
+                n, stats["unbacked"], stats["issued"], stats["refused"], stats["skipped_pending"],
+                stats["pending"], self._mamba_pins_held(), self._mamba_pin_budget,
+            )
+        return stats
 
     def load_back(
         self,

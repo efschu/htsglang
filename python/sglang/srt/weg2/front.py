@@ -153,21 +153,57 @@ def price_remainder(text: str, spans: SpanLRU) -> Tuple[int, int, bool]:
     return max(0, est_prompt - span), est_prompt, known
 
 
-def usage_of(body: Any) -> Tuple[int, int, int]:
-    """(prompt_tokens, cached_tokens, completion_tokens) from a response body."""
+def usage_of(body: Any) -> Tuple[int, int, int, bool]:
+    """(prompt_tokens, cached_tokens, completion_tokens, priced) from a response body.
+
+    #1233 zero-remainder (1j finding 3): a body without usage/meta_info is
+    NOT (0, 0) -- it is unpriced, and `priced=False` says so; the caller
+    refuses it by name instead of serving it on a fail-open 'serve'.
+    """
     if not isinstance(body, dict):
-        return 0, 0, 0
+        return 0, 0, 0, False
     u = body.get("usage") or {}
     if not u and "meta_info" in body:
         mi = body["meta_info"] or {}
-        return int(mi.get("prompt_tokens", 0)), int(mi.get("cached_tokens", 0)), int(mi.get("completion_tokens", 0))
+        if not isinstance(mi, dict) or "prompt_tokens" not in mi:
+            return 0, 0, 0, False
+        return (int(mi.get("prompt_tokens", 0) or 0), int(mi.get("cached_tokens", 0) or 0),
+                int(mi.get("completion_tokens", 0) or 0), True)
+    if not isinstance(u, dict) or "prompt_tokens" not in u:
+        return 0, 0, 0, False
     pt = int(u.get("prompt_tokens", 0) or 0)
     ct = 0
     det = u.get("prompt_tokens_details") or {}
     if isinstance(det, dict):
         ct = int(det.get("cached_tokens", 0) or 0)
     ct = int(u.get("cached_tokens", ct) or ct)
-    return pt, ct, int(u.get("completion_tokens", 0) or 0)
+    return pt, ct, int(u.get("completion_tokens", 0) or 0), True
+
+
+def usage_of_stream_tail(tail: bytes) -> Tuple[int, int, int, bool]:
+    """Price a STREAMED leg 2 from its final SSE chunks (1j finding 2).
+
+    /v1/* streams carry one trailing `data: {... "usage": {...}}` chunk when
+    `stream_options.include_usage` was requested (the front requests it on
+    every BATCH stream); /generate streams carry `meta_info` in every chunk.
+    Scans the retained tail from the end for the last priced chunk.
+    """
+    for raw in reversed(tail.split(b"\n")):
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]":
+            continue
+        try:
+            js = json.loads(data)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(js, dict) and (js.get("usage") or js.get("meta_info")):
+            pt, ct, comp, priced = usage_of(js)
+            if priced and pt:
+                return pt, ct, comp, True
+    return 0, 0, 0, False
 
 
 def double_prefill_verdict(prompt_tokens: int, cached_tokens: int, reroutes: int) -> str:
@@ -231,6 +267,7 @@ class Pending:
     est_prompt: int = 0
     span_known: bool = False
     leg1_prompt_tokens: int = 0
+    skip_leg1: bool = False  # #1233 route CARRIER-EXCEEDS: one prefill on D, no leg 1
 
 
 def _sid_alive(sid: int) -> bool:
@@ -284,7 +321,7 @@ def _session_pids(sid: int) -> set:
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
-                 weight_chunks: int = 0):
+                 weight_chunks: int = 0, carrier_max_tokens: int = 0):
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
         self.awake = awake
         # #1233 one-backup flip: the weights tag family both groups were built
@@ -311,6 +348,16 @@ class Front:
         self.t0 = time.time()
         self._rid = 0
         self._ready_for_d: List[Pending] = []
+        # #1233 zero-remainder: the longest prompt group D can READ from the
+        # store (its host staging pool x the prefetch rate bound, launcher-
+        # measured from D's log). Above it a BATCH prompt would be prefilled
+        # by P and then prefilled AGAIN by D (measured boot weg2ls4b2: 84,027
+        # tokens vs a 30,518-token D host pool -> '#915 PREFETCH REFUSED',
+        # cached_tokens=0, W16 after 6 min of GPU time). Such a prompt is
+        # routed to ONE prefill on D instead (no leg 1) -- served, single
+        # prefill, and named as the carrier bound it is.
+        self.carrier_max_tokens = int(carrier_max_tokens)
+        self.exact_tokens: Dict[str, int] = {}
 
     # ---------------- lifecycle ----------------
     async def startup(self, app):
@@ -318,8 +365,8 @@ class Front:
         app["controller"] = asyncio.create_task(self.controller())
         app["health"] = asyncio.create_task(self.health_poller())
         app["corridor"] = asyncio.create_task(self.corridor_sampler())
-        logger.info("WEG2-FRONT up tag=%s awake=%s P=%s D=%s W=%.0f s (operator V1 fairness bound)",
-                    self.tag, self.awake, self.groups["P"].url, self.groups["D"].url, self.w_s)
+        logger.info("WEG2-FRONT up tag=%s awake=%s P=%s D=%s W=%.0f s (operator V1 fairness bound) carrier_max_tokens=%d",
+                    self.tag, self.awake, self.groups["P"].url, self.groups["D"].url, self.w_s, self.carrier_max_tokens)
 
     async def cleanup(self, app):
         for k in ("controller", "health", "corridor"):
@@ -433,6 +480,24 @@ class Front:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
         stream = bool(payload.get("stream"))
+        exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
+        if self.carrier_max_tokens > 0 and (exact if exact else est_prompt) > self.carrier_max_tokens:
+            self.counters["route_carrier_exceeds"] += 1
+            logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill est_prompt=%d exact=%s > carrier_max=%d "
+                           "(group D host staging pool bound: the store cannot be read into D for a prompt this long; "
+                           "ONE prefill on D, no leg 1, no double prefill)", rid, est_prompt, exact, self.carrier_max_tokens)
+            if self.awake == "D" and self.admit_d and self.state == "serving":
+                return await self.leg2(request, rid, payload, text, stream, pending=None, single_prefill=True)
+            fut = asyncio.get_event_loop().create_future()
+            p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt, span_known=known, skip_leg1=True)
+            self.queue.append(p)
+            try:
+                await fut
+            except Weg2Stop as e:
+                return web.json_response({"error": str(e)}, status=503)
+            except Exception as e:  # noqa: BLE001
+                return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
+            return await self.leg2(request, rid, payload, text, stream, pending=p)
         if self.awake == "D" and self.admit_d and self.state == "serving" and remainder <= CHUNK_TOKENS:
             self.counters["route_short"] += 1
             logger.info("WEG2-ROUTE rid=%s SHORT -> D est_prompt=%d remainder=%d span_known=%s", rid, est_prompt, remainder, known)
@@ -475,47 +540,119 @@ class Front:
                     js = json.loads(body)
                 except Exception:  # noqa: BLE001
                     js = {}
-                pt, ct, _ = usage_of(js)
+                pt, ct, _, _ = usage_of(js)
                 p.leg1_prompt_tokens = pt
                 self.spans.record(p.text, pt)
+                self._note_exact(p.text, pt)
                 g.served += 1
                 logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d",
                             p.rid, pt, ct, time.time() - t0, self.epoch)
         finally:
             g.outstanding.pop(p.rid, None)
 
+    def _note_exact(self, text: str, prompt_tokens: int) -> None:
+        if prompt_tokens <= 0:
+            return
+        if len(self.exact_tokens) >= SPAN_LRU:
+            self.exact_tokens.pop(next(iter(self.exact_tokens)))
+        self.exact_tokens[hashlib.sha1(text.encode(errors="replace")).hexdigest()] = int(prompt_tokens)
+
+    def _leg2_verdict(self, pt: int, ct: int, priced: bool, pending: Optional[Pending],
+                      single_prefill: bool, stream: bool, rid: str) -> str:
+        """spec 3.6 verdict with the 1j holes closed (#1233 zero-remainder).
+
+        * single_prefill (route CARRIER-EXCEEDS): no leg 1 ever ran, so there
+          is no double prefill to price -- 'single_prefill', never W16;
+        * pending is None (route SHORT): no leg 1 either; a mis-priced SHORT
+          is counted as 'short_mispriced' and served, never logged as W16
+          (finding 4: SHORT passed reroutes=1 and produced verdict=W16 on a
+          served request);
+        * a stream cannot be re-routed or refused after its first byte, so a
+          streamed BATCH leg 2 whose realised usage exceeds the bound is
+          counted under W16 by name and reported, not refused (finding 2).
+        """
+        uncached = max(0, pt - ct)
+        if single_prefill:
+            self.counters["single_prefill_served"] += 1
+            return "single_prefill"
+        if pending is None:
+            if uncached > CHUNK_TOKENS:
+                self.counters["short_mispriced"] += 1
+                return "short_mispriced"
+            return "serve"
+        if not priced:
+            self.counters["W28_Weg2Leg2Unpriced_stream_served"] += 1
+            logger.error("W28 Weg2Leg2Unpriced rid=%s: STREAMED leg 2 ended without a usage/meta_info chunk; served, unpriced, counted", rid)
+            return "unpriced"
+        v = double_prefill_verdict(pt, ct, pending.reroutes)
+        if stream and v != "serve":
+            self.counters["W16_Weg2DoublePrefillExceeded"] += 1
+            self.counters["W16_stream_served"] += 1
+            logger.error("W16 Weg2DoublePrefillExceeded rid=%s (STREAM, served): %d > %d uncached on a streamed leg 2 -- "
+                         "reroute impossible after the first byte; counted by name, not refused", rid, uncached, CHUNK_TOKENS)
+            return "W16"
+        return v
+
     async def leg2(self, request: web.Request, rid: str, payload: dict, text: str, stream: bool,
-                   pending: Optional[Pending]) -> web.StreamResponse:
+                   pending: Optional[Pending], single_prefill: bool = False) -> web.StreamResponse:
         g = self.groups["D"]
         g.outstanding[rid] = time.time()
         t0 = time.time()
+        if pending is not None and pending.skip_leg1:
+            single_prefill = True
+        if stream and pending is not None and request.path.startswith("/v1/"):
+            # 1j finding 2: a STREAMED leg 2 is priced like a non-streamed one.
+            # OpenAI's stream_options.include_usage makes D append one usage
+            # chunk (empty choices) -- standard, and the only post-hoc price.
+            payload = dict(payload)
+            so = dict(payload.get("stream_options") or {})
+            so["include_usage"] = True
+            payload["stream_options"] = so
         try:
             async with self.session.post(f"{g.url}{request.path}", json=payload) as r:
                 if stream:
                     resp = web.StreamResponse(status=r.status)
                     resp.content_type = r.content_type
                     await resp.prepare(request)
+                    tail = bytearray()
                     async for chunk in r.content.iter_any():
                         await resp.write(chunk)
+                        tail += chunk
+                        if len(tail) > 262144:
+                            del tail[:-131072]
                     await resp.write_eof()
                     g.served += 1
-                    self.counters["leg2_unpriced_stream"] += 1
-                    logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d wall=%.2fs epoch=%d",
-                                rid, r.status, time.time() - t0, self.epoch)
+                    pt, ct, comp, priced = usage_of_stream_tail(bytes(tail))
+                    verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, True, rid)
+                    if pt:
+                        self.spans.record(text, pt)
+                        self._note_exact(text, pt)
+                    logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
+                                "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d", rid, r.status, pt, ct, comp, max(0, pt - ct),
+                                verdict, priced, time.time() - t0, self.epoch)
+                    if pending is not None and ct > 0:
+                        self.counters["cross_group_prefix_hits"] += 1
                     return resp
                 body = await r.read()
                 try:
                     js = json.loads(body)
                 except Exception:  # noqa: BLE001
                     js = {}
-                pt, ct, comp = usage_of(js)
-                verdict = double_prefill_verdict(pt, ct, pending.reroutes if pending else 1)
+                pt, ct, comp, priced = usage_of(js)
+                if r.status == 200 and not priced:
+                    # 1j finding 3: never price a body without usage/meta_info as (0,0).
+                    self.counters["W28_Weg2Leg2Unpriced"] += 1
+                    logger.error("W28 Weg2Leg2Unpriced rid=%s: D answered 200 without usage/meta_info (%d bytes); refusing by name "
+                                 "rather than serving on a fail-open (0,0) price", rid, len(body))
+                    return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
+                verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d", rid, r.status, pt, ct, comp, max(0, pt - ct),
                             verdict, time.time() - t0, self.epoch)
                 if pt:
                     self.spans.record(text, pt)
+                    self._note_exact(text, pt)
                 if r.status == 200 and pending is not None and verdict == "reroute":
                     self.counters["reroute"] += 1
                     pending.reroutes += 1
@@ -711,6 +848,9 @@ class Front:
                     batch = [self.queue.popleft() for _ in range(min(8, len(self.queue)))]
 
                     async def one(p: Pending):
+                        if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
+                            p.leg1_done = True  # type: ignore[attr-defined]
+                            return
                         async with sem:
                             try:
                                 await self.leg1(p)
@@ -726,7 +866,9 @@ class Front:
                         if not p.fut.done():
                             self._ready_for_d.append(p)
                 await self.flip("P", "D")
-                if self.state == "serving":
+                # 1j finding 1: release leg 2 only when D is the awake group -- a
+                # W1-refused flip leaves state=='serving' with P still awake.
+                if self.state == "serving" and self.awake == "D":
                     ready, self._ready_for_d = self._ready_for_d, []
                     for p in ready:
                         if not p.fut.done():
@@ -793,6 +935,7 @@ def main():
     ap.add_argument("--dc-reserve", default="", help="uuid=mib,uuid=mib")
     ap.add_argument("--fairness-w-s", type=float, default=45.0)
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
+    ap.add_argument("--carrier-max-tokens", type=int, default=0, help="#1233 zero-remainder: longest prompt group D can read from the store (0 = no CARRIER-EXCEEDS route)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
@@ -800,7 +943,7 @@ def main():
         k, v = kv.split("=")
         dc[k] = int(v)
     front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s,
-                  weight_chunks=args.weight_chunks)
+                  weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens)
     app = web.Application(client_max_size=1024**3)
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)
