@@ -1317,11 +1317,14 @@ class HiCacheController:
             )
             logger.info(
                 "#706 canonical KV page active: slots [%d, %d) of %d, %d B per "
-                "slot; KV keys carry content only (no tp/pp suffix).",
+                "slot; K/V-major extents %s of %d B; KV keys carry content "
+                "only (no tp/pp suffix).",
                 canonical_kv_page.first_slot,
                 canonical_kv_page.first_slot + canonical_kv_page.num_slots,
                 canonical_kv_page.spec.num_attn_layers,
                 canonical_kv_page.cell_bytes,
+                list(canonical_kv_page.as_extents().extents),
+                canonical_kv_page.spec.page_bytes,
             )
             canonical_mamba_blob = self._canonical_mamba_window(
                 server_args, model_config

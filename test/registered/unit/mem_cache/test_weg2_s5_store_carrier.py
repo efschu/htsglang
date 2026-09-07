@@ -174,10 +174,16 @@ def _payload(stage: int) -> torch.Tensor:
 
 
 def _expected_whole_page() -> torch.Tensor:
+    """K/V-major (#1233): a stage's flat payload is ``[K local][V local]``; its
+    K block lands at ``first * half`` in the K region and its V block at the
+    same offset inside the V region, which starts at ``half_page_bytes``."""
     out = torch.zeros(NUM_ATTN_LAYERS * CELL_BYTES, dtype=torch.uint8)
+    half, v0 = SPEC.half_cell_bytes, SPEC.half_page_bytes
     for stage, (first, count) in enumerate(P_STAGES):
-        lo = first * CELL_BYTES
-        out[lo : lo + count * CELL_BYTES] = _payload(stage)
+        payload = _payload(stage)
+        n = count * half
+        out[first * half : first * half + n] = payload[:n]
+        out[v0 + first * half : v0 + first * half + n] = payload[n:]
     return out
 
 

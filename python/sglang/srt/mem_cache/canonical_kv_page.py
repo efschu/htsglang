@@ -1,9 +1,22 @@
 """#704b: the canonical KV page (Option A), device side.
 
-#706 settled the page shape: a page carries ALL attention layers for its token
-range, layer-major within the page. ``page_size == 1`` is mandatory (required
-by ``dcp_owner_mode``, since a multi-token page would span owner ranks), so a
-page is ONE token -- on this checkpoint 16 x 2048 = 32,768 B.
+#706 settled the page shape: a page carries ALL attention layers for its
+token range. ``page_size == 1`` is mandatory (required by ``dcp_owner_mode``,
+since a multi-token page would span owner ranks), so a page is ONE token -- on
+this checkpoint 16 x 2048 = 32,768 B.
+
+BYTE ORDER (#1233, boot weg2ls3b4 root): the page is K/V-MAJOR, not
+layer-major. It is the flat host page as ``MHATokenToKVPoolHost.get_data_page``
+produces it and ``set_from_flat_data_page`` consumes it (``pool_host/mha.py``:
+``layer_first`` dims ``(2, layer_num, size, H, D)``, sliced per token and
+flattened): ``[K slot0 .. K slotN-1][V slot0 .. V slotN-1]``, one HALF-CELL of
+``head_num * head_dim * itemsize`` bytes per attention slot per K/V half. A
+slot's bytes are therefore TWO ranges, one in each half, never one contiguous
+cell. A rank holding every attention layer is self-consistent under either
+reading, which is why a same-geometry round trip cannot detect the difference;
+three PP stages depositing their local ``[K][V]`` blocks as one extent each
+scrambled 20 of 32 half-cells, and every answer decoded from the other group's
+pages was wrong while the GDN blob (composed per region) arrived intact.
 
 The contract both strands carry says the stored form is CANONICAL and
 layout-neutral: it depends on the model geometry ALONE, never on the PP cut,
@@ -50,20 +63,42 @@ class CanonicalPageSpec:
     num_attn_layers: int
     kv_bytes_per_token_per_attn_layer: int
 
+    def __post_init__(self) -> None:
+        if int(self.kv_bytes_per_token_per_attn_layer) % 2:
+            raise CanonicalPageError(
+                f"a cell of {self.kv_bytes_per_token_per_attn_layer} bytes "
+                "cannot be split into a K half and a V half; the page is "
+                "K/V-major and every slot has two equal halves."
+            )
+
     @property
     def page_bytes(self) -> int:
         return int(self.num_attn_layers) * int(self.kv_bytes_per_token_per_attn_layer)
 
-    def layer_span(self, slot: int) -> tuple[int, int]:
-        """Byte range of one attention slot, layer-major."""
+    @property
+    def half_cell_bytes(self) -> int:
+        """Bytes of one attention slot in ONE K/V half (``head_num * head_dim *
+        itemsize``, ``MHATokenToKVPoolHost.token_stride_size``)."""
+        return int(self.kv_bytes_per_token_per_attn_layer) // 2
+
+    @property
+    def half_page_bytes(self) -> int:
+        """Where the V region starts: all K half-cells come first."""
+        return int(self.num_attn_layers) * self.half_cell_bytes
+
+    def slot_spans(self, slot: int) -> tuple[tuple[int, int], tuple[int, int]]:
+        """The TWO byte ranges of one attention slot: its K half-cell in the
+        K region, its V half-cell in the V region. Never one range -- a page is
+        K/V-major (see the module docstring)."""
         if not 0 <= int(slot) < int(self.num_attn_layers):
             raise CanonicalPageError(
                 f"slot {slot} is outside the {self.num_attn_layers} attention "
                 "slots this page carries."
             )
-        cell = int(self.kv_bytes_per_token_per_attn_layer)
-        lo = int(slot) * cell
-        return lo, lo + cell
+        half = self.half_cell_bytes
+        k_lo = int(slot) * half
+        v_lo = self.half_page_bytes + k_lo
+        return (k_lo, k_lo + half), (v_lo, v_lo + half)
 
 
 def attn_layer_index(global_layer_id: int, attn_layer_ids: Sequence[int]) -> int:
@@ -83,43 +118,6 @@ def attn_layer_index(global_layer_id: int, attn_layer_ids: Sequence[int]) -> int
             "(GDN) layers are served by MambaPool and have their own canonical "
             "form (see the #706 mamba spec)."
         ) from None
-
-
-def scatter_page(page: torch.Tensor, spec: CanonicalPageSpec) -> list[torch.Tensor]:
-    """Per-slot VIEWS into a canonical page. Copies nothing."""
-    if page.dtype != torch.uint8:
-        raise CanonicalPageError(
-            f"a canonical page is raw bytes (uint8), got {page.dtype}."
-        )
-    if int(page.numel()) != spec.page_bytes:
-        raise CanonicalPageError(
-            f"page holds {int(page.numel())} bytes but the spec describes "
-            f"{spec.page_bytes} bytes; refusing to pad or truncate."
-        )
-    out = []
-    for slot in range(int(spec.num_attn_layers)):
-        lo, hi = spec.layer_span(slot)
-        out.append(page[lo:hi])
-    return out
-
-
-def gather_page(
-    per_layer: Sequence[torch.Tensor], spec: CanonicalPageSpec
-) -> torch.Tensor:
-    """Assemble a canonical page from per-slot buffers, layer-major."""
-    if len(per_layer) != int(spec.num_attn_layers):
-        raise CanonicalPageError(
-            f"{len(per_layer)} slots supplied for a page of "
-            f"{spec.num_attn_layers}; a page missing a slot is not a shorter "
-            "page, it is an incomplete one -- see PageCompleteness."
-        )
-    cell = int(spec.kv_bytes_per_token_per_attn_layer)
-    for i, buf in enumerate(per_layer):
-        if int(buf.numel()) != cell:
-            raise CanonicalPageError(
-                f"slot {i} holds {int(buf.numel())} bytes, expected {cell}."
-            )
-    return torch.cat([b.reshape(-1) for b in per_layer], dim=0)
 
 
 class PageCompleteness:

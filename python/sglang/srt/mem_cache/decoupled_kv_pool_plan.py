@@ -395,20 +395,20 @@ def validate_world_conservation(
         )
 
 
-def layer_extents(plan: KvPoolPlan, all_attn_layer_ids: Sequence[int]) -> tuple:
+def layer_slots(plan: KvPoolPlan, all_attn_layer_ids: Sequence[int]) -> tuple:
     """The plan in the canonical store's terms, for the #706 seam.
 
-    A canonical page is one token x ALL attention layers, laid out layer-major.
-    Returns ``(slot_index, byte_offset, byte_length)`` per layer this rank
-    holds, where ``slot_index`` is the GLOBAL attention index -- the same index
-    the canonical page uses, never a rank-local one.
+    Returns the GLOBAL attention slot index per layer this rank holds -- the
+    same index the canonical page uses, never a rank-local one. Byte offsets
+    are deliberately NOT derived here: the page is K/V-major (#1233), so a
+    slot is two ranges, and ``CanonicalPageWindow.as_extents`` is the single
+    place that turns slots into bytes.
 
     Under ``DECOUPLED`` this covers every slot, so a rank's residence is a
     whole page. Under ``STAGE_LOCAL`` it covers only the owned slots, which is
     precisely the partial-page shape the canonical store has to reassemble.
     """
     order = tuple(int(i) for i in all_attn_layer_ids)
-    cell = int(plan.cell_bytes_per_layer)
     out = []
     for layer in plan.layer_ids:
         if layer not in order:
@@ -416,6 +416,5 @@ def layer_extents(plan: KvPoolPlan, all_attn_layer_ids: Sequence[int]) -> tuple:
                 f"layer {layer} is not a full-attention layer; it has no "
                 "canonical page slot."
             )
-        slot = order.index(layer)
-        out.append((slot, slot * cell, cell))
+        out.append(order.index(layer))
     return tuple(out)

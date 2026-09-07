@@ -1,7 +1,8 @@
 """#706: the PERSISTED canonical page -- partial writes, completeness, read cut.
 
 ``canonical_kv_page`` defines the page (Option A: every attention layer of one
-token, layer-major, ``page_size == 1``). This module is the storage protocol
+token, K/V-major -- ``[K all slots][V all slots]`` -- ``page_size == 1``). This
+module is the storage protocol
 built on it: how three PP stages, each holding only its own layers, deposit
 their slots into ONE suffix-free page file, and how any later geometry reads
 its own slice back out of it.
@@ -213,11 +214,8 @@ class CanonicalPageWindow:
         return int(self.spec.kv_bytes_per_token_per_attn_layer)
 
     @property
-    def byte_offset(self) -> int:
-        return int(self.first_slot) * self.cell_bytes
-
-    @property
     def byte_length(self) -> int:
+        """Payload bytes of this window (its flat host page)."""
         return int(self.num_slots) * self.cell_bytes
 
     @property
@@ -229,10 +227,26 @@ class CanonicalPageWindow:
         return int(self.num_slots) == int(self.spec.num_attn_layers)
 
     def as_extents(self) -> CanonicalExtentWindow:
-        """The KV window as the generic one-extent case."""
+        """The KV window as byte extents of the K/V-MAJOR page.
+
+        TWO ranges in payload order, never one (#1233, boot weg2ls3b4 root):
+        the rank's flat page is ``[K local slots][V local slots]`` and the
+        canonical page is ``[K all slots][V all slots]``, so the K block lands
+        at ``first_slot * half`` in the K region and the V block at the same
+        offset inside the V region. ``_merge_sequential`` collapses the
+        whole-page window to exactly ``(0, page_bytes)``: a rank holding every
+        slot (the TP decode group) writes and reads the file it always did,
+        byte-identical, so there is no store migration -- only a PP stage's
+        cut changes, and that cut was the wrong one.
+        """
+        half = self.spec.half_cell_bytes
+        k_off = int(self.first_slot) * half
+        length = int(self.num_slots) * half
         return CanonicalExtentWindow(
             total_bytes=self.spec.page_bytes,
-            extents=((self.byte_offset, self.byte_length),),
+            extents=_merge_sequential(
+                [(k_off, length), (self.spec.half_page_bytes + k_off, length)]
+            ),
             label="KV page",
         )
 
@@ -555,8 +569,8 @@ def build_page_window(
         raise CanonicalPageError(
             f"this rank's flat KV page is {page_bytes} bytes over {len(local)} "
             "attention layers, which does not divide evenly. The canonical page "
-            "is layer-major with one cell per layer, so an indivisible page is "
-            "a different format."
+            "is K/V-major with one half-cell per layer per K/V half, so an "
+            "indivisible page is a different format."
         )
     cell = page_bytes // len(local)
     spec = CanonicalPageSpec(
@@ -798,8 +812,12 @@ def _missing_slots_from_coverage(
     """
     completeness = PageCompleteness(spec)
     for slot in range(int(spec.num_attn_layers)):
-        lo, hi = spec.layer_span(slot)
-        if any(c_lo <= lo and hi <= c_hi for c_lo, c_hi in coverage):
+        # A slot lives in BOTH halves of the K/V-major page; it is present only
+        # when its K half-cell AND its V half-cell are covered.
+        if all(
+            any(c_lo <= lo and hi <= c_hi for c_lo, c_hi in coverage)
+            for lo, hi in spec.slot_spans(slot)
+        ):
             completeness.mark(slot)
     return completeness.missing()
 

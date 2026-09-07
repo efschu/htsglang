@@ -69,12 +69,15 @@ def _stage_layers(lo, hi):
 
 
 def _payload(window, tag):
-    """Bytes whose provenance is checkable: every byte of slot ``s`` carries
-    ``tag + s``, so a slice landing in the wrong slot shows up as a wrong tag
-    rather than merely a wrong length."""
+    """K/V-major (#1233): the window's flat page is ``[K slots][V slots]``.
+    Every byte of slot ``s`` carries ``tag + s`` in the K half and
+    ``tag + s + 100`` in the V half, so a slice landing in the wrong slot OR
+    the wrong half shows up as a wrong tag rather than merely a wrong length."""
+    half = window.spec.half_cell_bytes
     buf = bytearray()
-    for slot in window.slots:
-        buf += bytes([(tag + slot) % 256]) * window.cell_bytes
+    for shift in (0, 100):
+        for slot in window.slots:
+            buf += bytes([(tag + slot + shift) % 256]) * half
     return torch.frombuffer(bytes(buf), dtype=torch.uint8).clone()
 
 
@@ -103,7 +106,9 @@ class TestCanonicalPageStore(CustomTestCase):
     def test_tp_phase_window_is_the_whole_page(self):
         window = window_for_layers(SPEC, ATTN_LAYER_IDS, ATTN_LAYER_IDS)
         self.assertTrue(window.is_whole_page)
-        self.assertEqual(window.byte_offset, 0)
+        # K/V-major (#1233): the whole page merges to ONE extent, so the decode
+        # group's files never change shape.
+        self.assertEqual(window.as_extents().extents, ((0, SPEC.page_bytes),))
         self.assertEqual(window.byte_length, SPEC.page_bytes)
 
     def test_non_contiguous_layers_are_refused(self):
@@ -192,8 +197,14 @@ class TestCanonicalPageStore(CustomTestCase):
         with open(part_path(self.page), "rb") as f:
             partial = f.read()
         self.assertEqual(len(partial), SPEC.page_bytes)
-        self.assertEqual(partial[7 * CELL : 12 * CELL], b"\x00" * (5 * CELL))
-        self.assertNotEqual(partial[0:CELL], b"\x00" * CELL)
+        # K/V-major (#1233): the five unwritten slots are zero in BOTH halves.
+        half, v0 = SPEC.half_cell_bytes, SPEC.half_page_bytes
+        self.assertEqual(partial[7 * half : 12 * half], b"\x00" * (5 * half))
+        self.assertEqual(
+            partial[v0 + 7 * half : v0 + 12 * half], b"\x00" * (5 * half)
+        )
+        self.assertNotEqual(partial[0:half], b"\x00" * half)
+        self.assertNotEqual(partial[v0 : v0 + half], b"\x00" * half)
 
         # And completing it makes the same key readable, from the same file.
         self.assertTrue(
@@ -412,7 +423,9 @@ class TestWindowFromPools(CustomTestCase):
         correct = window_for_layers(SPEC, ATTN_LAYER_IDS, _stage_layers(*PP_CUT[1]))
         guessed = CanonicalPageWindow(spec=SPEC, first_slot=0, num_slots=5)
         self.assertEqual(correct.byte_length, guessed.byte_length)
-        self.assertNotEqual(correct.byte_offset, guessed.byte_offset)
+        self.assertNotEqual(
+            correct.as_extents().extents, guessed.as_extents().extents
+        )
 
     def test_build_page_window_sizes_the_cell_from_the_page_the_pool_writes(self):
         for lo, hi in PP_CUT:

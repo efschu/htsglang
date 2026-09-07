@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.decoupled_kv_pool_plan import (
     DECOUPLED,
     STAGE_LOCAL,
     KvPoolPlanError,
-    layer_extents,
+    layer_slots,
     plan_for_rank,
     realized_share,
     validate_plan,
@@ -152,13 +152,10 @@ def test_degenerate_shares_are_refused():
 def test_layer_extents_use_the_GLOBAL_slot_index():
     """The #706 seam. A rank-local index would put bytes in the wrong slot --
     the same silent failure shape as the canonical-page work found."""
-    ext = layer_extents(_decoupled(1), ATTN)
-    assert len(ext) == 16
-    assert ext[0] == (0, 0, CELL)
-    assert ext[15] == (15, 15 * CELL, CELL)
+    ext = layer_slots(_decoupled(1), ATTN)
+    assert ext == tuple(range(16))
     # Stage-local rank1 owns global attention slots 7..11, NOT 0..4.
-    stage_ext = layer_extents(_stage(1), ATTN)
-    assert [slot for slot, _, _ in stage_ext] == [7, 8, 9, 10, 11]
+    assert layer_slots(_stage(1), ATTN) == (7, 8, 9, 10, 11)
 
 
 def test_decoupled_residence_is_a_WHOLE_canonical_page():
@@ -170,9 +167,9 @@ def test_decoupled_residence_is_a_WHOLE_canonical_page():
     production stays layer-sharded, so the 16 slots still arrive from three
     writers.
     """
-    covered = {slot for slot, _, _ in layer_extents(_decoupled(2), ATTN)}
+    covered = set(layer_slots(_decoupled(2), ATTN))
     assert covered == set(range(16)), "whole page resident on one rank"
-    partial = {slot for slot, _, _ in layer_extents(_stage(2), ATTN)}
+    partial = set(layer_slots(_stage(2), ATTN))
     assert partial != set(range(16)), "stage-local is a partial page"
 
 
@@ -181,7 +178,7 @@ def test_a_non_attention_layer_has_no_page_slot():
 
     p = dataclasses.replace(_decoupled(0), layer_ids=(4,))  # 4 is linear
     with pytest.raises(KvPoolPlanError, match="no canonical page slot"):
-        layer_extents(p, ATTN)
+        layer_slots(p, ATTN)
 
 
 def test_a_foreign_geometry_plans_the_same_way():

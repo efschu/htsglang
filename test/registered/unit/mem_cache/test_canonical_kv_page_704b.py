@@ -1,7 +1,8 @@
 """#704b: the canonical KV page (Option A), device side.
 
 #706 settled the page shape: a page carries ALL 16 attention layers for its
-token range, layer-major within the page. `page_size == 1` is mandatory
+token range, K/V-major (#1233: `[K all slots][V all slots]`, one half-cell per
+slot per half). `page_size == 1` is mandatory
 (`dcp_owner_mode`: a multi-token page would span owner ranks), so a page is ONE
 token -- 16 x 2048 = 32,768 B.
 
@@ -35,8 +36,6 @@ from sglang.srt.mem_cache.canonical_kv_page import (
     CanonicalPageSpec,
     PageCompleteness,
     attn_layer_index,
-    gather_page,
-    scatter_page,
 )
 
 # Qwen3.8-27B: 64 layers, full_attention_interval 4 -> attention at 3,7,...,63.
@@ -60,21 +59,17 @@ def test_attention_layer_index_is_global_and_dense():
         attn_layer_index(4, ATTN_LAYER_IDS)
 
 
-def test_round_trip_is_byte_identical():
-    page = torch.randint(0, 256, (SPEC.page_bytes,), dtype=torch.uint8)
-    per_layer = scatter_page(page, SPEC)
-    assert len(per_layer) == 16
-    rebuilt = gather_page(per_layer, SPEC)
-    assert torch.equal(rebuilt, page)
-
-
-def test_layer_slots_are_contiguous_and_layer_major():
-    page = torch.zeros(SPEC.page_bytes, dtype=torch.uint8)
-    per_layer = scatter_page(page, SPEC)
-    per_layer[5].fill_(0xAB)
-    lo, hi = 5 * 2048, 6 * 2048
-    assert page[lo:hi].eq(0xAB).all()
-    assert page[:lo].eq(0).all() and page[hi:].eq(0).all()
+def test_a_slot_is_two_half_cells_one_per_kv_region():
+    """K/V-major (#1233): slot 5 is bytes [5*1024, 6*1024) of the K region and
+    the same offsets inside the V region, which starts at 16*1024."""
+    (k_lo, k_hi), (v_lo, v_hi) = SPEC.slot_spans(5)
+    assert (k_lo, k_hi) == (5 * 1024, 6 * 1024)
+    assert (v_lo, v_hi) == (16 * 1024 + 5 * 1024, 16 * 1024 + 6 * 1024)
+    assert SPEC.half_cell_bytes == 1024 and SPEC.half_page_bytes == 16 * 1024
+    with pytest.raises(CanonicalPageError, match="outside"):
+        SPEC.slot_spans(16)
+    with pytest.raises(CanonicalPageError, match="K half and a V half"):
+        CanonicalPageSpec(num_attn_layers=16, kv_bytes_per_token_per_attn_layer=2047)
 
 
 def test_writing_with_a_rank_local_index_lands_in_the_wrong_slot():
@@ -157,7 +152,7 @@ def test_the_canonical_form_depends_on_geometry_alone():
     assert a == b
     assert a.page_bytes == b.page_bytes
     for i in range(16):
-        assert a.layer_span(i) == b.layer_span(i)
+        assert a.slot_spans(i) == b.slot_spans(i)
 
 
 def test_a_wrong_sized_payload_is_refused_rather_than_padded():
@@ -167,22 +162,12 @@ def test_a_wrong_sized_payload_is_refused_rather_than_padded():
     buffer is a geometry problem. Reporting both as "bytes" would send the
     reader to check the wrong thing.
     """
-    page = torch.zeros(SPEC.page_bytes, dtype=torch.uint8)
-    per_layer = scatter_page(page, SPEC)
-
+    tracker = PageCompleteness(SPEC)
+    for idx in range(15):
+        tracker.mark(idx)
     # Missing a slot: an incomplete page, not a shorter one.
-    with pytest.raises(CanonicalPageError, match="slots supplied"):
-        gather_page(per_layer[:15], SPEC)
-
-    # Right slot count, wrong slot size.
-    bad = list(per_layer)
-    bad[2] = torch.zeros(2047, dtype=torch.uint8)
-    with pytest.raises(CanonicalPageError, match="bytes, expected"):
-        gather_page(bad, SPEC)
-
-    # A page that is not page-sized at all.
-    with pytest.raises(CanonicalPageError, match="refusing to pad or truncate"):
-        scatter_page(torch.zeros(SPEC.page_bytes - 1, dtype=torch.uint8), SPEC)
+    assert not tracker.is_complete()
+    assert tracker.missing() == (15,)
 
 
 def test_slot_index_out_of_range_is_refused():

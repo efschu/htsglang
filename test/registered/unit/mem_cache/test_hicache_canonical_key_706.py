@@ -60,9 +60,15 @@ def _config(*, pp_rank=0, pp_size=1, tp_rank=0, tp_size=1, window=None, dcp=Fals
 
 
 def _payload(window, tag=10):
+    """K/V-major (#1233): the window's flat page is ``[K slots][V slots]``.
+    Every byte of slot ``s`` carries ``tag + s`` in the K half and
+    ``tag + s + 100`` in the V half, so a slice landing in the wrong slot OR
+    the wrong half shows up as a wrong tag rather than merely a wrong length."""
+    half = window.spec.half_cell_bytes
     buf = bytearray()
-    for slot in window.slots:
-        buf += bytes([(tag + slot) % 256]) * window.cell_bytes
+    for shift in (0, 100):
+        for slot in window.slots:
+            buf += bytes([(tag + slot + shift) % 256]) * half
     return torch.frombuffer(bytes(buf), dtype=torch.uint8).clone()
 
 
