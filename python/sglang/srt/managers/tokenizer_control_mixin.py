@@ -41,8 +41,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     KvReshardReqInput,
     KvReshardReqOutput,
-    PhaseFlipReqInput,
-    PhaseFlipReqOutput,
     SessionHandoverReqInput,
     SessionHandoverReqOutput,
     ListExternalCorporaReqInput,
@@ -119,7 +117,6 @@ _COMMUNICATOR_SPECS = [
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("kv_reshard", KvReshardReqOutput),
-    ("phase_flip", PhaseFlipReqOutput),
     ("session_handover", SessionHandoverReqOutput),
     ("session_checkpoint", SessionCheckpointReqOutput),
     ("vram_budget", VramBudgetReqOutput),
@@ -291,21 +288,6 @@ class TokenizerControlMixin:
         return (
             await self.kv_reshard_communicator(
                 KvReshardReqInput(target_vector=list(target_vector))
-            )
-        )[0]
-
-    async def phase_flip(
-        self: TokenizerManager, direction: str
-    ) -> PhaseFlipReqOutput:
-        """#631: arm a PP-prefill <-> TP-decode phase flip.
-
-        Returns the scheduler's arming verdict; the flip commits
-        asynchronously at the next group-wide quiescent consensus boundary
-        (watch the PHASE-FLIP log lines for the DONE record)."""
-        self.auto_create_handle_loop()
-        return (
-            await self.phase_flip_communicator(
-                PhaseFlipReqInput(direction=str(direction))
             )
         )[0]
 

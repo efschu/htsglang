@@ -30,15 +30,38 @@ import multiprocessing as mp
 import socket
 import unittest
 
-from sglang.srt.managers.scheduler_pp_mixin import (
-    DRAIN_DISCARD,
-    DRAIN_STASH,
-    classify_armed_drain_message,
-)
+import pytest
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+
+# #1233 (WEG 2, S0): RETIRED, not deleted, and NOT a free retirement -- every
+# one of this file's seven tests was GREEN on the base aef3ae7676 (measured
+# 2026-09-07: 7 passed, 4 subtests).  What it pins is the ARMED DRAIN: a rank
+# told a layout change is coming, demultiplexing the multiplexed PP wire so it
+# discards only `proxy` frames and stashes `output` ones.  Weg 2 has no
+# in-process layout change -- a process is a prefill process or a decode
+# process for its whole life -- so nothing ever arms, and S0 removed
+# `classify_armed_drain_message` with the armed drain it classified for.
+# The import is module-level, so the retirement has to be too.
+#
+# THE COST, STATED: what leaves with it is the #757 demultiplexing property
+# (an `output` belonging to work launched before an arm must not be eaten by a
+# drain).  Under Weg 2 the surviving PP wire still multiplexes proxy and
+# output, but nothing ever drains it while armed, because nothing arms.  If a
+# later slice reintroduces ANY whole-wire drain, this property comes back with
+# it and this file is the specimen to relight.
+#
+# The file itself is left for S7 to `git rm` with the 22 flip modules and the
+# other classified test files (spec §11, ordering discipline).
+pytest.skip(
+    "#1233 (WEG 2, S0): the armed drain this file pins does not exist; "
+    "classify_armed_drain_message was removed with it and the file is "
+    "deleted at S7",
+    allow_module_level=True,
+)
 
 #: The specimen, verbatim.
 SPECIMEN_STAMP = (2, 151, 512)

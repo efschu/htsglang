@@ -136,7 +136,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     KvReshardReqInput,
-    PhaseFlipReqInput,
     SessionHandoverReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
@@ -1023,12 +1022,11 @@ async def health_generate(request: Request) -> Response:
         f"The detokenizer is the LAST link; it goes quiet whenever any link "
         f"upstream of it stops producing. Measured 2026-08-31 (boot 20 "
         f"livelock): the detokenizer was idle in recv_pyobj with its last work "
-        f"finished, while the scheduler spun arm/abandon on a flip that could "
-        f"never reach quiescence. This line named the SILENT one instead of "
-        f"the NON-SPEAKER. Before suspecting the detokenizer, check the "
-        f"scheduler's own alarms -- `ADMISSION-WEDGE: N queued`, `PHASE-FLIP "
-        f"FLIP ABANDONED`, `PHASE-POLICY ARM-UNFUNDED` -- which name the link "
-        f"that actually stopped."
+        f"finished, while the scheduler spun on an admission decision it could "
+        f"never reach. This line named the SILENT one instead of the "
+        f"NON-SPEAKER. Before suspecting the detokenizer, check the "
+        f"scheduler's own alarms -- `ADMISSION-WEDGE: N queued` -- which name "
+        f"the link that actually stopped."
     )
     _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
@@ -1251,23 +1249,6 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return ret
     except ValueError as e:
         return _create_error_response(e)
-
-
-@app.api_route("/phase_flip", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def phase_flip(obj: Annotated[PhaseFlipReqInput, Body()], request: Request):
-    """#631: arm a PP-prefill <-> TP-decode phase flip (obj.direction is
-    pp_to_tp or tp_to_pp; requires --enable-phase-flip). The flip commits
-    at the next consensus boundary where every rank is quiescent; watch
-    the PHASE-FLIP log lines for the DONE record."""
-    try:
-        ret = await _global_state.tokenizer_manager.phase_flip(obj.direction)
-    except Exception as e:
-        return _create_error_response(e)
-    return ORJSONResponse(
-        {"success": ret.success, "message": ret.message},
-        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
-    )
 
 
 @app.api_route("/kv_reshard", methods=["POST"])

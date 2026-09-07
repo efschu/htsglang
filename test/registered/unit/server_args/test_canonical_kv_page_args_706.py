@@ -76,6 +76,27 @@ class TestCanonicalKvPageArgs(CustomTestCase):
                 ["--model-path", "m", "--phase-flip-canonical-kv-page"]
             )
 
+    def test_the_old_flag_name_is_refused_by_name_not_by_argparse(self):
+        """§7 item 4 asks for a LOUD refusal, and this flag is why.
+
+        ``SystemExit`` above is argparse's default ``error()`` for an unknown
+        option -- the same sentence a typo produces.  It does not say the flag
+        was renamed, and this one WAS: the page it arms is Weg 2's only carrier
+        across a flip, so an operator who reads "unrecognized arguments" and
+        drops the flag silently boots without the carrier.  #1233 (WEG 2, S0)
+        therefore refuses before argparse, naming the replacement.
+        """
+        from sglang.srt.removed_cli_flags import refuse_removed_flip_flags
+
+        with self.assertRaises(ValueError) as caught:
+            refuse_removed_flip_flags(
+                ["--model-path", "m", "--phase-flip-canonical-kv-page"]
+            )
+        message = str(caught.exception)
+        self.assertIn("--phase-flip-canonical-kv-page", message)
+        self.assertIn("--hicache-canonical-kv-page", message)
+        self.assertIn("#1233", message)
+
     def test_requires_the_file_backend(self):
         args = _args(hicache_canonical_kv_page=True, hicache_storage_backend="mooncake")
         with self.assertRaisesRegex(ValueError, "hicache-storage-backend file"):

@@ -20088,6 +20088,15 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         config_merger = ConfigArgumentMerger(parser)
         argv = config_merger.merge_config_with_args(argv)
 
+    # #1233 (WEG 2, S0): loud parse-time refusal for the flip flags this slice
+    # hard-removed, spec §7 item 4.  Placed AFTER the config merge so a flag
+    # that arrives from a config file is refused on the same terms, and BEFORE
+    # `parse_args` so the message the operator sees names the mechanism rather
+    # than argparse's generic "unrecognized arguments".
+    from sglang.srt.removed_cli_flags import refuse_removed_flip_flags
+
+    refuse_removed_flip_flags(argv)
+
     raw_args = parser.parse_args(argv)
 
     # Set up basic logging before ServerArgs.__post_init__ so that

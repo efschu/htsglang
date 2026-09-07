@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # #631 A-vs-A REGRESSION GATE boot: the NON-FLIP DEFAULT PATH, on either tree.
 #
-# WHY THIS SCRIPT EXISTS AT ALL. The gate asks one question: does the
+# WHY THIS SCRIPT EXISTS AT ALL. The gate asked one question: did the
 # phase-flip build regress the path a user gets when they do NOT ask for the
-# flip? So BOTH boots must run WITHOUT --enable-phase-flip, and
-# route_a_631_prod_boot.sh always passes it. This is that script with the
-# flip surface removed and nothing else changed, parameterised by WT so the
-# same bytes boot the flip tree and the baseline tree.
+# flip? So both boots ran without the flip flags, which
+# route_a_631_prod_boot.sh always passed. This is that script with the flip
+# surface removed and nothing else changed, parameterised by WT so the same
+# bytes boot either tree.
+#
+# #1233 (WEG 2, S0): the flip and its flags are gone, so this is now simply
+# THE stock PP=3 recipe of that family -- route_a_631_prod_boot.sh refuses.
 #
 # EVERY knob below is deliberately IDENTICAL across the two boots. The only
 # permitted difference between the two invocations is WT (which also sets
@@ -38,11 +41,10 @@ MAX_RUNNING="${MAX_RUNNING:-4}"
 MAMBA_SLOTS="${MAMBA_SLOTS:-20}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-500000}"
 # OFF, and it is not a choice. check_server_args REFUSES speculation under
-# pipeline parallelism unless --enable-phase-flip is set ("Pipeline
-# parallelism is not compatible with speculative decoding"), because the
-# draft worker only exists on the flip's TP stack. The non-flip default path
-# at pp_size 3 therefore CANNOT speculate, in either tree, so the gate
-# measures the shape that path actually has.
+# pipeline parallelism ("Pipeline parallelism is not compatible with
+# speculative decoding"): before #1233 the flip's TP stack was the one
+# exemption, and that stack is gone. A pp_size 3 boot therefore CANNOT
+# speculate, so this measures the shape that path actually has.
 SPEC="${SPEC:-off}"
 BARLINK="${BARLINK:-1}"
 LOG="${SERVING_LOG:?SERVING_LOG must be set explicitly for a gate boot}"
