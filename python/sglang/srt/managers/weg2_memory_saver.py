@@ -732,6 +732,132 @@ def sleep_acceptance_census(
 
 #: The one string a dormant refusal carries, so a log grep for the marker and
 #: the client-visible error name the same event.
+# ---------------------------------------------------------------------------
+# #1233 ONE-BACKUP FLIP: chunked weight tags (record section 1h, 2026-09-07)
+# ---------------------------------------------------------------------------
+#
+# Upstream pauses/resumes the weights as ONE tag, so at a flip the sleeping
+# group's whole cpu backup lands next to the waking group's whole backup and
+# the host holds TWO images (boot weg2ls1b2: 28.8 + 27.15 GiB -> host OOM).
+# The user's design statement is "only ONE layout lies in host RAM": the
+# weights region is tagged per group of layers at construction, so the front
+# can interleave D.pause(weights_k) with P.resume(weights_k) and the host
+# never holds more than one image plus one chunk (the torch_memory_saver
+# resume frees the chunk's host image, PATCH.md).
+#
+# The tag is the CURRENT torch_memory_saver tag at cudaMalloc time, so the
+# only mechanism here is `tms_set_current_tag` inside the already-open
+# weights region -- no second allocator, no pool, no bookkeeping of what
+# landed where (torch_memory_saver's own metadata map is the ledger).  The
+# tag family is `weights_<k>` for the layer chunks plus the base
+# GPU_MEMORY_TYPE_WEIGHTS for everything outside a layer (embeddings, head,
+# norms, the NEXTN draft, rotary caches); release/resume treat the whole
+# family as "the weights" (weight_updater.py).  Two envs, both set by the
+# launcher from the checkpoint's num_hidden_layers, both unset = the stock
+# single tag:
+#
+#   SGLANG_WEG2_WEIGHT_CHUNK_LAYERS   layers per chunk (L)
+#   SGLANG_WEG2_WEIGHT_CHUNKS         number of chunk tags (N); a layer id
+#                                     beyond N*L (the NEXTN draft layer)
+#                                     clamps to the last chunk
+#
+# Granularity caveat, stated so nobody measures it as a defect: the caching
+# allocator packs allocations < 10 MiB into shared 20 MiB segments and reuses
+# freed blocks across layers, and torch_memory_saver tags at SEGMENT
+# granularity, so a few MiB per chunk carry a neighbour's tag.  Every tag of
+# the family is paused before the group computes again and resumed before
+# it computes again, so this only blurs the per-chunk byte count, never the
+# content.  Chunk bytes are therefore MEASURED (RssShmem delta per chunk),
+# never derived.
+
+WEIGHT_CHUNK_ENV_LAYERS = "SGLANG_WEG2_WEIGHT_CHUNK_LAYERS"
+WEIGHT_CHUNK_ENV_COUNT = "SGLANG_WEG2_WEIGHT_CHUNKS"
+WEIGHT_CHUNK_PREFIX = GPU_MEMORY_TYPE_WEIGHTS + "_"
+_LAYER_ID_IN_NAME = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+
+
+def weight_chunk_geometry() -> Tuple[int, int]:
+    """(layers_per_chunk, chunk_count) from the env; (0, 0) = chunking OFF."""
+    try:
+        layers = int(os.environ.get(WEIGHT_CHUNK_ENV_LAYERS, "0") or 0)
+        count = int(os.environ.get(WEIGHT_CHUNK_ENV_COUNT, "0") or 0)
+    except ValueError:
+        return 0, 0
+    if layers <= 0 or count <= 0:
+        return 0, 0
+    return layers, count
+
+
+def weight_chunk_tag(layer_id: int) -> Optional[str]:
+    """The chunk tag of a layer, or None when chunking is off."""
+    layers, count = weight_chunk_geometry()
+    if layers <= 0:
+        return None
+    return f"{WEIGHT_CHUNK_PREFIX}{min(int(layer_id) // layers, count - 1)}"
+
+
+def weights_family_tags(chunk_count: Optional[int] = None) -> list:
+    """Every tag the sleep/wake path treats as 'the weights', chunks FIRST and
+    the base tag LAST -- the order the front pauses them in, so the base tag
+    (the remainder: embeddings, head, draft, buffers) closes the sleep."""
+    if chunk_count is None:
+        chunk_count = weight_chunk_geometry()[1]
+    return [f"{WEIGHT_CHUNK_PREFIX}{k}" for k in range(int(chunk_count))] + [
+        GPU_MEMORY_TYPE_WEIGHTS
+    ]
+
+
+def is_weights_family_tag(tag: Any) -> bool:
+    return isinstance(tag, str) and (
+        tag == GPU_MEMORY_TYPE_WEIGHTS or tag.startswith(WEIGHT_CHUNK_PREFIX)
+    )
+
+
+def layer_id_from_module_name(name: str) -> Optional[int]:
+    m = _LAYER_ID_IN_NAME.search(name or "")
+    return int(m.group(1)) if m else None
+
+
+def _tms_cdll_in_region():
+    """torch_memory_saver's C entry points, ONLY while a region is open on
+    this thread; None otherwise (no saver, not initialised, or outside a
+    region -- an allocation there is not tracked, so a tag is meaningless)."""
+    try:
+        import torch_memory_saver as _tms  # noqa: WPS433
+
+        impl = _tms.torch_memory_saver._impl
+    except Exception:  # noqa: BLE001 -- not installed / not the real lib
+        return None
+    if impl is None:
+        return None
+    cdll = impl._binary_wrapper.cdll
+    if not cdll.tms_get_interesting_region():
+        return None
+    return cdll
+
+
+@contextmanager
+def weight_chunk_scope(layer_id: Optional[int]) -> Iterator[Optional[str]]:
+    """Tag every allocation inside as the chunk of ``layer_id``.
+
+    Valid ONLY inside the weights region (model construction and the
+    post-load pass, both under model_runner's region(GPU_MEMORY_TYPE_WEIGHTS)):
+    on exit the current tag is restored to the base weights tag, which is
+    what the region set.  No-op when chunking is off, when no region is open,
+    or when ``layer_id`` is None (a module outside any layer).
+    """
+    tag = None if layer_id is None else weight_chunk_tag(layer_id)
+    cdll = None if tag is None else _tms_cdll_in_region()
+    if cdll is None:
+        yield None
+        return
+    cdll.tms_set_current_tag(tag.encode("utf-8"))
+    try:
+        yield tag
+    finally:
+        cdll.tms_set_current_tag(GPU_MEMORY_TYPE_WEIGHTS.encode("utf-8"))
+
+
 DORMANT_REFUSAL_MARKER = "W25 Weg2DormantRefused"
 
 

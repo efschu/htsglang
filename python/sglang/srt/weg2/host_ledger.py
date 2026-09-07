@@ -10,9 +10,13 @@ Two moments (record section 1c B2, spec section 4.2.3):
 
 * ``launch`` -- group D is loading (LOAD_TRANSIENT charged) while group P is
   already dormant with its cpu-backup image resident.
-* ``run`` -- both groups exist, BOTH cpu backups are resident (DR-1: the
-  torch_memory_saver cpu backup is shm-backed and never returns), the awake
-  group runs at its serving heap.
+* ``run`` -- both groups exist, the DORMANT group's cpu backup is resident and
+  the awake group runs at its serving heap.  With the #1233 one-backup flip
+  (record 1h: the patched torch_memory_saver frees a chunk's host image on
+  resume, and the front interleaves ``src.pause(weights_k)`` with
+  ``dst.resume(weights_k)``) the run moment is charged ONE image plus ONE
+  chunk (``weight_chunks`` > 0); with ``weight_chunks`` = 0 it is the round-1
+  shape, two persistent images (DR-1), which this box cannot fund.
 
 The arm ladder (record section 1c B2: "if the ledger refuses at S=2 the
 launcher sizes S=1 and prints why; if it refuses at S=1 the boot REFUSES") is
@@ -64,9 +68,21 @@ HEAP_DORMANT_GIB = 2.36
 #: shm-backed, 1x the image, persistent (DR-1) -- charged 1x per group.
 BACKUP_P_BYTES = 30.96 * GB
 BACKUP_D_BYTES = 29.15 * GB
-#: #721 LOAD_TRANSIENT (weg1_host_sizing.LOAD_TRANSIENT_BYTES): the loader's
-#: page-cache + staging transient while a group loads.  Launch moment only.
-LOAD_TRANSIENT_GIB = 27.0
+#: The loader's transient while group D loads next to dormant P, charged at
+#: the launch moment only.  #721's constant is 27 GiB
+#: (weg1_host_sizing.LOAD_TRANSIENT_BYTES, page cache + staging); on THIS
+#: launcher it is MEASURED smaller: memts of boot weg2ls1b2 (2026-09-07
+#: 07:09:44Z, first sample, right after D READY) read MemAvailable 48.0 GB
+#: against 60.0 GB once the load's page cache had been reclaimed (07:10:1xZ),
+#: i.e. 12 GB of the load's cache was not counted as available.  The in-load
+#: PEAK was not sampled (the sampler started after D was ready; this
+#: launcher now starts it before group P) -- what IS metal-proven is that the
+#: launch moment of that boot (same shape: P image resident, D loading,
+#: memavail 107.6 GiB) passed with no OOM while the 27 GiB constant plus the
+#: #1232 headroom would price it at -7.4 GiB, so the constant over-charges
+#: this loader by at least that much.  12 GiB is the measured residual; the
+#: next boot's memts series replaces it if the in-load peak reads higher.
+LOAD_TRANSIENT_GIB = 12.0
 #: b0: 10.19 GB MEASURED for six (rank x phase) anchor pools at m_mib=2400
 #: (2.55/1.49/1.06 + 2.55/1.27/1.27 GB).  Scaled linearly with M.
 ANCHORS_AT_2400_BYTES = 10.19 * GB
@@ -121,10 +137,20 @@ def price(
     m_mib: int,
     *,
     ranks_per_group: int = 3,
+    weight_chunks: int = 0,
 ) -> Arm:
-    """Price one arm at both moments.  Pure."""
+    """Price one arm at both moments.  Pure.
+
+    ``weight_chunks`` = N > 0 is the #1233 one-backup flip: the run moment
+    holds the larger of the two images (whichever group is dormant) plus one
+    chunk of the other (image / N, in flight between ``src.pause(w_k)`` and
+    ``dst.resume(w_k)``).  The chunk term is DERIVED (image / N) and the boot
+    postmortem carries the MEASURED per-chunk RssShmem delta beside it.
+    """
     if s_gb < 1 or m_mib < 1:
         raise ValueError(f"arm terms must be >= 1: S={s_gb} M={m_mib}")
+    if weight_chunks < 0:
+        raise ValueError(f"weight_chunks must be >= 0: {weight_chunks}")
     base_gib = min(memavail_bytes / GIB, memtotal_bytes / GIB - CLI_RESERVE_GIB)
     heaps_gib = ranks_per_group * (HEAP_AWAKE_GIB + HEAP_DORMANT_GIB)
     anchors_gib = (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
@@ -134,7 +160,13 @@ def price(
     backup_d_gib = BACKUP_D_BYTES / GIB
     common = base_gib - FLOOR_GIB - HOST_HEADROOM_GIB - heaps_gib - anchors_gib - rings_gib - overhead_gib
     launch = common - backup_p_gib - LOAD_TRANSIENT_GIB
-    run = common - backup_p_gib - backup_d_gib
+    if weight_chunks > 0:
+        backup_resident_gib = max(backup_p_gib, backup_d_gib)
+        chunk_gib = backup_resident_gib / weight_chunks
+    else:
+        backup_resident_gib = backup_p_gib
+        chunk_gib = backup_d_gib
+    run = common - backup_resident_gib - chunk_gib
     arm = Arm(
         s_gb=s_gb,
         m_mib=m_mib,
@@ -152,6 +184,9 @@ def price(
         "heaps_gib": heaps_gib,
         "backup_p_gib": backup_p_gib,
         "backup_d_gib": backup_d_gib,
+        "weight_chunks": weight_chunks,
+        "backup_resident_gib": backup_resident_gib,
+        "chunk_gib": chunk_gib,
         "load_transient_gib": LOAD_TRANSIENT_GIB,
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
@@ -169,6 +204,7 @@ def choose(
     store_min_gib: float,
     arms: Sequence[Tuple[int, int]] = DEFAULT_ARMS,
     ranks_per_group: int = 3,
+    weight_chunks: int = 0,
 ) -> Tuple[Arm, float, List[str]]:
     """Walk the ladder; return (arm, store_gib, printed lines) or raise W20.
 
@@ -180,7 +216,7 @@ def choose(
     """
     lines: List[str] = []
     priced = [
-        price(memtotal_bytes, memavail_bytes, s, m, ranks_per_group=ranks_per_group)
+        price(memtotal_bytes, memavail_bytes, s, m, ranks_per_group=ranks_per_group, weight_chunks=weight_chunks)
         for s, m in arms
     ]
     t = priced[0].terms
@@ -194,8 +230,16 @@ def choose(
         f"heaps={t['heaps_gib']:.2f} GiB ({ranks_per_group}x{HEAP_AWAKE_GIB} awake b0 + "
         f"{ranks_per_group}x{HEAP_DORMANT_GIB} dormant campaign (a)) "
         f"backup_P={t['backup_p_gib']:.2f} GiB backup_D={t['backup_d_gib']:.2f} GiB "
-        "(#809 census images, 1x each, DR-1 shm-backed) "
-        f"load_transient={LOAD_TRANSIENT_GIB:.0f} GiB (#721, launch moment only) "
+        "(#809 census images) "
+        + (
+            f"RUN MOMENT = one image {t['backup_resident_gib']:.2f} GiB (the dormant group) + one chunk "
+            f"{t['chunk_gib']:.2f} GiB (image / {weight_chunks} weights_<k> tags in flight, #1233 one-backup flip; "
+            "the patched saver frees a chunk's host image on resume) "
+            if weight_chunks > 0
+            else "RUN MOMENT = both images resident (DR-1, the round-1 two-backup shape) "
+        )
+        + f"launch_moment = P image + "
+        f"load_transient={LOAD_TRANSIENT_GIB:.0f} GiB (MEASURED residual of boot weg2ls1b2, #721 constant was 27; D loading while P is dormant) "
         f"anchors@2400={ANCHORS_AT_2400_BYTES / GIB:.2f} GiB (b0 measured, scaled by M) "
         f"rings=({RING_P_MULT_GB_PER_S:.0f}+{RING_D_MULT_GB_PER_S:.0f})xS GB (b0) "
         f"overhead={HOST_POOL_OVERHEAD:.0%} of host-pool posts (b0 U14)"
@@ -220,9 +264,11 @@ def choose(
         table = "\n".join(lines)
         raise Weg2HostLedgerRefused(
             "W20 Weg2HostLedgerRefused: no arm of the ladder funds both moments "
-            f"plus a {store_min_gib:.0f} GiB store floor on this box. Both groups "
-            "need a cpu backup (the INT8 checkpoint has only the cpu-backup wake "
-            "path, W4), and the ledger will not shrink another term silently.\n"
+            f"plus a {store_min_gib:.0f} GiB store floor on this box "
+            f"(weight_chunks={weight_chunks}: "
+            + ("one image + one chunk at the run moment" if weight_chunks > 0 else "two persistent images at the run moment")
+            + "). The INT8 checkpoint has only the cpu-backup wake path (W4), and "
+            "the ledger will not shrink another term silently.\n"
             + table
         )
     lines.append(

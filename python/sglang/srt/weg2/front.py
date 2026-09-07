@@ -58,6 +58,8 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+from sglang.srt.managers.weg2_memory_saver import weights_family_tags
+
 logger = logging.getLogger("weg2.front")
 
 FORWARD_PATHS = ("/generate", "/v1/completions", "/v1/chat/completions")
@@ -69,6 +71,7 @@ QUIESCE_DEADLINE_S = 90.0
 RPC_TIMEOUT_S = 900.0
 SPAN_LRU = 512
 SLEEP_TAGS = ["kv_cache", "weights"]
+KV_TAG = "kv_cache"
 
 
 class Weg2Stop(Exception):
@@ -280,9 +283,14 @@ def _session_pids(sid: int) -> set:
 
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
-                 prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float):
+                 prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
+                 weight_chunks: int = 0):
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
         self.awake = awake
+        # #1233 one-backup flip: the weights tag family both groups were built
+        # with (launcher: SGLANG_WEG2_WEIGHT_CHUNKS), chunks first, base last.
+        self.weight_chunks = int(weight_chunks)
+        self.weights_tags = weights_family_tags(self.weight_chunks)
         self.tag = tag
         self.store_dir = store_dir
         self.dc_reserve = dc_reserve
@@ -610,12 +618,39 @@ class Front:
                          f"{wv}: front ledger {sorted(S.outstanding)} vs rank({src}) flush_cache -> {msg[:400]!r}")
             return
         t_q = time.time()
-        # 3. sleep src
-        code, body = await self.rpc(S, "/release_memory_occupation", {"tags": SLEEP_TAGS}, RPC_TIMEOUT_S)
-        t_s = time.time()
+        # 3. THE ONE-BACKUP INTERLEAVE (#1233, record 1h): src.pause(kv_cache),
+        # then per weights tag k: src.pause(w_k) -> dst.resume(w_k) (the
+        # patched saver frees dst's chunk image on resume), then
+        # dst.resume(kv_cache).  The host holds at most ONE full image (the
+        # dormant group's) plus ONE chunk at any moment.  Serial by
+        # construction: the D2H of chunk k+1 never overlaps the H2D of chunk
+        # k (the rank-side PCIe lock would serialise them anyway).
+        sleep_ms = 0.0
+        wake_ms = 0.0
+        chunk_recs: List[dict] = []
+        t0 = time.time()
+        code, body = await self.rpc(S, "/release_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
+        sleep_ms += (time.time() - t0) * 1000
         if code != 200:
-            self.do_stop("W4 Weg2WakeRefused", f"sleep({src}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
+            self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
             return
+        for tag in self.weights_tags:
+            t0 = time.time()
+            code, body = await self.rpc(S, "/release_memory_occupation", {"tags": [tag]}, RPC_TIMEOUT_S)
+            t1 = time.time()
+            if code != 200:
+                self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {tag}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
+                return
+            code, body = await self.rpc(D, "/resume_memory_occupation", {"tags": [tag]}, RPC_TIMEOUT_S)
+            t2 = time.time()
+            if code != 200:
+                self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {tag}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
+                return
+            sleep_ms += (t1 - t0) * 1000
+            wake_ms += (t2 - t1) * 1000
+            chunk_recs.append({"tag": tag, "sleep_ms": round((t1 - t0) * 1000), "wake_ms": round((t2 - t1) * 1000)})
+            logger.info("WEG2-FLIP-CHUNK epoch=%d tag=%s %s.pause=%d ms %s.resume=%d ms", self.epoch, tag, src, chunk_recs[-1]["sleep_ms"], dst, chunk_recs[-1]["wake_ms"])
+        t_s = time.time()
         # 4. measure D_c(src); W19 for D at its first sleep
         pids = _session_pids(S.sid) if S.sid else set()
         dc = _nvml_process_mib(pids) if pids else {}
@@ -628,23 +663,28 @@ class Front:
                 self.do_stop("W19 DormantResidueRefused",
                              f"measured D_c(D) exceeds the reserve P's budget assumed: {over} (measured, reserved) MiB -- waking P would overcommit the card")
                 return
-        # 5. wake dst (W4)
-        code, body = await self.rpc(D, "/resume_memory_occupation", {"tags": SLEEP_TAGS}, RPC_TIMEOUT_S)
+        # 5. wake dst kv (W4)
+        t0 = time.time()
+        code, body = await self.rpc(D, "/resume_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
         t_w = time.time()
+        wake_ms += (t_w - t0) * 1000
         if code != 200:
-            self.do_stop("W4 Weg2WakeRefused", f"wake({dst}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
+            self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
             return
         self.awake = dst
         self.epoch += 1
         self.admit_d = True
         self.state = "serving"
         rec = {"epoch": self.epoch, "sleep": src, "wake": dst, "drain_quiesce_ms": round((t_q - t_flip0) * 1000),
-               "sleep_ms": round((t_s - t_q) * 1000), "wake_ms": round((t_w - t_s) * 1000), "flip_ms": round((t_w - t_flip0) * 1000),
+               "sleep_ms": round(sleep_ms), "wake_ms": round(wake_ms), "flip_ms": round((t_w - t_flip0) * 1000),
+               "interleave_ms": round((t_s - t_q) * 1000), "chunks": chunk_recs,
                "dc_mib": dc, "t": time.time()}
         self.flip_log.append(rec)
         self.counters["flips"] += 1
-        logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms wake=%d ms flip_total=%d ms dc=%s",
-                    rec["epoch"], src, dst, rec["drain_quiesce_ms"], rec["sleep_ms"], rec["wake_ms"], rec["flip_ms"], dc)
+        logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms (sum of %d %s RPCs) wake=%d ms (sum of %d %s RPCs) "
+                    "interleave=%d ms flip_total=%d ms weights_tags=%d dc=%s",
+                    rec["epoch"], src, dst, rec["drain_quiesce_ms"], rec["sleep_ms"], len(self.weights_tags) + 1, src,
+                    rec["wake_ms"], len(self.weights_tags) + 1, dst, rec["interleave_ms"], rec["flip_ms"], len(self.weights_tags), dc)
 
     async def controller(self) -> None:
         sem = asyncio.Semaphore(8)
@@ -752,13 +792,15 @@ def main():
     ap.add_argument("--decode-sid", type=int, default=0)
     ap.add_argument("--dc-reserve", default="", help="uuid=mib,uuid=mib")
     ap.add_argument("--fairness-w-s", type=float, default=45.0)
+    ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
     for kv in filter(None, args.dc_reserve.split(",")):
         k, v = kv.split("=")
         dc[k] = int(v)
-    front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s)
+    front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s,
+                  weight_chunks=args.weight_chunks)
     app = web.Application(client_max_size=1024**3)
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)
@@ -774,7 +816,7 @@ def main():
         app.router.add_get(path, front.handle_passthrough_get)
     for path in FORWARD_PATHS:
         app.router.add_post(path, front.handle_generate)
-    logger.info("WEG2-FRONT %s:%s -> P=%s D=%s awake=%s", args.host, args.port, args.prefill, args.decode, args.awake)
+    logger.info("WEG2-FRONT %s:%s -> P=%s D=%s awake=%s weights_tags=%s", args.host, args.port, args.prefill, args.decode, args.awake, front.weights_tags)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
 

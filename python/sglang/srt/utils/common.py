@@ -2004,9 +2004,18 @@ def make_layers(
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.distributed.utils import get_pp_layer_set
     from sglang.srt.layers.utils import PPMissingLayer
+    from sglang.srt.managers.weg2_memory_saver import weight_chunk_scope
     from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
+
+    # #1233 Weg-2 one-backup flip: each layer's allocations carry the
+    # torch_memory_saver tag of its layer chunk (weg2_memory_saver.py,
+    # weight_chunk_scope).  No-op unless the launcher set the chunk envs AND a
+    # memory-saver region is open around this construction.
+    def _make_layer(idx: int):
+        with weight_chunk_scope(idx):
+            return layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
 
     # NON-CONTIGUOUS OWNERSHIP (family placement). A stage has always been an
     # INTERVAL here, which is why a layout like "every linear-attention layer
@@ -2040,7 +2049,7 @@ def make_layers(
         modules = torch.nn.ModuleList(
             [
                 (
-                    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+                    _make_layer(idx)
                     if idx in owned
                     else PPMissingLayer(return_tuple=return_tuple, unowned_layer_id=idx)
                 )
@@ -2065,10 +2074,7 @@ def make_layers(
     modules = torch.nn.ModuleList(
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
         + get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(start_layer, end_layer)
-            ),
+            (_make_layer(idx) for idx in range(start_layer, end_layer)),
             **(offloader_kwargs or {}),
         )
         + [

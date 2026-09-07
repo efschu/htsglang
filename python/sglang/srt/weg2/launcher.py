@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -134,6 +135,8 @@ class BootState:
     t_ready: Dict[str, float] = field(default_factory=dict)
     sleep_p_ms: float = 0.0
     deviations: List[str] = field(default_factory=list)
+    weight_chunks: int = 0
+    tms_so: str = ""
 
 
 def _now() -> str:
@@ -451,8 +454,16 @@ def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
     ] + extra
 
 
-def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str) -> Dict[str, str]:
+def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
+              chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "") -> Dict[str, str]:
     env = dict(os.environ)
+    # #1233 one-backup flip: chunked weights tags (weg2_memory_saver.py) and
+    # the patched torch_memory_saver preload hook (tms_csrc/PATCH.md).
+    if chunk_layers > 0 and chunk_count > 0:
+        env["SGLANG_WEG2_WEIGHT_CHUNK_LAYERS"] = str(chunk_layers)
+        env["SGLANG_WEG2_WEIGHT_CHUNKS"] = str(chunk_count)
+    if tms_so:
+        env["SGLANG_WEG2_TMS_PRELOAD_SO"] = tms_so
     cu13 = f"{venv}/lib/python3.12/site-packages/nvidia/cu13/lib"
     # boot_855_train0901.sh:152-153 (NVRTC) and S1 killer K1: the memory
     # saver's cu13 preload hook links libcudart.so.13, which must be on the
@@ -533,14 +544,37 @@ def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, 
     return pid
 
 
-def sleep_group(port: int, log: Log, name: str) -> float:
+def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> float:
+    tags = ["kv_cache"] + list(weights_tags)
     t0 = time.time()
-    code, body = http("POST", f"http://127.0.0.1:{port}/release_memory_occupation", {"tags": ["kv_cache", "weights"]}, timeout=900)
+    code, body = http("POST", f"http://127.0.0.1:{port}/release_memory_occupation", {"tags": tags}, timeout=900)
     dt = (time.time() - t0) * 1000
     if code != 200:
         raise Weg2LaunchRefused(f"sleep({name}) failed: HTTP {code} {body[:300]!r}")
-    log(f"sleep({name}) OK in {dt:.0f} ms (tags kv_cache,weights; flush BEFORE pause per record 1d MUST_FIX)")
+    log(f"sleep({name}) OK in {dt:.0f} ms (tags {','.join(tags)}; flush BEFORE pause per record 1d MUST_FIX)")
     return dt
+
+
+def model_num_layers(model: str) -> int:
+    with open(os.path.join(model, "config.json")) as f:
+        cfg = json.load(f)
+    text = cfg.get("text_config", cfg)
+    n = int(text.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0)
+    if n <= 0:
+        raise Weg2LaunchRefused(f"num_hidden_layers not found in {model}/config.json")
+    return n
+
+
+def build_tms_preload(tree: str, venv: str, log: Log) -> str:
+    """Build (or reuse) the patched torch_memory_saver preload hook."""
+    script = os.path.join(tree, "scripts", "weg2", "tms", "build_tms_preload.sh")
+    r = subprocess.run([script, "--venv", venv], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Weg2LaunchRefused(f"torch_memory_saver preload build failed: {r.stderr[-800:]}")
+    so = r.stdout.strip().splitlines()[-1]
+    log(f"torch_memory_saver 0.0.9.post1 preload hook REBUILT from python/sglang/srt/weg2/tms_csrc (PATCH.md: cpu backup "
+        f"freed after resume) -> {so}; SGLANG_WEG2_TMS_PRELOAD_SO set for both groups")
+    return so
 
 
 def budgets_from_dc(cards: List[Card], dc_mib: Dict[str, int], log: Log, label: str) -> List[int]:
@@ -564,7 +598,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--model", default=MODEL_DEFAULT)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--debug-hold", choices=["none", "P", "D", "both"], default="none")
-    ap.add_argument("--store-min-gib", type=float, default=4.0)
+    ap.add_argument("--store-min-gib", type=float, default=8.0)
+    ap.add_argument("--weight-chunks", type=int, default=8,
+                    help="#1233: number of weights_<k> layer-chunk tags per group (0 = the round-1 single tag / two-backup shape)")
     ap.add_argument("--ready-deadline-s", type=float, default=900.0)
     ap.add_argument("--extra-p", default="", help="extra flags for group P (shell-split)")
     ap.add_argument("--extra-d", default="", help="extra flags for group D (shell-split)")
@@ -602,13 +638,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.cvd = cvd
     log("NVML -> CUDA ordinal map: " + ", ".join(f"ordinal {i} = nvml {c.nvml_index} {c.name} {c.uuid} total {c.total_mib} MiB" for i, c in enumerate(cards)))
 
+    # 1b. #1233 one-backup flip geometry + the patched saver hook
+    n_layers = model_num_layers(ns.model)
+    chunk_count = max(0, int(ns.weight_chunks))
+    chunk_layers = int(math.ceil(n_layers / chunk_count)) if chunk_count > 0 else 0
+    from sglang.srt.managers.weg2_memory_saver import weights_family_tags
+    weights_tags = weights_family_tags(chunk_count)
+    log(f"WEG2-WEIGHT-CHUNKS N={chunk_count} tags (layers per chunk {chunk_layers} of {n_layers}; family {weights_tags}); "
+        "flip = src.pause(kv) -> per tag: src.pause(w_k), dst.resume(w_k) -> dst.resume(kv); host holds one image + one chunk")
+    tms_so = "" if dry else build_tms_preload(tree, ns.venv, log)
+    state.weight_chunks = chunk_count
+    state.tms_so = tms_so
+
     # 2. host ledger
     mi = host_ledger.read_meminfo()
-    arm, store_gib, lines = host_ledger.choose(mi["MemTotal"], mi["MemAvailable"], store_min_gib=ns.store_min_gib)
+    arm, store_gib, lines = host_ledger.choose(mi["MemTotal"], mi["MemAvailable"], store_min_gib=ns.store_min_gib, weight_chunks=chunk_count)
     for ln in lines:
         log(ln)
     state.ledger_lines = lines
     state.store_gib = store_gib
+
+    # 2b. host memory time series from BEFORE the first group, so the launch
+    # moment (P image resident, D loading) is measured this time, not only
+    # the run moment (record 1h: the ls1b2 sampler started after D READY).
+    if not dry:
+        memts = f"{GPU_ARB}/memts_weg2_{ns.tag}.csv"
+        mpid = int(subprocess.run(["bash", "-c", f"setsid {MEMTS} {shlex.quote(memts)} 5 > /dev/null 2>&1 & echo $!"], capture_output=True, text=True).stdout.strip() or 0)
+        state.helper_pids.append(mpid)
+        log(f"mem time series pid {mpid} csv {memts} (started before group P: launch AND run moments sampled)")
 
     # 3. store
     mount_store(log, store_gib, dry)
@@ -628,7 +685,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
     budgets_p = budgets_from_dc(cards, dc_expect_d, log, "P")
     state.budgets["P"] = budgets_p
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so)
     spec_p = GroupSpec("P", PORT_P, argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     state.deviations = [
@@ -637,13 +694,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "group deadmen tier 1 only (PROBE_S spaced past the boot); tier 2 on the front's deadman",
         "no disk tier for the store (file backend has no second tier); tmpfs sized by the ledger",
         "the epoch is carried in the front's ledger only (no group echo/checksum on the RPC)",
+        "torch_memory_saver 0.0.9.post1 preload hook rebuilt from the vendored csrc with ONE patch (cpu backup freed after resume, "
+        "python/sglang/srt/weg2/tms_csrc/PATCH.md); the stock wheel is untouched and used when SGLANG_WEG2_TMS_PRELOAD_SO is unset",
+        f"weights paused/resumed as {chunk_count} weights_<k> chunk tags + the base tag (#1233 one-backup flip); cuda_graph stays resident (not in the sleep tag set, as in round 1)",
     ]
     for d in state.deviations:
         log(f"DEVIATION (declared): {d}")
     launch_group(spec_p, tree, log, dry)
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so)
         spec_d = GroupSpec("D", PORT_D, argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("DRY-RUN complete: nothing started, mounted, armed or written")
@@ -658,7 +718,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise Weg2LaunchRefused(f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half): P logged kv x{n_kv} blob x{n_blob}, need 3 each")
 
     # 4d. sleep P, measure D_c(P)
-    state.sleep_p_ms = sleep_group(PORT_P, log, "P")
+    state.sleep_p_ms = sleep_group(PORT_P, log, "P", weights_tags)
     time.sleep(2)
     pids_p = session_pids(spec_p.pid)
     dc_p = nvml_process_mib(pids_p)
@@ -677,7 +737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 5. group D
     budgets_d = budgets_from_dc(cards, dc_p, log, "D")
     state.budgets["D"] = budgets_d
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag)
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so)
     spec_d = GroupSpec("D", PORT_D, argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
@@ -701,6 +761,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--prefill-sid", str(spec_p.pid), "--decode-sid", str(spec_d.pid),
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d[c.uuid]}" for c in cards),
         "--fairness-w-s", str(ns.fairness_w_s),
+        "--weight-chunks", str(chunk_count),
     ]
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -715,10 +776,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.helper_pids.append(arm_deadman(log, spec_p.log, PORT_P, f"launch_server.*--port {PORT_P}", huge, ns.tag, "P", dry))
     state.helper_pids.append(arm_deadman(log, spec_d.log, PORT_D, f"launch_server.*--port {PORT_D}", huge, ns.tag, "D", dry))
     state.helper_pids.append(arm_deadman(log, front_log, PORT_FRONT, "sglang.srt.weg2.front", 120, ns.tag, "front", dry))
-    memts = f"{GPU_ARB}/memts_weg2_{ns.tag}.csv"
-    mpid = int(subprocess.run(["bash", "-c", f"setsid {MEMTS} {shlex.quote(memts)} 5 > /dev/null 2>&1 & echo $!"], capture_output=True, text=True).stdout.strip() or 0)
-    state.helper_pids.append(mpid)
-    log(f"mem time series pid {mpid} csv {memts}")
     os.system(f"ln -sfn {shlex.quote(front_log)} /root/current_boot.log")
     with open(f"{GPU_ARB}/weg2/boot_{ns.tag}.logpath", "w") as f:
         f.write(front_log + "\n")

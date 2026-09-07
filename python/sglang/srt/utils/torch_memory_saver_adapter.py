@@ -62,6 +62,25 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     """Adapter for TorchMemorySaver with tag-based control"""
 
     def configure_subprocess(self):
+        # #1233 Weg-2 one-backup flip: the launcher points this at a preload
+        # hook rebuilt from the vendored, patched torch_memory_saver csrc
+        # (srt/weg2/tms_csrc/PATCH.md: the cpu backup is freed after the
+        # restore).  HookUtilModePreload reads the binary path back from
+        # LD_PRELOAD itself, so this ONE env swap is the whole switch; unset,
+        # the stock wheel's hook is preloaded exactly as upstream does.
+        import os
+
+        override = os.environ.get("SGLANG_WEG2_TMS_PRELOAD_SO", "")
+        if override:
+            if not os.path.isfile(override) or "torch_memory_saver" not in override:
+                raise RuntimeError(
+                    "SGLANG_WEG2_TMS_PRELOAD_SO must name an existing file whose "
+                    f"name carries 'torch_memory_saver': {override!r}"
+                )
+            from torch_memory_saver.utils import change_env
+
+            logger.info("[weg2 tms] preloading patched hook %s", override)
+            return change_env("LD_PRELOAD", override)
         return torch_memory_saver.configure_subprocess()
 
     def region(self, tag: str, enable_cpu_backup: bool = False):
