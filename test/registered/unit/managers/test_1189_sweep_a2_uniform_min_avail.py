@@ -134,7 +134,12 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
         # `scheduler.py` hunks land ABOVE all three and shift every one of them
         # by the same +9.  Then 6860/6953/7322 -> 6463/6556/6925 at #1233 WEG 2
         # S0: the un-weave DELETES the in-process flip machinery above all
-        # three, so every one of them moves by the same -397.
+        # three, so every one of them moves by the same -397.  Then
+        # 6463/6556/6925 -> 6475/6568/6937 at #1234 slice A: the
+        # --max-kv-per-request writer lands at intake (`handle_generate_request`,
+        # beside `validate_input_length`) ABOVE all three and shifts every one
+        # of them by the same +12; the C11 X gate and its helpers sit BELOW
+        # them and move nothing.
         # The writer SET is what this row pins and it is unchanged across both:
         # three statements, byte-identical, re-read in the tree at the new
         # lines. A pin of literal line numbers is a Landmarken-Format row -- it
@@ -143,7 +148,7 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
         # different program.
         self.assertEqual(
             sets,
-            [6463, 6556, 6925],
+            [6475, 6568, 6937],
             f"the three writers of self.{ATTR} moved: {sets}",
         )
 

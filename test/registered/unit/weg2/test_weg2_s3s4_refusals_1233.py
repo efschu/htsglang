@@ -18,7 +18,6 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2.front import (
-    CHUNK_TOKENS,
     SpanLRU,
     double_prefill_verdict,
     fairness_reached,
@@ -45,14 +44,20 @@ def test_w3_silent_when_both_agree():
     assert witness_verdict(2, False) is None
 
 
+#: #1233 shipped X: one prefill chunk. Since #1234 slice A the bound is the
+#: --tp-prefill-max-tokens FLAG, passed in explicitly, so these cases keep
+#: asserting the same arithmetic against the same number.
+ONE_CHUNK = 4096
+
+
 # ---------------------------------------------------------------- W16
 def test_w16_serve_within_one_chunk():
-    assert double_prefill_verdict(10000, 10000 - CHUNK_TOKENS, 0) == "serve"
+    assert double_prefill_verdict(10000, 10000 - ONE_CHUNK, 0, ONE_CHUNK) == "serve"
 
 
 def test_w16_reroute_once_then_refuse():
-    assert double_prefill_verdict(10000, 0, 0) == "reroute"
-    assert double_prefill_verdict(10000, 0, 1) == "W16"
+    assert double_prefill_verdict(10000, 0, 0, ONE_CHUNK) == "reroute"
+    assert double_prefill_verdict(10000, 0, 1, ONE_CHUNK) == "W16"
 
 
 def test_w16_reads_cached_tokens_not_loaded():
@@ -60,7 +65,7 @@ def test_w16_reads_cached_tokens_not_loaded():
     pt, ct, comp = usage_of({"usage": {"prompt_tokens": 9000, "completion_tokens": 5,
                                        "prompt_tokens_details": {"cached_tokens": 8000}}})
     assert (pt, ct, comp) == (9000, 8000, 5)
-    assert double_prefill_verdict(pt, ct, 0) == "serve"
+    assert double_prefill_verdict(pt, ct, 0, ONE_CHUNK) == "serve"
 
 
 # ---------------------------------------------------------------- W17
@@ -119,7 +124,7 @@ def test_span_known_reduces_the_remainder():
     prefix = "system:you are helpful\n" * 200
     spans.record(prefix, 1000)
     remainder, est, known = price_remainder(prefix + "user:hi\n", spans)
-    assert known and remainder < est and remainder <= CHUNK_TOKENS
+    assert known and remainder < est and remainder <= ONE_CHUNK
 
 
 def test_fairness_bound_reaches_at_w():

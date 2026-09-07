@@ -4752,10 +4752,22 @@ class Scheduler(
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
-        # Validate prompt length
+        # WEG2_SCHEDULING_SPEC_0907 C14/K9: THE ONE WRITER of kv_cap_tokens.
+        # Placed here, at intake beside the length validation, because the
+        # cap is a property of the request for its whole life -- it must
+        # survive the phase flip, and there is no separating event at which
+        # a side map could be rebuilt.  Default = the model context, so an
+        # unset flag reproduces the as-built ceiling exactly.
+        req.kv_cap_tokens = int(
+            self.server_args.max_kv_per_request or self.model_config.context_len
+        )
+        # Reader (a): the admission growth bound.  The cap is applied through
+        # the EXISTING validation rather than as a second length gate, so
+        # there is one refusal shape for "this prompt is longer than this
+        # server will hold", not two that can disagree.
         error_msg = validate_input_length(
             req,
-            self.max_req_input_len,
+            min(self.max_req_input_len, req.kv_cap_tokens),
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
@@ -8963,6 +8975,114 @@ class Scheduler(
             return chunked_prefill_size
         return granted
 
+    def weg2_uncached_extent(self, req: Req) -> int:
+        """The request's REAL uncached prefill extent, in tokens (C11/R-31).
+
+        Three terms, every one of them replicated across the group:
+
+        * ``full_untruncated_fill_ids`` -- the request's own token ids;
+        * ``prefix_indices`` -- the device match on the replicated radix
+          tree, already capped to the group's geometry where a group
+          geometry exists;
+        * ``host_hit_length`` -- the host-tier match on the same tree, whose
+          prefetch completion crosses the existing MIN reduce.
+
+        Deliberately NOT here: ``available_size()``, free slot counts,
+        ``time.monotonic()`` or any other rank-local quantity. That
+        exclusion is the whole rank-uniformity argument, and it is meant to
+        be grep-checkable in this one function.
+        """
+        extend_input_len = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+        return max(0, extend_input_len - int(getattr(req, "host_hit_length", 0) or 0))
+
+    def _weg2_host_carry_tokens(self) -> int:
+        """Longest prefix the store can hand back to THIS group, in tokens.
+
+        The host staging pool's own size, which `sync_fixed_hicache_size`
+        has already reduced to the group minimum, so this is replicated. 0
+        when there is no host tier, which disables the exemption rather than
+        widening it.
+        """
+        ctrl = getattr(self.tree_cache, "cache_controller", None)
+        pool = getattr(ctrl, "mem_pool_host", None) if ctrl is not None else None
+        return int(getattr(pool, "size", 0) or 0)
+
+    def _weg2_x_refuses(self, req: Req) -> bool:
+        """W31 verdict for one request, with L9 printed on both outcomes."""
+        x = int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0)
+        if x <= 0:
+            return False
+        uncached = self.weg2_uncached_extent(req)
+        # R-3 / MUST NOT 2/3: THE CARRIER-EXCEEDS EXEMPTION, derived here
+        # rather than carried on the request.
+        #
+        # A prompt whose uncached extent exceeds this group's host staging
+        # pool cannot be read back from the store no matter WHO prefills it
+        # -- that is the measured #974 wall (84,027 tokens against a
+        # 30,518-token host pool -> `#915 PREFETCH REFUSED`,
+        # cached_tokens=0). Refusing such a request here does not move it to
+        # a group that can serve it; it bounces it around the wall:
+        # CARRIER-EXCEEDS -> W31 -> re-route -> flip -> store read refused
+        # -> whole prompt uncached -> W31 again. So it is EXEMPT, and the
+        # exemption dies in the same commit as the wall, when the carrier
+        # build gives this group an unbounded windowed store read.
+        #
+        # Derived from the host pool's own size, which
+        # `sync_fixed_hicache_size` already reduces to the group minimum, so
+        # the exemption is as replicated as the verdict it exempts from --
+        # and no marker has to survive an HTTP hop to get here.
+        carry = self._weg2_host_carry_tokens()
+        if carry > 0 and uncached > carry:
+            self._weg2_x_exempt = getattr(self, "_weg2_x_exempt", 0) + 1
+            if self._weg2_x_exempt <= 5 or self._weg2_x_exempt % 64 == 0:
+                logger.info(
+                    "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=True "
+                    "verdict=exempt_carrier_exceeds host_carry=%d occurrence=%d",
+                    str(getattr(req, "rid", "?"))[:16], uncached, x, carry, self._weg2_x_exempt,
+                )
+            return False
+        verdict = "W31" if uncached > x else "admit"
+        logger.info(
+            "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=True verdict=%s",
+            str(getattr(req, "rid", "?"))[:16], uncached, x, verdict,
+        )
+        return verdict == "W31"
+
+    def _weg2_answer_x_refusals(self, refused: List[Req]) -> None:
+        """Remove the W31-refused requests and answer them BY NAME (C11).
+
+        Not a silent skip: a request left in the queue would be re-offered
+        every pass and never served, which is a livelock wearing the costume
+        of a policy. The named 503 is what lets the caller re-route it
+        through the prefill group exactly once (its own W35 bounds that).
+        """
+        x = int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0)
+        refused_ids = {id(r) for r in refused}
+        self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
+        for req in refused:
+            uncached = self.weg2_uncached_extent(req)
+            message = (
+                f"W31 Weg2TpPrefillExceeded: this group may prefill at most {x} uncached "
+                f"tokens itself (--tp-prefill-max-tokens); this request's extent after "
+                f"prefix matching is {uncached}. Refused by name so the caller re-routes it "
+                f"through the prefill group -- never prefilled here silently."
+            )
+            logger.warning("W31 Weg2TpPrefillExceeded rid=%s uncached=%d X=%d", req.rid, uncached, x)
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            elif self.enable_hierarchical_cache:
+                self.tree_cache.terminate_prefetch(req.rid)
+            abort_req = AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=req.rid,
+            )
+            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -10718,6 +10838,11 @@ class Scheduler(
         )
 
         transport_only = bool(getattr(self, SEAM_TRANSPORT_ROUND_ATTR, False))
+        # C11: requests this pass refused by name (W31). Collected rather
+        # than aborted in place because the loop iterates `waiting_queue`
+        # itself; they are removed and answered after the loop, where
+        # mutating the list is safe. Empty on every boot with the flag off.
+        _x_refused: List[Req] = []
 
         # #968 NAME WHAT THE FOLLOWER IS ALREADY HOLDING. A rank that parked a
         # chunked continuation after a #797 void has it in `self.chunked_req`
@@ -11078,6 +11203,42 @@ class Scheduler(
                     req.storage_hit_length = int(loaded_tokens)
 
             req.init_next_round_input(self.tree_cache)
+
+            # WEG2_SCHEDULING_SPEC_0907 C11/W31 -- LAW 4, ENFORCED WHERE THE
+            # UNCACHED EXTENT IS REAL.
+            #
+            # The front prices a prompt with len(text)/3.0 minus an LRU
+            # prefix guess and never re-checks, so its verdict is an
+            # ESTIMATE by construction. Measured (weg2zr2 front log line
+            # 186, rid weg2-4-8): `prompt_tokens=19401 cached_tokens=0
+            # uncached=19401 verdict=short_mispriced` -- 19,401 uncached
+            # tokens served through a 4,096-token grant, because the only
+            # gate was the estimate.
+            #
+            # THIS is the point at which the extent exists: after
+            # `match_prefix` (the line above), where the device prefix and
+            # the host hit are both known. A bound applied beside
+            # `validate_input_length` at intake would see only the prompt --
+            # the same mis-pricing in a different place.
+            #
+            # RANK-UNIFORM WITHOUT A NEW COLLECTIVE (MUST NOT 6): every term
+            # is replicated -- the request's own token ids, the device match
+            # on the replicated radix tree, and the host hit whose prefetch
+            # completion already crosses the existing MIN reduce
+            # (unified_radix_cache `check_prefetch_progress`). No
+            # rank-local quantity (`available_size()`, free slots, a clock)
+            # enters it, which is what makes the verdict a group verdict.
+            #
+            # SUBTRACTING THE HOST HIT IS LOAD-BEARING, not a refinement:
+            # the request the flip hands to D has its whole prefix in the
+            # store, so its real uncached extent is small. Comparing X
+            # against the raw prompt instead would refuse exactly the
+            # requests the flip exists to serve, and the re-route would put
+            # them back in front of the same gate for ever.
+            if self._weg2_x_refuses(req):
+                _note_skip("weg2_x_refused", req.rid)
+                _x_refused.append(req)
+                continue
 
             # #791 PP ADMISSION UNIFORMITY. Every PP stage independently
             # re-derives its own admission verdict from its own local radix
@@ -11457,6 +11618,13 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        # C11: answer the requests this pass refused by name. AFTER the loop,
+        # because the loop iterates `waiting_queue` in place. Every rank runs
+        # this with the same list (the verdict is replicated), so the queue
+        # stays identical across the group; the send is a no-op off rank 0.
+        if _x_refused:
+            self._weg2_answer_x_refusals(_x_refused)
 
         # #1153: what this loop REACHED, recorded before any of the three
         # refusal raises below so the group-STOP line can name it (and once
