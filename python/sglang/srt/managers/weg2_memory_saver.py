@@ -125,6 +125,18 @@ def _resolve_uuid(nvml_uuid: Optional[str]) -> str:
     return nvml_registry.current_device_uuid()
 
 
+def resolve_pcie_lock_key() -> str:
+    """This process's physical-GPU key for the PCIe lock.
+
+    Public on purpose: a caller that wants to degrade to "unserialised" when
+    the card key cannot be resolved must be able to resolve the key in a
+    ``try`` of its own, and then take the lock OUTSIDE that handler -- so a
+    :class:`Weg2PcieLockTimeout` propagates by construction rather than by the
+    ordering of two ``except`` clauses.
+    """
+    return _resolve_uuid(None)
+
+
 @contextmanager
 def pcie_transfer_lock(
     *,
@@ -215,9 +227,14 @@ class SleepAcceptanceCensus:
     arena_backed_bytes: int
     arena_retained_bytes: int
     arena_rows: int
-    #: False when any live arena still owns unmapped handles: NVML charges the
-    #: process for that ADDRESS SPACE, so the freed-memory reading is not one.
-    retain_handles_asserted: bool
+    #: Tri-state.  True/False only when a live ``KvVmmArena`` was actually
+    #: censused: False means some arena still owns unmapped handles, and NVML
+    #: charges the process for that ADDRESS SPACE, so the freed-memory reading
+    #: is not one.  ``None`` means there was NO live arena to read -- the
+    #: permanent state under Weg 2, where ``--enable-vram-dial`` is refused
+    #: (W13) and the phase flip is deleted (S0/S7).  Reporting that case as
+    #: True would be an assertion the instrument never took.
+    retain_handles_asserted: Optional[bool]
     accepted: bool
     refusal_reason: Optional[str]
     denominator: str
@@ -235,13 +252,24 @@ class SleepAcceptanceCensus:
             if self.nvml_free_bytes is None
             else f"{self.nvml_free_bytes / MIB:.1f}"
         )
+        if self.arena_rows == 0:
+            # No live KvVmmArena in this process: print n/a, never a 0.0 MiB
+            # that reads like a measurement, and never `retain_handles=True`,
+            # which would be an assertion nothing was asserted against.
+            arena = (
+                "arena_backed=n/a arena_retained=n/a retain_handles=n/a "
+                "(no live KvVmmArena in this process)"
+            )
+        else:
+            arena = (
+                f"arena_backed={self.arena_backed_bytes / MIB:.1f} MiB "
+                f"arena_retained={self.arena_retained_bytes / MIB:.1f} MiB "
+                f"retain_handles={self.retain_handles_asserted}"
+            )
         return (
             f"[weg2 sleep-acceptance] uuid={self.nvml_uuid} pid={self.pid} "
             f"proc_used={used} MiB nvml_free={free} MiB "
-            f"arena_backed={self.arena_backed_bytes / MIB:.1f} MiB "
-            f"arena_retained={self.arena_retained_bytes / MIB:.1f} MiB "
-            f"rows={self.arena_rows} retain_handles_asserted="
-            f"{self.retain_handles_asserted} accepted={self.accepted} "
+            f"rows={self.arena_rows} {arena} accepted={self.accepted} "
             f"reason={self.refusal_reason or '-'} denominator={self.denominator}"
         )
 
@@ -326,8 +354,15 @@ def sleep_acceptance_census(
         backed += int(row.get("backed", 0))
         retained += int(row.get("retained", 0))
 
-    retain_handles_asserted = retained == 0
-    if not retain_handles_asserted:
+    arena_rows = len(rows or {})
+    # Tri-state, never a fabricated pass: with zero live arenas there is
+    # nothing to assert against, so `retain_handles` is n/a and `accepted` is
+    # decided by the NVML half ALONE.  Weg 2 makes the zero-row case permanent
+    # (W13 refuses --enable-vram-dial, S0/S7 delete the phase flip), so a
+    # `retain_handles_asserted=True` printed over an empty _LIVE_ARENAS would
+    # be quoted in every boot postmortem as a check that never ran.
+    retain_handles_asserted: Optional[bool] = None if arena_rows == 0 else retained == 0
+    if retain_handles_asserted is False:
         reasons.append(
             f"arena retain_handles is in force: {retained / MIB:.1f} MiB of "
             f"unmapped-but-owned ADDRESS SPACE stays charged to this process "
@@ -337,9 +372,16 @@ def sleep_acceptance_census(
         reasons.append(f"arena still backs {backed / MIB:.1f} MiB of device memory")
 
     accepted = proc_used is not None and not reasons
+    arena_denominator = (
+        "no live KvVmmArena, so the arena half is n/a and acceptance rests on "
+        "the NVML half alone"
+        if arena_rows == 0
+        else f"{arena_rows} live arena row(s)"
+    )
     denominator = (
         f"NVML per-process bytes for pid={pid} on uuid={uuid} over "
-        f"{proc_count} compute process(es); arena rows={len(rows or {})}"
+        f"{proc_count} compute process(es); arena_rows={arena_rows} "
+        f"({arena_denominator})"
     )
     return SleepAcceptanceCensus(
         pid=pid,
@@ -350,7 +392,7 @@ def sleep_acceptance_census(
         arena_reserved_bytes=reserved,
         arena_backed_bytes=backed,
         arena_retained_bytes=retained,
-        arena_rows=len(rows or {}),
+        arena_rows=arena_rows,
         retain_handles_asserted=retain_handles_asserted,
         accepted=accepted,
         refusal_reason="; ".join(reasons) if reasons else None,

@@ -40,10 +40,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.weg2_memory_saver import (
-    Weg2PcieLockTimeout,
     Weg2WakeRefused,
     assert_memory_saver_active,
     pcie_transfer_lock,
+    resolve_pcie_lock_key,
     sleep_acceptance_census,
 )
 
@@ -210,27 +210,30 @@ class SchedulerWeightUpdaterManager:
         * the lock is still held at the deadline -- that is a bounded wait
           whose expiry is a named refusal (``Weg2PcieLockTimeout``) and it
           PROPAGATES.  Never a longer wait, never a silent overlap.
+
+        The two are separated STRUCTURALLY, not by clause order.  The earlier
+        shape put `except Weg2PcieLockTimeout: raise` above a broad
+        `except Exception -> log + yield`, so deleting those two lines silently
+        downgraded every expiry to an unserialised overlap -- and the log line
+        then blamed "card key unresolved" for a lock that was merely held (own
+        mutant B-M2, which the whole suite survived green).  Here the only
+        thing inside a broad handler is the key resolution; the lock itself is
+        taken outside every `except`, so the refusal cannot be downgraded
+        without deleting the `with` statement that the AST gates pin.
         """
         try:
-            lock = pcie_transfer_lock(label=label)
-            lock.__enter__()
-        except Weg2PcieLockTimeout:
-            # A bounded wait that expired is a refusal, not a reason to
-            # overlap the link.  It propagates to the caller of the RPC.
-            raise
+            uuid_key = resolve_pcie_lock_key()
         except Exception as exc:
             logger.warning(
                 "[weg2 pcie] no PCIe serialisation for %s (card key "
-                "unresolved): %s -- proceeding unserialised",
+                "unresolved: %s) -- proceeding unserialised",
                 label,
                 exc,
             )
             yield
             return
-        try:
+        with pcie_transfer_lock(nvml_uuid=uuid_key, label=label):
             yield
-        finally:
-            lock.__exit__(None, None, None)
 
     def _weg2_log_sleep_acceptance(self) -> None:
         """Design (S) 2.4 step 11, EXECUTED on the flip path, not declared."""
@@ -249,6 +252,20 @@ class SchedulerWeightUpdaterManager:
         whose CONTENT IS UNDEFINED, so the weights are refilled through the
         upstream ``update_weights_from_disk`` endpoint from the page-cached
         checkpoint.  No fork loader: the upstream path is the path.
+
+        GATED on ``--enable-memory-saver``.  Without that flag every
+        ``pause()`` was a no-op, so nothing was ever released and there is
+        nothing to refill: a stock resume must be byte-for-byte the upstream
+        path.  Ungated, the ORDINARY upstream RL configuration
+        (``--enable-memory-saver`` alone, both backup flags default False --
+        ``server_args.py:6636`` / ``:6640``) paid a full checkpoint reload on
+        every wake (12.073/14.143/16.749 s measured on this rig, record
+        (S) 2.6), and that reload is not side-effect-free: ``model_runner.py``
+        ``:2866-2872`` rewrites ``self.load_config`` from a bare
+        ``LoadConfig(load_format=...)`` built at ``:2825``, discarding the
+        boot-time ``download_dir`` / ``model_loader_extra_config`` /
+        ``ignore_patterns``, and records a ``model_runner.update_weights``
+        override event for a weights update nobody requested.
         """
         server_args = self._weg2_server_args()
         if server_args is None:
@@ -259,7 +276,52 @@ class SchedulerWeightUpdaterManager:
                 "already been mutated; refusing rather than serving undefined "
                 "weights."
             )
-        if getattr(server_args, "enable_weights_cpu_backup", False):
+        if not getattr(server_args, "enable_memory_saver", False):
+            # Stock boot: pause() was `pass`, the pages were never released,
+            # the content is whatever it always was.  Upstream path, untouched.
+            return
+
+        # The backup verdict is NOT `server_args.enable_weights_cpu_backup`
+        # alone.  model_runner.py:2342-2344 builds the WEIGHTS region with
+        #   enable_weights_cpu_backup or (is_draft_worker and
+        #   enable_draft_weights_cpu_backup)
+        # so the draft shard in this process can be cpu-backed while the main
+        # shard is not.  The main shard is the binding term for "is a reload
+        # needed at all" (the draft's expression contains the main's), but a
+        # process whose two shards disagree cannot be served by ONE
+        # `update_weights_from_disk`: that call refills the main runner and
+        # then hands the SAME request -- and therefore the MAIN model_path --
+        # to the draft runner (weight_updater.py:120-121,
+        # eagle_worker_v2.py:3104-3107, multi_layer_eagle_worker_v2.py:1352-1362).
+        # Shards never disagree: STOP, never compensate.
+        main_carried = bool(getattr(server_args, "enable_weights_cpu_backup", False))
+        draft_carried = main_carried or bool(
+            getattr(server_args, "enable_draft_weights_cpu_backup", False)
+        )
+        if self.draft_worker is not None and draft_carried != main_carried:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: --enable-draft-weights-cpu-backup is set "
+                "without --enable-weights-cpu-backup, so the draft shard's "
+                "bytes were carried by the TMS restore and the main shard's "
+                "were not (model_runner.py:2342-2344). One "
+                "update_weights_from_disk serves both shards with one "
+                "model_path, so there is no arrangement that refills the main "
+                "shard without also pushing the main checkpoint through the "
+                "draft runner. Launch this group with both flags or neither."
+            )
+        if self.draft_worker is not None:
+            draft_path = getattr(server_args, "speculative_draft_model_path", None)
+            if draft_path is not None and draft_path != server_args.model_path:
+                raise Weg2WakeRefused(
+                    "W4 Weg2WakeRefused: the draft worker loads from "
+                    f"{draft_path!r}, not from {server_args.model_path!r}, and "
+                    "the backup-OFF wake has exactly one model_path to give. "
+                    "Refilling would push the main checkpoint through the "
+                    "draft runner. V1 runs MTP out of the main checkpoint "
+                    "(record 1b round-2 Q2, option (ii)); a separate draft "
+                    "checkpoint needs its own wake leg, which S1 does not build."
+                )
+        if main_carried:
             return
 
         # flush_cache MUST stay False here: at this point in the resume the KV
@@ -267,14 +329,25 @@ class SchedulerWeightUpdaterManager:
         # would write into unmapped pages -- the CAMPAIGN (a) fault, mirrored
         # onto the wake path.  torch_empty_cache likewise: the KV pool is about
         # to be recommitted.
-        out = self.update_weights_from_disk(
-            UpdateWeightFromDiskReqInput(
-                model_path=server_args.model_path,
-                load_format=getattr(server_args, "load_format", None),
-                flush_cache=False,
-                torch_empty_cache=False,
+        #
+        # The PCIe lock is taken HERE, a second time, and this is the take that
+        # matters in the V1 arm: with the cpu backup OFF,
+        # `resume(GPU_MEMORY_TYPE_WEIGHTS)` is a pure VMM recommit that moves
+        # no bytes, and the entire 12-17 s host->device refill is this call.
+        # Locking only the resume would leave the configured arm unserialised
+        # against a co-located sibling's sleep-D2H (spec (S) 2.7).  Safe to take
+        # after the caller's barrier(tp_cpu_group): update_weights_from_disk
+        # holds no collective (weight_updater.py:115-128 -> tp_worker.py:103-109
+        # -> model_runner.update_weights_from_disk, none of them collective).
+        with self._weg2_pcie_lock("wake-H2D weights reload"):
+            out = self.update_weights_from_disk(
+                UpdateWeightFromDiskReqInput(
+                    model_path=server_args.model_path,
+                    load_format=getattr(server_args, "load_format", None),
+                    flush_cache=False,
+                    torch_empty_cache=False,
+                )
             )
-        )
         if not getattr(out, "success", False):
             raise Weg2WakeRefused(
                 "W4 Weg2WakeRefused: the backup-OFF wake could not refill the "
@@ -288,7 +361,28 @@ class SchedulerWeightUpdaterManager:
         # no-op adapter every pause() below is `pass` and this RPC returns
         # success having released nothing.  A refusal that has already paused
         # a tag is not a refusal, so this is the first statement.
-        assert_memory_saver_active(self.memory_saver_adapter, context="first sleep")
+        #
+        # GATED on --enable-memory-saver, exactly like the launch arm in
+        # Scheduler.__init__.  This RPC is SHARED with the fork's #89
+        # hibernate: /hibernate sets destination="disk", tags=["weights"] and
+        # posts it (http_server.py:2034-2036), and hibernate is not gated on
+        # the memory saver (server_args.py:18214-18222 requires only
+        # --hibernate-dir).  Ungated, a stock boot's POST /hibernate raised
+        # here before _hibernate_park_weights ever ran; the dispatcher does not
+        # catch it (scheduler.py:2963), so it reached
+        # parent_process.send_signal(SIGQUIT) and killed the server -- and the
+        # registry's Class-1 adapter swallows the HTTP error
+        # (registry/adapters/class1_srt.py:401-408), so the feature died
+        # silently on every engine stop.  (S) 2.1's stated hazard -- "a
+        # launcher edit that drops the flag makes every sleep a no-op" -- stays
+        # covered: a Weg-2 group always carries the flag, and the launch arm
+        # already refuses the flag-on/adapter-dead boot before the first
+        # request.  Undecidable (no server_args reachable) -> refuse: a Weg-2
+        # group always has one, and a sleep whose gate cannot be read is not a
+        # sleep.
+        server_args = self._weg2_server_args()
+        if server_args is None or getattr(server_args, "enable_memory_saver", False):
+            assert_memory_saver_active(self.memory_saver_adapter, context="first sleep")
 
         assert (
             self.is_fully_idle()

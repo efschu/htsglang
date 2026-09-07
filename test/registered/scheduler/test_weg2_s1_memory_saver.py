@@ -32,6 +32,7 @@ import sys
 import textwrap
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, List, Optional
 
 import pytest
@@ -123,11 +124,24 @@ class FakeDeviceModule:
 
 
 class FakeServerArgs:
-    def __init__(self, *, enable_weights_cpu_backup: bool):
+    def __init__(
+        self,
+        *,
+        enable_weights_cpu_backup: bool,
+        enable_memory_saver: bool = True,
+        enable_draft_weights_cpu_backup: bool = False,
+        speculative_draft_model_path: Optional[str] = None,
+    ):
         self.enable_weights_cpu_backup = enable_weights_cpu_backup
+        # model_runner.py:2342-2344 builds the WEIGHTS region with
+        # `enable_weights_cpu_backup or (is_draft_worker and
+        # enable_draft_weights_cpu_backup)`, so the draft shard's backup verdict
+        # is a DIFFERENT expression from the main shard's.
+        self.enable_draft_weights_cpu_backup = enable_draft_weights_cpu_backup
+        self.speculative_draft_model_path = speculative_draft_model_path
         self.model_path = "/models/fake-27b"
         self.load_format = "auto"
-        self.enable_memory_saver = True
+        self.enable_memory_saver = enable_memory_saver
 
 
 class FakeScheduler:
@@ -136,22 +150,54 @@ class FakeScheduler:
         self.disaggregation_mode = None
 
 
+class FakeTpWorker:
+    """Just enough of ``self.tp_worker.model_runner.model`` for the sleep RPC."""
+
+    class _Runner:
+        model = object()
+
+    model_runner = _Runner()
+
+
 def _make_manager(
     *,
     adapter: FakeAdapter,
     server_args: Optional[FakeServerArgs] = None,
     idle: bool = True,
+    draft_worker: Any = None,
+    tp_worker: Any = None,
 ) -> Any:
     scheduler = FakeScheduler(server_args) if server_args is not None else None
     return wu.SchedulerWeightUpdaterManager(
-        tp_worker=None,
-        draft_worker=None,
+        tp_worker=tp_worker,
+        draft_worker=draft_worker,
         tp_cpu_group=None,
         memory_saver_adapter=adapter,
         flush_cache=lambda *a, **k: True,
         is_fully_idle=lambda *a, **k: idle,
         scheduler=scheduler,
     )
+
+
+@pytest.fixture()
+def noop_pcie_lock(monkeypatch):
+    """Hermetic stand-in for the per-card ``flock``.
+
+    ``_weg2_wake_reload_weights`` now takes the PCIe lock around the refill, so
+    a test that calls it directly would otherwise reach NVML and ``/dev/shm``.
+    The lock's own two behaviours are pinned separately by
+    ``test_pcie_lock_wrapper_propagates_the_named_refusal`` and
+    ``test_pcie_lock_wrapper_degrades_when_the_card_key_is_unresolvable``.
+    """
+    from contextlib import contextmanager as _cm
+
+    monkeypatch.setattr(wu, "resolve_pcie_lock_key", lambda: "GPU-hermetic")
+
+    @_cm
+    def _noop(**kwargs):
+        yield kwargs.get("label", "transfer")
+
+    monkeypatch.setattr(wu, "pcie_transfer_lock", _noop)
 
 
 def _record_disk_reload(monkeypatch, outcome=None) -> List[Any]:
@@ -362,6 +408,15 @@ def test_census_reports_per_process_bytes_and_its_denominator():
     assert census.denominator, "an instrument without a denominator is not one"
     line = census.format_line()
     assert "GPU-fake" in line and "denominator=" in line
+    # ZERO live arenas is the PERMANENT state under Weg 2 (--enable-vram-dial
+    # is refused by W13 and the phase flip is deleted by S0/S7), so the arena
+    # half must read n/a here.  Printing `arena_backed=0.0 MiB
+    # retain_handles_asserted=True` would be a fabricated measurement, and the
+    # boot postmortem would quote a pass the instrument never took.
+    assert census.retain_handles_asserted is None
+    assert "arena_backed=n/a" in line
+    assert "retain_handles=n/a" in line
+    assert "arena_rows=0" in census.denominator
 
 
 def test_census_refuses_acceptance_when_handles_are_retained():
@@ -504,9 +559,43 @@ def test_sleep_d2h_is_serialised_on_the_card():
 
 
 def test_wake_h2d_is_serialised_on_the_card():
+    """BOTH wake legs, because only one of them transfers in each arm.
+
+    With ``--enable-weights-cpu-backup`` the H2D is inside
+    ``resume(GPU_MEMORY_TYPE_WEIGHTS)``.  With it OFF -- the V1 arm of record
+    (record 1b round-2 Q2, option (ii)) -- that resume is a pure VMM recommit
+    that moves no bytes, and the whole 12-17 s refill is the
+    ``update_weights_from_disk`` leg inside ``_weg2_wake_reload_weights``.
+    A gate that pins only the first arm leaves the configured arm unserialised.
+    """
     body = _tag_block(_func_ast("resume_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
     guards = _with_items_around(body, "resume(GPU_MEMORY_TYPE_WEIGHTS)")
-    assert any("_weg2_pcie_lock" in g for g in guards)
+    assert any(
+        "_weg2_pcie_lock" in g for g in guards
+    ), "the backup-ON wake H2D is not under the per-physical-GPU PCIe lock"
+
+    reload_body = _func_ast("_weg2_wake_reload_weights").body
+    reload_guards = _with_items_around(reload_body, "update_weights_from_disk")
+    assert any("_weg2_pcie_lock" in g for g in reload_guards), (
+        "the backup-OFF wake refill (update_weights_from_disk, the only leg "
+        "that moves bytes in the V1 arm) runs OUTSIDE the PCIe lock; a "
+        "co-located sibling's sleep-D2H halves both"
+    )
+
+
+def test_wake_reload_holds_no_collective_under_the_pcie_lock():
+    """The second lock take must keep the invariant the first one keeps."""
+    func = _func_ast("_weg2_wake_reload_weights")
+    for stmt in ast.walk(func):
+        if not isinstance(stmt, ast.With):
+            continue
+        if not any(
+            "_weg2_pcie_lock" in ast.unparse(item.context_expr) for item in stmt.items
+        ):
+            continue
+        assert "torch.distributed.barrier" not in ast.unparse(
+            stmt
+        ), "_weg2_wake_reload_weights holds the PCIe lock across a collective"
 
 
 def test_no_collective_is_held_under_the_pcie_lock():
@@ -543,7 +632,7 @@ def test_pcie_lock_path_is_not_the_l2_ring_path(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_wake_reloads_from_disk_when_cpu_backup_is_off(monkeypatch):
+def test_wake_reloads_from_disk_when_cpu_backup_is_off(monkeypatch, noop_pcie_lock):
     manager = _make_manager(
         adapter=FakeAdapter(enabled=True),
         server_args=FakeServerArgs(enable_weights_cpu_backup=False),
@@ -556,7 +645,9 @@ def test_wake_reloads_from_disk_when_cpu_backup_is_off(monkeypatch):
     assert req.load_format == "auto"
 
 
-def test_wake_reload_never_flushes_the_still_paused_kv_pool(monkeypatch):
+def test_wake_reload_never_flushes_the_still_paused_kv_pool(
+    monkeypatch, noop_pcie_lock
+):
     """Danger direction: at this point ``pause(kv_cache)`` is still in force."""
     manager = _make_manager(
         adapter=FakeAdapter(enabled=True),
@@ -581,7 +672,7 @@ def test_wake_does_not_reload_when_cpu_backup_is_on(monkeypatch):
     assert calls == [], "the TMS cpu-backup buffer already carried the bytes"
 
 
-def test_wake_refuses_when_the_reload_fails(monkeypatch):
+def test_wake_refuses_when_the_reload_fails(monkeypatch, noop_pcie_lock):
     from sglang.srt.managers.weg2_memory_saver import Weg2WakeRefused
 
     manager = _make_manager(
@@ -675,6 +766,324 @@ def test_all_three_upstream_tags_are_still_handled_on_release():
         "GPU_MEMORY_TYPE_CUDA_GRAPH",
     ):
         assert tag in src
+
+
+# ---------------------------------------------------------------------------
+# 8. FIX ROUND 1 -- the stock boot, the wired census, and the wrapper itself
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def stock_boot_stubs(monkeypatch):
+    """Everything the weights sleep touches that a hermetic test has no copy of.
+
+    Deliberately does NOT stub ``_hibernate_park_weights``: each test that
+    needs it records it itself, so a test cannot pass on a stub that swallowed
+    the very call it claims to prove.
+    """
+    monkeypatch.setattr(wu, "_export_static_state", lambda model: {"stub": True})
+    monkeypatch.setattr(wu.torch.distributed, "barrier", lambda *a, **k: None)
+    monkeypatch.setattr(
+        wu.SchedulerWeightUpdaterManager,
+        "_weg2_log_sleep_acceptance",
+        lambda self: None,
+    )
+    monkeypatch.setattr(wu, "resolve_pcie_lock_key", lambda: "GPU-hermetic")
+
+    @contextmanager
+    def _noop_lock(**kwargs):
+        yield kwargs.get("label", "transfer")
+
+    monkeypatch.setattr(wu, "pcie_transfer_lock", _noop_lock)
+
+
+def _record_hibernate_park(monkeypatch) -> List[Any]:
+    calls: List[Any] = []
+    monkeypatch.setattr(
+        wu.SchedulerWeightUpdaterManager,
+        "_hibernate_park_weights",
+        lambda self, req: calls.append(req),
+    )
+    return calls
+
+
+def test_stock_boot_sleep_is_not_refused_and_still_parks_to_disk(
+    monkeypatch, fake_device, stock_boot_stubs
+):
+    """W12 is a WEG-2 refusal; ungated it deletes the fork's #89 hibernate.
+
+    ``/hibernate`` (http_server.py:2034-2036) sets ``destination="disk"``,
+    ``tags=["weights"]`` and posts THIS RPC, and hibernate is not gated on the
+    memory saver (server_args.py:18214-18222 requires only --hibernate-dir).
+    On a stock boot the adapter is the no-op one, so an ungated
+    ``assert_memory_saver_active`` raises before ``_hibernate_park_weights``
+    ever runs -- and the raise is not caught by the dispatcher
+    (scheduler.py:2963), so it reaches ``parent_process.send_signal(SIGQUIT)``:
+    a POST /hibernate kills the server instead of parking weights.  The
+    registry's Class-1 adapter then swallows it
+    (registry/adapters/class1_srt.py:401-408, `except Exception -> warning,
+    stopping anyway`), so the feature dies silently.
+    """
+    adapter = FakeAdapter(enabled=False)
+    manager = _make_manager(
+        adapter=adapter,
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False, enable_memory_saver=False
+        ),
+        tp_worker=FakeTpWorker(),
+    )
+    parked = _record_hibernate_park(monkeypatch)
+    req = wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+    req.destination = "disk"
+
+    out = manager.release_memory_occupation(req)
+
+    assert isinstance(out, wu.ReleaseMemoryOccupationReqOutput)
+    assert len(parked) == 1, (
+        "the #89 hibernate disk park never ran on a stock boot; W12's "
+        "first-sleep arm is ungated and deletes the feature"
+    )
+
+
+def test_weg2_boot_sleep_still_refuses_a_dead_adapter(fake_device, stock_boot_stubs):
+    """The gate must narrow W12, never delete it: flag ON + adapter dead."""
+    from sglang.srt.managers.weg2_memory_saver import Weg2MemorySaverInactive
+
+    adapter = FakeAdapter(enabled=False)
+    manager = _make_manager(
+        adapter=adapter,
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False, enable_memory_saver=True
+        ),
+    )
+    with pytest.raises(Weg2MemorySaverInactive):
+        manager.release_memory_occupation(
+            wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+        )
+    assert adapter.paused == []
+
+
+def test_wake_does_not_reload_from_disk_on_a_stock_boot(monkeypatch):
+    """A non-Weg-2 resume must be byte-for-byte the upstream path.
+
+    ``--enable-memory-saver`` without ``--enable-weights-cpu-backup`` is the
+    ORDINARY upstream RL configuration (both default False, server_args.py:6636
+    / :6640).  Ungated, every such wake paid a full
+    ``update_weights_from_disk`` -- measured 12.073/14.143/16.749 s on this rig
+    (record (S) 2.6) -- and it is not side-effect-free: model_runner.py:2866-2872
+    rewrites ``self.load_config`` from a bare ``LoadConfig(load_format=...)``
+    (:2825), discarding download_dir / model_loader_extra_config /
+    ignore_patterns, and records a ``model_runner.update_weights`` override
+    event that no operator asked for.
+    """
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False, enable_memory_saver=False
+        ),
+    )
+    calls = _record_disk_reload(monkeypatch)
+    manager._weg2_wake_reload_weights()
+    assert calls == [], (
+        "a stock memory-saver wake performed a full checkpoint reload and "
+        "rewrote the model runner's load_config"
+    )
+
+
+def test_wake_refuses_when_the_draft_backup_verdict_differs(monkeypatch):
+    """``enable_weights_cpu_backup`` alone is not the authority.
+
+    model_runner.py:2342-2344: the draft runner's region is cpu-backed by
+    ``enable_weights_cpu_backup or (is_draft_worker and
+    enable_draft_weights_cpu_backup)``.  Under the draft flag ALONE the two
+    shards in this process disagree about whether their bytes were carried,
+    and the one upstream primitive available here
+    (``update_weights_from_disk``) serves both shards with one request -- so
+    there is no arrangement that refills the main shard without also pushing
+    the MAIN model path through the draft runner
+    (eagle_worker_v2.py:3104-3107).  Ranks/shards never disagree: STOP.
+    """
+    from sglang.srt.managers.weg2_memory_saver import Weg2WakeRefused
+
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False,
+            enable_draft_weights_cpu_backup=True,
+        ),
+        draft_worker=object(),
+    )
+    calls = _record_disk_reload(monkeypatch)
+    with pytest.raises(Weg2WakeRefused) as exc:
+        manager._weg2_wake_reload_weights()
+    assert "--enable-draft-weights-cpu-backup" in str(exc.value)
+    assert calls == [], "the refusal must precede the reload, not follow it"
+
+
+def test_wake_refuses_when_the_draft_checkpoint_is_a_different_one(monkeypatch):
+    """One request, one ``model_path`` -- and the draft runner gets it too."""
+    from sglang.srt.managers.weg2_memory_saver import Weg2WakeRefused
+
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(
+            enable_weights_cpu_backup=False,
+            speculative_draft_model_path="/models/other-draft",
+        ),
+        draft_worker=object(),
+    )
+    calls = _record_disk_reload(monkeypatch)
+    with pytest.raises(Weg2WakeRefused) as exc:
+        manager._weg2_wake_reload_weights()
+    assert "/models/other-draft" in str(exc.value)
+    assert calls == []
+
+
+def test_wake_reloads_when_the_draft_shares_the_main_checkpoint(
+    monkeypatch, noop_pcie_lock
+):
+    """The V1 arm: MTP, no separate draft path, both backup flags off."""
+    manager = _make_manager(
+        adapter=FakeAdapter(enabled=True),
+        server_args=FakeServerArgs(enable_weights_cpu_backup=False),
+        draft_worker=object(),
+    )
+    calls = _record_disk_reload(monkeypatch)
+    manager._weg2_wake_reload_weights()
+    assert len(calls) == 1
+    assert calls[0].model_path == "/models/fake-27b"
+
+
+def test_census_refuses_acceptance_when_the_arena_still_backs_device_memory():
+    """B-M3: ``backed`` is the field that guards RESIDENT device memory.
+
+    ``arena_census()``'s own docstring (kv_vmm_backing.py:307) calls ``backed``
+    mapped physical memory, while ``retained`` is only unmapped-but-owned
+    address space -- so this is the MORE load-bearing of the two, and it was
+    the untested one.
+    """
+    from sglang.srt.managers.weg2_memory_saver import sleep_acceptance_census
+
+    census = sleep_acceptance_census(
+        nvml_uuid="GPU-fake",
+        _process_bytes={4242: 1294 * 1024 * 1024},
+        _memory_info=(32_088 * 1024 * 1024, 30_730 * 1024 * 1024),
+        _arena_census={
+            0: {"reserved": 8 << 30, "backed": 2 << 30, "retained": 0, "arenas": 1}
+        },
+        _pid=4242,
+    )
+    assert census.arena_backed_bytes == 2 << 30
+    assert census.accepted is False
+    assert "backs" in (census.refusal_reason or "")
+
+
+def test_census_asserts_retain_handles_only_on_a_row_bearing_read():
+    """The genuinely-earned branch: rows exist and they say retained == 0."""
+    from sglang.srt.managers.weg2_memory_saver import sleep_acceptance_census
+
+    census = sleep_acceptance_census(
+        nvml_uuid="GPU-fake",
+        _process_bytes={4242: 1294 * 1024 * 1024},
+        _memory_info=(32_088 * 1024 * 1024, 30_730 * 1024 * 1024),
+        _arena_census={
+            0: {"reserved": 8 << 30, "backed": 0, "retained": 0, "arenas": 1}
+        },
+        _pid=4242,
+    )
+    assert census.retain_handles_asserted is True
+    assert census.accepted is True
+    assert "retain_handles=True" in census.format_line()
+
+
+def test_sleep_rpc_runs_the_acceptance_census():
+    """B-M6: the one instrument whose wiring was asserted only in prose.
+
+    Building an instrument means wiring it in the SAME step (standing law);
+    every sibling wiring claim in this slice is pinned by an AST gate.
+    """
+    func = _func_ast("release_memory_occupation")
+    idx = _call_index(func.body, "_weg2_log_sleep_acceptance")
+    empty_at = _call_index(func.body, "empty_cache")
+    assert idx >= 0, "the sleep-acceptance census is never executed on the sleep path"
+    assert empty_at >= 0
+    assert empty_at < idx, "the census must read AFTER the allocator cache is emptied"
+
+
+def _bind_real_pcie_lock(monkeypatch, tmp_path, *, timeout_s: float = 0.5):
+    """Point the wrapper at a real ``flock`` in ``tmp_path`` with a short deadline."""
+    from sglang.srt.managers import weg2_memory_saver as wms
+
+    real = wms.pcie_transfer_lock
+    monkeypatch.setattr(wu, "resolve_pcie_lock_key", lambda: "GPU-a")
+
+    def _bound(**kwargs):
+        return real(
+            nvml_uuid=kwargs.get("nvml_uuid") or "GPU-a",
+            lock_dir=str(tmp_path),
+            timeout_s=timeout_s,
+            label=kwargs.get("label", "transfer"),
+        )
+
+    monkeypatch.setattr(wu, "pcie_transfer_lock", _bound)
+
+
+def test_pcie_lock_wrapper_propagates_the_named_refusal(monkeypatch, tmp_path):
+    """B-M2: the wrapper, not the module-level lock.
+
+    ``test_pcie_lock_wait_is_bounded`` exercises ``pcie_transfer_lock``; the
+    WRAPPER ``_weg2_pcie_lock`` -- the thing the two RPCs actually call -- had
+    no direct test, and its refusal survived only because an ``except
+    Weg2PcieLockTimeout: raise`` clause happened to sit above a broad
+    ``except Exception -> log + yield``.  Deleting those four lines turned
+    every expiry into a silent unserialised overlap with the whole suite green.
+    """
+    from sglang.srt.managers import weg2_memory_saver as wms
+    from sglang.srt.managers.weg2_memory_saver import Weg2PcieLockTimeout
+
+    _bind_real_pcie_lock(monkeypatch, tmp_path)
+    manager = _make_manager(adapter=FakeAdapter(enabled=True))
+
+    hold = threading.Event()
+    released = threading.Event()
+
+    def _holder():
+        with wms.pcie_transfer_lock(
+            nvml_uuid="GPU-a", lock_dir=str(tmp_path), timeout_s=5.0
+        ):
+            hold.set()
+            released.wait(timeout=10)
+
+    thread = threading.Thread(target=_holder)
+    thread.start()
+    try:
+        hold.wait(timeout=10)
+        entered = False
+        with pytest.raises(Weg2PcieLockTimeout):
+            with manager._weg2_pcie_lock("sleep-D2H weights"):
+                entered = True
+        assert not entered, "the wrapper ran the transfer body after the deadline"
+    finally:
+        released.set()
+        thread.join(timeout=10)
+
+
+def test_pcie_lock_wrapper_degrades_when_the_card_key_is_unresolvable(monkeypatch):
+    """The OTHER failure mode, kept apart on purpose: no key to serialise on.
+
+    Intentional degrade -- this lock is a throughput guard; the correctness
+    guards on this path are W12, W4 and the barriers.
+    """
+
+    def _boom():
+        raise RuntimeError("no NVML on this box")
+
+    monkeypatch.setattr(wu, "resolve_pcie_lock_key", _boom)
+    manager = _make_manager(adapter=FakeAdapter(enabled=True))
+    ran = False
+    with manager._weg2_pcie_lock("wake-H2D weights"):
+        ran = True
+    assert ran, "an unresolvable card key must not skip the transfer"
 
 
 # ---------------------------------------------------------------------------
