@@ -75,6 +75,15 @@ CORRIDOR_MIB = 1024
 #: first sleep by the front.  Plus D's open BAR1 windows (deviation above).
 DC_EXPECT_5090_MIB = 1848
 DC_EXPECT_3080_MIB = 1442
+#: MEASURED on boot weg2ls1b2 (2026-09-07 07:11:55-58Z, NVML per-process at
+#: group D's first sleep, tags kv_cache+weights, NEXTN draft + TP decode
+#: graphs resident): D_c(D) = 2228 MiB on the 5090, 1922 MiB on each 3080 --
+#: ABOVE the spec 1.6 expectations by 380 / 480 MiB.  These carry the
+#: provenance into P's budget until a boot measures them again; the front's
+#: W19 still grades the live measurement against the reserve actually used.
+DC_MEASURED_D_5090_MIB = 2228
+DC_MEASURED_D_3080_MIB = 1922
+DC_RESERVE_SLACK_MIB = 64
 D_WINDOWS_MIB = 16 + 32 + 24
 P_WINDOWS_MIB = 24 + 96
 MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
@@ -608,9 +617,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         os.makedirs(store_dir, exist_ok=True)
 
     # 4. group P
-    dc_expect_d = {c.uuid: (DC_EXPECT_5090_MIB if "5090" in c.name else DC_EXPECT_3080_MIB) + D_WINDOWS_MIB for c in cards}
+    dc_expect_d = {
+        c.uuid: (DC_MEASURED_D_5090_MIB if "5090" in c.name else DC_MEASURED_D_3080_MIB) + DC_RESERVE_SLACK_MIB
+        for c in cards
+    }
     state.dc_expect_d = dc_expect_d
-    log("dormant residue EXPECTATION for group D (spec 1.6 V1 arm B + D's open BAR1 windows; graded by W19 at D's first sleep): "
+    log("dormant residue RESERVE for group D = MEASURED D_c(D) of boot weg2ls1b2 (2228 / 1922 / 1922 MiB, "
+        f"NVML per-process, windows included) + {DC_RESERVE_SLACK_MIB} MiB slack; spec 1.6 expectation was "
+        f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); graded by W19 at D's first sleep: "
         + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
     budgets_p = budgets_from_dc(cards, dc_expect_d, log, "P")
     state.budgets["P"] = budgets_p
