@@ -8883,6 +8883,38 @@ class Scheduler(
         if pp_size > 1:
             if int(getattr(self.ps, "pp_rank", 0) or 0) != 0:
                 return chunked_prefill_size
+            # #1233 (boots weg2ls2b1/b2, 2026-09-07 08:40:55Z and 08:58:37Z):
+            # "PP0 DECIDES AND THE RING CARRIES IT" holds only while the #631
+            # row carrier exists. On the no-flip PP=3 form the followers log
+            # '#631 ROW AUTHORITY DISABLED' and plan rank-locally at the
+            # requested width; PP0 alone narrowed 4096 -> 448 here ('#656
+            # CORRIDOR-ADMISSION NARROWED', 785 MiB free on the 5090), sent a
+            # 448-row proxy for the followers' 4096-token batch, and PP1 died
+            # in the GDN extend with an illegal memory access. Same key as
+            # #973: PP0 may decide differently from its followers only when
+            # the carrier makes them execute its decision. Without it the
+            # width is the configured one on every rank, and the card's
+            # headroom is the launcher's job (weg2 launcher: P's measured
+            # awake overshoot is charged to its budget, so #656 has no reason
+            # to narrow). Any mismatch that still reaches the ring is refused
+            # by name in model_runner (PPWidthDivergenceRefused), never run.
+            if not pp_row_carrier_present(self):
+                _n = getattr(self, "_corridor_width_disarmed_calls", 0) + 1
+                self._corridor_width_disarmed_calls = _n
+                if _n == 1 or _n % 500 == 0:
+                    logger.warning(
+                        "#1233 #794 PP0 CORRIDOR NARROWING DISARMED: no #631 "
+                        "row carrier on this boot form (pp_size=%d), so a "
+                        "width cut taken here would reach the followers only "
+                        "as a mismatched proxy. The chunk stays at the "
+                        "configured %d tokens on every rank; the card's "
+                        "headroom is the launcher's budget term. passes=%d "
+                        "(every PP0 prefill-width decision on this form)",
+                        pp_size,
+                        requested,
+                        _n,
+                    )
+                return chunked_prefill_size
         else:
             grp = getattr(self, "tp_cpu_group", None)
             try:
@@ -11085,7 +11117,16 @@ class Scheduler(
                     # own fresh match, which is what the peers already do and
                     # what 94 of 94 healthy extents in the specimen boot show
                     # to be rank-uniform.
-                    if pp_row_authority_enabled(self):
+                    # #1233 sibling sweep (same class as the #973 wait and the
+                    # #794 width cut): the clamp is distributable only where
+                    # the CARRIER exists, not where the LAW is on. On the
+                    # no-flip PP=3 form pp_row_authority_enabled is True and
+                    # the followers still plan from their own fresh match
+                    # ('#631 ROW AUTHORITY DISABLED'), so this arm would move
+                    # PP0's prefix alone. pp_row_carrier_present is the same
+                    # fact the follower half keys on; byte-identical where
+                    # the carrier exists.
+                    if pp_row_carrier_present(self):
                         # #631 ROW AUTHORITY: the telling half is alive again
                         # (downstream builds from the row it receives BEFORE
                         # planning), so PP0's learned-floor clamp is

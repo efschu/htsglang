@@ -291,6 +291,44 @@ def pp_row_carrier_present(scheduler) -> bool:
 UNRESOLVED_DEFER_CAP = 3
 
 
+class PPWidthDivergenceRefused(RuntimeError):
+    """#1233: a PP stage received a proxy whose row count is not its batch.
+
+    RAENGE-NIE-UNEINS: two ranks that built different batches for the same
+    pass must STOP by name, on every boot form. Measured twice on the no-flip
+    PP=3 form (boots weg2ls2b1/b2, 2026-09-07): the #1004 guard in
+    model_runner logged 'WIDTH GUARD BYPASSED (flip off): 448 row(s) for 4096
+    token(s)' and continued, and the GDN extend then indexed 4096 positions
+    into a 448-row hidden state -- 'CUDA error: an illegal memory access',
+    a dead context, and a group that died five minutes later on a ring
+    deadline instead of at the divergence. The bypass rested on the claim
+    that with the flip off the mismatch cannot occur; it occurred.
+    """
+
+
+def refuse_pp_width_divergence(
+    received_rows: int, wanted_rows: int, provenance: str = ""
+) -> None:
+    """Raise :class:`PPWidthDivergenceRefused` unless the rows agree.
+
+    The one check every PP stage's forward passes through (model_runner,
+    the #631 width guard) calls this on the form where the guard used to
+    bypass. Pure, so the refusal can be shown to fail at the desk.
+    """
+    if int(received_rows) == int(wanted_rows):
+        return
+    raise PPWidthDivergenceRefused(
+        f"#1233 W27 PP WIDTH DIVERGENCE REFUSED: received hidden_states with "
+        f"{int(received_rows)} row(s) for a batch of {int(wanted_rows)} "
+        f"token(s) ({provenance or 'no provenance'}). Two PP stages built "
+        f"different batches for the same pass; the ranks disagree and this "
+        f"group stops here by name instead of running the kernel off the "
+        f"tensor (boots weg2ls2b1/b2: illegal memory access in the GDN "
+        f"extend). Look at the ADMISSION on the sender and on this rank, not "
+        f"at the wire."
+    )
+
+
 class PPScheduleRefused(Exception):
     """#791 CORE: this rank cannot EXECUTE the forwarded pass geometry.
 

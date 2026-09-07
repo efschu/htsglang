@@ -92,6 +92,18 @@ DC_EXPECT_3080_MIB = 1442
 DC_MEASURED_D_5090_MIB = 2228
 DC_MEASURED_D_3080_MIB = 1922
 DC_RESERVE_SLACK_MIB = 64
+#: #1233 boot weg2ls2b2 (2026-09-07 08:58Z, front corridor sampler with group
+#: P awake, epoch 1, idle after the wake): NVML free 785 / 1806 / 990 MiB on
+#: the 5090 (PP0) / nvml0 (PP1) / nvml2 (PP2) against the budget line's own
+#: expectation total - budget - D_c(D) measured = 1501 / 1496 / 1498 MiB, i.e.
+#: P lands 716 MiB OVER its line on the 5090 and 508 over on PP2 (PP1 310
+#: under).  The 5090 shortfall armed PP0's rank-local #656 narrowing (4096 ->
+#: 448) and killed the group (b1/b2 killer).  Charged here PER P ORDINAL so
+#: that P's idle free lands ~1.7 GiB on the 5090 (a full 4096-token GDN chunk
+#: prices ~635 MiB of transient there; the #656 floor is 1024) and ~1.5 GiB on
+#: PP2; PP1 keeps its budget.  R5 grades the result; a boot that measures a
+#: different overshoot replaces these numbers, it does not add to them.
+P_OVERSHOOT_MIB = [920, 0, 512]
 D_WINDOWS_MIB = 16 + 32 + 24
 P_WINDOWS_MIB = 24 + 96
 MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
@@ -584,15 +596,24 @@ def build_tms_preload(tree: str, venv: str, log: Log) -> str:
     return so
 
 
-def budgets_from_dc(cards: List[Card], dc_mib: Dict[str, int], log: Log, label: str) -> List[int]:
+def budgets_from_dc(
+    cards: List[Card],
+    dc_mib: Dict[str, int],
+    log: Log,
+    label: str,
+    overshoot_mib: Optional[List[int]] = None,
+) -> List[int]:
     out = []
-    for c in cards:
-        b = c.total_mib - CORRIDOR_MIB - dc_mib[c.uuid]
+    for i, c in enumerate(cards):
+        over = int(overshoot_mib[i]) if overshoot_mib is not None else 0
+        b = c.total_mib - CORRIDOR_MIB - dc_mib[c.uuid] - over
         b = (b // 8) * 8
         out.append(b)
         log(
-            f"budget {label} ordinal={cards.index(c)} nvml_idx={c.nvml_index} {c.name}: "
-            f"{b} MiB = total {c.total_mib} - corridor {CORRIDOR_MIB} - dormant_other {dc_mib[c.uuid]} MiB"
+            f"budget {label} ordinal={i} nvml_idx={c.nvml_index} {c.name}: "
+            f"{b} MiB = total {c.total_mib} - corridor {CORRIDOR_MIB} - dormant_other {dc_mib[c.uuid]}"
+            + (f" - measured_awake_overshoot {over} (boot weg2ls2b2)" if over else "")
+            + " MiB"
         )
     return out
 
@@ -690,7 +711,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"NVML per-process, windows included) + {DC_RESERVE_SLACK_MIB} MiB slack; spec 1.6 expectation was "
         f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); graded by W19 at D's first sleep: "
         + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
-    budgets_p = budgets_from_dc(cards, dc_expect_d, log, "P")
+    budgets_p = budgets_from_dc(cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB)
     state.budgets["P"] = budgets_p
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so)
     spec_p = GroupSpec("P", PORT_P, argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), state.logs["P"], env_p)

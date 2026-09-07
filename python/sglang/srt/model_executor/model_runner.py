@@ -4276,13 +4276,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if not getattr(
                     self.server_args, "enable_phase_flip", False
                 ):
-                    logger.warning(
-                        "#1004 #631 WIDTH GUARD BYPASSED (flip off): %d row(s) "
-                        "for %d token(s). The layer this guard belongs to is "
-                        "gated on enable_phase_flip; with one layout there is "
-                        "no cutover for it to police. Counted, never silent.",
+                    # #1233: THE BYPASS IS GONE. Boots weg2ls2b1/b2 (no-flip
+                    # PP=3, 2026-09-07) logged exactly this line ('448 row(s)
+                    # for 4096 token(s)') and the next kernel walked off the
+                    # tensor. A width divergence is never benign on any form;
+                    # the forward below indexes `_want` positions into `_hs`.
+                    # The falsifier the old comment asked for is answered:
+                    # the mispairing on the flip-off form was OURS (PP0's
+                    # rank-local #656 narrowing without the row carrier),
+                    # and the group now stops here by name.
+                    from sglang.srt.managers.pp_admission_congruence import (
+                        refuse_pp_width_divergence,
+                    )
+
+                    logger.error(
+                        "#1233 #631 WIDTH GUARD (flip off): %d row(s) for %d "
+                        "token(s); %s -- refusing by name.",
                         _hs.shape[0],
                         _want,
+                        _prov,
+                    )
+                    refuse_pp_width_divergence(
+                        _hs.shape[0], _want, _prov
                     )
                 else:
                     # F1 2026-08-31: the old text here claimed "the PP stages
