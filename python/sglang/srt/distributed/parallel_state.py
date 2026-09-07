@@ -1079,11 +1079,15 @@ class GroupCoordinator:
         (the sleep/wake RPC) owns the deadline -- this method has none of its
         own and must not grow one.
 
-        THIS METHOD ADDS NO REFUSAL, AND W6 IS CONDITIONAL ON THE ENVIRONMENT.
-        (S2 does add one refusal, but on the other side of the sleep: a
-        CLOSED `BarlinkCommunicator` now raises from `_select` instead of
-        answering over the gloo plane, so a group whose wake never reached
-        this method refuses rather than serving off-transport in silence.)
+        TWO REFUSALS OF ITS OWN, AND W6 IS CONDITIONAL ON THE ENVIRONMENT.
+        The first is below: a rebuild while CUDA graphs still hold this
+        transport's captured kernels is refused, because the rebuild frees
+        what those kernels reference and nothing re-captures them at wake.
+        The second sits on the other side of the sleep: a CLOSED
+        `BarlinkCommunicator` raises from `_select` instead of answering over
+        the gloo plane, so a group whose wake never reached this method
+        refuses rather than serving off-transport in silence -- and that is
+        also what a FAILED rebuild here leaves standing, deliberately.
         If a sibling group still holds the card's aperture, `window_for`
         raises `Bar1WindowRefused` (W6) and it propagates from here
         untouched -- but ONLY when the window was requested explicitly:
@@ -1100,6 +1104,7 @@ class GroupCoordinator:
         Flag off, this is a no-op that leaves `barlink_comm` None, exactly
         as at boot.
         """
+
         if self.cpu_group is None:
             raise RuntimeError(
                 f"barlink group {self.unique_name!r}: cannot reopen, this "
@@ -1110,12 +1115,51 @@ class GroupCoordinator:
                 "transports only (barlink_comm.close()) and leaves the "
                 "process groups standing."
             )
-        # A live communicator still holds its BAR1 ledger credit, so building a
-        # second one would price the new window against space this process has
-        # not returned. Close first: close() is idempotent and collective-free,
-        # which also makes this the safe path when the sleep already closed it.
+        # A REBUILD UNDER LIVE CUDA GRAPHS IS A USE-AFTER-FREE, so it is
+        # refused here -- before the close, or the refusal would destroy
+        # exactly what it exists to protect. A captured launch bakes this
+        # transport's kernels into a graph
+        # (`barlink_bar1.py:4776`: they "will run on every replay with no host
+        # code between them"), and those kernels reference transport-lifetime
+        # objects: `_step_dev` (`barlink_bar1.py:2607`), `_result_gen_dev`
+        # (`:2615`) and the reserved graph slots of the result ring
+        # (`:2499-2501`). `close()` frees all of it and gives the BAR1
+        # aperture back -- `vmm_free` = `cuMemUnmap`/`cuMemRelease`/
+        # `cuMemAddressFree`, so the virtual addresses go too -- and
+        # `_build_barlink()` then allocates fresh ones at fresh addresses.
+        # Nothing re-binds them: the weg2 wake sequence skips
+        # `resume("cuda_graph")` in V1 and re-captures nothing, so a resident
+        # graph would replay against freed VRAM and unmapped BAR1 pages, with
+        # no diagnostic at all. That is an operator decision (re-capture at
+        # wake, or a VA-stable reopen that keeps the window addresses), not
+        # something this method may take silently, and it is filed against the
+        # UNMEASURED register's U4.
+        old_comm = None
         if self.barlink_comm is not None:
-            self.barlink_comm.close()
+            # Read through the object, not through an import: the flag-off
+            # byte-identity rule keeps `barlink` out of this module's import
+            # graph except inside the construction gate, and the answer lives
+            # on the communicator anyway.
+            old_comm = self.barlink_comm
+            if old_comm.captured_launches():
+                raise RuntimeError(
+                    f"barlink group {self.unique_name!r}: cannot reopen, "
+                    "CUDA graphs hold this transport's captured kernels "
+                    "(_captured_launches). Rebuilding frees the objects "
+                    "those kernels reference -- _step_dev, _result_gen_dev "
+                    "and the reserved result-ring graph slots -- and unmaps "
+                    "the BAR1 pages behind them, while nothing re-captures "
+                    "or re-binds the graphs at wake. Replaying one "
+                    "afterwards reads freed VRAM. Drop the captured graphs "
+                    "before the sleep, or decide the wake's graph handling "
+                    "explicitly (weg2 register U4)."
+                )
+            # A live communicator still holds its BAR1 ledger credit, so
+            # building a second one would price the new window against space
+            # this process has not returned. Close first: close() is
+            # idempotent and collective-free, which also makes this the safe
+            # path when the sleep already closed it.
+            old_comm.close()
             self.barlink_comm = None
         # THE CONTRACT FOR THE CALLER, because this is the first code path in
         # the fork that takes a LIVE coordinator from a transport to none.
@@ -1136,9 +1180,21 @@ class GroupCoordinator:
         #
         # So the wake RPC must treat a raise from here as W4
         # (`Weg2WakeRefused`), group-fatal: never a retry, never a continue.
-        # This method deliberately does not catch it and must not grow a
-        # `try`.
-        self._build_barlink()
+        # The exception is never swallowed -- but the group is put back
+        # exactly as this method found it before it propagates. The restored
+        # communicator is CLOSED (`close()` sets `_closed` before its early
+        # return), so the seam predicate stays true and the next collective
+        # hits the named refusal in `BarlinkCommunicator._select` -- the STOP
+        # the "ranks never disagree" law asks for -- instead of NCCL. It holds
+        # no ledger credit and no abort-gate registration, so nothing is
+        # double-charged either. If there was no communicator to begin with
+        # (flag off), None is what this method found and None is what it
+        # leaves: barlink was never the plane there, and pynccl was built.
+        try:
+            self._build_barlink()
+        except BaseException:
+            self.barlink_comm = old_comm
+            raise
 
     def __repr__(self):
         return (

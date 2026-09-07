@@ -144,6 +144,11 @@ class _FakeComm:
         ledger.ledger_credit(device, group, _FAKE_REGION_BYTES)
         gate.register(self)
 
+    def captured_launches(self) -> bool:
+        """Delegates to the REAL module function, so this stays a fake of the
+        wiring and not a fake of the answer."""
+        return barlink_mod.transport_captured_launches(self)
+
     def all_reduce(self, value):
         if self.closed:
             raise RuntimeError(
@@ -313,20 +318,29 @@ def test_reopen_on_a_live_comm_does_not_double_charge_the_ledger(coord):
     )
 
 
-def test_a_failing_rebuild_propagates_and_leaves_no_half_woken_group(
-    coord, monkeypatch
-):
-    """(b) A wake that cannot rebuild must raise, and say so by being empty.
+def test_a_failing_rebuild_propagates_and_leaves_a_refusing_group(coord, monkeypatch):
+    """(b) A wake that cannot rebuild must raise -- and REFUSE, not fall to NCCL.
 
     `_build_barlink` genuinely can raise at wake: `Bar1WindowRefused` (W6)
     when a sibling still holds the aperture, `Bar1Failed` from the holder,
     `_enforce_cpu_transport_needs_eager` on a host transport under graphs.
-    Swallowing it would leave THIS rank awake with `barlink_comm` None while
-    its peers hold transports -- the dispatch seams then fall through to
-    torch.distributed on `device_group` (pynccl is not built when barlink was
-    active at boot), i.e. NCCL, and the ranks disagree about the plane. That
-    is a hang, not a STOP. The caller (the wake RPC) owns the verdict: W4,
-    group-fatal.
+    Swallowing it would leave THIS rank awake while its peers hold transports.
+
+    But leaving `barlink_comm` None is not a stop either. The dispatch seams
+    read exactly `if self.barlink_comm is not None:` (`parallel_state.py:1350`
+    for all_reduce) and the terminal branch of that method is
+    `inplace_all_reduce(...)` (`:1416`) -- NCCL, because pynccl was never
+    built when barlink was active at boot (`_barlink_active`, `:836`). So None
+    does not halt the group, it silently moves it to the plane the barlink
+    standard forbids; and on three ranks a BAR1 refusal is a PER-CARD fact, so
+    one rank can land there while its siblings rebuild. Ranks disagreeing
+    about the transport is a hang, not a STOP.
+
+    A failed reopen therefore puts the group back exactly as it found it. The
+    old communicator is CLOSED (`close()` sets `_closed` before its early
+    return), so every seam that dispatches afterwards hits the named refusal
+    in `_select`, while the exception still propagates for the caller's
+    verdict: W4, group-fatal.
     """
     coord._build_barlink()
     live = coord.barlink_comm
@@ -341,11 +355,15 @@ def test_a_failing_rebuild_propagates_and_leaves_no_half_woken_group(
     with pytest.raises(RuntimeError, match="window refused"):
         coord.barlink_reopen()
 
-    assert coord.barlink_comm is None, (
-        "a half-woken group must not look awake: the rebuild failed, so the "
-        "attribute must be None and the caller must refuse (W4), not continue"
+    assert coord.barlink_comm is live, (
+        "a failed wake must leave the group as it found it: the CLOSED "
+        "communicator stays installed so the seam predicate "
+        "'self.barlink_comm is not None' is still true and the next "
+        "collective refuses, instead of falling through to NCCL unannounced"
     )
     assert live.closed, "the old transport is returned before the build"
+    with pytest.raises(RuntimeError, match="closed"):
+        coord.barlink_comm.all_reduce(7)
     assert ledger.ledger_balance(coord.device) == [], (
         "a failed wake must not leave a BAR1 credit standing"
     )
@@ -432,6 +450,11 @@ def test_pin_flag_gate_is_unchanged():
         "the barlink import must sit inside the flag gate -- flag off must not "
         "import the communicator at all"
     )
+    # Round 2: the wake's captured-graph question is asked THROUGH the
+    # communicator (`old_comm.captured_launches()`), precisely so that it adds
+    # no second import here. If it ever grows one, this pin and
+    # test_barlink_port.py::test_construction_is_flag_gated both go red.
+    assert "captured_launches()" in ast.unparse(_fn(_tree(), "barlink_reopen"))
 
 
 def test_pin_destroy_still_tears_down_the_cpu_group():
@@ -451,3 +474,217 @@ def test_pin_transport_close_is_unchanged():
         "close() must unregister from the abort gate before the peers go, or "
         "the watchdog holds a reference into a torn-down window"
     )
+
+
+# ---------------------------------------------------------------------------
+# ROUND 2 -- the two remaining silent-wrongs on the wake path, and the shape
+# the round-1 refusal test did not cover
+# ---------------------------------------------------------------------------
+
+
+class _Bar1Stub:
+    """The one fact ``BarlinkBar1Transport`` carries about graph capture.
+
+    ``_captured_launches`` (``barlink_bar1.py:1798`` init, ``:4793`` set) is
+    armed the moment a launch runs under ``graph_capture_running()``. The
+    comment at ``:4774-4776`` says what it means: "this transport's kernels
+    are now inside a graph and will run on every replay with no host code
+    between them".
+    """
+
+    def __init__(self, captured: bool):
+        self._captured_launches = captured
+        self._up = True
+
+    def close(self) -> None:
+        self._up = False
+
+
+class _MatrixStub:
+    """Mirrors ``BarlinkMatrixTransport``: ``close()`` NULLS ``bar1``.
+
+    ``barlink_matrix_transport.py:600-603``. That one statement erases the
+    only place the capture latch lives, which is why the communicator has to
+    snapshot the fact at close time. Without the snapshot the refusal could
+    only ever fire on a reopen of a STILL-OPEN transport -- and the shape the
+    S2 slice boot drives (close, then reopen) is the other one. That is the
+    same defect class as the round-1 review's surviving mutant M2: a proof
+    taken on a shape production does not have.
+    """
+
+    def __init__(self, captured: bool):
+        self.bar1 = _Bar1Stub(captured)
+
+    def handles(self, op: str, nbytes: int) -> bool:
+        return self.bar1 is not None and self.bar1._up
+
+    def close(self) -> None:
+        if self.bar1 is not None:
+            self.bar1.close()
+            self.bar1 = None
+
+
+class _DownTransport:
+    """A closed BAR1 transport as ``close()`` actually leaves one.
+
+    ``BarlinkBar1Transport.close()`` sets ``self._up = False`` as its first
+    statement (``barlink_bar1.py:5721``) and ``handles()`` reads it
+    (``:3128``), so the object stays in place and answers False. It is
+    ``BarlinkCommunicator.close()`` that never nulls ``self.transport`` --
+    ``self.transport =`` occurs exactly once in ``barlink.py`` (``:702``, in
+    ``__init__``). So the real post-sleep shape is ``_closed`` True AND
+    ``transport`` NOT None.
+    """
+
+    def handles(self, op: str, nbytes: int) -> bool:
+        return False
+
+    def close(self) -> None:
+        return None
+
+
+def test_a_closed_communicator_refuses_on_the_shape_close_actually_leaves():
+    """The round-1 refusal, proven on the shape production has.
+
+    Its sibling above builds its carcass with ``transport = None``, and both
+    halves of that can-fail pair run on that one shape. A refusal narrowed to
+    ``_closed and self.transport is None`` therefore passes the whole file
+    while a really-slept communicator (``_closed`` True, ``transport`` a
+    down BAR1 transport) goes back to answering ``None`` from ``_select`` --
+    and ``None`` means the host-staged gloo plane, silently. This pins the
+    other shape.
+    """
+    comm = barlink_mod.BarlinkCommunicator.__new__(barlink_mod.BarlinkCommunicator)
+    comm.group = "tp:0"
+    comm._closed = False
+    comm.transport = _DownTransport()
+
+    # Can-fail half: a transport that merely DECLINES this size is None, i.e.
+    # the gloo plane, and that is right. The refusal must come from the close.
+    assert comm._select("all_reduce", 4096) is None
+
+    barlink_mod.BarlinkCommunicator.close(comm)
+
+    assert comm.transport is not None, (
+        "the shape being proven: close() leaves the transport object in place "
+        "(barlink.py assigns self.transport exactly once, at :702), so a "
+        "refusal keyed on 'transport is None' would never fire after a sleep"
+    )
+    with pytest.raises(RuntimeError, match="closed"):
+        comm._select("all_reduce", 4096)
+
+
+def test_the_real_communicator_answers_the_capture_question():
+    """The seam `barlink_reopen()` calls must exist on the REAL class.
+
+    The wake asks `old_comm.captured_launches()` with no getattr default: a
+    real communicator that lost the method raises AttributeError at the wake
+    rather than skipping the refusal, and this pin catches it at the desk.
+    """
+    assert hasattr(barlink_mod.BarlinkCommunicator, "captured_launches")
+    assert "transport_captured_launches(self)" in inspect.getsource(
+        barlink_mod.BarlinkCommunicator.captured_launches
+    ), "the method must be the seam onto the module function, not a second copy"
+
+
+def test_close_remembers_that_graphs_held_the_transport_kernels():
+    """The capture latch has to survive the teardown that erases it.
+
+    ``BarlinkMatrixTransport.close()`` nulls ``self.bar1``, and the latch
+    lives on the bar1 object. The communicator therefore snapshots the fact
+    while the chain is still whole, so ``barlink_reopen()`` can refuse on the
+    post-sleep shape and not only on the never-slept one.
+    """
+    comm = barlink_mod.BarlinkCommunicator.__new__(barlink_mod.BarlinkCommunicator)
+    comm.group = "tp:0"
+    comm._closed = False
+    comm.transport = _MatrixStub(captured=True)
+
+    assert comm.captured_launches() is True
+
+    barlink_mod.BarlinkCommunicator.close(comm)
+
+    assert comm.transport.bar1 is None, "the matrix close() erased the latch"
+    assert comm.captured_launches() is True, (
+        "the fact was lost with the bar1 object: a wake could then rebuild "
+        "the transport under live graphs without anything noticing"
+    )
+
+
+def test_close_without_capture_leaves_no_capture_claim():
+    """Can-fail half of the snapshot: no graphs, no claim."""
+    comm = barlink_mod.BarlinkCommunicator.__new__(barlink_mod.BarlinkCommunicator)
+    comm.group = "tp:0"
+    comm._closed = False
+    comm.transport = _MatrixStub(captured=False)
+
+    assert comm.captured_launches() is False
+    barlink_mod.BarlinkCommunicator.close(comm)
+    assert comm.captured_launches() is False, (
+        "a snapshot that is always True would refuse every wake"
+    )
+
+
+def test_reopen_refuses_while_graphs_hold_the_transport_kernels(coord):
+    """A rebuild under live CUDA graphs is a use-after-free, so it is refused.
+
+    The captured kernels reference transport-lifetime objects: ``_step_dev``
+    (``barlink_bar1.py:2607``), ``_result_gen_dev`` (``:2615`` -- "it must
+    keep counting on every graph replay") and the reserved graph slots of the
+    result ring (``:2499-2501``, "Each captured call site takes ONE graph
+    slot and does not give it back"). ``close()`` frees all of it and hands
+    the BAR1 aperture back -- ``vmm_free`` = ``cuMemUnmap`` / ``cuMemRelease``
+    / ``cuMemAddressFree``, so the virtual addresses go too -- and
+    ``_build_barlink()`` then allocates fresh ones at fresh addresses. The
+    wake sequence of the design spec (S2.5 step 3) SKIPS ``resume("cuda_graph")``
+    in V1 and re-captures nothing, so the resident graphs would replay against
+    freed VRAM and unmapped BAR1 pages.
+
+    The refusal must land BEFORE the close, or it refuses a group it has
+    already destroyed.
+    """
+    coord._build_barlink()
+    comm = coord.barlink_comm
+    comm.transport = _MatrixStub(captured=True)
+    prior_ledger = ledger.ledger_balance(coord.device)
+    prior_gate = gate.registered()
+
+    with pytest.raises(RuntimeError, match="captured"):
+        coord.barlink_reopen()
+
+    assert coord.barlink_comm is comm, "the refusal must precede the close"
+    assert not comm.closed, (
+        "refusing after the close would destroy exactly what the refusal "
+        "exists to protect"
+    )
+    assert _FakeComm.built == 1, "nothing may be rebuilt"
+    assert ledger.ledger_balance(coord.device) == prior_ledger
+    assert gate.registered() == prior_gate
+
+
+def test_reopen_refuses_on_the_post_sleep_shape_too(coord):
+    """The shape the S2 slice boot drives: sleep closed it, wake rebuilds.
+
+    By then the bar1 object is gone (``_MatrixStub``/``BarlinkMatrixTransport``
+    null it), so the refusal reads the snapshot the communicator took at
+    close time -- the state ``test_close_remembers_that_graphs_held_the_
+    transport_kernels`` proves the real class produces.
+    """
+    coord._build_barlink()
+    comm = coord.barlink_comm
+    comm.transport = _MatrixStub(captured=True)
+    comm.transport.close()
+    comm._closed_with_captured_launches = True
+
+    with pytest.raises(RuntimeError, match="captured"):
+        coord.barlink_reopen()
+
+
+def test_a_reopen_without_captured_graphs_still_proceeds(coord):
+    """Can-fail half of the refusal: the latch is what causes it."""
+    coord._build_barlink()
+    coord.barlink_comm.transport = _MatrixStub(captured=False)
+
+    coord.barlink_reopen()
+
+    assert _FakeComm.built == 2, "an unarmed latch must not block the wake"

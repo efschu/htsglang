@@ -604,6 +604,40 @@ def graph_capture_running() -> bool:
         return False
 
 
+def transport_captured_launches(comm) -> bool:
+    """True if CUDA graphs hold this communicator's transport kernels.
+
+    A captured launch bakes the transport's kernels into a graph and arms
+    ``_captured_launches`` on the transport (``barlink_bar1.py:4793``,
+    ``barlink_device.py:1436``); the comment there says what that means --
+    the kernels "will run on every replay with no host code between them".
+    The objects those kernels reference are TRANSPORT-LIFETIME: the sliding
+    window's step counter (``barlink_bar1.py:2607``), the graph-safe direct
+    mode's generation counter (``:2615``, "it must keep counting on every
+    graph replay") and the reserved graph slots of the result ring
+    (``:2499-2501``, "Each captured call site takes ONE graph slot and does
+    not give it back").
+
+    Read for ``GroupCoordinator.barlink_reopen()``, which frees exactly those
+    objects and the BAR1 mappings under them. Everything is read
+    defensively: this runs on the path that REFUSES, so it must never itself
+    be the cause of an error, and it also has to answer for the ``__new__``
+    stand-ins the unit tests build.
+    """
+    if comm is None:
+        return False
+    # The snapshot first: ``BarlinkMatrixTransport.close()`` nulls ``bar1``,
+    # which is the only home of the latch, so after a sleep the live chain
+    # can no longer answer. See ``BarlinkCommunicator.close()``.
+    if getattr(comm, "_closed_with_captured_launches", False):
+        return True
+    t = getattr(comm, "transport", None)
+    for obj in (getattr(t, "bar1", None), t):
+        if obj is not None and getattr(obj, "_captured_launches", False):
+            return True
+    return False
+
+
 def _transport_name(t) -> str:
     """The name of a transport for error messages, without ever raising itself.
 
@@ -1468,6 +1502,18 @@ class BarlinkCommunicator:
     # teardown
     # ------------------------------------------------------------------
 
+    def captured_launches(self) -> bool:
+        """True if CUDA graphs hold this communicator's transport kernels.
+
+        The one question ``GroupCoordinator.barlink_reopen()`` has to ask
+        before it tears the transports down, asked THROUGH the object that
+        owns them so that `parallel_state` needs no second import of this
+        module (its flag-off byte-identity rule allows exactly one, inside
+        the construction gate). The logic itself is the module function; this
+        is the seam, not a second copy of it.
+        """
+        return transport_captured_launches(self)
+
     def close(self) -> None:
         """Release the POSIX shm segment backing the shm/device transports.
 
@@ -1479,8 +1525,20 @@ class BarlinkCommunicator:
         The flag is set BEFORE the early return, and never cleared: after
         this the communicator refuses collectives (``_select``) rather than
         answering them over the gloo plane. A wake builds a new
-        communicator; it does not revive this one.
+        communicator; it does not revive this one. ``self.transport`` is
+        deliberately NOT nulled -- it is assigned exactly once, in
+        ``__init__`` -- so the post-sleep shape is ``_closed`` True with a
+        transport still in place, and the refusal in ``_select`` must key on
+        the flag alone.
         """
+        # Snapshot the capture latch BEFORE the teardown erases it:
+        # ``BarlinkMatrixTransport.close()`` nulls ``self.bar1`` and the latch
+        # lives on that object, so after this call nothing on the live chain
+        # can say any more whether graphs hold the freed kernels. One bit,
+        # taken at the one instant its source is destroyed, on the object that
+        # survives -- ``barlink_reopen()`` reads it to refuse a rebuild under
+        # live graphs.
+        self._closed_with_captured_launches = transport_captured_launches(self)
         self._closed = True
         if self.transport is None:
             return
