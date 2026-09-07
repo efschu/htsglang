@@ -101,6 +101,21 @@ class Weg2WakeRefused(RuntimeError):
     """
 
 
+class Weg2DormantRefused(RuntimeError):
+    """W25 (S1 boot killer K2, WEG2_BUILD_DECISIONS_0906.md section 1g).
+
+    A group whose ``kv_cache`` tag is paused holds NO request-index pool, NO KV
+    pool and NO mamba pool: ``prepare_for_extend`` on an admitted request
+    walks into ``write_req_to_token_pool_triton`` on released VMM pages and the
+    Triton launcher rejects the pointer, which kills the whole group.  Measured
+    2026-09-07 05:56:56 on weg2s1: one health-probe generation, 26 s into a
+    dormant dwell, took the group down.  The front never routes to a dormant
+    group; this refusal is the OTHER half -- anything that reaches the port
+    anyway (a probe, an operator curl, a stale client) gets a named abort at
+    the admission seam, BEFORE ``prepare_for_extend``, and the group lives.
+    """
+
+
 class Weg2PcieLockTimeout(RuntimeError):
     """The PCIe serialisation lock was not acquired inside its deadline."""
 
@@ -712,4 +727,26 @@ def sleep_acceptance_census(
         accepted=accepted,
         refusal_reason="; ".join(reasons) if reasons else None,
         denominator=denominator,
+    )
+
+
+#: The one string a dormant refusal carries, so a log grep for the marker and
+#: the client-visible error name the same event.
+DORMANT_REFUSAL_MARKER = "W25 Weg2DormantRefused"
+
+
+def dormant_refusal_message(*, rid: str, context: str) -> str:
+    """The abort text for a request admitted to a sleeping group.
+
+    Pure: no device access, no scheduler state.  ``context`` names the seam
+    that refused (generate / embedding) so a postmortem can tell them apart.
+    """
+    return (
+        f"{DORMANT_REFUSAL_MARKER}: this group is ASLEEP (kv_cache paused via "
+        f"release_memory_occupation) and refuses {context} request {rid!r} at "
+        "the admission seam. A sleeping group has no KV/mamba/req-index pool; "
+        "admitting the request would fault in write_req_to_token_pool_triton "
+        "on released VMM pages and kill the group (S1 boot killer K2). Route "
+        "to the awake group via the Weg-2 front on :30030, or wake this group "
+        "first (resume_memory_occupation)."
     )

@@ -545,6 +545,19 @@ class SchedulerWeightUpdaterManager:
             # device may be appended after the pause in this block.
             self.flush_cache()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            # W25 Weg2DormantRefused (S1 boot killer K2): from this statement
+            # on the req-index / KV / mamba pools are unmapped, so the
+            # admission seams (Scheduler.handle_generate_request /
+            # handle_embedding_request) must refuse by name instead of
+            # walking into prepare_for_extend.  ONE flag on the object that
+            # owns the pools; cleared after resume(KV_CACHE) below.
+            if scheduler is not None:
+                scheduler.weg2_dormant = True
+                logger.info(
+                    "WEG2-DORMANT set: kv_cache paused, admission seams refuse "
+                    "with %s until resume_memory_occupation",
+                    "W25 Weg2DormantRefused",
+                )
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             # #89 hibernate: destination="disk" parks the FINAL post-transform
@@ -636,6 +649,11 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             scheduler = self.scheduler
             if scheduler is not None:
+                # W25: the pools are mapped again; the admission seams admit.
+                scheduler.weg2_dormant = False
+                logger.info(
+                    "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
+                )
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     for queue_name in (
                         "disagg_decode_transfer_queue",

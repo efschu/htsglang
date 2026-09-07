@@ -2891,6 +2891,10 @@ class Scheduler(
         )
 
     def init_weight_updater(self) -> None:
+        # W25 Weg2DormantRefused: True between pause(kv_cache) and
+        # resume(kv_cache) (set/cleared by the weight updater, the owner of
+        # the sleep).  Read at the two admission seams only.
+        self.weg2_dormant = False
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
@@ -4515,10 +4519,39 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _weg2_refuse_dormant(self, recv_req, *, context: str) -> None:
+        """W25 Weg2DormantRefused: abort an admitted request BEFORE it can
+        reach prepare_for_extend on a group whose pools are released.
+
+        The abort is streamed straight out (prepare_abort + stream_output),
+        never queued: a queued one-token abort still goes through
+        alloc_for_extend, which is exactly the fault this refusal exists to
+        prevent (S1 boot killer K2, mem_cache/common.py:192).
+        """
+        from sglang.srt.managers.weg2_memory_saver import dormant_refusal_message
+
+        msg = dormant_refusal_message(rid=recv_req.rid, context=context)
+        logger.error(msg)
+        req = Req(
+            recv_req.rid,
+            recv_req.input_text,
+            recv_req.input_ids if recv_req.input_ids is not None else [],
+            recv_req.sampling_params,
+            vocab_size=self.model_config.vocab_size,
+            http_worker_ipc=getattr(recv_req, "http_worker_ipc", None),
+        )
+        req.tokenizer = self.tokenizer
+        prepare_abort(req, msg, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+        self.output_streamer.stream_output([req], req.return_logprob)
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # W25 Weg2DormantRefused -- FIRST, before any pool is touched.
+        if getattr(self, "weg2_dormant", False):
+            self._weg2_refuse_dormant(recv_req, context="generate")
+            return
         # #261 live handover: a prefix parked for handover must not be
         # extended while the destination may still commit. No-op on every
         # default path (runtime is None until the first handover request,
@@ -6201,6 +6234,10 @@ class Scheduler(
         self,
         recv_req: TokenizedEmbeddingReqInput,
     ):
+        # W25 Weg2DormantRefused -- FIRST, before any pool is touched.
+        if getattr(self, "weg2_dormant", False):
+            self._weg2_refuse_dormant(recv_req, context="embedding")
+            return
         req = Req(
             recv_req.rid,
             recv_req.input_text,
