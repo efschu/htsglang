@@ -351,8 +351,11 @@ def _package_of(path: Path) -> str:
 
 
 #: Recorded in place of a dynamically imported module whose name is computed.
-#: Never equal to any ``_DEAD_MODULES`` entry, so it is a finding to read, not a
-#: silent pass: a touched file that computes a module name has to say why.
+#: Never equal to any ``_DEAD_MODULES`` entry -- which is why ``_dead_imports``
+#: keeps it EXPLICITLY instead of matching it against that list.  Recording a
+#: sentinel and then filtering it out is the same silence with more code: a
+#: touched file that computes a module name has to say why, in
+#: ``_KNOWN_RESIDUAL_DEAD_IMPORTS``, or stop computing it.
 _DYNAMIC_IMPORT_ARG = "<dynamic>"
 
 
@@ -400,9 +403,13 @@ def _imported_modules(path: Path):
       runtime Guillotine probe covers import time while this is a function
       body).  The shape is live in this tree, not contrived: 28
       ``import_module(`` sites under ``python/sglang/srt``.
-      A NON-CONSTANT argument is recorded as ``<dynamic>`` rather than dropped,
-      so a computed module name in a touched file surfaces as an unresolvable
-      import instead of as silence.
+      A NON-CONSTANT argument is recorded as ``<dynamic>``, which
+      :func:`_dead_imports` KEEPS, so a computed module name in a touched file
+      surfaces as an unresolvable import instead of as silence.  Recording it
+      was not enough on its own: measured 2026-09-07, the sentinel was
+      collected here and dropped by the ``_DEAD_MODULES`` filter one function
+      later, so ``importlib.import_module("sglang.srt.managers." + name)`` in
+      a touched file still passed every gate.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     pkg_parts = _package_of(path).split(".")
@@ -436,12 +443,31 @@ def _imported_modules(path: Path):
 
 
 def _dead_imports(path: Path):
-    """The names in *path* that reach a module Weg 2 deletes."""
+    """The names in *path* that reach a module Weg 2 deletes.
+
+    ``_DYNAMIC_IMPORT_ARG`` IS KEPT, NOT FILTERED, and that is the whole
+    point of recording it.  Measured 2026-09-07 on the fix-3 tip: the
+    sentinel was appended by :func:`_imported_modules` and then dropped one
+    line later here, because it matches no ``_DEAD_MODULES`` entry by
+    construction -- so ``importlib.import_module("sglang.srt.managers." +
+    name)`` in a touched file returned ``[]`` from this function and was
+    invisible to all three coupling gates, exactly the shape the fix-3
+    commit claimed it had closed.
+
+    A computed module name cannot be proved NOT to name one of the 22
+    modules S7 deletes; there is no analysis at the desk that resolves it,
+    and the slice's whole premise is "S7 deletes 22 modules and nothing
+    breaks".  So it surfaces as an unresolvable import to be NAMED -- in
+    ``_KNOWN_RESIDUAL_DEAD_IMPORTS`` with the reason, or removed -- rather
+    than passing silently.  There are zero such sites in the twelve touched
+    files today (measured), so this costs the clean tree nothing.
+    """
     return sorted(
         {
             m
             for m in _imported_modules(path)
-            if any(m == d or m.startswith(d + ".") for d in _DEAD_MODULES)
+            if m == _DYNAMIC_IMPORT_ARG
+            or any(m == d or m.startswith(d + ".") for d in _DEAD_MODULES)
         }
     )
 
@@ -587,6 +613,145 @@ def _unreachable_statements(path: Path):
                     out.append((scope, nxt.lineno, type(nxt).__name__))
                     break
     return out
+
+
+def _function_named(path: Path, func: str):
+    """The ``def func`` node in *path*, or an ``AssertionError`` naming it."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == func
+        ):
+            return node
+    raise AssertionError("no %s() in %s" % (func, path.name))
+
+
+def _callee_name(node) -> Optional[str]:
+    """``ParkedDecodeSet`` for both ``ParkedDecodeSet(...)`` and ``x.P(...)``."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _keyword_values(path: Path, func: str, callee: str, keyword: str):
+    """``[(lineno, node)]`` for ``callee(..., keyword=<node>, ...)`` in *func*.
+
+    The pin that reads assignments answers "what is this NAME bound to".  The
+    question a re-armed default turns on is "what does the CONSUMER receive",
+    and the two are one line apart.
+    """
+    return [
+        (kw.value.lineno, kw.value)
+        for sub in ast.walk(_function_named(path, func))
+        if isinstance(sub, ast.Call) and _callee_name(sub.func) == callee
+        for kw in sub.keywords
+        if kw.arg == keyword
+    ]
+
+
+def _is_logging_call(node) -> bool:
+    """``logger.info(...)`` and friends -- a RECEIPT, never a consumer.
+
+    A receipt formats the pinned value for a human (``"ARMED" if want else
+    "off"``); a consumer acts on it.  Only the second may not be widened, so
+    the receipt is excluded here and pinned by its own row instead.
+    """
+    func = getattr(node, "func", None)
+    return (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "logger"
+    )
+
+
+def _widened_value_uses(path: Path, func: str, target: str):
+    """``[(lineno, sink, src)]`` where *target*'s value reaches a consumer
+    inside a WIDER expression instead of as the bare name.
+
+    THE PIN BINDS THE NAME; THIS BINDS THE VALUE THE CONSUMER RECEIVES.
+    Measured 2026-09-07 on the fix-3 tip: moving the arming term one line
+    down, from ``want = mamba_allocator is not None`` into
+    ``ParkedDecodeSet(..., enabled=want or (mamba_allocator is not None))``,
+    left ``_literal_assignments(..., "want")`` reporting ``[(3126, False),
+    (3138, False)]`` -- green -- while the parked decode set armed on a stock
+    PP=3 boot and the receipt still printed ``off``.  That is the slice's own
+    declared danger direction (a flip BRANCH promoted to the stock default)
+    plus an instrument lying about the state it reports.
+
+    A value sink is a keyword argument, a call argument, an assignment
+    right-hand side or a return value.  Reading the name as a CONDITION (``if
+    want and ...``) is not a sink: a condition cannot promote the value, only
+    branch on it.  ``logger.*`` arguments are excluded by
+    :func:`_is_logging_call` -- see there.  The identifier resolver is
+    :func:`_read_names`, defined with the rank-symmetry gate further down and
+    shared with it: "which names does this expression read" is one question.
+    """
+    body = _function_named(path, func)
+    src = path.read_text(encoding="utf-8").splitlines()
+
+    def bare(node) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id == target
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == target
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+        )
+
+    def leaves(node):
+        """Descend through the CONTAINERS a sink may be, never through an
+        expression that combines the value.
+
+        A call is a container: ``x = ParkedDecodeSet(..., enabled=want)``
+        reads ``want``, but the call is not what widens it -- its own keyword
+        is walked as a sink of its own, so flagging the call as well reports
+        the clean tree (measured: exactly this false positive on the first
+        shape of this helper).  A tuple, list, set, dict or star-arg is the
+        same case one level down.
+        """
+        if isinstance(node, ast.Call):
+            return
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            for e in node.elts:
+                yield from leaves(e)
+            return
+        if isinstance(node, ast.Dict):
+            for e in list(node.keys) + list(node.values):
+                if e is not None:
+                    yield from leaves(e)
+            return
+        if isinstance(node, ast.Starred):
+            yield from leaves(node.value)
+            return
+        yield node
+
+    def sinks():
+        for sub in ast.walk(body):
+            if isinstance(sub, ast.keyword):
+                yield "keyword %s=" % sub.arg, sub.value
+            elif isinstance(sub, ast.Call):
+                if _is_logging_call(sub):
+                    continue
+                for a in sub.args:
+                    yield "argument of %s()" % (_callee_name(sub.func) or "?"), a
+            elif isinstance(sub, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                if sub.value is not None:
+                    yield "assignment", sub.value
+            elif isinstance(sub, ast.Return) and sub.value is not None:
+                yield "return", sub.value
+
+    out = []
+    for what, node in sinks():
+        for leaf in leaves(node):
+            if bare(leaf) or target not in _read_names(leaf):
+                continue
+            text = ast.get_source_segment("\n".join(src), leaf) or ""
+            out.append((leaf.lineno, what, " ".join(text.split())))
+    return sorted(set(out))
 
 
 class _NotALiteral:
@@ -787,12 +952,20 @@ class TestNoExecutableFlipReference(unittest.TestCase):
     def test_the_lazy_import_gate_can_fail_on_every_shape_it_claims(self):
         """Can-it-fail proof, in-file rather than by planting a mutant.
 
-        Each of the six spellings below is a real import this gate must catch;
-        the five that once slipped past it are named.  The docstring used to
-        say "every shape it claims" while claiming only ``import``/``from``
-        spellings, which is honest and still leaves the slice's premise --
-        runtime reachability, not statement shape -- half-gated.  The last two
-        rows close that half.
+        Each of the seven spellings below is a real import this gate must
+        catch; the six that once slipped past it are named.  The docstring
+        used to say "every shape it claims" while claiming only
+        ``import``/``from`` spellings, which is honest and still leaves the
+        slice's premise -- runtime reachability, not statement shape --
+        half-gated.  The last three rows close that half.
+
+        ROW 7 IS THE SHAPE THE PREVIOUS ROUND CLAIMED AND DID NOT HAVE.  Both
+        dynamic rows passed a CONSTANT string, so the branch that records a
+        computed argument as ``_DYNAMIC_IMPORT_ARG`` had no row at all -- and
+        that sentinel was then dropped by ``_dead_imports`` one line after it
+        was collected (measured 2026-09-07: ``_dead_imports`` returned ``[]``
+        for row 7's source).  A gate whose can-it-fail proof does not cover a
+        shape its own docstring claims is a gate without a can-it-fail proof.
         """
         shapes = (
             # absolute, module-level, the shape the original gate did catch
@@ -811,6 +984,12 @@ class TestNoExecutableFlipReference(unittest.TestCase):
             # dynamic, the builtin spelling
             "def i():\n"
             "    __import__('sglang.srt.mem_cache.mamba_state_pool')\n",
+            # DYNAMIC with a COMPUTED argument -- unresolvable at the desk, so
+            # it cannot be proved not to name one of the 22.  This is the row
+            # the fix-3 record claimed and did not have.
+            "import importlib\n"
+            "def j(name):\n"
+            "    importlib.import_module('sglang.srt.managers.' + name)\n",
         )
         probe = _SRT / "managers" / "_weg2_s0_gate_probe.py"
         for i, src in enumerate(shapes):
@@ -1188,6 +1367,72 @@ class TestNoLiveSenderOutlivesItsHandler(unittest.TestCase):
             d(_NotRegistered())
 
 
+#: The attribute names that ARE a rank fact.  A guard is rank-gated when it
+#: reads one of these, or a local the function derived from one.
+_RANK_TOKENS = ("is_last_rank", "is_first_rank", "pp_rank")
+
+
+def _read_names(node) -> set:
+    """Every identifier an expression READS: bare names and attribute tails.
+
+    ``self.pp_group.is_last_rank`` yields ``{"self", "pp_group",
+    "is_last_rank"}``, so a rank fact is recognised by the same set membership
+    whether it is spelled out or bound to a local first.  Resolving the guard
+    beats reading its source text, which is what let the alias through.
+    """
+    out = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            out.add(sub.id)
+        elif isinstance(sub, ast.Attribute):
+            out.add(sub.attr)
+    return out
+
+
+def _rank_alias_names(body) -> set:
+    """Every local *body* binds whose value is derived from a rank fact.
+
+    ONE LOCAL ALIAS DEFEATED THE NAME-SHAPED GATE.  Measured 2026-09-07 on the
+    fix-3 tip, two probes with identical semantics against the real helper:
+    ``if not self.pp_group.is_last_rank and getattr(self, "_pp_proxy_drops",
+    0): continue`` was reported, and ``_tail = self.pp_group.is_last_rank``
+    followed by ``if not _tail and getattr(self, "_pp_proxy_drops", 0):
+    continue`` was NOT -- the gate read the source text of the enclosing
+    ``if`` and the text no longer carried the token.  A gate whose docstring
+    says "THE PROPERTY, NOT THE NAME" while it is name-shaped one indirection
+    away is a name gate.
+
+    FIXPOINT, because an alias of an alias is still a rank fact: ``_tail =
+    self.pp_group.is_last_rank`` then ``_not_tail = not _tail``.  Every
+    binding form ``_binds`` understands is walked -- ``Assign``, ``AnnAssign``,
+    ``AugAssign``, ``NamedExpr`` -- so the walrus inside the ``if`` test itself
+    is covered too.
+    """
+    binders = [
+        n
+        for n in ast.walk(body)
+        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr))
+    ]
+    aliases: set = set()
+    changed = True
+    while changed:
+        changed = False
+        for n in binders:
+            value = n.value
+            if value is None:
+                continue
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            bound = {b for b in (_binds(t) for t in targets) if b}
+            if not bound or bound <= aliases:
+                continue
+            read = _read_names(value)
+            if not (read & set(_RANK_TOKENS)) and not (read & aliases):
+                continue
+            aliases |= bound
+            changed = True
+    return aliases
+
+
 def _rank_gated_exits_before_the_barrier(path: Path, func: str):
     """``[(lineno, kind, test_src)]`` for every early exit this rank may take
     alone, lexically before the #753 per-iteration lockstep barrier.
@@ -1206,6 +1451,17 @@ def _rank_gated_exits_before_the_barrier(path: Path, func: str):
     A barrier is a rendezvous: whoever skips it leaves its peers blocked in it
     for ever.  So what must hold is not "those three methods are gone" but
     "every path to the barrier is rank-symmetric".
+
+    AND THE GUARD IS RESOLVED, NOT READ.  The first shape of this function
+    matched the three rank tokens against ``ast.get_source_segment`` of the
+    enclosing ``if`` test, which is a name gate one indirection down: binding
+    ``_tail = self.pp_group.is_last_rank`` and testing ``_tail`` removed the
+    token from the text and the gate went blind (measured 2026-09-07 against
+    the real helper: the spelled mutant reported, the aliased one ``[]``).
+    :func:`_rank_alias_names` now resolves every local the function derives
+    from a rank fact and the guard is matched by NAME SET, so the spelled
+    form, an alias, an alias of an alias, a ``self.`` attribute alias and a
+    walrus inside the test itself all report.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     src = path.read_text(encoding="utf-8").splitlines()
@@ -1232,20 +1488,30 @@ def _rank_gated_exits_before_the_barrier(path: Path, func: str):
         )
     barrier_line = barriers[0]
 
-    rank_tokens = ("is_last_rank", "is_first_rank", "pp_rank")
+    # RESOLVED, not read: the guard is rank-gated when it reads a rank fact
+    # OR a local this function derived from one.  The source-text match on
+    # the three spelled tokens is kept as well, because it costs nothing and
+    # catches a rank fact reached through a subscript or a call the name
+    # resolver does not model.
+    aliases = _rank_alias_names(body)
+    rank_names = set(_RANK_TOKENS) | aliases
     out = []
 
     def walk(node, guards):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.If):
                 text = ast.get_source_segment("\n".join(src), child.test) or ""
-                walk(child, guards + [(child.lineno, " ".join(text.split()))])
+                walk(
+                    child,
+                    guards
+                    + [(child.lineno, " ".join(text.split()), _read_names(child.test))],
+                )
                 continue
             if isinstance(child, (ast.Continue, ast.Break, ast.Return)):
                 if child.lineno >= barrier_line:
                     continue
-                for lineno, text in guards:
-                    if any(tok in text for tok in rank_tokens):
+                for lineno, text, read in guards:
+                    if (read & rank_names) or any(tok in text for tok in _RANK_TOKENS):
                         out.append(
                             (
                                 child.lineno,
@@ -1280,28 +1546,67 @@ class TestTheLockstepBarrierIsRankSymmetric(unittest.TestCase):
         Planting it in the tree and reverting is a two-minute manual loop that
         nobody repeats; running the detector over the source WITH the mutant
         spliced in is the same evidence, every run.
+
+        SIX SPELLINGS OF ONE SEMANTICS.  Row 1 is the mutant fix-2 left behind
+        and fix-3 caught.  Rows 2-6 are the same rank-asymmetric ``continue``
+        with the rank fact bound to a local first -- the indirection that
+        defeated the source-text match: an alias, an alias of an alias, a
+        ``self.`` attribute alias, a walrus inside the test, and a ``return``
+        rather than a ``continue``.  Measured 2026-09-07 on the fix-3 tip,
+        rows 2-6 all reported ``[]`` while row 1 reported the exit, which is
+        one mutant killed and five walking past a gate whose docstring says
+        "THE PROPERTY, NOT THE NAME".
         """
         mixin = _SRT / "managers" / "scheduler_pp_mixin.py"
         text = mixin.read_text(encoding="utf-8")
         needle = "                if self._pp_gapped_wire:\n"
         self.assertIn(needle, text, "the barrier guard moved; re-read the gate")
-        mutant = (
+        mutants = (
+            # spelled out, the fix-2 shape
             "                if not self.pp_group.is_last_rank and getattr(\n"
             '                    self, "_pp_proxy_drops", 0\n'
             "                ):\n"
-            "                    continue\n"
-        ) + needle
+            "                    continue\n",
+            # one local alias -- identical semantics, zero rank tokens in the
+            # guard's source text
+            "                _tail = self.pp_group.is_last_rank\n"
+            '                if not _tail and getattr(self, "_pp_proxy_drops", 0):\n'
+            "                    continue\n",
+            # an alias of an alias
+            "                _tail = self.pp_group.is_last_rank\n"
+            "                _not_tail = not _tail\n"
+            '                if _not_tail and getattr(self, "_pp_proxy_drops", 0):\n'
+            "                    continue\n",
+            # bound onto the instance rather than a local
+            "                self._tail_now = self.pp_group.is_last_rank\n"
+            "                if not self._tail_now:\n"
+            "                    continue\n",
+            # bound inside the test itself
+            "                if not (_t := self.pp_group.is_last_rank):\n"
+            "                    continue\n",
+            # a rank-asymmetric RETURN out of the loop, not a continue
+            "                _r = self.pp_group.pp_rank\n"
+            "                if _r > 0:\n"
+            "                    return None\n",
+        )
         probe = _SRT / "managers" / "_weg2_s0_barrier_probe.py"
-        probe.write_text(text.replace(needle, mutant, 1), encoding="utf-8")
-        try:
-            found = _rank_gated_exits_before_the_barrier(probe, "_event_loop_pp_body")
-            self.assertNotEqual(
-                [],
-                found,
-                "the rank-symmetry gate is blind to the mutant it exists for",
-            )
-        finally:
-            probe.unlink(missing_ok=True)
+        for i, mutant in enumerate(mutants):
+            with self.subTest(mutant=i):
+                probe.write_text(
+                    text.replace(needle, mutant + needle, 1), encoding="utf-8"
+                )
+                try:
+                    found = _rank_gated_exits_before_the_barrier(
+                        probe, "_event_loop_pp_body"
+                    )
+                    self.assertNotEqual(
+                        [],
+                        found,
+                        "the rank-symmetry gate is blind to mutant %d, which "
+                        "has the semantics of the one it exists for:\n%s" % (i, mutant),
+                    )
+                finally:
+                    probe.unlink(missing_ok=True)
 
 
 class TestTheProxyReceiveDecidesAcceptOrDrop(unittest.TestCase):
@@ -1801,6 +2106,52 @@ class TestStockPpPathSurvives(unittest.TestCase):
         ("abort_request", "deferred", False),
     )
 
+    #: WHERE EACH PINNED VALUE IS USED, because pinning the NAME is not
+    #: pinning the value the consumer receives.  Measured 2026-09-07 on the
+    #: fix-3 tip: moving the arming term one line down, out of ``want =
+    #: False`` and into ``ParkedDecodeSet(..., enabled=want or
+    #: (mamba_allocator is not None))``, armed the parked decode set on a
+    #: stock PP=3 boot -- silently discounting admission -- while both ``want``
+    #: literals stayed ``False``, ``_COLLAPSED`` stayed green and the boot
+    #: log's own receipt still printed ``off``.  A flip branch promoted to the
+    #: stock default is this slice's declared danger direction, and an
+    #: instrument that reports a state it does not have is the second defect
+    #: in the same edit.
+    #:
+    #: ``(func, target) -> (callee, keyword)`` names the ONE expression that
+    #: must receive the value unchanged -- the bare pinned name, or the pinned
+    #: literal where the pin IS the keyword.  ``None`` means the value has no
+    #: in-function consumer and escapes as an attribute its readers reach
+    #: through ``getattr(..., None)``; those rows are held by the widening
+    #: gate alone, which is stated here rather than left implied.
+    #:
+    #: NOT A SIXTH ``_COLLAPSED`` ROW.  ``('init_parked_decode_set',
+    #: 'enabled', False)`` would go RED on a HEALTHY tree: on the clean tree
+    #: ``enabled=want`` is an ``ast.Name``, so ``_literal_assignments``
+    #: returns ``_NOT_A_LITERAL`` for it (measured).  The consumer question is
+    #: a different question and gets its own gate.
+    _COLLAPSED_CONSUMERS = {
+        ("init_parked_decode_set", "want"): ("ParkedDecodeSet", "enabled"),
+        # The collapsed chain receiver reaches the receiver through this
+        # keyword; the attribute above is only what the mixin's readers see.
+        ("init_request_receiver", "pp_chain_receiver"): (
+            "SchedulerRequestReceiver",
+            "chain_receiver",
+        ),
+        ("init_request_receiver", "phase_policy_hook"): (
+            "SchedulerRequestReceiver",
+            "phase_policy_hook",
+        ),
+        # Escapes as an attribute; every reader is a `getattr(..., None)` in
+        # `scheduler_pp_mixin`, so there is nothing inside this function to
+        # bind.
+        ("init_request_receiver", "pp_flip_counters"): None,
+        # Consumed only by the #801 receipt, which `_widened_value_uses`
+        # excludes on purpose and `test_the_abort_receipt_reads_the_pin`
+        # covers instead.
+        ("abort_request", "deferred"): None,
+    }
+
     def test_the_named_collapsed_defaults_are_still_flag_off_literals(self):
         """The over-cut detector, applied to the values the commit names.
 
@@ -1826,6 +2177,254 @@ class TestStockPpPathSurvives(unittest.TestCase):
                         "scheduler.py:%d %s() collapsed %s to %r, not the "
                         "flag-off value %r" % (lineno, func, target, value, expected),
                     )
+
+    def test_every_collapsed_row_declares_where_its_value_is_used(self):
+        """The denominator of the two gates below, asserted not assumed.
+
+        A consumer table that silently omits a row is the same hole one level
+        up: the row would be pinned by name only, and nothing would say so.
+        """
+        self.assertEqual(
+            {(f, t) for f, t, _ in self._COLLAPSED},
+            set(self._COLLAPSED_CONSUMERS),
+            "a collapsed value has no declared consumer, or a consumer names "
+            "a value that is not pinned",
+        )
+        self.assertNotEqual(
+            {},
+            {k: v for k, v in self._COLLAPSED_CONSUMERS.items() if v is not None},
+            "no row declares a consumer -- the consumer arm is dead",
+        )
+
+    def test_the_collapsed_defaults_reach_their_consumer_unchanged(self):
+        """The value the CONSUMER receives, not the value the name holds.
+
+        ``want = False`` twice over is not the property; ``ParkedDecodeSet``
+        being handed ``want`` and nothing else is.  Measured 2026-09-07:
+        ``enabled=want or (mamba_allocator is not None)`` armed the parked set
+        on a stock boot with every existing gate green.
+        """
+        sched = _SRT / "managers" / "scheduler.py"
+        expected = {(f, t): e for f, t, e in self._COLLAPSED}
+        for (func, target), consumer in sorted(self._COLLAPSED_CONSUMERS.items()):
+            if consumer is None:
+                continue
+            callee, keyword = consumer
+            with self.subTest(where="%s -> %s(%s=)" % (target, callee, keyword)):
+                found = _keyword_values(sched, func, callee, keyword)
+                self.assertEqual(
+                    1,
+                    len(found),
+                    "expected exactly one %s(%s=) in %s(); found %d -- the "
+                    "consumer moved and this table must be re-read"
+                    % (callee, keyword, func, len(found)),
+                )
+                lineno, node = found[0]
+                if isinstance(node, ast.Name):
+                    self.assertEqual(
+                        target,
+                        node.id,
+                        "scheduler.py:%d hands %s(%s=) the name %r, not the "
+                        "pinned %r" % (lineno, callee, keyword, node.id, target),
+                    )
+                    continue
+                try:
+                    value = ast.literal_eval(node)
+                except (ValueError, TypeError):
+                    value = _NOT_A_LITERAL
+                self.assertIs(
+                    expected[(func, target)],
+                    value,
+                    "scheduler.py:%d hands %s(%s=) %r -- neither the pinned "
+                    "name %r nor the flag-off value %r.  A re-armed default "
+                    "by construction: the name pin above cannot see this."
+                    % (
+                        lineno,
+                        callee,
+                        keyword,
+                        value,
+                        target,
+                        expected[(func, target)],
+                    ),
+                )
+
+    def test_no_collapsed_default_is_widened_before_it_is_consumed(self):
+        """The class, applied to all five rows rather than to the named one.
+
+        A pinned flag-off value may be TESTED (``if want and ...``) and it may
+        be handed to a consumer bare.  It may not arrive there inside a wider
+        expression -- ``want or X``, ``want if C else True``, a local rebound
+        from it -- because that is a surviving branch wearing the pinned
+        name.
+        """
+        sched = _SRT / "managers" / "scheduler.py"
+        for func, target, _ in self._COLLAPSED:
+            with self.subTest(where="%s.%s" % (func, target)):
+                widened = _widened_value_uses(sched, func, target)
+                self.assertEqual(
+                    [],
+                    widened,
+                    "%s(): %r reaches a consumer inside a wider expression, "
+                    "so the flag-off pin above says nothing about the value "
+                    "actually used:\n%s"
+                    % (
+                        func,
+                        target,
+                        "\n".join("  line %d, %s: %s" % row for row in widened[:10]),
+                    ),
+                )
+
+    def test_a_hybrid_model_parks_nothing_when_the_method_actually_runs(self):
+        """The behavioural half: run the method, read the state it built.
+
+        Every gate above reads the SOURCE, which is the right instrument for
+        "is this expression still a constant" and the wrong one for "what does
+        this boot end up with".  ``init_parked_decode_set`` needs no model --
+        it reads ``req_to_token_pool.mamba_allocator`` and
+        ``max_running_requests`` and constructs one object -- so the reference
+        shape is affordable here: a hybrid whose GDN state pool reports 4096
+        slots, i.e. the exact arm on which ``mamba_allocator is not None`` and
+        ``slot_pool > 0`` are both TRUE and every re-arming mutant of this
+        method fires.
+
+        Asserting the two READERS as well, not just the flag: an armed set
+        that no reader consults would be a different (smaller) defect, and a
+        disarmed set whose verdict still reads TRUE was the #1233 initializer
+        bug this slice already fixed.  Both are pinned in one place.
+        """
+        from sglang.srt.managers.scheduler import Scheduler
+
+        class _Allocator:
+            size = 4096
+
+        class _ReqToTokenPool:
+            mamba_allocator = _Allocator()
+
+        stub = type("_SchedStub", (), {})()
+        stub.req_to_token_pool = _ReqToTokenPool()
+        stub.max_running_requests = 8
+        Scheduler.init_parked_decode_set(stub)
+
+        self.assertIs(
+            False,
+            stub.parked_decode_set.enabled,
+            "the parked decode set ARMED on a stock boot of a hybrid model: "
+            "admission is silently discounted and the boot log's receipt says "
+            "'off'",
+        )
+        self.assertIs(False, stub._parked_decode_verdict)
+        self.assertIs(False, Scheduler._decode_forbidden_this_phase(stub))
+        self.assertEqual(0, Scheduler._parked_carrier_discount(stub, 4))
+
+    def test_the_abort_receipt_reads_the_pin_it_reports(self):
+        """#801's ``deferred=%s`` must print the value it pinned.
+
+        ``_widened_value_uses`` excludes ``logger.*`` on purpose -- a receipt
+        formats, it does not act -- so the receipt needs its own row or the
+        exclusion is a hole.  This is the instrument-prints-its-denominator
+        half of the same defect: an armed state reported as ``off``.
+        """
+        sched = _SRT / "managers" / "scheduler.py"
+        body = _function_named(sched, "abort_request")
+        receipts = [
+            sub
+            for sub in ast.walk(body)
+            if isinstance(sub, ast.Call) and _is_logging_call(sub)
+        ]
+        self.assertEqual(1, len(receipts), "expected exactly one #801 abort receipt")
+        read = set()
+        for arg in receipts[0].args:
+            read |= _read_names(arg)
+        self.assertIn(
+            "deferred",
+            read,
+            "the #801 abort receipt no longer reads the pinned `deferred`; it "
+            "reports a state it does not read",
+        )
+
+    def test_the_over_cut_pin_can_fail_where_the_value_is_consumed(self):
+        """Can-it-fail proof for the two gates above, with the hole measured.
+
+        Each mutant is spliced into a probe copy of ``scheduler.py`` and both
+        the OLD pin and the NEW gates are run over it, so the record carries
+        the arithmetic rather than a claim: the old pin stays green on rows 0
+        and 1, which is exactly why the new gates exist.
+        """
+        sched = _SRT / "managers" / "scheduler.py"
+        src = sched.read_text(encoding="utf-8")
+        mutants = (
+            # the arming term moved one line down, into the consumer
+            (
+                "            enabled=want,\n",
+                "            enabled=want or (mamba_allocator is not None),\n",
+                "init_parked_decode_set",
+                "want",
+                True,
+            ),
+            # the arming term at the consumer WITHOUT the pinned name
+            (
+                "            enabled=want,\n",
+                "            enabled=(mamba_allocator is not None),\n",
+                "init_parked_decode_set",
+                "want",
+                True,
+            ),
+            # a local rebound from the pin, then handed over bare
+            (
+                "        self.parked_decode_set = ParkedDecodeSet(\n",
+                "        want2 = want or (mamba_allocator is not None)\n"
+                "        self.parked_decode_set = ParkedDecodeSet(\n",
+                "init_parked_decode_set",
+                "want",
+                True,
+            ),
+            # the collapsed chain receiver revived at its keyword
+            (
+                "            chain_receiver=None,\n",
+                "            chain_receiver=self.pp_chain_receiver or object(),\n",
+                "init_request_receiver",
+                "pp_chain_receiver",
+                False,
+            ),
+        )
+        probe = _SRT / "managers" / "_weg2_s0_collapse_probe.py"
+        expected = {(f, t): e for f, t, e in self._COLLAPSED}
+        for i, (needle, patch, func, target, pin_stays_green) in enumerate(mutants):
+            with self.subTest(mutant=i):
+                self.assertIn(needle, src, "mutant %d's anchor moved" % i)
+                probe.write_text(src.replace(needle, patch, 1), encoding="utf-8")
+                try:
+                    if pin_stays_green:
+                        # The hole, measured every run: the NAME pin passes.
+                        for _, value in _literal_assignments(probe, func, target):
+                            self.assertIs(
+                                expected[(func, target)],
+                                value,
+                                "mutant %d was supposed to leave the name pin "
+                                "green -- if it no longer does, this row is "
+                                "proving the wrong thing" % i,
+                            )
+                    consumer = self._COLLAPSED_CONSUMERS[(func, target)]
+                    caught = bool(_widened_value_uses(probe, func, target))
+                    if consumer is not None:
+                        callee, keyword = consumer
+                        found = _keyword_values(probe, func, callee, keyword)
+                        for _, node in found:
+                            if isinstance(node, ast.Name) and node.id == target:
+                                continue
+                            try:
+                                value = ast.literal_eval(node)
+                            except (ValueError, TypeError):
+                                value = _NOT_A_LITERAL
+                            if value is not expected[(func, target)]:
+                                caught = True
+                    self.assertTrue(
+                        caught,
+                        "mutant %d re-arms a collapsed default and neither the "
+                        "consumer gate nor the widening gate sees it:\n%s" % (i, patch),
+                    )
+                finally:
+                    probe.unlink(missing_ok=True)
 
     def test_parked_decode_verdict_default_agrees_with_its_readers(self):
         """The initializer, the writer and both readers must be ONE type.
