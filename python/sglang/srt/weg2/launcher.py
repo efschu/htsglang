@@ -101,6 +101,7 @@ class GroupSpec:
     log: str
     env: Dict[str, str]
     pid: int = 0
+    proc: Optional[subprocess.Popen] = None
 
 
 @dataclass
@@ -239,10 +240,15 @@ def http(method: str, url: str, body: Optional[dict] = None, timeout: float = 25
         return 0, f"{type(e).__name__}: {e}"
 
 
-def wait_ready(port: int, pid: int, deadline_s: float, log: Log, name: str) -> float:
+def wait_ready(port: int, pid: int, deadline_s: float, log: Log, name: str, proc: Optional[subprocess.Popen] = None) -> float:
     t0 = time.time()
     last = ""
     while time.time() - t0 < deadline_s:
+        # proc.poll() reaps: a dead child is a ZOMBIE until reaped and
+        # os.kill(pid, 0) still succeeds on it (measured 07:00Z: D died at
+        # parse and the launcher kept waiting).
+        if proc is not None and proc.poll() is not None:
+            raise Weg2LaunchRefused(f"group {name} pid {pid} died before READY (exit {proc.returncode}); see its log")
         if pid and not _alive(pid):
             raise Weg2LaunchRefused(f"group {name} pid {pid} died before READY")
         code, body = http("GET", f"http://127.0.0.1:{port}/health", timeout=25)
@@ -424,6 +430,9 @@ def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
     return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib) + [
         "--tp-size", "3", "--pp-size", "1",
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
+        # a per-rank MiB LIST under TP requires the uneven-TP ratio; 'auto'
+        # derives the weights from that list (server_args.py rank_tp_ratio).
+        "--rank-tp-ratio", "auto",
         "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
         "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
         "--uneven-dcp", "--uneven-dcp-weighted",
@@ -497,6 +506,7 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     fh.flush()
     p = subprocess.Popen(spec.argv, env=spec.env, stdout=fh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
     spec.pid = p.pid
+    spec.proc = p
     log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log}")
 
 
@@ -626,7 +636,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
     state.pids["P"] = spec_p.pid
     _write_state(state)
-    state.t_ready["P"] = wait_ready(PORT_P, spec_p.pid, ns.ready_deadline_s, log, "P")
+    state.t_ready["P"] = wait_ready(PORT_P, spec_p.pid, ns.ready_deadline_s, log, "P", spec_p.proc)
     n_kv = count_marker(spec_p.log, "#706 canonical KV page active")
     n_blob = count_marker(spec_p.log, "canonical GDN blob active")
     log(f"W7/W10 launcher half, group P log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob} (need >= 3 each: three ranks)")
@@ -659,7 +669,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
     _write_state(state)
-    state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D")
+    state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
     n_kv = count_marker(spec_d.log, "#706 canonical KV page active")
     n_blob = count_marker(spec_d.log, "canonical GDN blob active")
     log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}")
@@ -684,7 +694,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ffh = open(front_log, "ab")
     fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
     state.pids["front"] = fp.pid
-    state.t_ready["front"] = wait_ready(PORT_FRONT, fp.pid, 120, log, "front")
+    state.t_ready["front"] = wait_ready(PORT_FRONT, fp.pid, 120, log, "front", fp)
 
     # 7. deadmen + helpers
     huge = 10**7
