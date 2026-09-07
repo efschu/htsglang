@@ -675,6 +675,46 @@ def _store_allocated_bytes(d):
     return total
 
 
+# A key that falls to the DEFAULT branch of ``_suffix_for_key`` -- it is not a
+# bare page hash, so no neutralisation rule applies and every rank writes it
+# under its OWN ``config_suffix``. That is the population the sole eviction
+# owner has to widen its scan filter to see.
+DRAFT_KEY = f"{KEY[:-1]}%x.draft-a30db4b7c362c786"
+
+
+def _every_rank_writes_its_own_drafts(case, d, configs, n_drafts=4):
+    """Every rank of ONE group writes its own draft pages; a fresh rank-0
+    store then attaches as that group's sole eviction owner.
+
+    ONE fixture for all three axes on purpose. The mechanism under test,
+    ``HiCacheStorage._group_scan_suffixes``, derives the owner's scan
+    population from ``tp_size x pp_size x attn_cp_size``, so the only thing
+    that may differ between the axes is the GEOMETRY -- a fixture per axis
+    would be a second bookkeeping of exactly the derivation being graded, and
+    would drift the day a fourth axis is added.
+
+    Returns ``(owner, on_disk_bytes)``.
+    """
+    os.environ["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"] = "1G"
+    try:
+        stores = [HiCacheFile(c, file_path=d) for c in configs]
+        for r, store in enumerate(stores):
+            for i in range(n_drafts):
+                case.assertTrue(
+                    store.set(
+                        DRAFT_KEY % (r * 16 + i),
+                        torch.zeros(4096, dtype=torch.uint8),
+                    ),
+                    f"rank {r} draft {i} was not admitted",
+                )
+        owner = HiCacheFile(configs[0], file_path=d)
+    finally:
+        os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
+    on_disk = _store_allocated_bytes(d)
+    case.assertGreater(on_disk, 0, "the fixture wrote nothing")
+    return owner, on_disk
+
+
 class TestW8bTheIndexCanSeeTheCanonicalPages(CustomTestCase):
     """W8b ``Weg2StoreIndexBlind``. Measured on the store of record: of
     124,610 files, 104,267 (83.7 %) end with no rank's ``config_suffix`` and
@@ -726,24 +766,10 @@ class TestW8bTheIndexCanSeeTheCanonicalPages(CustomTestCase):
         apply, because the owner's scan filter was its own ``_0_3`` tail and
         ``reserve`` admits a non-owner's own-suffix write without indexing it.
         """
-        draft = f"{KEY[:-1]}%x.draft-a30db4b7c362c786"
         with tempfile.TemporaryDirectory() as d:
-            os.environ["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"] = "1G"
-            try:
-                stores = [HiCacheFile(_d_config(r), file_path=d) for r in range(3)]
-                for r, store in enumerate(stores):
-                    for i in range(4):
-                        self.assertTrue(
-                            store.set(
-                                draft % (r * 16 + i),
-                                torch.zeros(4096, dtype=torch.uint8),
-                            )
-                        )
-                owner = HiCacheFile(_d_config(0), file_path=d)
-            finally:
-                os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
-            on_disk = _store_allocated_bytes(d)
-            self.assertGreater(on_disk, 0, "the fixture wrote nothing")
+            owner, on_disk = _every_rank_writes_its_own_drafts(
+                self, d, [_d_config(r) for r in range(3)]
+            )
             coverage = owner._evictor.index_coverage()
             self.assertEqual(
                 coverage["indexed_entries"],
@@ -756,6 +782,131 @@ class TestW8bTheIndexCanSeeTheCanonicalPages(CustomTestCase):
                 f"the sole owner bounds {coverage['indexed_bytes']} of "
                 f"{on_disk} B: another rank's files are outside every bound",
             )
+
+    def test_the_owner_indexes_every_pp_stage_of_group_p(self):
+        """THE SAME QUESTION ON THE AXIS WEG 2 ACTUALLY PREFILLS ON.
+
+        The row above is ``_d_config`` -- ``tp_size=3, pp_size=1``. It is the
+        only shape any coverage row graded, so the pp loop of
+        ``_group_scan_suffixes`` had no can-it-fail proof while group P
+        (``pp_size=3, tp_size=1``) is a Weg-2 shape and the store is the SOLE
+        carrier across a flip. Dropping that loop leaves the whole suite green
+        and the owner scanning one stage's tail.
+
+        MEASURED at 34cd87bd55 on this fixture: group P's derived scan set is
+        four suffixes spanning ``pp_rank`` 0/1/2 plus the canonical kv tail
+        (``_0_1_3_0``, ``_0_1_3_1``, ``_0_1_3_2``, ``_<model>_<hash>``) and the
+        owner indexes 12 of 12. CAN-IT-FAIL, measured: with the pp loop pinned
+        to ``range(1)`` this row dies at ``Weg2StoreIndexBlind`` -- *"indexed
+        16384 of 49152 B (33.3 %, floor 50 %) across 4 of 12 files"*.
+
+        W8b FIRING HERE IS AN ARTEFACT OF THE FIXTURE, NOT THE PRODUCTION
+        BEHAVIOUR, and the row must not be read as "the gate already covers
+        this". The fixture is draft-only, so the lost stages are a third of the
+        bytes; the store of record is page-dominated (940 pages : 60 drafts,
+        spec 3.3 (4)), where the same mutant leaves the group-wide kv tail
+        indexed and gives coverage 0.960 -- above the floor, no refusal, and
+        two stages' files outside every byte bound. That is why the count is
+        asserted and not merely the gate's verdict.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            owner, on_disk = _every_rank_writes_its_own_drafts(
+                self, d, [_p_config(r) for r in range(3)]
+            )
+            coverage = owner._evictor.index_coverage()
+            self.assertEqual(
+                coverage["indexed_entries"],
+                12,
+                "3 PP stages x 4 drafts must all be in the one index",
+            )
+            self.assertEqual(
+                coverage["indexed_bytes"],
+                on_disk,
+                f"the sole owner bounds {coverage['indexed_bytes']} of "
+                f"{on_disk} B: another PP stage's files are outside every bound",
+            )
+
+    def test_the_owner_indexes_every_attn_cp_rank_of_the_group(self):
+        """The third axis of the same derivation, on a shipping shape.
+
+        ``attn_cp`` is not a Weg-2 group, but the term is appended with no
+        ``is_mla_model`` guard, so an MLA store's ranks name per-rank paths on
+        it -- the same reason ``_cp_config`` already grades the owner election
+        (R6). It is also the axis whose suffix is BOTH the config and the kv
+        tail, so nothing group-wide survives to pad the coverage.
+
+        THIS IS THE ROW WHERE THE GATE PROVABLY DOES NOT CATCH IT. MEASURED at
+        34cd87bd55: 8 of 8 indexed; with the cp loop pinned to ``range(1)`` the
+        owner indexes 4 of 8 -- coverage exactly 0.500, and
+        ``check_index_coverage`` compares ``fraction >= floor`` against
+        ``INDEX_COVERAGE_FLOOR = 0.5``, so W8b returns rather than raises and
+        this row fails on the count alone: *"AssertionError: 4 != 8"*. Half the
+        group's files outside every byte bound, no refusal anywhere.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            owner, on_disk = _every_rank_writes_its_own_drafts(
+                self, d, [_cp_config(r) for r in range(2)]
+            )
+            coverage = owner._evictor.index_coverage()
+            self.assertEqual(
+                coverage["indexed_entries"],
+                8,
+                "2 attn-cp ranks x 4 drafts must all be in the one index",
+            )
+            self.assertEqual(
+                coverage["indexed_bytes"],
+                on_disk,
+                f"the sole owner bounds {coverage['indexed_bytes']} of "
+                f"{on_disk} B: the sibling cp rank's files are outside every bound",
+            )
+
+    def test_the_owners_scan_set_is_every_suffix_its_group_can_name(self):
+        """GRADE THE DERIVATION ITSELF, not only the count it produces.
+
+        The three rows above count files, so a scan set wrong in a way no
+        fixture file happens to land on still passes them. Here the expected
+        set is taken from THE RANKS THEMSELVES -- each rank's own
+        ``(config_suffix, kv_config_suffix)`` pair, read off a constructed
+        store -- and the owner's filter must equal exactly that union.
+
+        That is deliberately NOT a second copy of ``_build_key_suffixes``: the
+        ranks are the authority on which paths they name, which is the same
+        reason ``_derive_key_suffixes`` answers the group-wide question by
+        re-deriving rather than by listing axes. One row therefore grades all
+        three loops -- drop any one of them and the owner's set is a strict
+        subset of what its own group writes.
+
+        THE ONE THING THIS ROW CANNOT SEE, stated so the green is not read
+        wider than it is: on the attn_cp shape ``config_suffix`` and
+        ``kv_config_suffix`` are the SAME string, so that subtest alone cannot
+        catch a mutant that drops the kv half of the derived set. Measured:
+        appending only ``cfg`` inside the loop turns the tp and pp subtests red
+        and leaves the cp one green. The tp and pp shapes carry the kv half.
+        """
+        for label, configs in (
+            ("group D, tp axis", [_d_config(r) for r in range(3)]),
+            ("group P, pp axis", [_p_config(r) for r in range(3)]),
+            ("attn_cp axis", [_cp_config(r) for r in range(2)]),
+        ):
+            with self.subTest(group=label), tempfile.TemporaryDirectory() as d:
+                ranks = [HiCacheFile(c, file_path=d) for c in configs]
+                named = set()
+                for rank in ranks:
+                    named.update(
+                        s for s in (rank.config_suffix, rank.kv_config_suffix) if s
+                    )
+                owner = ranks[0]
+                self.assertTrue(
+                    owner._evictor._scan_population_is_group_wide,
+                    f"{label}: the sole owner still scans its own tail",
+                )
+                self.assertEqual(
+                    set(owner._evictor._scan_suffixes),
+                    named,
+                    f"{label}: the owner scans "
+                    f"{sorted(owner._evictor._scan_suffixes)} while its group "
+                    f"writes {sorted(named)}",
+                )
 
     def test_every_rank_of_a_shared_key_group_refuses_a_blind_store(self):
         """W8b IS A GROUP VERDICT AT ATTACH, exactly as W8 is.
