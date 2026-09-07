@@ -1193,6 +1193,33 @@ class HiRadixCache(RadixCache):
         operation_id = self.cache_controller.write_storage(
             host_value, key, hash_value, prefix_keys, **self._get_extra_pools()
         )
+        # #1233 STORE-WRITE-ISSUED (boot weg2ls3b1): group P's first awake
+        # epoch published 13k tokens to the host tier and wrote ZERO pages to
+        # the store, its second wrote 13,229 files that did not overwrite the
+        # 13.7k group D had written for the same prompt (27.5k files, one
+        # suffix) while P's own prefetch matched D's chain 13,224 deep. Which
+        # half is which -- never issued, or issued under a different chain --
+        # is decidable from this line alone: it prints the chain's first and
+        # last page hash per issued write, rate-limited, with the count.
+        _n = getattr(self, "_1233_store_writes_issued", 0) + 1
+        self._1233_store_writes_issued = _n
+        if _n <= 12 or _n % 64 == 0:
+            try:
+                logger.info(
+                    "#1233 STORE-WRITE-ISSUED n=%d op=%s tokens=%d pages=%d "
+                    "first_hash=%s last_hash=%s prefix_keys=%s node=%s "
+                    "(denominator: every write_backup_storage call on this rank)",
+                    _n,
+                    operation_id,
+                    len(key),
+                    len(hash_value),
+                    str(hash_value[0])[:12] if len(hash_value) else "-",
+                    str(hash_value[-1])[:12] if len(hash_value) else "-",
+                    "none" if prefix_keys is None else len(prefix_keys),
+                    getattr(top, "id", "?"),
+                )
+            except Exception:  # noqa: BLE001
+                pass
         self.ongoing_backup[operation_id] = node
         node.protect_host()
         # #810: the DRAIN phase begins here. `protect_host` keeps these tokens

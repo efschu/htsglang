@@ -9583,10 +9583,48 @@ class Scheduler(
         # (`phase_flip_runtime._post_cutover_readmit`), so a #937-doomed
         # operation is retired and re-opened on the incoming binding at the
         # group-uniform event itself -- whole population, no collective.
-        return {
+        verdicts = {
             req.rid: self.tree_cache.check_prefetch_progress(req.rid)
             for req in self.waiting_queue
         }
+        # #1233 ORPHAN COLLECTION (boot weg2ls3b1, 2026-09-07 09:27:26Z ->
+        # 09:28:59Z W3): a request admitted WITHOUT WAITING for its storage
+        # prefetch (#969Z followers, #973 PP0 on the no-carrier form) leaves
+        # the waiting queue with its `ongoing_prefetch` record still open,
+        # and the comprehension above -- the only collector -- visits the
+        # waiting queue only. The record then outlives the request: P's
+        # HICACHE-ROUND printed ongoing_prefetch=1 on all three ranks for
+        # nine minutes after rid 14d4e2c4 had answered, is_fully_idle() read
+        # False on the len(tc.ongoing_prefetch)==0 clause, the front's sleep
+        # witness got 'Flush cache failed' to its deadline and STOPPED (W3).
+        # Same collector, wider population: every open record whose rid is
+        # no longer queued is advanced here too -- check_prefetch_progress
+        # terminates it under the configured stop policy (timeout/complete)
+        # and inserts what landed for the next matching request, exactly as
+        # for a queued rid. Rank-uniform by the same argument as the drain:
+        # ongoing_prefetch is the participation-voted set and the waiting
+        # queue is replicated, so the orphan set and its order agree on
+        # every rank; a rank without orphans contributes nothing and enters
+        # no collective it would enter alone.
+        _ongoing = getattr(self.tree_cache, "ongoing_prefetch", None)
+        if _ongoing:
+            for _rid in [r for r in list(_ongoing) if r not in verdicts]:
+                if self.tree_cache.check_prefetch_progress(_rid):
+                    _n = getattr(self, "_1233_prefetch_orphans_collected", 0) + 1
+                    self._1233_prefetch_orphans_collected = _n
+                    if _n <= 8 or _n % 64 == 0:
+                        logger.warning(
+                            "#1233 PREFETCH ORPHAN COLLECTED rid=%s: its "
+                            "request left the waiting queue with the "
+                            "prefetch open (admitted without waiting), so "
+                            "the drain collected it here instead of never. "
+                            "collected=%d ongoing_after=%d (denominator: "
+                            "every open prefetch record of this rank)",
+                            str(_rid)[:8],
+                            _n,
+                            len(_ongoing),
+                        )
+        return verdicts
 
     def _prefetch_done_for(self, req: Req, drained: Dict[str, bool]) -> bool:
         """Read the drained verdict for ``req``; refuse to answer locally.
@@ -13504,6 +13542,31 @@ class Scheduler(
         )
         _check("waiting_queue", len(self.waiting_queue) == 0)
         _check("grammar_queue", len(self.grammar_manager.grammar_queue) == 0)
+        # #1233: the four HiCache in-flight clauses of is_fully_idle were the
+        # unnamed ones -- boot weg2ls3b1 refused a flush for 90 s printing
+        # 'not-idle because: unknown' while HICACHE-ROUND showed
+        # ongoing_prefetch=1 one line away. A clause that can block is a
+        # clause that gets named.
+        if self.enable_hierarchical_cache:
+            tc = self.tree_cache
+            _check(
+                f"hicache_write_through({len(tc.ongoing_write_through)})",
+                len(tc.ongoing_write_through) == 0,
+            )
+            _check(
+                f"hicache_load_back({len(tc.ongoing_load_back)})",
+                len(tc.ongoing_load_back) == 0,
+            )
+            if tc.enable_storage:
+                _check(
+                    f"hicache_prefetch({len(tc.ongoing_prefetch)}: "
+                    f"{','.join(str(r)[:8] for r in list(tc.ongoing_prefetch)[:4])})",
+                    len(tc.ongoing_prefetch) == 0,
+                )
+                _check(
+                    f"hicache_backup({len(tc.ongoing_backup)})",
+                    len(tc.ongoing_backup) == 0,
+                )
         return blockers
 
     def handle_session_handover(
