@@ -9,7 +9,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 
 import torch
 
@@ -1313,34 +1313,72 @@ class HiCacheFile(HiCacheStorage):
         after construction.
         """
         g = self._key_geom
-        self.config_suffix = f"_{g['model_name']}"
-        self.kv_config_suffix = f"_{g['model_name']}"
+        self.config_suffix, self.kv_config_suffix = self._build_key_suffixes(g)
+        # WHICH OF THESE PATHS DOES EVERY RANK OF THE GROUP NAME?
+        # Asked by re-deriving the same two strings from the same builder with
+        # the rank terms zeroed, and comparing. It is deliberately not a list
+        # of axes: a list is a second bookkeeping of the derivation above and
+        # drifts the day an axis is added -- which is exactly how the first
+        # attempt at this answer (``is_mla_model`` alone) refused every write
+        # from an MLA PP stage 1 and from attn_cp rank 1, whose suffixes carry
+        # a rank term the tp-only exemption never touches.
+        #
+        # ``_evictor.reserve`` is the one consumer: a non-owner writing a path
+        # only it names holds bytes nobody else writes, and refusing it is a
+        # carrier that moves nothing (see
+        # ``weg2_store_gates.owner_write_covers_whole_file``).
+        rank0 = dict(g, tp_rank=0, pp_rank=0, attn_cp_rank=0)
+        rank0_config_suffix, rank0_kv_config_suffix = self._build_key_suffixes(rank0)
+        self._config_suffix_is_group_wide = self.config_suffix == rank0_config_suffix
+        self._kv_config_suffix_is_group_wide = (
+            self.kv_config_suffix == rank0_kv_config_suffix
+        )
+
+    def _build_key_suffixes(self, g: dict) -> Tuple[str, str]:
+        """(config_suffix, kv_config_suffix) for the geometry ``g``.
+
+        Pure in ``g``, so the caller above can run it a second time with the
+        rank terms zeroed and learn, from the derivation itself, whether this
+        rank's suffix is the group's or its own.
+        """
+        config_suffix = f"_{g['model_name']}"
+        kv_config_suffix = f"_{g['model_name']}"
         if g["identity_hash"]:
-            self.config_suffix += f"_{g['identity_hash']}"
-            self.kv_config_suffix += f"_{g['identity_hash']}"
+            config_suffix += f"_{g['identity_hash']}"
+            kv_config_suffix += f"_{g['identity_hash']}"
         if not g["is_mla_model"]:
-            self.config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
+            config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
             if not self.dcp_owner_mode and self.canonical_kv_page is None:
-                self.kv_config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
+                kv_config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
         if g["enable_pp"]:
-            self.config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
+            config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
             if self.canonical_kv_page is None:
-                self.kv_config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
+                kv_config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
         if g["attn_cp_size"] > 1:
-            self.config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
-            self.kv_config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
+            config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
+            kv_config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
+        return config_suffix, kv_config_suffix
 
+    def _suffix_for_key(self, key: str) -> Tuple[str, bool]:
+        """The suffix this key carries, and whether every rank names that path.
 
-    def _get_suffixed_key(self, key: str) -> str:
+        ONE branch, two answers, because the second question is only ever
+        asked about a path the first one chose. Splitting them would leave a
+        write admitted under the group-wide answer for the config suffix while
+        the bytes landed on the kv-suffixed path, or the reverse.
+        """
         if self._is_draft_key(key):
-            return key + self.config_suffix
+            return self.config_suffix, self._config_suffix_is_group_wide
         if (
             self.dcp_owner_mode or self.canonical_kv_page is not None
         ) and self._is_shared_kv_key(key):
-            return key + self.kv_config_suffix
+            return self.kv_config_suffix, self._kv_config_suffix_is_group_wide
         if self._is_shared_mamba_key(key):
-            return key + self.kv_config_suffix
-        return key + self.config_suffix
+            return self.kv_config_suffix, self._kv_config_suffix_is_group_wide
+        return self.config_suffix, self._config_suffix_is_group_wide
+
+    def _get_suffixed_key(self, key: str) -> str:
+        return key + self._suffix_for_key(key)[0]
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         """The LOOKUP-side component key.
@@ -1604,6 +1642,17 @@ class HiCacheFile(HiCacheStorage):
         propagate; a cap enforced over a fraction of the sole carrier is not a
         cap, and continuing would spend the group's awake phase evicting
         against numbers that do not describe the disk.
+
+        AND MUST ESCALATE IT GROUP-FATALLY: the wake caller turns this raise
+        into W4 ``Weg2WakeRefused`` -- a group-fatal STOP with no retry (spec
+        §5, which places the wake refusal at the launcher for exactly this
+        reason). The verdict is the eviction owner's alone and cannot be
+        moved: the census is filtered by that rank's scan suffixes, so a
+        non-owner grading the same directory grades a different population.
+        A rank that dies here alone while its siblings wake on is the
+        disagreement §0 forbids ("STOP, never compensation"). Wiring this
+        escalation is S1/S3's obligation, recorded as such in
+        WEG2_BUILD_DECISIONS_0906.md; S5 owns only the one definition.
         """
         return self._evictor.rescan()
 
@@ -1745,16 +1794,18 @@ class HiCacheFile(HiCacheStorage):
             value_bytes = value.numel() * value.element_size()
             # Ask the evictor to admit + reserve disk space (evicting if
             # needed). Whether a non-owner may write is a question about THIS
-            # FILE, not about this rank: under MLA every rank names one path
-            # and writes identical bytes, so the owner's write is the whole
-            # file; everywhere else the suffix carries this rank's terms and
-            # the owner never writes this path at all.
+            # FILE, not about this rank: when every rank of the group names
+            # this same path AND the model is rank-replicated, the owner's
+            # write already puts every byte there; where the suffix carries a
+            # rank term -- this rank's tp shard, its PP stage, its attn-cp
+            # rank -- the owner never writes this path at all.
             if not self._evictor.reserve(
                 suffixed,
                 value_bytes,
                 key=key,
                 owner_writes_whole_file=owner_write_covers_whole_file(
                     is_mla_model=self._key_geom["is_mla_model"],
+                    path_is_group_wide=self._suffix_for_key(key)[1],
                 ),
             ):
                 return False

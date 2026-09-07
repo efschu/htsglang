@@ -94,6 +94,7 @@ def owner_write_covers_whole_file(
     *,
     is_mla_model: bool,
     canonical_extent_write: bool = False,
+    path_is_group_wide: bool = True,
 ) -> bool:
     """Would the storage owner's write alone put EVERY byte of this file on disk?
 
@@ -113,11 +114,31 @@ def owner_write_covers_whole_file(
       Weg 2's store, where the cap is always configured, refusing them is a
       carrier that moves nothing and looks exactly like a cold cache.
 
-    Under MLA the suffix carries no rank term at all (``_derive_key_suffixes``
-    appends the tp terms only ``if not is_mla_model``), so every rank names ONE
-    path and writes byte-identical content into it: the owner's write really is
-    the whole file, and admitting the others would be three processes writing
-    one path for nothing. That case, and only that case, keeps the refusal.
+    Under MLA the suffix drops the TP terms and ONLY those:
+    ``_derive_key_suffixes`` appends ``_{tp_rank}_{tp_size}`` under
+    ``if not is_mla_model``, but appends ``_{pp_size}_{pp_rank}`` and
+    ``_cp{attn_cp_rank}_{attn_cp_size}`` two branches below with no such
+    guard. "MLA" therefore does NOT mean "every rank names one path", and
+    reading it that way was a measured regression: at 8a71eb87, hermetically,
+    an MLA run with pp_size=3 gave stage 1 the suffix ``_M_H_3_1`` -- a path
+    the elected owner (tp0/pp0/cp0) never writes -- and stages 1 and 2 were
+    refused every write, as was attn_cp rank 1. The parent aef3ae76 admitted
+    all of them, so this was a NEW refusal on a shipping non-Weg-2 path, under
+    a log line that asserted the false premise ("the owner writes this whole
+    file").
+
+    The caller therefore supplies the FACT rather than a list of shapes:
+    ``path_is_group_wide`` is True only when the suffix this key carries is
+    the string every rank of the group produces. ``HiCacheStorage`` answers it
+    by re-deriving its suffixes with the rank terms zeroed and comparing --
+    one derivation, two inputs -- so a rank axis added later is covered the
+    day it is added rather than the day someone remembers to extend a list
+    here. Where the path is this rank's alone, nobody else writes those bytes
+    and refusing is a carrier that moves nothing.
+
+    It defaults to True so a caller that does not know keeps the historical
+    refusal, which is the safe direction: a refused duplicate is lost cache,
+    while an admitted write the owner cannot account for is unbounded disk.
 
     A canonical EXTENT write is never whole by construction -- the format
     exists so that several ranks each deposit a part and the blob becomes
@@ -125,6 +146,8 @@ def owner_write_covers_whole_file(
     attention shape.
     """
     if canonical_extent_write:
+        return False
+    if not path_is_group_wide:
         return False
     return bool(is_mla_model)
 

@@ -103,6 +103,7 @@ def _d_config(
     canonical: bool = True,
     window=None,
     is_mla_model: bool = False,
+    extra_config=None,
 ):
     """Group D, rank ``tp_rank``: tp_size=3, pp_size=1.
 
@@ -130,6 +131,30 @@ def _d_config(
             if window is not None
             else (_whole_page_window() if canonical else None)
         ),
+        extra_config=extra_config,
+    )
+
+
+def _cp_config(attn_cp_rank: int, *, attn_cp_size: int = 2):
+    """An MLA rank on the attention-CP axis: tp_size=1, pp_size=1, cp_size=n.
+
+    Not a Weg-2 shape -- a shipping one. It is here because the attn-cp term
+    is appended to the suffix with no ``is_mla_model`` guard, so it is one of
+    the two axes on which "MLA means every rank names one path" is false.
+    """
+    return HiCacheStorageConfig(
+        tp_rank=0,
+        tp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
+        is_mla_model=True,
+        enable_storage_metrics=False,
+        is_page_first_layout=False,
+        model_name=MODEL_NAME,
+        model_identity_hash=IDENTITY,
+        canonical_kv_page=None,
     )
 
 
@@ -750,6 +775,89 @@ class TestW7TheGdnBlobIsMandatoryOnAHybrid(CustomTestCase):
         )
 
 
+def _drive_generate_storage_config(*, has_mamba_pool: bool, mamba_blob):
+    """Run the PRODUCTION W7 call site: ``HiCacheController._generate_storage_config``.
+
+    Called unbound on a double rather than on a real controller: what is being
+    graded is one keyword argument at one call site, and a real controller
+    would need pools, a model and a device. Everything the function reaches
+    outside itself is patched at the module attribute it looks up, which is
+    also why ``build_page_window`` / ``resolve_attn_layer_ids`` are patched on
+    ``canonical_page_store`` -- the function imports them at call time.
+    """
+    import types
+    from unittest import mock
+
+    import sglang.srt.managers.cache_controller as cc
+    import sglang.srt.mem_cache.canonical_page_store as cps
+
+    controller = types.SimpleNamespace(
+        mem_pool_device=object(),
+        mem_pool_device_hybrid=types.SimpleNamespace(
+            mamba_pool=object() if has_mamba_pool else None
+        ),
+        mem_pool_host=types.SimpleNamespace(layout="layer_first"),
+        enable_storage_metrics=False,
+        get_attn_cp_rank_and_size=lambda: (0, 1),
+        _canonical_mamba_window=lambda server_args, model_config: mamba_blob,
+        _dcp_owner_ctx=lambda: None,
+    )
+    server_args = types.SimpleNamespace(
+        hicache_canonical_kv_page=True,
+        get_model_config=lambda: object(),
+        hicache_host_role="retention",
+    )
+    parallel = types.SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+    window = CanonicalPageWindow(spec=SPEC, first_slot=0, num_slots=NUM_ATTN_LAYERS)
+    with mock.patch.object(cc, "get_parallel", lambda: parallel), mock.patch.object(
+        cc, "is_dp_attention_enabled", lambda: False
+    ), mock.patch.object(cc, "get_server_args", lambda: server_args), mock.patch.object(
+        cc, "canonical_identity_hash_for", lambda args, on: IDENTITY
+    ), mock.patch.object(
+        cps, "resolve_attn_layer_ids", lambda mc: list(range(NUM_ATTN_LAYERS))
+    ), mock.patch.object(
+        cps, "build_page_window", lambda ids, dev, host: window
+    ):
+        return cc.HiCacheController._generate_storage_config(
+            controller, model_name=MODEL_NAME
+        )
+
+
+class TestW7TheWiringCanFire(CustomTestCase):
+    """W7's SEAM, the blind spot W8b already had its own row for.
+
+    All three rows of ``TestW7TheGdnBlobIsMandatoryOnAHybrid`` call the pure
+    ``check_mamba_blob_present`` directly, so the ONE production call site is
+    graded nowhere. MEASURED: replacing
+    ``has_mamba_pool=getattr(self.mem_pool_device_hybrid, "mamba_pool", None)
+    is not None`` with ``has_mamba_pool=False`` -- after which the gate can
+    never fire on any model -- left both S5 files green (44 passed) and all
+    five touched neighbour suites green (71 passed). A gate that cannot fire
+    is the danger direction here: the failure it guards is the measured #931
+    shape, which on the sole carrier is a 100 % miss that reads as a cold
+    cache.
+    """
+
+    def test_the_production_call_site_refuses_a_hybrid_without_a_blob(self):
+        from sglang.srt.mem_cache.weg2_store_gates import Weg2MambaBlobAbsent
+
+        with self.assertRaises(Weg2MambaBlobAbsent):
+            _drive_generate_storage_config(has_mamba_pool=True, mamba_blob=None)
+
+    def test_the_production_call_site_lets_a_dense_model_through(self):
+        """CAN-FAIL COMPANION: no mamba pool bound is a dense model, and the
+        gate must not refuse it -- otherwise the row above would pass with a
+        call site that raises unconditionally."""
+        config = _drive_generate_storage_config(has_mamba_pool=False, mamba_blob=None)
+        self.assertIsInstance(config, HiCacheStorageConfig)
+
+    def test_the_production_call_site_lets_a_hybrid_with_a_blob_through(self):
+        config = _drive_generate_storage_config(
+            has_mamba_pool=True, mamba_blob=object()
+        )
+        self.assertIsInstance(config, HiCacheStorageConfig)
+
+
 class TestW8TheStoreCapMustBeFundable(CustomTestCase):
     """W8 ``Weg2StoreCapUnfundable`` (operator ruling Q5: 200 GiB cap,
     100 GiB min free on /spinning/hicache-weg2). The tree's existing
@@ -773,6 +881,84 @@ class TestW8TheStoreCapMustBeFundable(CustomTestCase):
 
         with tempfile.TemporaryDirectory() as d:
             check_store_cap_fundable(d, 1 << 20, 1 << 20)
+
+    def test_the_evictor_grades_its_own_configured_numbers(self):
+        """MB3, the SEAM: the two rows above hand the gate numbers by hand.
+
+        MEASURED: replacing ``self.min_free_bytes`` with ``0`` at the
+        production call site left the suite green -- and that mutant is not
+        cosmetic, because a cap that fits ``total`` but not
+        ``total - min_free`` then passes W8 and is SILENTLY clamped to exactly
+        that difference by ``_clamp_max_size_to_fs``: the operator's Q5 number
+        stays on the launch line while a smaller budget is served.
+        """
+        from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreCapUnfundable
+
+        with tempfile.TemporaryDirectory() as d:
+            st = os.statvfs(d)
+            total = st.f_blocks * (st.f_frsize or 4096)
+            with self.assertRaises(Weg2StoreCapUnfundable):
+                LRUFileEvictor(
+                    d,
+                    "_sfx",
+                    kv_config_suffix=None,
+                    tp_rank=0,
+                    writes_shared_keys=True,
+                    # Fits ``total`` on its own; does not fit total - min_free.
+                    extra_config={"max_size": total, "min_free_space": 4096},
+                )
+            # CAN-FAIL COMPANION: a fundable pair constructs, so the row above
+            # grades the numbers and not the constructor.
+            LRUFileEvictor(
+                d,
+                "_sfx",
+                kv_config_suffix=None,
+                tp_rank=0,
+                writes_shared_keys=True,
+                extra_config={"max_size": total // 4, "min_free_space": total // 4},
+            )
+
+    def test_every_rank_of_a_shared_key_group_refuses_together(self):
+        """W8 is a GROUP verdict: one rank refusing alone is a disagreement.
+
+        After the election runs over the full rank identity, exactly one rank
+        of a shared-key group is the eviction owner, so a gate placed below
+        the owner-only early return refuses rank 0 while ranks 1..n-1 build
+        their backend and walk into the next collective. Its three inputs are
+        rank-invariant by construction (same extra_config, same filesystem),
+        so every rank must reach the same verdict and stop together -- user
+        law §0, "Ranks never disagree ... STOP, never compensation".
+        """
+        from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreCapUnfundable
+
+        with tempfile.TemporaryDirectory() as d:
+            st = os.statvfs(d)
+            total = st.f_blocks * (st.f_frsize or 4096)
+            unfundable = {"max_size": total, "min_free_space": 4096}
+            for rank in range(3):
+                with self.assertRaises(
+                    Weg2StoreCapUnfundable, msg=f"rank {rank} did not refuse"
+                ):
+                    LRUFileEvictor(
+                        d,
+                        f"_sfx_{rank}_3",
+                        kv_config_suffix="_sfx",
+                        tp_rank=rank,
+                        writes_shared_keys=True,
+                        extra_config=unfundable,
+                    )
+            # CAN-FAIL COMPANION / no stock boot gains a refusal: where every
+            # rank owns its own suffixed files there is no shared budget to
+            # fund, and the same numbers construct.
+            for rank in range(3):
+                LRUFileEvictor(
+                    d,
+                    f"_sfx_{rank}_3",
+                    kv_config_suffix=None,
+                    tp_rank=rank,
+                    writes_shared_keys=False,
+                    extra_config=unfundable,
+                )
 
 
 class TestF7WriteAdmissionIsPerFileNotPerRank(CustomTestCase):
@@ -912,6 +1098,117 @@ class TestF7WriteAdmissionIsPerFileNotPerRank(CustomTestCase):
             self.assertTrue(
                 stores[0].exists(KEY),
                 "the blob never completed: the non-owner stages were dropped",
+            )
+
+    def test_an_mla_pp_stage_writes_the_file_only_it_names(self):
+        """MEASURED REGRESSION vs the parent, on a shipping non-Weg-2 shape.
+
+        ``is_mla_model`` was read as "every rank names one path". It is not:
+        ``_derive_key_suffixes`` drops the TP terms under MLA and appends
+        ``_{pp_size}_{pp_rank}`` and ``_cp{rank}_{size}`` with no such guard.
+        At 8a71eb87, MLA pp_size=3 gave stage 1 the suffix ``_M_H_3_1`` -- a
+        path the elected owner (pp0) never writes -- and stages 1 and 2 were
+        refused every write. The parent aef3ae76 (election ``tp_rank == 0``,
+        which every PP stage satisfies) admitted all three.
+        """
+
+        def body(d):
+            stores = [
+                HiCacheFile(
+                    _p_config(st, canonical=False, is_mla_model=True), file_path=d
+                )
+                for st in range(3)
+            ]
+            # Stages 1 and 2 first: on a key already on disk the
+            # already-exists fast path answers before admission is asked.
+            return stores, [
+                stores[1].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+                stores[2].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+                stores[0].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+            ]
+
+        with tempfile.TemporaryDirectory() as d:
+            stores, wrote = self._bounded(lambda: body(d))
+            self.assertEqual(
+                sorted({s.config_suffix for s in stores}),
+                [
+                    "_Qwen3.8-27B_520526c68d6530e9_3_0",
+                    "_Qwen3.8-27B_520526c68d6530e9_3_1",
+                    "_Qwen3.8-27B_520526c68d6530e9_3_2",
+                ],
+                "the premise of this test is that MLA PP stages name three paths",
+            )
+            self.assertEqual(
+                wrote,
+                [True, True, True],
+                "an MLA PP stage was refused the file only it names",
+            )
+            found = [f for _, _, fs in os.walk(d) for f in fs if f.endswith(".bin")]
+            self.assertEqual(
+                len(found), 3, f"3 per-stage files expected, found {found}"
+            )
+
+    def test_an_mla_attn_cp_rank_writes_the_file_only_it_names(self):
+        """The second unguarded axis, same shape as the PP one."""
+
+        def body(d):
+            stores = [HiCacheFile(_cp_config(r), file_path=d) for r in range(2)]
+            return stores, [
+                stores[1].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+                stores[0].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+            ]
+
+        with tempfile.TemporaryDirectory() as d:
+            stores, wrote = self._bounded(lambda: body(d))
+            self.assertNotEqual(
+                stores[0].config_suffix,
+                stores[1].config_suffix,
+                "the premise of this test is that attn-cp ranks name two paths",
+            )
+            self.assertEqual(
+                wrote,
+                [True, True],
+                "an MLA attn-cp rank was refused the file only it names",
+            )
+            found = [f for _, _, fs in os.walk(d) for f in fs if f.endswith(".bin")]
+            self.assertEqual(len(found), 2, f"2 per-cp-rank files, found {found}")
+
+    def test_an_admitted_non_owner_still_honours_the_free_space_watermark(self):
+        """MB1: the watermark is the ONLY bound left on an admitted non-owner.
+
+        A non-owner keeps no index (``test_a_non_owner_keeps_no_index_of_what
+        _it_wrote``) and does not enforce the byte cap -- that is the owner's
+        act. Four of Weg 2's six ranks are non-owners, so if this statvfs
+        check goes they write with no bound whatsoever, and the sole carrier
+        fills its filesystem until ``set`` rolls back on ENOSPC, which the ack
+        path reports as a partial backup, i.e. as a cache miss (spec 3.3 (5)).
+        """
+        draft = f"{KEY}.draft-a30db4b7c362c786"
+        with tempfile.TemporaryDirectory() as d:
+            store = HiCacheFile(
+                _d_config(1, extra_config={"max_size": "1G", "min_free_space": "1G"}),
+                file_path=d,
+            )
+            self.assertFalse(
+                store._evictor.is_storage_owner, "this test needs a non-owner"
+            )
+            total, _free = store._evictor._fs_stats()
+            # The filesystem as it is when the watermark is the thing that
+            # matters: 4 KiB left against a 1 GiB floor.
+            store._evictor._fs_stats = lambda: (total, 4096)
+            self.assertFalse(
+                store.set(draft, torch.zeros(4096, dtype=torch.uint8)),
+                "an admitted non-owner wrote past the free-space watermark",
+            )
+            found = [f for _, _, fs in os.walk(d) for f in fs if f.endswith(".bin")]
+            self.assertEqual(found, [], "bytes landed despite the refusal")
+            # CAN-FAIL COMPANION: with room on the filesystem the same write
+            # lands, so the row above grades the watermark and not the
+            # admission it rides on.
+            store._evictor._fs_stats = lambda: (total, total)
+            self.assertTrue(
+                store.set(draft, torch.zeros(4096, dtype=torch.uint8)),
+                "the watermark refused a write the filesystem can fund",
             )
 
     def test_a_non_owner_keeps_no_index_of_what_it_wrote(self):

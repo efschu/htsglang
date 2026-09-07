@@ -228,9 +228,6 @@ class LRUFileEvictor:
                 f"suffixed files), untracked here."
             )
 
-        if not self._eviction_enabled:
-            return
-
         # W8: on a shared-key store the operator's cap is not advisory. The
         # clamp below silently serves a SMALLER budget than the launch line
         # asked for, which is the right answer while this tier is a cache in
@@ -238,10 +235,29 @@ class LRUFileEvictor:
         # carrier between two process groups: the loss then appears weeks later
         # as a hit-rate decay with the operator's own number still on screen.
         # Refuse first, clamp only where a clamp is still honest.
-        if self._writes_shared_keys:
+        #
+        # GRADED BY EVERY RANK OF THE GROUP, ABOVE THE OWNER-ONLY RETURN. Once
+        # the election runs over the full rank identity, exactly ONE rank of a
+        # shared-key group reaches the code below; a refusal placed there kills
+        # rank 0 while ranks 1..n-1 build their backend and walk into the next
+        # collective, which is a rank disagreement rather than a stop (user law
+        # §0: "Ranks never disagree ... STOP, never compensation"). The three
+        # inputs here are rank-invariant by construction -- the same
+        # extra_config/env numbers and the same filesystem -- so every rank
+        # computes the same verdict and they refuse together. W8b cannot move
+        # with it: its census is filtered by ``_scan_suffixes``, which carries
+        # THIS rank's ``config_suffix``, so a non-owner would grade a different
+        # population and could disagree with the owner about coverage. It stays
+        # the owner's single verdict; the wake-path escalation that makes it
+        # group-fatal is named in ``HiCacheFile.rescan_eviction_index``.
+        if self._eviction_configured and self._writes_shared_keys:
             check_store_cap_fundable(
                 self.file_path, self.max_size_bytes, self.min_free_bytes
             )
+
+        if not self._eviction_enabled:
+            return
+
         self._clamp_max_size_to_fs()
 
         self._scan_existing_files()
