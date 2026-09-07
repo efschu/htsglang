@@ -14,6 +14,26 @@
 # the warning against it; it is also forbidden by the brief. And
 # seam_scaling_reboot.py --from-capture silently SKIPS its stop step, so
 # "reboot" scripts here do not imply anything was stopped.
+# --- #1233 (WEG 2, S0) HARD REFUSAL -------------------------------------
+# This recipe launches with flags that no longer exist. #1233 replaced the
+# in-process PP-prefill <-> TP-decode cutover with two independent process
+# groups per card, and slice S0 removed every flag that armed it
+# (spec §7 item 4: hard-remove with a loud refusal, no silent shim). The
+# server itself refuses these spellings at parse time; this script refuses
+# one step earlier, so nobody spends a GPU window discovering it.
+#
+# The recipe below is left BYTE-FOR-BYTE as the historical record of what
+# was booted; S7 `git rm`s this file once no launch line in the field can
+# still carry it. Do not "fix" it by deleting flags -- what it booted is
+# not what a Weg-2 boot is, and a half-swept recipe that starts is worse
+# than one that refuses.
+echo "REFUSED: s30_reboot_corridor_guard.sh launches a phase flip. #1233 (WEG 2) removed the" >&2
+echo "  in-process flip and its CLI surface; there is no equivalent flag." >&2
+echo "  Boot the two process groups from the WEG 2 launcher instead; see" >&2
+echo "  /spinning/gpu-arb/weg2/WEG2_DESIGN_SPEC_2026-09-06.md." >&2
+exit 1
+# --- end #1233 refusal --------------------------------------------------
+
 set -euo pipefail
 
 WT="${WT:-/spinning/wt-631-routea}"

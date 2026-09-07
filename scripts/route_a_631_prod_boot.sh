@@ -33,6 +33,30 @@
 # DECLARED override, named per key, printed to stderr, and passed to the gate
 # as --allow <that key>. There is deliberately no blanket bypass -- adding one
 # restores the defect in full.
+# --- #1233 (WEG 2, S0) HARD REFUSAL -------------------------------------
+# This recipe launches with --enable-phase-flip and four more flags that no
+# longer exist. #1233 replaced the in-process PP-prefill <-> TP-decode
+# cutover with two independent process groups per card, and slice S0 removed
+# every flag that armed it (spec §7 item 4: hard-remove with a loud refusal,
+# no silent shim). The server refuses these spellings at parse time; this
+# script refuses one step earlier, so nobody spends a GPU window on it.
+#
+# NOT SWEPT BY DELETING FLAGS, deliberately. Everything below is shaped by
+# the flip: the SGLANG_PHASE_POLICY_* tunables, the 30,17,17 TP vector, and
+# the BAR1 aperture split that exists because the flip builds flip_tp:0 and
+# flip_dcp:0 beside world:0 and pp:0. Stripping five argv lines would leave a
+# recipe that boots something nobody sized. The non-flip recipe of the same
+# shape already exists and is the replacement named below.
+#
+# The body is left BYTE-FOR-BYTE as the historical record; S7 `git rm`s it.
+echo "REFUSED: route_a_631_prod_boot.sh boots the #631 in-process phase" >&2
+echo "  flip, which #1233 (WEG 2) removed together with its CLI surface." >&2
+echo "  For the stock PP=3 path of the same shape use" >&2
+echo "  scripts/route_a_631_ava_boot.sh; for the two-group Weg 2 boot see" >&2
+echo "  /spinning/gpu-arb/weg2/WEG2_DESIGN_SPEC_2026-09-06.md (§1.5)." >&2
+exit 1
+# --- end #1233 refusal --------------------------------------------------
+
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

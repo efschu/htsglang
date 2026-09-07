@@ -44,6 +44,31 @@ import pytest
 
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 
+# #1233 (WEG 2, S0): RETIRED, not deleted.  Every property below rests on an
+# ARMED WINDOW -- a rank that has been told a layout change is coming and must
+# hold its microbatch slot until it arrives.  Weg 2 has no in-process layout
+# change: a process is a prefill process or a decode process for its whole
+# life, so nothing ever arms, and `_pp_flip_hold_slot` /
+# `_pp_flip_stashed_frame_forces_advance` / `_1173_forget_stashed_frame` were
+# removed with the premise they rest on (S0 fixer round 2; the removal of the
+# #1173 launched-pass GROUP STOP is booked by name in
+# WEG2_BUILD_DECISIONS_0906.md).  The class bodies bind those methods off the
+# mixin at IMPORT time, so the skip has to be module-level.
+#
+# The file itself is left for S7 to `git rm` together with the 22 flip modules
+# and the other classified test files (spec §11, ordering discipline): a slice
+# that removes a mechanism retires its test, and the slice that deletes the
+# machinery deletes the file.
+#
+# Eight of this file's fifteen tests were ALREADY red on the base aef3ae7676
+# (measured 2026-09-07: 8 failed / 7 passed), so this is not a working gate
+# being discarded.
+pytest.skip(
+    "#1233 (WEG 2, S0): the armed window this file pins does not exist; the "
+    "hold family was removed with it and the file is deleted at S7",
+    allow_module_level=True,
+)
+
 
 class _StopLoop(Exception):
     """Ends the (otherwise infinite) event loop at a known point."""

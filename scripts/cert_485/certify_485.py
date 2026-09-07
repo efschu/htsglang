@@ -430,7 +430,10 @@ def cmd_flags(argv) -> int:
     want = [
         "--pp-solve-cut", "--pp-stage-ratio", "--pp-attn-stage-ratio",
         "--pp-layer-ratio", "--max-total-tokens", "--rank-gpu-memory-mib",
-        "--rank-gpu-id", "--enable-phase-flip",
+        "--rank-gpu-id",
+        # "--enable-phase-flip" was here until #1233 (WEG 2, S0) removed the
+        # flag with the mechanism; asserting a removed flag is present would
+        # fail this certification for the one reason it is not about.
     ] + list(args.extra)
 
     try:

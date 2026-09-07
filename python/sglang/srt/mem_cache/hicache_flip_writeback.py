@@ -238,7 +238,7 @@ def require_canonical_store(tree_cache: Any) -> None:
             "page format, so its keys carry this phase's geometry "
             "(_{tp_rank}_{tp_size} and _{pp_size}_{pp_rank}). Pages written at "
             "the flip seam would be unreadable in the phase they were written "
-            "for. Enable --phase-flip-canonical-kv-page, or leave the "
+            "for. Enable --hicache-canonical-kv-page, or leave the "
             "writeback off; spending the IO for keys the other phase cannot "
             "name is the one outcome worth refusing."
         )
@@ -891,9 +891,13 @@ def maybe_flip_writeback(
         return None
     tree_cache = getattr(scheduler, "tree_cache", None)
     if tree_cache is None:
+        # #1233 (WEG 2, S0): states the SCHEDULER-SIDE condition rather than
+        # naming a flag. The spelling this message carried
+        # (`--phase-flip-writeback`) was deleted from `ServerArgs`, so an
+        # operator following it would be sent to a flag argparse rejects.
         raise FlipWritebackRefused(
-            f"{LOG_PREFIX} --phase-flip-writeback is set but this scheduler has "
-            "no tree cache to write back."
+            f"{LOG_PREFIX} the seam writeback was requested but this scheduler "
+            "has no tree cache to write back."
         )
     if deadline_s is None:
         deadline_s = float(

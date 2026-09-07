@@ -1,17 +1,27 @@
 """#706: argument-time gating of the geometry-neutral KV page -- CPU only.
 
-The flag moves every KV key, so the three things checked here are the three
-ways it could move them for nothing:
+The flag moves every KV key, so what is checked here is the ways it could move
+them for nothing:
 
-* set without ``--enable-phase-flip``, where there is no second geometry to be
-  neutral towards -- refused, not ignored, because an ignored flag reads to the
-  operator as a feature that is on;
 * set with a backend that cannot assemble a page from several stages;
 * set with a multi-token page, which would span token owners -- the same limit
   weighted uneven-DCP already carries.
 
-And the fourth, which is the one that protects every rig already running: the
-default is off, and off must be indistinguishable from before the flag existed.
+And the one that protects every rig already running: the default is off, and
+off must be indistinguishable from before the flag existed.
+
+RE-EXPRESSED, NOT PORTED (#1233, WEG 2 S0; spec §6.2 rule 1). This file used to
+have a third refusal -- ``--phase-flip-canonical-kv-page`` set without
+``--enable-phase-flip``, "where there is no second geometry to be neutral
+towards" -- plus a ``TestFlipWritebackArgs`` class for the #703 flip-time
+writeback. Both tested the MECHANISM rather than a surviving invariant, and
+both die with it: Weg 2 has no in-process phase change, so there is no flag to
+require and no flip seam to write back before. What survives is the format
+itself, which is now a plain HiCache property under its own name
+``--hicache-canonical-kv-page`` and is the ONE carrier between the two process
+groups. Red-first proof of the re-expression: every test below raises
+``TypeError: unexpected keyword argument 'hicache_canonical_kv_page'`` against
+the base tree, because the name it pins does not exist there.
 """
 
 import argparse
@@ -24,16 +34,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
-def flip_args(**kwargs):
-    """A phase-flip configuration that passes the family's own validation, so
-    a refusal in these tests can only come from the #706 clause.
+def _args(**kwargs):
+    """A configuration that passes the rest of the family's validation, so a
+    refusal in these tests can only come from the #706 clause.
 
     ``model_path='dummy'`` short-circuits ``__post_init__``, so the validator is
-    called explicitly -- the pattern the sibling #631 args test uses."""
+    called explicitly -- the pattern the sibling args tests use."""
     defaults = dict(
         model_path="dummy",
-        enable_phase_flip=True,
-        phase_flip_tp_vector="30,17,17",
         pp_size=3,
         tp_size=1,
         page_size=1,
@@ -51,91 +59,66 @@ class TestCanonicalKvPageArgs(CustomTestCase):
 
     def test_default_is_off(self):
         parsed = self.parser.parse_args(["--model-path", "m"])
-        self.assertFalse(parsed.phase_flip_canonical_kv_page)
+        self.assertFalse(parsed.hicache_canonical_kv_page)
 
     def test_flag_parses(self):
         parsed = self.parser.parse_args(
-            ["--model-path", "m", "--phase-flip-canonical-kv-page"]
+            ["--model-path", "m", "--hicache-canonical-kv-page"]
         )
-        self.assertTrue(parsed.phase_flip_canonical_kv_page)
+        self.assertTrue(parsed.hicache_canonical_kv_page)
 
-    def test_requires_enable_phase_flip(self):
-        args = ServerArgs(model_path="dummy", phase_flip_canonical_kv_page=True)
-        with self.assertRaisesRegex(ValueError, "requires\n?.*--enable-phase-flip"):
-            args._handle_phase_flip()
+    def test_the_old_flag_name_is_gone(self):
+        # Hard-removed, not shimmed (spec §7 item 4): a silent alias would let
+        # a stale launch line keep working while naming a mechanism that no
+        # longer exists.
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(
+                ["--model-path", "m", "--phase-flip-canonical-kv-page"]
+            )
+
+    def test_the_old_flag_name_is_refused_by_name_not_by_argparse(self):
+        """§7 item 4 asks for a LOUD refusal, and this flag is why.
+
+        ``SystemExit`` above is argparse's default ``error()`` for an unknown
+        option -- the same sentence a typo produces.  It does not say the flag
+        was renamed, and this one WAS: the page it arms is Weg 2's only carrier
+        across a flip, so an operator who reads "unrecognized arguments" and
+        drops the flag silently boots without the carrier.  #1233 (WEG 2, S0)
+        therefore refuses before argparse, naming the replacement.
+        """
+        from sglang.srt.removed_cli_flags import refuse_removed_flip_flags
+
+        with self.assertRaises(ValueError) as caught:
+            refuse_removed_flip_flags(
+                ["--model-path", "m", "--phase-flip-canonical-kv-page"]
+            )
+        message = str(caught.exception)
+        self.assertIn("--phase-flip-canonical-kv-page", message)
+        self.assertIn("--hicache-canonical-kv-page", message)
+        self.assertIn("#1233", message)
 
     def test_requires_the_file_backend(self):
-        args = flip_args(
-            phase_flip_canonical_kv_page=True, hicache_storage_backend="mooncake"
-        )
+        args = _args(hicache_canonical_kv_page=True, hicache_storage_backend="mooncake")
         with self.assertRaisesRegex(ValueError, "hicache-storage-backend file"):
-            args._handle_phase_flip()
+            args._handle_hicache_canonical_kv_page()
 
     def test_requires_page_size_one(self):
-        args = flip_args(phase_flip_canonical_kv_page=True, page_size=4)
+        args = _args(hicache_canonical_kv_page=True, page_size=4)
         with self.assertRaisesRegex(ValueError, "page-size 1"):
-            args._handle_phase_flip()
+            args._handle_hicache_canonical_kv_page()
 
     def test_accepted_in_its_supported_shape(self):
-        args = flip_args(phase_flip_canonical_kv_page=True)
-        args._handle_phase_flip()  # no raise
-        self.assertTrue(args.phase_flip_canonical_kv_page)
+        args = _args(hicache_canonical_kv_page=True)
+        args._handle_hicache_canonical_kv_page()  # no raise
+        self.assertTrue(args.hicache_canonical_kv_page)
 
-    def test_phase_flip_without_the_flag_is_unaffected(self):
-        """The gate is one-way: the flip itself keeps working exactly as it did,
-        with the pp-suffixed keys it has always written."""
-        args = flip_args()
-        args._handle_phase_flip()  # no raise
-        self.assertFalse(args.phase_flip_canonical_kv_page)
-
-
-class TestFlipWritebackArgs(CustomTestCase):
-    """#703: the flip-time writeback gate.
-
-    The refusals exist so an operator who asked for retention across the flip
-    cannot silently get none: without the geometry-neutral format the pages the
-    hook writes still carry the geometry of the phase that wrote them, so the
-    IO would be spent at the flip seam for a hit that cannot happen.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        cls.parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(cls.parser)
-
-    def test_default_is_off(self):
-        parsed = self.parser.parse_args(["--model-path", "m"])
-        self.assertFalse(parsed.phase_flip_writeback)
-        self.assertIsNone(parsed.phase_flip_writeback_deadline_s)
-
-    def test_requires_enable_phase_flip(self):
-        args = ServerArgs(model_path="dummy", phase_flip_writeback=True)
-        with self.assertRaisesRegex(ValueError, "requires --enable-phase-flip"):
-            args._handle_phase_flip()
-
-    def test_requires_the_canonical_page(self):
-        args = flip_args(phase_flip_writeback=True)
-        with self.assertRaisesRegex(ValueError, "canonical-kv-page"):
-            args._handle_phase_flip()
-
-    def test_accepted_with_the_canonical_page(self):
-        args = flip_args(phase_flip_writeback=True, phase_flip_canonical_kv_page=True)
-        args._handle_phase_flip()  # no raise
-        self.assertTrue(args.phase_flip_writeback)
-
-    def test_deadline_alone_is_refused(self):
-        args = flip_args(phase_flip_writeback_deadline_s=2.0)
-        with self.assertRaisesRegex(ValueError, "requires"):
-            args._handle_phase_flip()
-
-    def test_non_positive_deadline_is_refused(self):
-        args = flip_args(
-            phase_flip_writeback=True,
-            phase_flip_canonical_kv_page=True,
-            phase_flip_writeback_deadline_s=0.0,
-        )
-        with self.assertRaisesRegex(ValueError, "must be > 0"):
-            args._handle_phase_flip()
+    def test_off_is_untouched(self):
+        """The gate is one-way: a boot that does not ask for the format is not
+        validated against it and keeps the geometry-suffixed keys it always
+        wrote."""
+        args = _args(hicache_storage_backend="mooncake", page_size=4)
+        args._handle_hicache_canonical_kv_page()  # no raise
+        self.assertFalse(args.hicache_canonical_kv_page)
 
 
 if __name__ == "__main__":

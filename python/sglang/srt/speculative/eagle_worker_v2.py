@@ -34,10 +34,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.phase_flip_draft_bootstrap import (
-    batch_needs_bootstrap as batch_needs_draft_bootstrap,
-    clear_bootstrap as clear_draft_bootstrap,
-)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -2224,10 +2220,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # and let the _draft_extend_for_decode at the end of this round
             # seed the real chain from its FULL-captured hidden states.
             # From the next round the carried request is ordinary.
-            # See managers/phase_flip_draft_bootstrap.py for why this and
-            # not a carried hidden state.
-            flip_bootstrap = batch_needs_draft_bootstrap(batch)
-            if self.speculative_num_steps == 0 or flip_bootstrap:
+            # #1233 (WEG 2, S0): the cold-bootstrap mark is gone. It was
+            # planted only when a request crossed an in-process layout change
+            # into a draft worker that had never seen it; Weg 2's decode group
+            # builds its draft worker at boot and keeps it for the group's
+            # whole life, so no request in this process ever arrives cold.
+            if self.speculative_num_steps == 0:
                 # Drafting disabled (high batch size). _draft_extend below still
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
@@ -2256,11 +2254,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             elif (
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
-                # #631: the bootstrap round exists ONLY to produce the
-                # hidden states this draft_extend turns into a real seed.
-                # Stubbing it here would leave the carried request with the
-                # same empty chain it arrived with, one round later.
-                and not flip_bootstrap
+                # #1233 (WEG 2, S0): the ``and not flip_bootstrap`` term is
+                # gone with the mark. It kept the stub away from a bootstrap
+                # round, whose whole purpose was to produce the hidden states
+                # this draft_extend turns into a real seed for a request that
+                # had just crossed into a cold draft worker. No request in
+                # this process crosses into a cold draft worker any more.
             ):
                 self._stub_skipped_draft_extend(batch, batch_output)
             else:
@@ -2294,9 +2293,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # the cutover, or before the verify) would let an exception
             # between the two leave a request marked as bootstrapped while
             # its draft input is still the seed's zeros.
-            if flip_bootstrap:
-                clear_draft_bootstrap(batch)
-
             return batch_output
 
     def _forward_spill_tick_spec(self, batch: ScheduleBatch, on_publish=None):

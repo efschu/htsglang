@@ -141,9 +141,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     KvReshardReqInput,
     KvReshardReqOutput,
-    PhaseFlipDecision,
-    PhaseFlipReqInput,
-    PhaseFlipReqOutput,
     SessionHandoverReqInput,
     SessionHandoverReqOutput,
     ListExternalCorporaReqInput,
@@ -436,35 +433,23 @@ def derive_enable_hicache_storage(server_args: ServerArgs) -> bool:
     )
 
 
-def default_pp_micro_batch_size(
-    *, max_running_requests: int, pp_size: int, enable_phase_flip: bool
-) -> int:
+def default_pp_micro_batch_size(*, max_running_requests: int, pp_size: int) -> int:
     """The auto-computed ``pp_max_micro_batch_size``.
 
     Classic PP divides the concurrency cap by ``pp_size`` because the stages
     run micro-batches of one batch, so each stage may only hold its share.
 
-    UNDER THE PHASE FLIP THAT DIVISION IS WRONG, and it is the binding cap on
-    this deployment. Decode does not run in the PP layout at all -- it runs in
-    the TP layout, which has no pipeline to divide by. Dividing anyway throttles
-    the DECODE phase with a bound belonging to the PREFILL phase.
-
-    Measured 2026-08-16 on max_running_requests=4, pp_size=3: the default was
-    max(4 // 3, 1) = 1, and under a sustained depth-5 load decode concurrency
-    never exceeded 2 -- 973 prefill rounds with 0 requests running, 792 with 1,
-    48 with 2, against a configured ceiling of 4. Nothing was deadlocked; the
-    scheduler was obeying a cap of one.
-
-    The flip branch returns the full ``max_running_requests``. It is not
-    unbounded: ``get_num_allocatable_reqs`` still mins this against the
-    admission limiter, the request-slot pool, and the mamba/GDN state headroom,
-    so the state pool remains the real ceiling -- this only stops a
-    prefill-layout divisor from pre-empting all three.
+    #1233 (WEG 2, S0): the exemption that used to sit here returned the
+    UNDIVIDED cap, because one process served prefill in a PP layout and
+    decode in a TP layout and the PP divisor was throttling the decode half.
+    Weg 2 gives each role its own process: the prefill group is genuinely a
+    pipeline and the division is the right bound for it, and the decode group
+    runs ``pp_size=1``, where the division is the identity. Neither group
+    needs the exemption, and keeping it would have made the undivided cap the
+    new default for a real pipeline.
     """
     if max_running_requests <= 0:
         return 1
-    if enable_phase_flip:
-        return max(int(max_running_requests), 1)
     return max(int(max_running_requests) // max(int(pp_size), 1), 1)
 
 
@@ -647,21 +632,11 @@ class Scheduler(
         # built lazily on the first scheduler iteration when
         # --kv-reshard-vectors is set.
         self.kv_reshard_runtime = None
-        # #631 phase flip: runtime built lazily on the first scheduler
-        # iteration when --enable-phase-flip is set (the boot builder must
-        # have installed phase_flip_stacks by then). The abort deferral
-        # window exists from boot so abort routing never races the lazy
-        # build; it only defers while ACTIVE (armed flip). active_stack
-        # tracks the serving phase for the event-loop re-dispatch.
-        self.phase_flip_runtime = None
-        self.phase_flip_abort_window = None
-        self.phase_flip_active_stack = "pp"
-        if getattr(server_args, "enable_phase_flip", False):
-            from sglang.srt.managers.phase_flip_runtime import (
-                AbortDeferralWindow,
-            )
-
-            self.phase_flip_abort_window = AbortDeferralWindow()
+        # #1233 (WEG 2, S0): no in-process layout change, so no runtime to
+        # build lazily, no abort-deferral window to hold aborts across one,
+        # and no "which stack am I serving right now" record. This process
+        # serves the one role it was launched as until it exits; the role is
+        # a property of the launch, not a variable the scheduler tracks.
         # #631 automatic phase policy: the thing that decides WHEN to flip.
         # Built from boot config on every rank (so the state objects exist
         # and the code path is uniform), but only the request-origin rank
@@ -676,10 +651,12 @@ class Scheduler(
             # built for, not at whatever single carrier happened to finish
             # first. max_running_requests IS that width.
             formation_target=int(getattr(server_args, "max_running_requests", 0) or 0),
-            enabled=(
-                getattr(server_args, "enable_phase_flip", False)
-                and getattr(server_args, "phase_flip_policy", "manual") == "auto"
-            ),
+            # #1233 (WEG 2, S0): the in-process policy never arms. The
+            # decision "which group serves this request" belongs to the front,
+            # which is the only party that can see both groups. The config is
+            # still built so a bad env value is found at boot rather than
+            # never, exactly as before.
+            enabled=False,
             # #781: hand the whole ServerArgs over so the tuning knobs resolve
             # from FLAGS first and fall back to their deprecated env vars only
             # when a flag is unset. ServerArgs is pickled into this subprocess
@@ -697,67 +674,11 @@ class Scheduler(
         # on the first busy round. The pair check refuses the one
         # combination that deadlocks (purity enforced with no bounded PP
         # window to break a PP phase that may not decode and cannot admit).
+        # #1233 (WEG 2, S0): purity was "keep the work of one phase out of
+        # the other layout" inside ONE process. Two process groups enforce it
+        # by construction -- a prefill process has no decode path to leak
+        # into -- so nothing here resolves a purity mode any more.
         self._phase_purity = None
-        if getattr(server_args, "enable_phase_flip", False):
-            from sglang.srt.managers.phase_purity import (
-                purity_from_server_args,
-                validate_purity_policy_pair,
-                validate_tp_exit_pair,
-            )
-
-            self._phase_purity = purity_from_server_args(server_args)
-            validate_purity_policy_pair(self._phase_purity, self.phase_policy_cfg)
-            # #858b: the TP mirror. PP has been guarded since #665-F1; TP
-            # never was, and that asymmetry IS the missing exit that turned a
-            # tp_to_pp hold into a 535 s wedge.
-            validate_tp_exit_pair(self._phase_purity, self.phase_policy_cfg)
-            # Tell the policy that the TP layout cannot prefill, so its
-            # break-even N collapses to 0 in that direction. Without this
-            # the two features contradict: purity refuses the prefill and
-            # the policy refuses to leave TP for anything below N, so a
-            # prompt smaller than N never runs at all (metal, 21:39:50Z --
-            # a one-token health check wedged an otherwise idle server).
-            # W33 INVENTORY PIN -- NOT THE RUNTIME PURITY PAYLOAD.
-            # This is BOOT-TIME config derived from the purity MODE, not the
-            # per-round question "may a prefill batch run in TP right now".
-            # It collapses the policy's break-even N and nothing else. The
-            # runtime question has ONE authority
-            # (`phase_purity.seam_readmit_candidates`, via
-            # `seam_transport_exempt` / `seam_transport_pending_tokens` /
-            # `_phase_admits`); this line is deliberately NOT a fifth caller of
-            # it, because the seam-transport exemption is a per-round state and
-            # must never be baked into static config. Named here so the next
-            # Ein-Job-ein-Mover sweep does not re-litigate it.
-            if not self._phase_purity.prefill_allowed_in_tp():
-                self.phase_policy_cfg = dataclasses.replace(
-                    self.phase_policy_cfg, prefill_runs_in_tp=False
-                )
-                # #874: AND SAY WHAT THAT COSTS, HERE, WHERE IT IS DECIDED.
-                # Collapsing the threshold is correct for the mode and it is
-                # also the moment a large fixed cost loses its price gate. The
-                # instance already reports the flip RATE (counts) and the flip
-                # UNIT COST (DONE lines) -- in two different places, never
-                # multiplied -- so the product stayed invisible until a user
-                # timed a two-token ping at 16.6 s. Reported from config at
-                # boot rather than discovered by timing.
-                from sglang.srt.managers.phase_policy import (
-                    LOG_PREFIX as _PP_LOG_PREFIX,
-                    unpriced_seam_note,
-                )
-
-                _note = unpriced_seam_note(self.phase_policy_cfg)
-                if _note:
-                    logger.warning("%s %s", _PP_LOG_PREFIX, _note)
-            # The PP phase is drained when less than one chunk is left, and
-            # the chunk size is a runtime fact, not a policy guess. Only fill
-            # it in when the operator has not pinned one.
-            if self.phase_policy_cfg.pp_exit_tokens <= 0:
-                self.phase_policy_cfg = dataclasses.replace(
-                    self.phase_policy_cfg,
-                    pp_exit_tokens=int(
-                        getattr(server_args, "chunked_prefill_size", 0) or 0
-                    ),
-                )
         # #261 live session handover runtime: None on every default path;
         # built lazily on the first /session_handover control request. The
         # admission hook in handle_generate_request is a no-op while this
@@ -818,16 +739,11 @@ class Scheduler(
         # configured algorithm is kept aside here and swapped in at the
         # cutover, together with the draft worker that phase_flip_boot
         # builds on the flip's TP stack.
+        # #1233 (WEG 2, S0): the configured algorithm used to be parked
+        # here and swapped in when the process changed layout. Weg 2's decode
+        # group is a TP process that carries its draft worker from boot, and
+        # its prefill group carries none, so neither ever swaps.
         self.flip_spec_algorithm = SpeculativeAlgorithm.from_string(None)
-        if server_args.enable_phase_flip and not self.spec_algorithm.is_none():
-            self.flip_spec_algorithm = self.spec_algorithm
-            self.spec_algorithm = SpeculativeAlgorithm.from_string(None)
-            logger.info(
-                "#631 phase flip: speculation (%s) is armed for the TP "
-                "decode phase; the PP prefill phase runs without a draft "
-                "worker",
-                server_args.speculative_algorithm,
-            )
         # T156 stage 3/4: per-batch cross-algorithm switching (schedule and
         # auto/bandit modes). True => decode batches consult the meta-worker's
         # switch hook before prepare_for_decode, and DFLASH request validation
@@ -958,22 +874,10 @@ class Scheduler(
         # The #677 note directly below records the identical ordering mistake
         # made once before in this same constructor; this is its second
         # instance and the reason both now sit after their inputs.
-        self.phase_flip_host_pools = {}
-        if self.server_args.enable_phase_flip:
-            from sglang.srt.managers.phase_flip_boot import (
-                build_phase_flip_host_pools,
-                vote_phase_flip_boot_verdict,
-            )
-
-            self.phase_flip_host_pools = build_phase_flip_host_pools(self)
-            # #1206 S1-C14: THE ONE BOOT REDUCE, HERE AND NOT INSIDE THE
-            # BUILDER. Every abrupt exit of that function lies upstream of
-            # this line, so the collective count is rank-uniform whichever
-            # branch a rank took -- and S7's deletion of the builder at B6
-            # moves no vote site. Gated on flip AND hicache, the two flags the
-            # verdicts exist for, so a boot with neither gains no collective.
-            if self.enable_hierarchical_cache:
-                vote_phase_flip_boot_verdict(self, self.phase_flip_host_pools)
+        # #1233 (WEG 2, S0): the SECOND phase's host pools, and the boot
+        # reduce that voted on them, are gone. One process owns exactly one
+        # host pool for its whole life (build decisions record §1c B1), and
+        # the L3 canonical page store is the one carrier between the groups.
         self._pool_phase_probe("flip_host_pools")
 
         # #677 PHASE 1: HERE, AND NOT BESIDE init_admission_limiter.
@@ -1616,13 +1520,9 @@ class Scheduler(
         # BEFORE the post-capture pool resize below so the resize sees the
         # TP stack's VRAM as taken, never as free to grow into. Default
         # path: flag off, no import, nothing built.
-        self.phase_flip_stacks = None
-        if self.server_args.enable_phase_flip:
-            from sglang.srt.managers.phase_flip_boot import (
-                build_phase_flip_tp_stack,
-            )
-
-            self.phase_flip_stacks = build_phase_flip_tp_stack(self)
+        # #1233 (WEG 2, S0): the SECONDARY (TP decode) stack beside the
+        # primary one is what Weg 2 replaces with a second PROCESS GROUP. A
+        # process builds one stack and keeps it.
 
         # #797: hold a SEED vector to its claim, here and not earlier. Every
         # stack that can size a KV pool is built by this point -- the PP stack
@@ -1767,9 +1667,6 @@ class Scheduler(
                 pp_max_micro_batch_size=default_pp_micro_batch_size(
                     max_running_requests=self.max_running_requests,
                     pp_size=self.ps.pp_size,
-                    enable_phase_flip=bool(
-                        getattr(get_server_args(), "enable_phase_flip", False)
-                    ),
                 ),
             )
 
@@ -2490,7 +2387,6 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
                 (KvReshardReqInput, self.handle_kv_reshard),
-                (PhaseFlipReqInput, self.handle_phase_flip),
                 (SessionHandoverReqInput, self.handle_session_handover),
                 (SessionCheckpointReqInput, self.handle_session_checkpoint),
                 (VramBudgetReqInput, self.handle_vram_budget),
@@ -2928,8 +2824,6 @@ class Scheduler(
         # of the cut needs no second hook per loop. Applied only below PP0:
         # rank 0 built the decision and must not be handed a relayed copy of
         # its own.
-        if recv_reqs:
-            self._apply_phase_flip_decisions(recv_reqs)
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
             # #1158 NO HEALTH-CHECK DISPOSAL HERE, ON ANY RANK. The one
@@ -3005,84 +2899,6 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
-    def _build_pp_chain_receiver(self):
-        """#631: the single owner of this rank's request-chain receive
-        stream, or None to keep the unmodified upstream path.
-
-        Built ONLY with the phase flip on and only on a PP stage that has
-        an upstream, because it exists to serve one requirement: an armed
-        rank must keep consuming the chain WITHOUT blocking on it, so its
-        upstream never blocks committing a forward to it (boot 18). A boot
-        without the flip has no armed state, so it keeps the direct
-        point_to_point_pyobj call and is byte-for-byte unchanged.
-
-        It must be built ONCE per rank and used by BOTH the blocking and
-        the non-blocking consumer: two consumers posting their own irecv
-        on one stream would misframe it the moment a message was split
-        across them.
-
-        ON when the flip is enabled (#631 G). It was parked for one
-        design generation because the only consumer it offered was
-        ``poll()``, which rests on progressing a posted ``irecv`` by
-        polling ``is_completed()`` -- MEASURED FALSE on this build and
-        pinned in
-        test_pp_chain_receiver.test_measured_gloo_does_not_progress_a_posted_irecv_by_polling.
-        Wired live back then it would have absorbed nothing while the
-        matching announce-when-flushed clause withheld presence for ever,
-        so every flip would have abandoned at the presence deadline:
-        strictly worse than the defect it was written to fix.
-
-        What changed is the READINESS SIGNAL, not the transport. The armed
-        path no longer asks the transport whether a message arrived; it
-        reads the sender's published counter (``phase_flip_counters``) and
-        only then makes a deliberate BLOCKING receive, bounded by transfer
-        time. This class's two-step size-then-payload state machine is
-        exactly what that path needs, and it is why it was kept rather
-        than deleted.
-
-        ``SGLANG_PP_CHAIN_RECEIVER=0`` disables it as a kill switch --
-        which also disables the armed intake rule on this rank, so it is a
-        diagnostic, not a supported serving mode.
-        """
-        if os.environ.get("SGLANG_PP_CHAIN_RECEIVER", "1") != "1":
-            return None
-        if not self.server_args.enable_phase_flip:
-            return None
-        if self.ps.pp_size <= 1 or self.ps.pp_rank == 0:
-            return None
-        if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
-            return None
-        from sglang.srt.managers.phase_flip_counters import CHAN_REQ
-        from sglang.srt.managers.pp_chain_receiver import PpChainReceiver
-
-        dp_offset = self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
-        counters = self.pp_flip_counters
-        return PpChainReceiver(
-            group=self.world_group.cpu_group,
-            src=(self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-            dst=self.ps.pp_rank * self.ps.tp_size + dp_offset,
-            # Publish the consumed count as each message leaves the wire,
-            # so the upstream learns its send is gone and can reap it with
-            # a bounded blocking commit instead of a speculative one.
-            on_consumed=(
-                (lambda _n: counters.bump_consumed(CHAN_REQ))
-                if counters is not None
-                else None
-            ),
-            # #824 W5(b): give THIS funnel the blocked-recv marker #821
-            # only ever gave _pp_recv_typed_dict. Two of three ranks wedged
-            # in here on boot_827 and the watchdog could not say so,
-            # because nothing on this path recorded that it was blocked.
-            # getattr, not a direct bind: this builder is exercised by
-            # holder-based tests that stand in for a Scheduler with only the
-            # attributes the builder reads, and a hard reference here turns
-            # a diagnostic hook into a construction dependency.
-            on_blocked=getattr(self, "_note_pp_chain_blocked", None),
-            # #824 W4a: STATE-DRIVEN recovery. This is what lets the bound
-            # fire on metal without arming a wall clock -- see
-            # _pp_chain_abort_check.
-            abort_check=getattr(self, "_pp_chain_abort_check", None),
-        )
 
     def _note_pp_chain_blocked(self, arm, since):
         """Publish the chain receive's blocked state on the scheduler.
@@ -3101,123 +2917,19 @@ class Scheduler(
         self._pp_blocked_recv_since = since
         self._pp_blocked_recv_arm = f"chain-recv/{arm}"
 
-    def _pp_chain_abort_check(self, arm, waited_s):
-        """#824 W4a: is this chain wait part of a CLOSED ring right now?
 
-        STATE, NOT A CLOCK. The wall-clock bound
-        (SGLANG_PP_CHAIN_RECV_STALL_S) stays off by default because an idle
-        PP rank legitimately blocks here until a request arrives -- there is
-        no duration that separates "idle" from "wedged". This predicate
-        separates them by evidence instead, and it is only consulted while
-        the receive is already overdue, so a healthy pass never reaches it.
 
-        THE EVIDENCE. ``bump_attempted`` publishes that a rank has ENTERED a
-        send BEFORE it posts it (phase_flip_counters.py:220-226) -- the one
-        counter whose timing can witness a peer that is parked INSIDE a send
-        rather than one that has completed it. So when this rank's CHAN_DICT
-        upstream has entered more dict sends than this rank has taken off
-        that wire, the peer is sitting in a send only this rank can drain,
-        while this rank sits in a receive that peer will never feed. That is
-        the boot_827 ring exactly: PP0 blocked in
-        _pp_commit_admission_send_work on the typed-dict channel, PP1 and
-        PP2 blocked in the request-relay chain receive.
 
-        THE FALSE-POSITIVE DIRECTION IS THE SAFE ONE, the same argument
-        _pp_wait_for_dict_readiness makes for the mirror gate (#789). A
-        spurious fire costs one drain turn and a resumed receive -- the
-        receive stays posted and framed throughout, so nothing is lost and
-        the late message still arrives. Missing a real one costs the boot.
-
-        Returns a reason string to abort by the named branch, or None to
-        keep waiting.
-        """
-        counters = getattr(self, "pp_flip_counters", None)
-        if counters is None:
-            return None
-        try:
-            from sglang.srt.managers.phase_flip_counters import CHAN_DICT
-
-            upstream = self._pp_flip_upstream()
-            entered = counters.attempted(CHAN_DICT, upstream)
-            taken = counters.local_consumed(CHAN_DICT)
-        except Exception:  # noqa: BLE001 - a predicate may never break the loop
-            return None
-        if entered > taken:
-            return (
-                f"upstream rank {upstream} has ENTERED {entered - taken} "
-                f"CHAN_DICT send(s) this rank has not taken off the wire "
-                f"(attempted={entered} local_consumed={taken}); it is parked "
-                f"in a send only this rank can drain while this rank is "
-                f"parked in a receive it will never feed -- the boot_827 ring"
-            )
-        return None
-
-    def _pp_chain_stall_service(self):
-        """#824 W4a: break the ring the abort_check above just proved.
-
-        Takes the in-flight dict off the wire with the EXISTING #757 drain
-        rather than a new consumption path: it demultiplexes, stashes a
-        wrong-kind message in ``_pp_tensor_dict_inbox`` where its real
-        consumer already looks, and discards only a provably void proxy.
-        That is what makes servicing the dict wire out of the pass's normal
-        order safe -- nothing is eaten, it is only taken off the wire early,
-        which is precisely what releases the upstream's send.
-
-        Deliberately NOT a new protocol. #789's docstring declines to invent
-        one for the mirror case and this follows it: the ring is cut on the
-        arc that is waiting for a message nobody posted, using a primitive
-        that already runs on every disarm route.
-        """
-        live_mb_id = getattr(self, "_pp_live_mb_id", 0)
-        return self.pp_flip_drain_leftover_dicts(live_mb_id)
-
-    def _build_pp_flip_counters(self):
-        """#631 G: the pollable message-count channel, or None.
-
-        Built on EVERY rank of a flip-enabled PP boot -- including rank 0,
-        which has no upstream chain receiver but does have sends to reap
-        and is the rank whose starvation defined corpse G.
-        """
-        if not self.server_args.enable_phase_flip:
-            return None
-        if self.ps.pp_size <= 1:
-            return None
-        if self.ps.attn_tp_rank != 0 or self.ps.attn_cp_rank != 0:
-            return None
-        from sglang.srt.managers.phase_flip_counters import PhaseFlipCounters
-        from sglang.srt.managers.phase_flip_presence import (
-            DEFAULT_PRESENCE_DIR,
-            resolve_instance_tag,
-        )
-
-        counters = PhaseFlipCounters(
-            n_ranks=self.ps.pp_size,
-            rank=self.ps.pp_rank,
-            directory=DEFAULT_PRESENCE_DIR,
-            instance=resolve_instance_tag(),
-        )
-        # A previous boot's counts on this instance tag would be read as
-        # messages in flight and send this rank into a blocking recv for
-        # nothing. Same hazard the presence sweep exists for (boot 15).
-        counters.sweep()
-        return counters
-
-    def phase_flip_is_armed(self) -> bool:
-        """#631: is a flip armed on this rank right now?
-
-        Read straight off the runtime rather than mirrored into a flag:
-        the runtime's ``_pending`` is the one authority for arming, and a
-        second copy would be a state to keep in sync. Absent runtime (not
-        yet lazily built) means not armed.
-        """
-        runtime = getattr(self, "phase_flip_runtime", None)
-        return runtime is not None and runtime.is_armed()
 
     def init_request_receiver(self) -> None:
-        # #631 G: counters BEFORE the receiver -- the receiver publishes
-        # its consumed count through them.
-        self.pp_flip_counters = self._build_pp_flip_counters()
-        self.pp_chain_receiver = self._build_pp_chain_receiver()
+        # #1233 (WEG 2, S0): both were built only under the flip, to let an
+        # ARMED rank stop taking work at a quiescent boundary. Nothing arms
+        # any more, so both are None -- which is exactly what every boot
+        # without the flip already carried, and every reader of them in
+        # scheduler_pp_mixin already reads them through ``getattr(..., None)``
+        # and takes the direct upstream path.
+        self.pp_flip_counters = None
+        self.pp_chain_receiver = None
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -3240,46 +2952,19 @@ class Scheduler(
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
-            # #631: wired only when the policy is on; every other boot
-            # carries None here and the receiver path is untouched.
-            phase_policy_hook=(
-                self.maybe_arm_phase_policy
-                if (
-                    getattr(self, "phase_policy_cfg", None) is not None
-                    and self.phase_policy_cfg.enabled
-                )
-                else None
-            ),
-            # #631: both None unless the flip is enabled, so the default
-            # intake path is unchanged.
-            chain_receiver=self.pp_chain_receiver,
-            # #631 G: gated on the FLIP, not on the receiver. The receiver
-            # exists only on ranks with an upstream, so gating on it left
-            # the armed intake rule off on rank 0 -- the intake rank, the
-            # one that must stop admitting work for the group to reach a
-            # quiescent boundary at all, and the rank whose starvation
-            # defined corpse G.
-            phase_flip_armed_hook=(
-                self.phase_flip_is_armed if self.server_args.enable_phase_flip else None
-            ),
-            # #969 §W3: PP0's flip decision, taken exactly once per decision
-            # and put on the request stream beside the arm.
-            phase_flip_decision_hook=(
-                self._take_phase_flip_decision
-                if self.server_args.enable_phase_flip
-                else None
-            ),
-            # #824 W5(b): mark the DIRECT chain receive too. That branch
-            # runs on every boot without the flip, and it was the last
-            # blocking PP receive with no marker at all.
+            # #1233 (WEG 2, S0): None. The in-process policy that this hook
+            # armed is gone -- the decision "which group serves this request"
+            # belongs to the front, which is the only party that sees both
+            # groups. Every boot without the flip already passed None here.
+            phase_policy_hook=None,
+            # #1233 (WEG 2, S0): None, the value every non-flip boot already
+            # passed. The receiver falls back to the direct
+            # ``point_to_point_pyobj`` call, i.e. the upstream intake path.
+            chain_receiver=None,
+            # #824 W5(b): mark the DIRECT chain receive. That branch runs on
+            # every boot, and it was the last blocking PP receive with no
+            # marker at all.
             on_blocked_recv=self._note_pp_chain_blocked,
-            # #824 W4a: cut a closed ring by draining the dict wire the
-            # upstream is parked in, then resume the same posted receive.
-            pp_chain_stall_service=(
-                self._pp_chain_stall_service
-                if self.server_args.enable_phase_flip
-                else None
-            ),
             # #1158: the ONE health-check disposal, at the origin, before
             # relay. Wired on every boot: this is upstream's idle gate, moved
             # from the per-rank dispatch loop to the origin so the verdict
@@ -3431,14 +3116,14 @@ class Scheduler(
         from sglang.srt.managers.parked_decode_set import ParkedDecodeSet
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-        # Plain os.environ, matching its siblings (SGLANG_FLIP_SEAM_CHUNK_MIB,
-        # SGLANG_PHASE_POLICY_DRAIN_MODE) rather than the envs registry, so
-        # every phase-flip knob is set and read the same way.
-        want = bool(
-            int(os.environ.get("SGLANG_PHASE_PARK_CARRIERS", "1") or 0)
-            and getattr(self.server_args, "enable_phase_flip", False)
-            and mamba_allocator is not None
-        )
+        # #1233 (WEG 2, S0): OFF, and off by construction rather than by
+        # configuration. Parking exists to hold a decode carrier resident
+        # while the layout it is sitting in forbids decode -- a state only a
+        # process that alternates layouts can be in. In Weg 2 the group that
+        # decodes always may, and the group that prefills has no decode path
+        # to park in front of, so the arming term is the constant below.
+        # This is the same value every boot without the flip already computed.
+        want = False
         slot_pool = int(getattr(mamba_allocator, "size", 0) or 0)
         if want and slot_pool <= 0:
             # A pool that reports no slots cannot bound anything, and a
@@ -3456,13 +3141,24 @@ class Scheduler(
             max_running=int(self.max_running_requests or 0),
             enabled=want,
         )
-        #: The purity verdict the decode branch last reached, with the phase
-        #: it was reached in. The gate cannot re-evaluate it: the predicate
-        #: (`decode_blocked_here`) advances the starvation clock, so asking
-        #: twice per round would double-tick it. Recording the phase is what
-        #: makes a stale verdict safe -- a verdict from the other layout is
-        #: discarded rather than trusted.
-        self._parked_decode_verdict: Tuple[Optional[str], bool] = (None, False)
+        #: The purity verdict the decode branch last reached. The gate cannot
+        #: re-evaluate it: the predicate (`decode_blocked_here`) advances the
+        #: starvation clock, so asking twice per round would double-tick it.
+        #:
+        #: #1233 (WEG 2, S0): a BOOL, and the type is the whole point. This was
+        #: a `(phase, blocked)` pair because a verdict could outlive the LAYOUT
+        #: it was made in; one role per process means it can only ever be stale
+        #: in TIME, which `_parked_carrier_discount`'s resident-count clamp
+        #: already bounds. The initializer must agree with the writer at `:3937`
+        #: and both readers at `:3969`/`:3986`, and it did not: `(None, False)`
+        #: is a non-empty tuple, so `bool(...)` reads it as TRUE. With the only
+        #: writer unreachable (parking is off by construction above), that
+        #: initializer is what every reader sees for the life of the process --
+        #: a standing "this phase forbids decode" on the per-round admission
+        #: path of a process that has exactly one role. False is the value the
+        #: flag-off boot produced: at aef3ae7676 the tuple reader returned early
+        #: on `if not blocked`.
+        self._parked_decode_verdict: bool = False
         #: #888b: the relief's receipts are level-triggered on a per-round
         #: gate, so a steady residency would restate them forever -- the same
         #: 140184-lines-in-ten-minutes shape the parked set's own reconcile
@@ -3476,7 +3172,7 @@ class Scheduler(
             "ARMED" if want else "off",
             slot_pool,
             int(self.max_running_requests or 0),
-            "on" if getattr(self.server_args, "enable_phase_flip", False) else "off",
+            "one role per process (#1233)",
         )
 
     #: Rounds the target layout may take to build its first batch after a
@@ -3672,81 +3368,6 @@ class Scheduler(
         with no benefit -- so "no batch" alone is deliberately not the
         trigger.
         """
-        watch = getattr(self, "_arm_watch", None)
-        if watch is not None:
-            if ret is not None:
-                # The target ran. The verdict is vindicated; stop watching.
-                self._arm_watch = None
-                # W30 SAFETY NET: a target that runs also ends the livelock
-                # streak. Reset here (not only on a fresh arm) so the streak
-                # measures CONSECUTIVE fruitless arms and one good round
-                # clears it, exactly like `_seam_abandons_in_a_row`.
-                self._arm_verdict_wrong_streak = 0
-            else:
-                watch["rounds"] += 1
-                if watch["rounds"] == self.ARM_VERDICT_ROUNDS:
-                    committed = (
-                        getattr(self, "phase_flip_active_stack", None)
-                        != watch["phase_at_arm"]
-                    )
-                    if not committed:
-                        # ARM-UNFUNDED, NOT ARM-VERDICT-WRONG, and the split
-                        # matters because the first version accused the wrong
-                        # component. Measured 2026-08-16 11:05: three
-                        # ARM-VERDICT-WRONG against twelve
-                        # "FLIP ABANDONED (pool too small for the live set)",
-                        # eight of them "This rank: fits (a peer did not)".
-                        # The target layout never became active, so the
-                        # admissibility verdict was never tested -- the SEAM
-                        # could not pay. A falsifier that fires on funding
-                        # failures stops being a falsifier for verdicts.
-                        logger.warning(
-                            "PHASE-POLICY ARM-UNFUNDED: armed %s (%s) and the "
-                            "cutover has not committed after %d rounds -- the "
-                            "instance is still in the %s layout. This is a "
-                            "SEAM FUNDING failure, not a wrong admissibility "
-                            "verdict: the target was never entered, so the "
-                            "verdict was never tested. Look for FLIP ABANDONED "
-                            "on the binding rank, not at the arm.",
-                            watch["direction"],
-                            watch["reason"],
-                            watch["rounds"],
-                            watch["phase_at_arm"],
-                        )
-                    else:
-                        logger.warning(
-                            "PHASE-POLICY ARM-VERDICT-WRONG: armed %s (%s), the "
-                            "cutover COMMITTED into the target layout, and it "
-                            "still built no batch in %d rounds. The "
-                            "admissibility inputs that produced this arm were "
-                            "running_bs=%d pending=%d nothing_can_run=%s "
-                            "target_can_admit=%s ready_carriers=%d. The verdict "
-                            "was tested and was wrong; if this repeats in "
-                            "alternating directions it is the 2026-08-16 10:24 "
-                            "ping-pong and the target term is lying again.",
-                            watch["direction"],
-                            watch["reason"],
-                            watch["rounds"],
-                            watch["running_bs"],
-                            watch["pending"],
-                            watch["nothing_can_run"],
-                            watch["target_can_admit"],
-                            watch["ready_carriers"],
-                        )
-                        # W30 SAFETY NET, and the reason it exists: on
-                        # 2026-08-24 this exact line was emitted 12 times over
-                        # ten minutes while the instance flipped 150 times and
-                        # served nothing, and NOTHING consumed it. The purity
-                        # valve could not see the state at all -- it arms on
-                        # ABANDONED or REFUSED flips, and here every flip
-                        # COMMITTED. A log line is not a consumer (#800).
-                        #
-                        # Booked as a streak so one fruitless arm is not a
-                        # verdict; `flip_unavailable_reason` reads it as its
-                        # fourth cause.
-                        self._arm_verdict_wrong_streak = (
-                            int(getattr(self, "_arm_verdict_wrong_streak", 0) or 0) + 1
-                        )
         if ret is not None:
             self._round_built_nothing = False
             return
@@ -4315,98 +3936,6 @@ class Scheduler(
             return False
         return False
 
-    def _idle_locked_inputs(self, running_bs: int, pending_tokens: int):
-        """``(nothing_can_run, target_admissible)`` for the policy.
-
-        BOTH TERMS ARE SIMULATED NOW. Each was a proxy once and each cost a
-        live defect, in the same shape:
-
-        * ``target_can_admit`` was "work of that class exists". On 2026-08-16
-          10:24 that was permanently true on both sides while NEITHER layout
-          could run, and the policy ping-ponged every 3-4 seconds.
-        * ``nothing_can_run`` was "the round happened to build nothing". On
-          2026-08-16 10:47:42 that fired on a single transient empty round
-          with the pool 5% used, 6 of 12 GDN slots free and a request still
-          queued -- PP could plainly have admitted more. The arm bypassed
-          window formation (correctly, #688 outranks #689) and the decode
-          window opened at ONE carrier, which is the bs=1 defect #689 exists
-          to remove.
-
-        A ROUND THAT BUILT NOTHING IS NECESSARY BUT NOT SUFFICIENT. It is kept
-        as the trigger -- the check is worthless if it fires while batches are
-        being built -- but the verdict is now whether the layout CAN build
-        one, not whether it just did.
-        """
-        if not bool(getattr(self, "_round_built_nothing", False)):
-            return False, False
-        phase = getattr(self, "phase_flip_active_stack", None)
-        if phase not in ("pp", "tp"):
-            # No flip enabled, or a phase this rule says nothing about.
-            return False, False
-        other = "tp" if phase == "pp" else "pp"
-        here = self._layout_admits(phase, running_bs, pending_tokens)
-        there = self._layout_admits(other, running_bs, pending_tokens)
-        # #713: NAME THE TERMS WHEN THE VERDICT IS THE EXPENSIVE ONE.
-        #
-        # Measured 2026-08-17 03:0x: a TEN-token prompt waited 31.64 s on an
-        # idle box -- 0 running, 1 queued, 3 mamba slots free, 72033 KV rows
-        # free -- because this returned target_can_admit=False and the policy
-        # declined to flip. But replaying _layout_admits with exactly those
-        # numbers returns pp=True/tp=False, i.e. the simulation is RIGHT for
-        # that state and would have armed. So the inputs it reads in-process
-        # differ from what /metrics reports, and no external sampling can show
-        # which -- the terms have to be printed where they are computed.
-        #
-        # Emitted only on the refusal (nothing here, nothing there), and rate
-        # limited, because the whole point is to catch a state that persists
-        # for tens of seconds rather than to narrate healthy rounds.
-        if (not here) and (not there):
-            now = time.perf_counter()
-            last = getattr(self, "_idle_locked_diag_at", 0.0)
-            if now - last >= 5.0:
-                self._idle_locked_diag_at = now
-                mamba = getattr(
-                    getattr(self, "req_to_token_pool", None), "mamba_allocator", None
-                )
-                try:
-                    slots = int(mamba.available_size()) if mamba is not None else -1
-                except Exception as exc:  # noqa: BLE001 - a probe must not break
-                    slots = f"RAISED {type(exc).__name__}"
-                alloc = getattr(self, "token_to_kv_pool_allocator", None)
-                try:
-                    avail = int(alloc.available_size()) if alloc is not None else -1
-                except Exception as exc:  # noqa: BLE001
-                    avail = f"RAISED {type(exc).__name__}"
-                # THE THIRD PROBE GETS THE SAME ARMOUR, and it is not
-                # decoration: called bare inside the logger arguments, a raise
-                # here would kill the scheduler round this line exists to
-                # OBSERVE -- which is exactly how #715's RADIX SHAPE walk died
-                # inside the crash it was written to explain. "Probably safe
-                # because _layout_admits just evaluated it" is the reasoning
-                # the RAISED pattern exists to replace.
-                try:
-                    rows_seen = self._post_evict_rows()
-                except Exception as exc:  # noqa: BLE001
-                    rows_seen = f"RAISED {type(exc).__name__}"
-                logger.warning(
-                    "PHASE-POLICY IDLE-LOCKED TERMS phase=%s running_bs=%s "
-                    "pending_tokens=%s | here(%s)=%s there(%s)=%s | "
-                    "post_evict_rows=%s allocator_avail=%s mamba_slots=%s "
-                    "chunk=%s -- both layouts refused; these are the numbers "
-                    "the simulation actually read.",
-                    phase,
-                    running_bs,
-                    pending_tokens,
-                    phase,
-                    here,
-                    other,
-                    there,
-                    rows_seen,
-                    avail,
-                    slots,
-                    getattr(self.server_args, "chunked_prefill_size", None),
-                )
-        return (not here), there
 
     def _note_parked_carriers(self, running_batch, decode_blocked: bool) -> None:
         """Record this round's purity verdict and reconcile the parked set.
@@ -4416,8 +3945,7 @@ class Scheduler(
         """
         if not self.parked_decode_set.enabled:
             return
-        phase = getattr(self, "phase_flip_active_stack", None)
-        self._parked_decode_verdict = (phase, bool(decode_blocked))
+        self._parked_decode_verdict = bool(decode_blocked)
         reqs = (
             list(getattr(running_batch, "reqs", None) or []) if decode_blocked else []
         )
@@ -4429,44 +3957,48 @@ class Scheduler(
     def _parked_carrier_discount(self, running_bs: int) -> int:
         """Carriers the concurrency cap must not count, this round.
 
-        TWO CLAMPS, EACH FOR A DIFFERENT WAY THE RECORD CAN BE STALE.
+        ONE CLAMP (#1233, WEG 2, S0), because there is only one way left for
+        the record to be stale.
 
-        The verdict is recorded by the decode branch, which does not run on
-        every round -- a round that selects a prefill batch never reaches
-        it. So the record can outlive the layout it was made in, and a
-        verdict from the OTHER phase is discarded outright: PP forbids
-        decode and TP does not, so trusting a PP verdict inside TP would
-        discount carriers that are actively decoding.
+        It used to be two. The verdict is recorded by the decode branch, which
+        does not run on every round -- a round that selects a prefill batch
+        never reaches it -- so the record could outlive the LAYOUT it was made
+        in, and a verdict from the other phase was discarded outright. Weg 2
+        has one role per process for life, so there is no other layout to
+        discard a verdict from, and that clamp went with its premise.
 
-        The id set can also outlive the requests in it, for the same
-        reason -- a carrier that finished on a round the decode branch did
-        not reach is still listed. Clamping the discount to the resident
-        count means a stale id can never credit more than is there, so the
-        worst case degrades to the pre-change gate rather than to
-        over-admission.
+        What remains is staleness in TIME: the id set can outlive the requests
+        in it, because a carrier that finished on a round the decode branch did
+        not reach is still listed. Clamping the discount to the resident count
+        means a stale id can never credit more than is there, so the worst case
+        degrades to the pre-change gate rather than to over-admission.
         """
-        phase, blocked = getattr(self, "_parked_decode_verdict", (None, False))
-        if not blocked or phase != getattr(self, "phase_flip_active_stack", None):
+        # #1233 (WEG 2, S0): ONE clamp, not two. The discarded clamp threw
+        # away a verdict recorded in the OTHER layout; there is no other
+        # layout in this process, so a stale verdict can only be stale in
+        # TIME, which is what the resident-count clamp below already bounds.
+        if not bool(getattr(self, "_parked_decode_verdict", False)):
             return 0
         return min(self.parked_decode_set.carrier_discount(), max(0, int(running_bs)))
 
     # -- #888b: a resident the phase forbids to run must be able to yield ---
 
     def _decode_forbidden_this_phase(self) -> bool:
-        """Does the ACTIVE layout forbid decode, as recorded this residency?
+        """Does this process's role forbid decode, as recorded this residency?
 
-        THE SAME TWO CLAMPS AS ``_parked_carrier_discount``, reused rather
-        than re-derived, and the reuse is the point: a second reading of the
-        purity verdict would be a second thing to keep true. The verdict is
-        recorded by the decode branch, which does not run on every round, so
-        it can outlive the layout that produced it -- a PP verdict read inside
-        TP would report a prohibition that has already lifted, and everything
-        #888b does downstream of this predicate is destructive.
+        THE SAME RECORD AS ``_parked_carrier_discount``, read rather than
+        re-derived, and the reuse is the point: a second reading of the purity
+        verdict would be a second thing to keep true, and the predicate behind
+        it advances the starvation clock.
+
+        Everything #888b does downstream of this is DESTRUCTIVE -- it clears a
+        latch and it retracts a resident -- so the default matters as much as
+        the value: with parking off by construction (#1233) nothing ever writes
+        this record, and the initializer is the answer for the whole life of
+        the process. It is ``False``: this process decodes or it does not, for
+        life, and a prefill process has no decode path to forbid.
         """
-        phase, blocked = getattr(self, "_parked_decode_verdict", (None, False))
-        if not blocked:
-            return False
-        return phase == getattr(self, "phase_flip_active_stack", None)
+        return bool(getattr(self, "_parked_decode_verdict", False))
 
     def _rederive_latched_batch_full(self, running_batch) -> bool:
         """Under a phase prohibition, ``batch_is_full`` is not a latch.
@@ -5721,7 +5253,7 @@ class Scheduler(
                 if is_retracted:
                     req._969ac_site = "retract-intake"
                 elif _population == "queue":
-                    req._969ac_site = "cutover-requeue"
+                    req._969ac_site = "requeue"
                 else:
                     req._969ac_site = "intake"
                 req._969ac_lap = int(getattr(req, "_969ac_lap", 0)) + 1
@@ -5876,7 +5408,7 @@ class Scheduler(
         # population included (slice-3 fix: the `if population:` guard was
         # an unnamed deviation).
         logger.info(
-            "PHASE-FLIP SEAM RE-ADMISSION: %d retracted resident(s) + %d "
+            "SEAM RE-ADMISSION: %d retracted resident(s) + %d "
             "queue occupant(s) re-issued through the intake path in "
             "arrival order (queue %d -> %d, dropped_by_queue_limit=%d)",
             readmitted,
@@ -6335,12 +5867,12 @@ class Scheduler(
             )
 
             for _ in cleared:
-                _note_prefetch_gate("defer_cleared_cutover")
-        # ONE line per cutover, UNCONDITIONAL (n=0 included, slice-3 fix
-        # round 2): the A12.3 identity is read per cutover, and a zero from
-        # an ABSENT line is not a zero (denominator law).
+                _note_prefetch_gate("defer_cleared_reissue")
+        # ONE line per reissue, UNCONDITIONAL (n=0 included): the A12.3
+        # identity is read per reissue, and a zero from an ABSENT line is not
+        # a zero (denominator law).
         logger.info(
-            "#1068 PREFETCH DEFER CLEARED AT CUTOVER n=%d rids=%s -- the "
+            "#1068 PREFETCH DEFER CLEARED AT REISSUE n=%d rids=%s -- the "
             "operations that guarded these marks died at _reset_full; the "
             "fresh intake verdict under the incoming binding generation "
             "decides anew (population=%d)",
@@ -7210,7 +6742,7 @@ class Scheduler(
         _phase_domain_at = len(vals)
         _phase_domain_local = phase_domain_verdict.build_phase_domain_payload(self)
         vals = vals + _phase_domain_local
-        _phase_domain_phase = getattr(self, "phase_flip_active_stack", None)
+        _phase_domain_phase = None  # #1233 (WEG 2, S0): one layout per process.
         # `_phase_domain_layout_announced` IS THIS EMITTER'S OWN BOOKMARK of the
         # phase it last logged the layout for, and it cannot be recomputed where
         # it is read: nothing else in the process records whether THIS process
@@ -8134,14 +7666,10 @@ class Scheduler(
             "CORRIDOR LAW BREACHED on this rank's card: the continuous "
             "minimum over the last %s samples (%.0f s at %s ms) is %d MiB, "
             "%d MiB BELOW the %d MiB law. This is the time-series minimum, "
-            "not a snapshot -- the binding instant is a transient, typically "
-            "inside a flip cutover, and it is already over by the time this "
-            "line is written. It is reported because the alternative is what "
-            "the #656 acceptance did: breach for 63 minutes and find out "
-            "from a CSV afterwards. If this fires on a flip boot, the seam's "
-            "measured DRAW exceeds the gate's seam-entry reserve and the "
-            "arming floor is the number to re-derive (corridor_guard."
-            "arming_floor_mib).",
+            "not a snapshot -- the binding instant is a transient and it is "
+            "already over by the time this line is written. It is reported "
+            "because the alternative is what the #656 acceptance did: breach "
+            "for 63 minutes and find out from a CSV afterwards.",
             summary.get("n"),
             float(summary.get("span_s") or 0.0),
             summary.get("period_ms"),
@@ -8149,29 +7677,12 @@ class Scheduler(
             int(summary.get("corridor_mib", 0)) - floor,
             summary.get("corridor_mib"),
         )
-        # AND WRITE IT DOWN, so the next boot of this configuration sizes
-        # itself against a measured shortfall instead of an assumed one.
-        # Guarded and never raises: an instrument must not take serving down,
-        # and a rank with no seam record (a cold boot) simply has nothing to
-        # append to.
-        try:
-            from sglang.srt.managers.phase_flip_seam_reserve import (
-                record_corridor_shortfall,
-            )
-
-            # THE FLIP RUNTIME'S RANK, not self.ps.tp_rank. The seam record
-            # is keyed on the rank write_seam_reserve used (runtime._rank),
-            # and under --tp-size 1 --pp-size 3 the TP rank is 0 in ALL
-            # THREE processes -- register C605-3, where exactly that
-            # substitution filed three cards under one rank. No runtime, no
-            # record to append to, so nothing is written.
-            runtime = getattr(self, "phase_flip_runtime", None)
-            rank = getattr(runtime, "_rank", None)
-            if rank is not None:
-                depth_mib = int(summary.get("corridor_mib", 0)) - floor
-                record_corridor_shortfall(self.server_args, int(rank), depth_mib << 20)
-        except Exception:  # noqa: BLE001 - instrument must not raise
-            pass
+        # #1233 (WEG 2, S0): the shortfall used to be appended to the seam
+        # reserve record so the next boot could re-derive its arming floor.
+        # The seam fund and the arming floor are abolished by §4.5, and their
+        # removal is a PLANNER change that S7 makes deliberately -- so this
+        # writer is dropped here rather than left writing into a record
+        # nothing will read. The breach itself is still reported, above.
 
     def _census_tick(self) -> None:
         """Advance the census round and, on cadence, diff counts across ranks.
@@ -8300,132 +7811,8 @@ class Scheduler(
             )
         return int(self.token_to_kv_pool_allocator.available_size())
 
-    def _take_phase_flip_decision(self):
-        """#969 §W3: PP0's pending flip decision, for the request stream.
 
-        Returns it exactly ONCE (the runtime marks it taken), which is what
-        lets the decider know the followers have been told and that it may
-        execute on its next round. Never builds the runtime: a decision can
-        only exist once a flip is armed, and arming builds it.
-        """
-        rt = self.phase_flip_runtime
-        if rt is None:
-            return None
-        return rt.take_flip_decision()
 
-    def _apply_phase_flip_decisions(self, recv_reqs: List) -> None:
-        """#969 §W3: strip PP0's decision off the stream and hand it over.
-
-        Stripped IN PLACE on every rank -- `process_input_requests` below must
-        never meet a control object it does not know -- and applied only below
-        PP0 (`apply_flip_decision` no-ops on rank 0, so the rule lives in one
-        place rather than being restated at each call site).
-        """
-        if not any(isinstance(r, PhaseFlipDecision) for r in recv_reqs):
-            return
-        told = [r for r in recv_reqs if isinstance(r, PhaseFlipDecision)]
-        recv_reqs[:] = [r for r in recv_reqs if not isinstance(r, PhaseFlipDecision)]
-        rt = self.phase_flip_runtime
-        if rt is None:
-            # A decision for a rank whose runtime does not exist cannot be
-            # executed, and inventing a local answer is the thing this cut
-            # removes. The runtime is built on the first round of every
-            # flip-enabled rank, so this is unreachable in a live group.
-            raise RuntimeError(
-                f"#969 rank was handed PP0's flip decision {told[-1]!r} with "
-                f"no phase-flip runtime built. A follower that cannot execute "
-                f"its order must stop, not improvise."
-            )
-        # LAST WINS, deliberately: the stream is ordered and a later decision
-        # supersedes an earlier one for the same reason a later arm does.
-        rt.apply_flip_decision(told[-1])
-
-    def _phase_flip_on_round(self, require_armed_and_parked: bool = False):
-        """One phase-flip runtime round (#631): lazy-build, bounded
-        consensus, loop exit on commit.
-
-        Two call sites, one per loop family: get_next_batch_to_run for
-        event_loop_normal (lockstep TP rounds, periodic consensus), and
-        the END of the event_loop_pp microbatch iteration with
-        require_armed_and_parked=True -- under PP the ranks' local round
-        counters diverge absolutely, so the reduction is entered only from
-        an armed AND locally-parked state, where this rank owes no
-        pipeline send (measured wedges 2026-08-08, boots 9+10; see
-        PhaseFlipRuntime.on_round)."""
-        if self.phase_flip_runtime is None:
-            from sglang.srt.managers.phase_flip_runtime import (
-                build_phase_flip_runtime,
-            )
-
-            self.phase_flip_runtime = build_phase_flip_runtime(self)
-            # #656: the first round is the earliest point at which both
-            # layouts, the arena carrier and the drafter all exist, so it is
-            # the earliest point at which the seam's at-rest cost is a
-            # measurement rather than a prediction. Measure it once, leave
-            # the record for the next boot's sizer, and say out loud whether
-            # THIS boot can fund its own flip.
-            from sglang.srt.managers.phase_flip_seam_reserve import (
-                measure_and_record,
-            )
-
-            measure_and_record(self, self.phase_flip_runtime)
-        # #631: the per-rank output_ids clock, once per pass. Both loop
-        # families reach this line exactly once per pass, which is what
-        # makes the three ranks' lines comparable; the site name records
-        # WHERE in the pass the sample was taken, because the PP hook sits
-        # at the END of the iteration (after that pass's result was
-        # processed) and the TP one at the top (before this pass ran).
-        from sglang.srt.managers.phase_flip_output_trace import trace_tick
-
-        trace_tick(self, "pp_end" if require_armed_and_parked else "tp_top")
-        # SPEC ITEM 16: consult the rebalance lender on the one clock that
-        # ticks in every phase, including the seam and the rounds no gate
-        # prices. Rank-local, no collective (that is a hard requirement at
-        # this cadence -- see PhaseFlipRuntime.on_round), rate-limited to a
-        # monotonic clock read on the common path, and it never raises.
-        from sglang.srt.managers.corridor_rebalance import lend_on_round
-
-        lend_on_round(self)
-        # #657 item 16: re-apply the standing allocation steer. The DECISION
-        # was taken and reduced at the seam; this only keeps the free list's
-        # order matching it, because frees return pages to the head of the
-        # list and wash the partition out. Rate-limited, rank-local, and a
-        # pure reordering -- it places nothing new and frees nothing.
-        from sglang.srt.managers.corridor_steering import steer_on_round
-
-        steer_on_round(self)
-        flip_stats = self.phase_flip_runtime.on_round(
-            require_armed_and_parked=require_armed_and_parked
-        )
-        _drain_seam_abandons_into_policy(self)
-        if flip_stats is not None:
-            from sglang.srt.managers.phase_flip_runtime import (
-                PhaseFlipLoopExit,
-            )
-
-            # #656: bytes moved. This -- not the arm -- is what retires the
-            # outstanding attempt and clears any refusal backoff.
-            state = getattr(self, "phase_policy_state", None)
-            if state is not None:
-                try:
-                    from sglang.srt.managers.phase_policy import note_flip_completed
-
-                    note_flip_completed(
-                        self.phase_policy_cfg,
-                        state,
-                        flip_stats["direction"],
-                        time.perf_counter(),
-                    )
-                    # #819: PRICE THE WHOLE LEG, HERE, because this is the
-                    # only place that holds the completed flip's own stats.
-                    # `total_ms` contains movers and cutover; the refill leg
-                    # that used to be the sole feeder contains neither.
-                    from sglang.srt.managers.phase_policy import observe_flip_leg
-
-                    observe_flip_leg(flip_stats)
-                except Exception as e:  # pragma: no cover - bookkeeping only
-                    logger.warning("PHASE-POLICY completion not recorded: %s", e)
-            raise PhaseFlipLoopExit(flip_stats["direction"])
 
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -8644,21 +8031,11 @@ class Scheduler(
         # FIFO restore with hysteresis (merges the restored session back
         # into running_batch BEFORE batch selection / prepare_for_decode).
         if self.kv_session_offload is not None:
-            # #656 LAYOUT PIN, re-applied every round and BEFORE pre_schedule
-            # picks a tick. A host image belongs to the phase it was captured
-            # in; while the other phase is live, that session must not run.
-            # `suppress_tick` is a one-shot the picker clears, so this is a
-            # per-round re-assert and not a latch -- a latch would release
-            # itself on the first tick it suppressed, which is the tick that
-            # matters. No-op when the flip is off (no phase to pin against).
-            if getattr(self, "phase_flip_active_stack", None) is not None:
-                from sglang.srt.managers.kvso_flip_contract import (
-                    pin_spills_to_phase,
-                )
-
-                pin_spills_to_phase(
-                    self.kv_session_offload, self.phase_flip_active_stack
-                )
+            # #1233 (WEG 2, S0): the #656 layout pin held a spilled session
+            # out of the layout it was not captured in. A process has one
+            # layout for its whole life, so every image this process holds
+            # was captured in the layout it will be replayed in and there is
+            # no phase to pin against.
             running_batch = self.kv_session_offload.pre_schedule(
                 running_batch, last_batch
             )
@@ -8754,10 +8131,6 @@ class Scheduler(
         # blocking group reduction may only be entered once every send a
         # peer needs to reach ITS reduction of the same round is flushed --
         # i.e. as the LAST blocking op of the iteration.
-        if self.server_args.enable_phase_flip and not getattr(
-            self, "_defer_flip_round_to_pp_loop", False
-        ):
-            self._phase_flip_on_round()
 
         # #330 VRAM dial / KV capacity runtime: same lazy-build and cadence
         # discipline. Runs AFTER the reshard block so a #297 cutover in this
@@ -8965,58 +8338,6 @@ class Scheduler(
         # applies, the boundary arrives within a round or two, and the
         # pending prefill lands in PP -- which is the entire point of
         # arming tp_to_pp.
-        # The predicate lives next to the quiescence rule it must agree
-        # with (chunk_blocks_quiescence), so the two cannot drift apart
-        # again the way they did between defect O and 20:31:48.
-        from sglang.srt.managers.phase_flip_runtime import (
-            PP_TO_TP,
-            chunk_blocks_quiescence,
-        )
-
-        if (
-            self.server_args.enable_phase_flip
-            and self.phase_flip_runtime is not None
-            and self.phase_flip_runtime.pending is not None
-            # #1065: the strict/runnability terms are deleted with the shared
-            # predicate's strict clause (see chunk_blocks_quiescence). With
-            # them gone the park holds every armed round except the one-round
-            # mid-admission transient, so the drain reaches a settled chunk
-            # boundary and the flip lands -- instead of waiting on
-            # continuation chunks the current layout's builder refuses to
-            # build (the 2026-09-01 tp_to_pp livelock, 37 abandons/rank over
-            # 1114 s with 11 queued / 0 running).
-            #
-            # #1067: THE PARK IS THE ADMISSION OWNER'S VERDICT, NOT EVERY
-            # RANK'S. In the PP layout (pp_to_tp armed) a follower that parks
-            # stops the very drain the park exists to wait for: it withholds
-            # the pass that would execute an mb already launched upstream.
-            # Measured boot_855_1065umbau 06:26:07Z: pp_to_tp armed one pass
-            # after PP0 launched the final 118-token chunk mb; PP1 had
-            # RECEIVED and reconciled it (ROW-PROBE delivered=31) but parked
-            # before building, PP2 stayed at delivered=30, and PP0 blocked
-            # forever in the output recv (mb slots [0, 2] in flight) -- with
-            # the abandon carrier blocked, no 30 s abandon ever fired.
-            # Pre-#1065 the strict chunk clause kept the park open during a
-            # chunk ladder and masked this rank-local verdict. Under the PP0
-            # authority order followers execute what the row tells them and
-            # decide nothing: in the PP layout only PP0 parks (it stops
-            # SOURCING new work; in-flight mbs keep draining downstream). In
-            # the TP layout every rank is a replica of one decision made
-            # from replicated state, so the park stays group-wide.
-            and (
-                self.phase_flip_runtime.pending != PP_TO_TP
-                or self.ps.pp_size == 1
-                or self.ps.pp_rank == 0
-            )
-            and not chunk_blocks_quiescence(self.chunked_req)
-        ):
-            # A round withheld for a PENDING FLIP is not a round that could
-            # not build a batch -- it is one that deliberately did not try. It
-            # must not leave the previous round's verdict standing, or the
-            # arming gate reads a stale "nothing can run" from before the flip
-            # was armed.
-            self._round_built_nothing = False
-            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         # #797: A ROUND WITHHELD FOR A VOIDED PP PASS, on the same argument
         # and in the same shape as the pending-flip branch above -- and it has
@@ -9293,42 +8614,15 @@ class Scheduler(
             # A batch that never came through here (the decoupled spill batch)
             # simply carries no attribute, which the verdict reads as
             # "nothing to compare" rather than as a violation.
-            # getattr / try: same STAND-IN discipline as the two call sites
-            # below, and a batch object that refuses the attribute simply
-            # goes unstamped, which the verdict reads as "nothing to compare".
-            try:
-                ret._layout_admitted_phase = getattr(
-                    self, "_layout_routing_phase", lambda: None
-                )()
-            except Exception:  # noqa: BLE001 - a detector may never break serving
-                pass
+            # #1233 (WEG 2, S0): no admitted-phase stamp. It existed so a
+            # later forward could check that the batch was executing in the
+            # layout it was admitted in; a process now has one layout for its
+            # whole life, so the two can never differ and the comparison has
+            # nothing left to compare.
 
         self._note_round_build_outcome(ret, running_batch)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def _layout_routing_phase(self) -> Optional[str]:
-        """#838: the layout the FORWARD will route in, read rank-locally.
-
-        The same authority the batch line's ``phase=`` field uses (#758,
-        metrics_reporter._active_phase_field) and the same one the model code
-        branches on -- ``phase_flip_tp_routing_active()``. A second source of
-        truth here would just be a new way to lie, which is the sentence #758
-        already wrote about this exact field.
-
-        None when the phase flip is off: there is only one layout, the
-        question is meaningless, and every #838 verdict declines on None.
-        """
-        if not getattr(self.server_args, "enable_phase_flip", False):
-            return None
-        try:
-            from sglang.srt.distributed.parallel_state import (
-                phase_flip_tp_routing_active,
-            )
-            from sglang.srt.managers.phase_policy import PHASE_PP, PHASE_TP
-
-            return PHASE_TP if phase_flip_tp_routing_active() else PHASE_PP
-        except Exception:  # noqa: BLE001 - a detector may never break serving
-            return None
 
     def get_num_allocatable_reqs(self, running_bs):
         # #287: the floating admission limit joins the existing bounds as one
@@ -12962,60 +12256,7 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     @scheduler_nvtx_method("scheduler.run_batch")
-    def _check_layout_conformance(self, batch: ScheduleBatch) -> None:
-        """#838 class 1, at the execution site: did this batch run where it
-        was admitted?
 
-        Called from the top of ``run_batch``, i.e. after the point at which a
-        cutover could still have committed since the scheduling pass, and
-        before the forward that would consume the wrong groups.
-
-        #713: ONE READING OF THE ROUTING FLAG, used by the comparison AND by
-        the message that reports it. Calling the accessor a second time to
-        build the alarm text is how a violation could name a phase the
-        comparison never saw -- and on this path the second read could even
-        disagree with the first, which would make the line self-refuting.
-
-        A detector may never break serving: everything here is guarded, and a
-        failure to READ is silence, never an alarm.
-        """
-        try:
-            executing = self._layout_routing_phase()
-            if executing is None:
-                return
-            # Local, like every other manager import reached from this class:
-            # `sys.modules` is a dict lookup against a millisecond-scale
-            # forward, and a module-level import here would be the only new
-            # E402 in a file where all ~90 of them are already the same
-            # finding.
-            from sglang.srt.managers import layout_conformance
-
-            admitted = getattr(batch, "_layout_admitted_phase", None)
-            reqs = getattr(batch, "reqs", None) or ()
-            rid = getattr(reqs[0], "rid", "-") if reqs else "-"
-            alarm, detail = layout_conformance.admit_vs_exec_verdict(
-                admitted,
-                executing,
-                rid,
-                int(getattr(self, "_pp_live_mb_id", -1) or -1),
-                getattr(self.phase_policy_state, "last_reason", None),
-            )
-            if alarm:
-                layout_conformance.note_conformance_violation(
-                    detail, time.perf_counter()
-                )
-        except Exception:  # noqa: BLE001 - a detector may never break serving
-            pass
-
-    #: #1033c: how many forwards after a cutover run inside a published JIT
-    #: build window. Not "the first one": the first PREFILL and the first
-    #: DECODE of the new layout are different shapes, spec-decode adds a draft
-    #: forward, and the #887 one-chunk grant can put a TP prefill several
-    #: batches in. A small count covers the whole first-touch set without
-    #: anyone having to enumerate which kernels those are -- which is the
-    #: property that matters, because an enumeration that misses one lets the
-    #: next first-loader reproduce the identical wedge.
-    POST_CUTOVER_BUILD_BATCHES = 8
 
     def run_batch(
         self,
@@ -13090,109 +12331,7 @@ class Scheduler(
         divergence must crash the group at the single site that owns the
         decision -- not be compensated for here, one rank at a time.
         """
-        n = getattr(self, "_post_cutover_build_batches", 0)
-        if n <= 0:
-            return self._run_batch_forward(batch, pp_proxy_tensors)
-        self._post_cutover_build_batches = n - 1
-        from sglang.srt.utils.jit_cold_build import cold_build_window
-
-        idx = int(self.POST_CUTOVER_BUILD_BATCHES) - n + 1
-        reason = (
-            f"post-cutover first forwards, {self.phase_flip_active_stack} layout "
-            f"({idx}/{self.POST_CUTOVER_BUILD_BATCHES})"
-        )
-        # #1033c LOUD ON PURPOSE (the #640 lesson, built in on the new path
-        # rather than learned again): a multi-minute module load must read as a
-        # BUILD, not as a fresh hang. `cold_build_window` logs its own open and
-        # close; this pair adds the per-rank duration so a long cold load is
-        # attributable to this window and to nothing else.
-        _t0 = time.monotonic()
-        logger.warning(
-            "%s #1033c CUTOVER FORWARD WARMUP begin: %s. Shapes first touched "
-            "in this layout load their Triton modules now; the window is "
-            "PUBLISHED so peers stretch their collective deadlines instead of "
-            "aborting the group (#615). A pause here is a cold module load "
-            "ONLY WHILE THE RANKS BURN CPU -- check %%CPU before you wait. "
-            "Compiling is CPU-bound; 0%% CPU with the log frozen and the GPU "
-            "at 100%% is the #1073 wedge (cuModuleLoadData behind this "
-            "thread's own abort-poll synchronize), not a build. This sentence "
-            "said 'not a wedge' unconditionally until 2026-09-01, when "
-            "boot_855_1072cut hung exactly that way on all three ranks and the "
-            "line invited the reader to keep waiting.",
-            f"[rank {self.attn_tp_rank if hasattr(self, 'attn_tp_rank') else '?'}]",
-            reason,
-        )
-        # #1159: A BOUND ON THE REPORTING, NOT ON THE WINDOW.
-        #
-        # This wrapper has no clock of its own: it holds the forward for as
-        # long as the forward takes, and `cold_build_window` publishes a marker
-        # rather than enforcing anything. On weg1b3 the window opened at
-        # 23:59:54 on PP0 and PP2 (log lines 104478, 104858), PP1 never entered
-        # it, and no `WARMUP done` and no `build window CLOSE` was ever written
-        # on any rank -- the group deadlocked with two ranks inside the GDN
-        # extend forward and one at the top of the event loop. The ONLY thing
-        # the boot then produced about that state was 82,350 `#1073 ...
-        # RESUMING` lines, 41 % of the log: the symptom of the open window at
-        # tick rate, never the event.
-        #
-        # So a hung first forward gets ONE named line, from a timer thread
-        # (this thread is inside the forward and cannot report on itself). One
-        # shot, cancelled in the `finally` on both the normal and the exception
-        # path, so a healthy warmup -- 28-629 ms for every completed one in
-        # that boot -- never emits it.
-        #
-        # WHAT THIS DELIBERATELY DOES NOT DO, and the boundary is the point:
-        # it does not stop the group, does not abort, does not close the
-        # window and does not redesign this wrapper. A cutover that two ranks
-        # entered and one did not is a RANK DIVERGENCE, and under
-        # `raenge-nie-uneins-crash-stop` the answer to a detected divergence is
-        # a group stop at the one place that owns the decision -- which is
-        # #1158's subject, not this line's. This is an instrument: it makes the
-        # state visible in one line so #1158 has something to key on.
-        _warn_s = 0.0
-        try:
-            from sglang.srt.environ import envs as _envs_1159
-
-            _warn_s = float(_envs_1159.SGLANG_CUTOVER_WARMUP_OPEN_WARN_S.get())
-        except Exception:  # noqa: BLE001 - an instrument never breaks the forward
-            _warn_s = 120.0
-        _timer = None
-        if _warn_s > 0:
-            import threading as _threading_1159
-
-            def _warn_open():
-                logger.error(
-                    "#1159 CUTOVER FORWARD WARMUP OPEN > %.1fs: %s has been "
-                    "open %.1fs on this rank and the forward has not returned. "
-                    "Every completed warmup on this rig takes milliseconds "
-                    "(28-629 ms measured across boot weg1b3), so this is not a "
-                    "slow build. Two shapes produce it: a cold module load "
-                    "that is genuinely still running (the ranks BURN CPU), or "
-                    "a one-sided cutover in which a peer never entered this "
-                    "window and the collective can never form (0%% CPU, GPU at "
-                    "100%%) -- the weg1b3 death, 23:59:54. This line reports; "
-                    "the group stop for the divergence belongs to #1158.",
-                    _warn_s,
-                    reason,
-                    time.monotonic() - _t0,
-                )
-
-            _timer = _threading_1159.Timer(_warn_s, _warn_open)
-            _timer.daemon = True
-            _timer.start()
-        try:
-            with cold_build_window(reason):
-                return self._run_batch_forward(batch, pp_proxy_tensors)
-        finally:
-            if _timer is not None:
-                _timer.cancel()
-            logger.warning(
-                "#1033c CUTOVER FORWARD WARMUP done: %s in %.1f ms. "
-                "%d warmed forward(s) left in this window budget.",
-                reason,
-                (time.monotonic() - _t0) * 1e3,
-                self._post_cutover_build_batches,
-            )
+        return self._run_batch_forward(batch, pp_proxy_tensors)
 
     def _run_batch_forward(
         self,
@@ -13229,16 +12368,10 @@ class Scheduler(
                 int(getattr(self, "_decode_steps_this_phase", 0) or 0) + 1
             )
 
-        if self.draft_worker is not None and batch.forward_mode.is_extend():
-            from sglang.srt.managers.phase_flip_draft_bootstrap import (
-                arm_draft_cold_for_admission,
-            )
-
-            arm_draft_cold_for_admission(self, batch)
-        # getattr: same STAND-IN discipline as the policy gate -- a holder
-        # that binds `run_batch` unbound must not acquire a new requirement.
-        getattr(self, "_check_layout_conformance", lambda *_: None)(batch)
-
+        # #1233 (WEG 2, S0): the draft worker used to start COLD after a
+        # layout change, because it was built on the other stack. Weg 2's
+        # decode group builds its draft worker at boot and keeps it, so
+        # there is no cold-arming moment to detect here.
         # Pairing objective (#274 slice D): publish this batch's grain shape
         # for the lane's pairing policy. Read-only for the policy, one tuple
         # store here; None on every default path. Publishing must not alter
@@ -14274,55 +13407,6 @@ class Scheduler(
             return KvReshardReqOutput(success=False, message=str(e))
         return KvReshardReqOutput(success=ok, message=msg)
 
-    def handle_phase_flip(self, recv_req: PhaseFlipReqInput) -> PhaseFlipReqOutput:
-        """#631 control plane: arm a phase flip (mirror of handle_kv_reshard).
-
-        Replicated call through the broadcast pipe; arming does no
-        collective work -- the flip commits at a consensus boundary where
-        every rank is armed and quiescent. Delivery skew is absorbed by
-        the runtime's MIN-semantics on the armed flag. Routed through
-        arm_phase_flip so the abort deferral window activates atomically
-        with the arm (pin 4)."""
-        # An INTERNALLY generated request (the automatic phase policy) is
-        # answered with None, never with a PhaseFlipReqOutput. The reply
-        # path ends at _Communicator.handle_recv, which appends to
-        # _result_values -- an attribute that only exists while a caller
-        # is awaiting that RPC. The policy is not a caller: it synthesised
-        # this request inside the scheduler, so there is no awaiting
-        # future, _result_values is None, and answering raises
-        # AttributeError in the TokenizerManager's handle_loop. That
-        # exception is fatal to the tokenizer and takes the whole server
-        # with it (measured 2026-08-08: three consecutive boots died
-        # seconds after health, each one immediately after the policy's
-        # first arm). The outcome is logged by arm_phase_flip either way,
-        # so suppressing the reply loses nothing.
-        internal = bool(getattr(recv_req, "internal", False))
-        if not self.server_args.enable_phase_flip:
-            if internal:
-                return None
-            return PhaseFlipReqOutput(
-                success=False,
-                message=(
-                    "--enable-phase-flip is not set; this server has no "
-                    "secondary stack to flip to. Enable it at boot."
-                ),
-            )
-        try:
-            ok, msg = self.arm_phase_flip(
-                recv_req.direction, source=recv_req.source or "rpc"
-            )
-        except Exception as e:
-            # Arming performs no collective and moves no byte; every rank
-            # computes the same verdict from the same replicated input.
-            logger.warning("PHASE-FLIP arm failed: %s", e)
-            _note_policy_arm_outcome(self, recv_req.direction, False, str(e))
-            if internal:
-                return None
-            return PhaseFlipReqOutput(success=False, message=str(e))
-        _note_policy_arm_outcome(self, recv_req.direction, ok, msg)
-        if internal:
-            return None
-        return PhaseFlipReqOutput(success=ok, message=msg)
 
     def handle_vram_budget(self, recv_req: VramBudgetReqInput) -> VramBudgetReqOutput:
         """#330 control plane: dial a card's VRAM budget or query the state.
@@ -14407,7 +13491,7 @@ class Scheduler(
         flip's TP stack when one was built. Residency is checked by the
         caller -- this only enumerates."""
         pools = [self.token_to_kv_pool_allocator.get_kvcache()]
-        stacks = getattr(self, "phase_flip_stacks", None)
+        stacks = None  # #1233 (WEG 2, S0): one stack per process.
         if stacks is not None and getattr(stacks, "tp_worker", None) is not None:
             flip_pool = stacks.tp_worker.model_runner.token_to_kv_pool
             if flip_pool is not None and all(flip_pool is not p for p in pools):
@@ -14720,7 +13804,9 @@ class Scheduler(
                 if self.phase_policy_state is None:
                     logging.warning(
                         "phase_policy_decode_contention requires the phase "
-                        "policy to be enabled (--phase-flip-policy auto)."
+                        "policy to be enabled, and #1233 (Weg 2, S0) removed "
+                        "the flag that enabled it: there is no in-process "
+                        "policy left to contend for."
                     )
                     if_success = False
                     break
@@ -15164,873 +14250,16 @@ class Scheduler(
         )
         return pending
 
-    def maybe_arm_phase_policy(self, inflight_reqs=None):
-        """#631: evaluate the automatic phase policy on the intake rank.
 
-        ``inflight_reqs`` (#713) is the ``recv_reqs`` batch this evaluation is
-        riding in. It is REQUIRED for a correct verdict on an idle box: this
-        hook runs before those requests are queued, so without it the policy
-        reads an empty queue and refuses to flip toward the very work that
-        just woke it. Optional in the signature only so a caller that does not
-        have the batch degrades to the pre-#713 reading rather than failing.
 
-        Returns a ``PhaseFlipReqInput`` to put on the request stream, or
-        None. The AUTOMATIC path is then byte-for-byte the manual one --
-        same request type, same chain, same wake, same drain-park-meet --
-        and the only difference is who originates the arm: this policy on
-        rank 0, rather than an HTTP caller. That equivalence with a
-        mechanism proven on metal (~1.2 s cutovers, reproduced all
-        session) is the strongest argument the design has.
-
-        WHY A MESSAGE, when a message caused two deadlocks. Because THE
-        MESSAGE IS THE WAKEUP. Ranks 1..n-1 spend idle time BLOCKED in
-        the chain recv; forwarding the arm is precisely what unblocks
-        them. A message-free variant was built and measured (boot 10):
-        every rank reached an identical verdict and armed itself with
-        zero messages -- and it wedged solid, because rank 0 was idle,
-        therefore instantly parked, and entered the BLOCKING flip
-        reduction, which stops it forwarding the batch its peers are
-        blocked on. arms=3, cutovers=0, 0 % GPU, /generate dead at 45 s.
-        Removing the channel removed the synchronisation.
-
-        The hazard was never the channel; it was the ORDER. See
-        DELIVERY-BEFORE-BLOCK in scheduler_pp_mixin.
-
-        Only the request-ORIGIN rank evaluates, so exactly one arm enters
-        the chain. Consulting every rank was measured to give 1/2/3 arms
-        on PP0/PP1/PP2 (each stage injected its own and forwarded it on),
-        a 12765-line census flood and a self-kill -- see the origin guard
-        in request_receiver.
-        """
-        cfg = getattr(self, "phase_policy_cfg", None)
-        if cfg is None or not cfg.enabled:
-            return None
-        runtime = self.phase_flip_runtime
-        if runtime is None:
-            # No round has run yet, so there is no layout to flip from.
-            return None
-        if runtime.pending is not None:
-            # A flip is already armed and waiting for its consensus
-            # boundary; re-arming it would only restart the park clock.
-            return None
-
-        from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP
-        from sglang.srt.managers.phase_policy import (
-            IDLE_LOCKED as POLICY_IDLE_LOCKED,
-        )
-        from sglang.srt.managers.phase_policy import (
-            PhasePolicyDecision,
-            PhasePolicyInputs,
-            decide,
-            note_flip_armed,
-            observe_idle,
-        )
-
-        # THE RESIDENT SET, NOT self.running_batch (#631 J.1). This hook runs
-        # inside recv_requests(), i.e. once per MICROBATCH SLOT under
-        # event_loop_pp, immediately after that slot's rebind of
-        # running_batch/last_batch -- so reading running_batch here would count
-        # whichever slot happens to be bound, not the rank's resident set, and
-        # the PP->TP rule ("pending <= N AND running_bs > 0") would then depend
-        # on WHICH SLOT the hook sampled rather than on the load.
-        #
-        # #969: the DEFECT-M containment that used to wrap this is gone with
-        # `phase_flip_resident_carry`. It refused a resident set above
-        # max_running_requests, then -- because refusing deadlocked the only
-        # action that drains the set (#631 defect R: 1115 flips before, zero
-        # after, forever) -- repaired duplicates and re-asked. Both halves
-        # policed a set the cutover CARRIED. The cutover carries nothing now;
-        # it retracts every resident and re-admits it through the queue, so a
-        # duplicate cannot outlive a flip and there is nothing to repair.
-        running_bs = sum(len(b.reqs) for b in self._resident_batches())
-
-        # #713: ONE reading, used by the verdict AND by the message that
-        # reports it. Calling the accessor twice inside one constructor is how
-        # a refusal could name a number the simulation never saw.
-        # HEALTH-ISOLATION, THE ECONOMY READING. This is the number the flip
-        # policy compares against the break-even, and from which `starved` and
-        # the idle determination are derived -- so it is exactly the number a
-        # `/health_generate` probe must not appear in. The #887 GRANT reading
-        # at the `_tp_subchunk_grant_now` probe below deliberately keeps the
-        # default (health INCLUDED): that grant is what serves the probe in
-        # place. Two questions, named at the two call sites.
-        _pending_now = self._pending_prefill_tokens(
-            inflight_reqs, include_health=False
-        )
-        # #1173: THE BREAKDOWN OF THE READING THE VERDICT USES, captured
-        # HERE and not later -- the #887 grant probe below calls the same
-        # accessor with include_health=True and would overwrite the record.
-        # One read, one breakdown, one message (#713's rule).
-        _pending_terms_now = str(getattr(self, "_pending_prefill_terms", "") or "")
-        # W32: SEAM TRANSPORT IS NOT PENDING PP WORK, AND THE POLICY MUST READ
-        # THE SAME AUTHORITY THE PURITY GATE DOES.
-        #
-        # The tokens of a request the cutover retracted and re-admitted are
-        # destined to be served in the layout the flip just entered, by a
-        # read-through that recomputes nothing. Counted as pending prefill they
-        # make the tp-ward flip undo itself: W32 logged "arming tp_to_pp:
-        # pending prefill 1 tok > 0 (purity: prefill cannot run in tp)" 23
-        # times, and the seam-transport exemption got to run ONCE in 144
-        # pp_to_tp flips because the instance had already flipped away.
-        #
-        # Subtracted HERE, at the one boundary, so the drain exit, the
-        # break-even band and the tp-ward arm all see the same corrected
-        # quantity -- rather than three more copies of the same judgement,
-        # which is exactly the defect this fix exists to end.
-        _seam_transport_now = 0
-        try:
-            from sglang.srt.managers.phase_purity import (
-                seam_transport_pending_tokens,
-            )
-
-            _seam_transport_now = int(seam_transport_pending_tokens(self) or 0)
-        except Exception:  # noqa: BLE001 - an input probe never breaks arming
-            _seam_transport_now = 0
-        # #869c: THE PREMISE, ASKED ONCE, FOR BOTH SUBTRACTIONS.
-        #
-        # This deduction used to be unconditional while its twin below was
-        # gated on the TP phase AND on `seam_transport_premise_holds`. Both rest
-        # on the same claim -- that a seam re-admission is cheap flip transport
-        # because read-through serves its prefix -- and #861j verified that
-        # claim for the existence term only. Hoisted here so ONE predicate and
-        # ONE clock answer for both, which is that function's own contract and
-        # the #861g fix principle applied to the pair that broke it.
-        #
-        # When the premise is FALSE the tokens are a cold prefill of real work,
-        # and deducting them tells the policy that work does not exist. The
-        # consumer that pays is the #677(a) blocked-admission stall escape,
-        # which still reads RAW pending: a deflated pending holds a genuine
-        # stall below its own escape threshold.
-        _in_tp_now = getattr(runtime, "phase", None) == "tp"
-        _seam_premise_now = False
-        if _seam_transport_now > 0 and _in_tp_now:
-            try:
-                from sglang.srt.managers.phase_purity import (
-                    seam_transport_premise_holds,
-                )
-
-                _seam_premise_now = bool(seam_transport_premise_holds(self))
-            except Exception:  # noqa: BLE001 - an input probe never breaks arming
-                _seam_premise_now = False
-        from sglang.srt.managers.phase_purity import seam_transport_deduction
-
-        _pending_now = max(
-            0,
-            _pending_now
-            - seam_transport_deduction(
-                _seam_transport_now,
-                in_tp=_in_tp_now,
-                premise_holds=_seam_premise_now,
-            ),
-        )
-        # #861j DOOR 1: the SERVICEABLE-HERE subset of the seam transport.
-        #
-        # W37-F, three boots: the cutover re-admits its retracted residents,
-        # the existence term counts their full prompts, and the strict-purity
-        # demand arms tp_to_pp in THIS hook -- before the TP layout gets one
-        # scheduling round -- so the seam-transport exemption at the batch
-        # builder is never consulted (SEAM TRANSPORT ADMITTED=0, REFUSED=0,
-        # `Decode batch phase=`=0 on all three logs). The demand term must
-        # not claim tokens the purity gate will serve in this layout this
-        # round, and "will serve" is asked of the SAME authorities the gate
-        # itself uses: the stamped candidates (via seam_transport_pending_
-        # tokens above) and `seam_transport_premise_holds` -- one predicate,
-        # one clock, per that function's own contract.
-        #
-        # BOUNDED, because W37-E is the standing proof that a hold without an
-        # exit is a deadlock with better manners: the transport-debt clock
-        # starts when stamped candidates first appear in the TP phase and is
-        # cleared when they are admitted (the stamp is spent) or the phase
-        # leaves TP. Past the drain-stall deadline the credit lapses, the
-        # demand fires, and the work goes to PP exactly as it does today --
-        # one bounded delay, never a wedge.
-        # #1173: the witness STATE census beside the serviceable token count.
-        # The hold line must not read "verified on the store witness" when the
-        # verified state was `bounded` (no prefetch could exist by
-        # construction) -- that is a bounded recompute, not a loaded read.
-        _seam_witness_states_now = ""
-        try:
-            if _seam_transport_now > 0 and _in_tp_now:
-                from sglang.srt.managers.phase_purity import store_witness_census
-
-                _seam_witness_states_now = str(store_witness_census(self) or "")
-        except Exception:  # noqa: BLE001 - a census never breaks arming
-            _seam_witness_states_now = "UNREADABLE"
-        _seam_serviceable_now = 0
-        if _seam_transport_now > 0 and _in_tp_now:
-            # #869c: the SAME premise reading the deduction above used. It was
-            # asked here a second time; one predicate, one clock, per
-            # `seam_transport_premise_holds`'s own contract -- and two calls a
-            # round could disagree if the debt clock lapsed between them.
-            if _seam_premise_now:
-                _seam_serviceable_now = _seam_transport_now
-            _debt_since = getattr(self, "_seam_transport_debt_since", None)
-            if _debt_since is None:
-                self._seam_transport_debt_since = time.perf_counter()
-            else:
-                from sglang.srt.managers.phase_policy import (
-                    drain_stall_deadline_s,
-                )
-
-                if time.perf_counter() - _debt_since > drain_stall_deadline_s(cfg):
-                    # The lapse is loud exactly once per debt episode: a
-                    # transport that cannot land within a decode window is a
-                    # defect worth a line, and the demand that now fires is
-                    # the bounded exit, not the failure.
-                    if not getattr(self, "_seam_debt_lapse_announced", False):
-                        self._seam_debt_lapse_announced = True
-                        logger.warning(
-                            "PHASE-POLICY #861j transport-debt clock LAPSED: "
-                            "%d tok of seam re-admission were not admitted "
-                            "within %.1fs of TP residency; the serviceable "
-                            "credit is withdrawn and the flip demand now "
-                            "sends the work to the PP layout. The transport "
-                            "path did not land -- that is the finding this "
-                            "line records.",
-                            _seam_transport_now,
-                            drain_stall_deadline_s(cfg),
-                        )
-                    _seam_serviceable_now = 0
-        else:
-            self._seam_transport_debt_since = None
-            self._seam_debt_lapse_announced = False
-        # #942: THE #887 ONE-CHUNK GRANT, READ AT THE INPUT BOUNDARY.
-        #
-        # Asked of the #887 authority itself, never re-derived: the budget
-        # still owed in this TP phase (`tp_compute_budget_remaining`, epoch-
-        # keyed) AND the fit term the gate uses (`tp_compute_fits_in_one_chunk`,
-        # #870's strict `<` against `chunked_prefill_size`). Both are PURE
-        # READS -- `_spend_tp_compute_chunk` is called only from
-        # `prefill_blocked_here`, so this probe cannot empty the valve without
-        # a batch ever being built (the W33 divergence class, which the #887
-        # docstring names and reserves this exact probe path against).
-        #
-        # In TOKENS rather than chunks, because that is the currency the arm
-        # compares in. `tp_compute_fits_in_one_chunk` has already established
-        # 0 < pending < chunk, so the pending count IS the servable quantity.
-        #
-        # 0 outside TP, 0 on every stand-in and on every non-flip deployment,
-        # 0 the moment the gate spends the allowance -- so an unsupplied or
-        # unreadable field reproduces the pre-#942 behaviour exactly. An input
-        # probe never breaks arming (same discipline as its neighbours above).
-        _tp_subchunk_grant_now = 0
-        if _in_tp_now:
-            try:
-                from sglang.srt.managers.phase_purity import (
-                    tp_compute_budget_remaining as _tp_budget_left,
-                    tp_compute_fits_in_one_chunk as _tp_fits_one_chunk,
-                )
-
-                # #942c: BOTH READS TAKE THE #713 INFLIGHT BATCH, because this
-                # probe answers a POLICY question, not a batch-builder one.
-                #
-                # Without it this probe measured the WAITING QUEUE while the
-                # policy it feeds measured queue + inflight. On a fresh arrival
-                # -- the only arrival a bs1 stream makes, and precisely the case
-                # #887 exists for -- the queue is still empty at this instant
-                # (`recv_requests` evaluates the policy BEFORE queueing, which
-                # is why the `inflight` parameter exists at all), so the fit
-                # term read `0 < 0 < chunk` = False and the grant collapsed to
-                # 0. The #942 suppression then could not fire, and the tp-ward
-                # arm paid a full round trip for a prompt the TP layout was
-                # already allowed to finish.
-                #
-                # MEASURED, boot_855_1011idle: 11 `LAYOUT-ALLOWED
-                # tp_compute_one_chunk` grants, ZERO `SUBCHUNK-SERVED-IN-TP`,
-                # and 10 tp-ward arms reading `pending prefill 51 tok > 0`.
-                #
-                # STILL A PURE READ, so the #890/#906 grant-consumption hazard
-                # is untouched: `_spend_tp_compute_chunk` is called only from
-                # `prefill_blocked_here`, never here. Widening what this probe
-                # can SEE cannot spend the allowance, and the real gate keeps
-                # reading the queue alone (phase_purity.py:1093 passes no
-                # inflight) because a batch builder can only build what is
-                # actually queued.
-                if (
-                    _tp_budget_left(self) > 0
-                    and _tp_fits_one_chunk(self, inflight_reqs) is True
-                ):
-                    _tp_subchunk_grant_now = int(
-                        self._pending_prefill_tokens(inflight_reqs) or 0
-                    )
-            except Exception:  # noqa: BLE001 - an input probe never breaks arming
-                _tp_subchunk_grant_now = 0
-        # #869: may a decode step execute in the layout that is up right now?
-        # Computed before the snapshot so the probe's failure mode is a plain
-        # fallback rather than a half-built dataclass.
-        _decode_runs_here = True
-        try:
-            from sglang.srt.managers.phase_policy import PHASE_PP as _PHASE_PP
-            from sglang.srt.managers.phase_purity import purity_of
-
-            if getattr(runtime, "phase", None) == _PHASE_PP:
-                _decode_runs_here = bool(
-                    purity_of(self).decode_allowed_in_pp(int(running_bs or 0))
-                )
-        except Exception:  # noqa: BLE001 - an input probe never breaks arming
-            _decode_runs_here = True
-        # #1032 FIX 1: read the cohort, advance the replicated stall count, and
-        # emit ONE line per chain link -- the execution proof this fix is
-        # judged by. HOLD names the cohort size, RELEASE fires the round it
-        # becomes resident, BROKEN fires if the bound expires first.
-        _cohort_n, _cohort_tok, _cohort_spent = 0, 0, 0
-        try:
-            _cohort_n, _cohort_tok, _cohort_spent = self._seam_cohort_pending()
-            # SMOKE, unconditional and rate-limited: boot 564aa7aea7 emitted
-            # ZERO dwell lines and there was no way to tell "the reader ran and
-            # found no cohort" from "the reader never ran" -- the
-            # desk-written-never-executed trap, on my own instrument. This line
-            # separates them, and it prints the queue size beside the count so
-            # a zero can be attributed rather than guessed at.
-            _sn = int(getattr(self, "_1032_smoke_n", 0) or 0) + 1
-            self._1032_smoke_n = _sn
-            if _sn == 1 or _sn % 200 == 0:
-                logger.info(
-                    "#1032 COHORT-READ n=%d cohort=%d tok=%d waiting_queue=%d "
-                    "phase=%s",
-                    _sn,
-                    _cohort_n,
-                    _cohort_tok,
-                    len(getattr(self, "waiting_queue", ()) or ()),
-                    runtime.phase,
-                )
-            _prev = int(getattr(self, "_1032_stall_rounds", 0) or 0)
-            if _cohort_n > 0:
-                self._1032_stall_rounds = _prev + 1
-                _r = self._1032_stall_rounds
-                from sglang.srt.managers.phase_policy import (
-                    SEAM_COHORT_DWELL_ROUNDS as _DWELL,
-                )
-
-                # #1032d: THE LINE MUST NOT CLAIM A HOLD THAT IS OVER.
-                # Operator caught this on the live log: `DWELL-HOLD ...
-                # round=29600/400` -- printed 29200 rounds AFTER the bound
-                # expired, still saying "the pp-ward demand is held" when
-                # `seam_cohort_dwell_active()` had returned False since round
-                # 400 and the demand was free. The predicate was right; only
-                # this line lied. Gated on the same predicate the policy uses,
-                # so the two can no longer disagree, and the post-bound state
-                # gets its own honest wording instead of the hold's.
-                if _r <= _DWELL:
-                    if _r == 1 or _r % 100 == 0:
-                        logger.info(
-                            "#1032 DWELL-HOLD cohort=%d tok=%d round=%d/%d "
-                            "phase=%s -- the pp-ward demand is held while the "
-                            "cutover's own re-admission becomes resident; its "
-                            "tokens are not a backlog that may arm the flip "
-                            "against it.",
-                            _cohort_n,
-                            _cohort_tok,
-                            _r,
-                            _DWELL,
-                            runtime.phase,
-                        )
-                elif _r % 1000 == 0:
-                    logger.warning(
-                        "#1032 DWELL-LAPSED cohort=%d tok=%d round=%d (bound "
-                        "%d passed) phase=%s -- the demand is NOT held any "
-                        "more; this cohort has simply never become resident. "
-                        "The stall itself is the finding: %d request(s) that "
-                        "the cutover re-admitted are still not running.",
-                        _cohort_n,
-                        _cohort_tok,
-                        _r,
-                        _DWELL,
-                        runtime.phase,
-                        _cohort_n,
-                    )
-                if _r == _DWELL:
-                    logger.error(
-                        "#1032 DWELL-BROKEN cohort=%d tok=%d after %d rounds in "
-                        "phase=%s: the flip cohort NEVER became resident, so the "
-                        "bound has lapsed and the pp-ward demand is released. "
-                        "This is the anomaly path, not the normal end of the "
-                        "dwell -- the re-admission itself is being refused "
-                        "somewhere and that refusal is the defect to chase, not "
-                        "this release.",
-                        _cohort_n,
-                        _cohort_tok,
-                        _r,
-                        runtime.phase,
-                    )
-            else:
-                if _prev > 0:
-                    # #1028: SAY WHICH REASON ENDED THE DWELL. The cohort count
-                    # reaches zero on two different paths and only one of them
-                    # is "resident". When requests dropped out because their
-                    # one-chunk TP grant is spent, they are mid-recompute, and
-                    # calling that residency is the claim that let the
-                    # decode-empty verdict fire against work that was arriving.
-                    if _cohort_spent > 0:
-                        logger.warning(
-                            "#1032 DWELL-RELEASE after %d round(s) in phase=%s: "
-                            "the pp-ward demand is free again, but NOT because "
-                            "the cohort became resident -- %d re-admission(s) "
-                            "left the cohort with a SPENT one-chunk TP grant and "
-                            "are still recomputing. This is the #1028 path: the "
-                            "release is honest, the residency is not.",
-                            _prev,
-                            runtime.phase,
-                            _cohort_spent,
-                        )
-                    else:
-                        logger.info(
-                            "#1032 DWELL-RELEASE after %d round(s) in phase=%s: "
-                            "the flip cohort is resident; the pp-ward demand is "
-                            "free again. This is the normal end of the dwell.",
-                            _prev,
-                            runtime.phase,
-                        )
-                self._1032_stall_rounds = 0
-        except Exception:  # noqa: BLE001 - a probe may never break the policy
-            _cohort_n, _cohort_tok, _cohort_spent = 0, 0, 0
-
-        # #1159: THE ADVANCING CHUNKED PREFILL, READ AT THE INPUT BOUNDARY.
-        #
-        # weg1b3 armed `decode bundle STALLED, not draining` (log:100502)
-        # against a request whose prefix was growing one 4096-token chunk
-        # every ~3 s. `running_bs` cannot see that -- a chunk-prefilled
-        # request holds one slot for its whole prefill -- so the policy needs
-        # the prefix itself. Pure read of the replicated `chunked_req`
-        # (scheduler.py:8807 states that contract); books nothing.
-        _chunk_rid_now, _chunk_prefix_now = None, 0
-        try:
-            _chunk = getattr(self, "chunked_req", None)
-            if _chunk is not None:
-                _chunk_rid_now = str(getattr(_chunk, "rid", "") or "") or None
-                _chunk_prefix_now = int(
-                    len(getattr(_chunk, "prefix_indices", ()) or ())
-                )
-        except Exception:  # noqa: BLE001 - an input probe never breaks arming
-            _chunk_rid_now, _chunk_prefix_now = None, 0
-
-        inp = PhasePolicyInputs(
-            phase=runtime.phase,
-            # The same quantity the #363 observer reads, and the one the
-            # break-even N is denominated in: prompt tokens admitted but
-            # not yet computed.
-            pending_prefill_tokens=_pending_now,
-            # #1173: reported beside the number so a pp-exit arm can name
-            # the term that answered -- including the in-flight microbatch
-            # term whose absence armed weg1b4's fatal flip.
-            pending_prefill_terms=_pending_terms_now,
-            seam_witness_states=_seam_witness_states_now,
-            # #1173 review (N8): THE RANK-IDENTITY CLAIM BELOW DOES NOT COVER
-            # `pending_prefill_terms`. Its `inflight=` term is derived from
-            # `self.mbs`, which is this rank's own microbatch ring, so that
-            # ONE field is rank-DIVERGENT by construction (weg1b4 measured
-            # 5739 on PP0 against 3827 on PP1 for the same instant). It is a
-            # REPORTING field: no cross-rank ballot reads it, and the verdict
-            # it accompanies is taken on PP0 only. Anything that ever starts
-            # comparing it across ranks must reduce it first.
-            #
-            # #861c: the EXISTENCE number beside the ECONOMICS one. Computed
-            # here, from the same replicated waiting queue, so both fields of
-            # the snapshot are rank-identical by the same argument.
-            #
-            # NOT reduced by `_seam_transport_now` the way the economics number
-            # is: that subtraction exists because seam re-admissions are not PP
-            # WORKLOAD (they are flip transport, W32), which is an economics
-            # judgement. For the existence question a seam re-admission is
-            # exactly the thing that still needs a pass -- subtracting it here
-            # would recreate W37-C's blindness from the other side.
-            # getattr, for the SAME reason the block below states for its own
-            # field and which I broke by not reading it first: this gate is
-            # driven in tests by scheduler STAND-INS carrying only what the
-            # policy reads, and a stand-in without the observation has not
-            # observed anything. "Not observed" must mean 0 -- the pre-change
-            # behaviour, which `work_exists()` then reduces to the economics
-            # number alone -- rather than an AttributeError in the arming path.
-            # HEALTH-ISOLATION: the POLICY reading. This field feeds
-            # `work_exists()` and the `starved` term -- and `starved` is what
-            # BYPASSES the min-dwell thrash bound. A one-token liveness probe
-            # reaching it would lift the only guarantee that survives an
-            # adversarial arrival pattern, which is the most expensive place
-            # in the policy for a non-work token to appear.
-            admissible_prefill_tokens=int(
-                self._admissible_prefill_tokens(include_health=False)
-                if hasattr(self, "_admissible_prefill_tokens")
-                else 0
-            ),
-            # #861e: decode work the cutover retracted but did not finish.
-            # Same getattr discipline as the field above, and 0 on every
-            # stand-in and every non-flip deployment -- this field can only
-            # ADD decode work that genuinely exists, never invent it.
-            # #861i: the step-gate's input, wired. getattr for the same
-            # stand-in reason as its neighbours.
-            decode_steps_this_phase=int(
-                getattr(self, "_decode_steps_this_phase", 0) or 0
-            ),
-            # #869: the PHASE AXIS of the field above, without which the
-            # anti-chop floor is a constant in PP rather than a measurement.
-            # Asked of the purity authority itself (`decode_allowed_in_pp`),
-            # not re-derived from the mode name -- `decode_forbidden_in_pp`'s
-            # own docstring records what re-deriving it cost the spill guard.
-            #
-            # `decode_blocked_here` is NOT used despite being the scheduler-
-            # level phrasing of this question: it advances and clears the
-            # decode-starvation clock as a side effect, and an input probe that
-            # moves a starvation clock would make the snapshot the cause of the
-            # state it reports. Pure read here, side effects left to the gate.
-            #
-            # try/except and a True fallback for the same STAND-IN reason as
-            # its neighbours: a stand-in that cannot answer has not observed a
-            # prohibition, and "not observed" must reproduce the pre-#869
-            # behaviour rather than raise in the arming path.
-            decode_runs_in_this_phase=_decode_runs_here,
-            retracted_unfinished_bs=int(
-                (getattr(self, "_retracted_unfinished_bs", None) or (lambda: 0))() or 0
-            ),
-            # #1030: the cohort whose prefill finished but which the merge has
-            # not yet made resident. Same getattr discipline as its two
-            # neighbours and for the same stand-in reason.
-            prefilled_awaiting_merge_bs=int(
-                (getattr(self, "_prefilled_awaiting_merge_bs", None) or (lambda: 0))()
-                or 0
-            ),
-            # #1032 FIX 1: the flip cohort still becoming resident, and the
-            # replicated round count that bounds the dwell. Same getattr
-            # discipline as every neighbour here.
-            seam_cohort_pending_bs=_cohort_n,
-            seam_cohort_pending_tokens=_cohort_tok,
-            seam_cohort_stall_rounds=int(
-                getattr(self, "_1032_stall_rounds", 0) or 0
-            ),
-            seam_transport_tokens=_seam_transport_now,
-            # #861j: the serviceable-here subset computed above; 0 outside TP
-            # and on every stand-in, so an unsupplied field reproduces the
-            # pre-#861j behaviour exactly.
-            seam_serviceable_tokens=_seam_serviceable_now,
-            # #942: the #887 one-chunk allowance, in tokens, as computed above.
-            # 0 outside TP and once the gate has spent it, so the tp-ward arm
-            # is unchanged everywhere the grant is not actually open.
-            tp_subchunk_grant_tokens=_tp_subchunk_grant_now,
-            running_bs=int(running_bs or 0),
-            now=time.perf_counter(),
-            # getattr, because this gate is driven in tests by scheduler
-            # STAND-INS that carry only the fields the policy reads. A
-            # stand-in without the observation has not observed anything, and
-            # "not observed" must mean "do not arm on it" -- the pre-change
-            # behaviour -- rather than an AttributeError in the arming path.
-            # #689 FORMATION INPUTS. ready_carriers is the PARKED count, not
-            # running_bs: with #677 phase-1 parking live, carriers PP cannot
-            # decode are discounted from the admission cap, so running_bs
-            # reads 0 exactly when the window is fullest. Both terms are
-            # replicated -- the parked set is reconciled from the same
-            # resident batch on every rank, and the queue is the replicated
-            # waiting queue.
-            ready_carriers=int(
-                getattr(getattr(self, "parked_decode_set", None), "resident_count", 0)
-                or 0
-            ),
-            # #1040 ONE PREDICATE, TWO CONSUMERS. The tp-ward DRAINED arm and
-            # the post-cutover batch builder must ask the SAME buildability
-            # question, or they drift -- and they had: the arm's own refusal
-            # reads a boot-static flag hardcoded True, so it never fired,
-            # while the builder produced nothing. These are the two functions
-            # the `target_can_admit` probe already calls (:4165), and they
-            # read the REPLICATED queue, so the value is rank-uniform by the
-            # same contract as every other field on this object.
-            seam_readmit_ready=self._1040_seam_readmit_ready(),
-            queue_nonempty=bool(len(getattr(self, "waiting_queue", ()) or ())),
-            # #708: the RANK-UNIFORM availability, so the BOTH-BLOCKED decline
-            # names its binding resource from a measurement. Group MIN via the
-            # existing accessor, never this rank's local pool -- every field on
-            # PhasePolicyInputs is replicated by contract, and a local value
-            # would make the decline rank-dependent (#616g). None when it
-            # cannot be read, which the policy reports as "not measured"
-            # instead of guessing.
-            # getattr, because this gate is driven in tests by scheduler
-            # STAND-INS that carry only the fields the policy reads -- the
-            # same trap that broke _idle_locked_inputs and the both-blocked
-            # relief earlier in this series. A stand-in without the probe has
-            # measured nothing, and 'not measured' is a state the policy
-            # already reports honestly.
-            kv_available_tokens=getattr(self, "_uniform_kv_available", lambda: None)(),
-            # #1159: the in-flight chunked prefill's OWN computed prefix, and
-            # the rid it belongs to. `len(prefix_indices)` is the same
-            # quantity `dynamic_chunked_prefill_size` calls `history_len`
-            # (:9250) and the same one the ADMIT line prints as prefix_lens.
-            # getattr/try for the SAME stand-in reason as every neighbour
-            # here: a stand-in without a chunked request has observed nothing,
-            # and "not observed" must reproduce the pre-#1159 behaviour.
-            chunked_prefill_rid=_chunk_rid_now,
-            chunked_prefill_computed_tokens=_chunk_prefix_now,
-            **dict(
-                zip(
-                    ("nothing_can_run", "target_can_admit"),
-                    getattr(self, "_idle_locked_inputs", lambda *_: (False, False))(
-                        int(running_bs or 0), _pending_now
-                    ),
-                )
-            ),
-        )
-        state = self.phase_policy_state
-        observe_idle(state, inp)
-        decision = decide(cfg, state, inp)
-        # #631: DO NOT ARM a flip that cannot become ready.
-        #
-        # This used to decline EVERY pp_to_tp flip with anything resident,
-        # because a carried request had no draft state: the readiness
-        # predicate then held the flip until nothing was resident, and
-        # under sustained decode something always is, so the flip parked
-        # for the full deadline and abandoned EVERY time (05:21:16Z, and
-        # the abandon path itself faulted). That pinned the instance in PP
-        # at 16.8 tok/s against the 113 tok/s TP+MTP does.
-        #
-        # The draft-state bootstrap removes the cause
-        # (managers/phase_flip_draft_bootstrap.py), so a resident request
-        # is no longer a reason to decline. What survives is the structural
-        # residue: if the armed draft worker exposes no KV pool, the
-        # cutover cannot bootstrap anything and the old park-and-abandon
-        # would be back -- so keep declining in exactly that case.
-        #
-        # Still decided rank-locally, and still safe for the same reason:
-        # only the REQUEST-ORIGIN rank evaluates the policy and the arm is
-        # broadcast from it. A refusal inside PhaseFlipRuntime.arm would be
-        # a different thing and would risk diverging epochs, corpse H.
-        from sglang.srt.managers.phase_flip_runtime import (
-            _flip_can_bootstrap_draft,
-        )
-
-        if (
-            decision.wants_flip
-            and decision.direction == PP_TO_TP
-            and not self.flip_spec_algorithm.is_none()
-            and inp.running_bs > 0
-            and not _flip_can_bootstrap_draft(self)
-        ):
-            decision = PhasePolicyDecision(
-                None,
-                f"speculating TP phase and {inp.running_bs} request(s) "
-                f"resident, and the armed draft worker exposes no KV pool "
-                f"to bootstrap them into: arming would park until the "
-                f"deadline and abandon",
-            )
-        if not decision.wants_flip:
-            # #631 defect N: a policy that DECLINES used to be silent, so
-            # "the layout is wrong under load" was indistinguishable from
-            # "the hook never ran". One throttled line makes the standing
-            # reason readable from the same log as everything else -- the
-            # same bet as the withhold reason and the quiescence reason,
-            # both of which named a defect in a single boot.
-            #
-            # THROTTLE ON A NUMBER-FREE KEY. The reason string carries live
-            # quantities ("min dwell: 13.4s since last flip"), so keying on
-            # the string itself made every call look like a NEW reason and
-            # the throttle never engaged -- three identical lines inside one
-            # second, measured on the very boot that introduced it. A
-            # 12765-line log flood has already cost this feature a self-kill
-            # once (see the origin guard in request_receiver), so the key is
-            # the reason with its digits removed: the SHAPE of the hold, not
-            # its instantaneous value.
-            now_mono = inp.now
-            last = getattr(self, "_phase_policy_last_log", 0.0)
-            prev = getattr(self, "_phase_policy_last_reason", None)
-            key = _POLICY_REASON_DIGITS.sub("#", decision.reason)
-            if key != prev or now_mono - last >= 10.0:
-                self._phase_policy_last_log = now_mono
-                self._phase_policy_last_reason = key
-                logger.info(
-                    "PHASE-POLICY holding in %s: %s (pending prefill %d tok, "
-                    "running bs %d)",
-                    inp.phase,
-                    decision.reason,
-                    inp.pending_prefill_tokens,
-                    inp.running_bs,
-                )
-            # #838: the two detectors that can only be evaluated HERE, where
-            # the verdict, the config, the state and the inputs are all in
-            # scope at once. Placed after the hold line so the alarm reads
-            # directly beneath the hold it contradicts.
-            # getattr, for the same reason the three call sites below and
-            # above it use it: this gate is driven in tests by scheduler
-            # STAND-INS that carry only the fields the policy reads. A
-            # stand-in without the detector must behave exactly as before,
-            # not raise AttributeError inside the arming path.
-            getattr(self, "_check_layout_policy_conformance", lambda *_: None)(
-                cfg, state, inp, decision
-            )
-            # getattr, for the third time in this file and for the same
-            # reason: the policy gate is driven in tests by scheduler
-            # STAND-INS carrying only the fields the policy reads. A stand-in
-            # without the relief hook must decline exactly as before, not raise
-            # AttributeError inside the arming path.
-            getattr(self, "_apply_both_blocked_relief", lambda *_: None)(decision, inp)
-            return None
-        # #688 FUNDING COMPOSITION. An idle-locked arm that then cannot fund
-        # its seam has moved the zero-GPU window one stage right instead of
-        # removing it (live specimen 09:43:11Z: staging 1706 MiB needed
-        # against 1635 spendable -- 71 MiB short, with 364884 cached rows
-        # sitting there). Recorded on the runtime so the funding path can see
-        # WHY this flip was armed; cleared by the runtime once it is read.
-        rt_for_funding = getattr(self, "phase_flip_runtime", None)
-        if rt_for_funding is not None:
-            rt_for_funding.armed_idle_locked = bool(
-                (decision.reason or "").startswith(POLICY_IDLE_LOCKED)
-            )
-        # #688 ANTI-OSCILLATION AS A RUNTIME INVARIANT, not a test premise.
-        #
-        # The hermetic test asserted that the target runs after the flip by
-        # FEEDING that assumption in by hand, so it could not have caught the
-        # 10:24 ping-pong -- the assumption was the bug. The property has to
-        # be checked where it can actually be false: on metal, after the flip,
-        # against what the target layout then does. If the target does not
-        # build a batch within a few rounds, the admissibility verdict that
-        # armed this flip was WRONG, and the inputs that produced it are what
-        # a reader needs.
-        self._arm_watch = {
-            "direction": decision.direction,
-            "reason": (decision.reason or "")[:120],
-            "running_bs": int(inp.running_bs),
-            "pending": int(inp.pending_prefill_tokens),
-            "nothing_can_run": bool(getattr(inp, "nothing_can_run", False)),
-            "target_can_admit": bool(getattr(inp, "target_can_admit", False)),
-            "ready_carriers": int(getattr(inp, "ready_carriers", 0) or 0),
-            "rounds": 0,
-            # THE DISCRIMINATOR. An arm can only be judged once the layout it
-            # asked for actually arrived; until the phase changes, the cutover
-            # has not committed and any silence belongs to the FUNDING, not to
-            # the verdict.
-            "phase_at_arm": getattr(self, "phase_flip_active_stack", None),
-        }
-        note_flip_armed(state, decision, inp.now)
-        logger.warning(
-            "PHASE-POLICY arming %s: %s", decision.direction, decision.reason
-        )
-        # internal=True: nobody awaits a reply, and answering would kill
-        # the TokenizerManager (see handle_phase_flip).
-        return PhaseFlipReqInput(
-            direction=decision.direction, source="policy", internal=True
-        )
-
-    def _check_layout_policy_conformance(self, cfg, state, inp, decision) -> None:
-        """#838 classes 1 and 2, at the policy site.
-
-        Runs on every round the policy HOLDS. It never influences the
-        decision -- it is read-only over cfg/state/inp/decision and returns
-        nothing -- so a defect in here can cost a spurious log line and
-        nothing else.
-
-        #713: ONE READING of the routing flag and ONE READING of
-        ``decision.reason``, both taken into locals here and passed down. The
-        verdict functions build their own messages from those same values and
-        never reach back for either. A second read is what would let the
-        alarm quote a verdict the comparison did not make.
-
-        #699 COVERAGE, and the reason this is not folded into that detector:
-        the admission-wedge verdict short-circuits to "not wedged" the moment
-        ``running > 0`` (invariant_checker.py:598), because a box that is
-        serving is by its definition not wedged. The window-3 shape has 5 to
-        7 requests decoding throughout, so it is invisible there by
-        construction. Class 2 is keyed to the ECONOMICS of the hold rather
-        than to the absence of service, and therefore has no such guard: it
-        fires at any ``running_bs``.
-        """
-        try:
-            from sglang.srt.managers import layout_conformance
-            from sglang.srt.managers.phase_policy import (
-                drain_stall_deadline_s,
-                effective_flip_threshold,
-                flip_cost_fully_measured,
-                live_flip_cost_s,
-                live_flip_tokens,
-            )
-
-            reason = decision.reason
-            mb_id = int(getattr(self, "_pp_live_mb_id", -1) or -1)
-            now = inp.now
-
-            routing = self._layout_routing_phase()
-            if routing is not None:
-                alarm, detail = layout_conformance.verdict_vs_routing_verdict(
-                    inp.phase, routing, mb_id, reason
-                )
-                if alarm:
-                    layout_conformance.note_conformance_violation(detail, now)
-
-            window_s = layout_conformance.economy_window_s(drain_stall_deadline_s(cfg))
-            held_s = 0.0 if state.phase_since is None else now - state.phase_since
-            # Never observed shrinking -> the whole occupancy has passed with
-            # no recorded progress, which is exactly what that reads as.
-            bundle_stall_s = (
-                held_s
-                if state.last_bundle_progress_at is None
-                else now - state.last_bundle_progress_at
-            )
-            alarm, detail = layout_conformance.economy_divergence_verdict(
-                phase=inp.phase,
-                held_s=held_s,
-                window_s=window_s,
-                pending_prefill_tokens=int(inp.pending_prefill_tokens),
-                live_flip_tokens=int(live_flip_tokens(cfg)),
-                # #853(iii): THE BAR THE POLICY APPLIED, from the policy's own
-                # authority. `live_flip_tokens` is only the break-even; the
-                # hold this detector contradicts may have been taken against
-                # the higher secondary-band bar, and comparing against the
-                # lower one reported correct differential economics as a
-                # defect (W24 09:01:37). Same reading as `_decide_from_load`
-                # takes, computed from the same two inputs.
-                applied_bar_tokens=int(
-                    effective_flip_threshold(cfg, int(inp.running_bs))
-                ),
-                live_flip_cost_s=float(live_flip_cost_s(cfg)),
-                # #856: BOTH legs, not either. C is a round trip, and a
-                # half-measured one is still half seed -- which this gate
-                # refuses as "an assumption is not the policy's own claim".
-                price_measured=bool(flip_cost_fully_measured()),
-                hold_reason=reason,
-                since_flip_s=now - state.last_flip_at,
-                min_dwell_s=float(cfg.min_dwell_s),
-                staging_active=bool(
-                    getattr(self, "phase_flip_is_armed", lambda: False)()
-                ),
-                running_bs=int(inp.running_bs),
-                bundle_at_phase_entry=int(state.bundle_at_phase_entry or 0),
-                bundle_stall_s=bundle_stall_s,
-            )
-            if alarm:
-                layout_conformance.note_economy_anomaly(detail, now)
-            else:
-                # W25/#854: SILENCE MUST BE IMPOSSIBLE. W25 ran a sustained
-                # TP-sticky prefill phase that the user found by eye while the
-                # anomaly count read 0 for the whole boot. The detector was
-                # right to decline -- pending sat below the bar the policy
-                # applied -- but a zero that means "ran and declined" reads
-                # identically to "never ran". The decline is now a fact in the
-                # log, on a 60 s heartbeat, and the pair is mutually exclusive
-                # here by construction.
-                layout_conformance.note_economy_declined(detail, now)
-        except Exception:  # noqa: BLE001 - a detector may never break serving
-            pass
-
-    def arm_phase_flip(self, direction: str, source: str):
-        """#631: replicated arming entry (RPC / regime gate). Activates the
-        abort deferral window BEFORE arming so no abort can slip between
-        the arm and the first consensus round (pin 4); the window drains
-        at cutover, or deactivates here if arming is refused."""
-        if self.phase_flip_runtime is None:
-            return False, (
-                "phase-flip runtime not built yet (no scheduler round has "
-                "run); retry after the first round"
-            )
-        window = self.phase_flip_abort_window
-        if window is not None:
-            window.activate()
-        ok, msg = self.phase_flip_runtime.arm(direction, source)
-        if not ok and window is not None:
-            window.deactivate_and_drain()
-        return ok, msg
 
     def abort_request(self, recv_req: AbortReq):
-        # #631 pin 4: while a flip is armed/executing, abort work is
-        # DEFERRED -- an abort applied on one rank before its peers
-        # diverges the replicated live set mid-flip. The queue preserves
-        # order and drains in the first post-cutover round (or on refused
-        # arming). Inactive window (or no flip boot) = direct call,
-        # byte-identical to today.
-        window = self.phase_flip_abort_window
-        deferred = window is not None and window.active
+        # #1233 (WEG 2, S0): aborts are never deferred any more. The
+        # deferral existed because an abort applied on one rank before its
+        # peers diverged the replicated live set MID-LAYOUT-CHANGE; there is
+        # no in-process layout change to be mid-way through. This is the
+        # direct call every boot without the flip already made.
+        deferred = False
         # #801 CORROBORATION MARKER, and it exists because its absence was
         # unreadable. An abort applied on one rank before its peers diverges
         # the replicated live set -- pin 4 says exactly that, one comment up --
@@ -16055,16 +14284,12 @@ class Scheduler(
         # needs to place it against a wedge onset.
         logger.info(
             "#801 ABORT RECEIVED: rid=%s abort_all=%s deferred=%s. A "
-            "non-deferred abort mutates THIS rank's live set at whatever pass "
-            "it lands on; deferred=True means the flip window is holding it "
-            "until after the cutover (#631 pin 4).",
+            "non-deferred abort mutates THIS rank's live set at whatever "
+            "pass it lands on.",
             getattr(recv_req, "rid", None),
             getattr(recv_req, "abort_all", None),
             deferred,
         )
-        if deferred:
-            window.submit(lambda: self._abort_request_now(recv_req))
-            return
         self._abort_request_now(recv_req)
 
     def _abort_request_now(self, recv_req: AbortReq):
@@ -16385,16 +14610,6 @@ class Scheduler(
             and self.kv_reshard_runtime.pending is not None
         ):
             return
-        # #631: identical rationale for an armed phase flip -- the commit
-        # fires at a consensus boundary and a parked loop never reaches
-        # one. pending is replicated (armed via broadcast RPC or the
-        # regime gate's replicated decision), so every rank skips the
-        # sleep in the same rounds.
-        if (
-            self.phase_flip_runtime is not None
-            and self.phase_flip_runtime.pending is not None
-        ):
-            return
         # #330: same rationale for a pending capacity change -- the commit
         # needs consensus boundaries, and a parked loop never reaches one.
         # pending_work() is a pure function of replicated state, so every
@@ -16460,61 +14675,6 @@ class Scheduler(
         pass
 
 
-def run_phase_flip_event_loops(scheduler: Scheduler):
-    """#631: the re-dispatching wrapper around the event loops.
-
-    dispatch_event_loop picks its loop ONCE from server_args.pp_size, so a
-    flipped topology has no representation there -- this wrapper wraps
-    (never patches) that decision: each phase runs its own loop, and a
-    committed flip exits the current loop via PhaseFlipLoopExit (raised by
-    the on_round hook at a quiescent boundary, after all cutover rebuilds)
-    to be re-dispatched here under the new phase. A normal loop return
-    (shutdown) returns from the wrapper."""
-    from sglang.srt.managers.phase_flip_runtime import (
-        PHASE_TP,
-        PhaseFlipLoopExit,
-    )
-
-    assert scheduler.disaggregation_mode == DisaggregationMode.NULL, (
-        "phase flip x PD disaggregation is refused at argument time"
-    )
-    assert not scheduler.enable_pdmux, "phase flip x pdmux is out of scope"
-    while True:
-        try:
-            if scheduler.phase_flip_active_stack == PHASE_TP:
-                # TP decode phase: the non-PP production loop family.
-                if scheduler.enable_overlap:
-                    scheduler.event_loop_overlap()
-                else:
-                    scheduler.event_loop_normal()
-            else:
-                # PP prefill phase: the boot topology's loop.
-                scheduler.event_loop_pp()
-            return
-        except PhaseFlipLoopExit as e:
-            # #1033c: ARM THE PUBLISHED BUILD WINDOW FOR THE NEW LAYOUT'S FIRST
-            # FORWARDS. This is the one place that knows a layout change just
-            # committed, and the forwards that follow it are the ones that touch
-            # shapes never loaded in this process. See `Scheduler.run_batch` for
-            # the measured defect (boot 22: cuModuleLoadData blocked behind the
-            # peers' spin kernels -> Bar1CollectiveAborted).
-            #
-            # Set on EVERY re-dispatch, in both directions: pp_to_tp is where it
-            # was caught, but tp_to_pp re-enters the PP loop on shapes that are
-            # equally cold after a long TP phase, and nothing about the defect
-            # is direction-specific.
-            scheduler._post_cutover_build_batches = int(
-                getattr(scheduler, "POST_CUTOVER_BUILD_BATCHES", 8)
-            )
-            logger.warning(
-                "PHASE-FLIP event loop re-dispatch after %s (active stack now "
-                "%s); #1033c armed a published JIT build window for the next "
-                "%d forward(s) of the new layout",
-                e.direction,
-                scheduler.phase_flip_active_stack,
-                scheduler._post_cutover_build_batches,
-            )
-            continue
 
 
 def dispatch_event_loop(scheduler: Scheduler):
@@ -16534,10 +14694,6 @@ def dispatch_event_loop(scheduler: Scheduler):
             _pp.warmup_p2p_pairs()
 
     # Dispatch to the appropriate event loop based on the disaggregation mode
-    # #631: a phase-flip boot re-dispatches per phase; wrapper, not patch.
-    if getattr(scheduler.server_args, "enable_phase_flip", False):
-        run_phase_flip_event_loops(scheduler)
-        return
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
@@ -17122,43 +15278,6 @@ def run_scheduler_process(
             release_distributed(scheduler, graceful=scheduler.gracefully_exit)
 
 
-# ---------------------------------------------------------------------------
-# #656: the phase policy's control loop, at MODULE level and not on the class.
-#
-# Both are reached from handle_phase_flip and the round hook, and both of
-# those are exercised by stub schedulers (SimpleNamespace and _StubScheduler
-# in test_phase_flip_protocol) that bind the real method and carry none of the
-# scheduler's fields. As methods these turned "this stub has no policy" into
-# an AttributeError inside the RPC handler -- a wiring hole reported as a
-# protocol failure. As functions taking the scheduler, every field access is
-# already a guarded getattr and a stub simply has no policy to inform.
-# ---------------------------------------------------------------------------
-def _drain_seam_abandons_into_policy(scheduler) -> None:
-    """Report a seam ABANDON to the policy as a refused arm (#656).
-
-    An arm that returns True and then dies at the seam is, from the
-    policy's point of view, indistinguishable from an arm that was
-    refused outright: no layout changed, and the work the other layout
-    owes is still undone. Reporting only the second kind means the first
-    ``seam_abandon_cap()`` attempts of every unfundable configuration are
-    invisible to the policy -- which is exactly the window boot E spent
-    re-arming at the dwell interval.
-
-    Edge-triggered on the runtime's own sequence number so a rank that
-    reads it twice in one round counts one abandon.
-    """
-    rt = getattr(scheduler, "phase_flip_runtime", None)
-    if rt is None or getattr(scheduler, "phase_policy_state", None) is None:
-        return
-    seq = getattr(rt, "seam_abandon_seq", 0)
-    if seq == getattr(scheduler, "_last_seam_abandon_seq", 0):
-        return
-    scheduler._last_seam_abandon_seq = seq
-    last = getattr(rt, "last_seam_abandon", None)
-    if not last:
-        return
-    direction, detail = last
-    _note_policy_arm_outcome(scheduler, direction, False, f"seam abandoned: {detail}")
 
 
 def _note_policy_arm_outcome(scheduler, direction: str, ok: bool, msg: str) -> None:

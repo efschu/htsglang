@@ -4447,17 +4447,19 @@ class ModelRunnerKVCacheMixin:
                     # can only be sized against half the per-rank budget.
                     # This is the VA-backed allocation only; sizing is
                     # unchanged (post-capture sizing stays gated off here).
-                    # Both stacks must qualify, and they answer to DIFFERENT
-                    # signals: derive_tp_stack_server_args deliberately
-                    # clears enable_phase_flip on the TP copy (it DESCRIBES
-                    # a TP stack, it does not enable a nested flip), so the
-                    # flag alone catches only the PP side and the TP pool
-                    # would come up unswappable -- which is exactly how this
-                    # first failed on metal.
-                    swappable_backing=bool(
-                        self.server_args.enable_phase_flip
-                        or getattr(self, "is_phase_flip_tp_stack", False)
-                    ),
+                    # #1233 (WEG 2, S0): False, which is EXACTLY the value
+                    # this expression produced on every boot without the
+                    # phase flip -- the un-weave changes no default path
+                    # here. The VA reservation existed so two layouts in ONE
+                    # process could hand physical pages to each other; Weg 2
+                    # gives each layout its own process, which holds its
+                    # pages for its whole life. Consumers of the reservation
+                    # stand down cleanly rather than misbehave: the #1052
+                    # backing relief returns None on a pool without
+                    # ``supports_backing_spans`` (kv_backing_relief.py:4523),
+                    # and the release paths raise by name rather than
+                    # silently no-op (memory_pool.py:3492).
+                    swappable_backing=False,
                     **extra_args,
                 )
                 if _dial_initial_rows is not None:
