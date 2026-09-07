@@ -6733,28 +6733,16 @@ class Scheduler(
         #
         # Payload order, in full, after this block:
         #   [avail, (admission,) -avail, host, -host, mamba, -mamba,
-        #    corridor, head_match[0..TP_HEAD_SLOTS-1], admit_limit,
-        #    seam_premise,
+        #    corridor, admit_limit, seam_premise, phase_domain[..],
+        #    head_match[0..TP_HEAD_SLOTS-1],
         #    ballot_digest, -ballot_digest, ballot_v0..v{K-1}]
         #
-        # WHY THE LOCAL INPUTS ARE COMPUTED HERE. The sort key
-        # (`num_matched_prefix_tokens`) is normally populated inside
-        # `calc_priority`, which runs LATER in the pass -- so at reduce time
-        # it is either zero or last pass's value, and reducing that would
-        # agree on a stale number. The fix is the one #791b already used in
-        # this function for the prefetch verdicts: pull the RANK-LOCAL
-        # computation forward to here (no collective, and this site runs
-        # exactly once per TP-loop iteration) and memoise it for the batch
-        # formation to consume. Same move, same reason.
-        _head_canonical, _head_local_matches = self._local_head_prefix_matches()
-        # #823 W9b: the canonical head is no longer published as its own
-        # attribute -- it goes into the single verdict value below, together
-        # with the two numbers this reduce is about to produce, so the four
-        # halves of one decision cannot get out of step with each other.
-        _head_at = len(vals)
-        vals = vals + tp_head_congruence.build_head_order_payload(
-            _head_canonical, _head_local_matches
-        )
+        # FIX 2 (round 2): THE HEAD BLOCK MOVED DOWN, below the prefetch
+        # drain, and the block that used to sit here now sits under it.  It
+        # is still read by its own captured index and the ballot is still
+        # read from the TAIL, so the two readings this seam protects are
+        # unchanged; only the ORDER in which the local inputs are measured
+        # moved.  Why, in full, at the head block's new site.
         # The COUNT arm's vote. Its own slot rather than a derivation from
         # `avail` above, because `get_num_allocatable_reqs` is bounded by
         # `admission_limiter.current` (:6526-6529) -- rank-local floating
@@ -6846,6 +6834,42 @@ class Scheduler(
             )
         _ballot_verdicts = self._drain_prefetch_progress()
         self._pass_prefetch_verdicts = _ballot_verdicts
+        # WHY THE LOCAL INPUTS ARE COMPUTED HERE. The sort key
+        # (`num_matched_prefix_tokens`) is normally populated inside
+        # `calc_priority`, which runs LATER in the pass -- so at reduce time
+        # it is either zero or last pass's value, and reducing that would
+        # agree on a stale number. The fix is the one #791b already used in
+        # this function for the prefetch verdicts: pull the RANK-LOCAL
+        # computation forward to here (no collective, and this site runs
+        # exactly once per TP-loop iteration) and memoise it for the batch
+        # formation to consume. Same move, same reason.
+        #
+        # FIX 2 (round 2): AND IT IS MEASURED BELOW THE DRAIN, not above it.
+        # `_drain_prefetch_progress` is the call that publishes a completed
+        # store read into the host tier (`check_prefetch_progress` ->
+        # `_insert_helper_host`), and the pass on which a request first
+        # becomes eligible is exactly the pass its prefetch completes. Taken
+        # above the drain, this vote was a PRE-LOAD snapshot of a tree the
+        # gate then read POST-load: the group's match for the flip's own
+        # request was 0 while every rank's own match was the whole loaded
+        # prefix, and the X gate priced the difference as uncached work --
+        # the whole prompt, W31, re-route, P re-prefills a store-resident
+        # rid, flip, W31 again. #823's MIN is safe for the ORDER arm because
+        # a smaller match there means MORE WORK (tp_head_congruence.py:60-64);
+        # for a REFUSING consumer a smaller match means a REFUSAL, so the
+        # borrowed reduce's safety direction is inverted and the vote has to
+        # be a snapshot the gate can actually see. Nothing between the old
+        # site and this one takes a collective or reads the head vote, so the
+        # move is the whole of the fix on this side.
+        _head_canonical, _head_local_matches = self._local_head_prefix_matches()
+        # #823 W9b: the canonical head is no longer published as its own
+        # attribute -- it goes into the single verdict value below, together
+        # with the two numbers this reduce is about to produce, so the four
+        # halves of one decision cannot get out of step with each other.
+        _head_at = len(vals)
+        vals = vals + tp_head_congruence.build_head_order_payload(
+            _head_canonical, _head_local_matches
+        )
         _ballot_rids = [
             req.rid
             for req in self.waiting_queue[: prefetch_ballot.PREFETCH_BALLOT_SLOTS]
@@ -6995,9 +7019,42 @@ class Scheduler(
         Never raises: a rank that cannot price its head contributes nothing
         for those rids and the group's MIN treats them as absent, which
         delays them rather than splitting the group.
+
+        FIX 2 (round 2) -- A VOTE IS A MEASUREMENT OR AN ABSTENTION, NEVER A
+        DEFAULT, and this method used to publish a default on every pass of
+        every boot.  The measurement was gated on
+        ``tree.supports_fast_match_prefix()``; ``BasePrefixCache`` returns
+        ``False`` for it (base_prefix_cache.py:429) and NOTHING in this tree
+        overrides it -- two readers, zero writers, measured by grep -- so the
+        branch never ran, and what got published instead was
+        ``num_matched_prefix_tokens``, a field initialised to 0
+        (schedule_batch.py:1499) and written only by ``match_prefix_for_req``,
+        which under a cache-agnostic policy (D's FCFS) is never reached.  The
+        vote was therefore a constant 0 for every rid in the head.
+
+        Zero is not silence downstream: ``group_match_for`` returns ``None``
+        only at ``<= _ABSENT_MATCH`` (-1), so 0 arrives at the X gate as an
+        OPINION -- "some rank matched nothing" -- and C11's delta prices the
+        difference against the rank's own match as uncached work.  Measured
+        on the shipped code at 84148301c5: a 30,000-token prompt with 29,000
+        of it a store hit was priced at 30,000 and refused by W31, which is
+        the R-3 livelock (W31 -> re-route -> P re-prefills a store-resident
+        rid -> flip -> W31) with no request ever able to leave it.
+
+        So the capability guard goes.  It was borrowed from
+        ``calc_priority``, which walks the WHOLE waiting queue and therefore
+        has a real reason to ask whether a full match is cheap; this site is
+        bounded to the canonical head, which is the argument the paragraph
+        above already makes.  A rid this rank could not measure is contributed
+        as ABSENT (omitted, so ``build_head_order_payload`` rides
+        ``_ABSENT_MATCH``), never as 0 -- abstain-never-refuse, per rid rather
+        than per pass, so one unpriceable rid no longer voids the vote for
+        the rest of the head.
         """
         canonical: List[str] = []
         matches: Dict[str, int] = {}
+        by_rid: Dict[str, Req] = {}
+        tree = None
         try:
             # Local import: schedule_policy imports from this module's
             # package at load time, so binding this at module scope would
@@ -7007,20 +7064,33 @@ class Scheduler(
             by_rid = {req.rid: req for req in self.waiting_queue}
             canonical = tp_head_congruence.canonical_head_rids(list(by_rid.keys()))
             tree = getattr(self, "tree_cache", None)
-            can_match = tree is not None and tree.supports_fast_match_prefix()
-            for rid in canonical:
-                req = by_rid.get(rid)
-                if req is None:
-                    continue
-                if can_match:
-                    match_prefix_for_req(tree, req, include_req=True)
-                matches[rid] = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
         except Exception as exc:  # noqa: BLE001 - a vote may never break the reduce
             logger.warning(
                 "#823 head-congruence: could not price this rank's head (%s); "
                 "contributing an empty vote, which can only delay admissions",
                 exc,
             )
+            return canonical, matches
+        if tree is None or not hasattr(tree, "match_prefix"):
+            return canonical, matches
+        for rid in canonical:
+            req = by_rid.get(rid)
+            if req is None:
+                continue
+            try:
+                match_prefix_for_req(tree, req, include_req=True)
+            except Exception as exc:  # noqa: BLE001 - one rid may not void the head
+                self._head_vote_unpriced = getattr(self, "_head_vote_unpriced", 0) + 1
+                if self._head_vote_unpriced <= 5 or self._head_vote_unpriced % 64 == 0:
+                    logger.warning(
+                        "#823 head-congruence: could not price rid=%s (%s); "
+                        "contributed ABSENT, which delays it rather than "
+                        "publishing a 0 the X gate would read as an opinion "
+                        "(occurrence=%d)",
+                        str(rid)[:16], exc, self._head_vote_unpriced,
+                    )
+                continue
+            matches[rid] = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
         return canonical, matches
 
     def _tp_head_enforcer_gate(self) -> tp_head_congruence.GateVerdict:
@@ -9011,13 +9081,30 @@ class Scheduler(
         COUNT arms are.
 
         The correction is applied as a DELTA rather than as a replacement:
-        the group MIN is <= every rank's own match, so
-        ``delta = max(0, local_match - group_match)`` can only ever make the
-        extent LARGER, and when the two agree this function is byte-identical
-        to what it was.  A stale group value that exceeds the local match
-        yields delta 0 and the local number, i.e. the smaller extent -- the
-        abstain direction, never a refusal manufactured out of a stale
-        reduce.
+        when the two agree this function is byte-identical to what it was,
+        and in general it computes
+        ``len(full_untruncated_fill_ids) - min(local_match, group_match)`` --
+        a difference of two REPLICATED quantities, which is what makes the
+        verdict a group verdict at all.
+
+        FIX 2 (round 2) -- THE SAFETY CLAIM THIS DOCSTRING USED TO MAKE WAS
+        ONE-SIDED, AND THE OTHER SIDE WAS THE LIVE ONE.  It said a stale
+        group value "can only ever produce the SMALLER extent"; that covers
+        only the direction ``group > local``.  In the direction
+        ``group < local`` the same staleness produces the LARGER extent, and
+        for a REFUSING consumer larger means a refusal manufactured out of a
+        stale reduce -- the exact inversion of #823's own safety argument,
+        where a smaller match means only that a rank re-computes a prefix it
+        already had (tp_head_congruence.py:60-64: "slower, never wrong").
+        Two producers made that direction the live one, and both are fixed
+        rather than documented: the vote was a constant 0 rather than a
+        measurement (``_local_head_prefix_matches``), and it was taken ABOVE
+        the prefetch drain that publishes the store span the gate then reads
+        (`_update_uniform_pool_budget`).  What is left is a bounded
+        same-pass drift -- the adder re-matches a few hundred lines below the
+        reduce -- and in that window ``min`` takes the vote's slightly older
+        snapshot, which is conservative rather than arbitrary.  It is not a
+        total property and this docstring no longer claims one.
         """
         extend_input_len = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
         host_hit = int(getattr(req, "host_hit_length", 0) or 0)

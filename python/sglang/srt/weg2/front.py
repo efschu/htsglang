@@ -562,6 +562,27 @@ class Front:
     def _seats_in_use(self) -> int:
         return max(0, self.d_bs - self._d_seat._value)
 
+    def _handoff_in_flight(self) -> int:
+        """FIX 2 (round 2): requests HANDED to D that D does not hold yet.
+
+        The window the two D->P flip guards could not see.  A seat is taken
+        in the same synchronous step that resolves the client's future
+        (``d_admitter``, :932-937) or, on the SHORT path, immediately before
+        ``leg2`` is awaited; ``leg2`` registers the rid in ``D.outstanding``
+        at its first line and ``leg2``'s ``finally`` returns the seat.  So a
+        seat with no matching ``outstanding`` entry is exactly a request that
+        has been promised to D and has not arrived there -- invisible to
+        ``_ready_for_d`` (already popped) and to ``D.outstanding`` (not yet
+        registered), which are the only two sets the controller read.
+
+        Derived, not recorded: no second ledger to keep in step with the
+        seat's own lifecycle, and no state whose writer and deleter could be
+        separated by an event.  ``max(0, ...)`` because a leg 2 entered
+        without a seat counts in ``outstanding`` alone, and that is D work
+        the drain already covers.
+        """
+        return max(0, self._seats_in_use() - len(self.groups["D"].outstanding))
+
     def _d_token_budget_blocks(self, rid: str, est_tokens: int) -> bool:
         """FIX 4a: would admitting this request overcommit D's host pool?
 
@@ -1503,18 +1524,51 @@ class Front:
                         # group) and only when the dwell latch has expired
                         # -- an ungated mirror makes every SHORT arrival pay
                         # two flips (~30 s measured).
+                        #
+                        # FIX 2 (round 2): THE SEAT IS THE THIRD TERM, and
+                        # without it "D holds nothing" was false.  Between
+                        # the admitter's `popleft` + `fut.set_result(True)`
+                        # (:932/:937) and `leg2`'s `D.outstanding[rid] = ...`
+                        # the request is in NEITHER `_ready_for_d` NOR
+                        # `D.outstanding` -- the two sets both guards read --
+                        # so this arm could flip D->P on a request it had
+                        # already handed to D, and `flip`'s own `drain(D)`
+                        # could not protect it either: `D.outstanding` is
+                        # empty by construction in that window, so the drain
+                        # returns at once and D is put to sleep under it.
+                        # The client's leg 2 then POSTs into a sleeping group
+                        # and sits out the 3600 s ClientTimeout -- R-2's
+                        # LOST-REQUEST class in the D->P direction.  The seat
+                        # already spans exactly the missing interval (taken
+                        # where the future is resolved, returned in `leg2`'s
+                        # `finally`), so the hand-off is made visible with the
+                        # state that exists rather than with a second ledger.
                         if (self.idle_layout == "P" and not D.outstanding
+                                and not self._handoff_in_flight()
                                 and not self._ready_for_d and self.state == "serving"):
-                            logger.info("WEG2 IDLE-REST layout=%s queue=0 ready_for_d=%d d_outstanding=%d held_s=%.1f",
+                            logger.info("WEG2 IDLE-REST layout=%s queue=0 ready_for_d=%d d_outstanding=%d handing_off=%d held_s=%.1f",
                                         self.awake, len(self._ready_for_d), len(D.outstanding),
-                                        time.time() - self.t_awake)
+                                        self._handoff_in_flight(), time.time() - self.t_awake)
                             if self._dwell_ok("D", "P", fairness_fired, work_exhausted=True, oldest_wait_s=0.0):
                                 await self.flip("D", "P")
                         continue
-                    if not D.outstanding or not self.admit_d:
+                    # FIX 2 (round 2): the work arm reads the SAME hand-off
+                    # window the idle mirror above does, and for the same
+                    # reason -- "D has no outstanding work" is false while a
+                    # seat is held for a request that has been resolved but
+                    # has not yet reached `leg2`.  BOTH halves of the
+                    # condition need the term: the `admit_d` half flips
+                    # deliberately (the front is closing D down) and would
+                    # otherwise carry a handed-off request into the sleep
+                    # just as the idle mirror did.  It only ever DELAYS a
+                    # D->P flip, by at most the W36 barrier that already
+                    # bounds a dead client's seat.
+                    handing_off = self._handoff_in_flight()
+                    d_work_exhausted = not D.outstanding and not handing_off
+                    if (d_work_exhausted or not self.admit_d) and not handing_off:
                         if not self._flip_economics_ok(fairness_fired):
                             continue
-                        if not self._dwell_ok("D", "P", fairness_fired, work_exhausted=not D.outstanding,
+                        if not self._dwell_ok("D", "P", fairness_fired, work_exhausted=d_work_exhausted,
                                               oldest_wait_s=time.time() - (oldest or time.time())):
                             continue
                         await self.flip("D", "P")

@@ -929,3 +929,312 @@ def test_f4c_zero_disables_the_token_budget_and_it_is_a_flag():
                         drain_deadline_s=120.0, d_admit_max_tokens=0),
         0, 27466, 4, 6, 10000, 10000, "D")
     assert argv[argv.index("--d-admit-max-tokens") + 1] == "0"
+
+
+# ------------------------------------------------------- ROUND 2, FINDING 1
+def _head_stub(reqs, can_fast: bool = False, has_match_prefix: bool = True):
+    """A Scheduler stand-in for the head vote, with the REAL method bound."""
+    tree_fields = {"supports_fast_match_prefix": lambda: can_fast}
+    if has_match_prefix:
+        tree_fields["match_prefix"] = lambda *a, **k: None
+    return SimpleNamespace(waiting_queue=list(reqs),
+                           tree_cache=SimpleNamespace(**tree_fields))
+
+
+def _head_inputs_from_vote(canonical, matches):
+    from sglang.srt.managers import tp_head_congruence as thc
+
+    return thc.build_uniform_head_inputs(
+        canonical, thc.build_head_order_payload(canonical, matches), None, True
+    )
+
+
+def _gate_stub(x: int = 22000, host_carry: int = 30518, tp_size: int = 3):
+    _, stub = _stub_scheduler(x, host_carry=host_carry, tp_size=tp_size)
+    return stub
+
+
+def _flip_served_req(rid: str = "flip-1"):
+    """The flip's OWN request: 30,000 tokens, 29,000 of them a store hit that
+    the prefetch has just published (1,000 device + 28,000 host)."""
+    return SimpleNamespace(rid=rid, full_untruncated_fill_ids=list(range(30000)),
+                           prefix_indices=list(range(1000)), host_hit_length=28000)
+
+
+def test_f5a_the_head_vote_is_a_measurement_not_a_default(monkeypatch):
+    """FINDING 1, the producer.  The vote's measurement was gated on
+    `tree.supports_fast_match_prefix()`, which `BasePrefixCache` returns
+    False for and NOTHING in this tree overrides -- so the branch never ran
+    and the vote published `num_matched_prefix_tokens`, a field initialised
+    to 0 and written only by the call the guard was suppressing.  A vote is
+    a measurement or an abstention; it is never a default."""
+    from sglang.srt.managers import schedule_policy as sp
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+
+    # the fact the fix rests on, asserted rather than assumed
+    assert BasePrefixCache.supports_fast_match_prefix(None) is False
+
+    def measured(tree, r, include_req=True):
+        r.num_matched_prefix_tokens = 29000
+
+    monkeypatch.setattr(sp, "match_prefix_for_req", measured)
+    req = SimpleNamespace(rid="flip-1", num_matched_prefix_tokens=0)
+    canonical, matches = Scheduler._local_head_prefix_matches(_head_stub([req]))
+    assert canonical == ["flip-1"]
+    assert matches == {"flip-1": 29000}, matches
+
+
+def test_f5b_a_store_resident_request_is_not_refused_by_its_own_group(monkeypatch):
+    """FINDING 1, the consequence, end to end: the request the flip exists to
+    serve.  With the vote a constant 0, `group_match_for` returns 0 -- an
+    OPINION, not an abstention (None only at <= -1) -- and C11's delta
+    prices the WHOLE loaded prefix as uncached: extent 30,000 against
+    X=22,000, W31, re-route, P re-prefills a store-resident rid, flip, W31
+    again.  That is the R-3 livelock with no exit."""
+    from sglang.srt.managers import schedule_policy as sp
+    from sglang.srt.managers.scheduler import Scheduler
+
+    def measured(tree, r, include_req=True):
+        r.num_matched_prefix_tokens = 29000
+
+    monkeypatch.setattr(sp, "match_prefix_for_req", measured)
+    vote_req = SimpleNamespace(rid="flip-1", num_matched_prefix_tokens=0)
+    head = _head_inputs_from_vote(*Scheduler._local_head_prefix_matches(_head_stub([vote_req])))
+    gate, req = _gate_stub(), _flip_served_req()
+    assert Scheduler.weg2_uncached_extent(gate, req, head) == 1000
+    assert Scheduler._weg2_x_refuses(gate, req, head) is False
+
+
+def test_f5c_a_rid_this_rank_cannot_price_is_absent_never_zero(monkeypatch):
+    """FINDING 1, the abstain direction, per rid.  A rank that cannot price a
+    rid must contribute ABSENT -- the gate then abstains, which admits --
+    and it must still price the rest of the head."""
+    from sglang.srt.managers import schedule_policy as sp
+    from sglang.srt.managers import tp_head_congruence as thc
+    from sglang.srt.managers.scheduler import Scheduler
+
+    def measured_except_flip1(tree, r, include_req=True):
+        if r.rid == "flip-1":
+            raise RuntimeError("no match on this rank")
+        r.num_matched_prefix_tokens = 4000
+
+    monkeypatch.setattr(sp, "match_prefix_for_req", measured_except_flip1)
+    reqs = [SimpleNamespace(rid="flip-1", num_matched_prefix_tokens=0),
+            SimpleNamespace(rid="other", num_matched_prefix_tokens=0)]
+    canonical, matches = Scheduler._local_head_prefix_matches(_head_stub(reqs))
+    assert "flip-1" not in matches, matches
+    assert matches["other"] == 4000, "one unpriceable rid may not void the head"
+    head = _head_inputs_from_vote(canonical, matches)
+    assert thc.group_match_for(head, "flip-1") is None
+    gate, req = _gate_stub(), _flip_served_req()
+    assert Scheduler._weg2_x_refuses(gate, req, head) is False
+    assert gate._weg2_x_abstained == 1
+
+    # ... and a tree with no matching at all abstains for the whole head,
+    # rather than publishing a head of zeros.
+    _, none_matches = Scheduler._local_head_prefix_matches(
+        _head_stub(reqs, has_match_prefix=False))
+    assert none_matches == {}
+
+
+def _shipped_head_vote_order() -> str:
+    """WHICH ORDER THE SHIPPED REDUCE TAKES ITS TWO STEPS IN.  Read off the
+    shipped function so the driver below exercises the real ordering rather
+    than a hard-coded one."""
+    import inspect
+
+    from sglang.srt.managers.scheduler import Scheduler
+
+    src = inspect.getsource(Scheduler._update_uniform_pool_budget)
+    vote = src.index("self._local_head_prefix_matches()")
+    drain = src.index("_ballot_verdicts = self._drain_prefetch_progress()")
+    return "vote_first" if vote < drain else "drain_first"
+
+
+def test_f5d_the_head_vote_is_measured_below_the_prefetch_drain(monkeypatch):
+    """FINDING 1, the ordering.  `_drain_prefetch_progress` is the call that
+    publishes a completed store read into the host tier, and the pass on
+    which a request first becomes eligible IS the pass its prefetch
+    completes.  Taken above the drain the vote is a PRE-load snapshot of a
+    tree the gate then reads POST-load, so the group's match is 0 while the
+    rank's own is the whole loaded prefix and the delta prices the
+    difference as uncached work.  Driven in the order the shipped reduce
+    actually uses."""
+    from sglang.srt.managers import schedule_policy as sp
+    from sglang.srt.managers.scheduler import Scheduler
+
+    published = {"tokens": 0}  # what the host tier can hand back right now
+
+    def measured(tree, r, include_req=True):
+        r.num_matched_prefix_tokens = published["tokens"]
+
+    monkeypatch.setattr(sp, "match_prefix_for_req", measured)
+    vote_req = SimpleNamespace(rid="flip-1", num_matched_prefix_tokens=0)
+    # `can_fast=True` so this test is about ORDER alone: the capability
+    # guard f5a covers cannot also be the reason it fails.
+    stub = _head_stub([vote_req], can_fast=True)
+
+    def vote():
+        return Scheduler._local_head_prefix_matches(stub)
+
+    def drain():
+        published["tokens"] = 29000  # _insert_helper_host publishes the span
+
+    order = _shipped_head_vote_order()
+    if order == "vote_first":
+        canonical, matches = vote()
+        drain()
+    else:
+        drain()
+        canonical, matches = vote()
+    assert order == "drain_first", (
+        "the head vote is taken above the prefetch drain, so it is a pre-load "
+        "snapshot of the tree the X gate reads post-load"
+    )
+    head = _head_inputs_from_vote(canonical, matches)
+    gate, req = _gate_stub(), _flip_served_req()
+    assert Scheduler._weg2_x_refuses(gate, req, head) is False
+
+
+def test_f5e_the_gate_still_refuses_a_genuinely_cold_prompt(monkeypatch):
+    """The fix may not disarm law 4.  A cold 30,000-token prompt the group
+    agrees on is still W31, and a group MIN below this rank's match still
+    prices the group's extent, not this rank's."""
+    from sglang.srt.managers import schedule_policy as sp
+    from sglang.srt.managers.scheduler import Scheduler
+
+    def cold(tree, r, include_req=True):
+        r.num_matched_prefix_tokens = 0
+
+    monkeypatch.setattr(sp, "match_prefix_for_req", cold)
+    vote_req = SimpleNamespace(rid="cold", num_matched_prefix_tokens=0)
+    head = _head_inputs_from_vote(*Scheduler._local_head_prefix_matches(_head_stub([vote_req])))
+    gate = _gate_stub()
+    cold_req = SimpleNamespace(rid="cold", full_untruncated_fill_ids=list(range(30000)),
+                               prefix_indices=[], host_hit_length=0)
+    assert Scheduler.weg2_uncached_extent(gate, cold_req, head) == 30000
+    assert Scheduler._weg2_x_refuses(gate, cold_req, head) is True
+
+
+# ------------------------------------------------------- ROUND 2, FINDING 2
+def _handoff_front(**kw) -> Front:
+    kwargs = dict(d_bs=2, p_concurrency=2, idle_layout="P", min_dwell_ms=0.0,
+                  tp_prefill_max_tokens=0, flip_min_work_tokens=1)
+    kwargs.update(kw)
+    return Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, **kwargs)
+
+
+async def _drive_handoff(f: Front, queue_marks: List[str], after_handoff=None):
+    """Hand ONE request to D and stop there: the client never resumes, so
+    the rid never reaches `leg2` and never enters `D.outstanding`.  Returns
+    the flips the controller took while the request was in that window."""
+    flips: List[tuple] = []
+
+    async def fake_flip(src, dst):
+        flips.append((src, dst))
+
+    f.flip = fake_flip
+    for mark in queue_marks:
+        f.queue.append(Pending(mark, "/generate", {}, "x", time.time(),
+                               asyncio.get_event_loop().create_future(), est_prompt=100))
+    fut = asyncio.get_event_loop().create_future()
+    p = Pending("h1", "/generate", {}, "x", time.time(), fut, est_prompt=10)
+    f._ready_for_d.append(p)
+    f._sync_batch_gate()
+    tasks = [asyncio.create_task(f.d_admitter()), asyncio.create_task(f.controller())]
+    try:
+        assert await _until(lambda: fut.done(), timeout=5), "the seat was never granted"
+        assert not f._ready_for_d and not f.groups["D"].outstanding
+        # THE WINDOW, stated in the state that exists at the parent commit:
+        # a seat is held, and the rid is in neither set the controller reads.
+        assert f._seats_in_use() == 1
+        if after_handoff is not None:
+            after_handoff(f)
+        await asyncio.sleep(1.0)  # five controller ticks in the window
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return flips
+
+
+def test_f6a_the_idle_mirror_does_not_sleep_d_under_a_handed_off_request():
+    """FINDING 2: between the admitter's popleft + `fut.set_result(True)`
+    and `leg2`'s `D.outstanding[rid] = ...` the request is in NEITHER set
+    the C6 idle mirror reads, so the mirror could flip D->P on a request it
+    had already handed to D -- and `flip`'s own `drain(D)` cannot protect
+    it, because `D.outstanding` is empty by construction there.  The client
+    then POSTs into a sleeping group: R-2's LOST-REQUEST class, D->P."""
+
+    async def body():
+        f = _handoff_front()
+        assert await _drive_handoff(f, []) == []
+
+    asyncio.run(body())
+
+
+def test_f6b_the_work_arm_does_not_sleep_d_under_a_handed_off_request():
+    """The same window, the other guard: `not D.outstanding or not
+    self.admit_d` at :1514.  Queue non-empty, so this is the work arm and
+    not the idle mirror -- and the `admit_d` half needs the term too, since
+    it flips deliberately."""
+
+    async def body():
+        f = _handoff_front(idle_layout="D")
+        assert await _drive_handoff(f, ["q1"]) == []
+        # the `admit_d` half: the fairness switch closes D down DURING the
+        # window, which is exactly when it is closed in production.
+        f2 = _handoff_front(idle_layout="D")
+
+        def close_d(front):
+            front.admit_d = False
+
+        assert await _drive_handoff(f2, ["q2"], after_handoff=close_d) == []
+
+    asyncio.run(body())
+
+
+def test_f6c_the_flip_still_happens_once_the_request_has_arrived():
+    """The term may only DELAY: with D holding the request the drain can see
+    it, the work arm flips exactly as before."""
+
+    async def body():
+        f = _handoff_front(idle_layout="D")
+        flips: List[tuple] = []
+
+        async def fake_flip(src, dst):
+            flips.append((src, dst))
+
+        f.flip = fake_flip
+        f.queue.append(Pending("q1", "/generate", {}, "x", time.time(),
+                               asyncio.get_event_loop().create_future(), est_prompt=100))
+        f.admit_d = False  # the front is closing D down; D holds nothing
+        assert f._seats_in_use() == 0
+        task = asyncio.create_task(f.controller())
+        try:
+            assert await _until(lambda: flips == [("D", "P")], timeout=5), flips
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(body())
+
+
+def test_f6d_the_handoff_term_is_derived_from_the_seat_not_recorded():
+    """No second ledger: the term is `seats - outstanding`, so it has the
+    seat's own lifecycle and cannot be left behind by a missing deleter."""
+
+    async def body():
+        f = _handoff_front()
+        assert f._handoff_in_flight() == 0
+        await f._d_seat.acquire()  # the admitter's own acquire
+        seat = front_mod.Seat(f, "h1", "batch", tokens=10)
+        assert f._seats_in_use() == 1 and f._handoff_in_flight() == 1
+        f.groups["D"].outstanding["h1"] = time.time()  # leg2's first line
+        assert f._handoff_in_flight() == 0, "a request D holds is not a hand-off"
+        del f.groups["D"].outstanding["h1"]
+        seat.release("test")
+        assert f._seats_in_use() == 0 and f._handoff_in_flight() == 0
+
+    asyncio.run(body())
