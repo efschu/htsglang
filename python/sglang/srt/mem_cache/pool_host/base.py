@@ -152,10 +152,16 @@ class HostKVCache(abc.ABC):
         self.end_layer = device_pool.end_layer
 
         if self.size <= device_pool.size:
+            # The pool NAMES ITSELF (#1233 weg2dk4): the Mamba anchor host pool
+            # emitted this same sentence about its SLOTS, and a consumer that
+            # took the min over every matching line derived a 17-token carrier
+            # bound from a 30,518-token staging pool.  A population-style figure
+            # states its population.
             logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "HiCache host KV pool [%s] (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                self.budget_label,
                 self.size,
                 device_pool.size,
             )

@@ -57,9 +57,13 @@ def test_w16_reroute_once_then_refuse():
 
 def test_w16_reads_cached_tokens_not_loaded():
     # the #1176 defect: a body with cached_tokens in prompt_tokens_details
-    pt, ct, comp = usage_of({"usage": {"prompt_tokens": 9000, "completion_tokens": 5,
-                                       "prompt_tokens_details": {"cached_tokens": 8000}}})
-    assert (pt, ct, comp) == (9000, 8000, 5)
+    # usage_of grew a fourth term (`priced`, #1233 zero-remainder 1j finding 3)
+    # and this pin was not carried with it -- it has been failing to unpack
+    # since, i.e. red at bc31554f90 and at 53bd804e2e, before fix 4 touched
+    # anything.
+    pt, ct, comp, priced = usage_of({"usage": {"prompt_tokens": 9000, "completion_tokens": 5,
+                                               "prompt_tokens_details": {"cached_tokens": 8000}}})
+    assert (pt, ct, comp, priced) == (9000, 8000, 5, True)
     assert double_prefill_verdict(pt, ct, 0) == "serve"
 
 

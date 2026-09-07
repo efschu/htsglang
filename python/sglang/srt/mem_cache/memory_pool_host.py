@@ -477,10 +477,15 @@ class MambaPoolHost(HostKVCache):
         )
 
         if self.size <= device_pool.size:
+            # NOT the KV staging pool and not tokens: this is the Mamba anchor
+            # pool and its unit is SLOTS (#1233 weg2dk4 -- copying the KV pool's
+            # sentence here made the launcher read 19 anchor slots as a
+            # 19-token KV carrier bound and route every prompt above 17 tokens
+            # down the single-prefill lane).
             logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
-                "L2 cache effectiveness is reduced."
-                "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                "HiCache Mamba anchor host pool (%d slots) is smaller than the device pool (%d slots);"
+                "L2 anchor coverage is reduced."
+                "Consider increasing --hicache-mamba-host-mib for higher anchor hit rate.",
                 self.size,
                 device_pool.size,
             )

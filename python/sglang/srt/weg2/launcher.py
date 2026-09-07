@@ -248,6 +248,10 @@ P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB = 1450.0
 P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB = 5584.4
 P_CORRIDOR_TOP_MIB = 1229.0
 P_BYTES_PER_TOKEN = 8192 + 2048
+#: Group P's pipeline layer split, in STAGE order (ordinal 0 = the 5090).  Read
+#: twice on purpose and therefore defined once: by ``argv_p`` (the flag) and by
+#: the weg2dk4 flip-order map (which cards a weights_<k> chunk tag lives on).
+P_PP_STAGE_RATIO = (32, 18, 14)
 
 
 def derive_p_max_total_tokens() -> int:
@@ -605,7 +609,7 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float) -> List[st
 def argv_p(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float, extra: List[str]) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib) + [
         "--tp-size", "1", "--pp-size", "3",
-        "--pp-stage-ratio", "32,18,14", "--pp-attn-stage-ratio", "8,4,4",
+        "--pp-stage-ratio", ",".join(str(n) for n in P_PP_STAGE_RATIO), "--pp-attn-stage-ratio", "8,4,4",
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         "--barlink-bar1-window-mib", "24,PP_0=96",
         # #1233 draft KV across the flip (C15): P carries D's four speculative
@@ -1394,6 +1398,35 @@ def build_tms_preload(tree: str, venv: str, log: Log) -> str:
     return so
 
 
+#: The prefetch rate bound the carrier route is derived with: a prompt may be
+#: at most this fraction of the host staging pool that must carry it (it
+#: refused the 84k prompt on boot weg2ls4b2 at limit=27466 of pool 30518).
+CARRIER_PREFETCH_FRACTION = 0.9
+
+
+def carrier_bound_from_lines(lines) -> Tuple[int, Dict[str, List[int]]]:
+    """(carrier_max_tokens, pools by label) from group D's log.
+
+    DENOMINATOR, boot weg2dk4: the population is the LABELLED HiCache host KV
+    staging pools, one label per pool class, and nothing else.  The previous
+    form took the min over every line matching "HiCache host KV pool (N
+    tokens)" -- which the Mamba ANCHOR pool also emitted, about its 19 SLOTS --
+    and derived 17 from a 30,518-token staging pool, sending every prompt above
+    17 tokens down the single-prefill CARRIER-EXCEEDS lane.  Both emitters now
+    name themselves (pool_host/base.py, memory_pool_host.py); an UNLABELLED
+    line is deliberately not matched, so an old log yields 0 (route disabled,
+    logged) instead of a wrong number.
+    """
+    pools: Dict[str, List[int]] = {}
+    pat = re.compile(r"HiCache host KV pool \[([^\]]+)\] \((\d+) tokens\)")
+    for line in lines:
+        m = pat.search(line)
+        if m:
+            pools.setdefault(m.group(1), []).append(int(m.group(2)))
+    flat = [n for label in sorted(pools) for n in pools[label]]
+    return (int(CARRIER_PREFETCH_FRACTION * min(flat)) if flat else 0), {k: pools[k] for k in sorted(pools)}
+
+
 def budgets_from_dc(
     cards: List[Card],
     dc_mib: Dict[str, int],
@@ -1511,7 +1544,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     n_layers = model_num_layers(ns.model)
     chunk_count = max(0, int(ns.weight_chunks))
     chunk_layers = int(math.ceil(n_layers / chunk_count)) if chunk_count > 0 else 0
-    from sglang.srt.managers.weg2_memory_saver import weights_family_tags
+    from sglang.srt.managers.weg2_memory_saver import chunk_tag_cards, weights_family_tags
     weights_tags = weights_family_tags(chunk_count)
     log(f"WEG2-WEIGHT-CHUNKS N={chunk_count} tags (layers per chunk {chunk_layers} of {n_layers}; family {weights_tags}); "
         "flip (C9, gathered legs) = src.pause(kv) -> ONE src.release(family) and ONE dst.resume(family) "
@@ -1702,23 +1735,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # #1233 zero-remainder: the carrier bound the front routes by -- group D's
     # smallest host staging pool (tokens) x 0.9 (the prefetch rate bound that
     # refused the 84k prompt on boot weg2ls4b2: limit=27466 of pool 30518).
-    _pools = []
+    # DENOMINATOR (boot weg2dk4): the old regex took the min over EVERY line
+    # matching "HiCache host KV pool (N tokens)" -- and the Mamba ANCHOR pool
+    # emitted that same sentence about its 19 SLOTS (D.log:899/904/905), so the
+    # bound derived was 17 and every prompt above 17 tokens went down
+    # CARRIER-EXCEEDS.  Three pools, one sentence, one min.  Both emitters now
+    # name their pool (pool_host/base.py, memory_pool_host.py) and the
+    # population here is exactly the labelled KV staging pools, printed per
+    # label so the denominator is visible in the log.
     try:
         with open(spec_d.log, errors="replace") as _f:
-            for _ln in _f:
-                _m = re.search(r"HiCache host KV pool \((\d+) tokens\)", _ln)
-                if _m:
-                    _pools.append(int(_m.group(1)))
+            carrier_max_tokens, _pools = carrier_bound_from_lines(_f)
     except OSError:
-        pass
-    carrier_max_tokens = int(0.9 * min(_pools)) if _pools else 0
+        carrier_max_tokens, _pools = 0, {}
     state.carrier_max_tokens = carrier_max_tokens
-    log(f"CARRIER BOUND: group D host KV pools (tokens) = {_pools} -> front --carrier-max-tokens {carrier_max_tokens} "
-        f"(0 = not found in D's log, route disabled); prompts above it are served by ONE prefill on D")
+    log(f"CARRIER BOUND: group D host KV staging pools by label (tokens) = "
+        f"{ {k: _pools[k] for k in sorted(_pools)} } -> front --carrier-max-tokens {carrier_max_tokens} "
+        f"(0.9 x the min over that population; 0 = no labelled KV pool line in D's log, route disabled). "
+        f"The Mamba anchor pool is NOT in this population -- it counts slots and names itself.")
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
 
     # 6. front
+    # #1233 boot weg2dk4 -- WHICH CARD DOES A CHUNK TAG LIVE ON.  Group P is
+    # PP: a weights_<k> tag is a layer band and sits on ONE stage's card (two
+    # when the band straddles a stage boundary).  Group D is TP: every card
+    # holds a shard of every layer, so D has NO map and pauses in the natural
+    # order, exactly as before.  Derived here from the SAME stage ratio argv_p
+    # passes and the SAME chunk geometry both groups were built with; the front
+    # picks the pause order from it per flip, against a live NVML free sample.
+    p_chunk_cards = chunk_tag_cards(
+        P_PP_STAGE_RATIO, chunk_layers, chunk_count, card_of_stage=[c.nvml_index for c in cards]
+    )
+    src_chunk_cards = {"P": {t: list(v) for t, v in p_chunk_cards.items()}}
+    log(f"WEG2-FLIP-ORDER MAP group=P (pp stage ratio {list(P_PP_STAGE_RATIO)} over {n_layers} layers, "
+        f"{chunk_layers} layers per chunk, nvml {[c.nvml_index for c in cards]} in stage order): {src_chunk_cards['P']}; "
+        f"group=D TP -> no map (uniform across cards). Boot weg2dk4 died because the interleave paused P's tag k "
+        f"against D's tag k while P's bytes for k=0..5 were on OTHER cards than the one D was allocating on.")
     front_argv = [
         py, "-m", "sglang.srt.weg2.front",
         "--prefill", f"http://127.0.0.1:{PORT_P}", "--decode", f"http://127.0.0.1:{PORT_D}",
@@ -1729,6 +1782,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
         "--carrier-max-tokens", str(carrier_max_tokens),
+        "--src-chunk-cards", json.dumps(src_chunk_cards, sort_keys=True),
     ]
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"

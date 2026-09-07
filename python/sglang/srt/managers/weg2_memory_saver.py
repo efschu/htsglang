@@ -1359,6 +1359,57 @@ def weights_family_tags(chunk_count: Optional[int] = None) -> list:
     ]
 
 
+def chunk_tag_cards(
+    stage_layers: Sequence[int],
+    layers_per_chunk: int,
+    chunk_count: int,
+    card_of_stage: Optional[Sequence[int]] = None,
+) -> Dict[str, Tuple[int, ...]]:
+    """Which CARDS hold bytes of each ``weights_<k>`` chunk tag.
+
+    #1233 boot weg2dk4 (2026-09-07) died here, and the defect is a geometry
+    mismatch the tag index HIDES.  A chunk tag is a LAYER band
+    (``weight_chunk_tag``: ``layer_id // layers_per_chunk``).  Under PIPELINE
+    parallelism the layer axis is split across cards, so a chunk tag names
+    exactly the one or two stages whose layer range it overlaps; under TENSOR
+    parallelism every card holds a shard of every layer, so the same tag index
+    names ALL cards.  The one-backup interleave pauses the source's tag k and
+    resumes the destination's tag k in the same step (front.flip), which is a
+    fair trade only when both sides mean the same card by ``k``.
+
+    MEASURED on weg2dk4 with a PP source (``--pp-stage-ratio 32,18,14`` over 64
+    layers, 8 layers per chunk) and a TP destination: the last stage's card
+    (nvml2) holds P's bytes only in ``weights_6``/``weights_7``, so the pauses
+    of ``weights_0..5`` released NOTHING there while D's resumes took ~813 MiB
+    each -- driver_free fell 4,511 -> 277.8 MiB in five steps with no
+    recovery and ``cu_mem_create`` returned CUDA OOM on the sixth
+    (BOOT_weg2dk4_0907.md).  This map is what lets the interleave pause the
+    tight card's bands FIRST; see ``front.interleave_pause_order``.
+
+    ``card_of_stage`` gives the card id (NVML index) of each PP stage in stage
+    order; it defaults to the stage ordinals.  The base weights tag is NOT in
+    the map: its bytes (embeddings on the first stage, head on the last,
+    buffers everywhere) are not a layer band, and the family contract pauses it
+    last regardless.  A TP group has no layer split and therefore no map -- the
+    caller reads an EMPTY map as "uniform", never as "no bytes".
+    """
+    if layers_per_chunk <= 0 or chunk_count <= 0 or not stage_layers:
+        return {}
+    cards = list(card_of_stage) if card_of_stage is not None else list(range(len(stage_layers)))
+    if len(cards) != len(stage_layers):
+        raise ValueError(
+            f"card_of_stage {cards} does not match the {len(stage_layers)} PP stages {list(stage_layers)}"
+        )
+    acc: Dict[str, set] = {}
+    layer = 0
+    for stage, n_layers in enumerate(stage_layers):
+        for _ in range(int(n_layers)):
+            tag = f"{WEIGHT_CHUNK_PREFIX}{min(layer // int(layers_per_chunk), int(chunk_count) - 1)}"
+            acc.setdefault(tag, set()).add(int(cards[stage]))
+            layer += 1
+    return {tag: tuple(sorted(v)) for tag, v in sorted(acc.items())}
+
+
 def is_weights_family_tag(tag: Any) -> bool:
     return isinstance(tag, str) and (
         tag == GPU_MEMORY_TYPE_WEIGHTS or tag.startswith(WEIGHT_CHUNK_PREFIX)

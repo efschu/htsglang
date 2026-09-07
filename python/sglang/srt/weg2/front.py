@@ -58,7 +58,11 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from sglang.srt.managers.weg2_memory_saver import credit_epoch, weights_family_tags
+from sglang.srt.managers.weg2_memory_saver import (
+    WEIGHT_CHUNK_PREFIX,
+    credit_epoch,
+    weights_family_tags,
+)
 
 logger = logging.getLogger("weg2.front")
 
@@ -303,6 +307,52 @@ def fairness_reached(oldest_arrival: Optional[float], now: float, w_s: float) ->
     return oldest_arrival is not None and (now - oldest_arrival) >= w_s
 
 
+def interleave_pause_order(
+    tags: List[str],
+    tag_cards: Dict[str, Any],
+    free_mib: Dict[int, int],
+) -> Tuple[List[str], str]:
+    """The order the SOURCE group pauses its weights family in: TIGHTEST CARD
+    FIRST.  Returns ``(order, why)``; ``why`` names the reason in the log.
+
+    The interleave (``flip``) pauses one source tag and resumes one destination
+    tag per step, so per card the destination's demand is only paid for by the
+    source's release IF the two tags name the same card.  They do not when the
+    two groups have different parallelism: the source's chunk tag is a LAYER
+    band (PP: one card), the destination's is a shard of every layer (TP: all
+    cards).  Boot weg2dk4 measured the consequence on the PP source's LAST
+    stage -- 4,511 -> 277.8 MiB driver_free in five steps, then CUDA OOM in
+    ``cu_mem_create`` on the sixth resume, group D fatal.
+
+    The order below is the only free variable that fixes it without touching a
+    budget: the ENDPOINT of the flip is unchanged (the same tags are paused and
+    resumed), only the PATH is.  Releasing the tightest card's bands first pays
+    that card's demand up front and moves the drawdown onto the cards that have
+    the free memory to absorb it -- which is measured here, per flip, not
+    assumed.
+
+    Contracts kept: the base weights tag closes the sleep (``weights_family_tags``),
+    the result is always a permutation of ``tags``, and an incomplete input is a
+    NAMED refusal to reorder (identity), never a partial order.
+    """
+    tags = list(tags)
+    chunks = [t for t in tags if t.startswith(WEIGHT_CHUNK_PREFIX)]
+    rest = [t for t in tags if not t.startswith(WEIGHT_CHUNK_PREFIX)]
+    if not tag_cards:
+        return tags, "identity: the source has no chunk->card map (uniform/TP source, or no map passed)"
+    if not free_mib:
+        return tags, "identity: no NVML free sample for this flip"
+    missing = [t for t in chunks if t not in tag_cards]
+    if missing:
+        return tags, f"identity REFUSED to reorder: chunk tags absent from the map {missing}"
+    unknown = sorted({int(c) for t in chunks for c in tag_cards[t]} - set(free_mib))
+    if unknown:
+        return tags, f"identity REFUSED to reorder: cards {unknown} absent from the NVML free sample {sorted(free_mib)}"
+    index = {t: i for i, t in enumerate(chunks)}
+    order = sorted(chunks, key=lambda t: (min(free_mib[int(c)] for c in tag_cards[t]), index[t]))
+    return order + rest, "tightest-card-first"
+
+
 # --------------------------------------------------------------------------
 # runtime
 # --------------------------------------------------------------------------
@@ -388,13 +438,19 @@ def _session_pids(sid: int) -> set:
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
-                 weight_chunks: int = 0, carrier_max_tokens: int = 0):
+                 weight_chunks: int = 0, carrier_max_tokens: int = 0,
+                 src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None):
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
         self.awake = awake
         # #1233 one-backup flip: the weights tag family both groups were built
         # with (launcher: SGLANG_WEG2_WEIGHT_CHUNKS), chunks first, base last.
         self.weight_chunks = int(weight_chunks)
         self.weights_tags = weights_family_tags(self.weight_chunks)
+        # #1233 boot weg2dk4: per group, which cards (NVML index) hold each
+        # chunk tag's bytes -- derived by the launcher from that group's
+        # parallelism, EMPTY for a group whose tags are uniform across cards
+        # (TP).  Read by interleave_pause_order when that group is the source.
+        self.src_chunk_cards: Dict[str, Dict[str, List[int]]] = dict(src_chunk_cards or {})
         self.tag = tag
         self.store_dir = store_dir
         self.dc_reserve = dc_reserve
@@ -975,6 +1031,44 @@ class Front:
             self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
             return
         family = list(self.weights_tags)
+        # #1233 fix 4 ON THE RING FORM.  The tight-card-first order survives the
+        # move to gathered legs (C9); the serial per-tag RPC loop it used to
+        # drive does NOT.  Under the gathered legs the front issues ONE
+        # /release_memory_occupation per group, so the pause ORDER is no longer
+        # an RPC sequence the front controls step by step -- it is the ORDER OF
+        # THE TAG LIST that leg carries, which the group walks unchanged
+        # (`weights_tags = [t for t in tags if is_weights_family_tag(t)]` in
+        # weight_updater, both legs).  So the ordering is applied HERE, to the
+        # source leg's list, and the destination keeps the natural order.  That
+        # is ONE flip mechanism and ONE ordering function, not two.
+        #
+        # Why the order still matters with the legs gathered: the two legs now
+        # run CONCURRENTLY, so the destination's demand on a card overlaps the
+        # source's release on that same card.  Pausing the tightest card's
+        # bands first is what makes the source's bytes come free on the card
+        # the destination is about to want them on.  boot weg2dk4 died in
+        # cu_mem_create on exactly that card (driver_free 4,511 -> 277.8 MiB
+        # in five steps, BOOT_weg2dk4_0907.md).
+        #
+        # The free sample is taken HERE, after the source's kv_cache is already
+        # released, so it is the state the flip actually starts from.
+        free_mib = {idx: free for idx, _uuid, free in _nvml_free()}
+        pause_order, why = interleave_pause_order(
+            self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib
+        )
+        logger.info(
+            "WEG2-FLIP-ORDER epoch=%d src=%s driver_free=%s pause_order=%s resume_order=%s (%s) "
+            "-- applied to the GATHERED sleep leg's tag list (C9), not to a per-tag RPC loop",
+            self.epoch, src, free_mib, pause_order, self.weights_tags, why,
+        )
+        if sorted(pause_order) != sorted(self.weights_tags):
+            self.do_stop(
+                "W4 Weg2WakeRefused",
+                f"pause order {pause_order} is not a permutation of the weights family "
+                f"{self.weights_tags} -- a tag would be resumed on {dst} that was never "
+                f"paused on {src}; VRAM state untouched, no flip",
+            )
+            return
         # FIX 2 round 2: the token names the BOOT and the flip, not the flip
         # alone -- see weg2_memory_saver.credit_epoch for the leftover counters
         # a bare flip index made this boot inherit.
@@ -987,7 +1081,7 @@ class Front:
         # previous flip's terminal state as this flip's funding.
         (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
             self.timed_rpc(S, "/release_memory_occupation",
-                           {"tags": family, "epoch": flip_epoch}, RPC_TIMEOUT_S),
+                           {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
             self.timed_rpc(D, "/resume_memory_occupation",
                            {"tags": family, "epoch": flip_epoch}, RPC_TIMEOUT_S),
         )
@@ -1225,6 +1319,10 @@ def main():
     ap.add_argument("--fairness-w-s", type=float, default=45.0)
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
     ap.add_argument("--carrier-max-tokens", type=int, default=0, help="#1233 zero-remainder: longest prompt group D can read from the store (0 = no CARRIER-EXCEEDS route)")
+    ap.add_argument("--src-chunk-cards", default="",
+                    help="#1233 weg2dk4: JSON {group: {weights_k: [nvml_index, ...]}} -- which cards hold each chunk tag's "
+                         "bytes, per group, derived by the launcher from that group's parallelism. A group that is absent "
+                         "(or an empty map) pauses in the natural tag order, exactly as before.")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
@@ -1232,7 +1330,8 @@ def main():
         k, v = kv.split("=")
         dc[k] = int(v)
     front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s,
-                  weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens)
+                  weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens,
+                  src_chunk_cards=json.loads(args.src_chunk_cards) if args.src_chunk_cards else {})
     app = web.Application(client_max_size=1024**3)
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)
@@ -1248,7 +1347,8 @@ def main():
         app.router.add_get(path, front.handle_passthrough_get)
     for path in FORWARD_PATHS:
         app.router.add_post(path, front.handle_generate)
-    logger.info("WEG2-FRONT %s:%s -> P=%s D=%s awake=%s weights_tags=%s", args.host, args.port, args.prefill, args.decode, args.awake, front.weights_tags)
+    logger.info("WEG2-FRONT %s:%s -> P=%s D=%s awake=%s weights_tags=%s src_chunk_cards=%s", args.host, args.port,
+                args.prefill, args.decode, args.awake, front.weights_tags, front.src_chunk_cards)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
 
