@@ -38,7 +38,7 @@ import textwrap
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import pytest
 
@@ -91,6 +91,95 @@ def _call_index(body: List[ast.stmt], needle: str) -> int:
                 if needle in ast.unparse(sub):
                     return i
     return -1
+
+
+def _child_bodies(stmt: ast.stmt) -> List[Tuple[str, List[ast.stmt]]]:
+    """Every ``list[ast.stmt]`` field ``stmt`` owns, named by its field."""
+    out: List[Tuple[str, List[ast.stmt]]] = []
+    for field in ("body", "orelse", "finalbody"):
+        value = getattr(stmt, field, None)
+        if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+            out.append((field, value))
+    for i, handler in enumerate(getattr(stmt, "handlers", []) or []):
+        out.append((f"handler[{i}]", handler.body))
+    return out
+
+
+def _stmt_path_to_call(
+    body: List[ast.stmt], needle: str
+) -> Optional[List[Tuple[List[ast.stmt], int, str]]]:
+    """Path from ``body`` down to the statement whose OWN expression calls ``needle``.
+
+    Each hop is ``(enclosing_body, index_in_it, field_name_of_that_body)``; the
+    last hop is the innermost statement holding the call.  ``_call_index``
+    returns only the TOP-LEVEL index, which is why the order gate it fed could
+    not fail once the call was nested (own mutant RB2-M2, which the whole suite
+    survived: a second ``_export_static_state`` appended INSIDE the PCIe-lock
+    ``with``, after the pause).
+    """
+    for i, stmt in enumerate(body):
+        if not any(
+            isinstance(sub, ast.Call) and needle in ast.unparse(sub)
+            for sub in ast.walk(stmt)
+        ):
+            continue
+        for field, child in _child_bodies(stmt):
+            deeper = _stmt_path_to_call(child, needle)
+            if deeper is not None:
+                return [(body, i, field)] + deeper
+        return [(body, i, "")]
+    return None
+
+
+def _bodies_running_after(stmt: ast.stmt, taken_field: str) -> List[str]:
+    """Sibling bodies of ``stmt`` that still execute after ``taken_field`` finishes.
+
+    ``if``/``with`` have none (``orelse`` is mutually exclusive, a ``with`` owns
+    one body).  ``try`` runs ``else``/``finally`` afterwards, and a loop both
+    repeats its body and runs its ``else`` afterwards -- so "last statement of
+    the block" would stop meaning "nothing runs after the pause" if the code
+    ever grew one of those shapes around it.
+    """
+    after: List[str] = []
+    if isinstance(stmt, ast.Try):
+        if taken_field == "body":
+            after += [f for f in ("orelse", "finalbody") if getattr(stmt, f, None)]
+        elif taken_field.startswith("handler") or taken_field == "orelse":
+            after += ["finalbody"] if stmt.finalbody else []
+    elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+        after.append("the loop repeats its own body")
+        if stmt.orelse:
+            after.append("orelse")
+    return after
+
+
+def _assert_nothing_runs_after_the_call(
+    body: List[ast.stmt], needle: str, block_name: str
+) -> None:
+    """``needle`` is the LAST thing this block does, at EVERY nesting level."""
+    path = _stmt_path_to_call(body, needle)
+    assert path is not None, f"{needle} is never called in the {block_name} block"
+    depth_names = " -> ".join(
+        f"{type(enclosing[index]).__name__}[{index}/{len(enclosing) - 1}]"
+        for enclosing, index, _ in path
+    )
+    print(f"{block_name}: {needle} nesting path {depth_names}")
+    for level, (enclosing, index, field) in enumerate(path):
+        assert index == len(enclosing) - 1, (
+            f"{needle} sits at nesting level {level} as statement [{index}] of "
+            f"{len(enclosing)}; {len(enclosing) - 1 - index} statement(s) run "
+            f"after it in the {block_name} block (path {depth_names}). Every "
+            "one of them touches pages the pause has already unmapped."
+        )
+        if level + 1 < len(path):
+            stmt = enclosing[index]
+            running_after = _bodies_running_after(stmt, path[level + 1][2])
+            assert not running_after, (
+                f"{needle} is nested inside a "
+                f"{type(stmt).__name__} whose {', '.join(running_after)} still "
+                f"runs after it in the {block_name} block; 'last statement' no "
+                "longer means 'nothing touches the released pages afterwards'"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -327,14 +416,20 @@ def test_kv_block_flushes_before_pause():
 
 
 def test_kv_block_pause_is_the_last_statement():
-    """Nothing device-touching may follow the pause inside the same block."""
+    """Nothing device-touching may follow the pause inside the same block.
+
+    NESTING-AWARE (own mutant RB2-M2 on the sibling tag): a top-level statement
+    index is satisfied by anything appended INSIDE a ``with``/``if`` that ends
+    the block, and the weights leg already has exactly such a ``with`` (the
+    PCIe lock).  The kv leg has no lock today, so this assertion carries the
+    same shape in advance -- the gate must stay correct if one is ever added
+    here, not go quietly blind the day it is.
+    """
     body = _tag_block(
         _func_ast("release_memory_occupation"), "GPU_MEMORY_TYPE_KV_CACHE"
     )
-    pause_at = _call_index(body, "pause(GPU_MEMORY_TYPE_KV_CACHE)")
-    assert pause_at == len(body) - 1, (
-        f"pause(kv_cache) is statement [{pause_at}] of {len(body)}; "
-        "every later statement in this block touches released pages"
+    _assert_nothing_runs_after_the_call(
+        body, "pause(GPU_MEMORY_TYPE_KV_CACHE)", "kv_cache"
     )
 
 
@@ -1441,13 +1536,21 @@ def test_weights_block_pause_is_the_last_statement():
     a second export appended after the pause reads unmapped pages -- the
     campaign (a) fault on the weights tag.  The existing order gate uses the
     FIRST matching statement and stays green under exactly that duplicate.
+
+    NESTING-AWARE since fix 4.  The previous form compared TOP-LEVEL statement
+    indices, and fix 1 had since nested the pause inside
+    ``with self._weg2_pcie_lock("sleep-D2H weights"):`` -- which IS the last
+    top-level statement of the block no matter what is appended after the pause
+    inside it.  Own mutant RB2-M2 (a second ``_export_static_state`` in exactly
+    that position, i.e. the shape this docstring names) survived the whole
+    suite 80/80; only the control one level further out was killed.  A gate that
+    cannot fail on the hazard its own docstring names is not a gate, so the
+    assertion now walks the nesting path and requires "nothing after" at EVERY
+    level.
     """
     body = _tag_block(_func_ast("release_memory_occupation"), "GPU_MEMORY_TYPE_WEIGHTS")
-    pause_at = _call_index(body, "pause(GPU_MEMORY_TYPE_WEIGHTS)")
-    assert pause_at >= 0, "pause(weights) not called in the weights block"
-    assert pause_at == len(body) - 1, (
-        f"pause(weights) is statement [{pause_at}] of {len(body)}; every later "
-        "statement in this block touches unmapped weight pages"
+    _assert_nothing_runs_after_the_call(
+        body, "pause(GPU_MEMORY_TYPE_WEIGHTS)", "weights"
     )
 
 
@@ -1915,20 +2018,163 @@ def test_launch_arm_refuses_the_backup_off_quantized_combination():
     """The refusal is at LAUNCH too, where nothing is committed yet.
 
     Source gate: ``scheduler.py``'s memory-saver block must call the SAME
-    function, gated on ``enable_weights_cpu_backup`` being off.
+    function, and it must call it under the NEGATED
+    ``enable_weights_cpu_backup``.
+
+    AST, not a substring (own mutant RB2-M5, same class as F3-M2 and as the
+    W12 launch gate's own lesson two functions up -- "look for the CALL, not
+    the name"): flipping ``if not self.server_args.enable_weights_cpu_backup:``
+    to ``if self.server_args.enable_weights_cpu_backup:`` leaves all three
+    substrings in place and the suite green 80/80, while the one arm the
+    refusal exists for -- backup OFF on a quantized checkpoint -- boots
+    unrefused and is then caught only at the first wake, after
+    ``resume(GPU_MEMORY_TYPE_WEIGHTS)`` has recommitted the VMM pages, which
+    the block's own comment calls fatal for the group.
     """
     from sglang.srt.managers import scheduler as sched
 
-    source = inspect.getsource(
-        sched.Scheduler.init_watch_dog_memory_saver_input_blocker
+    source = textwrap.dedent(
+        inspect.getsource(sched.Scheduler.init_watch_dog_memory_saver_input_blocker)
     )
-    assert "assert_backup_off_wake_refill_is_defined" in source, (
+    tree = ast.parse(source)
+
+    def _calls_the_refusal(node: ast.AST) -> bool:
+        return any(
+            isinstance(sub, ast.Call)
+            and ast.unparse(sub.func).endswith(
+                "assert_backup_off_wake_refill_is_defined"
+            )
+            for sub in ast.walk(node)
+        )
+
+    assert _calls_the_refusal(tree), (
         "the launch arm does not refuse the undefined backup-OFF/quantized "
         "combination; the first wake would then commit the VMM pages and fail "
         "inside the loader"
     )
-    assert "enable_weights_cpu_backup" in source
+
+    negated_guards = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and "enable_weights_cpu_backup" in ast.unparse(node.test.operand)
+    ]
+    print(f"negated enable_weights_cpu_backup guards found: {len(negated_guards)}")
+    assert negated_guards, (
+        "no `if not <...>enable_weights_cpu_backup:` guard in the launch block; "
+        "the refusal is either ungated or gated on the WRONG polarity, in which "
+        "case it fires on the safe arm and never on the undefined one. (This "
+        "gate accepts the `not` spelling only, so a rewrite fails closed.)"
+    )
+    assert any(_calls_the_refusal(node) for node in negated_guards), (
+        "assert_backup_off_wake_refill_is_defined is called, but not inside the "
+        "`if not ...enable_weights_cpu_backup:` guard"
+    )
     assert "checkpoint_quantization" in source
+
+
+def _drive_launch_memory_saver_block(
+    monkeypatch,
+    *,
+    enable_weights_cpu_backup: bool,
+    quantization: Optional[str],
+    enable_memory_saver: bool = True,
+) -> Any:
+    """Run ``init_watch_dog_memory_saver_input_blocker`` on a fake scheduler.
+
+    Behavioural pin for the launch refusal.  The source gate above gets the
+    polarity right structurally; this one gets it right by CONSEQUENCE, which
+    is what "a refusal that cannot be shown to fire is not a refusal" asks for.
+    Everything the method touches besides the refusal is stubbed: the two
+    watchdog factories (they start threads), the adapter class (the real
+    ``create(enable=True)`` needs the library), and ``get_bool_env_var`` (the
+    input blocker reads ``self.ps``, which a fake scheduler has not got).
+    ``SchedulerRecvSkipper.maybe_create`` returns ``None`` on
+    ``scheduler_recv_interval <= 1`` (scheduler_recv_skipper.py:9-10), so it
+    needs no stub.
+    """
+    from sglang.srt.managers import scheduler as sched
+
+    class _FakeTMS:
+        @staticmethod
+        def create(enable):
+            return FakeAdapter(enabled=bool(enable))
+
+    monkeypatch.setattr(sched, "create_scheduler_watchdog", lambda *a, **k: "watchdog")
+    monkeypatch.setattr(
+        sched, "create_admission_wedge_watchdog", lambda *a, **k: "wedge"
+    )
+    monkeypatch.setattr(sched, "TorchMemorySaverAdapter", _FakeTMS)
+    monkeypatch.setattr(sched, "get_bool_env_var", lambda *a, **k: False)
+
+    server_args = FakeServerArgs(
+        enable_weights_cpu_backup=enable_weights_cpu_backup,
+        enable_memory_saver=enable_memory_saver,
+    )
+    server_args.watchdog_timeout = 300.0
+    server_args.scheduler_recv_interval = 1
+    server_args.quantization = None
+
+    class _FakeScheduler:
+        pass
+
+    fake = _FakeScheduler()
+    fake.server_args = server_args
+    fake.model_config = FakeModelConfig(quantization)
+    sched.Scheduler.init_watch_dog_memory_saver_input_blocker(fake)
+    return fake
+
+
+def test_launch_refuses_backup_off_on_a_quantized_checkpoint(monkeypatch):
+    """Polarity, by consequence: the arm the refusal exists for MUST refuse."""
+    from sglang.srt.managers.weg2_memory_saver import Weg2WakeRefused
+
+    with pytest.raises(Weg2WakeRefused) as exc:
+        _drive_launch_memory_saver_block(
+            monkeypatch,
+            enable_weights_cpu_backup=False,
+            quantization="compressed-tensors",
+        )
+    assert "launch" in str(exc.value)
+
+
+def test_launch_accepts_backup_on_with_the_same_quantized_checkpoint(monkeypatch):
+    """The other polarity: with the backup funded the wake is defined.
+
+    Without this half a refusal that fires on EVERY boot would also pass the
+    test above.
+    """
+    fake = _drive_launch_memory_saver_block(
+        monkeypatch,
+        enable_weights_cpu_backup=True,
+        quantization="compressed-tensors",
+    )
+    assert fake.memory_saver_adapter.enabled is True
+
+
+def test_launch_accepts_backup_off_on_an_unquantized_checkpoint(monkeypatch):
+    """The second defined lane named in the refusal message."""
+    fake = _drive_launch_memory_saver_block(
+        monkeypatch, enable_weights_cpu_backup=False, quantization=None
+    )
+    assert fake.memory_saver_adapter.enabled is True
+
+
+def test_launch_leaves_a_stock_boot_untouched(monkeypatch):
+    """No ``--enable-memory-saver`` -> neither W12 nor W4 is reachable.
+
+    The denominator of the two tests above: they say what happens INSIDE the
+    memory-saver block, not that the block is entered on a stock boot.
+    """
+    fake = _drive_launch_memory_saver_block(
+        monkeypatch,
+        enable_weights_cpu_backup=False,
+        quantization="compressed-tensors",
+        enable_memory_saver=False,
+    )
+    assert fake.memory_saver_adapter.enabled is False
 
 
 # --- finding 3: two flocks on one physical link -----------------------------
