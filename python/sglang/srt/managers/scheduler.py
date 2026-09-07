@@ -23,7 +23,7 @@ import sys
 import time
 from array import array
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -1451,7 +1451,8 @@ class Scheduler(
         logger.info(
             "WEG2 DRAFT-KV-PRODUCER armed stage=%d/%d drafter=%s layout=v%d heads=%d "
             "head_dim=%d page_bytes=%d embed=resident mtp_mib=%.1f embed_mib=%.1f "
-            "resident_mib=%.1f embed_dtype=%s build_s=%.1f",
+            "resident_mib=%.1f head_released_mib=%.1f nvml_delta_mib=%.1f "
+            "embed_dtype=%s build_s=%.1f",
             self.draft_kv_producer.stage,
             self.draft_kv_producer.stages,
             kv_cache_builder.drafter_identity_hash(self.server_args),
@@ -1461,9 +1462,24 @@ class Scheduler(
             2 * int(cfg.get_total_num_kv_heads()) * int(cfg.head_dim),
             mtp_mib,
             embed_mib,
-            # measured: NVML free before the build minus after the load +
-            # release (W11 reads it; -1 = unmeasured, which W11 refuses)
+            # THREE instruments, each named on the line, none averaged with
+            # another (fix 3, boot weg2dk3):
+            #   resident_mib      the producer's own live weight bytes on this
+            #                     stage, the shared target lm_head excluded.
+            #                     W11 grades THIS one; -1 = unmeasured.
+            #   head_released_mib the never-loaded lm_head table this handle
+            #                     deleted (0 under tie_word_embeddings, where
+            #                     no second table is ever built).
+            #   nvml_delta_mib    NVML free before the build minus after. Under
+            #                     --enable-memory-saver this reads the BUILD,
+            #                     not the residue: the weights live in the
+            #                     saver's torch.cuda.MemPool, which
+            #                     empty_cache() does not hand to the driver
+            #                     (memsaver.md N4), and the KV pools reuse the
+            #                     freed block out of that same pool.
             self.draft_kv_producer.resident_mib,
+            self.draft_kv_producer.head_released_mib,
+            self.draft_kv_producer.nvml_delta_mib,
             self.draft_kv_producer.embed_dtype,
             self.draft_kv_producer.build_s,
         )
@@ -1577,6 +1593,16 @@ class Scheduler(
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
+        if self.draft_kv_producer is not None:
+            # FIX 3: the producer captures nothing, but this call is what
+            # BUILDS its eager runner (model_runner.py:1484-1499). Boot
+            # weg2dk3 had no caller here at all, so the draft runner reached
+            # neither init_cuda_graphs nor _install_eager_only_runners and
+            # all three P ranks died at the first draft extend. The
+            # producer's other two lifecycle hooks are called from
+            # init_all_attention_backends / init_memory_pool right above --
+            # this one was the hole.
+            self.draft_kv_producer.init_cuda_graphs()
 
     def init_model_worker(self):
         # Load model weights.
@@ -12874,20 +12900,18 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
-                produce = self._draft_kv_producer_wants(batch)
-                if produce:
-                    from sglang.srt.model_executor.forward_batch_info import (
-                        CaptureHiddenMode,
+                with ExitStack() as _stack:
+                    produce = self._draft_kv_producer_wants(batch)
+                    if produce:
+                        # FIX 3: the restore is inside the stack, so a producer
+                        # that raises cannot leave the batch in FULL capture
+                        # for whatever runs next.
+                        _stack.enter_context(self._draft_kv_full_capture(batch))
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, **kwargs
                     )
-
-                    saved_capture_mode = batch.capture_hidden_mode
-                    batch.capture_hidden_mode = CaptureHiddenMode.FULL
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch, **kwargs
-                )
-                if produce:
-                    self._draft_kv_produce(batch, batch_result)
-                    batch.capture_hidden_mode = saved_capture_mode
+                    if produce:
+                        self._draft_kv_produce(batch, batch_result)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
@@ -12941,6 +12965,23 @@ class Scheduler(
             and batch.forward_mode.is_extend()
             and not batch.forward_mode.is_idle()
         )
+
+    @contextmanager
+    def _draft_kv_full_capture(self, batch: ScheduleBatch):
+        """C7: the target chunk must hand the producer FULL hidden states.
+
+        The restore is in a ``finally``: a producer that raises is a group
+        STOP, but it must not first leave the batch in FULL capture for
+        whatever the scheduler touches on the way down.
+        """
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        saved = batch.capture_hidden_mode
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        try:
+            yield
+        finally:
+            batch.capture_hidden_mode = saved
 
     def _draft_kv_produce(self, batch: ScheduleBatch, batch_result) -> None:
         """Run the draft-extend of this chunk on the producer and emit L1."""

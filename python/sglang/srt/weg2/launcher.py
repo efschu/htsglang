@@ -220,12 +220,28 @@ MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdn
 #: single-rank is_last_rank and which the producer drops when it shares the
 #: target's head (405.2 + 1213.0 + 2426.0 = 4044, 50 MiB from the reading).
 #: No second embedding is budgeted: `load_resident_embedding` loads INTO the
-#: built int8 tensors. Fix 2 releases that table explicitly (empty_cache) and
-#: the L2 line now carries `resident_mib=` MEASURED (NVML free before the
-#: build minus after the load); the W11 gate below refuses the boot when the
-#: measured residue exceeds this budget by more than the tolerance, so the
-#: corridor claim of this derivation is checked at readiness, never assumed.
-#: The next boot's L2 value replaces 1618.2 here, with its tag.
+#: built int8 tensors. The W11 gate below refuses the boot when the measured
+#: residue exceeds this budget by more than the tolerance, so the corridor
+#: claim of this derivation is checked at readiness, never assumed.
+#: BOOT weg2dk3 (bc31554f90, PP2 log :260) measured `resident_mib=3998.0`
+#: against this line and W11 refused. TWO defects, both fixed in fix 3, and
+#: the budget stands unchanged:
+#:  1. fix 2 released the table by swapping the MODULE and calling
+#:     empty_cache(); the upstream release form is `del lm_head.weight`
+#:     (qwen3_5_mtp.py:185-193), because a module swap frees nothing while
+#:     any other holder remains. Fix 3 deletes the parameters.
+#:  2. the instrument could not measure the residue at all: with
+#:     --enable-memory-saver the weights are loaded inside
+#:     `memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS)`, which is
+#:     `torch.cuda.use_mem_pool(...)` (torch_memory_saver/entrypoint.py:89-91),
+#:     and `empty_cache()` does not return a MemPool block to the driver
+#:     (maps/memsaver.md N4). The NVML free delta therefore reads the BUILD
+#:     under this boot form no matter what is released. It is not a loss --
+#:     the KV pools allocate from the SAME primary pool and reuse the block --
+#:     so `resident_mib` is now the draft model's live weight bytes (shared
+#:     target lm_head excluded) and the NVML delta rides beside it as its own
+#:     named term `nvml_delta_mib`.
+#: The next boot's L2 `resident_mib` replaces 1618.2 here, with its tag.
 P_DRAFT_RESIDENT_BUDGET_MIB = 405.2 + 1213.0
 P_DRAFT_RESIDENT_TOL_MIB = 256.0
 P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB = 1450.0

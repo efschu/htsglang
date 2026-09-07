@@ -301,17 +301,33 @@ class TestProducerCollectivesOnTheLastStageOnly(CustomTestCase):
 
 class TestResidentEmbeddingLoad(CustomTestCase):
     """Placement A pays the embedding ONCE: the checkpoint rows go INTO the
-    tensor the MTP build materialised, the head's own lm_head is released
-    (not left to GC), and a checkpoint that does not match the built
-    parameters is refused by name instead of cast (int8 codes into a bf16
-    table without their scale = token soup)."""
+    tensor the MTP build materialised, the head's own lm_head is released,
+    and a checkpoint that does not match the built parameters is refused by
+    name instead of cast (int8 codes into a bf16 table without their scale =
+    token soup).
+
+    FIX 3 corrected the release ASSERTION as well as the release: the
+    weakref pin below used to read "the module became garbage", which is not
+    the claim -- boot weg2dk3 dropped the module and still measured a
+    residue equal to the build. The claim is that the TABLE is gone, i.e.
+    the parameter is deleted (the upstream `del lm_head.weight` form). See
+    test_weg2_draftkv_fix3_1233.py for the second holder that separates the
+    two."""
 
     def _producer(self, embed, old_head, target_head):
         from sglang.srt.speculative import draft_kv_producer as dkp
 
-        draft_model = types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=embed), lm_head=old_head)
+        draft_model = torch.nn.Module()
+        draft_model.model = torch.nn.Module()
+        draft_model.model.embed_tokens = embed
+        draft_model.lm_head = old_head
         draft_model.set_lm_head_from_target = lambda h: setattr(draft_model, "lm_head", h)
         producer = dkp.DraftKvProducer.__new__(dkp.DraftKvProducer)
+        producer._free_before_mib = -1.0
+        producer.resident_mib = -1.0
+        producer.nvml_delta_mib = -1.0
+        producer.head_released_mib = 0.0
+        producer.embed_dtype = "?"
         producer.draft_runner = types.SimpleNamespace(model=draft_model)
         producer.draft_worker = types.SimpleNamespace(
             target_worker=types.SimpleNamespace(model_runner=types.SimpleNamespace(model=types.SimpleNamespace(lm_head=target_head)))
@@ -333,7 +349,8 @@ class TestResidentEmbeddingLoad(CustomTestCase):
         built_weight = embed.weight
         old_head = torch.nn.Module()
         old_head.weight = torch.nn.Parameter(torch.zeros(8, 4, dtype=torch.bfloat16), requires_grad=False)
-        target_head = object()
+        target_head = torch.nn.Module()
+        target_head.weight = torch.nn.Parameter(torch.zeros(8, 4, dtype=torch.bfloat16), requires_grad=False)
         producer, draft_model = self._producer(embed, old_head, target_head)
         ref = weakref.ref(old_head)
         ck = [
@@ -347,10 +364,15 @@ class TestResidentEmbeddingLoad(CustomTestCase):
         self.assertIs(draft_model.model.embed_tokens.weight, built_weight)  # into the built tensor
         self.assertTrue(bool((built_weight == 3).all()))
         self.assertIs(draft_model.lm_head, target_head)
+        self.assertEqual(list(old_head.named_parameters()), [], "the never-loaded table must be DELETED, not merely unbound")
+        self.assertAlmostEqual(producer.head_released_mib, 8 * 4 * 2 / float(2**20))
         del old_head
-        self.assertIsNone(ref(), "the head's own lm_head must be released, not left to a GC that the profiler runs before")
+        self.assertIsNone(ref(), "the gutted module should also go, but that alone is not the release")
         self.assertTrue(ec.called, "the released transient must reach the driver before the profiler reads free VRAM")
         self.assertAlmostEqual(mib, (8 * 4 + 8 * 2) / float(2**20))
+        # W11 reads the live weight bytes; the shared target head is the
+        # target's spend, not the producer's.
+        self.assertAlmostEqual(producer.resident_mib, (8 * 4 + 8 * 2) / float(2**20))
 
     def test_fix2_refuses_a_dtype_cast_and_an_orphan_scale(self):
         from unittest import mock
@@ -359,7 +381,7 @@ class TestResidentEmbeddingLoad(CustomTestCase):
 
         embed = torch.nn.Module()
         embed.weight = torch.nn.Parameter(torch.zeros(8, 4, dtype=torch.bfloat16), requires_grad=False)
-        producer, _ = self._producer(embed, torch.nn.Module(), object())
+        producer, _ = self._producer(embed, torch.nn.Module(), torch.nn.Module())
         ck = [("model.language_model.embed_tokens.weight", torch.zeros(8, 4, dtype=torch.int8))]
         with mock.patch.object(dkp, "_iter_checkpoint_tensors", lambda path, needle: iter(ck)):
             with self.assertRaisesRegex(RuntimeError, "int8.*bfloat16|dtype"):
