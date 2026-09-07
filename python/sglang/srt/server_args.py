@@ -5543,154 +5543,6 @@ class ServerArgs:
             "read when --kv-reshard-vectors is set.",
         ),
     ] = 8
-    enable_phase_flip: A[
-        bool,
-        Arg(
-            help="#631 Route A: PP-prefill <-> TP-decode phase flip. The "
-            "server boots as the PP topology (pp_size ranks, tp=1) and "
-            "additionally builds a SECONDARY tp/dcp group set over the same "
-            "ranks plus a TP-shaped runner stack; at a quiescent regime "
-            "boundary the SAME ranks flip layout (weights arena refill, KV "
-            "and GDN state redistribution on the #297 consensus envelope), "
-            "serve decode as TP, and flip back for the next prefill regime. "
-            "Requires --phase-flip-tp-vector. V1 scope: single node, pure "
-            "PP boot topology (tp_size 1), no PD, no hierarchical cache, "
-            "no dual-group lane, no dp/ep, no speculation (the TP+NEXTN "
-            "decode arm is the named follow-up). Default off = none of the "
-            "secondary machinery is built, byte-identical to today.",
-        ),
-    ] = False
-    phase_flip_policy: A[
-        str,
-        Arg(
-            help="#631: who decides when to flip. 'manual' (default) means "
-            "nothing flips unless a POST /phase_flip says so -- the server "
-            "then rests in whatever layout the last call left it in, which "
-            "is why a production instance could serve long prefills from "
-            "the TP layout indefinitely. 'auto' installs the phase policy: "
-            "PP rank 0 (the rank that owns the request intake) reads the "
-            "pending prefill queue each round and arms flips by injecting "
-            "the SAME control request the RPC path uses, so every rank "
-            "arms through one already-proven code path and no rank can "
-            "decide alone. Thresholds are env-tunable: "
-            "SGLANG_PHASE_POLICY_FLIP_TOKENS (the break-even token count "
-            "N, derived from the measured flip cost and the two prefill "
-            "throughputs), SGLANG_PHASE_POLICY_MIN_DWELL_S (the thrash "
-            "bound, independent of N), SGLANG_PHASE_POLICY_IDLE_DWELL_S "
-            "and HTSGLANG_PHASE_IDLE_STATE (prefill|decode -- which layout "
-            "a drained server returns to; prefill is the default because "
-            "an idle flip is free while a flip inside a request's TTFT is "
-            "not). Requires --enable-phase-flip.",
-            choices=["manual", "auto"],
-        ),
-    ] = "manual"
-    phase_flip_purity: A[
-        Optional[str],
-        Arg(
-            help="#631: how strictly each layout is confined to the work it "
-            "is for. 'prefill_in_tp' is the DEFAULT since 2026-08-14 (user, "
-            "explicit): decode still never runs in the PP layout, but prefill "
-            "MAY run in the TP layout below the break-even N, so a short "
-            "prompt arriving at an idle server is served where it lands "
-            "instead of paying a cutover round trip for it. "
-            "'strict' forbids BOTH mixed cases: no decode "
-            "step executes in the PP prefill layout, and not a single token "
-            "is prefilled in the TP decode layout. #874 measured what that "
-            "second half costs on this rig: a 13-token health-check ping took "
-            "15.6-16.6 s, all of it two ~6.3 s cutovers plus the minimum "
-            "dwell between them, because under 'strict' the flip threshold "
-            "collapses to 0 and ANY pending token arms a cutover -- while the "
-            "seam's dominant term (the weights arena, 16.4 GiB per rank) is "
-            "occupancy-independent and does not shrink for a small request. "
-            "Work for the other layout "
-            "is DEFERRED and executed batched after the next flip, so the "
-            "server alternates: run all pending prefill in PP (decode work "
-            "queues) -> flip -> run the deferred decode in TP with CUDA "
-            "graphs and speculation (prefill queues) -> flip. Measured "
-            "reason: with the layouts mixed, 87 decode batches ran in the PP "
-            "layout at 35 tok/s with no graphs while prefill barely "
-            "advanced, each half starving the other (2026-08-09). "
-            "'strict:<n>' (#887) is 'strict' PLUS the exception the user "
-            "granted on 2026-08-25: the TP phase may compute at most <n> "
-            "chunks of prefill ITSELF per TP phase, after which the strict "
-            "rule applies again until the next cutover. 'strict:1' is the "
-            "permission as granted -- ONE chunk. It is a valve against the "
-            "#858 shape (under bare 'strict' the TP phase may admit no "
-            "prefill at all, so a tp_to_pp hold waits for work this layout "
-            "forbids and nothing times it out), not a relaxation of the mode: "
-            "the flip is still demanded for the prefill behind that chunk, "
-            "and the policy's break-even N still collapses to 0. A HiCache or "
-            "radix RESTORE does not spend the budget and is unbounded in TP, "
-            "per the user's own qualification -- the cap is measured on "
-            "COMPUTED tokens only. 'strict:0' is exactly 'strict'. "
-            "'threshold:<n>' is the ESCAPE HATCH: decode may still run in "
-            "the PP layout while at most <n> requests are decoding, trading "
-            "a little layout purity for tail latency; it does NOT relax the "
-            "prefill-in-TP prohibition (TP prefills at 1681 tok/s against "
-            "PP's 7245) -- use 'prefill_in_tp' for that. This clause used to "
-            "add that the prohibition 'has no latency argument on the other "
-            "side'; #874 measured the argument and it is the seam: below "
-            "N = seam_s / (1/1681 - 1/7245) tokens, reaching PP costs more "
-            "than prefilling in place, which is exactly what N is for. "
-            "'off' lifts both and restores the pre-purity interleaving, kept "
-            "reachable for A/B only. The accepted cost of 'strict' is that a "
-            "request mid-decode when prefill pressure arrives is PAUSED, "
-            "resident, until the next TP window. Requires "
-            "--enable-phase-flip; env fallback SGLANG_PHASE_FLIP_PURITY.",
-        ),
-    ] = None
-    phase_flip_tp_vector: A[
-        Optional[str],
-        Arg(
-            help="#631: the weighted uneven-DCP token vector of the TP "
-            "decode phase, one comma-separated entry per rank (e.g. "
-            "'30,17,17'). Mandatory with --enable-phase-flip, refused "
-            "without it. Length must equal pp_size (the same ranks flip). "
-            "Also the TP layout's KV owner rule -- both phase pools are "
-            "sized at boot from it (DESIGN_631 section 3.4a).",
-        ),
-    ] = None
-    phase_flip_spill_depth: A[
-        Optional[str],
-        Arg(
-            help="#656 spec item 6: how much of the INACTIVE layout's cold "
-            "memory is given up at each phase change, as a selectable ladder "
-            "trading flip duration against reclaimed VRAM. Cumulative. "
-            "'none' keeps the pre-#656 behaviour. 'cache' (DEFAULT under "
-            "--enable-phase-flip) returns the outgoing phase's cached "
-            "allocator segments to the driver at the cutover seam. That rung "
-            "exists because the corridor is stated in NVML's FREE column, "
-            "which counts torch's cached-but-unused segments as USED: a "
-            "prefill grows the allocator's reserve by ~19-26 MiB per 1000 "
-            "prompt tokens per card on this rig and the allocator never "
-            "hands those blocks back, so the corridor decays one step per "
-            "longest-prefill-so-far and never recovers. Measured 2026-08-10 "
-            "on the live instance, the release returned 2.5-3.5 GiB per "
-            "card. It reclaims RESIDUE, not peak -- the transient a long "
-            "prefill needs while it runs is live and no allocator call can "
-            "return it. 'draft' additionally releases the DRAFT model's "
-            "weights (~1925 MiB/rank here) for the whole PP phase, where the "
-            "drafter is provably idle under strict purity -- measured as the "
-            "binding phase on both 3080s, so this rung is worth its full "
-            "payload. The weights sit on a VA-stable CUDA-VMM reservation, so "
-            "the spill unmaps PHYSICAL pages while every address the TP "
-            "decode graphs baked stands still; that is what makes this rung "
-            "compatible with keeping draft graphs ON, which spec item 8 "
-            # `%%`: argparse expands help through `%`-formatting, and `% o`
-            # parses as the octal conversion with a space flag -- one literal
-            # percent here made `--help` raise for EVERY option, not just this
-            # one. Pinned by test_help_text_renders.
-            "measured as worth 41%% of decode throughput. 'draft' REQUIRES "
-            "--phase-flip-purity strict (a PP-phase decode would touch "
-            "unbacked memory) and is refused at boot otherwise. "
-            "'draft+graphs' remains defined and REFUSED rather than clamped: "
-            "a captured graph cannot be refilled from a host image, it must "
-            "be re-CAPTURED per flip, which is a different trade and needs "
-            "its own measurement. Integers 0..3 are accepted so a depth "
-            "sweep can be scripted. Requires --enable-phase-flip; env "
-            "fallback SGLANG_PHASE_FLIP_SPILL_DEPTH.",
-        ),
-    ] = None
 
     # ------------------------------------------------------------------
     # #781: PROMOTED FROM ENV. These were SGLANG_* environment variables
@@ -5837,9 +5689,9 @@ class ServerArgs:
     seam_shrink: A[
         Optional[bool],
         Arg(
-            help="#834: run the flip's device-tier quiesce at ARM time and "
+            help="#834: run the seam's device-tier quiesce at ARM time and "
             "defer the rank-local KV grow out of the no-return window, "
-            "shrinking the cutover. OFF by default: both halves change WHEN "
+            "shrinking the seam. OFF by default: both halves change WHEN "
             "work happens relative to a collective, and their failure modes "
             "are invisible to a hermetic suite. Promoted from "
             "SGLANG_SEAM_SHRINK (#837); unset falls back to that env var, "
@@ -5871,8 +5723,8 @@ class ServerArgs:
             "shouts GROW-DEBT-UNPAID and names #814. A patience, not a "
             "measurement. 0 DISABLES THE ALARM ENTIRELY -- it does not mean "
             "'shout immediately', which is the natural reading and the wrong "
-            "one: the consumer returns early on patience <= 0 "
-            "(phase_flip_runtime.py:4753). Disabling it silences the guard on "
+            "one: the consumer returns early on patience <= 0. "
+            "Disabling it silences the guard on "
             "the one failure mode in this family that costs capacity silently "
             "and permanently (W13b criterion 13), so 0 is a deliberate act, "
             "not a tuning value. Promoted from "
@@ -5887,8 +5739,8 @@ class ServerArgs:
             "the arm is refused by name instead of the seam silently holding "
             "the ring. 0 disables the guard (the projection is still logged). "
             "The in-code default 1094 is DERIVED, not pinned: it is the "
-            "largest cutover observed across the 1014-flip HiCache-off corpus "
-            "in ANALYSE_830 section 2.1. Promoted from "
+            "largest layout change observed across the 1014-event "
+            "HiCache-off corpus in ANALYSE_830 section 2.1. Promoted from "
             "SGLANG_FLIP_SEAM_DRAIN_BUDGET_MS (#837).",
         ),
     ] = None
@@ -5909,18 +5761,6 @@ class ServerArgs:
             "Promoted from SGLANG_COLLECTIVE_CENSUS_INTERVAL (#781). Note the "
             "old env was read once at MODULE IMPORT into a global, so a later "
             "change was invisible; the flag is read per scheduler.",
-        ),
-    ] = None
-    phase_flip_corridor_floor_mib: A[
-        Optional[int],
-        Arg(
-            help="Corridor floor in MiB used by the phase-flip spill planner. "
-            "Promoted from SGLANG_CORRIDOR_FLOOR_MIB (#781), which was REMOVED "
-            "from the boot env because it silently overrode the corridor law "
-            "that lives in code (corridor_guard.CORRIDOR_LAW_MIB = 1024, band "
-            "819-1229): measurements were being judged against a band the "
-            "server did not use. Unset means the code law governs, which is "
-            "the intended state; set it only for a deliberate experiment.",
         ),
     ] = None
 
@@ -6074,16 +5914,6 @@ class ServerArgs:
             "SGLANG_KV_BACKING_RELIEF (#781). Default is ON."
         ),
     ] = None
-    phase_flip_image_file_backed: A[
-        Optional[bool],
-        Arg(
-            help="Keep phase-flip weight images as file-backed reclaimable "
-            "page cache instead of pinned anon-shared memory. Promoted from "
-            "SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED (#781). Without this the "
-            "images are ~68.7 GiB of unreclaimable host RAM on a swapless "
-            "box and the boot is OOM-killed during init.",
-        ),
-    ] = None
     corridor_rebalance: A[
         Optional[bool],
         Arg(
@@ -6114,13 +5944,13 @@ class ServerArgs:
         ),
     ] = None
 
-    phase_flip_canonical_kv_page: A[
+    hicache_canonical_kv_page: A[
         bool,
         Arg(
             help="#706: persist HiCache KV pages in the GEOMETRY-NEUTRAL "
             "whole-page format, so tokens produced by the same model do not "
-            "miss between the PP prefill phase and the TP decode phase, or "
-            "across a reboot. A stored page carries EVERY attention layer of "
+            "miss between a prefill group and a decode group, or across a "
+            "reboot. A stored page carries EVERY attention layer of "
             "one token (page_size 1, layer-major, global layer order); each PP "
             "stage deposits only its own slots at their global offset into one "
             "shared page and a completeness marker keeps the page invisible "
@@ -6132,48 +5962,17 @@ class ServerArgs:
             "format rather than applied to every PP run: the key carries "
             "exactly the geometry the bytes still depend on. Draft pages are "
             "excluded by name (head-sharded and token-complete, so no suffix "
-            "rule can neutralise them: the draft pool starts cold after a flip "
-            "and a cross-phase hit is PARTIAL by design), and component "
-            "(mamba/SWA) pools keep their per-rank keys. Requires "
-            "--enable-phase-flip, the 'file' storage backend and page_size 1. "
+            "rule can neutralise them: a draft pool starts cold in a group "
+            "that did not produce it and a cross-group hit is PARTIAL by "
+            "design), and component (mamba/SWA) pools keep their per-rank "
+            "keys. Requires the 'file' storage backend and page_size 1. "
+            "Renamed from --phase-flip-canonical-kv-page in #1233 (Weg 2 S0): "
+            "the format is a HiCache property, not a property of an "
+            "in-process phase change, and the groups that read each other's "
+            "pages are now separate processes. "
             "Default off = keys and bytes byte-identical to today.",
         ),
     ] = False
-    phase_flip_writeback: A[
-        bool,
-        Arg(
-            help="#703: push warm prefixes to the geometry-neutral store "
-            "BEFORE each phase flip, instead of hoping the normal write-back "
-            "policy already did. Nothing in the flip path touches HiCache "
-            "today: device rows ride through (the live row set is relocated by "
-            "row id), but the HOST tier is bound to the pool that BUILT it -- "
-            "the boot PP stack -- and in the TP phase that is not the live "
-            "pool, so the only way across the flip for a prefix is the disk "
-            "tier. Getting it there is not automatic: under "
-            "--hicache-write-policy write_back a prefix is staged only under "
-            "eviction pressure, and the host->storage stage is an asynchronous "
-            "queue that a flip neither forces nor waits for. This hook stages "
-            "the un-backed prefixes of the tree and WAITS for the storage "
-            "acknowledgements under a deadline "
-            "(--phase-flip-writeback-deadline-s), never unbounded: it runs "
-            "with requests parked, where an unbounded wait is a wedge. "
-            "REFUSES LOUDLY without --phase-flip-canonical-kv-page, because "
-            "pages keyed by the geometry of one phase cannot be read by the "
-            "other and the IO would buy nothing. Requires --enable-phase-flip. "
-            "Default off.",
-        ),
-    ] = False
-    phase_flip_writeback_deadline_s: A[
-        Optional[float],
-        Arg(
-            help="#703: hard bound on the flip-time writeback wait, in "
-            "seconds (default 2.0). Whatever is not acknowledged in time stays "
-            "in flight and is reported; the flip proceeds either way. A prefix "
-            "that misses the store costs a later cache miss, while a flip "
-            "stalled behind an unbounded drain costs the instance. Requires "
-            "--phase-flip-writeback.",
-        ),
-    ] = None
     scheduler_distributed_teardown: A[
         bool,
         Arg(
@@ -6211,26 +6010,6 @@ class ServerArgs:
             "bisecting.",
         ),
     ] = 120.0
-    phase_flip_rebind_hicache: A[
-        bool,
-        Arg(
-            help="#719: move the HiCache pool bindings to the phase-active "
-            "pools at the cutover, so the device tier is usable in BOTH "
-            "phases instead of only the one that built it. Without this the "
-            "controller, the radix cache and the scheduler all name the boot "
-            "(PP) pool permanently, and #718 disarms device-tier I/O in the TP "
-            "phase because copying against the wrong pool is silent corruption "
-            "in both directions. The rebind is ALL THREE READERS OR NONE and "
-            "is verified by generation afterwards: a rebind one subsystem sees "
-            "and another does not is worse than no rebind, because every call "
-            "still succeeds against different memory. It REFUSES unless the "
-            "incoming phase has its own host pool of matching shape -- a host "
-            "pool is allocated FROM a device pool, so reusing the other "
-            "phase's would copy matching row ids at mismatched widths. "
-            "Requires --enable-phase-flip. Default off = the #718 disarm "
-            "stands and behaviour is byte-identical.",
-        ),
-    ] = False
     enable_session_checkpoints: A[
         bool,
         Arg(
@@ -7111,9 +6890,10 @@ class ServerArgs:
         # start and quietly observe under an acting flag.
         self._handle_regime_controller()
 
-        # #631 Route A: validate the phase-flip surface at argument time
-        # (an invalid flip config fails the boot, not the first flip).
-        self._handle_phase_flip()
+        # #706: validate the geometry-neutral page format at argument time
+        # (an unusable backend or page size fails the boot, not the first
+        # store write).
+        self._handle_hicache_canonical_kv_page()
 
         # Erg. 9/9b KV pressure ladder: validate the step spec, the two
         # water marks and the asymmetric windows at argument time (a typo
@@ -7317,119 +7097,9 @@ class ServerArgs:
 
         materialize_declarations(self)
 
-        # #806: last, because it must read the RESOLVED value. Radix can be
-        # switched off by four handlers that run above (see the helper), so a
-        # check placed with the flip handler would pass a launch this one
-        # refuses.
-        self._validate_phase_flip_needs_a_tree_cache()
-        self._validate_phase_flip_needs_hierarchical_cache()
-
         self._dump_observation_ledger()
 
-    def _validate_phase_flip_needs_hierarchical_cache(self):
-        """#856: refuse --enable-phase-flip x hierarchical cache OFF at launch.
 
-        THE FLIP CARRIES NO KV. Its seam retracts every resident request and
-        DROPS the prefix tree, so the next phase's device tier is empty by
-        construction and every prefix it serves must come back through
-        HiCache. Without the hierarchical cache there is no tier to come back
-        through: the fence (#703 flip writeback) has nowhere to persist to, the
-        retracted prefixes are simply gone, and every carried conversation
-        silently re-prefills from scratch on every flip.
-
-        That is a CORRECTNESS-SHAPED cost, not a tuning one, which is why it
-        is refused rather than warned about. It is also invisible at runtime --
-        the flip completes, the requests complete, and only the token bill and
-        the latency say anything happened.
-
-        SAME SHAPE AND SAME PLACE AS #806, deliberately: that check refuses
-        --enable-phase-flip x --disable-radix-cache here, for the neighbouring
-        reason that the flip cannot enumerate what it must move. This one says
-        the flip cannot RESTORE what it deliberately drops. Both run after
-        `materialize_declarations`, so both read RESOLVED values -- the
-        hierarchical cache is switched by several handlers above and a check
-        placed with the flip handler would pass a launch this one refuses.
-
-        NO FALLBACK IS OFFERED ON PURPOSE. Reviving the KV mover for this case
-        would reintroduce the seam this ticket retired, the staging reserve
-        behind W25's 33 refused arms, and the resident carry that made #825's
-        tree reset crash. Both exits are named instead, because which one is
-        right depends on what the operator wanted and the process cannot know.
-
-        Nothing here runs unless phase flip is enabled, so every launch
-        without it is byte-identical.
-        """
-        if not self.enable_phase_flip or self.enable_hierarchical_cache:
-            return
-        raise ValueError(
-            "--enable-phase-flip requires --enable-hierarchical-cache.\n"
-            "Since #856 the flip carries NO KV: at the seam it retracts every "
-            "resident request and drops the prefix tree, so the next phase "
-            "starts with an empty device tier and restores prefixes by "
-            "read-through from the hierarchical cache. With the hierarchical "
-            "cache off there is nothing to read through -- the flip-time "
-            "writeback has nowhere to persist, and every conversation "
-            "re-prefills from scratch on each flip, silently.\n"
-            "Either add --enable-hierarchical-cache (a flip run needs the "
-            "host tier), or drop --enable-phase-flip (a run without the host "
-            "tier cannot flip). There is deliberately no fallback that moves "
-            "KV across the seam instead: that path is retired."
-        )
-
-    def _validate_phase_flip_needs_a_tree_cache(self):
-        """#806: refuse --enable-phase-flip x --disable-radix-cache at launch.
-
-        THE DEAD ARM. Without a radix cache the scheduler builds a
-        ``ChunkCache`` (``mem_cache/registry.py``, the
-        ``disable_radix_cache`` branch), and no ChunkCache variant --
-        ``ChunkCache``, ``SWAChunkCache``, ``PureSWAChunkCache`` -- implements
-        ``all_values_flatten``. The flip's own guard tests for exactly that
-        method (``phase_flip_runtime.py:1292``) and appends "tree cache
-        ChunkCache (no all_values_flatten enumeration)" to the guard list, so
-        EVERY flip is refused, every round, for the life of the process.
-
-        It cannot work, either: the flip has to enumerate the live KV slots to
-        move them, and a ChunkCache keeps no tree to enumerate. This is a
-        contradiction between two flags, not a tuning question.
-
-        WHY AT LAUNCH. The runtime refusal is correct and must stay -- it is
-        the guard that keeps the flip from moving KV it cannot enumerate. What
-        it cannot do is tell anyone in time: it fires once per flip attempt,
-        deep in a scheduler round, and says nothing at startup. Arm-1-v1 ran
-        that way to completion: 15 runtime refusals, a flip program that never
-        flipped once, and no hint at the start that it never could. A launch
-        line that cannot do the thing it asks for should not start.
-
-        BOTH EXITS ARE NAMED in the message on purpose. Which one is right
-        depends on what the operator wanted and the process cannot know: a
-        flip run needs the tree, a no-radix run cannot flip.
-
-        Nothing here runs unless BOTH are set, so every launch that sets one,
-        the other, or neither is byte-identical.
-        """
-        if not self.enable_phase_flip or not self.disable_radix_cache:
-            return
-        raise ValueError(
-            "--enable-phase-flip requires a radix cache, but "
-            "--disable-radix-cache is in effect.\n"
-            "Without radix the scheduler builds a ChunkCache, which has no "
-            "all_values_flatten enumeration; the flip guard tests for exactly "
-            "that method and refuses EVERY flip attempt for the life of the "
-            "process (phase_flip_runtime.py, 'tree cache ChunkCache (no "
-            "all_values_flatten enumeration)'). The flip must enumerate the "
-            "live KV slots to move them, and a ChunkCache keeps no tree to "
-            "enumerate -- so this launch would run a flip program that can "
-            "never flip, with no error until the first attempt.\n"
-            "Two ways out, and only you know which one you meant:\n"
-            "  * keep the flip and leave the radix cache ON (drop "
-            "--disable-radix-cache), or\n"
-            "  * keep radix off and drop --enable-phase-flip.\n"
-            "Note --disable-radix-cache can also be switched on for you: by "
-            "--enable-mis, by an HRM-text model, by Whisper, and by the "
-            "dual_chunk_flash_attn attention backend. Each logs its own reason "
-            "above this line; with any of them the second exit is the "
-            "applicable one."
-        )
 
     def _dump_observation_ledger(self) -> None:
         """Build the modelled ledger for the RECORD, not for sizing (#605).
@@ -8546,307 +8216,42 @@ class ServerArgs:
         # the enum member otherwise; store back the canonical string.
         self.objective = resolve_objective(self).value
 
-    def _handle_phase_flip(self):
-        """#631 Route A: argument-time validation of the phase flip.
+    def _handle_hicache_canonical_kv_page(self):
+        """#706: the two conditions the geometry-neutral whole-page format is
+        defined on, checked at argument time.
 
-        DESIGN_631 section 5.1: everything checkable without boot facts is
-        checked here, loudly. Semantic boot-time checks (group formation
-        order, pool sizing, arena fit) live with the builders."""
-        if self.phase_flip_policy not in ("manual", "auto"):
-            raise ValueError(
-                f"--phase-flip-policy={self.phase_flip_policy!r} is not a "
-                f"known mode; use 'manual' or 'auto'."
-            )
-        # Parse the purity mode HERE so an unusable value is an argument
-        # error, not a surprise on the first busy round. parse_purity is the
-        # single definition of what is valid; this call is what makes a typo
-        # loud instead of silently falling back to the default -- a
-        # mis-typed purity that read as 'strict' would look like it was
-        # enforcing a rule the operator never actually set.
-        from sglang.srt.managers.phase_purity import parse_purity
+        Both are silent corruption if left to be discovered later: a backend
+        that cannot do a partial write has no way to assemble a page across
+        stages, and a multi-token page would span token owners, which is why
+        ``dcp_owner_mode`` already requires page_size 1.
 
-        parse_purity(self.phase_flip_purity)
-        if self.enable_phase_flip:
-            self._post_phase_flip_rotation_host_ledger()
-        if not self.enable_phase_flip:
-            if self.phase_flip_purity is not None:
-                raise ValueError(
-                    "--phase-flip-purity requires --enable-phase-flip: with "
-                    "one layout there is no other layout to keep work out "
-                    "of, so the setting would do nothing."
-                )
-            if self.phase_flip_tp_vector is not None:
-                raise ValueError(
-                    "--phase-flip-tp-vector requires --enable-phase-flip "
-                    "(the vector configures the flip's TP layout; alone it "
-                    "does nothing, which would silently mask a typo)."
-                )
-            if self.phase_flip_rebind_hicache:
-                raise ValueError(
-                    "--phase-flip-rebind-hicache requires "
-                    "--enable-phase-flip: with one layout there is only one "
-                    "set of pools, so there is nothing to rebind between."
-                )
-            if self.phase_flip_writeback:
-                raise ValueError(
-                    "--phase-flip-writeback requires --enable-phase-flip: "
-                    "with one layout there is no flip to write back before."
-                )
-            if self.phase_flip_canonical_kv_page:
-                raise ValueError(
-                    "--phase-flip-canonical-kv-page requires "
-                    "--enable-phase-flip: the geometry-neutral page exists so "
-                    "the two phases can name the same bytes, and with one "
-                    "layout there is no second geometry to be neutral "
-                    "towards. Refused rather than ignored -- silently "
-                    "accepting it would move every KV key for nothing."
-                )
-            if self.phase_flip_spill_depth is not None:
-                raise ValueError(
-                    "--phase-flip-spill-depth requires --enable-phase-flip: "
-                    "the ladder gives up the INACTIVE layout's cold memory "
-                    "at a phase change, and without a second layout there is "
-                    "neither an inactive side nor a phase change."
-                )
-            if self.phase_flip_policy != "manual":
-                raise ValueError(
-                    "--phase-flip-policy=auto requires --enable-phase-flip: "
-                    "there is no secondary stack to flip to, so the policy "
-                    "would decide against a layout that does not exist. "
-                    "Refused rather than ignored, so a typo cannot read as "
-                    "'the policy is running'."
-                )
+        WEG 2 (#1233 S0): this used to live inside ``_handle_phase_flip``,
+        behind ``--enable-phase-flip``.  There is no in-process cutover any
+        more -- a process is a prefill process or a decode process for its
+        whole life -- so the flag it hung off is gone and the page format
+        stands on its own as a HiCache property.  The remaining Weg-2
+        refusals for it (both groups must carry it, W10) belong to the
+        launcher, not to argument parsing of one process.
+        """
+        if not self.hicache_canonical_kv_page:
             return
-
-        # SERVING-PROOF CEILING ON THE DERIVED POOL (#656 flip livelock).
-        #
-        # The TP pool is sized from the PP id space, so with no
-        # --max-total-tokens the pool is whatever the VRAM backs. On this rig
-        # that reached 683150 tokens: it booted, held the 1024 MiB corridor
-        # with zero breaches, answered /health with 200 -- and produced NO
-        # TOKENS. Every /generate timed out at 120 s against 362 flip events
-        # and a repeating
-        #   "POLICY holding in tp: min dwell: 3.0s since last flip < 3s
-        #    (pending prefill 1 tok, running bs 0)".
-        # The same build serves normally at 620000. It is the worst failure
-        # class we have: an instance that looks healthy from every side except
-        # the only one that matters.
-        #
-        # ROOT CAUSE, confirmed from the wedged boot's own log:
-        #   121x "staging 464 MiB needed but only 444 MiB is spendable"
-        #   336x "phase flip refused (guards): seam unfundable: tp_to_pp
-        #         abandoned 8 times consecutively"
-        #   179x "PHASE-POLICY arming" at the 3 s dwell cadence
-        # The pool sizer fills to the 1024 MiB corridor floor and leaves
-        # NOTHING for the flip seam, which must stage live KV rows across the
-        # layout change. At 683150 the seam needs 464 MiB and can spend 444 --
-        # short by 20 MiB. Every cutover is abandoned, the guards latch
-        # "seam unfundable", and under strict purity a prefill cannot be built
-        # in the TP phase at all, so the queued token waits forever.
-        # Compounding it, the policy commits its dwell clock in
-        # note_flip_armed BEFORE knowing whether the arm succeeded, and
-        # handle_phase_flip drops the outcome for internal requests, so the
-        # refusal never reaches the policy state: an unfundable seam becomes
-        # an unbounded silent retry instead of a bounded stand-down.
-        #
-        # THE REAL FIX was never this ceiling but a sizer that reserves the
-        # seam's staging bytes on top of the user corridor -- the pool should
-        # be VRAM minus corridor minus staging. THAT HAS LANDED, so the
-        # constant is DELETED rather than raised, exactly as this comment
-        # used to instruct.
-        #
-        # What replaced it, and why a number is no longer the right shape:
-        #   * phase_flip_seam_reserve sizes the pool so EVERY rank can fund
-        #     its own seam, from a position measured on the previous boot
-        #     with every unnamed post already resident.
-        #   * That solver targets equality, so it also carries a margin
-        #     (ENV_MARGIN_MIB, default 192 MiB): boot K3 derived 610942 and
-        #     re-measured 25 MiB the wrong side of its own floor. With the
-        #     margin, boot L2 re-measured every rank ABOVE its floor
-        #     (3716/439, 1004/484, 1340/927 MiB).
-        #   * The flip policy counts refusals and backs off instead of
-        #     re-arming at the dwell interval, which is what turned the
-        #     unfundable seam into a silent livelock in the first place.
-        #
-        # Measured on this rig (#656 kvuniverse-r4, 2026-08-13): with
-        # --phase-flip-tp-vector 30,16,18 the derived pool is 651498 tokens --
-        # ABOVE the 620000 this constant used to pin -- with 24 completed
-        # cutovers in both directions, 0 abandons, 0 refusals, 0 tracebacks,
-        # a 64001-token prefill, real generations, and a continuous 100 ms
-        # corridor minimum under load of 1426/3305/1902 MiB, 0 breaches.
-        #
-        # THE NET THAT STAYS is the seam reserve itself, not a token count: a
-        # pool sized as "VRAM minus corridor" with nothing left for the seam
-        # is the failure this family is about, and seam_reserve_enabled()
-        # defaults to True so that pool cannot be built by accident. A
-        # capacity number still means nothing without a completed generation
-        # beside it -- that discipline is unchanged and belongs to whoever
-        # reads the number, which is why nothing here silently clamps.
-
-        # Default the spill ladder to its lowest MEASURED rung, and resolve it
-        # here so a bad value is an argument error rather than an exception
-        # raised inside a cutover that has already released the source pool's
-        # pages. 'cache' is the default rather than 'none' because leaving it
-        # off is not a neutral choice: without it the corridor decays one step
-        # per longest-prefill-so-far and never recovers, which is a slow leak
-        # of the very budget the acceptance is judged on.
-        if self.phase_flip_spill_depth is None:
-            self.phase_flip_spill_depth = "cache"
-        from sglang.srt.managers.phase_flip_spill import resolve_spill_depth
-
-        resolve_spill_depth(self)
-        if self.phase_flip_tp_vector is None:
+        if self.hicache_storage_backend != "file":
             raise ValueError(
-                "--enable-phase-flip requires --phase-flip-tp-vector (the "
-                "TP decode layout's weighted DCP vector; there is no "
-                "default because pool sizing derives from it)."
+                "--hicache-canonical-kv-page needs "
+                "--hicache-storage-backend file, got "
+                f"{self.hicache_storage_backend!r}. The whole-page format "
+                "assembles one page from several stages by writing byte "
+                "ranges into it; no other backend implements that, and the "
+                "disk tier is where the format has to live anyway for "
+                "context to survive a reboot."
             )
-        try:
-            vec = [int(x) for x in self.phase_flip_tp_vector.split(",")]
-        except ValueError:
+        if self.page_size != 1:
             raise ValueError(
-                f"--phase-flip-tp-vector {self.phase_flip_tp_vector!r} is "
-                f"not a comma-separated integer vector."
-            ) from None
-        if not vec or any(v < 1 for v in vec):
-            raise ValueError(
-                f"--phase-flip-tp-vector entries must be >= 1, got "
-                f"{self.phase_flip_tp_vector!r}."
+                "--hicache-canonical-kv-page requires --page-size 1, "
+                f"got {self.page_size}. A canonical page is ONE token's "
+                "attention layers; a multi-token page would span token "
+                "owners, the same limit weighted uneven-DCP already sets."
             )
-        if self.pp_size <= 1:
-            raise ValueError(
-                "--enable-phase-flip boots as the PP topology and needs "
-                f"pp_size > 1, got pp_size={self.pp_size}."
-            )
-        if len(vec) != self.pp_size:
-            raise ValueError(
-                f"--phase-flip-tp-vector has {len(vec)} entries but "
-                f"pp_size is {self.pp_size}; the flip re-uses the SAME "
-                f"ranks, so the counts must match."
-            )
-        if self.tp_size != 1:
-            raise ValueError(
-                f"--enable-phase-flip V1 boots pure PP (tp_size 1), got "
-                f"tp_size={self.tp_size}."
-            )
-        blockers = []
-        if self.disaggregation_mode != "null":
-            blockers.append("--disaggregation-mode")
-        # #703: the BOOT-TIME twin of the runtime clause in
-        # phase_flip_runtime.flip_blocking_guards, narrowed identically and for
-        # the same reason. The #630 wedge was the DISK tier at warmup; its root
-        # was fixed by 9da9dfd025 (bounded collectives,
-        # mem_cache/hicache_collective.py). Refusing on the mere flag forced the
-        # serving line to run with no cache tier of any kind. Fixing only the
-        # runtime clause is not enough -- this one refuses at parse time, before
-        # a scheduler exists, so both must move together or the flag is still
-        # unusable.
-        # #703 stage 2 REMOVED this blocker, arguing that 9da9dfd025 (bounded
-        # collectives) had fixed the wedge. RESTORED 2026-08-17 when the
-        # configuration wedged on metal for 649 s, and LIFTED AGAIN the same
-        # day -- this time against the condition both twins named for
-        # themselves, and with the defect rooted rather than deferred.
-        #
-        # ROOT CAUSE (e4f1ae2556): bounded_wait POLLED work.is_completed()
-        # against a deadline and only called work.wait() once the poll had
-        # already succeeded. For gloo, is_completed() REPORTS state while
-        # wait() DRIVES the transfer -- so with both peers polling, neither
-        # side advanced the exchange and each sat until its own deadline. The
-        # #630 bound, written to stop a hang, WAS the livelock. Fixed by
-        # handing the deadline to the wait, which progresses and stays bounded.
-        #
-        # THE EVIDENCE IS OF THE REQUIRED KIND, which is the whole point of the
-        # restore that preceded it. test_pp_sync_rendezvous_630.py runs THREE
-        # REAL PROCESSES over a REAL gloo group and asserts the ring
-        # RENDEZVOUSES with the bound ACTIVE, that downstream ranks actually
-        # receive rank 0's values, and that a dead peer still raises the named
-        # bounded error. Mutation-proven: restoring the poll turns the first two
-        # red. Three mock stubs that modelled a wait() ignoring its deadline
-        # were corrected in the same commit -- they encoded the defect's own
-        # assumption, which is why no mock suite could ever have caught it.
-        #
-        # CONFIRMED ON METAL, 2026-08-17: the same PP=3 boot with
-        # --enable-hierarchical-cache --hicache-storage-backend file went from
-        # THREE HiCacheCollectiveTimeoutError occurrences to ZERO, and warmup
-        # advanced past the collective to a healthy flip arm.
-        #
-        # If this configuration wedges again: restore BOTH twins, and do not
-        # accept a green mock suite as grounds to lift them a third time.
-        if getattr(self, "dual_group_lane", False):
-            blockers.append("--dual-group-lane")
-        if self.dp_size > 1:
-            blockers.append("--dp-size > 1")
-        if self.ep_size > 1:
-            blockers.append("--ep-size > 1")
-        # Speculation IS supported now -- in the TP decode phase, which is
-        # what the follow-up this blocker used to name was about. The draft
-        # worker is built on the flip's TP stack and armed at cutover; the
-        # PP prefill phase carries none. Two shapes stay refused, because
-        # for them "armed in one phase only" is not a complete answer:
-        if self.speculative_algorithm is not None:
-            algo = str(self.speculative_algorithm).upper()
-            if algo == "NGRAM":
-                blockers.append(
-                    "--speculative-algorithm ngram (its external corpus "
-                    "manager is wired to the tokenizer channel and is not "
-                    "on the cutover rebuild list)"
-                )
-            if self.speculative_draft_placement == "solo":
-                blockers.append(
-                    "--speculative-draft-placement solo (solo/shadow rank "
-                    "identity is not modelled across a phase flip, where "
-                    "every rank changes topology)"
-                )
-        if blockers:
-            raise ValueError(f"--enable-phase-flip V1 refuses: {', '.join(blockers)}.")
-        if self.phase_flip_writeback and not self.phase_flip_canonical_kv_page:
-            raise ValueError(
-                "--phase-flip-writeback requires "
-                "--phase-flip-canonical-kv-page: the writeback exists to get "
-                "a prefix into a store the OTHER phase can name, and without "
-                "the geometry-neutral format the pages it writes still carry "
-                "the tp/pp suffixes of the phase that wrote them. Refused "
-                "rather than run, because the cost -- IO at the flip seam, "
-                "with requests parked -- would be paid for a hit that cannot "
-                "happen."
-            )
-        if self.phase_flip_writeback_deadline_s is not None:
-            if not self.phase_flip_writeback:
-                raise ValueError(
-                    "--phase-flip-writeback-deadline-s requires "
-                    "--phase-flip-writeback; alone it bounds nothing."
-                )
-            if self.phase_flip_writeback_deadline_s <= 0:
-                raise ValueError(
-                    "--phase-flip-writeback-deadline-s must be > 0, got "
-                    f"{self.phase_flip_writeback_deadline_s}."
-                )
-        self._validate_direct_io()
-
-        if self.phase_flip_canonical_kv_page:
-            # #706: the two conditions the whole-page protocol is defined on.
-            # Both are checkable here, and both are silent corruption if left
-            # to be discovered later -- a backend that cannot do a partial
-            # write has no way to assemble a page across stages, and a
-            # multi-token page would span token owners, which is why
-            # dcp_owner_mode already requires page_size 1.
-            if self.hicache_storage_backend != "file":
-                raise ValueError(
-                    "--phase-flip-canonical-kv-page needs "
-                    "--hicache-storage-backend file, got "
-                    f"{self.hicache_storage_backend!r}. The whole-page format "
-                    "assembles one page from several stages by writing byte "
-                    "ranges into it; no other backend implements that, and the "
-                    "disk tier is where the format has to live anyway for "
-                    "context to survive a reboot."
-                )
-            if self.page_size != 1:
-                raise ValueError(
-                    "--phase-flip-canonical-kv-page requires --page-size 1, "
-                    f"got {self.page_size}. A canonical page is ONE token's "
-                    "attention layers; a multi-token page would span token "
-                    "owners, the same limit weighted uneven-DCP already sets."
-                )
 
     def _handle_regime_controller(self):
         """#363: validate the mode and, for 'act', the entry gate.
@@ -9002,44 +8407,6 @@ class ServerArgs:
                 f"{self.admission_release_hysteresis}."
             )
 
-    def _refuse_incomplete_phase_flip_hicache_sizing_1068(self):
-        """#1068 (WEG 1, slice 1): the phase-flip HiCache rebind needs the
-        staging role AND both absolute knobs, or it refuses.
-
-        WHY. Under ``--phase-flip-rebind-hicache`` every rank carries TWO host
-        KV pools (the pp pool the boot builds and the tp pin the rebind binds
-        to at the cutover) plus two mamba anchor pools. Since #1068 the tp pin
-        is not sized on its own: its ROW COUNT is coupled to the pp pool that
-        ``--hicache-size`` built (phase_flip_boot.build_phase_flip_host_pools),
-        so both phase pools hold the same rows by construction. That coupling
-        has no meaning for a ratio-sized pp pool (a ratio scales with the
-        device pool, which differs per phase), and the anchor pool must be
-        rank-uniform and absolute (``--hicache-mamba-host-mib``, MIN-synced
-        across ranks, memory_pool_host.MambaPoolHost) because a divergent
-        anchor ceiling is a divergent prefetch vote. The role is 'staging' per
-        DESIGN_706_BOOT: the host tier is staging, the disk tier is retention.
-
-        NO RATIO FALLBACK, deliberately: falling back would restore the
-        device-pool-scaled pinned pool silently, under a flag set that claims
-        the opposite. Boots without the rebind flag reach none of this.
-        """
-        if not getattr(self, "phase_flip_rebind_hicache", False):
-            return
-        role = str(self.hicache_host_role)
-        size = int(self.hicache_size or 0)
-        mib = int(getattr(self, "hicache_mamba_host_mib", 0) or 0)
-        if role == "staging" and size > 0 and mib > 0:
-            return
-        raise ValueError(
-            "--phase-flip-rebind-hicache requires --hicache-host-role staging, "
-            "--hicache-size > 0 (GB, absolute; both phase pools are row-coupled "
-            "to it) and --hicache-mamba-host-mib > 0 (MiB per rank, MIN-synced "
-            f"across ranks); got role={role} size={size} mamba_mib={mib}.\n"
-            "The host tier is staging and the disk tier is retention "
-            "(DESIGN_706_BOOT); the tp pin is a second host pool whose rows are "
-            "coupled to --hicache-size, and the anchor pool must be rank-uniform "
-            "and absolute. There is no ratio fallback in this mode."
-        )
 
     def _handle_hicache_host_role(self):
         """#810: fail fast when the host tier is declared staging but sized
@@ -9062,13 +8429,7 @@ class ServerArgs:
         picked a number would be a second authority.
 
         With the role left at 'retention' nothing in this method runs and no
-        other argument changes meaning.
-
-        #1068 (WEG 1): under ``--phase-flip-rebind-hicache`` the three flags
-        are ONE contract and are checked first, before the retention
-        early-return, so a rebind boot can never fall through to a
-        ratio-sized tier."""
-        self._refuse_incomplete_phase_flip_hicache_sizing_1068()
+        other argument changes meaning."""
         if self.hicache_host_role == "retention":
             return
         if not self.enable_hierarchical_cache:
@@ -9114,52 +8475,6 @@ class ServerArgs:
             )
         self._post_hicache_staging_host_ledger()
 
-    def _post_phase_flip_rotation_host_ledger(self):
-        """#809/W28: put the flip-image rotation ring on the host ledger.
-
-        The chunk rotation keeps ONE layout image in RAM plus an overshoot, and
-        the overshoot has two terms (``rotation_overshoot_bytes``): the per-rank
-        size asymmetry and the in-flight window. Only the second is knowable at
-        parse time -- the asymmetry needs the arena layouts, which need the
-        model -- so this prices the RING, which is exact here: chunk x depth,
-        straight from the two envs that size it.
-
-        PRICED, NOT REGISTERED, and the distinction is load-bearing. The ring is
-        allocated in the WORKER, where ``rotation_ring`` builds it through
-        #720's ``ReadBufferPool`` and that charges the process-local registry
-        before allocating (#729). A ``register_pinned_post`` here would create a
-        launcher post for bytes the launcher never pins, which is exactly the
-        helper commit 272d0d9d8c deleted. ``joint_pinned_host_error`` is a pure
-        function and is the right tool at this layer.
-
-        MULTIPLIED BY THE RANKS: every rank runs its own rotation and its own
-        ring, and they all draw on the one machine's RAM.
-        """
-        from sglang.srt.mem_cache.pinned_host_budget import (
-            PinnedHostPost,
-            joint_pinned_host_error,
-            pinned_host_memory_bytes,
-        )
-        from sglang.srt.model_executor.weights_arena import (
-            _refill_chunk_bytes,
-            _refill_depth,
-        )
-
-        ring_bytes = int(_refill_chunk_bytes()) * int(_refill_depth())
-        if ring_bytes <= 0:
-            return
-        ranks = max(1, int(self.tp_size or 1)) * max(1, int(self.pp_size or 1))
-        posts = [
-            PinnedHostPost(
-                name=f"phase-flip rotation staging ring x{ranks} rank(s)",
-                flag="--enable-phase-flip (SGLANG_PHASE_FLIP_REFILL_CHUNK_MIB x _DEPTH)",
-                nbytes=ring_bytes * ranks,
-            )
-        ]
-        total_bytes, available_bytes = pinned_host_memory_bytes()
-        err = joint_pinned_host_error(posts, total_bytes, available_bytes)
-        if err is not None:
-            raise ValueError(err)
 
     def _post_hicache_staging_host_ledger(self):
         """#810: put the staging tier on the boot preflight's host ledger.
@@ -9227,35 +8542,12 @@ class ServerArgs:
                 nbytes=per_rank_bytes * ranks,
             )
         ]
-        # #1068 (WEG 1): under the phase-flip rebind the SECOND phase's pools
-        # are priced too. The tp pin is row-coupled to the staging tier, so
-        # its bytes are per_rank_bytes x (cell_tp / cell_pp); the exact cell
-        # ratio is a model property the launcher does not know, so this is a
-        # parse-time CEILING (2x, the ratio on this cut: 16 attention layers
-        # in tp vs 8 on pp0), and the boot-time HOST-LEDGER line
-        # (phase_flip_boot) prices it exactly. The anchor pools are exact:
-        # --hicache-mamba-host-mib per rank, two phases.
-        rebind = bool(getattr(self, "phase_flip_rebind_hicache", False))
-        tp_pin_bytes = 0
-        anchor_bytes = 0
-        if rebind:
-            tp_pin_bytes = per_rank_bytes * ranks * 2
-            posts.append(
-                PinnedHostPost(
-                    name="phase-flip tp pin (rows-coupled to --hicache-size, ceiling estimate 2x)",
-                    flag="--hicache-size (phase-flip)",
-                    nbytes=tp_pin_bytes,
-                )
-            )
-            anchor_mib = int(getattr(self, "hicache_mamba_host_mib", 0) or 0)
-            anchor_bytes = anchor_mib * (1024**2) * ranks * 2
-            posts.append(
-                PinnedHostPost(
-                    name="HiCache mamba anchor pools x2 phases",
-                    flag="--hicache-mamba-host-mib",
-                    nbytes=anchor_bytes,
-                )
-            )
+        # #1233 (WEG 2, S0): the second-phase pools this used to price are
+        # gone with the in-process rebind. One process owns exactly one host
+        # pool for its whole life, so the staging post above is the whole
+        # host-tier charge this parse can make. The Weg-2 host ledger for the
+        # OTHER group is priced by the launcher, which is the only place that
+        # knows how many groups this card carries.
         kvso_bytes = int((self.kv_session_offload_host_ram_gib or 0) * (1024**3))
         if kvso_bytes > 0:
             posts.append(
@@ -9346,23 +8638,6 @@ class ServerArgs:
         # The ledger entry itself. Without a line the operator can read, a
         # tier that got smaller is invisible in exactly the same way it was
         # when it was large.
-        if rebind:
-            logger.info(
-                "#810 host ledger: staging tier %.2f GB x %d rank(s) + phase-flip "
-                "tp pin ceiling %.2f GB (2x) + mamba anchor pools %.2f GB (x%d "
-                "ranks x2 phases) = %.2f GB against available %.2f GB minus "
-                "reserve %.2f GB%s",
-                per_rank_bytes / 1e9,
-                ranks,
-                tp_pin_bytes / 1e9,
-                anchor_bytes / 1e9,
-                ranks,
-                (per_rank_bytes * ranks + tp_pin_bytes + anchor_bytes) / 1e9,
-                (int(available_bytes) / 1e9) if available_bytes is not None else -1.0,
-                PINNED_HOST_RESERVE_BYTES / 1e9,
-                pin_note,
-            )
-            return
         logger.info(
             "#810 host ledger: staging tier %.2f GB x %d rank(s) = %.2f GB "
             "pinned host RAM (%s).%s",
@@ -17237,21 +16512,42 @@ class ServerArgs:
         ``RankResources`` by hand rather than dispatching through here, so a
         mirror of the path could not discover that the path was dead.
 
-        THE VECTOR IS THE TOKEN VECTOR, NOT THE FLIP WEIGHT VECTOR.
-        ``token_shares_from_vector`` says so in its own docstring: pass what
-        ``parse_flip_token_vector`` returns -- the resolved
-        ``SGLANG_UNEVEN_TOKEN_VECTOR``, or the flip vector when that env is
-        unset and the two genuinely coincide -- and never
-        ``--phase-flip-tp-vector`` read straight off the flag. The weight
-        shard follows COMPUTE and the token split follows each rank's
-        REMAINING memory once its weights are placed; sizing the arena with
-        the compute vector makes the most compute-loaded rank binding and the
-        min-reduce drags the group down to its unit.
+        THE VECTOR IS THE TOKEN VECTOR, NOT A WEIGHT VECTOR. The weight shard
+        follows COMPUTE and the token split follows each rank's REMAINING
+        memory once its weights are placed; sizing the arena with the compute
+        vector makes the most compute-loaded rank binding and the min-reduce
+        drags the group down to its unit. ``SGLANG_UNEVEN_TOKEN_VECTOR`` is
+        the one place that ratio is declared.
+
+        #1233 (WEG 2, S0): ``None`` when the env is unset, and that is a
+        MEANINGFUL answer, not a missing one. This used to fall back to the
+        weight vector of a second layout that lived in the same process; one
+        process now carries exactly one layout for its whole life, so there
+        is no second arena to split against and ``tp_token_shares=None`` is
+        the input that says so (``pp_cut.py`` reads it as "arena_layers =
+        n_attn", i.e. no dual-layout max()).
         """
-        from sglang.srt.managers.phase_flip_boot import parse_flip_token_vector
+        from sglang.srt import environ as _environ
         from sglang.srt.planner import pp_cut
 
-        return pp_cut.token_shares_from_vector(parse_flip_token_vector(self))
+        raw = _environ.envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+        if not raw:
+            return None
+        try:
+            vec = [int(x) for x in str(raw).split(",")]
+        except ValueError as e:
+            raise ValueError(
+                f"SGLANG_UNEVEN_TOKEN_VECTOR={raw!r} is not a comma-separated "
+                f"list of integers."
+            ) from e
+        if len(vec) != int(self.pp_size):
+            raise ValueError(
+                f"SGLANG_UNEVEN_TOKEN_VECTOR={raw!r} has {len(vec)} entries "
+                f"but pp_size is {self.pp_size}. The token split is a "
+                f"per-rank ratio over the ranks of this group, so the "
+                f"lengths must agree."
+            )
+        return pp_cut.token_shares_from_vector(vec)
 
     def _pp_cut_transients(self, calibration, census_dir: str):
         """Per-rank measured transient tables, or a refusal naming the fix.
@@ -17335,14 +16631,14 @@ class ServerArgs:
                     f"--pp-solve-cut {census_dir!r} carries no measured SEAM "
                     f"staging for stage {stage}, and the cut gate will not "
                     f"price the seam at zero. A cut that fits AT REST can "
-                    f"still be unable to reach its cutover: on the reference "
-                    f"rig the tp_to_pp seam drew 5800 MiB modally and 7055 "
+                    f"still be unable to reach a layout change: on the "
+                    f"reference rig that seam drew 5800 MiB modally and 7055 "
                     f"MiB at worst on the binding rank, while the gate that "
                     f"admitted that cut funded 0 MiB of it and reported "
                     f"374.9 MiB of headroom. Re-take the census on a boot "
-                    f"with --enable-phase-flip that actually FLIPS -- the "
-                    f"seam states are written by the cutover, so a boot that "
-                    f"never flipped measures no seam -- with "
+                    f"that exercises the seam -- the seam load states are "
+                    f"written by the layout change, so a boot that never "
+                    f"changed layout measures no seam -- with "
                     f"SGLANG_RESIDENCY_CENSUS=1, SGLANG_TRANSIENT_CENSUS=1 "
                     f"and SGLANG_RESIDENCY_CENSUS_DIR={census_dir}."
                 )
@@ -18813,10 +18109,6 @@ class ServerArgs:
             os.environ["SGLANG_UNEVEN_DCP_WEIGHTED"] = _b(self.uneven_dcp_weighted)
         if self.kv_backing_relief is not None:
             os.environ["SGLANG_KV_BACKING_RELIEF"] = _b(self.kv_backing_relief)
-        if self.phase_flip_image_file_backed is not None:
-            os.environ["SGLANG_PHASE_FLIP_IMAGE_FILE_BACKED"] = _b(
-                self.phase_flip_image_file_backed
-            )
         if self.corridor_rebalance is not None:
             os.environ["SGLANG_CORRIDOR_REBALANCE"] = _b(self.corridor_rebalance)
         if self.enable_tp_memory_imbalance_check is not None:
@@ -20163,22 +19455,17 @@ class ServerArgs:
             assert self.disable_overlap_schedule, (
                 "Pipeline parallelism is not compatible with overlap schedule"
             )
-            # #631 Route A: a phase-flip instance is ONE instance that runs
-            # PP for prefill and flips to TP for decode on the same ranks.
-            # Speculation is armed for the TP DECODE phase only: the draft
-            # worker is built on the flip's TP stack and swapped in at
-            # cutover, while the PP phase runs with spec_algorithm NONE and
-            # no draft worker at all.
-            #
-            # So the incompatibility this assert states is NOT waived -- no
-            # draft worker exists in a PP phase, the constructors take no
-            # pp_rank, and none is built. It is enforced by construction
-            # instead of by refusing the flag combination.
-            assert self.speculative_algorithm is None or self.enable_phase_flip, (
+            # #1233 (WEG 2, S0): back to the plain upstream refusal. The
+            # waiver that used to sit here existed because ONE process was
+            # both the PP prefill stack and the TP decode stack, and
+            # speculation was armed on the second one. Weg 2 splits those
+            # into two process groups: the prefill group is pure PP and
+            # carries no draft worker (no constructor here takes a pp_rank),
+            # and the decode group is TP with pp_size 1, so it never reaches
+            # this branch at all.
+            assert self.speculative_algorithm is None, (
                 "Pipeline parallelism is not compatible with speculative "
-                "decoding. With --enable-phase-flip, speculation runs in the "
-                "TP decode phase instead: the draft worker is built on the "
-                "flip's TP stack and armed at cutover."
+                "decoding."
             )
 
         assert not (

@@ -32,13 +32,10 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers import pp_admission_bulletin as pp_bulletin
-from sglang.srt.managers.io_struct import PhaseFlipReqInput
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.phase_flip_counters import (
+from sglang.srt.managers.pp_wire_channels import (
     CHAN_DICT,
-    CHAN_PASS,
     CHAN_REQ,
-    CHAN_SLOT,
     kind_axis_covers,
     kind_channel,
 )
@@ -57,7 +54,6 @@ from sglang.srt.managers.pp_row_defer_cap import (
     RowDeferCap,
 )
 from sglang.srt.managers.pp_stash_disposition import (
-    PP_LOOP_ONLY,
     UNDECLARED,
     census_stash,
     stash_keys_with_disposition,
@@ -3009,9 +3005,7 @@ def pp_apply_dead_premise_at_chunk_boundary(holder, req) -> str:
     # happened at phase_flip_draft_bootstrap.py (W37-B, 2026-08-25) and
     # scheduler.py:8108 carries the same warning in a comment. #946 spelled a
     # third copy regardless. Use the canonical one rather than adding a fourth.
-    from sglang.srt.managers.phase_flip_draft_bootstrap import (
-        prefix_len as _prefix_len,
-    )
+    from sglang.srt.managers.schedule_batch import prefix_len as _prefix_len
 
     discarded = _prefix_len(req)
     logger.warning(
@@ -3921,80 +3915,6 @@ def pp_pass_retraction_reason_of(holder, mb_id: int) -> Optional[str]:
     return fn(mb_id) if fn is not None else None
 
 
-def classify_armed_drain_message(msg, ran_mb_ids, epoch: Optional[int] = None) -> tuple:
-    """``(action, kind, why)`` for one message taken while ARMED.
-
-    #757. The armed drain used to be kind-BLIND and discard everything, which
-    is corpse S: the upstream wire MULTIPLEXES the proxy forward and the output
-    return, an output belongs to work launched BEFORE the arm, and eating one
-    blocked PP1 for ever. Disabling the drain then left only the receive-side
-    guard, and comp4 hit it under load:
-
-        #631 PROXY LEFTOVER REFUSED: proxy mb_id=2 seq=151 rows=512 arrived
-        while this rank is on mb_id=1 -- sent by an upstream that resumed
-        while this rank was still armed
-
-    Both failures are the same missing distinction, so this function makes it
-    once and the drain applies it:
-
-    * ``output`` -- ALWAYS stashed. It is owed to a real consumer that already
-      looks in the inbox. Discarding it destroys a microbatch's results and
-      strands every rank behind it. This is the corpse-S half.
-    * ``proxy`` for a microbatch this rank NEVER RAN -- discarded. There is no
-      batch it could pair with, now or later, so leaving it on the wire is what
-      strands it and puts every later receive off by one. This is the #757 half.
-    * ``proxy`` for a microbatch this rank DID run -- stashed. It was launched
-      before the arm and is still owed. The design note flagged exactly this
-      case as "the same question a second time"; the stamp answers it.
-    * ``proxy`` from ANOTHER FLIP EPOCH -- discarded, and checked BEFORE the
-      slot test above, because the slot test is what it defeats. The cutover
-      rebuilds the slot ring (``init_pp_loop_state``), so a slot number from
-      the previous epoch names nothing in this one however well it matches;
-      believing it is the 2026-08-21 mispair. See
-      ``pp_proxy_stamp_names_pass``. ``epoch=None`` (a caller with no runtime
-      to ask) skips this test entirely, leaving the pre-#795 behaviour.
-    * anything unstamped or of unknown kind -- stashed. An unidentifiable
-      message is not evidence of a void pass, and discarding on absence of
-      evidence is how the corpse-S class is re-entered.
-
-    Pure and module-level so the decision is testable without a scheduler, a
-    process group or a boot -- which is what the previous inline form was not.
-    """
-    if not isinstance(msg, dict):
-        return (DRAIN_STASH, "default", "not a dict; unidentifiable, so kept")
-    kind = msg.get("__msg_type__", "default")
-    if kind != "proxy":
-        return (DRAIN_STASH, kind, f"kind={kind} is owed to a real consumer")
-    stamp = msg.get("__stamp__")
-    if stamp is None:
-        return (DRAIN_STASH, kind, "proxy carries no stamp; cannot prove it void")
-    try:
-        mb_id = int(stamp[0])
-    except Exception:  # noqa: BLE001 - a malformed stamp proves nothing
-        return (DRAIN_STASH, kind, "proxy stamp unreadable; cannot prove it void")
-    stamp_epoch = pp_proxy_stamp_epoch(stamp)
-    if epoch is not None and stamp_epoch is not None and stamp_epoch != int(epoch):
-        # BEFORE the slot test below, because a cross-epoch slot number is
-        # exactly what defeats it: the cutover rebuilt the ring this rank
-        # indexes, so "this rank DID run slot N" is true of a DIFFERENT slot N.
-        return (
-            DRAIN_DISCARD,
-            kind,
-            f"proxy mb_id={mb_id} is from flip epoch {stamp_epoch} while this "
-            f"rank is on epoch {epoch}; the cutover rebuilt the slot ring, so "
-            f"no batch of this rank's can ever pair with it",
-        )
-    if mb_id in set(ran_mb_ids or ()):
-        return (
-            DRAIN_STASH,
-            kind,
-            f"proxy mb_id={mb_id} names a pass this rank DID run; still owed",
-        )
-    return (
-        DRAIN_DISCARD,
-        kind,
-        f"proxy mb_id={mb_id} names a pass this rank never ran; void while armed",
-    )
 
 
 class SchedulerPPMixin:
@@ -4035,19 +3955,11 @@ class SchedulerPPMixin:
         # recovery. Registered once per loop entry; the provider returns 0
         # (no bound) whenever no flip is armed, so ordinary receives keep
         # the pre-#968 unbounded behaviour byte-for-byte.
-        if getattr(getattr(self, "ps", None), "pp_rank", None) == 0:
-            from sglang.srt.distributed.pp_object_recv import (
-                set_recv_abort_provider,
-            )
-            from sglang.srt.managers.phase_flip_runtime import (
-                pp0_flip_hold_recv_bound_s,
-            )
-
-            set_recv_abort_provider(
-                lambda: pp0_flip_hold_recv_bound_s(
-                    getattr(self, "phase_flip_runtime", None)
-                )
-            )
+        # #1233 (WEG 2, S0): the provider is not registered. It existed to
+        # bound PP0's receive while a layout change was armed and returned 0
+        # (no bound) whenever nothing was armed -- which, with nothing left
+        # to arm, is every round. Not registering it is the same behaviour
+        # and one fewer thing to keep true.
         # #631: the phase-flip consensus must not run inside
         # get_next_batch_to_run here -- that is the TOP of the iteration,
         # before this rank's sends are issued, and a blocking world-
@@ -4480,16 +4392,10 @@ class SchedulerPPMixin:
                     self._969m_n = _n
                     if _n <= 3000 or _n % 64 == 0:
                         logger.warning(
-                            "#969M ARM n=%d mb_id=%s armed=%s epoch=%s pending=%s",
+                            "#969M ARM n=%d mb_id=%s epoch=%s",
                             _n,
                             mb_id,
-                            self.pp_phase_flip_armed(),
                             self._pp_flip_epoch(),
-                            getattr(
-                                getattr(self, "phase_flip_runtime", None),
-                                "pending",
-                                None,
-                            ),
                         )
                 except Exception:  # noqa: BLE001
                     logger.warning("#969M ARM PROBE RAISED", exc_info=True)
@@ -5393,8 +5299,6 @@ class SchedulerPPMixin:
                 # commit raises PhaseFlipLoopExit here -- a quiescent
                 # boundary by construction (ready_fn gates on drained
                 # microbatches).
-                if self.server_args.enable_phase_flip:
-                    self._phase_flip_on_round(require_armed_and_parked=True)
                     # #631 DEFECT Q. Do NOT advance the slot while the armed
                     # window is running dry: every rank must re-enter the
                     # pipeline on the slot it left it on.
@@ -5916,10 +5820,6 @@ class SchedulerPPMixin:
         # manual has only ever been exercised UNDER TRAFFIC, where the loop
         # keeps cycling and the commit happens naturally.
 
-        carries_flip_arm = bool(recv_reqs) and any(
-            isinstance(r, PhaseFlipReqInput) for r in recv_reqs
-        )
-
         # #631 REQ-TRACE (bounded): the check-2 wedge's open question is
         # where a relayed request dies between the consumed chain hop and
         # the downstream waiting queue (boot 631row16: s0=150=c1 balanced,
@@ -6084,25 +5984,6 @@ class SchedulerPPMixin:
         except Exception:  # noqa: BLE001 - pumping is strictly best effort
             return
 
-    def pp_phase_flip_armed(self: Scheduler) -> bool:
-        """#631: does the ARMED forward rule apply on this rank?
-
-        False on every boot without the flip, so the default PP path keeps
-        its exact shape.
-
-        It used to require a chain receiver as well, because the armed
-        rule was only safe while something still CONSUMED the chain and
-        the poll-based consumer was dead. THAT CONDITION WAS ALSO A BUG
-        (#631 G): rank 0 has no upstream and therefore no receiver, so the
-        armed rule was off on exactly the rank that most needs it -- the
-        intake rank kept admitting new work while armed and could never
-        drain to quiescence under load. The service turn is safe on every
-        rank now: on rank 0 its consume half is a no-op and its flush half
-        is real.
-        """
-        if not self.server_args.enable_phase_flip:
-            return False
-        return self.phase_flip_is_armed()
 
     def pp_owes_chain_send(self: Scheduler) -> bool:
         """#631 clause (i): does this rank still owe a request-chain send?
@@ -6217,262 +6098,11 @@ class SchedulerPPMixin:
         # from a leftover one. Set before the enable test so it is accurate
         # for every caller that can reach it.
         self._pp_live_mb_id = mb_id
-        if not getattr(self.server_args, "enable_phase_flip", False):
-            return
-        try:
-            armed = self.pp_phase_flip_armed()
-        except Exception:  # noqa: BLE001 - an instrument may never break the loop
-            return
-
-        passes = getattr(self, "_pp_flip_armed_passes", None)
-        counters = getattr(self, "pp_flip_counters", None)
-
-        if armed:
-            if passes is None:
-                self._pp_flip_armed_passes = 0
-                self._pp_flip_arm_mb_id = mb_id
-                # #829: WHICH RING THAT SLOT NUMBER BELONGS TO, recorded at
-                # the same instant as the slot itself. A slot index is an
-                # index into a ring of `pp_loop_size` slots that a cutover
-                # rebuilds from zero, so on its own it is not a name -- the
-                # same argument `_pp_proxy_stamp` makes for proxies (#795),
-                # applied to the one other place a slot number outlives the
-                # iteration that produced it. Read through
-                # `pp_flip_epoch_of` so a holder with no accessor keeps its
-                # pre-#795 behaviour.
-                self._pp_flip_arm_epoch = pp_flip_epoch_of(self)
-            else:
-                self._pp_flip_armed_passes = passes + 1
-            if counters is not None:
-                try:
-                    counters.publish_gauge(CHAN_PASS, self._pp_flip_armed_passes)
-                    # THE QUANTITY THE PIPELINE ACTUALLY PAIRS ON. The pass
-                    # count above measures the divergence; this one is the
-                    # thing that must NOT diverge, and publishing it is what
-                    # lets the falling edge below return a verdict instead of
-                    # a number nobody can act on.
-                    counters.publish_gauge(CHAN_SLOT, mb_id)
-                except Exception:  # noqa: BLE001
-                    pass
-            return
-
-        # Falling edge: the flip committed or -- the interesting case --
-        # abandoned. Report the whole group's pass counts from ONE rank,
-        # because correlating three log streams by timestamp is how the
-        # last two diagnoses in this feature lost a boot each.
-        if passes is None:
-            return
-        self._pp_flip_armed_passes = None
-        arm_mb = getattr(self, "_pp_flip_arm_mb_id", None)
-
-        # #824 W4(b): AN ARMED WINDOW THAT RAN NO ITERATIONS MUST NOT MOVE
-        # THE SLOT. This is the case the note above predicted -- "an armed
-        # rank must not ADVANCE its slot loop while it is doing no pipeline
-        # work" -- and boot_827 is its measurement:
-        #
-        #   rank 0 ran 0 slot iteration(s) (armed at mb_id=0,
-        #                                   disarmed at mb_id=1)
-        #
-        # _pp_flip_hold_slot is what normally guarantees every rank resumes
-        # on the slot it armed on, but it only engages once the armed window
-        # has run the pipeline DRY, which takes pp_loop_size parked
-        # iterations. A window that ends sooner never reaches it. The rank
-        # then advances its slot for an iteration in which it admitted
-        # nothing -- an armed rank's _pull_raw_reqs returns [] without
-        # touching the request chain -- so the slot moved while the chain
-        # that PACES it did not. Ranks that abandoned on a different clock
-        # re-enter the pipeline on different slots, and from then on stage
-        # k's hidden states pair with stage k+1's batch by an index the two
-        # no longer agree on (#631 defect Q).
-        #
-        # Restoring the arm slot is safe precisely in this case and is not
-        # claimed beyond it: with passes == 0 the rank launched no work
-        # (get_next_batch_to_run returns None while a flip is pending) and
-        # made no drain progress, so the slot it is sent back to is the one
-        # it was parked on. Longer windows keep going through the hold.
-        #
-        # #829: BUT ONLY IF THE RING IT NAMES STILL EXISTS. W4b's argument
-        # holds for an ABANDON, which returns to the same loop with the
-        # same ring -- and the falling edge does not distinguish an abandon
-        # from a COMMIT, which does not. A commit raises PhaseFlipLoopExit
-        # from `_phase_flip_on_round` (the round hook at the bottom of
-        # `_event_loop_pp_body`) while `_pp_flip_armed_passes` is still 0;
-        # the loop unwinds, the cutover swaps the topology,
-        # `init_pp_loop_state` builds a NEW ring, the body restarts at
-        # `mb_id = 0`, and the first tick of that new ring takes THIS
-        # branch with an `arm_mb` recorded against the ring that was just
-        # retired. Nothing cleared it: `_pp_flip_arm_mb_id` was written on
-        # the rising edge and read here, and the rebuild does not touch it.
-        #
-        # This tree already states the law (see the note above this method,
-        # "WHY A COMMIT IS SAFE AND AN ABANDON IS NOT"), and the #631
-        # guard's own message names the hazard: "a pass from before a
-        # cutover that rebuilt this rank's whole slot ring, whose slot
-        # number therefore names nothing here however well it matches".
-        #
-        # MEASURED, boot_window2_0823_1554 @ f9d7637f04. One second after
-        # the sixth cutover COMPLETED, PP0 logged this very restore --
-        #   "ran 0 slot iteration(s) (armed at mb_id=2, disarmed at
-        #    mb_id=0) [...] group RESUME SLOTS [2, 1, 1] -- DIVERGED"
-        # -- where mb_id=0 is not one slot later but the first slot of the
-        # new ring. PP1 then refused a proxy stamped mb_id=2 while sitting
-        # on mb_id=0 OF THE SAME EPOCH (#631 PROXY LEFTOVER REFUSED) and
-        # the group died. The epoch-4 cutover took the identical path 21 s
-        # earlier and survived only because all three ranks happened to
-        # carry the same retired slot ([1, 1, 1] -- AGREED). Agreement
-        # there was luck; this term is the guarantee.
-        #
-        # Refused POSITIVELY and by name rather than by omission, because
-        # the absence of a log line is what made the epoch-4 crossing look
-        # healthy. The rank simply stays where the rebuilt ring started it,
-        # which is the ring's own defined entry slot rather than a number
-        # inherited from a ring that no longer exists.
-        #
-        # WHAT IS NOT CLAIMED HERE, because #737 makes the loose version
-        # false: this is NOT "all ranks must sit on the same mb_id". PP
-        # stages legitimately run at different microbatch offsets, and the
-        # ring arithmetic says so itself -- `next_first_rank_mb_id` and
-        # `next_mb_id` are deliberately different slots. The claim is
-        # narrower and does not depend on any offset: a slot index recorded
-        # against ring generation N must not be applied to generation N+1,
-        # where it indexes a different array that a different cutover built
-        # and whose `pp_loop_size` may not even contain it.
-        now_epoch = pp_flip_epoch_of(self)
-        arm_epoch = getattr(self, "_pp_flip_arm_epoch", None)
-        ring_rebuilt = (
-            arm_epoch is not None
-            and now_epoch is not None
-            and int(arm_epoch) != int(now_epoch)
-        )
-        # Consumed once, like the slot it qualifies: a stale epoch must not
-        # be able to answer for a later window.
-        self._pp_flip_arm_epoch = None
-        would_restore = passes == 0 and arm_mb is not None and int(arm_mb) != int(mb_id)
-        # #838 CLASS 1, THE W12 FORM. Keyed on the SHAPE (zero armed passes
-        # across a ring rebuild) and NOT on `would_restore`, deliberately:
-        # the branch below speaks only when a jump was actually averted, and
-        # this file's own comment records that the epoch-4 crossing "survived
-        # only because all three ranks happened to carry the same retired
-        # slot -- agreement there was luck". A detector that stayed silent on
-        # the lucky crossing would report the same hazard as healthy exactly
-        # when it did no damage, and say nothing until the day it did.
-        try:
-            from sglang.srt.managers import layout_conformance
-
-            alarm, detail = layout_conformance.stale_ring_restore_verdict(
-                passes,
-                arm_epoch,
-                now_epoch,
-                arm_mb,
-                getattr(getattr(self, "phase_policy_state", None), "last_reason", None),
-            )
-            if alarm:
-                layout_conformance.note_conformance_violation(
-                    detail, time.perf_counter()
-                )
-        except Exception:  # noqa: BLE001 - a detector may never break the loop
-            pass
-        # Reported only when a jump was actually averted. A commit whose
-        # retired arm slot happens to equal the new ring's first slot
-        # changes nothing and should say nothing -- which is every commit
-        # at pp_loop_size 1, where the TP phase and the gapped wire both
-        # put the ring, and where the only slot there has ever been is 0.
-        if would_restore and ring_rebuilt:
-            logger.warning(
-                "%s SLOT RESTORE REFUSED: the armed window ran 0 slot "
-                "iterations and ended in a COMMIT, not an abandon -- it "
-                "armed at mb_id=%s in flip epoch %s and this tick is the "
-                "first of the ring epoch %s rebuilt. That slot number "
-                "names nothing in this ring, so it is not restored; this "
-                "rank stays on mb_id=%d, the slot the rebuilt ring itself "
-                "started it on. Restoring it is what put PP0 "
-                "on slot 2 of a fresh ring on boot_window2_0823_1554 and "
-                "killed the group one second later (#829, #824 W4b, "
-                "#631 defect Q).",
-                "PHASE-FLIP",
-                arm_mb,
-                arm_epoch,
-                now_epoch,
-                mb_id,
-            )
-        elif would_restore:
-            self._pp_flip_resume_slot = int(arm_mb)
-            logger.warning(
-                "%s SLOT RESTORE: the armed window ran 0 slot iterations and "
-                "abandoned at mb_id=%d after arming at mb_id=%s, so the hold "
-                "never engaged. Returning this rank to the slot it armed on; "
-                "without it the slot advances while the request chain that "
-                "paces it does not, and the ranks resume on different slots "
-                "(#824 W4b, #631 defect Q).",
-                "PHASE-FLIP",
-                mb_id,
-                arm_mb,
-            )
-
-        # #757: THE FALLING EDGE IS THE ONLY PLACE EVERY DISARM PASSES THROUGH.
-        # Disarm has three routes and two of them are purely rank-local --
-        # `_abandon_no_quorum` (phase_flip_runtime.py:3885) and
-        # `_abandon_unjoined_flip` (:3949) both clear `_pending` with no
-        # collective and no channel re-check, then hand control straight back
-        # to the ordinary loop. `pp_flip_channels_empty` is consulted only
-        # BEFORE this rank's own entry (:3682, :3748), never on the way out.
-        # So an upstream can abandon on its own clock, resume launching, and
-        # post a proxy into a downstream that is still armed -- and the
-        # emptiness proof that was supposed to prevent it is a SAMPLE taken
-        # earlier, not a barrier. Draining here catches the in-flight
-        # leftover on the way back to the pass loop, on every route out.
-        # #969 §W3: THE DISARM-EDGE LEFTOVER DRAIN IS DELETED WITH THE CLOCKS
-        # IT COMPENSATED FOR. Its own docstring named the defect exactly --
-        # "a flip abandon is rank-local: each rank times out on its own
-        # clock. The first rank to disarm resumes launching and sends its
-        # proxy hidden states" -- and that is no longer a state this system
-        # can be in: PP0 is the only timeout carrier, its abort decision
-        # travels on the request stream, and every rank disarms because it
-        # was told to, in stream order. A drain that exists to tidy up after
-        # ranks that disagreed is second bookkeeping the moment they cannot.
-        # If a leftover ever DOES arrive, `_pp_recv_proxy_tensors` refuses it
-        # fatally, which is now the correct answer rather than a symptom of
-        # a drain that did not run.
-        if counters is None:
-            return
-        try:
-            per_rank = [counters.sent(CHAN_PASS, r) for r in range(counters.n_ranks)]
-            slots = [counters.sent(CHAN_SLOT, r) for r in range(counters.n_ranks)]
-        except Exception:  # noqa: BLE001
-            return
-        spread = max(per_rank) - min(per_rank) if per_rank else 0
-        # #631 DEFECT Q, AS A VERDICT. The spread is expected and harmless:
-        # ranks spin at their own rate and abandon on their own clock. The
-        # SLOT is what may not diverge, because it is what the proxy stamp,
-        # the mbs occupancy and the output pairing are all indexed by. A
-        # rank reads its peers' last published armed slot here; with the
-        # hold in place (_pp_flip_hold_slot) every rank is parked on the
-        # slot it armed on, so these agree.
-        agreed = len(set(slots)) <= 1
-        logger.log(
-            logging.WARNING if agreed else logging.ERROR,
-            "%s PASS-CLOCK across the armed window: rank %d ran %d slot "
-            "iteration(s) (armed at mb_id=%s, disarmed at mb_id=%d); group "
-            "passes %s, SPREAD %d; group RESUME SLOTS %s -- %s. The spread "
-            "is not the defect: ranks spin at their own rate and abandon on "
-            "their own clock. The RESUME SLOT is, because stage k's hidden "
-            "states pair with stage k+1's batch by that index and by "
-            "nothing else (#631 defect Q).",
-            "PHASE-FLIP",
-            counters.rank,
-            passes,
-            arm_mb,
-            mb_id,
-            per_rank,
-            spread,
-            slots,
-            (
-                "AGREED"
-                if agreed
-                else "DIVERGED, so every later proxy on this instance is "
-                "mispaired and the slot hold did not do its job"
-            ),
-        )
+        # #1233 (WEG 2, S0): the armed-pass census below counted passes taken
+        # while a layout change was armed. Nothing arms, so the tick reduces
+        # to publishing the live slot -- which is what every boot without the
+        # flip already did.
+        return
 
     def _pp_flip_hold_slot(self: Scheduler) -> bool:
         """Must this rank stay on the SAME microbatch slot for another turn?
@@ -6564,13 +6194,10 @@ class SchedulerPPMixin:
         # instead of `bound`. In the TP phase `pp_loop_size` is 1, so the bound
         # is 4 -- small enough that a single inherited visit changes the verdict,
         # and the direction of that error is a FALSE group STOP.
-        if not getattr(self.server_args, "enable_phase_flip", False):
-            return self._1173_forget_stashed_frame()
-        try:
-            if not self.pp_phase_flip_armed():
-                return self._1173_forget_stashed_frame()
-        except Exception:  # noqa: BLE001 - never let a probe break the loop
-            return self._1173_forget_stashed_frame()
+        # #1233 (WEG 2, S0): the slot is never held. Holding existed so an
+        # armed rank re-entered the pipeline on the slot it left; with no
+        # layout change there is no leaving. This is the non-flip path.
+        return self._1173_forget_stashed_frame()
         if getattr(self, "chunked_req", None) is not None:
             return self._1173_forget_stashed_frame()
         mbs = getattr(self, "mbs", None)
@@ -7157,90 +6784,6 @@ class SchedulerPPMixin:
             )
         return retired
 
-    def pp_flip_retire_pp_loop_stash(self: Scheduler) -> int:
-        """#800: retire the PP-loop-only stash at a CUTOVER, by name.
-
-        Called from the cutover, which is the one moment these messages stop
-        being owed: they name a pass in a slot ring that the cutover destroys
-        (``init_pp_loop_state`` rebuilds it), and the phase they are consumed
-        in no longer exists after this point.
-
-        WHY THIS IS NOT ALREADY IMPLICIT. The cutover's own instrument states
-        that ``init_pp_loop_state`` "clears ... the tensor-dict inbox with no
-        drain and no carry" and reports ``inbox=%d`` under the heading CUTOVER
-        DISCARDS IN-FLIGHT OUTPUT. That stopped being true at #753, which moved
-        the inbox off the scheduler and onto the ``pp_group`` so the crossing
-        wire could share it; ``init_pp_loop_state`` explicitly does not touch it
-        any more. Nothing has cleared it since, so a message parked here
-        outlives the cutover, outlives the whole TP phase, and is handed to the
-        NEXT PP epoch's receive -- a mispair of exactly the class #795's epoch
-        stamp exists to catch. This makes the discard real and names what it
-        discarded.
-
-        THE THREE DISPOSITIONS ARE TREATED DIFFERENTLY HERE, and the split is
-        the point:
-
-        ``PP_LOOP_ONLY``  retired, at INFO. Expected, routine, and the reason
-                          this method exists.
-        ``UNDECLARED``    retired, at ERROR. An undeclared entry BLOCKS
-                          presence, so a rank cannot announce while holding
-                          one and finding it here means the gate was bypassed
-                          -- but leaving it is the very outliving this method
-                          prevents, and nothing is known to be owed it. So it
-                          goes, loudly. (This branch was missing from the
-                          first cut of #800: the sweep took only PP_LOOP_ONLY
-                          and an undeclared entry would have survived into the
-                          next phase, which is the defect being fixed, one
-                          disposition over.)
-        ``BLOCKS_FLIP``   NOT retired. A real consumer may still be owed the
-                          payload, so sweeping it would destroy a token to
-                          tidy up a predicate bug. Reported and left, so the
-                          defect stays visible.
-        """
-        inbox = getattr(self, "_pp_tensor_dict_inbox", None)
-        census = census_stash(inbox)
-        if census.blocking:
-            logger.error(
-                "%s CUTOVER FOUND A BLOCKING STASH: %s. The presence gate is "
-                "supposed to make this impossible -- a rank does not announce "
-                "while it holds one -- so this is a quiescence-predicate bug. "
-                "Left in place deliberately; sweeping it here would hide it, "
-                "and its payload may still be owed to a real consumer.",
-                "#800",
-                ", ".join(f"{n} x {kind}" for kind, n in census.blocking),
-            )
-        if census.undeclared:
-            logger.error(
-                "%s CUTOVER FOUND AN UNDECLARED STASH: %s. This also blocks "
-                "presence, so reaching a cutover with one held means the gate "
-                "was bypassed. Retired anyway -- nothing is registered to "
-                "consume it and leaving it would hand it to the next epoch's "
-                "receive -- but declare its disposition in "
-                "pp_stash_disposition rather than relying on this sweep.",
-                "#800",
-                ", ".join(f"{n} x {kind}" for kind, n in census.undeclared),
-            )
-        retired = 0
-        for key in stash_keys_with_disposition(inbox, (PP_LOOP_ONLY, UNDECLARED)):
-            queue = inbox.get(key)
-            depth = len(queue or ())
-            if not depth:
-                continue
-            queue.clear()
-            retired += depth
-            logger.info(
-                "%s cutover retired %d stashed message(s) of kind=%s from rank "
-                "%s: they name a pass in the slot ring this cutover rebuilds, "
-                "so no consumer can ever take them again",
-                "#800",
-                depth,
-                key[1] if isinstance(key, tuple) and len(key) >= 2 else key,
-                key[0] if isinstance(key, tuple) and len(key) >= 2 else "?",
-            )
-        seen = getattr(self, "_pp_stash_first_seen", None)
-        if seen:
-            seen.clear()
-        return retired
 
     def pp_flip_channels_empty(self: Scheduler) -> Optional[str]:
         """Are ALL of this rank's channels empty? None if yes, else why not.
@@ -7532,16 +7075,6 @@ class SchedulerPPMixin:
                     "enter the next forward while a peer is still in the last "
                     "one's output exchange. Their crossings then share one "
                     "ordered channel with nothing to tell the passes apart."
-                )
-            if getattr(self.server_args, "enable_phase_flip", False):
-                raise ValueError(
-                    "a gapped PP layer set cannot yet be combined with the "
-                    "phase flip. The flip's armed drain reads the tensor-dict "
-                    "wire on the assumption that a 'proxy' message is the only "
-                    "kind it may consume mid-pass; a gapped run replaces those "
-                    "with 'crossing' messages, and reconciling the two is a "
-                    "separate slice. Refused here rather than allowed to strand "
-                    "a crossing at the first arm."
                 )
 
         self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
@@ -10138,13 +9671,11 @@ class SchedulerPPMixin:
         below reads as "fall back to the slot-only comparison", i.e. exactly
         the behaviour that shipped before this field existed.
         """
-        runtime = getattr(self, "phase_flip_runtime", None)
-        if runtime is None:
-            return None
-        try:
-            return int(runtime.epoch)
-        except Exception:  # noqa: BLE001 - an unreadable epoch names no epoch
-            return None
+        # #1233 (WEG 2, S0): always None. The epoch counted COMPLETED
+        # in-process layout changes, and there are none; None is what every
+        # consumer below already reads as "fall back to the slot-only
+        # comparison", i.e. the behaviour that shipped before the field.
+        return None
 
     def _pp_proxy_stamp(self: Scheduler, mb_id: int, result) -> tuple:
         """#631 VARIANT B / #795: the identity a proxy message carries.
@@ -10963,49 +10494,22 @@ class SchedulerPPMixin:
             )
 
         self._pp_proxy_drops = getattr(self, "_pp_proxy_drops", 0) + 1
-        # #997/#1004: the IDENTITY half of the same layer, gated on the same
-        # switch and for the same reason. `mb_id` is a slot in the ring this
-        # guard polices ACROSS a cutover; with one layout the ring is never
-        # rebuilt and the cross-epoch case it names cannot arise. Boots 46-48
-        # died once each on this family with the flip off.
-        if not getattr(self.server_args, "enable_phase_flip", False):
-            logger.warning(
-                "#1004 #631 IDENTITY REFUSAL BYPASSED (flip off): stamp "
-                "mb_id=%s seq=%s rows=%s while on mb_id=%s. Flip machinery is "
-                "gated on enable_phase_flip; counted, never silent.",
-                stamp[0],
-                stamp[1],
-                stamp[2],
-                mb_id,
-            )
-            return None
-        raise RuntimeError(
-            f"#631 PROXY LEFTOVER REFUSED: a proxy stamped mb_id={stamp[0]} "
-            f"seq={stamp[1]} rows={stamp[2]} epoch={pp_proxy_stamp_epoch(stamp)} "
-            f"arrived while this rank is on mb_id={mb_id} in flip epoch "
-            f"{epoch}. It belongs to a pass this rank did not run -- either "
-            f"another slot of this epoch (in practice one sent by an upstream "
-            f"that resumed while this rank was still armed), or, when the "
-            f"epochs differ, a pass from before a cutover that rebuilt this "
-            f"rank's whole slot ring, whose slot number therefore names "
-            f"nothing here however well it matches (#795). Computing on it "
-            f"would pair one microbatch's hidden states with another's "
-            f"metadata and corrupt memory rather than merely fail; taking "
-            f"another message instead wedges the pipeline (corpse R), because "
-            f"the wire owes exactly one message per pass. "
-            f"#969 §W3: THIS IS A GROUP-FATAL DIVERGENCE AND NOTHING ELSE. "
-            f"The drains that used to be named here as the prevention "
-            f"(pp_flip_drain_tensor_dicts while armed, "
-            f"pp_flip_drain_leftover_dicts at disarm) are deleted: they "
-            f"compensated for ranks disarming on their own clocks, and no "
-            f"rank has a clock any more -- PP0 decides, the decision travels "
-            f"on the request stream, and every rank disarms in stream order. "
-            f"So reaching this line means the ranks are out of step about a "
-            f"decision only one of them makes, which is a broken premise, not "
-            f"a race to tidy up. The group stops (user law 2026-08-29: "
-            f"'raenge duerfen sich niemals uneins sein. wenn uneins crash "
-            f"stop')."
+        # #997/#1004, and #1233 (WEG 2, S0): `mb_id` is a slot in a ring
+        # this guard policed ACROSS an in-process layout change. With one
+        # layout per process the ring is never rebuilt and the cross-epoch
+        # case the refusal names cannot arise, so the bypass branch -- the
+        # one every boot without the flip already took -- is now the only
+        # branch. Counted, never silent: boots 46-48 died once each on this
+        # family with the refusal reachable and nothing logged.
+        logger.warning(
+            "#1004 IDENTITY REFUSAL BYPASSED (one layout per process): stamp "
+            "mb_id=%s seq=%s rows=%s while on mb_id=%s.",
+            stamp[0],
+            stamp[1],
+            stamp[2],
+            mb_id,
         )
+        return None
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,

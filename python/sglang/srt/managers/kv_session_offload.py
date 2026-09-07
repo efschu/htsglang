@@ -2105,10 +2105,6 @@ class WaveBackController:
 # ---------------------------------------------------------------------------
 
 
-from sglang.srt.managers.kvso_flip_contract import (
-    restore_permitted,
-    stamp_spill,
-)
 
 
 class SpillSlot:
@@ -4220,7 +4216,10 @@ class KVSessionOffloadManager:
             slot.draft_spill_boundary = boundary
             slot.draft_spill_L = L
             slot.spec_in_tick = True
-        stamp_spill(slot, getattr(self.scheduler, "phase_flip_active_stack", None))
+        # #1233 (WEG 2, S0): no layout stamp. The stamp recorded WHICH of a
+        # process's two KV layouts an image was captured in; a process now has
+        # one layout for its whole life, so every image this manager holds was
+        # captured in the layout it will be restored into.
         self.spills[req.req_pool_idx] = slot
         if budget_armed:
             # Episode opened: decode phase, clock started, D2H volume charged.
@@ -4581,7 +4580,8 @@ class KVSessionOffloadManager:
         )
         slot.born_spilled = True
         slot.adopted = False
-        stamp_spill(slot, getattr(self.scheduler, "phase_flip_active_stack", None))
+        # #1233 (WEG 2, S0): see the sibling site -- one layout per process,
+        # so there is nothing to stamp against.
         self.spills[rpi] = slot
         if getattr(self, "_budget_armed", False):
             # #236: born-spilled episode -- write-once prefill phase; the
@@ -4922,14 +4922,11 @@ class KVSessionOffloadManager:
         # incremental wave-back below and the committing restore, because
         # both are H2D copies into a device layout.
         #
-        # It is deliberately separate from the tick pin
-        # (kvso_flip_contract.pin_spills_to_phase), which stops the session
-        # from RUNNING in the wrong phase. Two independent gates on the same
-        # hazard means a bug in either one alone is still caught.
-        if not restore_permitted(
-            slot, getattr(self.scheduler, "phase_flip_active_stack", None)
-        ):
-            return running_batch
+        # #1233 (WEG 2, S0): ALWAYS PERMITTED, which is the answer this gate
+        # already gave on every process without two layouts ("no phase means
+        # no phase flip, which means always permitted"). Weg 2 has one KV
+        # layout per process for its whole life, so there is no wrong layout
+        # to restore into and the gate has nothing left to refuse.
 
         # DEVICE-RESUME UNDER SPEC -- MILESTONE GUARD. A spilled session decodes
         # PLAIN on host: its EAGLE/MTP draft state (hidden_states / topk /

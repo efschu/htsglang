@@ -1981,28 +1981,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
                 model_config=self.model_config,
             )
-            # #631 Route A: build the SECONDARY (flip-target) group set NOW,
-            # right after the primary topology and before ANY attention
-            # backend constructor caches dcp state (the attn_dcp_size
-            # silent-1 hazard, DESIGN_631 3.2). Eager on every rank -- the
-            # create is a collective; the flag is env-uniform, so reaching
-            # this line is rank-uniform. The verify-then-create manifest
-            # inside dies loudly on any divergence before creating anything.
-            if self.server_args.enable_phase_flip:
-                from sglang.srt.distributed.parallel_state import (
-                    initialize_phase_flip_secondary_groups,
-                    phase_flip_groups_initialized,
-                )
-
-                if not phase_flip_groups_initialized():
-                    flip_vec = [
-                        int(x) for x in self.server_args.phase_flip_tp_vector.split(",")
-                    ]
-                    initialize_phase_flip_secondary_groups(
-                        tp_size=len(flip_vec),
-                        pp_size=1,
-                        dcp_size=len(flip_vec),
-                    )
+            # #1233 (WEG 2, S0): the SECONDARY (flip-target) group set used to
+            # be built here, on the same ranks, so one process could hold two
+            # topologies. Weg 2 gives each topology its own process group, so
+            # a process builds exactly the one set of communicators it will
+            # ever use -- built directly above -- and there is no second
+            # manifest to verify or diverge on.
             # #704b step (a): BUILD the decoupled-KV group. Until this call
             # existed, initialize_decoupled_kv_group had ZERO callers anywhere
             # in the tree -- present-but-unwired, while SGLANG_DECOUPLED_KV

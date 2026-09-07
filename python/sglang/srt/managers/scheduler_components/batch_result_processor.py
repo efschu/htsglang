@@ -16,7 +16,6 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.phase_flip_output_trace import trace_round
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_MATCHED_TOKEN,
@@ -882,10 +881,10 @@ class SchedulerBatchResultProcessor:
         decode_reqs = batch.reqs
         decode_return_logprob = batch.return_logprob
 
-        # #631: what this round produced, recorded only inside a
-        # post-cutover window. A round that appends nothing and a round
-        # that produced nothing look identical in output_ids alone.
-        trace_round("decode", decode_reqs, next_token_ids, result)
+        # #1233 (WEG 2, S0): the round-output trace is gone with the window
+        # it was armed inside. It recorded what a POST-CUTOVER round produced
+        # so an appended-nothing round could be told from a produced-nothing
+        # one across a layout change; there is no layout change to cross.
 
         for i, req in enumerate(decode_reqs):
             req: Req
