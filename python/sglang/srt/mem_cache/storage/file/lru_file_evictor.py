@@ -90,6 +90,8 @@ class LRUFileEvictor:
         *,
         tp_rank: int,
         writes_shared_keys: bool,
+        pp_rank: int = 0,
+        attn_cp_rank: int = 0,
         kv_config_suffix: Optional[str] = None,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
@@ -118,6 +120,8 @@ class LRUFileEvictor:
             dict.fromkeys(s for s in (config_suffix, kv_config_suffix) if s)
         )
         self._tp_rank = tp_rank
+        self._pp_rank = pp_rank
+        self._attn_cp_rank = attn_cp_rank
         self._on_evict = on_evict
         # Every rank that writes into this directory shares one filesystem, so
         # by default the configured cap is split between them (see _load_config).
@@ -153,8 +157,23 @@ class LRUFileEvictor:
         # indices over one directory, each evicting against a cap divided by a
         # different tp_size. ``writes_shared_keys`` (mem_cache/weg2_store_gates)
         # is the one definition of that question.
+        # THE ELECTION IS OVER THE GROUP'S FULL RANK IDENTITY, NOT THE TP AXIS.
+        # ``tp_rank == 0`` alone elects a single owner only when the fan-out is
+        # TP. Weg 2's prefill group is pp_size=3, tp_size=1: all three stages
+        # have tp_rank == 0, so a tp-keyed election makes all three owners of
+        # one directory -- three private LRU indices, each carrying the whole
+        # operator cap and each unlinking victims the other two still count,
+        # and the W8b coverage gate graded three times at three moments (a
+        # reading near the floor could refuse one stage and pass the others,
+        # which is a rank disagreement rather than a stop). The tree already
+        # names this exact trap for the directory-creation guard
+        # (hicache_storage.py: "with pure PP every stage has tp_rank == 0 and
+        # attn_cp_rank == 0, so all three ranks elect THEMSELVES"); the same
+        # sentence is true here. One directory, one index, one owner.
         self._writes_shared_keys = bool(writes_shared_keys)
-        self._is_storage_owner = (not self._writes_shared_keys) or (tp_rank == 0)
+        self._is_storage_owner = (not self._writes_shared_keys) or (
+            tp_rank == 0 and pp_rank == 0 and attn_cp_rank == 0
+        )
 
         # suffixed_key -> allocated disk bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -201,9 +220,12 @@ class LRUFileEvictor:
         self._eviction_enabled = self._eviction_configured and self._is_storage_owner
         if self._eviction_configured and not self._is_storage_owner:
             logger.info(
-                f"HiCacheFile rank {self._tp_rank}: this group writes SHARED keys, so "
-                f"eviction is handled by rank 0; "
-                f"this rank skips LRU bookkeeping and will not create new files."
+                f"HiCacheFile rank tp={self._tp_rank} pp={self._pp_rank} "
+                f"cp={self._attn_cp_rank}: this group writes SHARED keys, so the "
+                f"LRU index and eviction for this directory belong to the "
+                f"group's rank 0. This rank keeps no index; it still writes the "
+                f"bytes only it holds (its extent of a shared page, its own "
+                f"suffixed files), untracked here."
             )
 
         if not self._eviction_enabled:
@@ -472,25 +494,61 @@ class LRUFileEvictor:
         """True when this rank owns (and may create/evict) the on-disk files."""
         return self._is_storage_owner
 
-    def reserve(self, suffixed_key: str, value_bytes: int, key: str = "") -> bool:
+    def reserve(
+        self,
+        suffixed_key: str,
+        value_bytes: int,
+        key: str = "",
+        *,
+        owner_writes_whole_file: bool = True,
+    ) -> bool:
         """Admit a new write of ``value_bytes``, evicting LRU victims as needed.
 
         On success the key is pre-reserved at MRU and flagged in-flight so a
         concurrent ``reserve`` won't evict it before the file is committed; the
         caller must then call ``commit`` (write landed) or ``abort`` (write
         failed). Returns ``False`` -- reserving nothing -- when the write is
-        refused: this rank is not the storage owner, the value is larger than
-        the cap, there is no evictable space, or the free-space watermark cannot
-        be met. When eviction is not configured the write is always admitted.
+        refused: the value is larger than the cap, there is no evictable space,
+        the free-space watermark cannot be met, or this rank is not the storage
+        owner AND the owner already writes every byte of this file. When
+        eviction is not configured the write is always admitted.
+
+        ``owner_writes_whole_file`` is the caller's answer to
+        ``weg2_store_gates.owner_write_covers_whole_file``. It defaults to True
+        so a caller that does not know keeps the historical refusal, which is
+        the safe direction: a duplicate write is lost cache, an admitted write
+        the owner cannot account for is unbounded disk.
         """
         if not self._eviction_configured:
             return True  # unbounded storage: nothing to enforce
         if not self._is_storage_owner:
-            logger.warning(
-                f"HiCacheFile rank {self._tp_rank} is not the shared-key storage owner; "
-                f"not caching new key {key} because file eviction is enabled."
-            )
-            return False
+            if owner_writes_whole_file:
+                logger.warning(
+                    f"HiCacheFile rank {self._tp_rank} is not the shared-key storage "
+                    f"owner and the owner writes this whole file; not caching new "
+                    f"key {key} because file eviction is enabled."
+                )
+                return False
+            # This rank holds bytes nobody else writes. Admitted, and
+            # deliberately NOT indexed: the LRU index for this directory has
+            # one owner, and a second index over the same files is exactly the
+            # twin bookkeeping F7 removes -- it would evict pages the owner
+            # still counts. ``commit``/``abort``/``touch`` are already no-ops
+            # on a non-owner, so nothing here needs unwinding.
+            #
+            # The free-space watermark still applies, because it is a statvfs
+            # fact any process can read rather than a second index. Checked
+            # without eviction: reclaiming space is the owner's act.
+            if self.min_free_bytes > 0:
+                fs = self._fs_stats()
+                if fs is not None and (fs[1] - value_bytes) < self.min_free_bytes:
+                    logger.warning(
+                        f"HiCacheFile: filesystem hosting {self.file_path!r} "
+                        f"would fall below min_free={self.min_free_bytes} B "
+                        f"after writing {value_bytes} B; refusing {key}."
+                    )
+                    return False
+            return True
         if self.max_size_bytes > 0 and value_bytes > self.max_size_bytes:
             logger.warning(
                 f"HiCacheFile: value {value_bytes} B exceeds cap "
@@ -826,6 +884,21 @@ class LRUFileEvictor:
                     self._lru[key] = size
                     self._total_bytes += size
             census = self.index_coverage()
+        # W8b, graded where the number exists. In ``__init__`` this store may
+        # be COLD -- Weg 2's first boot sees an empty directory, and coverage
+        # over zero bytes is 1.0 by definition, a gate with no denominator.
+        # The wake is the populated moment: the sibling group's whole awake
+        # phase has landed in this directory since this index was built, and
+        # this is the scan that has to see it. Same one definition, called
+        # again where the number is born.
+        if self._writes_shared_keys:
+            check_index_coverage(
+                store_path=self.file_path,
+                indexed_bytes=census["indexed_bytes"],
+                seen_bytes=census["seen_bytes"],
+                indexed_entries=census["indexed_entries"],
+                seen_entries=census["seen_entries"],
+            )
         logger.info(
             f"HiCacheFile eviction index re-scanned at wake: "
             f"{census['indexed_entries']} of {census['seen_entries']} files, "

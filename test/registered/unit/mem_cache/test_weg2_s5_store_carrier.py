@@ -79,7 +79,7 @@ def _stage_window(stage: int):
     return CanonicalPageWindow(spec=SPEC, first_slot=first, num_slots=count)
 
 
-def _p_config(stage: int, *, canonical: bool = True):
+def _p_config(stage: int, *, canonical: bool = True, is_mla_model: bool = False):
     """Group P, rank ``stage``: pp_size=3, tp_size=1."""
     return HiCacheStorageConfig(
         tp_rank=0,
@@ -88,7 +88,7 @@ def _p_config(stage: int, *, canonical: bool = True):
         pp_size=3,
         attn_cp_rank=0,
         attn_cp_size=1,
-        is_mla_model=False,
+        is_mla_model=is_mla_model,
         enable_storage_metrics=False,
         is_page_first_layout=False,
         model_name=MODEL_NAME,
@@ -97,8 +97,22 @@ def _p_config(stage: int, *, canonical: bool = True):
     )
 
 
-def _d_config(tp_rank: int, *, canonical: bool = True):
-    """Group D, rank ``tp_rank``: tp_size=3, pp_size=1."""
+def _d_config(
+    tp_rank: int,
+    *,
+    canonical: bool = True,
+    window=None,
+    is_mla_model: bool = False,
+):
+    """Group D, rank ``tp_rank``: tp_size=3, pp_size=1.
+
+    ``window`` overrides the whole-page window with a PARTIAL extent, which is
+    what a real TP rank deposits: group D's cut is head channels across every
+    layer, so no single rank's write completes the blob. The fixture cuts on
+    the layer axis instead -- the axis this page format expresses -- because
+    what the write path is being asked here is not which axis was cut but
+    whether a rank that writes only PART of a shared file is admitted at all.
+    """
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
         tp_size=3,
@@ -106,12 +120,16 @@ def _d_config(tp_rank: int, *, canonical: bool = True):
         pp_size=1,
         attn_cp_rank=0,
         attn_cp_size=1,
-        is_mla_model=False,
+        is_mla_model=is_mla_model,
         enable_storage_metrics=False,
         is_page_first_layout=False,
         model_name=MODEL_NAME,
         model_identity_hash=IDENTITY,
-        canonical_kv_page=_whole_page_window() if canonical else None,
+        canonical_kv_page=(
+            window
+            if window is not None
+            else (_whole_page_window() if canonical else None)
+        ),
     )
 
 
@@ -155,18 +173,30 @@ def worker_main() -> None:
     try:
         if role == "prefill":
             keys = []
+            owners = []
+            wrote = []
             for stage in range(3):
                 store = HiCacheFile(_p_config(stage), file_path=store_dir)
                 keys.append(store._get_suffixed_key(KEY))
-                store.set(KEY, _payload(stage))
-            result = {"status": "ok", "keys": keys}
+                owners.append(bool(store._evictor.is_storage_owner))
+                wrote.append(bool(store.set(KEY, _payload(stage))))
+            result = {"status": "ok", "keys": keys, "owners": owners, "wrote": wrote}
         else:
             store = HiCacheFile(_d_config(0), file_path=store_dir)
+            owners = [
+                bool(
+                    HiCacheFile(
+                        _d_config(r), file_path=store_dir
+                    )._evictor.is_storage_owner
+                )
+                for r in range(3)
+            ]
             target = torch.zeros(NUM_ATTN_LAYERS * CELL_BYTES, dtype=torch.uint8)
             got = store.get(KEY, target)
             result = {
                 "status": "ok",
                 "keys": [store._get_suffixed_key(KEY)],
+                "owners": owners,
                 "hit": got is not None,
                 "digest": _digest(target) if got is not None else None,
             }
@@ -393,6 +423,24 @@ class TestTheCarrierCrossesTwoProcesses(CustomTestCase):
                 _digest(_expected_whole_page()),
                 "the assembled page is not byte-identical to what P wrote",
             )
+            # ONE owner PER GROUP, graded on both shapes. Grading only group D
+            # let the election miss group P entirely: with pp_size=3, tp_size=1
+            # every stage has tp_rank == 0, so a tp-keyed election makes all
+            # three of them owners of one directory.
+            self.assertEqual(
+                sum(1 for o in a["owners"] if o),
+                1,
+                f"group P elected {a['owners']} storage owners over one directory",
+            )
+            self.assertEqual(
+                sum(1 for o in b["owners"] if o),
+                1,
+                f"group D elected {b['owners']} storage owners over one directory",
+            )
+            self.assertTrue(
+                all(a["wrote"]),
+                f"a P stage was refused its own extent of the blob: {a['wrote']}",
+            )
 
 
 class TestF7ExactlyOneEvictionOwnerPerGroup(CustomTestCase):
@@ -437,6 +485,39 @@ class TestF7ExactlyOneEvictionOwnerPerGroup(CustomTestCase):
                 p._evictor.max_size_bytes,
                 dd._evictor.max_size_bytes,
                 "one directory, one cap -- the two groups must agree",
+            )
+
+    def _prefill_group_evictors(self, d):
+        return [
+            HiCacheFile(
+                _p_config(stage),
+                file_path=d,
+            )._evictor
+            for stage in range(3)
+        ]
+
+    def test_exactly_one_rank_of_the_prefill_group_evicts(self):
+        """The half the acceptance line never graded.
+
+        Group P is ``pp_size=3, tp_size=1``, so a ``tp_rank == 0`` election
+        elects ALL THREE stages: three private LRU indices over one directory,
+        each carrying the whole operator cap and each unlinking victims the
+        other two still count. The tree names this exact trap 90 lines above
+        the call site (``hicache_storage.py``: "with pure PP every stage has
+        tp_rank == 0 and attn_cp_rank == 0, so all three ranks elect
+        THEMSELVES") -- for the directory, not for the eviction index.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"] = "1G"
+            try:
+                evictors = self._prefill_group_evictors(d)
+            finally:
+                os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
+            owners = [e for e in evictors if e._eviction_enabled]
+            self.assertEqual(
+                len(owners),
+                1,
+                f"{len(owners)} of 3 group-P stages own eviction over one directory",
             )
 
     def test_a_non_canonical_non_mla_store_still_has_every_rank_as_owner(self):
@@ -692,6 +773,311 @@ class TestW8TheStoreCapMustBeFundable(CustomTestCase):
 
         with tempfile.TemporaryDirectory() as d:
             check_store_cap_fundable(d, 1 << 20, 1 << 20)
+
+
+class TestF7WriteAdmissionIsPerFileNotPerRank(CustomTestCase):
+    """F7's second half: OWNING THE INDEX IS NOT PERMISSION TO WRITE.
+
+    ``reserve()`` refuses every write from a non-owner. That was safe exactly
+    while ``is_mla_model`` chose the non-owners, because MLA ranks write
+    byte-identical whole files under one rank-free suffix -- rank 0's write
+    already puts every byte of that path on disk. Re-pointing the ELECTION at
+    ``writes_shared_keys`` (which the canonical page and dcp owner mode make
+    true for a GQA model) carried that refusal to ranks whose bytes nobody
+    else writes: their extent of the shared blob, their own suffixed draft
+    file. On Weg 2's store, where the cap is always configured, that is a
+    carrier that moves nothing -- the failure W7 exists to refuse, arriving
+    through the write path instead.
+    """
+
+    def _bounded(self, fn):
+        os.environ["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"] = "1G"
+        try:
+            return fn()
+        finally:
+            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
+
+    def test_every_decode_rank_deposits_its_extent_of_one_blob(self):
+        """Three ranks, three disjoint extents, one blob -- with the cap on."""
+
+        def body(d):
+            stores = [
+                HiCacheFile(_d_config(r, window=_stage_window(r)), file_path=d)
+                for r in range(3)
+            ]
+            wrote = [stores[r].set(KEY, _payload(r)) for r in range(3)]
+            return stores, wrote
+
+        with tempfile.TemporaryDirectory() as d:
+            stores, wrote = self._bounded(lambda: body(d))
+            self.assertEqual(
+                wrote,
+                [True, True, True],
+                "a decode rank was refused its own extent of the shared blob",
+            )
+            self.assertTrue(
+                stores[0].exists(KEY),
+                "the blob never completed: the non-owner extents were dropped",
+            )
+            # Read back through a WHOLE-page window: each writer above holds
+            # only its own extent, so none of them can assemble the blob.
+            reader = HiCacheFile(_d_config(0), file_path=d)
+            target = torch.zeros(NUM_ATTN_LAYERS * CELL_BYTES, dtype=torch.uint8)
+            self.assertIsNotNone(reader.get(KEY, target))
+            self.assertEqual(_digest(target), _digest(_expected_whole_page()))
+
+    def test_every_decode_rank_writes_its_own_draft_file(self):
+        """Draft keys keep a per-rank suffix, so the owner never writes them.
+
+        The write-side twin of ``test_draft_keys_keep_their_per_rank_suffix``:
+        HEAD pins that the keys are per-rank AND that only rank 0 may write
+        them, which cannot both be intended.
+        """
+        draft = f"{KEY}.draft-a30db4b7c362c786"
+
+        def body(d):
+            stores = [HiCacheFile(_d_config(r), file_path=d) for r in range(3)]
+            return [s.set(draft, torch.zeros(4096, dtype=torch.uint8)) for s in stores]
+
+        with tempfile.TemporaryDirectory() as d:
+            wrote = self._bounded(lambda: body(d))
+            self.assertEqual(
+                wrote, [True, True, True], "a rank's own draft was refused"
+            )
+            found = []
+            for root, _, files in os.walk(d):
+                found += [f for f in files if f.endswith(".bin")]
+            self.assertEqual(
+                len(found), 3, f"3 per-rank draft files expected, found {found}"
+            )
+
+    def test_an_mla_non_owner_is_still_refused(self):
+        """GREEN PIN / CAN-FAIL: the upstream de-duplication must survive.
+
+        Under MLA the suffix carries no rank term at all
+        (``_derive_key_suffixes``: the tp terms are appended only
+        ``if not is_mla_model``), so every rank names ONE path and the owner's
+        write is the whole file. Admitting the others there would be three
+        processes writing one path -- the reason the refusal exists.
+        """
+
+        def body(d):
+            stores = [
+                HiCacheFile(
+                    _d_config(r, canonical=False, is_mla_model=True), file_path=d
+                )
+                for r in range(3)
+            ]
+            # Rank 1 goes FIRST, on a key nobody has written: otherwise the
+            # already-exists fast path answers before the admission question is
+            # ever asked, and the pin would grade nothing.
+            return [
+                stores[1].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+                stores[0].set(KEY, torch.zeros(4096, dtype=torch.uint8)),
+            ]
+
+        with tempfile.TemporaryDirectory() as d:
+            wrote = self._bounded(lambda: body(d))
+            self.assertEqual(
+                wrote,
+                [False, True],
+                "MLA ranks write one identical file; only the owner may write it",
+            )
+
+    def test_an_mla_stage_still_deposits_its_extent_of_the_canonical_blob(self):
+        """The one case where the two questions pull APART inside one write.
+
+        MLA is exactly where ``owner_writes_whole_file`` is True for an
+        ordinary page -- and an extent write is still a PART, because the
+        canonical format cuts on the layer axis, which MLA does not collapse.
+        Deriving the answer from the model shape alone would refuse stages 1
+        and 2 here and the blob would never complete, on a model where every
+        other write of theirs is correctly de-duplicated.
+        """
+
+        def body(d):
+            stores = [
+                HiCacheFile(_p_config(st, is_mla_model=True), file_path=d)
+                for st in range(3)
+            ]
+            return stores, [stores[st].set(KEY, _payload(st)) for st in range(3)]
+
+        with tempfile.TemporaryDirectory() as d:
+            stores, wrote = self._bounded(lambda: body(d))
+            self.assertEqual(
+                wrote,
+                [True, True, True],
+                "an MLA PP stage was refused its own layer extent of the blob",
+            )
+            self.assertTrue(
+                stores[0].exists(KEY),
+                "the blob never completed: the non-owner stages were dropped",
+            )
+
+    def test_a_non_owner_keeps_no_index_of_what_it_wrote(self):
+        """The non-owner writes UNTRACKED: one index per directory, on the owner.
+
+        A non-owner that indexed its own writes would be the second
+        bookkeeping over the same files that F7 removes -- and it would evict
+        from it, unlinking pages the owner still counts.
+        """
+        draft = f"{KEY}.draft-a30db4b7c362c786"
+
+        def body(d):
+            store = HiCacheFile(_d_config(1), file_path=d)
+            ok = store.set(draft, torch.zeros(4096, dtype=torch.uint8))
+            return store, ok
+
+        with tempfile.TemporaryDirectory() as d:
+            store, ok = self._bounded(lambda: body(d))
+            self.assertTrue(ok)
+            self.assertFalse(store._evictor.is_storage_owner)
+            self.assertEqual(len(store._evictor._lru), 0)
+            self.assertEqual(store._evictor._total_bytes, 0)
+            self.assertEqual(len(store._evictor._pending_writes), 0)
+
+
+class TestW8bTheGateIsGradedWhereTheNumberExists(CustomTestCase):
+    """W8b's two blind spots: the SEAM and the MOMENT.
+
+    Every other coverage test hands ``LRUFileEvictor`` its suffixes by hand,
+    so the one production wiring (``HiCacheFile`` -> evictor) is never graded
+    and re-pointing it at ``config_suffix`` -- the exact 83.7 %-blind defect --
+    passes the suite. And the gate ran only in ``__init__``, which on Weg 2's
+    first boot sees an EMPTY directory: coverage 1.0 over 0 bytes, a gate with
+    no denominator. The populated moment is the wake re-scan.
+    """
+
+    def test_the_backend_wires_the_kv_suffix_into_its_evictor(self):
+        with tempfile.TemporaryDirectory() as d:
+            probe = HiCacheFile(_d_config(0), file_path=d)
+            _seed_store(
+                d,
+                kv_suffix=probe.kv_config_suffix,
+                cfg_suffix=probe.config_suffix,
+                n_pages=40,
+                n_drafts=10,
+            )
+            os.environ["SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE"] = "1G"
+            try:
+                store = HiCacheFile(_d_config(0), file_path=d)
+            finally:
+                os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
+            coverage = store._evictor.index_coverage()
+            self.assertGreaterEqual(
+                coverage["fraction"],
+                0.95,
+                f"the backend's own evictor indexes "
+                f"{coverage['indexed_entries']} of {coverage['seen_entries']} "
+                f"files ({coverage['fraction']:.1%})",
+            )
+
+    def test_the_wake_rescan_grades_the_coverage_it_rebuilt(self):
+        """A cold store passes the gate vacuously; the sibling's writes are
+        what the woken owner must be graded against."""
+        from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
+
+        with tempfile.TemporaryDirectory() as d:
+            evictor = LRUFileEvictor(
+                d,
+                "_sfx",
+                kv_config_suffix=None,
+                tp_rank=0,
+                writes_shared_keys=True,
+                extra_config={"max_size": "1G"},
+            )
+            self.assertEqual(evictor.index_coverage()["seen_entries"], 0)
+            # The sibling group's hours of writes, under a suffix this scan
+            # filter cannot see.
+            for i in range(20):
+                with open(os.path.join(d, f"{i:04d}_other.bin"), "wb") as f:
+                    f.write(b"\x03" * 4096)
+            with self.assertRaises(Weg2StoreIndexBlind):
+                evictor.rescan()
+
+    def test_a_wake_rescan_that_still_sees_the_store_passes(self):
+        """CAN-FAIL GUARD: the wake gate must not refuse a healthy store."""
+        with tempfile.TemporaryDirectory() as d:
+            evictor = LRUFileEvictor(
+                d,
+                "_sfx",
+                kv_config_suffix=None,
+                tp_rank=0,
+                writes_shared_keys=True,
+                extra_config={"max_size": "1G"},
+            )
+            for i in range(20):
+                with open(os.path.join(d, f"{i:04d}_sfx.bin"), "wb") as f:
+                    f.write(b"\x03" * 4096)
+            census = evictor.rescan()
+            self.assertEqual(census["indexed_entries"], 20)
+
+
+class TestS5RegressionGuards(CustomTestCase):
+    """Two invariants the slice asserts in prose and graded nowhere."""
+
+    def test_touch_reaches_the_inode_of_a_file_this_owner_never_indexed(self):
+        """N2's actual case: the page the SIBLING wrote while this group slept.
+
+        The indexed key takes the ``move_to_end`` branch; a cross-group hit
+        takes the ADOPTION branch, and that is the branch whose recency has to
+        reach the inode -- it is the only recency fact the sibling can read.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            evictor = LRUFileEvictor(
+                d,
+                "_sfx",
+                kv_config_suffix=None,
+                tp_rank=0,
+                writes_shared_keys=True,
+                extra_config={"max_size": "1G"},
+            )
+            self.assertEqual(
+                len(evictor._lru), 0, "the adoption branch needs a cold index"
+            )
+            path = os.path.join(d, "page_sfx.bin")
+            with open(path, "wb") as f:
+                f.write(b"\x01" * 4096)
+            old = 1_000_000.0
+            os.utime(path, (old, old))
+            evictor.touch("page_sfx", path)
+            self.assertIn(
+                "page_sfx", evictor._lru, "the sibling's file was not adopted"
+            )
+            self.assertGreater(
+                os.stat(path).st_mtime,
+                old,
+                "an adopted cross-group hit left no recency the sibling can read",
+            )
+
+    def test_a_wake_rescan_preserves_an_in_flight_reservation(self):
+        """``rescan``'s documented invariant, graded.
+
+        A reservation belongs to this process and is not on disk yet, so
+        re-reading the directory must not drop it -- dropping it under-counts
+        ``_total_bytes`` and lets a concurrent ``reserve`` hand out space the
+        pending write already holds.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "a_sfx.bin"), "wb") as f:
+                f.write(b"\x01" * 4096)
+            evictor = LRUFileEvictor(
+                d,
+                "_sfx",
+                kv_config_suffix=None,
+                tp_rank=0,
+                writes_shared_keys=True,
+                extra_config={"max_size": "1G"},
+            )
+            before = evictor._total_bytes
+            self.assertTrue(evictor.reserve("inflight_sfx", 4096))
+            evictor.rescan()
+            self.assertIn(
+                "inflight_sfx",
+                evictor._lru,
+                "the wake re-scan dropped a write that is still in flight",
+            )
+            self.assertEqual(evictor._total_bytes, before + 4096)
 
 
 if __name__ == "__main__":

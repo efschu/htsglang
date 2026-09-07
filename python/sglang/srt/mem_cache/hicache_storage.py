@@ -15,7 +15,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.canonical_kv_page import CanonicalPageError
-from sglang.srt.mem_cache.weg2_store_gates import writes_shared_keys
+from sglang.srt.mem_cache.weg2_store_gates import (
+    owner_write_covers_whole_file,
+    writes_shared_keys,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.canonical_page_store import (
@@ -1119,6 +1122,13 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix,
             tp_rank=tp_rank,
             writes_shared_keys=shared_keys,
+            # The eviction owner is elected over the group's FULL rank
+            # identity. Group P is pp_size=3, tp_size=1: every stage has
+            # tp_rank == 0, so a tp-keyed election would give one directory
+            # three owners -- the same trap the directory-creation guard 90
+            # lines above already names for pure PP.
+            pp_rank=pp_rank,
+            attn_cp_rank=attn_cp_rank,
             # F7 / W8b: the canonical KV pages and GDN blobs end with the KV
             # suffix, not this rank's config_suffix. Without it the eviction
             # index cannot see them at all and the byte cap bounds only the
@@ -1545,7 +1555,21 @@ class HiCacheFile(HiCacheStorage):
             # Charged per SLICE: the writers together account for one blob, and
             # the one that completes it has ``commit`` correct the estimate to
             # the file's real allocation.
-            if not self._evictor.reserve(suffixed, window.payload_bytes, key=key):
+            if not self._evictor.reserve(
+                suffixed,
+                window.payload_bytes,
+                key=key,
+                # An extent write is a PART by construction: this rank
+                # deposits its layers (PP) or its head channels (TP) and the
+                # blob becomes readable only when the last byte lands. The
+                # storage owner's write never covers it, so the owner gate
+                # must not apply -- refusing here is a blob that never
+                # completes, which reads as a cold cache and never raises.
+                owner_writes_whole_file=owner_write_covers_whole_file(
+                    is_mla_model=self._key_geom["is_mla_model"],
+                    canonical_extent_write=True,
+                ),
+            ):
                 return False
             reserved = True
             self._ensure_shard_dir(tensor_path)
@@ -1572,6 +1596,14 @@ class HiCacheFile(HiCacheStorage):
         entirely outside this process's index while it slept; evicting against
         that index would evict against a snapshot of the past. A no-op for a
         non-owner or an unbounded store.
+
+        MAY RAISE ``Weg2StoreIndexBlind`` (W8b): the rebuilt index is graded
+        against the directory it just read, and the wake is the moment that
+        grading has a denominator -- at boot this store can be empty, where
+        coverage is 1.0 over zero bytes. A caller on the wake path must let it
+        propagate; a cap enforced over a fraction of the sole carrier is not a
+        cap, and continuing would spend the group's awake phase evicting
+        against numbers that do not describe the disk.
         """
         return self._evictor.rescan()
 
@@ -1711,8 +1743,20 @@ class HiCacheFile(HiCacheStorage):
         reserved = False
         try:
             value_bytes = value.numel() * value.element_size()
-            # Ask the evictor to admit + reserve disk space (evicting if needed).
-            if not self._evictor.reserve(suffixed, value_bytes, key=key):
+            # Ask the evictor to admit + reserve disk space (evicting if
+            # needed). Whether a non-owner may write is a question about THIS
+            # FILE, not about this rank: under MLA every rank names one path
+            # and writes identical bytes, so the owner's write is the whole
+            # file; everywhere else the suffix carries this rank's terms and
+            # the owner never writes this path at all.
+            if not self._evictor.reserve(
+                suffixed,
+                value_bytes,
+                key=key,
+                owner_writes_whole_file=owner_write_covers_whole_file(
+                    is_mla_model=self._key_geom["is_mla_model"],
+                ),
+            ):
                 return False
             reserved = True
 

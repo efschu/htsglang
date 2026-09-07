@@ -90,6 +90,45 @@ def writes_shared_keys(
     return bool(is_mla_model) or bool(dcp_owner_mode) or canonical_kv_page is not None
 
 
+def owner_write_covers_whole_file(
+    *,
+    is_mla_model: bool,
+    canonical_extent_write: bool = False,
+) -> bool:
+    """Would the storage owner's write alone put EVERY byte of this file on disk?
+
+    THE SECOND QUESTION, kept apart from ``writes_shared_keys`` on purpose.
+    That predicate answers file IDENTITY -- do two ranks name one path. This
+    one answers file COMPLETENESS -- is one rank's write the whole content.
+    They coincide only under MLA, and conflating them is what made a
+    correct-looking eviction election refuse writes:
+
+    * ``writes_shared_keys`` became true for a GQA model under the #706
+      canonical page and under dcp owner mode, so ranks 1..n-1 stopped being
+      storage owners -- correct, one LRU index per directory;
+    * but ``reserve()`` read "not the owner" as "has nothing to contribute",
+      and those ranks hold bytes NOBODY else writes: their extent of the
+      canonical blob (a PP stage holds its layers, a TP rank its head
+      channels), their dcp-owned pages, their own suffixed draft files. On
+      Weg 2's store, where the cap is always configured, refusing them is a
+      carrier that moves nothing and looks exactly like a cold cache.
+
+    Under MLA the suffix carries no rank term at all (``_derive_key_suffixes``
+    appends the tp terms only ``if not is_mla_model``), so every rank names ONE
+    path and writes byte-identical content into it: the owner's write really is
+    the whole file, and admitting the others would be three processes writing
+    one path for nothing. That case, and only that case, keeps the refusal.
+
+    A canonical EXTENT write is never whole by construction -- the format
+    exists so that several ranks each deposit a part and the blob becomes
+    readable only when the last byte lands -- so it answers False whatever the
+    attention shape.
+    """
+    if canonical_extent_write:
+        return False
+    return bool(is_mla_model)
+
+
 def check_mamba_blob_present(
     *,
     canonical_page_on: bool,
