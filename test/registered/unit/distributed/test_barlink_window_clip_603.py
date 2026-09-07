@@ -153,6 +153,50 @@ class WindowClipTest(unittest.TestCase):
                     group="tp:0",
                 )
 
+    # -- the row names its own denominator ---------------------------------
+
+    def test_a_second_clip_for_one_group_is_counted_not_overwritten(self):
+        """weg2 S2 makes the build repeatable, so one row is no longer one
+        clip.
+
+        Until ``GroupCoordinator.barlink_reopen()`` a group's window was
+        priced exactly once, at boot, and a single row per group WAS the
+        whole population. Every wake now prices a new window, so a wake clip
+        silently replacing the boot clip would leave the table unable to say
+        whether one build came up short or twelve.
+        """
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("SGLANG_BARLINK_BAR1_WINDOW_MIB")
+               and k != "SGLANG_BARLINK_BAR1_RESERVE_MIB"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                self._with_free(56), self._no_ledger():
+            mt.window_for("dcp:0", device=None)
+            # can-fail half: one build, one clip, count 1.
+            self.assertEqual(mt.window_clips()["dcp:0"]["count"], 1)
+            # the wake re-prices the same group against a smaller aperture
+            with self._with_free(48):
+                mt.window_for("dcp:0", device=None)
+
+        clips = mt.window_clips()
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(clips["dcp:0"]["count"], 2)
+        # The values in the row are the LATEST ones, which is what is in
+        # force: 48 free - 32 reserve = 16 MiB.
+        self.assertEqual(clips["dcp:0"]["granted_bytes"], 16 * MiB)
+
+    def test_state_summary_prints_how_many_builds_were_clipped(self):
+        from sglang.srt.distributed.device_communicators import barlink
+
+        barlink._STATE.clear()
+        self.addCleanup(barlink._STATE.clear)
+        barlink.report_state("dcp:0", "bar1", "bar1")
+        mt.record_clip("dcp:0", 96 * MiB, 24 * MiB,
+                       "SGLANG_BARLINK_BAR1_WINDOW_MIB", "arithmetic here")
+        self.assertIn("1 clipped build", barlink.state_summary())
+        mt.record_clip("dcp:0", 96 * MiB, 16 * MiB,
+                       "SGLANG_BARLINK_BAR1_WINDOW_MIB", "arithmetic here")
+        self.assertIn("2 clipped builds", barlink.state_summary())
+
     # -- the wording that misdirected the incident -------------------------
 
     def test_reduction_warning_does_not_claim_a_silent_gloo_fallback(self):

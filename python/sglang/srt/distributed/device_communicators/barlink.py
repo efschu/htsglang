@@ -181,10 +181,15 @@ def state_summary() -> str:
             "is unaffected; the payload per round is not):"
         )
         for name, c in sorted(clips.items()):
+            # The count is the row's denominator: since weg2 S2 a group's
+            # window is priced again at every wake, so "one row" no longer
+            # means "one clipped build".
+            times = int(c.get("count", 1))
             lines.append(
                 f"    {name}: {c['granted_bytes'] // 2**20} MiB granted of "
                 f"{c['requested_bytes'] // 2**20} MiB requested "
-                f"({c['source']})"
+                f"({c['source']}, {times} clipped "
+                f"build{'s' if times != 1 else ''}; values are the latest)"
             )
     return header + "\n" + "\n".join(lines)
 
@@ -599,6 +604,40 @@ def graph_capture_running() -> bool:
         return False
 
 
+def transport_captured_launches(comm) -> bool:
+    """True if CUDA graphs hold this communicator's transport kernels.
+
+    A captured launch bakes the transport's kernels into a graph and arms
+    ``_captured_launches`` on the transport (``barlink_bar1.py:4793``,
+    ``barlink_device.py:1436``); the comment there says what that means --
+    the kernels "will run on every replay with no host code between them".
+    The objects those kernels reference are TRANSPORT-LIFETIME: the sliding
+    window's step counter (``barlink_bar1.py:2607``), the graph-safe direct
+    mode's generation counter (``:2615``, "it must keep counting on every
+    graph replay") and the reserved graph slots of the result ring
+    (``:2499-2501``, "Each captured call site takes ONE graph slot and does
+    not give it back").
+
+    Read for ``GroupCoordinator.barlink_reopen()``, which frees exactly those
+    objects and the BAR1 mappings under them. Everything is read
+    defensively: this runs on the path that REFUSES, so it must never itself
+    be the cause of an error, and it also has to answer for the ``__new__``
+    stand-ins the unit tests build.
+    """
+    if comm is None:
+        return False
+    # The snapshot first: ``BarlinkMatrixTransport.close()`` nulls ``bar1``,
+    # which is the only home of the latch, so after a sleep the live chain
+    # can no longer answer. See ``BarlinkCommunicator.close()``.
+    if getattr(comm, "_closed_with_captured_launches", False):
+        return True
+    t = getattr(comm, "transport", None)
+    for obj in (getattr(t, "bar1", None), t):
+        if obj is not None and getattr(obj, "_captured_launches", False):
+            return True
+    return False
+
+
 def _transport_name(t) -> str:
     """The name of a transport for error messages, without ever raising itself.
 
@@ -673,6 +712,15 @@ class BarlinkCommunicator:
         self.world_size = dist.get_world_size(cpu_group)
         self.rank = dist.get_rank(cpu_group)
         self.disabled = self.world_size == 1
+        #: Set by ``close()`` and never cleared: this communicator's
+        #: transports are gone and it must not answer another collective.
+        #: weg2 S2 -- sleep closes the transports, and a group that was
+        #: closed but never reopened would otherwise keep ANSWERING over the
+        #: host-staged gloo plane, because ``_select`` returns ``None`` for a
+        #: transport that is down and ``None`` means "gloo". A wrong answer
+        #: is not what a closed transport owes its caller; a refusal is.
+        #: The reopen builds a NEW communicator, so this flag is one-way.
+        self._closed = False
         #: Who the peer PROCESSES of this group are. Published once, here,
         #: before any transport exists -- every gloo call below is bounded
         #: against it, so a SIGKILLed rank ends the wait with a named error
@@ -715,6 +763,10 @@ class BarlinkCommunicator:
     def _select(self, op: str, nbytes: int):
         """The transport for ``op`` at this size, or None for the gloo plane.
 
+        Raises ``RuntimeError`` when ``close()`` has run: a closed group has
+        no transports to select from, and the gloo plane is not a substitute
+        for one -- see the closed check at the top of the body.
+
         One attribute test plus the transport's own `handles` -- the same shape
         at every dispatch site, so op coverage can no longer differ silently
         between ops the way it did when each site hard-coded its own condition.
@@ -753,6 +805,25 @@ class BarlinkCommunicator:
            let through exactly this one case -- the only one where a
            measured decision leads into the gloo layer under capture.
         """
+        # A CLOSED communicator refuses instead of falling back (weg2 S2).
+        # Everywhere else in this method ``None`` means "take the gloo
+        # plane", and for a transport that merely declines this size that is
+        # right. For a transport that has been CLOSED it is not: sleep hands
+        # the BAR1 aperture back, and a group whose wake did not call
+        # ``GroupCoordinator.barlink_reopen()`` would go on serving over host
+        # staging with no line in the log saying it left bar1 -- the same
+        # shape as the mixed measurement the achieved-vs-requested pair
+        # exists to prevent. One flag on the object that already owns the
+        # transport, read defensively because this class also exists as a
+        # ``__new__`` stand-in.
+        if getattr(self, "_closed", False):
+            raise RuntimeError(
+                f"barlink group {getattr(self, 'group', '')!r}: the "
+                f"transports are closed; {op} cannot run until "
+                "GroupCoordinator.barlink_reopen() has rebuilt them. Falling "
+                "back to the gloo plane here would answer over host staging "
+                "without a single line saying this group left bar1."
+            )
         t = self.transport
         chosen = t if (t is not None and t.handles(op, nbytes)) else None
         dispatcher = getattr(self, "_path_dispatcher", None)
@@ -1431,13 +1502,44 @@ class BarlinkCommunicator:
     # teardown
     # ------------------------------------------------------------------
 
+    def captured_launches(self) -> bool:
+        """True if CUDA graphs hold this communicator's transport kernels.
+
+        The one question ``GroupCoordinator.barlink_reopen()`` has to ask
+        before it tears the transports down, asked THROUGH the object that
+        owns them so that `parallel_state` needs no second import of this
+        module (its flag-off byte-identity rule allows exactly one, inside
+        the construction gate). The logic itself is the module function; this
+        is the seam, not a second copy of it.
+        """
+        return transport_captured_launches(self)
+
     def close(self) -> None:
         """Release the POSIX shm segment backing the shm/device transports.
 
         Without this the segment survives the process and leaks a /dev/shm
         entry per run (rank 0 owns the unlink). Called from
-        GroupCoordinator.destroy().
+        GroupCoordinator.destroy() and, since weg2 S2, from
+        GroupCoordinator.barlink_reopen() (sleep closes, wake rebuilds).
+
+        The flag is set BEFORE the early return, and never cleared: after
+        this the communicator refuses collectives (``_select``) rather than
+        answering them over the gloo plane. A wake builds a new
+        communicator; it does not revive this one. ``self.transport`` is
+        deliberately NOT nulled -- it is assigned exactly once, in
+        ``__init__`` -- so the post-sleep shape is ``_closed`` True with a
+        transport still in place, and the refusal in ``_select`` must key on
+        the flag alone.
         """
+        # Snapshot the capture latch BEFORE the teardown erases it:
+        # ``BarlinkMatrixTransport.close()`` nulls ``self.bar1`` and the latch
+        # lives on that object, so after this call nothing on the live chain
+        # can say any more whether graphs hold the freed kernels. One bit,
+        # taken at the one instant its source is destroyed, on the object that
+        # survives -- ``barlink_reopen()`` reads it to refuse a rebuild under
+        # live graphs.
+        self._closed_with_captured_launches = transport_captured_launches(self)
+        self._closed = True
         if self.transport is None:
             return
         try:

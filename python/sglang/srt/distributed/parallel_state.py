@@ -794,83 +794,11 @@ class GroupCoordinator:
                 qr_rocm_arch_available,
             )
 
-        # barlink (task #117): vendor-neutral host-staged collectives, for TP
-        # groups that span GPUs without a common device collective library
-        # (NCCL and RCCL cannot form a joint communicator). Constructed
-        # BEFORE pynccl and consulted FIRST in every dispatch, so that when
-        # the flag is on no collective reaches NCCL.
-        #
-        # Flag OFF (the default) leaves barlink_comm as None and every dispatch
-        # seam falls through a single `is not None` check -- behavior is
-        # byte-identical to stock sglang.
-        #
-        # It attaches to self.cpu_group (gloo), which sglang already builds
-        # for every group, so this adds no process group and no new
-        # collective beyond barlink's own startup calibration.
-        self.barlink_comm: Optional[Any] = None
-        if should_build_barlink(self.world_size):
-            from sglang.srt.distributed.device_communicators.barlink import (
-                BarlinkCommunicator,
-            )
-
-            # The CPU transports host-stage every collective: shm calls
-            # cudaStreamSynchronize twice per op and spins on shm counters,
-            # the gloo plane calls cudaEventSynchronize plus a gloo CPU
-            # collective per chunk. All of that is ILLEGAL inside a CUDA-graph
-            # capture. Until now that constraint lived only in the log line
-            # below, so violating it surfaced as a bare
-            # `cudaErrorStreamCaptureUnsupported` in the middle of capture --
-            # the exact shape of the arm-E crash. Fail at startup, naming the
-            # cause, instead.
-            _enforce_cpu_transport_needs_eager(envs.SGLANG_BARLINK_TRANSPORT.get())
-            # Through a LOCAL variable, and so is the state query further
-            # down: `self.barlink_comm` may only be touched behind an
-            # `is not None` (test_dispatch_seams_are_all_none_guarded pins
-            # that, and rightly so -- it is what keeps the flag-off path
-            # byte-identical).
-            _comm = BarlinkCommunicator(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                group=self.unique_name,
-            )
-            self.barlink_comm = _comm
-            # What was REQUESTED and what was ACHIEVED -- kept apart.
-            #
-            # Until now this line named the requested transport, whatever had
-            # actually come of it. On the real model with SGLANG_UNEVEN_DCP
-            # that meant: 'tp' brought the direct path up in 27 ms, 'dcp'
-            # failed at the holder with ENOMEM and fell back to gloo -- and
-            # both lines said "transport=bar1". Half of the number won from
-            # that run was not a bar1 number at all. So the failure is now a
-            # WARNING carrying the group name and the reason, and the success
-            # says explicitly what is really running.
-            requested = envs.SGLANG_BARLINK_TRANSPORT.get()
-            state = getattr(_comm, "state", {}) or {}
-            achieved = state.get("achieved", requested)
-            if state.get("direct", True):
-                logger.info(
-                    "barlink enabled for group '%s': requested=%s, "
-                    "ACHIEVED=%s. Every SGLANG_BARLINK* env must be identical "
-                    "on all ranks; the host-staged transports (shm/gloo/ucx) "
-                    "additionally require --disable-cuda-graph.",
-                    self.unique_name,
-                    requested,
-                    achieved,
-                )
-            else:
-                logger.warning(
-                    "barlink group '%s': requested=%s, ACHIEVED=%s (%s: %s). "
-                    "This group does NOT run over %s. A measurement from "
-                    "this run is mixed and must not be reported as a "
-                    "%s value.",
-                    self.unique_name,
-                    requested,
-                    achieved,
-                    state.get("stage", "?"),
-                    state.get("reason", "?"),
-                    requested,
-                    requested,
-                )
+        # barlink (task #117): constructed here, at exactly the point in the
+        # sequence it has always been constructed at. The block itself lives in
+        # _build_barlink() so that a WAKE can reach it a second time (weg2 S2 /
+        # BI-1) without a second copy of it.
+        self._build_barlink()
 
         # When barlink is active the pynccl communicator is NOT CONSTRUCTED --
         # not merely left unused.
@@ -1036,6 +964,302 @@ class GroupCoordinator:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
+
+    def _build_barlink(self) -> None:
+        """Construct this group's barlink communicator, or leave it None.
+
+        ONE definition, two call sites: `__init__` at boot and
+        `barlink_reopen()` at wake (weg2 S2 / BI-1). A second copy of this
+        block would drift -- only the boot path would keep the abort-gate
+        registration, the BAR1 ledger credit and the achieved-vs-requested
+        log line -- which is the second-bookkeeping shape the
+        upstream-minimal law targets.
+
+        Reads `self.world_size`, `self.cpu_group`, `self.device` and
+        `self.unique_name`; all four are assigned earlier in `__init__` than
+        the call site below, so the extraction changes no ordering.
+        """
+        # barlink (task #117): vendor-neutral host-staged collectives, for TP
+        # groups that span GPUs without a common device collective library
+        # (NCCL and RCCL cannot form a joint communicator). Constructed
+        # BEFORE pynccl and consulted FIRST in every dispatch, so that when
+        # the flag is on no collective reaches NCCL.
+        #
+        # Flag OFF (the default) leaves barlink_comm as None and every dispatch
+        # seam falls through a single `is not None` check -- behavior is
+        # byte-identical to stock sglang.
+        #
+        # It attaches to self.cpu_group (gloo), which sglang already builds
+        # for every group, so this adds no process group and no new
+        # collective beyond barlink's own startup calibration.
+        self.barlink_comm: Optional[Any] = None
+        if should_build_barlink(self.world_size):
+            from sglang.srt.distributed.device_communicators.barlink import (
+                BarlinkCommunicator,
+            )
+
+            # The CPU transports host-stage every collective: shm calls
+            # cudaStreamSynchronize twice per op and spins on shm counters,
+            # the gloo plane calls cudaEventSynchronize plus a gloo CPU
+            # collective per chunk. All of that is ILLEGAL inside a CUDA-graph
+            # capture. Until now that constraint lived only in the log line
+            # below, so violating it surfaced as a bare
+            # `cudaErrorStreamCaptureUnsupported` in the middle of capture --
+            # the exact shape of the arm-E crash. Fail at startup, naming the
+            # cause, instead.
+            _enforce_cpu_transport_needs_eager(envs.SGLANG_BARLINK_TRANSPORT.get())
+            # Through a LOCAL variable, and so is the state query further
+            # down: `self.barlink_comm` may only be touched behind an
+            # `is not None` (test_dispatch_seams_are_all_none_guarded pins
+            # that, and rightly so -- it is what keeps the flag-off path
+            # byte-identical).
+            _comm = BarlinkCommunicator(
+                cpu_group=self.cpu_group,
+                device=self.device,
+                group=self.unique_name,
+            )
+            self.barlink_comm = _comm
+            # What was REQUESTED and what was ACHIEVED -- kept apart.
+            #
+            # Until now this line named the requested transport, whatever had
+            # actually come of it. On the real model with SGLANG_UNEVEN_DCP
+            # that meant: 'tp' brought the direct path up in 27 ms, 'dcp'
+            # failed at the holder with ENOMEM and fell back to gloo -- and
+            # both lines said "transport=bar1". Half of the number won from
+            # that run was not a bar1 number at all. So the failure is now a
+            # WARNING carrying the group name and the reason, and the success
+            # says explicitly what is really running.
+            requested = envs.SGLANG_BARLINK_TRANSPORT.get()
+            state = getattr(_comm, "state", {}) or {}
+            achieved = state.get("achieved", requested)
+            if state.get("direct", True):
+                logger.info(
+                    "barlink enabled for group '%s': requested=%s, "
+                    "ACHIEVED=%s. Every SGLANG_BARLINK* env must be identical "
+                    "on all ranks; the host-staged transports (shm/gloo/ucx) "
+                    "additionally require --disable-cuda-graph.",
+                    self.unique_name,
+                    requested,
+                    achieved,
+                )
+            else:
+                logger.warning(
+                    "barlink group '%s': requested=%s, ACHIEVED=%s (%s: %s). "
+                    "This group does NOT run over %s. A measurement from "
+                    "this run is mixed and must not be reported as a "
+                    "%s value.",
+                    self.unique_name,
+                    requested,
+                    achieved,
+                    state.get("stage", "?"),
+                    state.get("reason", "?"),
+                    requested,
+                    requested,
+                )
+
+    def _ranks_holding_captured_launches(self, local: bool) -> List[int]:
+        """The ranks of this group whose transport kernels sit inside a graph.
+
+        ONE VERDICT AT ONE PLACE, for a question every rank of the group must
+        answer identically before ``barlink_reopen()`` may free anything. The
+        capture latch is a rank-local observation -- it is armed when a launch
+        runs under ``graph_capture_running()`` on that rank's own stream -- but
+        the consequence is collective: the rebuild it guards runs
+        ``_exchange_fds`` and ``bounded_barrier`` on ``cpu_group``, so a rank
+        that refuses by itself strands its siblings in a barrier and turns a
+        STOP into a bounded timeout. Agreeing first makes a genuine split
+        (some ranks captured, some not) a named refusal on EVERY rank instead.
+
+        THE SAME SHAPE AS ``barlink._agree_fallback``, deliberately: a one-hot
+        ``int64`` vector reduced with SUM, so the result names every voting
+        rank at a fixed size and without a pickle round trip. A second
+        agreement idiom for the same kind of fact would be the
+        second-bookkeeping shape the upstream-minimal law targets.
+
+        Skipped at world size 1: there is no second rank that could disagree,
+        and the answer is then exactly this rank's own. ``cpu_group`` is never
+        ``None`` here -- ``barlink_reopen()`` refuses on that two statements
+        earlier -- and a failure of the reduction itself is NOT swallowed: it
+        propagates, and the caller's W4 obligation makes it group-fatal. A
+        wake that cannot agree has no answer to proceed on.
+        """
+        world = torch.distributed.get_world_size(self.cpu_group)
+        rank = torch.distributed.get_rank(self.cpu_group)
+        if world < 2:
+            return [rank] if local else []
+        votes = torch.zeros(world, dtype=torch.int64)
+        votes[rank] = 1 if local else 0
+        torch.distributed.all_reduce(
+            votes, op=torch.distributed.ReduceOp.SUM, group=self.cpu_group
+        )
+        return [r for r in range(world) if int(votes[r]) != 0]
+
+    def barlink_reopen(self) -> None:
+        """Rebuild this group's barlink transports after a sleep closed them.
+
+        weg2 S2 / BI-1. Sleep closes the transports
+        (`BarlinkBar1Transport.close()`, which is collective-free and hands
+        the BAR1 aperture and the abort-gate registration back); until now
+        `__init__` was the only build site, so a woken group had no
+        transports and no abort poller.
+
+        NEVER USE `destroy()` AS A SLEEP. It also destroys the gloo
+        `cpu_group` (`destroy`, below), and every barlink bring-up runs
+        collectives on that group -- the fd exchange, the liveness install,
+        the window minimum. That case is refused here by name rather than
+        faulting somewhere inside the fd exchange, where the cause is no
+        longer on hand.
+
+        This is a BUILD, and the fork's rule is that a flip pays COPY time
+        and never BUILD time. The deviation is taken with its bound: the
+        rebuild is a collective fd exchange plus a cuMemMap, and the caller
+        (the sleep/wake RPC) owns the deadline -- this method has none of its
+        own and must not grow one.
+
+        TWO REFUSALS OF ITS OWN, AND W6 IS CONDITIONAL ON THE ENVIRONMENT.
+        The first is below: a rebuild while CUDA graphs still hold this
+        transport's captured kernels is refused, because the rebuild frees
+        what those kernels reference and nothing re-captures them at wake.
+        That one is a GROUP verdict, agreed over `cpu_group` before anything
+        is freed (`_ranks_holding_captured_launches`), so a rank never
+        refuses alone while its siblings walk into the rebuild's collectives.
+        The exceptions listed below are the OTHER kind and stay rank-local by
+        nature: they come from the build itself, which every rank is already
+        inside, and the caller's W4 obligation is what makes them group-fatal.
+        The second sits on the other side of the sleep: a CLOSED
+        `BarlinkCommunicator` raises from `_select` instead of answering over
+        the gloo plane, so a group whose wake never reached this method
+        refuses rather than serving off-transport in silence -- and that is
+        also what a FAILED rebuild here leaves standing, deliberately.
+        If a sibling group still holds the card's aperture, `window_for`
+        raises `Bar1WindowRefused` (W6) and it propagates from here
+        untouched -- but ONLY when the window was requested explicitly:
+        the raise sits behind `if source in os.environ`
+        (`barlink_matrix_transport.py:380-381`), and with neither
+        `SGLANG_BARLINK_BAR1_WINDOW_MIB` nor its `_<GROUP>` form set,
+        `_requested()` returns the 96 MiB DEFAULT (`:67`) under a name that
+        is not in the environment. In that state the wake does not refuse:
+        it CLIPS the window to what is left, records the clip
+        (`record_clip`) and warns. Weg 2 must therefore set the variable in
+        the launch if it wants a refusal at wake; that is an S3 launcher
+        prerequisite, not something this method can decide.
+
+        Flag off, this is a no-op that leaves `barlink_comm` None, exactly
+        as at boot.
+        """
+
+        if self.cpu_group is None:
+            raise RuntimeError(
+                f"barlink group {self.unique_name!r}: cannot reopen, this "
+                "group's gloo cpu_group is gone. GroupCoordinator.destroy() "
+                "was used where a sleep was meant -- it tears down the "
+                "cpu_group that every barlink bring-up needs (fd exchange, "
+                "liveness install, window minimum). A sleep closes the "
+                "transports only (barlink_comm.close()) and leaves the "
+                "process groups standing."
+            )
+        # A REBUILD UNDER LIVE CUDA GRAPHS IS A USE-AFTER-FREE, so it is
+        # refused here -- before the close, or the refusal would destroy
+        # exactly what it exists to protect. A captured launch bakes this
+        # transport's kernels into a graph
+        # (`barlink_bar1.py:4776`: they "will run on every replay with no host
+        # code between them"), and those kernels reference transport-lifetime
+        # objects: `_step_dev` (`barlink_bar1.py:2607`), `_result_gen_dev`
+        # (`:2615`) and the reserved graph slots of the result ring
+        # (`:2499-2501`). `close()` frees all of it and gives the BAR1
+        # aperture back -- `vmm_free` = `cuMemUnmap`/`cuMemRelease`/
+        # `cuMemAddressFree`, so the virtual addresses go too -- and
+        # `_build_barlink()` then allocates fresh ones at fresh addresses.
+        # Nothing re-binds them: the weg2 wake sequence skips
+        # `resume("cuda_graph")` in V1 and re-captures nothing, so a resident
+        # graph would replay against freed VRAM and unmapped BAR1 pages, with
+        # no diagnostic at all. That is an operator decision (re-capture at
+        # wake, or a VA-stable reopen that keeps the window addresses), not
+        # something this method may take silently, and it is filed against the
+        # UNMEASURED register's U4.
+        old_comm = None
+        if self.barlink_comm is not None:
+            # Read through the object, not through an import: the flag-off
+            # byte-identity rule keeps `barlink` out of this module's import
+            # graph except inside the construction gate, and the answer lives
+            # on the communicator anyway.
+            old_comm = self.barlink_comm
+            # AGREED ACROSS THE GROUP, not read off this rank. The latch is
+            # armed by a capture on THIS rank's own stream, and
+            # `graph_capture_running()` says what that costs a collective
+            # decision (`barlink.py:590-593`): "Anyone using this function to
+            # make a COLLECTIVE decision is relying on exactly that; where it
+            # doesn't hold, the decision is misplaced." What this refusal
+            # guards is collective -- `_build_barlink()` runs `_exchange_fds`
+            # (`barlink_bar1.py:1534`) and `bounded_barrier` (`:1576`,
+            # `:2618`) on `cpu_group` -- so a rank refusing alone would leave
+            # its siblings inside a barrier for a peer that is unwinding: a
+            # bounded timeout, which is a hang dressed as a deadline, not the
+            # STOP the "ranks never disagree" law asks for. Unlike the BAR1
+            # window (a genuine per-card physical fact) this verdict is
+            # cheaply agreeable: the guard above has just proven `cpu_group`
+            # is present, so the channel is guaranteed here.
+            captured_ranks = self._ranks_holding_captured_launches(
+                old_comm.captured_launches()
+            )
+            if captured_ranks:
+                raise RuntimeError(
+                    f"barlink group {self.unique_name!r}: cannot reopen, "
+                    "CUDA graphs hold this transport's captured kernels "
+                    "(_captured_launches) on rank(s) "
+                    f"{', '.join(str(r) for r in captured_ranks)} of this "
+                    "group. Rebuilding frees the objects "
+                    "those kernels reference -- _step_dev, _result_gen_dev "
+                    "and the reserved result-ring graph slots -- and unmaps "
+                    "the BAR1 pages behind them, while nothing re-captures "
+                    "or re-binds the graphs at wake. Replaying one "
+                    "afterwards reads freed VRAM. Every rank of the group "
+                    "refuses on this same agreed answer, so the ranks stop "
+                    "together instead of splitting over the transport. Drop "
+                    "the captured graphs before the sleep, or decide the "
+                    "wake's graph handling explicitly (weg2 register U4)."
+                )
+            # A live communicator still holds its BAR1 ledger credit, so
+            # building a second one would price the new window against space
+            # this process has not returned. Close first: close() is
+            # idempotent and collective-free, which also makes this the safe
+            # path when the sleep already closed it.
+            old_comm.close()
+            self.barlink_comm = None
+        # THE CONTRACT FOR THE CALLER, because this is the first code path in
+        # the fork that takes a LIVE coordinator from a transport to none.
+        # Before weg2, `barlink_comm` went non-None -> None only in
+        # `destroy()`, where the process groups die in the next statements and
+        # nothing dispatches afterwards. Here the group keeps serving.
+        #
+        # A raise from the build below (W6 `Bar1WindowRefused`, `Bar1Failed`,
+        # `_enforce_cpu_transport_needs_eager`) therefore leaves THIS group
+        # with no barlink and no pynccl either -- pynccl is not built when
+        # barlink was active at boot (`_barlink_active`, above) -- so every
+        # dispatch seam's `if self.barlink_comm is not None` falls through to
+        # `torch.distributed` on `device_group`, i.e. NCCL. That is the
+        # fallback the barlink standard forbids, and on a three-rank group a
+        # BAR1 refusal is a PER-CARD fact: one rank can land here while its
+        # siblings rebuild, which is ranks disagreeing about the transport --
+        # a hang, not a STOP.
+        #
+        # So the wake RPC must treat a raise from here as W4
+        # (`Weg2WakeRefused`), group-fatal: never a retry, never a continue.
+        # The exception is never swallowed -- but the group is put back
+        # exactly as this method found it before it propagates. The restored
+        # communicator is CLOSED (`close()` sets `_closed` before its early
+        # return), so the seam predicate stays true and the next collective
+        # hits the named refusal in `BarlinkCommunicator._select` -- the STOP
+        # the "ranks never disagree" law asks for -- instead of NCCL. It holds
+        # no ledger credit and no abort-gate registration, so nothing is
+        # double-charged either. If there was no communicator to begin with
+        # (flag off), None is what this method found and None is what it
+        # leaves: barlink was never the plane there, and pynccl was built.
+        try:
+            self._build_barlink()
+        except BaseException:
+            self.barlink_comm = old_comm
+            raise
 
     def __repr__(self):
         return (
