@@ -2978,8 +2978,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         UnifiedRadixCache._weg2_end_anchor_n = n
         tokens = len(token_ids)
         try:
+            # RadixKey asserts the array('q') type of `token_ids` (boot weg2zr1:
+            # a list raised at the probe); slicing keeps the type.
             probe = RadixKey(
-                list(token_ids[:-1]), req.extra_key, is_bigram=self.is_eagle
+                token_ids[:-1], req.extra_key, is_bigram=self.is_eagle
             ).page_aligned(self.page_size)
             target_units = len(probe)
             mr = self.match_prefix(MatchPrefixParams(key=probe))

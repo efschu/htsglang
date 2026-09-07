@@ -66,6 +66,12 @@ FORWARD_PATHS = ("/generate", "/v1/completions", "/v1/chat/completions")
 PASSTHROUGH_GET = ("/v1/models", "/get_model_info", "/get_server_info", "/model_info", "/metrics")
 CHUNK_TOKENS = 4096
 CHARS_PER_TOKEN = 3.0  # conservative: over-estimates tokens, never under-prices
+# #1233 zero-remainder: the CARRIER-EXCEEDS route must not UNDER-estimate --
+# measured boot weg2zr1: 80,000 chars of markdown = 30,100 tokens (2.66
+# chars/token), priced 26,701 by CHARS_PER_TOKEN and routed BATCH past the
+# 27,466-token carrier bound. Route by a lower divisor; the realised leg-1
+# count corrects any prompt that still slips through (see leg1).
+CARRIER_CHARS_PER_TOKEN = 2.4
 T_DRAIN_S = 120.0  # spec 3.5.4: the #111 link-seam bound reused
 QUIESCE_DEADLINE_S = 90.0
 RPC_TIMEOUT_S = 900.0
@@ -481,7 +487,8 @@ class Front:
         self.counters["requests"] += 1
         stream = bool(payload.get("stream"))
         exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
-        if self.carrier_max_tokens > 0 and (exact if exact else est_prompt) > self.carrier_max_tokens:
+        carrier_est = exact if exact else int(len(text) / CARRIER_CHARS_PER_TOKEN) + 1
+        if self.carrier_max_tokens > 0 and carrier_est > self.carrier_max_tokens:
             self.counters["route_carrier_exceeds"] += 1
             logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill est_prompt=%d exact=%s > carrier_max=%d "
                            "(group D host staging pool bound: the store cannot be read into D for a prompt this long; "
@@ -544,6 +551,14 @@ class Front:
                 p.leg1_prompt_tokens = pt
                 self.spans.record(p.text, pt)
                 self._note_exact(p.text, pt)
+                if self.carrier_max_tokens > 0 and pt > self.carrier_max_tokens and not p.skip_leg1:
+                    # The realised count says D cannot read this prompt from the
+                    # store (host staging pool bound): leg 2 is ONE prefill on D,
+                    # not a reroute/W16 loop. P's prefill was spent; counted.
+                    p.skip_leg1 = True
+                    self.counters["carrier_exceeds_after_leg1"] += 1
+                    logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS after leg 1: prompt_tokens=%d > carrier_max=%d; leg 2 = single prefill on D",
+                                   p.rid, pt, self.carrier_max_tokens)
                 g.served += 1
                 logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d",
                             p.rid, pt, ct, time.time() - t0, self.epoch)

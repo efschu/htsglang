@@ -536,6 +536,33 @@ class SchedulerWeightUpdaterManager:
             joined,
         )
 
+    def _weg2_drain_hicache_before_sleep(self, bound_s: float = 30.0) -> None:
+        """Drain HiCache in-flight terms (write-through / storage backup /
+        load-back / prefetch) before a sleep is judged -- see the caller."""
+        sch = self.scheduler
+        tc = getattr(sch, "tree_cache", None)
+        if not getattr(sch, "enable_hierarchical_cache", False) or tc is None:
+            return
+        if not hasattr(tc, "check_hicache_events") or not hasattr(sch, "idle_blockers"):
+            return
+        t0 = time.time()
+        polls = 0
+        first = list(sch.idle_blockers())
+        while time.time() - t0 < bound_s:
+            blockers = list(sch.idle_blockers())
+            if not blockers or any(not b.startswith("hicache") for b in blockers):
+                break
+            tc.check_hicache_events()
+            polls += 1
+            if sch.is_fully_idle():
+                break
+            time.sleep(0.01)
+        logger.warning(
+            "WEG2 SLEEP-DRAIN: waited %.2f s (%d polls) for HiCache in-flight terms "
+            "before the sleep; blockers at entry %s, now %s",
+            time.time() - t0, polls, first, list(sch.idle_blockers()),
+        )
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         # W12 Weg2MemorySaverInactive, BEFORE anything is mutated: with the
         # no-op adapter every pause() below is `pass` and this RPC returns
@@ -580,6 +607,18 @@ class SchedulerWeightUpdaterManager:
         )
         if weg2_memory_saver_on or getattr(recv_req, "destination", None) != "disk":
             assert_memory_saver_active(self.memory_saver_adapter, context="first sleep")
+
+        # #1233 zero-remainder (boot weg2zr1 killer, W4): under PP the front's
+        # quiesce witness is PP0's /flush_cache verdict, while this assert runs
+        # on EVERY rank. A follower that finished the last request later than
+        # PP0 can still hold its own write-through / storage backups of that
+        # request in flight when the sleep RPC lands (PP2: 'not-idle because:
+        # hicache_backup(2)' -> AssertionError -> group death, 15:34:06Z).
+        # Those terms drain by themselves through check_hicache_events, which
+        # only the scheduler loop drives; drive it here, bounded, before
+        # judging. Any non-HiCache blocker still fails the assert below.
+        if not self.is_fully_idle():
+            self._weg2_drain_hicache_before_sleep()
 
         assert (
             self.is_fully_idle()
