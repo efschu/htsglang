@@ -804,6 +804,43 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             scheduler = self.scheduler
+            if scheduler is not None and weg2_memory_saver_on:
+                # WAKE INVARIANT (boot weg2ls2b1 killer, 2026-09-07): the
+                # resume maps FRESH physical pages under the kv_cache region
+                # -- on the two-group form they are the pages the OTHER group
+                # released one RPC earlier -- and this tag has no cpu backup,
+                # so every table that was created WITH A VALUE inside the
+                # region is garbage now: req_to_token (torch.zeros,
+                # memory_pool.py ReqToTokenPool.__init__), the hybrid
+                # req->mamba index maps, MambaPool's conv/temporal states and
+                # cursors.  The fork states the invariant itself ("freshly
+                # booted pools are torch.zeros", zero_kv_data_buffers) and
+                # relies on it: a reader of an unwritten index position read a
+                # benign 0 on every boot before this one and read a page
+                # index from another group's KV after the first wake -> PP1
+                # 'CUDA error: an illegal memory access' in the first GDN
+                # extend after the wake (qwen3_5.py linear_attn), group P
+                # dead.  flush_cache() is the fork's own restore of that
+                # state (ReqToTokenPool.clear -> req_to_token.zero_(),
+                # HybridReqToTokenPool.clear -> mamba maps + reset_state,
+                # allocator + tree reset, KV bytes under SGLANG_FLUSH_ZERO_KV),
+                # and upstream already runs it in this handler; here it runs
+                # AFTER the resume, the mirror image of the MUST_FIX flush
+                # BEFORE the pause.  The group is drained (idle assert on the
+                # sleep) so the flush cannot refuse.
+                t_f0 = time.perf_counter()
+                flushed = self.flush_cache()
+                logger.info(
+                    "WEG2-WAKE-INVARIANT kv_cache pools re-zeroed after resume: flush_cache=%s in %.0f ms "
+                    "(fresh-boot zero invariant restored on recycled pages)",
+                    flushed,
+                    (time.perf_counter() - t_f0) * 1000,
+                )
+                if not flushed:
+                    raise RuntimeError(
+                        "W26 Weg2WakeInvariantRefused: flush_cache() refused after resume(kv_cache) "
+                        "(the group is not idle?) -- the pools hold recycled pages, serving on them is unsafe"
+                    )
             if scheduler is not None:
                 # W25: the pools are mapped again; the admission seams admit.
                 scheduler.weg2_dormant = False
