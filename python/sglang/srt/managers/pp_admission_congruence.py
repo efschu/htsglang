@@ -241,6 +241,36 @@ def pp_row_authority_enabled(scheduler) -> bool:
     return ps is not None and getattr(ps, "pp_size", 1) > 1
 
 
+def pp_row_carrier_present(scheduler) -> bool:
+    """#973: does a carrier deliver PP0's admission decision to the followers
+    in the SAME pass, so that they execute it instead of forming an opinion?
+
+    ``pp_row_authority_enabled`` says whether the row is the geometry LAW; this
+    says whether that law can be EXECUTED on the running boot form. The
+    downstream receive-before-plan half keys on the ``pp_flip_counters`` side
+    channel (``_pp_proxy_frame_pending`` answers None without it, and the
+    follower falls back to planning rank-locally: '#631 ROW AUTHORITY
+    DISABLED: no pp_flip_counters side channel on this boot form'). A form
+    without that channel -- the no-flip PP=3 group, Weg 2 group P -- therefore
+    has followers that decide for themselves, and every term that lets PP0
+    decide DIFFERENTLY from them (withhold a request for its own pending
+    prefetch, #1066; wait for the peers' completion stamps, #1175) is the
+    skew #969Z measured and closed once before: PP0 idles the pass while the
+    followers launch, the followers block in the proxy receive for a frame
+    PP0 does not owe, and PP0's deferred chain-send join expires 120 s later
+    as '#973 RING COMMIT TIMEOUT' (boot weg2ls1b3proof, 2026-09-07 07:21:30Z:
+    PP0 'ongoing_prefetch=1' and no admission beside PP1/PP2 '#969Z ... TAKE
+    WITHOUT WAITING' and '#631 ROW AUTHORITY DISABLED').
+
+    Both halves read this ONE fact (the #1039 lesson: two halves armed off
+    different memos diverge): PP0 may withhold only when the followers will
+    execute its row.
+    """
+    if not pp_row_authority_enabled(scheduler):
+        return False
+    return getattr(scheduler, "pp_flip_counters", None) is not None
+
+
 #: #944: how many consecutive rounds a rid may be DEFERRED for being
 #: unresolvable before PP0 stops asking, refuses loudly, and pins the next
 #: offer to `told=0`.

@@ -223,6 +223,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     pp_admission_verdict_is_vacuous,
     forwarded_schedule_stop_message,
     pp_row_authority_enabled,
+    pp_row_carrier_present,
     rank_local_count_veto_applies,
     store_read_bound_s,
 )
@@ -10826,9 +10827,31 @@ class Scheduler(
             # stays relevant for the loading; it no longer decides admission
             # anywhere in a PP group.
             _pp_group = self.ps.pp_size > 1
+            # #973: PP0 MAY WITHHOLD A PASS ONLY WHEN THE FOLLOWERS EXECUTE ITS
+            # DECISION. Both PP0-only terms below (#1066 own-prefetch wait,
+            # #1175 group completion) were priced against the #631 row
+            # carrier: "downstream receives frame+row BEFORE it plans, so
+            # PP0's membership decision travels same-pass and followers
+            # execute it without forming an opinion". On a boot form WITHOUT
+            # the pp_flip_counters side channel -- the no-flip PP=3 group,
+            # Weg 2 group P -- that premise is false: the followers log
+            # '#631 ROW AUTHORITY DISABLED' and plan rank-locally, i.e. they
+            # TAKE WITHOUT WAITING (#969Z, the branch below the PP0 block).
+            # A PP0 that then withholds is the skew #969Z measured and closed
+            # once already ("an asymmetric deletion just moves which rank is
+            # out of step"): boot weg2ls1b3proof 07:21:30Z -- PP0
+            # 'ongoing_prefetch=1' skipped the pass, PP1/PP2 admitted
+            # ('#969 EXTENT', '#924D station=alloc') and blocked in the proxy
+            # receive for a frame PP0 never owed, and PP0's deferred
+            # chain-send join expired as '#973 RING COMMIT TIMEOUT'. So
+            # without the carrier EVERY rank of the group, PP0 included,
+            # takes without waiting -- #969Z's uniform, wireless verdict --
+            # and the flip-form terms stay exactly as they were where the
+            # carrier exists. Resolved ONCE per call, like the kill switch.
+            _pp0_may_withhold = _pp_group and pp_row_carrier_present(self)
             # #1175: the group-completion gate, resolved ONCE per request
             # so the kill switch cannot flip mid-loop and split the pass.
-            _group_completion_enabled = _pp_group and _group_completion_on()
+            _group_completion_enabled = _pp0_may_withhold and _group_completion_on()
             if self.enable_hicache_storage and _pp_group:
                 # #1066: PP0 DOES WAIT NOW -- and only PP0. The #969Z verdict
                 # above ("TAKE WITHOUT WAITING, uniform and therefore
@@ -10846,7 +10869,35 @@ class Scheduler(
                 # correct 28672-token fetch (boot_855_tiprevert1033,
                 # 05:04:33). The wait is bounded by the prefetch policy
                 # ('timeout' by default) exactly as on the non-PP path.
-                if self.ps.pp_rank == 0:
+                if self.ps.pp_rank == 0 and not _pp0_may_withhold:
+                    # #973 execution proof, with its denominator: `n` counts
+                    # every request PP0 admits through the disarmed gate,
+                    # `pending` the subset whose own prefetch had NOT
+                    # completed -- the passes the #1066 wait would have
+                    # withheld and the followers would have launched alone.
+                    _n = getattr(self, "_973_pp0_take_n", 0) + 1
+                    self._973_pp0_take_n = _n
+                    _pend = getattr(self, "_973_pp0_take_pending_n", 0)
+                    _pending_now = prefetch_verdicts.get(req.rid) is False
+                    if _pending_now:
+                        _pend += 1
+                        self._973_pp0_take_pending_n = _pend
+                    if _n == 1 or _n % 512 == 0 or (_pending_now and _pend <= 8):
+                        logger.warning(
+                            "#973 PP0 PREFETCH WAIT DISARMED (n=%d pending=%d): no "
+                            "#631 row carrier on this boot form (pp_flip_counters "
+                            "absent, followers plan rank-locally), so PP0 takes "
+                            "without waiting exactly like its followers (#969Z). "
+                            "rid=%s local_prefetch_done=%s. A withheld pass here "
+                            "is the '#973 RING COMMIT TIMEOUT' wedge of boot "
+                            "weg2ls1b3proof; the L3 credit of a still-running "
+                            "prefetch is forgone, never the admission.",
+                            _n,
+                            _pend,
+                            req.rid,
+                            prefetch_verdicts.get(req.rid),
+                        )
+                elif self.ps.pp_rank == 0:
                     _local_prefetch_done = self._prefetch_done_for(
                         req, prefetch_verdicts
                     )
