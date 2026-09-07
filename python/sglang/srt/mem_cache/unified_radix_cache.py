@@ -475,6 +475,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.is_eagle = params.is_eagle
+        # #1233 ONE KEY SCHEME FOR THE SHARED STORE (boot weg2ls3b3, 2026-09-07
+        # 10:24-10:26Z, desk-reproduced): every reader of this flag in this
+        # cache and in mamba_component is a KEY-SCHEME reader -- RadixKey
+        # is_bigram at the three insert/prefetch sites, maybe_to_bigram_view,
+        # the mamba key-unit count. A group with NEXTN/EAGLE keys its pages by
+        # BIGRAM (page 0 of [248045, ...] -> c90c5e64dea9), a group without
+        # by UNIGRAM (-> f9ec16cdf22e); the canonical page store keys files by
+        # these hashes, so group P (PP=3, no spec) and group D (TP=3+NEXTN)
+        # wrote disjoint chains for the same prompt and D never read P's
+        # pages ('#1233 STORE-WRITE-ISSUED ... first_hash=' on both logs, the
+        # store census 27.7k files for one 13k prompt). SGLANG_HICACHE_BIGRAM_KEYS=1
+        # makes a spec-less group key like its spec-decoding partner; on a
+        # group that already runs EAGLE/NEXTN it is a no-op.
+        import os as _os
+
+        if _os.environ.get("SGLANG_HICACHE_BIGRAM_KEYS", "0") == "1" and not self.is_eagle:
+            self.is_eagle = True
+            logger.warning(
+                "#1233 HICACHE BIGRAM KEYS FORCED: SGLANG_HICACHE_BIGRAM_KEYS=1 on a "
+                "group without EAGLE/NEXTN -- radix and store keys use the bigram "
+                "scheme so that this group's pages are readable by its spec-decoding "
+                "partner group (Weg 2 canonical page store, one chain for both groups)"
+            )
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()

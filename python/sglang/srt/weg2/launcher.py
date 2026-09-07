@@ -491,6 +491,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     env["PYTHONPATH"] = f"{tree}/python"
     env["CUDA_VISIBLE_DEVICES"] = cvd
     env["SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION"] = "0"  # K2: pure liveness /health
+    # #1233 boot weg2ls3b3: group D (NEXTN) keys the store by BIGRAM page
+    # hashes, group P (no spec) by UNIGRAM -- disjoint chains for the same
+    # prompt, D never read P's pages. One key scheme for both groups; a
+    # no-op on D (already bigram), forces bigram on P.
+    env["SGLANG_HICACHE_BIGRAM_KEYS"] = "1"
     env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     env["SGLANG_UNEVEN_DCP"] = "1"
     env["SGLANG_UNEVEN_DCP_WEIGHTED"] = "1"
