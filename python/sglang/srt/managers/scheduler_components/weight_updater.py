@@ -94,6 +94,11 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    #: #1233: the pre-pause census of the sleep in progress (taken at the
+    #: first release RPC of a sleep, graded at the RPC that completes the
+    #: WEG2_SLEEP_TAGS population).  A slots dataclass: a field, not an
+    #: ad-hoc attribute.
+    weg2_sleep_before: Any = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -527,8 +532,8 @@ class SchedulerWeightUpdaterManager:
         # pause, so the difference is exactly what the whole sleep released.
         # Weg-2 path only: a stock release must stay upstream.
         if weg2_memory_saver_on and sleep_begins:
-            self._weg2_sleep_before = sleep_acceptance_census(tags=tags)
-        weg2_before_census = getattr(self, "_weg2_sleep_before", None)
+            self.weg2_sleep_before = sleep_acceptance_census(tags=tags)
+        weg2_before_census = self.weg2_sleep_before
         t_rpc0 = time.perf_counter()
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
@@ -646,7 +651,7 @@ class SchedulerWeightUpdaterManager:
             self._weg2_log_sleep_acceptance(
                 weg2_before_census, sorted(self.offload_tags)
             )
-            self._weg2_sleep_before = None
+            self.weg2_sleep_before = None
 
         return ReleaseMemoryOccupationReqOutput()
 
