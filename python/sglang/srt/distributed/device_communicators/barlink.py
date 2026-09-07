@@ -733,6 +733,25 @@ class BarlinkCommunicator:
         #: can differ per group: tp and dcp get differently sized windows,
         #: and what fits in one doesn't have to fit in the other.
         self._fallback_reported: set = set()
+        #: #1234 -- ``warn`` (today's behaviour) or ``refuse``. Read ONCE,
+        #: here, from a rank-uniform environment variable that
+        #: ``ServerArgs`` publishes from ``--barlink-uncovered-class``: a
+        #: value re-read per call could change under a running group and
+        #: split it.
+        #:
+        #: The library default stays ``warn`` on purpose. A default that
+        #: aborts on a new operating point can brick a boot, and the whole
+        #: point of the derived round bound is that a fallback now only
+        #: happens when bar1 genuinely would be slower -- in which case the
+        #: fallback is the CORRECT answer. ``refuse`` is a deployment
+        #: decision: the Weg-2 launcher sets it for group D, where a silent
+        #: host-staged 4.7x is a known boot killer.
+        self._uncovered_class = (
+            "refuse"
+            if str(os.environ.get("SGLANG_BARLINK_UNCOVERED_CLASS", "warn")
+                   ).strip().lower() == "refuse"
+            else "warn"
+        )
         self.transport = _build_transport(
             _TRANSPORT, cpu_group, device, disabled=self.disabled, group=group,
         )
@@ -864,15 +883,44 @@ class BarlinkCommunicator:
             if reported is None:
                 reported = set()
                 self._fallback_reported = reported
-            if key not in reported:
-                reported.add(key)
-                reason = ""
+            refusing = getattr(self, "_uncovered_class", "warn") == "refuse"
+            reason = ""
+            # Priced only when the sentence is actually going to be said.
+            # ``why_not`` now inverts ``max_payload`` to name the smallest
+            # covering window, which is far too expensive to run per call on
+            # a class that keeps falling back under ``warn``.
+            if refusing or key not in reported:
                 why_not = getattr(t, "why_not", None)
                 if callable(why_not):
                     try:
                         reason = why_not(op, nbytes) or ""
                     except Exception as e:      # noqa: BLE001
                         reason = f"(reason could not be determined: {e!r})"
+            # #1234 L4: the refusal. Opt-in per deployment, never a library
+            # default -- but where it IS set, an uncovered hot-path class
+            # stops the group instead of quietly costing it 4.7x. The
+            # `raise` deliberately precedes the once-per-size-class filter:
+            # a refusal that fired once and then let the same class through
+            # would be worse than no refusal at all.
+            if refusing:
+                raise RuntimeError(
+                    f"barlink[{getattr(self, 'group', '?')}]: "
+                    f"{_transport_name(t)} does NOT cover {op!r} at {nbytes} "
+                    f"bytes. Reason: {reason} The fallback would be the "
+                    f"inline host-staged gloo plane (pinned D2H, dist.* on "
+                    f"the CPU, H2D) -- measured 4.7x slower per byte than "
+                    f"bar1 on this rig. Not clipped and not staged: this "
+                    f"group was launched with --barlink-uncovered-class="
+                    f"refuse, so an uncovered hot-path class is a stop, not "
+                    f"a slow answer. Fix the window or the bound, or pass "
+                    f"--barlink-uncovered-class warn to accept the cost."
+                )
+            # #1234 L5: the warn path, now PRICED. Once per (operation, size
+            # class) as before -- but the sentence carries what it costs and
+            # what would carry it, because a fallback that is merely named is
+            # what let a 0.196 % shortfall run 4.7x slow for two minutes.
+            if key not in reported:
+                reported.add(key)
                 logger.warning(
                     "barlink[%s]: %s does NOT cover %r at %d bytes -- falling "
                     "back to the host-staged layer. Covered there: %s.%s "

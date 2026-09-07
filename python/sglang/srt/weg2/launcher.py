@@ -28,7 +28,8 @@ flags and the flip image env are NOT inherited (S0 removed the flags).
 Declared V1 deviations (all printed at launch and listed in the postmortem):
 * transports stay OPEN across sleep -- ``barlink_reopen()`` is not wired on
   the wake path in this round; D's BAR1 windows are sized so both groups fit
-  the 3080 aperture (24+96 for P, 16+32+24 for D = 192 of 224 MiB usable).
+  the 3080 aperture (24+96 for P, 16+32+40 for D = 208 of 224 MiB usable;
+  #1234 C1 raised dcp:0 from 24, measured BAR1 Used 224/256 per 3080).
 * SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0 for both groups (K2): /health
   is a pure liveness probe; the front's /health_generate reaches the AWAKE
   group only.
@@ -91,6 +92,76 @@ DC_EXPECT_3080_MIB = 1442
 DC_MEASURED_D_5090_MIB = 2228
 DC_MEASURED_D_3080_MIB = 1922
 DC_RESERVE_SLACK_MIB = 64
+#: #1234 C6 -- the DEVELOPMENT transport switch, and the one number it moves.
+#:
+#: The user's order of 2026-09-07 put development on NCCL until barlink
+#: covers the Weg-2 message classes again. NCCL is a LAUNCHER-level mode, not
+#: a tier inside barlink: a barlink-owned group never constructs a PyNccl
+#: communicator (parallel_state.should_build_pynccl), and building one would
+#: change the flip path, which is out of bounds. Dropping --barlink instead
+#: leaves the stock sglang dispatch in place, which does build one.
+#:
+#: MEASURED (A/B boot weg2ab0, ARM 0): D's dormant residue on the 5090 rises
+#: 2230 -> 2310 MiB under NCCL, because libnccl's buffers are not
+#: memory-saver-tagged and therefore survive the sleep. That tripped W19
+#: DormantResidueRefused against DC_MEASURED_D_5090_MIB 2228 +
+#: DC_RESERVE_SLACK_MIB 64 = 2292 and killed the run. The extra slack lives
+#: HERE, behind the switch, and not in the constant -- under 'bar1' nothing
+#: about the flip path changes, which is the entire point.
+DC_RESERVE_SLACK_NCCL_MIB = 192
+#: Flags that only make sense while barlink owns the group's collectives.
+#: Each takes a value except the bare --barlink itself.
+BARLINK_FLAGS_WITH_VALUE = (
+    "--barlink-transport",
+    "--barlink-bar1-window-mib",
+    "--barlink-bar1-cap-cycles",
+    "--barlink-uncovered-class",
+)
+BARLINK_FLAGS_BARE = ("--barlink",)
+#: Environment keys the bar1 build path owns; dropped with the flags so the
+#: NCCL arm is not half-configured for a transport it does not run.
+BARLINK_ENV_KEYS = ("SGLANG_BARLINK_BUILD_WINDOW_CAP_S",)
+
+
+def transport_argv(argv: List[str], transport: str) -> List[str]:
+    """``argv`` as the chosen transport needs it. One seam, both groups."""
+    return argv if str(transport) != "nccl" else strip_barlink_flags(argv)
+
+
+def reserve_slack_mib(transport: str) -> int:
+    """Dormant-residue slack for group D under this transport, in MiB.
+
+    ONE definition, so the NCCL arm's +128 MiB cannot drift away from the
+    reason it exists. Under 'bar1' this is the unchanged
+    :data:`DC_RESERVE_SLACK_MIB`, and the flip path's arithmetic is exactly
+    what it was.
+    """
+    return (DC_RESERVE_SLACK_NCCL_MIB if str(transport) == "nccl"
+            else DC_RESERVE_SLACK_MIB)
+
+
+def strip_barlink_flags(argv: List[str]) -> List[str]:
+    """``argv`` without the barlink family -- the NCCL development mode.
+
+    Removal, not substitution: without --barlink the group takes the stock
+    sglang dispatch, which builds the PyNccl communicator barlink suppresses.
+    Written as a filter over the ONE argv builder rather than as a second
+    argv builder, so the two arms cannot drift apart in anything except the
+    transport.
+    """
+    out: List[str] = []
+    skip = False
+    for token in argv:
+        if skip:
+            skip = False
+            continue
+        if token in BARLINK_FLAGS_WITH_VALUE:
+            skip = True
+            continue
+        if token in BARLINK_FLAGS_BARE:
+            continue
+        out.append(token)
+    return out
 #: #1233 boot weg2ls2b2 (2026-09-07 08:58Z, front corridor sampler with group
 #: P awake, epoch 1, idle after the wake): NVML free 785 / 1806 / 990 MiB on
 #: the 5090 (PP0) / nvml0 (PP1) / nvml2 (PP2) against the budget line's own
@@ -483,13 +554,45 @@ def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
         "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
         "--uneven-dcp", "--uneven-dcp-weighted",
         "--uneven-token-vector", "29,19,16", "--uneven-token-vector-role", "seed",
-        "--barlink-bar1-window-mib", "16,TP_0=32,DCP_0=24",
+        # #1234 C1 -- dcp:0 goes 24 -> 40 MiB. MEASURED, and this one
+        # number is the whole regression fix.
+        #
+        # WHY 24 WAS WRONG. At a 24-MiB window max_payload yields
+        # chunk_max = 2 093 056 B, exactly one 4096-byte page below 2 MiB,
+        # so 16 rounds carry 100 466 688 B = 4088 tokens. The dcp
+        # attention-out combine at --chunked-prefill-size 4096 sends
+        # 4096 x 24576 = 100 663 296 B. Miss: 196 608 B, 0.196 %, EIGHT
+        # TOKENS -- and every one of the 16 calls per prefill chunk ran on
+        # the host-staged gloo plane at 0.68 GB/s instead of bar1's 3.19.
+        #
+        # WHY 40 AND NOT MORE. The binding gate is not "sum of declared <=
+        # 224" but NVML free minus RESERVE_MIB_DEFAULT (32), evaluated when
+        # each group builds (barlink_matrix_transport.py:330, :357-364);
+        # measured at dcp:0 build time on boot weg2ab1: 74 - 32 = 42 MiB.
+        # DCP_0=48 was REFUSED on metal (Bar1WindowRefused, boot weg2ab1).
+        # At 40 MiB chunk_max = 3 493 888, so the 96-MiB all_reduce plans to
+        # 10 rounds and the 22-MiB q_full all_gather to 7; measured BAR1
+        # Used 224/256 MiB per 3080, i.e. the aperture is EXHAUSTED, which
+        # is the argument for the derived round bound rather than for a
+        # bigger window next time.
+        #
+        # WHY NOT 25 (the arithmetic minimum for 16 rounds). Because the
+        # window also buys all_gather rounds: 12 -> 7 across the same step.
+        # ARM 1 of the A/B boot measured w40 at 2361.4 ms of wait per full
+        # chunk against the baseline's 4755.7 and NCCL's 3307.6.
+        "--barlink-bar1-window-mib", "16,TP_0=32,DCP_0=40",
+        # #1234 C5: group D is the one place where a silent host-staged
+        # 4.7x is a known boot killer, and with the window above no declared
+        # class is anywhere near the round budget. The library default stays
+        # 'warn'; opting in is a deployment decision, made here.
+        "--barlink-uncovered-class", "refuse",
         "--port", str(PORT_D),
     ] + extra
 
 
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
-              chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "") -> Dict[str, str]:
+              chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "",
+              transport: str = "bar1") -> Dict[str, str]:
     env = dict(os.environ)
     # #1233 one-backup flip: chunked weights tags (weg2_memory_saver.py) and
     # the patched torch_memory_saver preload hook (tms_csrc/PATCH.md).
@@ -521,6 +624,12 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     env["SGLANG_UNEVEN_DCP_WEIGHTED"] = "1"
     env["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
     env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = env.get("SGLANG_BARLINK_BUILD_WINDOW_CAP_S", "60")
+    if str(transport) == "nccl":
+        # #1234 C6: half-configuring a transport the group does not run is
+        # how a mode switch turns into a mystery. The flags go with
+        # strip_barlink_flags(), the env keys go here.
+        for key in BARLINK_ENV_KEYS:
+            env.pop(key, None)
     env["SGLANG_PP_CHAIN_RECV_STALL_S"] = env.get("SGLANG_PP_CHAIN_RECV_STALL_S", "60")
     env["SGLANG_PP_OCCUPANT_HORIZON_S"] = env.get("SGLANG_PP_OCCUPANT_HORIZON_S", "90")
     env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = store_dir
@@ -659,6 +768,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--extra-p", default="", help="extra flags for group P (shell-split)")
     ap.add_argument("--extra-d", default="", help="extra flags for group D (shell-split)")
     ap.add_argument("--fairness-w-s", type=float, default=45.0)
+    ap.add_argument(
+        "--transport", choices=["bar1", "nccl"], default="bar1",
+        help="Collective transport for BOTH groups. 'bar1' is the shipping "
+             "default. 'nccl' is the DEVELOPMENT mode of the user's order of "
+             "2026-09-07: it drops the barlink flag family so the stock "
+             "sglang dispatch builds a PyNccl communicator, and it raises "
+             "group D's dormant-residue slack 64 -> 192 MiB because NCCL's "
+             "buffers are not memory-saver-tagged and survive the sleep "
+             "(measured 2230 -> 2310 MiB on the 5090, boot weg2ab0). Under "
+             "'bar1' nothing about the flip path changes.",
+    )
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
     ns = ap.parse_args(argv)
     if ns.teardown:
@@ -728,29 +848,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         os.makedirs(store_dir, exist_ok=True)
 
     # 4. group P
+    slack_mib = reserve_slack_mib(ns.transport)
     dc_expect_d = {
-        c.uuid: (DC_MEASURED_D_5090_MIB if "5090" in c.name else DC_MEASURED_D_3080_MIB) + DC_RESERVE_SLACK_MIB
+        c.uuid: (DC_MEASURED_D_5090_MIB if "5090" in c.name else DC_MEASURED_D_3080_MIB) + slack_mib
         for c in cards
     }
+    if ns.transport == "nccl":
+        log(
+            f"TRANSPORT=nccl (development mode, user order 2026-09-07): barlink flags dropped from both groups; "
+            f"group D's dormant-residue slack raised {DC_RESERVE_SLACK_MIB} -> {slack_mib} MiB because libnccl's buffers "
+            f"are not memory-saver-tagged and survive the sleep (MEASURED 2230 -> 2310 MiB on the 5090, boot weg2ab0 ARM 0, "
+            f"where the unchanged 2228+64 reserve tripped W19 DormantResidueRefused). Under --transport bar1 this number "
+            f"and the whole flip path are untouched."
+        )
     state.dc_expect_d = dc_expect_d
     log("dormant residue RESERVE for group D = MEASURED D_c(D) of boot weg2ls1b2 (2228 / 1922 / 1922 MiB, "
-        f"NVML per-process, windows included) + {DC_RESERVE_SLACK_MIB} MiB slack; spec 1.6 expectation was "
+        f"NVML per-process, windows included) + {slack_mib} MiB slack; spec 1.6 expectation was "
         f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); graded by W19 at D's first sleep: "
         + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
     budgets_p = budgets_from_dc(
         cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls2b2"
     )
     state.budgets["P"] = budgets_p
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport)
     # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
     # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
-    spec_p = GroupSpec("P", PORT_P, argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), state.logs["P"], env_p)
+    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     state.deviations = [
-        "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+24 MiB)",
+        "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
+        "= 208 of 224 usable, measured Used 224/256 incl. RM carve-out; #1234 C1 raised dcp:0 from 24 so the 96-MiB dcp all_reduce plans to 10 rounds "
+        "instead of 17 and stops falling to the host-staged plane)",
         "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0 on both groups (K2); /health_generate only via the front to the awake group",
         "group deadmen tier 1 only (PROBE_S spaced past the boot); tier 2 on the front's deadman",
         "no disk tier for the store (file backend has no second tier); tmpfs sized by the ledger",
@@ -770,8 +901,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_p, tree, log, dry)
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so)
-        spec_d = GroupSpec("D", PORT_D, argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), state.logs["D"], env_d)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
@@ -806,8 +937,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1"
     )
     state.budgets["D"] = budgets_d
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so)
-    spec_d = GroupSpec("D", PORT_D, argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), state.logs["D"], env_d)
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid

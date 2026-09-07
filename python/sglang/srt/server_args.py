@@ -5868,6 +5868,23 @@ class ServerArgs:
             "SGLANG_BARLINK_BAR1_CAP_CYCLES (#781)."
         ),
     ] = None
+    barlink_uncovered_class: A[
+        Optional[str],
+        Arg(
+            choices=["warn", "refuse"],
+            help="What happens when the configured barlink transport does "
+            "not cover a message class at its size. 'warn' (the default, "
+            "and today's behaviour) logs once per operation and size class "
+            "and answers on the inline host-staged gloo plane -- correct, "
+            "but measured 4.7x slower per byte than bar1 on a 96-MiB "
+            "all_reduce. 'refuse' stops the group instead. Note there is no "
+            "NCCL rung underneath: a barlink-owned group never constructs a "
+            "PyNccl communicator (parallel_state.should_build_pynccl), so a "
+            "declined size has exactly one destination. Use 'refuse' where "
+            "a silent 4.7x on a hot-path class is worse than a failed boot "
+            "-- #1234, group D of the Weg-2 launcher.",
+        ),
+    ] = None
     mamba_slot_reorder: A[
         Optional[bool],
         Arg(
@@ -18076,6 +18093,13 @@ class ServerArgs:
         if self.barlink_bar1_cap_cycles is not None:
             os.environ["SGLANG_BARLINK_BAR1_CAP_CYCLES"] = str(
                 self.barlink_bar1_cap_cycles
+            )
+        if self.barlink_uncovered_class is not None:
+            # Read ONCE per communicator at build time (#1234,
+            # barlink.BarlinkCommunicator.__init__), so it must be settled
+            # before the group is built -- which a flag guarantees.
+            os.environ["SGLANG_BARLINK_UNCOVERED_CLASS"] = str(
+                self.barlink_uncovered_class
             )
         if self.barlink_bar1_window_mib is not None:
             # Either a bare integer (every group) or a mix of a bare default

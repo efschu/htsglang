@@ -1021,6 +1021,15 @@ class Envs:
     SGLANG_BARLINK_SLOT_MIB = EnvInt(64)
     # Chunk size (MiB) of the gloo data-plane pipeline.
     SGLANG_BARLINK_CHUNK_MIB = EnvInt(8)
+    # #1234 -- what happens when the configured transport does not cover a
+    # message class at its size: "warn" (log once per operation and size
+    # class, answer on the inline host-staged gloo plane) or "refuse" (stop
+    # the group). Published by --barlink-uncovered-class and read ONCE per
+    # communicator at build time, so it is rank-uniform by construction.
+    # "warn" stays the library default: a default that aborts on a new
+    # operating point can brick a boot, and with the derived round bound a
+    # fallback now only happens where bar1 genuinely would be slower.
+    SGLANG_BARLINK_UNCOVERED_CLASS = EnvStr("warn")
     # Chunk size (MiB) of the device transport's dual-stream pipeline.
     # Unset -> calibrated at startup (a collective sweep; see the
     # rank-uniformity note above -- set it on all ranks or on none).

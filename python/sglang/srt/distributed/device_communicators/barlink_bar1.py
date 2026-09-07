@@ -1392,6 +1392,174 @@ def ar_plan(nbytes: int, chunk_max: int, world: int) -> list:
     return plan
 
 
+# ===========================================================================
+# The round bound, DERIVED (#1234)
+# ===========================================================================
+#
+# What this replaces, and why. Until #1234 the four round caps were the hand
+# constant 16, and the docstring of ``ar_max_rounds`` bound it at "~384 MiB
+# at an 8188-KiB slot" -- an 8188-KiB slot is a **96-MiB** window. Group
+# ``dcp:0`` of Weg 2 runs a 24-MiB window (two process groups in one 3080's
+# 256-MiB aperture), i.e. a 2044-KiB slot, where the same 16 rounds carry
+# only 95.81 MiB. The group's attention-out combine sends 96.00 MiB
+# (4096 tokens x 24576 B). The miss was 196 608 B -- 0.196 %, eight tokens --
+# and the payload spent two minutes on the host-staged gloo plane at
+# 0.68 GB/s instead of bar1's measured 3.19 GB/s.
+#
+# Nothing in the mechanism binds at 17: the kernel's round number is a u64
+# device counter, the flag region ``(2+2(R-1)[+1])*R*256 + 2R*256`` has no
+# round-dependent term, the ack banks compare ``>=``, and the round loop is a
+# plain Python ``for``. The 16 was a POLICY number -- "arbitrarily many
+# kernel launches would not be a transport but a loop" -- calibrated at one
+# operating point and never re-derived when the window was cut to a quarter.
+#
+# A policy number sized at an operating point is the defect class itself, so
+# the replacement is not 17 but the question the 16 was trying to answer:
+# **is this decomposition still faster than the rung it would fall to?**
+# That is a crossover, not an integer, and it moves with the window, the
+# world size and the payload on its own.
+
+#: Sentinel for a cap that is derived per call instead of pinned.
+ROUND_CAP_AUTO = "auto"
+
+#: Fixed cost of ONE round, microseconds: kernel launch + the entry barrier
+#: against the #622 ack banks + the ``len(plan) > 1`` D2D ``copy_`` at
+#: ``_all_reduce_one_round``.
+#:
+#: BIND PROOF -- **INTERIM, and stated as such.** Fitted by the #1234 judge
+#: over three windows (24/32/40 MiB, payloads >= 20 MiB, n = 76 rank-lines
+#: from the D logs of boots ``weg2zr2`` / ``weg2ab1b``), normalised condition
+#: number 16.4, residual mean 0.33 ms / max 1.86 ms. It supersedes a
+#: single-window fit (0.2496 us, cond 1.9e5) that was UNIDENTIFIED: at one
+#: window ``rounds`` and ``wire_bytes`` are collinear. It still overpredicts
+#: the measured w40 point by 7 %, so it is not yet a bind-at-operating-point
+#: proof -- boot ``wait`` carries rank skew and is not a transport timing.
+#:
+#: The artifact that must replace it: ``scripts/weg2/barlink_round_bench.py``
+#: (windows {16,24,32,40} MiB x messages {24..128} MiB, per-round term
+#: isolated by differencing two windows at the SAME byte count, so no
+#: regression and no collinearity). Until that has run, these are interim.
+#:
+#: Why shipping on interim constants is nevertheless safe: at the operating
+#: point the budget is 283 rounds against the 17 the call needs. A +-2x error
+#: in either constant does not move the DECISION -- only the estimated
+#: milliseconds in the log line, which decides nothing.
+DEFAULT_ROUND_US = 432.0
+
+#: Rate at which bytes cross the peer aperture, GB/s. Same fit, same status.
+#: The in-boot cross-check: bar1's measured payload rate is flat at
+#: 3.15-3.20 GB/s from 3 MiB to 95 MiB across 80 size buckets, and
+#: ``wire = 4/3 x payload`` at R=3 puts that at ~4.3 GB/s of wire; the joint
+#: fit reads 5.47 because it also carries the per-round term out of the same
+#: numbers. Both predict the same DECISION.
+DEFAULT_WIRE_GBPS = 5.47
+
+#: The rung a refused decomposition actually falls to: the inline host-staged
+#: plane in ``BarlinkCommunicator`` (pinned D2H -> ``dist.all_reduce`` on the
+#: gloo CPU group -> H2D, in 8-MiB chunks). NOT NCCL -- a barlink-owned group
+#: never constructs a PyNccl communicator at all
+#: (``parallel_state.should_build_pynccl(..., barlink_active)``), so ``None``
+#: from ``_select`` has exactly one meaning and always did.
+#:
+#: BIND PROOF: 146.97 ms for 100 663 296 B, n = 711 rank-lines, boot
+#: ``weg2zr2`` D log. **ONE size**, modelled with no fixed term. Below a few
+#: MiB that understates the rung's real latency and therefore understates the
+#: budget -- we refuse marginally early, which is the safe direction.
+DEFAULT_NEXT_RUNG_GBPS = 0.685
+
+
+def parse_round_cap(env_name: str, default: str = ROUND_CAP_AUTO):
+    """``"auto"`` or a pinned ``int``, from a rank-uniform env var.
+
+    An integer still pins the cap exactly as before #1234 -- that is what
+    bisection, benchmarking and the regression test need, and it is the
+    escape hatch if a future rig makes the crossover the wrong question.
+    Anything unparsable is ``auto``: a typo in an env var must not silently
+    become a cap of zero.
+    """
+    raw = str(os.environ.get(env_name, default)).strip().lower()
+    if raw in ("auto", ""):
+        return ROUND_CAP_AUTO
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "barlink-BAR1: %s=%r is neither an integer nor 'auto' -- using "
+            "the derived bound.", env_name, raw,
+        )
+        return ROUND_CAP_AUTO
+    if value < 1:
+        logger.warning(
+            "barlink-BAR1: %s=%d would refuse every decomposition -- using "
+            "the derived bound.", env_name, value,
+        )
+        return ROUND_CAP_AUTO
+    return value
+
+
+def wire_bytes_for(op: str, nbytes: int, world: int) -> int:
+    """Bytes ONE rank pushes across the peer aperture for this collective.
+
+    Counted against the ported kernels, the same way
+    :func:`window_requirement` counts what they need mapped:
+
+    * ``all_reduce`` -- reduce-scatter then all-gather, ``2(R-1)`` shards of
+      ``ceil(N/R)``. Identical to ``window_requirement`` for mesh/ring, which
+      is where this term comes from.
+    * ``all_gather`` / ``broadcast`` -- the sender writes its own buffer into
+      each of the ``R-1`` peers, once. ``nbytes`` is the SHARD for
+      all_gather, which is what the seam asks with.
+    * ``all_to_all`` -- each rank ships everything except its own block,
+      i.e. ``(R-1)`` blocks of ``ceil(N/R)``.
+
+    Pure arithmetic on group-uniform inputs. No rank-local state, by
+    construction: two ranks that priced the same call differently would send
+    one into the collective and the other into the fallback, and the result
+    would be a hang, not an error.
+    """
+    world = int(world)
+    if world < 2 or nbytes <= 0:
+        return 0
+    share = -(-int(nbytes) // world)
+    if op == "all_reduce":
+        return 2 * (world - 1) * share
+    if op in ("all_gather", "broadcast"):
+        return (world - 1) * int(nbytes)
+    return (world - 1) * share
+
+
+def round_budget(nbytes: int, wire_bytes: int, round_us: float,
+                 wire_gbps: float, next_rung_gbps: float) -> int:
+    """Largest round count at which the bar1 plan still beats the next rung.
+
+    ::
+
+        ms_bar1(rounds) = round_us/1000 * rounds + wire_bytes / wire_Bps
+        ms_next         = nbytes / next_rung_Bps
+        budget          = max(1, floor((ms_next - wire/wire_Bps) / round_ms))
+
+    Every input is group-uniform (``nbytes`` and ``wire_bytes`` from the call,
+    the three constants from rank-uniform environment), so the caller stays
+    rank-uniform -- a per-rank bound would HANG, not error.
+
+    Never below 1: a single round is the decomposition the transport has
+    always been able to do, and refusing it would turn a slow answer into no
+    answer. Above that the bound is honest in the safe direction -- the next
+    rung is modelled without its fixed per-chunk cost, so at small payloads
+    we understate the budget and refuse marginally early.
+
+    Pure function. It reads no ``self``, no environment and no torch state,
+    and ``test_barlink_bar1_round_budget`` asserts that by inspecting this
+    source: the moment it grows rank-local state, the group can split.
+    """
+    round_ms = float(round_us) / 1000.0
+    if round_ms <= 0 or wire_gbps <= 0 or next_rung_gbps <= 0:
+        return 1
+    ms_wire = float(wire_bytes) / (float(wire_gbps) * 1e9) * 1e3
+    ms_next = float(nbytes) / (float(next_rung_gbps) * 1e9) * 1e3
+    return max(1, int((ms_next - ms_wire) // round_ms))
+
+
 def a2a_rounds(largest_block: int, slot: int) -> int:
     """Round count for an ``all_to_all``, from the LARGEST block.
 
@@ -2153,12 +2321,13 @@ class BarlinkBar1Transport:
         )
         #: How many rounds a shard may cost at most. Not a window limit but
         #: a round limit: each round is one kernel launch with one barrier.
-        #: 16 carries a shard of ~128 MiB at a slot of just under 8 MiB
-        #: (96-MiB window, R=3), and thus every size that occurs in this
-        #: model -- the largest measured is 10.6 MB. Above that, the path
-        #: withdraws instead of presenting a loop as a transport.
-        self.ag_max_rounds = int(
-            os.environ.get("SGLANG_BARLINK_BAR1_AG_MAX_ROUNDS", "16")
+        #: **DERIVED since #1234** (:func:`round_budget`), and the sibling
+        #: sweep is not cosmetic: the 22-MiB ``q_full`` all_gather of group
+        #: dcp:0 is 17 rounds at a 16-MiB window and hits the identical wall
+        #: the all_reduce hit at 24 MiB. All four caps move together or the
+        #: next window change simply moves the defect to another op.
+        self.ag_max_rounds = parse_round_cap(
+            "SGLANG_BARLINK_BAR1_AG_MAX_ROUNDS"
         )
         #: broadcast over the same a2a kernel. DEFAULT ON, for the same
         #: reason as all_gather: without it, the standard run aborts while
@@ -2197,22 +2366,47 @@ class BarlinkBar1Transport:
             os.environ.get("SGLANG_BARLINK_BAR1_BC_MIN_BYTES", "1")
         )
         #: Round limit as with all_gather, for the same reason: each round
-        #: is one kernel launch with one barrier.
-        self.bc_max_rounds = int(
-            os.environ.get("SGLANG_BARLINK_BAR1_BC_MAX_ROUNDS", "16")
+        #: is one kernel launch with one barrier. Derived (#1234) unless
+        #: pinned to an integer.
+        self.bc_max_rounds = parse_round_cap(
+            "SGLANG_BARLINK_BAR1_BC_MAX_ROUNDS"
         )
-        #: Round limit for all_reduce and all_to_all -- the same kind of
-        #: limit as ag/bc and for the same reason: each round is one kernel
-        #: launch with one barrier, and arbitrarily many of those per
-        #: collective would not be a transport but a loop. 16 carries an
-        #: all_reduce payload of ~384 MiB at an 8188-KiB slot and R=3, and
-        #: thus every size that occurs in this model -- the standard run's
-        #: working point is 20 MiB.
-        self.ar_max_rounds = int(
-            os.environ.get("SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS", "16")
+        #: Round limit for all_reduce and all_to_all. **DERIVED since
+        #: #1234**, see :func:`round_budget`: the question "would this many
+        #: kernel launches still be a transport rather than a loop" is
+        #: answered by comparing the plan against the rung it would fall to,
+        #: not by a number.
+        #:
+        #: The number it replaces was 16, and its own docstring bound it at
+        #: "~384 MiB at an 8188-KiB slot and R=3" -- an 8188-KiB slot is a
+        #: 96-MiB window. Group dcp:0 of Weg 2 runs a 2044-KiB slot, where
+        #: the same 16 rounds carry 95.81 MiB against a 96.00-MiB call. The
+        #: constant was never re-derived when the window was cut to a
+        #: quarter; that is the whole regression.
+        #:
+        #: An integer still pins it exactly as before (bisection,
+        #: benchmarking, and the regression proof in
+        #: ``test_barlink_bar1_round_budget``).
+        self.ar_max_rounds = parse_round_cap(
+            "SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS"
         )
-        self.a2a_max_rounds = int(
-            os.environ.get("SGLANG_BARLINK_BAR1_A2A_MAX_ROUNDS", "16")
+        self.a2a_max_rounds = parse_round_cap(
+            "SGLANG_BARLINK_BAR1_A2A_MAX_ROUNDS"
+        )
+        #: The crossover's three terms, rank-uniform via the environment.
+        #: Their bind proofs -- including the fact that they are INTERIM and
+        #: which artifact must replace them -- sit on the module-level
+        #: defaults, never as a bare number here.
+        self.round_us = float(
+            os.environ.get("SGLANG_BARLINK_BAR1_ROUND_US", DEFAULT_ROUND_US)
+        )
+        self.wire_gbps = float(
+            os.environ.get("SGLANG_BARLINK_BAR1_WIRE_GBPS", DEFAULT_WIRE_GBPS)
+        )
+        self.next_rung_gbps = float(
+            os.environ.get(
+                "SGLANG_BARLINK_BAR1_NEXT_RUNG_GBPS", DEFAULT_NEXT_RUNG_GBPS
+            )
         )
         #: Only valid after `byte_proof_broadcast`. Its own flag even
         #: though the same kernel runs: if the broadcast proof fails, that
@@ -2479,6 +2673,10 @@ class BarlinkBar1Transport:
                 f"the graph pool together; it cannot be smaller than its "
                 f"eager part."
             )
+        # #1234: kept so `smallest_covering_window_mib` inverts max_payload
+        # with the SAME inputs the live geometry was built from, instead of
+        # re-deriving them and drifting.
+        self._pipe_range = pipe_range
         max_bytes = max_payload(self.world, self.window_bytes, self.a2a_on,
                                  self.pipe_on, self.pipe_result_ring,
                                  pipe_range)
@@ -2657,6 +2855,21 @@ class BarlinkBar1Transport:
             ", ".join(f"{g or '<unnamed>'}: {b / 2**20:.1f} MiB"
                       for g, b in _ledger.ledger_balance(self.device)),
         )
+        # #1234 L1-L3: what this group covers, printed HERE and not two
+        # minutes later as a runtime warning. Everything below comes from
+        # state this transport already holds; nothing reads ServerArgs and
+        # nothing derives a message class. The three lines are rank-uniform
+        # and the boot grades them as such -- a disagreement between ranks
+        # is a group STOP, not a warning.
+        try:
+            for line in self.coverage_lines():
+                logger.info("%s", line)
+        except Exception as e:      # noqa: BLE001
+            # A log line must never be the thing that fails a bring-up that
+            # otherwise succeeded.
+            logger.warning(
+                "barlink-BAR1: coverage lines could not be built: %r", e
+            )
 
     def _bind_peer(self, peer: int, foreign_fds: list) -> PeerTarget:
         """Attach, map, and register both regions of a peer."""
@@ -3164,9 +3377,11 @@ class BarlinkBar1Transport:
         if chunk_max < 16:
             return False
         # The round limit replaces the old size cap. It is not a window
-        # limit but a limit on kernel launches.
+        # limit but a limit on kernel launches -- and since #1234 it is
+        # DERIVED per call (round_budget_for), so it moves with the window
+        # instead of being a number bound at one operating point.
         rounds = ar_plan(nbytes, chunk_max, self.world)
-        if len(rounds) > self.ar_max_rounds:
+        if len(rounds) > self.round_budget_for("all_reduce", nbytes)[0]:
             return False
         # The LARGEST round is checked. It is the only one that could
         # fail -- and it is the same group-wide.
@@ -3209,6 +3424,255 @@ class BarlinkBar1Transport:
             return 0
         return len(ar_plan(nbytes, chunk_max, self.world))
 
+    # -- the derived round bound (#1234) -----------------------------------
+
+    #: Attribute holding the pin (or ``ROUND_CAP_AUTO``) per operation. One
+    #: table so a new op cannot quietly acquire a fifth, differently-spelled
+    #: cap.
+    _ROUND_CAP_ATTR = {
+        "all_reduce": ("ar_max_rounds", "SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS"),
+        "all_gather": ("ag_max_rounds", "SGLANG_BARLINK_BAR1_AG_MAX_ROUNDS"),
+        "broadcast": ("bc_max_rounds", "SGLANG_BARLINK_BAR1_BC_MAX_ROUNDS"),
+        "all_to_all": ("a2a_max_rounds", "SGLANG_BARLINK_BAR1_A2A_MAX_ROUNDS"),
+        "all_to_all_single": (
+            "a2a_max_rounds", "SGLANG_BARLINK_BAR1_A2A_MAX_ROUNDS",
+        ),
+    }
+
+    #: How far ``coverage_ceiling`` probes before it reports "no ceiling".
+    #: Not a cap on anything the transport does -- purely the point at which
+    #: the search stops looking for a root that the linear model does not
+    #: have. 4096 rounds at dcp:0's per-round payload is 24 GiB.
+    _CEILING_PROBE_ROUNDS = 4096
+
+    def round_budget_for(self, op: str, nbytes: int):
+        """``(budget, provenance)`` -- the ONE authority for the round bound.
+
+        ``provenance`` is ``"auto"`` or ``"pinned <n> (<ENV>)"``, and it is
+        carried into every log line: a bound nobody can trace back to either
+        a derivation or an explicit pin is exactly the thing #1234 exists to
+        remove.
+
+        Rank-uniform in both branches: the pin comes from a rank-uniform env
+        var, the derivation from :func:`round_budget` over group-uniform
+        sizes. Two ranks answering differently here would hang, not error.
+        """
+        attr, env = self._ROUND_CAP_ATTR.get(
+            op, ("ar_max_rounds", "SGLANG_BARLINK_BAR1_AR_MAX_ROUNDS")
+        )
+        cap = getattr(self, attr, ROUND_CAP_AUTO)
+        if cap != ROUND_CAP_AUTO:
+            return int(cap), f"pinned {int(cap)} ({env})"
+        wire = wire_bytes_for(op, nbytes, self.world)
+        round_us, wire_gbps, next_rung_gbps = self._calibration()
+        return (
+            round_budget(nbytes, wire, round_us, wire_gbps, next_rung_gbps),
+            ROUND_CAP_AUTO,
+        )
+
+    def _calibration(self):
+        """``(round_us, wire_gbps, next_rung_gbps)``.
+
+        Read through ``getattr`` with the module defaults, not off the
+        attributes directly: ``__init__`` always sets all three, but this
+        class is also constructed through ``__new__`` as a stand-in (tests,
+        and the seam's own probes), and a log line or a coverage question
+        that dies on a missing attribute would be a new failure introduced by
+        the machinery that exists to explain failures. The values are the
+        same either way.
+        """
+        return (
+            float(getattr(self, "round_us", DEFAULT_ROUND_US)),
+            float(getattr(self, "wire_gbps", DEFAULT_WIRE_GBPS)),
+            float(getattr(self, "next_rung_gbps", DEFAULT_NEXT_RUNG_GBPS)),
+        )
+
+    def _round_unit(self, op: str) -> int:
+        """Largest payload ONE round of ``op`` carries, in bytes.
+
+        The ceiling is a whole number of these, so this is where the four
+        ops' differing arithmetic is stated once instead of four times.
+        """
+        geo = self._geo
+        if op == "all_reduce":
+            chunk_max = int(geo.get("chunk_max", 0))
+            if chunk_max < 16:
+                return 0
+            return (chunk_max // 16) * self.world * 16
+        slot = int(geo.get("a2a_slot", 0))
+        if slot <= 0:
+            return 0
+        if op in ("all_to_all", "all_to_all_single"):
+            # ``_handles_a2a`` asks with the total buffer and divides by R.
+            return slot * self.world
+        return slot
+
+    def coverage_ceiling(self, op: str):
+        """Largest ``nbytes`` ``handles`` accepts, or ``None`` for no ceiling.
+
+        ``None`` is a real answer, not a failure to compute one. Under the
+        derived bound the budget grows with the payload FASTER than the round
+        count does -- at dcp:0's geometry bar1 is ~3.2 GB/s effective against
+        a 0.685 GB/s host-staged rung at every size -- so the crossover has
+        no root and the round count never refuses anything. Printing a
+        fabricated number there would be the same kind of claim the hand
+        constant was.
+
+        Verified against :meth:`handles` before it is returned, so the boot
+        line cannot drift away from the predicate it describes.
+        """
+        unit = self._round_unit(op)
+        if unit <= 0:
+            return None
+        cap = getattr(
+            self, self._ROUND_CAP_ATTR.get(op, ("ar_max_rounds", ""))[0],
+            ROUND_CAP_AUTO,
+        )
+        if cap == ROUND_CAP_AUTO:
+            k = 1
+            while k <= self._CEILING_PROBE_ROUNDS:
+                if self.round_budget_for(op, k * unit)[0] < k:
+                    break
+                k += 1
+            if k > self._CEILING_PROBE_ROUNDS:
+                return None
+            k -= 1
+        else:
+            k = int(cap)
+        # A physical refusal (window, max_bytes, algorithm) can bind below
+        # the round bound. Walk down until the printed number is one the
+        # predicate really accepts; a handful of steps, at setup only.
+        for _ in range(64):
+            if k < 1:
+                return None
+            if self.handles(op, k * unit):
+                return k * unit
+            k -= 1
+        return None
+
+    def smallest_covering_window_mib(self, op: str, nbytes: int,
+                                     budget: int):
+        """Smallest BAR1 window, in MiB, at which ``budget`` rounds suffice.
+
+        Computed by inverting the tree's OWN :func:`max_payload` rather than
+        by a second copy of the aperture arithmetic -- if the layout ever
+        changes, this moves with it instead of drifting away from it. Log
+        path only (once per operation and size class), so the search is
+        cheaper than the mistake it prevents.
+        """
+        budget = max(1, int(budget))
+        if nbytes <= 0 or self.world < 2:
+            return None
+        for mib in range(1, 1025):
+            n = max_payload(
+                self.world, mib << 20, self.a2a_on,
+                bool(getattr(self, "pipe_on", False)),
+                int(getattr(self, "pipe_result_ring", 0) or 0),
+                int(getattr(self, "_pipe_range", 0) or 0),
+            )
+            if n <= 0:
+                continue
+            slot = n // self.world
+            if slot <= 0:
+                continue
+            if op == "all_reduce":
+                rounds = -(-nbytes // n)
+            elif op in ("all_to_all", "all_to_all_single"):
+                rounds = -(-(-(-nbytes // self.world)) // slot)
+            else:
+                rounds = -(-nbytes // slot)
+            if rounds <= budget:
+                return mib
+        return None
+
+    def _est_ms(self, op: str, nbytes: int, rounds: int):
+        """``(bar1 ms, next-rung ms)`` for this call. For log lines only."""
+        wire = wire_bytes_for(op, nbytes, self.world)
+        round_us, wire_gbps, next_rung_gbps = self._calibration()
+        bar1 = (round_us / 1000.0) * max(1, int(rounds))
+        bar1 += wire / (wire_gbps * 1e9) * 1e3 if wire_gbps > 0 else 0.0
+        nxt = (nbytes / (next_rung_gbps * 1e9) * 1e3
+               if next_rung_gbps > 0 else 0.0)
+        return bar1, nxt
+
+    def _round_refusal_text(self, op: str, nbytes: int, rounds: int,
+                            bound_desc: str) -> str:
+        """The priced sentence behind every round-limited refusal.
+
+        A fallback that is merely NAMED is what let a 0.196 % shortfall run
+        4.7x slow for two minutes. Named WITH ITS COST is a different
+        object: rounds needed, the bound and where it came from, what IS
+        covered at this geometry, the two estimated times, and the smallest
+        window that would carry it.
+        """
+        budget, how = self.round_budget_for(op, nbytes)
+        bar1_ms, next_ms = self._est_ms(op, nbytes, rounds)
+        covered = self._round_unit(op) * max(1, budget)
+        window = self.smallest_covering_window_mib(op, nbytes, budget)
+        return (
+            f"would need {rounds} rounds {bound_desc}, budget {budget} "
+            f"({how}); covered at this geometry: {covered} bytes. "
+            f"est bar1 {bar1_ms:.1f} ms vs next rung {next_ms:.1f} ms. "
+            + (f"smallest covering window {window} MiB."
+               if window else "no window up to 1024 MiB would cover it.")
+        )
+
+    def coverage_lines(self) -> list:
+        """L1-L3 of #1234: what this transport covers, printed at setup.
+
+        Built from state the transport already holds -- geometry, world, the
+        four bounds, the three constants. It derives no message classes and
+        reads no ``ServerArgs``: a second bookkeeping of what the model
+        sends is exactly what turned a one-page shortfall into a runtime
+        warning two minutes into the boot, and adding another one here would
+        repeat the mistake at a different address.
+
+        Rank-uniform by construction, and the boot grades it that way: the
+        three lines must be identical on every rank of the group.
+        """
+        geo = self._geo
+        slot = int(geo.get("a2a_slot", 0))
+        chunk_max = int(geo.get("chunk_max", 0))
+        unit = self._round_unit("all_reduce")
+        # Only the PROVENANCE is wanted here (auto vs pinned); the number
+        # itself is per call and belongs in L2's ceilings.
+        _, how = self.round_budget_for("all_reduce", max(unit, 16) * 16)
+        round_us, wire_gbps, next_rung_gbps = self._calibration()
+        group = self.group or "<unnamed>"
+        window_mib = int(getattr(self, "window_bytes", 0) or 0) / 2**20
+        l1 = (
+            f"barlink-BAR1 coverage[{group}]: window {window_mib:.1f} MiB, "
+            f"slot {chunk_max // 1024} KiB, per-round {unit // 1024} KiB, "
+            f"world {self.world}, budget={how} (round {round_us:.0f} us, "
+            f"wire {wire_gbps:.2f} GB/s, next rung host-staged gloo "
+            f"{next_rung_gbps:.3f} GB/s) -- calibration INTERIM, "
+            f"scripts/weg2/barlink_round_bench.py is the artifact that "
+            f"replaces it"
+        )
+
+        def _ceil(op: str) -> str:
+            c = self.coverage_ceiling(op)
+            if c is None:
+                return "unbounded (the round bound has no root here)"
+            return f"{c} B ({c // max(1, self._round_unit(op))} rounds)"
+
+        l2 = (
+            f"barlink-BAR1 ceiling[{group}]: all_reduce {_ceil('all_reduce')}; "
+            f"all_gather {_ceil('all_gather')}; "
+            f"all_to_all {_ceil('all_to_all')}; "
+            f"broadcast {_ceil('broadcast')}"
+        )
+        l3 = (
+            f"barlink-BAR1 ladder[{group}]: rung 1 bar1 (slot {slot} B); "
+            f"rung 2 NONE -- no PyNccl communicator is built for a "
+            f"barlink-owned group (parallel_state.should_build_pynccl), so a "
+            f"declined size has exactly one destination; rung 3 the inline "
+            f"host-staged gloo plane at ~{next_rung_gbps:.3f} GB/s "
+            f"-- uncovered-class="
+            f"{os.environ.get('SGLANG_BARLINK_UNCOVERED_CLASS', 'warn')}"
+        )
+        return [l1, l2, l3]
+
     def why_not(self, op: str, nbytes: int) -> str:
         """Why ``handles`` says False for this size -- in words.
 
@@ -3238,9 +3702,10 @@ class BarlinkBar1Transport:
             if nbytes < self.a2a_min_bytes:
                 return f"{nbytes} bytes are below a2a_min_bytes ({self.a2a_min_bytes})"
             n = a2a_rounds(-(-nbytes // self.world), slot) if slot else 0
-            if n > self.a2a_max_rounds:
-                return (f"would need {n} rounds at a {slot}-byte slot, "
-                        f"{self.a2a_max_rounds} are allowed")
+            if n > self.round_budget_for(op, nbytes)[0]:
+                return self._round_refusal_text(
+                    op, nbytes, n, f"at a {slot}-byte slot"
+                )
         elif op == "all_gather":
             if not self.ag_on:
                 return "all_gather is disabled via SGLANG_BARLINK_BAR1_AG=0"
@@ -3248,9 +3713,11 @@ class BarlinkBar1Transport:
                 return "the a2a byte-level proof does not hold (all_gather rides on it)"
             if nbytes < self.ag_min_bytes:
                 return f"{nbytes} bytes are below ag_min_bytes ({self.ag_min_bytes})"
-            if slot and -(-nbytes // slot) > self.ag_max_rounds:
-                return (f"would need {-(-nbytes // slot)} rounds at a "
-                        f"{slot}-byte slot, {self.ag_max_rounds} are allowed")
+            if slot and (-(-nbytes // slot)
+                         > self.round_budget_for(op, nbytes)[0]):
+                return self._round_refusal_text(
+                    op, nbytes, -(-nbytes // slot), f"at a {slot}-byte slot"
+                )
         elif op == "broadcast":
             if not self.bc_on:
                 return "broadcast is disabled via SGLANG_BARLINK_BAR1_BC=0"
@@ -3258,9 +3725,11 @@ class BarlinkBar1Transport:
                 return "the broadcast byte-level proof does not hold"
             if nbytes < self.bc_min_bytes:
                 return f"{nbytes} bytes are below bc_min_bytes ({self.bc_min_bytes})"
-            if slot and -(-nbytes // slot) > self.bc_max_rounds:
-                return (f"would need {-(-nbytes // slot)} rounds at a "
-                        f"{slot}-byte slot, {self.bc_max_rounds} are allowed")
+            if slot and (-(-nbytes // slot)
+                         > self.round_budget_for(op, nbytes)[0]):
+                return self._round_refusal_text(
+                    op, nbytes, -(-nbytes // slot), f"at a {slot}-byte slot"
+                )
         else:
             if nbytes < self.min_bytes:
                 return f"{nbytes} bytes are below min_bytes ({self.min_bytes})"
@@ -3272,10 +3741,11 @@ class BarlinkBar1Transport:
                         f"per rank ({self.world})")
             if chunk_max >= 16:
                 n = len(ar_plan(nbytes, chunk_max, self.world))
-                if n > self.ar_max_rounds:
-                    return (f"would need {n} rounds at a chunk bound of "
-                            f"{chunk_max} bytes, {self.ar_max_rounds} are "
-                            f"allowed")
+                if n > self.round_budget_for(op, nbytes)[0]:
+                    return self._round_refusal_text(
+                        op, nbytes, n,
+                        f"at a chunk bound of {chunk_max} bytes",
+                    )
         if self._geo.get("region_bytes", 0) > self._window_minimum:
             return (f"the region ({self._geo.get('region_bytes')} bytes) does "
                     f"not fit into the group-wide smallest mapped window "
@@ -3896,7 +4366,8 @@ class BarlinkBar1Transport:
         # but a round limit: every round is one kernel launch with one
         # barrier, and arbitrarily many of those per collective would not
         # be a transport but a loop. Rank-uniform, because nbytes is.
-        if -(-nbytes // int(geo["a2a_slot"])) > self.ag_max_rounds:
+        if (-(-nbytes // int(geo["a2a_slot"]))
+                > self.round_budget_for("all_gather", nbytes)[0]):
             return False
         return True
 
@@ -4039,7 +4510,8 @@ class BarlinkBar1Transport:
         # SMALLEST actually mapped length.
         if geo["region_bytes"] > self._window_minimum:
             return False
-        if -(-nbytes // int(geo["a2a_slot"])) > self.bc_max_rounds:
+        if (-(-nbytes // int(geo["a2a_slot"]))
+                > self.round_budget_for("broadcast", nbytes)[0]):
             return False
         return True
 
@@ -4251,8 +4723,8 @@ class BarlinkBar1Transport:
         # broadcast. The coarse number here is the uniform case; the exact
         # round count falls out in `supports_a2a`, once the group-wide
         # largest block is known.
-        if a2a_rounds(-(-nbytes // self.world),
-                      int(geo["a2a_slot"])) > self.a2a_max_rounds:
+        if (a2a_rounds(-(-nbytes // self.world), int(geo["a2a_slot"]))
+                > self.round_budget_for("all_to_all", nbytes)[0]):
             return False
         # The same window concept as with all_reduce: against the
         # group-wide SMALLEST actually mapped length, not against the
@@ -4289,7 +4761,14 @@ class BarlinkBar1Transport:
             return False
         # If it does not fit into ONE slot, it runs in several rounds --
         # only what does not work even in rounds is rejected.
-        return a2a_rounds(largest_block, slot) <= self.a2a_max_rounds
+        # The crossover is asked with the payload the group actually moves
+        # in this call -- ``largest_block`` per directed pair, i.e. a total
+        # of ``largest_block * R`` per rank. Group-wide by construction (the
+        # seam maximises before asking), so this stays rank-uniform.
+        budget = self.round_budget_for(
+            "all_to_all", int(largest_block) * self.world
+        )[0]
+        return a2a_rounds(largest_block, slot) <= budget
 
     def a2a_rounds_for(self, largest_block: int) -> int:
         """Round count the caller passes to ``barlink_all_to_all_single``.

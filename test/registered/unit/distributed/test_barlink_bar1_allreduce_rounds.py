@@ -412,10 +412,21 @@ class TestWhyNot(CustomTestCase):
         self.assertIn("multiple of 16", t.why_not("all_reduce", 4097))
 
     def test_too_many_rounds_names_the_cap(self):
+        """#1234: the cap is still named -- and now PRICED.
+
+        The wording moved from "N are allowed" to the crossover's own terms
+        (rounds needed, the budget and where it came from, what is covered,
+        the two estimated times, the smallest covering window). A refusal
+        that costs the caller 4.7x has to say so; naming the number alone is
+        what let a 0.196 % shortfall run slow for two minutes.
+        """
         t = _stub(ar_max_rounds=2)
         reason = t.why_not("all_reduce", _bytes(8192))
         self.assertIn("rounds", reason)
-        self.assertIn("2 are allowed", reason)
+        self.assertIn("budget 2", reason)
+        self.assertIn("pinned 2", reason)
+        self.assertIn("est bar1", reason)
+        self.assertIn("next rung", reason)
 
     def test_an_op_outside_the_coverage_says_so(self):
         self.assertIn("BARLINK_OPS", _stub().why_not("reduce_scatter", 4096))
