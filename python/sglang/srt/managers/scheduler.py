@@ -3141,13 +3141,24 @@ class Scheduler(
             max_running=int(self.max_running_requests or 0),
             enabled=want,
         )
-        #: The purity verdict the decode branch last reached, with the phase
-        #: it was reached in. The gate cannot re-evaluate it: the predicate
-        #: (`decode_blocked_here`) advances the starvation clock, so asking
-        #: twice per round would double-tick it. Recording the phase is what
-        #: makes a stale verdict safe -- a verdict from the other layout is
-        #: discarded rather than trusted.
-        self._parked_decode_verdict: Tuple[Optional[str], bool] = (None, False)
+        #: The purity verdict the decode branch last reached. The gate cannot
+        #: re-evaluate it: the predicate (`decode_blocked_here`) advances the
+        #: starvation clock, so asking twice per round would double-tick it.
+        #:
+        #: #1233 (WEG 2, S0): a BOOL, and the type is the whole point. This was
+        #: a `(phase, blocked)` pair because a verdict could outlive the LAYOUT
+        #: it was made in; one role per process means it can only ever be stale
+        #: in TIME, which `_parked_carrier_discount`'s resident-count clamp
+        #: already bounds. The initializer must agree with the writer at `:3937`
+        #: and both readers at `:3969`/`:3986`, and it did not: `(None, False)`
+        #: is a non-empty tuple, so `bool(...)` reads it as TRUE. With the only
+        #: writer unreachable (parking is off by construction above), that
+        #: initializer is what every reader sees for the life of the process --
+        #: a standing "this phase forbids decode" on the per-round admission
+        #: path of a process that has exactly one role. False is the value the
+        #: flag-off boot produced: at aef3ae7676 the tuple reader returned early
+        #: on `if not blocked`.
+        self._parked_decode_verdict: bool = False
         #: #888b: the relief's receipts are level-triggered on a per-round
         #: gate, so a steady residency would restate them forever -- the same
         #: 140184-lines-in-ten-minutes shape the parked set's own reconcile
@@ -3946,21 +3957,21 @@ class Scheduler(
     def _parked_carrier_discount(self, running_bs: int) -> int:
         """Carriers the concurrency cap must not count, this round.
 
-        TWO CLAMPS, EACH FOR A DIFFERENT WAY THE RECORD CAN BE STALE.
+        ONE CLAMP (#1233, WEG 2, S0), because there is only one way left for
+        the record to be stale.
 
-        The verdict is recorded by the decode branch, which does not run on
-        every round -- a round that selects a prefill batch never reaches
-        it. So the record can outlive the layout it was made in, and a
-        verdict from the OTHER phase is discarded outright: PP forbids
-        decode and TP does not, so trusting a PP verdict inside TP would
-        discount carriers that are actively decoding.
+        It used to be two. The verdict is recorded by the decode branch, which
+        does not run on every round -- a round that selects a prefill batch
+        never reaches it -- so the record could outlive the LAYOUT it was made
+        in, and a verdict from the other phase was discarded outright. Weg 2
+        has one role per process for life, so there is no other layout to
+        discard a verdict from, and that clamp went with its premise.
 
-        The id set can also outlive the requests in it, for the same
-        reason -- a carrier that finished on a round the decode branch did
-        not reach is still listed. Clamping the discount to the resident
-        count means a stale id can never credit more than is there, so the
-        worst case degrades to the pre-change gate rather than to
-        over-admission.
+        What remains is staleness in TIME: the id set can outlive the requests
+        in it, because a carrier that finished on a round the decode branch did
+        not reach is still listed. Clamping the discount to the resident count
+        means a stale id can never credit more than is there, so the worst case
+        degrades to the pre-change gate rather than to over-admission.
         """
         # #1233 (WEG 2, S0): ONE clamp, not two. The discarded clamp threw
         # away a verdict recorded in the OTHER layout; there is no other
@@ -3973,15 +3984,19 @@ class Scheduler(
     # -- #888b: a resident the phase forbids to run must be able to yield ---
 
     def _decode_forbidden_this_phase(self) -> bool:
-        """Does the ACTIVE layout forbid decode, as recorded this residency?
+        """Does this process's role forbid decode, as recorded this residency?
 
-        THE SAME TWO CLAMPS AS ``_parked_carrier_discount``, reused rather
-        than re-derived, and the reuse is the point: a second reading of the
-        purity verdict would be a second thing to keep true. The verdict is
-        recorded by the decode branch, which does not run on every round, so
-        it can outlive the layout that produced it -- a PP verdict read inside
-        TP would report a prohibition that has already lifted, and everything
-        #888b does downstream of this predicate is destructive.
+        THE SAME RECORD AS ``_parked_carrier_discount``, read rather than
+        re-derived, and the reuse is the point: a second reading of the purity
+        verdict would be a second thing to keep true, and the predicate behind
+        it advances the starvation clock.
+
+        Everything #888b does downstream of this is DESTRUCTIVE -- it clears a
+        latch and it retracts a resident -- so the default matters as much as
+        the value: with parking off by construction (#1233) nothing ever writes
+        this record, and the initializer is the answer for the whole life of
+        the process. It is ``False``: this process decodes or it does not, for
+        life, and a prefill process has no decode path to forbid.
         """
         return bool(getattr(self, "_parked_decode_verdict", False))
 
@@ -5393,7 +5408,7 @@ class Scheduler(
         # population included (slice-3 fix: the `if population:` guard was
         # an unnamed deviation).
         logger.info(
-            "PHASE-FLIP SEAM RE-ADMISSION: %d retracted resident(s) + %d "
+            "SEAM RE-ADMISSION: %d retracted resident(s) + %d "
             "queue occupant(s) re-issued through the intake path in "
             "arrival order (queue %d -> %d, dropped_by_queue_limit=%d)",
             readmitted,
@@ -13789,7 +13804,9 @@ class Scheduler(
                 if self.phase_policy_state is None:
                     logging.warning(
                         "phase_policy_decode_contention requires the phase "
-                        "policy to be enabled (--phase-flip-policy auto)."
+                        "policy to be enabled, and #1233 (Weg 2, S0) removed "
+                        "the flag that enabled it: there is no in-process "
+                        "policy left to contend for."
                     )
                     if_success = False
                     break

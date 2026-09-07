@@ -401,9 +401,10 @@ class RingCommitBounded973(unittest.TestCase):
         msg = str(caught.exception)
         self.assertIn("#973 RING COMMIT TIMEOUT", msg)
         self.assertIn("req/send_req_work", msg)
-        # Counters are absent on a non-flip boot; the statement must SAY so
-        # rather than silently omitting the peer half.
-        self.assertIn("no phase-flip counters on this boot", msg)
+        # Counters are absent on every boot since #1233 (Weg 2, S0) removed
+        # the in-process layout change that published them; the statement must
+        # SAY so rather than silently omitting the peer half.
+        self.assertIn("no PP wire counters on this boot", msg)
         self.assertLess(elapsed, 30.0, "the bound did not fire promptly")
 
     def test_arm3_neutering_the_bound_restores_the_hang(self):

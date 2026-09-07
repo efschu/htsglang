@@ -82,9 +82,18 @@ class TestTheRefusalCarriesTheSpecNote(unittest.TestCase):
         whole finding: no argv reaches it on this topology."""
         self.assertIn("STRUCTURALLY UNREACHABLE", _refusal())
 
-    def test_it_names_the_pressure_ladder_as_the_alternative(self):
+    def test_it_describes_the_pressure_ladder_without_naming_a_dead_flag(self):
+        """#1233 (Weg 2, S0) deleted the flag that drove the ladder.
+
+        The message used to name ``--phase-flip-spill-depth`` as the
+        alternative; argparse now rejects that spelling, so naming it would
+        hand the operator a dead end in a helpful tone.  The RUNGS still have
+        to be described -- that is what stops the rung count being quoted as
+        an acceptance result -- so what changes is the flag, not the content.
+        """
         msg = _refusal()
-        self.assertIn("--phase-flip-spill-depth", msg)
+        self.assertNotIn("--phase-flip-spill-depth", msg)
+        self.assertIn("NO ALTERNATIVE REMAINS", msg)
         for rung in ("cache", "draft", "arena"):
             self.assertIn(f"'{rung}'", msg)
 

@@ -1164,10 +1164,10 @@ def _pp_ring_commit_peer_statement(holder, chan: str) -> str:
     counters = getattr(holder, "pp_flip_counters", None)
     if counters is None:
         return (
-            "no phase-flip counters on this boot, so no peer statement is "
-            "available (the CHAN counters are published only under "
-            "--enable-phase-flip); the silent hop must be read from a "
-            "py-spy of the peers instead"
+            "no PP wire counters on this boot, so no peer statement is "
+            "available (#1233, Weg 2 S0: the CHAN counters were published "
+            "only by the deleted in-process layout change); the silent hop "
+            "must be read from a py-spy of the peers instead"
         )
     try:
         key = chan.split("/")[0]
@@ -6520,7 +6520,7 @@ class SchedulerPPMixin:
             self.pp_flip_flush_drained_sends()
         except Exception as exc:  # noqa: BLE001 - best effort, abandon must not raise
             logger.warning(
-                "%s #787 pre-abandon send flush failed: %s", "PHASE-FLIP", exc
+                "%s #787 pre-abandon send flush failed: %s", "PP-WIRE", exc
             )
 
     def pp_flip_drain_leftover_dicts(self: Scheduler, live_mb_id: int) -> int:
@@ -6669,7 +6669,7 @@ class SchedulerPPMixin:
                 "this rank resumes on mb_id=%s in flip epoch %s. It names a pass "
                 "from another slot or another flip epoch, so no batch of this "
                 "rank's can ever pair with it. (%d this window)",
-                "PHASE-FLIP",
+                "PP-WIRE",
                 stamp,
                 live_mb_id,
                 epoch,
@@ -10081,7 +10081,7 @@ class SchedulerPPMixin:
                 "appeared within %.1fs. No upstream scheduled work for this "
                 "slot -- refusing to enter the blocking %s receive rather "
                 "than wedge.",
-                "PHASE-FLIP",
+                "PP-WIRE",
                 label,
                 mb_id,
                 upstream,
@@ -10136,7 +10136,7 @@ class SchedulerPPMixin:
                     "declines the blocking receive and takes its no-output "
                     "exit instead of dying. Waiting longer cannot help -- the "
                     "counters are the upstream's own in-band statement.",
-                    "PHASE-FLIP",
+                    "PP-WIRE",
                     label,
                     mb_id,
                     upstream,
