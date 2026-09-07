@@ -1057,6 +1057,43 @@ class GroupCoordinator:
                     requested,
                 )
 
+    def _ranks_holding_captured_launches(self, local: bool) -> List[int]:
+        """The ranks of this group whose transport kernels sit inside a graph.
+
+        ONE VERDICT AT ONE PLACE, for a question every rank of the group must
+        answer identically before ``barlink_reopen()`` may free anything. The
+        capture latch is a rank-local observation -- it is armed when a launch
+        runs under ``graph_capture_running()`` on that rank's own stream -- but
+        the consequence is collective: the rebuild it guards runs
+        ``_exchange_fds`` and ``bounded_barrier`` on ``cpu_group``, so a rank
+        that refuses by itself strands its siblings in a barrier and turns a
+        STOP into a bounded timeout. Agreeing first makes a genuine split
+        (some ranks captured, some not) a named refusal on EVERY rank instead.
+
+        THE SAME SHAPE AS ``barlink._agree_fallback``, deliberately: a one-hot
+        ``int64`` vector reduced with SUM, so the result names every voting
+        rank at a fixed size and without a pickle round trip. A second
+        agreement idiom for the same kind of fact would be the
+        second-bookkeeping shape the upstream-minimal law targets.
+
+        Skipped at world size 1: there is no second rank that could disagree,
+        and the answer is then exactly this rank's own. ``cpu_group`` is never
+        ``None`` here -- ``barlink_reopen()`` refuses on that two statements
+        earlier -- and a failure of the reduction itself is NOT swallowed: it
+        propagates, and the caller's W4 obligation makes it group-fatal. A
+        wake that cannot agree has no answer to proceed on.
+        """
+        world = torch.distributed.get_world_size(self.cpu_group)
+        rank = torch.distributed.get_rank(self.cpu_group)
+        if world < 2:
+            return [rank] if local else []
+        votes = torch.zeros(world, dtype=torch.int64)
+        votes[rank] = 1 if local else 0
+        torch.distributed.all_reduce(
+            votes, op=torch.distributed.ReduceOp.SUM, group=self.cpu_group
+        )
+        return [r for r in range(world) if int(votes[r]) != 0]
+
     def barlink_reopen(self) -> None:
         """Rebuild this group's barlink transports after a sleep closed them.
 
@@ -1083,6 +1120,12 @@ class GroupCoordinator:
         The first is below: a rebuild while CUDA graphs still hold this
         transport's captured kernels is refused, because the rebuild frees
         what those kernels reference and nothing re-captures them at wake.
+        That one is a GROUP verdict, agreed over `cpu_group` before anything
+        is freed (`_ranks_holding_captured_launches`), so a rank never
+        refuses alone while its siblings walk into the rebuild's collectives.
+        The exceptions listed below are the OTHER kind and stay rank-local by
+        nature: they come from the build itself, which every rank is already
+        inside, and the caller's W4 obligation is what makes them group-fatal.
         The second sits on the other side of the sleep: a CLOSED
         `BarlinkCommunicator` raises from `_select` instead of answering over
         the gloo plane, so a group whose wake never reached this method
@@ -1141,18 +1184,40 @@ class GroupCoordinator:
             # graph except inside the construction gate, and the answer lives
             # on the communicator anyway.
             old_comm = self.barlink_comm
-            if old_comm.captured_launches():
+            # AGREED ACROSS THE GROUP, not read off this rank. The latch is
+            # armed by a capture on THIS rank's own stream, and
+            # `graph_capture_running()` says what that costs a collective
+            # decision (`barlink.py:590-593`): "Anyone using this function to
+            # make a COLLECTIVE decision is relying on exactly that; where it
+            # doesn't hold, the decision is misplaced." What this refusal
+            # guards is collective -- `_build_barlink()` runs `_exchange_fds`
+            # (`barlink_bar1.py:1534`) and `bounded_barrier` (`:1576`,
+            # `:2618`) on `cpu_group` -- so a rank refusing alone would leave
+            # its siblings inside a barrier for a peer that is unwinding: a
+            # bounded timeout, which is a hang dressed as a deadline, not the
+            # STOP the "ranks never disagree" law asks for. Unlike the BAR1
+            # window (a genuine per-card physical fact) this verdict is
+            # cheaply agreeable: the guard above has just proven `cpu_group`
+            # is present, so the channel is guaranteed here.
+            captured_ranks = self._ranks_holding_captured_launches(
+                old_comm.captured_launches()
+            )
+            if captured_ranks:
                 raise RuntimeError(
                     f"barlink group {self.unique_name!r}: cannot reopen, "
                     "CUDA graphs hold this transport's captured kernels "
-                    "(_captured_launches). Rebuilding frees the objects "
+                    "(_captured_launches) on rank(s) "
+                    f"{', '.join(str(r) for r in captured_ranks)} of this "
+                    "group. Rebuilding frees the objects "
                     "those kernels reference -- _step_dev, _result_gen_dev "
                     "and the reserved result-ring graph slots -- and unmaps "
                     "the BAR1 pages behind them, while nothing re-captures "
                     "or re-binds the graphs at wake. Replaying one "
-                    "afterwards reads freed VRAM. Drop the captured graphs "
-                    "before the sleep, or decide the wake's graph handling "
-                    "explicitly (weg2 register U4)."
+                    "afterwards reads freed VRAM. Every rank of the group "
+                    "refuses on this same agreed answer, so the ranks stop "
+                    "together instead of splitting over the transport. Drop "
+                    "the captured graphs before the sleep, or decide the "
+                    "wake's graph handling explicitly (weg2 register U4)."
                 )
             # A live communicator still holds its BAR1 ledger credit, so
             # building a second one would price the new window against space

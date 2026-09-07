@@ -166,10 +166,77 @@ class _FakeComm:
         ledger.ledger_debit(self.device, self.group)
 
 
+class _FakeCpuGroup:
+    """Stands in for the group's gloo ``ProcessGroup`` on the wake path.
+
+    It carries the three facts the capture agreement reads -- world size,
+    this rank, and what the SIBLING ranks would contribute to the reduction --
+    plus a record of every collective issued on it. The siblings are the
+    point: a verdict taken on the local latch alone cannot see a rank that
+    holds captured graphs while this one does not, and that is the shape
+    ``sibling_votes`` builds.
+    """
+
+    def __init__(self, world: int = 3, rank: int = 0):
+        self.world = world
+        self.rank = rank
+        #: One entry per rank; this rank's own slot is ignored, its vote comes
+        #: from the real code under test.
+        self.sibling_votes = [0] * world
+        self.all_reduce_calls: list = []
+
+
+def _install_fake_dist(monkeypatch, group: _FakeCpuGroup) -> None:
+    """Model gloo for ``_FakeCpuGroup`` only, delegating for everything else.
+
+    The three functions are patched on ``torch.distributed`` itself because
+    that is the module ``parallel_state`` calls through (``:43 import
+    torch.distributed``). Anything that is not our stand-in falls through to
+    the real implementation, so a patched-in fake can never silently answer a
+    question some other collective in the same process asked.
+    """
+    real_world_size = torch.distributed.get_world_size
+    real_rank = torch.distributed.get_rank
+    real_all_reduce = torch.distributed.all_reduce
+
+    def _world_size(group_arg=None):
+        if isinstance(group_arg, _FakeCpuGroup):
+            return group_arg.world
+        return real_world_size(group_arg)
+
+    def _rank(group_arg=None):
+        if isinstance(group_arg, _FakeCpuGroup):
+            return group_arg.rank
+        return real_rank(group_arg)
+
+    def _all_reduce(tensor, op=None, group=None, async_op=False):
+        if not isinstance(group, _FakeCpuGroup):
+            return real_all_reduce(tensor, op=op, group=group, async_op=async_op)
+        assert op is torch.distributed.ReduceOp.SUM, (
+            "the vote is a one-hot vector reduced with SUM, so each rank keeps "
+            "its own slot -- MAX would collapse the vector and lose the names"
+        )
+        group.all_reduce_calls.append([int(v) for v in tensor.tolist()])
+        for r, vote in enumerate(group.sibling_votes):
+            if r != group.rank:
+                tensor[r] += int(vote)
+        return None
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", _world_size)
+    monkeypatch.setattr(torch.distributed, "get_rank", _rank)
+    monkeypatch.setattr(torch.distributed, "all_reduce", _all_reduce)
+
+
 @pytest.fixture
 def coord(monkeypatch):
     """A GroupCoordinator carcass with exactly the four attributes the barlink
-    construction block reads, and a faked communicator class."""
+    construction block reads, and a faked communicator class.
+
+    ``cpu_group`` is a ``_FakeCpuGroup`` rather than a bare ``object()``: the
+    wake's capture verdict is a GROUP verdict and runs a collective on this
+    group, so every behavioural test here exercises the agreement, with the
+    siblings voting "no captured graphs" unless a test says otherwise.
+    """
     monkeypatch.setenv("SGLANG_BARLINK_TRANSPORT", "device")
     monkeypatch.setattr(ps, "should_build_barlink", lambda world_size: True)
     monkeypatch.setattr(barlink_mod, "BarlinkCommunicator", _FakeComm)
@@ -179,7 +246,8 @@ def coord(monkeypatch):
 
     c = ps.GroupCoordinator.__new__(ps.GroupCoordinator)
     c.world_size = 3
-    c.cpu_group = object()
+    c.cpu_group = _FakeCpuGroup(world=3, rank=0)
+    _install_fake_dist(monkeypatch, c.cpu_group)
     c.device = torch.device("cuda:0")
     c.unique_name = "tp:0"
     c.barlink_comm = None
@@ -318,7 +386,47 @@ def test_reopen_on_a_live_comm_does_not_double_charge_the_ledger(coord):
     )
 
 
-def test_a_failing_rebuild_propagates_and_leaves_a_refusing_group(coord, monkeypatch):
+#: The three raises `barlink_reopen()`'s own docstring names as what a wake
+#: hits. They are PRODUCTION classes, not stand-ins, and that is the point of
+#: this list: a handler narrowed to "swallow W6 and return" is invisible to a
+#: test that drives the failure with a bare ``RuntimeError``, and W6 is the one
+#: the record says a Weg-2 wake actually meets ("if a sibling group still holds
+#: the card's aperture", `parallel_state.py` docstring). ``Bar1WindowRefused``
+#: is defined at `barlink_matrix_transport.py:86` and raised at `:381`;
+#: ``Bar1Failed`` at `barlink.py:73`; the eager enforcement raises ``ValueError``
+#: (`parallel_state.py:421`, two raises).
+_WAKE_FAILURES = [
+    pytest.param(
+        lambda: ledger.Bar1WindowRefused(
+            "barlink-BAR1: group 'tp:0' was explicitly given 96 MiB via "
+            "SGLANG_BARLINK_BAR1_WINDOW_MIB, but only 32 MiB of BAR1 is "
+            "available on this card."
+        ),
+        ledger.Bar1WindowRefused,
+        "explicitly given",
+        id="W6-Bar1WindowRefused",
+    ),
+    pytest.param(
+        lambda: barlink_mod.Bar1Failed("the peer mapping did not come up", "peers"),
+        barlink_mod.Bar1Failed,
+        "peer mapping",
+        id="Bar1Failed",
+    ),
+    pytest.param(
+        lambda: ValueError(
+            "barlink transport 'gloo' is host-staged and needs --disable-cuda-graph"
+        ),
+        ValueError,
+        "host-staged",
+        id="cpu-transport-needs-eager",
+    ),
+]
+
+
+@pytest.mark.parametrize("make_exc, exc_type, match", _WAKE_FAILURES)
+def test_a_failing_rebuild_propagates_and_leaves_a_refusing_group(
+    coord, monkeypatch, make_exc, exc_type, match
+):
     """(b) A wake that cannot rebuild must raise -- and REFUSE, not fall to NCCL.
 
     `_build_barlink` genuinely can raise at wake: `Bar1WindowRefused` (W6)
@@ -348,11 +456,11 @@ def test_a_failing_rebuild_propagates_and_leaves_a_refusing_group(coord, monkeyp
 
     class _RefusingComm:
         def __init__(self, cpu_group, device, group):
-            raise RuntimeError("window refused: no BAR1 aperture left")
+            raise make_exc()
 
     monkeypatch.setattr(barlink_mod, "BarlinkCommunicator", _RefusingComm)
 
-    with pytest.raises(RuntimeError, match="window refused"):
+    with pytest.raises(exc_type, match=match):
         coord.barlink_reopen()
 
     assert coord.barlink_comm is live, (
@@ -688,3 +796,237 @@ def test_a_reopen_without_captured_graphs_still_proceeds(coord):
     coord.barlink_reopen()
 
     assert _FakeComm.built == 2, "an unarmed latch must not block the wake"
+
+
+# ---------------------------------------------------------------------------
+# ROUND 3 -- the DEVICE transport's half of the capture gate, the closed
+# refusal's POSITION, and the capture verdict as a GROUP verdict
+# ---------------------------------------------------------------------------
+
+
+class _DeviceTransportStub:
+    """``BarlinkDeviceTransport`` in the two respects the S2 surface reads it.
+
+    (i) THE LATCH LIVES ON THE TRANSPORT ITSELF. ``self._captured_launches``
+        is initialised at ``barlink_device.py:1062`` and armed at ``:1436``,
+        both on ``BarlinkDeviceTransport`` (``:973``), and that class has NO
+        ``bar1`` attribute at all -- ``grep -c 'self\\.bar1'
+        barlink_device.py`` is 0. The bar1 chain ``_MatrixStub`` models is the
+        OTHER transport, so for a device-transport group the transport object
+        is the only reader that can answer.
+
+    (ii) ``handles()`` IS STATE-FREE. ``return op in self.BARLINK_OPS``
+        (``barlink_device.py:1279``), and ``close()`` (``:1600``) closes the
+        shm segment and unregisters the abort gate but sets no liveness flag,
+        so it still answers True after a close. ``BarlinkShmTransport.handles()``
+        (``barlink_shm.py:206``) has the same shape apart from the size test.
+        ``_DownTransport`` above models the BAR1 shape, which is the other one.
+
+    This is the DEFAULT transport: ``SGLANG_BARLINK_TRANSPORT`` is
+    ``EnvStr("device")`` (``environ.py:1004``), which the ``coord`` fixture
+    also sets explicitly.
+    """
+
+    BARLINK_OPS = frozenset({"all_reduce", "all_gather", "reduce_scatter", "broadcast"})
+
+    def __init__(self, captured: bool = False):
+        self._captured_launches = captured
+        self.closed = False
+
+    def handles(self, op: str, nbytes: int) -> bool:
+        return op in self.BARLINK_OPS
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _carcass(transport) -> "barlink_mod.BarlinkCommunicator":
+    """A ``BarlinkCommunicator`` with only the attributes under test set."""
+    comm = barlink_mod.BarlinkCommunicator.__new__(barlink_mod.BarlinkCommunicator)
+    comm.group = "tp:0"
+    comm._closed = False
+    comm.transport = transport
+    return comm
+
+
+def test_the_capture_gate_reads_the_device_transports_own_latch():
+    """The half of ``transport_captured_launches`` nothing was holding.
+
+    The helper reads two homes -- ``for obj in (getattr(t, "bar1", None), t)``
+    -- and its docstring names both (``barlink_bar1.py:4793``,
+    ``barlink_device.py:1436``). Every other test in this file builds the
+    bar1 chain, so narrowing that tuple to ``(getattr(t, "bar1", None),)``
+    passed the whole slice while leaving the DEFAULT transport's launches
+    invisible: ``barlink_reopen()`` would not refuse, ``close()`` would run
+    ``cuMemUnmap``/``cuMemRelease``/``cuMemAddressFree``, ``_build_barlink()``
+    would re-allocate at fresh addresses, and a resident graph would replay
+    against freed VRAM -- the exact use-after-free the round-2 refusal exists
+    to prevent. This pins the ``t`` half on the shape that has no ``bar1``.
+    """
+    comm = _carcass(_DeviceTransportStub(captured=True))
+    assert not hasattr(comm.transport, "bar1"), (
+        "the shape being pinned: BarlinkDeviceTransport has no bar1 chain, so "
+        "the bar1 half of the tuple cannot answer for it"
+    )
+    assert barlink_mod.transport_captured_launches(comm) is True
+
+
+def test_the_capture_gate_says_no_when_the_device_transport_is_unarmed():
+    """Can-fail half: the latch is what causes the True, not the shape."""
+    comm = _carcass(_DeviceTransportStub(captured=False))
+    assert barlink_mod.transport_captured_launches(comm) is False
+
+
+def test_reopen_refuses_when_the_device_transport_holds_captured_launches(coord):
+    """And the refusal reaches the wake on that shape, not only through bar1."""
+    coord._build_barlink()
+    comm = coord.barlink_comm
+    comm.transport = _DeviceTransportStub(captured=True)
+    prior_ledger = ledger.ledger_balance(coord.device)
+    prior_gate = gate.registered()
+
+    with pytest.raises(RuntimeError, match="captured"):
+        coord.barlink_reopen()
+
+    assert coord.barlink_comm is comm, "the refusal must precede the close"
+    assert not comm.closed
+    assert _FakeComm.built == 1
+    assert ledger.ledger_balance(coord.device) == prior_ledger
+    assert gate.registered() == prior_gate
+
+
+def test_a_closed_communicator_refuses_even_when_handles_still_answers_yes():
+    """The POSITION of the closed check: above the selection, not below it.
+
+    Both existing closed-shape tests use a transport whose ``handles()`` goes
+    False (``transport = None`` in one, ``_DownTransport`` in the other), so
+    ``chosen`` is None in both and a refusal moved BELOW the selection --
+    ``if chosen is None and self._closed: raise`` -- still fires and passes
+    them. The default transport is the other shape: ``handles()`` is
+    ``op in self.BARLINK_OPS`` and survives ``close()`` untouched, so under
+    that move ``_select`` would return the CLOSED transport and
+    ``barlink_all_reduce`` would run on it -- silently wrong, on the transport
+    the fixture and ``environ.py:1004`` both name as the default.
+    """
+    transport = _DeviceTransportStub()
+    comm = _carcass(transport)
+
+    # Can-fail half: while open, a transport that claims the op is returned.
+    assert comm._select("all_reduce", 4096) is transport
+
+    barlink_mod.BarlinkCommunicator.close(comm)
+
+    assert comm.transport is transport and transport.handles("all_reduce", 4096), (
+        "the shape being proven: this transport still claims the op after "
+        "close(), so 'no transport claimed it' can never be the trigger"
+    )
+    with pytest.raises(RuntimeError, match="closed"):
+        comm._select("all_reduce", 4096)
+
+
+def test_the_capture_verdict_is_agreed_across_the_group(coord):
+    """A sibling's captured graphs must refuse THIS rank's wake too.
+
+    ``_captured_launches`` is armed by a real capture on this rank's own
+    stream, and ``graph_capture_running()``'s docstring says in the tree what
+    that costs a collective decision (``barlink.py:590-593``): "Anyone using
+    this function to make a COLLECTIVE decision is relying on exactly that;
+    where it doesn't hold, the decision is misplaced." The work the refusal
+    guards IS collective -- ``_build_barlink()`` runs ``_exchange_fds``
+    (``barlink_bar1.py:1534``) and ``bounded_barrier`` (``:1576``, ``:2618``)
+    on ``cpu_group`` -- so a rank that refuses alone leaves its siblings
+    inside a barrier for a peer that is unwinding: a bounded timeout, not the
+    STOP the "ranks never disagree" law asks for.
+
+    So the verdict is agreed first, on the group channel ``barlink_reopen()``
+    has just proven present two statements earlier, and ANY rank's yes
+    refuses every rank. Here rank 0 (this one) has no captured graphs at all
+    and must still refuse, naming rank 2.
+    """
+    coord._build_barlink()
+    comm = coord.barlink_comm
+    comm.transport = _DeviceTransportStub(captured=False)
+    coord.cpu_group.sibling_votes = [0, 0, 1]
+
+    assert comm.captured_launches() is False, (
+        "the local latch says no -- a rank-local verdict would proceed here"
+    )
+
+    with pytest.raises(RuntimeError, match="captured") as excinfo:
+        coord.barlink_reopen()
+
+    assert "rank(s) 2" in str(excinfo.value), (
+        "the refusal must NAME the ranks that hold captured graphs; without "
+        "them the message accuses this rank of a state it is not in, and an "
+        "operator reading it on rank 0 has nothing to look at. The substring "
+        "carries the label because a bare '2' also matches 'weg2 register "
+        f"U4' at the end of the same message: {excinfo.value}"
+    )
+    assert "rank(s) 0" not in str(excinfo.value), (
+        "and it must not name a rank that voted no"
+    )
+    assert len(coord.cpu_group.all_reduce_calls) == 1, (
+        "exactly one vote per wake, and it must actually be issued -- a "
+        "verdict read off the local latch takes no collective at all"
+    )
+    assert coord.cpu_group.all_reduce_calls[0] == [0, 0, 0], (
+        "the vector sent is one-hot on THIS rank's own answer (here: no)"
+    )
+    assert coord.barlink_comm is comm and not comm.closed, (
+        "the agreed refusal lands before the close, exactly as the local one"
+    )
+    assert _FakeComm.built == 1
+    assert gate.registered() == [comm]
+
+
+def test_the_agreed_verdict_also_refuses_when_only_this_rank_is_captured(coord):
+    """The other direction of the same agreement: a local yes still refuses.
+
+    Round 2's behaviour must survive the agreement -- the vote is a widening,
+    never a way for a rank that IS captured to be out-voted by its siblings.
+    """
+    coord._build_barlink()
+    coord.barlink_comm.transport = _DeviceTransportStub(captured=True)
+    coord.cpu_group.sibling_votes = [0, 0, 0]
+
+    with pytest.raises(RuntimeError, match="captured") as excinfo:
+        coord.barlink_reopen()
+
+    assert "rank(s) 0" in str(excinfo.value), str(excinfo.value)
+    assert coord.cpu_group.all_reduce_calls[0] == [1, 0, 0], (
+        "this rank's own yes is what it contributes to the reduction"
+    )
+
+
+def test_a_wake_with_no_captured_graphs_anywhere_votes_and_proceeds(coord):
+    """Can-fail half of the agreement: nobody captured, everybody rebuilds."""
+    coord._build_barlink()
+    coord.barlink_comm.transport = _DeviceTransportStub(captured=False)
+    coord.cpu_group.sibling_votes = [0, 0, 0]
+
+    coord.barlink_reopen()
+
+    assert _FakeComm.built == 2, "an all-no vote must not block the wake"
+    assert len(coord.cpu_group.all_reduce_calls) == 1, (
+        "the vote is taken on every wake, not only on the refusing ones -- a "
+        "collective that some ranks skip is the desync it exists to remove"
+    )
+
+
+def test_the_flag_off_wake_takes_no_collective_at_all(coord, monkeypatch):
+    """Flag off must stay byte-identical: no barlink, hence nothing to agree.
+
+    The vote sits inside ``if self.barlink_comm is not None:``, which is the
+    same predicate every dispatch seam uses and is uniform across a group
+    (``should_build_barlink`` reads an env flag and the world size). A vote
+    hoisted above that guard would add a collective to a path that has none
+    today, and a group whose ranks disagree about whether to issue it hangs.
+    """
+    monkeypatch.setattr(ps, "should_build_barlink", lambda world_size: False)
+
+    coord.barlink_reopen()
+
+    assert coord.barlink_comm is None
+    assert coord.cpu_group.all_reduce_calls == [], (
+        "flag off: the wake must issue no collective the boot path does not"
+    )
