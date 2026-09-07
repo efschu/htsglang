@@ -10551,6 +10551,16 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        # THE INTER-FORWARD BUBBLE (pp_bubble.PPBubbleMeter). This is the one
+        # site every PP forward passes through -- all three call sites in the
+        # loop route here -- so it is where "how long did this rank hold no
+        # forward" is answerable at all. The existing `wait` term cannot
+        # answer it: it sums collectives INSIDE a forward window, and on a
+        # tp_size=1 stage there are none (MEASURED 861/861 lines at
+        # `wait 0.0` on boot bsscale, BSSCALE_0907.md P2).
+        _bubble = self._pp_bubble_meter()
+        if _bubble is not None:
+            _bubble.begin(mb_id)
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
@@ -10581,7 +10591,24 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+        if _bubble is not None:
+            _window = _bubble.end()
+            if _window:
+                logger.info("%s", _window)
         return result, event
+
+    def _pp_bubble_meter(self: Scheduler):
+        """The rank's bubble meter, or None when there is no reporter.
+
+        ``getattr`` all the way down and never constructed here: the meter is
+        owned by ``RankPrefillLog`` so the per-batch ``bubble_ms=`` field and
+        the per-window ``PP-BUBBLE`` line read the SAME accumulators, and a
+        scheduler stand-in without a metrics reporter (the PP tests'
+        fixtures) must not grow one.
+        """
+        reporter = getattr(self, "metrics_reporter", None)
+        log = getattr(reporter, "rank_prefill_log", None) if reporter else None
+        return getattr(log, "bubble", None) if log is not None else None
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group

@@ -13,6 +13,7 @@ from typing import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.pp_bubble import PPBubbleMeter
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability import spill_tiers
 from sglang.srt.observability.metrics_collector import (
@@ -313,6 +314,15 @@ class RankPrefillLog:
     unobservable here -- reporting ``wait 0.0`` for them would be a lie
     rather than a measurement.
 
+    BLIND SPOT OF ``wait``, NAMED HERE SO IT IS NOT READ AS A ZERO BUBBLE:
+    ``wait`` only sums collective spans measured INSIDE one forward's event
+    window, so on a stage with no intra-forward collective (``tp_size=1,
+    dcp_size=1`` -- Weg-2 group P, where 861/861 lines read ``wait 0.0``) it
+    is structurally zero however long the pipeline stalls, because the PP
+    bubble lives BETWEEN forwards; that gap is the separate ``bubble_ms``
+    term measured by ``pp_bubble.PPBubbleMeter`` and is never derived from
+    this one.
+
     Pairing is FIFO on both sides: records are queued in schedule order and
     the DeviceTimer harvests interval durations in completion order of the
     same forwards, so index i of one queue corresponds to index i of the
@@ -343,7 +353,15 @@ class RankPrefillLog:
         # rank. Reporting resumes in the untimed form rather than stopping,
         # because the token counts are still true.
         self.pairing_refused: bool = False
-        # (new_tokens, cached_tokens, graphed)
+        # The inter-forward gap meter. Driven at the ONE site that runs every
+        # PP forward (scheduler_pp_mixin._pp_launch_batch); stays at its
+        # zero state on a stage that never calls it, so a non-PP boot's line
+        # is byte-identical to before.
+        self.bubble = PPBubbleMeter()
+        # (new_tokens, cached_tokens, graphed, bubble) where bubble is
+        # (gap_ms, mb_id) or None. Carried INSIDE the record tuple rather
+        # than in a third queue on purpose: the #691 pairing guard below is
+        # positional over two queues, and a third would need its own guard.
         self._pending: deque = deque()
         # (total_seconds, collective_seconds | None), completion order
         self._durations: deque = deque()
@@ -393,7 +411,9 @@ class RankPrefillLog:
         graphed: bool = False,
     ) -> None:
         if timed and self.timer is not None and not self.pairing_refused:
-            self._pending.append((new_tokens, cached_tokens, graphed))
+            self._pending.append(
+                (new_tokens, cached_tokens, graphed, self.bubble.take_pending())
+            )
         else:
             logger.info(
                 "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1",
@@ -410,7 +430,7 @@ class RankPrefillLog:
         """
         self._durations.clear()
         while self._pending:
-            new_tokens, cached_tokens, _graphed = self._pending.popleft()
+            new_tokens, cached_tokens, _graphed, _bubble = self._pending.popleft()
             logger.info(
                 "Prefill rank batch, #new-token: %d, #cached-token: %d, #chunks: 1",
                 new_tokens,
@@ -469,8 +489,17 @@ class RankPrefillLog:
         # family -> [total_ms, count]. Merged across the records folded into
         # this one line, the same way gpu-ms and wait already are.
         family_acc: dict = {}
+        # The inter-forward gaps of the folded records. Summed, because
+        # #chunks: K folds K forwards into one line and K gaps preceded them;
+        # ``mb`` names the LAST folded microbatch, which is the one the
+        # trailing gap belongs to.
+        bubble_ms = 0.0
+        bubble_mb = None
         for _ in range(k):
-            n, c, graphed = self._pending.popleft()
+            n, c, graphed, bub = self._pending.popleft()
+            if bub is not None:
+                bubble_ms += bub[0]
+                bubble_mb = bub[1]
             new_tokens += n
             cached_tokens += c
             t, w, fams = self._durations.popleft()
@@ -512,6 +541,12 @@ class RankPrefillLog:
                 )
                 line += " (wait by family: %s)"
                 args.append(parts)
+        if bubble_mb is not None:
+            # A SECOND, INDEPENDENT term -- never derived from wait. Emitted
+            # unconditionally of ``split_known``: a graph-covered forward has
+            # no readable wait but its host-side gap is measured all the same.
+            line += " bubble_ms=%.1f (between forwards, mb=%d)"
+            args += [bubble_ms, bubble_mb]
         logger.info(line, *args)
         # #363: the same numbers, kept for one structured reader instead of
         # only being formatted into a log line. ``last_split_known`` is False
@@ -616,6 +651,10 @@ class SchedulerMetricsReporter:
         self.fwd_occupancy = float("nan")
 
         self.rank_prefill_log = RankPrefillLog()
+        # The bubble line names its own rank; pp_rank is the stage identity
+        # the reader needs (a boot of three stages emits three PP-BUBBLE
+        # lines per window and they must be tellable apart).
+        self.rank_prefill_log.bubble.rank = int(self.pp_rank or 0)
 
         self.forward_pass_device_timer: DeviceTimer | None = None
 

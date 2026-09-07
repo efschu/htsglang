@@ -194,6 +194,33 @@ P_WINDOWS_MIB = 24 + 96
 MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
 VENV_DEFAULT = "/spinning/htsglang-gpu/.venv"
 
+#: The operating point both groups are launched at (`--context-length`), and
+#: therefore the longest prompt group P can be asked to prefill. It is the
+#: default floor for P's KV pool: P frees a request's rows once its prefill
+#: completes, but DURING that prefill the whole prefix must be device-resident
+#: for the stage's attention layers, so a pool below this cannot serve the
+#: boot's own admitted maximum.
+CONTEXT_LENGTH = 262144
+
+#: MEASURED per-stage prefill cost, ms per layer, boot `bsscale`
+#: (/spinning/gpu-arb/weg2/BSSCALE_0907.md, tip 37c884b0b0, table under
+#: "The headline of Table A"): per full 4096-token chunk at bs6 PP0 259.1 ms
+#: over 32 layers = 8.10, PP1 632.9 over 18 = 35.16, PP2 470.2 over 14 =
+#: 33.59, with stage 0 on the 5090 and stages 1-2 on the two 3080s. The two
+#: 3080 figures differ by 4.7 %, which is inside the +-10 % per-rank spread
+#: that measurement's own A/A repeat established. Used as the ANCHOR for the
+#: card-rate library's ratios, and as the whole cost model when no measured
+#: library exists.
+MEASURED_MS_PER_LAYER = "8.10,35.16,33.59"
+
+#: Per-rank arming floor for the pool model, MiB. The rig's VRAM corridor is
+#: 819-1229 MiB NVML-free per card under load and the desk pre-flight arming
+#: floor is <= 1229; the ceiling is taken because a floor that under-charges
+#: inflates the pool, which is the unsafe direction for a capacity FLOOR.
+#: pp_cut.PhasePoolModel names the gap this stands in for: the per-layout
+#: solved floor exists only for a layout that has booted.
+ARMING_FLOOR_MIB = 1229.0
+
 
 class Weg2LaunchRefused(RuntimeError):
     pass
@@ -491,16 +518,30 @@ def store_extra_config(store_gib: float) -> str:
 # --------------------------------------------------------------------------
 
 
-def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float) -> List[str]:
+def common_flags(
+    model: str,
+    s_gb: int,
+    m_mib: int,
+    store_gib: float,
+    write_policy: str = "write_through",
+) -> List[str]:
+    # --disable-overlap-schedule IS NO LONGER HERE. It is group P's flag, not
+    # a common one: the justification is `pp_size > 1` (server_args.py:19507,
+    # "Pipeline parallelism is not compatible with overlap schedule", plus
+    # the same forcing in arg_groups/overrides._pipeline_parallel_overlap_
+    # disable), and group D runs pp_size=1. MEASURED consequence of the old
+    # placement: D booted with disable_overlap_schedule=True inheriting a
+    # PP-only reason (BSSCALE_0907.md D4), so CPU scheduling of round n+1
+    # could not hide behind GPU work of round n on a group that has no
+    # pipeline at all. See argv_p / argv_d.
     return [
         "--model-path", model,
         "--trust-remote-code",
         "--served-model-name", "Qwen3.8-27B",
         "--rank-gpu-id", "0,1,2",
         "--skip-server-warmup",
-        "--disable-overlap-schedule",
         "--kv-cache-dtype", "fp8_e4m3",
-        "--context-length", "262144",
+        "--context-length", str(CONTEXT_LENGTH),
         "--max-running-requests", "8",
         "--reasoning-parser", "qwen3",
         "--tool-call-parser", "qwen3_coder",
@@ -511,7 +552,7 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float) -> List[st
         "--hicache-host-role", "staging",
         "--hicache-size", str(s_gb),
         "--hicache-mamba-host-mib", str(m_mib),
-        "--hicache-write-policy", "write_through",
+        "--hicache-write-policy", write_policy,
         "--hicache-storage-backend", "file",
         "--hicache-mem-layout", "layer_first",
         "--hicache-io-backend", "direct",
@@ -533,19 +574,66 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float) -> List[st
     ]
 
 
-def argv_p(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float, extra: List[str]) -> List[str]:
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib) + [
+def argv_p(
+    py: str,
+    model: str,
+    budgets: List[int],
+    s_gb: int,
+    m_mib: int,
+    store_gib: float,
+    extra: List[str],
+    stage_ratio: str = "32,18,14",
+    attn_stage_ratio: str = "8,4,4",
+    write_policy: str = "write_through",
+) -> List[str]:
+    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, write_policy) + [
         "--tp-size", "1", "--pp-size", "3",
-        "--pp-stage-ratio", "32,18,14", "--pp-attn-stage-ratio", "8,4,4",
+        # P is the pp_size>1 group, so the overlap schedule is refused HERE
+        # and only here (server_args.py:19507). Passing it explicitly rather
+        # than letting the post-process pass force it keeps the argv an
+        # honest statement of what this group runs.
+        "--disable-overlap-schedule",
+        # SOLVED unless the operator pinned them; the launcher prints the
+        # PP-CUT provenance line either way. Never a hand constant reaching
+        # this line unannounced.
+        "--pp-stage-ratio", stage_ratio, "--pp-attn-stage-ratio", attn_stage_ratio,
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         "--barlink-bar1-window-mib", "24,PP_0=96",
         "--port", str(PORT_P),
     ] + extra
 
 
-def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float, extra: List[str]) -> List[str]:
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib) + [
+def argv_d(
+    py: str,
+    model: str,
+    budgets: List[int],
+    s_gb: int,
+    m_mib: int,
+    store_gib: float,
+    extra: List[str],
+    num_continuous_decode_steps: int = 1,
+    disable_overlap: bool = False,
+) -> List[str]:
+    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib) + (
+        ["--disable-overlap-schedule"] if disable_overlap else []
+    ) + [
         "--tp-size", "3", "--pp-size", "1",
+        # OVERLAP SCHEDULE ON for D -- by ABSENCE of the disable flag, which
+        # is the only way to have it: there is no --enable-overlap-schedule.
+        # Every gate that forces it off was checked against THIS argv and
+        # none applies: pp_size>1 (D is 1), --enable-pdmux (not passed,
+        # server_args.py:19553), device cpu/mps (cuda), sparse-head
+        # embeddings and dllm (neither), and the hybrid-mamba resolution
+        # (arg_groups/overrides._mamba_radix_cache_resolution), which picks
+        # 'extra_buffer' and LEAVES overlap on for Qwen3_5ForConditional-
+        # Generation on linear_attn_backend=triton -- that arch is in
+        # _MAMBA_EXTRA_BUFFER_ARCHS. If a gate ever does refuse, it is not to
+        # be weakened: the launcher's --d-disable-overlap-schedule puts the
+        # flag back and logs W41.
+        #
+        # #1030's justification is PP-only and does not reach D
+        # (BSSCALE_0907.md D4).
+        "--num-continuous-decode-steps", str(int(num_continuous_decode_steps)),
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         # a per-rank MiB LIST under TP requires the uneven-TP ratio; 'auto'
         # derives the weights from that list (server_args.py rank_tp_ratio).
@@ -765,6 +853,143 @@ def budgets_from_dc(
     return out
 
 
+def _max_running_requests(model: str) -> int:
+    """``--max-running-requests`` as this launcher actually passes it."""
+    flags = common_flags(model, 1, 1, 1.0)
+    return int(flags[flags.index("--max-running-requests") + 1])
+
+
+def _csv_ints(text: str) -> List[int]:
+    return [int(x.strip()) for x in str(text).split(",") if x.strip()]
+
+
+def _csv_floats(text: str) -> List[float]:
+    return [float(x.strip()) for x in str(text).split(",") if x.strip()]
+
+
+def solve_p_cut(ns, cards: List[Card], budgets_p: List[int], model: str, log) -> Tuple[str, str]:
+    """Group P's layer + attention cut, and the ONE provenance line for it.
+
+    Returns ``(stage_ratio, attn_stage_ratio)`` as the launcher's own flag
+    strings. Everything it feeds the solver is either measured on this box
+    (NVML card names, the per-rank budgets this launcher just derived, the
+    checkpoint's own weight headers and KV cell) or a flag whose default
+    carries its provenance in the help text -- no number is chosen here.
+    """
+    from sglang.srt.planner import pp_cut as _pp_cut
+    from sglang.srt.planner import pp_cut_launch as _cut
+
+    cfg_path = os.path.join(model, "config.json")
+    with open(cfg_path) as fh:
+        cfg = json.load(fh)
+    text_cfg = cfg.get("text_config") or cfg
+    n_layers = int(text_cfg["num_hidden_layers"])
+    kinds = text_cfg.get("layer_types") or []
+    n_attn = sum(1 for k in kinds if str(k) == "full_attention")
+    if n_attn <= 0:
+        raise Weg2LaunchRefused(
+            f"W40 Weg2PPCutRefused: {cfg_path} states no full_attention layer "
+            f"in layer_types, so the attention axis cannot be solved and the "
+            f"KV pool cannot be priced. Refusing rather than defaulting."
+        )
+    # The KV cell is CONSUMED from config, never fitted (#704 D1).
+    kv_mib = _pp_cut.kv_mib_per_token_per_attn_layer_from_config(
+        cfg, "fp8_e4m3", n_layers
+    )
+    # Weights from the safetensors HEADERS, not from a parameter formula.
+    terms = _pp_cut.checkpoint_weight_terms(model)
+    n_attn_ckpt = len(terms.attention_layer_indices)
+    mean_layer_mib = (
+        terms.attn_layer_weight_bytes * n_attn_ckpt
+        + terms.linear_layer_weight_bytes * (terms.n_layers - n_attn_ckpt)
+    ) / max(1, terms.n_layers) / _pp_cut.MIB
+    ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
+    model_pool = _pp_cut.PhasePoolModel(
+        free_mib=tuple(float(b) for b in budgets_p),
+        # The FAMILY split of weights is deliberately averaged: a stage's
+        # divisor in stage_pp_capacities is its ATTENTION COUNT, and moving
+        # one attention layer changes that divisor by 1 in 4-8 (12-25 %)
+        # while changing weights by the attn/linear difference of a single
+        # layer against a ~17-28 GiB free -- two orders of magnitude apart.
+        # The total is exact for any cut summing to n_layers.
+        weight_mib_per_layer=mean_layer_mib,
+        kv_mib_per_token_per_attn_layer=kv_mib,
+        arming_floor_mib=tuple(float(ns.pp_cut_arming_floor_mib) for _ in budgets_p),
+        mamba_mib_per_linear_layer_per_slot=float(
+            ns.pp_cut_mamba_mib_per_linear_layer_per_slot
+        ),
+        # Read off the argv this launcher builds rather than restated: a
+        # second copy of --max-running-requests would drift the day the flag
+        # moves, and the mamba residency scales linearly with it.
+        mamba_slots=_max_running_requests(model),
+    )
+    families = tuple(
+        _pp_cut.LAYER_FAMILY_ATTENTION
+        if str(k) == "full_attention"
+        else _pp_cut.LAYER_FAMILY_LINEAR
+        for k in kinds
+    )
+    incumbent = _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else _csv_ints("32,18,14")
+    decision = _cut.solve_launch_cut(
+        layer_families=families,
+        incumbent_layers=incumbent,
+        measured_ms_per_layer=ms,
+        measured_provenance=(
+            "MEASURED per-layer ms %s (boot bsscale, BSSCALE_0907.md tip "
+            "37c884b0b0: PP0 259.1 ms/32 layers, PP1 632.9/18, PP2 470.2/14, "
+            "per full 4096-token chunk at bs6)" % ns.pp_cut_measured_ms_per_layer
+        ),
+        card_names=[c.name for c in cards],
+        pool_model=model_pool,
+        cap_tokens=int(ns.max_kv_per_request),
+        pinned_layers=_csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else None,
+        pinned_attn=_csv_ints(ns.pp_attn_stage_ratio) if ns.pp_attn_stage_ratio else None,
+    )
+    log(
+        f"PP-CUT inputs: layers={n_layers} attn={n_attn} "
+        f"kv={kv_mib * 1024 * 1024:.0f} B/token/attn-layer (from config, fp8_e4m3) "
+        f"weights attn {terms.attn_layer_weight_bytes / _pp_cut.MIB:.1f} / linear "
+        f"{terms.linear_layer_weight_bytes / _pp_cut.MIB:.1f} MiB per layer -> mean "
+        f"{mean_layer_mib:.1f} used; free={budgets_p} MiB (this launcher's own "
+        f"per-rank budgets); arming floor {ns.pp_cut_arming_floor_mib} MiB/rank; "
+        f"mamba/linear-layer/slot {ns.pp_cut_mamba_mib_per_linear_layer_per_slot} MiB "
+        f"(0.0 = UNFUNDED, pool is an UPPER bound)"
+    )
+    log(decision.provenance_line())
+    # ROUND TRIP AGAINST THE RUNTIME AUTHORITY, not against our own model.
+    # --pp-stage-ratio entries are SCORES: server_args hands them to
+    # derive_pp_layer_split, which SNAPS the boundary into the window that
+    # realizes the attention target -- and snaps SILENTLY when an attention
+    # vector is given (the #505(a) warning in _handle_pp_stage_ratio only
+    # fires when attn_scores is None). MEASURED: 43,10,11 with attn 5,6,5
+    # comes back as 23,24,17. A solved cut that does not survive this call is
+    # a cut the boot would not run, so it is refused here rather than logged
+    # and departed from.
+    stage_ratio = ",".join(str(n) for n in decision.chosen.layers)
+    attn_ratio = ",".join(str(a) for a in decision.chosen.attn)
+    from sglang.srt.distributed.utils import derive_pp_layer_split
+
+    realized = derive_pp_layer_split(
+        list(decision.chosen.layers),
+        is_full_attention=[str(k) == "full_attention" for k in kinds],
+        attn_scores=list(decision.chosen.attn),
+    )
+    if list(realized) != list(decision.chosen.layers):
+        raise Weg2LaunchRefused(
+            f"W40 Weg2PPCutRefused: the cut this launcher solved "
+            f"({stage_ratio} / attn {attn_ratio}) does not survive "
+            f"derive_pp_layer_split -- it would run as "
+            f"{','.join(str(c) for c in realized)}. Refusing rather than "
+            f"booting a layout the provenance line misdescribes."
+        )
+    log(
+        f"PP-CUT round trip: derive_pp_layer_split({stage_ratio}, attn "
+        f"{attn_ratio}) = {','.join(str(c) for c in realized)} -- the argv "
+        f"states what the boot will run."
+    )
+    return stage_ratio, attn_ratio
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tree", required=True)
@@ -790,6 +1015,81 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "buffers are not memory-saver-tagged and survive the sleep "
              "(measured 2230 -> 2310 MiB on the 5090, boot weg2ab0). Under "
              "'bar1' nothing about the flip path changes.",
+    )
+    # -- group P: the layer cut ------------------------------------------
+    ap.add_argument(
+        "--pp-stage-ratio", default=None,
+        help="OVERRIDE the solved layer cut for group P (e.g. '32,18,14'). "
+             "Passing it is announced as 'PINNED (user override)' in the "
+             "PP-CUT provenance line and priced on the same two axes as the "
+             "solved cut. Unset = the solver decides.",
+    )
+    ap.add_argument(
+        "--pp-attn-stage-ratio", default=None,
+        help="OVERRIDE the solved full-attention split for group P (e.g. "
+             "'8,4,4'). Same PINNED provenance. Unset = the attention axis is "
+             "resolved for the chosen layer cut by pp_cut.best_attention_split.",
+    )
+    ap.add_argument(
+        "--max-kv-per-request", type=int, default=CONTEXT_LENGTH,
+        help=f"Group P's KV pool must hold at least this many tokens: one "
+             f"whole prompt must be device-resident for the stage's attention "
+             f"layers while its prefill runs. Default {CONTEXT_LENGTH} = "
+             f"--context-length, i.e. the longest prompt this boot admits. "
+             f"A cut below it is refused (W40), never silently taken.",
+    )
+    ap.add_argument(
+        "--pp-cut-measured-ms-per-layer", default=MEASURED_MS_PER_LAYER,
+        help=f"Per-stage prefill ms per layer for the cost model. Default "
+             f"'{MEASURED_MS_PER_LAYER}' is MEASURED on boot bsscale "
+             f"(/spinning/gpu-arb/weg2/BSSCALE_0907.md, tip 37c884b0b0, "
+             f"per full 4096-token chunk at bs6: PP0 259.1 ms/32 layers, PP1 "
+             f"632.9/18, PP2 470.2/14). Used as the ANCHOR when the measured "
+             f"card-rate library supplies the per-card ratios.",
+    )
+    ap.add_argument(
+        "--pp-cut-arming-floor-mib", type=float, default=ARMING_FLOOR_MIB,
+        help=f"Per-rank arming floor subtracted before KV in the pool model. "
+             f"Default {ARMING_FLOOR_MIB} = the top of the rig's VRAM "
+             f"corridor (819-1229 MiB NVML-free per card under load). "
+             f"pp_cut.PhasePoolModel names the gap this stands in for: the "
+             f"solved per-layout floor only exists for a layout that has "
+             f"booted, and the proxy carries about +-500 MiB.",
+    )
+    ap.add_argument(
+        "--pp-cut-mamba-mib-per-linear-layer-per-slot", type=float, default=0.0,
+        help="Device GDN state per linear layer per sequence slot, MiB. "
+             "Default 0.0 = UNFUNDED, and the direction is named rather than "
+             "hidden: omitting it inflates every stage's capacity, more for "
+             "stages holding more linear layers, so the printed pool is an "
+             "UPPER bound and the pool floor is looser than reality. Pass a "
+             "measured value to tighten it.",
+    )
+    # -- group D: the decode knobs ---------------------------------------
+    ap.add_argument(
+        "--num-continuous-decode-steps", type=int, default=1,
+        help="Group D only. Decode steps run per scheduler visit "
+             "(server_args.py:1424). Default 1 = the shipped value; the "
+             "value that pays is MEASURED in the boot, not chosen here.",
+    )
+    ap.add_argument(
+        "--d-disable-overlap-schedule", action="store_true",
+        help="Put --disable-overlap-schedule back on group D. The escape "
+             "hatch for a server_args gate that refuses overlap under D's "
+             "combination; taking it logs W41 with the gate named. Not a "
+             "tuning knob.",
+    )
+    # -- measurement arms -------------------------------------------------
+    ap.add_argument(
+        "--p-hicache-write-policy", default="write_through",
+        choices=["write_through", "write_back", "write_through_selective"],
+        help="MEASUREMENT ONLY. Group P's hicache write policy. Default "
+             "write_through = unchanged shipped behaviour. 'off' is NOT "
+             "offered because this runtime has no such policy "
+             "(server_args.py:4318 choices); write_back is the nearest arm "
+             "-- it defers the store write rather than removing it, and the "
+             "structural removal (a shared ring, async ack) belongs to the "
+             "ring slice, not here.",
     )
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
     ns = ap.parse_args(argv)
@@ -888,7 +1188,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
-    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), ns.transport), state.logs["P"], env_p)
+    stage_ratio, attn_stage_ratio = solve_p_cut(ns, cards, budgets_p, ns.model, log)
+    if ns.d_disable_overlap_schedule:
+        log(
+            "W41 Weg2OverlapRefused: --d-disable-overlap-schedule was passed, "
+            "so group D keeps --disable-overlap-schedule. The gate that "
+            "refused must be named in this boot's record; the flag is not a "
+            "tuning knob and no server_args gate is to be weakened to avoid it."
+        )
+    else:
+        log(
+            "SCHEDULER: --disable-overlap-schedule is group P's flag only "
+            "(pp_size=3, server_args.py:19507). Group D runs pp_size=1 with "
+            "the overlap scheduler ON; every forcing gate was checked against "
+            "D's argv (pdmux off, device cuda, no sparse-head/dllm, and the "
+            "hybrid-mamba resolution picks extra_buffer for "
+            "Qwen3_5ForConditionalGeneration on linear_attn_backend=triton). "
+            f"--num-continuous-decode-steps {ns.num_continuous_decode_steps} "
+            "on D (1 = the shipped value; the value that pays is measured in "
+            "the boot)."
+        )
+    if ns.p_hicache_write_policy != "write_through":
+        log(
+            f"MEASUREMENT ARM: group P --hicache-write-policy "
+            f"{ns.p_hicache_write_policy} (shipped default is write_through; "
+            f"#1016 measured the write_through store tax at +3.9 % @50k / "
+            f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
+            f"arm exists to, and changes nothing else). Group D is unchanged."
+        )
+    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy), ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     state.deviations = [
         "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
@@ -914,7 +1242,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport)
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
@@ -950,7 +1278,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     state.budgets["D"] = budgets_d
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport)
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid

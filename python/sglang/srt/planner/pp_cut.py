@@ -2763,6 +2763,43 @@ def pp_phase_pool(
     return min(stage_pp_capacities(counts, attn_counts, model))
 
 
+def attention_split_is_realizable(
+    layer_families: Sequence[str],
+    counts: Sequence[int],
+    attn_counts: Sequence[int],
+) -> bool:
+    """Can this runtime actually put ``attn_counts`` attention layers per stage?
+
+    THE PREMISE THIS REFUSES, because it is the natural one and it is wrong.
+    GDN/linear layers carry no token-scaling KV, so it LOOKS as though the
+    attention split were a free second axis to be allocated for capacity
+    while the layer split is allocated for time. It is not free: the PP split
+    is CONTIGUOUS (``derive_pp_layer_split``: *"stage boundaries only, like
+    SGLANG_PP_LAYER_PARTITION itself"*), so a stage's attention count is
+    fully determined by its two boundaries. ``--pp-attn-stage-ratio`` does
+    not allocate attention layers -- it CHOOSES WHICH BOUNDARY inside the
+    snap window, i.e. it is a second parameterisation of the same boundary.
+
+    MEASURED on the reference checkpoint (64 layers, full_attention every
+    4th): asking for layers ``43,10,11`` with attention ``5,6,5`` -- a
+    perfectly well-formed free allocation, both vectors summing correctly --
+    comes back from ``derive_pp_layer_split`` as ``23,24,17``. The requested
+    cut is not refused, it is SNAPPED, which is the #505(a) silent-
+    substitution class the same function warns about in its own log line. A
+    solver that enumerated free allocations would therefore rank cuts the
+    boot cannot run and hand one to the launcher as an answer.
+
+    What IS decoupled, and it is worth the flag: up to ``period - 1`` LINEAR
+    layers can move across a boundary without changing any attention count,
+    which is why cuts that share an attention split but differ in layer
+    counts exist at all. That freedom is inside the contiguous enumeration
+    already; it needs no separate axis.
+    """
+    return tuple(int(a) for a in attn_counts) == attention_counts(
+        layer_families, [int(c) for c in counts]
+    )
+
+
 def tp_phase_pool(total_attn_layers: int, n_ranks: int, model: PhasePoolModel) -> float:
     """TP-phase pool: the SUM over ranks, independent of any PP cut.
 
