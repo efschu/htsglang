@@ -97,30 +97,6 @@ class TestArrivingWorkIsCounted(CustomTestCase):
             "arriving work must be counted: it is why the policy was woken",
         )
 
-    def test_the_idle_box_ARMS_once_the_arriving_request_is_counted(self):
-        """End to end: the verdict the specimen should have produced."""
-        s = _sched()
-        pending = s._pending_prefill_tokens([_arriving()])
-        nothing_can_run, target_can_admit = s._idle_locked_inputs(0, pending)
-        self.assertTrue(nothing_can_run)
-        self.assertTrue(
-            target_can_admit,
-            "with the arriving 22 tokens counted, pp can prefill and the flip "
-            "must arm -- this is the 31.64 s TTFT",
-        )
-
-    def test_the_uncounted_state_is_exactly_the_reported_refusal(self):
-        """Pins the DEFECT itself, so a regression is recognisable.
-
-        Without the arriving work the pair is (True, False) -- nothing can run
-        and the target 'cannot' admit -- which is the BOTH BLOCKED the specimen
-        logged.
-        """
-        s = _sched()
-        self.assertEqual(
-            s._idle_locked_inputs(0, s._pending_prefill_tokens()), (True, False)
-        )
-
     def test_the_early_false_is_what_hides_the_holding_terms(self):
         """Why the diagnostic showed both PP terms holding and still refused."""
         s = _sched()
@@ -153,32 +129,6 @@ class TestTheObserverPathIsUnchanged(CustomTestCase):
 
 class TestRefusalStaysReachableForItsGenuineCauses(CustomTestCase):
     """The fix must not weaken admission where the hold is CORRECT."""
-
-    def test_a_truly_empty_box_still_refuses(self):
-        s = _sched()
-        self.assertEqual(s._pending_prefill_tokens([]), 0)
-        self.assertEqual(s._idle_locked_inputs(0, 0), (True, False))
-
-    def test_a_starved_pool_still_refuses_even_with_arriving_work(self):
-        s = _sched(avail=3)
-        pending = s._pending_prefill_tokens([_arriving()])
-        self.assertEqual(pending, PENDING)
-        self.assertFalse(s._layout_admits("pp", 0, pending), "rows < need")
-        self.assertEqual(s._idle_locked_inputs(0, pending), (True, False))
-
-    def test_no_state_slot_still_refuses_even_with_arriving_work(self):
-        s = _sched(slots=0)
-        pending = s._pending_prefill_tokens([_arriving()])
-        self.assertFalse(s._layout_admits("pp", 0, pending), "no GDN slot")
-        self.assertEqual(s._idle_locked_inputs(0, pending), (True, False))
-
-    def test_a_round_that_BUILT_something_is_never_idle_locked(self):
-        s = _sched()
-        s._round_built_nothing = False
-        self.assertEqual(
-            s._idle_locked_inputs(0, s._pending_prefill_tokens([_arriving()])),
-            (False, False),
-        )
 
     def test_non_prefill_intake_is_not_counted_as_work(self):
         """recv_reqs carries control messages too -- an abort or a flip arm is

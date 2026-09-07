@@ -445,92 +445,6 @@ def _intake(armed, pp_rank, service_calls):
     return rx
 
 
-@pytest.mark.parametrize("pp_rank", [0, 1, 2])
-def test_the_armed_intake_services_and_never_blocks_on_any_rank(pp_rank):
-    """CORPSE G, AT ITS ROOT.
-
-    An armed rank must reach the flip's hook by its OWN poll. Blocking
-    here for a message from an upstream that is itself armed -- and
-    therefore issuing no forwards -- is the starvation that reproduced
-    identically every epoch.
-
-    Rank 0 is in the parametrisation deliberately. The armed rules used to
-    be gated on the chain receiver, which exists only on ranks with an
-    upstream, so they were off on exactly the rank that must stop
-    admitting work for the group to reach a quiescent boundary at all.
-    """
-    calls = []
-    rx = _intake(armed=True, pp_rank=pp_rank, service_calls=calls)
-    assert rx._pull_raw_reqs() == [], (
-        "an armed rank admitted work or returned None; empty means 'no new "
-        "work this pass', which every later step already handles"
-    )
-    assert calls == [pp_rank], "the armed intake skipped its service turn on this rank"
-
-
-def test_the_receiver_wiring_actually_publishes_the_consumed_count(tmp_path):
-    """THE WIRING, not just the pieces. Metal boot 2026-08-09 01:00Z.
-
-    Every unit above passed while the live system never published a single
-    consumed count: the callback that ``Scheduler._build_pp_chain_receiver``
-    hands to the receiver raised ``NameError`` on its first call, was
-    caught as best-effort, and logged. The upstream could therefore never
-    learn its send had been taken, withheld presence for ever, and all
-    three epochs abandoned at the 60 s deadline.
-
-    Nothing in the unit suite touched that lambda. This test builds the
-    receiver THROUGH the real factory and drives one message through the
-    real state machine, so the callback is executed rather than merely
-    constructed.
-    """
-    from sglang.srt.managers import pp_chain_receiver as rxmod
-    from sglang.srt.managers.scheduler import Scheduler
-
-    class _Ps:
-        pp_size = 3
-        pp_rank = 1
-        tp_size = 1
-        attn_tp_rank = 0
-        attn_cp_rank = 0
-        attn_dp_rank = 0
-        attn_cp_size = 1
-        attn_tp_size = 1
-
-    class _Args:
-        enable_phase_flip = True
-
-    class _Grp:
-        cpu_group = None
-
-    class S:
-        ps = _Ps()
-        server_args = _Args()
-        world_group = _Grp()
-
-    s = S()
-    s.pp_flip_counters = _counters(tmp_path, rank=1)
-    rx = Scheduler._build_pp_chain_receiver.__get__(s, S)()
-    assert rx is not None, "the receiver must be built when the flip is on"
-
-    # Drive one whole message through the real machine.
-    monkey = _FakeSizeZeroDist()
-    original = rxmod.dist
-    rxmod.dist = monkey
-    try:
-        rx._advance(block=True)
-    finally:
-        rxmod.dist = original
-
-    assert rx.publish_failures == 0, (
-        "the consumed-counter callback raised; the upstream is then blind "
-        "to this rank's progress and every flip abandons at the deadline"
-    )
-    assert rx.consumed == 1
-    assert _counters(tmp_path, rank=0).consumed(CHAN_REQ, 1) == 1, (
-        "the consumed count never reached /dev/shm, so no peer can read it"
-    )
-
-
 class _FakeSizeZeroDist:
     """Hands out one empty (size-0) chain message, which is a whole
     message: an empty forward still carries the pass."""
@@ -574,19 +488,6 @@ def _tick_harness(counters, armed=True, enabled=True):
     return s, SchedulerPPMixin._pp_flip_pass_tick.__get__(s, S)
 
 
-def test_the_pass_clock_counts_slot_iterations_while_armed(tmp_path):
-    c = _counters(tmp_path, rank=0)
-    s, tick = _tick_harness(c)
-
-    for mb in (0, 1, 2, 0, 1):
-        tick(mb)
-
-    assert c.sent(CHAN_PASS, 0) == 4, (
-        "the first armed pass establishes the baseline and each later one "
-        "adds a pass; five ticks are four iterations of armed window"
-    )
-
-
 def test_the_pass_clock_is_silent_without_the_flip(tmp_path):
     """Zero cost on every boot that does not use this feature."""
     c = _counters(tmp_path, rank=0)
@@ -596,32 +497,6 @@ def test_the_pass_clock_is_silent_without_the_flip(tmp_path):
         tick(mb)
 
     assert c.sent(CHAN_PASS, 0) == 0
-
-
-def test_can_fail_the_instrument_actually_SEES_a_drifting_group(tmp_path):
-    """THE CAN-FAIL FOR THE INSTRUMENT ITSELF.
-
-    Three ranks share one /dev/shm directory and run DIFFERENT numbers of
-    slot iterations inside one armed window -- exactly what the hypothesis
-    says the armed intake rule permits. Any rank must be able to read the
-    whole group's counts and compute a non-zero spread.
-
-    If this ever reads 0, the instrument is blind and a green pass-clock
-    line on metal would mean nothing.
-    """
-    ranks = [_counters(tmp_path, rank=r) for r in range(3)]
-    harnesses = [_tick_harness(c) for c in ranks]
-
-    for passes, (s, tick) in zip((30, 12, 7), harnesses):
-        for i in range(passes):
-            tick(i % 3)
-
-    observed = [ranks[0].sent(CHAN_PASS, r) for r in range(3)]
-    assert observed == [29, 11, 6], observed
-    assert max(observed) - min(observed) == 23, (
-        "rank 0 could not see its peers' pass counts; the instrument cannot "
-        "detect the drift it exists to detect"
-    )
 
 
 def test_the_falling_edge_reports_and_rearms(tmp_path):

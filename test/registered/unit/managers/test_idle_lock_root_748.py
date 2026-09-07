@@ -150,55 +150,12 @@ class TestTheTpPremiseWasFalse748(CustomTestCase):
     def test_the_largest_tp_specimen_also_admits(self):
         self.assertTrue(_sched()._layout_admits("tp", 0, TP_PENDING_MAX))
 
-    def test_the_tp_specimen_no_longer_reads_as_nothing_can_run(self):
-        """The escape's input, on the specimen's exact numbers."""
-        nothing_can_run, _ = _terms(_sched(), "tp", 0, TP_PENDING)
-        self.assertFalse(
-            nothing_can_run,
-            "tp could prefill 163 tok, so 'nothing can run in tp' is false and "
-            "the #688 escape has no premise",
-        )
-
-    def test_the_policy_therefore_does_not_arm_on_the_tp_specimen(self):
-        from sglang.srt.managers.phase_policy import (
-            PhasePolicyInputs,
-            PhasePolicyState,
-            decide,
-        )
-
-        s = _sched()
-        nothing_can_run, target_can_admit = _terms(s, "tp", 0, TP_PENDING)
-        d = decide(
-            _policy_cfg(),
-            PhasePolicyState(),
-            PhasePolicyInputs(
-                phase="tp",
-                now=1000.0,
-                running_bs=0,
-                pending_prefill_tokens=TP_PENDING,
-                nothing_can_run=nothing_can_run,
-                target_can_admit=target_can_admit,
-            ),
-        )
-        self.assertFalse(
-            (d.reason or "").startswith(IDLE_LOCKED),
-            f"the 9.4/min churn entered here: {d.reason!r}",
-        )
-
-
 class TestTheEscapeStillEscapes748(CustomTestCase):
     """CAN-FAIL COUNTERWEIGHTS. Every way the escape must survive."""
 
     def test_strict_purity_still_refuses_tp_prefill(self):
         """The sentence in the old docstring is true -- for ONE mode."""
         self.assertFalse(_sched(purity="strict")._layout_admits("tp", 0, TP_PENDING))
-
-    def test_strict_purity_still_arms_the_escape(self):
-        nothing_can_run, target_can_admit = _terms(
-            _sched(purity="strict"), "tp", 0, TP_PENDING
-        )
-        self.assertTrue(nothing_can_run)
-        self.assertTrue(target_can_admit, "pp can prefill it")
 
     def test_a_scheduler_without_a_purity_rule_is_unchanged(self):
         """#713's fixture shape: absent evidence is not a licence."""
@@ -230,17 +187,6 @@ class TestTheEscapeStillEscapes748(CustomTestCase):
 
     def test_tp_still_decodes_when_nothing_is_pending(self):
         self.assertTrue(_sched()._layout_admits("tp", 2, 0))
-
-    def test_the_pp_side_specimen_still_arms(self):
-        """08:39:39 verbatim: 1 resident, 0 pending, in pp.
-
-        This one is a REAL lock -- prefill_in_tp forbids decode in PP and there
-        is no prefill to do -- so it must keep escaping. Fixing the tp side
-        removes its cause, not its correctness.
-        """
-        nothing_can_run, target_can_admit = _terms(_sched(), "pp", PP_RESIDENT, 0)
-        self.assertTrue(nothing_can_run, "pp cannot decode under prefill_in_tp")
-        self.assertTrue(target_can_admit, "tp can decode the carrier")
 
     def test_purity_off_lets_pp_decode(self):
         """The mirror of the tp defect: under ``off`` both prohibitions are

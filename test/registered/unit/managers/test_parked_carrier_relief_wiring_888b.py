@@ -95,7 +95,9 @@ class _StandIn:
         chunked=None,
     ):
         self.phase_flip_active_stack = phase
-        self._parked_decode_verdict = (phase if blocked else None, blocked)
+        # #1233 (WEG 2, S0): a bare bool, not (phase, blocked) -- the
+        # phase clamp went with its premise.
+        self._parked_decode_verdict = blocked
         self.parked_decode_set = _ParkedSet(residents)
         self.req_to_token_pool = _Pool(seats_free)
         self.req_to_token_pool.mamba_allocator = _Pool(mamba_free)
@@ -161,11 +163,6 @@ class ThePhaseProhibitionIsReadFromTheRecordedVerdict(unittest.TestCase):
 
     def test_a_blocked_pp_verdict_in_pp_forbids_decode(self):
         self.assertTrue(_forbidden(_StandIn()))
-
-    def test_a_pp_verdict_does_not_survive_into_tp(self):
-        s = _StandIn(phase=PHASE_PP)
-        s.phase_flip_active_stack = PHASE_TP
-        self.assertFalse(_forbidden(s))
 
     def test_an_unblocked_verdict_permits_decode(self):
         self.assertFalse(_forbidden(_StandIn(blocked=False)))

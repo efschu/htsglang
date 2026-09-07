@@ -77,53 +77,6 @@ def _holder(attempted=0, consumed=0, counters=True, upstream=0):
 # ---------------------------------------------------------------------------
 
 
-def test_a_peer_parked_in_a_dict_send_aborts_the_chain_wait():
-    """The boot_827 ring, in counters."""
-    s = _holder(attempted=3, consumed=2)
-    reason = s._pp_chain_abort_check("size", 12.0)
-    assert reason, (
-        "the upstream has entered a dict send this rank has not taken, so "
-        "the ring is closed and the chain wait must not be permanent"
-    )
-    assert "CHAN_DICT" in reason
-    assert "attempted=3" in reason and "local_consumed=2" in reason
-
-
-def test_an_idle_rank_is_never_aborted():
-    """THE REGRESSION THAT MATTERS. An idle PP rank blocks here for as long
-    as no request arrives, and no elapsed time may change that."""
-    s = _holder(attempted=5, consumed=5)
-    assert s._pp_chain_abort_check("size", 0.0) is None
-    assert s._pp_chain_abort_check("size", 3600.0) is None, (
-        "an idle rank was aborted for waiting -- this is the wall-clock "
-        "default the design refuses"
-    )
-
-
-def test_a_consumed_ahead_of_attempted_reading_never_aborts():
-    """Counters are read without a lock, so the skew both ways must be
-    inert rather than clever."""
-    s = _holder(attempted=2, consumed=7)
-    assert s._pp_chain_abort_check("size", 30.0) is None
-
-
-def test_no_counters_means_no_opinion():
-    """A boot without the flip has no counters and must behave exactly as
-    it did before this predicate existed."""
-    s = _holder(counters=False)
-    assert s._pp_chain_abort_check("size", 30.0) is None
-
-
-def test_a_broken_counter_read_never_breaks_the_loop():
-    s = _holder(attempted=3, consumed=1)
-
-    def _boom():
-        raise RuntimeError("shm gone")
-
-    s._pp_flip_upstream = _boom
-    assert s._pp_chain_abort_check("size", 30.0) is None
-
-
 # ---------------------------------------------------------------------------
 # the ring-cut: stall -> drain -> resume the SAME receive
 # ---------------------------------------------------------------------------

@@ -431,7 +431,7 @@ class TestTheNamedExits(_Clean):
                 + c.get("defer_expired", 0)
                 + c.get("defer_released", 0)
                 + c.get("defer_dropped", 0)
-                + c.get("defer_cleared_cutover", 0)
+                + c.get("defer_cleared_reissue", 0)
             )
 
         self.assertEqual(c.get("deferred", 0), _exits())
@@ -466,7 +466,7 @@ class TestThe969CIntakeLine(_Clean):
         self.assertIn("population=queue", lines[1])
         self.assertIn("rid=occ", lines[1])
         self.assertEqual(resident._969ac_site, "retract-intake")
-        self.assertEqual(occupant._969ac_site, "cutover-requeue")
+        self.assertEqual(occupant._969ac_site, "requeue")
         self.assertEqual(plain._969ac_site, "intake")
         # the population marker is consumed by the intake: a later ordinary
         # retraction of the same request must not print population=queue
@@ -570,11 +570,11 @@ class TestTheMarkDoesNotSurviveTheCutover(_Clean):
         for r in (x, x_tp0):
             _assert_unmarked(self, r)
         # the CLEARER ran, not the retry's drop gate: the census tells them apart
-        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_cleared_cutover", 0), 2)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_cleared_reissue", 0), 2)
         self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_dropped", 0), 0)
         self.assertEqual(tp1.last_seam_readmit["deferral_cleared"], 1)
         self.assertEqual(tp0.last_seam_readmit["deferral_cleared"], 1)
-        cleared = [ln for ln in caught.output if "#1068 PREFETCH DEFER CLEARED AT CUTOVER" in ln]
+        cleared = [ln for ln in caught.output if "#1068 PREFETCH DEFER CLEARED AT REISSUE" in ln]
         self.assertEqual(len(cleared), 2, caught.output)
         self.assertRegex(cleared[0], _field("n", 1))
         self.assertRegex(cleared[0], _field("rids", "x"))
@@ -599,13 +599,13 @@ class TestTheMarkDoesNotSurviveTheCutover(_Clean):
         s.waiting_queue = [_Req("p", seq=1)]
         with self.assertLogs(LOG, level="INFO") as caught:
             s.readmit_seam_residents([], requeue_waiting=True)
-        cleared = [ln for ln in caught.output if "#1068 PREFETCH DEFER CLEARED AT CUTOVER" in ln]
+        cleared = [ln for ln in caught.output if "#1068 PREFETCH DEFER CLEARED AT REISSUE" in ln]
         self.assertEqual(len(cleared), 1, caught.output)
         self.assertRegex(cleared[0], _field("n", 0))
         self.assertRegex(cleared[0], _field("rids", "-"))
         self.assertRegex(cleared[0], _field("population", 1))
         self.assertEqual(s.last_seam_readmit["deferral_cleared"], 0)
-        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_cleared_cutover", 0), 0)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_cleared_reissue", 0), 0)
 
     def test_the_readmit_clears_a_landed_hold_too(self):
         # `_prefetch_landed_hold_once` guards one more pass for a landing
@@ -618,7 +618,7 @@ class TestTheMarkDoesNotSurviveTheCutover(_Clean):
         tp.waiting_queue = [r]
         tp.readmit_seam_residents([], requeue_waiting=True)
         _assert_unmarked(self, r)
-        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_cleared_cutover", 0), 1)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_cleared_reissue", 0), 1)
         self.assertFalse(tp._admission_held_for_deferred_prefetch(r))
 
     def test_a_mark_that_meets_a_refused_deferral_at_retry_is_dropped_by_name_never_retried(self):

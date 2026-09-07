@@ -135,26 +135,6 @@ def _resume(s):
 # -- the root -----------------------------------------------------------
 
 
-def test_a_committed_cutover_does_not_carry_the_arm_slot_into_the_new_ring():
-    """PP0's sequence at 15:59:57, tick for tick."""
-    s, tick = _tick_harness(epoch=5)
-
-    tick(2)  # rising edge: armed at mb_id=2, in the ring of flip epoch 5
-    assert s._pp_flip_arm_mb_id == 2
-    assert s._pp_flip_armed_passes == 0
-
-    _commit(s, 6)  # the cutover commits; init_pp_loop_state rebuilds the ring
-    tick(0)  # first tick of the NEW ring -> falling edge
-
-    assert _resume(s) is None, (
-        "the arm slot was recorded against the ring of epoch 5 and that "
-        "ring no longer exists; applying it to epoch 6's ring is the "
-        "15:59:57 'armed at mb_id=2, disarmed at mb_id=0' line, and one "
-        "second later PP1 refused a proxy stamped mb_id=2 while sitting "
-        "on mb_id=0 of the same epoch"
-    )
-
-
 def test_two_ranks_crossing_one_cutover_resume_on_the_same_slot():
     """The group consequence, with the specimen's own numbers.
 
@@ -198,72 +178,6 @@ def test_two_ranks_crossing_one_cutover_resume_on_the_same_slot():
 
 
 # -- what must NOT change: #824 W4b's own case --------------------------
-
-
-def test_an_abandon_in_the_same_epoch_still_restores_the_arm_slot():
-    """#824 W4b, unweakened.
-
-    THIS ARM IS THE POINT OF THE FILE AS MUCH AS THE ONES ABOVE. The
-    cheapest way to make the two tests above pass is to delete the
-    restore, and that reopens boot_827: an armed window that ran zero
-    iterations and abandoned advanced the slot while the request chain
-    that paces it did not. Same ring, same epoch, so the arm slot still
-    names the slot this rank is parked on and returning to it is right.
-    """
-    s, tick = _tick_harness(epoch=5)
-
-    tick(0)  # armed at mb_id=0
-    s._armed = False  # abandoned -- the epoch does NOT move
-    tick(1)  # falling edge one slot later, having run 0 iterations
-
-    assert _resume(s) == 0, (
-        "an abandoned zero-iteration window returns to the SAME ring, "
-        "where the arm slot is still the slot this rank is parked on; "
-        "#824 W4b must survive #829 intact"
-    )
-
-
-def test_a_holder_that_names_no_epoch_keeps_its_pre_795_behaviour():
-    """``pp_flip_epoch_of``'s documented convention, applied here too.
-
-    "No accessor" reads as "no epoch", which is the slot-only behaviour
-    that shipped before #795. A holder written before this file must not
-    change meaning because #829 started asking a question it cannot
-    answer.
-    """
-    s, tick = _tick_harness(epoch=5)
-    del s._pp_flip_epoch
-
-    tick(0)
-    s._armed = False
-    tick(1)
-
-    assert _resume(s) == 0, (
-        "with no epoch accessor there is no evidence the ring was "
-        "rebuilt, so the restore must behave exactly as it did before"
-    )
-
-
-def test_the_leftover_drain_still_runs_on_a_committed_falling_edge():
-    """#757 regression, asserted rather than assumed.
-
-    The falling edge is the ONLY place every disarm passes through, and
-    ``pp_flip_drain_leftover_dicts`` is there for that reason. A #829 fix
-    that suppressed the falling edge after a commit -- for instance by
-    clearing ``_pp_flip_armed_passes`` in ``init_pp_loop_state`` -- would
-    silently take that drain away. #829 removes the SLOT decision on this
-    path and nothing else.
-    """
-    s, tick = _tick_harness(epoch=5)
-
-    tick(2)
-    _commit(s, 6)
-    tick(0)
-
-    assert s.drained == [0], (
-        "the commit path must still reach #757's leftover drain, on the "
-        f"slot the rank is actually on; got {s.drained}"
-    )
 
 
 def test_a_disabled_flip_never_records_an_arm_at_all():

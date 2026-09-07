@@ -206,30 +206,5 @@ class TestReachability(CustomTestCase):
 
         self.assertFalse(ServerArgs(model_path="dummy").enable_hierarchical_cache)
 
-    def test_the_dangerous_combination_is_accepted_which_is_why_this_guard_exists(
-        self,
-    ):
-        """Nothing refuses flip + hierarchical cache any more -- the #630
-        blocker was deliberately removed from both the boot-time and the
-        runtime guard lists so a prefix cache could ride the flip. That
-        decision is what makes the binding hazard reachable, and this test is
-        the tripwire: if a refusal is ever added back, the guard's premise
-        changed and this test says so."""
-        from sglang.srt.server_args import ServerArgs
-
-        args = ServerArgs(
-            model_path="dummy",
-            enable_phase_flip=True,
-            phase_flip_tp_vector="30,17,17",
-            pp_size=3,
-            tp_size=1,
-            page_size=1,
-            enable_hierarchical_cache=True,
-        )
-        args._handle_phase_flip()  # no raise
-        self.assertTrue(args.enable_phase_flip)
-        self.assertTrue(args.enable_hierarchical_cache)
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -454,16 +454,6 @@ def scheduler_stub(pp_size, pp_rank, tp_world=1):
     )
 
 
-def test_pp0_narrows_because_the_ring_carries_its_decision(monkeypatch):
-    gate = CuttingGate()
-    monkeypatch.setattr(
-        "sglang.srt.managers.scheduler.get_prefill_admission_gate",
-        lambda _s: gate,
-    )
-    assert WIDTH(scheduler_stub(pp_size=3, pp_rank=0), 4096) == MIN_CHUNK_TOKENS
-    assert gate.calls == 1
-
-
 def test_a_downstream_pp_rank_never_narrows(monkeypatch):
     gate = CuttingGate()
     monkeypatch.setattr(

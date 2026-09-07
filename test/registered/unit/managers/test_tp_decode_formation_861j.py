@@ -216,36 +216,6 @@ class TestDoor1PolicyArmsAwayFromItsOwnReadmission(CustomTestCase):
         ret = s.maybe_arm_phase_policy()
         return s, ret
 
-    def test_the_first_tp_round_must_not_arm_away_from_the_readmission(self):
-        """RED ON 35b9914e50. The 7 requests the cutover just retracted and
-        re-admitted are the flip's own justification; the seam-transport
-        exemption exists to serve them IN THIS LAYOUT. A tp_to_pp arm on the
-        first round destroys that -- the arm's execution voids the arm's own
-        justification (W30's rule), and the layout oscillates for ever with
-        zero decode batches, which is the W37-F metal specimen."""
-        s, ret = self._armed(dwell_ago_s=8.0)
-        self.assertIsNone(
-            ret,
-            "the policy armed away from the seam re-admission on the first "
-            f"TP round: {s.phase_policy_state.last_reason!r}. These tokens "
-            "are flip transport, served in THIS layout by read-through -- "
-            "counting them as PP demand makes the tp-ward flip undo itself "
-            "(21+21 flips, 0 decode batches on metal)",
-        )
-
-    def test_not_even_the_dwell_floor_holds_the_instant_rearm(self):
-        """RED ON 35b9914e50, same root, sharper clock: 0.1 s after the
-        cutover the `starved` bypass at the min-dwell floor reads the same
-        unclassified existence quantity, so the arm fires with the dwell
-        floor live -- the specimen's same-second re-arm."""
-        s, ret = self._armed(dwell_ago_s=0.1)
-        self.assertIsNone(
-            ret,
-            "armed tp_to_pp 0.1s after the cutover (min dwell 3s bypassed by "
-            f"the starved term): {s.phase_policy_state.last_reason!r}",
-        )
-
-
 class TestDoor2PremiseRefusesThePopulationItExistsFor(CustomTestCase):
     def test_a_stamp_without_a_store_read_no_longer_opens_the_gate(self):
         """INVERTED under #1157 (was `test_the_purity_gate_must_admit_the_
@@ -452,57 +422,6 @@ class TestTheHoldHasABoundedExit(CustomTestCase):
         _register_store_reads(s, reqs)
         s.phase_policy_state.last_flip_at = time.perf_counter() - 8.0
         return s
-
-    def test_a_lapsed_transport_debt_lets_the_demand_fire(self):
-        """The transport-debt clock is the hold's exit: past the drain-stall
-        deadline (10 s at the metal seam cost) the serviceable credit lapses
-        and the demand MUST arm tp_to_pp -- the work goes to PP exactly as it
-        did before #861j, one bounded delay later, never a wedge."""
-        s = self._cutover_state()
-        s._seam_transport_debt_since = time.perf_counter() - 11.0
-        ret = s.maybe_arm_phase_policy()
-        self.assertIsNotNone(
-            ret,
-            "the hold outlived its own deadline: 7 stamped requests sat "
-            "unadmitted past the drain-stall bound and nothing armed -- that "
-            "is the W37-E wedge shape reintroduced by the fix meant to close "
-            "W37-F",
-        )
-        self.assertEqual(ret.direction, "tp_to_pp")
-
-    def test_fresh_unstamped_work_still_demands_the_pp_layout(self):
-        """Stamped transport plus ONE fresh queued request: the fresh prompt
-        is not serviceable in TP (the exemption's builder filter excludes
-        it), so the demand must fire undiminished -- the subtraction may
-        remove exactly the transport, never a token more."""
-        s = self._cutover_state()
-        fresh = _mk_prefilled_req(99, prompt_len=3047)
-        fresh.output_ids = []
-        s.waiting_queue.append(fresh)
-        ret = s.maybe_arm_phase_policy()
-        self.assertIsNotNone(
-            ret,
-            "a fresh request's prefill demand was swallowed by the seam "
-            "subtraction -- the transport credit is claiming work that is "
-            "not transport",
-        )
-        self.assertEqual(ret.direction, "tp_to_pp")
-
-    def test_the_hold_names_its_state_in_the_log(self):
-        """The W37-F specimen's whole cost was an invisible closed door; the
-        hold this fix introduces must be readable from the boot log."""
-        from sglang.srt.managers import scheduler as sched_mod
-
-        s = self._cutover_state()
-        with self.assertLogs(sched_mod.logger, level="INFO") as cm:
-            ret = s.maybe_arm_phase_policy()
-        self.assertIsNone(ret)
-        self.assertIn(
-            "seam transport",
-            "\n".join(cm.output),
-            "the hold fired but did not name the seam-transport state",
-        )
-
 
 class TestDarkRadixTransportIsLoud(CustomTestCase):
     """#861k, the W37-G specimen: 27 TP transport batches recomputed cold

@@ -132,7 +132,9 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
         # `scheduler.py` :7173-7222 and :7250-7273, 50 + 24 = 74 lines.
         # Then 6851/6944/7313 -> 6860/6953/7322 at the B1 merge: S1's
         # `scheduler.py` hunks land ABOVE all three and shift every one of them
-        # by the same +9.
+        # by the same +9.  Then 6860/6953/7322 -> 6463/6556/6925 at #1233 WEG 2
+        # S0: the un-weave DELETES the in-process flip machinery above all
+        # three, so every one of them moves by the same -397.
         # The writer SET is what this row pins and it is unchanged across both:
         # three statements, byte-identical, re-read in the tree at the new
         # lines. A pin of literal line numbers is a Landmarken-Format row -- it
@@ -141,7 +143,7 @@ class UniformMinAvailIsRoundScoped(unittest.TestCase):
         # different program.
         self.assertEqual(
             sets,
-            [6860, 6953, 7322],
+            [6463, 6556, 6925],
             f"the three writers of self.{ATTR} moved: {sets}",
         )
 

@@ -542,25 +542,6 @@ class TestTheRefusalIsCONVERTEDNotDeleted(CustomTestCase):
 
 
 class TestTheBootWiresIt(CustomTestCase):
-    def test_the_scheduler_calls_the_writer(self):
-        import inspect
-
-        from sglang.srt.managers.scheduler import Scheduler
-
-        # W33 arm 1: the wiring must sit AFTER `self.tree_cache` is assigned,
-        # not inside `init_model_worker`. It needs THREE inputs -- both device
-        # pools AND the host tier -- and the host tier hangs off `tree_cache`,
-        # which is assigned after that method returns. Placed too early the
-        # writer runs, finds no host tier, and refuses; measured on metal.
-        src = inspect.getsource(Scheduler.__init__)
-        self.assertNotIn(
-            "build_phase_flip_host_pools",
-            inspect.getsource(Scheduler.init_model_worker),
-            "too early: the host tier does not exist yet there",
-        )
-        self.assertIn("build_phase_flip_host_pools", src)
-        self.assertIn("phase_flip_host_pools", src)
-
     def test_the_ledger_post_is_named(self):
         import inspect
 

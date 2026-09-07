@@ -384,31 +384,6 @@ class TheAlarmQuotesTheVerdictItSaw(unittest.TestCase):
     def tearDown(self):
         lc.reset_for_test()
 
-    def test_the_routing_flag_is_read_exactly_once_per_check(self):
-        calls = []
-        check, holder, batch = self._holder(calls, [PHASE_TP])
-        check(holder, batch)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(lc.counters().conformance_violations, 1)
-
-    def test_a_conformant_batch_is_still_only_read_once(self):
-        calls = []
-        check, holder, batch = self._holder(calls, [PHASE_PP])
-        check(holder, batch)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(lc.counters().conformance_violations, 0)
-
-    def test_a_batch_with_no_stamp_reaches_no_alarm_through_the_wiring(self):
-        """The decoupled spill batch: it never passes the funnel that stamps,
-        so `run_batch` must judge nothing about it."""
-        calls = []
-        check, holder, batch = self._holder(calls, [PHASE_TP])
-        del batch._layout_admitted_phase
-        check(holder, batch)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(lc.counters().conformance_violations, 0)
-
-
 # ---------------------------------------------------------------------------
 # MUTANTS. Each block mutates the detector and asserts that an assertion this
 # file already makes FLIPS. A test that cannot fail is not evidence, and this

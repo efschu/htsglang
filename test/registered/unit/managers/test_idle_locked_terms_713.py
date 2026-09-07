@@ -62,19 +62,6 @@ class TestIdleBoxMustAdmit713(CustomTestCase):
         refusal would be correct rather than a defect."""
         self.assertFalse(_sched()._layout_admits("tp", 0, PENDING))
 
-    def test_the_pair_would_have_armed_the_flip(self):
-        """(nothing_can_run, target_can_admit) on the measured state."""
-        s = _sched()
-        s._round_built_nothing = True
-        s.phase_flip_active_stack = "tp"
-        nothing_can_run, target_can_admit = s._idle_locked_inputs(0, PENDING)
-        self.assertTrue(nothing_can_run, "tp could not run -- that half is right")
-        self.assertTrue(
-            target_can_admit,
-            "pp COULD admit, so the policy should have armed rather than "
-            "declaring BOTH BLOCKED",
-        )
-
     def test_starved_pool_still_refuses(self):
         """The refusal must remain reachable for its real cause."""
         self.assertFalse(_sched(avail=0, evictable=0)._layout_admits("pp", 0, PENDING))
@@ -101,19 +88,6 @@ class TestIdleLockedDiagnostic713(CustomTestCase):
             m.logger.warning("sentinel")
             s._idle_locked_inputs(0, pending)
         return "\n".join(cm.output)
-
-    def test_double_refusal_prints_every_term(self):
-        out = self._run(avail=0, slots=0, pending=PENDING)
-        self.assertIn("IDLE-LOCKED TERMS", out)
-        for token in ("pending_tokens=22", "mamba_slots=0", "post_evict_rows=0"):
-            self.assertIn(token, out, f"{token} missing from: {out}")
-
-    def test_silent_when_the_target_can_admit(self):
-        """CAN-FAIL: a healthy round must not narrate. A diagnostic that fires
-        on every round is noise, and noise is how a real signal gets filtered."""
-        out = self._run(avail=ROWS_AVAIL, slots=MAMBA_SLOTS, pending=PENDING)
-        self.assertNotIn("IDLE-LOCKED TERMS", out, out)
-
 
 if __name__ == "__main__":
     unittest.main()
@@ -153,21 +127,3 @@ class TestDiagnosticProbesAreAllDefended713(CustomTestCase):
             )
         return s
 
-    def test_a_raising_probe_never_breaks_the_round(self):
-        for which in ("slots",):
-            with self.subTest(probe=which):
-                s = self._raising_sched(which)
-                # must RETURN, not raise: the round survives its own diagnostic
-                nothing_can_run, target = s._idle_locked_inputs(0, PENDING)
-                self.assertTrue(nothing_can_run)
-                self.assertFalse(target)
-
-    def test_the_line_still_prints_with_a_raising_probe(self):
-        from sglang.srt.managers import scheduler as m
-
-        s = self._raising_sched("slots")
-        with self.assertLogs(m.logger, level="WARNING") as cm:
-            s._idle_locked_inputs(0, PENDING)
-        out = "\n".join(cm.output)
-        self.assertIn("IDLE-LOCKED TERMS", out, out)
-        self.assertIn("RAISED", out, "a raising probe must be NAMED, not read as 0")

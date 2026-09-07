@@ -53,7 +53,9 @@ class _StandIn:
             slot_pool=SLOT_POOL, max_running=MAX_RUNNING, enabled=enabled
         )
         self.phase_flip_active_stack = phase
-        self._parked_decode_verdict = (None, False)
+        # #1233 (WEG 2, S0): the record is a bare bool -- one role per
+        # process for life, so there is no other layout to key it on.
+        self._parked_decode_verdict = False
 
 
 class _Req:
@@ -78,7 +80,7 @@ class TheVerdictIsRecordedOncePerRound(unittest.TestCase):
     def test_a_blocked_round_parks_every_resident_carrier(self):
         s = _StandIn()
         _note(s, _Batch("a", "b", "c", "d"), blocked=True)
-        self.assertEqual((PHASE_PP, True), s._parked_decode_verdict)
+        self.assertEqual(True, s._parked_decode_verdict)
         self.assertEqual(4, _discount(s, running_bs=4))
 
     def test_an_unblocked_round_releases_them(self):
@@ -93,13 +95,6 @@ class AStaleVerdictFromTheOtherPhaseIsDiscarded(unittest.TestCase):
     """PP forbids decode and TP does not. Trusting a PP verdict inside TP
     would discount carriers that are actively decoding, which is the one
     direction that over-admits."""
-
-    def test_the_pp_verdict_does_not_survive_into_tp(self):
-        s = _StandIn(phase=PHASE_PP)
-        _note(s, _Batch("a", "b", "c", "d"), blocked=True)
-        self.assertEqual(4, _discount(s, running_bs=4))
-        s.phase_flip_active_stack = PHASE_TP  # the flip commits
-        self.assertEqual(0, _discount(s, running_bs=4))
 
     def test_no_verdict_at_all_discounts_nothing(self):
         s = _StandIn()
@@ -130,7 +125,7 @@ class DisarmedIsTheOldGateExactly(unittest.TestCase):
     def test_nothing_is_recorded_and_nothing_is_discounted(self):
         s = _StandIn(enabled=False)
         _note(s, _Batch("a", "b", "c", "d"), blocked=True)
-        self.assertEqual((None, False), s._parked_decode_verdict)
+        self.assertEqual(False, s._parked_decode_verdict)
         self.assertEqual(0, _discount(s, running_bs=4))
         self.assertEqual([], s.parked_decode_set.ids)
 

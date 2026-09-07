@@ -11,7 +11,6 @@ This is the #505 discipline applied to that: an invariant asserted only in a
 comment is not an invariant. The test fails if the caller stops routing.
 """
 
-import ast
 import inspect
 import unittest
 
@@ -28,34 +27,6 @@ class TheDeclineMustRouteToTheRemedy(unittest.TestCase):
             hasattr(scheduler_mod.Scheduler, "_apply_both_blocked_relief"),
             "the BOTH-BLOCKED receipt promises an evict; the method that "
             "performs it is gone, so the promise is prose again.",
-        )
-
-    def test_the_arming_path_calls_it(self):
-        src = inspect.getsource(scheduler_mod)
-        tree = ast.parse(src)
-        cls = next(
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.ClassDef) and n.name == "Scheduler"
-        )
-        fn = next(
-            n
-            for n in cls.body
-            if isinstance(n, ast.FunctionDef) and n.name == "maybe_arm_phase_policy"
-        )
-        # MATCH THE NAME, NOT THE CALL FORM. The routing is invoked through
-        # getattr(self, "...", noop) so scheduler STAND-INS in the policy tests
-        # do not raise; that is not an attribute call and an AST walk keyed on
-        # ast.Attribute misses it. Keying on the identifier anywhere in the
-        # function survives either spelling and still fails if the routing is
-        # deleted -- which is the only thing this pin is for.
-        body = ast.get_source_segment(src, fn) or ""
-        self.assertIn(
-            "_apply_both_blocked_relief",
-            body,
-            "maybe_arm_phase_policy no longer routes the decline to the evict "
-            "rung. That is exactly the 2026-08-16 16:23 wedge: the diagnosis "
-            "loops forever and the named remedy never runs.",
         )
 
     def test_the_relief_actually_calls_eviction(self):

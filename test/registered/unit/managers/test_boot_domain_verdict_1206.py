@@ -996,52 +996,6 @@ class TestTheVoteSiteItself(CustomTestCase):
         src = inspect.getsource(pfb.build_phase_flip_host_pools)
         self.assertNotIn("vote_phase_flip_boot_verdict", src)
 
-    def test_the_scheduler_votes_under_the_two_flags_and_nothing_else(self):
-        import ast
-        import inspect
-        import textwrap
-
-        from sglang.srt.managers.scheduler import Scheduler
-
-        tree = ast.parse(textwrap.dedent(inspect.getsource(Scheduler.__init__)))
-        calls = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "vote_phase_flip_boot_verdict"
-        ]
-        self.assertEqual(len(calls), 1)
-        target = calls[0]
-
-        conditions = []
-
-        def walk(node, guards):
-            if isinstance(node, ast.If):
-                for child in node.body:
-                    walk(child, guards + [ast.unparse(node.test)])
-                for child in node.orelse:
-                    walk(child, guards + ["not (%s)" % ast.unparse(node.test)])
-                return
-            for sub in ast.walk(node):
-                if sub is target:
-                    conditions.append(list(guards))
-                    return
-            return
-
-        for stmt in tree.body[0].body:
-            walk(stmt, [])
-        self.assertEqual(len(conditions), 1)
-        self.assertEqual(
-            conditions[0],
-            [
-                "self.server_args.enable_phase_flip",
-                "self.enable_hierarchical_cache",
-            ],
-            "flip AND hicache, and nothing a rank can answer differently",
-        )
-
-
 class TestThePackedPayloadCarriesTheTerms(CustomTestCase):
     """The FORGOTTEN VOTE, on both S1 slots of the packed bus.
 
