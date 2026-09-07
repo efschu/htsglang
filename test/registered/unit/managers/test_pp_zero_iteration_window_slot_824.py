@@ -71,6 +71,17 @@ def _tick_harness(armed=True, enabled=True, loop_size=3):
     return s, SchedulerPPMixin._pp_flip_pass_tick.__get__(s, S)
 
 
+_S0_RETIRED = pytest.mark.skip(
+    "#1233 (WEG 2, S0): the rising/falling edge of an ARMED window, which "
+    "this property is about, does not exist in Weg 2 -- nothing arms, so "
+    "`_pp_flip_pass_tick` reduces to publishing the live slot and no slot "
+    "restore is ever requested.  The two cases below that survive the cut "
+    "(no restore when the slot never moved; the flip being off costs "
+    "nothing) still run.  File deleted at S7 with the flip modules."
+)
+
+
+@_S0_RETIRED
 def test_zero_iteration_window_asks_for_the_arm_slot_back():
     """The boot_827 sequence, tick for tick."""
     s, tick = _tick_harness()
@@ -89,6 +100,7 @@ def test_zero_iteration_window_asks_for_the_arm_slot_back():
     )
 
 
+@_S0_RETIRED
 def test_a_window_that_ran_iterations_is_left_to_the_hold():
     """Not a blanket rewind. Longer windows reach _pp_flip_hold_slot, which
     already guarantees the arm slot, and second-guessing it here would move
@@ -129,6 +141,7 @@ def test_the_flip_being_off_costs_nothing():
     assert getattr(s, "_pp_flip_arm_mb_id", None) is None
 
 
+@_S0_RETIRED
 def test_the_loop_returns_to_the_arm_slot_without_advancing():
     """The consumer half: the event loop must restart the body on the
     restored slot rather than carrying on and incrementing.

@@ -112,6 +112,14 @@ class TestTheDrainedPremiseCountsLaunchedWork(unittest.TestCase):
         )
 
 
+@unittest.skip(
+    "#1233 (WEG 2, S0): D2b's premise -- an ARMED follower holding its "
+    "microbatch slot -- does not exist in Weg 2; the hold family and the "
+    "launched-pass GROUP STOP were removed with it (booked in "
+    "WEG2_BUILD_DECISIONS_0906.md, S0 fixer round 2).  D1, D2a, the arm "
+    "census and the ring-rebuild classes in this file are UNAFFECTED and "
+    "still run."
+)
 class TestTheHoldReleasesForAStashedFrame(unittest.TestCase):
     """D2b: an armed follower must reach the slot a launched frame names."""
 

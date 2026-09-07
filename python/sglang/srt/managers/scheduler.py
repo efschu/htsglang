@@ -14694,8 +14694,6 @@ def dispatch_event_loop(scheduler: Scheduler):
             _pp.warmup_p2p_pairs()
 
     # Dispatch to the appropriate event loop based on the disaggregation mode
-    # #631: a phase-flip boot re-dispatches per phase; wrapper, not patch.
-        return
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:

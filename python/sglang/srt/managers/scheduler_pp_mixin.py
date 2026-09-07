@@ -3978,12 +3978,12 @@ class SchedulerPPMixin:
     def _event_loop_pp_body(self):
         while True:
             server_is_idle = True
-            # #631 DEFECT Q, CLOSED HERE. The slot index is a WHILE loop and
-            # not a ``for`` because an armed, fully parked rank must HOLD it
-            # -- see _pp_flip_hold_slot for the measurement and the argument.
-            # With the flip disabled the two are the same loop: the hold is
-            # never taken and mb_id increments once per iteration exactly as
-            # ``for mb_id in range(self.pp_loop_size)`` did.
+            # #631 DEFECT Q. The slot index is a WHILE loop rather than a
+            # ``for`` because an armed, fully parked rank used to HOLD it.
+            # #1233 (WEG 2, S0) removed the hold with the armed window it
+            # rested on, so this loop is now exactly
+            # ``for mb_id in range(self.pp_loop_size)`` -- which is what
+            # every boot without the flip already ran.
             mb_id = 0
             while mb_id < self.pp_loop_size:
                 self.running_batch = self.running_mbs[mb_id]
@@ -3994,10 +3994,11 @@ class SchedulerPPMixin:
                 # #824 W4(b): honour a slot restore requested by the falling
                 # edge above. Restart the body on that slot rather than
                 # advancing, so this rank re-enters the pipeline where it
-                # armed -- the same guarantee _pp_flip_hold_slot gives a
-                # window long enough to reach it. Cleared before the jump,
-                # and set only on a falling edge, so it fires once per
-                # abandoned window and cannot loop.
+                # armed. #1233 (WEG 2, S0): nothing writes the request any
+                # more -- the falling edge went with the armed window -- so
+                # this read is the constant None every boot without the flip
+                # already saw. Named for S7 rather than cut here, because the
+                # branch is the loop's own restart path, not flip vocabulary.
                 resume_slot = getattr(self, "_pp_flip_resume_slot", None)
                 if resume_slot is not None:
                     self._pp_flip_resume_slot = None
@@ -5290,21 +5291,6 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_pending_req_work()
 
-                # #631 phase-flip round hook, deferred from
-                # get_next_batch_to_run: every send of this iteration is
-                # flushed above (output dict committed, proxy isend issued,
-                # request forward sent at the top), so the bounded
-                # consensus is now the LAST blocking op of the iteration
-                # and cannot close a cycle with a peer's pending recv. A
-                # commit raises PhaseFlipLoopExit here -- a quiescent
-                # boundary by construction (ready_fn gates on drained
-                # microbatches).
-                    # #631 DEFECT Q. Do NOT advance the slot while the armed
-                    # window is running dry: every rank must re-enter the
-                    # pipeline on the slot it left it on.
-                    if self._pp_flip_hold_slot():
-                        continue
-
                 # #753: THE LOCKSTEP THE GAPPED LAYOUT REQUIRES, MADE EXPLICIT.
                 #
                 # A gapped forward is not a pipeline. Every stage owns layers
@@ -6103,279 +6089,6 @@ class SchedulerPPMixin:
         # to publishing the live slot -- which is what every boot without the
         # flip already did.
         return
-
-    def _pp_flip_hold_slot(self: Scheduler) -> bool:
-        """Must this rank stay on the SAME microbatch slot for another turn?
-
-        #631 DEFECT Q, and this is its fix rather than another instrument
-        for it.
-
-        THE MEASUREMENT THAT NAMES THE DEFECT (2026-08-09 07:19:23Z, the
-        boot that produced corpse R):
-
-            rank 0 ran 44477 slot iteration(s) (armed at mb_id=2,
-                   disarmed at mb_id=2)
-            rank 1 ran 33690 slot iteration(s) (armed at mb_id=2,
-                   disarmed at mb_id=0)
-            rank 2 ran 38069 slot iteration(s) (armed at mb_id=2,
-                   disarmed at mb_id=2)   SPREAD 10787
-
-        ALL THREE RANKS ARM ON THE SAME SLOT AND LEAVE ON DIFFERENT ONES.
-        That is the whole defect, and it is not a message defect.
-
-        WHY THE ARMED WINDOW DRIFTS AT ALL. In steady state the pass loop
-        is PACED BY THE REQUEST CHAIN: every slot iteration makes exactly
-        one blocking chain receive, so rank k's i-th iteration is rank
-        k-1's i-th iteration and the slot indices cannot diverge. An armed
-        rank admits nothing (``_pull_raw_reqs`` returns [] before touching
-        the chain) and launches nothing (``get_next_batch_to_run`` returns
-        ``batch_to_run=None`` while a flip is pending), so its iterations
-        are pure spin -- roughly 8 kHz here -- and the pacing is gone. Each
-        rank then abandons on its OWN park deadline, having spun a
-        different number of times, and re-enters the pipeline on a
-        different slot.
-
-        WHAT THAT COSTS, and why it looked like a stranded message. Nothing
-        is left on the wire: a parked rank neither sends nor receives a
-        proxy, so the one-message-per-pass contract is never broken and the
-        counts stay balanced. What breaks is the LABEL. Stage k computes
-        the hidden states of its slot-s batch while stage k+1 applies them
-        to its slot-s' batch, for ever after, because both indices simply
-        advance from wherever their rank happened to stop. The proxy stamp
-        detects the first such message ("stamp mb_id=2 ... while this rank
-        is on mb_id=1") and both disposals died trying to treat a standing
-        phase offset as one stale message: corpse R took a second message
-        against a debt of one and wedged; corpse S drained a wire that had
-        nothing surplus on it and ate an output.
-
-        THE FIX IS TO STOP THE INDEX, NOT TO REPAIR ITS CONSEQUENCES. Hold
-        the slot once the armed window has run the pipeline dry; the rank
-        keeps spinning, keeps servicing its channels, keeps polling the
-        gate -- it simply does so on ONE slot. Every rank then resumes
-        where it armed, whatever its spin count was, and the spread becomes
-        irrelevant instead of fatal.
-
-        WHY THE HOLD IS REACHED ON THE SAME SLOT ON EVERY RANK, which is
-        the only property that makes this correct. A parked iteration sets
-        ``mbs[mb_id] = None``. The arm itself is slot-uniform because it
-        rides the request chain, which is 1:1 and ordered, so it lands on
-        the same ordinal iteration everywhere (measured above: "armed at
-        mb_id=2" on all three ranks). From that shared slot every rank
-        needs exactly ``pp_loop_size`` parked iterations to null every
-        slot, so ``all(mb is None)`` first holds at the same slot index on
-        every rank. ``is None`` and not ``is_empty()`` deliberately: the
-        stricter test is the one that is reached after a FIXED number of
-        iterations rather than whenever a slot happens to be empty.
-
-        A HALF-WRITTEN CHUNK IS NOT A HOLD. ``chunked_req`` is exempt from
-        the park (its continuation must complete or quiescence is
-        unreachable), so those iterations launch real work, are chain-paced
-        like any other, and are lockstep across ranks. Holding there would
-        stop a rank the pipeline is still driving.
-
-        ONE AUTHORITY FOR "ARMED", checked rather than assumed. The park in
-        ``get_next_batch_to_run`` keys on ``phase_flip_runtime.pending is
-        not None``; ``pp_phase_flip_armed`` -> ``is_armed()`` is a read of
-        that same ``_pending`` and nothing else. So "armed" here and
-        "parked" there cannot disagree, and this predicate can never hold a
-        rank that is still being handed batches.
-
-        NO LAUNCH TIMING MOVES -- the refined design law. Every iteration
-        this suppresses launches nothing, sends nothing and receives
-        nothing; it is a spin the loop was already doing, on a different
-        index. No rank waits on any peer to decide whether to hold, so no
-        synchronisation point is added at arm time either.
-        """
-        # #1173 review (blocker 2): EVERY EARLY RETURN CLEARS THE STASHED-FRAME
-        # BOOKKEEPING. The visit budget below is scoped to ONE armed window and
-        # ONE frame; a count left standing here would be inherited by the next
-        # armed window (the falling edge and the ring rebuild both pass through
-        # these returns) and a fresh, healthy frame would get `bound - k` visits
-        # instead of `bound`. In the TP phase `pp_loop_size` is 1, so the bound
-        # is 4 -- small enough that a single inherited visit changes the verdict,
-        # and the direction of that error is a FALSE group STOP.
-        # #1233 (WEG 2, S0): the slot is never held. Holding existed so an
-        # armed rank re-entered the pipeline on the slot it left; with no
-        # layout change there is no leaving. This is the non-flip path.
-        return self._1173_forget_stashed_frame()
-        if getattr(self, "chunked_req", None) is not None:
-            return self._1173_forget_stashed_frame()
-        mbs = getattr(self, "mbs", None)
-        if not mbs:
-            return self._1173_forget_stashed_frame()
-        if not all(mb is None for mb in mbs):
-            return self._1173_forget_stashed_frame()
-        # #1173 D2b: A STASHED FRAME IS A LAUNCHED PASS, AND THE ARM DOES NOT
-        # OWN IT. The hold above freezes `mb_id`, which is correct while the
-        # ring is genuinely empty -- but a proxy frame sitting in the typed
-        # inbox names a pass PP0 LAUNCHED BEFORE THE ARM, and its named slot
-        # is only reached by advancing `mb_id`. Freezing here strands it: the
-        # follower spins on one slot for ever (the `#1000 SLOT-OCCUPANT
-        # no-statement` shape of #1153) while the launcher waits on an output
-        # that will never be produced. So while a frame is stashed the hold is
-        # RELEASED and the loop walks the ring to the slot the frame names,
-        # where the ordinary row-authority receive consumes it.
-        return not self._pp_flip_stashed_frame_forces_advance(len(mbs))
-
-    def _1173_forget_stashed_frame(self: Scheduler) -> bool:
-        """Drop the stashed-frame budget and answer "no frame forces advance".
-
-        #1173 review (blocker 2). Returning False rather than None so every
-        early return of ``_pp_flip_hold_slot`` can both clear and answer in one
-        expression -- the clear cannot be forgotten at a new early return
-        without also losing the answer.
-        """
-        self._1173_held_frame_key = None
-        self._1173_held_frame_visits = 0
-        self._1173_held_frame_slot = None
-        return False
-
-    def _pp_flip_stashed_frame_forces_advance(self: Scheduler, ring: int) -> bool:
-        """#1173 D2b: is a launched pass's frame waiting in the typed inbox?
-
-        Reads the inbox ONLY -- never the "provably in flight" counter half of
-        ``_pp_row_any_proxy_signal``. A frame still in transit would otherwise
-        read as present on every one of the ~8 kHz armed spin iterations and
-        turn the bound below into a false STOP; a frame that has actually
-        landed is a frame the loop can reach by advancing.
-
-        THE BOUND IS A GROUP STOP, NOT A PARK (the #1153 mechanism, kept):
-        with the hold released the loop reaches any named slot within one ring
-        of advances, so a frame that survives roughly two rings has named a
-        slot this rank cannot execute under the arm. That is a rank
-        disagreement about what was launched, and the standing law is
-        crash/stop, never compensation -- the launcher learns through the
-        group instead of blocking for ever on an output nobody will send.
-
-        WHAT THE BUDGET COUNTS, AND WHY IT IS NOT "VISITS" (#1173 review,
-        blocker 1, MEASURED by the reviewer's probe: ring=3, three frames each
-        consumed after 3 visits -> "SPURIOUS STOP after 9 visits while every
-        frame WAS consumed"). The first draft counted CONSECUTIVE ARMED VISITS
-        AT WHICH ANY FRAME SAT AT THE HEAD, against a bound derived for ONE
-        frame, and reset only when the queue went EMPTY. A follower draining
-        several back-to-back frames -- exactly the multi-launched-pass shape
-        this fix targets, and exactly what weg1b4 armed with (mb slots [0, 1]
-        live, log 82182) -- therefore tripped the STOP with every frame
-        consumed well inside the bound, and the fatal message asserted a fact
-        that was false at the instant it fired ("stayed in the typed inbox for
-        9 armed iterations" about a frame that had just arrived: the
-        instrument-text-lies class, in the group-killing direction).
-
-        Two corrections, both narrowing:
-
-        (a) THE BUDGET IS KEYED TO THE FRAME (and to the arm epoch). A new head
-            frame starts a new budget, so consuming one frame while more remain
-            queued can never spend the next frame's budget. Identity is the
-            head's stamp when it is readable -- the stamp is the pass's own
-            name, ``(mb_id, ..., epoch, fwd_ct, row)`` -- and ``id(head)``
-            otherwise, which is stable for as long as the object sits in the
-            queue and is all this predicate needs.
-
-        (b) A VISIT COUNTS ONLY WHEN THE LOOP IS ON THE SLOT THE FRAME NAMES.
-            The bound's own words are "two rings of advances"; counting loop
-            iterations instead meant any OTHER guard that suppressed
-            advancement burned this budget for a frame the ring was never
-            given a chance to reach. What the STOP actually claims is "the
-            loop KEPT ARRIVING at this frame's slot and the receive still did
-            not take it", so that is what is counted -- an arrival at the
-            named slot is one real chance the ordinary row-authority receive
-            had, and nothing else is.
-
-            Counting arrivals rather than mb_id CHANGES is load-bearing on
-            the TP ring: there ``pp_loop_size`` is 1, ``mb_id`` is 0 on every
-            single iteration and never changes value, so a change-detector is
-            structurally blind exactly where the bound is smallest -- an
-            unfireable guard, which the indicator law forbids as loudly as a
-            false one.
-
-            The slot is read from ``_pp_live_mb_id``, which
-            ``_pp_flip_pass_tick`` publishes at the top of every iteration
-            before any enable test, so it is present on every real armed
-            pass. If EITHER the live slot or the frame's named slot is
-            unreadable the budget does not advance at all: an instrument that
-            cannot measure the chance it is counting must never fire a group
-            stop (the danger direction is the false positive).
-        """
-        try:
-            src = resolve_src(self.pp_group, None)
-            q = typed_inbox(self.pp_group).get((src, "proxy"))
-        except Exception:  # noqa: BLE001 - an unreadable inbox never holds
-            return self._1173_forget_stashed_frame()
-        if not q:
-            return self._1173_forget_stashed_frame()
-        head = q[0]
-        stamp = head.get("__stamp__") if isinstance(head, dict) else None
-        try:
-            epoch_now = pp_flip_epoch_of(self)
-        except Exception:  # noqa: BLE001 - an unreadable epoch is not an identity
-            epoch_now = None
-        try:
-            frame_name = tuple(stamp) if stamp is not None else None
-        except Exception:  # noqa: BLE001 - an unhashable stamp is not an identity
-            frame_name = None
-        key = (epoch_now, frame_name if frame_name is not None else id(head))
-        if getattr(self, "_1173_held_frame_key", None) != key:
-            # A different frame (or a different armed window): its own budget.
-            self._1173_held_frame_key = key
-            self._1173_held_frame_visits = 0
-            self._1173_held_frame_slot = None
-        slot_now = getattr(self, "_pp_live_mb_id", None)
-        try:
-            named_slot = int(stamp[0]) if stamp is not None else None
-        except Exception:  # noqa: BLE001 - an unreadable slot never counts
-            named_slot = None
-        n = int(getattr(self, "_1173_held_frame_visits", 0))
-        if (
-            slot_now is not None
-            and named_slot is not None
-            and int(slot_now) == named_slot
-        ):
-            n += 1
-            self._1173_held_frame_visits = n
-            self._1173_held_frame_slot = slot_now
-        bound = 2 * max(1, int(ring)) + 2
-        if n > bound:
-            slot = -1
-            rid = "unknown"
-            try:
-                slot = int(stamp[0])
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                rid = str(stamp[PP_PROXY_STAMP_ROW_INDEX][0])
-            except Exception:  # noqa: BLE001
-                pass
-            fwd_ct = int(getattr(self, "forward_ct", -1))
-            try:
-                fwd_ct = int(stamp[PP_PROXY_STAMP_FWD_CT_INDEX])
-            except Exception:  # noqa: BLE001 - fall back to this rank's count
-                pass
-            try:
-                epoch = int(pp_proxy_stamp_epoch(stamp) or -1)
-            except Exception:  # noqa: BLE001
-                epoch = -1
-            self._1173_forget_stashed_frame()
-            raise RuntimeError(
-                "#1173 LAUNCHED PASS UNEXECUTED UNDER ARM STOP rank=%d "
-                "slot=%d fwd_ct=%d rid=%s arm_epoch=%d reason=%s"
-                % (
-                    int(getattr(self.ps, "pp_rank", -1)),
-                    slot,
-                    fwd_ct,
-                    rid,
-                    epoch,
-                    (
-                        "the loop ARRIVED AT THIS FRAME'S OWN SLOT %d times "
-                        "and the receive still did not take it (bound %d = "
-                        "two rings of %d slots); the budget is keyed to this "
-                        "frame and to this armed window, so no earlier frame "
-                        "and no earlier window contributed to the count. The "
-                        "arm cannot execute it and the launcher would wait "
-                        "for ever" % (n, bound, int(ring))
-                    ),
-                )
-            )
-        return True
 
     def _pp_flip_bump_sent(self: Scheduler, chan: str) -> None:
         counters = getattr(self, "pp_flip_counters", None)
