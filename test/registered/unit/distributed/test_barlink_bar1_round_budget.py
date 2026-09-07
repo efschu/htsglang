@@ -38,6 +38,9 @@ from sglang.srt.distributed.device_communicators.barlink import (
     BarlinkCommunicator,
 )
 from sglang.srt.distributed.device_communicators.barlink_bar1 import (
+    DEFAULT_NEXT_RUNG_GBPS,
+    DEFAULT_ROUND_US,
+    DEFAULT_WIRE_GBPS,
     ROUND_CAP_AUTO,
     BarlinkBar1Transport,
     ar_plan,
@@ -73,11 +76,15 @@ DCP_AR_COVERED_16 = 16 * W24_ROUND_MAX                   # 100 466 688
 W16_SLOT = 1396736
 AG_Q_FULL_SHARD = 23068672
 
-#: INTERIM calibration (three-window refit, n=76, normalised cond 16.4).
+#: The calibration that SHIPS, read off the module rather than typed: the
+#: stub must grade what the boot runs. Measured 2026-09-07 by
+#: ``scripts/weg2/barlink_round_bench.py`` (artifact
+#: ``roundbench_fixed_0907.json``, 323.2 us / 6.02 GB/s, residual max
+#: 0.052 ms over four rows including a 33-round decomposition).
 #: The tests pin the DECISION, not these numbers -- see ``round_budget``.
-ROUND_US = 432.0
-WIRE_GBPS = 5.47
-NEXT_RUNG_GBPS = 0.685
+ROUND_US = DEFAULT_ROUND_US
+WIRE_GBPS = DEFAULT_WIRE_GBPS
+NEXT_RUNG_GBPS = DEFAULT_NEXT_RUNG_GBPS
 
 
 def _stub(rank: int = 0, world: int = WORLD, **kw) -> BarlinkBar1Transport:
@@ -178,10 +185,13 @@ class TestRoundBudget(CustomTestCase):
         self.assertGreaterEqual(small, 1, msg="never zero: one round always")
 
     def test_t1b_the_margin_at_the_operating_point_is_not_marginal(self):
-        """Why interim constants are safe to ship.
+        """Why the DECISION never depended on the calibration.
 
-        A +-2x error in either constant does not move the DECISION: the
-        budget is 17-28x the rounds the call needs.
+        A +-2x error in either constant does not move it: the budget is
+        22x-38x the rounds the call needs, at the interim numbers and at the
+        measured ones alike. That margin is why C1 could ship before the
+        bench had run -- and why re-deriving the constants afterwards changed
+        the ``est ms`` in the log lines and nothing else.
         """
         wire = wire_bytes_for("all_reduce", DCP_AR_BYTES, WORLD)
         for ru, wg in ((ROUND_US * 2, WIRE_GBPS / 2),
@@ -595,6 +605,256 @@ class TestServerArgsFlag(CustomTestCase):
         self.assertIn("barlink_uncovered_class", ServerArgs.__dataclass_fields__)
         self.assertIsNone(
             ServerArgs.__dataclass_fields__["barlink_uncovered_class"].default
+        )
+
+
+# ---------------------------------------------------------------------------
+# FIX 1 (review of #1234, 2026-09-07): the abort's scope, and the calibration
+# ---------------------------------------------------------------------------
+
+#: The four rows the microbench actually EXECUTED (artifact
+#: ``/spinning/gpu-arb/weg2/barlink-0907/roundbench_fixed_0907.json``, boot
+#: window jpvycx, cards 0/1/2, world 3, all four ``correct: true``).
+#: ``(window_mib, nbytes, rounds, wire_bytes, measured_ms)``.
+BENCH_ROWS = (
+    (16, 100663296, 25, 134217728, 30.3647774271667),
+    (16, 134217728, 33, 178956972, 40.396679658442736),
+    (40, 100663296, 10, 134217728, 25.576976127922535),
+    (40, 134217728, 13, 178956972, 33.888129983097315),
+)
+
+
+class TestRefusalScopeIsItsReason(CustomTestCase):
+    """F1-F6: ``refuse`` may only kill what its justification covers.
+
+    C5's reason is the round-limited class: "a silent host-staged 4.7x is a
+    known boot killer, and with C1 no declared class is anywhere near the
+    round budget". The first cut raised on EVERY ``handles() == False``,
+    which is strictly larger than that reason -- a 4096-byte all_reduce or an
+    odd-sized bf16 buffer anywhere in group D's process became a boot kill
+    where a small, cheap gloo answer was the right one. The abort now fires
+    only on the two costly kinds (round-limited, and a payload too big for
+    the window); every structural refusal keeps the priced warn path.
+    """
+
+    def test_f1_a_below_min_bytes_call_does_not_kill_the_group(self):
+        t = _stub()
+        c = _comm(t, uncovered="refuse")
+        with self.assertLogs(
+            "sglang.srt.distributed.device_communicators.barlink", "WARNING"
+        ) as cm:
+            self.assertIsNone(c._select("all_reduce", 16))
+        self.assertIn("does NOT cover", "\n".join(cm.output))
+
+    def test_f2_a_misaligned_call_does_not_kill_the_group(self):
+        t = _stub()
+        c = _comm(t, uncovered="refuse")
+        with self.assertLogs(
+            "sglang.srt.distributed.device_communicators.barlink", "WARNING"
+        ):
+            self.assertIsNone(c._select("all_reduce", 4104))
+
+    def test_f2b_fewer_than_one_packet_per_rank_does_not_kill_the_group(self):
+        t = _stub(min_bytes=16)
+        c = _comm(t, uncovered="refuse")
+        with self.assertLogs(
+            "sglang.srt.distributed.device_communicators.barlink", "WARNING"
+        ):
+            self.assertIsNone(c._select("all_reduce", 32))
+
+    def test_f3_the_boots_own_class_still_kills_the_group(self):
+        """The whole point of C5 must survive the narrowing."""
+        t = _stub(ar_max_rounds=16)
+        c = _comm(t, uncovered="refuse")
+        with self.assertRaises(RuntimeError) as e:
+            c._select("all_reduce", DCP_AR_BYTES)
+        self.assertIn("17 rounds", str(e.exception))
+
+    def test_f3b_an_oversize_payload_still_kills_the_group(self):
+        """Too big for the mapped window is the same 4.7x, priced the same."""
+        t = _stub(max_bytes=1024)
+        c = _comm(t, uncovered="refuse")
+        with self.assertRaises(RuntimeError):
+            c._select("all_reduce", DCP_AR_BYTES)
+
+    def test_f4_the_classifier_names_the_kind_of_every_refusal(self):
+        self.assertEqual(
+            _stub().uncovered_refusal_kind("all_reduce", DCP_AR_BYTES), "")
+        self.assertEqual(
+            _stub().uncovered_refusal_kind("all_reduce", 16), "structural")
+        self.assertEqual(
+            _stub().uncovered_refusal_kind("all_reduce", 4104), "structural")
+        self.assertEqual(
+            _stub(min_bytes=16).uncovered_refusal_kind("all_reduce", 32),
+            "structural")
+        self.assertEqual(
+            _stub(ag_on=False).uncovered_refusal_kind("all_gather", 1 << 20),
+            "structural")
+        self.assertEqual(
+            _stub(ar_max_rounds=16).uncovered_refusal_kind(
+                "all_reduce", DCP_AR_BYTES),
+            "round")
+        self.assertEqual(
+            _stub(max_bytes=1024).uncovered_refusal_kind(
+                "all_reduce", DCP_AR_BYTES),
+            "oversize")
+        self.assertEqual(
+            _stub(_window_minimum=4096).uncovered_refusal_kind(
+                "all_reduce", DCP_AR_BYTES),
+            "oversize")
+
+    def test_f4b_the_kind_agrees_with_the_words(self):
+        """One classifier, not two: ``why_not`` is its text half."""
+        for t, nbytes in (
+            (_stub(), 16),
+            (_stub(), 4104),
+            (_stub(ar_max_rounds=16), DCP_AR_BYTES),
+            (_stub(max_bytes=1024), DCP_AR_BYTES),
+        ):
+            self.assertFalse(t.handles("all_reduce", nbytes))
+            self.assertTrue(t.uncovered_refusal_kind("all_reduce", nbytes))
+            self.assertTrue(t.why_not("all_reduce", nbytes))
+
+    def test_f5_the_seam_aborts_on_exactly_two_kinds(self):
+        """The policy set is pinned, so widening it needs a test change."""
+        killed = set()
+        for kind in ("", "structural", "round", "oversize", "something-new"):
+            t = _stub(ar_max_rounds=16)
+            c = _comm(t, uncovered="refuse")
+            with mock.patch.object(
+                BarlinkBar1Transport, "uncovered_refusal_kind",
+                lambda self, op, nbytes, _k=kind: _k,
+            ):
+                try:
+                    with self.assertLogs(
+                        "sglang.srt.distributed.device_communicators.barlink",
+                        "WARNING",
+                    ):
+                        c._select("all_reduce", DCP_AR_BYTES)
+                except RuntimeError:
+                    killed.add(kind)
+        self.assertEqual(killed, {"round", "oversize"})
+
+    def test_f6_a_transport_that_cannot_classify_is_never_aborted_on(self):
+        """No classifier -> no abort: the scope cannot exceed the evidence."""
+        t = _stub(ar_max_rounds=16)
+        c = _comm(t, uncovered="refuse")
+        with mock.patch.object(
+            BarlinkBar1Transport, "uncovered_refusal_kind", None
+        ):
+            with self.assertLogs(
+                "sglang.srt.distributed.device_communicators.barlink",
+                "WARNING",
+            ):
+                self.assertIsNone(c._select("all_reduce", DCP_AR_BYTES))
+
+
+class TestCalibrationIsMeasured(CustomTestCase):
+    """F7-F8: the shipped constants come from the bench, not from a fit.
+
+    Spec section 6 conditions C2 on three deliverables. They have now run
+    (window jpvycx, 2026-09-07 18:20Z): the per-round term isolated by
+    differencing two windows at the SAME byte count (319.2 / 325.4 us,
+    median 322.3, n=2), the joint fit over both windows, and TWO
+    decompositions above 16 rounds -- 25 and 33 -- EXECUTED with a
+    correctness check that passed. Section 10.3 is closed: the 16 was
+    policy, and the policy was wrong.
+    """
+
+    def _predict(self, rounds, wire_bytes):
+        from sglang.srt.distributed.device_communicators import barlink_bar1
+        return (
+            barlink_bar1.DEFAULT_ROUND_US / 1e3 * rounds
+            + wire_bytes / (barlink_bar1.DEFAULT_WIRE_GBPS * 1e9) * 1e3
+        )
+
+    def test_f7_the_shipped_constants_reproduce_every_measured_row(self):
+        worst = 0.0
+        for wmib, nbytes, rounds, wire, measured in BENCH_ROWS:
+            resid = abs(self._predict(rounds, wire) - measured)
+            worst = max(worst, resid)
+            self.assertLess(
+                resid, 0.1,
+                msg=f"w{wmib} {nbytes} B, {rounds} rounds: predicted "
+                    f"{self._predict(rounds, wire):.3f} ms vs measured "
+                    f"{measured:.3f} ms",
+            )
+        self.assertLess(worst, 0.1)
+
+    def test_f7b_the_isolated_per_round_term_brackets_the_shipped_one(self):
+        """Deliverable 1: dt/dR at a fixed byte count, no regression."""
+        from sglang.srt.distributed.device_communicators import barlink_bar1
+
+        by_bytes = {}
+        for wmib, nbytes, rounds, wire, measured in BENCH_ROWS:
+            by_bytes.setdefault(nbytes, []).append((rounds, measured))
+        isolated = []
+        for rows in by_bytes.values():
+            (r1, m1), (r2, m2) = sorted(rows)
+            isolated.append((m2 - m1) / (r2 - r1) * 1e3)
+        self.assertGreaterEqual(len(isolated), 2)
+        self.assertGreater(barlink_bar1.DEFAULT_ROUND_US, min(isolated) - 5)
+        self.assertLess(barlink_bar1.DEFAULT_ROUND_US, max(isolated) + 5)
+
+    def test_f8_the_bind_proof_names_the_artifact_and_drops_INTERIM(self):
+        """A constant whose docstring points at a bench that never ran is a
+        hand constant with extra words. The block must name the run."""
+        import inspect
+
+        from sglang.srt.distributed.device_communicators import barlink_bar1
+
+        src = inspect.getsource(barlink_bar1)
+        start = src.index("ROUND_CAP_AUTO = ")
+        block = src[start:src.index("def parse_round_cap", start)]
+        self.assertIn("roundbench_fixed_0907.json", block)
+        for token in ("25", "33", "residual"):
+            self.assertIn(token, block)
+        self.assertNotIn("INTERIM", block)
+
+    def test_f8b_the_setup_line_no_longer_calls_itself_interim(self):
+        lines = _stub().coverage_lines()
+        self.assertNotIn("INTERIM", lines[0])
+        self.assertIn("roundbench", lines[0])
+
+
+class TestTheDerivedBoundNeverBindsHere(CustomTestCase):
+    """MUST_FIX (boot weg2bl1): write the consequence down, in a test.
+
+    ``budget`` and ``rounds`` are both linear in ``nbytes`` at a fixed slot,
+    so the crossover is scale-invariant: if bar1 beats the host-staged rung
+    at one size it beats it at every size, and the derived bound has no root
+    on this rig. Two consequences, both load-bearing: the round count is
+    guarded solely by the six physical refusals, and C5's ``refuse`` is inert
+    on the round branch unless a cap is PINNED.
+    """
+
+    def test_the_ratio_of_budget_to_rounds_is_flat_in_nbytes(self):
+        t = _stub()
+        unit = t._round_unit("all_reduce")
+        ratios = []
+        for k in (1, 4, 16, 64, 256, 1024):
+            nbytes = k * unit
+            budget, how = t.round_budget_for("all_reduce", nbytes)
+            self.assertEqual(how, ROUND_CAP_AUTO)
+            ratios.append(budget / k)
+        self.assertLess(max(ratios) / min(ratios), 1.05,
+                        msg=f"not scale-invariant: {ratios}")
+        self.assertGreater(min(ratios), 2.0,
+                           msg="the bound would bind -- rewrite the note")
+
+    def test_under_auto_the_seam_never_reaches_the_round_branch(self):
+        t = _stub()
+        for k in (1, 8, 64, 512):
+            self.assertEqual(
+                t.uncovered_refusal_kind(
+                    "all_reduce", k * t._round_unit("all_reduce")),
+                "",
+            )
+        self.assertEqual(
+            _stub(ar_max_rounds=16).uncovered_refusal_kind(
+                "all_reduce", DCP_AR_BYTES),
+            "round",
+            msg="a PINNED cap is the one way to reach it",
         )
 
 

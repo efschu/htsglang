@@ -638,6 +638,25 @@ def transport_captured_launches(comm) -> bool:
     return False
 
 
+#: The refusal kinds ``--barlink-uncovered-class refuse`` actually stops a
+#: group on (#1234 FIX 1). The transport names its own kind
+#: (``BarlinkBar1Transport.uncovered_refusal_kind``); this is the policy half,
+#: and it lives at the seam because the seam is what the launcher configures.
+#:
+#: ``round``    -- the decomposition needs more rounds than the bound allows.
+#:                 Boot ``weg2zr2``'s killer: 17 rounds against a bound of 16,
+#:                 a 0.196 % shortfall, 4.7x for two minutes.
+#: ``oversize`` -- the payload does not fit what this window maps at all.
+#:                 Same cost, same advice ("widen the window"), same stop.
+#:
+#: Everything else -- below ``min_bytes``, not a multiple of 16, fewer than one
+#: packet per rank, a disabled collective, an unported algorithm, a transport
+#: that is not up -- keeps the priced warn path. Those calls are small or
+#: structurally impossible, the gloo answer is the right answer, and an abort
+#: there would be strictly larger than the reason C5 was granted for.
+UNCOVERED_REFUSAL_STOPS = ("round", "oversize")
+
+
 def _transport_name(t) -> str:
     """The name of a transport for error messages, without ever raising itself.
 
@@ -883,7 +902,34 @@ class BarlinkCommunicator:
             if reported is None:
                 reported = set()
                 self._fallback_reported = reported
+            # #1234 FIX 1: the abort's scope is its reason, and no wider.
+            # ``refuse`` exists for the size-driven refusals -- a full-size
+            # hot-path message on the host-staged plane at 4.7x per byte.
+            # ``handles() == False`` is a much bigger set than that: a
+            # 4096-byte all_reduce (below ``min_bytes``) and an odd-sized
+            # bf16 buffer (not a multiple of 16) are also uncovered, and for
+            # those the gloo answer is small, cheap and correct. Killing the
+            # group there would be an abort larger than its justification --
+            # on group D, where a boot kill is most expensive. So the
+            # transport classifies its own "no" and only two kinds stop the
+            # group; a transport that cannot classify is never aborted on,
+            # because the scope must not exceed the evidence.
             refusing = getattr(self, "_uncovered_class", "warn") == "refuse"
+            kind = ""
+            if refusing:
+                classify = getattr(t, "uncovered_refusal_kind", None)
+                if callable(classify):
+                    try:
+                        kind = classify(op, nbytes) or ""
+                    except Exception as e:      # noqa: BLE001
+                        logger.warning(
+                            "barlink[%s]: %s could not classify its refusal "
+                            "of %r at %d bytes (%r) -- treating it as the "
+                            "priced warn path, not as a stop.",
+                            getattr(self, "group", "?"), _transport_name(t),
+                            op, nbytes, e,
+                        )
+                refusing = kind in UNCOVERED_REFUSAL_STOPS
             reason = ""
             # Priced only when the sentence is actually going to be said.
             # ``why_not`` now inverts ``max_payload`` to name the smallest
@@ -906,14 +952,18 @@ class BarlinkCommunicator:
                 raise RuntimeError(
                     f"barlink[{getattr(self, 'group', '?')}]: "
                     f"{_transport_name(t)} does NOT cover {op!r} at {nbytes} "
-                    f"bytes. Reason: {reason} The fallback would be the "
+                    f"bytes ({kind}). Reason: {reason} The fallback would be the "
                     f"inline host-staged gloo plane (pinned D2H, dist.* on "
                     f"the CPU, H2D) -- measured 4.7x slower per byte than "
                     f"bar1 on this rig. Not clipped and not staged: this "
                     f"group was launched with --barlink-uncovered-class="
                     f"refuse, so an uncovered hot-path class is a stop, not "
-                    f"a slow answer. Fix the window or the bound, or pass "
-                    f"--barlink-uncovered-class warn to accept the cost."
+                    f"a slow answer. Only the size-driven kinds "
+                    f"{UNCOVERED_REFUSAL_STOPS} stop the group -- a small, "
+                    f"misaligned or structurally unsupported call still "
+                    f"takes the priced warn path. Fix the window or the "
+                    f"bound, or pass --barlink-uncovered-class warn to "
+                    f"accept the cost."
                 )
             # #1234 L5: the warn path, now PRICED. Once per (operation, size
             # class) as before -- but the sentence carries what it costs and

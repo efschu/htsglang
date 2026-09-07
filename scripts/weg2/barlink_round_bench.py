@@ -22,9 +22,29 @@ The three things it must deliver, and none of them is optional:
 2. **The joint fit** ``ms = round_ms*rounds + wire/wire_Bps`` over >= 3
    windows, with its residuals printed, not summarised.
 3. **At least one decomposition of MORE THAN 16 ROUNDS actually EXECUTED**,
-   with a correctness check on the result. No such decomposition has ever run
-   on this rig; until one has, the widened coverage is arithmetic, not a
-   measurement. 128 MiB at a 16-MiB window is 33 rounds.
+   with a correctness check on the result. Until one has, the widened
+   coverage is arithmetic, not a measurement. 128 MiB at a 16-MiB window is
+   33 rounds.
+
+WHAT IT HAS ALREADY DELIVERED
+=============================
+Run 2026-09-07 18:20Z, gpuq window ``jpvycx``, cards 0/1/2, world 3; artifact
+``/spinning/gpu-arb/weg2/barlink-0907/roundbench_fixed_0907.json`` (+ ``.out``).
+Per-round term in isolation 319.2 / 325.4 us (median 322.3), joint fit
+323.2 us and 6.02 GB/s with residual mean 0.026 ms / max 0.052 ms over four
+rows, and **25- and 33-round decompositions executed with CORRECT results** --
+the first above 16 rounds on this rig. Those are the numbers
+``barlink_bar1.DEFAULT_{ROUND_US,WIRE_GBPS}`` now carry.
+
+The first version of this script could not have delivered any of it: its
+correctness gate called the out-of-place ``comm.all_reduce`` for effect and
+asserted on the untouched input, so it aborted with ``WRONG RESULT`` at every
+window -- including window 40 / 10 rounds, the operating point boot
+``weg2bl1`` served 30 100 tokens through correctly. That control is what
+identified the bench, and not bar1, as the broken party. ``verify_all_reduce``
+is now the single gate, and ``test/registered/unit/weg2/
+test_barlink_round_bench_1234.py`` exercises it against an out-of-place, an
+in-place and a deliberately wrong communicator without any hardware.
 
 WHAT IT MEASURES AGAINST
 ========================
@@ -167,6 +187,42 @@ def _timed(fn, seconds: float, at_least: int = 3) -> list:
     return samples
 
 
+def reduced_result(comm, probe):
+    """The tensor that carries the result, whichever contract ``comm`` has.
+
+    ``BarlinkCommunicator.all_reduce`` is OUT-OF-PLACE -- "Returns a new
+    tensor", ``barlink.py:1114-1119`` -- while ``torch.distributed.all_reduce``
+    mutates and returns ``None``. Calling the first for effect and then
+    reading the input back is how this script's correctness gate came to fail
+    at 25 rounds while the very same geometry served 30 100 tokens correctly
+    in boot ``weg2bl1``: every rank read back its own ``rank + 1``, and a
+    broken verification reported a transport defect that was not there.
+    """
+    out = comm.all_reduce(probe)
+    return probe if out is None else out
+
+
+def verify_all_reduce(comm, buf, world: int, where: str):
+    """One all_reduce of ``buf``, checked. Returns the reduced tensor.
+
+    Runs on a CLONE, so the caller's buffer is reusable whichever contract
+    the communicator has -- the timing loop below depends on that. Raises
+    ``SystemExit`` on a wrong sum: a decomposition that returns the wrong
+    answer is not a slow case, and no timing taken after it means anything.
+    """
+    probe = reduced_result(comm, buf.clone())
+    want = float(sum(range(1, world + 1)))
+    import torch
+
+    if not bool(torch.all(probe == want).item()):
+        raise SystemExit(
+            f"WRONG RESULT: {where} -- expected {want}, got "
+            f"{probe.min().item()}..{probe.max().item()}. A decomposition "
+            f"that returns the wrong sum is not a slow case."
+        )
+    return probe
+
+
 def run_rank(a) -> int:
     import torch
     import torch.distributed as dist
@@ -236,18 +292,11 @@ def run_rank(a) -> int:
 
             # -- correctness, BEFORE any timing. A fast wrong answer is the
             # -- one failure mode a throughput bench cannot see.
-            probe = buf.clone()
-            comm.all_reduce(probe)
-            want = float(sum(range(1, world + 1)))
-            ok = bool(torch.all(probe == want).item())
-            if not ok:
-                raise SystemExit(
-                    f"WRONG RESULT: window {wmib} MiB, {nbytes} B, {rounds} "
-                    f"rounds -- expected {want}, got "
-                    f"{probe.min().item()}..{probe.max().item()}. A "
-                    f"decomposition that returns the wrong sum is not a slow "
-                    f"case."
-                )
+            verify_all_reduce(
+                comm, buf, world,
+                f"window {wmib} MiB, {nbytes} B, {rounds} rounds",
+            )
+            ok = True
 
             work = buf.clone()
             _timed(lambda: comm.all_reduce(work), a.warmup)

@@ -585,6 +585,18 @@ def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
         # 4.7x is a known boot killer, and with the window above no declared
         # class is anywhere near the round budget. The library default stays
         # 'warn'; opting in is a deployment decision, made here.
+        #
+        # WHAT THIS DOES AND DOES NOT STOP (FIX 1). Only the two size-driven
+        # refusal kinds -- 'round' and 'oversize', barlink.py's
+        # UNCOVERED_REFUSAL_STOPS -- stop the group. A sub-min_bytes or
+        # misaligned collective anywhere in D's process still takes the
+        # priced warn path and its small, correct gloo answer; killing a boot
+        # for one of those would be an abort wider than the reason above.
+        # Under the DERIVED bound the 'round' half is currently inert on this
+        # rig (the crossover is scale-invariant and has no root here -- see
+        # barlink_bar1.round_budget); it binds when a cap is pinned, which is
+        # exactly how boot weg2zr2 failed, and 'oversize' is the reachable
+        # half that guards the window this line sits next to.
         "--barlink-uncovered-class", "refuse",
         "--port", str(PORT_D),
     ] + extra

@@ -1426,33 +1426,50 @@ ROUND_CAP_AUTO = "auto"
 #: against the #622 ack banks + the ``len(plan) > 1`` D2D ``copy_`` at
 #: ``_all_reduce_one_round``.
 #:
-#: BIND PROOF -- **INTERIM, and stated as such.** Fitted by the #1234 judge
-#: over three windows (24/32/40 MiB, payloads >= 20 MiB, n = 76 rank-lines
-#: from the D logs of boots ``weg2zr2`` / ``weg2ab1b``), normalised condition
-#: number 16.4, residual mean 0.33 ms / max 1.86 ms. It supersedes a
-#: single-window fit (0.2496 us, cond 1.9e5) that was UNIDENTIFIED: at one
-#: window ``rounds`` and ``wire_bytes`` are collinear. It still overpredicts
-#: the measured w40 point by 7 %, so it is not yet a bind-at-operating-point
-#: proof -- boot ``wait`` carries rank skew and is not a transport timing.
+#: BIND PROOF -- MEASURED, not fitted from boot logs. Artifact
+#: ``/spinning/gpu-arb/weg2/barlink-0907/roundbench_fixed_0907.json`` (and
+#: ``.out``), produced by ``scripts/weg2/barlink_round_bench.py`` on
+#: 2026-09-07 18:20Z, gpuq window ``jpvycx``, cards 0/1/2, world 3, three
+#: 3080/5090 peers over PCIe with no P2P.
 #:
-#: The artifact that must replace it: ``scripts/weg2/barlink_round_bench.py``
-#: (windows {16,24,32,40} MiB x messages {24..128} MiB, per-round term
-#: isolated by differencing two windows at the SAME byte count, so no
-#: regression and no collinearity). Until that has run, these are interim.
+#: The four rows it executed, all with a correctness check that PASSED --
+#: ``(window MiB, payload, rounds, measured ms)``::
 #:
-#: Why shipping on interim constants is nevertheless safe: at the operating
-#: point the budget is 283 rounds against the 17 the call needs. A +-2x error
-#: in either constant does not move the DECISION -- only the estimated
-#: milliseconds in the log line, which decides nothing.
-DEFAULT_ROUND_US = 432.0
+#:     16 MiB   96 MiB   25 rounds   30.365 ms
+#:     16 MiB  128 MiB   33 rounds   40.397 ms
+#:     40 MiB   96 MiB   10 rounds   25.577 ms
+#:     40 MiB  128 MiB   13 rounds   33.888 ms
+#:
+#: DELIVERABLE 1 (the term in ISOLATION, no regression, no collinearity):
+#: the same byte count at two windows gives two round counts, and the time
+#: difference over the round difference is the per-round term outright --
+#: 96 MiB: (30.365 - 25.577)/(25 - 10) = 319.2 us; 128 MiB:
+#: (40.397 - 33.888)/(33 - 13) = 325.4 us. Median 322.3, spread 6.2.
+#: DELIVERABLE 2 (the joint fit over both windows): 323.2 us with the wire
+#: term below, residual mean 0.026 ms, max 0.052 ms, n = 4.
+#: DELIVERABLE 3 (spec section 6.3, which C2 does not ship without): the
+#: 25- and 33-round decompositions above are the first above 16 rounds ever
+#: EXECUTED on this rig, and both returned the CORRECT sum. Section 10.3 is
+#: closed in barlink's favour: the 16 was policy, and the policy was wrong.
+#:
+#: This supersedes two boot-log fits -- 249.6 us (single window, normalised
+#: condition 1.9e5, UNIDENTIFIED: at one window ``rounds`` and ``wire_bytes``
+#: are collinear) and 432 us (three windows, cond 16.4, residual max 1.86 ms,
+#: overpredicting the w40 point by 7 %). Boot ``wait`` carries rank skew and
+#: is not a transport timing; both were shipped as interim and both are now
+#: retired. The DECISION never depended on them -- at the operating point the
+#: budget is 385 rounds against the 10 the call needs -- but the ``est ms``
+#: term in L1/L4/L5 did, and that is what these numbers repair.
+DEFAULT_ROUND_US = 323.2
 
-#: Rate at which bytes cross the peer aperture, GB/s. Same fit, same status.
-#: The in-boot cross-check: bar1's measured payload rate is flat at
+#: Rate at which bytes cross the peer aperture, GB/s. Same artifact, same
+#: joint fit, same residuals (mean 0.026 ms, max 0.052 ms over the four rows
+#: above). The in-boot cross-check: bar1's measured payload rate is flat at
 #: 3.15-3.20 GB/s from 3 MiB to 95 MiB across 80 size buckets, and
-#: ``wire = 4/3 x payload`` at R=3 puts that at ~4.3 GB/s of wire; the joint
-#: fit reads 5.47 because it also carries the per-round term out of the same
-#: numbers. Both predict the same DECISION.
-DEFAULT_WIRE_GBPS = 5.47
+#: ``wire = 4/3 x payload`` at R = 3 puts that at ~4.3 GB/s of wire; the
+#: bench reads 6.02 because it measures the aperture without the scheduler
+#: gaps a boot's ``wait`` instrument folds in. Supersedes the interim 5.47.
+DEFAULT_WIRE_GBPS = 6.02
 
 #: The rung a refused decomposition actually falls to: the inline host-staged
 #: plane in ``BarlinkCommunicator`` (pinned D2H -> ``dist.all_reduce`` on the
@@ -1464,7 +1481,8 @@ DEFAULT_WIRE_GBPS = 5.47
 #: BIND PROOF: 146.97 ms for 100 663 296 B, n = 711 rank-lines, boot
 #: ``weg2zr2`` D log. **ONE size**, modelled with no fixed term. Below a few
 #: MiB that understates the rung's real latency and therefore understates the
-#: budget -- we refuse marginally early, which is the safe direction.
+#: budget -- we refuse marginally early, which is the safe direction. The
+#: bench's ``--gloo-rung`` cell re-measures it whenever it runs.
 DEFAULT_NEXT_RUNG_GBPS = 0.685
 
 
@@ -1551,6 +1569,32 @@ def round_budget(nbytes: int, wire_bytes: int, round_us: float,
     Pure function. It reads no ``self``, no environment and no torch state,
     and ``test_barlink_bar1_round_budget`` asserts that by inspecting this
     source: the moment it grows rank-local state, the group can split.
+
+    WHAT THIS BOUND DOES *NOT* DO ON THIS RIG (boot ``weg2bl1``, recorded
+    because it is load-bearing and easy to misread). At a fixed slot both
+    terms are linear in ``nbytes``: the budget is
+    ``nbytes * (1/next_rung_Bps - 2/wire_Bps) / round_s`` and the round count
+    is ``nbytes / round_unit``. The crossover is therefore SCALE-INVARIANT --
+    if bar1 beats the host-staged rung at one size it beats it at every size,
+    and the derived bound has NO ROOT here. With the measured calibration the
+    ratio is ~36x (it was ~28x with the interim one), and ``coverage_ceiling``
+    correctly prints "unbounded" for all four ops in every group.
+
+    Two consequences follow, and neither is a defect:
+    1. The round count is guarded solely by the six physical refusals in
+       ``_handles_all_reduce`` (min_bytes, 16-byte alignment, one packet per
+       rank, ``max_bytes``, ``chunk_max``, the algorithm/window pair). That is
+       the correct division of labour -- those are physics, this is economics
+       -- but it means a runaway decomposition is bounded by the aperture, not
+       by this function.
+    2. ``--barlink-uncovered-class refuse`` is inert on the ROUND branch
+       unless a cap is pinned; it still guards the oversize branch, which is
+       the reachable half. The guard is not thereby pointless: the pinned cap
+       is exactly how boot ``weg2zr2`` failed, and a future operating point
+       (chunk 8192, a larger model, a slower rung) moves the ratio.
+    A rig where ``next_rung_Bps`` approaches ``wire_Bps/2`` -- a fast NCCL rung
+    rather than a host-staged one -- makes the bound bind again, which is why
+    it is derived rather than deleted.
     """
     round_ms = float(round_us) / 1000.0
     if round_ms <= 0 or wire_gbps <= 0 or next_rung_gbps <= 0:
@@ -3596,7 +3640,7 @@ class BarlinkBar1Transport:
         return bar1, nxt
 
     def _round_refusal_text(self, op: str, nbytes: int, rounds: int,
-                            bound_desc: str) -> str:
+                            bound_desc: str, priced: bool = True) -> str:
         """The priced sentence behind every round-limited refusal.
 
         A fallback that is merely NAMED is what let a 0.196 % shortfall run
@@ -3606,6 +3650,11 @@ class BarlinkBar1Transport:
         window that would carry it.
         """
         budget, how = self.round_budget_for(op, nbytes)
+        if not priced:
+            # The classifier's path: the KIND is all the caller wants, and
+            # inverting ``max_payload`` per call on a class that keeps
+            # falling back would put a search in the hot path.
+            return f"would need {rounds} rounds {bound_desc}, budget {budget}"
         bar1_ms, next_ms = self._est_ms(op, nbytes, rounds)
         covered = self._round_unit(op) * max(1, budget)
         window = self.smallest_covering_window_mib(op, nbytes, budget)
@@ -3645,9 +3694,9 @@ class BarlinkBar1Transport:
             f"slot {chunk_max // 1024} KiB, per-round {unit // 1024} KiB, "
             f"world {self.world}, budget={how} (round {round_us:.0f} us, "
             f"wire {wire_gbps:.2f} GB/s, next rung host-staged gloo "
-            f"{next_rung_gbps:.3f} GB/s) -- calibration INTERIM, "
-            f"scripts/weg2/barlink_round_bench.py is the artifact that "
-            f"replaces it"
+            f"{next_rung_gbps:.3f} GB/s) -- calibration MEASURED, "
+            f"roundbench_fixed_0907.json (windows 16/40 MiB x 96/128 MiB, "
+            f"10-33 rounds, residual max 0.052 ms, n=4)"
         )
 
         def _ceil(op: str) -> str:
@@ -3673,6 +3722,36 @@ class BarlinkBar1Transport:
         )
         return [l1, l2, l3]
 
+    #: The three kinds of "no" this transport can say, and the only two the
+    #: seam is allowed to STOP a group on (#1234 review, 2026-09-07).
+    #:
+    #: ``refuse`` exists for one shape: a hot-path class whose full-size
+    #: message falls to the host-staged plane and costs 4.7x per byte, which
+    #: is a known boot killer on group D. That reason covers the size-driven
+    #: refusals and nothing else. A 4096-byte all_reduce or an odd-sized
+    #: bf16 buffer is ALSO uncovered here -- and for those the gloo answer is
+    #: small, cheap and correct, so killing the group would be an abort whose
+    #: scope is larger than its reason. The first cut of C5 did exactly that.
+    REFUSAL_ROUND = "round"          #: more rounds than the bound allows
+    REFUSAL_OVERSIZE = "oversize"    #: too big for what this window maps
+    REFUSAL_STRUCTURAL = "structural"  #: too small, misaligned, off, unbuilt
+
+    def uncovered_refusal_kind(self, op: str, nbytes: int) -> str:
+        """Which KIND of refusal this call would get -- ``""`` if none.
+
+        The seam's policy input. It is deliberately the same classifier that
+        produces :meth:`why_not`'s words (one authority, not two: a kind that
+        disagreed with the sentence beside it would be a second bookkeeping
+        of the same fact), but it runs UNPRICED -- no window inversion, no
+        estimated milliseconds -- because under ``refuse`` it is consulted on
+        every call of a class that is not going to be reported again.
+
+        Rank-uniform for the same reason :meth:`handles` is: every input is
+        group-uniform. A per-rank answer would stop one rank and let the
+        others into the collective, i.e. a hang instead of an error.
+        """
+        return self._refusal(op, nbytes, priced=False)[0]
+
     def why_not(self, op: str, nbytes: int) -> str:
         """Why ``handles`` says False for this size -- in words.
 
@@ -3686,71 +3765,145 @@ class BarlinkBar1Transport:
         sentence in the log. A silent fallback, by contrast, costs a
         measurement.
         """
+        return self._refusal(op, nbytes)[1]
+
+    def _refusal(self, op: str, nbytes: int, priced: bool = True):
+        """``(kind, words)`` for this call -- ``("", "")`` if it is covered.
+
+        ONE walk of the conditions, two consumers: :meth:`why_not` takes the
+        words, :meth:`uncovered_refusal_kind` takes the kind. Every branch
+        below therefore has to answer both questions, which is the point --
+        a refusal nobody can classify is a refusal nobody can price.
+        """
+        rnd, big, sct = (self.REFUSAL_ROUND, self.REFUSAL_OVERSIZE,
+                         self.REFUSAL_STRUCTURAL)
         if op not in self.BARLINK_OPS:
-            return f"{op} is not in BARLINK_OPS"
+            return sct, f"{op} is not in BARLINK_OPS"
         if not self._up or self._ext is None:
-            return "the direct path is not set up"
+            return sct, "the direct path is not set up"
         if not self._proofs_hold:
-            return "the byte-level proof per pair does not hold"
+            return sct, "the byte-level proof per pair does not hold"
         slot = int(self._geo.get("a2a_slot", 0))
         chunk_max = int(self._geo.get("chunk_max", 0))
         if op in ("all_to_all", "all_to_all_single"):
             if not self.a2a_on:
-                return "all_to_all is disabled via SGLANG_BARLINK_BAR1_A2A=0"
+                return sct, "all_to_all is disabled via SGLANG_BARLINK_BAR1_A2A=0"
             if not self._a2a_proof:
-                return "the a2a byte-level proof does not hold"
+                return sct, "the a2a byte-level proof does not hold"
             if nbytes < self.a2a_min_bytes:
-                return f"{nbytes} bytes are below a2a_min_bytes ({self.a2a_min_bytes})"
+                return sct, (f"{nbytes} bytes are below a2a_min_bytes "
+                           f"({self.a2a_min_bytes})")
             n = a2a_rounds(-(-nbytes // self.world), slot) if slot else 0
             if n > self.round_budget_for(op, nbytes)[0]:
-                return self._round_refusal_text(
-                    op, nbytes, n, f"at a {slot}-byte slot"
+                return rnd, self._round_refusal_text(
+                    op, nbytes, n, f"at a {slot}-byte slot", priced=priced
                 )
         elif op == "all_gather":
             if not self.ag_on:
-                return "all_gather is disabled via SGLANG_BARLINK_BAR1_AG=0"
+                return sct, "all_gather is disabled via SGLANG_BARLINK_BAR1_AG=0"
             if not self._a2a_proof:
-                return "the a2a byte-level proof does not hold (all_gather rides on it)"
+                return sct, ("the a2a byte-level proof does not hold "
+                           "(all_gather rides on it)")
             if nbytes < self.ag_min_bytes:
-                return f"{nbytes} bytes are below ag_min_bytes ({self.ag_min_bytes})"
+                return sct, (f"{nbytes} bytes are below ag_min_bytes "
+                           f"({self.ag_min_bytes})")
             if slot and (-(-nbytes // slot)
                          > self.round_budget_for(op, nbytes)[0]):
-                return self._round_refusal_text(
-                    op, nbytes, -(-nbytes // slot), f"at a {slot}-byte slot"
+                return rnd, self._round_refusal_text(
+                    op, nbytes, -(-nbytes // slot), f"at a {slot}-byte slot",
+                    priced=priced,
                 )
         elif op == "broadcast":
             if not self.bc_on:
-                return "broadcast is disabled via SGLANG_BARLINK_BAR1_BC=0"
+                return sct, "broadcast is disabled via SGLANG_BARLINK_BAR1_BC=0"
             if not self._bc_proof:
-                return "the broadcast byte-level proof does not hold"
+                return sct, "the broadcast byte-level proof does not hold"
             if nbytes < self.bc_min_bytes:
-                return f"{nbytes} bytes are below bc_min_bytes ({self.bc_min_bytes})"
+                return sct, (f"{nbytes} bytes are below bc_min_bytes "
+                           f"({self.bc_min_bytes})")
             if slot and (-(-nbytes // slot)
                          > self.round_budget_for(op, nbytes)[0]):
-                return self._round_refusal_text(
-                    op, nbytes, -(-nbytes // slot), f"at a {slot}-byte slot"
+                return rnd, self._round_refusal_text(
+                    op, nbytes, -(-nbytes // slot), f"at a {slot}-byte slot",
+                    priced=priced,
                 )
         else:
             if nbytes < self.min_bytes:
-                return f"{nbytes} bytes are below min_bytes ({self.min_bytes})"
+                return sct, f"{nbytes} bytes are below min_bytes ({self.min_bytes})"
             if nbytes % 16:
-                return (f"{nbytes} bytes are not a multiple of 16 -- the "
-                        f"kernel's access width is 128 bits")
+                return sct, (f"{nbytes} bytes are not a multiple of 16 -- the "
+                           f"kernel's access width is 128 bits")
             if nbytes // 16 < self.world:
-                return (f"{nbytes} bytes are fewer than one 128-bit packet "
-                        f"per rank ({self.world})")
+                return sct, (f"{nbytes} bytes are fewer than one 128-bit packet "
+                           f"per rank ({self.world})")
             if chunk_max >= 16:
-                n = len(ar_plan(nbytes, chunk_max, self.world))
+                rounds = ar_plan(nbytes, chunk_max, self.world)
+                n = len(rounds)
                 if n > self.round_budget_for(op, nbytes)[0]:
-                    return self._round_refusal_text(
+                    return rnd, self._round_refusal_text(
                         op, nbytes, n,
                         f"at a chunk bound of {chunk_max} bytes",
+                        priced=priced,
                     )
+                # The per-round GEOMETRY refusals, in ``_handles_all_reduce``'s
+                # own order. Before #1234's review these fell through to the
+                # region check below and, when the region did fit, produced an
+                # EMPTY sentence for a real refusal -- the exact shape the
+                # honesty rule exists to remove. They are OVERSIZE: the payload
+                # is bigger than what this window maps, so naming a covering
+                # window is honest advice.
+                largest_round = max(length for _, length in rounds)
+                if largest_round > self.max_bytes:
+                    return big, (
+                        f"the largest of {n} rounds is {largest_round} bytes, "
+                        f"above the mapped payload max_bytes "
+                        f"({self.max_bytes}) -- the window is too small for "
+                        f"one round of this call"
+                    )
+                largest_chunk = -(-(largest_round // 16) // self.world) * 16
+                if largest_chunk > chunk_max:
+                    return big, (
+                        f"one round's per-rank shard is {largest_chunk} bytes "
+                        f"and the slot holds {chunk_max}"
+                    )
+                for _, length in rounds:
+                    algo = self.algorithm_for(length)
+                    if algo not in ("mesh", "mesh_pipe", "ring"):
+                        # NOT oversize: a bigger window does not port an
+                        # algorithm, so "widen the window" would be wrong
+                        # advice and stopping the group would be wrong policy.
+                        return sct, (
+                            f"a {length}-byte round selects algorithm "
+                            f"{algo!r}, which is not ported to bar1 (no "
+                            f"silent fallback to 'mesh')"
+                        )
+                    if algo == "mesh_pipe" and not self._pipe_supports(length):
+                        return sct, (
+                            f"a {length}-byte round selects 'mesh_pipe' and "
+                            f"the pipe does not support that length"
+                        )
+                    need = window_requirement(algo, length, self.world)
+                    if need > self._window_minimum:
+                        return big, (
+                            f"a {length}-byte round needs {need} bytes mapped "
+                            f"and the group-wide smallest window is "
+                            f"{self._window_minimum}"
+                        )
         if self._geo.get("region_bytes", 0) > self._window_minimum:
-            return (f"the region ({self._geo.get('region_bytes')} bytes) does "
-                    f"not fit into the group-wide smallest mapped window "
-                    f"({self._window_minimum} bytes)")
-        return ""
+            return big, (f"the region ({self._geo.get('region_bytes')} bytes) does "
+                       f"not fit into the group-wide smallest mapped window "
+                       f"({self._window_minimum} bytes)")
+        # Nothing above matched. Either the call IS covered -- the seam also
+        # asks after a path-dispatcher HINT_GLOO, which is a routing decision
+        # and not a coverage failure -- or ``handles`` declined for a reason
+        # this walk does not know about. The second case must still carry a
+        # kind, or the seam would silently treat an unexplained refusal as a
+        # routing choice.
+        if self.handles(op, nbytes):
+            return "", ""
+        return sct, ("the direct path declined this call and no more specific "
+                   "condition matched -- report this, it is a gap in "
+                   "BarlinkBar1Transport._refusal")
 
     def _kernel(self, moved: int, threshold: int, where: str) -> int:
         """``1`` = cooperative multi-block launch (``grid``), ``0`` = ``1blk``.
