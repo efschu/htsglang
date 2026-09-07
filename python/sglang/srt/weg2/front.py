@@ -245,6 +245,26 @@ def double_prefill_verdict(
     return "reroute"
 
 
+#: The name D's own gate refuses with (C11).  The front never re-prices the
+#: body -- D's gate is the authority -- so the only question anywhere on the
+#: leg-2 path is whether this NAME is present.
+X_REFUSAL_NAME = "W31 Weg2TpPrefillExceeded"
+
+
+def x_refusal_marker_in(body_text: str) -> bool:
+    """True iff this text carries D's named W31 refusal, at any status.
+
+    FIX 2 (round 1): the refusal reaches the front in TWO wire shapes and
+    only one of them carries a status.  `tokenizer_manager.py:1518-1537`
+    raises `HTTPException(503, detail=message)` only when the request is NOT
+    streamed; for a streamed request the same abort is yielded as an
+    IN-BAND chunk on an otherwise 200 response.  A status-only test
+    therefore sees exactly half of law 4's traffic, and OpenAI chat
+    completions under agent load are the streamed half.
+    """
+    return X_REFUSAL_NAME in (body_text or "")
+
+
 def is_x_refusal(status: int, body_text: str) -> bool:
     """True iff D answered this leg 2 with the named W31 refusal (C11/C12).
 
@@ -252,7 +272,20 @@ def is_x_refusal(status: int, body_text: str) -> bool:
     front's own number is an ESTIMATE, L10), so the only question here is
     whether the group refused BY NAME.  A 503 that is not W31 stays a 503.
     """
-    return status == 503 and "W31 Weg2TpPrefillExceeded" in (body_text or "")
+    return status == 503 and x_refusal_marker_in(body_text)
+
+
+async def _first_stream_chunk(r) -> Optional[bytes]:
+    """The first body chunk of a streamed response, or None when empty.
+
+    Read BEFORE `resp.prepare()` so the in-band W31 shape is still
+    re-routable (FIX 2).  Bounded by the response itself: exactly one
+    `__anext__`, no buffering, no timeout of its own -- the leg-2 session
+    timeout is the bound, as it is for every other chunk.
+    """
+    async for chunk in r.content.iter_any():
+        return chunk
+    return None
 
 
 def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
@@ -327,19 +360,27 @@ class Seat:
     seat twice and inflate D's concurrency past its own bs.
     """
 
-    __slots__ = ("front", "rid", "source", "held")
+    __slots__ = ("front", "rid", "source", "held", "tokens")
 
-    def __init__(self, front: Front, rid: str, source: str):
+    def __init__(self, front: Front, rid: str, source: str, tokens: int = 0):
         self.front = front
         self.rid = rid
         self.source = source
         self.held = True
+        # FIX 4a (round 1): a seat is a COUNT of one AND a charge against
+        # D's host staging pool.  Charged where the seat is taken, refunded
+        # where it is returned, so the two can never drift.
+        self.tokens = max(0, int(tokens))
+        self.front._d_inflight_tokens += self.tokens
 
     def release(self, freed_by: str) -> None:
         if not self.held:
             return
         self.held = False
         self.front._d_seat.release()
+        self.front._d_inflight_tokens = max(
+            0, self.front._d_inflight_tokens - self.tokens
+        )
         self.front.counters["d_seat_released"] += 1
         # L3: the "wenn ein slot frei wird, wird nachgezogen" instrument.
         logger.info(
@@ -405,7 +446,8 @@ class Front:
                  flip_min_work_tokens: Optional[int] = None,
                  min_dwell_ms: Optional[float] = None,
                  idle_layout: str = "D",
-                 drain_deadline_s: float = DRAIN_DEADLINE_DEFAULT_S):
+                 drain_deadline_s: float = DRAIN_DEADLINE_DEFAULT_S,
+                 d_admit_max_tokens: Optional[int] = None):
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
         self.awake = awake
         # #1233 one-backup flip: the weights tag family both groups were built
@@ -481,6 +523,36 @@ class Front:
         # prefill, and named as the carrier bound it is.
         self.carrier_max_tokens = int(carrier_max_tokens)
         self.exact_tokens: Dict[str, int] = {}
+        # FIX 4a (round 1), boot weg2sc1 LINK 1 -- D's CONCURRENCY IS A
+        # TOKEN BUDGET, NOT ONLY A COUNT.
+        #
+        # C4 opens `--d-bs` seats at once and nothing couples that number to
+        # D's host staging pool, which is a TOKEN budget.  Measured on
+        # weg2sc1: six seats opened, three requests staged
+        # (occupied=25100 = 8203+8397+8500 against limit=27466), and the
+        # fourth met `#915 PREFETCH REFUSED reason=vote_negative need=8629
+        # available=5418`.  A refused prefetch means `match_prefix` finds
+        # nothing, `extend_input_len` becomes the WHOLE prompt, and C11's X
+        # gate then refuses it correctly -- for a reason that is not the
+        # request's: its prefix IS in the store, the staging pool merely had
+        # no room this pass.  C12 re-queued it to P, P re-prefilled a
+        # store-resident rid, and P's PP ranks then diverged on its
+        # re-admission extent (W27, the boot killer).
+        #
+        # This is the measured #974 host-pool wall (record 1l) lifted from
+        # PER-REQUEST -- which CARRIER-EXCEEDS does bound, at
+        # `carrier_max_tokens` -- to AGGREGATE, which nothing bounded.  The
+        # bound is the same pool, so the default is the same number; 0 = off,
+        # and the flag is the override.  It only ever DELAYS an admission,
+        # never forces one, and never starves: a request alone in flight is
+        # admitted whatever it costs (the truly-oversized case is
+        # CARRIER-EXCEEDS's, not this one).
+        self.d_admit_max_tokens = (
+            self.carrier_max_tokens if d_admit_max_tokens is None
+            else max(0, int(d_admit_max_tokens))
+        )
+        self._d_inflight_tokens = 0
+        self._d_token_hold_rid: Optional[str] = None
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
     def seats_free(self) -> int:
@@ -489,6 +561,36 @@ class Front:
 
     def _seats_in_use(self) -> int:
         return max(0, self.d_bs - self._d_seat._value)
+
+    def _d_token_budget_blocks(self, rid: str, est_tokens: int) -> bool:
+        """FIX 4a: would admitting this request overcommit D's host pool?
+
+        False whenever the budget is off, whenever nothing is in flight (a
+        sole request is never starved by a bound its own size), or whenever
+        it fits.  Rate-limited to one line per held rid, then every 10 s, so
+        the hold is READABLE without the 20 Hz admitter loop flooding the
+        log -- and the suppressed passes are counted (denominator law).
+        """
+        budget = self.d_admit_max_tokens
+        if budget <= 0 or self._d_inflight_tokens <= 0:
+            self._d_token_hold_rid = None
+            return False
+        if self._d_inflight_tokens + max(0, int(est_tokens)) <= budget:
+            self._d_token_hold_rid = None
+            return False
+        self.counters["d_admit_token_held"] += 1
+        held = self.counters["d_admit_token_held"]
+        if self._d_token_hold_rid != rid or held % 200 == 0:
+            self._d_token_hold_rid = rid
+            logger.info(
+                "WEG2 D-ADMIT-HOLD rid=%s est_tokens=%d inflight_tokens=%d "
+                "budget=%d seats_free=%d held_passes=%d (D host staging pool "
+                "is a TOKEN budget; admitting here is the #915 vote_negative "
+                "shape that mis-prices the X gate)",
+                rid, int(est_tokens), self._d_inflight_tokens, budget,
+                self.seats_free(), held,
+            )
+        return True
 
     def _sync_batch_gate(self) -> None:
         """THE ONLY writer of ``_batch_gate`` (C5).
@@ -513,12 +615,15 @@ class Front:
         app["corridor"] = asyncio.create_task(self.corridor_sampler())
         logger.info("WEG2-FRONT up tag=%s awake=%s P=%s D=%s W=%.0f s (operator V1 fairness bound, 0 = off) "
                     "carrier_max_tokens=%d p_concurrency=%d d_bs=%d X=%d flip_min_work_tokens=%d "
-                    "idle_layout=%s min_dwell_ms=%s drain_deadline_s=%.0f",
+                    "idle_layout=%s min_dwell_ms=%s drain_deadline_s=%.0f d_admit_max_tokens=%d "
+                    "(derived_from=%s)",
                     self.tag, self.awake, self.groups["P"].url, self.groups["D"].url, self.w_s,
                     self.carrier_max_tokens, self.p_concurrency, self.d_bs, self.tp_prefill_max_tokens,
                     self.flip_min_work_tokens, self.idle_layout,
                     "derived" if self.min_dwell_ms is None else f"{self.min_dwell_ms:.0f}",
-                    self.drain_deadline_s)
+                    self.drain_deadline_s, self.d_admit_max_tokens,
+                    "carrier_max_tokens" if self.d_admit_max_tokens == self.carrier_max_tokens
+                    else "flag")
 
     async def cleanup(self, app):
         for k in ("controller", "admitter", "health", "corridor"):
@@ -641,7 +746,7 @@ class Front:
                            "(group D host staging pool bound: the store cannot be read into D for a prompt this long; "
                            "ONE prefill on D, no leg 1, no double prefill)", rid, est_prompt, exact, self.carrier_max_tokens)
             if self.awake == "D" and self.admit_d and self.state == "serving":
-                seat = await self._acquire_short_seat(rid)
+                seat = await self._acquire_short_seat(rid, carrier_est)
                 if seat is not None:
                     self._log_admit(rid, source="short", t_arrive=time.time())
                     return await self.leg2(request, rid, payload, text, stream, pending=None,
@@ -665,7 +770,7 @@ class Front:
         logger.info("WEG2 X-ROUTE rid=%s est_uncached=%d X=%d (ESTIMATE, front pricing, no tokenizer)",
                     rid, remainder, self.tp_prefill_max_tokens)
         if self.awake == "D" and self.admit_d and self.state == "serving" and short_ok:
-            seat = await self._acquire_short_seat(rid)
+            seat = await self._acquire_short_seat(rid, est_prompt)
             if seat is not None:
                 self.counters["route_short"] += 1
                 logger.info("WEG2-ROUTE rid=%s SHORT -> D est_prompt=%d remainder=%d span_known=%s", rid, est_prompt, remainder, known)
@@ -704,7 +809,7 @@ class Front:
         if p is not None and p.posted_evt is not None and not p.posted_evt.is_set():
             p.posted_evt.set()
 
-    async def _acquire_short_seat(self, rid: str) -> Optional[Seat]:
+    async def _acquire_short_seat(self, rid: str, est_tokens: int = 0) -> Optional[Seat]:
         """A SHORT arrival's seat -- behind the BATCH gate (C5/R-16).
 
         Returns ``None`` when the request must fall through to route BATCH:
@@ -722,11 +827,17 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
+        if self._d_token_budget_blocks(rid, est_tokens):
+            # FIX 4a: the same aggregate bound the BATCH admitter obeys.  A
+            # SHORT arrival that does not fit falls through to route BATCH
+            # rather than overcommitting the staging pool -- the return
+            # contract this method already has for a held gate.
+            return None
         await self._d_seat.acquire()
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             self._d_seat.release()
             return None
-        return Seat(self, rid, "short")
+        return Seat(self, rid, "short", tokens=est_tokens)
 
     def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None) -> None:
         """L2.  ``rank`` is this admission's ORDINAL in the current epoch.
@@ -758,6 +869,30 @@ class Front:
 
         Guarded on ``awake == "D"``, so a W1-refused flip that leaves P
         awake still releases nothing (the 1j finding-1 fix, preserved).
+
+        FIX 1 (round 1) -- THE SEAT IS ACQUIRED WHILE THE REQUEST IS STILL
+        IN THE DEQUE, and the phase is re-checked after the acquire.  The
+        guard above is at the TOP of the loop only; ``_d_seat.acquire()``
+        below it blocks for the whole lifetime of a running decode, so the
+        phase read there is arbitrarily stale.  Popping first and resolving
+        after opened three holes at once, all of them the same window:
+
+        * the resolved request POSTs its leg 2 into a group that is
+          flipping or asleep, and ``leg2`` re-registers it in
+          ``D.outstanding`` in the middle of ``drain(D)`` -- the drain can
+          then never terminate (W1, three times W2 STOP);
+        * ``do_stop`` answers ``self.queue + self._ready_for_d``
+          (:meth:`do_stop`) and the popped request is in NEITHER, so a STOP
+          raised during the acquire never reaches it;
+        * popping the LAST entry runs ``_sync_batch_gate`` and OPENS the
+          batch gate, so a SHORT arrival may take the seat this admitter is
+          queued for -- R-16 inverted.
+
+        Peeking closes all three: the entry stays reachable, the gate stays
+        closed and the C6/R-2 idle-guard term stays true for the whole wait,
+        and the pop happens only in the same synchronous step that resolves
+        the future.  This is the batch-side counterpart of the check
+        :meth:`_acquire_short_seat` already performs after ITS acquire.
         """
         while True:
             await asyncio.sleep(0.05)
@@ -766,19 +901,37 @@ class Front:
                     continue
                 if not self._ready_for_d:
                     continue
-                p = self._ready_for_d.popleft()
-                self._sync_batch_gate()
+                p = self._ready_for_d[0]
                 if p.fut.done():
                     # Already resolved, failed or cancelled (leg 1 error, an
                     # abort, a STOP): no seat is spent on it.
+                    self._ready_for_d.popleft()
+                    self._sync_batch_gate()
                     self.counters["d_admit_skipped_done"] += 1
                     continue
+                if self._d_token_budget_blocks(p.rid, p.est_prompt):
+                    # FIX 4a: the seat is not even reached -- taking one and
+                    # holding it while the tokens are unavailable would block
+                    # the refill the budget is waiting for.
+                    continue
                 await self._d_seat.acquire()
-                if p.fut.done():
+                if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+                    # The phase moved while this admitter was queued behind a
+                    # running decode.  Give the seat back and leave the
+                    # request where it is: the deque head is still the oldest
+                    # (law 2) and is still answerable by do_stop.
+                    self._d_seat.release()
+                    self.counters["d_admit_phase_moved"] += 1
+                    continue
+                if not self._ready_for_d or self._ready_for_d[0] is not p or p.fut.done():
+                    # do_stop cleared the deque, or answered this request,
+                    # while the seat was being waited for.
                     self._d_seat.release()
                     self.counters["d_admit_skipped_done"] += 1
                     continue
-                p.seat = Seat(self, p.rid, "batch")
+                self._ready_for_d.popleft()
+                self._sync_batch_gate()
+                p.seat = Seat(self, p.rid, "batch", tokens=p.est_prompt)
                 p.posted_evt = asyncio.Event()
                 self._log_admit(p.rid, source="batch", t_arrive=p.t_arrive)
                 p.fut.set_result(True)
@@ -848,7 +1001,8 @@ class Front:
         self.exact_tokens[hashlib.sha1(text.encode(errors="replace")).hexdigest()] = int(prompt_tokens)
 
     def _leg2_verdict(self, pt: int, ct: int, priced: bool, pending: Optional[Pending],
-                      single_prefill: bool, stream: bool, rid: str) -> str:
+                      single_prefill: bool, stream: bool, rid: str,
+                      x_inband: bool = False) -> str:
         """spec 3.6 verdict with the 1j holes closed (#1233 zero-remainder).
 
         * single_prefill (route CARRIER-EXCEEDS): no leg 1 ever ran, so there
@@ -862,6 +1016,13 @@ class Front:
           counted under W16 by name and reported, not refused (finding 2).
         """
         uncached = max(0, pt - ct)
+        if x_inband:
+            # FIX 2 (round 1): D refused this streamed request by name after
+            # the first byte.  It carries no usage chunk, so the pre-existing
+            # code priced it as W28 "unpriced" -- the right name for a
+            # missing price, the wrong name for a refusal that has one.  The
+            # caller has already counted W31_stream_served.
+            return "W31_stream_served"
         if single_prefill:
             self.counters["single_prefill_served"] += 1
             return "single_prefill"
@@ -902,20 +1063,82 @@ class Front:
             payload["stream_options"] = so
         try:
             async with self.session.post(f"{g.url}{request.path}", json=payload) as r:
+                # FIX 2 (round 1): LAW 4's RE-ROUTE IS DECIDED BEFORE THE
+                # RESPONSE IS COMMITTED, ON BOTH WIRE SHAPES.  The check used
+                # to sit below the `if stream:` branch, which returns; so for
+                # every streamed request -- the normal shape for OpenAI chat
+                # completions under agent load, and the gate is ON for every
+                # boot because the launcher always passes
+                # `--tp-prefill-max-tokens` to argv_d -- W31 was never
+                # counted, `_requeue_after_x_refusal` was never called, W35
+                # could never apply, and the client got D's refusal instead of
+                # being prefilled by P.  Both shapes are handled here, above
+                # `resp.prepare()`, because nothing can be re-routed after the
+                # first byte has been committed to the client.
+                early_body: Optional[bytes] = None
+                first_chunk: Optional[bytes] = None
+                if r.status != 200:
+                    # Shape 1: the non-stream abort, `HTTPException(503)`.
+                    early_body = await r.read()
+                    if is_x_refusal(r.status, early_body.decode(errors="replace")):
+                        g.outstanding.pop(rid, None)
+                        return await self._requeue_after_x_refusal(
+                            request, rid, payload, text, stream, pending, seat, early_body
+                        )
+                elif stream:
+                    # Shape 2: the IN-BAND abort on a 200.  A request refused
+                    # at admission is aborted before it decodes anything, so
+                    # the refusal IS the first chunk -- reading it costs one
+                    # chunk of head-of-line latency (the client sees nothing
+                    # before the first token anyway) and buys the re-route.
+                    first_chunk = await _first_stream_chunk(r)
+                    if first_chunk is not None and x_refusal_marker_in(
+                        first_chunk.decode(errors="replace")
+                    ):
+                        self.counters["W31_stream_inband_requeued"] += 1
+                        g.outstanding.pop(rid, None)
+                        return await self._requeue_after_x_refusal(
+                            request, rid, payload, text, stream, pending, seat, first_chunk
+                        )
                 if stream:
                     resp = web.StreamResponse(status=r.status)
                     resp.content_type = r.content_type
                     await resp.prepare(request)
                     tail = bytearray()
-                    async for chunk in r.content.iter_any():
+
+                    async def _push(chunk: bytes) -> None:
                         await resp.write(chunk)
-                        tail += chunk
+                        tail.extend(chunk)
                         if len(tail) > 262144:
                             del tail[:-131072]
+
+                    if early_body is not None:
+                        # A non-200 whose body this method already consumed
+                        # for the refusal test: forward it verbatim.
+                        await _push(early_body)
+                    else:
+                        if first_chunk is not None:
+                            await _push(first_chunk)
+                        async for chunk in r.content.iter_any():
+                            await _push(chunk)
                     await resp.write_eof()
                     g.served += 1
                     pt, ct, comp, priced = usage_of_stream_tail(bytes(tail))
-                    verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, True, rid)
+                    x_inband = x_refusal_marker_in(bytes(tail).decode(errors="replace"))
+                    if x_inband:
+                        # The W16 precedent's counterpart (finding 2): the
+                        # refusal arrived AFTER the first byte, so the
+                        # re-route is impossible.  Counted BY NAME rather
+                        # than landing in W28 as an unpriced stream.
+                        self.counters["W31_Weg2TpPrefillExceeded"] += 1
+                        self.counters["W31_stream_served"] += 1
+                        logger.error(
+                            "W31 Weg2TpPrefillExceeded rid=%s (STREAM, served): D refused this request "
+                            "by name after the first byte -- re-route impossible, counted by name",
+                            rid,
+                        )
+                    verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, True, rid,
+                                                 x_inband=x_inband)
                     if pt:
                         self.spans.record(text, pt)
                         self._note_exact(text, pt)
@@ -925,21 +1148,16 @@ class Front:
                     if pending is not None and ct > 0:
                         self.counters["cross_group_prefix_hits"] += 1
                     return resp
-                body = await r.read()
+                # C11/C12 -- a W31 that came back from D's own gate, where
+                # the UNCACHED EXTENT IS REAL (after match_prefix), has
+                # already been re-routed above; law 4 says such a request is
+                # prefilled by P, so it re-joins route BATCH and is never
+                # re-offered to D a third time (W35).
+                body = early_body if early_body is not None else await r.read()
                 try:
                     js = json.loads(body)
                 except Exception:  # noqa: BLE001
                     js = {}
-                if is_x_refusal(r.status, body.decode(errors="replace")):
-                    # C11/C12 -- W31 came back from D's own gate, where the
-                    # UNCACHED EXTENT IS REAL (after match_prefix).  Law 4
-                    # says such a request is prefilled by P, so it re-joins
-                    # route BATCH; it is never silently prefilled on D and
-                    # never re-offered to D a third time (W35).
-                    g.outstanding.pop(rid, None)
-                    return await self._requeue_after_x_refusal(
-                        request, rid, payload, text, stream, pending, seat, body
-                    )
                 pt, ct, comp, priced = usage_of(js)
                 if r.status == 200 and not priced:
                     # 1j finding 3: never price a body without usage/meta_info as (0,0).
@@ -1458,6 +1676,13 @@ def main():
                          "by name (W1 -> W2). Today's shipped value, promoted from a literal.")
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
     ap.add_argument("--carrier-max-tokens", type=int, default=0, help="#1233 zero-remainder: longest prompt group D can read from the store (0 = no CARRIER-EXCEEDS route)")
+    ap.add_argument("--d-admit-max-tokens", type=int, default=None,
+                    help="FIX 4a: AGGREGATE bound on the estimated prompt tokens D may hold in "
+                         "flight at once, i.e. its host staging pool read as the TOKEN budget it "
+                         "is. Derived default: --carrier-max-tokens, the same pool at per-request "
+                         "granularity. 0 disables the bound and restores the count-only admitter "
+                         "that overcommitted the pool on boot weg2sc1 (#915 vote_negative -> a "
+                         "mis-priced X gate -> a store-resident rid re-queued to P).")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
@@ -1470,7 +1695,8 @@ def main():
                   tp_prefill_max_tokens=args.tp_prefill_max_tokens,
                   flip_min_work_tokens=args.flip_min_work_tokens,
                   min_dwell_ms=args.min_dwell_ms, idle_layout=args.idle_layout,
-                  drain_deadline_s=args.drain_deadline_s)
+                  drain_deadline_s=args.drain_deadline_s,
+                  d_admit_max_tokens=args.d_admit_max_tokens)
     app = web.Application(client_max_size=1024**3)
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)

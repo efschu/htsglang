@@ -8975,25 +8975,60 @@ class Scheduler(
             return chunked_prefill_size
         return granted
 
-    def weg2_uncached_extent(self, req: Req) -> int:
+    def weg2_uncached_extent(self, req: Req, head_inputs=None) -> int:
         """The request's REAL uncached prefill extent, in tokens (C11/R-31).
 
-        Three terms, every one of them replicated across the group:
+        Three terms:
 
         * ``full_untruncated_fill_ids`` -- the request's own token ids;
-        * ``prefix_indices`` -- the device match on the replicated radix
-          tree, already capped to the group's geometry where a group
-          geometry exists;
+        * ``prefix_indices`` -- the device match on this rank's radix tree;
         * ``host_hit_length`` -- the host-tier match on the same tree, whose
           prefetch completion crosses the existing MIN reduce.
 
         Deliberately NOT here: ``available_size()``, free slot counts,
-        ``time.monotonic()`` or any other rank-local quantity. That
-        exclusion is the whole rank-uniformity argument, and it is meant to
-        be grep-checkable in this one function.
+        ``time.monotonic()`` or any other rank-local quantity.
+
+        FIX 3 (round 1) -- THAT EXCLUSION IS NOT THE UNIFORMITY ARGUMENT,
+        and the previous revision of this docstring claimed it was.  The
+        grep it invited proves that no rank-local IDENTIFIER appears in the
+        expression; the claim it was offered for is about the PROVENANCE of
+        the values that flow in.  ``len(req.prefix_indices)`` is a match
+        against THIS rank's radix tree, and under D's uneven DCP the ranks'
+        pools differ in size, so their evictions -- and therefore their
+        trees -- can differ.  Nothing prevented a split and nothing detected
+        one, on a verdict that then REPLACED this rank's ``waiting_queue``:
+        ranks-never-disagree, silently and permanently, because
+        ``send_to_tokenizer`` is a ``SenderWrapper(None)`` off rank 0
+        (ipc_channels.py:71) and a refusal firing on rank 1 or 2 alone drops
+        the request there with no client-visible signal at all.
+
+        So the extent is now priced with the GROUP's match where the group
+        has one.  ``head_inputs`` carries #823's MIN-reduced per-rid match
+        lengths (``num_matched_prefix_tokens`` = device + host match), taken
+        from the packed reduce that ``_update_uniform_pool_budget`` already
+        runs pre-branch on this same pass -- no new collective (MUST NOT 6),
+        the third consumer of an existing one, exactly as the ORDER and
+        COUNT arms are.
+
+        The correction is applied as a DELTA rather than as a replacement:
+        the group MIN is <= every rank's own match, so
+        ``delta = max(0, local_match - group_match)`` can only ever make the
+        extent LARGER, and when the two agree this function is byte-identical
+        to what it was.  A stale group value that exceeds the local match
+        yields delta 0 and the local number, i.e. the smaller extent -- the
+        abstain direction, never a refusal manufactured out of a stale
+        reduce.
         """
         extend_input_len = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
-        return max(0, extend_input_len - int(getattr(req, "host_hit_length", 0) or 0))
+        host_hit = int(getattr(req, "host_hit_length", 0) or 0)
+        uncached = max(0, extend_input_len - host_hit)
+        group_match = tp_head_congruence.group_match_for(
+            head_inputs, str(getattr(req, "rid", "") or "")
+        )
+        if group_match is None:
+            return uncached
+        local_match = len(req.prefix_indices) + host_hit
+        return uncached + max(0, local_match - int(group_match))
 
     def _weg2_host_carry_tokens(self) -> int:
         """Longest prefix the store can hand back to THIS group, in tokens.
@@ -9007,12 +9042,40 @@ class Scheduler(
         pool = getattr(ctrl, "mem_pool_host", None) if ctrl is not None else None
         return int(getattr(pool, "size", 0) or 0)
 
-    def _weg2_x_refuses(self, req: Req) -> bool:
-        """W31 verdict for one request, with L9 printed on both outcomes."""
+    def _weg2_x_refuses(self, req: Req, head_inputs=None) -> bool:
+        """W31 verdict for one request, with L9 printed on both outcomes.
+
+        FIX 3 (round 1): THE VERDICT IS THE GROUP'S OR IT IS NOT TAKEN.
+        Below `tp_size > 1` the group must have published a match for this
+        rid on this pass; when it has not -- no verdict published, the rid
+        outside the canonical head, or some rank not holding it at all --
+        this method ABSTAINS.  Abstaining admits, which is the pre-C11
+        behaviour and is uniform across the ranks by construction (every
+        one of those three conditions is itself a group property: the
+        publication is unconditional and pre-branch, the head is derived
+        from the rid SET alone, and an absent rid MIN-reduces to absent on
+        every rank).  Refusing on a rank-local number would not: it is
+        exactly the split this whole method now exists to prevent, and it is
+        permanent, because the refusal deletes the request from THIS rank's
+        waiting_queue.
+        """
         x = int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0)
         if x <= 0:
             return False
-        uncached = self.weg2_uncached_extent(req)
+        tp_size = int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1)
+        group_match = tp_head_congruence.group_match_for(
+            head_inputs, str(getattr(req, "rid", "") or "")
+        )
+        if tp_size > 1 and group_match is None:
+            self._weg2_x_abstained = getattr(self, "_weg2_x_abstained", 0) + 1
+            if self._weg2_x_abstained <= 5 or self._weg2_x_abstained % 64 == 0:
+                logger.info(
+                    "WEG2 X-GATE rid=%s uncached=? X=%d replicated_term=False "
+                    "verdict=abstain_no_group_match occurrence=%d",
+                    str(getattr(req, "rid", "?"))[:16], x, self._weg2_x_abstained,
+                )
+            return False
+        uncached = self.weg2_uncached_extent(req, head_inputs)
         # R-3 / MUST NOT 2/3: THE CARRIER-EXCEEDS EXEMPTION, derived here
         # rather than carried on the request.
         #
@@ -9031,24 +9094,30 @@ class Scheduler(
         # `sync_fixed_hicache_size` already reduces to the group minimum, so
         # the exemption is as replicated as the verdict it exempts from --
         # and no marker has to survive an HTTP hop to get here.
+        # L9's `replicated_term` is now a READING, not an assertion: `group`
+        # means the extent carried #823's MIN-reduced match for this rid,
+        # `solo` means tp_size == 1 and there is nothing to reduce.  The
+        # third value, abstain, is printed above and takes no verdict.
+        term = "group" if group_match is not None else "solo"
         carry = self._weg2_host_carry_tokens()
         if carry > 0 and uncached > carry:
             self._weg2_x_exempt = getattr(self, "_weg2_x_exempt", 0) + 1
             if self._weg2_x_exempt <= 5 or self._weg2_x_exempt % 64 == 0:
                 logger.info(
-                    "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=True "
+                    "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s "
                     "verdict=exempt_carrier_exceeds host_carry=%d occurrence=%d",
-                    str(getattr(req, "rid", "?"))[:16], uncached, x, carry, self._weg2_x_exempt,
+                    str(getattr(req, "rid", "?"))[:16], uncached, x, term, carry,
+                    self._weg2_x_exempt,
                 )
             return False
         verdict = "W31" if uncached > x else "admit"
         logger.info(
-            "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=True verdict=%s",
-            str(getattr(req, "rid", "?"))[:16], uncached, x, verdict,
+            "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
+            str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
         )
         return verdict == "W31"
 
-    def _weg2_answer_x_refusals(self, refused: List[Req]) -> None:
+    def _weg2_answer_x_refusals(self, refused: List[Req], head_inputs=None) -> None:
         """Remove the W31-refused requests and answer them BY NAME (C11).
 
         Not a silent skip: a request left in the queue would be re-offered
@@ -9060,7 +9129,7 @@ class Scheduler(
         refused_ids = {id(r) for r in refused}
         self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
         for req in refused:
-            uncached = self.weg2_uncached_extent(req)
+            uncached = self.weg2_uncached_extent(req, head_inputs)
             message = (
                 f"W31 Weg2TpPrefillExceeded: this group may prefill at most {x} uncached "
                 f"tokens itself (--tp-prefill-max-tokens); this request's extent after "
@@ -11235,7 +11304,7 @@ class Scheduler(
             # against the raw prompt instead would refuse exactly the
             # requests the flip exists to serve, and the re-route would put
             # them back in front of the same gate for ever.
-            if self._weg2_x_refuses(req):
+            if self._weg2_x_refuses(req, _head_inputs):
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
                 continue
@@ -11620,11 +11689,19 @@ class Scheduler(
             mamba_allocator.alloc_group_end()
 
         # C11: answer the requests this pass refused by name. AFTER the loop,
-        # because the loop iterates `waiting_queue` in place. Every rank runs
-        # this with the same list (the verdict is replicated), so the queue
-        # stays identical across the group; the send is a no-op off rank 0.
+        # because the loop iterates `waiting_queue` in place.
+        #
+        # FIX 3 (round 1): "the verdict is replicated" used to be an
+        # assertion about one expression's identifiers; it is now a property
+        # of the verdict's INPUTS -- the gate prices the extent with #823's
+        # MIN-reduced group match and abstains below `tp_size > 1` when the
+        # group published none. The queue mutation below is therefore the
+        # same on every rank, which is what makes it safe to make at all:
+        # the send is a no-op off rank 0 (`SenderWrapper(None)`,
+        # ipc_channels.py:71), so a rank-local refusal would drop the
+        # request from that rank's queue with no client-visible signal.
         if _x_refused:
-            self._weg2_answer_x_refusals(_x_refused)
+            self._weg2_answer_x_refusals(_x_refused, _head_inputs)
 
         # #1153: what this loop REACHED, recorded before any of the three
         # refusal raises below so the group-STOP line can name it (and once

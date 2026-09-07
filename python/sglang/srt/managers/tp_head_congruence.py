@@ -489,6 +489,42 @@ def degradation_is_a_defect(gate_enabled: bool, source: str) -> bool:
     return bool(gate_enabled) and source != SOURCE_GROUP
 
 
+def group_match_for(
+    inputs: Optional["UniformHeadInputs"], rid: str
+) -> Optional[int]:
+    """THE GROUP's prefix match for one rid, or None when it has no opinion.
+
+    The third consumer of the same reduce (after the ORDER and COUNT arms):
+    WEG2_SCHEDULING_SPEC_0907 C11's X gate, which must price a request's
+    uncached extent as a GROUP quantity (MUST NOT 7) without taking a new
+    collective (MUST NOT 6).  This is the analogue of ``uniform_min_avail()``
+    for tree MATCHING that the X gate's rank-uniformity claim needed: the
+    gate's own grep proved that no rank-local IDENTIFIER appears in its
+    expression, which is a statement about one expression, not about the
+    PROVENANCE of the values flowing into it -- and ``len(prefix_indices)``
+    is a match against THIS rank's radix tree, whose evictions are driven by
+    pool pressure that differs per rank under uneven DCP.
+
+    None on three counts, and every one of them is itself group-uniform:
+    no verdict was published this pass, the rid is outside the canonical
+    head (``TP_HEAD_SLOTS``, derived from the rid SET alone), or some rank
+    did not hold the rid and the MIN carried ``_ABSENT_MATCH`` through.  The
+    caller must then ABSTAIN rather than fall back to its own number --
+    abstain-never-refuse, the same safety direction as the ballot's own
+    delay-never-force.
+    """
+    if inputs is None or not inputs.canonical:
+        return None
+    try:
+        slot = inputs.canonical.index(rid)
+    except ValueError:
+        return None
+    if slot >= len(inputs.group_match_lens):
+        return None
+    value = int(inputs.group_match_lens[slot])
+    return None if value <= _ABSENT_MATCH else value
+
+
 def head_order_is_uniform(orders: Sequence[Sequence[str]]) -> bool:
     """Did every rank end up with the same decision?"""
     if not orders:
@@ -521,5 +557,6 @@ __all__ = [
     "build_head_order_payload",
     "uniform_head_order",
     "local_head_order",
+    "group_match_for",
     "head_order_is_uniform",
 ]

@@ -46,6 +46,10 @@ class FakeGroup:
         self.info_hits = 0
         self.hold: Optional[Dict[str, asyncio.Event]] = None
         self.refuse_x_for: Dict[str, int] = {}
+        #: FIX 2: the IN-BAND shape -- a 200 whose FIRST chunk carries the
+        #: W31 abort, which is what tokenizer_manager.py:1518-1537 emits for
+        #: a STREAMED request (the non-stream leg raises HTTPException(503)).
+        self.refuse_x_inband_for: Dict[str, int] = {}
         self.x_refusals: List[str] = []
         self.server: Optional[TestServer] = None
         self.url = ""
@@ -70,6 +74,27 @@ class FakeGroup:
                 return web.json_response(
                     {"error": f"W31 Weg2TpPrefillExceeded rid=? uncached=99999"}, status=503
                 )
+            if payload.get("stream"):
+                inband = self.refuse_x_inband_for.get(mark, 0)
+                resp = web.StreamResponse(status=200)
+                resp.content_type = "text/event-stream"
+                await resp.prepare(request)
+                if inband > 0:
+                    self.refuse_x_inband_for[mark] = inband - 1
+                    self.x_refusals.append(mark)
+                    await resp.write(
+                        b'data: {"meta_info": {"finish_reason": {"type": "abort", '
+                        b'"status_code": 503, "message": "W31 Weg2TpPrefillExceeded: '
+                        b'this group may prefill at most 10 uncached tokens itself"}}}\n\n'
+                    )
+                else:
+                    await resp.write(b'data: {"text": "x"}\n\n')
+                    await resp.write(
+                        b'data: {"meta_info": {"prompt_tokens": 100, '
+                        b'"completion_tokens": 1, "cached_tokens": 100}}\n\n'
+                    )
+                await resp.write_eof()
+                return resp
             if self.hold is not None:
                 self.hold.setdefault(mark, asyncio.Event())
                 await self.hold[mark].wait()
@@ -179,8 +204,10 @@ class Harness:
         await self.p.stop()
         await self.d.stop()
 
-    def post(self, mark: str, chars: int = 3000) -> asyncio.Task:
+    def post(self, mark: str, chars: int = 3000, stream: bool = False) -> asyncio.Task:
         body = {"prompt": f"MARK{mark} " + f"{mark}" * chars}
+        if stream:
+            body["stream"] = True
         t = asyncio.create_task(self._post(body))
         self.posts.append(t)
         return t
@@ -406,18 +433,21 @@ def test_t8_idle_layout_decides_all_three_rest_cases():
 
 
 # --------------------------------------------------------------- T9, law 4
-def _stub_scheduler(x: int, host_carry: int):
+def _stub_scheduler(x: int, host_carry: int, tp_size: int = 1):
     from sglang.srt.managers.scheduler import Scheduler
 
     stub = SimpleNamespace(
         server_args=SimpleNamespace(tp_prefill_max_tokens=x),
+        ps=SimpleNamespace(tp_size=tp_size),
         tree_cache=SimpleNamespace(
             cache_controller=SimpleNamespace(mem_pool_host=SimpleNamespace(size=host_carry))
         ),
     )
     # bind the REAL method bodies back onto the stub, so the arithmetic and
     # the host-carry read under test are the shipped ones, not doubles.
-    stub.weg2_uncached_extent = lambda req: Scheduler.weg2_uncached_extent(stub, req)
+    stub.weg2_uncached_extent = lambda req, head=None: Scheduler.weg2_uncached_extent(
+        stub, req, head
+    )
     stub._weg2_host_carry_tokens = lambda: Scheduler._weg2_host_carry_tokens(stub)
     return Scheduler, stub
 
@@ -578,3 +608,324 @@ def test_c10_x_prefers_this_rigs_own_measured_lines(tmp_path):
     x, prov = launcher_mod.resolve_x(None, str(tmp_path), 4096)
     assert "source=boot:" in prov and log.name in prov
     assert x == launcher_mod.derive_x_star(13.247, 30100 / 43.62, 30100 / 8.27, 4096)
+
+
+# =====================================================================
+# ROUND-1 FIXER -- the four findings, each pinned at its own seam.
+# =====================================================================
+
+def _bare_pending(rid: str) -> Pending:
+    return Pending(rid, "/generate", {}, "x", time.time(),
+                   asyncio.get_event_loop().create_future())
+
+
+def test_f1a_the_batch_admitter_rechecks_the_phase_after_the_seat_acquire():
+    """FINDING 1: `await self._d_seat.acquire()` blocks for the whole
+    lifetime of a running decode, so the guard at the TOP of the admitter
+    loop is arbitrarily stale by the time the seat is granted.  A request
+    resolved there POSTs its leg 2 into a group that is flipping or asleep,
+    and `leg2` re-registers it in `D.outstanding` in the middle of
+    `drain(D)` -- W1, three times W2 STOP.
+
+    RED at 5cde96fc7d: `AssertionError: BUG: d_admitter resolved a request
+    into group D while state='flipping' awake='P'`.
+    """
+
+    async def body():
+        f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=1)
+        p1, p2 = _bare_pending("r1"), _bare_pending("r2")
+        f._ready_for_d.extend([p1, p2])
+        f._sync_batch_gate()
+        task = asyncio.create_task(f.d_admitter())
+        assert await _until(lambda: p1.fut.done(), 5.0), "p1 never admitted"
+        p1.posted_evt.set()
+        # The admitter is now queued on the seat for p2.
+        await asyncio.sleep(0.3)
+        assert not p2.fut.done()
+        # THE FLIP: state='flipping' (front.py:1097) and then awake='P'.
+        f.state, f.awake = "flipping", "P"
+        p1.seat.release("leg2_finished")
+        await asyncio.sleep(0.3)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert not p2.fut.done(), (
+            "d_admitter resolved a request into D while state=%r awake=%r"
+            % (f.state, f.awake))
+        assert f.counters["d_admit_phase_moved"] >= 1, "the re-check must be COUNTED"
+        # and the request is still answerable and still oldest-first
+        assert list(f._ready_for_d) == [p2]
+        assert not f._batch_gate.is_set(), (
+            "popping the last entry would open the batch gate and let a SHORT "
+            "arrival take the seat the admitter is queued for (R-16 inverted)")
+
+    asyncio.run(body())
+
+
+def test_f1b_the_short_path_rechecks_the_phase_after_its_own_acquire():
+    """FINDING 1, the other face: mutant M5 (deleting the SHORT path's
+    post-acquire re-check at front.py:729-733) survived the whole suite, so
+    the property was unpinned on BOTH paths.  Pinned here."""
+
+    async def body():
+        f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=1)
+        held = await f._acquire_short_seat("busy")
+        assert held is not None
+        task = asyncio.create_task(f._acquire_short_seat("racer"))
+        await asyncio.sleep(0.2)
+        assert not task.done(), "the racer must be queued on the seat"
+        f.state, f.awake = "flipping", "P"
+        held.release("leg2_finished")
+        seat = await asyncio.wait_for(task, 5.0)
+        assert seat is None, "a SHORT seat must not be granted into a flipping group"
+        assert f.seats_free() == f.d_bs, "the seat must be given back, not leaked"
+
+    asyncio.run(body())
+
+
+def test_f1c_a_stop_during_the_acquire_still_reaches_the_waiting_request():
+    """FINDING 1, third face: `do_stop` answers `self.queue +
+    self._ready_for_d` (front.py:538).  A request the admitter had already
+    popped was in NEITHER, so a STOP raised while it waited for a seat never
+    reached it -- its coroutine stayed on `await fut` behind a one-hour
+    client timeout."""
+
+    async def body():
+        f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=1)
+        p1, p2 = _bare_pending("r1"), _bare_pending("r2")
+        f._ready_for_d.extend([p1, p2])
+        f._sync_batch_gate()
+        task = asyncio.create_task(f.d_admitter())
+        assert await _until(lambda: p1.fut.done(), 5.0)
+        p1.posted_evt.set()
+        await asyncio.sleep(0.3)
+        f.do_stop("W99 TestStop", "a stop while the admitter waits for a seat")
+        await asyncio.sleep(0.1)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert p2.fut.done() and isinstance(p2.fut.exception(), front_mod.Weg2Stop)
+
+    asyncio.run(body())
+
+
+def test_f2a_a_streamed_leg2_is_requeued_on_the_503_w31_shape():
+    """FINDING 2: `is_x_refusal` was consulted 27 lines BELOW the
+    `if stream:` branch's own `return resp`, so law 4's re-route -- the half
+    that makes W31 a policy rather than a kill -- existed only on the
+    non-streamed leg.  The launcher passes `--tp-prefill-max-tokens` to
+    argv_d on every boot and OpenAI chat completions under load are
+    streamed, so this was the normal shape."""
+
+    async def body():
+        async with Harness(awake="D", p_concurrency=2, d_bs=4,
+                           tp_prefill_max_tokens=10, idle_layout="D") as h:
+            h.d.refuse_x_for["S1"] = 1
+            t = h.post("S1", chars=40, stream=True)
+            status, _text = await asyncio.wait_for(t, 20.0)
+            assert status == 200, "the client must be SERVED, through P"
+            assert h.front.counters["W31_Weg2TpPrefillExceeded"] == 1
+            assert h.front.counters["W35_Weg2XReQueueLoop"] == 0
+            assert "S1" in h.p.gen_marks, "P must have prefilled the re-queued request"
+
+    asyncio.run(body())
+
+
+def test_f2b_a_streamed_leg2_is_requeued_on_the_inband_w31_shape():
+    """FINDING 2, the second wire shape and the one the producer actually
+    takes for a stream: `tokenizer_manager.py:1518-1537` raises
+    HTTPException(503) only `if not is_stream`; otherwise the same abort is
+    yielded as an IN-BAND chunk on a 200.  The refusal is read BEFORE
+    `resp.prepare()`, where nothing is committed yet, so both shapes
+    re-route identically."""
+
+    async def body():
+        async with Harness(awake="D", p_concurrency=2, d_bs=4,
+                           tp_prefill_max_tokens=10, idle_layout="D") as h:
+            h.d.refuse_x_inband_for["S2"] = 1
+            t = h.post("S2", chars=40, stream=True)
+            status, text = await asyncio.wait_for(t, 20.0)
+            assert status == 200
+            assert front_mod.X_REFUSAL_NAME not in text, (
+                "the client must get the served answer, not D's refusal")
+            assert h.front.counters["W31_stream_inband_requeued"] == 1
+            assert h.front.counters["W31_Weg2TpPrefillExceeded"] == 1
+            assert h.front.counters["W28_Weg2Leg2Unpriced_stream_served"] == 0, (
+                "a refusal with a name must never land in W28")
+            assert "S2" in h.p.gen_marks
+
+    asyncio.run(body())
+
+
+def test_f2c_a_late_inband_w31_is_counted_by_name_not_as_w28():
+    """The W16 precedent's counterpart: after the first byte the re-route is
+    impossible, so the refusal is COUNTED by name rather than absorbed as an
+    unpriced stream.  W16 had `W16_stream_served`; W31 had none."""
+    f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
+              tp_prefill_max_tokens=10)
+    p = _pending_for_verdict()
+    assert f._leg2_verdict(0, 0, False, p, False, True, "r", x_inband=True) == "W31_stream_served"
+    assert f.counters["W28_Weg2Leg2Unpriced_stream_served"] == 0
+    # unchanged without the marker
+    assert f._leg2_verdict(0, 0, False, p, False, True, "r") == "unpriced"
+    assert f.counters["W28_Weg2Leg2Unpriced_stream_served"] == 1
+
+
+def _pending_for_verdict() -> Pending:
+    fut = asyncio.new_event_loop().create_future()
+    return Pending("r", "/generate", {}, "x", time.time(), fut)
+
+
+def test_f3_the_x_verdict_is_the_groups_or_it_is_not_taken():
+    """FINDING 3: `len(req.prefix_indices)` is a match against THIS rank's
+    radix tree, whose evictions differ per rank under D's uneven DCP.  The
+    verdict then REPLACED that rank's waiting_queue and sent an abort that
+    is a no-op off rank 0 -- a permanent, silent rank split.
+
+    The extent now carries #823's MIN-reduced per-rid group match (no new
+    collective: the third consumer of the reduce
+    `_update_uniform_pool_budget` already runs pre-branch), and below
+    `tp_size > 1` a rid the group has no opinion on is ABSTAINED on."""
+    from sglang.srt.managers import tp_head_congruence as thc
+
+    Scheduler, solo = _stub_scheduler(10000, host_carry=30518, tp_size=1)
+    req = _stub_req(12000, prefix=4000, host_hit=0, rid="a")
+    # tp_size == 1: nothing to reduce, today's arithmetic, unchanged.
+    assert Scheduler.weg2_uncached_extent(solo, req) == 8000
+    assert Scheduler._weg2_x_refuses(solo, req) is False
+
+    Scheduler, grp = _stub_scheduler(10000, host_carry=30518, tp_size=3)
+    # no group opinion -> ABSTAIN, never a rank-local refusal
+    assert Scheduler._weg2_x_refuses(grp, req) is False
+    assert grp._weg2_x_abstained == 1
+    # the group's MIN says a peer matched only 500 of this rank's 4,000, so
+    # the group's uncached extent is 11,500 and the verdict is W31 for ALL.
+    head = thc.build_uniform_head_inputs(["a"], [500], None, True)
+    assert Scheduler.weg2_uncached_extent(grp, req, head) == 11500
+    assert Scheduler._weg2_x_refuses(grp, req, head) is True
+    # agreement is byte-identical to the pre-fix arithmetic
+    agree = thc.build_uniform_head_inputs(["a"], [4000], None, True)
+    assert Scheduler.weg2_uncached_extent(grp, req, agree) == 8000
+    assert Scheduler._weg2_x_refuses(grp, req, agree) is False
+    # a rid some rank does not hold MIN-reduces to absent -> no group opinion
+    absent = thc.build_uniform_head_inputs(["a"], [-1], None, True)
+    assert thc.group_match_for(absent, "a") is None
+    assert Scheduler._weg2_x_refuses(grp, req, absent) is False
+
+
+def test_f3b_the_queue_filter_is_what_makes_a_split_permanent():
+    """M6 (deleting the waiting_queue filter) survived 17/17.  The filter is
+    load-bearing -- without it the refused request is re-offered every pass
+    and never served -- and that is exactly why the verdict driving it has
+    to be the group's."""
+    from sglang.srt.managers.scheduler import Scheduler
+
+    sent = []
+    kept = [_stub_req(10, rid="keep"), _stub_req(10, rid="drop")]
+    stub = SimpleNamespace(
+        server_args=SimpleNamespace(tp_prefill_max_tokens=10),
+        ps=SimpleNamespace(tp_size=3),
+        waiting_queue=list(kept),
+        enable_hicache_storage=False,
+        enable_hierarchical_cache=False,
+        tree_cache=SimpleNamespace(
+            cache_controller=SimpleNamespace(mem_pool_host=SimpleNamespace(size=30518))
+        ),
+        ipc_channels=SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=lambda a, b: sent.append(a))
+        ),
+    )
+    stub.weg2_uncached_extent = lambda req, head=None: Scheduler.weg2_uncached_extent(
+        stub, req, head)
+    kept[1].time_stats = SimpleNamespace(
+        trace_ctx=SimpleNamespace(abort=lambda abort_info=None: None))
+    Scheduler._weg2_answer_x_refusals(stub, [kept[1]])
+    assert [r.rid for r in stub.waiting_queue] == ["keep"]
+    assert len(sent) == 1, "the refusal is answered BY NAME, never a silent skip"
+
+
+def test_f4a_the_d_admitter_bounds_the_aggregate_host_staging_tokens():
+    """FINDING 4, LINK 1 (boot weg2sc1's origin): C4 opens --d-bs seats at
+    once and nothing coupled that count to D's host staging pool, which is a
+    TOKEN budget.  Measured: three requests staged (occupied=25100 vs
+    limit=27466), the fourth met `#915 PREFETCH REFUSED
+    reason=vote_negative`; its prefix WAS in the store, so its whole prompt
+    then priced as uncached, C11 refused it correctly for the wrong reason,
+    and C12 re-queued a store-resident rid to P -- which is what W27 killed
+    the group over."""
+
+    async def body():
+        f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
+                  d_bs=6, carrier_max_tokens=27466)
+        assert f.d_admit_max_tokens == 27466, "derived from the same pool"
+        ps = []
+        for i in range(4):
+            p = _bare_pending(f"r{i}")
+            p.est_prompt = 8400
+            ps.append(p)
+        f._ready_for_d.extend(ps)
+        f._sync_batch_gate()
+        task = asyncio.create_task(f.d_admitter())
+        for p in ps[:3]:
+            # R-15's barrier: the admitter resolves one future, then waits for
+            # that request's POST before the next.
+            assert await _until(lambda p=p: p.fut.done(), 5.0), f"{p.rid} not admitted"
+            p.posted_evt.set()
+        await asyncio.sleep(0.4)
+        assert not ps[3].fut.done(), (
+            "3 x 8400 = 25200 of a 27466-token budget; the fourth does not fit "
+            "and there are 3 free SEATS -- the count alone would admit it")
+        assert f.seats_free() == 3
+        assert f.counters["d_admit_token_held"] >= 1
+        # a decode finishes -> the tokens come back with the seat
+        ps[0].seat.release("leg2_finished")
+        assert await _until(lambda: ps[3].fut.done(), 5.0), (
+            "a freed seat's tokens must be refunded, or the bound wedges")
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(body())
+
+
+def test_f4b_a_sole_request_is_never_starved_by_the_token_budget():
+    """The bound only ever DELAYS an admission.  A request alone in flight
+    is admitted whatever it costs -- the truly-oversized case belongs to
+    CARRIER-EXCEEDS (R-3), not here."""
+
+    async def body():
+        f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
+                  d_bs=6, carrier_max_tokens=1000)
+        p = _bare_pending("huge")
+        p.est_prompt = 900000
+        f._ready_for_d.append(p)
+        f._sync_batch_gate()
+        task = asyncio.create_task(f.d_admitter())
+        assert await _until(lambda: p.fut.done(), 5.0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(body())
+
+
+def test_f4c_zero_disables_the_token_budget_and_it_is_a_flag():
+    """MUST NOT 5/10: a knob, a derived default, a provenance line -- no env
+    gate and no hand number.  0 restores the count-only admitter."""
+    f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
+              d_bs=6, carrier_max_tokens=27466, d_admit_max_tokens=0)
+    assert f.d_admit_max_tokens == 0
+    f._d_inflight_tokens = 10 ** 9
+    assert f._d_token_budget_blocks("r", 10 ** 9) is False
+    # and the launcher forwards it only when the operator set it, so the
+    # derivation stays with the one place that knows D's pool size.
+    src = launcher_mod.front_argv_for.__doc__ or ""
+    assert "TOLD" in src
+    argv = launcher_mod.front_argv_for(
+        "py", "/tmp/store", 1, 2, {}, [],
+        SimpleNamespace(tag="t", fairness_w_s=45.0, min_dwell_ms=None,
+                        drain_deadline_s=120.0, d_admit_max_tokens=None),
+        0, 27466, 4, 6, 10000, 10000, "D")
+    assert "--d-admit-max-tokens" not in argv
+    argv = launcher_mod.front_argv_for(
+        "py", "/tmp/store", 1, 2, {}, [],
+        SimpleNamespace(tag="t", fairness_w_s=45.0, min_dwell_ms=None,
+                        drain_deadline_s=120.0, d_admit_max_tokens=0),
+        0, 27466, 4, 6, 10000, 10000, "D")
+    assert argv[argv.index("--d-admit-max-tokens") + 1] == "0"

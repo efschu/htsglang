@@ -956,6 +956,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="K8: which layout is awake at rest -- tp = group D (today's shape), "
                          "pp = group P. The front's idle guard always counts the requests P has "
                          "just prefilled, so resting on P loses no request.")
+    ap.add_argument("--d-admit-max-tokens", type=int, default=None,
+                    help="FIX 4a: AGGREGATE bound on the estimated prompt tokens group D may hold "
+                         "in flight at once. Default: the front derives it from "
+                         "--carrier-max-tokens, i.e. D's own host staging pool -- the same pool at "
+                         "aggregate instead of per-request granularity. 0 disables it.")
     ap.add_argument("--drain-deadline-s", type=float, default=120.0,
                     help="K10: seconds before a flip is refused by name (W1 -> W2). Shipped value.")
     ap.add_argument("--max-kv-per-request", type=int, default=None,
@@ -1210,6 +1215,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.carrier_max_tokens = carrier_max_tokens
     log(f"CARRIER BOUND: group D host KV pools (tokens) = {_pools} -> front --carrier-max-tokens {carrier_max_tokens} "
         f"(0 = not found in D's log, route disabled); prompts above it are served by ONE prefill on D")
+    log(f"D-ADMIT TOKEN BUDGET (FIX 4a): front --d-admit-max-tokens "
+        f"{'derived = carrier_max_tokens ' + str(carrier_max_tokens) if ns.d_admit_max_tokens is None else str(ns.d_admit_max_tokens) + ' (operator override)'}"
+        f"; the SAME host staging pool as the carrier bound, read at AGGREGATE granularity. "
+        f"Per-request it is CARRIER-EXCEEDS; in aggregate nothing bounded it, and "
+        f"--d-bs {d_bs} seats opened at once overcommitted it on boot weg2sc1 "
+        f"(occupied=25100 vs limit=27466 -> #915 vote_negative on the fourth request)")
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
 
@@ -1269,6 +1280,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     ]
     if ns.min_dwell_ms is not None:
         argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
+    if ns.d_admit_max_tokens is not None:
+        argv += ["--d-admit-max-tokens", str(ns.d_admit_max_tokens)]
     return argv
 
 
