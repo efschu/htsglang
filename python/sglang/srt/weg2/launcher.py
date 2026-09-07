@@ -68,7 +68,14 @@ MEMTS = f"{GPU_ARB}/devtools/mem_timeseries.sh"
 HOST_PREFLIGHT = f"{GPU_ARB}/devtools/host_ledger_preflight.sh"
 PRESENCE_DIR = "/dev/shm/sglang-phase-flip-presence"
 STORE_MOUNT = "/spinning/hicache-weg2-ram"
-CORRIDOR_MIB = 1024
+#: The corridor law is 819-1229 MiB NVML-free per card under the awake
+#: group's load.  MEASURED 2026-09-07 boot weg2onebackup2 with this constant
+#: at 1024: the 5090's continuous minimum under group D was 620-684 MiB
+#: (P log "CORRIDOR LAW BREACHED", 4 samples) -- the awake group lands
+#: ~400 MiB below the budget line (CUDA context + BAR1 windows sit outside
+#: the --rank-gpu-memory-mib fraction).  The measured overshoot is charged
+#: here so the minimum lands mid-band; R5 grades the result.
+CORRIDOR_MIB = 1024 + 404
 #: Spec section 1.6 V1 (arm B, graphs resident) derived upper bounds for the
 #: dormant residue of a rank: 5090 1,848 MiB, 3080 1,442 MiB -- EXPECTATIONS
 #: (record 1d/1f B6), printed beside the measurement, used only for group P's

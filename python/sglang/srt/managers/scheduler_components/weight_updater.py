@@ -6,6 +6,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
@@ -470,6 +471,71 @@ class SchedulerWeightUpdaterManager:
                 "but their content is undefined; this group is fatal."
             )
 
+    def _weg2_group_fence(self, what: str) -> None:
+        """Every rank of the group joins here before the owner rank answers.
+
+        The RPC answer is ONE rank's: scheduler.py process_input_requests
+        sends the output from the rank that owns the tokenizer socket (PP0 /
+        TP0), and a PP follower runs this handler only on ITS next pass,
+        after the chain forward.  The Weg-2 front reads the answer as "the
+        GROUP has released / mapped these pages" and moves the OTHER group's
+        pages onto the same cards.  MEASURED 2026-09-07, boot weg2onebackup2:
+        PP2's base-weights pause (3336 MiB, nvml2) completed 0.4 s after the
+        RPC had returned; the front had already woken D's kv_cache on that
+        card -> cu_mem_create out of memory, group D dead.  The front's dc
+        line read 4714 MiB and was mis-read as residue growth; the rank's own
+        census 0.4 s later read 1378, unchanged.
+
+        Same mechanism as upstream's barrier(tp_cpu_group) in this handler,
+        over the group's world cpu group instead (P: 3 PP stages x TP 1,
+        D: 1 x TP 3).  On a PP stage the request-chain send to the next
+        stage is COMMITTED first -- clause (ii) of
+        _pp_forward_and_process_input_requests: the forward is posted
+        async before the handler runs and is otherwise progressed only at the
+        end of the pass, so blocking here without the commit is variant A
+        (the owner waits for a peer that never received the request).  The
+        last stage owes no forward; its list is empty and the commit is a
+        no-op.  Weg-2 path only (the callers gate on the memory saver), so a
+        stock hibernate stays byte-for-byte upstream.
+        """
+        scheduler = self.scheduler
+        if scheduler is None:
+            return
+        world_group = getattr(scheduler, "world_group", None)
+        cpu_group = getattr(world_group, "cpu_group", None)
+        if cpu_group is None:
+            return
+        world = torch.distributed.get_world_size(group=cpu_group)
+        if world <= 1:
+            return
+        t0 = time.perf_counter()
+        ps = getattr(scheduler, "ps", None)
+        joined = "n/a"
+        if ps is not None and getattr(ps, "pp_size", 1) > 1:
+            # The bounded join of the fork (#973 deadline, clears the list),
+            # not a naked wait(): the peer is idle in its chain recv (the
+            # group is drained before every sleep/wake), so this returns as
+            # soon as the message is taken.
+            pending = getattr(scheduler, "send_req_work", None)
+            joined = str(len(pending)) if pending is not None else "none"
+            if pending:
+                scheduler._pp_join_comm_work(pending)
+        # gloo-only monitored barrier: bounded, and on expiry it NAMES the
+        # ranks that did not join (a plain barrier on this group would sit
+        # for the group's two-hour timeout).  120 s is the #973 budget class;
+        # the largest single pause measured is ~1.5 s (3336 MiB D2H).
+        torch.distributed.monitored_barrier(
+            group=cpu_group, timeout=timedelta(seconds=120), wait_all_ranks=True
+        )
+        logger.info(
+            "WEG2-GROUP-FENCE %s joined in %.0f ms (world=%d ranks, chain sends joined=%s; "
+            "the RPC answer now means every rank finished this tag)",
+            what,
+            (time.perf_counter() - t0) * 1000,
+            world,
+            joined,
+        )
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         # W12 Weg2MemorySaverInactive, BEFORE anything is mutated: with the
         # no-op adapter every pause() below is `pass` and this RPC returns
@@ -674,9 +740,18 @@ class SchedulerWeightUpdaterManager:
             )
             self.weg2_sleep_before = None
 
+        if weg2_memory_saver_on:
+            self._weg2_group_fence("release tags=%s" % (list(tags),))
+
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        # Same gate as the release path: the Weg-2 fence below runs only on
+        # a --enable-memory-saver engine (a stock resume stays upstream).
+        server_args = self._weg2_server_args()
+        weg2_memory_saver_on = server_args is None or bool(
+            getattr(server_args, "enable_memory_saver", False)
+        )
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
@@ -747,6 +822,9 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.resume_memory_occupation()
+
+        if weg2_memory_saver_on:
+            self._weg2_group_fence("resume tags=%s" % (list(tags),))
 
         return ResumeMemoryOccupationReqOutput()
 
