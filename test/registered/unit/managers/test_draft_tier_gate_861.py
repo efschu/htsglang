@@ -129,9 +129,15 @@ def test_can_fail_term3_matching_generation_stays_open():
 # ------------------------------------------------------- the six consume points
 
 
+# #1233 draft KV across the flip: two ADMISSION-direction consume points join
+# the four/two transfer points -- the claim agreement in `prefetch_thread_func`
+# (L8, one MIN all_reduce over [claim, -claim]) and the presence-only draft
+# transfer of `HybridCacheController._storage_hit_query`. Both go through the
+# ONE gate; the pin counts them so a seventh site reading `has_draft` directly
+# is still caught.
 CONSUME_SITES = {
-    "sglang.srt.managers.cache_controller": 4,
-    "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller": 2,
+    "sglang.srt.managers.cache_controller": 5,
+    "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller": 3,
 }
 
 
