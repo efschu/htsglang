@@ -80,14 +80,24 @@ def test_w20_refuses_when_no_arm_funds_the_store():
     assert "ARM S=1 M=600" in str(ei.value)  # the whole ladder is printed
 
 
-def test_w20_funds_the_live_box_shape_and_prints_every_term():
+def test_w20_refuses_the_live_box_shape_with_the_1232_headroom_and_prints_every_term():
+    """boot weg2ls1b2 (2026-09-07): with the #721 floor alone the ledger funded
+    S=1/M=1200/store 5 GiB and the box OOM-killed at group D's first sleep.
+    With the #1232 headroom charged the same box REFUSES by name."""
     memtotal = 118 * GIB
     memavail = 107 * GIB
+    with pytest.raises(host_ledger.Weg2HostLedgerRefused) as ei:
+        host_ledger.choose(memtotal, memavail, store_min_gib=4.0)
+    text = str(ei.value)
+    for term in ("heaps=", "backup_P=", "backup_D=", "load_transient=", "anchors@2400=", "rings=", "floor=", "host_headroom="):
+        assert term in text
+
+
+def test_w20_funds_a_box_with_enough_ram_and_prints_every_term():
+    memtotal = 160 * GIB
+    memavail = 150 * GIB
     arm, store, lines = host_ledger.choose(memtotal, memavail, store_min_gib=4.0)
     assert arm.s_gb == 1 and store >= 4
-    text = "\n".join(lines)
-    for term in ("heaps=", "backup_P=", "backup_D=", "load_transient=", "anchors@2400=", "rings=", "floor="):
-        assert term in text
     assert arm.launch_leftover_gib >= 0 and arm.run_leftover_gib >= 0
 
 

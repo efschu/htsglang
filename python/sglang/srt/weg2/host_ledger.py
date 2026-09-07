@@ -43,6 +43,14 @@ GB = 1e9
 
 #: #721 floor (host_ledger_preflight.sh FLOOR_G, weg1_host_sizing.FLOOR_BYTES).
 FLOOR_GIB = 16.0
+#: #1232 HOST HEADROOM (boot_855_train0901.sh:568-585, WEG1_HOST_HEADROOM_GB
+#: default 16): three slice boots of 2026-09-06 died from a HOST OOM with the
+#: #721 floor nominally intact, and boot weg2ls1b2 (2026-09-07 07:10:36-48Z)
+#: repeated it: lxcfs MemAvailable 45.0 GiB before group D's first sleep,
+#: the 27.15 GiB cpu-backup image landing in shm, oom_kill 7 -> 18 while the
+#: sampler still read ~18-22 GB available.  The box OOMs ABOVE the #721 floor;
+#: this term is the measured gap.  Charged at both moments.
+HOST_HEADROOM_GIB = 16.0
 #: Operator list, record section 1g: "the Claude CLIs (~10 GiB)".  Charged
 #: ONCE against MemTotal (they are live RSS, so MemAvailable already nets out
 #: whatever they hold right now; the term keeps their room when they grow).
@@ -124,7 +132,7 @@ def price(
     overhead_gib = HOST_POOL_OVERHEAD * (anchors_gib + rings_gib)
     backup_p_gib = BACKUP_P_BYTES / GIB
     backup_d_gib = BACKUP_D_BYTES / GIB
-    common = base_gib - FLOOR_GIB - heaps_gib - anchors_gib - rings_gib - overhead_gib
+    common = base_gib - FLOOR_GIB - HOST_HEADROOM_GIB - heaps_gib - anchors_gib - rings_gib - overhead_gib
     launch = common - backup_p_gib - LOAD_TRANSIENT_GIB
     run = common - backup_p_gib - backup_d_gib
     arm = Arm(
@@ -140,6 +148,7 @@ def price(
         "cli_reserve_gib": CLI_RESERVE_GIB,
         "base_gib": base_gib,
         "floor_gib": FLOOR_GIB,
+        "host_headroom_gib": HOST_HEADROOM_GIB,
         "heaps_gib": heaps_gib,
         "backup_p_gib": backup_p_gib,
         "backup_d_gib": backup_d_gib,
@@ -181,6 +190,7 @@ def choose(
         f"(live /proc/meminfo) cli_reserve={CLI_RESERVE_GIB:.0f} GiB (record 1g, "
         f"charged once against MemTotal) base=min(memavail, memtotal-cli)="
         f"{t['base_gib']:.2f} GiB floor={FLOOR_GIB:.0f} GiB (#721) "
+        f"host_headroom={HOST_HEADROOM_GIB:.0f} GiB (#1232, boot weg2ls1b2 OOM at ~18 GiB lxcfs-available) "
         f"heaps={t['heaps_gib']:.2f} GiB ({ranks_per_group}x{HEAP_AWAKE_GIB} awake b0 + "
         f"{ranks_per_group}x{HEAP_DORMANT_GIB} dormant campaign (a)) "
         f"backup_P={t['backup_p_gib']:.2f} GiB backup_D={t['backup_d_gib']:.2f} GiB "
