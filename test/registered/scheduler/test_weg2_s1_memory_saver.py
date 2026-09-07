@@ -8,8 +8,13 @@ Red-first tests for the six things S1 owns:
    campaign's matched can-it-fail check, ported into the suite;
 2. refusal W12 ``Weg2MemorySaverInactive`` on the no-op adapter, at the launch
    check the launcher calls AND at the first sleep;
-3. ``empty_cache()`` in the sleep RPC (spec (S) 2.4 step 10) -- without it the
-   freed pages sit in torch's reserve and NVML free does not move;
+3. ``empty_cache()`` in the sleep RPC, kept for the UNTAGGED remainder only:
+   spec (S) 2.4 step 10's premise ("without it NVML free does not move") is
+   MEASURED FALSE for the tagged regions -- campaign (a) measured NVML free
+   1870.8 -> 30730.8 MiB and per-process 30,154 -> 1,294 MiB WITHOUT the call,
+   9/9 cycles over two cold boots (CAMPAIGN_a_0906.md section 2 arm 1), because
+   TMS unmaps the tagged segments' physical pages directly.  Gated with the
+   census so a stock POST /hibernate keeps upstream's tail;
 4. the sleep-acceptance census (spec (S) 2.4 step 11) -- an instrument on the
    flip path, with its denominator, never a registry;
 5. the per-physical-GPU PCIe ``flock`` (spec (S) 2.7, lifted from #89
@@ -380,8 +385,9 @@ def test_release_rpc_empties_the_allocator_cache(fake_device):
         wu.ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
     )
     assert "empty_cache" in fake_device.calls, (
-        "release_memory_occupation did not empty the allocator cache; freed "
-        "pages stay in torch's reserve and NVML free does not move"
+        "release_memory_occupation did not empty the allocator cache; the "
+        "TAGGED regions release without it (campaign (a), measured), but the "
+        "untagged remainder stays in torch's reserve"
     )
     assert fake_device.calls.index("synchronize") < fake_device.calls.index(
         "empty_cache"
