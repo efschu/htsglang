@@ -121,7 +121,7 @@ class SpanLRU:
 
     def __init__(self, cap: int = SPAN_LRU):
         self.cap = cap
-        self.entries: "collections.OrderedDict[str, Tuple[str, int]]" = collections.OrderedDict()
+        self.entries: collections.OrderedDict[str, Tuple[str, int]] = collections.OrderedDict()
 
     def record(self, text: str, prompt_tokens: int) -> None:
         if not text or prompt_tokens <= 0:
@@ -226,7 +226,7 @@ class Pending:
     payload: dict
     text: str
     t_arrive: float
-    fut: "asyncio.Future"
+    fut: asyncio.Future
     reroutes: int = 0
     est_prompt: int = 0
     span_known: bool = False

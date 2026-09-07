@@ -44,8 +44,6 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Sequence
 
-import torch
-
 
 class CanonicalPageError(ValueError):
     """A page layout violation. Never downgraded to a warning."""

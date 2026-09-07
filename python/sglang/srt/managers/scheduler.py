@@ -222,7 +222,6 @@ from sglang.srt.managers.pp_admission_congruence import (
     forwarded_last_chunk,
     pp_admission_verdict_is_vacuous,
     forwarded_schedule_stop_message,
-    pp_row_authority_enabled,
     pp_row_carrier_present,
     rank_local_count_veto_applies,
     store_read_bound_s,

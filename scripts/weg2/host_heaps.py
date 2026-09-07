@@ -16,7 +16,7 @@ Two modes, both read-only, both print their denominator:
       RssAnon/RssFile/RssShmem from /proc/<pid>/status every INTERVAL s
       for SECONDS s into OUT.csv (bounded; exits by itself).
 """
-import os, sys, time
+import sys, time
 
 
 def classify(path: str, flags: str) -> str:
