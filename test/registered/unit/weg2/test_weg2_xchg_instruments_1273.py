@@ -122,12 +122,102 @@ class _FakeAdapter:
     def __init__(self, stats_by_tag):
         self._stats = dict(stats_by_tag)
         self.resumed = []
+        self.stats_calls = []
 
     def resume(self, tag):
         self.resumed.append(tag)
 
     def resume_stats(self, tag):
+        self.stats_calls.append(tag)
         return self._stats.get(tag)
+
+
+class _FakeSelf:
+    """The three attributes the emitter reaches for on the scheduler."""
+
+    def __init__(self, adapter):
+        self.memory_saver_adapter = adapter
+
+    def _weg2_group_name(self):
+        return "P"
+
+    def _weg2_rank(self):
+        return 3
+
+
+class _FakeLogger:
+    def __init__(self):
+        self.lines = []
+
+    def info(self, fmt, *args):
+        self.lines.append(fmt % args)
+
+
+def _emitter_sources():
+    """The two S7 statements of the wake path, as EXECUTABLE source.
+
+    ROUND-2 REVIEW F2 IS WHY THIS EXISTS.  Every emitter test in the first cut
+    of this file was a source-text or AST grep: they asserted the format string
+    and the presence of both argument expressions IN ANY ORDER, so swapping the
+    last two arguments -- printing the copy cost under ``map_ms=`` and the map
+    cost under ``copy_ms=`` -- left all 17 tests green.  That is the class-A
+    instrument lie this slice's own docstrings invoke, one field over, and only
+    a RENDERED line can see it.
+
+    The statements are lifted out of the module's AST rather than copied here,
+    for the same reason :func:`_flip_tag_format` reads the format string out of
+    it: a test carrying its own copy of the emitter stops testing the emitter
+    the first time one of the two is edited.
+    """
+    src = open(WEIGHT_UPDATER, encoding="utf-8").read()
+    tree = ast.parse(src)
+    stats, loops = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            seg = ast.get_source_segment(src, node)
+            if seg and "memory_saver_adapter.resume_stats(tag)" in seg:
+                stats.append((node, seg))
+        elif isinstance(node, ast.For):
+            seg = ast.get_source_segment(src, node)
+            if seg and "WEG2-FLIP-TAG" in seg and "dir=h2d " in seg:
+                loops.append((node, seg))
+    assert len(stats) == 1, f"expected one resume_stats read, got {len(stats)}"
+    assert loops, "no loop containing the dir=h2d emitter"
+    # the INNERMOST enclosing loop: ast.walk also yields every loop around it
+    node, seg = min(loops, key=lambda pair: len(pair[1]))
+    import textwrap
+
+    return (
+        textwrap.dedent(" " * stats[0][0].col_offset + stats[0][1]),
+        textwrap.dedent(" " * node.col_offset + seg),
+    )
+
+
+def _drive_emitter(stats_by_tag, per_tag):
+    """Run the real statements over a fake saver; return the rendered lines.
+
+    The values are chosen so that every S7 field carries a number that appears
+    nowhere else on the line: an ordering defect shows up as the wrong number
+    beside the right token, which is the only shape of it a reader can catch.
+    """
+    adapter = _FakeAdapter(stats_by_tag)
+    logger = _FakeLogger()
+    ns = {
+        "self": _FakeSelf(adapter),
+        "logger": logger,
+        "weg2_map_stats": {},
+        "weg2_per_tag": dict(per_tag),
+        "card_uuid": "GPU-fake-card",
+        "MIB_": 1024 * 1024,
+        "TMS_RING_GRANULE_BYTES": 32 * 1024 * 1024,
+        "WEG2_TAG_POPULATION_WEIGHTS": "weights",
+    }
+    stats_src, emit_src = _emitter_sources()
+    for tag in per_tag:
+        ns["tag"] = tag
+        exec(compile(stats_src, WEIGHT_UPDATER, "exec"), ns)  # noqa: S102
+    exec(compile(emit_src, WEIGHT_UPDATER, "exec"), ns)  # noqa: S102
+    return logger.lines, adapter
 
 
 class XchgInstrumentTest(CustomTestCase):
@@ -166,6 +256,41 @@ class XchgInstrumentTest(CustomTestCase):
             ring_table._TAG_RE.search(rendered),
             f"ring_table._TAG_RE no longer parses the wake line: {rendered!r}",
         )
+
+    def test_the_emitter_binds_each_field_to_its_own_number(self):
+        """The RENDERED line, from the module's own statements over a fake saver.
+
+        Round-2 review F2: the argument order was untested.  Swapping the last
+        two arguments of the emitter prints the copy cost as ``map_ms`` and the
+        map cost as ``copy_ms`` -- a line whose every token is right and whose
+        two numbers are exchanged, published under the name of the measurement
+        the whole slice exists to make.  Distinct values per field, asserted as
+        one contiguous substring, is what makes that visible.
+        """
+        lines, adapter = _drive_emitter(
+            {"w_mapped": {"allocations": 271, "map_ms": 111.1, "copy_ms": 222.2}},
+            {"w_mapped": [3.0 * 1024 * 1024 * 1024, 1000.0]},
+        )
+        self.assertEqual(len(lines), 1)
+        line = lines[0]
+        self.assertIn("allocations=271 map_ms=111.1 copy_ms=222.2", line)
+        self.assertIn("tag=w_mapped", line)
+        self.assertIn("bytes=3072 MiB", line)
+        # the fixture is exercised, not merely defined: the emitter's stats read
+        # goes through the adapter, once, naming the tag it is about to print
+        self.assertEqual(adapter.stats_calls, ["w_mapped"])
+
+    def test_the_rendered_line_prints_na_for_an_absent_record(self):
+        """The absence, rendered -- not asserted as source text.
+
+        Denominator law, executed: a hook without the symbol yields None, and
+        the line must carry ``n/a`` in all three fields rather than a zero that
+        reads as "the remap was free".
+        """
+        lines, adapter = _drive_emitter({}, {"w_absent": [1024 * 1024, 5.0]})
+        self.assertEqual(len(lines), 1)
+        self.assertIn("allocations=n/a map_ms=n/a copy_ms=n/a", lines[0])
+        self.assertEqual(adapter.stats_calls, ["w_absent"])
 
     def test_the_emitter_reads_the_stats_inside_the_resume_loop(self):
         """One record, so it must be read before the next tag overwrites it.
@@ -329,6 +454,60 @@ class XchgInstrumentTest(CustomTestCase):
             "a refusing launch must not also print the arming line",
         )
 
+    def test_w55_leaves_cli_as_the_named_line_and_exit_2(self):
+        """The refusal must be ENROLLED in the handler, not merely promise it.
+
+        ROUND-2 REVIEW F1.  W55 shipped as a bare ``RuntimeError``, a subclass
+        of none of ``launcher.REFUSALS``' members, so ``cli()`` did not catch
+        it: exit **1** with a raw traceback -- which any wrapper keying on the
+        exit code reads as a crash rather than as the refusal it is -- and
+        ``drop_admin_key_file()`` never ran, leaving the secret of a boot that
+        never served behind (#1275 fix 2).  Three docstrings in this slice
+        promised exit 2 while the code did not deliver it.
+
+        This is boot weg2rg1's W34 defect one module later, and the guard it
+        produced (``test_weg2_ring_ledger_1235`` ::
+        ``test_every_refusal_of_this_module_leaves_cli_as_the_named_line_and_exit_2``)
+        asserts on the CLASS for exactly that reason.  Here the assertion goes
+        one step further and drives ``cli()`` itself, because a subclass check
+        proves enrolment and only a call proves the handler runs.
+        """
+        import contextlib
+        import io
+
+        from sglang.srt.weg2 import launcher, xchg_residency
+
+        self.assertTrue(
+            issubclass(xchg_residency.Weg2XchgResidencyUnarmable, launcher.REFUSALS),
+            "W55 is not enrolled in launcher.REFUSALS: it will exit 1",
+        )
+        self.assertTrue(
+            issubclass(
+                xchg_residency.Weg2XchgResidencyUnarmable,
+                xchg_residency.Weg2XchgRefused,
+            ),
+            "a future exchange refusal must inherit the handler, not re-enrol",
+        )
+
+        def boom(argv=None):
+            raise xchg_residency.Weg2XchgResidencyUnarmable(
+                "W55 Weg2XchgResidencyUnarmable: synthetic, for the handler only"
+            )
+
+        real_main = launcher.main
+        launcher.main = boom
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = launcher.cli([])
+        finally:
+            launcher.main = real_main
+        out = buf.getvalue()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("WEG2-LAUNCH REFUSED", out)
+        self.assertIn("W55 Weg2XchgResidencyUnarmable", out)
+        self.assertIn("admin key file", out)
+
     def test_sb4_census_reproduces_the_spec_residency_table(self):
         """Every cell of spec section 5.1 / 5.2, from the census, not from prose.
 
@@ -410,13 +589,110 @@ class XchgInstrumentTest(CustomTestCase):
         self.assertEqual(len(checks), 6)
         self.assertTrue(all("wakes" in ln for ln in checks))
 
+    def test_armed_line_says_whether_any_rank_behaviour_is_wired(self):
+        """An acceptance line on a boot that exchanges nothing must say so.
+
+        ROUND-2 REFUTER F2.  Until S6 propagates ``--weg2-weight-source`` into
+        the two groups' argv, the request structs and the saver's region flag,
+        a boot launched with ``exchange`` runs the RING path end to end and
+        still prints this line.  A later grep of the boot log -- the only thing
+        anyone reads -- could not tell that boot from an exchanging one, which
+        is the same defect the neighbouring docstring refuses in words ("an
+        unarmed gate must never be read as a passed one").
+        """
+        from sglang.srt.weg2 import launcher, xchg_residency
+
+        lines = []
+        with _census_file(_sb4_census()) as path:
+            launcher.prepare_weight_exchange(
+                _cards(), lines.append, "exchange", path, "b.1", 0,
+            )
+        armed = [ln for ln in lines if ln.startswith("WEG2-XCHG-ARMED")][0]
+        self.assertIn("wired=no", armed)
+        self.assertIn("reason=S7-gate-only", armed)
+        self.assertFalse(launcher.XCHG_RANK_BEHAVIOUR_WIRED)
+        # and the token follows the FACT, not the format string: flip the fact
+        # and the same builder prints the other value
+        res = xchg_residency.solve(_cards(), _inline_census(_sb4_census()), 1229.0)
+        self.assertIn(
+            "wired=yes reason=none",
+            xchg_residency.armed_line(
+                res, "b.1", 1, 0, True, launcher.XCHG_UNWIRED_REASON
+            ),
+        )
+
+    def test_launch_refuses_when_the_peak_exceeds_the_board_itself(self):
+        """Spec section 5.3's own criterion: the peak does not FIT, floor aside.
+
+        ROUND-2 REVIEW F4.  The spec-named refusal test drives the ARMING FLOOR
+        branch (peak 20344 of 20480, free 136), not a peak that exceeds the
+        card, so section 5.3's actual inequality and the ``wave1_fits=NO``
+        branch went untested: with the floor removed the gate would still have
+        had to refuse here, and nothing proved it did.
+        """
+        from sglang.srt.weg2 import launcher, xchg_residency
+
+        census = _sb4_census()
+        # 12000 MiB of never-paused resident bytes on card 1 puts BOTH of its
+        # directions over the 20480 MiB board itself, wave 1 included.
+        census["cards"][_UUID[1]]["tags"]["D"]["weights_resident_probe"] = 12000
+        lines = []
+        with _census_file(census) as path:
+            with self.assertRaises(xchg_residency.Weg2XchgResidencyUnarmable) as ctx:
+                launcher.prepare_weight_exchange(
+                    _cards(), lines.append, "exchange", path, "b.0", 0,
+                )
+        msg = str(ctx.exception)
+        # 16344 + 12000 = 28344 against a 20480 MiB board: NEGATIVE free
+        self.assertIn("leaves -7864 MiB", msg)
+        self.assertIn("dir=d2p", msg)
+        self.assertIn("dir=p2d", msg)
+        self.assertNotIn(_UUID[0], msg)
+        self.assertNotIn(_UUID[2], msg)
+        checks = [
+            ln for ln in lines if ln.startswith("WEG2-XCHG-CHECK") and _UUID[1] in ln
+        ]
+        self.assertEqual(len(checks), 2)
+        self.assertTrue(all("wave1_fits=NO" in ln for ln in checks), checks)
+        self.assertTrue(all("free_mib=-" in ln for ln in checks), checks)
+        # and the wave-1 census is 4/6, not an aggregate that hides which two
+        res = xchg_residency.solve(_cards(), _inline_census(census), 1229.0)
+        self.assertEqual(res.wave1_ok(), (4, 6))
+
+    def test_duplicate_or_nameless_cards_are_refused(self):
+        """Two boards under one key are priced as one board.
+
+        ROUND-2 REFUTER F13.  Every per-card figure is keyed by UUID, so a
+        collision silently drops a card from the peak table while the arming
+        line still reads as complete.
+        """
+        from sglang.srt.weg2 import xchg_residency
+
+        cards = _cards()
+        cards[2].uuid = cards[1].uuid
+        res = xchg_residency.solve(cards, _inline_census(_sb4_census()), 1229.0)
+        self.assertFalse(res.armed)
+        self.assertTrue(any("more than one live card" in r for r in res.refusals))
+
+        cards = _cards()
+        cards[0].uuid = ""
+        res = xchg_residency.solve(cards, _inline_census(_sb4_census()), 1229.0)
+        self.assertFalse(res.armed)
+        self.assertTrue(any("carry no UUID" in r for r in res.refusals))
+
     def test_region_mib_is_arithmetic_over_stated_layout_terms(self):
         """385 is computed from four named inputs, never written down."""
         from sglang.srt.weg2 import launcher, xchg_residency
 
+        # the pair count is DERIVED from this boot's card list (round-2 review
+        # F8): it was typed as 6, which is n*(n-1) evaluated on this rig and
+        # silently wrong on any other card count
+        self.assertEqual(launcher.xchg_region_pairs(len(_cards())), 6)
+        self.assertEqual(launcher.xchg_region_pairs(4), 12)
+        self.assertEqual(launcher.xchg_region_pairs(1), 0)
         self.assertEqual(
             xchg_residency.region_mib_from_layout(
-                launcher.XCHG_REGION_PAIRS,
+                launcher.xchg_region_pairs(len(_cards())),
                 launcher.XCHG_REGION_SLOTS_PER_PAIR,
                 launcher.XCHG_REGION_SLOT_MIB,
                 launcher.XCHG_REGION_HEADER_MIB,

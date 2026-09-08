@@ -69,6 +69,19 @@ DIRECTION_WORDS: Mapping[str, str] = {
 #: one-group census cannot state a co-residency peak.
 GROUPS: Tuple[str, str] = ("P", "D")
 
+#: WHERE THE ARMING FLOOR COMES FROM, printed beside every use of it (round-2
+#: review F5).  It is ``launcher.ARMING_FLOOR_MIB``, the top of this rig's
+#: measured VRAM corridor -- and that corridor was measured UNDER LOAD, while
+#: the exchange peak occurs with no load running and both KV pools released
+#: (spec section 5.0/5.2).  Borrowing it is deliberate and conservative, but a
+#: threshold whose regime is not on the line beside it is a number the next
+#: reader will re-derive or, worse, trust for the wrong reason.
+FLOOR_PROVENANCE: str = (
+    "the rig's VRAM corridor ceiling, measured UNDER LOAD; the exchange peak "
+    "occurs unloaded with both KV pools released, so this floor is borrowed "
+    "from a stricter regime and is conservative here"
+)
+
 #: Region layout terms, spec section 6/S3.  They live here ONLY so the arming
 #: line can print ``region_mib`` before S3 exists; see
 #: :func:`region_mib_from_layout`.
@@ -102,7 +115,27 @@ def region_mib_from_layout(
     return int(header_mib) + int(pairs) * int(slots_per_pair) * int(slot_mib)
 
 
-class Weg2XchgResidencyUnarmable(RuntimeError):
+class Weg2XchgRefused(RuntimeError):
+    """Every named refusal this module raises at the LAUNCH check.
+
+    A BASE class, exactly as :class:`ring_table.Weg2RingRefused` is one, so
+    ``launcher.REFUSALS`` catches the CLASS and a refusal added here later
+    inherits ``cli()``'s handler -- the one named line and exit 2 -- rather
+    than needing a second entry that can go out of step with the raises.
+
+    ROUND-2 REVIEW FINDING F1 IS WHY IT EXISTS.  The refusal below shipped as a
+    bare ``RuntimeError``, a subclass of none of ``REFUSALS``' four members, so
+    it escaped ``cli()`` uncaught: exit **1** with a raw traceback -- which any
+    wrapper keying on the exit code reads as a crash rather than as the refusal
+    it is -- and ``drop_admin_key_file()`` never ran, so a boot that never
+    served left its secret behind (#1275 fix 2's "both exits, or the guarantee
+    is only half true").  That is boot weg2rg1's W34 defect, which
+    ``ring_table.Weg2RingRefused``'s own docstring records, repeated one module
+    later; the seam existed and was not used.
+    """
+
+
+class Weg2XchgResidencyUnarmable(Weg2XchgRefused):
     """W55: a card / direction / wave peak, or the wave-1 inequality, does not fit.
 
     Raised by the LAUNCHER, before either group starts, where
@@ -148,6 +181,13 @@ class XchgCensus:
     #: TODO(S7->S1): ``weight_exchange`` derives this from ``chunk_tag_cards``;
     #: until it lands the launcher has no producer and W55 refuses rather than
     #: inventing a partition.
+    #: AND THE HAZARD THAT COMES WITH IT (round-2 refuter F11): the partition
+    #: priced here is read by ONE process and transmitted to nobody.  Today
+    #: that is harmless because no rank acts on it; from S6 on, the priced
+    #: schedule and the EXECUTED schedule are two objects, which is R2-5's
+    #: shape one layer up.  S1/S6 must publish this list to the ranks and have
+    #: them refuse a mismatch, exactly as the front already refuses a pause
+    #: order that is not its own weights tags.
     waves: Tuple[Tuple[str, ...], ...]
     provenance: str = ""
     path: str = ""
@@ -366,13 +406,24 @@ def _wave_tags(census: XchgCensus) -> List[str]:
 
 
 def check_partition(census: XchgCensus) -> List[str]:
-    """The wave partition must PARTITION the exchanged tags -- no gap, no repeat.
+    """The wave list must not REPEAT a tag, and must name no tag the census lacks.
 
     Same test the front applies to the transmitted pause order
     (``sorted(order) != sorted(self.weights_tags)``, front.py:2656-2663,
     refuter finding R2-5), applied one layer earlier to the object the launcher
-    prices.  A tag in two waves is charged twice and a tag in none is charged
-    never; both make the peak a number about a schedule nobody runs.
+    prices.  A tag in two waves is charged twice; a wave tag with no census
+    bytes is an absent measurement read as a zero.  Both make the peak a number
+    about a schedule nobody runs.
+
+    WHAT THIS DOES **NOT** CHECK, and why the name above says "repeat" and not
+    "partition" (round-2 review F6): the reverse gap.  A tag that the census
+    carries and NO wave names is not refused -- :func:`solve` classifies it as
+    permanently resident and charges BOTH groups' copies of it for the whole
+    window.  That is the conservative reading (it can only over-price the peak,
+    never under-price it), and it is the reading S8's resident vision tower
+    needs; but it means an S1 partition that simply DROPS a real weights tag
+    arms without comment, priced as if that tag never moved.  Stated here
+    rather than implied by a docstring that claims more than the code does.
     """
     bad: List[str] = []
     flat = _wave_tags(census)
@@ -406,9 +457,39 @@ def solve(
     TOTALS are live NVML; the BYTES are the census; the two are joined by UUID
     and never by position, because an NVML re-enumeration between the census
     boot and this one silently swaps two rows otherwise.
+
+    TODO(S7->S6), spec section 5.3, and it is not a nicety (round-2 review F6 /
+    refuter F4): this is a LAUNCH-TIME check against the census plus the NVML
+    TOTAL.  The spec asks additionally for a read of the live NVML FREE in the
+    RPC preamble, because R6 -- the allocator's unbounded cache -- is the one
+    term this arithmetic cannot bound, and refusing there is cheaper than
+    taking a ``cu_mem_create`` OOM at a wave whose source pages are already
+    unmapped.  S6 owns the preamble; until it exists W55 is launch-only and
+    that is a WEAKER gate than section 5.3 specifies, not an equal one.
     """
     res = XchgResidency(provenance=census.provenance, floor_mib=float(floor_mib))
     res.order = [getattr(c, "uuid", "") for c in cards]
+    # Round-2 refuter F13: every per-card figure below is keyed by UUID, so two
+    # cards sharing one key (or carrying none) collapse into one row and the
+    # arming line silently prices two boards as one.  Unreachable with real
+    # NVML cards, which is exactly the class of assumption that stops holding
+    # in a fixture, a mock rig or a driver that returns an empty string.
+    blank = [
+        getattr(c, "nvml_index", "?") for c in cards if not getattr(c, "uuid", "")
+    ]
+    if blank:
+        res.refusals.append(
+            f"card(s) at nvml index {blank} carry no UUID -- the census is joined "
+            "by UUID and an empty key is not a join, it is a collision waiting "
+            "for a second nameless card"
+        )
+    dupes = sorted({u for u in res.order if u and res.order.count(u) > 1})
+    if dupes:
+        res.refusals.append(
+            f"UUID(s) {dupes} name more than one live card -- two boards under "
+            "one key are priced as one board, and the peak that matters is the "
+            "one that was never computed"
+        )
     res.refusals.extend(check_partition(census))
     wave_tags = set(_wave_tags(census))
     for card in cards:
@@ -494,8 +575,8 @@ def _peak_refusals(res: XchgResidency) -> List[str]:
             f"card {peak.uuid} nvml{peak.nvml_index} {peak.name} dir={peak.direction} "
             f"({DIRECTION_WORDS[peak.direction]}) wave={peak.wave}: predicted peak "
             f"{peak.resident_mib} MiB against NVML total {peak.total_mib} MiB leaves "
-            f"{peak.free_mib} MiB, below the arming floor {res.floor_mib:g} MiB.  "
-            f"Terms: {peak.terms()}"
+            f"{peak.free_mib} MiB, below the arming floor {res.floor_mib:g} MiB "
+            f"({FLOOR_PROVENANCE}).  Terms: {peak.terms()}"
         )
     return bad
 
@@ -529,10 +610,14 @@ def _check_lines(res: XchgResidency) -> List[str]:
             f"wave1_mib={wave1.resident_mib} "
             f"wave1_fits={'yes' if wave1.resident_mib <= wave1.total_mib else 'NO'} "
             f"-- terms: {peak.terms()} "
-            "(NVML total is the full board; the driver carve-out this rig "
-            "measures at 425-518 MiB/card is NOT subtracted here, exactly as the "
-            "awake budget does not subtract it -- a separate open finding, named "
-            "so the margin is not read as larger than it is)"
+            f"(floor: {FLOOR_PROVENANCE}.  NVML total is the full board; the "
+            "driver carve-out this rig measures at 425-518 MiB/card is NOT "
+            "subtracted here, exactly as the awake budget does not subtract it "
+            "-- a separate open finding, named so the margin is not read as "
+            "larger than it is.  Consequence, stated rather than left to the "
+            "reader: free_mib above overstates the NVML-free this card will "
+            "actually show by that carve-out, so the effective NVML-free floor "
+            "is the printed one MINUS 425-518 MiB)"
         )
     return out
 
@@ -542,14 +627,25 @@ def armed_line(
     epoch: object,
     region_mib: int,
     ring_h_mib: int,
+    wired: bool,
+    unwired_reason: str,
 ) -> str:
-    """The spec's acceptance line, token sequence verbatim.
+    """The spec's acceptance line, token sequence verbatim, plus ``wired=``.
 
     ``peak_mib``/``free_mib`` are printed in the launcher's card order (NVML
     ordinal order), ``d2p`` first.  The DIRECTION BINDING is this tree's, not
     the spec example's -- see the module docstring; every WEG2-XCHG-CHECK line
     above spells it out in words so the two cannot be confused by a reader who
     only has the log.
+
+    ``wired`` IS NOT DECORATION (round-2 review F2).  Until S6 propagates
+    ``--weg2-weight-source`` into the two groups' argv, the request structs and
+    the saver's region flag, a boot launched with ``exchange`` runs the RING
+    path end to end and logs this line -- and a log is the only thing anyone
+    reads afterwards.  A grep that cannot tell that boot from an exchanging one
+    turns this acceptance line into the same defect its own neighbour refuses:
+    an unarmed gate read as a passed one.  So the line states, in its own
+    tokens, whether any rank behaviour is wired to the arm it just priced.
     """
     ok, total = res.wave1_ok()
     peaks = " ".join(
@@ -564,6 +660,8 @@ def armed_line(
         f"WEG2-XCHG-ARMED epoch={epoch} waves={res.waves} peak_mib={peaks} "
         f"free_mib={frees} wave1_ok={ok}/{total} floor_mib={res.floor_mib:g} "
         f"region_mib={region_mib} ring_H_mib={ring_h_mib} "
+        f"wired={'yes' if wired else 'no'} "
+        f"reason={'none' if wired else (unwired_reason or 'UNSTATED')} "
         f"-- provenance: {res.provenance or 'UNSTATED (the census named no source)'}"
     )
 

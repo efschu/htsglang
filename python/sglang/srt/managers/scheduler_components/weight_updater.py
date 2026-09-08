@@ -1579,9 +1579,16 @@ class SchedulerWeightUpdaterManager:
                 # plus pass 3's single synchronise; pass 4's granule release is
                 # in neither, so ``map_ms + copy_ms`` is a LOWER bound on ``ms``
                 # and not a partition of it.  ``n/a`` means the instrument is
-                # absent (hook without the symbol, or a record naming another
-                # tag) -- it is never printed as 0, because a 0 here would read
-                # as "the remap was free" and that is the claim under test.
+                # ABSENT -- hook without the symbol, a record naming another
+                # tag, or a ROCm build, whose resume path never records at all.
+                # The absence and a measured zero are different findings and
+                # this is the whole denominator law: a 0 printed for an absent
+                # instrument would read as "the remap was free", which is the
+                # claim under test.  A tag whose resume matched no allocation
+                # DOES print ``allocations=0 map_ms=0.0`` -- that is a real
+                # measurement of "nothing was mapped", not an absence, and the
+                # guard above deliberately does not hide it (round-2 refuter
+                # F8: the earlier wording claimed a 0 was never printed).
                 st = weg2_map_stats.get(tag)
                 logger.info(
                     "WEG2-FLIP-TAG group=%s rank=%d card=%s dir=h2d tag=%s bytes=%d MiB "

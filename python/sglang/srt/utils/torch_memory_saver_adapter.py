@@ -202,6 +202,23 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         check would print the previous tag's map cost under this tag's name the
         first time anything resumed between the two.  Never fall back to the
         last record when the tags differ -- report the absence.
+
+        WHAT THE TAG CHECK DOES NOT COVER (round-2 refuter F7): two records of
+        the SAME tag are indistinguishable, because the returned sequence
+        number is used only as a "never recorded" sentinel and not compared to
+        a value read before the resume.  That is reachable only if a resume of
+        this same tag happened between this call and the one it annotates, and
+        it cannot happen today: every ``CUDA_ERROR_CHECK`` / ``SIMPLE_CHECK`` in
+        ``tms_csrc`` exits the process, so a failed resume kills the rank
+        instead of leaving a stale record behind.  Named, not fixed, because a
+        pre-read costs a second ctypes call per tag on the flip's critical path
+        for a case no code path reaches.
+
+        ROCm RECORDS NOTHING: ``core.cpp`` dispatches ROCm to ``rocm_resume``
+        before the instrumented CUDA branch, so ``last_resume_seq_`` stays 0
+        and this returns None forever there.  Correct by absence -- the caller
+        prints ``n/a``, never a zero -- but stated here so a ROCm reader does
+        not conclude the remap was free.
         """
         import ctypes
 
