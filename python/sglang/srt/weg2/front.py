@@ -941,6 +941,11 @@ class Front:
         #: until a boot's WEG2-IDLE-CENSUS line supplies a measured one.
         self.host_watermark_period_s = 15.0
         self._observed_anon_drift_mib_per_min: Optional[float] = None
+        #: #1269 fix 3: cgroup anon BEFORE this boot existed -- the only valid
+        #: foreign baseline.  Set by the launcher's preflight (weg2sb5b measured
+        #: 10.05 GiB and the guard did not use it).  None => no split is printed
+        #: rather than an invented one.
+        self._anon_preboot_bytes: Optional[int] = None
         self.stop: Optional[Weg2Stop] = None
         self.admit_d = True
         self.queue: Deque[Pending] = collections.deque()
@@ -1527,17 +1532,24 @@ class Front:
                     # and their desk work, so the verdict carries the split:
                     # a breach the operator's own pytest run caused is named,
                     # not charged to the boot.
-                    own_pids: list = []
-                    for sid in (self.groups["P"].sid, self.groups["D"].sid):
-                        try:
-                            own_pids.extend(_session_pids(int(sid)))
-                        except Exception:  # noqa: BLE001
-                            pass
+                    # #1269 fix 3: test NON-RECLAIMABLE pressure, not raw
+                    # memory.current -- the raw reading counts page cache the
+                    # kernel drops before it OOMs, and on weg2sb5b that refused
+                    # a boot 28 GiB below danger.  The split comes from the
+                    # PRE-BOOT anon baseline; `cgroup anon - sum(RssAnon)` is
+                    # not subtractable and printed foreign=-30.91 on that boot.
+                    pr = host_ledger.read_cgroup_pressure()
                     verdict = host_ledger.watermark_breach_verdict(
                         int(current),
                         margin=margin,
+                        nonreclaim_gib=pr.get("nonreclaim_gib"),
+                        file_reclaimable_gib=pr.get("file_reclaimable_gib"),
                         cgroup_anon_bytes=host_ledger.read_cgroup_anon_bytes(),
-                        own_pids=own_pids,
+                        anon_preboot_bytes=self._anon_preboot_bytes,
+                        composition={
+                            k[:-4]: v for k, v in pr.items()
+                            if k.endswith("_gib") and k != "nonreclaim_gib"
+                        },
                     )
                     if verdict is not None:
                         self.counters["host_watermark_breach"] += 1
@@ -3501,6 +3513,13 @@ def main():
                          "and that level requires the admin key once one is configured. A path, "
                          "not a value, so the key does not appear in this process's argv too.")
     ap.add_argument("--commit", default="", help="#1233 fix 8: the tip this boot runs, stamped into every measurement")
+    ap.add_argument("--anon-preboot-bytes", type=int, default=0,
+                    help="#1269 fix 3: cgroup memory.stat `anon` measured by the "
+                         "launcher preflight BEFORE this boot existed. The only "
+                         "valid foreign baseline for the W22 split -- "
+                         "`cgroup anon - sum(RssAnon)` is not subtractable and "
+                         "printed foreign=-30.91 GiB on weg2sb5b. 0 = unset, and "
+                         "then no split is printed rather than an invented one.")
     ap.add_argument("--ledger-arm", default="",
                     help="#1233 fix 8: JSON {s_gb, m_mib, store_gib} -- the arm the ledger chose, needed to "
                          "derive the RUN-MOMENT residual from the front's own cgroup reading")
@@ -3522,6 +3541,10 @@ def main():
                   measured_record=args.measured_record, commit=args.commit,
                   ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {},
                   admin_key_file=args.admin_key_file)
+    # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
+    # against. Kept from weg2/idle-anon-0908.
+    if args.anon_preboot_bytes > 0:
+        front._anon_preboot_bytes = int(args.anon_preboot_bytes)
     # #1275: say ONCE whether this boot has the live levers, and say it with the
     # PATH and a redaction -- never the key. The front log is world-readable and
     # is routinely pasted into records.

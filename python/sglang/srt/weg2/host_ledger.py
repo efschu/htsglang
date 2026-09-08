@@ -426,6 +426,54 @@ def measure_foreign_anon(
     )
 
 
+def split_by_baseline(
+    anon_now_bytes: Optional[int], anon_preboot_bytes: Optional[int]
+) -> Tuple[Optional[float], Optional[float], str]:
+    """(sglang GiB, foreign GiB, source) from the PRE-BOOT anon baseline.
+
+    #1269 fix 3. The previous form, ``cgroup anon - sum(RssAnon of own pids)``,
+    is ARITHMETICALLY INVALID, and boot weg2sb5b printed the proof:
+
+        SPLIT sglang=61.48 foreign=-30.91 GiB anon
+              [cgroup anon 30.57 - sglang RssAnon 61.48 over 111/111 pids]
+
+    ``cgroup anon`` counts each physical page ONCE; ``sum(RssAnon)`` counts a
+    shared page once PER PROCESS that maps it, and six ranks plus ~105 forked
+    workers share a great deal. The two are not subtractable, the difference
+    went negative -- which is impossible -- and so the line's conclusion
+    ("sglang dominates") was unsupported even if it happened to be true.
+
+    The pre-boot reading IS subtractable, being the same quantity at an earlier
+    time: whatever anon the cgroup held before this boot existed is foreign to
+    it, and the rise since is the boot's. sb5b measured 10.05 GiB pre-boot,
+    exactly as its checklist asked, and the guard did not use it.
+
+    HONEST LIMIT, stated rather than papered over: this attributes by TIME, not
+    by OWNER. Desk work started after the baseline is charged to sglang. That is
+    the conservative direction for a guard whose job is to tear down -- it never
+    under-reports the boot's own share -- but it is not an ownership
+    measurement, and a later foreign spike cannot be separated from the boot's
+    own growth by this instrument.
+    """
+    if anon_now_bytes is None or anon_preboot_bytes is None:
+        return None, None, "no pre-boot anon baseline -- split not computable"
+    foreign = float(anon_preboot_bytes) / GIB
+    sglang = float(anon_now_bytes) / GIB - foreign
+    if sglang < 0.0:
+        return (
+            0.0,
+            float(anon_now_bytes) / GIB,
+            f"anon fell BELOW the pre-boot baseline {foreign:.2f} GiB (foreign "
+            "work exited); the boot's own share is not separable here",
+        )
+    return (
+        sglang,
+        foreign,
+        f"cgroup anon now {float(anon_now_bytes) / GIB:.2f} GiB vs pre-boot "
+        f"baseline {foreign:.2f} GiB (attribution by TIME, not by owner)",
+    )
+
+
 def resolve_margin(
     flip_transient_gib: Optional[float] = None,
     drift_mib_per_min: Optional[float] = None,
@@ -486,9 +534,23 @@ def watermark_provenance(margin: Optional[Margin] = None,
     events = ", ".join(f"{k} {v:.2f}" for k, v in sorted(REAP_SAMPLES_GIB.items()))
     excl = ", ".join(f"{k} {v:.2f} EXCLUDED ({why})"
                      for k, (v, why) in sorted(REAP_SAMPLE_EXCLUDED.items()))
+    live = read_cgroup_pressure()
+    if live.get("nonreclaim_gib") is not None:
+        cur = (
+            f" LIVE nonreclaim={live['nonreclaim_gib']:.2f} "
+            f"raw_current={live['current_gib']:.2f} "
+            f"file_reclaimable={live['file_reclaimable_gib']:.2f} GiB "
+            f"[{live['source']}]"
+        )
+    else:
+        cur = f" LIVE unreadable [{live.get('source')}]"
     return (
-        f"WEG2-HOST WATERMARK={w:.2f} GiB source=[{events}] margin={m.total_gib:.2f} GiB "
-        f"({m.terms()}); hard bound = {w - m.total_gib:.2f} GiB; excluded=[{excl}]"
+        f"WEG2-HOST WATERMARK={w:.2f} GiB CURRENCY=non-reclaimable "
+        f"(= memory.current at a reap, because the kernel has ALREADY reclaimed the "
+        f"file cache by then: dk5's own reap row carries 0.03 GiB of it; dk6's "
+        f"memory.stat was not captured, so that half is inference from one row) "
+        f"source=[{events}] margin={m.total_gib:.2f} GiB "
+        f"({m.terms()}); hard bound = {w - m.total_gib:.2f} GiB; excluded=[{excl}].{cur}"
     )
 
 
@@ -506,37 +568,67 @@ def watermark_breach_verdict(
     watermark_gib: Optional[float] = None,
     cgroup_anon_bytes: Optional[int] = None,
     own_pids: Sequence[int] = (),
+    nonreclaim_gib: Optional[float] = None,
+    file_reclaimable_gib: Optional[float] = None,
+    anon_preboot_bytes: Optional[int] = None,
+    composition: Optional[Dict[str, Optional[float]]] = None,
 ) -> Optional[str]:
-    """The runtime check. Returns the verdict LINE when the bound is crossed,
-    else None. Pure: the caller performs the teardown, so this is testable
-    against a synthetic cgroup reading with no processes involved.
+    """The runtime check, in NON-RECLAIMABLE currency (#1269 fix 3).
 
-    When ``cgroup_anon_bytes`` and ``own_pids`` are given the verdict carries the
-    ``sglang=`` / ``foreign=`` split, so a breach caused by the operator's own
-    desk work (pytest runs, worktrees, dry-runs, a checkpoint-reading probe --
-    all of which land in this same cgroup) is NAMED as such instead of being
-    charged to the boot. It changes no decision: the threshold is crossed either
-    way and the teardown is the same. It changes who has to fix it."""
+    Returns the verdict LINE when the bound is crossed, else None. Pure, so it
+    is testable against a synthetic memory.stat with no processes involved.
+
+    ``nonreclaim_gib`` is what the bound is tested against; the raw reading is
+    printed beside it so the line carries BOTH currencies and the next boot can
+    see which one bites. With no non-reclaimable reading available the raw one
+    is used and the line SAYS SO -- conservative (it can only over-report
+    pressure), but it is exactly the comparison that refused weg2sb5b 28 GiB
+    below danger, so it is never silent about which currency it used.
+
+    The split comes from the PRE-BOOT anon baseline (:func:`split_by_baseline`),
+    never from ``cgroup anon - sum(RssAnon)``: that subtraction is invalid and
+    printed a negative foreign term on sb5b. ``cgroup_anon_bytes`` /
+    ``own_pids`` are kept in the signature for callers that still pass them,
+    but ``own_pids`` no longer participates in the arithmetic.
+    """
     m = margin if margin is not None else resolve_margin()
     w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    bound = w - m.total_gib
     current = float(current_bytes) / GIB
-    if current <= w - m.total_gib:
+    if nonreclaim_gib is not None:
+        tested = float(nonreclaim_gib)
+        currency = "non-reclaimable"
+    else:
+        tested = current
+        currency = "RAW memory.current -- INCLUDES reclaimable cache, no memory.stat"
+    if tested <= bound:
         return None
+    cache = (
+        f" file_reclaimable={file_reclaimable_gib:.2f}"
+        if file_reclaimable_gib is not None
+        else ""
+    )
+    if composition:
+        cache += " STAT " + " ".join(
+            f"{k}={v:.2f}" for k, v in sorted(composition.items()) if v is not None
+        )
     split = ""
-    if cgroup_anon_bytes is not None and own_pids:
-        foreign, sglang, src = measure_foreign_anon(cgroup_anon_bytes, own_pids)
-        if foreign is not None:
+    if cgroup_anon_bytes is not None and anon_preboot_bytes is not None:
+        sg, fo, src = split_by_baseline(cgroup_anon_bytes, anon_preboot_bytes)
+        if sg is not None and fo is not None:
             split = (
-                f" SPLIT sglang={sglang:.2f} foreign={foreign:.2f} GiB anon [{src}]"
-                f" -- {'FOREIGN desk load dominates this breach' if foreign > sglang else 'sglang dominates this breach'}."
+                f" SPLIT sglang={sg:.2f} foreign={fo:.2f} GiB anon [{src}]"
+                f" -- {'FOREIGN desk load' if fo > sg else 'sglang'} dominates."
             )
     return (
-        f"W22 Weg2HostWatermarkBreached current={current:.2f} watermark={w:.2f} "
-        f"margin={m.total_gib:.2f} ({m.terms()}); hard bound {w - m.total_gib:.2f} GiB "
-        f"crossed by {current - (w - m.total_gib):.2f} GiB.{split} CONTROLLED TEARDOWN "
+        f"W22 Weg2HostWatermarkBreached current={tested:.2f} watermark={w:.2f} "
+        f"margin={m.total_gib:.2f} ({m.terms()}); hard bound {bound:.2f} GiB "
+        f"crossed by {tested - bound:.2f} GiB in {currency} currency "
+        f"[raw memory.current={current:.2f}{cache}].{split} CONTROLLED TEARDOWN "
         "down the killer path. Standing order 2026-09-08: the threshold is never "
         "crossed; crossing only ends in a crash, so there is no 'accept the risk'."
     )
+
 #: #1233 boot weg2dk5: the OBSERVED REAP POINT of this box's cgroup -- the
 #: memts row at 21:15:30Z, ``cg_current_b=102,998,904,832`` with ``oom_kill``
 #: 18 -> 24 in the same row (and /proc/vmstat 60 -> 66 independently, same
@@ -1393,6 +1485,98 @@ def price(
 #: its successor a number.  The sidecar is that loop, and it stores WHO measured
 #: (commit, boot tag, timestamp), never a bare figure.
 MEASURED_RECORD_NAME = "weg2_measured_record.json"
+
+
+def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[float]]:
+    """NON-RECLAIMABLE PRESSURE in GiB, with the raw reading beside it.
+
+    #1269 fix 3 -- the defect that refused boot weg2sb5b 28 GiB below danger.
+    ``memory.current`` counts RECLAIMABLE page cache, which the kernel drops
+    before it ever OOMs; the run-peak model is built from anon + shmem. The two
+    cannot be compared during a load, and sb5b is the proof (launcher memts,
+    host-wide /proc/meminfo terms):
+
+        peak 18:57:01Z  memory.current 96.94 GiB
+                      = anon 27.72 + shmem 40.50 (rings+store)
+                      + page cache excl. shmem 28.08 + ~0.64 slab/kernel
+        NON-RECLAIMABLE 68.86 GiB; max over the boot 78.26 GiB
+
+    and that 28 GiB of cache was ALREADY RESIDENT BEFORE THE BOOT -- pre-boot
+    28.53 -> peak 28.08, it FELL. Foreign, reclaimable, and nothing the
+    checkpoint load put there; the boot's own growth was 57.4 GiB and entirely
+    anon + shmem. Against the 87.30 GiB bound the honest figure had 9.04 GiB of
+    room while the raw reading breached by 9.64.
+
+    WHY THE WATERMARK CARRIES OVER UNCHANGED, as a derivation with its
+    assumption rather than an assertion: at a real reap the kernel has ALREADY
+    reclaimed the file cache -- that is what reclaim IS, and it runs before the
+    OOM killer -- so ``memory.current`` at the moment of the kill is already
+    ~pure non-reclaimable. dk5's own reap row bears this out: its
+    ``pagecache_ex_shmem`` is 28,916 kB = 0.03 GiB. So 95.90 / 96.06 are
+    already non-reclaimable readings and need no restatement.
+    ASSUMPTION: that dk6's row behaves as dk5's did. dk6's memory.stat was not
+    captured, so this is inference from ONE measured row, not two.
+
+    Preferred formula ``current - inactive_file - active_file`` (the two file
+    LRUs are exactly what reclaim walks). The sum form
+    ``anon + shmem + slab_unreclaimable + unevictable`` is the fallback when
+    those fields are absent, and is reported as such: it can differ from the
+    first by kernel-internal terms.
+    """
+    out: Dict[str, Optional[float]] = {
+        "current_gib": None,
+        "nonreclaim_gib": None,
+        "file_reclaimable_gib": None,
+        "anon_gib": None,
+        "shmem_gib": None,
+        "source": None,
+    }
+    st: Dict[str, int] = {}
+    try:
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    st[parts[0]] = int(parts[1])
+    except OSError:
+        st = {}
+    try:
+        with open(f"{root}/memory.current") as f:
+            out["current_gib"] = int(f.read().strip()) / GIB
+    except (OSError, ValueError):
+        pass
+    if st:
+        out["anon_gib"] = st.get("anon", 0) / GIB
+        out["shmem_gib"] = st.get("shmem", 0) / GIB
+        # The memts sampler dumps these column names per row from the next boot
+        # on; carrying them VERBATIM is what lets acceptance diff the guard's
+        # line against the sampler without a translation table.
+        for k in (
+            "file", "slab_reclaimable", "slab_unreclaimable",
+            "inactive_file", "active_file", "unevictable",
+        ):
+            out[f"{k}_gib"] = st[k] / GIB if k in st else None
+    if out["current_gib"] is not None and "inactive_file" in st and "active_file" in st:
+        filec = (st["inactive_file"] + st["active_file"]) / GIB
+        out["file_reclaimable_gib"] = filec
+        out["nonreclaim_gib"] = out["current_gib"] - filec
+        out["source"] = "memory.current - inactive_file - active_file"
+    elif st:
+        out["nonreclaim_gib"] = (
+            st.get("anon", 0)
+            + st.get("shmem", 0)
+            + st.get("slab_unreclaimable", 0)
+            + st.get("unevictable", 0)
+        ) / GIB
+        if out["current_gib"] is not None:
+            out["file_reclaimable_gib"] = out["current_gib"] - out["nonreclaim_gib"]
+        out["source"] = (
+            "anon+shmem+slab_unreclaimable+unevictable FALLBACK "
+            "(inactive_file/active_file absent; may differ by kernel-internal terms)"
+        )
+    else:
+        out["source"] = "memory.stat unreadable -- no non-reclaimable reading"
+    return out
 
 
 def read_cgroup_anon_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
