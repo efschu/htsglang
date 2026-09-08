@@ -1074,6 +1074,7 @@ async def weight_version():
 
 
 @app.get("/get_server_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_server_info():
     """Get the server information (deprecated - use /server_info instead)."""
     logger.warning(
@@ -1084,6 +1085,7 @@ async def get_server_info():
 
 
 @app.get("/server_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.

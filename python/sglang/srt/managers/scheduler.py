@@ -15257,7 +15257,20 @@ class Scheduler(
             lane.lending.maybe_lend()
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__
+        # #1275 fix 5: THE SECOND PRODUCER, and it is the same defect as #1282.
+        # `dict(vars(...))` returns every instance attribute -- including the
+        # live `admin_api_key` and the non-field `model_config` -- and this dict
+        # is served as `internal_states[0]` by /get_server_info AND by
+        # /get_internal_state on all three ports. On boot weg2sb5e the key was
+        # readable there VERBATIM AND WITHOUT A BEARER.
+        #
+        # #1282 closed the OTHER accounting (the top-level `**asdict(...)`
+        # spread) and the comment at http_server.py's `/get_server_info`
+        # predicted exactly this one. I fixed the half I was looking at and did
+        # not enumerate the producers -- the same caller-enumeration failure as
+        # the sb5 401, in a second costume. A repo-wide test now fails on ANY
+        # serialisation of ServerArgs outside `redacted_dict`.
+        ret = get_server_args().redacted_dict()
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
