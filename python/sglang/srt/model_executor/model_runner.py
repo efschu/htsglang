@@ -62,7 +62,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
-from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
@@ -2301,6 +2300,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
         return model
 
+    def _weg2_xchg_tag_bytes(self, tag: str) -> int:
+        """#1273 S2: the saver's OWN byte sum for one tag, or 0 with a reason.
+
+        The same instrument and the same absence rule as
+        ``weight_updater._weg2_tag_bytes``: a 0 means THE SAVER COULD NOT
+        ANSWER (no hook, no such symbol), printed by the caller as
+        ``tms_answered=no``, and never read as "this tag is empty". Never falls
+        back to RssShmem, which the shared host ring makes meaningless.
+        """
+        getter = getattr(self.memory_saver_adapter, "tag_bytes", None)
+        if getter is None:
+            return 0
+        try:
+            return int(getter(tag) or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -2419,8 +2435,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
-        with self.memory_saver_adapter.region(
-            GPU_MEMORY_TYPE_WEIGHTS,
+        # #1273 S2 (spec section 4.1): under --weg2-weight-source exchange the
+        # NEXTN/MTP draft runner's weights carry their OWN tag, outside the
+        # weights family -- group P has no --speculative-* in this form, so
+        # those bytes have no VRAM source on the other side and must never
+        # enter a leg.  No-op under the default `ring` mode.  The runner is
+        # CLASSIFIED (classify_runner) rather than read off the is_draft_worker
+        # CONSTRUCTION gate: the lane (#274) and the phase-flip TP stack (#631)
+        # ride that gate too and hold TARGET weights (see :514-521), and a
+        # shape the classifier does not know is refused by name (W60), never
+        # guessed.  weights_region publishes the tag weight_chunk_scope must
+        # restore -- the C hook cannot be asked for it -- and opens the region
+        # in the same statement, so the two cannot disagree.
+        from sglang.srt.managers.weg2_memory_saver import weights_region
+        from sglang.srt.weg2.weight_exchange import (
+            RunnerShape,
+            weights_region_tag_for,
+        )
+
+        weights_tag = weights_region_tag_for(RunnerShape.of(self))
+        with weights_region(
+            self.memory_saver_adapter,
+            weights_tag,
             enable_cpu_backup=enable_cpu_backup,
         ):
             from sglang.srt.observability.startup_func_log_and_timer import (
@@ -2510,6 +2546,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.remote_instance_transfer_engine_weight_info = (
                         self.loader.remote_instance_transfer_engine_weight_info
                     )
+        # #1273 S2 (spec section 6/S2): arm the exchange for this rank at the
+        # END OF WEIGHT LOADING -- every weight page this runner will ever hold
+        # exists now and nothing has been paused yet.  A no-op under the
+        # default `ring` mode (no walk, no lines, no cost).  It VOTES rather
+        # than raises: there is no group fence in scope here, and a rank-local
+        # raise at boot leaves the other five in a collective that no longer
+        # has six members.  The fenced re-check is the wake RPC's preamble
+        # (spec section 3.6), which reads weight_exchange.boot_vote().
+        from sglang.srt.weg2.weight_exchange import arm_coverage_at_load
+
+        arm_coverage_at_load(
+            self.model,
+            rank=self.tp_rank,
+            tag_bytes=self._weg2_xchg_tag_bytes,
+            region_tag=weights_tag,
+        )
+
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:
