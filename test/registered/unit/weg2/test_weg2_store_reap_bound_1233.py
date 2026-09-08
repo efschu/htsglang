@@ -184,19 +184,41 @@ class TestLadderOnTheTrainTipBox(CustomTestCase):
     """The same three arms through :func:`host_ledger.choose`, on the readings
     the refusing dry-run itself printed."""
 
-    def test_the_train_tip_box_now_funds_an_arm(self):
-        arm, store, lines = _ladder()
-        self.assertEqual((arm.s_gb, arm.m_mib), (1, 1200))
-        self.assertEqual(store, 11)
-        chosen = [ln for ln in lines if "WEG2-HOST-LEDGER CHOSEN" in ln]
-        self.assertEqual(len(chosen), 1)
-        # The CHOSEN line carries the store's PROVENANCE: which bound won.
-        self.assertIn("bound=reap", chosen[0])
-        self.assertIn("reap-bound", chosen[0])
+    # #1269 (standing order 2026-09-08, "kein uebertreten mehr der schwelle"):
+    # THE EXPECTED OUTCOME ON THESE READINGS CHANGED, and these three tests are
+    # updated rather than relaxed. The watermark is no longer compared bare --
+    # the bound is watermark MINUS a named margin (ring-era flip transient 2.88
+    # + ring-era run-peak residual 5.16 + drift beyond the residual window 0.56
+    # = 8.60 GiB). On THIS box that is decisive and the arithmetic is not close:
+    #
+    #   peak without store          83.66 GiB (already non-reclaimable --
+    #                                     choose() nets reclaimable_bytes)
+    #   hard bound  95.90 - 8.60 =  87.30 GiB
+    #   room for a store             3.64 GiB, against a 8.00 GiB floor
+    #
+    # so no arm funds and the ladder REFUSES by name. That is the order's whole
+    # point: a boot that has not left room for the flip transient and the
+    # measured under-prediction is already lost. The funding path itself is
+    # still covered -- by `test_a_box_with_room_still_funds_an_arm` below, on a
+    # lighter reading -- so this file did not lose its subject, only its
+    # premise.
+    def test_the_train_tip_box_no_longer_funds_an_arm_under_the_hard_bound(self):
+        with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
+            _ladder()
+        text = str(cm.exception)
+        self.assertIn("HARD BOUND", text)
+        self.assertIn("margin", text)
+        # the refusal must name the terms, not just the number
+        self.assertIn("transient", text)
+        self.assertIn("residual", text)
 
     def test_every_arm_line_prints_all_three_numbers_and_the_winner(self):
-        _, _, lines = _ladder()
-        arms = [ln for ln in lines if "WEG2-HOST-LEDGER ARM" in ln]
+        """The per-arm table is printed on the REFUSAL too -- that is where a
+        reader needs it most, and fix 8 emits it in both cases on purpose."""
+        with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
+            _ladder()
+        arms = [ln for ln in str(cm.exception).splitlines()
+                if "WEG2-HOST-LEDGER ARM" in ln]
         self.assertEqual(len(arms), 3)
         for ln in arms:
             self.assertIn("leftover ", ln)
@@ -204,12 +226,33 @@ class TestLadderOnTheTrainTipBox(CustomTestCase):
             self.assertIn("floor ", ln)
             self.assertIn("bound=", ln)
 
-    def test_the_chosen_arms_predicted_peak_is_below_the_watermark(self):
-        arm, store, _ = _ladder()
-        self.assertLess(arm.predicted_run_peak_gib(store), REAP_GIB)
-        # ... and below it by at least the unsampled term the watermark
-        # over-states by, which is the whole reason that term is subtracted.
-        self.assertLessEqual(arm.predicted_run_peak_gib(store), REAP_GIB - UNSAMPLED_GIB)
+    #: A ring 6 GiB smaller than the train tip's. That is the lever the W21
+    #: refusal itself names ("cut Sigma H -- the per-card host ring table"), and
+    #: it is the only one that moves this box: the origin cannot be lowered,
+    #: because run_origin_gib takes max(launch reading, run-moment residual
+    #: floor) and the floor binds here.
+    SMALLER_RING_BYTES = RING_BYTES - 6000 * 1024 * 1024
+    SMALLER_SPAN1_BYTES = RING_SPAN1_BYTES - 6000 * 1024 * 1024
+
+    def test_a_box_with_room_still_funds_an_arm(self):
+        """The funding path, kept alive on a ring that fits the hard bound."""
+        arm, store, lines = _ladder(
+            ring_bytes=self.SMALLER_RING_BYTES,
+            ring_span1_bytes=self.SMALLER_SPAN1_BYTES,
+        )
+        self.assertEqual((arm.s_gb, arm.m_mib), (1, 1200))
+        self.assertGreaterEqual(store, STORE_MIN_GIB)
+        chosen = [ln for ln in lines if "WEG2-HOST-LEDGER CHOSEN" in ln]
+        self.assertEqual(len(chosen), 1)
+        self.assertIn("reap-bound", chosen[0])
+
+    def test_the_chosen_arms_predicted_peak_is_below_the_hard_bound(self):
+        arm, store, _ = _ladder(
+            ring_bytes=self.SMALLER_RING_BYTES,
+            ring_span1_bytes=self.SMALLER_SPAN1_BYTES,
+        )
+        margin = host_ledger.resolve_margin()
+        self.assertLess(arm.predicted_run_peak_gib(store), REAP_GIB - margin.total_gib)
 
     def test_the_floor_still_refuses_and_it_is_W21_that_names_the_bound(self):
         """A floor above every arm's reap bound: the binding quantity is the
@@ -223,8 +266,15 @@ class TestLadderOnTheTrainTipBox(CustomTestCase):
     def test_an_unreadable_slab_reading_still_bounds_the_store(self):
         """With no slab reading the bound is computed WITHOUT the term and says
         so -- it is never silently priced as a whole-leftover store again."""
-        arm, store, lines = _ladder(slab_reclaimable_bytes=None)
-        self.assertLess(arm.predicted_run_peak_gib(store), REAP_GIB)
+        arm, store, lines = _ladder(
+            slab_reclaimable_bytes=None,
+            ring_bytes=self.SMALLER_RING_BYTES,
+            ring_span1_bytes=self.SMALLER_SPAN1_BYTES,
+        )
+        self.assertLess(
+            arm.predicted_run_peak_gib(store),
+            REAP_GIB - host_ledger.resolve_margin().total_gib,
+        )
         self.assertTrue(
             any("unsampled unreadable" in ln for ln in lines if "ARM" in ln)
         )
