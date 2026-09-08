@@ -245,6 +245,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
     truncation_align_admission_error,
@@ -4753,10 +4754,22 @@ class Scheduler(
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
-        # Validate prompt length
+        # WEG2_SCHEDULING_SPEC_0907 C14/K9: THE ONE WRITER of kv_cap_tokens.
+        # Placed here, at intake beside the length validation, because the
+        # cap is a property of the request for its whole life -- it must
+        # survive the phase flip, and there is no separating event at which
+        # a side map could be rebuilt.  Default = the model context, so an
+        # unset flag reproduces the as-built ceiling exactly.
+        req.kv_cap_tokens = int(
+            self.server_args.max_kv_per_request or self.model_config.context_len
+        )
+        # Reader (a): the admission growth bound.  The cap is applied through
+        # the EXISTING validation rather than as a second length gate, so
+        # there is one refusal shape for "this prompt is longer than this
+        # server will hold", not two that can disagree.
         error_msg = validate_input_length(
             req,
-            self.max_req_input_len,
+            min(self.max_req_input_len, req.kv_cap_tokens),
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
@@ -4826,6 +4839,75 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
+    def _carrierless_pp_store_read_refused(self) -> bool:
+        """#1234 W38: is a store READ a rank-local geometry on this boot form?
+
+        THE ROOT OF THE weg2sc1 BOOT KILLER, and it is the third member of a
+        class this tree has already closed twice.  On a PP group WITHOUT the
+        #631 row carrier the followers plan rank-locally ('#631 ROW AUTHORITY
+        DISABLED': `pp_row_carrier_present` is False because the
+        `pp_flip_counters` side channel does not exist on the no-flip PP=3
+        form, which is exactly Weg 2's group P).  Every term that lets one
+        rank decide differently from another has therefore been DISARMED on
+        that form rather than compensated: PP0's #1066 prefetch wait (#973)
+        and PP0's #794 corridor width cut (#1233).  The storage READ is the
+        third, and the one that was left armed.
+
+        WHY IT IS A GEOMETRY AND NOT A CREDIT.  A completed prefetch inserts
+        its KV into THIS rank's radix tree, so from the next
+        `init_next_round_input` on it is indistinguishable from an ordinary
+        device match and it lengthens `prefix_indices` -- the very quantity
+        `ScheduleBatch.prepare_for_extend` sizes the cross-stage tensor from.
+        Storage completion is per-rank and per-pass (each rank's backend
+        finishes at its own speed); on the TP axis the existing MIN reduce
+        makes that uniform (`prefetch_ballot`, and the reduce
+        `weg2_uncached_extent` prices with), on the PP axis there is NOTHING,
+        and #631's wire was reverted twice on metal after deadlocks
+        (d7618425a4, #1015) -- a new PP collective on the admission path is a
+        recorded fatal, not an option.
+
+        MEASURED, boot weg2sc1 (2026-09-07): a W31-refused request was
+        re-queued to P; PP2's prefetch and MAMBA-HOST-RESUME had completed,
+        PP0's and PP1's had not, so PP2 admitted `(8747, 8748)` while its
+        peers admitted `(0, 4096)` -- '#1233 W27 PP WIDTH DIVERGENCE REFUSED:
+        received hidden_states with 4096 rows for a batch of 1 token', the
+        group STOP, on the re-admission path C12 had just created.
+
+        WHAT THIS COSTS, priced rather than waved past: group P forgoes L3
+        prefix reuse.  Its DEVICE tier is untouched and is fed by P's own
+        prefills, which every rank of the group runs identically, so
+        within-epoch prefix sharing is unaffected; what is lost is a hit that
+        would have had to come back from the store, and a re-queued request
+        is re-prefilled instead of read back.  WRITE-THROUGH IS UNTOUCHED --
+        P still publishes everything it prefills, which is what the flip
+        hands to D -- and D is TP-only (`pp_size == 1`), so this predicate is
+        False there and D's store read, the one Weg 2 actually depends on,
+        is unchanged.  The exemption lifts itself the moment a carrier
+        exists: it keys on the same `pp_row_carrier_present` fact as the
+        other two disarmed terms, so all three re-arm together (#1039's
+        lesson: two halves armed off different memos diverge).
+        """
+        ps = getattr(self, "ps", None)
+        if ps is None or int(getattr(ps, "pp_size", 1) or 1) <= 1:
+            return False
+        if pp_row_carrier_present(self):
+            return False
+        n = getattr(self, "_w38_carrierless_store_reads", 0) + 1
+        self._w38_carrierless_store_reads = n
+        if n == 1 or n % 512 == 0:
+            logger.warning(
+                "#1234 W38 Weg2CarrierlessPpStoreRead REFUSED (n=%d, every "
+                "store read this group would have issued): no #631 row "
+                "carrier on this PP form, so a prefetch completing on one "
+                "rank and not another lengthens that rank's prefix_indices "
+                "alone -- the W27 width divergence that killed boot weg2sc1 "
+                "on the C12 re-admission path. Device-tier prefix reuse and "
+                "the write-through are unaffected; the L3 READ returns with "
+                "the carrier.",
+                n,
+            )
+        return True
+
     def _prefetch_kvcache(self, req: Req) -> str:
         """Issue a storage prefetch for ``req``. Returns WHAT ACTUALLY HAPPENED.
 
@@ -4890,6 +4972,9 @@ class Scheduler(
         if not self.enable_hicache_storage:
             _note_prefetch_gate("storage_disabled")
             return "declined:storage_disabled"
+        if self._carrierless_pp_store_read_refused():
+            _note_prefetch_gate("carrierless_pp")
+            return "declined:carrierless_pp"
         req.init_next_round_input(self.tree_cache, cow_mamba=False)
         last_host_node = req.last_host_node
         # RANK-LOCAL: `backuped` means "full KV present in THIS rank's host
@@ -6722,28 +6807,16 @@ class Scheduler(
         #
         # Payload order, in full, after this block:
         #   [avail, (admission,) -avail, host, -host, mamba, -mamba,
-        #    corridor, head_match[0..TP_HEAD_SLOTS-1], admit_limit,
-        #    seam_premise,
+        #    corridor, admit_limit, seam_premise, phase_domain[..],
+        #    head_match[0..TP_HEAD_SLOTS-1],
         #    ballot_digest, -ballot_digest, ballot_v0..v{K-1}]
         #
-        # WHY THE LOCAL INPUTS ARE COMPUTED HERE. The sort key
-        # (`num_matched_prefix_tokens`) is normally populated inside
-        # `calc_priority`, which runs LATER in the pass -- so at reduce time
-        # it is either zero or last pass's value, and reducing that would
-        # agree on a stale number. The fix is the one #791b already used in
-        # this function for the prefetch verdicts: pull the RANK-LOCAL
-        # computation forward to here (no collective, and this site runs
-        # exactly once per TP-loop iteration) and memoise it for the batch
-        # formation to consume. Same move, same reason.
-        _head_canonical, _head_local_matches = self._local_head_prefix_matches()
-        # #823 W9b: the canonical head is no longer published as its own
-        # attribute -- it goes into the single verdict value below, together
-        # with the two numbers this reduce is about to produce, so the four
-        # halves of one decision cannot get out of step with each other.
-        _head_at = len(vals)
-        vals = vals + tp_head_congruence.build_head_order_payload(
-            _head_canonical, _head_local_matches
-        )
+        # FIX 2 (round 2): THE HEAD BLOCK MOVED DOWN, below the prefetch
+        # drain, and the block that used to sit here now sits under it.  It
+        # is still read by its own captured index and the ballot is still
+        # read from the TAIL, so the two readings this seam protects are
+        # unchanged; only the ORDER in which the local inputs are measured
+        # moved.  Why, in full, at the head block's new site.
         # The COUNT arm's vote. Its own slot rather than a derivation from
         # `avail` above, because `get_num_allocatable_reqs` is bounded by
         # `admission_limiter.current` (:6526-6529) -- rank-local floating
@@ -6835,6 +6908,53 @@ class Scheduler(
             )
         _ballot_verdicts = self._drain_prefetch_progress()
         self._pass_prefetch_verdicts = _ballot_verdicts
+        # WHY THE LOCAL INPUTS ARE COMPUTED HERE. The sort key
+        # (`num_matched_prefix_tokens`) is normally populated inside
+        # `calc_priority`, which runs LATER in the pass -- so at reduce time
+        # it is either zero or last pass's value, and reducing that would
+        # agree on a stale number. The fix is the one #791b already used in
+        # this function for the prefetch verdicts: pull the RANK-LOCAL
+        # computation forward to here (no collective, and this site runs
+        # exactly once per TP-loop iteration) and memoise it for the batch
+        # formation to consume. Same move, same reason.
+        #
+        # FIX 2 (round 2): AND IT IS MEASURED BELOW THE DRAIN, not above it.
+        # `_drain_prefetch_progress` is the call that publishes a completed
+        # store read into the host tier (`check_prefetch_progress` ->
+        # `_insert_helper_host`), and the pass on which a request first
+        # becomes eligible is exactly the pass its prefetch completes. Taken
+        # above the drain, this vote was a PRE-LOAD snapshot of a tree the
+        # gate then read POST-load: the group's match for the flip's own
+        # request was 0 while every rank's own match was the whole loaded
+        # prefix, and the X gate priced the difference as uncached work --
+        # the whole prompt, W31, re-route, P re-prefills a store-resident
+        # rid, flip, W31 again. #823's MIN is safe for the ORDER arm because
+        # a smaller match there means MORE WORK (tp_head_congruence.py:60-64);
+        # for a REFUSING consumer a smaller match means a REFUSAL, so the
+        # borrowed reduce's safety direction is inverted and the vote has to
+        # be a snapshot the gate can actually see. Nothing between the old
+        # site and this one takes a collective or reads the head vote, so the
+        # move is the whole of the fix on this side.
+        _head_canonical, _head_local_matches = self._local_head_prefix_matches()
+        # #823 W9b: the canonical head is no longer published as its own
+        # attribute -- it goes into the single verdict value below, together
+        # with the two numbers this reduce is about to produce, so the four
+        # halves of one decision cannot get out of step with each other.
+        _head_at = len(vals)
+        vals = vals + tp_head_congruence.build_head_order_payload(
+            _head_canonical, _head_local_matches
+        )
+        # FIX 7 (round 7): THE COMPLETION ARM, on the SAME canonical head and
+        # the SAME reduce. `_admission_held_for_deferred_prefetch`'s own
+        # docstring names this as the honest close of #1203 family A3 ("a
+        # group-uniform defer budget or a second per-rid ballot arm"); this is
+        # the second arm, and it is here rather than beside the ballot because
+        # the ballot is indexed by QUEUE ORDER while the X gate reads the
+        # canonical head. No new collective (MUST NOT 6).
+        _xpend_at = len(vals)
+        vals = vals + tp_head_congruence.build_x_pending_payload(
+            _head_canonical, self._weg2_local_store_read_pending_ages(_head_canonical)
+        )
         _ballot_rids = [
             req.rid
             for req in self.waiting_queue[: prefetch_ballot.PREFETCH_BALLOT_SLOTS]
@@ -6856,6 +6976,22 @@ class Scheduler(
         _head_match_lens = t[
             _head_at : _head_at + tp_head_congruence.TP_HEAD_SLOTS
         ].tolist()
+        # FIX 7: read back by its own captured head index, before the ballot,
+        # under exactly the discipline the corridor width and the head block
+        # are read under -- so a later change to the ballot layout cannot
+        # silently move it.
+        _xpend_lens = t[
+            _xpend_at : _xpend_at + tp_head_congruence.TP_HEAD_SLOTS
+        ].tolist()
+        if len(_xpend_lens) != tp_head_congruence.TP_HEAD_SLOTS:
+            raise RuntimeError(
+                "#1234 W37 X-COMPLETION LAYOUT STOP: the reduced payload carries "
+                f"no completion slice (head={_xpend_at}, "
+                f"expected={tp_head_congruence.TP_HEAD_SLOTS}, "
+                f"available={len(vals) - _xpend_at}). Pricing law 4 on a slice "
+                "of the wrong width would read another arm's numbers as store-read "
+                "ages, so the group stops here by name instead."
+            )
         _admit_limit = int(t[_limit_at])
         # #1203: read back by its captured head index, before the ballot, under
         # the same discipline as the corridor width and the head block.
@@ -6922,6 +7058,7 @@ class Scheduler(
             _head_match_lens,
             _admit_limit,
             self._uniform_prefetch_ballot is not None,
+            _xpend_lens,
         )
         self._uniform_min_avail = int(t[0].item())
         # >= 0: the local budget can only exceed the group minimum.
@@ -6984,9 +7121,42 @@ class Scheduler(
         Never raises: a rank that cannot price its head contributes nothing
         for those rids and the group's MIN treats them as absent, which
         delays them rather than splitting the group.
+
+        FIX 2 (round 2) -- A VOTE IS A MEASUREMENT OR AN ABSTENTION, NEVER A
+        DEFAULT, and this method used to publish a default on every pass of
+        every boot.  The measurement was gated on
+        ``tree.supports_fast_match_prefix()``; ``BasePrefixCache`` returns
+        ``False`` for it (base_prefix_cache.py:429) and NOTHING in this tree
+        overrides it -- two readers, zero writers, measured by grep -- so the
+        branch never ran, and what got published instead was
+        ``num_matched_prefix_tokens``, a field initialised to 0
+        (schedule_batch.py:1499) and written only by ``match_prefix_for_req``,
+        which under a cache-agnostic policy (D's FCFS) is never reached.  The
+        vote was therefore a constant 0 for every rid in the head.
+
+        Zero is not silence downstream: ``group_match_for`` returns ``None``
+        only at ``<= _ABSENT_MATCH`` (-1), so 0 arrives at the X gate as an
+        OPINION -- "some rank matched nothing" -- and C11's delta prices the
+        difference against the rank's own match as uncached work.  Measured
+        on the shipped code at 84148301c5: a 30,000-token prompt with 29,000
+        of it a store hit was priced at 30,000 and refused by W31, which is
+        the R-3 livelock (W31 -> re-route -> P re-prefills a store-resident
+        rid -> flip -> W31) with no request ever able to leave it.
+
+        So the capability guard goes.  It was borrowed from
+        ``calc_priority``, which walks the WHOLE waiting queue and therefore
+        has a real reason to ask whether a full match is cheap; this site is
+        bounded to the canonical head, which is the argument the paragraph
+        above already makes.  A rid this rank could not measure is contributed
+        as ABSENT (omitted, so ``build_head_order_payload`` rides
+        ``_ABSENT_MATCH``), never as 0 -- abstain-never-refuse, per rid rather
+        than per pass, so one unpriceable rid no longer voids the vote for
+        the rest of the head.
         """
         canonical: List[str] = []
         matches: Dict[str, int] = {}
+        by_rid: Dict[str, Req] = {}
+        tree = None
         try:
             # Local import: schedule_policy imports from this module's
             # package at load time, so binding this at module scope would
@@ -6996,20 +7166,33 @@ class Scheduler(
             by_rid = {req.rid: req for req in self.waiting_queue}
             canonical = tp_head_congruence.canonical_head_rids(list(by_rid.keys()))
             tree = getattr(self, "tree_cache", None)
-            can_match = tree is not None and tree.supports_fast_match_prefix()
-            for rid in canonical:
-                req = by_rid.get(rid)
-                if req is None:
-                    continue
-                if can_match:
-                    match_prefix_for_req(tree, req, include_req=True)
-                matches[rid] = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
         except Exception as exc:  # noqa: BLE001 - a vote may never break the reduce
             logger.warning(
                 "#823 head-congruence: could not price this rank's head (%s); "
                 "contributing an empty vote, which can only delay admissions",
                 exc,
             )
+            return canonical, matches
+        if tree is None or not hasattr(tree, "match_prefix"):
+            return canonical, matches
+        for rid in canonical:
+            req = by_rid.get(rid)
+            if req is None:
+                continue
+            try:
+                match_prefix_for_req(tree, req, include_req=True)
+            except Exception as exc:  # noqa: BLE001 - one rid may not void the head
+                self._head_vote_unpriced = getattr(self, "_head_vote_unpriced", 0) + 1
+                if self._head_vote_unpriced <= 5 or self._head_vote_unpriced % 64 == 0:
+                    logger.warning(
+                        "#823 head-congruence: could not price rid=%s (%s); "
+                        "contributed ABSENT, which delays it rather than "
+                        "publishing a 0 the X gate would read as an opinion "
+                        "(occurrence=%d)",
+                        str(rid)[:16], exc, self._head_vote_unpriced,
+                    )
+                continue
+            matches[rid] = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
         return canonical, matches
 
     def _tp_head_enforcer_gate(self) -> tp_head_congruence.GateVerdict:
@@ -7185,6 +7368,67 @@ class Scheduler(
         self._tp_head_count_degraded_this_pass = False
         return self.__dict__.pop("_uniform_head_inputs", None)
 
+    def _head_order_arrival_seqs(self) -> Optional[Dict[str, int]]:
+        """FIX 3 (round 3): the ORDER arm's key, or None to keep the old one.
+
+        LAW 2 OF WEG2_SCHEDULING_SPEC_0907 ("D admits OLDEST-first ... refills
+        a freed seat from the arrival order") IS BROKEN AT D BY #823's ORDER
+        ARM, and R-14's justification ("append order IS admission order,
+        because calc_priority does not sort under FCFS") missed this method:
+        it runs immediately AFTER `calc_priority` and rewrites the head
+        whatever the policy did.  Measured at the parent commit for arrival
+        order 1,2,3: `['weg2-1-2', 'weg2-1-3', 'weg2-1-1']`.
+
+        THE RULE, and it is general rather than Weg-2 special-casing: the
+        ORDER arm exists to replace the divergence born in
+        `_sort_by_longest_prefix` (schedule_policy.py:225-232, reachable only
+        under a CacheAwarePolicy).  Under a cache-AGNOSTIC policy that sort
+        never runs, so there is nothing to replace and a prefix-length
+        re-sort here is a reordering the policy never asked for.  The key is
+        then `kv_arrival_seq` -- assigned once per request in
+        `_add_request_to_queue` (:5247) off the same broadcast stream on every
+        rank, hence rank-uniform (phase_flip_runtime.py:9689), so #823's
+        uniformity requirement is met exactly as well as by the MIN-reduced
+        match.  What is given up is a cache-locality heuristic that this arm,
+        under this policy, was never asked to provide.
+
+        THE X FLAG FORCES IT TOO, whatever the policy: a group serving Weg 2's
+        law 2 may not have its admission order rewritten by a cache
+        heuristic, and `--tp-prefill-max-tokens` is that group's own marker
+        (it reaches argv_d and never argv_p).
+
+        None -- the pre-FIX-3 match-length key -- under a CacheAwarePolicy on
+        a non-Weg-2 boot, where the sort DID run and this arm is replacing it.
+        """
+        # DEFENSIVE, and for the same reason `_local_admit_limit` is: a KEY
+        # may never break the arm it feeds. Every read is a `getattr` and the
+        # whole derivation is caught, because `_apply_uniform_head_order`
+        # turns any exception below it into the #823 HEAD-ORDER APPLY STOP --
+        # a group STOP that would then name the wrong cause. No key means the
+        # pre-FIX-3 behaviour, which is a valid order, never a divergence.
+        try:
+            server_args = getattr(self, "server_args", None)
+            weg2 = int(getattr(server_args, "tp_prefill_max_tokens", 0) or 0) > 0
+            if not weg2:
+                policy = getattr(getattr(self, "policy", None), "policy", None)
+                if isinstance(policy, CacheAwarePolicy):
+                    return None
+            seqs: Dict[str, int] = {}
+            for req in getattr(self, "waiting_queue", ()) or ():
+                seq = getattr(req, "kv_arrival_seq", None)
+                if seq is not None:
+                    seqs[str(req.rid)] = int(seq)
+            # A VACUOUS KEY IS NOT A KEY. An empty mapping would order the
+            # whole head by rid string (every rid lands in the "no arrival
+            # rank" bucket), which is neither arrival order nor the match
+            # order -- a third order nobody asked for. `kv_arrival_seq` is
+            # assigned unconditionally in `_add_request_to_queue` (:5320) and
+            # survives a retraction, so an empty mapping means a queue of
+            # requests that never entered through it, i.e. a stand-in.
+            return seqs or None
+        except Exception:  # noqa: BLE001 - a key may never break the order arm
+            return None
+
     def _apply_uniform_head_order(
         self, head_inputs: Optional[tp_head_congruence.UniformHeadInputs]
     ) -> None:
@@ -7223,6 +7467,7 @@ class Scheduler(
                     {},
                     digest_agreed=head_inputs.digest_agreed,
                     enforcer_enabled=True,
+                    arrival_seqs=self._head_order_arrival_seqs(),
                 )
                 by_rid = {req.rid: req for req in self.waiting_queue}
                 head = [by_rid[rid] for rid in order if rid in by_rid]
@@ -8963,6 +9208,515 @@ class Scheduler(
         if granted <= 0 or granted > requested:
             return chunked_prefill_size
         return granted
+
+    def weg2_uncached_extent(self, req: Req, head_inputs=None) -> int:
+        """The request's REAL uncached prefill extent, in tokens (C11/R-31).
+
+        Three terms:
+
+        * ``full_untruncated_fill_ids`` -- the request's own token ids;
+        * ``prefix_indices`` -- the device match on this rank's radix tree;
+        * ``host_hit_length`` -- the host-tier match on the same tree, whose
+          prefetch completion crosses the existing MIN reduce.
+
+        Deliberately NOT here: ``available_size()``, free slot counts,
+        ``time.monotonic()`` or any other rank-local quantity.
+
+        FIX 3 (round 1) -- THAT EXCLUSION IS NOT THE UNIFORMITY ARGUMENT,
+        and the previous revision of this docstring claimed it was.  The
+        grep it invited proves that no rank-local IDENTIFIER appears in the
+        expression; the claim it was offered for is about the PROVENANCE of
+        the values that flow in.  ``len(req.prefix_indices)`` is a match
+        against THIS rank's radix tree, and under D's uneven DCP the ranks'
+        pools differ in size, so their evictions -- and therefore their
+        trees -- can differ.  Nothing prevented a split and nothing detected
+        one, on a verdict that then REPLACED this rank's ``waiting_queue``:
+        ranks-never-disagree, silently and permanently, because
+        ``send_to_tokenizer`` is a ``SenderWrapper(None)`` off rank 0
+        (ipc_channels.py:71) and a refusal firing on rank 1 or 2 alone drops
+        the request there with no client-visible signal at all.
+
+        So the extent is now priced with the GROUP's match where the group
+        has one.  ``head_inputs`` carries #823's MIN-reduced per-rid match
+        lengths (``num_matched_prefix_tokens`` = device + host match), taken
+        from the packed reduce that ``_update_uniform_pool_budget`` already
+        runs pre-branch on this same pass -- no new collective (MUST NOT 6),
+        the third consumer of an existing one, exactly as the ORDER and
+        COUNT arms are.
+
+        The correction is applied as a DELTA rather than as a replacement:
+        when the two agree this function is byte-identical to what it was,
+        and in general it computes
+        ``len(full_untruncated_fill_ids) - min(local_match, group_match)`` --
+        a difference of two REPLICATED quantities, which is what makes the
+        verdict a group verdict at all.
+
+        FIX 3 (round 3) -- THE DELTA WAS NOT A GROUP VERDICT AND THE MIN
+        WAS THE PROOF.  ``uncached + max(0, local_match - group_match)``
+        equals ``len(fill_ids) - min(local_match, group_match)``, and ``min``
+        SELECTS THE RANK-LOCAL VALUE whenever ``local <= group`` -- which is
+        the ordinary case, since the group value is a MIN over the ranks.
+        MUST NOT 7 ("no rank-local decision ... a detected disagreement is a
+        group STOP") and C11's own CHECK ("a grep proving no rank-local
+        quantity enters the compared term") were therefore not met, and the
+        residual was reachable: ``local_match`` is re-derived at the gate by
+        ``init_next_round_input``, and its HOST half is mutated between the
+        vote and the gate by the HiCache controller THREADS
+        (``check_prefetch_progress`` -> ``_insert_helper_host``, write-back,
+        eviction), which the scheduler thread does not own.  A host entry
+        lost on one rank between the two reads shrinks that rank's local
+        below the group MIN; the refusal then deletes the request from THAT
+        rank's waiting_queue only, and ``send_to_tokenizer`` is a
+        ``SenderWrapper(None)`` off rank 0 -- silent and permanent, the
+        exact failure this method exists to prevent.  Measured on the parent
+        commit: one rid, one group value, host halves 19,000 and 29,000 ->
+        extents 10,000 and 5,000, i.e. with X=8,000 one rank raises W31 and
+        the other admits.
+
+        SO THE PRICE IS THE GROUP'S ALONE: ``len(full_untruncated_fill_ids)
+        - group_match``.  Both terms are replicated -- the request's own
+        token ids and #823's MIN-reduced match -- so every rank computes the
+        SAME number from the SAME inputs and the verdict is total.  The
+        direction it can be wrong in is the safe one: a group value above
+        this rank's local UNDER-states the extent, i.e. ADMITS, which is the
+        delay-never-force side a REFUSING consumer needs (a group value
+        below it over-states and refuses, but it refuses on EVERY rank, and
+        a request refused by name is re-queued to P by C12 -- served, once,
+        never dropped).
+
+        TWO OBSERVERS RIDE ALONG, and only one of them stops the group.
+        ``group_match > len(fill_ids)`` is a genuine CROSS-RANK split -- the
+        group priced a longer prefix than this rid's own replicated token
+        ids, which can only mean the ranks reduced over different requests
+        under one rid -- and it is a named STOP (MUST NOT 7,
+        raenge-nie-uneins).  ``local_match < group_match`` is NOT a split:
+        the verdict no longer reads ``local_match`` at all, so no rank can
+        decide differently because of it; it is a READING of how stale the
+        same-pass reduce is against this rank's own tree, counted and
+        throttled with its denominator, and deliberately not a boot killer
+        (a host eviction by a controller thread between the vote and the
+        gate is an ordinary event under pressure).
+
+        FIX 2 (round 2) -- THE SAFETY CLAIM THIS DOCSTRING USED TO MAKE WAS
+        ONE-SIDED, AND THE OTHER SIDE WAS THE LIVE ONE.  It said a stale
+        group value "can only ever produce the SMALLER extent"; that covers
+        only the direction ``group > local``.  In the direction
+        ``group < local`` the same staleness produces the LARGER extent, and
+        for a REFUSING consumer larger means a refusal manufactured out of a
+        stale reduce -- the exact inversion of #823's own safety argument,
+        where a smaller match means only that a rank re-computes a prefix it
+        already had (tp_head_congruence.py:60-64: "slower, never wrong").
+        Two producers made that direction the live one, and both are fixed
+        rather than documented: the vote was a constant 0 rather than a
+        measurement (``_local_head_prefix_matches``), and it was taken ABOVE
+        the prefetch drain that publishes the store span the gate then reads
+        (`_update_uniform_pool_budget`).  What is left is a bounded
+        same-pass drift -- the adder re-matches a few hundred lines below the
+        reduce -- and in that window ``min`` takes the vote's slightly older
+        snapshot, which is conservative rather than arbitrary.  It is not a
+        total property and this docstring no longer claims one.
+        """
+        fill_ids = req.full_untruncated_fill_ids
+        total = len(fill_ids)
+        host_hit = int(getattr(req, "host_hit_length", 0) or 0)
+        group_match = tp_head_congruence.group_match_for(
+            head_inputs, str(getattr(req, "rid", "") or "")
+        )
+        if group_match is None:
+            # No group opinion: the caller ABSTAINS above this line, so this
+            # value never reaches a verdict on a multi-rank boot. Solo boots
+            # (tp_size == 1) price locally, which is replicated by
+            # construction there.
+            return max(0, (total - len(req.prefix_indices)) - host_hit)
+        gm = int(group_match)
+        if gm > total:
+            raise RuntimeError(
+                f"#1234 W37 X-TERM SPLIT STOP rid={getattr(req, 'rid', '?')}: the "
+                f"group published a prefix match of {gm} tokens for a request "
+                f"whose own token ids are {total} long. Both quantities are "
+                "supposed to be replicated, so the ranks reduced over different "
+                "requests under one rid -- a batch-formation split, not a "
+                "pricing question. The group stops here by name (MUST NOT 7) "
+                "instead of refusing or admitting on a term it cannot trust."
+            )
+        local_match = len(req.prefix_indices) + host_hit
+        if local_match < gm:
+            # A READING, never a verdict: see the docstring. Counted with its
+            # denominator so an absence of lines is readable as an absence of
+            # drift rather than as a silent emitter.
+            self._weg2_x_term_drift = getattr(self, "_weg2_x_term_drift", 0) + 1
+            self._weg2_x_term_priced = getattr(self, "_weg2_x_term_priced", 0)
+            n = self._weg2_x_term_drift
+            if n <= 5 or n % 64 == 0:
+                logger.info(
+                    "WEG2 X-TERM-DRIFT rid=%s local=%d group=%d priced=%d "
+                    "drifted=%d (this rank's own tree fell BELOW the group MIN "
+                    "it voted; the verdict is priced on the group term alone "
+                    "and is therefore unaffected -- no rank-local quantity "
+                    "enters it)",
+                    str(getattr(req, "rid", "?"))[:16], local_match, gm,
+                    self._weg2_x_term_priced, n,
+                )
+        self._weg2_x_term_priced = getattr(self, "_weg2_x_term_priced", 0) + 1
+        return max(0, total - gm)
+
+    def _weg2_host_carry_tokens(self) -> int:
+        """Longest prefix the store can hand back to THIS group, in tokens.
+
+        The host staging pool's own size, which `sync_fixed_hicache_size`
+        has already reduced to the group minimum, so this is replicated. 0
+        when there is no host tier, which disables the exemption rather than
+        widening it.
+        """
+        ctrl = getattr(self.tree_cache, "cache_controller", None)
+        pool = getattr(ctrl, "mem_pool_host", None) if ctrl is not None else None
+        return int(getattr(pool, "size", 0) or 0)
+
+    def _weg2_store_read_is_pending(self, req) -> bool:
+        """Does THIS rank expect a store read for ``req`` that has not landed?
+
+        Narrower than ``check_prefetch_progress``, and the difference IS the
+        FIX-7 defect.  That method answers True at its first line for a rid
+        that is not in ``ongoing_prefetch`` (hiradix_cache.py:1914) -- so
+        "nothing was ever registered", "the record was just reaped" and "the
+        read completed and landed" are ONE answer, and the X gate read all
+        three as *landed*.  Two of them are not.
+
+        The two states this returns True on, and nothing else:
+
+        * an ``ongoing_prefetch`` record exists -- the read is in flight;
+        * the #1068 (A12.2) ``prefetch_deferred`` mark stands -- the read was
+          rate-limited out of registration and ``_retry_deferred_prefetches``
+          will re-issue it at the top of a coming pass.
+
+        A read that terminated having loaded nothing (``#915 PREFETCH
+        REFUSED``, an undeferrable span) is in NEITHER state, so it prices
+        immediately and W31 fires honestly.  That is the point: the defer is
+        for reads that are still coming, never for reads that are not.
+
+        RANK-LOCAL BY CONSTRUCTION, and never consumed as such -- the caller
+        reads the MIN-reduced group value.  Both terms are per-rank: the
+        record set is this rank's, and the mark is timed off this rank's
+        clock and set from this rank's prefetch budget
+        (``_admission_held_for_deferred_prefetch`` states that, and states
+        that its own hold is therefore inert in the TP phase, which is group
+        D).  A vote is exactly what a rank-local reading is allowed to be.
+        """
+        rid = str(getattr(req, "rid", "") or "")
+        if not rid:
+            return False
+        if getattr(req, "prefetch_deferred", None) is not None:
+            return True
+        ongoing = getattr(getattr(self, "tree_cache", None), "ongoing_prefetch", None)
+        try:
+            return bool(ongoing) and rid in ongoing
+        except TypeError:
+            return False
+
+    def _weg2_local_store_read_pending_ages(self, canonical) -> Dict[str, int]:
+        """This rank's pending-age vote for the canonical head, in ms.
+
+        The stamp is taken the first pass a rid is seen pending and dropped
+        the pass it stops being pending, so the age measures THE WAIT and not
+        the request's life.  LIFECYCLE TABLE for ``_weg2_x_defer_since``
+        (the rule for every new state field):
+
+          WRITER   this method, one entry per canonical rid observed pending.
+          READER   this method only, on the next pass (the age is emitted
+                   into the payload; nothing else reads the dict).
+          DELETER  this method, in the same call: a rid that is no longer
+                   pending, or no longer in the canonical head, is dropped.
+                   The canonical head is derived from the waiting queue, so a
+                   request that leaves the queue takes its stamp with it and
+                   the dict cannot outgrow the head.
+
+        Separating event: none -- writer, reader and deleter are one call per
+        pass, which is why no cutover can delete a stamp its consumer still
+        needs.
+
+        A VOTE MAY NEVER BREAK THE REDUCE, and this one sits on the
+        collective path on every rank -- the same guard and the same reason
+        as ``_local_head_prefix_matches``: an exception here would leave one
+        rank out of an ``all_reduce`` its peers are already in, which is the
+        #580 split this arm exists to prevent, arriving through the door
+        marked "safety".  An empty vote is neutral (:data:`NOT_PENDING_MS`
+        everywhere), so the failure mode is "nobody defers", never "the
+        ranks disagree".
+        """
+        stamps = getattr(self, "_weg2_x_defer_since", None)
+        if stamps is None:
+            stamps = {}
+            self._weg2_x_defer_since = stamps
+        ages: Dict[str, int] = {}
+        try:
+            now = time.monotonic()
+            by_rid = {req.rid: req for req in self.waiting_queue}
+            alive = set()
+            for rid in canonical:
+                req = by_rid.get(rid)
+                if req is None or not self._weg2_store_read_is_pending(req):
+                    continue
+                alive.add(rid)
+                if rid not in stamps:
+                    stamps[rid] = now
+                ages[rid] = max(0, int((now - stamps[rid]) * 1000.0))
+            for rid in [r for r in stamps if r not in alive]:
+                stamps.pop(rid, None)
+        except Exception as exc:  # noqa: BLE001 - a vote may never break the reduce
+            n = getattr(self, "_weg2_x_pending_unvoted", 0) + 1
+            self._weg2_x_pending_unvoted = n
+            if n <= 5 or n % 64 == 0:
+                logger.warning(
+                    "FIX 7 completion arm: could not price this rank's pending "
+                    "head (%s); contributing an empty vote, which can only make "
+                    "the gate price as it did before this arm (occurrence=%d)",
+                    exc, n,
+                )
+            return {}
+        return ages
+
+    def _weg2_local_store_read_pending_ms(self, req) -> Optional[int]:
+        """This rank's OWN wait for ``req``'s store read in ms, or ``None``.
+
+        Read-only on purpose, and that is not a style point: the payload
+        builder above both stamps and REAPS, so calling it for a single rid
+        would drop every other rid's stamp and reset the group's clock on
+        each pass. One writer, one reader, and the reader may not be the
+        writer under another name.
+
+        ``0`` (not ``None``) for a rid that is pending but unstamped: it
+        became pending after this pass's vote, and a zero age is the truthful
+        reading of a wait that has just started.
+        """
+        if not self._weg2_store_read_is_pending(req):
+            return None
+        stamps = getattr(self, "_weg2_x_defer_since", None) or {}
+        t0 = stamps.get(str(getattr(req, "rid", "") or ""))
+        if t0 is None:
+            return 0
+        return max(0, int((time.monotonic() - t0) * 1000.0))
+
+    def _weg2_x_store_read_bound_s(self, req) -> float:
+        """The length-priced store-read timeout for ``req``, or 0.0.
+
+        DERIVED, NOT PICKED.  It is ``_deferred_prefetch_bound_s`` -- the
+        tree's own ``prefetch_timeout_base + pages * prefetch_timeout_per_page``
+        -- which is the price the #1068 deferral machinery already puts on
+        "how long may this span's store read take".  Two consumers, one
+        derivation: a defer that outlived the deferral's own bound is a read
+        that is not coming back, and there is no second number to keep in
+        step.
+
+        0.0 on a tree that cannot price it (``_deferred_prefetch_bound_s``
+        reads all three terms WITHOUT defaults, by design), which the caller
+        turns into "price it now".  A missing bound must never mean an
+        unbounded wait -- that is the wedge this defer exists to avoid,
+        wearing the other costume.
+        """
+        span = len(getattr(req, "full_untruncated_fill_ids", None) or
+                   getattr(req, "origin_input_ids", None) or ())
+        try:
+            return max(0.0, float(self._deferred_prefetch_bound_s(span)))
+        except Exception:  # noqa: BLE001 - an unpriceable bound is not a wait
+            return 0.0
+
+    def _weg2_x_defers(self, req: Req, head_inputs=None) -> bool:
+        """LAW 4's COMPLETION PREDICATE: must the X gate WAIT to price this?
+
+        WHAT BOOT weg2sc3 MEASURED (2026-09-08).  The seat gate FIX 4/5 built
+        holds the head of D's arrival queue until D *has room* to issue the
+        store read -- ``available >= need``, ``occupied < limit``,
+        ``held_passes`` up to 200.  It does exactly that, on D's own #915
+        terms (``WEG2 D-SEAT-WAIT ... occupied=23282``).  And W31 still fired
+        25 times on servable 8.6-11.2k prompts, W35 10 times, because HAVING
+        ROOM TO ISSUE A READ IS NOT THE READ HAVING COMPLETED.  The refused
+        requests were priced at their whole extent (``X-GATE uncached=8866
+        X=8192 verdict=W31``); the six that got through, same prompts and
+        same route, priced at ``uncached = 2``.  The only difference was
+        whether the read had LANDED when the gate ran.  A capacity condition
+        stood where a completion condition was required.
+
+        So: TRUE to leave ``req`` in the queue for this pass (the caller
+        ``continue``s, nothing is deleted, nothing is answered), FALSE to let
+        the pricing gate below have it.
+
+        THE FACT IS THE GROUP'S OR IT IS NOT TAKEN -- the same rule
+        :meth:`_weg2_x_refuses` states for the extent, for the same reason:
+        the decision downstream DELETES the request from this rank's
+        ``waiting_queue``, so a rank-local term makes the deletion
+        rank-local, and that is permanent.  The value read here is the
+        MIN-reduced pending arm of the packed reduce
+        (``build_x_pending_payload``); this rank's own timer is a VOTE into
+        that reduce and never an input to this verdict.  No group opinion
+        (single rank, no vote taken, rid outside the canonical head) is
+        ``X_PRICE``: abstain-never-defer, which restores exactly the
+        behaviour that existed before this arm.
+
+        BOUNDED, so a read that never lands cannot wedge the request: past
+        :meth:`_weg2_x_store_read_bound_s` the verdict is
+        ``X_BOUND_EXPIRED``, the request IS priced, and W31 may fire --
+        honestly this time, on an extent nothing further was going to
+        improve.  Both outcomes speak a line with the same denominators, so
+        an absence of defers reads as an absence of pending reads rather than
+        as a silenced emitter.
+        """
+        pending_ms = tp_head_congruence.group_store_read_pending_ms(
+            head_inputs, str(getattr(req, "rid", "") or "")
+        )
+        if pending_ms is None:
+            return False
+        # W37: MIN can only ever be <= this rank's own vote. A group age ABOVE
+        # it means the ranks reduced over different slots under one rid -- a
+        # head-mapping split, not a completion question -- and the group stops
+        # by name rather than deferring or pricing on a term it cannot trust.
+        # Same detector shape and same W number as the X-TERM split above.
+        local_ms = self._weg2_local_store_read_pending_ms(req)
+        if local_ms is not None and pending_ms > local_ms + 1:
+            raise RuntimeError(
+                f"#1234 W37 X-COMPLETION SPLIT STOP rid={getattr(req, 'rid', '?')}: "
+                f"the group published a store-read age of {pending_ms} ms for a "
+                f"request this rank has been waiting {local_ms} ms for. The arm is "
+                "MIN-reduced, so the group's value can never exceed a voting "
+                "rank's own -- the ranks indexed the canonical head differently. "
+                "The group stops here by name (MUST NOT 7) instead of deferring "
+                "or pricing on a term it cannot trust."
+            )
+        bound_s = self._weg2_x_store_read_bound_s(req)
+        verdict = tp_head_congruence.x_completion_verdict(pending_ms, bound_s)
+        n = getattr(self, "_weg2_x_defer_passes", 0) + 1
+        self._weg2_x_defer_passes = n
+        if verdict == tp_head_congruence.X_DEFER:
+            if n <= 5 or n % 200 == 0:
+                logger.info(
+                    "WEG2 X-DEFER rid=%s reason=prefetch_pending age_s=%.2f "
+                    "bound_s=%.2f replicated_term=group verdict=defer "
+                    "held_passes=%d (the store read for this request is still in "
+                    "flight on at least one rank; pricing it now is the "
+                    "uncached=whole-prompt W31 of boot weg2sc3. Denominator: "
+                    "every pass in which any request was found pending)",
+                    str(getattr(req, "rid", "?"))[:16], pending_ms / 1000.0,
+                    bound_s, n,
+                )
+            return True
+        logger.info(
+            "WEG2 X-DEFER rid=%s reason=prefetch_pending age_s=%.2f bound_s=%.2f "
+            "replicated_term=group verdict=bound_expired held_passes=%d (the "
+            "group's youngest store-read timer outlived the span's own "
+            "length-priced bound, so the request is priced as it stands and W31 "
+            "may fire honestly)",
+            str(getattr(req, "rid", "?"))[:16], pending_ms / 1000.0, bound_s, n,
+        )
+        return False
+
+    def _weg2_x_refuses(self, req: Req, head_inputs=None) -> bool:
+        """W31 verdict for one request, with L9 printed on both outcomes.
+
+        FIX 3 (round 1): THE VERDICT IS THE GROUP'S OR IT IS NOT TAKEN.
+        Below `tp_size > 1` the group must have published a match for this
+        rid on this pass; when it has not -- no verdict published, the rid
+        outside the canonical head, or some rank not holding it at all --
+        this method ABSTAINS.  Abstaining admits, which is the pre-C11
+        behaviour and is uniform across the ranks by construction (every
+        one of those three conditions is itself a group property: the
+        publication is unconditional and pre-branch, the head is derived
+        from the rid SET alone, and an absent rid MIN-reduces to absent on
+        every rank).  Refusing on a rank-local number would not: it is
+        exactly the split this whole method now exists to prevent, and it is
+        permanent, because the refusal deletes the request from THIS rank's
+        waiting_queue.
+        """
+        x = int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0)
+        if x <= 0:
+            return False
+        tp_size = int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1)
+        group_match = tp_head_congruence.group_match_for(
+            head_inputs, str(getattr(req, "rid", "") or "")
+        )
+        if tp_size > 1 and group_match is None:
+            self._weg2_x_abstained = getattr(self, "_weg2_x_abstained", 0) + 1
+            if self._weg2_x_abstained <= 5 or self._weg2_x_abstained % 64 == 0:
+                logger.info(
+                    "WEG2 X-GATE rid=%s uncached=? X=%d replicated_term=False "
+                    "verdict=abstain_no_group_match occurrence=%d",
+                    str(getattr(req, "rid", "?"))[:16], x, self._weg2_x_abstained,
+                )
+            return False
+        uncached = self.weg2_uncached_extent(req, head_inputs)
+        # R-3 / MUST NOT 2/3: THE CARRIER-EXCEEDS EXEMPTION, derived here
+        # rather than carried on the request.
+        #
+        # A prompt whose uncached extent exceeds this group's host staging
+        # pool cannot be read back from the store no matter WHO prefills it
+        # -- that is the measured #974 wall (84,027 tokens against a
+        # 30,518-token host pool -> `#915 PREFETCH REFUSED`,
+        # cached_tokens=0). Refusing such a request here does not move it to
+        # a group that can serve it; it bounces it around the wall:
+        # CARRIER-EXCEEDS -> W31 -> re-route -> flip -> store read refused
+        # -> whole prompt uncached -> W31 again. So it is EXEMPT, and the
+        # exemption dies in the same commit as the wall, when the carrier
+        # build gives this group an unbounded windowed store read.
+        #
+        # Derived from the host pool's own size, which
+        # `sync_fixed_hicache_size` already reduces to the group minimum, so
+        # the exemption is as replicated as the verdict it exempts from --
+        # and no marker has to survive an HTTP hop to get here.
+        # L9's `replicated_term` is now a READING, not an assertion: `group`
+        # means the extent carried #823's MIN-reduced match for this rid,
+        # `solo` means tp_size == 1 and there is nothing to reduce.  The
+        # third value, abstain, is printed above and takes no verdict.
+        term = "group" if group_match is not None else "solo"
+        carry = self._weg2_host_carry_tokens()
+        if carry > 0 and uncached > carry:
+            self._weg2_x_exempt = getattr(self, "_weg2_x_exempt", 0) + 1
+            if self._weg2_x_exempt <= 5 or self._weg2_x_exempt % 64 == 0:
+                logger.info(
+                    "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s "
+                    "verdict=exempt_carrier_exceeds host_carry=%d occurrence=%d",
+                    str(getattr(req, "rid", "?"))[:16], uncached, x, term, carry,
+                    self._weg2_x_exempt,
+                )
+            return False
+        verdict = "W31" if uncached > x else "admit"
+        logger.info(
+            "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
+            str(getattr(req, "rid", "?"))[:16], uncached, x, term, verdict,
+        )
+        return verdict == "W31"
+
+    def _weg2_answer_x_refusals(self, refused: List[Req], head_inputs=None) -> None:
+        """Remove the W31-refused requests and answer them BY NAME (C11).
+
+        Not a silent skip: a request left in the queue would be re-offered
+        every pass and never served, which is a livelock wearing the costume
+        of a policy. The named 503 is what lets the caller re-route it
+        through the prefill group exactly once (its own W35 bounds that).
+        """
+        x = int(getattr(self.server_args, "tp_prefill_max_tokens", 0) or 0)
+        refused_ids = {id(r) for r in refused}
+        self.waiting_queue = [q for q in self.waiting_queue if id(q) not in refused_ids]
+        for req in refused:
+            uncached = self.weg2_uncached_extent(req, head_inputs)
+            message = (
+                f"W31 Weg2TpPrefillExceeded: this group may prefill at most {x} uncached "
+                f"tokens itself (--tp-prefill-max-tokens); this request's extent after "
+                f"prefix matching is {uncached}. Refused by name so the caller re-routes it "
+                f"through the prefill group -- never prefilled here silently."
+            )
+            logger.warning("W31 Weg2TpPrefillExceeded rid=%s uncached=%d X=%d", req.rid, uncached, x)
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            elif self.enable_hierarchical_cache:
+                self.tree_cache.terminate_prefetch(req.rid)
+            abort_req = AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "message": message,
+                },
+                rid=req.rid,
+            )
+            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
@@ -10719,6 +11473,11 @@ class Scheduler(
         )
 
         transport_only = bool(getattr(self, SEAM_TRANSPORT_ROUND_ATTR, False))
+        # C11: requests this pass refused by name (W31). Collected rather
+        # than aborted in place because the loop iterates `waiting_queue`
+        # itself; they are removed and answered after the loop, where
+        # mutating the list is safe. Empty on every boot with the flag off.
+        _x_refused: List[Req] = []
 
         # #968 NAME WHAT THE FOLLOWER IS ALREADY HOLDING. A rank that parked a
         # chunked continuation after a #797 void has it in `self.chunked_req`
@@ -11079,6 +11838,55 @@ class Scheduler(
                     req.storage_hit_length = int(loaded_tokens)
 
             req.init_next_round_input(self.tree_cache)
+
+            # WEG2_SCHEDULING_SPEC_0907 C11/W31 -- LAW 4, ENFORCED WHERE THE
+            # UNCACHED EXTENT IS REAL.
+            #
+            # The front prices a prompt with len(text)/3.0 minus an LRU
+            # prefix guess and never re-checks, so its verdict is an
+            # ESTIMATE by construction. Measured (weg2zr2 front log line
+            # 186, rid weg2-4-8): `prompt_tokens=19401 cached_tokens=0
+            # uncached=19401 verdict=short_mispriced` -- 19,401 uncached
+            # tokens served through a 4,096-token grant, because the only
+            # gate was the estimate.
+            #
+            # THIS is the point at which the extent exists: after
+            # `match_prefix` (the line above), where the device prefix and
+            # the host hit are both known. A bound applied beside
+            # `validate_input_length` at intake would see only the prompt --
+            # the same mis-pricing in a different place.
+            #
+            # RANK-UNIFORM WITHOUT A NEW COLLECTIVE (MUST NOT 6): every term
+            # is replicated -- the request's own token ids, the device match
+            # on the replicated radix tree, and the host hit whose prefetch
+            # completion already crosses the existing MIN reduce
+            # (unified_radix_cache `check_prefetch_progress`). No
+            # rank-local quantity (`available_size()`, free slots, a clock)
+            # enters it, which is what makes the verdict a group verdict.
+            #
+            # SUBTRACTING THE HOST HIT IS LOAD-BEARING, not a refinement:
+            # the request the flip hands to D has its whole prefix in the
+            # store, so its real uncached extent is small. Comparing X
+            # against the raw prompt instead would refuse exactly the
+            # requests the flip exists to serve, and the re-route would put
+            # them back in front of the same gate for ever.
+            # FIX 7 (round 7): THE COMPLETION PREDICATE, AND IT SITS DIRECTLY
+            # ON TOP OF THE PRICING ONE. Boot weg2sc3: W31 = 25 on servable
+            # prompts, every one of them priced at its FULL extent while six
+            # identical requests that got through priced at `uncached = 2`.
+            # The difference was never the prompt and never the bound -- it
+            # was whether D's store read had LANDED when the gate ran. A
+            # request whose read is still in flight is left in the queue here
+            # (no deletion, no answer, no seat given up), bounded by the span's
+            # own length-priced store-read timeout so a read that never lands
+            # is priced rather than waited on for ever.
+            if self._weg2_x_defers(req, _head_inputs):
+                _note_skip("weg2_x_defer", req.rid)
+                continue
+            if self._weg2_x_refuses(req, _head_inputs):
+                _note_skip("weg2_x_refused", req.rid)
+                _x_refused.append(req)
+                continue
 
             # #791 PP ADMISSION UNIFORMITY. Every PP stage independently
             # re-derives its own admission verdict from its own local radix
@@ -11508,6 +12316,21 @@ class Scheduler(
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+
+        # C11: answer the requests this pass refused by name. AFTER the loop,
+        # because the loop iterates `waiting_queue` in place.
+        #
+        # FIX 3 (round 1): "the verdict is replicated" used to be an
+        # assertion about one expression's identifiers; it is now a property
+        # of the verdict's INPUTS -- the gate prices the extent with #823's
+        # MIN-reduced group match and abstains below `tp_size > 1` when the
+        # group published none. The queue mutation below is therefore the
+        # same on every rank, which is what makes it safe to make at all:
+        # the send is a no-op off rank 0 (`SenderWrapper(None)`,
+        # ipc_channels.py:71), so a rank-local refusal would drop the
+        # request from that rank's queue with no client-visible signal.
+        if _x_refused:
+            self._weg2_answer_x_refusals(_x_refused, _head_inputs)
 
         # #1153: what this loop REACHED, recorded before any of the three
         # refusal raises below so the group-STOP line can name it (and once
@@ -13960,6 +14783,15 @@ class Scheduler(
         # reporting exactly what it reported before.
         ret["effective_max_running_requests_per_dp"] = self.admission_limiter.current
         ret["admission_limiter"] = self.admission_limiter.snapshot()
+
+        # FIX 4 (round 4), boot weg2sc1: the host-pool terms the #915 prefetch
+        # gate applies, published on the endpoint an out-of-process scheduler
+        # (the Weg-2 front's D-admission gate) already polls. A READING, not a
+        # verdict -- see `prefetch_residency` for what each term binds and why
+        # the reader must treat it as an estimate that D enforces for real.
+        from sglang.srt.mem_cache.prefetch_budget import prefetch_residency
+
+        ret["hicache_prefetch"] = prefetch_residency(self.tree_cache)
 
         if (
             not self.spec_algorithm.is_none()

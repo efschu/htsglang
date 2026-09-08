@@ -1301,6 +1301,14 @@ class Req(ReqDllmMixin):
         # lives in the pinned host pool; None on the default path).
         self.kv_arrival_seq: Optional[int] = None
         self.kv_spill_state: Optional[str] = None
+        # WEG2_SCHEDULING_SPEC_0907 C14/K9: this request's own KV ceiling in
+        # tokens (--max-kv-per-request, default = context_length).  ONE
+        # non-None writer, at intake beside validate_input_length; readers
+        # are the admission growth bound and (slice C) the pressure
+        # reservation term.  It lives on the Req rather than in a side map
+        # because it must survive the phase flip, which has no separating
+        # event for it.
+        self.kv_cap_tokens: Optional[int] = None
         # S1b partial spill: number of device-resident head tokens [0, boundary);
         # the tail [boundary, seq) lives on host (0 == not partially spilled).
         self.kv_spill_boundary: int = 0

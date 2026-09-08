@@ -12,7 +12,6 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.srt.weg2.front import (
-    CHUNK_TOKENS,
     Front,
     Pending,
     usage_of,
@@ -50,8 +49,15 @@ def test_stream_tail_without_usage_is_unpriced_not_zero_zero():
     assert usage_of_stream_tail(tail) == (0, 0, 0, False)
 
 
+#: #1233 shipped X: one prefill chunk. Since #1234 slice A it is the
+#: --tp-prefill-max-tokens flag; these cases pin it to the shipped value so
+#: they keep testing the same arithmetic.
+ONE_CHUNK = 4096
+
+
 def _front() -> Front:
-    return Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, carrier_max_tokens=27466)
+    return Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, carrier_max_tokens=27466,
+                 tp_prefill_max_tokens=ONE_CHUNK)
 
 
 def test_short_route_never_yields_w16_even_when_mispriced():
@@ -82,7 +88,7 @@ def test_batch_stream_over_the_bound_is_counted_under_w16_by_name():
 def test_batch_leg2_within_one_chunk_serves():
     f = _front()
     p = Pending("r", "/v1/chat/completions", {}, "x", 0.0, None)
-    assert f._leg2_verdict(13225, 13225 - CHUNK_TOKENS, True, p, False, False, "r") == "serve"
+    assert f._leg2_verdict(13225, 13225 - ONE_CHUNK, True, p, False, False, "r") == "serve"
 
 
 # ------------------------------------------------ END-OF-PREFILL ANCHOR split

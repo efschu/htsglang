@@ -44,6 +44,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -200,6 +201,149 @@ D_WINDOWS_MIB = 16 + 32 + 24
 P_WINDOWS_MIB = 24 + 96
 MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
 VENV_DEFAULT = "/spinning/htsglang-gpu/.venv"
+#: The model context both groups are launched with.  Named once because K9's
+#: --max-kv-per-request default IS this number (the as-built cap, decoupled
+#: from the model context so it can be lowered without touching the context).
+CONTEXT_LENGTH_TOKENS = 262144
+#: D's prefill chunk width.  Named once because it is X's FLOOR (K5): a bound
+#: below one chunk would refuse work D must be able to do to make progress.
+CHUNKED_PREFILL_TOKENS = 4096
+#: WEG2_SCHEDULING_SPEC_0907 C10/K5 -- the RECORDED break-even inputs, used
+#: only when this rig's own logs carry none.  Measured pair from record
+#: 1l/1o (boot weg2zr2, tip 7e3a9150b4): D's realised single-prefill rate at
+#: the fast end of 610-690 tok/s, P's leg-1 rate ~3,640 tok/s, and the
+#: SHORTER of the two measured flips (13.247 s of 13.2-16.1) -- the
+#: conservative corner of the range in all three terms, which is why the
+#: value it produces is ~22,000 rather than the 27,200 the other corner
+#: gives.  STAMPED PRE-BARLINK: record 1n measured D at 1,354 tok/s after
+#: the barlink fix, which pushes X to ~69,000, and the flipcost build pulls
+#: it back; the launcher recomputes from this boot's lines and this pair is
+#: only the fallback (O4 -- do not freeze a table).
+X_RECORDED_R_D_TOKS = 690.0
+X_RECORDED_R_P_TOKS = 3640.0
+X_RECORDED_FLIP_S = 13.247
+
+
+def derive_x_star(flip_s: float, r_d: float, r_p: float, floor_tokens: int) -> int:
+    """X* = 2*flip_s / (1/r_D - 1/r_P), floored (spec section 0, K5, A1-4).
+
+    THE BREAK-EVEN of the round trip: below X* it is cheaper for D to
+    prefill the request itself than to pay two flips so P can do it faster.
+    ONE number, TWO consumers -- the per-request bound of law 4 and C7's
+    aggregate departure latch -- so there is no second hand number.
+
+    Refuses (ValueError) rather than guessing when the inputs cannot
+    produce a break-even: a D that is not slower than P has none.
+    """
+    if flip_s <= 0 or r_d <= 0 or r_p <= 0:
+        raise ValueError(f"non-positive input: flip_s={flip_s} r_d={r_d} r_p={r_p}")
+    denom = (1.0 / r_d) - (1.0 / r_p)
+    if denom <= 0:
+        raise ValueError(
+            f"r_D {r_d:.0f} >= r_P {r_p:.0f}: no break-even exists, the round trip never pays"
+        )
+    return max(int(floor_tokens), int(2.0 * flip_s / denom))
+
+
+_RE_FLIP = re.compile(r"flip_total=(\d+) ms")
+_RE_LEG1 = re.compile(
+    r"WEG2-SERVED group=P leg=1 .*?prompt_tokens=(\d+) cached_tokens=(\d+) wall=([0-9.]+)s"
+)
+_RE_LEG2 = re.compile(
+    r"WEG2-SERVED group=D leg=2 .*?uncached=(\d+) verdict=(\S+) wall=([0-9.]+)s"
+)
+
+
+def _median(xs: List[float]) -> float:
+    ys = sorted(xs)
+    n = len(ys)
+    return ys[n // 2] if n % 2 else 0.5 * (ys[n // 2 - 1] + ys[n // 2])
+
+
+def measure_x_inputs(log_path: str, floor_tokens: int) -> Optional[Tuple[float, float, float, int, int, int]]:
+    """(flip_s, r_D, r_P, n_flips, n_leg2, n_leg1) from ONE front log, or None.
+
+    Reads the front's OWN instruments -- ``flip_total=`` and the two
+    ``WEG2-SERVED`` lines -- so every input to X is a measurement this rig
+    printed, not a table.  Only leg-2 lines that actually prefilled on D
+    (``verdict=single_prefill|short_mispriced``) and only extents of at
+    least one chunk count, because a rate taken over a few hundred tokens
+    prices fixed overhead, not throughput.
+    """
+    flips: List[float] = []
+    r_d: List[float] = []
+    r_p: List[float] = []
+    try:
+        with open(log_path, errors="replace") as f:
+            for line in f:
+                m = _RE_FLIP.search(line)
+                if m:
+                    flips.append(int(m.group(1)) / 1000.0)
+                    continue
+                m = _RE_LEG2.search(line)
+                if m:
+                    unc, verdict, wall = int(m.group(1)), m.group(2), float(m.group(3))
+                    if verdict in ("single_prefill", "short_mispriced") and unc >= floor_tokens and wall > 0:
+                        r_d.append(unc / wall)
+                    continue
+                m = _RE_LEG1.search(line)
+                if m:
+                    unc = int(m.group(1)) - int(m.group(2))
+                    wall = float(m.group(3))
+                    if unc >= floor_tokens and wall > 0:
+                        r_p.append(unc / wall)
+    except OSError:
+        return None
+    if not (flips and r_d and r_p):
+        return None
+    return (_median(flips), _median(r_d), _median(r_p), len(flips), len(r_d), len(r_p))
+
+
+def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> Tuple[int, str]:
+    """X and its PROVENANCE LINE, naming the three inputs and their source.
+
+    Order: an explicit ``--tp-prefill-max-tokens`` wins (A1-4: derived with
+    the flag as override), else the newest front log on this rig that
+    carries all three instruments, else the recorded PRE-BARLINK pair.
+    """
+    if override is not None:
+        return max(floor_tokens, int(override)), (
+            f"X={max(floor_tokens, int(override))} source=flag "
+            f"(--tp-prefill-max-tokens, operator override; floor {floor_tokens})"
+        )
+    logs: List[str] = []
+    try:
+        logs = sorted(
+            (os.path.join(evidence_dir, n) for n in os.listdir(evidence_dir) if n.endswith(".front.log")),
+            key=lambda q: os.path.getmtime(q),
+            reverse=True,
+        )
+    except OSError:
+        logs = []
+    for path in logs[:8]:
+        got = measure_x_inputs(path, floor_tokens)
+        if got is None:
+            continue
+        flip_s, r_d, r_p, n_f, n_d, n_p = got
+        try:
+            x = derive_x_star(flip_s, r_d, r_p, floor_tokens)
+        except ValueError:
+            continue
+        return x, (
+            f"X={x} source=boot:{os.path.basename(path)} "
+            f"X*=2*flip_s/(1/r_D-1/r_P) flip_s={flip_s:.2f} (median of {n_f}) "
+            f"r_D={r_d:.0f} tok/s (median of {n_d} D single prefills) "
+            f"r_P={r_p:.0f} tok/s (median of {n_p} P leg 1s) floor={floor_tokens}"
+        )
+    x = derive_x_star(X_RECORDED_FLIP_S, X_RECORDED_R_D_TOKS, X_RECORDED_R_P_TOKS, floor_tokens)
+    return x, (
+        f"X={x} source=recorded PRE-BARLINK (no front log on this rig carried all three "
+        f"instruments) X*=2*flip_s/(1/r_D-1/r_P) flip_s={X_RECORDED_FLIP_S} "
+        f"r_D={X_RECORDED_R_D_TOKS:.0f} tok/s r_P={X_RECORDED_R_P_TOKS:.0f} tok/s "
+        f"floor={floor_tokens} -- record 1l/1o weg2zr2, conservative corner of the measured "
+        f"range; post-barlink r_D 1354 tok/s pushes X far higher and post-flipcost pulls it "
+        f"back, so this is a fallback, never a table (O4)"
+    )
 
 
 class Weg2LaunchRefused(RuntimeError):
@@ -504,7 +648,14 @@ def store_extra_config(store_gib: float) -> str:
 # --------------------------------------------------------------------------
 
 
-def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float) -> List[str]:
+def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float,
+                 max_kv_per_request: int) -> List[str]:
+    """Flags BOTH groups share.
+
+    ``--max-running-requests`` is NOT here any more (C1/R-12): sharing it
+    pinned P and D to one value by construction, and law 2 says the two are
+    independent.  It is emitted per group from --p-bs / --d-bs instead.
+    """
     return [
         "--model-path", model,
         "--trust-remote-code",
@@ -513,8 +664,11 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float) -> List[st
         "--skip-server-warmup",
         "--disable-overlap-schedule",
         "--kv-cache-dtype", "fp8_e4m3",
-        "--context-length", "262144",
-        "--max-running-requests", "8",
+        "--context-length", str(CONTEXT_LENGTH_TOKENS),
+        # C14/K9: the per-request KV ceiling, decoupled from the model
+        # context. A CEILING, not the pressure relief: on D the device pool
+        # is far below d_bs x 262,144, so this never binds first.
+        "--max-kv-per-request", str(max_kv_per_request),
         "--reasoning-parser", "qwen3",
         "--tool-call-parser", "qwen3_coder",
         "--chat-template-default-kwargs", '{"preserve_thinking": true}',
@@ -531,7 +685,7 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float) -> List[st
         "--hicache-storage-backend-extra-config", store_extra_config(store_gib),
         "--hicache-canonical-kv-page",
         "--host", "127.0.0.1",
-        "--chunked-prefill-size", "4096",
+        "--chunked-prefill-size", str(CHUNKED_PREFILL_TOKENS),
         "--scheduler-distributed-teardown",
         "--page-size", "1",
         "--random-seed", "785500001",
@@ -546,8 +700,13 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float) -> List[st
     ]
 
 
-def argv_p(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float, extra: List[str]) -> List[str]:
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib) + [
+def argv_p(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float,
+           extra: List[str], p_bs: int, max_kv_per_request: int) -> List[str]:
+    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + [
+        # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
+        # the size of P's req_to_token_pool (R-13), which is why it is
+        # resolved before the budget solve and printed with it.
+        "--max-running-requests", str(p_bs),
         "--tp-size", "1", "--pp-size", "3",
         "--pp-stage-ratio", "32,18,14", "--pp-attn-stage-ratio", "8,4,4",
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
@@ -556,8 +715,49 @@ def argv_p(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
     ] + extra
 
 
-def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float, extra: List[str]) -> List[str]:
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib) + [
+def w38_armed_line(argv_of_p: Sequence[str]) -> str:
+    """MF-3 (b): state group P's disarmed store read AT LAUNCH, once.
+
+    The cost is structural and permanent for this boot form, so it may not be
+    something a reader has to reconstruct from a rank log at 3 a.m.  It is
+    READ OFF THE ARGV THIS LAUNCHER IS ABOUT TO RUN rather than asserted from
+    memory: ``--pp-size N`` with N > 1 on group P is exactly the predicate
+    ``Scheduler._carrierless_pp_store_read_refused`` keys on (a PP group, and
+    the no-flip PP form has no #631 row carrier), so if that flag ever changes
+    the line changes with it instead of lying.
+    """
+    pp = 1
+    for i, a in enumerate(argv_of_p):
+        if a == "--pp-size" and i + 1 < len(argv_of_p):
+            try:
+                pp = int(argv_of_p[i + 1])
+            except ValueError:
+                pp = 1
+    if pp <= 1:
+        return ("WEG2 W38 NOT ARMED: group P is launched with --pp-size %d, so the store read is "
+                "not refused on it and P keeps its L3 prefix reuse" % pp)
+    return ("WEG2 W38 ARMED: group P reads no store; the PP0-authoritative materialisation (#968) "
+            "is the named remedy. Group P is launched --pp-size %d and the no-flip PP form carries "
+            "no #631 row carrier, so every storage read on P is refused by name "
+            "(#1234 W38 Weg2CarrierlessPpStoreRead) -- a prefetch completing on one rank and not "
+            "another would lengthen that rank's prefix_indices alone (the W27 width divergence that "
+            "killed boot weg2sc1). WHAT IT COSTS: a multi-turn follow-up whose prefix has left P's "
+            "device tier is prefilled WHOLE again, which is the user's soft no-double-prefill law "
+            "paying for a hard correctness refusal. Measured per drain epoch by the front's "
+            "'WEG2 P-PREFIX-REUSE' line; the write-through and D's own store read are untouched." % pp)
+
+
+def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float,
+           extra: List[str], d_bs: int, max_kv_per_request: int, x_tokens: int) -> List[str]:
+    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + [
+        # C1/K2: D's own bs, independent of P's by construction.
+        "--max-running-requests", str(d_bs),
+        # C11/K5: law 4 enforced where the uncached extent is REAL -- after
+        # match_prefix, on extend_input_len, inside get_new_batch_prefill.
+        # The front prices with len(text)/3.0 and never re-checks, so a
+        # front-side estimate alone let a 19,401-token uncached extent
+        # through a 4,096-token grant (weg2zr2 rid weg2-4-8). 0 = off.
+        "--tp-prefill-max-tokens", str(x_tokens),
         "--tp-size", "3", "--pp-size", "1",
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         # a per-rank MiB LIST under TP requires the uneven-TP ratio; 'auto'
@@ -1512,7 +1712,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--ready-deadline-s", type=float, default=900.0)
     ap.add_argument("--extra-p", default="", help="extra flags for group P (shell-split)")
     ap.add_argument("--extra-d", default="", help="extra flags for group D (shell-split)")
-    ap.add_argument("--fairness-w-s", type=float, default=45.0)
+    ap.add_argument("--fairness-w-s", type=float, default=45.0,
+                    help="A1-1: the only sanctioned pre-emption; 0 disables it. Passed to the front.")
+    ap.add_argument("--p-bs", type=int, default=8,
+                    help="K1: group P's --max-running-requests AND the front's leg-1 concurrency. "
+                         "Independent of --d-bs (law 2). Default 8 = today's shipped value. Also "
+                         "sizes P's req_to_token_pool, so it is resolved before the budget solve.")
+    ap.add_argument("--d-bs", type=int, default=8,
+                    help="K2: group D's --max-running-requests AND the number of front seats, so "
+                         "the front never hands D more concurrent requests than D can run.")
+    ap.add_argument("--tp-prefill-max-tokens", type=int, default=None,
+                    help="K5 (X): uncached tokens D may prefill itself. Unset = DERIVED as "
+                         "2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip "
+                         "lines, else the recorded PRE-BARLINK pair; floor = --chunked-prefill-size. "
+                         "The derivation and its three inputs are printed at launch.")
+    ap.add_argument("--flip-min-work-tokens", type=int, default=None,
+                    help="K6: queued tokens that make a D->P round trip worth its cost. Unset = X.")
+    ap.add_argument("--min-dwell-ms", type=float, default=None,
+                    help="K7: minimum phase dwell. Unset = derived from the last flip in that direction.")
+    ap.add_argument("--idle-layout", choices=["tp", "pp"], default="tp",
+                    help="K8: which layout is awake at rest -- tp = group D (today's shape), "
+                         "pp = group P. The front's idle guard always counts the requests P has "
+                         "just prefilled, so resting on P loses no request.")
+    ap.add_argument("--d-admit-max-tokens", type=int, default=None,
+                    help="FIX 4 (round 4): OPERATOR CEILING on the aggregate store-read budget "
+                         "group D may hold in flight. Unset (the default) is NOT a derived number "
+                         "any more -- the front reads group D's own #915 host-pool terms off "
+                         "/server_info and needs no launcher-side proxy for them. 0 disables the "
+                         "gate.")
+    ap.add_argument("--drain-deadline-s", type=float, default=120.0,
+                    help="K10: seconds before a flip is refused by name (W1 -> W2). Shipped value.")
+    ap.add_argument("--max-kv-per-request", type=int, default=None,
+                    help="K9: per-request KV ceiling for BOTH groups. Unset = the model context "
+                         f"({CONTEXT_LENGTH_TOKENS}), i.e. the as-built cap.")
     ap.add_argument("--carrier-max-tokens", type=int, default=None,
                     help="#1246: ship a LOWER carrier bound than the one the census reads from group D's "
                          "own '#915 PREFETCH LIMIT' line. IT CAN ONLY LOWER IT: N is accepted exactly on "
@@ -1615,6 +1847,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.cvd = cvd
     log("NVML -> CUDA ordinal map: " + ", ".join(f"ordinal {i} = nvml {c.nvml_index} {c.name} {c.uuid} total {c.total_mib} MiB" for i, c in enumerate(cards)))
 
+    # 1a2. WEG2_SCHEDULING_SPEC_0907 slice A -- THE SCHEDULING KNOBS, RESOLVED
+    # BEFORE THE BUDGET SOLVE (R-13), and the host ledger is part of that
+    # solve, so they are resolved above it. --p-bs / --d-bs are not only
+    # concurrency: max_running_requests sizes req_to_token_pool and feeds
+    # formation_target, so a bs decided after the budgets would be a
+    # post-hoc override of the planner. X is derived here for the same
+    # reason -- one number, printed with its inputs, then TOLD to both the
+    # front and group D (C2/R-6: no HTTP round trip to a sleeping group).
+    p_bs = max(1, int(ns.p_bs))
+    d_bs = max(1, int(ns.d_bs))
+    max_kv_per_request = int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS)
+    x_tokens, x_provenance = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
+    flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
+    idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
+    log(f"SCHEDULING KNOBS (spec slice A, resolved before the budget solve): --p-bs {p_bs} "
+        f"(group P --max-running-requests + front leg-1 concurrency) --d-bs {d_bs} (group D "
+        f"--max-running-requests + front D seats), independent by construction; "
+        f"--max-kv-per-request {max_kv_per_request} (K9, = --context-length {CONTEXT_LENGTH_TOKENS} "
+        f"unless overridden); --idle-layout {ns.idle_layout} -> front --idle-layout "
+        f"{idle_layout_front}; --fairness-w-s {ns.fairness_w_s} "
+        f"({'OFF' if float(ns.fairness_w_s) <= 0 else 'the only sanctioned pre-emption, A1-1'}); "
+        f"--drain-deadline-s {ns.drain_deadline_s}; --min-dwell-ms "
+        f"{'derived from the last flip in that direction' if ns.min_dwell_ms is None else ns.min_dwell_ms}")
+    log(f"X PROVENANCE: {x_provenance}; --flip-min-work-tokens {flip_min_work_tokens} "
+        f"({'= X, the same break-even at aggregate granularity' if ns.flip_min_work_tokens is None else 'operator override'})")
+
+    log(f"SCHEDULING FLAGS AS EMITTED -- group P: --max-running-requests {p_bs} "
+        f"--max-kv-per-request {max_kv_per_request} (no --tp-prefill-max-tokens: the PP prefill "
+        f"group is not the one law 4 bounds); group D: --max-running-requests {d_bs} "
+        f"--max-kv-per-request {max_kv_per_request} --tp-prefill-max-tokens {x_tokens}; "
+        f"front: --p-concurrency {p_bs} --d-bs {d_bs} --tp-prefill-max-tokens {x_tokens} "
+        f"--flip-min-work-tokens {flip_min_work_tokens} --idle-layout {idle_layout_front} "
+        f"--drain-deadline-s {ns.drain_deadline_s} --fairness-w-s {ns.fairness_w_s}"
+        + ("" if ns.min_dwell_ms is None else f" --min-dwell-ms {ns.min_dwell_ms}"))
+
     # 1b. #1233 one-backup flip geometry + the patched saver hook
     n_layers = model_num_layers(ns.model)
     chunk_count = max(0, int(ns.weight_chunks))
@@ -1704,8 +1971,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
-    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), ns.transport), state.logs["P"], env_p)
+    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request), ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
+    log(w38_armed_line(spec_p.argv))
     state.deviations = [
         "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
         "= 208 of 224 usable, measured Used 224/256 incl. RM carve-out; #1234 C1 raised dcp:0 from 24 so the 96-MiB dcp all_reduce plans to 10 rounds "
@@ -1730,8 +1998,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
+        log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
+            py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
+            flip_min_work_tokens, idle_layout_front)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
     state.pids["P"] = spec_p.pid
@@ -1766,7 +2037,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     state.budgets["D"] = budgets_d
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
@@ -1850,21 +2121,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"group D is awake and serving -- SHORT is four conjuncts, so while D sleeps a sub-floor prompt "
         f"queues to BATCH and round-trips as well")
     state.carrier_max_tokens = carrier_max_tokens
+    log(f"D-ADMIT STORE-READ GATE (FIX 4, round 4): the budget is group D's OWN #915 reading "
+        f"(available/occupied/limit via /server_info hicache_prefetch), not a launcher-derived "
+        f"proxy; front --d-admit-max-tokens "
+        f"{'unset (that reading alone)' if ns.d_admit_max_tokens is None else str(ns.d_admit_max_tokens) + ' (operator ceiling)'}"
+        f". Per-request the same pool is CARRIER-EXCEEDS at {carrier_max_tokens}; in aggregate "
+        f"nothing bounded it, and --d-bs {d_bs} seats opened at once overcommitted it on boot "
+        f"weg2sc1 (D read available=5418 occupied=25100 limit=27466 -> #915 vote_negative while "
+        f"the round-1 front-local tally read 27466 free -- the quantity, not the bound, was wrong)")
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
 
     # 6. front
-    front_argv = [
-        py, "-m", "sglang.srt.weg2.front",
-        "--prefill", f"http://127.0.0.1:{PORT_P}", "--decode", f"http://127.0.0.1:{PORT_D}",
-        "--port", str(PORT_FRONT), "--awake", "D", "--tag", ns.tag,
-        "--store-dir", store_dir,
-        "--prefill-sid", str(spec_p.pid), "--decode-sid", str(spec_d.pid),
-        "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d[c.uuid]}" for c in cards),
-        "--fairness-w-s", str(ns.fairness_w_s),
-        "--weight-chunks", str(chunk_count),
-        "--carrier-max-tokens", str(carrier_max_tokens),
-    ]
+    front_argv = front_argv_for(
+        py, store_dir, spec_p.pid, spec_d.pid, dc_expect_d, cards, ns, chunk_count,
+        carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,
+    )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
     # C14 / FIX 2 round 2: the BOOT half of the VRAM credit epoch.  Launcher
@@ -1892,6 +2164,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _write_state(state)
     log(f"LAUNCHED: P pid {spec_p.pid} (asleep) D pid {spec_d.pid} (awake) front pid {fp.pid}; state {state_path(state)}; /root/current_boot.log -> {front_log}")
     return 0
+
+
+def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d: Dict[str, int],
+                   cards: List[Card], ns, chunk_count: int, carrier_max_tokens: int,
+                   p_bs: int, d_bs: int, x_tokens: int, flip_min_work_tokens: int,
+                   idle_layout_front: str) -> List[str]:
+    """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
+
+    C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
+    group over HTTP -- that round trip would make the front's startup depend
+    on a group the launcher has just put to sleep, for numbers the launcher
+    itself wrote.
+    """
+    argv = [
+        py, "-m", "sglang.srt.weg2.front",
+        "--prefill", f"http://127.0.0.1:{PORT_P}", "--decode", f"http://127.0.0.1:{PORT_D}",
+        "--port", str(PORT_FRONT), "--awake", "D", "--tag", ns.tag,
+        "--store-dir", store_dir,
+        "--prefill-sid", str(p_pid), "--decode-sid", str(d_pid),
+        "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d.get(c.uuid, 0)}" for c in cards),
+        "--fairness-w-s", str(ns.fairness_w_s),
+        "--weight-chunks", str(chunk_count),
+        "--carrier-max-tokens", str(carrier_max_tokens),
+        "--p-concurrency", str(p_bs),
+        "--d-bs", str(d_bs),
+        "--tp-prefill-max-tokens", str(x_tokens),
+        "--flip-min-work-tokens", str(flip_min_work_tokens),
+        "--idle-layout", idle_layout_front,
+        "--drain-deadline-s", str(ns.drain_deadline_s),
+    ]
+    if ns.min_dwell_ms is not None:
+        argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
+    if ns.d_admit_max_tokens is not None:
+        argv += ["--d-admit-max-tokens", str(ns.d_admit_max_tokens)]
+    return argv
 
 
 def state_path(state: BootState) -> str:

@@ -1196,6 +1196,40 @@ class ServerArgs:
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
     ] = None
+    tp_prefill_max_tokens: A[
+        int,
+        Arg(
+            help=(
+                "WEG2_SCHEDULING_SPEC_0907 C11/K5 (law 4, 'X'): the largest "
+                "UNCACHED prefill extent this group may take itself. Tested "
+                "in get_new_batch_prefill AFTER match_prefix, on the "
+                "request's real extent, because that is the only point at "
+                "which the uncached extent exists -- a bound applied at "
+                "intake can only see the prompt and mis-prices exactly the "
+                "same way a router does. A request over the bound is refused "
+                "by name (W31 Weg2TpPrefillExceeded) back to its caller, "
+                "which re-routes it through the prefill group; it is never "
+                "silently chunked here. 0 = OFF, which is the default and "
+                "leaves the default path untouched. The value is DERIVED "
+                "per boot from the round-trip break-even "
+                "2*flip_s/(1/r_D - 1/r_P), floored at --chunked-prefill-size."
+            ),
+        ),
+    ] = 0
+    max_kv_per_request: A[
+        Optional[int],
+        Arg(
+            help=(
+                "WEG2_SCHEDULING_SPEC_0907 C14/K9: per-request KV ceiling, "
+                "in tokens. Default (None) = --context-length, i.e. the "
+                "as-built cap, so this ships inert; setting it lower "
+                "decouples the per-request cap from the model context "
+                "without touching the context. A CEILING, not a pressure "
+                "relief: where the device pool is far below "
+                "max_running_requests x context_length it never binds first."
+            ),
+        ),
+    ] = None
     max_total_tokens: A[
         Optional[int],
         Arg(

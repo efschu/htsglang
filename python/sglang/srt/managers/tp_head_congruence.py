@@ -102,6 +102,23 @@ TP_HEAD_SLOTS = 32
 #: missing a request removes it from the group's head.
 _ABSENT_MATCH = -1
 
+#: "This rank expects no store read for this rid, or its read has landed."
+#: Deliberately LARGE, because the pending arm is MIN-reduced like every
+#: other arm of this payload: a rank with nothing pending must be the
+#: NEUTRAL element, so one rank that IS still reading pulls the group's
+#: value down and the group defers.  MIN == "pending on ANY rank", which is
+#: the delay-never-force direction the ballot already uses.
+NOT_PENDING_MS = 1 << 40
+
+#: FIX 7 verdicts of the completion predicate (WEG2_SCHEDULING_SPEC_0907
+#: law 4).  Named strings rather than a bool pair, because "price it, the
+#: read landed" and "price it, the read never will" are the same ACTION and
+#: different EVIDENCE, and a log that cannot tell them apart cannot say
+#: whether a W31 is honest.
+X_PRICE = "price"
+X_DEFER = "defer"
+X_BOUND_EXPIRED = "bound_expired"
+
 
 def canonical_head_rids(rids: Sequence[str], slots: int = TP_HEAD_SLOTS) -> List[str]:
     """The slot->rid mapping, derived from the rid SET alone.
@@ -130,12 +147,127 @@ def build_head_order_payload(
     return payload
 
 
+def build_x_pending_payload(
+    canonical: Sequence[str],
+    local_pending_age_ms: Dict[str, int],
+    slots: int = TP_HEAD_SLOTS,
+) -> List[int]:
+    """This rank's STORE-READ COMPLETION vote, one slot per canonical rid.
+
+    FIX 7 (round 7) -- THE X GATE'S PREDICATE WAS CAPACITY, NOT COMPLETION.
+    Boot weg2sc3 measured the whole shape: ``X-GATE uncached=8866 X=8192
+    verdict=W31`` on requests whose peers, served moments later, priced at
+    ``uncached = 2``.  Same prompts, same route, same gate -- the only
+    difference was whether D's store read for that rid had LANDED when the
+    gate priced it.  The front's seat gate holds the head until D HAS ROOM
+    to issue the read (``available >= need``, ``occupied < limit``); having
+    room to issue a read is not the read having completed.
+
+    ``local_pending_age_ms`` maps rid -> how long THIS rank has been waiting
+    for that rid's store read, in milliseconds.  A rid absent from the map
+    rides :data:`NOT_PENDING_MS`, which is the MIN-neutral element, so:
+
+    * a rank that is still reading pulls the group's value down and the
+      group DEFERS -- pending on ANY rank is pending for the group, the same
+      delay-never-force direction as the #791b ballot's MIN == AND;
+    * a rank that does not hold the rid at all contributes neutrally and
+      never forces a defer of its own.
+
+    The reduced value is therefore the YOUNGEST pending timer in the group,
+    which is the conservative age to price a bound against: the group gives
+    up waiting only once even the rank that started latest is past it.
+
+    NO NEW COLLECTIVE (MUST NOT 6).  These slots ride the packed MIN reduce
+    ``_update_uniform_pool_budget`` already takes once per TP-loop
+    iteration, beside the head-order arm and indexed by the SAME canonical
+    head -- so the slot -> rid mapping is the one derived from the rid SET
+    alone and needs no second agreement.
+    """
+    payload = [NOT_PENDING_MS] * slots
+    for i, rid in enumerate(canonical[:slots]):
+        payload[i] = int(local_pending_age_ms.get(rid, NOT_PENDING_MS))
+    return payload
+
+
+def group_store_read_pending_ms(
+    inputs: Optional["UniformHeadInputs"], rid: str
+) -> Optional[int]:
+    """The GROUP's pending age for one rid, or ``None`` for "nothing pending".
+
+    ``None`` on four counts, every one of them group-uniform for the same
+    reasons :func:`group_match_for` gives: no verdict published this pass,
+    no pending arm in the payload at all (a caller that does not vote), the
+    rid outside the canonical head, or every rank neutral on it.  A caller
+    that gets ``None`` may price; it must never fall back to its own timer,
+    which is rank-local and would split the ranks on the one decision that
+    DELETES a request from a queue.
+    """
+    if inputs is None or not inputs.canonical or not inputs.pending_age_ms:
+        return None
+    try:
+        slot = inputs.canonical.index(rid)
+    except ValueError:
+        return None
+    if slot >= len(inputs.pending_age_ms):
+        return None
+    value = int(inputs.pending_age_ms[slot])
+    return None if value >= NOT_PENDING_MS else max(0, value)
+
+
+def x_completion_verdict(
+    group_pending_ms: Optional[int], bound_s: float
+) -> str:
+    """May the X gate price this request yet?
+
+    :data:`X_PRICE` when the group holds no pending store read for it,
+    :data:`X_DEFER` while one is in flight inside the bound, and
+    :data:`X_BOUND_EXPIRED` once the group's YOUNGEST timer is past the
+    bound -- at which point the request IS priced and W31 may fire, honestly
+    this time, on an extent nothing further is going to improve.
+
+    THE BOUND IS WHY THIS IS NOT A WEDGE.  Deferring for ever on a read that
+    never lands is the livelock the defer exists to prevent, wearing the
+    other costume; ``bound_s`` is the caller's length-priced store-read
+    timeout, so a read that has outlived its own price is over whether or
+    not anyone reported it.  A non-positive bound therefore never defers.
+    """
+    if group_pending_ms is None:
+        return X_PRICE
+    if bound_s <= 0:
+        return X_BOUND_EXPIRED
+    if group_pending_ms >= bound_s * 1000.0:
+        return X_BOUND_EXPIRED
+    return X_DEFER
+
+
 def uniform_head_order(
     canonical: Sequence[str],
     group_match_lens: Sequence[int],
     slots: int = TP_HEAD_SLOTS,
+    arrival_seqs: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """The order EVERY rank must form its batch in.
+
+    FIX 3 (round 3) -- THE KEY IS A CHOICE, AND MATCH LENGTH IS THE WRONG
+    ONE UNDER AN FCFS POLICY.  This arm exists to replace the divergence
+    born in ``_sort_by_longest_prefix`` (see the module docstring); under a
+    cache-AGNOSTIC policy that sort never runs, `calc_priority` returns
+    having changed nothing, and re-sorting the head by prefix length here
+    MANUFACTURES an order the policy did not ask for -- measured at the
+    parent: arrival order 1,2,3 came out ``['weg2-1-2','weg2-1-3',
+    'weg2-1-1']``, i.e. the oldest request admitted LAST, which is
+    WEG2_SCHEDULING_SPEC_0907 law 2 ("D admits OLDEST-first") broken at D by
+    the very module that was making D uniform.
+
+    ``arrival_seqs`` is the replacement key: ``Req.kv_arrival_seq``, assigned
+    once in ``_add_request_to_queue`` from a per-rank counter fed by the same
+    broadcast request stream, so it is rank-uniform for the same reason the
+    rid SET is (phase_flip_runtime.py:9689 states it, and kvso already orders
+    victims by it).  It satisfies #823's uniformity requirement exactly as
+    well as the MIN-reduced match does -- what it gives up is a cache-
+    locality heuristic this arm was never asked to provide.  A rid with no
+    arrival seq sorts AFTER every rid that has one, by rid string, so the
+    order stays total and process-independent.
 
     ``group_match_lens`` is the MIN-reduced payload, so entry i is the
     smallest match any rank has for ``canonical[i]``.
@@ -152,7 +284,20 @@ def uniform_head_order(
         for i, rid in enumerate(canonical[:slots])
         if i < len(group_match_lens) and int(group_match_lens[i]) > _ABSENT_MATCH
     ]
-    ranked.sort(key=lambda pair: (-pair[1], pair[0]))
+    if arrival_seqs is None:
+        ranked.sort(key=lambda pair: (-pair[1], pair[0]))
+    else:
+        # ELIGIBILITY still comes from the MIN-reduced payload above (a rid
+        # some rank does not hold is dropped, delay-never-force); only the
+        # ORDER comes from the arrival key.  Two replicated inputs, two
+        # separate jobs, neither of them rank-local.
+        ranked.sort(
+            key=lambda pair: (
+                0 if pair[0] in arrival_seqs else 1,
+                int(arrival_seqs.get(pair[0], 0)),
+                pair[0],
+            )
+        )
     return [rid for rid, _ in ranked]
 
 
@@ -185,6 +330,7 @@ def head_decision(
     digest_agreed: bool,
     enforcer_enabled: bool,
     slots: int = TP_HEAD_SLOTS,
+    arrival_seqs: Optional[Dict[str, int]] = None,
 ):
     """THE SECOND BEHAVIOUR CHANGE, and the one easiest to leave implicit.
 
@@ -212,7 +358,9 @@ def head_decision(
     if not enforcer_enabled:
         return local_head_order(local_rids, local_match_lens), SOURCE_RANK_LOCAL
     return (
-        uniform_head_order(canonical, group_match_lens, slots=slots),
+        uniform_head_order(
+            canonical, group_match_lens, slots=slots, arrival_seqs=arrival_seqs
+        ),
         SOURCE_GROUP,
     )
 
@@ -347,6 +495,11 @@ class UniformHeadInputs:
     group_match_lens: Tuple[int, ...]
     admit_limit: Optional[int]
     digest_agreed: bool
+    #: FIX 7: the pending arm, same canonical indexing as ``group_match_lens``.
+    #: Empty when the caller took no pending vote, which reads as "no opinion"
+    #: rather than "nothing pending" -- the difference matters, because the
+    #: second would license pricing on a read nobody asked about.
+    pending_age_ms: Tuple[int, ...] = ()
 
 
 def build_uniform_head_inputs(
@@ -354,6 +507,7 @@ def build_uniform_head_inputs(
     group_match_lens: Sequence[int],
     admit_limit: Optional[int],
     digest_agreed: bool,
+    pending_age_ms: Sequence[int] = (),
 ) -> UniformHeadInputs:
     """Freeze this pass's reduce results into the value the pass hands down."""
     return UniformHeadInputs(
@@ -361,6 +515,7 @@ def build_uniform_head_inputs(
         group_match_lens=tuple(int(v) for v in (group_match_lens or ())),
         admit_limit=None if admit_limit is None else int(admit_limit),
         digest_agreed=bool(digest_agreed),
+        pending_age_ms=tuple(int(v) for v in (pending_age_ms or ())),
     )
 
 
@@ -489,6 +644,42 @@ def degradation_is_a_defect(gate_enabled: bool, source: str) -> bool:
     return bool(gate_enabled) and source != SOURCE_GROUP
 
 
+def group_match_for(
+    inputs: Optional["UniformHeadInputs"], rid: str
+) -> Optional[int]:
+    """THE GROUP's prefix match for one rid, or None when it has no opinion.
+
+    The third consumer of the same reduce (after the ORDER and COUNT arms):
+    WEG2_SCHEDULING_SPEC_0907 C11's X gate, which must price a request's
+    uncached extent as a GROUP quantity (MUST NOT 7) without taking a new
+    collective (MUST NOT 6).  This is the analogue of ``uniform_min_avail()``
+    for tree MATCHING that the X gate's rank-uniformity claim needed: the
+    gate's own grep proved that no rank-local IDENTIFIER appears in its
+    expression, which is a statement about one expression, not about the
+    PROVENANCE of the values flowing into it -- and ``len(prefix_indices)``
+    is a match against THIS rank's radix tree, whose evictions are driven by
+    pool pressure that differs per rank under uneven DCP.
+
+    None on three counts, and every one of them is itself group-uniform:
+    no verdict was published this pass, the rid is outside the canonical
+    head (``TP_HEAD_SLOTS``, derived from the rid SET alone), or some rank
+    did not hold the rid and the MIN carried ``_ABSENT_MATCH`` through.  The
+    caller must then ABSTAIN rather than fall back to its own number --
+    abstain-never-refuse, the same safety direction as the ballot's own
+    delay-never-force.
+    """
+    if inputs is None or not inputs.canonical:
+        return None
+    try:
+        slot = inputs.canonical.index(rid)
+    except ValueError:
+        return None
+    if slot >= len(inputs.group_match_lens):
+        return None
+    value = int(inputs.group_match_lens[slot])
+    return None if value <= _ABSENT_MATCH else value
+
+
 def head_order_is_uniform(orders: Sequence[Sequence[str]]) -> bool:
     """Did every rank end up with the same decision?"""
     if not orders:
@@ -499,6 +690,13 @@ def head_order_is_uniform(orders: Sequence[Sequence[str]]) -> bool:
 
 __all__ = [
     "TP_HEAD_SLOTS",
+    "NOT_PENDING_MS",
+    "X_PRICE",
+    "X_DEFER",
+    "X_BOUND_EXPIRED",
+    "build_x_pending_payload",
+    "group_store_read_pending_ms",
+    "x_completion_verdict",
     "SOURCE_GROUP",
     "SOURCE_RANK_LOCAL",
     "ARM_ORDER",
@@ -521,5 +719,6 @@ __all__ = [
     "build_head_order_payload",
     "uniform_head_order",
     "local_head_order",
+    "group_match_for",
     "head_order_is_uniform",
 ]
