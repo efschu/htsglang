@@ -25,6 +25,7 @@ Hermetic: no CUDA, no server, no boot.  The one test that needs a device
 carried on metal by ``arm_dormant_boot.sh`` instead.
 """
 
+import contextlib
 import inspect
 import os
 import re
@@ -38,17 +39,28 @@ from sglang.srt.constants import (
 )
 
 
-def _saver(armed: bool):
+def _saver(armed: bool, group: str = "P", raw: str = None):
     """Import ``weg2_memory_saver`` with the graph tag armed or disarmed.
 
-    ``weg2_graph_tag_armed`` caches on purpose (the sleep and the wake must not
-    be able to disagree), so a test that wants the other answer resets the
-    cache explicitly rather than relying on import order.
+    Both cached resolvers are reset explicitly rather than relying on import
+    order: they cache ON PURPOSE (the sleep and the wake must not be able to
+    disagree), so a test that wants the other answer has to say so.
+
+    ``group`` is the FIX 2 discriminator -- ``""`` means "this engine is not a
+    Weg-2 group at all", which is the stock path.  ``raw`` overrides the env
+    string when the test is about the PARSER rather than the decision.
     """
     from sglang.srt.managers import weg2_memory_saver as ms
 
-    os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "1" if armed else "0"
+    os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = (
+        raw if raw is not None else ("1" if armed else "0")
+    )
+    if group:
+        os.environ[ms.WEG2_GROUP_ENV] = group
+    else:
+        os.environ.pop(ms.WEG2_GROUP_ENV, None)
     ms._GRAPH_TAG_ARMED = None
+    ms._WEG2_GROUP_NAME = None
     return ms
 
 
@@ -84,7 +96,10 @@ def test_graph_tag_rides_the_kv_carrier_and_nothing_else():
         GPU_MEMORY_TYPE_KV_CACHE,
         GPU_MEMORY_TYPE_CUDA_GRAPH,
     ]
-    # The stock (non-Weg-2) path is byte-identical to what it always was.
+    # An engine WITHOUT the memory saver: nothing to pause, nothing added.
+    # This is NOT the whole stock path -- see
+    # test_a_stock_memory_saver_engine_is_not_widened_by_this_item, which is
+    # the case FIX 2 finding 1 was about and which this assertion cannot see.
     assert add([GPU_MEMORY_TYPE_KV_CACHE], False) == [GPU_MEMORY_TYPE_KV_CACHE]
 
 
@@ -140,6 +155,189 @@ def test_both_handlers_call_the_coupling_and_the_wake_calls_it_before_removing()
 
 
 # ---------------------------------------------------------------------------
+# FIX 2: the three conjuncts of the arming gate.  Each of these went red on
+# 3d507dfab8 -- the gate was ONE env read there, and neither the Weg-2 term
+# nor the memory-saver term existed.
+# ---------------------------------------------------------------------------
+
+
+def test_a_stock_memory_saver_engine_is_not_widened_by_this_item():
+    """THE finding: `--enable-memory-saver` is an UPSTREAM flag on an UPSTREAM
+    endpoint, so it cannot be the gate for a Weg-2-only change of that
+    endpoint's meaning.
+
+    The configuration below is documented upstream, not exotic: the memory
+    saver on and `SGLANG_MEMORY_SAVER_CUDA_GRAPH` set (environ.py registers it;
+    full_cuda_graph_backend.py:78-81 reads it).  A caller that posts
+    `{"tags":["kv_cache"]}` on such an engine asked for ONE tag.  Before this
+    fix it also got `cuda_graph` paused -- the capture pool plus the 384 MiB
+    flashinfer FLOAT workspace -- and a `zero_flashinfer_workspaces()` memset
+    on the paired resume.  release_memory_occupation's own rule says a stock
+    call "must stay byte-for-byte the upstream path".
+    """
+    _saver(armed=True, group="")          # memory saver ON, env ON, NOT Weg 2
+    add = _updater()._weg2_with_graph_tag
+    assert add([GPU_MEMORY_TYPE_KV_CACHE], True) == [GPU_MEMORY_TYPE_KV_CACHE], (
+        "a stock --enable-memory-saver engine had its kv_cache RPC silently "
+        "widened to kv_cache + cuda_graph"
+    )
+    # ...and the same engine's attention backend must not route its float
+    # workspace into a region no sleep of that engine will ever pause.
+    ms = _saver(armed=True, group="")
+    with ms.weg2_graph_scratch_region(384 * 1024 * 1024, True) as tagged:
+        assert tagged is False
+
+
+def test_the_weg2_conjunct_is_the_group_env_and_the_launcher_publishes_it():
+    """The discriminator has to EXIST, which is the half that was missing.
+
+    `server_args.weg2_group` was believed to be it: it is read once
+    (weight_updater._weg2_group_name) and assigned nowhere, so it answered "?"
+    on every rank of every boot.  The env below is published by build_env for
+    both groups and by nothing else.
+    """
+    from sglang.srt import server_args as sa
+    from sglang.srt.managers import weg2_memory_saver as ms
+    from sglang.srt.weg2 import launcher
+
+    # Assigned nowhere in the tree -- the reason a new fact was needed at all.
+    assert not hasattr(sa.ServerArgs, "weg2_group"), (
+        "server_args grew a weg2_group field -- then IT is the discriminator "
+        "and SGLANG_WEG2_GROUP is second bookkeeping; collapse them"
+    )
+
+    saved = os.environ.pop(ms.WEG2_GROUP_ENV, None)
+    try:
+        for group in ("P", "D"):
+            env = launcher.build_env(tree="/tmp/t", venv="/tmp/v", cvd="0",
+                                     store_dir="/tmp/s", debug_hold=False,
+                                     tag="probe", group=group)
+            assert env[ms.WEG2_GROUP_ENV] == group
+        # An inherited value must be SCRUBBED, not carried: the same discipline
+        # the ring family already follows, and here it decides whether a
+        # coupling nobody asked for is armed.
+        os.environ[ms.WEG2_GROUP_ENV] = "leftover-from-the-operators-shell"
+        env = launcher.build_env(tree="/tmp/t", venv="/tmp/v", cvd="0",
+                                 store_dir="/tmp/s", debug_hold=False, tag="probe")
+        assert ms.WEG2_GROUP_ENV not in env
+    finally:
+        os.environ.pop(ms.WEG2_GROUP_ENV, None)
+        if saved is not None:
+            os.environ[ms.WEG2_GROUP_ENV] = saved
+
+
+def test_every_launcher_call_site_names_its_group():
+    """The helper being right is not the wiring being right (the commit-3 M1
+    lesson).  build_env defaults `group=""` so a probe caller stays stock; that
+    default is exactly what would silently disarm the item if a launch site
+    forgot it, and the boot's only symptom would be a missing log line.
+    """
+    from sglang.srt.weg2 import launcher
+
+    src = inspect.getsource(launcher)
+    calls = [ln for ln in src.splitlines() if "= build_env(" in ln]
+    assert len(calls) == 3, f"launcher has {len(calls)} build_env call sites, expected 3"
+    for ln in calls:
+        assert 'group="' in ln, f"a launch site does not name its group: {ln.strip()}"
+
+
+def test_the_sleep_gate_reads_the_capture_sites_own_reader():
+    """The invariant is agreement with the CAPTURE, not with the registry.
+
+    Three parsers exist for this one variable and they disagree; measured, one
+    process per value:
+
+        value    hand-rolled(v1)   get_bool_env_var   envs.EnvBool
+        'yes'    True              False              True
+        'on'     True              False              False
+        'y'      False             False              True
+
+    An armed sleep tag whose capture did NOT route into that tag releases a
+    workspace whose graph is not released with it -- what
+    flashinfer_backend.py:1060-1061 means by "released together or not at all".
+    The launcher honours an operator override of this variable
+    (launcher.py:1383-1385), so a non-canonical value is a reachable input.
+    """
+    from sglang.srt.utils.common import get_bool_env_var
+
+    for raw in ("1", "true", "TRUE", "yes", "on", "y", "0", "false", "", "banana"):
+        ms = _saver(armed=True, group="P", raw=raw)
+        capture_routes = get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        assert ms.weg2_graph_tag_armed(True) is bool(capture_routes), (
+            f"value {raw!r}: the sleep gate and the capture site disagree"
+        )
+
+    # And the capture site really is the reader mirrored above: if it is ever
+    # migrated to `envs`, this goes red instead of the boot.
+    from sglang.srt.model_executor.runner_backend import full_cuda_graph_backend as fg
+
+    cap = inspect.getsource(fg)
+    assert 'get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")' in cap, (
+        "the capture site changed its reader -- weg2_graph_tag_armed mirrors "
+        "get_bool_env_var and the two can now disagree on a value"
+    )
+
+
+def test_the_memory_saver_conjunct_is_read_from_the_callers_server_args():
+    """Finding 2(a): with the saver OFF but the env ON, the capture site builds
+    a NOOP adapter and routes nothing, while the region used to build a REAL
+    TorchMemorySaverAdapter and route 384 MiB into a tag no sleep would pause.
+    """
+    ms = _saver(armed=True, group="P")
+    assert ms.weg2_graph_tag_armed(False) is False
+    with ms.weg2_graph_scratch_region(384 * 1024 * 1024, False) as tagged:
+        assert tagged is False
+
+    # The flashinfer call site must pass the real fact, not a literal.
+    from sglang.srt.layers.attention import flashinfer_backend as fb
+
+    src = inspect.getsource(fb)
+    start = src.index("with weg2_graph_scratch_region(")
+    window = src[start : start + 900]
+    assert "enable_memory_saver" in window, (
+        "the region's memory-saver conjunct is not read from the caller's "
+        "server_args -- a hardcoded value re-opens the split it closes"
+    )
+
+
+def test_a_missing_torch_memory_saver_wheel_degrades_instead_of_killing_the_boot(caplog):
+    """Finding 4: `TorchMemorySaverAdapter.create(enable=True)` RE-RAISES the
+    import error (torch_memory_saver_adapter.py:36-45), and in the first
+    version it sat ABOVE the try that exists to stop exactly that -- so it
+    escaped into FlashInferAttnBackend.__init__, which is the boot killer the
+    degrade path names as its reason to exist.
+    """
+    from sglang.srt.utils import torch_memory_saver_adapter as tmsa
+
+    ms = _saver(armed=True, group="P")
+    saved = tmsa.import_error
+    tmsa.import_error = ImportError("No module named 'torch_memory_saver'")
+    try:
+        with caplog.at_level("WARNING"):
+            with ms.weg2_graph_scratch_region(384 * 1024 * 1024, True) as tagged:
+                assert tagged is False
+    finally:
+        tmsa.import_error = saved
+    assert "NOT tagged" in caplog.text
+    assert "RESIDENT across the sleep" in caplog.text
+
+
+def test_the_group_name_instrument_stops_printing_a_question_mark():
+    """Klasse A, carried: WEG2-FLIP-TAG's `group=` read an attribute nobody
+    assigns, so it printed "?" on every rank of every boot while claiming to
+    name the group.  ring_table._TAG_RE reads the token as a non-space run and does
+    not capture it, so a real name breaks no parser.
+    """
+    M = _updater()
+    probe = M.__new__(M)
+
+    _saver(armed=True, group="D")
+    assert M._weg2_group_name(probe) == "D"
+    _saver(armed=True, group="")
+    assert M._weg2_group_name(probe) == "?"
+
+
+# ---------------------------------------------------------------------------
 # The region and its four refusals
 # ---------------------------------------------------------------------------
 
@@ -167,7 +365,7 @@ def test_below_min_bytes_refuses_at_the_gate_not_downstream(caplog):
 
     ms = _saver(armed=True)
     with caplog.at_level("WARNING"):
-        with ms.weg2_graph_scratch_region(MIN_TAGGED_BYTES - 1) as tagged:
+        with ms.weg2_graph_scratch_region(MIN_TAGGED_BYTES - 1, True) as tagged:
             assert tagged is False
     assert "NOT tagged" not in caplog.text, (
         "a sub-MIN_TAGGED_BYTES allocation reached the pool -- the #102 size "
@@ -178,7 +376,7 @@ def test_below_min_bytes_refuses_at_the_gate_not_downstream(caplog):
 
 def test_region_is_a_no_op_when_disarmed():
     ms = _saver(armed=False)
-    with ms.weg2_graph_scratch_region(384 * 1024 * 1024) as tagged:
+    with ms.weg2_graph_scratch_region(384 * 1024 * 1024, True) as tagged:
         assert tagged is False
 
 
@@ -193,18 +391,90 @@ def test_region_degrades_loudly_and_says_the_bytes_stay_resident(caplog):
             raise RuntimeError("saver not initialised")
 
     with caplog.at_level("WARNING"):
-        with ms.weg2_graph_scratch_region(384 * 1024 * 1024, adapter=_Boom()) as tagged:
+        with ms.weg2_graph_scratch_region(384 * 1024 * 1024, True, adapter=_Boom()) as tagged:
             assert tagged is False
     text = caplog.text
     assert "NOT tagged" in text
     assert "RESIDENT across the sleep" in text or "default pool" in text
 
 
+@contextlib.contextmanager
+def _tagged_region(ms):
+    """Drive the region down its TAGGED path on a box with no CUDA.
+
+    FIX 2 mutant M14 SURVIVED the first version of the caller-exception test,
+    and the reason is the whole point of writing mutants: on this box the
+    region degrades long before it reaches `yield True`, so a test that merely
+    raises inside `with region(...)` proves nothing about the block that
+    actually wraps the caller -- it exercised an early `yield False` return
+    instead.  The pool and region API are therefore faked here so the caller's
+    body really does run inside the guarded block.
+    """
+    import torch
+
+    entered = []
+
+    class _Pool:
+        pass
+
+    @contextlib.contextmanager
+    def _use_mem_pool(pool):
+        entered.append("pool")
+        yield
+
+    class _Adapter:
+        @contextlib.contextmanager
+        def region_config(self, **_kw):
+            entered.append("region")
+            yield
+
+    saved = (getattr(torch.cuda, "MemPool", None), getattr(torch.cuda, "use_mem_pool", None))
+    saved_pool = ms._GRAPH_SCRATCH_POOL
+    torch.cuda.MemPool = _Pool
+    torch.cuda.use_mem_pool = _use_mem_pool
+    ms._GRAPH_SCRATCH_POOL = None
+    try:
+        yield _Adapter(), entered
+    finally:
+        if saved[0] is None:
+            delattr(torch.cuda, "MemPool")
+        else:
+            torch.cuda.MemPool = saved[0]
+        if saved[1] is None:
+            delattr(torch.cuda, "use_mem_pool")
+        else:
+            torch.cuda.use_mem_pool = saved[1]
+        ms._GRAPH_SCRATCH_POOL = saved_pool
+
+
+def test_the_region_really_tags_when_the_pool_and_the_region_are_available():
+    """The precondition of the test below: without this, a green
+    caller-exception test can be green because the region never opened."""
+    ms = _saver(armed=True)
+    with _tagged_region(ms) as (adapter, entered):
+        with ms.weg2_graph_scratch_region(384 * 1024 * 1024, True, adapter=adapter) as t:
+            assert t is True
+        assert entered == ["pool", "region"], (
+            "the pool and the region_config were not both entered, so the "
+            "allocation did not land in the cuda_graph tag"
+        )
+
+
 def test_callers_own_exception_is_not_swallowed_by_the_degrade_path():
+    """Both paths: the early degrade AND the guarded block the caller's body
+    actually runs inside (mutant M14)."""
     ms = _saver(armed=True)
     with pytest.raises(ValueError, match="caller fault"):
-        with ms.weg2_graph_scratch_region(384 * 1024 * 1024):
+        with ms.weg2_graph_scratch_region(384 * 1024 * 1024, True):
             raise ValueError("caller fault")
+
+    ms = _saver(armed=True)
+    with _tagged_region(ms) as (adapter, _entered):
+        with pytest.raises(ValueError, match="caller fault inside the region"):
+            with ms.weg2_graph_scratch_region(
+                384 * 1024 * 1024, True, adapter=adapter
+            ):
+                raise ValueError("caller fault inside the region")
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +583,12 @@ def test_launcher_arms_the_graph_tag_and_lets_an_operator_override_it():
     saved = os.environ.pop("SGLANG_MEMORY_SAVER_CUDA_GRAPH", None)
     try:
         env = build_env(tree="/tmp/t", venv="/tmp/v", cvd="0", store_dir="/tmp/s",
-                        debug_hold=False, tag="probe")
+                        debug_hold=False, tag="probe", group="P")
         assert env["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] == "1"
 
         os.environ["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = "0"
         env = build_env(tree="/tmp/t", venv="/tmp/v", cvd="0", store_dir="/tmp/s",
-                        debug_hold=False, tag="probe")
+                        debug_hold=False, tag="probe", group="P")
         assert env["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] == "0"
     finally:
         os.environ.pop("SGLANG_MEMORY_SAVER_CUDA_GRAPH", None)
@@ -371,7 +641,7 @@ def test_captured_graph_static_buffers_keep_their_addresses_across_pause_resume(
 
     adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
     adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
-    ms.weg2_graph_tag_armed()  # the resolver must not raise on this path
+    ms.weg2_graph_tag_armed(True)  # the resolver must not raise on this path
 
     assert (static_in.data_ptr(), static_out.data_ptr()) == before_ptr, (
         "the pause/resume MOVED a static buffer -- the captured graph now reads "

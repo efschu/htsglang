@@ -1080,7 +1080,12 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
         with weg2_graph_scratch_region(
-            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+            # FIX 2, finding 2: the region's arming gate is the CAPTURE site's
+            # pair, and this is the half of it that only the caller has.  Read
+            # from the same object the capture site reads it from, so the two
+            # cannot be given different answers on one rank.
+            bool(getattr(model_runner.server_args, "enable_memory_saver", False)),
         ) as weg2_region_open:
             global_workspace_buffer = register_flashinfer_workspace_buffer(
                 get_buffer("flashinfer_workspace", _weg2_new_workspace)

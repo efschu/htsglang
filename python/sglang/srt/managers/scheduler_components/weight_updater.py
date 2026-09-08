@@ -386,16 +386,30 @@ class SchedulerWeightUpdaterManager:
         the wake would read two different processes' idea of whether it is
         armed, and the wake's ``offload_tags.remove`` raises ``KeyError`` on a
         tag the sleep never added -- a group-fatal fault from an env drift.
-        Both legs call this, both read ``weg2_graph_tag_armed()``, which is
-        cached per process, so the pair cannot disagree.
+        Both legs call this, both read ``weg2_graph_tag_armed()``, whose env
+        term is cached per process, so the pair cannot disagree.
 
         Three ways this returns the input untouched, each of them the correct
         answer rather than a fallback: the stock (non-Weg-2) path, a request
         that is not the kv_cache carrier (the weights family legs, the #89
         disk park), and a request that already names the tag (``tags=None`` ->
         ``GPU_MEMORY_ALL_TYPES``, which contains it).
+
+        FIX 2, finding 1: "the stock path" is decided by
+        ``weg2_memory_saver.weg2_group_name()``, INSIDE ``weg2_graph_tag_armed``
+        -- not by ``weg2_memory_saver_on``, which is true on every upstream
+        engine launched with ``--enable-memory-saver``.  Gating on that alone
+        silently widened a stock ``POST /release_memory_occupation
+        {"tags":["kv_cache"]}`` into ``kv_cache + cuda_graph`` (and added a
+        ``zero_flashinfer_workspaces`` memset to the paired resume) on any such
+        engine that also set ``SGLANG_MEMORY_SAVER_CUDA_GRAPH`` -- the
+        documented configuration, and the one this file's own rule at the top
+        of ``release_memory_occupation`` forbids touching: "a stock POST
+        /hibernate must stay byte-for-byte the upstream path".
         """
-        if not weg2_memory_saver_on or not weg2_graph_tag_armed():
+        if not weg2_memory_saver_on or not weg2_graph_tag_armed(
+            weg2_memory_saver_on
+        ):
             return list(tags)
         if GPU_MEMORY_TYPE_KV_CACHE not in tags:
             return list(tags)
@@ -943,8 +957,22 @@ class SchedulerWeightUpdaterManager:
     # ------------------------------------------------------------------
 
     def _weg2_group_name(self) -> str:
-        server_args = self._weg2_server_args()
-        return str(getattr(server_args, "weg2_group", "") or "?")
+        """``"P"``/``"D"``, or ``"?"`` when this rank is not a Weg-2 group.
+
+        FIX 2 (finding 1, carried): this read WAS
+        ``getattr(server_args, "weg2_group", "")`` -- an attribute that is
+        assigned NOWHERE in either tree, so every ``WEG2-FLIP-TAG group=`` line
+        of every boot printed ``?`` while claiming to name a group.  That is
+        the Klasse-A instrument defect in its plainest form, and it is the same
+        root as the finding: there was no in-process Weg-2 identity at all.
+        There is one now, published by ``launcher.build_env(group=...)``.
+        ``ring_table._TAG_RE`` reads this token as ``group=\\S+`` and does not
+        capture it, so a real name is strictly more information, not a format
+        change any parser depends on.
+        """
+        from sglang.srt.managers.weg2_memory_saver import weg2_group_name
+
+        return weg2_group_name() or "?"
 
     def _weg2_rank(self) -> int:
         scheduler = self.scheduler

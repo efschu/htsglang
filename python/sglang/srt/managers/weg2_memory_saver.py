@@ -134,12 +134,30 @@ WEG2_SLEEP_TAGS = frozenset((GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS))
 #: always get their own segment.  Same number, same reason, not a second one.
 WEG2_GRAPH_SCRATCH_MIN_BYTES = 2 * 1024 * 1024
 
+#: Item `dormant` FIX 2, finding 1: the name of THIS rank's Weg-2 group, or the
+#: empty string on every engine that is not a Weg-2 group at all.  Set by
+#: ``weg2/launcher.build_env`` for both groups and by nothing else, which is
+#: exactly why it can be the discriminator: ``--enable-memory-saver`` cannot,
+#: because upstream engines set it too.
+#:
+#: There is NO server-args equivalent to read instead.  ``weg2_group`` is read
+#: once (``weight_updater._weg2_group_name``) and ASSIGNED NOWHERE in either
+#: tree -- `grep -rn 'weg2_group' --include=*.py .` returns 18 lines, all of
+#: them reads or unrelated ``_weg2_group_*`` method names -- so that getattr
+#: has always fallen through to its ``"?"`` default on every rank of every
+#: boot.  This env is the fact that was believed to exist there.
+WEG2_GROUP_ENV = "SGLANG_WEG2_GROUP"
+
 #: Item `dormant`: whether this rank's sleep also releases the CUDA-graph tag.
 #: Resolved ONCE per process, deliberately: the sleep adds the tag to
 #: ``offload_tags`` and the wake removes it, so a resolver that could change
 #: answer between the two legs would raise ``KeyError`` on a tag that was never
 #: paused.  A cached read cannot drift.
 _GRAPH_TAG_ARMED: Optional[bool] = None
+
+#: Item `dormant` FIX 2: the cached :data:`WEG2_GROUP_ENV` reading, same reason
+#: as above -- both legs of a flip must get the same answer.
+_WEG2_GROUP_NAME: Optional[str] = None
 
 #: Item `dormant`: ONE private ``torch.cuda.MemPool`` for the graph tag's
 #: non-capture scratch, created on first use and kept for the process lifetime
@@ -1402,29 +1420,86 @@ def sleep_acceptance_census(
 # the UPSTREAM `cuda_graph` tag, so there is exactly one tag and one ledger.
 
 
-def weg2_graph_tag_armed() -> bool:
+def weg2_group_name() -> str:
+    """This rank's Weg-2 group name, or ``""`` on an engine that is not one.
+
+    FIX 2, finding 1.  Cached for the process lifetime for the same reason the
+    graph-tag answer is: a sleep and its wake must not be able to read
+    different answers.
+    """
+    global _WEG2_GROUP_NAME
+    if _WEG2_GROUP_NAME is None:
+        _WEG2_GROUP_NAME = os.environ.get(WEG2_GROUP_ENV, "").strip()
+    return _WEG2_GROUP_NAME
+
+
+def weg2_graph_tag_armed(memory_saver_on: bool) -> bool:
     """True when this rank's sleep also releases ``GPU_MEMORY_TYPE_CUDA_GRAPH``.
 
-    The gate is the SAME pair the capture path already reads
-    (``full_cuda_graph_backend.py:78-81``): the memory saver must be on and
-    ``SGLANG_MEMORY_SAVER_CUDA_GRAPH`` must be set.  Reading the same pair here
-    is what makes the two sides agree without a second flag -- if the capture
-    did not route into the tag, the pause has nothing to release and the tag
-    must not be added.
+    THREE conjuncts, and FIX 2 (findings 1 and 2) added two of them because the
+    first version had only the third and was wrong in both directions:
 
-    Cached on first call.  The sleep ADDS the tag to ``offload_tags`` and the
-    wake REMOVES it; a resolver that could answer differently between those two
-    legs would ``KeyError`` on a tag that was never paused.
+    1. ``memory_saver_on`` -- the caller's own
+       ``server_args.enable_memory_saver``.  It is the half of the capture
+       site's pair (``full_cuda_graph_backend.py:78-81``,
+       ``enable=enable_memory_saver and get_bool_env_var(...)``) that the first
+       version's docstring claimed to read and did not.  Without it, an engine
+       with the env set but the saver off armed the sleep tag while the capture
+       built a Noop adapter -- the exact split ``flashinfer_backend.py`` calls
+       out ("the two must be released together or not at all").
+    2. :func:`weg2_group_name` -- THIS IS A WEG-2 MECHANISM AND MUST GATE ON
+       WEG 2.  ``enable_memory_saver`` is an upstream flag on an upstream
+       endpoint: gating on it alone silently widened a stock
+       ``POST /release_memory_occupation {"tags":["kv_cache"]}`` into
+       ``kv_cache + cuda_graph`` on any engine that ran the documented
+       memory-saver + cuda-graph configuration.  The caller asked for one tag
+       and got two; that is not this item's to change.  With this conjunct the
+       stock path is byte-identical BY CONSTRUCTION, not by a test's opinion of
+       what "stock" means.
+    3. ``SGLANG_MEMORY_SAVER_CUDA_GRAPH`` -- read through
+       :func:`get_bool_env_var`, which is the function the CAPTURE site calls,
+       so the two sides cannot disagree on a value.
+
+    On (3), why not ``envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()`` even though
+    that is the canonical registry entry: MEASURED on this box, one process per
+    value, the three readers disagree ::
+
+        value    hand-rolled(v1)   get_bool_env_var   envs.EnvBool
+        '1'      True              True               True
+        'true'   True              True               True
+        'yes'    True              False              True
+        'on'     True              False              False
+        'y'      False             False              True
+
+    The invariant is agreement with the CAPTURE, not with the registry, and the
+    launcher honours an operator override of this variable
+    (``launcher.py:1383-1385``), so a non-canonical value is a reachable input
+    rather than a hypothetical.  ``envs`` would fix ``'on'`` and newly break
+    ``'y'`` and leave ``'yes'`` broken; ``get_bool_env_var`` is exact for all
+    five because it is literally the other side's reader.  If the capture site
+    is ever migrated to ``envs``, ``test_the_sleep_gate_reads_the_capture_sites
+    _own_reader`` goes red rather than the boot.
+
+    Only (3) is cached: it is the drifting term (an env), and the sleep ADDS
+    the tag to ``offload_tags`` while the wake REMOVES it, so a resolver that
+    answered differently between the legs would ``KeyError`` on a tag that was
+    never paused.  (1) is a per-call argument because it is a per-caller fact,
+    and both legs read it from the same ``server_args`` object.
     """
+    if not memory_saver_on or not weg2_group_name():
+        return False
     global _GRAPH_TAG_ARMED
     if _GRAPH_TAG_ARMED is None:
-        raw = os.environ.get("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "")
-        _GRAPH_TAG_ARMED = raw.strip().lower() in ("1", "true", "yes", "on")
+        from sglang.srt.utils.common import get_bool_env_var
+
+        _GRAPH_TAG_ARMED = bool(get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH"))
     return _GRAPH_TAG_ARMED
 
 
 @contextmanager
-def weg2_graph_scratch_region(nbytes: int, adapter: Any = None) -> Iterator[bool]:
+def weg2_graph_scratch_region(
+    nbytes: int, memory_saver_on: bool, adapter: Any = None
+) -> Iterator[bool]:
     """Route ONE large, content-free graph-side allocation into the graph tag.
 
     Yields True when the enclosed allocation is tagged, False when it is not --
@@ -1433,9 +1508,14 @@ def weg2_graph_scratch_region(nbytes: int, adapter: Any = None) -> Iterator[bool
 
     Three refusals to tag, each for a stated reason:
 
-    * the tag is not armed (``weg2_graph_tag_armed``) -- then the capture path
-      did not route into the tag either, and a workspace alone in a paused tag
-      would be released while the graph that reads it is not;
+    * the tag is not armed (``weg2_graph_tag_armed(memory_saver_on)``) -- then
+      the capture path did not route into the tag either, and a workspace alone
+      in a paused tag would be released while the graph that reads it is not.
+      ``memory_saver_on`` is the caller's own
+      ``server_args.enable_memory_saver``: FIX 2, finding 2, the first version
+      read the env alone here, so an engine WITHOUT the saver but WITH the env
+      built a real ``TorchMemorySaverAdapter`` and routed 384 MiB into a region
+      no sleep would ever pause;
     * ``nbytes`` is below :data:`WEG2_GRAPH_SCRATCH_MIN_BYTES` -- #102's
       correctness gate, see the constant;
     * ``torch.cuda.MemPool`` / ``use_mem_pool`` or the adapter's
@@ -1443,21 +1523,65 @@ def weg2_graph_scratch_region(nbytes: int, adapter: Any = None) -> Iterator[bool
       cross-tag free-list reuse impossible, so without it the allocation stays
       in the default pool rather than landing untracked in a shared segment.
 
+    Two more are FAILURES rather than decisions, and both degrade loudly to the
+    pre-change behaviour instead of raising: the adapter could not be BUILT
+    (FIX 2, finding 4 -- ``TorchMemorySaverAdapter.create`` re-raises the
+    missing-wheel import error), and the pool or the region could not be
+    ENTERED.  Raising in either place would turn a VRAM optimisation into a
+    boot killer at attention-backend build time.
+
     The caller is responsible for restoring the allocation's content contract
     after a resume; for the flashinfer float workspace that is
     ``zero_flashinfer_workspaces()``, which the wake path calls.
     """
-    if not weg2_graph_tag_armed() or int(nbytes) < WEG2_GRAPH_SCRATCH_MIN_BYTES:
+    if (
+        not weg2_graph_tag_armed(memory_saver_on)
+        or int(nbytes) < WEG2_GRAPH_SCRATCH_MIN_BYTES
+    ):
         yield False
         return
     import torch
 
     from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 
+    # FIX 2, finding 4.  ``TorchMemorySaverAdapter.create`` RE-RAISES the
+    # import error when torch-memory-saver is missing
+    # (``torch_memory_saver_adapter.py:36-45``), and in the first version this
+    # call sat ABOVE the guarded block -- so the one exception this region can
+    # produce escaped the very try written to stop it, straight into
+    # ``FlashInferAttnBackend.__init__``, exactly the "boot killer at
+    # attention-backend build time" the degrade path below names as the thing
+    # it exists to prevent.  Caught HERE rather than inside that block because
+    # the block also contains the ``yield``: wrapping the caller's body in an
+    # ``except Exception`` would swallow the CALLER's exception, which is a
+    # second defect and has its own test.
+    #
+    # ``enable=True`` is no longer a hardcoded claim either: the arming gate
+    # above now requires ``memory_saver_on``, so this is the same value the
+    # capture site passes (``full_cuda_graph_backend.py:78-81``) and the
+    # upstream warning "enable_memory_saver is enabled, but torch-memory-saver
+    # is not installed" can no longer be printed on an engine that never
+    # enabled it.
     if adapter is None:
-        from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+        try:
+            from sglang.srt.utils.torch_memory_saver_adapter import (
+                TorchMemorySaverAdapter,
+            )
 
-        adapter = TorchMemorySaverAdapter.create(enable=True)
+            adapter = TorchMemorySaverAdapter.create(enable=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "WEG2-SLEEP graph scratch NOT tagged (%d bytes): the memory-saver "
+                "adapter could not be built (%s: %s) -- the allocation stays in "
+                "the default pool and is RESIDENT across the sleep (pre-change "
+                "behaviour, not a silent success)",
+                int(nbytes),
+                type(exc).__name__,
+                exc,
+            )
+            yield False
+            return
+
     region_config = getattr(adapter, "region_config", None)
     mempool_cls = getattr(torch.cuda, "MemPool", None)
     use_mem_pool = getattr(torch.cuda, "use_mem_pool", None)

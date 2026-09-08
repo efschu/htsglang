@@ -1310,8 +1310,29 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
 
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
               chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "",
-              transport: str = "bar1", ring: Optional["HostRingPlan"] = None) -> Dict[str, str]:
+              transport: str = "bar1", ring: Optional["HostRingPlan"] = None,
+              group: str = "") -> Dict[str, str]:
     env = dict(os.environ)
+    # FIX 2, finding 1: WHICH WEG-2 GROUP THIS RANK BELONGS TO, and the only
+    # thing in either tree that says so.  Read by
+    # `weg2_memory_saver.weg2_group_name()`; it is the discriminator the
+    # graph-tag coupling gates on, because the alternative it used first
+    # (`server_args.enable_memory_saver`) is an UPSTREAM flag that upstream
+    # engines set too -- gating a Weg-2-only widening of an upstream RPC on it
+    # changed stock `/release_memory_occupation` semantics for everyone.
+    #
+    # `server_args.weg2_group` was believed to be this fact and is not: it is
+    # read in exactly one place (`weight_updater._weg2_group_name`) with a
+    # `getattr(..., "")` default and is ASSIGNED NOWHERE, so it has answered
+    # "?" on every rank of every boot.
+    #
+    # Same discipline as the ring family above: published only when this call
+    # names a group, and POPPED otherwise, so a value inherited from the
+    # operator's own shell can never arm a coupling nobody asked for.
+    if group:
+        env["SGLANG_WEG2_GROUP"] = group
+    else:
+        env.pop("SGLANG_WEG2_GROUP", None)
     # C18: the shared host granule ring (spec C1-C8).  These four variables are
     # LAUNCHER OUTPUT, never operator input (R19): every size in them is solved
     # by ring_table from the previous boot's own lines, and the whole family is
@@ -1371,7 +1392,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # Upstream's own flag, read at the CAPTURE site
     # (full_cuda_graph_backend.py:78-81) and, since commit 2, at the SLEEP site
     # (weg2_memory_saver.weg2_graph_tag_armed); both groups get it so the two
-    # sides can never disagree.  Expected release per rank from [1y]:
+    # sides can never disagree.  FIX 2: this flag ALONE no longer arms the
+    # sleep-side coupling -- SGLANG_WEG2_GROUP above is the Weg-2 conjunct, so
+    # setting this variable on a stock engine gets stock behaviour, which is
+    # what it always meant upstream.  Expected release per rank from [1y]:
     # 384 MiB workspace + 92-133 MiB capture pool, measured on the boot by
     # `WEG2-SLEEP released tags=['cuda_graph'] mib=`.
     #
@@ -1707,7 +1731,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls2b2"
     )
     state.budgets["P"] = budgets_p
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P")
     # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
     # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
@@ -1738,7 +1762,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_p, tree, log, dry)
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D")
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("DRY-RUN complete: nothing started, mounted, armed or written")
@@ -1774,7 +1798,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1"
     )
     state.budgets["D"] = budgets_d
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D")
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
