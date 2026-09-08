@@ -19,6 +19,17 @@ THE TWO CHECKS, and why the second one is the one that matters:
   wrong NUMBER would pass it.  (That is precisely the defect class this
   module's commit exists to close, so the acceptance may not rest on it.)
 
+  AND IT GRADES IN ONE UNIT (fix 3).  The band is allocatable free; a pre-fix
+  log's minima are allocatable free PLUS the driver carve-out.  The report
+  therefore converts before it grades -- through
+  :func:`ring_table.corridor_allocatable`, the same converter the ring credit
+  uses, not a second table here -- and prints the source figure, the
+  correction and the converted figure on one line.  Where the conversion is
+  impossible the card is UNGRADED with the reason, and under
+  ``require_in_band`` that refusal is a failure: the predecessor of this
+  paragraph graded rg6's ``859`` against the 819-1229 band and blessed the
+  5090 that was 478 MiB below the floor.
+
 * :func:`pair_verdict` is the proof.  It pairs the in-tree sampler's own
   per-card ``free`` against an INDEPENDENT reader -- ``nvidia-smi
   --query-gpu=memory.free`` -- taken at the same instant, and requires
@@ -46,14 +57,23 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from sglang.srt.weg2 import front, ring_table
 
-#: The reference rig's carve-outs, MiB, measured 2026-09-08 via NVML v2 with
-#: the cards idle (record [SECTION 1x] table).  Used ONLY to recognise the
-#: pre-fix failure shape in :func:`pair_verdict` and name it -- never to
-#: correct a number, and never as an input to a verdict.
+#: The DELTAS a pre-fix pairing shows, MiB.  Used ONLY to recognise the pre-fix
+#: failure shape in :func:`pair_verdict` and name it -- never to correct a
+#: number and never as an input to a verdict.  (The correction table is
+#: :data:`ring_table.RECORD_CARVE_OUT_MIB`, keyed by card UUID, and it is the
+#: only one; this tuple is a different quantity in a different role.)
+#:
+#: WHY 424 SITS BESIDE 425.  These are DELTAS BETWEEN TWO TOOLS, not the driver
+#: constant: pynvml and nvidia-smi floor different byte values, so the 3080's
+#: 425 MiB carve-out showed up as a 424 MiB delta on the rg6 instant
+#: (1454-1030) and as 425 idle.  The tuple therefore carries both, and
+#: ``test_the_two_carve_out_tables_cannot_drift_apart`` pins every recorded
+#: constant to within that 1 MiB of an entry here so the two cannot diverge in
+#: silence.
 KNOWN_CARVE_OUT_MIB = (424, 425, 518)
 
 #: ``0, 1030`` from ``nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits``.
@@ -166,8 +186,13 @@ class ArmReport:
     #: law), and because reading one of these as a sample is exactly the defect
     #: :func:`ring_table._corridor_sample_phase` closes.
     prose_mentions: int = 0
-    #: ``{phase: {nvml index: minimum free MiB}}``.
+    #: ``{phase: {nvml index: minimum free MiB}}``, IN THE SOURCE LOG'S OWN
+    #: UNIT.  Never graded directly -- see :attr:`units`.
     minima: Dict[str, Dict[int, int]] = field(default_factory=dict)
+    #: ``{phase: CorridorUnit}`` -- the same minima brought into ALLOCATABLE
+    #: free, the unit :attr:`band_mib` is stated in, or a named refusal.  THE
+    #: ONLY THING THIS REPORT GRADES.
+    units: Dict[str, ring_table.CorridorUnit] = field(default_factory=dict)
     band_mib: Tuple[int, int] = (0, 0)
     problems: List[str] = field(default_factory=list)
 
@@ -180,25 +205,69 @@ class ArmReport:
         head = (
             f"WEG2-CORRIDOR-ARM log={self.path} instrument={self.instrument} "
             f"samples={self.samples} prose_mentions={self.prose_mentions} "
-            f"band={floor}-{ceil}MiB verdict={'PASS' if self.ok else 'FAIL'}"
+            f"band={floor}-{ceil}MiB(allocatable free) "
+            f"verdict={'PASS' if self.ok else 'FAIL'}"
         )
         body = []
         for phase in sorted(self.minima):
+            unit = self.units.get(phase)
+            body.append(f"  phase={phase}(awake) unit: "
+                        + (unit.correction_line() if unit else "not converted"))
             for idx, mib in sorted(self.minima[phase].items()):
-                body.append(
-                    f"  phase={phase}(awake) nvml{idx}: min_free={mib}MiB "
-                    f"verdict={front.corridor_verdict(mib)}"
-                )
+                # THE SOURCE NUMBER AND THE GRADED NUMBER, ALWAYS BOTH.  The
+                # operator greps this line against the boot log, which prints
+                # the source unit; printing only the converted figure would
+                # make the two disagree with no way to see why.
+                if unit is not None and unit.ok and idx in unit.allocatable:
+                    got = unit.allocatable[idx]
+                    correction = unit.correction_mib.get(idx, 0)
+                    shown = f"min_free={got}MiB" + (
+                        f"(allocatable; the log printed {mib}MiB, "
+                        f"-{correction} MiB carve-out)"
+                        if correction
+                        else ""
+                    )
+                    body.append(
+                        f"  phase={phase}(awake) nvml{idx}: {shown} "
+                        f"verdict={front.corridor_verdict(got)}"
+                    )
+                else:
+                    body.append(
+                        f"  phase={phase}(awake) nvml{idx}: min_free={mib}MiB"
+                        f"({self.instrument}) verdict=UNGRADED"
+                    )
         body += [f"  PROBLEM: {p}" for p in self.problems]
         return "\n".join([head] + body)
 
 
-def arm_report(path: str, require_in_band: bool = False) -> ArmReport:
+def arm_report(
+    path: str,
+    require_in_band: bool = False,
+    carve_out_by_uuid: Optional[Mapping[str, int]] = None,
+) -> ArmReport:
     """Read one front log and grade its corridor instrument.
 
     ``require_in_band`` is OFF by default and that is deliberate: BELOW the
     floor is a capacity finding for the strand, not evidence that the
     instrument is wrong.  This function's own subject is the INSTRUMENT.
+
+    ONE UNIT (fix 3, round-2 blocker).  The band is stated in ALLOCATABLE free,
+    so every number graded against it is brought into that unit first, by the
+    SAME converter the ring credit uses (:func:`ring_table.corridor_allocatable`).
+    The predecessor graded a pre-fix log's minima -- allocatable free PLUS the
+    carve-out -- against the allocatable band, in the same function that had
+    already printed "every free is over-stated by that card's driver carve-out"
+    two lines earlier: on the real rg6 log it printed ``nvml1: min_free=859MiB
+    verdict=IN`` for the 5090 that sat 478 MiB BELOW the floor, and listed the
+    two 3080s that were genuinely IN band as ABOVE it.  A log whose samples
+    cannot be converted (no card identity, an unknown instrument token, a card
+    with no measured or recorded carve-out) is UNGRADED with the reason
+    printed, and under ``require_in_band`` that refusal is itself a PROBLEM --
+    a strict check must never pass by declining to look.
+
+    ``carve_out_by_uuid`` is an optional measured carve-out per card; without
+    it the converter falls back to the recorded per-card constants, which are
+    keyed by UUID and so cannot be applied to a card they do not name.
     """
     rep = ArmReport(path=path, band_mib=front.corridor_band_mib())
     try:
@@ -216,6 +285,13 @@ def arm_report(path: str, require_in_band: bool = False) -> ArmReport:
 
     rep.instrument = ring_table.front_corridor_instrument(path)
     rep.minima = ring_table.parse_front_corridor(path)
+    _, by_nvml = ring_table.parse_card_identity(path)
+    rep.units = {
+        phase: ring_table.corridor_allocatable(
+            mins, rep.instrument, by_nvml, carve_out_by_uuid
+        )
+        for phase, mins in rep.minima.items()
+    }
 
     if rep.samples == 0:
         rep.problems.append(
@@ -238,11 +314,18 @@ def arm_report(path: str, require_in_band: bool = False) -> ArmReport:
     if require_in_band:
         floor, ceil = rep.band_mib
         for phase in sorted(rep.minima):
-            for idx, mib in sorted(rep.minima[phase].items()):
+            unit = rep.units.get(phase)
+            if unit is None or not unit.ok:
+                rep.problems.append(
+                    f"phase={phase} cannot be graded against the {floor}-{ceil} MiB "
+                    f"band: {unit.reason if unit else 'no unit conversion was attempted'}"
+                )
+                continue
+            for idx, mib in sorted(unit.allocatable.items()):
                 if not floor <= mib <= ceil:
                     rep.problems.append(
-                        f"phase={phase} nvml{idx} minimum {mib} MiB is "
-                        f"{front.corridor_verdict(mib)} the {floor}-{ceil} MiB band"
+                        f"phase={phase} nvml{idx} minimum {mib} MiB (allocatable free) "
+                        f"is {front.corridor_verdict(mib)} the {floor}-{ceil} MiB band"
                     )
     return rep
 

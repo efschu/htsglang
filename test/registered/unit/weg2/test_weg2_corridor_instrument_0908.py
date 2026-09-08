@@ -606,22 +606,31 @@ class ProseIsNotASampleTest(unittest.TestCase):
         self.assertEqual(got["P"], {0: 1030, 1: 341, 2: 852})
 
     def test_provenance_does_not_claim_a_pre_fix_instrument_for_a_post_fix_boot(self):
-        """The printed consequence, end to end."""
-        warning = "this boot's corridor samples are free PLUS the driver carve-out"
-        post = ring_table.RingTable(
-            boot="b", instrument="i", lines_read=1, image_source="s",
-            credit_instrument=ring_table.front_corridor_instrument(
-                _write_log(self, RG6_PROSE_LINE, POST_FIX_LINE)
-            ),
+        """The printed consequence, end to end.
+
+        FIX 3 moved what the provenance line SAYS about a pre-fix source: it no
+        longer warns that the credits are over-stated (they are converted now),
+        it NAMES the source instrument beside the unit the credits are in.  The
+        round-1 property under test is unchanged -- a post-fix boot must not be
+        described as a pre-fix one.
+        """
+        def prov(*lines):
+            return ring_table.RingTable(
+                boot="b", instrument="i", lines_read=1, image_source="s",
+                credit_instrument=ring_table.front_corridor_instrument(
+                    _write_log(self, *lines)
+                ),
+            ).provenance()
+
+        post = prov(RG6_PROSE_LINE, POST_FIX_LINE)
+        self.assertIn("CREDIT unit: ALLOCATABLE free", post)
+        self.assertIn("source instrument nvml_v2_free,allocatable", post)
+        self.assertNotIn(ring_table.CORRIDOR_INSTRUMENT_PRE_FIX, post)
+        pre = prov(RG6_PROSE_LINE, PRE_FIX_LINE)
+        self.assertIn("CREDIT unit: ALLOCATABLE free", pre)
+        self.assertIn(
+            f"source instrument {ring_table.CORRIDOR_INSTRUMENT_PRE_FIX}", pre
         )
-        self.assertNotIn(warning, post.provenance())
-        pre = ring_table.RingTable(
-            boot="b", instrument="i", lines_read=1, image_source="s",
-            credit_instrument=ring_table.front_corridor_instrument(
-                _write_log(self, RG6_PROSE_LINE, PRE_FIX_LINE)
-            ),
-        )
-        self.assertIn(warning, pre.provenance())
 
 
 class TheProseLineIsRealTest(unittest.TestCase):
@@ -952,7 +961,10 @@ class BootArmTest(unittest.TestCase):
         self.assertTrue(corridor_arm.arm_report(path).ok)
         strict = corridor_arm.arm_report(path, require_in_band=True)
         self.assertFalse(strict.ok)
-        self.assertIn("nvml1 minimum 341 MiB is BELOW", " ".join(strict.problems))
+        self.assertIn(
+            "nvml1 minimum 341 MiB (allocatable free) is BELOW",
+            " ".join(strict.problems),
+        )
 
     def test_the_band_check_grades_BOTH_edges(self):
         """ABOVE the ceiling is "the boot did not pass", not a free pass.
@@ -966,8 +978,8 @@ class BootArmTest(unittest.TestCase):
         rep = corridor_arm.arm_report(_write_log(self, above), require_in_band=True)
         self.assertFalse(rep.ok)
         joined = " ".join(rep.problems)
-        self.assertIn("nvml0 minimum 5000 MiB is ABOVE", joined)
-        self.assertIn("nvml1 minimum 341 MiB is BELOW", joined)
+        self.assertIn("nvml0 minimum 5000 MiB (allocatable free) is ABOVE", joined)
+        self.assertIn("nvml1 minimum 341 MiB (allocatable free) is BELOW", joined)
 
     def test_an_in_band_log_passes_the_strict_check(self):
         """Can-fail the other way: the strict check must be satisfiable."""
@@ -1066,6 +1078,258 @@ class BootArmAgainstRealBootsTest(unittest.TestCase):
             rep = corridor_arm.arm_report(path)
             self.assertFalse(rep.ok, f"{key} passed an arm it must fail")
             self.assertGreater(rep.samples, 0, key)
+            self.assertIn("pre-fix total-minus-used sampler", " ".join(rep.problems), key)
+
+
+#: The rg6 front log's own ``NVML -> CUDA ordinal map`` line, verbatim (line 5
+#: of ``boot_weg2_weg2rg6_7f88b1c75d_0908_070324.front.log``).  A carve-out
+#: belongs to a CARD, so a fixture that wants one converted has to name its
+#: cards the way a real boot does.
+REAL_ORDINAL_MAP = (
+    "[2026-09-08T07:03:24Z] WEG2-LAUNCH NVML -> CUDA ordinal map: "
+    "ordinal 0 = nvml 1 NVIDIA GeForce RTX 5090 "
+    "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d total 32607 MiB, "
+    "ordinal 1 = nvml 0 NVIDIA GeForce RTX 3080 "
+    "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 total 20480 MiB, "
+    "ordinal 2 = nvml 2 NVIDIA GeForce RTX 3080 "
+    "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 total 20480 MiB"
+)
+
+
+class ArmGradesInOneUnitTest(unittest.TestCase):
+    """FIX 3, the round-2 blocker: the arm graded front units against the
+    allocatable band and blessed the one card the strand exists for.
+
+    ``arm_report`` read a pre-fix log's minima -- allocatable free PLUS the
+    driver carve-out -- and graded every one of them with
+    ``front.corridor_verdict``, i.e. against the 819-1229 MiB ALLOCATABLE band,
+    in the same call that had already appended "every free is over-stated by
+    that card's driver carve-out" as a problem.  On the real rg6 log that
+    printed ``nvml1: min_free=859MiB verdict=IN`` for the 5090 that sat at
+    341 MiB, 478 MiB below the floor, and reported the two 3080s that were
+    genuinely in band as ABOVE it.  Every assertion here fails on the parent
+    commit 4302724e8b.
+    """
+
+    def _pre_fix(self, *free, identity=True):
+        line = (
+            "[2026-09-08T07:31:30Z] INFO weg2.front: WEG2-CORRIDOR phase=D(awake) "
+            "epoch=20 " + " ".join(f"nvml{i}:free={v}MiB" for i, v in free)
+        )
+        return _write_log(self, *(([REAL_ORDINAL_MAP] if identity else []) + [line]))
+
+    def test_a_pre_fix_minimum_is_graded_in_the_bands_unit(self):
+        """859 front units = 341 allocatable = BELOW, not IN."""
+        rep = corridor_arm.arm_report(self._pre_fix((0, 1454), (1, 859), (2, 1276)))
+        line = rep.report()
+        self.assertIn("nvml1: min_free=341MiB", line)
+        self.assertIn("verdict=BELOW", line)
+        self.assertNotIn("min_free=859MiB verdict=IN", line)
+
+    def test_the_report_shows_the_source_number_and_the_correction(self):
+        """The operator greps the boot log, which prints the SOURCE unit."""
+        rep = corridor_arm.arm_report(self._pre_fix((1, 859)))
+        self.assertIn(
+            "nvml1: min_free=341MiB(allocatable; the log printed 859MiB, "
+            "-518 MiB carve-out) verdict=BELOW",
+            rep.report(),
+        )
+
+    def test_the_two_3080s_are_no_longer_reported_ABOVE_the_band(self):
+        """1454/1276 front units are 1029/851 allocatable: IN and IN."""
+        rep = corridor_arm.arm_report(
+            self._pre_fix((0, 1454), (1, 859), (2, 1276)), require_in_band=True
+        )
+        joined = " ".join(rep.problems)
+        self.assertNotIn("nvml0 minimum", joined)
+        self.assertNotIn("nvml2 minimum", joined)
+        self.assertIn("nvml1 minimum 341 MiB (allocatable free) is BELOW", joined)
+
+    def test_the_band_check_can_still_pass_on_a_converted_log(self):
+        """Can-fail the other way: conversion must not make the check vacuous.
+
+        A pre-fix log always fails the arm on its INSTRUMENT -- that problem is
+        the point of the arm and converting the numbers does not retire it --
+        so what must be satisfiable here is the BAND half: 1454/1400/1276 front
+        units convert to 1029/882/851, all three in band, and no band problem
+        may be raised.
+        """
+        rep = corridor_arm.arm_report(
+            self._pre_fix((0, 1454), (1, 1400), (2, 1276)), require_in_band=True
+        )
+        band = [p for p in rep.problems if "band" in p]
+        self.assertEqual(band, [], rep.report())
+        self.assertEqual(len(rep.problems), 1, rep.report())
+        self.assertIn("pre-fix total-minus-used sampler", rep.problems[0])
+
+    def test_a_pre_fix_log_with_no_card_identity_is_ungraded_not_graded(self):
+        """No ordinal map -> the nvml indices name no card -> no carve-out."""
+        rep = corridor_arm.arm_report(self._pre_fix((1, 859), identity=False))
+        self.assertIn("verdict=UNGRADED", rep.report())
+        self.assertNotIn("verdict=IN", rep.report())
+
+    def test_an_ungradeable_log_FAILS_the_strict_check(self):
+        """A strict check must never pass by declining to look."""
+        rep = corridor_arm.arm_report(
+            self._pre_fix((1, 859), identity=False), require_in_band=True
+        )
+        self.assertFalse(rep.ok)
+        self.assertIn("cannot be graded against the 819-1229 MiB band",
+                      " ".join(rep.problems))
+        self.assertIn("no measured or recorded driver carve-out",
+                      " ".join(rep.problems))
+
+    def test_an_unknown_instrument_token_is_never_graded(self):
+        """Mixed units in their least visible form: a unit nobody declared."""
+        line = PRE_FIX_LINE.replace(
+            "epoch=20", "epoch=20 instrument=free_by_some_future_reader"
+        )
+        rep = corridor_arm.arm_report(
+            _write_log(self, REAL_ORDINAL_MAP, line), require_in_band=True
+        )
+        self.assertFalse(rep.ok)
+        self.assertIn("names neither the allocatable unit", " ".join(rep.problems))
+        self.assertIn("verdict=UNGRADED", rep.report())
+
+    def test_a_post_fix_log_is_not_corrected_twice(self):
+        """Already allocatable: correction 0, and the line stays as it was."""
+        rep = corridor_arm.arm_report(_write_log(self, REAL_ORDINAL_MAP, POST_FIX_LINE))
+        self.assertTrue(rep.ok, rep.report())
+        self.assertIn("nvml1: min_free=341MiB verdict=BELOW", rep.report())
+        self.assertFalse(rep.units["D"].converted)
+        self.assertIn("already allocatable free", rep.report())
+
+    def test_a_measured_carve_out_wins_over_the_recorded_one(self):
+        """The launcher's own NVML read is the live registry snapshot."""
+        rep = corridor_arm.arm_report(
+            self._pre_fix((1, 859)),
+            carve_out_by_uuid={"GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 500},
+        )
+        self.assertEqual(rep.units["D"].allocatable[1], 359)
+        self.assertIn("matched by UUID", rep.report())
+
+    def test_the_recorded_table_is_keyed_by_card_never_by_index(self):
+        """NVML order shifts between boots; 518 must not land on a 3080."""
+        self.assertEqual(
+            set(ring_table.RECORD_CARVE_OUT_MIB),
+            {
+                "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
+                "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+                "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+            },
+        )
+        swapped = REAL_ORDINAL_MAP.replace(
+            "nvml 1 NVIDIA GeForce RTX 5090", "nvml 7 NVIDIA GeForce RTX 5090"
+        )
+        line = (
+            "[2026-09-08T07:31:30Z] INFO weg2.front: WEG2-CORRIDOR phase=D(awake) "
+            "epoch=20 nvml7:free=859MiB"
+        )
+        rep = corridor_arm.arm_report(_write_log(self, swapped, line))
+        self.assertEqual(rep.units["D"].allocatable[7], 341, "the CARD carries 518")
+
+    def test_the_two_carve_out_tables_cannot_drift_apart(self):
+        """The pairing's delta tuple and the correction table are one rig.
+
+        ``KNOWN_CARVE_OUT_MIB`` recognises a pairing's DELTAS (which carry the
+        1 MiB spread between pynvml and nvidia-smi); ``RECORD_CARVE_OUT_MIB``
+        corrects a NUMBER.  Different quantities, different roles -- but the
+        same three cards, so a value that appears in one and not the other is
+        a drift, not a design.
+        """
+        for uuid, mib in ring_table.RECORD_CARVE_OUT_MIB.items():
+            self.assertTrue(
+                any(abs(mib - k) <= 1 for k in corridor_arm.KNOWN_CARVE_OUT_MIB),
+                f"{uuid} carve-out {mib} matches no KNOWN_CARVE_OUT_MIB entry",
+            )
+
+    def test_the_arm_and_the_ring_credit_share_one_converter(self):
+        """ONE converter, no second table (AST, so a copy cannot creep back).
+
+        ``arm_report`` must reach its numbers through
+        ``ring_table.corridor_allocatable`` and must not do the arithmetic
+        itself: a second subtraction here is exactly how the two readers came
+        to disagree about the unit in the first place.  (The subtractions
+        elsewhere in the module belong to :func:`pair_verdict`, whose whole
+        subject is the DIFFERENCE between two readers and which corrects
+        nothing.)
+        """
+        src = open(corridor_arm.__file__.replace(".pyc", ".py")).read()
+        fn = next(
+            n for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.FunctionDef) and n.name == "arm_report"
+        )
+        self.assertEqual(
+            [n for n in ast.walk(fn)
+             if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Sub)],
+            [],
+            "arm_report subtracts something itself instead of calling "
+            "ring_table.corridor_allocatable",
+        )
+        called = {
+            ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)
+        }
+        self.assertIn("ring_table.corridor_allocatable", called)
+        self.assertFalse(
+            [
+                n for n in ast.walk(ast.parse(src))
+                if isinstance(n, ast.Dict)
+                and any(
+                    isinstance(k, ast.Constant) and str(k.value).startswith("GPU-")
+                    for k in n.keys
+                )
+            ],
+            "the arm carries its own per-card carve-out table",
+        )
+
+
+class ArmAgainstTheRealPreFixBootsTest(unittest.TestCase):
+    """The blocker, reproduced and closed on the logs it was found on."""
+
+    EVIDENCE = RealBootLogsAreProvenPreFixTest.EVIDENCE
+    STEMS = RealBootLogsAreProvenPreFixTest.STEMS
+
+    #: Phase D whole-boot minima, allocatable free, and the verdict the band
+    #: gives them.  Re-derived from each boot's own front log minus that card's
+    #: carve-out; cross-validated against the independent ``memory.free``
+    #: samplers of rg5 (161) and rg6 (1030/341/852) to 0-1 MiB.
+    EXPECTED_D = {
+        "rg3": {0: (1125, "IN"), 1: (579, "BELOW"), 2: (893, "IN")},
+        "rg5": {0: (969, "IN"), 1: (161, "BELOW"), 2: (745, "BELOW")},
+        "rg6": {0: (1029, "IN"), 1: (341, "BELOW"), 2: (851, "IN")},
+    }
+
+    def _log(self, key):
+        p = os.path.join(self.EVIDENCE, self.STEMS[key] + ".front.log")
+        if not os.path.exists(p):
+            self.skipTest(f"evidence tree absent: {p}")
+        return p
+
+    def test_every_pre_fix_boot_is_graded_in_allocatable_free(self):
+        for key, expected in self.EXPECTED_D.items():
+            rep = corridor_arm.arm_report(self._log(key))
+            unit = rep.units["D"]
+            self.assertTrue(unit.ok, f"{key}: {unit.reason}")
+            for idx, (mib, verdict) in expected.items():
+                self.assertEqual(unit.allocatable[idx], mib, f"{key} nvml{idx}")
+                self.assertEqual(front.corridor_verdict(mib), verdict, f"{key} nvml{idx}")
+
+    def test_the_rg6_5090_is_no_longer_blessed(self):
+        """The exact line the round-2 review quoted, and its correction."""
+        rep = corridor_arm.arm_report(self._log("rg6"), require_in_band=True)
+        line = rep.report()
+        self.assertNotIn("nvml1: min_free=859MiB verdict=IN", line)
+        self.assertIn("nvml1: min_free=341MiB", line)
+        joined = " ".join(rep.problems)
+        self.assertIn("nvml1 minimum 341 MiB (allocatable free) is BELOW", joined)
+        self.assertNotIn("phase=D nvml0 minimum", joined)
+        self.assertNotIn("phase=D nvml2 minimum", joined)
+
+    def test_the_instrument_problem_is_still_raised(self):
+        """Converting the number does not make the pre-fix SAMPLER acceptable."""
+        for key in self.STEMS:
+            rep = corridor_arm.arm_report(self._log(key))
+            self.assertFalse(rep.ok, key)
             self.assertIn("pre-fix total-minus-used sampler", " ".join(rep.problems), key)
 
 

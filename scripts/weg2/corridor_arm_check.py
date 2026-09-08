@@ -18,7 +18,9 @@ USAGE, in the order a boot uses them:
     scripts/weg2/corridor_arm_check.py --log /spinning/evidence-665-f1/<stem>.front.log
 
     # 3. Both, plus the band check (BELOW the floor is a capacity finding,
-    #    not an instrument one -- opt in deliberately):
+    #    not an instrument one -- opt in deliberately).  The band is
+    #    ALLOCATABLE free and a pre-fix log is converted into it before it is
+    #    graded, so the printed verdict and the band are always one unit:
     scripts/weg2/corridor_arm_check.py --log <stem>.front.log --pair --require-in-band
 
 Exit code 0 = every requested check passed, 1 = at least one failed, 2 = the
@@ -71,7 +73,13 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--require-in-band",
         action="store_true",
-        help="also fail when a per-card minimum is outside the corridor band",
+        help=(
+            "also fail when a per-card minimum is outside the corridor band. "
+            "The band is ALLOCATABLE free, so a pre-fix log's minima are "
+            "converted (minus that card's driver carve-out) before grading; a "
+            "log that cannot be converted fails with the reason rather than "
+            "passing ungraded"
+        ),
     )
     ap.add_argument(
         "--tolerance-mib",

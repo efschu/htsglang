@@ -68,6 +68,14 @@ The four quantities, and the exact line each comes from:
     from that group's ``KV Cache is allocated ... K size: X GB, V size: Y GB``
     lines, summed over every pool the rank allocates.
 
+    IN ALLOCATABLE FREE, ALWAYS (fix 3).  The corridor law, the arm's verdict
+    and this credit are all statements about the free the driver will actually
+    hand to an allocation.  Boots up to weg2rg6 sampled ``total - used``, which
+    is that free PLUS the driver carve-out, so the source's number is converted
+    by :func:`corridor_allocatable` before it is credited -- or the boot is
+    refused by name.  The conversion, per card and with its source, is printed
+    in the RING provenance line (:attr:`RingTable.credit_correction`).
+
 Then R5, per card per direction, with ``S`` the sleeping group and ``W`` the
 waking one::
 
@@ -205,6 +213,187 @@ def _corridor_sample_phase(line: str) -> Optional[str]:
 #: ``total - used`` over nvidia-smi's carve-out-free ``memory.used``, i.e. free
 #: PLUS the driver carve-out.  Named, never silently equated with the new one.
 CORRIDOR_INSTRUMENT_PRE_FIX = "total_minus_used(carve-out-blind)"
+
+#: The substring by which a corridor instrument token DECLARES ITS UNIT.  Both
+#: post-fix tokens carry it (``front.CORRIDOR_INSTRUMENT`` =
+#: ``nvml_v2_free,allocatable``, and the v2-less degradation
+#: ``nvml_v1_free,allocatable(carve-out-unknown)``): both structs' ``free`` is
+#: already allocatable, only the carve-out BESIDE it is unknown in the second.
+#:
+#: THE UNIT RULE LIVES HERE, THE TOKENS LIVE IN ``front``, and the two are
+#: pinned to each other by a test rather than by a copied literal (round-2
+#: finding 2 was a copied band).  A token this marker does not recognise is
+#: REFUSED, never graded -- an unknown unit is the mixed-unit defect in its
+#: least visible form.
+CORRIDOR_ALLOCATABLE_MARKER = ",allocatable"
+
+#: The reference rig's driver carve-outs, MiB, KEYED BY CARD UUID.  Measured
+#: 2026-09-08 via NVML v2 ``reserved`` with the cards idle (record
+#: ``[SECTION 1x]`` table, cross-validated against ``nvidia-smi
+#: --query-gpu=memory.free`` on boots rg5 and rg6 to 0-1 MiB).  The carve-out
+#: is a per-card driver constant, not load-dependent, which is what makes a
+#: recorded value usable at all.
+#:
+#: KEYED BY UUID, NEVER BY NVML INDEX, and that is the whole point: NVML
+#: enumeration is not stable across boots or driver states (the same reason
+#: :data:`_ORDINAL_MAP_RE` exists), so a table keyed by index would silently
+#: subtract the 5090's 518 MiB from a 3080 the day the order shifts.  A card
+#: this table does not name gets NO correction and a REFUSAL by name.
+RECORD_CARVE_OUT_MIB: Dict[str, int] = {
+    "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 425,  # RTX 3080, nvml 0 on rg3/rg6
+    "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 518,  # RTX 5090, nvml 1 on rg3/rg6
+    "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 425,  # RTX 3080, nvml 2 on rg3/rg6
+}
+RECORD_CARVE_OUT_PROVENANCE = (
+    "record [SECTION 1x] table, live NVML v2 `reserved` on idle cards 2026-09-08 "
+    "(3080 425 / 5090 518 / 3080 425 MiB), keyed by card UUID"
+)
+
+
+def corridor_instrument_is_allocatable(instrument: str) -> bool:
+    """True when a log's samples are ALREADY the band's unit (allocatable free).
+
+    False for :data:`CORRIDOR_INSTRUMENT_PRE_FIX` (front units = allocatable
+    free PLUS the carve-out) AND for every token this reader does not know --
+    ``"unreadable"``, ``"no WEG2-CORRIDOR samples"``, or a token a future
+    emitter invents.  The caller must treat False as "convert or refuse",
+    never as "grade anyway".
+    """
+    return bool(instrument) and CORRIDOR_ALLOCATABLE_MARKER in instrument
+
+
+@dataclass
+class CorridorUnit:
+    """One log's corridor samples brought into ONE unit -- or a named refusal.
+
+    THE DEFECT THIS CLOSES (round-2 blocker, boots rg3/rg5/rg6).  Two readers
+    -- the boot arm's band verdict and the ring's ``credit(S->W)`` -- consumed
+    ``parse_front_corridor`` output directly and treated it as allocatable
+    free.  On a PRE-FIX boot it is not: it is allocatable free plus that card's
+    driver carve-out.  The arm therefore printed ``nvml1: min_free=859MiB
+    verdict=IN`` for the 5090 that sat at 341 MiB, 478 MiB BELOW the floor, and
+    the ring credited that same card 518 MiB it never had -- which UNDERSTATES
+    ``need`` by 518 MiB, so an R5 case that should have been refused arms
+    instead.  Both are the optimistic, i.e. unsafe, direction, and both came
+    from grading a number in one unit against a rule stated in another.
+
+    ONE CONVERTER, used by both readers.  Not two call-site patches and not a
+    second carve-out table: :func:`corridor_allocatable` is the only place in
+    this tree where a corridor sample changes unit.
+    """
+
+    #: The source log's instrument token, verbatim.
+    instrument: str = ""
+    #: ``{nvml index: ALLOCATABLE free MiB}`` -- the band's unit.  Empty when
+    #: :attr:`reason` is set; a caller that grades this dict is in one unit.
+    allocatable: Dict[int, int] = field(default_factory=dict)
+    #: ``{nvml index: MiB subtracted}``.  All zero for an already-allocatable
+    #: source, and printed rather than folded away: a correction nobody can see
+    #: is indistinguishable from no correction.
+    correction_mib: Dict[int, int] = field(default_factory=dict)
+    #: Where each carve-out came from, named for the line that prints it.
+    provenance: str = ""
+    #: Non-empty = REFUSED.  Nothing in :attr:`allocatable` may be graded.
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.reason
+
+    @property
+    def converted(self) -> bool:
+        """True when a carve-out was actually subtracted from some card."""
+        return any(self.correction_mib.values())
+
+    def correction_line(self) -> str:
+        """The one-line correction summary for a provenance/report line."""
+        if not self.ok:
+            return f"UNCONVERTIBLE ({self.reason})"
+        if not self.converted:
+            return f"already allocatable free ({self.instrument}), no conversion"
+        per_card = ", ".join(
+            f"nvml{i}-{self.correction_mib[i]}"
+            for i in sorted(self.correction_mib)
+            if self.correction_mib[i]
+        )
+        return (
+            f"CONVERTED from {self.instrument} to allocatable free by subtracting "
+            f"each card's driver carve-out ({per_card} MiB); {self.provenance}"
+        )
+
+
+def corridor_allocatable(
+    samples: Mapping[int, int],
+    instrument: str,
+    by_nvml: Mapping[int, str],
+    carve_out_by_uuid: Optional[Mapping[str, int]] = None,
+) -> CorridorUnit:
+    """Bring one phase's per-card samples into ALLOCATABLE free, or refuse.
+
+    ``samples`` is ``{nvml index: MiB}`` as :func:`parse_front_corridor`
+    returns it, ``instrument`` what :func:`front_corridor_instrument` says that
+    same log is in, and ``by_nvml`` the SOURCE boot's own ``nvml -> UUID`` map
+    (:func:`parse_card_identity`) -- because the carve-out belongs to a CARD,
+    and the only thing an nvml index proves about a card is which boot printed
+    it.
+
+    ``carve_out_by_uuid`` is the caller's measured carve-outs, and it WINS over
+    the recorded table: the launcher already resolved its cards through the one
+    NVML reader, so ``Card.reserved_mib`` is this rig's live registry snapshot
+    and needs no second read here.  Where it is absent or zero the recorded
+    per-card constants stand in, and where neither names a card the whole phase
+    is REFUSED by name -- a missing carve-out may never become a zero, because
+    a zero correction IS the defect.
+    """
+    res = CorridorUnit(instrument=instrument)
+    if not samples:
+        res.provenance = "no samples to convert"
+        return res
+    if corridor_instrument_is_allocatable(instrument):
+        res.allocatable = {int(i): int(v) for i, v in samples.items()}
+        res.correction_mib = {int(i): 0 for i in samples}
+        res.provenance = f"{instrument} is already the band's unit"
+        return res
+    if instrument != CORRIDOR_INSTRUMENT_PRE_FIX:
+        res.reason = (
+            f"corridor samples carry the instrument token {instrument!r}, which "
+            "names neither the allocatable unit the corridor band is stated in "
+            f"(a token containing {CORRIDOR_ALLOCATABLE_MARKER!r}) nor the known "
+            f"pre-fix unit {CORRIDOR_INSTRUMENT_PRE_FIX!r} -- an unknown unit is "
+            "not graded and not credited"
+        )
+        return res
+
+    supplied = {u: int(m) for u, m in (carve_out_by_uuid or {}).items() if int(m) > 0}
+    carve: Dict[int, int] = {}
+    missing: List[int] = []
+    sources = set()
+    for idx in sorted(samples):
+        uuid = by_nvml.get(int(idx), "")
+        if uuid and uuid in supplied:
+            carve[int(idx)] = supplied[uuid]
+            sources.add("live NVML v2 `reserved` for that card, matched by UUID")
+        elif uuid and uuid in RECORD_CARVE_OUT_MIB:
+            carve[int(idx)] = RECORD_CARVE_OUT_MIB[uuid]
+            sources.add(RECORD_CARVE_OUT_PROVENANCE)
+        else:
+            missing.append(int(idx))
+    if missing:
+        res.reason = (
+            "pre-fix corridor samples cannot be converted to allocatable free: "
+            + "; ".join(
+                f"nvml{i} ("
+                + (f"card {by_nvml[i]}" if by_nvml.get(i) else "no card identity in the source log")
+                + ") has no measured or recorded driver carve-out"
+                for i in missing
+            )
+            + " -- refused rather than graded in the source's own unit"
+        )
+        return res
+    res.allocatable = {i: int(samples[i]) - carve[i] for i in carve}
+    res.correction_mib = carve
+    res.provenance = "carve-out source: " + " + ".join(sorted(sources))
+    return res
 #: ``NVML -> CUDA ordinal map: ordinal 0 = nvml 1 NVIDIA GeForce RTX 5090
 #: GPU-31d7ef41-... total 32607 MiB, ordinal 1 = nvml 0 ...`` (launcher.py).
 #: The SOURCE boot's own ordinal/nvml -> UUID map, and the reason this module
@@ -386,9 +575,16 @@ class RingTable:
     #: the RING line can be quoted without the instrument that produced it.
     image_source: str = "no WEG2 DORMANT-IMAGE line in the source boot"
     bound_groups: Tuple[str, ...] = ()
-    #: Which "free" the per-card credits are in -- see
+    #: Which "free" the SOURCE BOOT's corridor samples were in -- see
     #: :func:`front_corridor_instrument`.  Printed with them, never assumed.
     credit_instrument: str = CORRIDOR_INSTRUMENT_PRE_FIX
+    #: What :func:`corridor_allocatable` did to get those samples into the ONE
+    #: unit every credit here is in (allocatable free), verbatim from
+    #: :meth:`CorridorUnit.correction_line`.  The credits below are ALWAYS
+    #: allocatable free; this line says what had to be subtracted to make them
+    #: so, per card and from which source, because a correction nobody can see
+    #: cannot be checked against the next boot's own ARMED line.
+    credit_correction: str = "no corridor samples were converted"
 
     def provenance(self) -> str:
         bound = (
@@ -405,14 +601,8 @@ class RingTable:
             "the tag census over ALL BACKED-UP tags, cross-checked against the "
             "sleeping group's summed per-rank RssShmem from that boot's own "
             f"WEG2 DORMANT-IMAGE line ({self.image_source}){bound}"
-            f"; per-card CREDIT instrument: {self.credit_instrument}"
-            + (
-                " -- this boot's corridor samples are free PLUS the driver "
-                "carve-out, so every credit is over-stated by that card's "
-                "carve-out and the resulting H is the optimistic end"
-                if self.credit_instrument == CORRIDOR_INSTRUMENT_PRE_FIX
-                else ""
-            )
+            f"; per-card CREDIT unit: ALLOCATABLE free, source instrument "
+            f"{self.credit_instrument} -- {self.credit_correction}"
         )
 
     def env_map(self) -> str:
@@ -1009,16 +1199,20 @@ def front_corridor_instrument(path: str) -> str:
     The credit below (``credit(S->W) = NVML free while S is awake + released
     kv``) is only as honest as that free, and the unit changed mid-campaign:
     boots up to weg2rg6 printed ``total - used``, which is free PLUS the driver
-    carve-out (424 MiB per 3080, 518 per 5090 on the reference rig), so their
-    samples OVER-credit every card by that much -- the unsafe direction, since
-    a larger credit makes R5's host requirement smaller.  Boots after the fix
-    print ``instrument=nvml_v2_free,allocatable`` in the line itself.
+    carve-out (425 MiB per 3080, 518 per 5090 on the reference rig), so their
+    samples over-state every card's free by that much -- the unsafe direction,
+    since a larger credit makes R5's host requirement smaller.  Boots after the
+    fix print ``instrument=nvml_v2_free,allocatable`` in the line itself.
 
-    Deliberately NOT a refusal and NOT a correction: the pre-fix number is
-    still the best (only) sample those boots carry, and the table that rg6
-    proved on metal is built from one of them.  What must not happen is a
-    reader quoting a credit without knowing which unit it is in, so this is
-    returned and printed beside the number.
+    THIS FUNCTION IS STILL ONLY THE NAMER (fix 3 changed the CONSUMERS, not
+    it): it classifies, it never corrects and never refuses.  What changed is
+    that no consumer may now take its answer as an allocatable number -- both
+    the ring credit and the boot arm pass it through
+    :func:`corridor_allocatable`, which converts a pre-fix sample by
+    subtracting that card's carve-out or refuses the log by name.  The pre-fix
+    number is still the best (only) sample those boots carry, and the table rg6
+    proved on metal is built from one of them; what must not happen is a reader
+    grading or crediting it in the source's own unit.
 
     ONLY A SAMPLE MAY TESTIFY (FIX 2, finding 1).  The classification is made
     from lines that carry a measurement, never from a line that merely mentions
@@ -1280,10 +1474,39 @@ def solve(
         )
         pairs["dorm_p"], pairs["dorm_d"] = dorm_p, dorm_d
 
+        # ONE UNIT FOR ARM AND CREDIT (fix 3).  ``credit(S->W)`` is "NVML free
+        # while S is awake + released kv", and the free half is only that if the
+        # source boot's samples are ALLOCATABLE free.  Up to boot rg6 they were
+        # ``total - used``, i.e. allocatable free PLUS the carve-out, and
+        # crediting them raw over-credited every card by 425/518/425 MiB --
+        # which UNDERSTATES ``need`` by the same amount, so an R5 case that
+        # should have been refused arms instead (the unsafe direction, disclosed
+        # by fix 1 and closed here).  The carve-outs come from the caller's own
+        # cards where the launcher measured them, and are NEVER assumed by
+        # position: an unnamed card refuses this boot rather than crediting it.
+        credit_instrument = front_corridor_instrument(f_log)
+        measured_carve_out = {
+            c.uuid: int(getattr(c, "reserved_mib", 0) or 0) for c in cards
+        }
+        unit_d = corridor_allocatable(
+            corridor["D"], credit_instrument, by_nvml, measured_carve_out
+        )
+        unit_p = corridor_allocatable(
+            corridor["P"], credit_instrument, by_nvml, measured_carve_out
+        )
+        bad_unit = next((u for u in (unit_d, unit_p) if not u.ok), None)
+        if bad_unit is not None:
+            reasons.append(f"{stem}: {bad_unit.reason}")
+            continue
+
         table = RingTable(
             boot=stem,
             instrument=gd.instrument or gp.instrument,
-            credit_instrument=front_corridor_instrument(f_log),
+            credit_instrument=credit_instrument,
+            credit_correction=" | ".join(
+                f"phase {tag}: {u.correction_line()}"
+                for tag, u in (("D", unit_d), ("P", unit_p))
+            ),
             lines_read=gp.lines_read + gd.lines_read,
             image_source=f"P: {src_p} | D: {src_d}",
             bound_groups=tuple(
@@ -1295,9 +1518,11 @@ def solve(
             ),
         )
         # The corridor sample is keyed by the SOURCE boot's nvml index, which is
-        # mapped to a card by that boot's own map -- never by this boot's.
-        free_d = {by_nvml[i]: v for i, v in corridor["D"].items() if i in by_nvml}
-        free_p = {by_nvml[i]: v for i, v in corridor["P"].items() if i in by_nvml}
+        # mapped to a card by that boot's own map -- never by this boot's.  The
+        # values re-keyed here are the CONVERTED ones: allocatable free, the
+        # same unit the corridor band and the arm's verdict are stated in.
+        free_d = {by_nvml[i]: v for i, v in unit_d.allocatable.items() if i in by_nvml}
+        free_p = {by_nvml[i]: v for i, v in unit_p.allocatable.items() if i in by_nvml}
         for card in cards:
             cr = CardRing(uuid=card.uuid, nvml_index=card.nvml_index, name=card.name)
             cr.tags_p_mib = int(pairs["image_p"].get(card.uuid, 0))
