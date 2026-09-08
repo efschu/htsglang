@@ -28,9 +28,36 @@ import os
 import struct
 import unittest
 
-from sglang.srt.weg2 import front, ring_table
+from sglang.srt.weg2 import front, host_ledger, ring_table
 
-EVIDENCE = "/spinning/evidence-665-f1"
+#: #1264 fix 2c: THE BOOT LOGS THIS SUITE READS ARE NOW IN-TREE.
+#:
+#: They used to be `/spinning/evidence-665-f1`, the LIVE evidence tree, and that
+#: made the suite non-hermetic in a way that bit twice. `ring_table.solve` reads
+#: TWO things out of that directory: the stem's own logs (immutable once a boot
+#: ends) and `weg2_measured_record.json`, an APPEND-ONLY sidecar every later
+#: boot writes to. So boots t2a and t2b appended dormant samples and moved the
+#: priced spans of a solve pinned to weg2rg6 -- the #1264 (B) ratchet -- and
+#: these guards went red for a reason that had nothing to do with the form gate
+#: they exist to protect. A guard that a later boot can flip is not a guard.
+#:
+#: The fixture is COPIED VERBATIM, never synthesized: every line is a real line
+#: from the real boot, kept when it matches a predicate one of `ring_table`'s
+#: own parsers applies, with the source sha256 and the kept/total counts in
+#: PROVENANCE.json beside it. Proven faithful at build time -- solve() on the
+#: fixture returns spans, form_same and residuals byte-equal to solve() on the
+#: live tree, for all three p_argv arms.
+#:
+#: The sidecar is copied too, WITH t2a's and t2b's foreign samples still in it.
+#: That is deliberate: those two entries are exactly what used to poison this
+#: solve, so keeping them turns the fixture into a standing proof of the (B)
+#: rule instead of a way of dodging it. See `test_foreign_boot_samples_cannot_
+#: reach_this_solve`.
+EVIDENCE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "fixtures", "ring_form_gate_1261"
+)
+#: The tree this suite must never touch again.
+_FORBIDDEN_ROOTS = ("/spinning/evidence-665-f1", "/spinning/gpu-arb")
 RG6 = "boot_weg2_weg2rg6_7f88b1c75d_0908_070324"
 TR2 = "boot_weg2_weg2tr2_d047f8e80b_0908_110126"
 MIB = 1024 * 1024
@@ -49,11 +76,68 @@ CARDS = [
 
 
 def have_evidence():
+    """True on every box now, and that is the point of fix 2c.
+
+    This used to gate the suite on the rig's own evidence tree, so the guards
+    that matter most SKIPPED on the remote desk -- silently, which is the worst
+    way for a guard to be absent. The fixture is in the repository, so they run
+    wherever the tests run.
+    """
     return all(
         os.path.exists(os.path.join(EVIDENCE, f"{stem}.{half}.log"))
         for stem in (RG6, TR2)
         for half in ("front",)
     ) and os.path.exists(os.path.join(EVIDENCE, f"{RG6}.P.log"))
+
+
+class _NoLiveEvidence:
+    """Context manager: any read under the live evidence/gpu-arb trees RAISES.
+
+    The hermeticity claim has to be ENFORCED, not documented -- a later edit
+    that reaches for `/spinning/evidence-665-f1` again would otherwise re-open
+    the exact hole fix 2c closes, and it would pass on the rig and fail only on
+    a machine that does not have the tree.
+
+    Scoped to the two mutable data trees rather than to all of `/spinning`: the
+    sglang package and this worktree live under `/spinning` too, and pytest
+    reads source files lazily when it renders a traceback, so a blanket ban
+    would fire on the test harness itself rather than on the defect.
+    """
+
+    def __enter__(self):
+        import builtins
+
+        self._open, self._listdir = builtins.open, os.listdir
+
+        def guard(path, *a, **kw):
+            s = str(path)
+            for root in _FORBIDDEN_ROOTS:
+                if s.startswith(root):
+                    raise AssertionError(
+                        f"NON-HERMETIC: this suite opened {s!r}. The boot logs and "
+                        f"the measured-record sidecar are fixtures under "
+                        f"fixtures/ring_form_gate_1261 precisely so that no boot "
+                        f"can move these expectations again (#1264 fix 2c)."
+                    )
+            return None
+
+        def _open_guarded(path, *a, **kw):
+            guard(path)
+            return self._open(path, *a, **kw)
+
+        def _listdir_guarded(path=".", *a, **kw):
+            guard(path)
+            return self._listdir(path, *a, **kw)
+
+        builtins.open = _open_guarded
+        os.listdir = _listdir_guarded
+        return self
+
+    def __exit__(self, *exc):
+        import builtins
+
+        builtins.open, os.listdir = self._open, self._listdir
+        return False
 
 
 def write_synthetic_checkpoint(directory, *, n_layers, attn_every, with_mtp=True):
@@ -291,10 +375,37 @@ class AgainstTheRealBoots(unittest.TestCase):
     """The killer, reproduced and then refused, on the two real boot logs."""
 
     def setUp(self):
+        # #1264 fix 2c: every test in this class runs with the live evidence and
+        # gpu-arb trees SEALED. The fixture is the only data source, and an edit
+        # that reaches past it fails here instead of on someone else's box.
+        self._sealed = _NoLiveEvidence()
+        self._sealed.__enter__()
+        self.addCleanup(self._sealed.__exit__, None, None, None)
         self.tr2, _ = ring_table.parse_p_form(os.path.join(EVIDENCE, f"{TR2}.front.log"))
         self.rg6, _ = ring_table.parse_p_form(os.path.join(EVIDENCE, f"{RG6}.front.log"))
         self.assertIsNotNone(self.tr2)
         self.assertIsNotNone(self.rg6)
+
+    def test_the_seal_can_actually_fail(self):
+        """A guard nobody has seen refuse is not a guard (desk-written-never-
+        executed). This is the can-fail proof for the seal itself."""
+        for probe in (
+            "/spinning/evidence-665-f1/weg2_measured_record.json",
+            "/spinning/gpu-arb/weg2/WEG2_BUILD_DECISIONS_0906.md",
+        ):
+            with self.assertRaises(AssertionError) as ctx:
+                open(probe)
+            self.assertIn("NON-HERMETIC", str(ctx.exception))
+        # ... and it does NOT seal the package or the fixture it must read.
+        with open(os.path.join(EVIDENCE, f"{RG6}.front.log")) as f:
+            self.assertTrue(f.readline())
+
+    def test_the_suite_reads_no_live_evidence_at_all(self):
+        """The whole solve path, under the seal: if `ring_table` reached for the
+        live tree anywhere -- stems, logs, or the sidecar -- this raises."""
+        t, _ = ring_table.solve(CARDS, EVIDENCE, RG6, p_argv=self.rg6)
+        self.assertIsNotNone(t)
+        self.assertEqual([c.span1_mib for c in t.cards], [13860, 7548, 8504])
 
     def test_the_two_forms_differ_by_the_drafter(self):
         a, an = ring_table.p_form_key(self.tr2)
@@ -312,24 +423,132 @@ class AgainstTheRealBoots(unittest.TestCase):
 
     def test_a_foreign_form_is_repriced_and_the_killer_disappears(self):
         """weg2tr2's own arithmetic: the two stages that fitted stay put, and the
-        one whose contents changed gains the drafter."""
+        one whose contents changed is repriced until L6 is satisfied.
+
+        #1264 fix 2c: THE ASSERTION IS THE RELATION, NOT A LITERAL. This read
+        `assertGreater(spans[2], 12000)`, a threshold calibrated on a PP2
+        checkpoint of 12429 MiB. That number stopped existing at `d7e7df4ed1`
+        ("the ring is sized for the head that exists"): #1259 made the MTP head
+        share the target's `lm_head`, so the drafter's own 2425 MiB head is
+        never allocated and PP2's checkpoint is 10004 MiB. 12429 - 10004 =
+        2425.0 exactly -- the test was red because the fork got BETTER, and a
+        literal could not tell that from a regression.
+
+        So it now asserts what the gate is actually for: the repriced span must
+        COVER this form's own checkpoint, whatever that checkpoint becomes. The
+        next change to the drafter moves both sides together and this stays
+        green for the right reason.
+        """
         t, _ = ring_table.solve(CARDS, EVIDENCE, RG6, p_argv=self.tr2)
         self.assertIs(t.form_same, False)
         spans = [c.span1_mib for c in t.cards]
-        self.assertEqual(spans[:2], [13860, 7548])
-        self.assertGreater(spans[2], 12000)
+        self.assertEqual(spans[:2], [13860, 7548], "the fitting stages stay put")
+        # The stage was REPRICED UPWARD off the source's measurement ...
+        same, _ = ring_table.solve(CARDS, EVIDENCE, RG6, p_argv=self.rg6)
+        self.assertGreater(spans[2], same.cards[2].span1_mib)
+        # ... and far enough that the independent L6 gate is satisfied.
+        self.assertGreaterEqual(spans[2], t.cards[2].ckpt_weights_mib)
+        self.assertEqual(t.ckpt_refusals(), [])
         self.assertIn("W48", t.form_verdict)
 
     def test_mutant_form_key_ignored_reproduces_the_killer(self):
         """MUTANT 1: the gate disarmed.  The predecessor's behaviour exactly --
-        PP2 sized at 8504 while the stage will load ~12429 MiB of weights -- and
-        the independent L6 catches it where the census could not."""
+        PP2 sized off a foreign boot's measurement while this form's stage will
+        load more than that -- and the independent L6 catches it where the
+        census could not.
+
+        #1264 fix 2c: `assertGreater(armed - disarmed, 3000)` was the same stale
+        literal in a second spelling (3925 = 12429 - 8504, the pre-#1259 gap).
+        The property is not a gap size; it is that the disarmed table UNDER-SIZES
+        the ring and L6 REFUSES it by name while the armed one passes.
+        """
         t, _ = ring_table.solve(CARDS, EVIDENCE, RG6, p_argv=None)
         self.assertIsNone(t.form_same)
         self.assertEqual([c.span1_mib for c in t.cards], [13860, 7548, 8504])
-        # and armed, the same table is refused by name rather than run
+
+        # THE KILLER, stated as the inequality it is: this form loads more than
+        # the disarmed table reserves.
         armed, _ = ring_table.solve(CARDS, EVIDENCE, RG6, p_argv=self.tr2)
-        self.assertGreater(armed.cards[2].span1_mib, t.cards[2].span1_mib + 3000)
+        need = armed.cards[2].ckpt_weights_mib
+        self.assertLess(t.cards[2].span1_mib, need, "the killer must still be a killer")
+        self.assertGreater(armed.cards[2].span1_mib, t.cards[2].span1_mib)
+        self.assertGreaterEqual(armed.cards[2].span1_mib, need)
+
+        # And L6 is the instrument that says so, on the DISARMED table -- the
+        # census that sized it cannot, which is the whole point of W49.
+        t.cards[2].ckpt_weights_mib = need
+        t.cards[2].ckpt_terms = "weg2tr2 form, stage 2"
+        refusals = t.ckpt_refusals()
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("RING UNDER-SIZED", refusals[0])
+
+    def test_foreign_boot_samples_cannot_reach_this_solve(self):
+        """#1264 (B), pinned where it broke: the sidecar in this fixture STILL
+        carries weg2t2a's and weg2t2b's dormant samples, and a solve pinned to
+        weg2rg6 must be untouched by them.
+
+        That is the whole ratchet, in one assertion. Before the stem-binding,
+        `read_measured_record` returned the newest entry per group -- whatever
+        booted last -- while the correction subtracted from it came from the
+        STEM's own arm, so every new boot moved these numbers. Two boots, one
+        subtraction.
+        """
+
+        sidecar = os.path.join(EVIDENCE, "weg2_measured_record.json")
+        with open(sidecar) as f:
+            tags = {s.get("boot_tag") for s in json.load(f)["samples"]}
+        self.assertTrue(
+            {"weg2t2a", "weg2t2b"} <= tags,
+            "the fixture must KEEP the poisoning samples, or it proves nothing",
+        )
+        self.assertNotIn("weg2rg6", tags, "the stem itself has no sample here")
+
+        # Bound to the stem -> the foreign samples are an ABSENCE, not a value.
+        self.assertEqual(
+            host_ledger.read_measured_record(sidecar, boot_tag="weg2rg6"), {}
+        )
+        t, _ = ring_table.solve(CARDS, EVIDENCE, RG6, p_argv=self.rg6)
+        self.assertEqual([c.span1_mib for c in t.cards], [13860, 7548, 8504])
+
+    def test_the_fixture_still_matches_its_provenance_record(self):
+        """TAMPER-EVIDENCE, on every box, not only the one that built it.
+
+        The source sha256 in PROVENANCE.json cannot be re-checked away from the
+        rig (the 33/67 MB originals live only there), so the property that IS
+        checkable everywhere is checked instead: each fixture still holds
+        exactly the number of extracted lines the record claims, under the
+        three-line header the extractor wrote. A hand-edit to make a red test
+        green -- the failure mode a frozen fixture invites -- moves that count.
+        """
+        with open(os.path.join(EVIDENCE, "PROVENANCE.json")) as f:
+            prov = json.load(f)
+        self.assertGreaterEqual(len(prov), 5, "every fixture file must be recorded")
+        for name, rec in prov.items():
+            path = os.path.join(EVIDENCE, name)
+            self.assertTrue(os.path.exists(path), f"{name} is recorded but missing")
+            self.assertIn("source_sha256", rec)
+            if not name.endswith(".log"):
+                continue
+            with open(path) as f:
+                lines = f.read().splitlines()
+            header = [ln for ln in lines[:3] if ln.startswith("#")]
+            self.assertEqual(len(header), 3, f"{name} lost its provenance header")
+            self.assertEqual(
+                len(lines) - 3, rec["kept"],
+                f"{name} holds {len(lines) - 3} extracted lines, record says "
+                f"{rec['kept']} -- the fixture was edited after extraction",
+            )
+            self.assertLess(rec["kept"], rec["total"], "extraction must be a subset")
+
+    def test_the_same_stem_prices_the_same_table_every_time(self):
+        """DETERMINISM is the invariant fix 2c exists to hold: one stem, one
+        table, however often it is solved and whatever else has booted."""
+        first, _ = ring_table.solve(CARDS, EVIDENCE, RG6, p_argv=self.rg6)
+        second, _ = ring_table.solve(CARDS, EVIDENCE, RG6, p_argv=self.rg6)
+        self.assertEqual(
+            [(c.span1_mib, round(c.residual_mib, 3)) for c in first.cards],
+            [(c.span1_mib, round(c.residual_mib, 3)) for c in second.cards],
+        )
 
     def test_the_residual_is_small_positive_and_uniform(self):
         """The calibration the whole derivation rests on: with the vision tower

@@ -1,0 +1,13 @@
+# #1264 fix 2c: these .log files are FIXTURES, not boot output.
+#
+# The repository root ignores `*.log` (.gitignore:62), which is right for every
+# other .log on this tree and exactly wrong here: `ring_table._boot_stems`
+# discovers a boot by the literal suffixes `.front.log` / `.P.log` / `.D.log`,
+# so the fixture cannot be renamed without teaching the production code a test
+# file extension. Un-ignoring them HERE, scoped to this directory, keeps that
+# coupling where it belongs.
+#
+# Without this the fixtures would be silently skipped by `git add`, the suite
+# would pass on the box that built them and fail on every other -- the precise
+# failure mode fix 2c exists to remove.
+!*.log
