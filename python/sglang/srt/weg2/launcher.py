@@ -2337,8 +2337,29 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               match_refusal_census_every: int = MATCH_REFUSAL_CENSUS_EVERY,
               arming_floor_solved: bool = True,
               hicache_bigram_keys: bool = True,
-              hicache_flush_publish_sweep: bool = True) -> Dict[str, str]:
+              hicache_flush_publish_sweep: bool = True,
+              group: str = "") -> Dict[str, str]:
     env = dict(os.environ)
+    # FIX 2, finding 1: WHICH WEG-2 GROUP THIS RANK BELONGS TO, and the only
+    # thing in either tree that says so.  Read by
+    # `weg2_memory_saver.weg2_group_name()`; it is the discriminator the
+    # graph-tag coupling gates on, because the alternative it used first
+    # (`server_args.enable_memory_saver`) is an UPSTREAM flag that upstream
+    # engines set too -- gating a Weg-2-only widening of an upstream RPC on it
+    # changed stock `/release_memory_occupation` semantics for everyone.
+    #
+    # `server_args.weg2_group` was believed to be this fact and is not: it is
+    # read in exactly one place (`weight_updater._weg2_group_name`) with a
+    # `getattr(..., "")` default and is ASSIGNED NOWHERE, so it has answered
+    # "?" on every rank of every boot.
+    #
+    # Same discipline as the ring family above: published only when this call
+    # names a group, and POPPED otherwise, so a value inherited from the
+    # operator's own shell can never arm a coupling nobody asked for.
+    if group:
+        env["SGLANG_WEG2_GROUP"] = group
+    else:
+        env.pop("SGLANG_WEG2_GROUP", None)
     # C18: the shared host granule ring (spec C1-C8).  These four variables are
     # LAUNCHER OUTPUT, never operator input (R19): every size in them is solved
     # by ring_table from the previous boot's own lines, and the whole family is
@@ -2400,11 +2421,47 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     else:
         env.pop("SGLANG_ARMING_FLOOR_SOLVED", None)
+    # Item `dormant` (record [1y]): the ONE switch that puts the CUDA-graph
+    # capture pool and the flashinfer FLOAT workspace inside the memory saver's
+    # `cuda_graph` region, so the sleeping group hands their physical pages
+    # back and the wake remaps them at stable virtual addresses -- no
+    # recapture, which RESTORE-NEVER-REBUILD forbids inside a cutover.
+    # Upstream's own flag, read at the CAPTURE site
+    # (full_cuda_graph_backend.py:78-81) and, since that slice's commit 2, at
+    # the SLEEP site (weg2_memory_saver.weg2_graph_tag_armed); both groups get
+    # it so the two sides can never disagree.  Its fix 2: this flag ALONE no
+    # longer arms the sleep-side coupling -- SGLANG_WEG2_GROUP above is the
+    # Weg-2 conjunct, so setting this variable on a stock engine gets stock
+    # behaviour, which is what it always meant upstream.  Expected release per
+    # rank from [1y]: 384 MiB workspace + 92-133 MiB capture pool, measured on
+    # the boot by `WEG2-SLEEP released tags=['cuda_graph'] mib=`.
+    #
+    # Compatible with this boot's spec config: adaptive graph memory is the one
+    # mechanism declared mutually exclusive with this flag
+    # (adaptive_graph_memory.py:390-394), and it resolves through `auto`, which
+    # LOGS and degrades to 'offload-scratch' rather than raising -- and is not
+    # even reached here, since both groups run speculative_adaptive=False.
+    #
+    # TRAIN 2 MERGE NOTE, an OPEN item rather than a silent change: this is the
+    # last read-THROUGH-the-launcher's-environment default left in this
+    # function.  The #1235 R19 rule below turned every sibling into launcher
+    # OUTPUT precisely because an inherited export won silently and the boot
+    # then ran a value no flag and no log line named.  It is kept in the
+    # dormant slice's own form here -- changing it would remove the operator's
+    # only way to disable the coupling while its arm is still being graded --
+    # and it is named here so the next pass makes it a flag rather than
+    # discovering it.
+    env["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = env.get(
+        "SGLANG_MEMORY_SAVER_CUDA_GRAPH", "1"
+    )
     # THE DOUBLY-STATED FACTS, FROM THE SAME TABLE THE ARGV IS BUILT FROM
     # (#1235). Not second bookkeeping: ServerArgs reads these keys off
     # os.environ before the matching flags publish themselves -- see
     # EarlyReadFact for the file:line ordering. Written for BOTH groups, which
     # preserves an existing asymmetry the table records rather than hides.
+    # (The dormant slice restated SGLANG_UNEVEN_DCP / _WEIGHTED /
+    # SGLANG_MAMBA_SSM_DTYPE here by hand; that is the pre-#1235 form of the
+    # same three facts and this loop is the one that survives.)
     for fact in EARLY_READ_FACTS:
         env[fact.env_key] = fact.env_value
     env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = str(barlink_build_window_cap_s)
@@ -5286,7 +5343,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls2b2"
     )
     state.budgets["P"] = budgets_p
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, **_env_knobs(ns))
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", **_env_knobs(ns))
     # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
     # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
@@ -5489,7 +5546,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         log(d_ratio.line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, **_env_knobs(ns))
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
@@ -5555,7 +5612,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     log(d_ratio.line)
     log(d_tokvec.line)
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, **_env_knobs(ns))
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)

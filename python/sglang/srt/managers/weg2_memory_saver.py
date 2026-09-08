@@ -35,7 +35,7 @@ import logging
 import os
 import re
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple, Union
 
@@ -121,6 +121,56 @@ WEG2_SLEEP_MIN_RELEASED_FRACTION = 0.5
 #: PROPER SUBSET and cannot be graded against the whole; see
 #: :func:`sleep_acceptance_census`.
 WEG2_SLEEP_TAGS = frozenset((GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS))
+
+#: Item `dormant`: the smallest allocation that may be routed into the graph
+#: tag's private pool.  NOT a tuning knob -- it is #102's ``MIN_TAGGED_BYTES``
+#: (``adaptive_graph_memory.py:269``) and it is a CORRECTNESS gate with a
+#: measured reason: the caching allocator splits large blocks, so a tagged
+#: segment can carry a free tail of up to ~2 MiB, a later sub-2MiB allocation
+#: of another tag can be served from that tail, and once the first tag is
+#: paused the tail is UNMAPPED -- first touch is then an illegal memory access
+#: (observed live on the 5-state high-accept boot: state k2's ~1.5 MiB
+#: custom_mask in paused k5's segment tail).  Allocations at or above this size
+#: always get their own segment.  Same number, same reason, not a second one.
+WEG2_GRAPH_SCRATCH_MIN_BYTES = 2 * 1024 * 1024
+
+#: Item `dormant` FIX 2, finding 1: the name of THIS rank's Weg-2 group, or the
+#: empty string on every engine that is not a Weg-2 group at all.  Set by
+#: ``weg2/launcher.build_env`` for both groups and by nothing else, which is
+#: exactly why it can be the discriminator: ``--enable-memory-saver`` cannot,
+#: because upstream engines set it too.
+#:
+#: There is NO server-args equivalent to read instead.  ``weg2_group`` is read
+#: once (``weight_updater._weg2_group_name``) and ASSIGNED NOWHERE in either
+#: tree -- `grep -rn 'weg2_group' --include=*.py .` returns 18 lines, all of
+#: them reads or unrelated ``_weg2_group_*`` method names -- so that getattr
+#: has always fallen through to its ``"?"`` default on every rank of every
+#: boot.  This env is the fact that was believed to exist there.
+WEG2_GROUP_ENV = "SGLANG_WEG2_GROUP"
+
+#: Item `dormant`: whether this rank's sleep also releases the CUDA-graph tag.
+#: Resolved ONCE per process, deliberately: the sleep adds the tag to
+#: ``offload_tags`` and the wake removes it, so a resolver that could change
+#: answer between the two legs would raise ``KeyError`` on a tag that was never
+#: paused.  A cached read cannot drift.
+_GRAPH_TAG_ARMED: Optional[bool] = None
+
+#: Item `dormant` FIX 2: the cached :data:`WEG2_GROUP_ENV` reading, same reason
+#: as above -- both legs of a flip must get the same answer.
+_WEG2_GROUP_NAME: Optional[str] = None
+
+#: Item `dormant`: ONE private ``torch.cuda.MemPool`` for the graph tag's
+#: non-capture scratch, created on first use and kept for the process lifetime
+#: (#102's rule: a tag's free space must only ever be visible to allocations of
+#: that same tag).
+_GRAPH_SCRATCH_POOL: Any = None
+
+#: Item `dormant` FIX 3, finding 2: how often each conjunct of
+#: :func:`weg2_graph_tag_armed` refused, by reason.  The line is rate-limited
+#: (see :func:`_refuse_graph_tag`), so this is the DENOMINATOR the log's
+#: ``occurrence=`` field is drawn from -- a reader must never take "one line"
+#: for "one refusal".
+_GRAPH_TAG_REFUSALS: Dict[str, int] = {}
 
 
 class Weg2MemorySaverInactive(RuntimeError):
@@ -1322,6 +1372,380 @@ def sleep_acceptance_census(
 
 #: The one string a dormant refusal carries, so a log grep for the marker and
 #: the client-visible error name the same event.
+# ---------------------------------------------------------------------------
+# ITEM `dormant`: THE CUDA-GRAPH TAG ON THE WEG-2 SLEEP PATH
+# (record section [1y], 2026-09-08)
+# ---------------------------------------------------------------------------
+#
+# The dormant group holds 1820 / 1368 / 1422 MiB per rank (rg6, NVML
+# per-process bytes on the sleep-acceptance line).  Section [1y] attributes it;
+# two of its rows are releasable and the mechanism for both already exists
+# upstream, unwired:
+#
+#   R4  the CUDA-graph CAPTURE POOL (92 / 102 / 133 MiB).  Captures already
+#       route through `memory_saver_adapter.cuda_graph(tag=cuda_graph)` when
+#       `enable_memory_saver` AND `SGLANG_MEMORY_SAVER_CUDA_GRAPH`
+#       (full_cuda_graph_backend.py:78-81, :132-139), and both RPC handlers
+#       already have their `GPU_MEMORY_TYPE_CUDA_GRAPH in tags` branch.  What
+#       is missing is that NOTHING SENDS THE TAG: the front's sleep RPC carries
+#       [kv_cache] alone.
+#   R3a the flashinfer FLOAT workspace (384 MiB/rank -- env default
+#       384*1024*1024, and Qwen3_5ForConditionalGeneration is deliberately NOT
+#       in HIGH_WORKSPACE_ARCHITECTURES, flashinfer_workspace.py:59-67).  It is
+#       the one workspace on this path with a stated content contract, and the
+#       contract is ZERO: `zero_flashinfer_workspaces()` wipes it after every
+#       finished request, and its docstring carries the #50 GPU bisection
+#       verbatim -- zeroing exactly the FLOAT workspace flattens the
+#       request-ordinal output, "int workspace / kv_lens wipes do not".  So a
+#       pause that unmaps it and a resume that maps fresh pages destroys
+#       nothing, PROVIDED the resume restores the zero.
+#
+# WHAT IS DELIBERATELY LEFT RESIDENT, with its size, because it holds content
+# a remap would destroy or content the wake needs:
+#
+#   * the flashinfer INT workspace (inside [1y] R3b, 87 MiB/rank together with
+#     cuBLAS and the graph static buffers).  The decode backend is `full`, i.e.
+#     "attention metadata is captured INSIDE the graph"
+#     (full_cuda_graph_backend.py:54-57), so the plan the wrapper wrote there at
+#     capture time is what the replay reads: a capture-time constant.  The #50
+#     bisection is the positive evidence that this is NOT the zero-contract
+#     buffer.  It stays tagged-out.
+#   * the CUDA context ([1y] R1, 492 / 205 / 205 MiB) and the communicator
+#     buffers ([1y] R2, 307 / 184 / 184 MiB, of which 120 MiB/rank is the
+#     barlink BAR1 windows).  Untouchable by the item's own terms; BAR1
+#     re-registration is a collective and its extension is a JIT build, which
+#     RESTORE-NEVER-REBUILD forbids inside a cutover.
+#   * the `_export_static_state` clones ([1y] R5, >= 100 MiB/rank).  They ARE
+#     what the wake imports back.
+#
+# NO SECOND MECHANISM IS BUILT.  #102 ("Capture-Pools + IO-Buffer taggbar",
+# htsglang:078feed5ea34 / :0195ffb3e1325) already owns the shape -- one private
+# MemPool per tag plus `region_config`, with the size gate above -- but every
+# one of its wrap sites is scoped to an ADAPTIVE DRAFT state build
+# (`_ACTIVE_MANAGER`), and group P runs speculative_algorithm=None, so on this
+# path they are all `nullcontext()`.  What follows reuses that shape keyed to
+# the UPSTREAM `cuda_graph` tag, so there is exactly one tag and one ledger.
+
+
+def weg2_group_name() -> str:
+    """This rank's Weg-2 group name, or ``""`` on an engine that is not one.
+
+    FIX 2, finding 1.  Cached for the process lifetime for the same reason the
+    graph-tag answer is: a sleep and its wake must not be able to read
+    different answers.
+    """
+    global _WEG2_GROUP_NAME
+    if _WEG2_GROUP_NAME is None:
+        _WEG2_GROUP_NAME = os.environ.get(WEG2_GROUP_ENV, "").strip()
+    return _WEG2_GROUP_NAME
+
+
+def weg2_env_present() -> bool:
+    """True when SOME ``SGLANG_WEG2_*`` variable other than the group is set.
+
+    FIX 3, finding 2.  The refusal below has to distinguish two things that
+    look identical from inside one rank:
+
+    * a STOCK engine, which never had :data:`WEG2_GROUP_ENV` and must stay
+      byte-identical -- including in its log, so no new line may be printed
+      there, and
+    * a WEG-2 rank whose group name did not arrive, which is a silent
+      capability loss (the #1246 shape) and must be loud.
+
+    ``launcher.build_env`` publishes the group beside a family of other
+    ``SGLANG_WEG2_*`` variables (``SGLANG_WEG2_WEIGHT_CHUNK_LAYERS``,
+    ``SGLANG_WEG2_WEIGHT_CHUNKS``, ``SGLANG_WEG2_TMS_PRELOAD_SO``,
+    ``SGLANG_WEG2_PCIE_DUPLEX``, ...), so the presence of any of them with the
+    group ABSENT is the signature of the second case.  A stock engine has none
+    of them and stays silent.
+
+    HONEST LIMIT: the family is conditional (a boot with no chunking, no
+    preload and no duplex publishes none of them), so this is a sufficient
+    signal for the loud case, not a necessary one.  It never produces a FALSE
+    loud line on a stock engine, which is the direction that would change
+    upstream behaviour; it can miss a Weg-2 rank that had lost the whole
+    family, and such a rank is not a Weg-2 rank in any other respect either.
+    """
+    for key in os.environ:
+        if key.startswith("SGLANG_WEG2_") and key != WEG2_GROUP_ENV:
+            return True
+    return False
+
+
+def _refuse_graph_tag(reason: str, detail: str) -> None:
+    """Name a graph-tag refusal in the log, rate-limited, with its denominator.
+
+    FIX 3, finding 2.  Before this, every conjunct of
+    :func:`weg2_graph_tag_armed` refused SILENTLY: a rank that lost
+    :data:`WEG2_GROUP_ENV` produced no line at the gate, no line at the region
+    (``yield False`` with no logger call), no line at the sleep (the tag list
+    came back unchanged) -- and therefore was byte-identical in the logs to a
+    rank running the tree from before this item.  The boot arm looked for a
+    degrade line that could only be emitted by ONE of the refusal paths (the
+    adapter-build failure), so the one degrade it could not see was the one
+    that silently disarmed the whole item.
+
+    RATE LIMIT AND ITS DENOMINATOR: this is called once per sleep leg and once
+    per attention-backend build, so it is not hot, but it must not scroll
+    either.  The line fires on occurrence 1, 2, 4, 8, ... per reason and always
+    prints ``occurrence=`` -- a reader can therefore tell "refused once" from
+    "refused on every leg", which a plain once-per-process line cannot, and
+    :data:`_GRAPH_TAG_REFUSALS` carries the exact count for a test.
+    """
+    n = _GRAPH_TAG_REFUSALS.get(reason, 0) + 1
+    _GRAPH_TAG_REFUSALS[reason] = n
+    if n & (n - 1):  # not a power of two -- suppressed, but counted above
+        return
+    logger.warning(
+        "WEG2-SLEEP graph tag NOT armed: %s -- %s. occurrence=%d for this reason "
+        "in this process (the line is rate-limited to occurrences 1,2,4,8,...; "
+        "the count is the denominator, the line is not). The sleeping rank keeps "
+        "the CUDA-graph capture pool and the flashinfer FLOAT workspace resident "
+        "(pre-item behaviour, not a silent success)",
+        reason,
+        detail,
+        n,
+    )
+
+
+def weg2_graph_tag_refusals() -> Dict[str, int]:
+    """A copy of :data:`_GRAPH_TAG_REFUSALS` -- the rate limit's denominator."""
+    return dict(_GRAPH_TAG_REFUSALS)
+
+
+def weg2_graph_tag_armed(memory_saver_on: bool) -> bool:
+    """True when this rank's sleep also releases ``GPU_MEMORY_TYPE_CUDA_GRAPH``.
+
+    THREE conjuncts, and FIX 2 (findings 1 and 2) added two of them because the
+    first version had only the third and was wrong in both directions:
+
+    1. ``memory_saver_on`` -- the caller's own
+       ``server_args.enable_memory_saver``.  It is the half of the capture
+       site's pair (``full_cuda_graph_backend.py:78-81``,
+       ``enable=enable_memory_saver and get_bool_env_var(...)``) that the first
+       version's docstring claimed to read and did not.  Without it, an engine
+       with the env set but the saver off armed the sleep tag while the capture
+       built a Noop adapter -- the exact split ``flashinfer_backend.py`` calls
+       out ("the two must be released together or not at all").
+    2. :func:`weg2_group_name` -- THIS IS A WEG-2 MECHANISM AND MUST GATE ON
+       WEG 2.  ``enable_memory_saver`` is an upstream flag on an upstream
+       endpoint: gating on it alone silently widened a stock
+       ``POST /release_memory_occupation {"tags":["kv_cache"]}`` into
+       ``kv_cache + cuda_graph`` on any engine that ran the documented
+       memory-saver + cuda-graph configuration.  The caller asked for one tag
+       and got two; that is not this item's to change.  With this conjunct the
+       stock path is byte-identical BY CONSTRUCTION, not by a test's opinion of
+       what "stock" means.
+    3. ``SGLANG_MEMORY_SAVER_CUDA_GRAPH`` -- read through
+       :func:`get_bool_env_var`, which is the function the CAPTURE site calls,
+       so the two sides cannot disagree on a value.
+
+    On (3), why not ``envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()`` even though
+    that is the canonical registry entry: MEASURED on this box, one process per
+    value, the three readers disagree ::
+
+        value    hand-rolled(v1)   get_bool_env_var   envs.EnvBool
+        '1'      True              True               True
+        'true'   True              True               True
+        'yes'    True              False              True
+        'on'     True              False              False
+        'y'      False             False              True
+
+    The invariant is agreement with the CAPTURE, not with the registry, and the
+    launcher honours an operator override of this variable
+    (``launcher.py:1383-1385``), so a non-canonical value is a reachable input
+    rather than a hypothetical.  ``envs`` would fix ``'on'`` and newly break
+    ``'y'`` and leave ``'yes'`` broken; ``get_bool_env_var`` is exact for all
+    five because it is literally the other side's reader.  If the capture site
+    is ever migrated to ``envs``, ``test_the_sleep_gate_reads_the_capture_sites
+    _own_reader`` goes red rather than the boot.
+
+    Only (3) is cached: it is the drifting term (an env), and the sleep ADDS
+    the tag to ``offload_tags`` while the wake REMOVES it, so a resolver that
+    answered differently between the legs would ``KeyError`` on a tag that was
+    never paused.  (1) is a per-call argument because it is a per-caller fact,
+    and both legs read it from the same ``server_args`` object.
+
+    FIX 3, finding 2: every one of the three refuses BY NAME through
+    :func:`_refuse_graph_tag` -- except on a stock engine, where the whole
+    point is that nothing changes, including the log.  :func:`weg2_env_present`
+    is what tells the two apart.
+    """
+    group = weg2_group_name()
+    if not memory_saver_on:
+        if group or weg2_env_present():
+            _refuse_graph_tag(
+                "no_memory_saver",
+                "the caller's server_args.enable_memory_saver is False on a "
+                "Weg-2 rank (group=%r); launcher.common_flags passes "
+                "--enable-memory-saver, so this rank was launched by something "
+                "else" % (group,),
+            )
+        return False
+    if not group:
+        # THE condition FIX 2 added and FIX 3 gave an instrument to.  A stock
+        # engine legitimately has no group and must stay silent; a Weg-2 rank
+        # that lost the variable is a silent capability loss, and this is the
+        # only place in either tree that can say so.
+        if weg2_env_present():
+            _refuse_graph_tag(
+                "no_group",
+                "%s is empty or unset on a rank that carries other SGLANG_WEG2_* "
+                "variables -- launcher.build_env publishes it at every launch "
+                "site, so it was lost between the launcher and this process"
+                % WEG2_GROUP_ENV,
+            )
+        return False
+    global _GRAPH_TAG_ARMED
+    if _GRAPH_TAG_ARMED is None:
+        from sglang.srt.utils.common import get_bool_env_var
+
+        _GRAPH_TAG_ARMED = bool(get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH"))
+    if not _GRAPH_TAG_ARMED:
+        _refuse_graph_tag(
+            "env_off",
+            "SGLANG_MEMORY_SAVER_CUDA_GRAPH is not truthy to get_bool_env_var "
+            "(the CAPTURE site's own reader, so the capture did not route into "
+            "the tag either -- releasing it alone would pause a workspace the "
+            "graph still reads). An operator override of this variable is a "
+            "legitimate input; this line says what it costs",
+        )
+    return _GRAPH_TAG_ARMED
+
+
+@contextmanager
+def weg2_graph_scratch_region(
+    nbytes: int, memory_saver_on: bool, adapter: Any = None
+) -> Iterator[bool]:
+    """Route ONE large, content-free graph-side allocation into the graph tag.
+
+    Yields True when the enclosed allocation is tagged, False when it is not --
+    the caller may need to know, and a silent no-op is how a region that never
+    ran gets reported as one that did.
+
+    Three refusals to tag, each for a stated reason:
+
+    * the tag is not armed (``weg2_graph_tag_armed(memory_saver_on)``) -- then
+      the capture path did not route into the tag either, and a workspace alone
+      in a paused tag would be released while the graph that reads it is not.
+      ``memory_saver_on`` is the caller's own
+      ``server_args.enable_memory_saver``: FIX 2, finding 2, the first version
+      read the env alone here, so an engine WITHOUT the saver but WITH the env
+      built a real ``TorchMemorySaverAdapter`` and routed 384 MiB into a region
+      no sleep would ever pause;
+    * ``nbytes`` is below :data:`WEG2_GRAPH_SCRATCH_MIN_BYTES` -- #102's
+      correctness gate, see the constant;
+    * ``torch.cuda.MemPool`` / ``use_mem_pool`` or the adapter's
+      ``region_config`` is unavailable -- the pool is the thing that makes
+      cross-tag free-list reuse impossible, so without it the allocation stays
+      in the default pool rather than landing untracked in a shared segment.
+
+    Two more are FAILURES rather than decisions, and both degrade loudly to the
+    pre-change behaviour instead of raising: the adapter could not be BUILT
+    (FIX 2, finding 4 -- ``TorchMemorySaverAdapter.create`` re-raises the
+    missing-wheel import error), and the pool or the region could not be
+    ENTERED.  Raising in either place would turn a VRAM optimisation into a
+    boot killer at attention-backend build time.
+
+    The caller is responsible for restoring the allocation's content contract
+    after a resume; for the flashinfer float workspace that is
+    ``zero_flashinfer_workspaces()``, which the wake path calls.
+    """
+    if (
+        not weg2_graph_tag_armed(memory_saver_on)
+        or int(nbytes) < WEG2_GRAPH_SCRATCH_MIN_BYTES
+    ):
+        yield False
+        return
+    import torch
+
+    from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+
+    # FIX 2, finding 4.  ``TorchMemorySaverAdapter.create`` RE-RAISES the
+    # import error when torch-memory-saver is missing
+    # (``torch_memory_saver_adapter.py:36-45``), and in the first version this
+    # call sat ABOVE the guarded block -- so the one exception this region can
+    # produce escaped the very try written to stop it, straight into
+    # ``FlashInferAttnBackend.__init__``, exactly the "boot killer at
+    # attention-backend build time" the degrade path below names as the thing
+    # it exists to prevent.  Caught HERE rather than inside that block because
+    # the block also contains the ``yield``: wrapping the caller's body in an
+    # ``except Exception`` would swallow the CALLER's exception, which is a
+    # second defect and has its own test.
+    #
+    # ``enable=True`` is no longer a hardcoded claim either: the arming gate
+    # above now requires ``memory_saver_on``, so this is the same value the
+    # capture site passes (``full_cuda_graph_backend.py:78-81``) and the
+    # upstream warning "enable_memory_saver is enabled, but torch-memory-saver
+    # is not installed" can no longer be printed on an engine that never
+    # enabled it.
+    if adapter is None:
+        try:
+            from sglang.srt.utils.torch_memory_saver_adapter import (
+                TorchMemorySaverAdapter,
+            )
+
+            adapter = TorchMemorySaverAdapter.create(enable=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "WEG2-SLEEP graph scratch NOT tagged (%d bytes): the memory-saver "
+                "adapter could not be built (%s: %s) -- the allocation stays in "
+                "the default pool and is RESIDENT across the sleep (pre-change "
+                "behaviour, not a silent success)",
+                int(nbytes),
+                type(exc).__name__,
+                exc,
+            )
+            yield False
+            return
+
+    region_config = getattr(adapter, "region_config", None)
+    mempool_cls = getattr(torch.cuda, "MemPool", None)
+    use_mem_pool = getattr(torch.cuda, "use_mem_pool", None)
+    if region_config is None or mempool_cls is None or use_mem_pool is None:
+        logger.warning(
+            "WEG2-SLEEP graph scratch NOT tagged (%d bytes): "
+            "region_config=%s MemPool=%s use_mem_pool=%s -- the allocation stays "
+            "in the default pool, which is resident across the sleep",
+            int(nbytes),
+            region_config is not None,
+            mempool_cls is not None,
+            use_mem_pool is not None,
+        )
+        yield False
+        return
+    global _GRAPH_SCRATCH_POOL
+    stack = ExitStack()
+    try:
+        if _GRAPH_SCRATCH_POOL is None:
+            _GRAPH_SCRATCH_POOL = mempool_cls()
+        stack.enter_context(use_mem_pool(_GRAPH_SCRATCH_POOL))
+        stack.enter_context(region_config(tag=GPU_MEMORY_TYPE_CUDA_GRAPH))
+    except Exception as exc:  # noqa: BLE001
+        # The fourth refusal, and the only one that is a FAILURE rather than a
+        # decision: the pool or the region could not be entered (no CUDA, an
+        # uninitialised saver, a torch that refuses the pool).  Degrade to
+        # untagged -- which is exactly the behaviour before this change, so the
+        # allocation is correct and merely resident -- but say so with the
+        # exception named.  Raising instead would turn a VRAM optimisation into
+        # a boot killer at attention-backend build time.
+        stack.close()
+        logger.warning(
+            "WEG2-SLEEP graph scratch NOT tagged (%d bytes): %s: %s -- the "
+            "allocation stays in the default pool and is RESIDENT across the "
+            "sleep (pre-change behaviour, not a silent success)",
+            int(nbytes),
+            type(exc).__name__,
+            exc,
+        )
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        stack.close()
+
+
 # ---------------------------------------------------------------------------
 # #1233 ONE-BACKUP FLIP: chunked weight tags (record section 1h, 2026-09-07)
 # ---------------------------------------------------------------------------

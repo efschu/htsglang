@@ -1048,16 +1048,58 @@ class FlashInferAttnBackend(AttentionBackend):
         # state is the contract they were validated against. It is restored
         # at request boundaries via zero_flashinfer_workspaces() — every
         # workspace allocation below must be registered.
-        global_workspace_buffer = register_flashinfer_workspace_buffer(
-            get_buffer(
-                "flashinfer_workspace",
-                lambda: torch.empty(
-                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                    dtype=torch.uint8,
-                    device=model_runner.device,
-                ),
+        # Item `dormant` (record [1y] row R3a): the FLOAT workspace is 384 MiB
+        # per rank and stays fully resident while a Weg-2 group sleeps.  The
+        # NOTE(#50) above is exactly the licence to release it: the contract
+        # this buffer owes its kernels is ZERO, restored at every request
+        # boundary, so a torch_memory_saver pause that unmaps its pages and a
+        # resume that maps fresh ones destroys nothing the next
+        # zero_flashinfer_workspaces() would not have destroyed anyway -- and
+        # the Weg-2 wake path calls it right after resume(cuda_graph) for that
+        # reason.  The region is a no-op unless the graph tag is armed, which is
+        # the same condition under which the CAPTURE routed into that tag; the
+        # two must be released together or not at all.
+        #
+        # NOT the int workspace: that one carries the plan the `full` backend
+        # captured INSIDE the graph, and #50's own bisection is the evidence
+        # (an int-workspace wipe does NOT move the output, a float wipe does).
+        from sglang.srt.managers.weg2_memory_saver import weg2_graph_scratch_region
+
+        # get_buffer is a CACHE: on a second backend instance the factory does
+        # not run and nothing is allocated inside the region.  The flag records
+        # whether the allocation ACTUALLY happened there, so the line below
+        # cannot announce a tagging that did not occur (instrument-text law).
+        weg2_alloc_ran: List[bool] = []
+
+        def _weg2_new_workspace() -> torch.Tensor:
+            weg2_alloc_ran.append(True)
+            return torch.empty(
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                dtype=torch.uint8,
+                device=model_runner.device,
             )
-        )
+
+        with weg2_graph_scratch_region(
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+            # FIX 2, finding 2: the region's arming gate is the CAPTURE site's
+            # pair, and this is the half of it that only the caller has.  Read
+            # from the same object the capture site reads it from, so the two
+            # cannot be given different answers on one rank.
+            bool(getattr(model_runner.server_args, "enable_memory_saver", False)),
+        ) as weg2_region_open:
+            global_workspace_buffer = register_flashinfer_workspace_buffer(
+                get_buffer("flashinfer_workspace", _weg2_new_workspace)
+            )
+        weg2_tagged = weg2_region_open and bool(weg2_alloc_ran)
+        if weg2_tagged:
+            logger.info(
+                "WEG2-SLEEP graph scratch TAGGED: flashinfer float workspace %.1f MiB "
+                "allocated inside region_config(cuda_graph) on its own MemPool "
+                "(instrument: the requested allocation size, not a device reading) -- "
+                "released by pause(cuda_graph), re-zeroed on resume; the int workspace "
+                "is deliberately NOT tagged (capture-time plan, #50 bisection)",
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() / (1024 * 1024),
+            )
         if init_new_workspace:
             # When built for an adaptive runtime state in offload mode, the
             # private workspace is tagged as pauseable per-state scratch: its
