@@ -701,6 +701,38 @@ def argv_p(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
     ] + extra
 
 
+def w38_armed_line(argv_of_p: Sequence[str]) -> str:
+    """MF-3 (b): state group P's disarmed store read AT LAUNCH, once.
+
+    The cost is structural and permanent for this boot form, so it may not be
+    something a reader has to reconstruct from a rank log at 3 a.m.  It is
+    READ OFF THE ARGV THIS LAUNCHER IS ABOUT TO RUN rather than asserted from
+    memory: ``--pp-size N`` with N > 1 on group P is exactly the predicate
+    ``Scheduler._carrierless_pp_store_read_refused`` keys on (a PP group, and
+    the no-flip PP form has no #631 row carrier), so if that flag ever changes
+    the line changes with it instead of lying.
+    """
+    pp = 1
+    for i, a in enumerate(argv_of_p):
+        if a == "--pp-size" and i + 1 < len(argv_of_p):
+            try:
+                pp = int(argv_of_p[i + 1])
+            except ValueError:
+                pp = 1
+    if pp <= 1:
+        return ("WEG2 W38 NOT ARMED: group P is launched with --pp-size %d, so the store read is "
+                "not refused on it and P keeps its L3 prefix reuse" % pp)
+    return ("WEG2 W38 ARMED: group P reads no store; the PP0-authoritative materialisation (#968) "
+            "is the named remedy. Group P is launched --pp-size %d and the no-flip PP form carries "
+            "no #631 row carrier, so every storage read on P is refused by name "
+            "(#1234 W38 Weg2CarrierlessPpStoreRead) -- a prefetch completing on one rank and not "
+            "another would lengthen that rank's prefix_indices alone (the W27 width divergence that "
+            "killed boot weg2sc1). WHAT IT COSTS: a multi-turn follow-up whose prefix has left P's "
+            "device tier is prefilled WHOLE again, which is the user's soft no-double-prefill law "
+            "paying for a hard correctness refusal. Measured per drain epoch by the front's "
+            "'WEG2 P-PREFIX-REUSE' line; the write-through and D's own store read are untouched." % pp)
+
+
 def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float,
            extra: List[str], d_bs: int, max_kv_per_request: int, x_tokens: int) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + [
@@ -1112,6 +1144,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
     spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request), ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
+    log(w38_armed_line(spec_p.argv))
     state.deviations = [
         "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
         "= 208 of 224 usable, measured Used 224/256 incl. RM carve-out; #1234 C1 raised dcp:0 from 24 so the 96-MiB dcp all_reduce plans to 10 rounds "

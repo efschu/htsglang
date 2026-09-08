@@ -368,6 +368,11 @@ class Pending:
     posted_evt: Optional[asyncio.Event] = None
     #: C12: how often D refused this rid with W31.  A second one is W35.
     x_requeues: int = 0
+    #: MF-3: the tokens of this prompt whose prefix the front's OWN ROUTING
+    #: PROBE already priced as store-resident, captured at arrival because
+    #: the probe's source (:class:`SpanLRU`) is mutated by this very request
+    #: once leg 1 answers.  See :meth:`Front._note_p_prefix_reuse`.
+    store_span_est: int = 0
 
 
 class Seat:
@@ -526,6 +531,8 @@ class Front:
         self.min_dwell_ms = None if min_dwell_ms is None else float(min_dwell_ms)
         # law 5 / C6: which group is awake when nothing is pending.
         self.idle_layout = "P" if str(idle_layout).upper().startswith("P") else "D"
+        # MF-1: the IDLE-REST line's edge trigger (see _idle_disposition).
+        self._idle_rest_shown = False
         self.drain_deadline_s = float(drain_deadline_s)
         # C4: oldest-first, one seat per running request on D.
         self._ready_for_d: Deque[Pending] = collections.deque()
@@ -1029,6 +1036,15 @@ class Front:
         rid = f"weg2-{self.epoch}-{self._rid}"
         text = request_text(payload)
         remainder, est_prompt, known = price_remainder(text, self.spans)
+        # MF-3: the routing probe's OTHER half, taken here and nowhere else.
+        # `price_remainder` already asked the span LRU how much of this prompt
+        # is a prefix the front has seen realised before -- i.e. a prefix P
+        # prefilled and WROTE THROUGH to the store -- and subtracted it.  That
+        # difference is the store-resident prefix estimate, so MF-3's
+        # denominator costs no second probe.  It must be captured HERE: leg 1
+        # records this very text into the same LRU, after which the probe
+        # would answer with the request's own prefill.
+        store_span = max(0, est_prompt - remainder)
         if not known:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
@@ -1047,7 +1063,8 @@ class Front:
                     return await self.leg2(request, rid, payload, text, stream, pending=None,
                                            single_prefill=True, seat=seat)
             fut = asyncio.get_event_loop().create_future()
-            p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt, span_known=known, skip_leg1=True)
+            p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt, span_known=known,
+                        skip_leg1=True, store_span_est=store_span)
             self.queue.append(p)
             try:
                 await fut
@@ -1082,7 +1099,8 @@ class Front:
             # served by the NEXT P phase, whose epoch this line names.
             logger.info("WEG2 LATE-BATCH rid=%s deferred_to_epoch=%d", rid, self.epoch + 1)
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt, span_known=known)
+        p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt, span_known=known,
+                    store_span_est=store_span)
         self.queue.append(p)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
                     rid, self.awake, self.admit_d, est_prompt, remainder, len(self.queue))
@@ -1275,6 +1293,7 @@ class Front:
                     js = {}
                 pt, ct, _, _ = usage_of(js)
                 p.leg1_prompt_tokens = pt
+                self._note_p_prefix_reuse(p, ct)
                 self.spans.record(p.text, pt)
                 self._note_exact(p.text, pt)
                 if self.carrier_max_tokens > 0 and pt > self.carrier_max_tokens and not p.skip_leg1:
@@ -1290,6 +1309,49 @@ class Front:
                             p.rid, pt, ct, time.time() - t0, self.epoch)
         finally:
             g.outstanding.pop(p.rid, None)
+
+    def _note_p_prefix_reuse(self, p: Pending, leg1_cached_tokens: int) -> None:
+        """MF-3: price ONE P prefill against the prefix reuse W38 forgoes.
+
+        THE COST THIS MAKES VISIBLE.  ``#1234 W38 Weg2CarrierlessPpStoreRead``
+        refuses EVERY storage read on group P (scheduler.py, and it is the
+        right refusal: without the #631 row carrier a prefetch completing on
+        one PP rank and not another splits the geometry -- the W27 divergence
+        that killed boot weg2sc1).  The consequence is that a multi-turn
+        follow-up whose prefix left P's device tier is prefilled WHOLE again,
+        which is the user's soft no-double-prefill law paying for a hard
+        correctness refusal.  MF-3 orders that cost MEASURED until the
+        PP0-authoritative materialisation (#968 form) removes it, so that it
+        is a number in the log rather than a sentence in a postmortem.
+
+        WHAT THE THREE TERMS MEASURE, each with its instrument:
+
+        * ``prefix_tokens_available_in_store`` -- the front's OWN ROUTING
+          PROBE (:func:`price_remainder` over :class:`SpanLRU`), captured at
+          arrival in ``Pending.store_span_est``.  It is an ESTIMATE at TEXT
+          granularity: the longest common prefix with a prompt this front saw
+          realised, scaled by that prompt's realised token count.  It is a
+          LOWER bound in two named ways -- a prefix from before the LRU's
+          window is invisible, and a W31 re-queue deliberately contributes 0
+          (D's own refusal is evidence the prefix did NOT come back) -- and it
+          is an upper bound in one: it counts the text prefix, not the store's
+          page keys, so a prefix shorter than one page cannot actually be read
+          back.  It is NOT a store key probe; the front has no tokenizer and
+          no store index, and inventing one for an instrument would be the
+          second bookkeeping this tree deletes on sight.
+        * ``prefix_tokens_reused`` -- MEASURED, never assumed: P's own leg-1
+          ``cached_tokens``.  Under W38 this can only come from P's DEVICE
+          tier (its radix tree, fed by P's own prefills in this epoch); the
+          store contributes nothing by construction.  It is written as a
+          measurement precisely so the day the carrier arrives and the read
+          re-arms, this line moves on its own instead of lying.
+        * ``forgone_tokens`` -- ``available - reused``, floored at 0: prefix
+          tokens the store held, P's device tier did not, and P therefore
+          recomputed.  That is the double prefill, priced.
+        """
+        self.counters["p_prefill_requests"] += 1
+        self.counters["p_prefix_tokens_in_store"] += max(0, int(p.store_span_est))
+        self.counters["p_prefix_tokens_reused"] += max(0, int(leg1_cached_tokens))
 
     def _note_exact(self, text: str, prompt_tokens: int) -> None:
         if prompt_tokens <= 0:
@@ -1550,6 +1612,14 @@ class Front:
             p = Pending(rid, request.path, payload, text, time.time(),
                         asyncio.get_event_loop().create_future(),
                         est_prompt=len(text) // int(CHARS_PER_TOKEN) + 1, span_known=False)
+            # MF-3: `store_span_est` stays 0 on this path ON PURPOSE, and the
+            # reason is evidence, not caution: D has just refused this rid
+            # with W31, i.e. its uncached extent AFTER match_prefix was larger
+            # than X, so the prefix the span LRU would price as store-resident
+            # demonstrably did not come back on D.  Pricing it here would
+            # inflate the forgone-reuse figure with tokens no store read was
+            # going to save.  The P-PREFIX-REUSE line is therefore a LOWER
+            # bound, and says so.
             p.x_requeues = n
         else:
             p.fut = asyncio.get_event_loop().create_future()
@@ -1763,6 +1833,76 @@ class Front:
                     queued_tokens, self.flip_min_work_tokens, fairness_fired, "flip" if ok else "hold")
         return ok
 
+    def _idle_disposition(self, awake: str, at_rest: bool) -> str:
+        """LAW 5, ONE DECISION FOR BOTH DIRECTIONS: rest, flip, or busy.
+
+        MF-1 (operator, boot weg2sc2, and it is a CODE FACT rather than a
+        missed measurement).  The two idle arms this replaces were each gated
+        on the OTHER layout: the D-awake mirror required
+        ``idle_layout == "P"`` and the P-awake tail flipped whenever
+        ``idle_layout == "D"``.  ``--idle-layout tp`` makes the launcher emit
+        front ``--idle-layout D``, so under tp -- the DEFAULT -- neither arm
+        could reach its ``WEG2 IDLE-REST``: the witness for law 5's own
+        acceptance probe did not exist in that direction, which retro-explains
+        weg2sc1's and weg2sc2's zero IDLE-REST lines.
+
+        THE DECISION, keyed on the CONFIGURED layout and nothing else:
+
+        * not at rest -> ``"busy"``; the caller does its ordinary work.
+        * at rest and the awake group IS ``self.idle_layout`` -> ``"rest"``,
+          and this method prints the L-line naming the layout and the reason.
+        * at rest and it is NOT -> ``"flip"``; the caller flips (still behind
+          its own dwell/economics latches, which this method does not
+          second-guess), and the NEXT pass rests in the configured layout.
+          One flip, then rest -- the mirror, stated once.
+
+        THE LATCH is the printer's own de-dup, not a second scheduling
+        ledger: the controller wakes every 0.2 s, so a resting front would
+        otherwise emit five identical lines a second for as long as it is
+        idle.  The line is edge-triggered -- printed on the transition into
+        rest, re-armed by any pass that is not resting (work arriving, a
+        flip, a hand-off in flight).
+
+        WHAT WENT AWAY WITH THE OLD SHAPE, deliberately: the D-awake arm used
+        to print ``IDLE-REST`` and then FLIP in the same pass, i.e. the line
+        claimed a rest the front was in the act of leaving.  A flip announces
+        itself with ``WEG2-FLIP begin``; ``IDLE-REST`` now means what it says.
+        """
+        if not at_rest:
+            self._idle_rest_shown = False
+            return "busy"
+        if awake != self.idle_layout:
+            self._idle_rest_shown = False
+            return "flip"
+        if not self._idle_rest_shown:
+            self._idle_rest_shown = True
+            logger.info("WEG2 IDLE-REST layout=%s configured=%s reason=%s queue=0 ready_for_d=%d "
+                        "d_outstanding=%d handing_off=%d held_s=%.1f (no backlog and the awake "
+                        "group IS the layout --idle-layout asked for; there is nothing to flip to)",
+                        awake, self.idle_layout, "awake_group_is_configured_idle_layout",
+                        len(self._ready_for_d), len(self.groups["D"].outstanding),
+                        int(self._handoff_in_flight()), time.time() - self.t_awake)
+        return "rest"
+
+    def _log_p_prefix_reuse(self, before: Tuple[int, int, int]) -> None:
+        """MF-3 (L15): this drain epoch's forgone prefix reuse on group P.
+
+        The terms and their instruments are documented on
+        :meth:`_note_p_prefix_reuse`, which is where they are counted.  Here
+        they are only differenced against the epoch's entry reading and
+        spoken -- with ``requests=0`` printed too, so a drain that prefilled
+        nothing is a reading rather than a silence.
+        """
+        n = self.counters.get("p_prefill_requests", 0) - before[0]
+        avail = self.counters.get("p_prefix_tokens_in_store", 0) - before[1]
+        reused = self.counters.get("p_prefix_tokens_reused", 0) - before[2]
+        logger.info("WEG2 P-PREFIX-REUSE epoch=%d requests=%d prefix_tokens_available_in_store=%d "
+                    "prefix_tokens_reused=%d forgone_tokens=%d (W38 carrierless: P reads no store; "
+                    "available= is the front's own routing probe, a text-span ESTIMATE and a LOWER "
+                    "bound; reused= is MEASURED from P's leg-1 cached_tokens, device tier only; "
+                    "the remedy is the PP0-authoritative materialisation, #968)",
+                    self.epoch, n, avail, reused, max(0, avail - reused))
+
     def _fairness_switch(self, oldest_arrival: Optional[float], queue_name: str) -> bool:
         """A1-1: the ONE sanctioned pre-emption, and it names itself.
 
@@ -1820,12 +1960,9 @@ class Front:
                         # where the future is resolved, returned in `leg2`'s
                         # `finally`), so the hand-off is made visible with the
                         # state that exists rather than with a second ledger.
-                        if (self.idle_layout == "P" and not D.outstanding
-                                and not self._handoff_in_flight()
-                                and not self._ready_for_d and self.state == "serving"):
-                            logger.info("WEG2 IDLE-REST layout=%s queue=0 ready_for_d=%d d_outstanding=%d handing_off=%d held_s=%.1f",
-                                        self.awake, len(self._ready_for_d), len(D.outstanding),
-                                        self._handoff_in_flight(), time.time() - self.t_awake)
+                        at_rest = (not D.outstanding and not self._handoff_in_flight()
+                                   and not self._ready_for_d and self.state == "serving")
+                        if self._idle_disposition("D", at_rest) == "flip":
                             if self._dwell_ok("D", "P", fairness_fired, work_exhausted=True, oldest_wait_s=0.0):
                                 await self.flip("D", "P")
                         continue
@@ -1859,6 +1996,12 @@ class Front:
                 prefilled = 0
                 passes = 0
                 short_behind_p0 = self.counters.get("short_behind_p", 0)
+                # MF-3: the same delta idiom as `short_behind_p0` -- the
+                # epoch's terms are read off the running counters rather than
+                # carried in a second per-epoch structure.
+                reuse0 = (self.counters.get("p_prefill_requests", 0),
+                          self.counters.get("p_prefix_tokens_in_store", 0),
+                          self.counters.get("p_prefix_tokens_reused", 0))
                 while self.queue and self.state == "serving":
                     passes += 1
                     batch = [self.queue.popleft()
@@ -1898,17 +2041,18 @@ class Front:
                     logger.info("WEG2 SHORT-BEHIND-P epoch=%d n=%d oldest_wait_s=%.1f",
                                 self.epoch, self.counters.get("short_behind_p", 0) - short_behind_p0,
                                 oldest_short)
+                    # MF-3 (L15): what group P's disarmed store read cost THIS
+                    # drain, beside the drain it cost it in.
+                    self._log_p_prefix_reuse(reuse0)
                 # C6/R-2: the _ready_for_d term is NOT optional.  Without it,
                 # --idle-layout pp keeps P awake with requests P has just
                 # prefilled sitting on `await fut` behind a one-hour client
                 # timeout -- a LOST-REQUEST class introduced by the fix for
                 # law 5.  The admitter (C4) releases them once D is awake.
-                if self.queue or self._ready_for_d or self.idle_layout == "D":
+                if self.queue or self._ready_for_d:
                     await self.flip("P", "D")
-                else:
-                    logger.info("WEG2 IDLE-REST layout=%s queue=0 ready_for_d=%d d_outstanding=%d held_s=%.1f",
-                                self.awake, len(self._ready_for_d),
-                                len(self.groups["D"].outstanding), time.time() - self.t_awake)
+                elif self._idle_disposition("P", at_rest=True) == "flip":
+                    await self.flip("P", "D")
             except Weg2Stop as e:
                 self.do_stop(e.name, e.detail)
             except Exception as e:  # noqa: BLE001

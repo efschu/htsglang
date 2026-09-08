@@ -403,8 +403,16 @@ def _law4_reach_slice():
     return ns["_law4_reach"], free
 
 
-def _run_law4_reach(refuses: bool):
-    """Run that slice for ONE request and report what the loop actually did."""
+def _run_law4_reach(refuses: bool, drive_pp: bool = False):
+    """Run that slice for ONE request and report what the loop actually did.
+
+    ``drive_pp`` (ROUND 6, item 4) turns the permissive stub into a Weg-2
+    GROUP P: HiCache storage on and ``pp_size > 1``, so the conditional PP
+    admission block at ``scheduler.py:11419`` -- which the permissive stub
+    steps OVER, because ``_No`` answers ``enable_hicache_storage`` with
+    "no" -- is EXECUTED on the way to the gate.  That block was FIX 5's own
+    named coverage residue.
+    """
     fn, free = _law4_reach_slice()
     skips, refused, past, seen = [], [], [], []
     req = SimpleNamespace(
@@ -416,14 +424,36 @@ def _run_law4_reach(refuses: bool):
         seen.append(r)
         return refuses
 
+    over = dict(waiting_queue=[req], _weg2_x_refuses=_spy)
     kw = {name: _NO for name in free}
-    kw["self"] = _No(waiting_queue=[req], _weg2_x_refuses=_spy)
+    if drive_pp:
+        # Group P's OWN shape, and every override is one of its facts:
+        # PP=3 with no #631 row carrier (so `_pp0_may_withhold` is False and
+        # the #973 disarmed-take arm runs), storage on, this rank's prefetch
+        # complete (the only answer that does not `continue`), and the three
+        # running counters those arms increment -- `_No` would hand them a
+        # sentinel and `sentinel + 1` is a TypeError, not a skip.
+        over.update(
+            enable_hicache_storage=True,
+            ps=SimpleNamespace(pp_size=3, pp_rank=0),
+            _prefetch_done_for=lambda *a, **k: True,
+            _admit_under_group_completion=lambda *a, **k: True,
+            tree_cache=SimpleNamespace(pop_prefetch_loaded_tokens=lambda rid: 0),
+            _973_pp0_take_n=0,
+            _973_pp0_take_pending_n=0,
+            _969z_followed=0,
+        )
+        kw["pp_row_carrier_present"] = lambda *a, **k: False
+        kw["observe_store_witness"] = lambda *a, **k: None
+        kw["prefetch_verdicts"] = {}
+        kw["logger"] = logging.getLogger("weg2.reach.pp")
+    kw["self"] = _No(**over)
     kw["_note_skip"] = lambda kind, rid: skips.append((kind, rid))
     kw["_x_refused"] = refused
     kw["_reach_past_gate"] = past
     fn(**kw)
     return SimpleNamespace(req=req, entered=seen, skips=skips,
-                           refused=refused, past=past)
+                           refused=refused, past=past, sched=kw["self"])
 
 
 def test_b1e_the_x_gate_is_ENTERED_when_the_real_loop_runs():
@@ -472,6 +502,51 @@ def test_b1f_a_refused_request_is_skipped_and_collected_by_the_real_loop():
         "a refused request must not continue into the rest of the pass -- the "
         "gate's `continue` is what keeps it out of this batch"
     )
+
+
+def test_b1g_the_gate_is_reached_THROUGH_the_conditional_pp_block():
+    """ROUND 6, item 4: FIX 5's own named coverage residue, closed.
+
+    FIX 5 recorded it rather than leaving it to be discovered: ``_No`` answers
+    every question with "no", so ``if self.enable_hicache_storage and
+    _pp_group:`` at ``scheduler.py:11419`` is FALSE in ``b1e``/``b1f`` and the
+    whole 150-line PP admission block is stepped over.  A mutant planted
+    INSIDE it (a ``continue`` on the #973 disarmed-take arm, say) was reached
+    by neither the execution slice nor the AST companion.
+
+    This arm drives that block with group P's own configuration and asserts
+    the SAME property: the gate is still entered, the request still falls
+    through.  Two honest limits, stated so nobody reads more into it:
+
+    * the exposure it closes is P-SIDE ONLY.  Group D is TP-only
+      (``--tp-size 3 --pp-size 1``), so on the group law 4 is actually
+      enforced on, ``_pp_group`` is False and this block cannot execute at
+      all -- a skip inside it could never have disarmed X on D.  What it CAN
+      do is drop a request out of a P prefill pass, which is why it is worth
+      a test rather than a shrug.
+    * it drives ONE path through the block (carrier-less, prefetch complete),
+      which is Weg 2's, not all of them.  The block's other exits are
+      `continue`s by design (a pending prefetch), and a test that made them
+      fire would be asserting the stub.
+    """
+    got = _run_law4_reach(refuses=False, drive_pp=True)
+    # FIRST: prove the block RAN, or this test is the permissive arm again
+    # under a longer name.  Both counters are incremented inside it and
+    # nowhere else in the slice.
+    assert got.sched._973_pp0_take_n == 1 and got.sched._969z_followed == 1, (
+        "the PP admission block did not execute -- the drive is not driving, "
+        "and the arm proves nothing the permissive stub did not already"
+    )
+    assert len(got.entered) == 1 and got.entered[0] is got.req, (
+        "with HiCache storage on and pp_size > 1 the loop runs the PP "
+        "admission block before law 4's gate -- and something in there kept "
+        "control from arriving at the gate"
+    )
+    assert got.past == [got.req]
+    assert got.skips == [] and got.refused == []
+    # and the refusing half still refuses through the same path
+    got = _run_law4_reach(refuses=True, drive_pp=True)
+    assert got.refused == [got.req] and got.past == []
 
 
 def test_b1c_the_answer_removes_the_request_and_names_w31_on_the_wire():
@@ -565,7 +640,15 @@ def test_b2c_every_l_line_the_spec_names_is_present_with_its_denominators():
         "L5": (front_src, "WEG2 LATE-BATCH", ["deferred_to_epoch="]),
         "L9": (sched_src, "WEG2 X-GATE", ["uncached=", "X=", "replicated_term=", "verdict="]),
         "L10": (front_src, "WEG2 X-ROUTE", ["est_uncached=", "X=", "ESTIMATE"]),
-        "L11": (front_src, "WEG2 IDLE-REST", ["layout=", "ready_for_d=", "d_outstanding=", "held_s="]),
+        # L11 gains `configured=` and `reason=` in FIX 6 (MF-1): a rest line
+        # that names only the AWAKE layout cannot say whether the front is
+        # resting where it was told to or merely where it happens to be.
+        "L11": (front_src, "WEG2 IDLE-REST", ["layout=", "configured=", "reason=",
+                                              "ready_for_d=", "d_outstanding=", "held_s="]),
+        # L15 (MF-3): the interim cost of W38 on group P, per drain epoch.
+        "L15": (front_src, "WEG2 P-PREFIX-REUSE",
+                ["epoch=", "requests=", "prefix_tokens_available_in_store=",
+                 "prefix_tokens_reused=", "forgone_tokens="]),
         "L12": (front_src, "WEG2 MIN-DWELL", ["src=", "dst=", "awake_ms=",
                                               "derived_from_flip_ms=", "overridden_by="]),
         "L13": (front_src, "WEG2 FLIP-ECONOMICS", ["queued_tokens=", "threshold=",
@@ -1061,6 +1144,7 @@ def test_a10_a_failed_read_is_remembered_for_one_age_window(caplog):
         f = _pool_front(sess)
         Seat(f, "running", "batch", tokens=1)
         with caplog.at_level(logging.WARNING, logger=front_mod.logger.name):
+            t_fail = time.time()
             assert await f._d_pool_reading() is None
             assert sess.calls == 1 and f.counters["d_pool_read_failed"] == 1
             for _ in range(9):
@@ -1073,7 +1157,23 @@ def test_a10_a_failed_read_is_remembered_for_one_age_window(caplog):
                 "a suppressed read is counted apart from a failed one -- the "
                 "UNREADABLE line's denominators name what they count")
 
-            # The window is BOUNDED: it retries, it does not give up.
+            # ROUND 6, FINDING 1: THE BOUND ITSELF, READ OFF THE STAMP THE
+            # CODE CHOSE.  Round 5 asserted the CONSEQUENCE (suppressed reads)
+            # and then HAND-SET `_d_pool_retry_after` to prove the retry, so
+            # the length of the window was never checked against anything: a
+            # stamp of `t0 + 10 * D_POOL_MAX_AGE_S` -- a group D silent for
+            # ten age windows after ONE slow answer -- left this file green,
+            # and so did `t0 + 0` for the second half.  The window is now
+            # asserted where the code writes it, with a tolerance for the
+            # wall clock between the two readings and nothing more.
+            window = f._d_pool_retry_after - t_fail
+            assert front_mod.D_POOL_MAX_AGE_S <= window <= front_mod.D_POOL_MAX_AGE_S + 0.5, (
+                f"a failed read must be remembered for exactly one age window "
+                f"({front_mod.D_POOL_MAX_AGE_S:.1f} s), not {window:.3f} s: shorter and the "
+                f"negative cache does not bound anything, longer and a single slow answer "
+                f"blinds the gate for as long as the stamp says")
+
+            # And the window is BOUNDED: it retries, it does not give up.
             f._d_pool_retry_after = time.time() - 0.001
             assert await f._d_pool_reading() is None
             assert sess.calls == 2
@@ -1165,6 +1265,78 @@ def test_a13_the_read_timeout_is_derived_from_its_own_freshness_bound():
             "the timeout must be the derived constant, not a literal: "
             + ast.dump(value)
         )
+
+
+def test_a14_the_forgone_prefix_reuse_is_priced_by_the_routing_probe(caplog):
+    """MF-3 (a): the interim cost of W38 on group P, MEASURED per drain epoch.
+
+    W38 refuses every storage read on group P -- correctly, because without
+    the #631 row carrier a prefetch that completes on one PP rank and not
+    another splits the geometry (the W27 divergence that killed weg2sc1).
+    The consequence is that a multi-turn follow-up whose prefix has left P's
+    device tier is prefilled WHOLE again: the user's soft no-double-prefill
+    law paying for a hard correctness refusal.  MF-3 orders that cost priced
+    rather than left as a sentence in a postmortem.
+
+    THE DENOMINATOR IS THE FRONT'S OWN ROUTING PROBE, not a new one.
+    ``price_remainder`` already asks the span LRU how much of an arriving
+    prompt is a prefix this front saw realised before -- a prefix P prefilled
+    and wrote through -- and the CARRIER-EXCEEDS / SHORT routing decision is
+    taken on the difference.  ``est_prompt - remainder`` is therefore the
+    store-resident estimate at no extra cost, and it is captured at ARRIVAL
+    because leg 1 records this very text into the same LRU moments later.
+
+    The reused term is MEASURED (P's own leg-1 ``cached_tokens``), never the
+    literal 0 the finding predicts, so the day the carrier arrives and the
+    read re-arms this line moves on its own instead of lying.
+    """
+    f = _front_with_reading(None)
+    text = "a shared system preamble that two turns of one conversation carry"
+    f.spans.record(text, 120)
+
+    follow_up = text + " ... and the second turn's own question"
+    remainder, est_prompt, known = front_mod.price_remainder(follow_up, f.spans)
+    span = max(0, est_prompt - remainder)
+    assert known and span > 0, "the routing probe itself must see this prefix"
+
+    before = (f.counters.get("p_prefill_requests", 0),
+              f.counters.get("p_prefix_tokens_in_store", 0),
+              f.counters.get("p_prefix_tokens_reused", 0))
+    p = Pending("weg2-3-1", "/generate", {}, follow_up, 0.0, None, store_span_est=span)
+    f._note_p_prefix_reuse(p, 7)          # P's device tier covered 7 of them
+    cold = Pending("weg2-3-2", "/generate", {}, "cold", 0.0, None)
+    f._note_p_prefix_reuse(cold, 0)       # nothing of this one is in the store
+    with caplog.at_level(logging.INFO, logger=front_mod.logger.name):
+        f._log_p_prefix_reuse(before)
+
+    line = [ln for ln in caplog.text.splitlines() if "WEG2 P-PREFIX-REUSE" in ln]
+    assert len(line) == 1, "one line per drain epoch, printed with requests=0 too"
+    assert f"requests={2}" in line[0]
+    assert f"prefix_tokens_available_in_store={span}" in line[0]
+    assert "prefix_tokens_reused=7" in line[0], (
+        "the reused term is P's own leg-1 cached_tokens, a MEASUREMENT -- a "
+        "hardcoded 0 would keep printing 0 after the carrier lands")
+    assert f"forgone_tokens={span - 7}" in line[0], (
+        "forgone = what the store held minus what P's device tier saved; that "
+        "difference IS the double prefill W38 buys the geometry with")
+    assert "W38" in line[0] and "#968" in line[0], (
+        "the line must name the refusal it prices and the remedy that ends it")
+
+
+def test_a15_a_w31_requeue_does_not_inflate_the_forgone_figure():
+    """The one place the estimate is deliberately floored at 0, with its
+    reason: a request D refused with W31 had an uncached extent LARGER than X
+    after ``match_prefix``, i.e. the prefix the span LRU would price as
+    store-resident demonstrably did not come back on D.  Counting it would
+    inflate the cost of W38 with tokens no store read was going to save.  The
+    line is a LOWER bound, and the code says so where it makes it one."""
+    src = inspect.getsource(Front._requeue_after_x_refusal)
+    assert "store_span_est" in src and "LOWER" in src, (
+        "the W31 re-queue path must name why it prices no store span")
+    assert "store_span_est=" not in src.split("Pending(")[1].split(")")[0], (
+        "and must not pass one")
+    assert Pending("weg2-4-1", "/generate", {}, "", 0.0, None).store_span_est == 0, (
+        "the dataclass default is the floor")
 
 
 def test_a7_the_reading_is_group_d_s_own_915_terms():

@@ -11,6 +11,8 @@ There is no pytest-asyncio in this venv, so every async test body is run by
 """
 
 import asyncio
+import inspect
+import logging
 import re
 import time
 from types import SimpleNamespace
@@ -1266,3 +1268,139 @@ def test_f6d_the_handoff_term_is_derived_from_the_seat_not_recorded():
         assert f._seats_in_use() == 0 and f._handoff_in_flight() == 0
 
     asyncio.run(body())
+
+
+# ======================================================= ROUND 6 (FIX 6), MF-1
+# Law 5's idle-rest decision, keyed on the CONFIGURED layout in BOTH
+# directions.  Boot weg2sc2 could not observe it at all: `--idle-layout tp`
+# makes the launcher emit front `--idle-layout D`, and BOTH old emit sites
+# were gated on the OTHER layout, so `WEG2 IDLE-REST` was unreachable under
+# the default -- a code fact, not a missed measurement.  These drive the REAL
+# controller, so they answer "does it run", not "is it written".
+def _idle_lines(caplog) -> List[str]:
+    return [ln for ln in caplog.text.splitlines() if "WEG2 IDLE-REST" in ln]
+
+
+def test_g1a_idle_tp_rests_on_d_and_says_so(caplog):
+    """MF-1, the direction that could not print: D awake, empty backlog,
+    `--idle-layout tp` (front `D`).  The front must REST -- and say which
+    layout it is resting in and why -- rather than fall silently through the
+    controller pass, which is what weg2sc2's zero IDLE-REST lines were."""
+
+    async def body():
+        with caplog.at_level(logging.INFO, logger=front_mod.logger.name):
+            async with Harness(awake="D", p_concurrency=4, d_bs=6,
+                               tp_prefill_max_tokens=10, idle_layout="D") as h:
+                await asyncio.sleep(1.0)  # five controller ticks
+                assert h.front.awake == "D", "resting means NOT flipping"
+                assert h.front.epoch == 0
+                lines = _idle_lines(caplog)
+                assert len(lines) == 1, (
+                    f"exactly one line per rest spell (the controller ticks at "
+                    f"0.2 s; a rest without an edge trigger would print five a "
+                    f"second), got {len(lines)}")
+                assert "layout=D" in lines[0] and "configured=D" in lines[0]
+                assert "reason=" in lines[0] and "held_s=" in lines[0]
+
+    asyncio.run(body())
+
+
+def test_g1b_idle_pp_rests_on_p_and_says_so(caplog):
+    """The mirror direction, which round 3 could already print -- kept as a
+    test so ONE decision serving both cannot regress on this side while it is
+    being fixed on the other."""
+
+    async def body():
+        with caplog.at_level(logging.INFO, logger=front_mod.logger.name):
+            async with Harness(awake="P", p_concurrency=4, d_bs=6,
+                               tp_prefill_max_tokens=10, idle_layout="P") as h:
+                await asyncio.sleep(1.0)
+                assert h.front.awake == "P" and h.front.epoch == 0
+                lines = _idle_lines(caplog)
+                assert len(lines) == 1, f"one line, not one per tick: {len(lines)}"
+                assert "layout=P" in lines[0] and "configured=P" in lines[0]
+
+    asyncio.run(body())
+
+
+def test_g1c_a_front_awake_in_the_wrong_layout_flips_once_then_rests(caplog):
+    """The two CROSS cases, both halves of law 5's mirror: when the awake
+    group is not the configured idle layout, the front flips to it ONCE and
+    then rests there -- it does not flip back and it does not keep flipping."""
+
+    async def d_awake_idle_pp():
+        with caplog.at_level(logging.INFO, logger=front_mod.logger.name):
+            async with Harness(awake="D", p_concurrency=4, d_bs=6,
+                               tp_prefill_max_tokens=10, idle_layout="P",
+                               min_dwell_ms=0.0) as h:
+                assert await _until(lambda: h.front.awake == "P", timeout=10)
+                await asyncio.sleep(0.8)
+                assert h.front.awake == "P", "and it stays there"
+                assert h.front.epoch == 1, "exactly one flip, not a ping-pong"
+                lines = _idle_lines(caplog)
+                assert len(lines) == 1 and "layout=P" in lines[0], lines
+
+    async def p_awake_idle_tp():
+        with caplog.at_level(logging.INFO, logger=front_mod.logger.name):
+            async with Harness(awake="P", p_concurrency=4, d_bs=6,
+                               tp_prefill_max_tokens=10, idle_layout="D") as h:
+                assert await _until(lambda: h.front.awake == "D", timeout=10)
+                await asyncio.sleep(0.8)
+                assert h.front.awake == "D" and h.front.epoch == 1
+                lines = _idle_lines(caplog)
+                assert len(lines) == 1 and "layout=D" in lines[0], lines
+
+    asyncio.run(d_awake_idle_pp())
+    caplog.clear()
+    asyncio.run(p_awake_idle_tp())
+
+
+# ======================================================= ROUND 6 (FIX 6), MF-3
+def test_g2_every_drain_prices_what_the_disarmed_store_read_cost_p(caplog):
+    """MF-3 (a): the W38 cost is a number in the log, per drain epoch.
+
+    W38 refuses every storage read on group P, so a follow-up whose prefix
+    has left P's device tier is re-prefilled whole.  The arithmetic is
+    asserted in ``test_weg2_sched_fix3_0907.py::test_a14``; what this proves
+    is REACH -- that a real drain emits the line at all, beside the P-DRAIN
+    line it belongs to, with the epoch's own denominators."""
+
+    async def body():
+        with caplog.at_level(logging.INFO, logger=front_mod.logger.name):
+            async with Harness(awake="P", p_concurrency=4, d_bs=6,
+                               tp_prefill_max_tokens=10, idle_layout="D") as h:
+                for i in range(3):
+                    h.post(f"pr{i}")
+                assert await _until(lambda: h.front.awake == "D", timeout=15)
+                await asyncio.sleep(0.3)
+        lines = [ln for ln in caplog.text.splitlines() if "WEG2 P-PREFIX-REUSE" in ln]
+        assert len(lines) == 1, f"one line per drain that prefilled anything: {lines}"
+        assert "requests=3" in lines[0], lines[0]
+        # the fake group answers every leg 1 with cached_tokens=100, so the
+        # reused term is a MEASUREMENT that moves -- not a hardcoded zero.
+        assert "prefix_tokens_reused=300" in lines[0], lines[0]
+        assert "prefix_tokens_available_in_store=" in lines[0]
+        assert "forgone_tokens=" in lines[0]
+        drain = [ln for ln in caplog.text.splitlines() if "WEG2 P-DRAIN" in ln]
+        assert len(drain) == 1, "and it is priced per drain epoch, beside it"
+
+    asyncio.run(body())
+
+
+def test_g3_the_launcher_states_w38_at_launch_from_the_argv_it_runs():
+    """MF-3 (b): the cost is stated ONCE AT LAUNCH, so it is never silent --
+    and it is read off the P argv this launcher is about to run rather than
+    asserted from memory, so a group P that stopped being a PP group would
+    change the line instead of leaving it lying."""
+    argv = launcher_mod.argv_p("py", "/m", [1, 2, 3], 8, 512, 1.0, [], 4, 30000)
+    line = launcher_mod.w38_armed_line(argv)
+    assert line.startswith("WEG2 W38 ARMED"), (
+        "group P ships --pp-size 3, so the store read IS refused on it")
+    assert "#968" in line and "PP0-authoritative" in line, "name the remedy"
+    assert "P-PREFIX-REUSE" in line, "and where the interim cost is measured"
+    # the other polarity is not hypothetical: it is what a carrier or a TP-only
+    # group P would produce, and the line must then stop claiming the cost.
+    assert launcher_mod.w38_armed_line(["--pp-size", "1"]).startswith("WEG2 W38 NOT ARMED")
+    # WIRED, not merely written (desk-written-never-executed): main logs it.
+    main_src = inspect.getsource(launcher_mod.main)
+    assert "log(w38_armed_line(spec_p.argv))" in main_src
