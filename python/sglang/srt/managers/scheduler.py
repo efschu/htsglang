@@ -1241,6 +1241,27 @@ class Scheduler(
             logger.warning("load snapshot writer init failed: %s", e)
 
     def init_idle_sleeper(self) -> None:
+        # #1276: THE THIRD WAY IN, and the one that makes the weg-2 form
+        # reachable at all. The #547 ladder below is fully built and correct,
+        # but on boot weg2sb4 it was never CONSTRUCTED: neither
+        # --sleep-on-idle nor SGLANG_IDLE_BLOCKING_POLL was set, so
+        # `idle_sleeper` was None on all six ranks of both groups and the
+        # loop never blocked. Measured on that boot's own logs: group P ran
+        # 1,499.8 HICACHE-ROUND/s and group D 303.1/s with an empty queue and
+        # a live front, for 34 idle minutes.
+        #
+        # The rank gate is NOT the defect and is deliberately kept. Only the
+        # request ORIGIN owns the zmq sockets this ladder polls; ranks above
+        # it take a blocking chain receive / broadcast and are driven at the
+        # origin's cadence (`request_receiver._pull_raw_reqs`: "ranks 1..n-1
+        # from point_to_point_pyobj", woken by the origin's forward). Parking
+        # the origin therefore parks the whole group -- one wait point, not
+        # six, and no rank-local decision (RAENGE-NIE-UNEINS).
+        #
+        # `SGLANG_WEG2_GROUP` is the weg-2 form's own discriminator, published
+        # by the launcher and already established as such (weg2/launcher.py:
+        # "the only thing in either tree that says so"). Arming on it scopes
+        # this to the weg-2 boot form and leaves the stock default untouched.
         if (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
@@ -1249,6 +1270,8 @@ class Scheduler(
                 self.server_args.sleep_on_idle
                 # #547: same mechanism, reachable without the server arg.
                 or envs.SGLANG_IDLE_BLOCKING_POLL.get()
+                # #1276: the weg-2 form arms it by construction.
+                or bool(os.environ.get("SGLANG_WEG2_GROUP", ""))
             )
         ):
             self.idle_sleeper = IdleSleeper(
@@ -1259,6 +1282,20 @@ class Scheduler(
             )
         else:
             self.idle_sleeper = None
+        # #1269/#1276: the census runs on EVERY rank, unlike the sleeper. The
+        # per-stage anon question boot weg2sb4 could not answer (PP2 flat while
+        # PP0/PP1 grew 12.5 MiB over 140 s) needs a per-rank series, and a
+        # follower that never sleeps is exactly the rank whose growth matters.
+        # Imported here, not at module scope: `sglang.srt.weg2` reaches back
+        # into managers, and this file is already the import-order chokepoint.
+        from sglang.srt.weg2.idle_census import IdleCensus
+
+        self.idle_census = IdleCensus(
+            group=os.environ.get("SGLANG_WEG2_GROUP", ""),
+            rank=int(getattr(self.ps, "pp_rank", -1) or 0)
+            if int(getattr(self.ps, "pp_size", 1) or 1) > 1
+            else int(getattr(self.ps, "attn_tp_rank", -1) or 0),
+        )
         # #1262 (2): set by `_idle_census_control_hold` when a control message
         # was already queued at the moment `on_idle` wanted to run its pool
         # census, cleared by `process_input_requests` -- the one function every
@@ -14155,7 +14192,16 @@ class Scheduler(
             # as far as the idle poll is concerned -- back to the zero-poll rung.
             if self.idle_sleeper is not None:
                 self.idle_sleeper.reset()
+            if getattr(self, "idle_census", None) is not None:
+                self.idle_census.reset()
             return
+
+        # #1269/#1276: one idle pass. `tick` is a counter increment; `maybe_emit`
+        # does a /proc/self/status read at most once per WEG2_IDLE_CENSUS_S and
+        # never walks smaps.
+        if getattr(self, "idle_census", None) is not None:
+            self.idle_census.tick()
+            self.idle_census.maybe_emit()
 
         if self.enable_unified_memory:
             try:

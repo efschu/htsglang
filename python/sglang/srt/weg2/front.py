@@ -936,6 +936,11 @@ class Front:
         # process's own start time serves, boot-unique for the same reason.
         self.boot_epoch = os.environ.get("TMS_HOST_RING_EPOCH", "").strip() or str(int(time.time()))
         self.state = "serving"  # serving | flipping | STOP
+        #: #1269: how often the host-watermark guard samples, and the drift
+        #: rate it prices the margin with.  None => host_ledger's sb4 default
+        #: until a boot's WEG2-IDLE-CENSUS line supplies a measured one.
+        self.host_watermark_period_s = 15.0
+        self._observed_anon_drift_mib_per_min: Optional[float] = None
         self.stop: Optional[Weg2Stop] = None
         self.admit_d = True
         self.queue: Deque[Pending] = collections.deque()
@@ -1433,6 +1438,7 @@ class Front:
         app["corridor"] = asyncio.create_task(self.corridor_sampler())
         # #1262 tier 3 -- the deadman's third signal, see flip_stall_check.
         app["flip_stall"] = asyncio.create_task(self.flip_stall_sampler())
+        app["host_watermark"] = asyncio.create_task(self.host_watermark_sampler())
         logger.info("WEG2-FRONT up tag=%s awake=%s P=%s D=%s W=%.0f s (operator V1 fairness bound, 0 = off) "
                     "carrier_max_tokens=%d p_concurrency=%d d_bs=%d X=%d flip_min_work_tokens=%d "
                     "idle_layout=%s min_dwell_ms=%s drain_deadline_s=%.0f d_admit_max_tokens=%d "
@@ -1486,6 +1492,61 @@ class Front:
         if t is None:
             return None
         return (time.monotonic() if now is None else now) - t
+
+    async def host_watermark_sampler(self) -> None:
+        """#1269 / standing order 2026-09-08: THE HOST THRESHOLD IS NEVER CROSSED.
+
+        Reads the cgroup's own ``memory.current`` -- the quantity the reaper
+        watches -- and when it crosses the HARD BOUND (reap watermark minus the
+        named margin) performs a CONTROLLED TEARDOWN down the same path a
+        killer takes (:meth:`do_stop`).  Never "accept the risk", never a
+        silent restart.
+
+        The order exists because that offer was made and taken: base weg2sb4
+        stood green at 95.92 -> 96.36 -> 96.47 GiB against a 95.90 GiB reap
+        mark, growth entirely anon and entirely at idle, and the box went into
+        the OOM anyway.  User, verbatim: "kein uebertreten mehr der schwelle.
+        fuehrt nur zum absturz."
+
+        The margin is NAMED, not a cushion (host_ledger.resolve_margin): the
+        flip transient this form actually spends plus the idle anon drift it
+        actually accumulates over the planned window.  Once a boot carries
+        WEG2-IDLE-CENSUS the drift term comes from that line instead of the
+        sb4 default.
+        """
+        margin = host_ledger.resolve_margin(
+            drift_mib_per_min=self._observed_anon_drift_mib_per_min
+        )
+        logger.info("%s", host_ledger.watermark_provenance(margin))
+        while True:
+            try:
+                cg = host_ledger.read_cgroup()
+                current = (cg or {}).get("current")
+                if current:
+                    # The cgroup that reaps is SHARED with the Claude sessions
+                    # and their desk work, so the verdict carries the split:
+                    # a breach the operator's own pytest run caused is named,
+                    # not charged to the boot.
+                    own_pids: list = []
+                    for sid in (self.groups["P"].sid, self.groups["D"].sid):
+                        try:
+                            own_pids.extend(_session_pids(int(sid)))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    verdict = host_ledger.watermark_breach_verdict(
+                        int(current),
+                        margin=margin,
+                        cgroup_anon_bytes=host_ledger.read_cgroup_anon_bytes(),
+                        own_pids=own_pids,
+                    )
+                    if verdict is not None:
+                        self.counters["host_watermark_breach"] += 1
+                        logger.error("%s", verdict)
+                        self.do_stop("W22 Weg2HostWatermarkBreached", verdict)
+                        return
+            except Exception:  # noqa: BLE001 - a guard may never kill the front
+                logger.exception("host_watermark_sampler")
+            await asyncio.sleep(self.host_watermark_period_s)
 
     def do_stop(self, name: str, detail: str) -> None:
         if self.state == "STOP":

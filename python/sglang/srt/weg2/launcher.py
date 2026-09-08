@@ -2667,6 +2667,34 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env["SGLANG_DEBUG_HOLD_DIR"] = env.get("SGLANG_DEBUG_HOLD_DIR", f"{GPU_ARB}/debug_hold")
         env["SGLANG_DEBUG_HOLD_TAG"] = tag
         os.makedirs(env["SGLANG_DEBUG_HOLD_DIR"], exist_ok=True)
+    # #1269/#1276: THE IDLE FAMILY, published to BOTH groups with provenance.
+    #
+    # SGLANG_IDLE_BLOCKING_POLL -- boot weg2sb4 set neither this nor
+    # --sleep-on-idle, so Scheduler.init_idle_sleeper built no sleeper on any
+    # of the six ranks and both loops spun: group P 1,499.8 scheduler
+    # rounds/s, group D 303.1/s, 34 idle minutes, empty queue, live front.
+    # The serve tree now also arms on SGLANG_WEG2_GROUP, so this is the
+    # BELT to that braces -- published explicitly so the boot log names the
+    # decision instead of leaving it to a discriminator set for other reasons.
+    #
+    # MALLOC_ARENA_MAX=4 -- chosen from this rig's own measurement, not a
+    # folk value. glibc defaults to 8 x ncores arenas; CPU affinity on this
+    # box is 0-31, so the default ceiling is 256, and the measured growth was
+    # 64 MiB-aligned [anon] arenas being extended in place plus NEW arenas
+    # appearing (+5.4 MiB/min on P PP0/PP1, +2.8 on each D rank, +19.0 MiB/min
+    # over the six ranks against an independently observed +21.3). The
+    # allocating threads on the steady-state path are the scheduler thread
+    # plus the three the reset path names by hand -- "#N RESET JOIN
+    # threads=['prefetch', 'backup', 'prefetch_io_aux']" -- so 4 gives each
+    # one its own arena without the default's fragmentation surface. This is a
+    # CEILING, not a target: a rank that needs fewer uses fewer.
+    #
+    # THE RANK THREAD COUNT WAS NOT CAPTURED before the host OOM took the base
+    # down, so 4 is derived from the reset line's thread names, not from a
+    # live count. WEG2-IDLE-CENSUS prints `threads=` for exactly this reason;
+    # the next boot confirms or corrects the value.
+    env.setdefault("SGLANG_IDLE_BLOCKING_POLL", "1")
+    env.setdefault("MALLOC_ARENA_MAX", "4")
     return env
 
 

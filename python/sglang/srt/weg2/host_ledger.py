@@ -155,6 +155,22 @@ FLOOR_GIB = 16.0
 #: whatever they hold right now; the term keeps their room when they grow).
 CLI_RESERVE_GIB = 10.0
 #: b0: awake steady RssAnon peaks 3.385 / 3.038 / 2.996 GiB (L-bf2), max taken.
+#:
+#: RE-CHECKED 2026-09-08 against the live sb4 base and CONFIRMED CORRECT -- the
+#: ~6.5 GiB/rank figure that circulated in the weg-2 briefings is NOT in this
+#: ledger and must not be put back. That figure was an INSTRUMENT ERROR: CUDA
+#: pinned host memory maps `/dev/zero` MAP_SHARED and the kernel counts it as
+#: RssShmem, NOT RssAnon, so anon + pinned + heap were being summed as "anon".
+#: Measured on the six live ranks: RssAnon 3395 / 3014 / 2346 MiB (P) and
+#: 3240 / 2959 / 2896 MiB (D) -- i.e. 2.3-3.4 GiB, which is exactly what this
+#: constant already carries.
+#:
+#: NO TERM DOUBLE-COUNTS, checked rather than assumed: the pinned half lives in
+#: the `/dev/zero` shmem mappings and is priced HERE as `rings` + `anchors`
+#: (RING_*_MULT_GB_PER_S, ANCHORS_AT_2400_BYTES), and the host weights image as
+#: `Sigma H` (ring_bytes). Those are shmem currency; this constant is anon
+#: currency. Summing them is correct; replacing this one with 6.5 would charge
+#: the pinned buffers twice.
 HEAP_AWAKE_GIB = 3.385
 #: Campaign (a): RssAnon "flat at 2.36 GiB" on the dormant tp=1 rank.
 HEAP_DORMANT_GIB = 2.36
@@ -238,6 +254,289 @@ DK7_PROVENANCE = (
 #: content at the death): a standing cost this ledger already budgets as
 #: ``store_gib``, not a leak.
 FLIP_HOST_TRANSIENT_GIB = 9.97
+#: ...AND IT IS THE PRE-RING VALUE. With the shared registered host ring the
+#: transient collapses, because the legs copy THROUGH a preallocated region
+#: instead of each tag allocating a fresh cudaMallocHost:
+#:   weg2rg2 (2026-09-08 03:00Z, 8c7f5d8d00)  +1.10 GiB  "drops from +9.97 to +1.1"
+#:   weg2rg3 (2026-09-08 04:5xZ)              +2.88 GiB  13 flips; the record calls
+#:                                                       its 10 s sampler a LOWER bound
+#: The MAX is taken, not the mean: the margin must cover the worst recorded flip
+#: of this form, and rg3's is explicitly a lower bound, so this term is itself a
+#: lower bound on the true worst case.
+RING_ERA_FLIP_TRANSIENT_GIB = {"weg2rg2": 1.10, "weg2rg3": 2.88}
+
+#: RUN-PEAK UNDER-PREDICTION, the term the pre-ring transient was accidentally
+#: standing in for. The estimator does not miss the flip; it misses the STEADY
+#: STATE, and that is what actually killed the boots:
+#:   weg2dk5  predicted 92.89, reached 95.90               +3.01   (pre-ring)
+#:   weg2dk6  predicted 91.23, sampled 96.06 / peak 98.90  +4.83 / +7.67 (pre-ring)
+#:   weg2rg6  predicted 93.66, peak 93.55                  -0.11   (ring era)
+#:   weg2sb4  predicted 91.44, idled 96.03-96.60           +5.16   (ring era)
+#: Only the RING-ERA rows are used -- the form is what the bound is for -- so the
+#: term is sb4's +5.16. Measured over sb4's own idle window (boot 16:29Z, 96.60
+#: reached ~17:30Z, ~60 min), which is why the drift term below is charged only
+#: for the window length BEYOND that.
+#:
+#: THIS TERM IS AN EMPIRICAL CATCH-ALL. It is (measured - predicted), so it
+#: already contains the idle anon drift of those boots, the foreign desk load
+#: those boots carried, and the estimator's own error. Re-adding any of those in
+#: full would double-charge; that is why the drift term is charged only on the
+#: EXCESS window and the foreign term is measured and PRINTED but not re-added.
+RUN_PEAK_RESIDUAL_GIB = {"weg2sb4": 5.16, "weg2rg6": -0.11}
+RESIDUAL_WINDOW_MIN = 60.0
+
+#: #1269 / user order 2026-09-08 ("kein uebertreten mehr der schwelle. fuehrt
+#: nur zum absturz"): THE REAP WATERMARK IS A HARD BOUND WITH A NAMED MARGIN.
+#:
+#: WHICH SAMPLES COUNT. A reap sample is a reading where the KERNEL reaped --
+#: an `oom_kill` delta in the same row. Two qualify and one does not:
+#:   weg2dk5  95.90 GiB  oom_kill 18 -> 24, /proc/vmstat 60 -> 66   COUNTS
+#:   weg2dk6  96.06 GiB sampled / 98.90 kernel peak, "died the same death"
+#:                                                                 COUNTS
+#:   weg2sb4  96.60 GiB  NO kernel OOM -- the OPERATOR killed it    DOES NOT
+#: sb4 is evidence that the box is unhappy above the mark, not evidence of
+#: where the kernel reaps; counting a human's patience as a kernel threshold
+#: would move the watermark UP on the strength of a boot that never reaped.
+#: The bound is the LOWEST kernel sample, so dk5 remains authoritative.
+REAP_SAMPLES_GIB = {
+    "weg2dk5": 95.90,   # oom_kill 18 -> 24 in the same memts row
+    "weg2dk6": 96.06,   # sampled; 98.90 kernel peak; same death
+}
+REAP_SAMPLE_EXCLUDED = {
+    "weg2sb4": (96.60, "operator kill, no kernel OOM -- not a reap sample"),
+}
+
+#: One ring granule: the smallest unit a flip copy moves (ring_table's C3/C4
+#: form issues 2 MiB granules). It is the FLOOR of the transient term, so the
+#: margin can never collapse to zero when a record is missing.
+RING_GRANULE_GIB = 2.0 / 1024.0
+
+#: Idle anon drift, MiB/min, used until a boot carries WEG2-IDLE-CENSUS
+#: `d_anon_mib_per_min`. Conservative default from the sb4 table measured
+#: 2026-09-08 over two /proc samples 140 s apart: P PP0 +5.4, PP1 +5.4,
+#: PP2 +0.0, each D rank +2.8 => +19.0 MiB/min over the six ranks, against an
+#: independently observed +21.3 MiB/min. The SUM is the right term: the drift
+#: is charged to one cgroup, not per rank.
+IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT = 19.0
+
+#: Planned window length in minutes that the drift is integrated over. The
+#: operator hands out 90-minute windows (GPU-Fenster-Rotation), so a boot is
+#: expected to stand for at least that long without crossing the mark.
+PLANNED_WINDOW_MIN_DEFAULT = 90.0
+
+
+@dataclass(frozen=True)
+class Margin:
+    """The named margin between the predicted peak and the reap watermark.
+
+    NOT a hand number and NOT a safety factor. Three measured terms, and the
+    care is in what is NOT added twice:
+
+    ``transient``  the worst recorded flip transient OF THIS FORM. Ring-era, so
+                   ~2.9 GiB, not the 9.97 GiB of the per-allocation form.
+    ``residual``   max (measured peak - predicted peak) over the ring-era boots.
+                   An EMPIRICAL CATCH-ALL: it already contains those boots' idle
+                   drift, their foreign desk load, and the estimator's error.
+    ``drift``      charged ONLY on the window BEYOND the one the residual was
+                   measured over, because inside that window it is already in
+                   the residual.
+    ``foreign``    reserve for desk load ARRIVING AFTER arm time. Default 0, and
+                   that is deliberate -- see below.
+
+    WHY ``foreign`` DEFAULTS TO ZERO, which is the opposite of a hand-wave. The
+    cgroup that reaps is shared with the Claude sessions, their pytest runs,
+    worktrees and dry-runs, and that load is real (measured on the sb4 base:
+    cgroup anon 33.49 GiB against 21.78 GiB of sglang RssAnon = 11.71 GiB
+    foreign, which independently validates the 10 GiB CLI_RESERVE_GIB the
+    ledger already carried -- in the WRONG denominator, against MemTotal rather
+    than against the cgroup the reaper watches).
+
+    But that load AT ARM TIME IS ALREADY IN THE ORIGIN: :func:`run_origin_gib`
+    returns a ``memory.current`` reading, and a cgroup reading counts every
+    process in the cgroup, Claude included. Re-adding it as a margin term would
+    charge it twice. What is NOT in the origin is desk work that arrives LATER,
+    and that is unbounded by construction -- a boot cannot reserve against how
+    much an operator will run tomorrow. So it is MEASURED and PRINTED (so a
+    breach can be attributed) and left to the RUNTIME guard, which is what a
+    guard is for: the boot bound reserves what is predictable, W22 catches what
+    is not.
+    """
+
+    transient_gib: float
+    residual_gib: float
+    drift_gib: float
+    foreign_gib: float
+    drift_mib_per_min: float
+    window_min: float
+    transient_source: str
+    residual_source: str
+    drift_source: str
+    foreign_source: str
+
+    @property
+    def total_gib(self) -> float:
+        return (
+            self.transient_gib + self.residual_gib + self.drift_gib + self.foreign_gib
+        )
+
+    def terms(self) -> str:
+        return (
+            f"transient {self.transient_gib:.2f} [{self.transient_source}] "
+            f"+ residual {self.residual_gib:.2f} [{self.residual_source}] "
+            f"+ drift {self.drift_gib:.2f} [{self.drift_mib_per_min:.1f} MiB/min x "
+            f"{max(0.0, self.window_min - RESIDUAL_WINDOW_MIN):.0f} min beyond the "
+            f"residual's own {RESIDUAL_WINDOW_MIN:.0f} min, {self.drift_source}] "
+            f"+ foreign {self.foreign_gib:.2f} [{self.foreign_source}] GiB"
+        )
+
+
+def measure_foreign_anon(
+    cgroup_anon_bytes: Optional[int], own_pids: Sequence[int]
+) -> Tuple[Optional[float], float, str]:
+    """Non-sglang anon in the shared cgroup: (foreign GiB, sglang GiB, source).
+
+    ``cgroup anon - sum(RssAnon of the boot's own pids)``. The cgroup that reaps
+    is shared with the Claude sessions and their desk work, and that share is
+    NOT small: the boot agent counted 9 ``.lxc`` oom_kills that were Claude
+    CLIs, and a single desk probe reading the checkpoint added +815 MiB inside
+    sb4's own idle window. A breach that this term explains is a breach the
+    operator caused, and it must be named as such rather than charged to sglang.
+    """
+    own = 0
+    seen = 0
+    for pid in own_pids:
+        try:
+            with open(f"/proc/{pid}/status", "rb") as fh:
+                for raw in fh:
+                    if raw.startswith(b"RssAnon:"):
+                        own += int(raw.split()[1]) * 1024
+                        seen += 1
+                        break
+        except OSError:
+            continue
+    own_gib = own / GIB
+    if cgroup_anon_bytes is None:
+        return None, own_gib, "cgroup memory.stat anon unreadable -- foreign share unknown"
+    foreign = float(cgroup_anon_bytes) / GIB - own_gib
+    return (
+        foreign,
+        own_gib,
+        f"cgroup anon {float(cgroup_anon_bytes) / GIB:.2f} GiB - sglang RssAnon "
+        f"{own_gib:.2f} GiB over {seen}/{len(own_pids)} readable pids",
+    )
+
+
+def resolve_margin(
+    flip_transient_gib: Optional[float] = None,
+    drift_mib_per_min: Optional[float] = None,
+    window_min: float = PLANNED_WINDOW_MIN_DEFAULT,
+    residual_gib: Optional[float] = None,
+    foreign_headroom_gib: float = 0.0,
+    foreign_source: str = "",
+) -> Margin:
+    """Build the margin from measurements, naming every source.
+
+    The transient is read from the RING-ERA records of this form (max over the
+    recorded flips); the pre-ring :data:`FLIP_HOST_TRANSIENT_GIB` is used only
+    when no ring-era sample exists, and the line says which one was used.
+    """
+    if flip_transient_gib is not None:
+        transient, t_src = float(flip_transient_gib), "caller-supplied measured transient"
+    elif RING_ERA_FLIP_TRANSIENT_GIB:
+        boot, transient = max(RING_ERA_FLIP_TRANSIENT_GIB.items(), key=lambda kv: kv[1])
+        t_src = f"RING-ERA max over {sorted(RING_ERA_FLIP_TRANSIENT_GIB)}, binding {boot}"
+    else:
+        transient, t_src = FLIP_HOST_TRANSIENT_GIB, "PRE-RING fallback, no ring-era sample exists"
+    if transient < RING_GRANULE_GIB:
+        transient, t_src = RING_GRANULE_GIB, f"floored at one ring granule ({t_src} was smaller)"
+
+    if residual_gib is not None:
+        residual, r_src = float(residual_gib), "caller-supplied measured residual"
+    else:
+        rb, residual = max(RUN_PEAK_RESIDUAL_GIB.items(), key=lambda kv: kv[1])
+        residual = max(0.0, residual)
+        r_src = f"RING-ERA max (measured peak - predicted) over {sorted(RUN_PEAK_RESIDUAL_GIB)}, binding {rb}"
+
+    if drift_mib_per_min is None:
+        drift_rate, d_src = IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT, "sb4 default, no WEG2-IDLE-CENSUS yet"
+    else:
+        drift_rate, d_src = float(drift_mib_per_min), "WEG2-IDLE-CENSUS d_anon_mib_per_min"
+    excess_min = max(0.0, float(window_min) - RESIDUAL_WINDOW_MIN)
+    return Margin(
+        transient_gib=transient,
+        residual_gib=residual,
+        drift_gib=drift_rate * excess_min / 1024.0,
+        foreign_gib=float(foreign_headroom_gib),
+        drift_mib_per_min=drift_rate,
+        window_min=float(window_min),
+        transient_source=t_src,
+        residual_source=r_src,
+        drift_source=d_src,
+        foreign_source=foreign_source
+        or "0 by design: arm-time foreign load is already in the origin; later "
+        "desk load is unbounded and is the RUNTIME guard's job (W22)",
+    )
+
+
+def watermark_provenance(margin: Optional[Margin] = None,
+                         watermark_gib: Optional[float] = None) -> str:
+    """`WEG2-HOST WATERMARK=<v> source=<events> margin=<v> (terms)`."""
+    m = margin if margin is not None else resolve_margin()
+    w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    events = ", ".join(f"{k} {v:.2f}" for k, v in sorted(REAP_SAMPLES_GIB.items()))
+    excl = ", ".join(f"{k} {v:.2f} EXCLUDED ({why})"
+                     for k, (v, why) in sorted(REAP_SAMPLE_EXCLUDED.items()))
+    return (
+        f"WEG2-HOST WATERMARK={w:.2f} GiB source=[{events}] margin={m.total_gib:.2f} GiB "
+        f"({m.terms()}); hard bound = {w - m.total_gib:.2f} GiB; excluded=[{excl}]"
+    )
+
+
+class Weg2HostWatermarkBreached(RuntimeError):
+    """W22: the RUNTIME breach. cgroup memory.current crossed the hard bound
+    while serving. The response is a CONTROLLED teardown down the killer path,
+    never "accept the risk" and never a silent restart -- the user's standing
+    order of 2026-09-08, given after exactly that offer was taken and the box
+    went into the OOM anyway."""
+
+
+def watermark_breach_verdict(
+    current_bytes: int,
+    margin: Optional[Margin] = None,
+    watermark_gib: Optional[float] = None,
+    cgroup_anon_bytes: Optional[int] = None,
+    own_pids: Sequence[int] = (),
+) -> Optional[str]:
+    """The runtime check. Returns the verdict LINE when the bound is crossed,
+    else None. Pure: the caller performs the teardown, so this is testable
+    against a synthetic cgroup reading with no processes involved.
+
+    When ``cgroup_anon_bytes`` and ``own_pids`` are given the verdict carries the
+    ``sglang=`` / ``foreign=`` split, so a breach caused by the operator's own
+    desk work (pytest runs, worktrees, dry-runs, a checkpoint-reading probe --
+    all of which land in this same cgroup) is NAMED as such instead of being
+    charged to the boot. It changes no decision: the threshold is crossed either
+    way and the teardown is the same. It changes who has to fix it."""
+    m = margin if margin is not None else resolve_margin()
+    w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    current = float(current_bytes) / GIB
+    if current <= w - m.total_gib:
+        return None
+    split = ""
+    if cgroup_anon_bytes is not None and own_pids:
+        foreign, sglang, src = measure_foreign_anon(cgroup_anon_bytes, own_pids)
+        if foreign is not None:
+            split = (
+                f" SPLIT sglang={sglang:.2f} foreign={foreign:.2f} GiB anon [{src}]"
+                f" -- {'FOREIGN desk load dominates this breach' if foreign > sglang else 'sglang dominates this breach'}."
+            )
+    return (
+        f"W22 Weg2HostWatermarkBreached current={current:.2f} watermark={w:.2f} "
+        f"margin={m.total_gib:.2f} ({m.terms()}); hard bound {w - m.total_gib:.2f} GiB "
+        f"crossed by {current - (w - m.total_gib):.2f} GiB.{split} CONTROLLED TEARDOWN "
+        "down the killer path. Standing order 2026-09-08: the threshold is never "
+        "crossed; crossing only ends in a crash, so there is no 'accept the risk'."
+    )
 #: #1233 boot weg2dk5: the OBSERVED REAP POINT of this box's cgroup -- the
 #: memts row at 21:15:30Z, ``cg_current_b=102,998,904,832`` with ``oom_kill``
 #: 18 -> 24 in the same row (and /proc/vmstat 60 -> 66 independently, same
@@ -661,6 +960,7 @@ def size_store_gib(
     peak_without_store_gib: Optional[float],
     unsampled_reclaim_gib: Optional[float],
     watermark_gib: float = OBSERVED_REAP_NONRECLAIM_BYTES / GIB,
+    margin_gib: float = 0.0,
 ) -> StoreSizing:
     """The store is ``min(run leftover, reap bound)`` -- TRAIN FIX 3.
 
@@ -724,7 +1024,14 @@ def size_store_gib(
             "reap row carries no slab column, so the watermark over-states the reap "
             "point by it)"
         )
-    reap_bound = watermark_gib - unsampled - float(peak_without_store_gib)
+    # #1269 / standing order 2026-09-08: the HARD bound is the watermark minus
+    # the NAMED margin, and the store is what is left under it. The store
+    # shrinks; the margin never does. `bound="leftover"` can therefore no
+    # longer exceed watermark - margin either -- that is what `min` below
+    # enforces, and it is the half the pre-order ledger did not have: sb4's
+    # chosen arm reported `bound=leftover` with a 4.46 GiB gap to the raw
+    # watermark and was still 4.6-5.2 GiB over the mark on the metal.
+    reap_bound = watermark_gib - unsampled - float(margin_gib) - float(peak_without_store_gib)
     allowed = min(leftover, reap_bound)
     return StoreSizing(
         gib=float(math.floor(allowed)) if allowed > 0 else 0.0,
@@ -1088,6 +1395,24 @@ def price(
 MEASURED_RECORD_NAME = "weg2_measured_record.json"
 
 
+def read_cgroup_anon_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
+    """``memory.stat anon`` in bytes, or ``None`` when unreadable.
+
+    The denominator :func:`measure_foreign_anon` splits: anon is the currency
+    the idle grower (#1269) and the desk load both move in, while the store and
+    the host ring sit in ``shmem`` and are flat.
+    """
+    try:
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "anon" and parts[1].isdigit():
+                    return int(parts[1])
+    except OSError:
+        return None
+    return None
+
+
 def read_cgroup_shmem_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
     """``memory.stat shmem`` in bytes, or ``None`` when unreadable.
 
@@ -1410,6 +1735,7 @@ def choose(
     cg_ceiling_source: str = "",
     cg_oom_kill: Optional[int] = None,
     measured_record: Optional[Dict[str, dict]] = None,
+    margin: Optional[Margin] = None,
 ) -> Tuple[Arm, float, List[str]]:
     """Walk the ladder; return (arm, store_gib, printed lines) or raise W20/W21.
 
@@ -1513,6 +1839,14 @@ def choose(
     )
     # FIX 6: origin and watermark in ONE currency -- both non-reclaimable.
     watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    # #1269 / standing order 2026-09-08: the watermark alone is not the bound.
+    # The bound is the watermark MINUS a named margin -- the flip transient the
+    # box will actually spend and the idle anon drift it will actually
+    # accumulate over the planned window. Both WILL happen during the window,
+    # so an arm that has not left room for them is already lost.
+    margin = margin if margin is not None else resolve_margin()
+    hard_bound_gib = watermark_gib - margin.total_gib
+    lines.append(watermark_provenance(margin, watermark_gib))
     chosen: Optional[Arm] = None
     store_gib = 0.0
     peak_bound_any = False
@@ -1527,6 +1861,7 @@ def choose(
             arm.predicted_run_peak_gib(0.0),
             unsampled_gib,
             watermark_gib=watermark_gib,
+            margin_gib=margin.total_gib,
         )
         sizing_of[id(arm)] = sizing
         run_store = sizing.gib
@@ -1538,7 +1873,8 @@ def choose(
         # already condemned.  It stays as a guard: with the store bounded above
         # this can only fire when the arm's peak WITHOUT any store is already
         # over the watermark, which no store size can repair.
-        peak_ok = predicted is None or predicted <= watermark_gib
+        # #1269: against the HARD BOUND (watermark - margin), not the raw mark.
+        peak_ok = predicted is None or predicted <= hard_bound_gib
         binding: List[str] = []
         if arm.launch_leftover_gib < 0:
             binding.append(f"launch moment ({arm.launch_leftover_gib:.2f} GiB)")
@@ -1551,7 +1887,9 @@ def choose(
             )
         if not peak_ok:
             binding.append(
-                f"RUN PEAK ({predicted:.2f} > {watermark_gib:.2f} GiB reap point)"
+                f"RUN PEAK ({predicted:.2f} > {hard_bound_gib:.2f} GiB hard bound "
+                f"= {watermark_gib:.2f} reap point - {margin.total_gib:.2f} margin "
+                f"[{margin.terms()}])"
             )
         ok = moments_ok and store_ok and peak_ok
         # The reap point is the binding quantity BOTH when the predicted peak
@@ -1612,9 +1950,10 @@ def choose(
         )
         if peak_bound_any:
             raise Weg2HostRunPeakRefused(
-                "W21 Weg2HostRunPeakRefused: an arm funds both moments and the observed "
-                f"reap point {watermark_gib:.2f} GiB (boot weg2dk5 21:15:30Z) still binds "
-                "it -- either its predicted RUN PEAK is not below the watermark even with "
+                "W21 Weg2HostRunPeakRefused: an arm funds both moments and the HARD BOUND "
+                f"{hard_bound_gib:.2f} GiB (reap point {watermark_gib:.2f} GiB minus margin "
+                f"{margin.total_gib:.2f} GiB = {margin.terms()}) still binds "
+                "it -- either its predicted RUN PEAK is not below the hard bound even with "
                 "NO store, or the store that watermark leaves room for is below the "
                 f"--store-min-gib floor ({store_min_gib:.0f} GiB). {outcome}. The binding "
                 "term and the reap-bound are printed per arm below; the image term is now "
