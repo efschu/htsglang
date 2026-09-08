@@ -423,11 +423,22 @@ class XchgInstrumentTest(CustomTestCase):
             ),
             385,
         )
-        src = open(
+        # no NUMERIC literal 385 anywhere in either module: the prose may name
+        # the number it derives (and does), the code may not carry it
+        for path in (
             os.path.join(ROOT, "python", "sglang", "srt", "weg2", "xchg_residency.py"),
-            encoding="utf-8",
-        ).read()
-        self.assertNotIn("385", src, "the region size must be derived, not typed")
+            os.path.join(ROOT, "python", "sglang", "srt", "weg2", "launcher.py"),
+        ):
+            tree = ast.parse(open(path, encoding="utf-8").read())
+            self.assertFalse(
+                [
+                    n
+                    for n in ast.walk(tree)
+                    if isinstance(n, ast.Constant) and n.value == 385
+                    and not isinstance(n.value, (str, bool))
+                ],
+                f"the region size is typed as a literal in {path}, not derived",
+            )
 
     # ---------------------------------------------------------------- refusals
 
