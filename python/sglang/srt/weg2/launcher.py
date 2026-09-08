@@ -4309,7 +4309,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # by name, never a silent zero.
     from sglang.srt.weg2 import carrier_census as _cc
 
-    _floor, _floor_why = _cc.route_floor()
+    # the floor is derived against THIS boot's SHORT bound (slice A's X), not
+    # against a literal: the front routes SHORT on `remainder <= X`.
+    _floor, _floor_why = _cc.route_floor(x_tokens)
     _expect_ranks = _cc.tp_size_of(spec_d.argv)
     _cen = _cc.census(spec_d.log, expected_ranks=_expect_ranks, floor=_floor)
     log(f"CARRIER BOUND: source='{_cc.SOURCE_MARKER}' in {spec_d.log}; component={_cc.COMPONENT}; "

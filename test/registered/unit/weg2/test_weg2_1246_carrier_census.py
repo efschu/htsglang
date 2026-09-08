@@ -60,6 +60,13 @@ def _limit_lines(values, *, role="staging", size=30518, frac="0.9", site=cc.CENS
     return out
 
 
+#: The SHORT bound these floor cases are derived against. It used to be
+#: ``SHORT_BOUND``; slice A replaced that constant with the per-boot
+#: ``--tp-prefill-max-tokens`` (X), so the bound is STATED here and handed to
+#: ``route_floor`` rather than read off a module that no longer owns it. Every
+#: number below is the same number it always was, at the same bound.
+SHORT_BOUND = 4096
+
 # ------------------------------------------------------------------ the floor
 def test_route_floor_is_in_carrier_est_tokens_not_chunk_tokens():
     """FIX 2, the unit defect.  ``carrier_max_tokens`` is compared against
@@ -69,9 +76,9 @@ def test_route_floor_is_in_carrier_est_tokens_not_chunk_tokens():
     prompt of ANY length could round-trip under one."""
     from sglang.srt.weg2 import front
 
-    floor, why = cc.route_floor()
-    assert floor > front.CHUNK_TOKENS
-    assert floor == int(front.CHUNK_TOKENS * front.CHARS_PER_TOKEN
+    floor, why = cc.route_floor(SHORT_BOUND)
+    assert floor > SHORT_BOUND
+    assert floor == int(SHORT_BOUND * front.CHARS_PER_TOKEN
                         / front.CARRIER_CHARS_PER_TOKEN)
     assert floor == 5120  # at today's constants; the line above is the rule
 
@@ -83,7 +90,7 @@ def test_route_floor_carries_its_derivation_and_resolves_its_citations():
 
     from sglang.srt.weg2 import front
 
-    floor, why = cc.route_floor()
+    floor, why = cc.route_floor(SHORT_BOUND)
     assert str(floor) in why
     assert "CHARS_PER_TOKEN" in why and "CARRIER_CHARS_PER_TOKEN" in why
     assert "CARRIER-EXCEEDS" in why and "SHORT" in why
@@ -92,9 +99,8 @@ def test_route_floor_carries_its_derivation_and_resolves_its_citations():
     assert "four conjuncts" in why and "conservative refusal" in why
 
     lines = inspect.getsourcelines(front)[0]
-    for anchor in ("CHUNK_TOKENS = ",
-                   "and carrier_est > self.carrier_max_tokens:",
-                   "and remainder <= CHUNK_TOKENS:"):
+    for anchor in ("and carrier_est > self.carrier_max_tokens:",
+                   "and remainder <= self.tp_prefill_max_tokens:"):
         cited = cc._front_line(anchor, -1)
         assert cited > 0, f"anchor vanished from front.py: {anchor!r}"
         assert anchor in lines[cited - 1], (
@@ -179,7 +185,7 @@ def test_a_bound_exactly_at_the_floor_is_still_an_off_switch(tmp_path):
     """The round-trip set is EMPTY at equality, so the test is strict, not >=.
     Driven at the REAL floor, so the boundary the census enforces is the
     boundary the front actually routes by (see the routing test below)."""
-    floor, _ = cc.route_floor()
+    floor, _ = cc.route_floor(SHORT_BOUND)
     c = cc.census(_write(tmp_path, _limit_lines([floor] * 3)), expected_ranks=3, floor=floor)
     assert c.verdict == "below_floor"
     c2 = cc.census(_write(tmp_path, _limit_lines([floor + 1] * 3), name="d2.log"),
@@ -192,9 +198,9 @@ def test_the_old_chunk_tokens_floor_would_have_passed_an_off_switch(tmp_path):
     5688 tokens yields limit 5119, which the CHUNK_TOKENS floor called ok."""
     from sglang.srt.weg2 import front
 
-    floor, _ = cc.route_floor()
+    floor, _ = cc.route_floor(SHORT_BOUND)
     log = _write(tmp_path, _limit_lines([5119] * 3, size=5688))
-    assert cc.census(log, expected_ranks=3, floor=front.CHUNK_TOKENS).verdict == "ok"
+    assert cc.census(log, expected_ranks=3, floor=SHORT_BOUND).verdict == "ok"
     assert cc.census(log, expected_ranks=3, floor=floor).verdict == "below_floor"
 
 
@@ -473,8 +479,11 @@ def _route_of(bound: int, n_chars: int) -> str:
     from sglang.srt.weg2.front import Front
 
     async def go():
+        # X IS THE SHORT BOUND NOW (slice A), so the router must be built at
+        # the same bound the floor was derived against, or the two halves of
+        # this test would price different fronts.
         f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
-                  carrier_max_tokens=bound)
+                  carrier_max_tokens=bound, tp_prefill_max_tokens=SHORT_BOUND)
         f.state = "serving"
         f.admit_d = True
 
@@ -506,8 +515,8 @@ def test_at_the_floor_the_real_front_round_trips_nothing_and_one_above_it_does()
     census while the front round-tripped nothing."""
     from sglang.srt.weg2 import front
 
-    floor, _ = cc.route_floor()
-    shortest_non_short = int(front.CHUNK_TOKENS * front.CHARS_PER_TOKEN)  # 12288 chars
+    floor, _ = cc.route_floor(SHORT_BOUND)
+    shortest_non_short = int(SHORT_BOUND * front.CHARS_PER_TOKEN)  # 12288 chars
 
     assert _route_of(floor + 1, shortest_non_short) == "route_batch"
     assert _route_of(floor, shortest_non_short) == "route_carrier_exceeds"
@@ -521,7 +530,7 @@ def test_a_bound_the_old_floor_accepted_round_trips_nothing():
     an off switch: measured against the real router, over the whole axis."""
     from sglang.srt.weg2 import front
 
-    assert 5119 > front.CHUNK_TOKENS
+    assert 5119 > SHORT_BOUND
     for n in (10, 12287, 12288, 12300, 40000, 300000):
         assert _route_of(5119, n) in ("route_short", "route_carrier_exceeds"), n
 
@@ -583,7 +592,7 @@ def test_the_regex_matches_the_live_emitter_not_only_a_recorded_line():
 # The interval is floor < N <= measured, and a census that measured NOTHING has
 # no interval at all.
 
-FLOOR = 5120  # cc.route_floor() at today's constants; asserted as a rule above
+FLOOR = 5120  # cc.route_floor(SHORT_BOUND) at today's constants; asserted as a rule above
 
 
 def _census_of(tmp_path, values, *, name, ranks=3, floor=FLOOR, **kw):
@@ -792,12 +801,11 @@ def test_printed_citations_lead_with_symbols_that_exist():
     from sglang.srt.weg2 import front
 
     assert callable(front.Front.handle_generate) and callable(front.Front.leg1)
-    assert isinstance(front.CHUNK_TOKENS, int)
+    assert isinstance(SHORT_BOUND, int)
 
-    _floor, why = cc.route_floor()
+    _floor, why = cc.route_floor(SHORT_BOUND)
     assert "front.Front.handle_generate, front.py:" in why
-    assert "front.CHUNK_TOKENS, front.py:" in why
-
+    
     detail = cc.decide_bound(
         cc.census("/nonexistent", expected_ranks=3, floor=FLOOR), None, floor_why="w").detail
     assert "front.py:279" not in detail  # the citation fix 1 printed for SHORT
@@ -816,7 +824,7 @@ def test_replay_both_real_logs_still_decide_27466_with_no_flag():
     """The healthy path through the WHOLE decision, on both real D logs: the
     number the front gets is unchanged by fix 3."""
     for path in (RG3_LOG, RG5_LOG):
-        cen = cc.census(path, expected_ranks=3, floor=cc.route_floor()[0])
+        cen = cc.census(path, expected_ranks=3, floor=cc.route_floor(SHORT_BOUND)[0])
         d = cc.decide_bound(cen, None, log_path=path, floor_why="w")
         assert not d.refused and d.bound == 27466 and d.source == "census"
         # and the same logs refuse the number that re-arms W16

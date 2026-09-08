@@ -271,7 +271,7 @@ def _front_ref(symbol: str, anchor: str, default: int) -> str:
     return f"{symbol}, front.py:{_front_line(anchor, default)}"
 
 
-def route_floor() -> Tuple[int, str]:
+def route_floor(short_bound: Optional[int] = None) -> Tuple[int, str]:
     """The largest carrier bound at which the round trip is still unreachable.
 
     DERIVED FROM WHAT THE ROUTE NEEDS, and derived IN THE UNIT THE BOUND IS
@@ -286,7 +286,7 @@ def route_floor() -> Tuple[int, str]:
       that route cannot UNDER-estimate (the constant's own comment, #1233).
 
     ``carrier_max_tokens`` is compared against ``carrier_est``, so the floor has
-    to be expressed in ``carrier_est`` tokens.  ``front.CHUNK_TOKENS`` is not:
+    to be expressed in ``carrier_est`` tokens.  The SHORT bound X is not:
     it is a ``remainder`` number, 1.25x smaller, and taking it as the floor
     passed every bound in (4096, 5120] as usable when in fact NO prompt of ANY
     length can round-trip under one -- the same silent capability loss as boot
@@ -322,7 +322,14 @@ def route_floor() -> Tuple[int, str]:
     """
     from sglang.srt.weg2 import front
 
-    chunk = int(front.CHUNK_TOKENS)
+    # THE SHORT BOUND IS NO LONGER A MODULE CONSTANT (weg2 train 0908). Slice A
+    # replaced `remainder <= CHUNK_TOKENS` with `remainder <=
+    # self.tp_prefill_max_tokens` (front.Front.handle_generate) -- X, the
+    # per-boot grant the launcher derives -- so a floor derived from a 4096
+    # literal here would price a branch the front no longer has. The caller
+    # passes the boot's own X; with no caller (a bare probe) the front's OWN
+    # default for that flag stands in, never a number owned by this module.
+    chunk = int(front.X_FALLBACK_TOKENS if short_bound is None else short_bound)
     spans = front.SpanLRU()
 
     def _not_short(n_chars: int) -> bool:
@@ -337,7 +344,7 @@ def route_floor() -> Tuple[int, str]:
         if hi > (chunk + 4) * 64:  # unreachable for any sane divisor; fail loud
             raise RuntimeError(
                 "#1246 route_floor: no prompt length up to %d chars exceeds "
-                "front.CHUNK_TOKENS=%d under front.price_remainder" % (hi, chunk)
+                "the SHORT bound %d under front.price_remainder" % (hi, chunk)
             )
     lo = 0
     while lo < hi:
@@ -355,23 +362,25 @@ def route_floor() -> Tuple[int, str]:
     carrier_est_at_l_star = int(l_star / front.CARRIER_CHARS_PER_TOKEN) + 1
     floor = carrier_est_at_l_star - 1
 
-    ref_chunk = _front_ref("front.CHUNK_TOKENS", "CHUNK_TOKENS = ", 67)
+    ref_chunk = _front_ref("front.Front.handle_generate",
+                           "and remainder <= self.tp_prefill_max_tokens:", -1)
     ref_carrier = _front_ref("front.Front.handle_generate",
                              "and carrier_est > self.carrier_max_tokens:", 561)
-    ref_short = _front_ref("front.Front.handle_generate", "and remainder <= CHUNK_TOKENS:", 578)
+    ref_short = _front_ref("front.Front.handle_generate",
+                           "and remainder <= self.tp_prefill_max_tokens:", -1)
     ref_est = _front_ref("front.Front.handle_generate", "carrier_est = exact if exact else", 560)
     why = (
-        f"floor={floor} tokens of CARRIER-EXCEEDS price, NOT front.CHUNK_TOKENS={chunk}: the two "
+        f"floor={floor} tokens of CARRIER-EXCEEDS price, NOT the SHORT bound {chunk} itself: the two "
         f"bypass branches price the same prompt in different units -- SHORT ({ref_short}) "
         f"compares front.price_remainder's estimate at CHARS_PER_TOKEN={front.CHARS_PER_TOKEN}, "
         f"CARRIER-EXCEEDS ({ref_carrier}) compares carrier_est at "
         f"CARRIER_CHARS_PER_TOKEN={front.CARRIER_CHARS_PER_TOKEN} ({ref_est}), and "
         f"carrier_max_tokens is compared against the latter. The shortest prompt SHORT will not "
-        f"serve is {l_star} chars (front.CHUNK_TOKENS={chunk}, {ref_chunk}, bisected over "
+        f"serve is {l_star} chars (SHORT bound X={chunk}, {ref_chunk}, bisected over "
         f"front.price_remainder with an empty span store = the most permissive cache state), which "
         f"CARRIER-EXCEEDS prices at {carrier_est_at_l_star} tokens; so every bound <= {floor} "
         f"bypasses the leg-1/leg-2 round trip for EVERY prompt length. Scope: SHORT is four "
-        f"conjuncts (awake=D, admit_d, state=serving, remainder<=CHUNK_TOKENS), so while D sleeps a "
+        f"conjuncts (awake=D, admit_d, state=serving, remainder<=X), so while D sleeps a "
         f"sub-chunk prompt does queue to BATCH -- this floor is a conservative refusal in D's "
         f"serving steady state, never a licence"
     )
