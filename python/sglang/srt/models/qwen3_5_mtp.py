@@ -14,9 +14,10 @@
 
 """Inference-only Qwen3_5 MTP model."""
 
+import contextvars
 import copy
 import logging
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -85,6 +86,103 @@ class Qwen3_5MtpEmbeddingAbsent(RuntimeError):
     without this refusal the forward would hand the int64 token ids on as
     if they were a ``[T, hidden]`` embedding and write garbage draft KV
     with a successful-looking forward."""
+
+
+class Qwen3_5MtpLmHeadNotShared(RuntimeError):
+    """#1259 (b): the MTP head's ``lm_head`` was DEFERRED at build time and
+    the target's module was never shared into it. The placeholder carries no
+    weight, so every reader of it must stop here by name rather than fail
+    three frames away on a missing attribute."""
+
+
+#: #1259 (b). True while a ``Qwen3_5ForCausalLMMTP`` is being CONSTRUCTED by a
+#: caller that will share the co-located target's ``lm_head`` into it before
+#: the first forward (``set_lm_head_from_target``). Set by
+#: ``speculative/draft_kv_producer.py`` around the draft build; default False,
+#: so every other path -- group D's NEXTN drafter, a standalone MTP boot, the
+#: model tests -- builds exactly the table it built before.
+_LM_HEAD_FROM_TARGET: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "qwen3_5_mtp_lm_head_from_target", default=False
+)
+
+
+@contextmanager
+def lm_head_from_target():
+    """Build the MTP head WITHOUT its own ``[vocab, hidden]`` output table.
+
+    THE POINT IS THE ALLOCATION, NOT THE RELEASE. The caller that enters this
+    already shared the target's head afterwards and already DELETED the
+    parameters of the head it built (``draft_kv_producer._drop_parameters``,
+    the upstream ``del self.lm_head.weight`` form) -- and that release does
+    not come back as free VRAM. Measured, boot ``weg2tr1``, the producer's own
+    instrument line: ``head_released_mib=2425.0`` beside
+    ``nvml_delta_mib=3998.0``. Under ``--enable-memory-saver`` the weights are
+    allocated inside ``torch_memory_saver``'s single primary
+    ``torch.cuda.MemPool`` (``entrypoint.py:88-95``), and
+    ``torch.cuda.empty_cache()`` does not hand a block of a non-default pool
+    back to the driver; the KV budget is profiled from ``mem_get_info``
+    (``model_runner_kv_cache_mixin.py:847``), which therefore still charges
+    every byte the build touched.
+
+    A table that is never built needs no release. Nothing in the checkpoint
+    ever landed in it either -- ``load_weights`` below skips every name
+    without ``mtp`` in it, so the head's own ``lm_head.weight`` was always an
+    uninitialised allocation waiting to be overwritten by the target's module.
+    """
+    token = _LM_HEAD_FROM_TARGET.set(True)
+    try:
+        yield
+    finally:
+        _LM_HEAD_FROM_TARGET.reset(token)
+
+
+class Qwen3_5MtpLmHeadDeferred(nn.Module):
+    """The placeholder ``build_mtp_lm_head`` installs under
+    ``lm_head_from_target()``: no parameters, no buffers, no vocab table.
+
+    ``set_lm_head_from_target`` replaces the whole module, so this object is
+    expected to be unreachable by the time anything runs. It refuses by name
+    rather than quietly resolving, because both ways of reaching it -- the
+    forward through ``LogitsProcessor`` and a ``.weight`` read -- would
+    otherwise surface as an ``AttributeError`` on a module whose absence is
+    the actual finding.
+    """
+
+    @property
+    def weight(self):
+        raise Qwen3_5MtpLmHeadNotShared(
+            "the MTP head's lm_head is the deferred placeholder: it was built "
+            "under lm_head_from_target() and set_lm_head_from_target() never "
+            "ran, so there is no output table on this stage."
+        )
+
+    def forward(self, *args, **kwargs):
+        raise Qwen3_5MtpLmHeadNotShared(
+            "the MTP head's lm_head is the deferred placeholder and was asked "
+            "to compute logits. The co-located target's lm_head must be shared "
+            "in (set_lm_head_from_target) before the first draft forward."
+        )
+
+
+def build_mtp_lm_head(config, quant_config, prefix: str):
+    """The MTP head's output table, or the deferred placeholder (#1259 b).
+
+    ``tie_word_embeddings`` is NOT deferrable: there the head IS this module's
+    own resident embedding, no second table is ever built, and returning a
+    placeholder would hand the caller a head it must not replace. The caller
+    handles the tie case before reaching here; this guard is the second half
+    of that contract and keeps the decision readable at the branch itself.
+    """
+    if _LM_HEAD_FROM_TARGET.get() and not getattr(
+        config, "tie_word_embeddings", False
+    ):
+        return Qwen3_5MtpLmHeadDeferred()
+    return ParallelLMHead(
+        config.vocab_size,
+        config.hidden_size,
+        quant_config=quant_config,
+        prefix=add_prefix("lm_head", prefix),
+    )
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
@@ -161,12 +259,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+                self.lm_head = build_mtp_lm_head(config, quant_config, prefix)
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -179,7 +272,21 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             num_groups=None,
         )
 
+    @property
+    def lm_head_is_deferred(self) -> bool:
+        """#1259 (b): this stage built no output table of its own and is still
+        waiting for the target's module."""
+        return isinstance(getattr(self, "lm_head", None), Qwen3_5MtpLmHeadDeferred)
+
     def get_embed_and_head(self):
+        # `.weight` on the deferred placeholder raises Qwen3_5MtpLmHeadNotShared
+        # by itself; naming the caller here is what makes that message useful.
+        if self.lm_head_is_deferred:
+            raise Qwen3_5MtpLmHeadNotShared(
+                "get_embed_and_head() on an MTP head whose lm_head is still the "
+                "deferred placeholder (#1259 b): this head has no output table "
+                "to hand out -- share the target's in first."
+            )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
