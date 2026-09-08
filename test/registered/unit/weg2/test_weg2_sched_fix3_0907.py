@@ -580,7 +580,7 @@ def test_b1c_the_answer_removes_the_request_and_names_w31_on_the_wire():
     abort, r = sent[0]
     assert r is req
     assert abort.finished_reason["status_code"] == 503
-    assert "W31 Weg2TpPrefillExceeded" in abort.finished_reason["message"]
+    assert "W47 Weg2TpPrefillExceeded" in abort.finished_reason["message"]
 
 
 # ============================================================ b2: the L-lines
