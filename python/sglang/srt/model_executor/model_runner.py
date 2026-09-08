@@ -62,7 +62,6 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
-from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
@@ -2419,8 +2418,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
-        with self.memory_saver_adapter.region(
-            GPU_MEMORY_TYPE_WEIGHTS,
+        # #1273 S2 (spec section 4.1): under --weg2-weight-source exchange the
+        # NEXTN/MTP draft runner's weights carry their OWN tag, outside the
+        # weights family -- group P has no --speculative-* in this form, so
+        # those bytes have no VRAM source on the other side and must never
+        # enter a leg.  No-op under the default `ring` mode, and gated on
+        # is_draft_model_runner rather than the is_draft_worker CONSTRUCTION
+        # gate (see :514-521: the lane and the phase-flip TP stack ride that
+        # gate too and hold TARGET weights).  weights_region_tag publishes the
+        # tag weight_chunk_scope must restore, which the C hook cannot be asked
+        # for.
+        from sglang.srt.managers.weg2_memory_saver import weights_region_tag
+        from sglang.srt.weg2.weight_exchange import weights_region_tag_for
+
+        weights_tag = weights_region_tag_for(
+            is_draft_model_runner=self.is_draft_model_runner
+        )
+        with weights_region_tag(weights_tag), self.memory_saver_adapter.region(
+            weights_tag,
             enable_cpu_backup=enable_cpu_backup,
         ):
             from sglang.srt.observability.startup_func_log_and_timer import (

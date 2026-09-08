@@ -81,8 +81,12 @@ class _Rope(nn.Module):
 class _Layer(nn.Module):
     def __init__(self, rope_mib: int = 0):
         super().__init__()
-        self.qkv_proj = nn.Parameter(torch.zeros(4 * MIB, dtype=torch.uint8))
-        self.o_proj = nn.Parameter(torch.zeros(2 * MIB, dtype=torch.uint8))
+        self.qkv_proj = nn.Parameter(
+            torch.zeros(4 * MIB, dtype=torch.uint8), requires_grad=False
+        )
+        self.o_proj = nn.Parameter(
+            torch.zeros(2 * MIB, dtype=torch.uint8), requires_grad=False
+        )
         if rope_mib:
             self.rotary_emb = _Rope(rope_mib)
 
@@ -93,7 +97,9 @@ class _Model(nn.Module):
         self.layers = nn.ModuleList(
             [_Layer(rope_mib if i == 0 else 0) for i in range(n_layers)]
         )
-        self.embed_tokens = nn.Parameter(torch.zeros(8 * MIB, dtype=torch.uint8))
+        self.embed_tokens = nn.Parameter(
+            torch.zeros(8 * MIB, dtype=torch.uint8), requires_grad=False
+        )
 
 
 def _planned_names(model, *, drop=()):
@@ -127,6 +133,21 @@ class _CaptureLog:
         self.lines.append(line)
 
 
+class _ChunkedCase(unittest.TestCase):
+    """The launcher's chunk geometry, as the Weg-2 form publishes it: 8 layers
+    per chunk, 8 chunks (WEG2_REUSE_SPEC_0908.md section 1.2, the sb4 form).
+    Both of this double's layers therefore land in ``weights_0`` and the
+    non-layer parameters in the base tag."""
+
+    def setUp(self):
+        os.environ["SGLANG_WEG2_WEIGHT_CHUNK_LAYERS"] = "8"
+        os.environ["SGLANG_WEG2_WEIGHT_CHUNKS"] = "8"
+
+    def tearDown(self):
+        os.environ.pop("SGLANG_WEG2_WEIGHT_CHUNK_LAYERS", None)
+        os.environ.pop("SGLANG_WEG2_WEIGHT_CHUNKS", None)
+
+
 class DraftTagOutOfFamilyTest(unittest.TestCase):
     """Spec section 4.1 / S2: ``weights_draft`` is not a weights-family tag."""
 
@@ -151,9 +172,7 @@ class DraftTagOutOfFamilyTest(unittest.TestCase):
             self.assertFalse(wms.is_weights_family_tag(tag), tag)
 
     def test_resident_line_names_the_draft_tag_out_of_family(self):
-        line = wx.resident_line(
-            rank=1, tag=GPU_MEMORY_TYPE_WEIGHTS_DRAFT, mib=1311.0
-        )
+        line = wx.resident_line(rank=1, tag=GPU_MEMORY_TYPE_WEIGHTS_DRAFT, mib=1311.0)
         self.assertTrue(line.startswith("WEG2-XCHG-RESIDENT "))
         self.assertIn("tag=weights_draft", line)
         self.assertIn("rank=1", line)
@@ -204,9 +223,7 @@ class DraftRegionTagTest(unittest.TestCase):
         os.environ["SGLANG_WEG2_WEIGHT_CHUNK_LAYERS"] = "8"
         os.environ["SGLANG_WEG2_WEIGHT_CHUNKS"] = "8"
         try:
-            with unittest.mock.patch.object(
-                wms, "_tms_cdll_in_region", lambda: fake
-            ):
+            with unittest.mock.patch.object(wms, "_tms_cdll_in_region", lambda: fake):
                 # Base region: unchanged behaviour, chunk tag then base tag.
                 with wms.weights_region_tag(GPU_MEMORY_TYPE_WEIGHTS):
                     with wms.weight_chunk_scope(0) as tag:
@@ -234,19 +251,15 @@ class DraftRegionTagTest(unittest.TestCase):
             os.environ.pop("SGLANG_WEG2_WEIGHT_CHUNKS", None)
 
     def test_region_tag_is_restored_after_the_scope(self):
-        self.assertEqual(
-            wms.current_weights_region_tag(), GPU_MEMORY_TYPE_WEIGHTS
-        )
+        self.assertEqual(wms.current_weights_region_tag(), GPU_MEMORY_TYPE_WEIGHTS)
         with wms.weights_region_tag(GPU_MEMORY_TYPE_WEIGHTS_DRAFT):
             self.assertEqual(
                 wms.current_weights_region_tag(), GPU_MEMORY_TYPE_WEIGHTS_DRAFT
             )
-        self.assertEqual(
-            wms.current_weights_region_tag(), GPU_MEMORY_TYPE_WEIGHTS
-        )
+        self.assertEqual(wms.current_weights_region_tag(), GPU_MEMORY_TYPE_WEIGHTS)
 
 
-class CoverageTest(unittest.TestCase):
+class CoverageTest(_ChunkedCase):
     def test_uncovered_tensor_refuses(self):
         """A stray ``torch.Tensor`` attribute inside a layer's module is a page
         with no source: W51, by name, with the module path in the message."""
@@ -289,7 +302,9 @@ class CoverageTest(unittest.TestCase):
             planned_names_by_tag=_planned_names(model),
             # 256 MiB of buffer + 12 MiB of parameters under weights_0, plus
             # 7 MiB of allocator slack.
-            tag_bytes=lambda tag: int((256 + 12 + 7) * MIB) if tag == "weights_0" else 0,
+            tag_bytes=lambda tag: (
+                int((256 + 12 + 7) * MIB) if tag == "weights_0" else 0
+            ),
             log=_CaptureLog(),
         )
         row = rows["weights_0"]
@@ -390,7 +405,7 @@ class CoverageTest(unittest.TestCase):
             self.assertTrue(wms.is_weights_family_tag(tag), tag)
 
 
-class PlanInterfaceTest(unittest.TestCase):
+class PlanInterfaceTest(_ChunkedCase):
     """The minimal interface S1 owns.  Pinned here so the two slices meet.
 
     TODO(S1, branch weg2/xchg-s1-0908): ``weight_exchange.build_plan()`` must
