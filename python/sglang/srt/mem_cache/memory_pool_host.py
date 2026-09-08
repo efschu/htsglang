@@ -477,10 +477,21 @@ class MambaPoolHost(HostKVCache):
         )
 
         if self.size <= device_pool.size:
+            # NAME THE POOL THIS IS ABOUT (#1246, instrument-text law, Klasse A:
+            # the text did not describe what the code does).  This is the MAMBA
+            # anchor pool -- the very next call registers it as "HiCache Mamba
+            # anchor host pool" -- and it said "HiCache host KV pool".  Measured
+            # cost of the lie: on boot weg2rg5 the M=600 ledger arm put this pool
+            # at 19 slots against a 20-slot device pool, this warning fired, a
+            # launcher census that keyed on the words "KV pool" took min(30518,
+            # 19) and derived a 17-token carrier bound; every request then took
+            # the front's CARRIER-EXCEEDS branch and group P executed zero
+            # prefill passes for the whole boot (BOOT_weg2rg5_0908.md).
             logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "HiCache host pool %s (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                getattr(self, "budget_label", None) or type(self).__name__,
                 self.size,
                 device_pool.size,
             )

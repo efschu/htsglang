@@ -152,10 +152,20 @@ class HostKVCache(abc.ABC):
         self.end_layer = device_pool.end_layer
 
         if self.size <= device_pool.size:
+            # NAME THE POOL THIS IS ABOUT (#1246, instrument-text law).  This
+            # line used to say "HiCache host KV pool" unconditionally, and this
+            # is a BASE class: every subclass reaches it, so a mamba/GDN state
+            # pool and a DeepSeek state pool announced themselves as a KV pool.
+            # A launcher census then read 19 mamba slots as the KV carrier's
+            # capacity and shipped a 17-token carrier bound (boot weg2rg5,
+            # BOOT_weg2rg5_0908.md).  ``budget_label`` is the identity this pool
+            # already carries for the pinned-host-RAM guard, so naming it here
+            # adds no second bookkeeping.
             logger.warning(
-                "HiCache host KV pool (%d tokens) is smaller than the device pool (%d tokens);"
+                "HiCache host pool %s (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
+                getattr(self, "budget_label", None) or type(self).__name__,
                 self.size,
                 device_pool.size,
             )
