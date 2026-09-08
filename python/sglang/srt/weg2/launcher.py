@@ -2459,6 +2459,51 @@ def p_stage_layers(is_full_attention: Sequence[bool]) -> List[int]:
     )
 
 
+def shipped_layer_split(
+    stage_ratio: str,
+    attn_stage_ratio: str,
+    layer_set: str,
+    is_full_attention: Sequence[bool],
+    n_stages: int,
+) -> List[int]:
+    """The per-stage LAYER COUNTS group P's ARGV will actually run.
+
+    The counterpart of :func:`p_stage_layers`, and the reason it exists: that
+    function's own docstring says it reads "the SAME two score vectors
+    ``argv_p`` passes", and since the merge train brought :func:`solve_p_cut`
+    that premise is no longer true by construction -- argv_p passes whatever
+    the solver returned.  A premise that used to hold and now has to be CHECKED
+    is a guard, not a comment, so the split is derived from the argv strings
+    themselves and compared (``main``, W46).
+
+    Both argv forms are resolved through the runtime's OWN parser for that
+    form -- ``parse_pp_layer_sets`` for a layer SET, ``derive_pp_layer_split``
+    for the score pair -- never by counting the score vector, which is the
+    conflation :func:`p_stage_layers` exists to undo.  ``[]`` when the argv
+    states no cut at all; an empty answer is never compared as agreement.
+    """
+    if layer_set:
+        from sglang.srt.distributed.utils import parse_pp_layer_sets
+
+        return [
+            len(x)
+            for x in parse_pp_layer_sets(
+                layer_set, len(list(is_full_attention)), int(n_stages), allow_gapped=True
+            )
+        ]
+    if not stage_ratio:
+        return []
+    from sglang.srt.distributed.utils import derive_pp_layer_split
+
+    return list(
+        derive_pp_layer_split(
+            _csv_ints(stage_ratio),
+            is_full_attention=list(is_full_attention),
+            attn_scores=_csv_ints(attn_stage_ratio) if attn_stage_ratio else None,
+        )
+    )
+
+
 def build_tms_preload(tree: str, venv: str, log: Log) -> str:
     """Build (or reuse) the patched torch_memory_saver preload hook."""
     script = os.path.join(tree, "scripts", "weg2", "tms", "build_tms_preload.sh")
@@ -3386,6 +3431,62 @@ class PCutFacts:
     gapped: bool = False
 
 
+def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str):
+    """WHICH priced candidate group P ships, and why.  Pure.
+
+    The solver ranks by makespan; that is a QUESTION, not an order.  Three
+    things go wrong when its answer ships unasked, and all three are measured:
+
+    * the maxkv law (user 2026-09-08, #1254): the pool-maximal cut and the
+      speed cut differ by 47.7 % of the KV pool on this box, and a boot may not
+      pay that trade by accident;
+    * boot weg2rg6 PROVED one cut on metal (32,18,14 / attention 8,4,4, pool
+      714,788).  A cut nothing has booted is not a better default than one that
+      has, however it ranks;
+    * and the one that makes this a REFUSAL rather than a preference: ``main``
+      derives the WEG2-FLIP-ORDER MAP from the incumbent score constants via
+      :func:`p_stage_layers`, while ``argv_p`` ships whatever this function
+      returns.  A divergence leaves the map complete but WRONG PER CARD (a
+      weights tag mapped to one card while its bytes straddle two) -- the
+      wrong-per-card-accounting class that killed boot weg2dk4.
+
+    So the SHIPPED cut is chosen by objective, and ``incumbent`` is the
+    default: the same vector the map is derived from, agreeing by identity.
+    Every objective's candidate stays priced and printed either way.
+
+    The candidate is looked up in the solver's OWN ranked field rather than
+    constructed here -- a hand-built row would carry a pool figure this
+    launcher invented.  An incumbent the solver did not rank is a REFUSAL (W40)
+    naming it, never a silent fallback to the ranking's winner.
+    """
+    if objective == "speed":
+        return decision.chosen, "the makespan-optimal cut (--p-cut-objective speed)"
+    if objective == "maxkv":
+        return decision.kv_floor, "the pool-maximal cut (--p-cut-objective maxkv)"
+    want_layers = tuple(int(n) for n in incumbent_layers)
+    want_attn = tuple(int(a) for a in incumbent_attn)
+    for cand in decision.ranked:
+        if (
+            cand.kind == "contiguous"
+            and tuple(cand.layers) == want_layers
+            and tuple(cand.attn) == want_attn
+        ):
+            return cand, (
+                "the INCUMBENT cut (--p-cut-objective incumbent, the default): "
+                "boot-proven on weg2rg6 and identical to the vector the "
+                "flip-order map is derived from"
+            )
+    raise Weg2LaunchRefused(
+        "W40 Weg2PPCutRefused: --p-cut-objective incumbent asks for the cut "
+        f"{','.join(str(n) for n in want_layers)} / attention "
+        f"{','.join(str(a) for a in want_attn)}, and the solver did not rank it "
+        f"as a choosable candidate ({len(decision.ranked)} ranked). Refusing "
+        "rather than shipping the ranking's winner under the incumbent's name "
+        "-- that substitution is exactly what would desynchronise argv from the "
+        "flip-order map."
+    )
+
+
 def solve_p_cut(
     ns,
     cards: List[Card],
@@ -3577,7 +3678,42 @@ def solve_p_cut(
     log(decision.provenance_line())
     for row in decision.table_lines():
         log(row)
-    if decision.chosen.kind == "gapped":
+    # WHICH of those priced rows this boot actually SHIPS (#1254 + the
+    # flip-order-map identity -- see :func:`pick_shipped_cut`).  An operator pin
+    # outranks the objective: it IS the chosen candidate, and overriding it here
+    # would make --pp-stage-ratio a suggestion.
+    if decision.pinned:
+        chosen, ship_why = decision.chosen, (
+            "PINNED by --pp-stage-ratio (the operator's own cut, which outranks "
+            "--p-cut-objective)"
+        )
+    else:
+        chosen, ship_why = pick_shipped_cut(
+            decision,
+            P_PP_STAGE_RATIO_SCORES,
+            P_PP_ATTN_STAGE_RATIO_SCORES,
+            str(getattr(ns, "p_cut_objective", "incumbent")),
+        )
+    log(
+        "PP-CUT SHIPPED: layers=%s attn=%s pool_tokens=%d makespan_ms=%.1f -- %s. "
+        "The other two objectives stay priced on the rows above and are NOT paid "
+        "by accident: makespan-optimal %s pool %d makespan %.1f, pool-maximal %s "
+        "pool %d makespan %.1f (--p-cut-objective speed|maxkv ships them)."
+        % (
+            ",".join(str(n) for n in chosen.layers),
+            ",".join(str(a) for a in chosen.attn),
+            int(chosen.pool_tokens),
+            chosen.makespan_ms,
+            ship_why,
+            decision.chosen.fmt(),
+            int(decision.chosen.pool_tokens),
+            decision.chosen.makespan_ms,
+            decision.kv_floor.fmt(),
+            int(decision.kv_floor.pool_tokens),
+            decision.kv_floor.makespan_ms,
+        )
+    )
+    if chosen.kind == "gapped":
         # A GAPPED map is not expressible as --pp-stage-ratio and does not go
         # through derive_pp_layer_split at all: it is published as the layer
         # SET and executed by the #753 mid-loop crossing wire. The round trip
@@ -3587,16 +3723,16 @@ def solve_p_cut(
         from sglang.srt.distributed.utils import parse_pp_layer_sets
 
         back = parse_pp_layer_sets(
-            decision.chosen.layer_set, n_layers, len(budgets_p), allow_gapped=True
+            chosen.layer_set, n_layers, len(budgets_p), allow_gapped=True
         )
         realized_counts = tuple(len(x) for x in back)
-        if realized_counts != decision.chosen.layers:
+        if realized_counts != chosen.layers:
             raise Weg2LaunchRefused(
                 "W40 Weg2PPCutRefused: the gapped map this launcher solved "
                 "(%s) does not survive parse_pp_layer_sets -- it comes back as "
                 "%s layers per stage. Refusing rather than booting a layout the "
                 "provenance line misdescribes."
-                % (decision.chosen.layer_set, realized_counts)
+                % (chosen.layer_set, realized_counts)
             )
         log(
             "PP-CUT round trip: parse_pp_layer_sets(%s) = %s layers per stage, "
@@ -3607,10 +3743,10 @@ def solve_p_cut(
             "count of 0 and silently re-derives a contiguous split from any "
             "other), so the map travels once, on the wire."
             % (
-                decision.chosen.layer_set,
+                chosen.layer_set,
                 realized_counts,
-                ",".join(str(a) for a in decision.chosen.attn),
-                decision.chosen.crossings,
+                ",".join(str(a) for a in chosen.attn),
+                chosen.crossings,
             )
         )
         return PCutFacts(
@@ -3622,12 +3758,12 @@ def solve_p_cut(
             # exactly one layout -- the one on the wire.
             stage_ratio="",
             attn_stage_ratio="",
-            pool_tokens=float(decision.chosen.pool_tokens),
-            attn_counts=tuple(int(a) for a in decision.chosen.attn),
+            pool_tokens=float(chosen.pool_tokens),
+            attn_counts=tuple(int(a) for a in chosen.attn),
             kv_mib_per_token_per_attn_layer=float(kv_mib),
             hidden_size=int(text_cfg["hidden_size"]),
             cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
-            layer_set=decision.chosen.layer_set,
+            layer_set=chosen.layer_set,
             gapped=True,
         )
     # ROUND TRIP AGAINST THE RUNTIME AUTHORITY, not against our own model.
@@ -3639,16 +3775,16 @@ def solve_p_cut(
     # comes back as 23,24,17. A solved cut that does not survive this call is
     # a cut the boot would not run, so it is refused here rather than logged
     # and departed from.
-    stage_ratio = ",".join(str(n) for n in decision.chosen.layers)
-    attn_ratio = ",".join(str(a) for a in decision.chosen.attn)
+    stage_ratio = ",".join(str(n) for n in chosen.layers)
+    attn_ratio = ",".join(str(a) for a in chosen.attn)
     from sglang.srt.distributed.utils import derive_pp_layer_split
 
     realized = derive_pp_layer_split(
-        list(decision.chosen.layers),
+        list(chosen.layers),
         is_full_attention=[str(k) == "full_attention" for k in kinds],
-        attn_scores=list(decision.chosen.attn),
+        attn_scores=list(chosen.attn),
     )
-    if list(realized) != list(decision.chosen.layers):
+    if list(realized) != list(chosen.layers):
         raise Weg2LaunchRefused(
             f"W40 Weg2PPCutRefused: the cut this launcher solved "
             f"({stage_ratio} / attn {attn_ratio}) does not survive "
@@ -3664,8 +3800,8 @@ def solve_p_cut(
     return PCutFacts(
         stage_ratio=stage_ratio,
         attn_stage_ratio=attn_ratio,
-        pool_tokens=float(decision.chosen.pool_tokens),
-        attn_counts=tuple(int(a) for a in decision.chosen.attn),
+        pool_tokens=float(chosen.pool_tokens),
+        attn_counts=tuple(int(a) for a in chosen.attn),
         kv_mib_per_token_per_attn_layer=float(kv_mib),
         hidden_size=int(text_cfg["hidden_size"]),
         cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
@@ -3810,6 +3946,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="OVERRIDE the solved full-attention split for group P (e.g. "
              "'8,4,4'). Same PINNED provenance. Unset = the attention axis is "
              "resolved for the chosen layer cut by pp_cut.best_attention_split.",
+    )
+    ap.add_argument(
+        "--p-cut-objective", default="incumbent",
+        choices=("incumbent", "maxkv", "speed"),
+        help="WHICH priced cut group P actually SHIPS. 'incumbent' (default) "
+             f"is the rg6-proven contiguous kv-floor cut "
+             f"{','.join(str(n) for n in P_PP_STAGE_RATIO_SCORES)} / attention "
+             f"{','.join(str(a) for a in P_PP_ATTN_STAGE_RATIO_SCORES)} -- the "
+             "SAME vector p_stage_layers derives the flip-order map from, so "
+             "argv and map agree by identity rather than by coincidence. "
+             "'speed' ships the makespan-optimal cut and 'maxkv' the "
+             "pool-maximal one; both are priced and printed on EVERY boot "
+             "either way, so the trade is visible without being paid by "
+             "accident (maxkv law, user 2026-09-08 / #1254). An explicit "
+             "--pp-stage-ratio pin outranks this flag.",
     )
     ap.add_argument(
         "--pp-cut-measured-ms-per-layer", default=MEASURED_MS_PER_LAYER,
@@ -4140,6 +4291,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     cut = solve_p_cut(ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens)
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
+    # #1254 W46: THE MAP AND THE ARGV MUST BE THE SAME SPLIT.  The WEG2-FLIP-
+    # ORDER MAP above is derived from the incumbent score constants
+    # (p_stage_layers); argv_p ships whatever solve_p_cut returned.  While the
+    # solver's winner differs from the incumbent those two halves describe
+    # DIFFERENT layouts, and the map is then complete but WRONG PER CARD -- a
+    # weights tag charged to one card while its bytes straddle two, which is
+    # the accounting class that killed boot weg2dk4.  Neither half can see the
+    # other, and interleave_pause_order refuses only an INCOMPLETE map, so a
+    # confident wrong pause order is exactly what a silent divergence buys.
+    # Checked here, by name, before either group starts.
+    shipped_split = shipped_layer_split(
+        stage_ratio, attn_stage_ratio, cut.layer_set, p_kinds, len(budgets_p)
+    )
+    if p_split and shipped_split and list(shipped_split) != list(p_split):
+        raise Weg2LaunchRefused(
+            "W46 Weg2PPSplitMapMismatch: group P's argv would run the layer "
+            f"split {','.join(str(n) for n in shipped_split)} (argv "
+            f"--pp-stage-ratio {stage_ratio or '(none)'} --pp-attn-stage-ratio "
+            f"{attn_stage_ratio or '(none)'}"
+            + (f" --pp-layer-set {cut.layer_set}" if cut.layer_set else "")
+            + f"), while the WEG2-FLIP-ORDER MAP was derived from "
+            f"{','.join(str(n) for n in p_split)} (p_stage_layers over the "
+            f"incumbent scores {list(P_PP_STAGE_RATIO_SCORES)} / "
+            f"{list(P_PP_ATTN_STAGE_RATIO_SCORES)}). A map built for one split "
+            "and an argv running another is COMPLETE BUT WRONG PER CARD -- the "
+            "weg2dk4 accounting class -- and interleave_pause_order refuses "
+            "only an INCOMPLETE map, so it would pause the wrong card first "
+            "with a confident reason. Ship the incumbent (--p-cut-objective "
+            "incumbent, the default), or pin the map's split explicitly with "
+            "--pp-stage-ratio; the flip-order map must be derived from the same "
+            "cut before another objective can ship."
+        )
+    log(
+        "WEG2-PP-SPLIT CHECK: argv split "
+        f"{','.join(str(n) for n in shipped_split) if shipped_split else 'NOT STATED'} "
+        f"== flip-order map split "
+        f"{','.join(str(n) for n in p_split) if p_split else 'MAP REFUSED (see above)'} "
+        "-- W46 checks the premise p_stage_layers' docstring used to be able to "
+        "assume (that argv_p passes the same two score vectors), which the "
+        "solver made checkable rather than true"
+    )
     # #1240 THE LAUNCHER IS THE ONLY WRITER. The solved (or pinned) map is
     # published here, into the environment group P will actually get -- the
     # flag is the interface, the variable is the wire. A GAPPED map also arms
