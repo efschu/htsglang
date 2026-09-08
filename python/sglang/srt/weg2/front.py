@@ -366,11 +366,24 @@ def d_seat_need(est_tokens: int, realised_tokens: int = 0):
 #: The name D's own gate refuses with (C11).  The front never re-prices the
 #: body -- D's gate is the authority -- so the only question anywhere on the
 #: leg-2 path is whether this NAME is present.
-X_REFUSAL_NAME = "W31 Weg2TpPrefillExceeded"
+#:
+#: RENUMBERED W31 -> W47 (train fix 5).  W31 named TWO unrelated refusals on
+#: this rig: this serving-path re-route and ``Weg2HostRingExhausted`` in
+#: host_ring.cpp, the host-ring exhaustion that killed boot weg2tr2.  A census
+#: that greps ``W31`` reports one number for a fatal host-ring exhaustion and a
+#: routing event, which is how a boot postmortem merges a killer into noise.
+#:
+#: THE DETECTOR IS KEYED ON THE EXCEPTION NAME, NOT THE NUMBER (:data:
+#: `X_REFUSAL_MARKER`).  That is the durable half of this fix: the number is a
+#: label humans and greps read, the name is what identifies the refusal, and a
+#: wire protocol keyed on a renumberable label breaks silently at exactly the
+#: renumber that fixes the collision.
+X_REFUSAL_MARKER = "Weg2TpPrefillExceeded"
+X_REFUSAL_NAME = "W47 " + X_REFUSAL_MARKER
 
 
 def x_refusal_marker_in(body_text: str) -> bool:
-    """True iff this text carries D's named W31 refusal, at any status.
+    """True iff this text carries D's named Weg2TpPrefillExceeded refusal.
 
     FIX 2 (round 1): the refusal reaches the front in TWO wire shapes and
     only one of them carries a status.  `tokenizer_manager.py:1518-1537`
@@ -379,8 +392,12 @@ def x_refusal_marker_in(body_text: str) -> bool:
     IN-BAND chunk on an otherwise 200 response.  A status-only test
     therefore sees exactly half of law 4's traffic, and OpenAI chat
     completions under agent load are the streamed half.
+
+    Matched on :data:`X_REFUSAL_MARKER` -- the exception NAME -- so the W-code
+    renumber that resolved the W31 collision cannot silently stop the front
+    recognising D's refusal (train fix 5).
     """
-    return X_REFUSAL_NAME in (body_text or "")
+    return X_REFUSAL_MARKER in (body_text or "")
 
 
 def is_x_refusal(status: int, body_text: str) -> bool:
@@ -1594,8 +1611,8 @@ class Front:
             # the first byte.  It carries no usage chunk, so the pre-existing
             # code priced it as W28 "unpriced" -- the right name for a
             # missing price, the wrong name for a refusal that has one.  The
-            # caller has already counted W31_stream_served.
-            return "W31_stream_served"
+            # caller has already counted W47_stream_served.
+            return "W47_stream_served"
         if single_prefill:
             self.counters["single_prefill_served"] += 1
             return "single_prefill"
@@ -1668,7 +1685,7 @@ class Front:
                     if first_chunk is not None and x_refusal_marker_in(
                         first_chunk.decode(errors="replace")
                     ):
-                        self.counters["W31_stream_inband_requeued"] += 1
+                        self.counters["W47_stream_inband_requeued"] += 1
                         g.outstanding.pop(rid, None)
                         return await self._requeue_after_x_refusal(
                             request, rid, payload, text, stream, pending, seat, first_chunk
@@ -1703,10 +1720,10 @@ class Front:
                         # refusal arrived AFTER the first byte, so the
                         # re-route is impossible.  Counted BY NAME rather
                         # than landing in W28 as an unpriced stream.
-                        self.counters["W31_Weg2TpPrefillExceeded"] += 1
-                        self.counters["W31_stream_served"] += 1
+                        self.counters["W47_Weg2TpPrefillExceeded"] += 1
+                        self.counters["W47_stream_served"] += 1
                         logger.error(
-                            "W31 Weg2TpPrefillExceeded rid=%s (STREAM, served): D refused this request "
+                            "W47 Weg2TpPrefillExceeded rid=%s (STREAM, served): D refused this request "
                             "by name after the first byte -- re-route impossible, counted by name",
                             rid,
                         )
@@ -1808,7 +1825,7 @@ class Front:
         self._x_requeues[rid] = n
         if pending is not None:
             pending.x_requeues = n
-        self.counters["W31_Weg2TpPrefillExceeded"] += 1
+        self.counters["W47_Weg2TpPrefillExceeded"] += 1
         logger.warning("WEG2 X-REQUEUE rid=%s n=%d verdict=%s", rid, n,
                        "requeue" if n <= 1 else "W35")
         if n > 1:
@@ -1842,7 +1859,7 @@ class Front:
             p.fut = asyncio.get_event_loop().create_future()
             p.t_arrive = time.time()
         if seat is not None:
-            seat.release("W31_requeue")
+            seat.release("W47_requeue")
         p.seat = None
         self.queue.append(p)
         try:

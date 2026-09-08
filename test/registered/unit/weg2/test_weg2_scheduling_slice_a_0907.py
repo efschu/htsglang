@@ -75,7 +75,7 @@ class FakeGroup:
                 self.refuse_x_for[mark] = left - 1
                 self.x_refusals.append(mark)
                 return web.json_response(
-                    {"error": f"W31 Weg2TpPrefillExceeded rid=? uncached=99999"}, status=503
+                    {"error": f"W47 Weg2TpPrefillExceeded rid=? uncached=99999"}, status=503
                 )
             if payload.get("stream"):
                 inband = self.refuse_x_inband_for.get(mark, 0)
@@ -87,7 +87,7 @@ class FakeGroup:
                     self.x_refusals.append(mark)
                     await resp.write(
                         b'data: {"meta_info": {"finish_reason": {"type": "abort", '
-                        b'"status_code": 503, "message": "W31 Weg2TpPrefillExceeded: '
+                        b'"status_code": 503, "message": "W47 Weg2TpPrefillExceeded: '
                         b'this group may prefill at most 10 uncached tokens itself"}}}\n\n'
                     )
                 else:
@@ -501,7 +501,7 @@ def test_t9c_the_front_requeues_a_w31_once_and_then_raises_w35():
             h.d.refuse_x_for["q1"] = 1  # refuse once, then serve
             status, _ = await asyncio.wait_for(h.post("q1"), timeout=30)
             assert status == 200
-            assert h.front.counters["W31_Weg2TpPrefillExceeded"] == 1
+            assert h.front.counters["W47_Weg2TpPrefillExceeded"] == 1
             assert h.front.counters.get("W35_Weg2XReQueueLoop", 0) == 0
             assert h.p.gen_marks == ["q1"], h.p.gen_marks  # P prefilled it
 
@@ -526,9 +526,9 @@ def test_t9d_all_four_front_sites_read_one_x():
                            single_prefill=False, stream=False, rid="r") == "serve"
     assert f._leg2_verdict(pt=30000, ct=0, priced=True, pending=None,
                            single_prefill=False, stream=False, rid="r") == "short_mispriced"
-    assert is_x_refusal(503, "W31 Weg2TpPrefillExceeded: ...") is True
+    assert is_x_refusal(503, "W47 Weg2TpPrefillExceeded: ...") is True
     assert is_x_refusal(503, "W28 Weg2Leg2Unpriced") is False
-    assert is_x_refusal(200, "W31 Weg2TpPrefillExceeded") is False
+    assert is_x_refusal(200, "W47 Weg2TpPrefillExceeded") is False
 
 
 # -------------------------------------------------------------- T10, R-5
@@ -725,7 +725,7 @@ def test_f2a_a_streamed_leg2_is_requeued_on_the_503_w31_shape():
             t = h.post("S1", chars=40, stream=True)
             status, _text = await asyncio.wait_for(t, 20.0)
             assert status == 200, "the client must be SERVED, through P"
-            assert h.front.counters["W31_Weg2TpPrefillExceeded"] == 1
+            assert h.front.counters["W47_Weg2TpPrefillExceeded"] == 1
             assert h.front.counters["W35_Weg2XReQueueLoop"] == 0
             assert "S1" in h.p.gen_marks, "P must have prefilled the re-queued request"
 
@@ -749,8 +749,8 @@ def test_f2b_a_streamed_leg2_is_requeued_on_the_inband_w31_shape():
             assert status == 200
             assert front_mod.X_REFUSAL_NAME not in text, (
                 "the client must get the served answer, not D's refusal")
-            assert h.front.counters["W31_stream_inband_requeued"] == 1
-            assert h.front.counters["W31_Weg2TpPrefillExceeded"] == 1
+            assert h.front.counters["W47_stream_inband_requeued"] == 1
+            assert h.front.counters["W47_Weg2TpPrefillExceeded"] == 1
             assert h.front.counters["W28_Weg2Leg2Unpriced_stream_served"] == 0, (
                 "a refusal with a name must never land in W28")
             assert "S2" in h.p.gen_marks
@@ -765,7 +765,7 @@ def test_f2c_a_late_inband_w31_is_counted_by_name_not_as_w28():
     f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
               tp_prefill_max_tokens=10)
     p = _pending_for_verdict()
-    assert f._leg2_verdict(0, 0, False, p, False, True, "r", x_inband=True) == "W31_stream_served"
+    assert f._leg2_verdict(0, 0, False, p, False, True, "r", x_inband=True) == "W47_stream_served"
     assert f.counters["W28_Weg2Leg2Unpriced_stream_served"] == 0
     # unchanged without the marker
     assert f._leg2_verdict(0, 0, False, p, False, True, "r") == "unpriced"

@@ -98,6 +98,7 @@ rather than paired by position.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -182,6 +183,297 @@ _CORRIDOR_FREE_RE = re.compile(r"nvml(\d+):free=(\d+)MiB")
 _ORDINAL_MAP_RE = re.compile(
     r"ordinal\s+(\d+)\s*=\s*nvml\s+(\d+)\s+.*?(GPU-[0-9a-fA-F-]+)\s+total"
 )
+#: ``[2026-09-08T11:01:57Z] WEG2-LAUNCH group P argv: <py> -m sglang.launch_server
+#: --model-path ... --pp-stage-ratio 32,18,14 ... --speculative-algorithm NEXTN ...``
+#: The launcher has logged this on EVERY boot of this rig's whole history, into
+#: the same front log this module already reads for the ordinal map and the
+#: corridor -- which is why the form gate needed no new emitter, only a reader.
+_P_ARGV_RE = re.compile(r"\bgroup P argv:\s*(\S.*?)\s*$")
+
+#: Flags DROPPED before the form key is hashed, each because its value is a
+#: CONSEQUENCE of something the ring itself feeds, not a statement about what
+#: group P loads.  Named here and PRINTED on the form line, so a reader can
+#: check the exclusion rather than trust it -- an unprintable exclusion list is
+#: how a form key quietly stops discriminating.
+#:
+#: * the three hicache-arm flags: their values are chosen by
+#:   ``host_ledger.choose_host_ledger``, which is priced FROM this table.  A key
+#:   that included them would depend on its own consequence and no two boots
+#:   could ever share a form.
+#: * ``--pp-async-batch-depth``: solved by ``solve_p_depth`` AFTER the ring is
+#:   armed (it reads the layer-set out of the environment the ring helped
+#:   build), so it is not knowable at the moment the key must be computed.  It
+#:   sizes microbatch ACTIVATION buffers, which are device-side and transient;
+#:   it moves no weight byte into the host image this table sizes.
+#: * ``--port``: boot identity.
+FORM_KEY_EXCLUDED_FLAGS: Tuple[str, ...] = (
+    "--hicache-size",
+    "--hicache-mamba-host-mib",
+    "--hicache-storage-backend-extra-config",
+    "--pp-async-batch-depth",
+    "--port",
+)
+#: Every flag that is NOT in :data:`FORM_KEY_EXCLUDED_FLAGS` is in the key.  A
+#: BLACKLIST on purpose: a whitelist silently stops discriminating the day a
+#: new form-changing flag is added, which is precisely the failure this gate
+#: exists to prevent, and it would have failed exactly that way here (nobody
+#: would have thought to whitelist ``--speculative-draft-kv-only``).
+FORM_KEY_POLICY = "blacklist"
+
+
+def _flag_pairs(argv: Sequence[str]) -> List[str]:
+    """``argv`` as ``--flag=value`` / ``--flag`` tokens plus positional ones.
+
+    A flag's value is the next token when that token does not itself start with
+    ``--``; this is how the launcher emits every one of them.
+    """
+    out: List[str] = []
+    i = 0
+    argv = list(argv)
+    while i < len(argv):
+        tok = argv[i]
+        if tok.startswith("--"):
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                out.append(f"{tok}={argv[i + 1]}")
+                i += 2
+            else:
+                out.append(tok)
+                i += 1
+        else:
+            out.append(tok)
+            i += 1
+    return out
+
+
+def p_form_key(argv: Sequence[str]) -> Tuple[str, str]:
+    """``(12-hex key, the normalised form string)`` of a group-P argv.
+
+    THE FORM IS WHAT GROUP P LOADS, and the argv already states all of it: the
+    checkpoint (``--model-path``), the shipped cut (``--pp-stage-ratio`` /
+    ``--pp-attn-stage-ratio``, or ``--pp-layer-set`` under a gapped map), the
+    pipeline shape (``--tp-size`` / ``--pp-size``) and the drafter identity (the
+    ``--speculative-*`` family, which is what makes an MTP head land on the last
+    stage and is exactly the term boot weg2tr2 died of).
+
+    Normalisation is SORTED, so a flag that merely moved position across two
+    launcher revisions is not a form change: measured on this rig's own two
+    boots, weg2rg6 emits ``--disable-overlap-schedule`` and
+    ``--max-running-requests`` early and weg2tr2 emits them late, with identical
+    values, and an order-sensitive key would have called that a different form
+    and refused a table that was in fact only wrong about the drafter.
+
+    The interpreter path and ``-m sglang.launch_server`` are dropped: they are
+    the same on every boot and a venv move is not a form change.
+    """
+    import hashlib
+
+    dropped = set(FORM_KEY_EXCLUDED_FLAGS)
+    toks = [
+        t
+        for t in _flag_pairs(argv)
+        if t.startswith("--") and t.split("=", 1)[0] not in dropped
+    ]
+    normalised = " ".join(sorted(toks))
+    return hashlib.sha1(normalised.encode()).hexdigest()[:12], normalised
+
+
+def parse_p_form(front_log: str) -> Tuple[Optional[List[str]], str]:
+    """``(group P's argv, "")`` from a boot's front log, or ``(None, reason)``."""
+    import shlex
+
+    try:
+        with open(front_log, errors="replace") as fh:
+            for line in fh:
+                if "group P argv:" not in line:
+                    continue
+                found = _P_ARGV_RE.search(line)
+                if found:
+                    try:
+                        return shlex.split(found.group(1)), ""
+                    except ValueError as exc:
+                        return None, f"its 'group P argv:' line does not shell-split: {exc}"
+    except OSError as exc:
+        return None, f"front log unreadable: {exc}"
+    return None, (
+        "its front log carries no 'group P argv:' line, so what group P LOADED "
+        "in that boot cannot be established and its per-card census cannot be "
+        "told from a census of some other form"
+    )
+
+
+@dataclass(frozen=True)
+class StageWeights:
+    """One PP stage's weight bytes, derived from the checkpoint headers.
+
+    Every field is MiB and every field is printed: the L6 row states the terms,
+    not just their sum, because the whole point of an INDEPENDENT check is that
+    a reader can redo it.
+    """
+
+    stage: int
+    attn_layers: int
+    linear_layers: int
+    attn_mib: float
+    linear_mib: float
+    replicated_mib: float
+    embedding_mib: float
+    lm_head_mib: float
+    drafter_mib: float
+    drafter_terms: str
+
+    @property
+    def total_mib(self) -> float:
+        return (
+            self.attn_mib
+            + self.linear_mib
+            + self.replicated_mib
+            + self.embedding_mib
+            + self.lm_head_mib
+            + self.drafter_mib
+        )
+
+    def terms(self) -> str:
+        parts = [
+            f"attn {self.attn_layers}x{self.attn_mib / max(1, self.attn_layers):.2f}"
+            f"={self.attn_mib:.1f}",
+            f"linear {self.linear_layers}x"
+            f"{self.linear_mib / max(1, self.linear_layers):.2f}={self.linear_mib:.1f}",
+            f"replicated={self.replicated_mib:.1f}",
+        ]
+        if self.embedding_mib:
+            parts.append(f"embedding={self.embedding_mib:.1f}")
+        if self.lm_head_mib:
+            parts.append(f"lm_head={self.lm_head_mib:.1f}")
+        if self.drafter_mib:
+            parts.append(f"drafter={self.drafter_mib:.1f} ({self.drafter_terms})")
+        return " + ".join(parts) + f" = {self.total_mib:.1f} MiB"
+
+
+#: The ``replicated_breakdown`` keys that are NOT carried by every stage of
+#: group P.  CALIBRATED, not assumed (boot weg2rg6, cut 32,18,14 attn 8,4,4,
+#: group P WITHOUT a drafter): with the vision tower charged to every stage and
+#: the ``mtp.*`` tensors charged to none, the three checkpoint-derived stage
+#: totals are 13720.38 / 7425.39 / 8385.79 MiB against that boot's three
+#: MEASURED per-card sleep images of 13860 / 7548 / 8504 -- residuals of
+#: +139.62 / +122.61 / +118.21 MiB, uniform and all POSITIVE, so the derivation
+#: is a genuine one-sided lower bound.  Charging ``mtp`` to every stage instead
+#: puts stage 0 at 14125.55 against a measured 13860, i.e. NEGATIVE residual,
+#: which refutes that reading on this boot form.
+DRAFTER_ONLY_REPLICATED_KEYS = ("mtp",)
+
+
+def checkpoint_stage_weights(
+    model_path: str,
+    layer_split: Sequence[int],
+    attn_split: Sequence[int],
+    carries_drafter: bool,
+) -> List[StageWeights]:
+    """Per-PP-stage weight MiB from the safetensors HEADERS and the shipped cut.
+
+    THE INDEPENDENT SOURCE.  It touches no boot log, no census and no
+    predecessor: only the checkpoint this boot will load and the cut this boot
+    will ship.  That is what lets it catch a stale table at launch (W49) and
+    what lets it re-price the weight half of a foreign-form table (W48).
+
+    ``carries_drafter`` puts the speculative head on the LAST stage.  Its bytes
+    are the ``mtp.*`` tensors PLUS a second embedding and lm_head, because the
+    NEXTN head is loaded as its OWN model runner and materialises them again --
+    MEASURED, not assumed: boot weg2tr2's PP2 log carries a second ``Load weight
+    end ... type=Qwen3_5ForCausalLMMTP`` whose ``avail mem`` falls 10.88 -> 6.88
+    (4.00 units) against a checkpoint sum of 405.17 + 1212.97 + 2425.00 =
+    4043.14 MiB.  This is the term the rg6-derived ring did not price and the
+    term PP2 died of.
+    """
+    from sglang.srt.planner import pp_cut as _pp_cut
+
+    terms = _pp_cut.checkpoint_weight_terms(model_path)
+    if len(layer_split) != len(attn_split):
+        raise Weg2RingFormMismatch(
+            f"W48 Weg2RingFormMismatch: layer split {list(layer_split)} and "
+            f"attention split {list(attn_split)} have different lengths, so no "
+            "stage can be priced from the checkpoint"
+        )
+    drafter_only = sum(
+        float(terms.replicated_breakdown.get(k, 0.0))
+        for k in DRAFTER_ONLY_REPLICATED_KEYS
+    )
+    per_stage_replicated = (terms.replicated_weight_bytes - drafter_only) / MIB
+    attn_b = terms.attn_layer_weight_bytes / MIB
+    lin_b = terms.linear_layer_weight_bytes / MIB
+    embed = terms.embedding_weight_bytes / MIB
+    head = terms.lm_head_weight_bytes / MIB
+    mtp = drafter_only / MIB
+    last = len(layer_split) - 1
+    out: List[StageWeights] = []
+    for s, (n_layers, n_attn) in enumerate(zip(layer_split, attn_split)):
+        n_lin = int(n_layers) - int(n_attn)
+        if n_lin < 0:
+            raise Weg2RingFormMismatch(
+                f"W48 Weg2RingFormMismatch: stage {s} of the cut "
+                f"{list(layer_split)}/{list(attn_split)} has more attention "
+                "layers than layers"
+            )
+        out.append(
+            StageWeights(
+                stage=s,
+                attn_layers=int(n_attn),
+                linear_layers=n_lin,
+                attn_mib=int(n_attn) * attn_b,
+                linear_mib=n_lin * lin_b,
+                replicated_mib=per_stage_replicated,
+                embedding_mib=embed if s == 0 else 0.0,
+                lm_head_mib=head if s == last else 0.0,
+                drafter_mib=(mtp + embed + head) if (carries_drafter and s == last) else 0.0,
+                drafter_terms=(
+                    f"mtp {mtp:.1f} + its own embedding {embed:.1f} + its own "
+                    f"lm_head {head:.1f}; a NEXTN head is a second model runner"
+                    if (carries_drafter and s == last)
+                    else ""
+                ),
+            )
+        )
+    return out
+
+
+def _flag_value(argv: Sequence[str], flag: str) -> Optional[str]:
+    argv = list(argv)
+    for i, tok in enumerate(argv):
+        if tok == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith(flag + "="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def stage_weights_from_argv(argv: Sequence[str]) -> Tuple[Optional[List[StageWeights]], str]:
+    """``(per-stage weights, "")`` for a group-P argv, or ``(None, reason)``.
+
+    ONE authority for both sides of the form comparison: this boot's argv and
+    the source boot's argv are read by the same function, so the residual
+    ``measured - derived`` is a difference of two readings and never of two
+    definitions.
+    """
+    model = _flag_value(argv, "--model-path")
+    if not model:
+        return None, "its group-P argv states no --model-path"
+    split = _flag_value(argv, "--pp-stage-ratio")
+    attn = _flag_value(argv, "--pp-attn-stage-ratio")
+    if not split or not attn:
+        return None, (
+            "its group-P argv states no --pp-stage-ratio/--pp-attn-stage-ratio, "
+            "so the per-stage weight split cannot be derived from the checkpoint "
+            "(a gapped --pp-layer-set boot is not priceable by this route)"
+        )
+    try:
+        layer_split = [int(x) for x in split.split(",")]
+        attn_split = [int(x) for x in attn.split(",")]
+    except ValueError as exc:
+        return None, f"its cut flags do not parse as integer lists: {exc}"
+    carries = any(str(t).startswith("--speculative-") for t in argv)
+    try:
+        return checkpoint_stage_weights(model, layer_split, attn_split, carries), ""
+    except (Weg2RingFormMismatch, OSError, Exception) as exc:  # noqa: BLE001
+        return None, f"the checkpoint terms of {model!r} could not be read: {exc}"
 
 
 class Weg2RingRefused(RuntimeError):
@@ -216,6 +508,63 @@ class Weg2FlipTagUnparsable(Weg2RingRefused):
     a parser whose text claims to read an instrument must FAIL LOUDLY when the
     emitter's format has moved, never degrade to the answer it can still compute.
     Zero parsed lines out of zero is nothing to say; zero out of N is a refusal.
+    """
+
+
+class Weg2RingFormMismatch(Weg2RingRefused):
+    """W48: the source boot's group-P FORM is not this boot's, so its per-card
+    census is NOT a measurement of this boot and may never be charged as one.
+
+    THIS IS THE weg2tr2 KILLER, AS A REFUSAL.  The predecessor picked the newest
+    boot whose lines PARSED and asked no question about what that boot had
+    LOADED.  Boot weg2rg6's group P carried no MTP head; boot weg2tr2's group P
+    carries one on its LAST stage.  Every other term matched -- weg2tr2's own
+    sleep images came in at 13860 and 7548 MiB against rg6-derived spans of
+    13860 and 7548, to the megabyte, on the two stages whose contents had not
+    changed -- and the third stage asked its ring for 2426 MiB with 204 free,
+    waited 110 028 ms and took the group down through a 120 s
+    ``monitored_barrier``.  ``peer_holder_pid=0``: nobody was holding the ring,
+    it was simply too small.  Two rows right to the megabyte are exactly what
+    makes a stale table dangerous -- they read as corroboration.
+
+    THE FORM IS THE ARGV (see :func:`p_form_key`).  Group P's argv already
+    STATES all three things the image depends on: the checkpoint
+    (``--model-path``), the shipped cut (``--pp-stage-ratio`` /
+    ``--pp-attn-stage-ratio`` / ``--pp-layer-set``) and the drafter identity
+    (the ``--speculative-*`` family).  Hashing a normalised projection of it is
+    therefore ONE authority, not a third restatement of three facts that already
+    have one -- and every boot on this rig has logged that line for its whole
+    history (``WEG2-LAUNCH group P argv:``), so no new emitter had to be built
+    for the reading side to exist.
+
+    WHAT THE REFUSAL DOES, and why it is not simply an exit-2.  A hard stop here
+    would make the FIRST boot of every new form unbootable, which is a strand
+    that never moves.  So the refusal is of the TABLE, term by term: a
+    foreign-form boot's WEIGHT statement is discarded and replaced by THIS
+    boot's own checkpoint arithmetic (:func:`checkpoint_stage_weights`), and
+    only its NON-weight residual is carried across, named, with the form diff
+    printed.  This class is RAISED -- exit 2, before either group starts -- when
+    that replacement cannot be made: no checkpoint terms, no cut on either argv,
+    or a source boot with no ``group P argv:`` line at all, i.e. exactly when
+    the alternative would be to charge a foreign form's bytes in silence.
+    """
+
+
+class Weg2RingWeightsUnderSized(Weg2RingRefused):
+    """W49: L6 checked against an INDEPENDENT source, and the ring is short.
+
+    The launch check L6 used to compare the ring against the same per-card
+    census that had sized it -- a premise validated against itself, which is why
+    weg2tr2's L6 passed at 11:01:52 and the runtime contradicted it at 11:02:27
+    with ``the launch check (L6) was violated`` in its own W31 line.
+
+    The independent source is the CHECKPOINT: safetensors headers plus the cut
+    this boot ships, which no census touches and no predecessor boot can make
+    stale.  ``span1(c)`` must be at least the weight bytes stage ``c`` will
+    load.  Calibrated on boot weg2rg6, whose three measured spans exceed this
+    lower bound by 139.62 / 122.61 / 118.21 MiB -- so the bound is real, tight
+    and one-sided, and a violation is a stale table caught BY NAME at launch
+    rather than 110 s into the first sleep.
     """
 
 
@@ -262,6 +611,24 @@ class CardRing:
     dormant_d_mib: int = 0
     dormant_p_bound: bool = False
     dormant_d_bound: bool = False
+    # -- the INDEPENDENT source (W48/W49): this boot's checkpoint + this boot's
+    # cut, which no census touches and no predecessor boot can make stale. -----
+    #: This card's PP stage in group P.  ``cards`` is ordinal-ordered and rank
+    #: ``n`` runs on ``cards[n]``, so the index IS the stage.
+    stage_index: int = -1
+    #: Weight MiB stage :attr:`stage_index` will load, from the safetensors
+    #: headers.  A one-sided LOWER BOUND on ``image_P`` (calibrated on weg2rg6:
+    #: three measured spans exceed it by 139.62 / 122.61 / 118.21 MiB).
+    ckpt_weights_mib: float = 0.0
+    #: The NON-weight part of the source boot's measured image on this card --
+    #: spec intermediates, workspaces, allocator rounding, CUDA context. Carried
+    #: across a form change because it is the only term a checkpoint cannot
+    #: state; ``residual_source`` names where it came from and whether the form
+    #: it was measured under was this one.
+    residual_mib: float = 0.0
+    residual_source: str = ""
+    #: The terms of :attr:`ckpt_weights_mib`, printed on the L6 row.
+    ckpt_terms: str = ""
 
     @property
     def h_mib(self) -> int:
@@ -355,6 +722,31 @@ class RingTable:
     #: the RING line can be quoted without the instrument that produced it.
     image_source: str = "no WEG2 DORMANT-IMAGE line in the source boot"
     bound_groups: Tuple[str, ...] = ()
+    # -- the FORM GATE (W48) -------------------------------------------------
+    #: This boot's group-P form key, and the source boot's.  Equal = the census
+    #: is a measurement OF THIS BOOT; unequal = its weight statement was
+    #: discarded and re-derived from this boot's checkpoint.
+    form_key: str = ""
+    source_form_key: str = ""
+    #: ``None`` = the gate was not armed (no argv given, e.g. a unit test that
+    #: is not about the form).  Printed as such: an unarmed gate must never read
+    #: as a passed one.
+    form_same: Optional[bool] = None
+    #: One line naming exactly what differs between the two forms.
+    form_diff: str = ""
+
+    @property
+    def form_verdict(self) -> str:
+        if self.form_same is None:
+            return "form gate NOT ARMED (no group-P argv was given to solve())"
+        if self.form_same:
+            return f"form key {self.form_key} MATCHES the source boot's"
+        return (
+            f"W48 Weg2RingFormMismatch: form key {self.form_key} != source "
+            f"{self.source_form_key} -- the source boot's WEIGHT statement is "
+            f"DISCARDED and re-derived from this boot's own checkpoint; only its "
+            f"non-weight residual is carried. {self.form_diff}"
+        )
 
     def provenance(self) -> str:
         bound = (
@@ -363,6 +755,7 @@ class RingTable:
             else "; both groups' dormant images are MEASURED"
         )
         return (
+            f"{self.form_verdict}; "
             f"boot {self.boot}, {self.lines_read} lines, instrument: {self.instrument} "
             "(every MiB below is that boot's own, none is a constant in this tree); "
             f"Sigma H {self.total_h_bytes // MIB} MiB = per card the LARGER of "
@@ -406,7 +799,44 @@ class RingTable:
                 f"slack={c.slack_serial_d2p_mib}/{c.slack_serial_p2d_mib} MiB "
                 f"-- provenance: {prov}"
             )
+            out.append(
+                f"WEG2-HOST-LEDGER RING-CKPT card={c.uuid} nvml{c.nvml_index} "
+                f"stage={c.stage_index} span1={c.span1_mib} MiB >= checkpoint "
+                f"weights {c.ckpt_weights_mib:.1f} MiB [{c.ckpt_terms}] "
+                f"+ residual {c.residual_mib:.1f} MiB ({c.residual_source}) "
+                f"-- L6's INDEPENDENT source: the safetensors headers of this "
+                f"boot's own checkpoint under this boot's own cut, which the "
+                f"census that sized the ring does not touch.  The predecessor "
+                f"compared the ring against that same census, so a stale table "
+                f"passed L6 at launch and the runtime contradicted it 110 s "
+                f"later inside the first sleep (boot weg2tr2, W31 'the launch "
+                f"check (L6) was violated')"
+            )
         return out
+
+    def ckpt_refusals(self) -> List[str]:
+        """Every card whose span1 is below the weight bytes its stage will load.
+
+        The check L6 could not make before, because it had only the census that
+        had sized the ring.  One-sided by construction -- the checkpoint states
+        weights and nothing else, so a violation is never a rounding argument.
+        """
+        bad = []
+        for c in self.cards:
+            if c.ckpt_weights_mib <= 0:
+                continue
+            if c.span1_mib < c.ckpt_weights_mib:
+                bad.append(
+                    f"RING UNDER-SIZED: span1 {c.span1_mib} MiB < checkpoint "
+                    f"weights {c.ckpt_weights_mib:.1f} MiB on card {c.uuid} "
+                    f"(nvml{c.nvml_index} {c.name}, PP stage {c.stage_index}): "
+                    f"{c.ckpt_terms}.  The ring cannot hold what this stage "
+                    f"loads, so its FIRST pause blocks and the group dies on the "
+                    f"acquire budget -- short by "
+                    f"{c.ckpt_weights_mib - c.span1_mib:.1f} MiB before a single "
+                    f"non-weight byte is charged"
+                )
+        return bad
 
     def refusals(self) -> List[str]:
         """Every violated R5 case, with its arithmetic.  Empty = the launch check passes."""
@@ -1099,12 +1529,40 @@ def solve(
     cards: Sequence,
     evidence_dir: str,
     boot_stem: Optional[str] = None,
+    p_argv: Optional[Sequence[str]] = None,
 ) -> Tuple[Optional[RingTable], str]:
     """Solve the table from the newest usable boot, or return (None, reason).
 
     ``cards`` is the launcher's ORDERED card list (ordinal 0 first): rank ``n``
     of either group runs on ``cards[n]``.
+
+    ``p_argv`` is THIS boot's group-P argv and it ARMS THE FORM GATE (W48).
+    With it, a source boot whose P form differs is never charged as a
+    measurement of this boot: its WEIGHT statement is replaced, per stage, by
+    this boot's own checkpoint arithmetic, and only its non-weight residual is
+    carried across with the form difference named.  Without it the gate is
+    disarmed and every line says so -- an unarmed gate must never read as a
+    passed one.  The launcher always passes it; the callers that do not are the
+    unit tests that are about some other property.
     """
+    my_key = my_form = ""
+    my_stage: Optional[List[StageWeights]] = None
+    my_stage_why = ""
+    if p_argv is not None:
+        my_key, my_form = p_form_key(p_argv)
+        my_stage, my_stage_why = stage_weights_from_argv(p_argv)
+        if my_stage is None:
+            # Refusing here rather than silently disarming: an argv this
+            # launcher BUILT that cannot be priced is a defect in this boot, and
+            # continuing would charge a predecessor's weights under the name of
+            # a gate that did not run.
+            raise Weg2RingFormMismatch(
+                "W48 Weg2RingFormMismatch: this boot's own group-P argv cannot "
+                f"be priced from the checkpoint -- {my_stage_why}.  The form "
+                "gate cannot be armed and the ring would be sized from a "
+                "predecessor's weight statement with no way to check it, which "
+                "is the weg2tr2 killer.  Refusing before either group starts."
+            )
     stems = _boot_stems(evidence_dir)
     if not stems:
         return None, f"no boot in {evidence_dir} carries all three of .front/.P/.D log"
@@ -1136,6 +1594,41 @@ def solve(
         if not gp.image or not gd.image:
             reasons.append(f"{stem}: no sleep-pass lines for {'P' if not gp.image else 'D'}")
             continue
+        # THE FORM GATE (W48), BEFORE any of this boot's bytes are charged.
+        src_key = ""
+        src_stage: Optional[List[StageWeights]] = None
+        form_same: Optional[bool] = None
+        form_diff = ""
+        if p_argv is not None:
+            src_argv, why = parse_p_form(f_log)
+            if src_argv is None:
+                reasons.append(
+                    f"{stem}: W48 Weg2RingFormMismatch -- {why}.  A boot whose "
+                    "group-P form cannot be established is never charged as a "
+                    "measurement of this one"
+                )
+                continue
+            src_key, src_form = p_form_key(src_argv)
+            form_same = src_key == my_key
+            if not form_same:
+                mine = set(my_form.split(" "))
+                theirs = set(src_form.split(" "))
+                only_mine = sorted(mine - theirs)
+                only_theirs = sorted(theirs - mine)
+                form_diff = (
+                    f"THIS boot's group P has {only_mine or 'nothing'} that the "
+                    f"source has not; the SOURCE has {only_theirs or 'nothing'} "
+                    f"that this boot has not (excluded from the key by name: "
+                    f"{', '.join(FORM_KEY_EXCLUDED_FLAGS)})"
+                )
+                src_stage, src_why = stage_weights_from_argv(src_argv)
+                if src_stage is None:
+                    reasons.append(
+                        f"{stem}: W48 Weg2RingFormMismatch -- its group-P form "
+                        f"{src_key} is not this boot's {my_key}, and its weight "
+                        f"statement cannot be replaced either: {src_why}"
+                    )
+                    continue
         corridor = parse_front_corridor(f_log)
         if "P" not in corridor or "D" not in corridor:
             reasons.append(f"{stem}: front carries no WEG2-CORRIDOR phase=P(awake)/D(awake) samples")
@@ -1217,6 +1710,10 @@ def solve(
             instrument=gd.instrument or gp.instrument,
             lines_read=gp.lines_read + gd.lines_read,
             image_source=f"P: {src_p} | D: {src_d}",
+            form_key=my_key,
+            source_form_key=src_key,
+            form_same=form_same,
+            form_diff=form_diff,
             bound_groups=tuple(
                 g for g, b in (("P", bound_p), ("D", bound_d)) if b
             ),
@@ -1229,8 +1726,15 @@ def solve(
         # mapped to a card by that boot's own map -- never by this boot's.
         free_d = {by_nvml[i]: v for i, v in corridor["D"].items() if i in by_nvml}
         free_p = {by_nvml[i]: v for i, v in corridor["P"].items() if i in by_nvml}
-        for card in cards:
+        # THE SOURCE BOOT'S OWN STAGE MAP, by UUID, never by this boot's
+        # positions: ``cards`` is ordinal-ordered and rank n runs on cards[n],
+        # so ordinal IS the PP stage -- read out of the SOURCE boot's own
+        # 'NVML -> CUDA ordinal map' line, which is the same authority FIX 2
+        # already uses for every other cross-boot pairing.
+        src_stage_by_uuid = {u: ordinal for ordinal, u in by_ordinal.items()}
+        for stage_index, card in enumerate(cards):
             cr = CardRing(uuid=card.uuid, nvml_index=card.nvml_index, name=card.name)
+            cr.stage_index = stage_index
             cr.tags_p_mib = int(pairs["image_p"].get(card.uuid, 0))
             cr.tags_d_mib = int(pairs["image_d"].get(card.uuid, 0))
             cr.dormant_p_mib = int(pairs["dorm_p"].get(card.uuid, 0))
@@ -1249,6 +1753,71 @@ def solve(
             cr.image_d_mib = max(cr.tags_d_mib, cr.dormant_d_mib)
             cr.max_tag_p_mib = int(pairs["maxtag_p"].get(card.uuid, 0))
             cr.max_tag_d_mib = int(pairs["maxtag_d"].get(card.uuid, 0))
+            # ---- THE INDEPENDENT SOURCE, and the re-pricing it licenses -----
+            # ``image_P`` above is a MEASUREMENT OF THE SOURCE BOOT.  It is a
+            # measurement of THIS boot only while the two forms are equal, and
+            # weg2tr2 is what treating them as equal costs.  So the image is
+            # decomposed against the checkpoint:
+            #
+            #   image_P(c) = weights_ckpt(stage(c), FORM) + residual(c)
+            #
+            # ``weights_ckpt`` comes from the safetensors headers and the cut
+            # named ON THE ARGV -- each boot's own.  ``residual`` is everything
+            # a checkpoint cannot state (spec intermediates, workspaces, pools,
+            # allocator rounding) and is the ONLY term carried across a form
+            # change.  Same form: the two reconstruct the measurement exactly
+            # and the max is the measurement, so nothing regresses.  Different
+            # form: the weight half is THIS boot's, which is precisely the
+            # +4043 MiB MTP head that rg6 could not have known about.
+            if my_stage is not None:
+                mine = my_stage[stage_index] if stage_index < len(my_stage) else None
+                src_i = src_stage_by_uuid.get(card.uuid, stage_index)
+                base = src_stage if src_stage is not None else my_stage
+                theirs = base[src_i] if src_i < len(base) else None
+                if mine is not None and theirs is not None:
+                    cr.ckpt_weights_mib = mine.total_mib
+                    cr.ckpt_terms = mine.terms()
+                    cr.residual_mib = max(0.0, cr.image_p_mib - theirs.total_mib)
+                    derived = mine.total_mib + cr.residual_mib
+                    if form_same is False:
+                        cr.residual_source = (
+                            f"boot {stem} stage {src_i}, measured image "
+                            f"{cr.image_p_mib} MiB minus ITS OWN checkpoint "
+                            f"weights {theirs.total_mib:.1f} MiB -- CARRIED "
+                            f"ACROSS A FORM CHANGE, so it is the only term of "
+                            f"that boot still charged here; its weight "
+                            f"statement is DISCARDED (W48)"
+                        )
+                        # The measured value is NOT max()'d in: it prices a
+                        # different form and taking the larger of the two would
+                        # re-admit exactly the number the gate just refused.
+                        cr.image_p_mib = int(math.ceil(derived))
+                        # max_tag is likewise a statement about the source form,
+                        # and the drafter's bytes join THE TAG THAT IS ALREADY
+                        # THE LARGEST -- read out of the tagging scheme, not
+                        # assumed as a worst case.  weg2_memory_saver's base tag
+                        # GPU_MEMORY_TYPE_WEIGHTS is documented at its own
+                        # definition as "everything outside a layer (embeddings,
+                        # head, norms, THE NEXTN DRAFT, rotary caches)", and on
+                        # the last PP stage that base tag is already the maximum
+                        # because it carries lm_head: rg6's stage 2 measured
+                        # max_tag 2916 MiB against an lm_head of 2425 MiB.  The
+                        # metal agrees -- weg2tr2's own W31 line names
+                        # ``tag=weights``, the base tag, as the one that could
+                        # not be funded.  So the delta ADDS to the maximum
+                        # rather than competing with it.
+                        delta = max(0.0, mine.total_mib - theirs.total_mib)
+                        if delta > 0:
+                            cr.max_tag_p_mib = int(
+                                math.ceil(cr.max_tag_p_mib + delta)
+                            )
+                    else:
+                        cr.residual_source = (
+                            f"boot {stem} stage {src_i}, SAME FORM ({my_key}): "
+                            f"measured image {cr.image_p_mib} MiB minus "
+                            f"checkpoint weights {theirs.total_mib:.1f} MiB"
+                        )
+                        cr.image_p_mib = max(cr.image_p_mib, int(math.ceil(derived)))
             # credit(S->W) = NVML free while S is awake + the kv bytes S releases.
             cr.credit_d2p_mib = int(free_d.get(card.uuid, 0)) + int(pairs["kv_d"].get(card.uuid, 0))
             cr.credit_p2d_mib = int(free_p.get(card.uuid, 0)) + int(pairs["kv_p"].get(card.uuid, 0))

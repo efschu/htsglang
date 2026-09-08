@@ -229,6 +229,21 @@ P_OVERSHOOT_MIB = [920, 0, 512]
 D_OVERSHOOT_MIB = [489, 0, 0]
 D_WINDOWS_MIB = 16 + 32 + 24
 P_WINDOWS_MIB = 24 + 96
+#: TRAIN FIX 5.  The group-P FORM KEY has to be computed BEFORE the host ring,
+#: because the ring is sized for the form that will run -- and the host-ledger
+#: arm (S, M, store) is priced FROM the ring, so it does not exist yet.  These
+#: four sentinels stand in its place while the form argv is assembled.  They are
+#: SAFE ONLY BECAUSE every flag they reach is in
+#: ``ring_table.FORM_KEY_EXCLUDED_FLAGS`` and is dropped before the hash, and
+#: that is not left as a claim: the key is re-derived from the REAL argv once the
+#: arm exists and any difference is a named refusal (W48). Values are
+#: deliberately impossible ones, so a sentinel that ever escaped into a real
+#: flag would be loud rather than plausible.
+RING_FORM_SENTINEL_S_GB = -1
+RING_FORM_SENTINEL_M_MIB = -1
+RING_FORM_SENTINEL_STORE_GIB = -1.0
+RING_FORM_SENTINEL_DEPTH = -1
+
 MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
 #: #1233 draft KV across the flip (spec section 6, Q17): group P's token
 #: capacity is EXPLICIT, never left to the profiler, because the last stage
@@ -1753,7 +1768,8 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
                       evidence_dir: str, boot_stem: str, dry: bool,
                       leg_form: str = "", pcie_directional: Optional[bool] = None,
                       duplex_probe: str = "", tree: str = "",
-                      py: str = "") -> HostRingPlan:
+                      py: str = "",
+                      p_argv: Optional[Sequence[str]] = None) -> HostRingPlan:
     """C20 + C18: solve the table, print L6, REFUSE by name, then arm the region.
 
     Order is load-bearing: the inequalities are checked and the per-card files
@@ -1796,7 +1812,7 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     for ln in plan.lines:
         log(ln)
     logged = len(plan.lines)
-    table, reason = ring_table.solve(cards, evidence_dir, boot_stem or None)
+    table, reason = ring_table.solve(cards, evidence_dir, boot_stem or None, p_argv=p_argv)
     if table is None:
         plan.lines.append(
             "WEG2-HOST-RING R22: no measured per-card byte table -- " + reason +
@@ -1848,6 +1864,21 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     # W32 is spec R5's corridor inequality -- the one that makes a blocking ring
     # deadlock-free when the legs are GATHERED (spec C9).  It is checked always.
     checks = [
+        # L6 AGAINST AN INDEPENDENT SOURCE (train fix 5).  Listed FIRST because
+        # it is the only one of the three that does not read the census that
+        # sized the ring: it compares span1 against the weight bytes the
+        # checkpoint says this boot's stages will load.  boot weg2tr2 passed
+        # every check below it and then died at its first sleep with the runtime
+        # saying "the launch check (L6) was violated" -- because L6 was checking
+        # a premise against itself.  A stale table now stops here, by name,
+        # before either group starts.
+        ("W49 Weg2RingWeightsUnderSized",
+         "span1 is below the checkpoint's own weight bytes for that PP stage on "
+         "{n} card(s) -- the ring cannot hold what the stage loads, so its FIRST "
+         "pause blocks and the group dies on the acquire budget, which is boot "
+         "weg2tr2 exactly",
+         table.ckpt_refusals(),
+         ring_table.Weg2RingWeightsUnderSized),
         ("W32 Weg2RingCreditRefused",
          "the R5 corridor inequality (H(c) >= image_W(c) - device_credit(c) + "
          "max_tag_S(c) + max_tag_W(c), spec C20) fails on {n} (card x direction) "
@@ -4214,12 +4245,76 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.weight_chunks = chunk_count
     state.tms_so = tms_so
 
+    # 1b-. TRAIN FIX 5: THE BUDGET AND CUT SOLVE MOVED IN FRONT OF THE RING.
+    # The ring must be sized for the form group P will actually run, and the CUT
+    # IS PART OF THAT FORM -- a boot whose stages carry different layers parks
+    # different bytes per card.  While the cut was solved after the ring, the
+    # ring could only ever be sized from a PREDECESSOR's form, which is boot
+    # weg2tr2's killer: rg6's group P carried no MTP head, tr2's carries one on
+    # its last stage, and PP2 asked for 2426 MiB with 204 free.  Nothing in this
+    # block reads the host-ledger arm or the store (see the chunk-size
+    # re-check under "4. group P", which proves that rather than asserting it),
+    # so the move is sound; ``env_p`` stays behind because it does need the ring.
+    slack_mib = reserve_slack_mib(ns.transport)
+    dc_expect_d = {
+        c.uuid: (DC_MEASURED_D_5090_MIB if "5090" in c.name else DC_MEASURED_D_3080_MIB) + slack_mib
+        for c in cards
+    }
+    if ns.transport == "nccl":
+        log(
+            f"TRANSPORT=nccl (development mode, user order 2026-09-07): barlink flags dropped from both groups; "
+            f"group D's dormant-residue slack raised {DC_RESERVE_SLACK_MIB} -> {slack_mib} MiB because libnccl's buffers "
+            f"are not memory-saver-tagged and survive the sleep (MEASURED 2230 -> 2310 MiB on the 5090, boot weg2ab0 ARM 0, "
+            f"where the unchanged 2228+64 reserve tripped W19 DormantResidueRefused). Under --transport bar1 this number "
+            f"and the whole flip path are untouched."
+        )
+    state.dc_expect_d = dc_expect_d
+    log("dormant residue RESERVE for group D = MEASURED D_c(D) of boot weg2ls1b2 (2228 / 1922 / 1922 MiB, "
+        f"NVML per-process, windows included) + {slack_mib} MiB slack; spec 1.6 expectation was "
+        f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); graded by W19 at D's first sleep: "
+        + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
+    budgets_p = budgets_from_dc(
+        cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls2b2"
+    )
+    state.budgets["P"] = budgets_p
+    chunk_tokens = chunked_prefill_size_of(
+        common_flags(ns.model, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
+                     RING_FORM_SENTINEL_STORE_GIB, max_kv_per_request, ns.p_hicache_write_policy)
+    )
+    cut = solve_p_cut(ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens)
+    stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
+
+    # 1b'. THE FORM KEY (W48).  The argv group P will run, built with SENTINEL
+    # host-ledger terms because the ledger is priced FROM the ring and cannot
+    # exist yet -- and those three flags are excluded from the key BY NAME
+    # (ring_table.FORM_KEY_EXCLUDED_FLAGS), so the sentinel cannot reach the
+    # hash.  Re-derived from the REAL argv further down and refused on any
+    # difference, so the exclusion is proven on every boot, not trusted.
+    form_argv_p = argv_p(
+        py, ns.model, budgets_p, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
+        RING_FORM_SENTINEL_STORE_GIB, shlex.split(ns.extra_p), p_bs, max_kv_per_request,
+        stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy,
+        RING_FORM_SENTINEL_DEPTH,
+    )
+    form_key, form_norm = ring_table.p_form_key(form_argv_p)
+    log(
+        f"WEG2-P-FORM key={form_key} -- the identity of what group P LOADS, "
+        f"hashed over its own argv with these flags excluded by name: "
+        f"{', '.join(ring_table.FORM_KEY_EXCLUDED_FLAGS)} "
+        f"(policy={ring_table.FORM_KEY_POLICY}: everything else is IN, because a "
+        f"whitelist stops discriminating the day a new form-changing flag is "
+        f"added -- nobody would have thought to whitelist "
+        f"--speculative-draft-kv-only, and that is the flag family boot weg2tr2 "
+        f"died of). A ring table solved from a boot of another form is never "
+        f"MEASURED for this one. FORM: {form_norm}"
+    )
+
     # 1b. C20: the R5 corridor inequality per card per direction, and C18: the
     # per-card region, both BEFORE either group starts.  The table it is solved
     # from also carries the ledger's host weights term, so this runs first.
     ring_plan = prepare_host_ring(cards, log, ns.tag, ns.ring_form, ns.evidence_dir,
                                   ns.ring_table_boot, dry, duplex_probe=ns.duplex_probe,
-                                  tree=tree, py=py)
+                                  tree=tree, py=py, p_argv=form_argv_p)
     state.ring_lines = ring_plan.lines
     state.ring_epoch = str(ring_plan.epoch)
     # A1-3: an un-armed ring has no fallback form to name.  The predecessor
@@ -4258,39 +4353,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         os.makedirs(store_dir, exist_ok=True)
 
     # 4. group P
-    slack_mib = reserve_slack_mib(ns.transport)
-    dc_expect_d = {
-        c.uuid: (DC_MEASURED_D_5090_MIB if "5090" in c.name else DC_MEASURED_D_3080_MIB) + slack_mib
-        for c in cards
-    }
-    if ns.transport == "nccl":
-        log(
-            f"TRANSPORT=nccl (development mode, user order 2026-09-07): barlink flags dropped from both groups; "
-            f"group D's dormant-residue slack raised {DC_RESERVE_SLACK_MIB} -> {slack_mib} MiB because libnccl's buffers "
-            f"are not memory-saver-tagged and survive the sleep (MEASURED 2230 -> 2310 MiB on the 5090, boot weg2ab0 ARM 0, "
-            f"where the unchanged 2228+64 reserve tripped W19 DormantResidueRefused). Under --transport bar1 this number "
-            f"and the whole flip path are untouched."
-        )
-    state.dc_expect_d = dc_expect_d
-    log("dormant residue RESERVE for group D = MEASURED D_c(D) of boot weg2ls1b2 (2228 / 1922 / 1922 MiB, "
-        f"NVML per-process, windows included) + {slack_mib} MiB slack; spec 1.6 expectation was "
-        f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); graded by W19 at D's first sleep: "
-        + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
-    budgets_p = budgets_from_dc(
-        cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls2b2"
-    )
-    state.budgets["P"] = budgets_p
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
     # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
     # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
-    chunk_tokens = chunked_prefill_size_of(
+    # TRAIN FIX 5: the chunk size the cut solver was given BEFORE the ring is
+    # re-read here against the arm this boot actually chose.  The hoist above
+    # rests on --chunked-prefill-size being a CONSTANT of common_flags rather
+    # than a function of the ledger arm; this line proves that premise on every
+    # boot instead of assuming it, and a divergence is named rather than
+    # silently shipping a cut solved for a chunk size the argv does not carry.
+    chunk_tokens_armed = chunked_prefill_size_of(
         common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, max_kv_per_request, ns.p_hicache_write_policy)
     )
-    cut = solve_p_cut(ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens)
-    stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
+    if chunk_tokens_armed != chunk_tokens:
+        raise Weg2LaunchRefused(
+            f"W40 Weg2PPCutRefused: the PP cut was solved for "
+            f"--chunked-prefill-size {chunk_tokens}, read before the host-ledger "
+            f"arm existed, but the argv this boot ships carries "
+            f"{chunk_tokens_armed}. The cut solve has to run BEFORE the ring "
+            f"(the ring must be sized for the form that ships, and the cut is "
+            f"part of that form), which is sound only while the chunk size does "
+            f"not depend on the arm. It now does. Refusing rather than shipping "
+            f"a cut solved against the wrong chunk."
+        )
     # #1254 W46: THE MAP AND THE ARGV MUST BE THE SAME SPLIT.  The WEG2-FLIP-
     # ORDER MAP above is derived from the incumbent score constants
     # (p_stage_layers); argv_p ships whatever solve_p_cut returned.  While the
@@ -4417,7 +4505,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
             f"arm exists to, and changes nothing else). Group D is unchanged."
         )
-    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth), ns.transport), state.logs["P"], env_p)
+    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth)
+    # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
+    # gated the ring table was hashed over an argv built with sentinel ledger
+    # terms, which is sound only while every flag those sentinels reach is
+    # excluded from the key by name.  Here the REAL argv exists, so the key is
+    # re-derived from it and any difference is a refusal -- the alternative is a
+    # ring gated on a form that is not the one launched, which is a subtler
+    # version of the very defect this gate exists to catch.
+    shipped_key, shipped_norm = ring_table.p_form_key(shipped_argv_p)
+    if shipped_key != form_key:
+        mine, theirs = set(shipped_norm.split(" ")), set(form_norm.split(" "))
+        raise ring_table.Weg2RingFormMismatch(
+            f"W48 Weg2RingFormMismatch: the host ring was gated on group-P form "
+            f"key {form_key}, but the argv this boot ships hashes to "
+            f"{shipped_key}. The gate ran against a form that is not the one "
+            f"being launched, so the ring's size is not a statement about this "
+            f"boot. Shipped-only: {sorted(mine - theirs)}; gated-only: "
+            f"{sorted(theirs - mine)}. Either a flag reached by the sentinel "
+            f"ledger terms is NOT in ring_table.FORM_KEY_EXCLUDED_FLAGS "
+            f"({', '.join(ring_table.FORM_KEY_EXCLUDED_FLAGS)}), or a "
+            f"form-changing flag is added to argv_p after the ring is armed. "
+            f"Refusing before either group starts."
+        )
+    log(f"WEG2-P-FORM CONFIRMED key={shipped_key} on the argv actually shipped "
+        f"(the ring was gated on this same key before the host-ledger arm "
+        f"existed; the sentinel terms are proven inert, not assumed to be)")
+    spec_p = GroupSpec("P", PORT_P, transport_argv(shipped_argv_p, ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     log(w38_armed_line(spec_p.argv))
     state.deviations = [
