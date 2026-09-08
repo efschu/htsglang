@@ -164,17 +164,45 @@ class Qwen3_5MtpLmHeadDeferred(nn.Module):
         )
 
 
-def build_mtp_lm_head(config, quant_config, prefix: str):
-    """The MTP head's output table, or the deferred placeholder (#1259 b).
+def mtp_builds_own_lm_head(head_from_target: bool, tie_word_embeddings: bool) -> bool:
+    """Does a ``Qwen3_5ForCausalLMMTP`` allocate its OWN ``[vocab, hidden]``
+    output table?  Pure, and THE one statement of that decision.
+
+    #1261 / train 2.  There are two callers and they run in different
+    PROCESSES, which is exactly why this is a function and not an ``if`` in
+    each of them:
+
+    * :func:`build_mtp_lm_head`, inside the producer rank, deciding what to
+      allocate;
+    * ``weg2.ring_table.checkpoint_stage_weights``, inside the LAUNCHER,
+      deciding how many bytes the host ring must park for that stage.
+
+    Boot weg2tr2 died of those two disagreeing in the other direction (the
+    ring was sized from a predecessor whose group P carried no MTP head at
+    all).  Sizing the ring for a table this predicate says is never built is
+    the same defect with the sign flipped: the ring would carry 2425 MiB of
+    ballast per boot and the credit inequality would refuse a form that fits.
+    A boot where the head IS built -- group D's NEXTN drafter, a standalone
+    MTP boot, any caller that never enters :func:`lm_head_from_target` -- must
+    still be priced for it, and is, because the SAME function answers both.
 
     ``tie_word_embeddings`` is NOT deferrable: there the head IS this module's
     own resident embedding, no second table is ever built, and returning a
-    placeholder would hand the caller a head it must not replace. The caller
-    handles the tie case before reaching here; this guard is the second half
-    of that contract and keeps the decision readable at the branch itself.
+    placeholder would hand the caller a head it must not replace.  It is a
+    parameter rather than a config read so the launcher can answer from the
+    checkpoint's ``config.json`` without constructing anything.
     """
-    if _LM_HEAD_FROM_TARGET.get() and not getattr(
-        config, "tie_word_embeddings", False
+    return not (bool(head_from_target) and not bool(tie_word_embeddings))
+
+
+def build_mtp_lm_head(config, quant_config, prefix: str):
+    """The MTP head's output table, or the deferred placeholder (#1259 b).
+
+    The branch itself is :func:`mtp_builds_own_lm_head` -- see there for why
+    the decision is a named function and not an ``if`` written twice.
+    """
+    if not mtp_builds_own_lm_head(
+        _LM_HEAD_FROM_TARGET.get(), getattr(config, "tie_word_embeddings", False)
     ):
         return Qwen3_5MtpLmHeadDeferred()
     return ParallelLMHead(

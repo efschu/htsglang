@@ -585,11 +585,34 @@ class StageWeights:
 DRAFTER_ONLY_REPLICATED_KEYS = ("mtp",)
 
 
+def _tie_word_embeddings(model_path: str) -> bool:
+    """``tie_word_embeddings`` off the checkpoint's own ``config.json``.
+
+    Read where the model runner reads it -- ``text_config`` first, because a
+    multimodal checkpoint states the language model's flag there and the top
+    level carries the wrapper's.  Absent means False, which is this
+    checkpoint's value and also the conservative direction for the ring: a
+    False answer keeps the head PRICED, and a ring sized for bytes that turn
+    out not to exist refuses nothing, while the reverse under-sizes it.
+    """
+    import json
+    import os
+
+    try:
+        with open(os.path.join(model_path, "config.json")) as fh:
+            cfg = json.load(fh)
+    except OSError:
+        return False
+    text = cfg.get("text_config") or cfg
+    return bool(text.get("tie_word_embeddings", cfg.get("tie_word_embeddings", False)))
+
+
 def checkpoint_stage_weights(
     model_path: str,
     layer_split: Sequence[int],
     attn_split: Sequence[int],
     carries_drafter: bool,
+    drafter_head_from_target: bool = False,
 ) -> List[StageWeights]:
     """Per-PP-stage weight MiB from the safetensors HEADERS and the shipped cut.
 
@@ -599,14 +622,29 @@ def checkpoint_stage_weights(
     what lets it re-price the weight half of a foreign-form table (W48).
 
     ``carries_drafter`` puts the speculative head on the LAST stage.  Its bytes
-    are the ``mtp.*`` tensors PLUS a second embedding and lm_head, because the
-    NEXTN head is loaded as its OWN model runner and materialises them again --
-    MEASURED, not assumed: boot weg2tr2's PP2 log carries a second ``Load weight
-    end ... type=Qwen3_5ForCausalLMMTP`` whose ``avail mem`` falls 10.88 -> 6.88
-    (4.00 units) against a checkpoint sum of 405.17 + 1212.97 + 2425.00 =
-    4043.14 MiB.  This is the term the rg6-derived ring did not price and the
-    term PP2 died of.
+    are the ``mtp.*`` tensors PLUS a second embedding, and PLUS a second
+    lm_head ONLY WHERE ONE IS ACTUALLY BUILT, because the NEXTN head is loaded
+    as its own model runner and materialises them again -- MEASURED, not
+    assumed: boot weg2tr2's PP2 log carries a second ``Load weight end ...
+    type=Qwen3_5ForCausalLMMTP`` whose ``avail mem`` falls 10.88 -> 6.88 (4.00
+    units) against a checkpoint sum of 405.17 + 1212.97 + 2425.00 = 4043.14
+    MiB.  This is the term the rg6-derived ring did not price and the term PP2
+    died of.
+
+    ``drafter_head_from_target`` (train 2, #1259 b x #1261) is the OTHER half
+    of that measurement, and it is why this parameter exists rather than a
+    constant 4043.14: on a producer that builds the head inside
+    ``qwen3_5_mtp.lm_head_from_target()`` -- which is every group P launched
+    with ``--speculative-draft-kv-only`` -- the head's own ``[vocab, hidden]``
+    table is NEVER ALLOCATED; it shares the co-located target's.  Sizing the
+    ring for a table that is never built is the weg2tr2 defect with the sign
+    flipped: 2425 MiB of ballast per boot, and a credit inequality that refuses
+    a form which fits.  The decision is NOT restated here -- it is
+    :func:`sglang.srt.models.qwen3_5_mtp.mtp_builds_own_lm_head`, the same
+    function ``build_mtp_lm_head`` branches on inside the producer rank, so the
+    launcher and the process it launches cannot disagree.
     """
+    from sglang.srt.models.qwen3_5_mtp import mtp_builds_own_lm_head
     from sglang.srt.planner import pp_cut as _pp_cut
 
     terms = _pp_cut.checkpoint_weight_terms(model_path)
@@ -626,6 +664,12 @@ def checkpoint_stage_weights(
     embed = terms.embedding_weight_bytes / MIB
     head = terms.lm_head_weight_bytes / MIB
     mtp = drafter_only / MIB
+    # THE ONE PREDICATE, asked here exactly as the producer asks it.  ``tie``
+    # comes off the checkpoint's own config, which is what the model runner in
+    # that process will read too -- no second source, and no assumption that
+    # this rig's checkpoint is untied.
+    tie = _tie_word_embeddings(model_path)
+    drafter_head = head if mtp_builds_own_lm_head(drafter_head_from_target, tie) else 0.0
     last = len(layer_split) - 1
     out: List[StageWeights] = []
     for s, (n_layers, n_attn) in enumerate(zip(layer_split, attn_split)):
@@ -646,10 +690,20 @@ def checkpoint_stage_weights(
                 replicated_mib=per_stage_replicated,
                 embedding_mib=embed if s == 0 else 0.0,
                 lm_head_mib=head if s == last else 0.0,
-                drafter_mib=(mtp + embed + head) if (carries_drafter and s == last) else 0.0,
+                drafter_mib=(mtp + embed + drafter_head) if (carries_drafter and s == last) else 0.0,
                 drafter_terms=(
                     f"mtp {mtp:.1f} + its own embedding {embed:.1f} + its own "
-                    f"lm_head {head:.1f}; a NEXTN head is a second model runner"
+                    f"lm_head {drafter_head:.1f}"
+                    + (
+                        ""
+                        if drafter_head
+                        else f" (NOT BUILT: the producer builds this head under "
+                             f"qwen3_5_mtp.lm_head_from_target() and shares the "
+                             f"co-located target's table, so the {head:.1f} MiB "
+                             f"the drafter would otherwise allocate is never "
+                             f"allocated -- #1259 b, mtp_builds_own_lm_head)"
+                    )
+                    + "; a NEXTN head is a second model runner"
                     if (carries_drafter and s == last)
                     else ""
                 ),
@@ -693,8 +747,21 @@ def stage_weights_from_argv(argv: Sequence[str]) -> Tuple[Optional[List[StageWei
     except ValueError as exc:
         return None, f"its cut flags do not parse as integer lists: {exc}"
     carries = any(str(t).startswith("--speculative-") for t in argv)
+    # #1259 b x #1261: DOES THAT DRAFTER BUILD ITS OWN OUTPUT TABLE?  The flag
+    # is the same one the scheduler gates the producer on
+    # (scheduler.py: `if not server_args.speculative_draft_kv_only: return`
+    # before `DraftKvProducer(...)`), and DraftKvProducer.__init__ builds the
+    # EagleDraftWorker inside `qwen3_5_mtp.lm_head_from_target()` --
+    # unconditionally, so the flag's presence in group P's argv IS the scope
+    # being active for that boot.  Read off the argv rather than assumed,
+    # because a group D drafter carries --speculative-algorithm WITHOUT this
+    # flag and must still be priced for its own head.
+    head_from_target = "--speculative-draft-kv-only" in [str(t) for t in argv]
     try:
-        return checkpoint_stage_weights(model, layer_split, attn_split, carries), ""
+        return checkpoint_stage_weights(
+            model, layer_split, attn_split, carries,
+            drafter_head_from_target=head_from_target,
+        ), ""
     except (Weg2RingFormMismatch, OSError, Exception) as exc:  # noqa: BLE001
         return None, f"the checkpoint terms of {model!r} could not be read: {exc}"
 
