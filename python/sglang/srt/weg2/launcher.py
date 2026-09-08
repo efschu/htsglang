@@ -2756,13 +2756,38 @@ def budgets_from_dc(
     return out
 
 
-def _max_running_requests(model: str) -> int:
-    """``--max-running-requests`` as this launcher actually passes it."""
-    flags = common_flags(model, 1, 1, 1.0)
+def _max_running_requests(model: str, group: str = "D", bs: int = 8) -> int:
+    """``--max-running-requests`` as this launcher actually passes it, per GROUP.
+
+    PRE-EXISTING BOOT KILLER, found by this slice's own --dry-run and fixed
+    here rather than left for the next window (it is two frames below
+    ``solve_p_cut``, so no boot from the merge-train tip reached group P's
+    launch). It read the flag out of ``common_flags``, and the flag LEFT
+    ``common_flags`` when C1/R-12 made P's and D's bs independent -- so this
+    reader was wrong twice over, and both raise rather than answer:
+
+      * ``common_flags(model, 1, 1, 1.0)`` is missing ``max_kv_per_request``
+        (TypeError), because a fifth required parameter was added ahead of it;
+      * even given the arguments, ``flags.index("--max-running-requests")``
+        raises ValueError, because common_flags' own docstring says the flag is
+        "NOT here any more ... emitted per group from --p-bs / --d-bs instead".
+
+    THE CLASS, so the sweep is on the record: a flag MOVED and one consumer was
+    not moved with it. The fix keeps the property the original was reaching for
+    -- the number is READ OFF THE ARGV this launcher builds, never restated --
+    by reading it off the GROUP's argv, which is where the flag now lives. The
+    two callers ask about different groups and now say which: the P pool
+    model's mamba slots are P's ``--p-bs``, and D's ping-pong price is D's
+    ``--d-bs``. Sharing one value was the very coupling C1/R-12 removed.
+    """
+    if str(group) == "P":
+        flags = argv_p("py", model, [1, 1, 1], 1, 1, 1.0, [], p_bs=int(bs))
+    else:
+        flags = argv_d("py", model, [1, 1, 1], 1, 1, 1.0, [], d_bs=int(bs))
     return int(flags[flags.index("--max-running-requests") + 1])
 
 
-def d_mamba_ping_pong_cost(model: str, disable_overlap: bool) -> Tuple[str, int, int, int]:
+def d_mamba_ping_pong_cost(model: str, disable_overlap: bool, d_bs: int = 8) -> Tuple[str, int, int, int]:
     """What D's overlap choice costs in DEVICE mamba state slots (FIX 1r/1).
 
     Returns ``(strategy, ping_pong_slots_per_running_request, extra_slots_per
@@ -2794,7 +2819,10 @@ def d_mamba_ping_pong_cost(model: str, disable_overlap: bool) -> Tuple[str, int,
     from sglang.srt.mem_cache.mamba_pool_floor import mamba_ping_pong_slots
     from sglang.srt.server_args import ServerArgs
 
-    flags = common_flags(model, 1, 1, 1.0)
+    # Group D's own argv, for the same reason and with the same defect history
+    # as _max_running_requests above: this list is read for the presence of a
+    # flag, so it must be the list the group actually gets.
+    flags = argv_d("py", model, [1, 1, 1], 1, 1, 1.0, [], d_bs=int(d_bs))
 
     class _StrategyView:
         """Exactly the ServerArgs surface ``mamba_ping_pong_slots`` reads."""
@@ -2815,11 +2843,11 @@ def d_mamba_ping_pong_cost(model: str, disable_overlap: bool) -> Tuple[str, int,
     # The arm this replaces: group D as it booted before the overlap schedule
     # was turned on, i.e. the arm every DC_MEASURED_D_* number was taken on.
     baseline = mamba_ping_pong_slots(_StrategyView("no_buffer", True))
-    mrr = _max_running_requests(model)
+    mrr = _max_running_requests(model, "D", d_bs)
     return strategy, per_req, (per_req - baseline) * mrr, mrr
 
 
-def d_overlap_cost_line(model: str, disable_overlap: bool) -> str:
+def d_overlap_cost_line(model: str, disable_overlap: bool, d_bs: int = 8) -> str:
     """The one line that must appear wherever D's overlap choice is announced.
 
     The launcher must not be able to change D's device residency without the
@@ -2827,7 +2855,7 @@ def d_overlap_cost_line(model: str, disable_overlap: bool) -> str:
     :func:`d_mamba_ping_pong_cost` rather than typed, and the MiB conversion
     it does NOT make is named rather than left as a silent omission.
     """
-    strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(model, disable_overlap)
+    strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(model, disable_overlap, d_bs)
     baseline_per_req = per_req - (extra // max(1, mrr))
     return (
         f"DEVICE PRICE OF THAT CHOICE: --mamba-radix-cache-strategy "
@@ -4026,7 +4054,8 @@ def solve_p_cut(
         # Read off the argv this launcher builds rather than restated: a
         # second copy of --max-running-requests would drift the day the flag
         # moves, and the mamba residency scales linearly with it.
-        mamba_slots=_max_running_requests(model),
+        # P's OWN bs (C1/R-12): this is P's pool model.
+        mamba_slots=_max_running_requests(model, "P", int(getattr(ns, "p_bs", 8) or 8)),
     )
     families = tuple(
         _pp_cut.LAYER_FAMILY_ATTENTION
@@ -4974,7 +5003,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "so group D keeps --disable-overlap-schedule. The gate that "
             "refused must be named in this boot's record; the flag is not a "
             "tuning knob and no server_args gate is to be weakened to avoid it. "
-            + d_overlap_cost_line(ns.model, True)
+            + d_overlap_cost_line(ns.model, True, d_bs)
         )
     else:
         log(
@@ -4988,7 +5017,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"on D (default {D_NUM_CONTINUOUS_DECODE_STEPS}). "
             + D_DECODE_STEPS_PROVENANCE
             + " "
-            + d_overlap_cost_line(ns.model, False)
+            + d_overlap_cost_line(ns.model, False, d_bs)
         )
     if ns.p_hicache_write_policy != "write_through":
         log(

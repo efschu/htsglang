@@ -384,3 +384,46 @@ class TestLiteralsAndEnvGates1235(unittest.TestCase):
             _flag_value(d, "--barlink-bar1-window-mib"), "16,TP_0=32,DCP_0=40"
         )
         self.assertEqual(_flag_value(d, "--barlink-uncovered-class"), "refuse")
+
+
+class TestMaxRunningRequestsReader(unittest.TestCase):
+    """A pre-existing boot killer on the merge-train tip, found by --dry-run.
+
+    ``_max_running_requests`` read ``--max-running-requests`` out of
+    ``common_flags``. The flag LEFT common_flags when C1/R-12 made P's and D's
+    bs independent, and a fifth required parameter was later added ahead of the
+    ones it passed -- so the reader raised TypeError, two frames below
+    ``solve_p_cut`` and ``d_overlap_cost_line``, i.e. on every boot from that
+    tip before group P ever launched. The class is: a flag MOVED and one
+    consumer did not move with it.
+    """
+
+    def test_it_answers_per_group_off_that_group_s_own_argv(self):
+        from sglang.srt.weg2.launcher import _max_running_requests
+
+        self.assertEqual(_max_running_requests(MODEL, "P", 8), 8)
+        self.assertEqual(_max_running_requests(MODEL, "D", 6), 6)
+        # independent by construction -- sharing one value is the coupling
+        # C1/R-12 removed, so the two groups must be able to disagree.
+        self.assertNotEqual(
+            _max_running_requests(MODEL, "P", 8), _max_running_requests(MODEL, "D", 6)
+        )
+
+    def test_the_price_line_that_used_to_raise_now_renders(self):
+        from sglang.srt.weg2.launcher import d_overlap_cost_line
+
+        line = d_overlap_cost_line(MODEL, False, 6)
+        self.assertIn("extra_buffer", line)
+        self.assertIn("--max-running-requests 6", line)
+
+    def test_no_consumer_still_indexes_a_common_flags_list(self):
+        # the sibling sweep, as a check rather than as prose: common_flags is
+        # read for --chunked-prefill-size (still there) and for nothing else.
+        import inspect
+
+        from sglang.srt.weg2 import launcher as L
+
+        src = inspect.getsource(L)
+        for line in src.splitlines():
+            if "common_flags(" in line and "def common_flags" not in line:
+                self.assertNotIn("--max-running-requests", line)
