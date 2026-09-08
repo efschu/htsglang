@@ -107,6 +107,15 @@ def _producer_child(path: str, pair: int, slot: int, nbytes: int, publish: bool)
         time.sleep(0.05)
 
 
+def _register_child(path: str, row: int, start) -> None:
+    region = xr.XchgRegion.open(path)
+    try:
+        start.wait(30)
+        region.mark_registered(row)
+    finally:
+        region.close()
+
+
 def _rank_child(path: str, row: int, out_path: str, waves: int) -> None:
     """One rank of the six-rank double: Gate 0, then ``waves`` wave gates."""
     lines = []
@@ -462,6 +471,50 @@ def test_region_layout_is_disjoint_and_the_line_prints_its_denominator(tmp_path)
         region.mark_registered(0)  # idempotent: a bitmap, not a counter
         assert "registered=6/6" in xr.region_line(region, sems=24)
     finally:
+        region.close()
+
+
+def test_mark_registered_writes_only_that_ranks_own_byte(tmp_path):
+    """A per-rank byte, not a bitmap -- a MEASURED lost update, not a style.
+
+    The first implementation was ``bits |= 1 << row`` on one shared u64.  Six
+    processes read-modify-writing one word drop each other's bits, and the
+    six-rank double below reported ``registered=5/6`` on the remote desk
+    (2026-09-08) before this was structural.
+    """
+    region = _make(tmp_path)
+    try:
+        region.mark_registered(2)
+        raw = bytes(region._mm[xr.REGISTERED_OFF: xr.REGISTERED_OFF + 8])
+        assert raw == b"\x00\x00\x01\x00\x00\x00\x00\x00", raw
+        assert region.registered_rows() == [2]
+        region.mark_registered(2)
+        assert region.registered_count() == 1, "idempotent: a byte, not a counter"
+        with pytest.raises(ValueError):
+            region.mark_registered(xr.N_RANKS)
+    finally:
+        region.close()
+
+
+def test_six_processes_registering_at_once_are_all_counted(tmp_path):
+    region = _make(tmp_path)
+    ctx = mp.get_context("fork")
+    procs = []
+    try:
+        start = ctx.Barrier(xr.N_RANKS)
+        for row in range(xr.N_RANKS):
+            p = ctx.Process(target=_register_child, args=(region.path, row, start))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join(60)
+        assert [p.exitcode for p in procs] == [0] * xr.N_RANKS
+        assert region.registered_rows() == list(range(xr.N_RANKS))
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.kill()
+                p.join(10)
         region.close()
 
 

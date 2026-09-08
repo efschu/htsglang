@@ -108,6 +108,10 @@ SLOT_BYTES = 32 * MIB
 
 HEADER_OFF = 0
 HEADER_FIELDS_BYTES = 128
+#: Header word 6, read as SIX INDEPENDENT BYTES: byte *r* is rank *r*'s
+#: "I have cudaHostRegister'ed this region" flag.  See
+#: :meth:`XchgRegion.mark_registered` for why this is not a bitmap.
+REGISTERED_OFF = HEADER_OFF + 6 * 8
 EPOCH_STR_OFF = HEADER_OFF + HEADER_FIELDS_BYTES
 EPOCH_STR_BYTES = 128
 SLOTS_OFF = 256
@@ -487,7 +491,7 @@ class XchgRegion:
         f = struct.unpack_from("<16Q", self._mm, HEADER_OFF)
         return {
             "magic": f[0], "version": f[1], "epoch_hash": f[2], "n_ranks": f[3],
-            "slot_bytes": f[4], "hook_mode": f[5], "registered_bits": f[6],
+            "slot_bytes": f[4], "hook_mode": f[5], "registered_flags": f[6],
             "region_bytes": f[7], "n_pairs": f[8], "slots_per_pair": f[9],
             "created_ns": f[10], "creator_pid": f[11],
         }
@@ -495,16 +499,33 @@ class XchgRegion:
     def mark_registered(self, row: int) -> int:
         """Record that one rank has ``cudaHostRegister``ed this region (S4).
 
-        A bitmap rather than a counter: a rank that registers twice must not
-        make the denominator read 7/6, and a rank that never registers must be
-        namable, not merely missing from a total.
+        ONE BYTE PER RANK, at that rank's own address -- not a bitmap, and the
+        difference is a MEASURED defect rather than a style preference.  The
+        first version of this method was ``bits |= 1 << row`` on a shared u64:
+        a read-modify-write, which pure Python on an mmap cannot make atomic.
+        The six-rank hermetic double reported ``registered=5/6`` on the remote
+        desk (2026-09-08) because two ranks read the same word and the later
+        store dropped the earlier rank's bit.  An under-count here reads as
+        "one rank never registered", i.e. it turns an armed region into an
+        apparently unarmed one -- and the same class of lost update could just
+        as easily hide a rank that genuinely did not register.
+
+        A per-rank byte needs no atomic: distinct addresses, one writer each,
+        which is the same law the gate rows and matrix rows already obey.
+        Idempotent by construction, so a rank that registers twice cannot make
+        the denominator read 7/6.
         """
-        bits = self.header()["registered_bits"] | (1 << int(row))
-        struct.pack_into("<Q", self._mm, HEADER_OFF + 6 * 8, bits)
-        return bits
+        if not 0 <= int(row) < N_RANKS:
+            raise ValueError(f"row must be 0..{N_RANKS - 1}, not {row!r}")
+        self._mm[REGISTERED_OFF + int(row)] = 1
+        return self.registered_count()
+
+    def registered_rows(self) -> List[int]:
+        """Which ranks have registered -- namable, not merely a total."""
+        return [r for r in range(N_RANKS) if self._mm[REGISTERED_OFF + r]]
 
     def registered_count(self) -> int:
-        return bin(self.header()["registered_bits"]).count("1")
+        return len(self.registered_rows())
 
     # ---- slots ----------------------------------------------------------
 
@@ -531,6 +552,17 @@ class XchgRegion:
         return XchgSlot(*fields, index=index)
 
     def _write_slot_record(self, index: int, rec: XchgSlot) -> None:
+        """Rewrite one 48-byte slot record.  SINGLE WRITER AT A TIME.
+
+        Producer and consumer both write this record, and it is not atomic --
+        but they never write it concurrently, because the ``empty``/``full``
+        semaphore pair (S4) makes them strictly alternate: the producer owns
+        the slot from ``sem_wait(empty)`` to ``sem_post(full)``, the consumer
+        from ``sem_wait(full)`` to ``sem_post(empty)``.  That is the same
+        reason the gate and matrix areas give every rank its own row: a shared
+        word with two writers and no atomic is a lost update, which this
+        module already measured once (see :meth:`mark_registered`).
+        """
         SLOT_STRUCT.pack_into(
             self._mm, self._slot_off(index),
             rec.state, rec.pair_id, rec.epoch_hash, rec.seq,
