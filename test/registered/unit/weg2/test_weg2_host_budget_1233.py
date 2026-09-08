@@ -236,9 +236,17 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         # THE RED-FIRST FACT, unchanged: on weg2dk5 this exact call FUNDED
         # S=1/M=1200 with a 9 GiB store and the box was reaped 9 minutes later.
         # On the ring the call still does not hand back that arm.
-        arm, store, lines = _choose(DK5_STORE_MIN_GIB)
-        self.assertEqual((arm.s_gb, arm.m_mib), (1, 600), "the ladder must fall past M=1200")
-        self.assertEqual(store, 11.0)
+        # #1269: THE CLASS'S CLAIM SURVIVES AND IS SHARPENED. Under the hard
+        # bound (watermark MINUS the named margin) the ladder no longer falls to
+        # M=600 -- it refuses OUTRIGHT again, as it did under fix 8 before the
+        # ring made every moment 16.41 GiB cheaper. dk5's best arm predicts
+        # 92.19 GiB against a hard bound of 87.30, so nothing on the ladder
+        # fits. "weg2dk5 would have been named before it booted" is now true by
+        # a blanket refusal rather than by a smaller arm, which is the STRONGER
+        # form of this class's sentence, not a weaker one.
+        with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
+            _choose(DK5_STORE_MIN_GIB)
+        lines = str(cm.exception).splitlines()
         # and M=1200 -- the arm that died -- is refused by name, at the LAUNCH
         # moment, which is the term the ring does NOT make free (it charges
         # Sigma span1 = 29.21 GiB there plus the 12 GiB load transient).
@@ -275,8 +283,20 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         # is BELOW it, because the ring took 16.41 GiB out of the run moment and
         # dk5's worst arm was only 3.13 GiB over.  The advisory still prints
         # beside the whole ladder, which is what made the verdict checkable.
-        arm, store, lines = _choose(DK5_STORE_MIN_GIB)
+        # #1269: BOTH halves are now asserted, and they are what separate the
+        # raw watermark from the bound the order actually enforces: every arm is
+        # still BELOW the raw reap point (the ring's 16.41 GiB is real), and
+        # every arm is ABOVE the hard bound (watermark - margin), which is why
+        # the ladder refuses. Stating both is the re-derivation; asserting only
+        # the first would hide the change that matters.
+        with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
+            _choose(DK5_STORE_MIN_GIB)
+        lines = str(cm.exception).splitlines()
         watermark = host_ledger.OBSERVED_REAP_CURRENT_BYTES / GIB
+        hard_bound = (
+            host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+            - host_ledger.resolve_margin().total_gib
+        )
         self.assertAlmostEqual(watermark, 95.93, delta=0.02)
         for m, (_launch, run) in self.DK5_LADDER_ON_THE_RING.items():
             priced = host_ledger.price(
@@ -286,6 +306,11 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
             self.assertAlmostEqual(priced.run_leftover_gib, run, delta=0.05)
             peak = priced.predicted_run_peak_gib(max(0.0, float(int(run))))
             self.assertLess(peak, watermark, f"M={m} predicts {peak:.2f}")
+            self.assertGreater(
+                peak, hard_bound,
+                f"M={m} predicts {peak:.2f}, which must be ABOVE the hard bound "
+                f"{hard_bound:.2f} -- that is why this ladder refuses",
+            )
         self.assertIn("RUN-PEAK ADVISORY", "\n".join(lines))
         for m in (2400, 1200, 600):
             self.assertIn(f"M={m}", "\n".join(lines))
