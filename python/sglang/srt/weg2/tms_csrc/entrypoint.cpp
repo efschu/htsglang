@@ -145,6 +145,24 @@ int tms_backed_up_tag_bytes(char* out, size_t len) {
     return TorchMemorySaver::instance().backed_up_tag_bytes(out, len);
 }
 
+// S7 (#1273) -- THE REMAP INSTRUMENT.  Resume pass 1 maps every allocation of
+// a tag one at a time (``cu_mem_create`` + ``cuMemMap`` + ``cu_mem_set_access``),
+// so its wall is proportional to an ALLOCATION COUNT that no log has ever
+// carried; without it, pass 1's cost is charged to the copy rate and every
+// GB/s on a WEG2-FLIP-TAG line has the wrong denominator (spec risk R2,
+// ADDENDUM 3 section 4's unexplained remainder).  The weight exchange leaves
+// this cost unchanged in BOTH arms, which is why both must measure it.
+//
+// ``tag`` is written back so the caller can VERIFY the numbers belong to the
+// tag it just resumed instead of assuming it -- two resumes and one read would
+// otherwise print the first tag's cost under the second tag's name.  Returns
+// the record sequence number; **0 means no resume has been recorded in this
+// process**, which the reader must print as an absence and never as a zero.
+uint64_t tms_resume_stats(char* tag, size_t tag_len,
+                          uint64_t* allocations, double* map_ms, double* copy_ms) {
+    return TorchMemorySaver::instance().resume_stats(tag, tag_len, allocations, map_ms, copy_ms);
+}
+
 //: Returns 0 when this boot published no ring (stock cudaMallocHost path), 1
 //: otherwise.  Every out-pointer may be null.  ``card_uuid`` is written NUL
 //: terminated and truncated to ``card_uuid_len``.
