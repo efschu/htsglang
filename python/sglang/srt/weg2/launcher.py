@@ -57,7 +57,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
-from sglang.srt.weg2 import host_ledger, ring_table
+from sglang.srt.weg2 import host_ledger, ring_table, weight_exchange_region
 
 MIB = 1024 * 1024
 PORT_FRONT = 30030
@@ -98,6 +98,17 @@ SHM_OWN_PREFIXES = (
     "hicache-weg2-",                # the canonical page store when it is put on /dev/shm
     ".weg2-pcie-serialize-",        # model_loader/hibernate.py:504
     "sglang_loads_",                # managers/load_snapshot.py:285
+    # #1273 S3: the weight-exchange staging region (385 MiB) and the 24 named
+    # POSIX semaphores glibc materialises as `/dev/shm/sem.<name>`. Both
+    # families are created by weg2/weight_exchange_region.py. Without these two
+    # entries a crashed exchange boot leaves 385 MiB of tmpfs resident and
+    # INVISIBLE to this sweep -- exactly the weg2dk7 shape (3.23 GiB of a boot
+    # dead for ~16 h, counted by the ledger as occupied) that the sweep exists
+    # for. `sem.` is a SEPARATE entry because the semaphore names do not begin
+    # with the region prefix; a prefix list that assumed they did would sweep
+    # the region and leave the handshake behind.
+    weight_exchange_region.REGION_PREFIX,           # "weg2-xchg-"
+    f"sem.{weight_exchange_region.REGION_PREFIX}",  # "sem.weg2-xchg-"
 )
 #: The corridor law is 819-1229 MiB NVML-free per card under the awake
 #: group's load.  MEASURED 2026-09-07 boot weg2onebackup2 with this constant
@@ -2282,6 +2293,77 @@ def sweep_dead_credit_counters(log: Log, credit_dir: str = "",
     log(f"WEG2-VRAM-CREDIT residue swept: {len(removed)} dead-epoch counter(s) "
         f"{removed} -- a crashed boot runs no teardown, so LAUNCH sweeps too")
     return removed
+
+
+def sweep_xchg_semaphores(log: Log, shm_dir: str = SHM_DIR, dry: bool = False) -> List[str]:
+    """#1273 S3: ``sem_unlink`` the exchange semaphores a dead boot left behind.
+
+    ORDERING IS LOAD-BEARING: call this only AFTER :func:`shm_residue_sweep`,
+    which is the one authority that refuses the boot while another
+    ``launch_server`` is alive.  This function does not repeat that test, so
+    running it first would unlink a LIVE boot's handshake -- the exact class
+    the residue sweep's own docstring forbids ("nothing is killed and nothing
+    is swept" while a holder lives).
+
+    WHY A SEPARATE SWEEP AT ALL, given that ``sem.weg2-xchg-*`` is now in
+    :data:`SHM_OWN_PREFIXES` and the generic sweep would archive the files:
+    a POSIX named semaphore is closed by ``sem_unlink``, not by moving its
+    backing file.  Renaming the file leaves the kernel object referenced by
+    any process that still has it open, and a later ``sem_open(O_CREAT)`` on
+    the same name would create a SECOND object while the first still holds
+    waiters.  The prefix entry is the visibility half (a leaked handshake is
+    named and its bytes counted); this is the correctness half.
+    """
+    try:
+        names = sorted(os.listdir(shm_dir))
+    except OSError:
+        log(f"#1273 xchg semaphores: {shm_dir} unreadable -- NOT swept, and not read as empty")
+        return []
+    prefix = f"sem.{weight_exchange_region.REGION_PREFIX}"
+    stale = [n for n in names if n.startswith(prefix)]
+    if not stale:
+        log("WEG2-XCHG-SEM residue: none")
+        return []
+    if dry:
+        log(f"WEG2-XCHG-SEM DRY-RUN: would sem_unlink {len(stale)} name(s): {stale}")
+        return []
+    lib = weight_exchange_region._libc()
+    gone: List[str] = []
+    for entry in stale:
+        posix_name = "/" + entry[len("sem."):]
+        if lib.sem_unlink(posix_name.encode("ascii")) == 0:
+            gone.append(posix_name)
+    log(f"WEG2-XCHG-SEM residue swept: {len(gone)}/{len(stale)} sem_unlink'ed {gone} "
+        f"-- a crashed boot runs no teardown, so LAUNCH sweeps too")
+    return gone
+
+
+def prepare_xchg_region(log: Log, epoch: str, hook_mode: int, dry: bool = False) -> Dict[str, object]:
+    """#1273 S3: create the staging region + its 24 semaphores, return the env.
+
+    TODO(#1273 S6): the caller that decides ``--weg2-weight-source exchange``
+    lives in S6.  It calls this once, before either group starts, and merges
+    the returned ``env`` into BOTH groups' environment -- one region, six
+    ranks, found by the same two names.  Under ``ring`` this is not called at
+    all and no region file exists, which is what makes the ring form byte-for-
+    byte today's path.
+    """
+    if dry:
+        path = weight_exchange_region.region_path(epoch)
+        log(f"WEG2-XCHG-REGION DRY-RUN: would create {path} "
+            f"({weight_exchange_region.REGION_BYTES} bytes) and 24 semaphores")
+        return {"path": path, "epoch": str(epoch), "env": {}, "sems": 0, "line": ""}
+    return weight_exchange_region.prepare_region(epoch, hook_mode=hook_mode, log=log)
+
+
+def teardown_xchg_region(log: Log, epoch: str) -> Dict[str, int]:
+    """#1273 S3 / spec section 3.8: unlink the 24 names and remove the region.
+
+    Both halves matter -- teardown alone leaves a crashed boot's region
+    behind, which is the case :func:`sweep_xchg_semaphores` and the
+    :data:`SHM_OWN_PREFIXES` entry close at the NEXT launch.
+    """
+    return weight_exchange_region.teardown_region(epoch, log=log)
 
 
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
@@ -5563,6 +5645,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # 1. preflight
     state.shm_sweep = shm_residue_sweep(log, ns.tag, stamp, dry)
+    # #1273 S3: strictly AFTER shm_residue_sweep -- that call is the one that
+    # refuses the boot while another launch_server lives, and unlinking a live
+    # boot's handshake would be worse than leaving a dead one's behind.
+    sweep_xchg_semaphores(log, dry=dry)
     sweep_dead_credit_counters(log, dry=dry)
     stale_deadman_sweep(log, [PORT_FRONT, PORT_P, PORT_D], dry)
     host_preflight(log, ns.tag, dry)
