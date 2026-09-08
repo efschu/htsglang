@@ -14,7 +14,12 @@ than the margin) and the RUNTIME breach (a controlled teardown verdict).
 import pytest
 
 from sglang.srt.weg2.host_ledger import (
+    FLIP_HOST_TRANSIENT_GIB,
     GIB,
+    RESIDUAL_WINDOW_MIN,
+    RING_ERA_FLIP_TRANSIENT_GIB,
+    RUN_PEAK_RESIDUAL_GIB,
+    measure_foreign_anon,
     OBSERVED_REAP_NONRECLAIM_BYTES,
     REAP_SAMPLE_EXCLUDED,
     REAP_SAMPLES_GIB,
@@ -30,19 +35,93 @@ WATERMARK = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
 
 
 # ------------------------------------------------------------------ margin
-def test_margin_is_two_named_terms_not_a_hand_number():
+def test_margin_is_named_terms_not_a_hand_number():
     m = resolve_margin()
-    assert m.transient_gib > 0 and m.drift_gib > 0
-    assert m.total_gib == pytest.approx(m.transient_gib + m.drift_gib)
-    assert "transient" in m.terms() and "drift" in m.terms()
-    # every term names where it came from
-    assert m.transient_source and m.drift_source
+    assert m.transient_gib > 0 and m.residual_gib > 0 and m.drift_gib > 0
+    assert m.total_gib == pytest.approx(
+        m.transient_gib + m.residual_gib + m.drift_gib + m.foreign_gib
+    )
+    for t in ("transient", "residual", "drift", "foreign"):
+        assert t in m.terms()
+    assert (
+        m.transient_source and m.residual_source and m.drift_source and m.foreign_source
+    )
 
 
-def test_drift_is_the_rate_times_the_planned_window():
+def test_drift_is_charged_only_beyond_the_residuals_own_window():
+    """CORRECTION: the residual is (measured - predicted) over a ~60 min window,
+    so it ALREADY contains that window's drift. Charging the full 90 min on top
+    would double-count the very thing the residual measured."""
     m = resolve_margin(drift_mib_per_min=19.0, window_min=90.0)
-    assert m.drift_gib == pytest.approx(19.0 * 90.0 / 1024.0)
-    assert "19.0 MiB/min x 90 min" in m.terms()
+    assert m.drift_gib == pytest.approx(19.0 * (90.0 - RESIDUAL_WINDOW_MIN) / 1024.0)
+    m_short = resolve_margin(drift_mib_per_min=19.0, window_min=RESIDUAL_WINDOW_MIN)
+    assert m_short.drift_gib == 0.0, (
+        "inside the residual's window, drift is not re-added"
+    )
+
+
+def test_the_transient_is_ring_era_not_the_pre_ring_constant():
+    """CORRECTION: 9.97 GiB is the PRE-RING per-allocation transient. With the
+    shared registered ring it is 1.1 (rg2) / 2.88 (rg3); the max binds."""
+    m = resolve_margin()
+    assert m.transient_gib == pytest.approx(max(RING_ERA_FLIP_TRANSIENT_GIB.values()))
+    assert m.transient_gib < FLIP_HOST_TRANSIENT_GIB
+    assert "RING-ERA" in m.transient_source and "weg2rg3" in m.transient_source
+
+
+def test_the_pre_ring_value_is_used_only_when_no_ring_sample_exists(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.srt.weg2.host_ledger.RING_ERA_FLIP_TRANSIENT_GIB", {}, raising=True
+    )
+    m = resolve_margin()
+    assert m.transient_gib == pytest.approx(FLIP_HOST_TRANSIENT_GIB)
+    assert "PRE-RING fallback" in m.transient_source
+
+
+def test_the_residual_is_the_ring_era_under_prediction():
+    """THE REAL GAP: the estimator misses the steady state, not the flip."""
+    m = resolve_margin()
+    assert m.residual_gib == pytest.approx(max(RUN_PEAK_RESIDUAL_GIB.values()))
+    assert "weg2sb4" in m.residual_source
+    assert m.residual_gib > m.transient_gib, (
+        "the residual, not the flip, is the big term"
+    )
+
+
+# ------------------------------------------------------------- foreign load
+def test_foreign_anon_is_the_cgroup_minus_the_boots_own_pids():
+    import os
+
+    foreign, sglang, src = measure_foreign_anon(None, [os.getpid()])
+    assert foreign is None and sglang > 0 and "unreadable" in src
+    big = int((sglang + 7.0) * GIB)
+    foreign, sglang2, src = measure_foreign_anon(big, [os.getpid()])
+    assert foreign == pytest.approx(7.0, abs=0.05)
+    assert "cgroup anon" in src and "sglang RssAnon" in src
+
+
+def test_foreign_is_not_re_added_to_the_margin_by_default():
+    """It is ALREADY in the origin (run_origin_gib returns a cgroup reading,
+    which counts every process in the cgroup, Claude included)."""
+    m = resolve_margin()
+    assert m.foreign_gib == 0.0
+    assert "already in the origin" in m.foreign_source
+
+
+def test_the_breach_verdict_names_who_caused_it():
+    import os
+
+    m = resolve_margin()
+    over = int((WATERMARK - m.total_gib + 0.5) * GIB)
+    own = measure_foreign_anon(0, [os.getpid()])[1]
+    v = watermark_breach_verdict(
+        over,
+        margin=m,
+        cgroup_anon_bytes=int((own + 40.0) * GIB),
+        own_pids=[os.getpid()],
+    )
+    assert "SPLIT sglang=" in v and "foreign=" in v
+    assert "FOREIGN desk load dominates" in v
 
 
 def test_a_measured_census_rate_supersedes_the_sb4_default():
@@ -146,11 +225,15 @@ def test_the_verdict_is_pure_and_needs_no_processes():
     """Synthetic cgroup reading only -- no /proc, no cgroup, no front."""
     m = Margin(
         transient_gib=1.0,
-        drift_gib=1.0,
+        residual_gib=0.5,
+        drift_gib=0.5,
+        foreign_gib=0.0,
         drift_mib_per_min=1.0,
         window_min=1024.0,
         transient_source="t",
+        residual_source="r",
         drift_source="d",
+        foreign_source="f",
     )
     assert (
         watermark_breach_verdict(int(10 * GIB), margin=m, watermark_gib=100.0) is None
@@ -183,4 +266,39 @@ def test_the_pre_order_ledger_would_have_funded_sb4_and_this_one_does_not():
     assert new.gib < 8.0, "no store fits under the hard bound -> W21"
 
     shortfall = predicted - (WATERMARK - m.total_gib)
-    assert 7.0 < shortfall < 7.5, f"sb4 is over the hard bound by {shortfall:.2f} GiB"
+    assert 4.0 < shortfall < 4.3, f"sb4 is over the hard bound by {shortfall:.2f} GiB"
+
+
+def test_the_ring_form_DOES_fit_but_not_on_the_arm_sb4_chose():
+    """THE ANSWER, pinned. With the corrected terms the binding constraint is
+    NOT the host ring -- it is the mamba anchor pool M. sb4's three arms, from
+    its own boot log (front.log 16:29:38Z):
+
+        S=1 M=2400  peak 91.44 store 11  anchors 9.49 GiB
+        S=1 M=1200  peak 91.50 store 16  anchors 4.75 GiB
+        S=1 M=600   peak 92.04 store 19  anchors 2.37 GiB
+
+    The ring (Sigma H 32.19-34.94 GiB) is inside ALL THREE peaks, so it cannot
+    be what separates them. The ledger picked M=2400 because the pre-margin
+    bound passed it; with the margin it is refused and the ladder falls to an
+    arm that fits with room.
+    """
+    m = resolve_margin()
+    hard = WATERMARK - m.total_gib
+    arms = {
+        "M=2400": (91.44, 11.0, 11.61),
+        "M=1200": (91.50, 16.0, 16.54),
+        "M=600": (92.04, 19.0, 19.01),
+    }
+    stores = {
+        name: size_store_gib(left, peak - store, 0.58, margin_gib=m.total_gib).gib
+        for name, (peak, store, left) in arms.items()
+    }
+    assert stores["M=2400"] < 8.0, "the arm sb4 actually chose is refused"
+    assert stores["M=1200"] >= 8.0, "a smaller anchor pool fits with a real store"
+    assert stores["M=600"] >= 8.0
+    assert max(stores.values()) >= 8.0, "SOME store >= the floor fits the ring form"
+    # and the peak without any store is under the bound on every arm, so the
+    # arm itself is never the impossible part -- the store size is.
+    for name, (peak, store, _) in arms.items():
+        assert peak - store < hard, f"{name}: peak without store must fit"

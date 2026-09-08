@@ -1512,8 +1512,21 @@ class Front:
                 cg = host_ledger.read_cgroup()
                 current = (cg or {}).get("current")
                 if current:
+                    # The cgroup that reaps is SHARED with the Claude sessions
+                    # and their desk work, so the verdict carries the split:
+                    # a breach the operator's own pytest run caused is named,
+                    # not charged to the boot.
+                    own_pids: list = []
+                    for sid in (self.groups["P"].sid, self.groups["D"].sid):
+                        try:
+                            own_pids.extend(_session_pids(int(sid)))
+                        except Exception:  # noqa: BLE001
+                            pass
                     verdict = host_ledger.watermark_breach_verdict(
-                        int(current), margin=margin
+                        int(current),
+                        margin=margin,
+                        cgroup_anon_bytes=host_ledger.read_cgroup_anon_bytes(),
+                        own_pids=own_pids,
                     )
                     if verdict is not None:
                         self.counters["host_watermark_breach"] += 1
