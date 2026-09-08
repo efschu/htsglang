@@ -717,11 +717,42 @@ def _token_vector_role(server_args) -> str:
     from sglang.srt.environ import envs as _envs
 
     role = str(_envs.SGLANG_UNEVEN_TOKEN_VECTOR_ROLE.get() or "").strip().lower()
-    if not role:
-        role = str(getattr(server_args, "uneven_token_vector_role", "") or "").lower()
-    role = role.strip()
     if role:
         return role
+    return token_vector_role_from_args(server_args)
+
+
+def token_vector_role_from_args(server_args) -> str:
+    """The role THIS argv asserts, resolved WITHOUT consulting the role env.
+
+    #1270b -- THE PUBLISHER'S HALF OF THE ROLE, and the reason the #1270 fix
+    was inert on metal.  ``_token_vector_role`` reads the env FIRST and only
+    falls through to the "was anything declared?" rung when the env is empty.
+    In a real process that rung is UNREACHABLE: ``ServerArgs`` carried the
+    literal string ``"pin"`` as the flag's DEFAULT, and
+    ``_publish_promoted_781_flags`` published that default into
+    ``SGLANG_UNEVEN_TOKEN_VECTOR_ROLE`` unconditionally, so every boot answered
+    its own question with 'pin' before anybody asked it.  Boot weg2sb4s
+    (9f2e58b797) printed ``role='pin'`` and ``active_vector=[30, 17, 17]`` with
+    no vector on its argv at all; the desk test read 'estimate' only because
+    its stub set the flag to ``""``, a value a real ServerArgs never holds.
+
+    So the flag default is now ``None`` -- "nobody said" -- and THIS function
+    is what a process publishes: the role resolved from the argv alone.  A
+    consumer keeps reading :func:`token_vector_role`, which is env-first
+    because the env is what survives into the flip's second stack build.  The
+    two must not be the same function: resolving the value to publish by
+    reading the variable being published is how the default smuggled itself in.
+
+    Call it only AFTER the vector itself has been published (the ``#901``
+    resolution runs one line earlier in ``_publish_promoted_781_flags``), so
+    that "was anything declared?" sees an inherited env vector too -- an
+    ambient vector this argv did not choose is still a declared vector, and a
+    declared vector with no stated role is a ``pin``.
+    """
+    role = str(getattr(server_args, "uneven_token_vector_role", "") or "").strip()
+    if role:
+        return role.lower()
     return ROLE_PIN if token_vector_is_declared(server_args) else ROLE_ESTIMATE
 
 

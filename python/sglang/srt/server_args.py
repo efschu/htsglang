@@ -5892,12 +5892,22 @@ class ServerArgs:
         ),
     ] = None
     uneven_token_vector_role: A[
-        str,
+        Optional[str],
         Arg(
             choices=["pin", "seed"],
             help="What --uneven-token-vector (or SGLANG_UNEVEN_TOKEN_VECTOR) "
             "MEANS (#797). "
-            "'pin' (default, unchanged behaviour): the vector is an "
+            "DEFAULT IS UNSTATED, NOT 'pin' (#1270b). Leaving this alone means "
+            "nobody said, and the runtime then answers it from whether a "
+            "vector was DECLARED at all: a declared vector with no stated role "
+            "is a 'pin' (unchanged behaviour), while a vector this boot derived "
+            "for itself from --rank-gpu-memory-mib is an 'estimate' and is "
+            "superseded by the measured optimum exactly as a 'seed' is. The "
+            "default used to be the literal string 'pin', which meant a boot "
+            "that declared nothing still asserted something: weg2sb4s served "
+            "group D at 574,336 tokens instead of ~670,720 because its own "
+            "budget estimate [30,17,17] was published as an operator pin. "
+            "'pin': the vector is an "
             "ASSERTION. It is installed as given and suppresses the measured "
             "capacity solve entirely -- the runtime may only print a restart "
             "hint naming a better vector, and a human has to act on it. "
@@ -5918,7 +5928,7 @@ class ServerArgs:
             "is the honest role for it. Reserve 'pin' for a vector you are "
             "actively asserting against the runtime's own measurement.",
         ),
-    ] = "pin"
+    ] = None
     uneven_token_vector_provenance: A[
         Optional[str],
         Arg(
@@ -18084,6 +18094,10 @@ class ServerArgs:
         Parse-time and cheap: two attribute reads and, in the announced case,
         one log line per process.
         """
+        from sglang.srt.distributed.utils import (
+            token_vector_role_from_args as _token_vector_role_from_args,
+        )
+
         if self.uneven_token_vector is not None:
             # The decode-phase KV token split. Published rather than read from
             # a ServerArgs field by the consumer because the resolver runs
@@ -18124,9 +18138,15 @@ class ServerArgs:
                 winner=resolution.winner.loss_label(),
                 subject="the uneven-DCP KV token vector this process publishes",
                 effective=(
+                    # #1270b: name the role that will actually be published a
+                    # few lines later, not the raw field. They used to be the
+                    # same string only because the field defaulted to "pin";
+                    # now an unstated role resolves against whether a vector
+                    # was declared at all, and this announcement must not go
+                    # on quoting a value nothing publishes.
                     f"this boot inherits it from the ambient environment while "
                     f"publishing SGLANG_UNEVEN_TOKEN_VECTOR_ROLE="
-                    f"{str(self.uneven_token_vector_role)!r} from THIS command "
+                    f"{_token_vector_role_from_args(self)!r} from THIS command "
                     f"line beside it"
                 ),
                 loss=knob_resolution.loss_clause(
@@ -18208,8 +18228,30 @@ class ServerArgs:
         # (unlike the vector) because 'no vector set' and 'vector set, role
         # pin' must stay distinguishable from a stale env left by an earlier
         # process in the same shell.
-        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR_ROLE"] = str(
-            self.uneven_token_vector_role
+        #
+        # #1270b: WHAT IS PUBLISHED IS THE RESOLVED ROLE, NOT THE RAW FIELD.
+        # The field's default used to be the literal string "pin", so this line
+        # stamped an operator's assertion onto a boot where no operator had
+        # said anything -- and because the consumer reads this env FIRST, the
+        # #1270 "an undeclared vector is an estimate" rung was unreachable in
+        # every real process. Measured on weg2sb4s (9f2e58b797): D's argv
+        # carried no --uneven-token-vector and no role, ServerArgs logged
+        # `uneven_token_vector_role='pin'` at boot, the sizing site logged
+        # `role='pin' active_vector=[30, 17, 17]`, the install was suppressed
+        # and the pool stayed at 574,336 tokens against a profiled optimum of
+        # ~670,720. The desk test for #1270 was green throughout because its
+        # stub set the field to "", which no ServerArgs ever holds.
+        #
+        # `token_vector_role_from_args` resolves the role from THIS argv alone
+        # and deliberately does not consult the variable being written -- the
+        # unconditional publish keeps doing its job of overwriting a stale
+        # value, it just no longer invents one. It runs AFTER the #901 vector
+        # publication above so that "was anything declared?" also sees a vector
+        # inherited from the environment.
+        from sglang.srt.distributed.utils import token_vector_role_from_args
+
+        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR_ROLE"] = token_vector_role_from_args(
+            self
         )
         # #797: the PROVENANCE travels with the vector for the same reason the
         # role does -- the resolver and the retraction gate both run inside the

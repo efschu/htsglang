@@ -6238,7 +6238,20 @@ class ModelRunnerKVCacheMixin:
             else:
                 improves = c_optimal > c_active
             if optimal != active and improves:
-                mode = self.server_args.rank_kv_ratio
+                # #1270b: NAME THE ARM, NOT THE MODE. `rank_kv_ratio` is
+                # 'coupled' on the boot this fix exists for (group D ships
+                # --rank-tp-ratio auto and no --rank-kv-ratio), and 'coupled'
+                # is documented as "exactly today's behaviour, byte-identical"
+                # -- printing it as the thing that installed a vector names a
+                # producer that did not produce it, which is the same defect
+                # class as the role default this ticket is about. The install
+                # is armed by the derived MODE when there is one and by the
+                # ROLE otherwise, so the line says which.
+                mode = (
+                    self.server_args.rank_kv_ratio
+                    if self.server_args.uneven_kv_derived_mode()
+                    else _role
+                )
                 set_cp_token_ratios(optimal)
                 # #797: MAKE THE INSTALL SURVIVE THE CUTOVER. Under
                 # --enable-phase-flip the decode stack does not inherit this
@@ -6272,12 +6285,11 @@ class ModelRunnerKVCacheMixin:
                     # already applied. Quoting this projection as a delivered
                     # gain is a mistake this comment exists to prevent.
                     logger.info(
-                        "Uneven DCP %s mode (--rank-kv-ratio %s): installed "
+                        "Uneven DCP (armed by %s): installed "
                         "measured KV-token ownership vector %s (pre-boot "
                         "estimate was %s), max_total_num_tokens %d -> ~%d "
                         "before any later pool cap "
                         "(per-rank profiled capacity %s).",
-                        mode,
                         mode,
                         optimal,
                         active,
@@ -6286,16 +6298,20 @@ class ModelRunnerKVCacheMixin:
                         p_by_rank,
                     )
             elif self.tp_rank == 0:
-                mode = self.server_args.rank_kv_ratio
+                # #1270b: same reason as the branch above -- the arm, not the
+                # mode string, is what decided this.
+                mode = (
+                    self.server_args.rank_kv_ratio
+                    if self.server_args.uneven_kv_derived_mode()
+                    else _role
+                )
                 logger.info(
-                    "Uneven DCP %s mode (--rank-kv-ratio %s): pre-boot "
-                    "estimate %s is already the %s optimum "
+                    "Uneven DCP (armed by %s): pre-boot "
+                    "estimate %s is already the measured optimum "
                     "(max_total_num_tokens=%d, per-rank profiled capacity "
                     "%s).",
                     mode,
-                    mode,
                     active,
-                    mode,
                     c_active,
                     p_by_rank,
                 )
