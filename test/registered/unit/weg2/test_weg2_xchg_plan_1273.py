@@ -1441,5 +1441,50 @@ class TestAcceptanceLineDenominator(CustomTestCase):
         self.assertTrue(line.rstrip().endswith(f"plan_id={plan.plan_id}"))
 
 
+class TestThreeWaveAcceptanceLine(CustomTestCase):
+    """The acceptance artifact on the shape spec §6/S1 accepts: ``waves=3``.
+
+    The first round captured its line from a two-parameter, ONE-wave fixture,
+    so the greppable artifact and the accepted shape did not match (review
+    F10).  The wave machinery was already pinned against boot weg2sb4's own
+    cut; what was missing was the line itself.
+    """
+
+    def test_the_acceptance_line_on_the_sb4_three_wave_schedule(self):
+        cards = chunk_tag_cards(
+            SB4_STAGE_LAYERS, SB4_LAYERS_PER_CHUNK, SB4_CHUNKS, CARDS
+        )
+        tags = weights_family_tags(SB4_CHUNKS)
+        waves = derive_waves(tags, cards, CARDS)
+        self.assertEqual(waves, SB4_WAVES)
+
+        inventory = []
+        for tag in tags:
+            # A tag's bytes live on the stages its layer band overlaps; the
+            # base tag spans everything, which is why it closes the schedule.
+            stage = min(cards.get(tag, CARDS))
+            inventory.append(
+                _qkvz_geom().replace(
+                    name=f"model.{tag}.linear_attn.in_proj_qkvz.weight",
+                    tag=tag,
+                    stage=stage,
+                )
+            )
+            inventory.append(
+                _mlp_down_geom().replace(
+                    name=f"model.{tag}.mlp.down_proj.weight", tag=tag, stage=stage
+                )
+            )
+        plan = build_plan(inventory, _p_layout(), _d_layout(MLP_RATIO), waves=waves)
+        line = emit_plan_line(plan)
+        print("ACCEPTANCE " + line)
+        self.assertIn("dir=P2D", line)
+        self.assertIn("waves=3", line)
+        self.assertEqual(len(plan.tag_bytes), len(tags))
+        self.assertEqual(
+            sum(n for _, n in plan.tag_bytes), plan.oncard_bytes + plan.cross_bytes
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
