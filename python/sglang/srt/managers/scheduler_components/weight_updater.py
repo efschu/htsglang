@@ -788,10 +788,32 @@ class SchedulerWeightUpdaterManager:
         # model_runner's `enable_weights_cpu_backup or (is_draft_worker and
         # enable_draft_weights_cpu_backup)` is False for BOTH shards here.
         #
+        # #1273 S2 (refuter F6): the region tag is DERIVED, and the same
+        # statement that opens the region publishes it, so this site and
+        # model_runner's boot load cannot silently disagree about the tag the
+        # post-load repack (`weight_chunk_scope`, model_loader/loader.py:941)
+        # restores.  Under --weg2-weight-source exchange with a draft shard in
+        # this process the derivation REFUSES: one region carries one tag and
+        # this call refills two shards that now want two.
+        from sglang.srt.managers.weg2_memory_saver import weights_region
+        from sglang.srt.weg2.weight_exchange import (
+            roll_forward_refusal_message,
+            roll_forward_weights_tag,
+        )
+
+        weights_reload_tag = roll_forward_weights_tag(
+            has_draft_shard=self.draft_worker is not None
+        )
+        if weights_reload_tag is None:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: " + roll_forward_refusal_message()
+            )
+
         # Region outside, PCIe lock inside: the region must cover every
         # allocation the loader makes, the lock only the link.
-        with self.memory_saver_adapter.region(
-            GPU_MEMORY_TYPE_WEIGHTS,
+        with weights_region(
+            self.memory_saver_adapter,
+            weights_reload_tag,
             enable_cpu_backup=False,
         ):
             with self._weg2_pcie_lock("wake-H2D weights reload"):

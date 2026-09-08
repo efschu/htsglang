@@ -39,7 +39,11 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple, Union
 
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.constants import (
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+    GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +206,31 @@ class Weg2DormantRefused(RuntimeError):
 
 class Weg2PcieLockTimeout(RuntimeError):
     """The PCIe serialisation lock was not acquired inside its deadline."""
+
+
+class Weg2XchgCoverageRefused(RuntimeError):
+    """W51 -- a live tensor under an exchanged tag has no source.
+
+    #1273 spec section 6/S2.  The weight-byte exchange fills the destination's
+    weight pages from the SOURCE's VRAM, descriptor by descriptor, and restores
+    every ``named_buffers()`` entry from ``_export_static_state``
+    (weight_updater.py:1291 -> :1755).  A tensor that is neither -- a stray
+    ``torch.Tensor`` attribute on a module, a Parameter the plan does not carry
+    -- is a page the destination never receives.  It does not fault and it does
+    not raise: it serves whatever the arena held, which is the worst class of
+    wrongness this design can produce.
+
+    Raised at the end of weight loading and re-checked in the wake RPC's
+    preamble, BEFORE the first ``resume`` -- where an abandon costs nothing
+    because neither side's VRAM has been mutated (spec section 3.6).
+
+    NOT raised for SLACK.  "Cover every byte of the tag" is impossible:
+    allocator overhang is real and measured at +0.08 to +0.58 GiB per rank, so
+    the arithmetic against ``tms_tag_bytes`` is PRINTED with the slack named
+    and never compared for equality.  What is asserted is the population --
+    every live tensor is a plan Parameter or a registered buffer -- not the
+    byte count.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -1885,9 +1914,30 @@ def chunk_tag_cards(
     return {tag: tuple(sorted(v)) for tag, v in sorted(acc.items())}
 
 
+#: A CHUNK TAG IS ``weights_<integer>``, NOT ``weights_<anything>``.
+#:
+#: #1273 S2.  ``WEIGHT_CHUNK_PREFIX`` is the literal ``"weights_"``, so a
+#: ``startswith`` test also matches every FUTURE tag that merely shares the
+#: prefix -- and the exchange introduces exactly such a tag,
+#: ``weights_draft`` (constants.py), whose entire purpose is to be OUTSIDE the
+#: family.  Under the prefix test it was inside it, which would have put the
+#: drafter back into every leg, census and wave and left the exchange with a
+#: destination range that has no VRAM source (W58).  Same defect one layer down
+#: for the planned ``weights_vision`` (spec section 6/S8).
+#:
+#: The index is what ``weight_chunk_tag`` writes, so the index is what the
+#: predicate reads.  Built from the prefix rather than a second literal.
+_WEIGHT_CHUNK_TAG_RE = re.compile(r"^" + re.escape(WEIGHT_CHUNK_PREFIX) + r"(\d+)$")
+
+
+def is_weights_chunk_tag(tag: Any) -> bool:
+    """``weights_<integer>`` -- one layer band of the weights family."""
+    return isinstance(tag, str) and _WEIGHT_CHUNK_TAG_RE.match(tag) is not None
+
+
 def is_weights_family_tag(tag: Any) -> bool:
     return isinstance(tag, str) and (
-        tag == GPU_MEMORY_TYPE_WEIGHTS or tag.startswith(WEIGHT_CHUNK_PREFIX)
+        tag == GPU_MEMORY_TYPE_WEIGHTS or is_weights_chunk_tag(tag)
     )
 
 
@@ -1914,17 +1964,109 @@ def _tms_cdll_in_region():
     return cdll
 
 
+#: THE TAG THE OPEN WEIGHTS REGION WAS CREATED WITH, process-local.
+#:
+#: #1273 S2.  ``tms_set_current_tag`` is write-only from Python (there is no
+#: ``tms_get_current_tag`` in the vendored hook, entrypoint.cpp:101, and
+#: ``current_tag_`` is thread_local C++), so the one caller that must restore a
+#: tag -- ``weight_chunk_scope`` -- cannot ask the saver which tag the region
+#: set.  It used to restore the literal ``GPU_MEMORY_TYPE_WEIGHTS``, which is
+#: correct for exactly one region tag and silently wrong for any other.  With
+#: the draft's own region tag that becomes a real defect: the drafter's block
+#: is a one-layer ``Qwen3_5ForCausalLM`` (qwen3_5_mtp.py:277-283) built through
+#: ``make_layers`` (utils/common.py:2017), so its layer would be tagged
+#: ``weights_0`` -- back inside the family -- and everything built after that
+#: scope would carry the BASE weights tag instead of the draft tag.
+#:
+#: NOT second bookkeeping beside an upstream truth: the upstream truth is
+#: unreadable from here.  Single-threaded by construction (model construction
+#: and the post-load pass), nested by context manager, restored on exit.
+#:
+#: ASYMMETRY, stated rather than assumed (#1273 S2 review F11): the C
+#: ``current_tag_`` this shadows is ``thread_local``, this publisher is
+#: PROCESS-global.  Sound for every load path in the tree today -- the only
+#: ``threading.Thread`` on a load path (model_loader/loader.py:2686) is the
+#: remote-instance loader, which no weights region reaches -- and WRONG the day
+#: a parallel loader opens two weights regions in two threads, where one
+#: thread's exit would restore its base tag over the other's.  A future
+#: parallel loader must make this a ``threading.local``, not merely hope.
+_WEIGHTS_REGION_TAG = GPU_MEMORY_TYPE_WEIGHTS
+
+#: Every tag a WEIGHTS region may legally be opened with.  A weights region
+#: carrying anything else is a naming accident, not a decision: the pause
+#: population, the census and the family predicate all read these names.
+_LEGAL_WEIGHTS_REGION_TAGS = frozenset(
+    (GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_WEIGHTS_DRAFT)
+)
+
+
+def current_weights_region_tag() -> str:
+    """The tag ``model_runner``'s open weights region was created with."""
+    return _WEIGHTS_REGION_TAG
+
+
+@contextmanager
+def weights_region_tag(tag: str) -> Iterator[str]:
+    """Publish the weights region's tag for the duration of the region."""
+    global _WEIGHTS_REGION_TAG
+    previous = _WEIGHTS_REGION_TAG
+    _WEIGHTS_REGION_TAG = tag
+    try:
+        yield tag
+    finally:
+        _WEIGHTS_REGION_TAG = previous
+
+
+@contextmanager
+def weights_region(adapter: Any, tag: str, *, enable_cpu_backup: bool) -> Iterator[str]:
+    """Open a WEIGHTS region AND publish its tag -- the only way to do either.
+
+    #1273 S2 (refuter F6).  Publishing the region tag and opening the region
+    were two statements at two call sites (model_runner's boot load and
+    weight_updater's W57 roll-forward), and one of them adopted the publisher
+    while the other kept a hardcoded ``GPU_MEMORY_TYPE_WEIGHTS``.  That is
+    split brain, not a TODO: the roll-forward's post-load repack runs
+    ``weight_chunk_scope`` (model_loader/loader.py:941), which reads THIS
+    publisher, so a region opened with one tag while the publisher says another
+    tags the reloaded parameters into the wrong family -- silently, and only
+    the NEXT flip fails, with a destination range that has no VRAM source.
+
+    One opener makes the two impossible to disagree.  Nesting order is
+    load-bearing: publish BEFORE the region opens (an allocation inside it must
+    already see the tag) and restore AFTER it closes.
+    """
+    if tag not in _LEGAL_WEIGHTS_REGION_TAGS:
+        raise ValueError(
+            f"a weights region may be opened with {sorted(_LEGAL_WEIGHTS_REGION_TAGS)}, "
+            f"not {tag!r}: the pause population, the per-tag census and "
+            "is_weights_family_tag all read this name. A layer band "
+            "(weights_<n>) is a SCOPE inside the base region, never a region "
+            "of its own -- see weight_chunk_scope."
+        )
+    with weights_region_tag(tag):
+        with adapter.region(tag, enable_cpu_backup=enable_cpu_backup):
+            yield tag
+
+
 @contextmanager
 def weight_chunk_scope(layer_id: Optional[int]) -> Iterator[Optional[str]]:
     """Tag every allocation inside as the chunk of ``layer_id``.
 
-    Valid ONLY inside the weights region (model construction and the
+    Valid ONLY inside the BASE weights region (model construction and the
     post-load pass, both under model_runner's region(GPU_MEMORY_TYPE_WEIGHTS)):
-    on exit the current tag is restored to the base weights tag, which is
-    what the region set.  No-op when chunking is off, when no region is open,
-    or when ``layer_id`` is None (a module outside any layer).
+    on exit the current tag is restored to that base tag, which is what the
+    region set.  No-op when chunking is off, when no region is open, when
+    ``layer_id`` is None (a module outside any layer), and -- #1273 S2 -- when
+    the open region is NOT the base weights region: a layer band is a subdivision
+    of the exchanged weights family and of nothing else, so the draft region's
+    allocations keep the draft tag they were opened with.
     """
-    tag = None if layer_id is None else weight_chunk_tag(layer_id)
+    base = current_weights_region_tag()
+    tag = (
+        None
+        if (layer_id is None or base != GPU_MEMORY_TYPE_WEIGHTS)
+        else weight_chunk_tag(layer_id)
+    )
     cdll = None if tag is None else _tms_cdll_in_region()
     if cdll is None:
         yield None
@@ -1933,7 +2075,7 @@ def weight_chunk_scope(layer_id: Optional[int]) -> Iterator[Optional[str]]:
     try:
         yield tag
     finally:
-        cdll.tms_set_current_tag(GPU_MEMORY_TYPE_WEIGHTS.encode("utf-8"))
+        cdll.tms_set_current_tag(base.encode("utf-8"))
 
 
 DORMANT_REFUSAL_MARKER = "W25 Weg2DormantRefused"
