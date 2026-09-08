@@ -326,16 +326,25 @@ class TheGappedArgvOmitsTheCountFlags(unittest.TestCase):
     """
 
     def argv(self, stage_ratio, attn_stage_ratio):
+        # BY KEYWORD, and that is the fix rather than a style choice. This
+        # helper passed the two ratios POSITIONALLY, and --p-bs and
+        # --max-kv-per-request had since been inserted ahead of them in
+        # argv_p's signature -- so slots 8 and 9 were binding p_bs and
+        # max_kv_per_request while stage_ratio/attn_stage_ratio kept their
+        # defaults, and all four tests in this class were asserting about a
+        # call they never made. Same class as the _max_running_requests boot
+        # killer found in the #1235 argv slice: a signature grew and a
+        # positional caller was left behind. Keywords cannot drift that way.
         return argv_p(
             PY,
             MODEL,
             [1000, 1000, 1000],
-            8,
-            1024,
-            8.0,
+            1,
+            1,
+            1.0,
             [],
-            stage_ratio,
-            attn_stage_ratio,
+            stage_ratio=stage_ratio,
+            attn_stage_ratio=attn_stage_ratio,
         )
 
     def test_a_contiguous_cut_still_states_both_flags(self):

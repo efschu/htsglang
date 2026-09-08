@@ -23,19 +23,28 @@ import unittest
 
 import pytest
 
+# THE SKIP GUARD IS NARROW ON PURPOSE. The sibling weg2 files wrap their whole
+# import in try/except and skip the module, which is right for "this build has
+# no weg2 launcher" and WRONG here: every symbol below is one this slice adds,
+# so an ImportError on it is exactly the regression these tests exist to catch.
+# Measured: with the wide guard, running this file against the parent commit
+# reported "1 skipped" -- a red-first proof that could never go red.
 try:
-    from sglang.srt.weg2.launcher import (
-        D_TP_OBJECTIVE_CHOICES,
-        D_TP_OBJECTIVE_DEFAULT,
-        Card,
-        Weg2LaunchRefused,
-        argv_d,
-        build_parser,
-        d_tp_ratio_decision,
-    )
-except Exception as exc:  # pragma: no cover
+    from sglang.srt.weg2 import launcher as _launcher  # noqa: F401
+except Exception as exc:  # pragma: no cover - no weg2 launcher in this build
     pytest.skip(f"weg2 launcher unavailable: {exc}", allow_module_level=True)
 
+from sglang.srt.weg2.launcher import (  # noqa: E402
+    D_TP_OBJECTIVE_CHOICES,
+    D_TP_OBJECTIVE_DEFAULT,
+    Card,
+    Weg2LaunchRefused,
+    argv_d,
+    argv_p,
+    build_parser,
+    d_token_vector_decision,
+    d_tp_ratio_decision,
+)
 
 MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
 BUDGETS = [28904, 17704, 17672]
@@ -275,7 +284,12 @@ class TestPCutObjective1254(unittest.TestCase):
             self.assertIn("maxkv cut", line)
             self.assertIn("makespan cut", line)
             self.assertEqual(line.count("ms/chunk"), 2)
-            self.assertEqual(line.count("pool"), 3)  # constraint + two rows
+            # both rows' POOLS by value, not a magic substring count: the
+            # point is that a reader sees each objective's capacity as well
+            # as its time, from either side of the choice.
+            decision = self._solve(objective)
+            self.assertIn(" pool %d " % int(decision.kv_floor.pool_tokens), line)
+            self.assertIn(" pool %d " % int(decision.makespan.pool_tokens), line)
 
     def test_trade_line_does_the_division_in_both_currencies(self):
         trade = self._solve("maxkv").trade_line()
