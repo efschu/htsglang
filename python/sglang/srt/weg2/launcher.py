@@ -5833,6 +5833,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.ledger_lines = lines
     state.store_gib = store_gib
 
+    # #1269 fix 4 follow-up: KEEP THE PREFLIGHT'S OWN ANON READING. `cg` is the
+    # cgroup snapshot the ledger just took, BEFORE any group process exists, so
+    # `cg["anon"]` is exactly the baseline W22's `sglang=/foreign=` split has to
+    # subtract. It was already measured and already returned here, and was being
+    # dropped -- sb5c's split was reconstructed by hand afterwards.
+    #
+    # ONE READ, CARRIED -- not a second `read_cgroup()` at front-launch time.
+    # A baseline taken after the groups start is not a baseline, and two reads
+    # are two quantities; the fix-2 lesson, on a measurement instead of a key.
+    anon_preboot_bytes = int(cg.get("anon") or 0)
+    log(f"WEG2-LAUNCH ANON-BASELINE preboot_anon={anon_preboot_bytes / 1073741824:.2f} GiB "
+        f"(cgroup memory.stat anon at PREFLIGHT, before any group process exists; "
+        f"handed to the front as --anon-preboot-bytes so W22 can split its reading into "
+        f"sglang= and foreign=. 0 = unreadable -> the front prints NO split rather than "
+        f"an invented one; sb5c had to be split by hand because this value was dropped)")
+
     # 2b. host memory time series from BEFORE the first group, so the launch
     # moment (P image resident, D loading) is measured this time, not only
     # the run moment (record 1h: the ls1b2 sampler started after D READY).
@@ -6086,7 +6102,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
-            flip_min_work_tokens, idle_layout_front, admin_key_file=admin_key_file)))
+            flip_min_work_tokens, idle_layout_front, admin_key_file=admin_key_file,
+            anon_preboot_bytes=anon_preboot_bytes)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
     state.pids["P"] = spec_p.pid
@@ -6316,6 +6333,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         src_chunk_cards=src_chunk_cards, measured_record=measured_record_path(),
         commit=tip, ledger_arm={"s_gb": arm.s_gb, "m_mib": arm.m_mib, "store_gib": store_gib},
         admin_key_file=admin_key_file,
+        anon_preboot_bytes=anon_preboot_bytes,
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -6353,7 +6371,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
                    src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None,
                    measured_record: str = "", commit: str = "",
                    ledger_arm: Optional[Dict[str, float]] = None,
-                   admin_key_file: str = "") -> List[str]:
+                   admin_key_file: str = "",
+                   anon_preboot_bytes: int = 0) -> List[str]:
     """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
 
     C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
@@ -6383,6 +6402,16 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     # takes only --admin-api-key) but the front does, so it uses it.
     if admin_key_file:
         argv += ["--admin-key-file", admin_key_file]
+    # #1269 fix 4 follow-up: THE PRE-BOOT ANON BASELINE, MEASURED ONCE AND
+    # CARRIED. The W22 guard splits its reading into `sglang=` and `foreign=`
+    # by subtracting this baseline, and the split is only subtractable because
+    # it is THE SAME QUANTITY AT AN EARLIER TIME -- cgroup anon before this
+    # boot's processes existed. The preflight already reads it
+    # (`choose_host_ledger` -> `cg["anon"]`) and, until now, DROPPED it: boot
+    # weg2sb5c's split had to be computed by hand afterwards. 0 stays "unset",
+    # and the front then prints no split rather than an invented one.
+    if anon_preboot_bytes > 0:
+        argv += ["--anon-preboot-bytes", str(int(anon_preboot_bytes))]
     if ns.min_dwell_ms is not None:
         argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
     if ns.d_admit_max_tokens is not None:
