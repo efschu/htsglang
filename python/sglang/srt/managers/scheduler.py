@@ -1452,8 +1452,8 @@ class Scheduler(
         logger.info(
             "WEG2 DRAFT-KV-PRODUCER armed stage=%d/%d drafter=%s layout=v%d heads=%d "
             "head_dim=%d page_bytes=%d embed=resident mtp_mib=%.1f embed_mib=%.1f "
-            "resident_mib=%.1f head_released_mib=%.1f nvml_delta_mib=%.1f "
-            "embed_dtype=%s build_s=%.1f",
+            "resident_mib=%.1f head_released_mib=%.1f head_deferred=%s "
+            "nvml_delta_mib=%.1f embed_dtype=%s build_s=%.1f",
             self.draft_kv_producer.stage,
             self.draft_kv_producer.stages,
             kv_cache_builder.drafter_identity_hash(self.server_args),
@@ -1470,7 +1470,12 @@ class Scheduler(
             #                     W11 grades THIS one; -1 = unmeasured.
             #   head_released_mib the never-loaded lm_head table this handle
             #                     deleted (0 under tie_word_embeddings, where
-            #                     no second table is ever built).
+            #                     no second table is ever built, AND 0 since
+            #                     #1259 b, where it is never built either).
+            #   head_deferred     #1259 (b): the table was never ALLOCATED, so
+            #                     mem_get_info never charged it to this rank's
+            #                     KV budget. Distinguishes that from the tie
+            #                     case, which also reports head_released_mib=0.
             #   nvml_delta_mib    NVML free before the build minus after. Under
             #                     --enable-memory-saver this reads the BUILD,
             #                     not the residue: the weights live in the
@@ -1480,6 +1485,7 @@ class Scheduler(
             #                     freed block out of that same pool.
             self.draft_kv_producer.resident_mib,
             self.draft_kv_producer.head_released_mib,
+            self.draft_kv_producer.head_deferred,
             self.draft_kv_producer.nvml_delta_mib,
             self.draft_kv_producer.embed_dtype,
             self.draft_kv_producer.build_s,

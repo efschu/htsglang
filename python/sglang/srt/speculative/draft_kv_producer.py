@@ -47,6 +47,7 @@ class DraftKvProducer:
 
     def __init__(self, scheduler, algorithm):
         from sglang.srt.distributed.parallel_state import draft_pp_scope, get_pp_group
+        from sglang.srt.models.qwen3_5_mtp import lm_head_from_target
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
         server_args = scheduler.server_args
@@ -87,15 +88,34 @@ class DraftKvProducer:
         self.resident_mib = -1.0
         self.nvml_delta_mib = -1.0
         self.head_released_mib = 0.0
+        # #1259 (b): True when the head's own [vocab, hidden] output table was
+        # never BUILT (the deferral below) rather than built-and-deleted. The
+        # two are not interchangeable on the ledger: a deleted table is still
+        # charged to this rank's KV budget, because the release goes back into
+        # the memory saver's MemPool and not to the driver (see the note on
+        # `nvml_delta_mib` above). Reported beside `head_released_mib` so the
+        # instrument line says WHICH of the two happened; a boot where both
+        # are 0 and this is False is a tie_word_embeddings boot.
+        self.head_deferred = False
         self.embed_dtype = "?"
 
         # The draft build sees a pp_size-1 world: its one layer would fail
         # `make_layers`' `num_hidden_layers >= pp_size` assert under the
         # primary pp_size, and its embedding/norm/lm_head are built on
         # `is_first_rank`/`is_last_rank` of the group `get_pp_group()` returns.
+        #
+        # #1259 (b): and it builds NO output table of its own. This stage is
+        # the target's LAST one, so the target's `lm_head` is resident here and
+        # `load_resident_embedding` shares that module in below -- which is
+        # what the head runs on either way. Building the second
+        # [vocab x hidden] bf16 table first and deleting it afterwards cost
+        # 2425.0 MiB of this rank's KV budget for the whole boot (measured,
+        # weg2tr1: `head_released_mib=2425.0` and `nvml_delta_mib=3998.0` on
+        # the same line -- the release is invisible to `mem_get_info`, which is
+        # what the budget is profiled from).
         draft_args = _draft_server_args(server_args)
         t0 = time.monotonic()
-        with draft_pp_scope():
+        with draft_pp_scope(), lm_head_from_target():
             self.draft_worker = EagleDraftWorker(
                 server_args=draft_args,
                 gpu_id=scheduler.ps.gpu_id,
@@ -226,6 +246,19 @@ class DraftKvProducer:
         target_model = self.draft_worker.target_worker.model_runner.model
         head = getattr(target_model, "lm_head", None)
         own_head = getattr(draft_model, "lm_head", None)
+        # #1259 (b): with the build deferred there is NO fallback table. If the
+        # target has no `lm_head` on this stage the share cannot happen, and
+        # the honest place to say so is here, at boot, and not per chunk inside
+        # the logits processor -- the draft forward goes through it (C21
+        # returns only after `_draft_extend_for_prefill`'s forward).
+        self.head_deferred = bool(getattr(draft_model, "lm_head_is_deferred", False))
+        if self.head_deferred and head is None:
+            raise RuntimeError(
+                "draft-KV producer: the MTP head's lm_head was deferred at build "
+                "time (#1259 b) but the co-located target carries no lm_head on "
+                "this stage, so there is nothing to share in. The producer must "
+                "run on the target's LAST pipeline stage."
+            )
         if head is not None and hasattr(draft_model, "set_lm_head_from_target"):
             draft_model.set_lm_head_from_target(head)
         if (
