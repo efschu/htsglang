@@ -455,6 +455,59 @@ def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
     return "rank idle, front still holds requests"
 
 
+def flip_stage_report(stage: str, age_s: Optional[float]) -> str:
+    """``stage_last_known=<stage> age_s=<n>`` -- NEVER a bare ``stage=``.
+
+    #1264 fix 2b (1).  The weg2t2b stall line said ``stage=sleep-kv`` at
+    12:45:07Z about a stage that had COMPLETED at 12:43:04Z (D logged
+    ``WEG2-DORMANT set`` and the RPC returned 200) and a controller that had
+    been dead since 12:43:04,131Z.  ``_flip_stage`` is only advanced at the
+    NEXT stage, so after an escape it names the last stage ENTERED, not the
+    stage running -- and the bare ``stage=`` spelling asserted the second.
+    That one word sent the triage two minutes and one whole boot analysis down
+    the HiCache drain, which was a consequence and not the cause.
+
+    So the name carries the epistemics: ``stage_last_known`` says "this is the
+    last stage that was entered", and ``age_s`` is what makes it checkable --
+    an age far larger than any stage's plausible duration IS the signal that
+    nothing is advancing it.  On weg2t2b this would have read
+    ``stage_last_known=sleep-kv age_s=123.1``, against a sleep RPC that had
+    answered in 0.6 s.
+
+    ``age_s`` is ``None`` only when no stage was ever stamped; it prints
+    ``unknown`` rather than a zero, because a zero here reads as "just now".
+    """
+    age = "unknown" if age_s is None else f"{age_s:.1f}"
+    return f"stage_last_known={stage} age_s={age}"
+
+
+def controller_dead_line(
+    epoch: int, stage: str, age_s: Optional[float], exc: BaseException
+) -> str:
+    """The one line a controller death must produce, at the moment it dies.
+
+    #1264 fix 2b (2).  On weg2t2b the death produced ``controller error:
+    cannot unpack non-iterable CardFree object`` -- a generic handler message
+    with no marker, no stage and no verdict -- and the loop continued into an
+    idle ``serving`` check forever.  Only the 4x stall timer spoke, 123.7 s
+    later, and it spoke about the wrong thing.  A tool is built only when it is
+    wired: this line is the deadman's tier-3 pattern (boot_deadman.sh), so the
+    death is a VERDICT within one poll instead of a log entry someone reads
+    afterwards.
+
+    Pure, so both the wording and the deadman's pattern can be tested against
+    the same string without a front, a socket or a boot.
+    """
+    return (
+        f"WEG2-FLIP CONTROLLER-DEAD epoch={epoch} "
+        f"{flip_stage_report(stage, age_s)} exc={type(exc).__name__} "
+        f"-- the controller loop raised while a flip was OPEN, so the flip took "
+        f"none of its named exits and `state` stays 'flipping'; the loop's own "
+        f"guard then skips every later iteration. VRAM occupancy is undefined "
+        f"on both groups. No retry; recovery = teardown + relaunch"
+    )
+
+
 def flip_escape_verdict(
     state: str, stage: str, epoch: int, exc: BaseException
 ) -> Optional[Tuple[str, str]]:
@@ -880,7 +933,11 @@ class Front:
         # measured cost of every completed flip -- so the third signal lives
         # here, in the one process that knows a flip began and has not ended.
         self._flip_t0: Optional[float] = None
-        self._flip_stage: str = "none"
+        #: #1264 fix 2b (1): the stage's VALUE and the monotonic instant it was
+        #: assigned, always written together -- see the `_flip_stage` property.
+        self._flip_stage_value: str = "none"
+        self._flip_stage_t: float = time.monotonic()
+        self._flip_stage = "none"
         #: the epoch a STALL line has already been emitted for; -1 = none, so
         #: it can never collide with a real epoch (which starts at 0). One
         #: line per flip: a repeating alarm is a monitor, and persistent
@@ -1356,6 +1413,38 @@ class Front:
                 t.cancel()
         if self.session:
             await self.session.close()
+
+    # ------------------------------------------------------------------
+    # #1264 fix 2b (1): the stage carries its own timestamp, STRUCTURALLY.
+    #
+    # A property rather than "remember to stamp it at each assignment": there
+    # are seven assignment sites today and the next stage anyone inserts would
+    # otherwise ship unstamped, which is the same shape as the defect -- an
+    # instrument that quietly reports a stale value as a current one. Written
+    # through the setter, the two can never disagree, and `age_s` is a fact
+    # about the WRITE, not about whoever remembered to record one.
+    # ------------------------------------------------------------------
+    @property
+    def _flip_stage(self) -> str:
+        return self._flip_stage_value
+
+    @_flip_stage.setter
+    def _flip_stage(self, stage: str) -> None:
+        self._flip_stage_value = stage
+        self._flip_stage_t = time.monotonic()
+
+    def flip_stage_age_s(self, now: Optional[float] = None) -> Optional[float]:
+        """Seconds since the last stage assignment, on the MONOTONIC clock.
+
+        Monotonic because this is a duration and the wall clock can step; the
+        stall line's own `elapsed` uses `time.time()` for a different reason
+        (it is compared against the flip's start, which the flip log records in
+        wall time). ``None`` when nothing was ever stamped.
+        """
+        t = getattr(self, "_flip_stage_t", None)
+        if t is None:
+            return None
+        return (time.monotonic() if now is None else now) - t
 
     def do_stop(self, name: str, detail: str) -> None:
         if self.state == "STOP":
@@ -2851,6 +2940,19 @@ class Front:
                     self.state, self._flip_stage, self.epoch, e
                 )
                 if verdict is not None:
+                    # #1264 fix 2b (2): THE DEATH IS ITS OWN LINE, and it is
+                    # emitted BEFORE the verdict and before this loop continues.
+                    # `logger.exception` alone carried no marker a watcher could
+                    # match, so on weg2t2b the only thing that ever spoke was the
+                    # 4x stall timer, 123.7 s later and about the wrong stage.
+                    # This line is boot_deadman.sh's tier-3 pattern.
+                    logger.error(
+                        "%s",
+                        controller_dead_line(
+                            self.epoch, self._flip_stage, self.flip_stage_age_s(), e
+                        ),
+                    )
+                    self.counters["controller_dead"] += 1
                     logger.exception("controller error during flip: %s", e)
                     self.do_stop(*verdict)
                 else:
@@ -2982,7 +3084,9 @@ class Front:
         self._flip_stall_reported_epoch = self.epoch
         line = (
             f"WEG2-FLIP STALL epoch={self.epoch} elapsed={elapsed:.1f} s "
-            f"bound={bound:.1f} s stage={self._flip_stage} awake={self.awake} "
+            f"bound={bound:.1f} s "
+            f"{flip_stage_report(self._flip_stage, self.flip_stage_age_s())} "
+            f"awake={self.awake} "
             f"queue={len(self.queue)} flips={len(self.flip_log)} "
             f"(bound provenance: {provenance}). The flip began and has not "
             f"completed; tier 1 (a process exists) and tier 2 "

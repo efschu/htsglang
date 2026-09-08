@@ -45,6 +45,8 @@ Three parts, three fixtures, all executable without a GPU or a boot:
 * (C) the idle tree-cache sanity walk, bounded on #1262's mechanism.
 """
 
+import os
+import pathlib
 import re
 import unittest
 from types import SimpleNamespace
@@ -449,6 +451,126 @@ class TestIsFullyIdleIsNotAnUnboundedPath(CustomTestCase):
             re.search(r"\bfor\s+\w+\s+in\s+self\.(tree_cache|token_to_kv_pool)", src),
             "is_fully_idle must not iterate a pool or the tree",
         )
+
+
+# ======================================================================
+# fix 2b -- the two INSTRUMENT defects that sent the triage to the wrong end
+# ======================================================================
+_DEADMAN = "/spinning/gpu-arb/devtools/boot_deadman.sh"
+
+
+class TestStallLineNamesTheLastKnownStage(CustomTestCase):
+    """fix 2b (1).  `stage=sleep-kv` was reported as if current, two minutes
+    after that stage had completed and the controller had died."""
+
+    def test_report_carries_the_age_and_never_a_bare_stage(self):
+        line = front_mod.flip_stage_report("sleep-kv", 123.06)
+        self.assertEqual(line, "stage_last_known=sleep-kv age_s=123.1")
+        # RED-FIRST, as a property of the OUTPUT: the old spelling asserted
+        # currency, and the whole defect is that word. `stage=` must not appear
+        # as a field of its own anywhere in the report.
+        self.assertNotRegex(line, r"(^|\s)stage=")
+
+    def test_an_unstamped_stage_prints_unknown_not_zero(self):
+        """A zero here would read as 'just now', which is the same lie in a
+        different font."""
+        self.assertEqual(
+            front_mod.flip_stage_report("none", None), "stage_last_known=none age_s=unknown"
+        )
+
+    def test_the_stall_line_source_no_longer_spells_a_bare_stage(self):
+        import inspect
+
+        src = inspect.getsource(front_mod.Front.flip_stall_check)
+        self.assertIn("flip_stage_report", src)
+        self.assertNotIn("stage={self._flip_stage}", src)
+
+    def test_every_assignment_is_stamped_because_it_is_a_property(self):
+        """STRUCTURAL, and that is the point: there are seven assignment sites
+        and the eighth would otherwise ship unstamped.  Written through the
+        setter, value and timestamp cannot disagree."""
+        f = front_mod.Front.__new__(front_mod.Front)
+        f._flip_stage_value = "none"
+        f._flip_stage_t = 0.0
+        f._flip_stage = "drain"
+        self.assertEqual(f._flip_stage, "drain")
+        first = f._flip_stage_t
+        self.assertGreater(first, 0.0, "the setter must stamp a monotonic time")
+        f._flip_stage = "sleep-kv"
+        self.assertGreaterEqual(f._flip_stage_t, first)
+        # and the age is derived from THAT write, with an injectable now
+        self.assertAlmostEqual(
+            f.flip_stage_age_s(now=f._flip_stage_t + 42.0), 42.0, places=3
+        )
+
+
+class TestControllerDeathIsItsOwnVerdict(CustomTestCase):
+    """fix 2b (2).  The death produced `controller error: ...` -- a generic
+    handler message with no marker -- and only the 4x stall timer spoke."""
+
+    _EXC = TypeError("cannot unpack non-iterable CardFree object")
+
+    def test_the_line_carries_marker_epoch_stage_age_and_exception(self):
+        line = front_mod.controller_dead_line(0, "sleep-kv", 123.06, self._EXC)
+        self.assertIn("WEG2-FLIP CONTROLLER-DEAD epoch=0", line)
+        self.assertIn("stage_last_known=sleep-kv age_s=123.1", line)
+        self.assertIn("exc=TypeError", line)
+        self.assertIn("No retry", line)
+
+    def test_the_controller_emits_it_before_the_verdict(self):
+        """desk-written-never-executed: ORDER matters -- the death line must be
+        on the log before do_stop's own line, so a watcher reading forward sees
+        the cause first."""
+        import inspect
+
+        src = inspect.getsource(front_mod.Front.controller)
+        self.assertIn("controller_dead_line", src)
+        self.assertLess(
+            src.index("controller_dead_line"),
+            src.index("self.do_stop(*verdict)"),
+            "the CONTROLLER-DEAD line must precede the W4 verdict",
+        )
+
+    @unittest.skipUnless(os.path.exists(_DEADMAN), "boot_deadman.sh not on this box")
+    def test_the_deadman_pattern_matches_what_the_front_emits(self):
+        """THE WIRE, checked from both ends in one assertion.
+
+        The tier's value is entirely in the two strings agreeing, and they live
+        in different repositories -- front.py here, boot_deadman.sh under
+        /spinning/gpu-arb.  Nothing else would notice them drifting apart until
+        a boot died unwatched, which is the failure this whole fix is about.
+        """
+        pattern = None
+        for raw in pathlib.Path(_DEADMAN).read_text().splitlines():
+            if "CONTROLLER-DEAD epoch=" in raw and "grep -cE" in raw:
+                pattern = raw.split("'")[1]
+                break
+        self.assertIsNotNone(pattern, "the deadman carries no CONTROLLER-DEAD pattern")
+        emitted = front_mod.controller_dead_line(0, "sleep-kv", 123.06, self._EXC)
+        self.assertRegex(emitted, pattern)
+        # ... and the W4 half, which do_stop writes.
+        code, detail = front_mod.flip_escape_verdict("flipping", "sleep-kv", 0, self._EXC)
+        self.assertRegex(f"WEG2 STOP {code} -- {detail}", pattern)
+
+    @unittest.skipUnless(os.path.exists(_DEADMAN), "boot_deadman.sh not on this box")
+    def test_the_deadman_prose_does_not_arm_its_own_tier(self):
+        """#995: both tokens appear in the deadman's own comments.  An
+        unanchored pattern would arm the tier off documentation."""
+        import re as _re
+
+        pattern = None
+        for raw in pathlib.Path(_DEADMAN).read_text().splitlines():
+            if "CONTROLLER-DEAD epoch=" in raw and "grep -cE" in raw:
+                pattern = raw.split("'")[1]
+                break
+        prose = [
+            "this deadman treats a `WEG2-FLIP CONTROLLER-DEAD` line as a kill signal",
+            "the flip refuses with W4 Weg2WakeRefused when a leg fails",
+        ]
+        for line in prose:
+            self.assertIsNone(
+                _re.search(pattern, line), f"prose must not arm the tier: {line!r}"
+            )
 
 
 register_cpu_ci(__file__)
