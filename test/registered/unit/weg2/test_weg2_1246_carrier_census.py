@@ -382,7 +382,10 @@ def test_the_launcher_no_longer_scrapes_the_warning():
     assert "HiCache host KV pool" not in src
     assert "0.9 * min" not in src
     assert "carrier_census" in src
-    assert "W45 Weg2CarrierCensusRefused" in src
+    # FIX 3: the refusal text is built where the decision is taken, so the
+    # launcher no longer carries a second copy of it.
+    assert "decide_bound" in src
+    assert "W45 Weg2CarrierCensusRefused" in inspect.getsource(cc)
 
 
 def test_the_launcher_has_no_flag_that_ships_a_bound_of_zero():
@@ -403,7 +406,7 @@ def test_the_launcher_has_no_flag_that_ships_a_bound_of_zero():
     assert "no_carrier_route" not in src, (
         "the launcher still reads the removed flag off the namespace")
     assert '"--carrier-max-tokens", type=int, default=None' in src
-    assert "operator_below_floor" in src
+    assert "operator_below_floor" in inspect.getsource(cc)
     # no arm of the region may assign a bound of 0
     assert "carrier_max_tokens = 0" not in src
 
@@ -564,3 +567,361 @@ def test_the_regex_matches_the_live_emitter_not_only_a_recorded_line():
     assert m.group("rank") == "0" and m.group("now") == "27466"
     assert m.group("fraction") == "0.9" and m.group("host_size") == "30518"
     assert m.group("role") == "staging" and m.group("site") == cc.CENSUS_SITES[0]
+
+
+# ======================================================================= FIX 3
+# THE OVERRIDE MAY ONLY LOWER A MEASURED BOUND.
+#
+# Fix 2 replaced --no-carrier-route with --carrier-max-tokens N and checked N
+# against the FLOOR alone.  That left the escape hatch open on the side the
+# bound exists to guard: N above what group D's carrier reports it will enforce
+# is a bound the store cannot honour, so every prompt priced between the
+# measured bound and N takes leg 1 on P and then a leg-2 read the store must
+# refuse -- '#915 PREFETCH REFUSED' / W16, boot weg2ls4b2.  Both round-2
+# refuters reached it independently, at 262144 (this rig's --max-model-len).
+#
+# The interval is floor < N <= measured, and a census that measured NOTHING has
+# no interval at all.
+
+FLOOR = 5120  # cc.route_floor() at today's constants; asserted as a rule above
+
+
+def _census_of(tmp_path, values, *, name, ranks=3, floor=FLOOR, **kw):
+    """A census over a written log, at the REAL floor unless told otherwise."""
+    return cc.census(_write(tmp_path, _limit_lines(values, **kw), name=name),
+                     expected_ranks=ranks, floor=floor)
+
+
+def _ok_census(tmp_path, name="ok.log", now=27466):
+    return _census_of(tmp_path, [now] * 3, name=name)
+
+
+def test_an_override_above_the_measured_bound_is_refused(tmp_path):
+    """THE BLOCKING DEFECT OF FIX 2.  27466 is what the carrier enforces; 262144
+    is the number an operator reaches for (this rig's --max-model-len, and the
+    value the front-side help's wording invites).  Shipping it does not enlarge
+    the carrier -- it only stops the front bypassing what the carrier cannot
+    read back."""
+    cen = _ok_census(tmp_path)
+    assert cen.measured == 27466
+    for n in (27467, 100000, 262144, 10 ** 9):
+        d = cc.decide_bound(cen, n, floor_why="w")
+        assert d.refused and d.reason == "operator_above_measured", (n, d.reason)
+        assert d.bound == 0
+        assert str(n) in d.detail and "27466" in d.detail
+        assert "W16" in d.detail and "weg2ls4b2" in d.detail
+        assert f"{FLOOR} < N <= 27466" in d.detail
+
+
+def test_an_override_inside_the_interval_ships_and_names_measured_floor_and_n(tmp_path):
+    """The one accepted shape, and the log line the operator is owed: it names
+    all three numbers, so a reader of the boot log can check the decision
+    without re-deriving it."""
+    cen = _ok_census(tmp_path)
+    for n in (FLOOR + 1, 9000, 27466):
+        d = cc.decide_bound(cen, n, floor_why="w")
+        assert not d.refused and d.bound == n and d.reason == ""
+        assert d.source == "operator --carrier-max-tokens"
+        assert f"N={n}" in d.note
+        assert "measured=27466" in d.note
+        assert f"floor={FLOOR}" in d.note
+        assert "never raise one" in d.note
+
+
+@pytest.mark.parametrize("n", [0, 1, 17, 4096, FLOOR])
+def test_an_override_at_or_below_the_floor_is_still_refused(tmp_path, n):
+    """Fix 2's arm, kept: it is the OTHER end of the same interval.  0 is in it
+    and is not an off switch."""
+    d = cc.decide_bound(_ok_census(tmp_path), n, floor_why="w")
+    assert d.refused and d.reason == "operator_below_floor" and d.bound == 0
+    assert "weg2rg5" in d.detail
+    assert f"{FLOOR} < N <= 27466" in d.detail
+
+
+@pytest.mark.parametrize("verdict, build", [
+    ("missing", lambda t: cc.census(str(t / "absent.log"), expected_ranks=3, floor=FLOOR)),
+    ("missing", lambda t: _census_of(t, [27466, 27466], name="partial.log")),
+    ("disagree", lambda t: cc.census(
+        _write(t, _limit_lines([27466, 27466]) + [LINE_TPL.format(
+            rank=2, now=24000, frac="0.9", size=30518, role="staging", pool=9,
+            site=cc.CENSUS_SITES[0])], name="disagree.log"),
+        expected_ranks=3, floor=FLOOR)),
+])
+def test_an_override_is_refused_when_the_census_measured_nothing(tmp_path, verdict, build):
+    """The re-armed failure the refusal exists for: with no measured number
+    there is nothing to lower and nothing to check N against, so the flag cannot
+    stand in for a census.  Fix the census, not the number."""
+    cen = build(tmp_path)
+    assert cen.verdict == verdict and cen.measured is None
+    for n in (9000, 27466, 262144):
+        d = cc.decide_bound(cen, n, floor_why="w")
+        assert d.refused and d.reason == "operator_without_measured_bound", (n, d.reason)
+        assert d.bound == 0
+        assert "measured no carrier bound" in d.detail
+        assert "Fix the census, not the number" in d.detail
+
+
+def test_a_measured_bound_below_the_floor_leaves_no_interval_at_all(tmp_path):
+    """boot weg2rg5's own shape: the carrier measured 17.  `measured` exists, so
+    the refusal is not `without_measured_bound` -- but floor < N <= 17 is empty,
+    so EVERY override is refused by one of the two ends."""
+    cen = _census_of(tmp_path, [17] * 3, name="rg5.log", size=19)
+    assert cen.verdict == "below_floor" and cen.measured == 17
+    seen = set()
+    for n in (0, 17, FLOOR, FLOOR + 1, 27466, 262144):
+        d = cc.decide_bound(cen, n, floor_why="w")
+        assert d.refused, n
+        seen.add(d.reason)
+    assert seen == {"operator_below_floor", "operator_above_measured"}
+
+
+def test_the_census_path_ships_only_ok_and_is_untouched_by_fix_3(tmp_path):
+    """The healthy no-override path: unchanged."""
+    d = cc.decide_bound(_ok_census(tmp_path), None, floor_why="w")
+    assert not d.refused and d.bound == 27466 and d.source == "census" and d.note == ""
+
+    for cen in (_census_of(tmp_path, [17] * 3, name="low.log", size=19),
+                cc.census(str(tmp_path / "absent.log"), expected_ranks=3, floor=FLOOR)):
+        r = cc.decide_bound(cen, None, floor_why="w")
+        assert r.refused and r.reason == cen.verdict and r.bound == 0
+
+
+def test_the_remedy_sentence_describes_the_refusal_the_operator_would_actually_get(tmp_path):
+    """INSTRUMENT-TEXT LAW, KLASSE A, and the exact form round 1 and round 2 both
+    blocked on: the W45 remedy is the ONE sentence an operator is ever told to
+    follow, so what it promises is checked against what the flag then does.  Fix
+    2's said the flag 'is checked against the SAME floor, so there is no way to
+    ship a bound that cannot carry the route' -- and 10^9 shipped."""
+    for cen in (cc.census(str(tmp_path / "absent.log"), expected_ranks=3, floor=FLOOR),
+                _census_of(tmp_path, [17] * 3, name="low2.log", size=19)):
+        detail = cc.decide_bound(cen, None, floor_why="w").detail
+        assert "fix the MEASUREMENT, not the number" in detail
+        assert "may only LOWER" in detail
+        assert "floor < N <= measured" in detail
+        # and the promise is true: the flag really is refused on this census
+        for n in (9000, 262144):
+            assert cc.decide_bound(cen, n, floor_why="w").refused, (cen.verdict, n)
+        # the sentence no longer claims the flag rescues the boot
+        assert "pass --carrier-max-tokens N with a bound you measured yourself" not in detail
+
+
+def test_the_launcher_delegates_the_whole_decision_and_keeps_no_second_check(tmp_path):
+    """ONE MECHANISM.  The launcher must not hold its own comparison beside
+    decide_bound's -- that split is how the floor check ended up alone."""
+    import inspect
+
+    from sglang.srt.weg2 import launcher
+
+    src = inspect.getsource(launcher)
+    assert "_cc.decide_bound(_cen, ns.carrier_max_tokens" in src
+    assert "raise Weg2LaunchRefused(_dec.detail)" in src
+    assert "_override" not in src, "the launcher still compares the operator's number itself"
+    assert "if not _cen.ok" not in src
+
+
+def test_the_flag_help_states_the_interval_and_every_refusal_it_can_produce():
+    """The help is the other operator-facing surface; it must name what the code
+    does, including the arm fix 2 had no text for because it had no check."""
+    import inspect
+
+    from sglang.srt.weg2 import launcher
+
+    src = inspect.getsource(launcher)
+    start = src.index('"--carrier-max-tokens", type=int, default=None')
+    help_text = src[start:src.index("ap.add_argument(", start + 10)]
+    assert "floor < N <= measured" in help_text
+    for code in ("operator_above_measured", "operator_below_floor",
+                 "operator_without_measured_bound"):
+        assert code in help_text, code
+        assert code in inspect.getsource(cc), code
+    assert "0 is NOT an off switch" in help_text
+    assert "fixing the census, not by typing a number" in help_text
+
+
+def test_terms_are_the_ones_measured_even_on_a_refusal_that_parsed_lines(tmp_path):
+    """NONBLOCKING ITEM 1.  The `expected_ranks <= 0` branch returned before the
+    first row was taken, so a log whose three lines parsed perfectly printed
+    `role=? fraction=0.0 host_size=0` -- a MEASURED zero where an observation
+    existed."""
+    c = _census_of(tmp_path, [27466] * 3, name="notp.log", ranks=0)
+    assert c.verdict == "missing" and len(c.lines) == 3
+    assert c.terms() == "role=staging fraction=0.9 host_size=30518"
+    assert "fraction=0.0" not in c.terms() and "role=?" not in c.terms()
+    # and a census that really measured nothing still says so
+    empty = cc.census(str(tmp_path / "absent.log"), expected_ranks=0, floor=FLOOR)
+    assert "not measured" in empty.terms()
+
+
+def test_measured_is_none_exactly_when_there_is_nothing_to_lower(tmp_path):
+    """`bound` holds 0 on missing/disagree because a frozen field must hold
+    something; `measured` is the property that says whether it is an
+    observation."""
+    assert _ok_census(tmp_path).measured == 27466
+    assert _census_of(tmp_path, [17] * 3, name="bf.log", size=19).measured == 17
+    assert cc.census(str(tmp_path / "absent.log"), expected_ranks=3, floor=FLOOR).measured is None
+    assert _census_of(tmp_path, [27466, 27466], name="part.log").measured is None
+
+
+def test_the_source_docstring_names_the_condition_of_its_emitter():
+    """NONBLOCKING ITEM 2, instrument-text law applied to this module's own
+    prose: it convicted the old source of hiding a condition while calling the
+    new one 'unconditional', and one of the two emitting sites sits inside
+    `if storage_backend is not None:`."""
+    import inspect
+
+    from sglang.srt.mem_cache import hiradix_cache, unified_radix_cache
+
+    doc = cc.__doc__
+    assert "once per rank, unconditionally" not in doc  # fix 1's claim
+    assert "NOT unconditional" in doc
+    assert "if storage_backend is not None:" in doc
+    assert "storage backend" in doc
+
+    # the condition the docstring names is the condition in the source
+    u = inspect.getsource(unified_radix_cache)
+    i = u.index('log_prefetch_limit(self.cache_controller, site="init_hicache")')
+    assert "if storage_backend is not None:" in u[:i]
+    h = inspect.getsource(hiradix_cache.HiRadixCache.__init__)
+    assert 'site="hiradix_init"' in h
+
+
+def test_printed_citations_lead_with_symbols_that_exist():
+    """NONBLOCKING ITEM 3.  A line number in a printed string cannot see its own
+    drift; a symbol can be pinned.  The citations name real attributes of the
+    real module, and the resolved line still holds the anchor."""
+    from sglang.srt.weg2 import front
+
+    assert callable(front.Front.handle_generate) and callable(front.Front.leg1)
+    assert isinstance(front.CHUNK_TOKENS, int)
+
+    _floor, why = cc.route_floor()
+    assert "front.Front.handle_generate, front.py:" in why
+    assert "front.CHUNK_TOKENS, front.py:" in why
+
+    detail = cc.decide_bound(
+        cc.census("/nonexistent", expected_ranks=3, floor=FLOOR), None, floor_why="w").detail
+    assert "front.py:279" not in detail  # the citation fix 1 printed for SHORT
+    import inspect
+    anchor = "and pt > self.carrier_max_tokens"
+    ref = cc._front_ref("front.Front.leg1", anchor, -1)
+    assert ref.startswith("front.Front.leg1, front.py:")
+    cited = int(ref.rsplit(":", 1)[1])
+    assert anchor in inspect.getsourcelines(front)[0][cited - 1], (
+        f"front.py:{cited} does not hold {anchor!r} -- the citation drifted")
+
+
+@pytest.mark.skipif(not (os.path.exists(RG3_LOG) and os.path.exists(RG5_LOG)),
+                    reason="evidence logs absent")
+def test_replay_both_real_logs_still_decide_27466_with_no_flag():
+    """The healthy path through the WHOLE decision, on both real D logs: the
+    number the front gets is unchanged by fix 3."""
+    for path in (RG3_LOG, RG5_LOG):
+        cen = cc.census(path, expected_ranks=3, floor=cc.route_floor()[0])
+        d = cc.decide_bound(cen, None, log_path=path, floor_why="w")
+        assert not d.refused and d.bound == 27466 and d.source == "census"
+        # and the same logs refuse the number that re-arms W16
+        assert cc.decide_bound(cen, 262144, log_path=path).reason == "operator_above_measured"
+
+
+# ------------------------------- the launcher's OWN region, executed verbatim
+def _decision_region() -> str:
+    """The launcher's carrier-bound decision, lifted out of ``launcher.py`` by
+    text so the test drives THE CODE THAT SHIPS rather than a paraphrase of it.
+
+    The region's f-strings and its raise only ever run inside a boot, which is
+    why fix 1 and fix 2 could each ship an operator-facing sentence that did not
+    match the arm beneath it: nothing at desk level executed the arm.  The
+    anchors are the two lines that bracket the decision in every version of this
+    region -- the source-line loop above it and the state write below it.
+    """
+    import inspect
+    import textwrap
+
+    from sglang.srt.weg2 import launcher
+
+    src = inspect.getsource(launcher)
+    a = src.index("for _sl in _cen.lines:")
+    b = src.index("state.carrier_max_tokens = carrier_max_tokens", a)
+    body = src[a:b].split("\n")[2:]  # drop the loop itself, keep what follows
+    return textwrap.dedent("\n".join(body))
+
+
+def _launcher_decision(cen, override, *, floor_why="the floor, derived"):
+    """Run that region.  Returns ``(shipped_bound, log_lines)`` or raises
+    ``Weg2LaunchRefused`` exactly as the launcher would."""
+    from types import SimpleNamespace
+
+    from sglang.srt.weg2 import carrier_census as _cc_mod
+    from sglang.srt.weg2.launcher import Weg2LaunchRefused
+
+    logged = []
+    g = {
+        "_cc": _cc_mod,
+        "_cen": cen,
+        "ns": SimpleNamespace(carrier_max_tokens=override),
+        "log": logged.append,
+        "Weg2LaunchRefused": Weg2LaunchRefused,
+        "_floor": cen.floor,
+        "_floor_why": floor_why,
+        "spec_d": SimpleNamespace(log="<group D log>"),
+    }
+    exec(compile(_decision_region(), "<launcher decision region>", "exec"), g)
+    return g["carrier_max_tokens"], logged
+
+
+def test_the_launcher_region_refuses_an_override_above_the_measured_bound(tmp_path):
+    """THE BLOCKING DEFECT, AT THE SEAM THAT SHIPS IT.  On this census the
+    launcher holds 27466 -- it prints it on the line above -- and fix 2 shipped
+    262144, 10^9 and 2^62 beside it, logging only that they cleared the floor."""
+    from sglang.srt.weg2.launcher import Weg2LaunchRefused
+
+    cen = _ok_census(tmp_path)
+    for n in (27467, 262144, 10 ** 9, 2 ** 62):
+        with pytest.raises(Weg2LaunchRefused) as e:
+            _launcher_decision(cen, n)
+        assert "operator_above_measured" in str(e.value), n
+        assert "27466" in str(e.value)
+
+
+def test_the_launcher_region_ships_the_interval_and_logs_all_three_numbers(tmp_path):
+    """What an accepted override must leave in the boot log: N, the measured
+    bound it lowered, and the floor -- so the decision can be checked from the
+    log alone."""
+    cen = _ok_census(tmp_path)
+    bound, logged = _launcher_decision(cen, 9000)
+    assert bound == 9000
+    override_lines = [ln for ln in logged if "OPERATOR OVERRIDE" in ln]
+    assert len(override_lines) == 1
+    line = override_lines[0]
+    assert "N=9000" in line and "measured=27466" in line and f"floor={FLOOR}" in line
+    assert any("--carrier-max-tokens 9000" in ln for ln in logged)
+
+
+def test_the_launcher_region_refuses_an_override_with_no_measured_bound(tmp_path):
+    """A census that measured nothing is fixed by fixing the census.  This is
+    the state in which the W45 remedy sentence is actually printed, so it is the
+    state in which fix 2's advice ('pass a bound you measured yourself') would
+    have been followed -- with no measured ceiling to aim at."""
+    from sglang.srt.weg2.launcher import Weg2LaunchRefused
+
+    for cen in (cc.census(str(tmp_path / "absent.log"), expected_ranks=3, floor=FLOOR),
+                _census_of(tmp_path, [27466, 27466], name="part2.log")):
+        for n in (9000, 262144):
+            with pytest.raises(Weg2LaunchRefused) as e:
+                _launcher_decision(cen, n)
+            assert "operator_without_measured_bound" in str(e.value)
+
+
+def test_the_launcher_region_is_unchanged_on_the_healthy_path(tmp_path):
+    """No override, healthy census: the front gets the measured bound, no
+    OPERATOR OVERRIDE line, and a refusing census still refuses."""
+    from sglang.srt.weg2.launcher import Weg2LaunchRefused
+
+    bound, logged = _launcher_decision(_ok_census(tmp_path), None)
+    assert bound == 27466
+    assert not [ln for ln in logged if "OPERATOR OVERRIDE" in ln]
+    assert any("front --carrier-max-tokens 27466" in ln for ln in logged)
+
+    with pytest.raises(Weg2LaunchRefused) as e:
+        _launcher_decision(_census_of(tmp_path, [17] * 3, name="rg5b.log", size=19), None)
+    assert "W45 Weg2CarrierCensusRefused (below_floor)" in str(e.value)

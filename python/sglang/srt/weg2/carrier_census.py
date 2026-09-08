@@ -1,8 +1,8 @@
 """#1246: where the front's ``--carrier-max-tokens`` comes from.
 
 THE BOUND IS READ, NOT RE-DERIVED.  Group D's KV carrier host pool prints the
-prefetch budget it will actually enforce, once per rank, unconditionally, at
-``init_hicache``::
+prefetch budget it will actually enforce, once per rank, at whichever
+launch-time cache-init site built its cache::
 
     #915 PREFETCH LIMIT now=27466 (fraction=0.9 x host size 30518) role=staging
       pool_id=131401976285280 phase=pp generation=0 site=init_hicache
@@ -14,6 +14,19 @@ the fraction, the pool identity, the binding phase and the emitting site
 the line was emitted, and the census admits only the two launch-time cache-init
 sites -- see :data:`CENSUS_SITES`, which names all three call sites and why the
 third is excluded.
+
+WHEN THE LINE IS EMITTED, exactly (it is NOT unconditional, and this module may
+not use that word about someone else's emitter while convicting the old source
+of hiding a condition -- defect 3 below).  ``hiradix_init`` runs in
+``HiRadixCache.__init__`` (:file:`hiradix_cache.py:216`) with no guard above it.
+``init_hicache`` runs in ``UnifiedRadixCache`` under the guard
+``if storage_backend is not None:`` (:file:`unified_radix_cache.py:1027`, the
+emitter at :file:`1049`), so a group D built with no storage backend emits
+nothing at that site.  For the weg2 boot form that
+condition always holds -- the launcher writes ``--hicache-storage-backend file``
+into both groups' argv (:file:`launcher.py:525`) -- and where it does not hold
+there is no store for leg 2 to read, so the carrier route has nothing to bound
+and the ``missing`` refusal below is the right answer rather than a false alarm.
 
 WHY IT NAMES THE KV CARRIER AND NOTHING ELSE.  The line is formed from
 ``cache_controller.mem_pool_host`` through ``prefetch_budget.host_pool_anchor``
@@ -152,6 +165,24 @@ class CarrierCensus:
     def ok(self) -> bool:
         return self.verdict == "ok"
 
+    @property
+    def measured(self) -> Optional[int]:
+        """The bound this group's ranks actually agreed on, or ``None``.
+
+        THE NUMBER AN OVERRIDE MAY LOWER, and the reason it is a property and
+        not ``bound``: ``bound`` is a frozen field that has to hold something on
+        every verdict, and on ``missing``/``disagree`` it holds 0 -- a
+        placeholder, not an observation, the same distinction :meth:`terms`
+        exists for.  A measurement exists exactly when every expected rank
+        reported and they agreed on every term, i.e. on ``ok`` (the agreed bound
+        clears the floor) and on ``below_floor`` (it does not).  On
+        ``below_floor`` the measurement is real and unusable at once, so the
+        interval ``floor < N <= measured`` is empty and every override is
+        refused -- which is the honest outcome: an operator cannot type his way
+        past a carrier that cannot carry the route.
+        """
+        return self.bound if self.verdict in ("ok", "below_floor") else None
+
     def terms(self) -> str:
         """The measured terms, or the words that say they were NOT measured.
 
@@ -224,6 +255,20 @@ def _front_line(anchor: str, default: int) -> int:
     except Exception:  # noqa: BLE001 - a citation may never break a launch
         pass
     return default
+
+
+def _front_ref(symbol: str, anchor: str, default: int) -> str:
+    """``front.Front.handle_generate, front.py:561`` -- SYMBOL FIRST.
+
+    A printed citation is an instrument, and a line number is the part of it
+    that rots: it is right only until someone inserts a line above it, and no
+    test can see the drift because a test can only pin the string.  A SYMBOL
+    does not drift, a test can assert it still exists, and a reader can find it
+    without counting lines.  The line number is kept after it as a locator and
+    is RESOLVED here rather than transcribed (:func:`_front_line`), so the pair
+    is either right or loudly wrong.
+    """
+    return f"{symbol}, front.py:{_front_line(anchor, default)}"
 
 
 def route_floor() -> Tuple[int, str]:
@@ -310,18 +355,19 @@ def route_floor() -> Tuple[int, str]:
     carrier_est_at_l_star = int(l_star / front.CARRIER_CHARS_PER_TOKEN) + 1
     floor = carrier_est_at_l_star - 1
 
-    ln_chunk = _front_line("CHUNK_TOKENS = ", 67)
-    ln_carrier = _front_line("and carrier_est > self.carrier_max_tokens:", 561)
-    ln_short = _front_line("and remainder <= CHUNK_TOKENS:", 578)
-    ln_est = _front_line("carrier_est = exact if exact else", 560)
+    ref_chunk = _front_ref("front.CHUNK_TOKENS", "CHUNK_TOKENS = ", 67)
+    ref_carrier = _front_ref("front.Front.handle_generate",
+                             "and carrier_est > self.carrier_max_tokens:", 561)
+    ref_short = _front_ref("front.Front.handle_generate", "and remainder <= CHUNK_TOKENS:", 578)
+    ref_est = _front_ref("front.Front.handle_generate", "carrier_est = exact if exact else", 560)
     why = (
         f"floor={floor} tokens of CARRIER-EXCEEDS price, NOT front.CHUNK_TOKENS={chunk}: the two "
-        f"bypass branches price the same prompt in different units -- SHORT (front.py:{ln_short}) "
+        f"bypass branches price the same prompt in different units -- SHORT ({ref_short}) "
         f"compares front.price_remainder's estimate at CHARS_PER_TOKEN={front.CHARS_PER_TOKEN}, "
-        f"CARRIER-EXCEEDS (front.py:{ln_carrier}) compares carrier_est at "
-        f"CARRIER_CHARS_PER_TOKEN={front.CARRIER_CHARS_PER_TOKEN} (front.py:{ln_est}), and "
+        f"CARRIER-EXCEEDS ({ref_carrier}) compares carrier_est at "
+        f"CARRIER_CHARS_PER_TOKEN={front.CARRIER_CHARS_PER_TOKEN} ({ref_est}), and "
         f"carrier_max_tokens is compared against the latter. The shortest prompt SHORT will not "
-        f"serve is {l_star} chars (front.CHUNK_TOKENS={chunk}, front.py:{ln_chunk}, bisected over "
+        f"serve is {l_star} chars (front.CHUNK_TOKENS={chunk}, {ref_chunk}, bisected over "
         f"front.price_remainder with an empty span store = the most permissive cache state), which "
         f"CARRIER-EXCEEDS prices at {carrier_est_at_l_star} tokens; so every bound <= {floor} "
         f"bypasses the leg-1/leg-2 round trip for EVERY prompt length. Scope: SHORT is four "
@@ -394,11 +440,22 @@ def census(
             detail=detail,
         )
 
+    # The first parsed row is taken BEFORE any refusal, so a refusal that did
+    # parse lines prints the terms it actually read.  The ``expected_ranks <= 0``
+    # branch below returned with ``first=None`` while ``lines`` was already
+    # full, and ``terms()`` then printed ``role=? fraction=0.0 host_size=0`` --
+    # a MEASURED zero standing in for an observation that exists, which is the
+    # one confusion this whole module is built to remove (indicator law).
+    first: Optional[Dict[str, str]] = (
+        rank_rows[sorted(rank_rows)[0]][0] if rank_rows else None
+    )
+
     if expected_ranks <= 0:
         return _mk(
             "missing",
             f"the group's argv named no --tp-size, so the census has no rank population to check "
             f"(expected_ranks={expected_ranks})",
+            first=first,
         )
 
     if not rows:
@@ -408,8 +465,6 @@ def census(
             f"never reported the budget it enforces, so this boot's carrier bound was NOT measured "
             f"(that is not the same fact as a route that was switched off)",
         )
-
-    first = rank_rows[sorted(rank_rows)[0]][0]
 
     missing_ranks = [r for r in range(expected_ranks) if r not in per_rank]
     if missing_ranks:
@@ -465,4 +520,191 @@ def census(
         f"{first['host_size']}, role {first['role']}), which clears the floor {floor}",
         bound=bound,
         first=first,
+    )
+
+
+#: The failure the carrier bound exists to prevent, named once so every refusal
+#: that cites it cites the same measured event rather than a remembered one.
+W16_SHAPE = ("the '#915 PREFETCH REFUSED' / W16 shape of boot weg2ls4b2: 84,027 tokens asked of a "
+             "30,518-token host pool, cached_tokens=0, W16 after 6 min of GPU time")
+
+
+@dataclass(frozen=True)
+class BoundDecision:
+    """What the launcher ships to the front, or why it ships nothing.
+
+    ONE MECHANISM FOR BOTH SOURCES.  The census bound and the operator's
+    ``--carrier-max-tokens`` are decided here, together, because they are the
+    same decision -- "what number may the front route by" -- and splitting it
+    across two arms of an ``if`` is how fix 2 came to check the operator's
+    number against the floor and against nothing else.
+
+    ``reason`` is the W45 sub-code and is empty exactly when the decision ships
+    a bound; :attr:`refused` reads it.  ``detail`` is the whole sentence, built
+    here so it can be tested against the behaviour it describes instead of
+    being written beside it.  ``note`` is an extra log line for the shipping
+    path (empty on the census path, the operator-override line otherwise).
+    """
+
+    bound: int
+    source: str
+    reason: str
+    detail: str
+    note: str = ""
+
+    @property
+    def refused(self) -> bool:
+        return bool(self.reason)
+
+
+def decide_bound(
+    cen: CarrierCensus,
+    override: Optional[int],
+    *,
+    log_path: str = "<group D log>",
+    floor_why: str = "",
+) -> BoundDecision:
+    """The bound the front gets, or the W45 that stops the launch.  Pure.
+
+    THE OVERRIDE MAY ONLY LOWER A MEASURED BOUND.  ``--carrier-max-tokens N``
+    is accepted exactly on ``floor < N <= measured``:
+
+    * ``N <= floor`` (``operator_below_floor``) is a bound under which NO prompt
+      of any length takes the leg-1/leg-2 round trip, so group P runs zero
+      prefill passes -- boot weg2rg5's outcome (bound 17, exit 0), asked for by
+      hand.  0 is inside this arm and is not an off switch; there is no flag
+      that is.
+    * ``N > measured`` (``operator_above_measured``) is the arm fix 2 did not
+      have, and its absence re-armed the failure the whole bound exists to
+      prevent.  Raising the number does not enlarge group D's carrier: it only
+      stops the front from BYPASSING prompts the carrier cannot read back, so
+      every prompt priced between ``measured`` and ``N`` takes leg 1 on P and
+      then a leg-2 store read that the store must refuse.  Measured on this
+      tip: at N=262144 (this rig's ``--max-model-len``, the round number the
+      flag's own front-side help invites) an 84,027-token prompt takes
+      route_batch with the post-leg-1 correction disarmed.
+    * no measurement at all (``operator_without_measured_bound``): a
+      ``missing`` or ``disagree`` census has no number to lower, so there is
+      nothing to check ``N`` against.  The refusal is about the MEASUREMENT and
+      a typed number cannot stand in for one -- an operator who wants a boot
+      whose census cannot be read fixes the census, not the number.
+
+    The census path is unchanged: ``ok`` ships its bound, every other verdict is
+    the W45 it already was.
+    """
+    ref_carrier = _front_ref("front.Front.handle_generate",
+                             "and carrier_est > self.carrier_max_tokens:", 561)
+    ref_leg1 = _front_ref("front.Front.leg1", "and pt > self.carrier_max_tokens", 624)
+    provenance = (
+        f"Source '{SOURCE_MARKER}' in {log_path}; component={COMPONENT}; "
+        f"per-rank(TP)={cen.per_rank}; {cen.terms()}; floor={cen.floor} [{floor_why}]"
+    )
+    measured = cen.measured
+
+    def _interval() -> str:
+        """The accepted interval, and the words for the case where it is EMPTY.
+
+        A census that measured a bound at or below the floor prints
+        ``5120 < N <= 17``, which is not an interval an operator can aim at; it
+        is a statement that no override exists on this boot.  Say that instead
+        of leaving the reader to notice the bounds cross (same class as
+        :meth:`CarrierCensus.terms`).
+        """
+        if measured is not None and measured > cen.floor:
+            return f"the accepted interval on this boot is {cen.floor} < N <= {measured}"
+        return (
+            f"the accepted interval floor < N <= measured is EMPTY on this boot: the carrier "
+            f"measured {measured}, at or below the floor {cen.floor}, so no override can be "
+            f"shipped and the census itself is what has to change"
+        )
+
+    if override is None:
+        if cen.ok:
+            return BoundDecision(bound=cen.bound, source="census", reason="", detail=cen.detail)
+        if measured is None:
+            why_not_lowerable = (
+                "this census measured no bound at all, so there is nothing to lower")
+        else:
+            why_not_lowerable = (
+                f"this census measured {measured}, which is itself at or below the floor "
+                f"{cen.floor}, so the interval is empty")
+        return BoundDecision(
+            bound=0,
+            source="",
+            reason=cen.verdict,
+            detail=(
+                f"W45 Weg2CarrierCensusRefused ({cen.verdict}): {cen.detail}. {provenance}. "
+                f"Remedy: fix the MEASUREMENT, not the number. --carrier-max-tokens N cannot stand "
+                f"in for a census: N may only LOWER a bound the census measured (accepted interval "
+                f"floor < N <= measured), and {why_not_lowerable} -- so passing the flag on this "
+                f"boot is refused as well. Make group D report a carrier bound above the floor: a "
+                f"storage backend on group D so a cache-init site emits the line at all, all "
+                f"{cen.expected_ranks} TP ranks reaching it, and agreement between them on every "
+                f"term. Then re-launch."
+            ),
+        )
+
+    n = int(override)
+    if measured is None:
+        return BoundDecision(
+            bound=0,
+            source="",
+            reason="operator_without_measured_bound",
+            detail=(
+                f"W45 Weg2CarrierCensusRefused (operator_without_measured_bound): "
+                f"--carrier-max-tokens {n} cannot be shipped, because this census measured no "
+                f"carrier bound for it to lower (verdict={cen.verdict}: {cen.detail}). The override "
+                f"may only LOWER a measured bound -- accepted interval floor {cen.floor} < N <= "
+                f"measured -- and with no measured number there is nothing to check {n} against, so "
+                f"shipping it would let the front route prompts group D's carrier may be unable to "
+                f"read back: {W16_SHAPE}. Fix the census, not the number. {provenance}"
+            ),
+        )
+
+    if n <= cen.floor:
+        return BoundDecision(
+            bound=0,
+            source="",
+            reason="operator_below_floor",
+            detail=(
+                f"W45 Weg2CarrierCensusRefused (operator_below_floor): --carrier-max-tokens {n} is "
+                f"at or below the route floor {cen.floor} [{floor_why}], so no prompt of any length "
+                f"could take the leg-1/leg-2 round trip and group P would run zero prefill passes -- "
+                f"the boot weg2rg5 outcome, asked for by hand. 0 is refused by this same check and "
+                f"is not an off switch: the front's two carrier guards read 'carrier_max_tokens > 0' "
+                f"({ref_carrier}; {ref_leg1}), so 0 removes the CARRIER-EXCEEDS bypass and leaves "
+                f"the store read unbounded -- {W16_SHAPE}. {_interval()} (measured = the bound group "
+                f"D's own carrier reported). {provenance}"
+            ),
+        )
+
+    if n > measured:
+        return BoundDecision(
+            bound=0,
+            source="",
+            reason="operator_above_measured",
+            detail=(
+                f"W45 Weg2CarrierCensusRefused (operator_above_measured): --carrier-max-tokens {n} "
+                f"is ABOVE the bound group D's own carrier reports it will enforce ({measured}). The "
+                f"override may only LOWER a measured bound, never raise one: {_interval()}. A "
+                f"higher number does not enlarge the carrier; it "
+                f"only stops the front BYPASSING prompts the carrier cannot read back ({ref_carrier} "
+                f"and the post-leg-1 correction at {ref_leg1} are both guarded by this number), so "
+                f"every prompt the front prices between {measured} and {n} takes leg 1 on P and then "
+                f"a leg-2 store read the store must refuse -- {W16_SHAPE}. {provenance}"
+            ),
+        )
+
+    return BoundDecision(
+        bound=n,
+        source="operator --carrier-max-tokens",
+        reason="",
+        detail=cen.detail,
+        note=(
+            f"OPERATOR OVERRIDE N={n} replaces the measured bound measured={measured} "
+            f"(census verdict={cen.verdict}); accepted because floor={cen.floor} < N={n} <= "
+            f"measured={measured} -- the override may only lower a measured bound, never raise one, "
+            f"so the front now bypasses everything above {n} that the carrier could have carried up "
+            f"to {measured}"
+        ),
     )
