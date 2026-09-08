@@ -100,7 +100,7 @@ def test_route_floor_carries_its_derivation_and_resolves_its_citations():
 
     lines = inspect.getsourcelines(front)[0]
     for anchor in ("and carrier_est > self.carrier_max_tokens:",
-                   "and remainder <= self.tp_prefill_max_tokens:"):
+                   "short_ok = remainder <= self.tp_prefill_max_tokens"):
         cited = cc._front_line(anchor, -1)
         assert cited > 0, f"anchor vanished from front.py: {anchor!r}"
         assert anchor in lines[cited - 1], (
@@ -488,7 +488,7 @@ def _route_of(bound: int, n_chars: int) -> str:
         f.admit_d = True
 
         async def fake_leg2(request, rid, payload, text, stream, pending=None,
-                            single_prefill=False):
+                            single_prefill=False, seat=None):
             return "served"
 
         f.leg2 = fake_leg2

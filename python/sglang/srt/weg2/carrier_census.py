@@ -363,11 +363,11 @@ def route_floor(short_bound: Optional[int] = None) -> Tuple[int, str]:
     floor = carrier_est_at_l_star - 1
 
     ref_chunk = _front_ref("front.Front.handle_generate",
-                           "and remainder <= self.tp_prefill_max_tokens:", -1)
+                           "short_ok = remainder <= self.tp_prefill_max_tokens", -1)
     ref_carrier = _front_ref("front.Front.handle_generate",
                              "and carrier_est > self.carrier_max_tokens:", 561)
     ref_short = _front_ref("front.Front.handle_generate",
-                           "and remainder <= self.tp_prefill_max_tokens:", -1)
+                           "short_ok = remainder <= self.tp_prefill_max_tokens", -1)
     ref_est = _front_ref("front.Front.handle_generate", "carrier_est = exact if exact else", 560)
     why = (
         f"floor={floor} tokens of CARRIER-EXCEEDS price, NOT the SHORT bound {chunk} itself: the two "
