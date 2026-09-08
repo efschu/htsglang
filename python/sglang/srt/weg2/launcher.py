@@ -762,7 +762,7 @@ def _split_decisions(
 
 def _serialised_cards(
     card_uuids: Sequence[str],
-    splits: Optional[Dict[str, bool]] = None,
+    published: str = "",
     leg_form: str = "interleave",
 ) -> List[str]:
     """The cards on which the two flip legs are SERIALISED, by UUID.
@@ -784,10 +784,18 @@ def _serialised_cards(
     MiB, its peer holding the granules and itself queued on that same single
     key, ending in W29 on all three P ranks and a group-fatal W4.
 
-    ``splits`` is :func:`_split_decisions`' answer, read back through the module
-    that OWNS the key -- never re-derived here, because a launch check computed
-    from a different number than the key the rank builds is exactly how the
-    predecessor certified a corridor the metal did not walk.
+    IT ASKS THE KEY, NOT ITS OWN DICT (FIX 2 round 2, finding 2).  The
+    predecessor passed :func:`_split_decisions`' answer straight back in as
+    ``splits=``, so the saver returned it verbatim and the check was
+    tautological -- it could not see a rank that would resolve the published
+    string differently, which is the ONE thing it exists to see.  Here the
+    argument is the PUBLISHED STRING, it is resolved the way a rank resolves it
+    (through :data:`weg2_memory_saver.PCIE_DUPLEX_ENV`), and the answer is read
+    off the KEY ITSELF: the two directions' lock paths, compared.  Any saver on
+    ``PYTHONPATH`` answers that -- including one older than the wire format,
+    which returns ONE path for both directions and is therefore reported here as
+    SERIALISED, refused by W34 before either group starts, instead of taking one
+    key on all three cards at the first flip.
     """
     if leg_form != "interleave":
         # The front itself does not gather: every card is serialised, whatever
@@ -795,11 +803,66 @@ def _serialised_cards(
         return list(card_uuids)
     from sglang.srt.managers import weg2_memory_saver
 
-    return [
-        uuid for uuid in card_uuids
-        if not weg2_memory_saver.pcie_lock_separates_directions(
-            uuid, splits=splits or {})
-    ]
+    serialised: List[str] = []
+    saved = os.environ.get(weg2_memory_saver.PCIE_DUPLEX_ENV)
+    os.environ[weg2_memory_saver.PCIE_DUPLEX_ENV] = published
+    try:
+        for uuid in card_uuids:
+            try:
+                keys = {
+                    weg2_memory_saver.pcie_lock_path(uuid, direction=d)
+                    for d in weg2_memory_saver.PCIE_DIRECTIONS
+                }
+            except TypeError:
+                # A saver whose pcie_lock_path has no direction parameter at
+                # all: one key, both legs, by construction.
+                keys = {weg2_memory_saver.pcie_lock_path(uuid)}
+            except getattr(weg2_memory_saver, "Weg2DuplexDecisionRefused", ()):
+                # W36 raised while resolving.  It is already a named refusal;
+                # here it means SERIALISED, so the launcher's own W34 arm gives
+                # the operator the whole picture in one refusal instead of a
+                # traceback out of a helper.
+                keys = {uuid}
+            if len(keys) < len(weg2_memory_saver.PCIE_DIRECTIONS):
+                serialised.append(uuid)
+    finally:
+        if saved is None:
+            os.environ.pop(weg2_memory_saver.PCIE_DUPLEX_ENV, None)
+        else:
+            os.environ[weg2_memory_saver.PCIE_DUPLEX_ENV] = saved
+    return serialised
+
+
+def remove_vram_credit_counters(credit_dir: str = "") -> List[str]:
+    """Unlink this box's per-card VRAM credit counters.  Returns what went.
+
+    FIX 2 round 2, finding 1.  ``vram_credit_path`` is keyed by card UUID and
+    nothing else, so the file outlives the boot that wrote it -- and a TERMINAL
+    one (``leg_complete`` plus a whole image of credit) is exactly what a later
+    boot's flip of the same index read as its own funding while the epoch was
+    only the front's flip counter.  Measured on this rig 2026-09-08: three such
+    files from boot weg2rg2, one carrying 13912 MiB of credit.
+    """
+    from sglang.srt.managers import weg2_memory_saver
+
+    directory = credit_dir or os.environ.get(
+        weg2_memory_saver.VRAM_CREDIT_DIR_ENV,
+        os.environ.get(weg2_memory_saver.PCIE_LOCK_DIR_ENV,
+                       weg2_memory_saver.DEFAULT_PCIE_LOCK_DIR),
+    )
+    prefix = "." + weg2_memory_saver.VRAM_CREDIT_PREFIX
+    removed: List[str] = []
+    if not os.path.isdir(directory):
+        return removed
+    for name in sorted(os.listdir(directory)):
+        if not name.startswith(prefix):
+            continue
+        try:
+            os.unlink(os.path.join(directory, name))
+        except OSError:
+            continue
+        removed.append(name)
+    return removed
 
 
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
@@ -931,12 +994,18 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     # THE DECISION IS PUBLISHED HERE AND NOWHERE ELSE (R19: launcher output).
     # The ranks build their key from this same string, so the inequality this
     # module checks and the key the metal takes cannot be two different facts.
-    plan.duplex_env = ",".join(
+    # THE FORMAT NAMES ITS VERSION (FIX 2 round 2).  A reader that does not know
+    # ``v2`` refuses by name (W36) instead of dropping every row and resolving a
+    # single key on every card, which is what the un-versioned predecessor did
+    # to any older saver on PYTHONPATH -- strictly worse than boot weg2rg2, and
+    # silent.
+    from sglang.srt.managers import weg2_memory_saver as _saver
+    plan.duplex_env = f"{_saver.PCIE_DUPLEX_FORMAT}|" + ",".join(
         f"{u}={('%.3f' % duplex.ratios[u]) if duplex and u in duplex.ratios else ''}"
         f":{'split' if splits[u] else 'single'}"
         for u in card_uuids
     )
-    serialised = _serialised_cards(card_uuids, splits, leg_form)
+    serialised = _serialised_cards(card_uuids, plan.duplex_env, leg_form)
     checks_logged = len(plan.lines)
     for c in table.cards:
         is_serial = c.uuid in serialised
@@ -1512,6 +1581,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ]
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
+    # C14 / FIX 2 round 2: the BOOT half of the VRAM credit epoch.  Launcher
+    # OUTPUT in exactly the class of TMS_HOST_RING_MAP (R19), never an operator
+    # knob: it is this boot's ring epoch, the same nonce every rank already got
+    # from build_env, so the front's composed <boot>.<flip> token and the ranks'
+    # ring identity name ONE boot.  Absent (no armed ring) the front falls back
+    # to its own start time, which is boot-unique for the same reason.
+    if ring_plan is not None and ring_plan.armed:
+        fenv["TMS_HOST_RING_EPOCH"] = str(ring_plan.epoch)
     log("front argv: " + " ".join(shlex.quote(a) for a in front_argv))
     ffh = open(front_log, "ab")
     fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)
@@ -1593,6 +1670,13 @@ def teardown(path: str) -> int:
         except OSError:
             pass
         print(f"host ring dir {ring_dir} removed")
+    # C14 / FIX 2 round 2, finding 1: the per-card VRAM credit counters are
+    # /dev/shm pages of THIS boot, and a terminal one left behind
+    # (leg_complete + a whole image of credit) is what the next boot's flip of
+    # the same index used to read as its own funding.  The composed epoch makes
+    # that harmless; removing the file makes it absent.  Two halves, because
+    # teardown alone cannot clean up after a boot that crashed.
+    print("vram credit counters removed: " + str(remove_vram_credit_counters()))
     print(subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader"], capture_output=True, text=True).stdout)
     return 0
 

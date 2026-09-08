@@ -251,8 +251,18 @@ class DirectionKeyTest(unittest.TestCase):
             ms.pcie_lock_path(self.OK, lock_dir=self.dir, direction="both")
 
     def test_the_published_table_is_parsed_and_an_unparsable_row_is_dropped(self):
-        parsed = ms.duplex_ratios("GPU-a=1.759,GPU-b=nonsense,,GPU-c=1.2")
+        # An unparsable RATIO is still dropped -- a defaulted ratio is the hand
+        # number spec 10.3 forbids.  What is no longer permissive is the
+        # DECISION: FIX 2 round 2 makes a published string that names no
+        # decision a named refusal, so the rows here carry theirs.
+        parsed = ms.duplex_ratios(
+            "v2|GPU-a=1.759:split,GPU-b=nonsense:split,,GPU-c=1.2:split")
         self.assertEqual(parsed, {"GPU-a": 1.759, "GPU-c": 1.2})
+        self.assertEqual(
+            ms.duplex_splits(
+                "v2|GPU-a=1.759:split,GPU-b=nonsense:split,,GPU-c=1.2:split"),
+            {"GPU-a": True, "GPU-b": True, "GPU-c": True},
+            "a card whose ratio nobody could read still has a decision")
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +276,8 @@ class VramCreditTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="weg2credit-")
         self.addCleanup(shutil.rmtree, self.dir, True)
-        self.credit = ms.VramCredit("GPU-c14", credit_dir=self.dir)
+        self.uuid = "GPU-c14"
+        self.credit = ms.VramCredit(self.uuid, credit_dir=self.dir)
 
     def test_the_publisher_is_monotone_within_a_leg(self):
         self.credit.begin_leg(1)
@@ -279,7 +290,8 @@ class VramCreditTest(unittest.TestCase):
         self.credit.publish("weights_0", 100 * MIB)
         self.credit.begin_leg(2)
         self.assertEqual(self.credit.read()["credit_bytes"], 0)
-        self.assertEqual(self.credit.read()["epoch"], 2)
+        self.assertEqual(self.credit.read()["epoch"], "2",
+                         "the stamp is a TOKEN, not a number -- see credit_epoch")
 
     def test_a_previous_legs_TERMINAL_state_is_not_read_as_this_flips_funding(self):
         # FIX 1 round 1, finding 4.  The epoch was WRITE-ONLY: begin_leg stamped
@@ -303,6 +315,63 @@ class VramCreditTest(unittest.TestCase):
         self.assertIn("epoch 7", str(cm.exception))
         self.assertIn("not this flip's 8", str(cm.exception))
 
+    def test_a_previous_BOOTs_terminal_credit_is_not_read_as_this_boots(self):
+        # FIX 2 round 2, finding 1 -- THE CROSS-BOOT HALF, and a REGRESSION of
+        # the property the grandparent had.  FIX 1 dated the counter with
+        # front.Front.self.epoch, a counter initialised to 0 at every front
+        # start; the counter FILE lives in /dev/shm and nothing unlinked it, so
+        # boot A that ran K flips left epoch K-1 on disk with leg_complete and a
+        # whole image of credit, and boot B's flip K-1 read it as ITS OWN.  Spec
+        # 9.1 demands >= 4 flips per direction, so every boot walks through the
+        # range its predecessor left behind.  Measured on this rig 2026-09-08:
+        # three terminal files from boot weg2rg2, one carrying 13912 MiB.
+        # int(time.time()) -- what FIX 1 replaced -- never collided; a per-front
+        # counter always will.  The epoch now names the BOOT and the flip.
+        boot_a = ms.VramCredit(self.uuid, credit_dir=self.dir)
+        boot_a.begin_leg(ms.credit_epoch("1757300000", 7))
+        boot_a.publish("weights_0", 13 * 1024 * MIB)
+        boot_a.leg_complete()
+
+        boot_b = ms.VramCredit(self.uuid, credit_dir=self.dir)
+        with self.assertRaises(ms.Weg2VramCreditRefused) as cm:
+            boot_b.wait_for(2 * 1024 * MIB, budget_s=0.3, tag="weights_0",
+                            free_bytes_now=0,
+                            epoch=ms.credit_epoch("1757399999", 7))
+        self.assertIn("EXPIRED", str(cm.exception),
+                      "a previous BOOT's terminal state must be waited past for "
+                      "the same reason a previous flip's is -- it says nothing "
+                      "about the leg now in flight")
+        self.assertIn("1757300000.7", str(cm.exception))
+
+    def test_the_credit_epoch_names_the_boot_AND_the_flip(self):
+        # The flip index alone cannot date a file that outlives the front, and
+        # an old file's bare integer must not compare equal to a composed token.
+        self.assertNotEqual(ms.credit_epoch("1757300000", 7),
+                            ms.credit_epoch("1757399999", 7))
+        self.assertNotEqual(ms.credit_epoch("1757300000", 7), "7")
+        # boot weg2rg2's leftovers on this rig carry a bare integer stamp.
+        legacy = ms.VramCredit(self.uuid, credit_dir=self.dir)
+        legacy.begin_leg(12)
+        legacy.publish("weights_0", 13 * 1024 * MIB)
+        legacy.leg_complete()
+        with self.assertRaises(ms.Weg2VramCreditRefused):
+            legacy.wait_for(2 * 1024 * MIB, budget_s=0.3, tag="weights_0",
+                            free_bytes_now=0,
+                            epoch=ms.credit_epoch("1757399999", 12))
+
+    def test_teardown_unlinks_the_credit_counters_it_created(self):
+        # Two halves, because neither closes the other: the epoch makes a
+        # leftover harmless (including after a CRASH, which teardown never
+        # runs after), and teardown makes it absent.
+        from sglang.srt.weg2 import launcher
+
+        credit = ms.VramCredit(self.uuid, credit_dir=self.dir)
+        credit.begin_leg(ms.credit_epoch("1757300000", 1))
+        self.assertTrue(os.path.exists(credit.path))
+        removed = launcher.remove_vram_credit_counters(self.dir)
+        self.assertEqual(len(removed), 1, removed)
+        self.assertFalse(os.path.exists(credit.path))
+
     def test_a_stale_full_credit_does_not_licence_a_resume(self):
         self.credit.begin_leg(7)
         self.credit.publish("weights_0", 10 * 1024 * MIB)
@@ -325,9 +394,12 @@ class VramCreditTest(unittest.TestCase):
 
         src = inspect.getsource(front.Front.flip)
         self.assertIn('"/release_memory_occupation",\n                           '
-                      '{"tags": family, "epoch": self.epoch}', src)
+                      '{"tags": family, "epoch": flip_epoch}', src)
         self.assertIn('"/resume_memory_occupation",\n                           '
-                      '{"tags": family, "epoch": self.epoch}', src)
+                      '{"tags": family, "epoch": flip_epoch}', src)
+        # FIX 2 round 2: and the token both legs carry names the BOOT as well as
+        # the flip, because the counter file outlives the boot.
+        self.assertIn("flip_epoch = credit_epoch(self.boot_epoch, self.epoch)", src)
 
     def test_a_leg_without_a_flip_epoch_arms_no_credit_rather_than_reading_one(self):
         # A counter that cannot be dated cannot be told from the previous

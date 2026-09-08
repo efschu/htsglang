@@ -69,10 +69,19 @@ PCIE_DUPLEX_ENV = "SGLANG_WEG2_PCIE_DUPLEX"
 #: direction split is a null".  A threshold ruled by the spec, not a size
 #: guessed here -- and the numbers it grades are measured, per card.  The
 #: step-0 probe of 2026-09-07T23:13Z measured 1.759 on the 5090 (nvml1) and
-#: 1.687 on nvml2, both DUPLEX-OK, against 1.316 on nvml0 (the x4 slot) which
-#: is DUPLEX-NULL and therefore keeps the single key and keeps serialising.
-#: Amendment A1-4: the benefit is PER CARD and the flip's critical path is
-#: exactly the card that does not get it.
+#: 1.687 on nvml2, both DUPLEX-OK, against 1.316 on nvml0 (the x4 slot) which is
+#: DUPLEX-NULL.
+#:
+#: FIX 2 round 2, finding 4: DUPLEX-NULL DOES NOT MEAN ONE KEY ON THIS TREE, and
+#: the sentence that said it did is RETRACTED, not softened.  The ratio is
+#: an expectation about THROUGHPUT; whether the key splits is a CORRECTNESS
+#: decision, and under the gathered legs of C9 the launcher decides ``split``
+#: for EVERY card whatever its ratio (``launcher._split_decisions``:
+#: ``if leg_form == "interleave": return {uuid: True ...}``) -- because on a
+#: one-key card the gathered pair serialises into a deadlock, which is boot
+#: weg2rg2's W31 -> W29 -> W4.  What this threshold still grades is the VALUE of
+#: the split: Amendment A1-4, the benefit is PER CARD and the flip's critical
+#: path is exactly the card that does not get it.
 DUPLEX_SPLIT_MIN_RATIO = 1.5
 
 #: The two direction tokens the key may carry.  ``d2h`` is a sleep's copy to the
@@ -268,6 +277,40 @@ def duplex_ratios(published: Optional[str] = None) -> Dict[str, float]:
     return _parse_duplex(published)[0]
 
 
+#: FIX 2 round 2, finding 2.  The wire format of :data:`PCIE_DUPLEX_ENV` carries
+#: its own version, and a reader that does not know the version REFUSES.  The
+#: predecessor's format (``<uuid>=<ratio>:split``) was a silent superset of the
+#: one before it (``<uuid>=<ratio>``): an older parser did ``float("1.759:split")``,
+#: dropped every row, resolved an EMPTY table, and therefore gave one key on ALL
+#: THREE cards -- strictly worse than the boot the split exists to fix, with no
+#: line saying so anywhere.  A format that degrades to the unsafe answer is not a
+#: format; the version token is what makes the degrade a named stop instead.
+PCIE_DUPLEX_FORMAT = "v2"
+
+
+class Weg2DuplexDecisionRefused(RuntimeError):
+    """W36 -- this rank cannot resolve the launcher's per-card key decision.
+
+    Two shapes, one refusal, both of them "the launcher and the rank do not
+    agree on what the key is", which is the precondition for boot weg2rg2's
+    deadlock (S blocked in ``acquire`` holding the key W needs, W31 at the
+    120 s budget, W29 on every rank, group-fatal W4 -- 120 s into a flip that
+    has already mutated VRAM):
+
+    * an UNKNOWN FORMAT VERSION -- a newer launcher against an older tree on
+      ``PYTHONPATH``, the partial-rebase case the launcher's own W34 comment
+      names;
+    * DECISIONS PUBLISHED BUT NONE PARSED -- a non-empty published string that
+      yields no ``split``/``single`` row at all.  Falling back to R17's ratio
+      gate there is precisely the silent degrade: the ratio gate answers a
+      question about VALUE and would leave the x4 card on one key.
+
+    There is no fallback and none is claimed: the launcher's own launch check
+    resolves the key through this same module (``_serialised_cards``), so this
+    refusal is normally raised BEFORE either group starts, and never mid-flip.
+    """
+
+
 def duplex_splits(published: Optional[str] = None) -> Dict[str, bool]:
     """``{card uuid: does its key split}`` as the launcher DECIDED it.
 
@@ -276,20 +319,40 @@ def duplex_splits(published: Optional[str] = None) -> Dict[str, bool]:
     longer the same question.  The launcher makes that decision once, from the
     ratio AND from the leg form, and publishes it here beside the ratio so the
     rank that builds the key and the launch check that prices it read one
-    answer.  A card with no published decision falls back to the ratio gate,
-    which is what a pre-decision boot's map carries.
+    answer.
+
+    FIX 2 round 2: a published string this reader cannot resolve is
+    :class:`Weg2DuplexDecisionRefused`, never a fall back to the ratio gate.
     """
     return _parse_duplex(published)[1]
 
 
 def _parse_duplex(published: Optional[str]) -> Tuple[Dict[str, float], Dict[str, bool]]:
-    """``<uuid>=<ratio>[:split|:single]`` rows -> (ratios, decisions).
+    """``[v2|]<uuid>=<ratio>[:split|:single]`` rows -> (ratios, decisions).
 
     The ratio may be empty (``<uuid>=:split``): a card the step-0 probe never
     measured still needs a decision, and under gathered legs that decision is
     ``split`` -- see :func:`pcie_lock_separates_directions`.
+
+    Refuses (W36) on an unknown version token, and on a non-empty string that
+    produced no decision at all.  The EMPTY string is not a refusal: it is the
+    honest "nothing was published on this boot", and it resolves to no split,
+    which the launcher's own check then reads as SERIALISED and refuses at
+    launch (W34).
     """
     raw = os.environ.get(PCIE_DUPLEX_ENV, "") if published is None else published
+    raw = (raw or "").strip()
+    if "|" in raw:
+        version, _, raw = raw.partition("|")
+        version = version.strip()
+        if version != PCIE_DUPLEX_FORMAT:
+            raise Weg2DuplexDecisionRefused(
+                f"W36 Weg2DuplexDecisionRefused {PCIE_DUPLEX_ENV} carries format "
+                f"{version!r}, and this tree reads {PCIE_DUPLEX_FORMAT!r} -- the "
+                "launcher and this rank would build DIFFERENT PCIe keys, which is "
+                "the single-key deadlock of boot weg2rg2 (W31 -> W29 -> W4).  No "
+                "fallback: relaunch with one tree on PYTHONPATH."
+            )
     ratios: Dict[str, float] = {}
     splits: Dict[str, bool] = {}
     for item in raw.split(","):
@@ -308,6 +371,15 @@ def _parse_duplex(published: Optional[str]) -> Tuple[Dict[str, float], Dict[str,
             ratios[uuid] = float(ratio_text)
         except ValueError:
             continue
+    if raw and not splits:
+        raise Weg2DuplexDecisionRefused(
+            f"W36 Weg2DuplexDecisionRefused {PCIE_DUPLEX_ENV} is set "
+            f"({raw[:200]!r}) but names no split/single decision for any card.  "
+            "R17's ratio gate is NOT the fallback here: it grades whether the "
+            "split is worth having, not whether the single key is safe, and "
+            "under gathered legs the single key deadlocks (boot weg2rg2). "
+            "No fallback: relaunch with one tree on PYTHONPATH."
+        )
     return ratios, splits
 
 
@@ -347,8 +419,11 @@ def pcie_lock_separates_directions(
     its own, which is a statement about value, never about safety (A1-4 says
     that card gets no benefit from the split, not that it must not have one).
 
-    With no published decision the ratio gate stands, which is a pre-weg2rg2
-    boot's map and the conservative reading of it.
+    With NOTHING published the ratio gate stands -- the no-launcher case, and
+    the conservative reading of it.  With something published that this reader
+    cannot resolve, :func:`_parse_duplex` refuses by name (W36, FIX 2 round 2):
+    the ratio gate is not a fallback for a decision that exists and could not
+    be read.
     """
     decisions = duplex_splits() if splits is None else splits
     if nvml_uuid in decisions:
@@ -541,8 +616,45 @@ VRAM_CREDIT_PREFIX = "weg2-vram-credit"
 VRAM_CREDIT_DIR_ENV = "SGLANG_WEG2_VRAM_CREDIT_DIR"
 
 
+def credit_epoch(boot_nonce: Any, flip_index: Any) -> str:
+    """The credit counter's epoch: ``<boot>.<flip>``, a token, never a number.
+
+    FIX 2 round 2, finding 1 -- A CROSS-BOOT REGRESSION, and the whole reason
+    this function exists rather than the bare flip counter.  FIX 1 dated the
+    counter with ``front.Front.self.epoch``, which is initialised to 0 at every
+    front start and incremented once per flip.  The counter FILE outlives the
+    front: it lives at ``/dev/shm/.weg2-vram-credit-<uuid>.json`` and nothing
+    unlinked it, so boot A that ran K flips left epoch K-1 on disk with
+    ``leg_complete: true`` and a whole image of credit -- and boot B's flip K-1
+    read it as ITS OWN counter, because the two integers are equal.  Spec
+    section 9.1 demands >= 4 flips per direction, so every boot walks straight
+    through the range its predecessor left behind.  Measured on this rig
+    2026-09-08: three terminal files from boot weg2rg2, one carrying
+    ``{"epoch": 12, "credit_bytes": 14589886464, "leg_complete": true}``.  That
+    is C14's failure verbatim (spec section 10.5): W is told the peer funded
+    bytes nobody released, ``resume(tag)`` maps and H2Ds them, CUDA OOM,
+    rank-local.  ``int(time.time())`` -- what FIX 1 replaced -- never collided
+    across boots; a per-front counter always will.
+
+    THE EPOCH MUST NAME THE FLIP AND THE BOOT, so it is composed of both.  The
+    boot half is the launcher's own ring epoch (``HostRingPlan.epoch``, already
+    published to every rank as ``TMS_HOST_RING_EPOCH``): one boot nonce for the
+    boot, not a second one invented here.  The flip half is the front's
+    counter.  Composed as a STRING and compared as a string -- no field width to
+    overflow, no arithmetic to get wrong, and an old boot's bare integer
+    ``12`` can never equal ``"1757308800.12"``.
+    """
+    return f"{boot_nonce}.{flip_index}"
+
+
 def vram_credit_path(nvml_uuid: str, *, credit_dir: Optional[str] = None) -> str:
-    """Path of the per-card credit counter.  Keyed exactly like the PCIe lock."""
+    """Path of the per-card credit counter.  Keyed exactly like the PCIe lock.
+
+    NOT keyed by boot: the epoch inside the file is (see :func:`credit_epoch`),
+    and the launcher's teardown unlinks the file with the ring files it already
+    removes.  Both halves matter -- teardown alone leaves a CRASHED boot's file
+    behind, and that is the case the epoch closes.
+    """
     directory = credit_dir or os.environ.get(
         VRAM_CREDIT_DIR_ENV, os.environ.get(PCIE_LOCK_DIR_ENV, DEFAULT_PCIE_LOCK_DIR)
     )
@@ -624,13 +736,18 @@ class VramCredit:
 
     # -- the sleeping rank's side -------------------------------------------
 
-    def begin_leg(self, epoch: int, *, pid: Optional[int] = None) -> None:
-        """S opens a leg: the counter is zeroed and stamped."""
+    def begin_leg(self, epoch: Any, *, pid: Optional[int] = None) -> None:
+        """S opens a leg: the counter is zeroed and stamped.
+
+        The stamp is stored as a TOKEN (:func:`credit_epoch`), so a previous
+        BOOT's file -- whose stamp is that boot's flip counter -- can never
+        compare equal to this boot's.
+        """
         with self._locked(True) as handle:
             self._store(
                 handle,
                 {
-                    "epoch": int(epoch),
+                    "epoch": str(epoch),
                     "credit_bytes": 0,
                     "leg_complete": False,
                     "publisher_pid": int(pid if pid is not None else os.getpid()),
@@ -671,7 +788,7 @@ class VramCredit:
         tag: str,
         free_bytes_now: Optional[int] = None,
         poll_s: float = 0.01,
-        epoch: Optional[int] = None,
+        epoch: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """W waits for the peer to fund ``need_bytes``, or refuses by name.
 
@@ -686,6 +803,11 @@ class VramCredit:
         cannot license a resume of bytes nobody freed and a stale complete flag
         cannot refuse a flip nothing is wrong with.  ``None`` accepts any epoch
         and is for callers that own the ordering themselves (the tests).
+
+        FIX 2 round 2: the epoch is a TOKEN naming the BOOT and the flip
+        (:func:`credit_epoch`), because the file outlives the boot and the flip
+        counter restarts at 0 with every front -- see that function for the
+        leftovers this rig was carrying.
 
         Returns a record (never raises) in the two cases where nothing is owed:
 
@@ -718,9 +840,13 @@ class VramCredit:
         stale_epoch = None
         while True:
             state = self.read()
-            if epoch is not None and state and int(state.get("epoch", -1)) != int(epoch):
-                # Not this flip's counter.  Neither its bytes nor its
-                # leg_complete flag say anything about the leg now in flight.
+            if epoch is not None and state and str(state.get("epoch")) != str(epoch):
+                # Not this flip's counter -- and "this flip" means THIS BOOT's
+                # flip: the comparison is on the composed token of
+                # :func:`credit_epoch`, so a previous boot's leftover file is
+                # waited past for the same reason and by the same line as a
+                # previous flip's.  Neither its bytes nor its leg_complete flag
+                # say anything about the leg now in flight.
                 stale_epoch = state.get("epoch")
                 state = {}
             credit = int(state.get("credit_bytes", 0))

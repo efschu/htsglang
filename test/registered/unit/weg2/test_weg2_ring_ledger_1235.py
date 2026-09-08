@@ -729,17 +729,20 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
         cards = ["GPU-aaaa", "GPU-bbbb"]
         gathered = launcher._split_decisions(cards, ratios, "interleave")
         self.assertEqual(gathered, {"GPU-aaaa": True, "GPU-bbbb": True})
-        self.assertEqual(launcher._serialised_cards(cards, gathered, "interleave"), [])
+        published_gathered = "v2|GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        self.assertEqual(
+            launcher._serialised_cards(cards, published_gathered, "interleave"), [])
         # A front that does NOT gather has no pair in flight to deadlock, so
         # there the ratio gate stands and the card below it keeps one key.
         serial = launcher._split_decisions(cards, ratios, "serial")
         self.assertEqual(serial, {"GPU-aaaa": True, "GPU-bbbb": False})
         self.assertEqual(
-            launcher._serialised_cards(cards, serial, "serial"), cards,
+            launcher._serialised_cards(cards, "v2|GPU-aaaa=1.759:split,"
+                                       "GPU-bbbb=1.316:single", "serial"), cards,
             "a front that does not gather serialises every card, whatever its key")
         # And the RANK reads the same decision the launcher published, through
         # the module that owns the key -- not the ratio it was derived from.
-        published = "GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        published = "v2|GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
         self.assertEqual(weg2_memory_saver.duplex_splits(published),
                          {"GPU-aaaa": True, "GPU-bbbb": True})
         self.assertTrue(weg2_memory_saver.pcie_lock_separates_directions(
@@ -749,6 +752,149 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
             "GPU-bbbb", lock_dir="/dev/shm", direction="d2h",
             splits=weg2_memory_saver.duplex_splits(published)).endswith(".d2h.lock"),
             "and the KEY the rank builds is the one the decision names")
+
+    def test_an_unknown_wire_format_version_REFUSES_instead_of_one_key(self):
+        # FIX 2 round 2, finding 2.  The predecessor's format
+        # (<uuid>=<ratio>:split) was a SILENT superset of the one before it
+        # (<uuid>=<ratio>): the older parser did float("1.759:split"), dropped
+        # every row, resolved an empty table, and therefore took ONE key on ALL
+        # THREE cards -- strictly worse than boot weg2rg2, which had one key on
+        # nvml0 only, and with no line saying so anywhere.  A format that
+        # degrades to the unsafe answer is not a format.
+        from sglang.srt.managers import weg2_memory_saver
+
+        with self.assertRaises(weg2_memory_saver.Weg2DuplexDecisionRefused) as cm:
+            weg2_memory_saver.duplex_splits("v3|GPU-aaaa=1.759:split")
+        self.assertIn("W36 Weg2DuplexDecisionRefused", str(cm.exception))
+        # ... and no fallback is claimed, because there is none.
+        self.assertIn("No fallback", str(cm.exception))
+
+    def test_decisions_published_but_none_parsed_REFUSES(self):
+        # The other half of the same mismatch: a non-empty published string that
+        # names no split/single row at all.  Resolving that to R17's ratio gate
+        # is the silent degrade -- the ratio grades whether the split is WORTH
+        # having, never whether the single key is SAFE, and under gathered legs
+        # it is not (boot weg2rg2: W31 -> W29 -> group-fatal W4).
+        from sglang.srt.managers import weg2_memory_saver
+        from sglang.srt.weg2 import launcher
+
+        with self.assertRaises(weg2_memory_saver.Weg2DuplexDecisionRefused) as cm:
+            weg2_memory_saver.duplex_splits("GPU-aaaa=1.759,GPU-bbbb=1.316")
+        self.assertIn("W36 Weg2DuplexDecisionRefused", str(cm.exception))
+        # The EMPTY string is not a refusal: nothing was published, which is an
+        # honest state, and it resolves to no split -- which the launch check
+        # then reads as SERIALISED and refuses at launch (W34).
+        self.assertEqual(weg2_memory_saver.duplex_splits(""), {})
+        self.assertEqual(
+            launcher._serialised_cards(["GPU-aaaa", "GPU-bbbb"], "", "interleave"),
+            ["GPU-aaaa", "GPU-bbbb"])
+
+    def test_the_launch_check_resolves_the_KEY_THE_RANK_WILL_BUILD(self):
+        # FIX 2 round 2, finding 2 -- THE TAUTOLOGY.  The predecessor passed
+        # _split_decisions' own answer back into
+        # pcie_lock_separates_directions(splits=...), so the saver returned it
+        # verbatim and the check could not see a rank that would resolve the
+        # published string differently -- which is the ONE thing it exists to
+        # see.  The launcher's W34 comment names that scenario ("a stale
+        # worktree on PYTHONPATH, a partial rebase") as the one the arm exists
+        # for; the leg-form half was caught, the KEY half was not.
+        from sglang.srt.managers import weg2_memory_saver
+        from sglang.srt.weg2 import launcher
+
+        cards = ["GPU-aaaa", "GPU-bbbb"]
+        ratios = {"GPU-aaaa": 1.759, "GPU-bbbb": 1.316}
+        splits = launcher._split_decisions(cards, ratios, "interleave")
+        published = f"{weg2_memory_saver.PCIE_DUPLEX_FORMAT}|" + ",".join(
+            f"{u}={'%.3f' % ratios[u]}:{'split' if splits[u] else 'single'}"
+            for u in cards)
+        # The check the launch gate was missing: feed the launcher's OWN
+        # published string to the saver's parser and compare the resolved key
+        # per card against the launcher's decision per card.
+        for uuid in cards:
+            keys = {weg2_memory_saver.pcie_lock_path(
+                uuid, lock_dir="/dev/shm", direction=d,
+                splits=weg2_memory_saver.duplex_splits(published))
+                for d in weg2_memory_saver.PCIE_DIRECTIONS}
+            self.assertEqual(
+                len(keys) == len(weg2_memory_saver.PCIE_DIRECTIONS), splits[uuid],
+                f"{uuid}: the launcher decided {splits[uuid]} and the rank builds "
+                f"{len(keys)} key(s)")
+
+    def test_a_saver_that_cannot_read_the_format_is_reported_SERIALISED(self):
+        # And the reason the check must ask the KEY rather than a dict: an older
+        # saver on PYTHONPATH answers the question wrongly and silently.  Here
+        # it is, verbatim -- the parent's duplex_ratios did float() on the whole
+        # right-hand side, so every row dropped, the table was empty, and
+        # pcie_lock_path returned ONE path for both directions.  The launch
+        # check must see that and hand the card to W34, not arm.
+        from sglang.srt.managers import weg2_memory_saver
+        from sglang.srt.weg2 import launcher
+
+        cards = ["GPU-aaaa", "GPU-bbbb"]
+        published = "v2|GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        real = weg2_memory_saver.pcie_lock_path
+
+        def old_pcie_lock_path(nvml_uuid, *, lock_dir=None, direction=None,
+                               ratios=None, splits=None):
+            # the parent's resolution: float("1.759:split") raises, row dropped
+            table = {}
+            for item in os.environ.get(
+                    weg2_memory_saver.PCIE_DUPLEX_ENV, "").split(","):
+                uuid, _, value = item.partition("=")
+                try:
+                    table[uuid.strip()] = float(value)
+                except ValueError:
+                    continue
+            key = nvml_uuid
+            ratio = table.get(nvml_uuid)
+            if direction and ratio is not None and ratio >= 1.5:
+                key = f"{key}.{direction}"
+            return f"/dev/shm/.weg2-pcie-serialize-{key}.lock"
+
+        weg2_memory_saver.pcie_lock_path = old_pcie_lock_path
+        try:
+            self.assertEqual(
+                launcher._serialised_cards(cards, published, "interleave"), cards,
+                "an old saver takes one key on EVERY card, and the launch check "
+                "must see the key it will actually build, not the launcher's dict")
+        finally:
+            weg2_memory_saver.pcie_lock_path = real
+
+    def test_no_module_outside_the_decision_claims_a_card_keeps_ONE_key(self):
+        # FIX 2 round 2, finding 4, as a structural guard.  FIX 1 made every key
+        # split under gathered legs and closed the false sentence in the
+        # launcher's printed lines -- and left three callers asserting the
+        # opposite, one of them (front.py's L5 comment) instructing the operator
+        # to read ZERO OVERLAP on the flip's critical-path card as expected
+        # behaviour.  Under this tree zero overlap there means the key did NOT
+        # split, i.e. the blocking finding has occurred, and the comment told
+        # the reader to dismiss it.
+        from sglang.srt.weg2 import launcher
+
+        cards = ["GPU-aaaa", "GPU-bbbb"]
+        self.assertEqual(
+            set(launcher._split_decisions(
+                cards, {"GPU-aaaa": 1.759, "GPU-bbbb": 1.316}, "interleave").values()),
+            {True},
+            "the premise: under gathered legs every card splits, whatever its ratio")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(launcher.__file__)))
+        # The dead sentences, verbatim.  They are NOT re-quoted anywhere in the
+        # tree -- a retraction that reprints the claim gives the next grep a
+        # false positive and the next reader a true one -- so any occurrence is
+        # an assertion and an offender.
+        banned = ("keeps the single key", "keep the single key",
+                  "serialises the legs by design", "still serialise by design",
+                  "serialise by design")
+        offenders = []
+        for rel in ("weg2/front.py", "weg2/ring_table.py", "weg2/host_ledger.py",
+                    "weg2/launcher.py", "managers/weg2_memory_saver.py"):
+            path = os.path.join(root, rel)
+            if not os.path.exists(path):
+                continue
+            for n, line in enumerate(open(path, errors="replace"), 1):
+                if any(b in line for b in banned):
+                    offenders.append(f"{rel}:{n}: {line.strip()}")
+        self.assertEqual(offenders, [], "\n".join(offenders))
 
     def test_a_card_below_the_gate_is_checked_against_the_SERIAL_requirement(self):
         # BOOT weg2rg2, THE KILLER, AS A TEST.  The predecessor computed the
@@ -1321,6 +1467,44 @@ class DormantImageInstrumentTest(unittest.TestCase):
         self.assertIsNotNone(table, reason)
         self.assertTrue(table.cards[0].dormant_p_bound)
         self.assertIn("a LOWER BOUND", table.provenance())
+
+    def test_a_flip_tag_line_with_NO_population_FIELD_stays_a_LOWER_BOUND(self):
+        # FIX 2 round 2, finding 3.  The test above writes population=
+        # weights-family EXPLICITLY, so it exercises the explicit-weak-claim
+        # branch and never the ABSENT-claim branch its name promises.  The
+        # absent branch is the live one: the emitter at 8c7f5d8d00 -- the commit
+        # boots weg2rg1 and weg2rg2 actually ran -- writes WEG2-FLIP-TAG lines
+        # with no population token at all, so the first table solved from a
+        # weg2rg2-family log takes exactly this path.  ring_table's
+        # ``m.group(5) or TAG_POPULATION_WEIGHTS`` IS the guard, and mutating
+        # that default to TAG_POPULATION_ALL -- i.e. reinstating round 1's
+        # finding 2 -- left the whole suite green.  It does not any more.
+        #
+        # The h2d line is here for a second reason: _TAG_RE matches dir=\S+, so
+        # ANY direction's line can flip covers_all.  A silent claim must not
+        # reach the census through the direction nobody was looking at.
+        for prefix, group in (("PP", "P"), ("TP", "D")):
+            with open(os.path.join(self.dir, f"{self.stem}.{group}.log"), "w") as f:
+                f.write(
+                    f"[2026-09-07 21:10:23 {prefix}0] WEG2-FLIP-TAG group={group} rank=0 "
+                    f"card={CARDS[0].uuid} dir=d2h tag=weights_0 bytes=300 MiB "
+                    "(source: tms_tag_bytes, NOT RssShmem) ms=100 GB/s=3.00 granules=150\n"
+                    f"[2026-09-07 21:10:24 {prefix}0] WEG2-FLIP-TAG group={group} rank=0 "
+                    f"card={CARDS[0].uuid} dir=h2d tag=weights_0 bytes=300 MiB "
+                    "(source: tms_tag_bytes, NOT RssShmem) ms=100 GB/s=3.00 granules=150\n"
+                    f"[2026-09-07 21:06:30 {prefix}0] KV Cache is allocated. dtype: "
+                    "torch.float8_e4m3fn, #tokens: 1, K size: 0.50 GB, V size: 0.50 GB\n"
+                )
+        with open(os.path.join(self.dir, f"{self.stem}.front.log"), "w") as f:
+            f.write(_front_log({"P": [{1: 100}], "D": [{1: 100}]}))
+        table, reason = ring_table.solve([CARDS[0]], self.dir, self.stem)
+        self.assertIsNotNone(table, reason)
+        self.assertTrue(
+            table.cards[0].dormant_p_bound,
+            "a line that does not state its population states the WEAKER claim")
+        self.assertTrue(table.cards[0].dormant_d_bound)
+        self.assertIn("a LOWER BOUND", table.provenance())
+        self.assertNotIn("it IS A1-2's measured dormant image", table.provenance())
 
 
 class DuplexTableTest(unittest.TestCase):

@@ -1969,7 +1969,11 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # cannot tell this leg's counter from the previous flip's terminal state and
     # must consult none (weg2_memory_saver.VramCredit.wait_for).  None on every
     # non-Weg-2 path -- a stock request is unchanged.
-    epoch: Optional[int] = None
+    #
+    # FIX 2 round 2: a TOKEN naming the boot AND the flip
+    # (weg2_memory_saver.credit_epoch), not the bare flip index -- the counter
+    # file outlives the boot, so two boots' flip 7 used to compare equal.
+    epoch: Optional[str] = None
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
@@ -2001,7 +2005,11 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # cannot tell this leg's counter from the previous flip's terminal state and
     # must consult none (weg2_memory_saver.VramCredit.wait_for).  None on every
     # non-Weg-2 path -- a stock request is unchanged.
-    epoch: Optional[int] = None
+    #
+    # FIX 2 round 2: a TOKEN naming the boot AND the flip
+    # (weg2_memory_saver.credit_epoch), not the bare flip index -- the counter
+    # file outlives the boot, so two boots' flip 7 used to compare equal.
+    epoch: Optional[str] = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):

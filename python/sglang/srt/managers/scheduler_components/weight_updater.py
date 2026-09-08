@@ -918,7 +918,7 @@ class SchedulerWeightUpdaterManager:
             return None
         try:
             credit = vram_credit(uuid_key)
-            credit.begin_leg(int(epoch))
+            credit.begin_leg(str(epoch))
         except OSError as exc:
             logger.warning(
                 "[weg2 credit] no VRAM credit published on %s (%s) -- a "
@@ -942,7 +942,7 @@ class SchedulerWeightUpdaterManager:
         if uuid_key is None:
             return None, None
         try:
-            return vram_credit(uuid_key), int(epoch)
+            return vram_credit(uuid_key), str(epoch)
         except OSError:
             return None, None
 

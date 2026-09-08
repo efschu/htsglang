@@ -58,7 +58,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from sglang.srt.managers.weg2_memory_saver import weights_family_tags
+from sglang.srt.managers.weg2_memory_saver import credit_epoch, weights_family_tags
 
 logger = logging.getLogger("weg2.front")
 
@@ -400,6 +400,15 @@ class Front:
         self.dc_reserve = dc_reserve
         self.w_s = w_s
         self.epoch = 0
+        # C14 / FIX 2 round 2, finding 1: THE BOOT HALF OF THE CREDIT EPOCH.
+        # ``self.epoch`` alone dates a flip only WITHIN this front; the counter
+        # file it dates lives in /dev/shm and outlives the boot, so flip 7 of
+        # this boot used to read flip 7 of the last boot's terminal state as its
+        # own funding.  The boot nonce is the launcher's ring epoch, published
+        # to the ranks as TMS_HOST_RING_EPOCH (launcher output, R19 -- not an
+        # operator knob); with no armed ring there is none to inherit and this
+        # process's own start time serves, boot-unique for the same reason.
+        self.boot_epoch = os.environ.get("TMS_HOST_RING_EPOCH", "").strip() or str(int(time.time()))
         self.state = "serving"  # serving | flipping | STOP
         self.stop: Optional[Weg2Stop] = None
         self.admit_d = True
@@ -874,10 +883,17 @@ class Front:
         #
         # And the per-card PCIe lock, which used to serialise the two legs into
         # each other whatever this driver did, now keys on <uuid>.<d2h|h2d>
-        # (C12/C13) -- on the cards whose MEASURED duplex ratio earns it.  The
-        # x4-linked card measured 1.316 and keeps the single key, so on THAT
-        # card the two legs still serialise by design; that is a per-card
-        # property printed by the launcher, never a global assumption.
+        # (C12/C13) on EVERY card while the legs are gathered.  FIX 2 round 2,
+        # finding 4: what stood here instead was that the x4-linked card, having
+        # measured 1.316, kept one key and so still serialised the pair by
+        # design.  RETRACTED -- it is false on this tree and was already false
+        # when it was written.  The ratio is an expectation about
+        # THROUGHPUT; the split is a CORRECTNESS decision, taken once in
+        # launcher._split_decisions, which returns split for every card under
+        # leg_form == "interleave" because a one-key card deadlocks the gathered
+        # pair (boot weg2rg2: W31 -> W29 -> group-fatal W4).  What the launcher
+        # prints per card is that decision (WEG2-HOST-RING CHECK ... key=), and
+        # a card printed SINGLE there does not arm -- it refuses W34.
         sleep_ms = 0.0
         wake_ms = 0.0
         chunk_recs: List[dict] = []
@@ -888,6 +904,10 @@ class Front:
             self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
             return
         family = list(self.weights_tags)
+        # FIX 2 round 2: the token names the BOOT and the flip, not the flip
+        # alone -- see weg2_memory_saver.credit_epoch for the leftover counters
+        # a bare flip index made this boot inherit.
+        flip_epoch = credit_epoch(self.boot_epoch, self.epoch)
         t_gather0 = time.perf_counter()
         # C14 / FIX 1 round 1: the FLIP'S epoch rides on BOTH legs.  It is the
         # only thing that dates the per-card VRAM credit counter, and this
@@ -896,9 +916,9 @@ class Front:
         # previous flip's terminal state as this flip's funding.
         (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
             self.timed_rpc(S, "/release_memory_occupation",
-                           {"tags": family, "epoch": self.epoch}, RPC_TIMEOUT_S),
+                           {"tags": family, "epoch": flip_epoch}, RPC_TIMEOUT_S),
             self.timed_rpc(D, "/resume_memory_occupation",
-                           {"tags": family, "epoch": self.epoch}, RPC_TIMEOUT_S),
+                           {"tags": family, "epoch": flip_epoch}, RPC_TIMEOUT_S),
         )
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)
@@ -984,9 +1004,20 @@ class Front:
         #                          hid.  Its denominator is the SHORTER leg:
         #                          100 % means the shorter leg cost nothing in
         #                          wall time, and it can never exceed that.
-        # Zero overlap is a READING, not a fault: on a card whose measured
-        # duplex ratio did not earn the direction split (the x4-linked 3080,
-        # 1.316) the per-card PCIe lock serialises the legs by design.
+        # ZERO OVERLAP ON THIS TREE IS A FINDING, NOT A READING (FIX 2 round 2,
+        # finding 4).  The comment that stood here pre-authorised it: it told the
+        # reader that on a card whose measured duplex ratio did not earn the
+        # direction split (the x4-linked 3080, 1.316) the per-card PCIe lock
+        # ordered the two legs one after the other on purpose.  RETRACTED -- that
+        # premise is dead: under gathered legs the launcher
+        # splits the key on EVERY card whatever its ratio.  So if section 9.6's
+        # L5 acceptance reading comes back at ~0 %, do not dismiss it; check, in
+        # this order, (1) the launcher's WEG2-HOST-RING CHECK line per card for
+        # key=SPLIT per direction, (2) the rank's RESOLVED lock path (a
+        # <uuid>.d2h / <uuid>.h2d pair in /dev/shm, not a bare <uuid>), (3)
+        # W36 Weg2DuplexDecisionRefused in the rank logs.  A ratio below R17's
+        # gate predicts a small SPEEDUP from the split on that card (A1-4), not
+        # a serialisation.
         legs_ms = [("sleep/" + src, s_ms, s_crit), ("wake/" + dst, w_ms, w_crit)]
         crit_leg, crit_ms, crit_note = max(legs_ms, key=lambda x: x[1])
         overlap_ms = max(0.0, s_ms + w_ms - legs_wall_ms)
