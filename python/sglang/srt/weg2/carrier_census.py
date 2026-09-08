@@ -10,7 +10,10 @@ prefetch budget it will actually enforce, once per rank, unconditionally, at
 That line is the census's sole source.  Every term the front needs is on it and
 named: the budget, the fraction it came from, the pool size, the role that chose
 the fraction, the pool identity, the binding phase and the emitting site
-(``prefetch_budget.log_prefetch_limit``, :file:`prefetch_budget.py:71-99`).
+(``prefetch_budget.log_prefetch_limit``).  ``site`` is the field that says WHEN
+the line was emitted, and the census admits only the two launch-time cache-init
+sites -- see :data:`CENSUS_SITES`, which names all three call sites and why the
+third is excluded.
 
 WHY IT NAMES THE KV CARRIER AND NOTHING ELSE.  The line is formed from
 ``cache_controller.mem_pool_host`` through ``prefetch_budget.host_pool_anchor``
@@ -67,17 +70,25 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 #: What a reader should grep for in group D's log to see the census's input.
-SOURCE_MARKER = "#915 PREFETCH LIMIT now=<n> (fraction=<f> x host size <s>) role=<r> ... site=init_hicache"
+SOURCE_MARKER = ("#915 PREFETCH LIMIT now=<n> (fraction=<f> x host size <s>) role=<r> ... "
+                 "site=<init_hicache|hiradix_init>")
 
 #: The component the bound describes, named once so the log line cannot drift
 #: from the docstring above.
 COMPONENT = "group D KV carrier host pool (cache_controller.mem_pool_host via prefetch_budget.host_pool_anchor)"
 
-#: The emitting site the census admits.  ``log_prefetch_limit`` also runs after
-#: every cutover rebind; the census is taken at launch, before any traffic and
-#: before any flip, so ``init_hicache`` IS the population and saying so keeps a
-#: later rebind line from silently joining the sample (denominator law).
-CENSUS_SITE = "init_hicache"
+#: The emitting sites the census admits: the two LAUNCH-TIME cache-init sites.
+#: ``log_prefetch_limit`` has THREE call sites and they are not interchangeable
+#: -- ``init_hicache`` (:file:`unified_radix_cache.py:1049`), ``hiradix_init``
+#: (:file:`hiradix_cache.py:216`) and ``rebind_for_cutover``
+#: (:file:`hicache_phase_binding.py:971`).  The first two are the constructors of
+#: the two cache classes, exactly one of which any group D builds; the third runs
+#: after every flip.  The census is taken at launch, before any traffic and
+#: before any flip, so the two init sites ARE the population, and naming them
+#: keeps a later rebind line from silently joining the sample (denominator law).
+#: Admitting only ``init_hicache`` would turn a group D built on ``HiRadixCache``
+#: into a W45 ``missing`` refusal while its carrier was perfectly healthy.
+CENSUS_SITES: Tuple[str, ...] = ("init_hicache", "hiradix_init")
 
 #: TRAP-SAFE by shape, not by token (#995).  ``#915 PREFETCH LIMIT`` also occurs
 #: in the fork's own PROSE -- :file:`scheduler_pp_mixin.py:2932` tells the
@@ -105,9 +116,18 @@ class CarrierCensus:
         the floor.  ``bound`` is what the front gets.
     ``missing``
         the KV carrier's line is absent for at least one expected rank while the
-        route is expected.  NOT a bound of 0 -- a bound of 0 means the launcher
-        deliberately switched the route off, and a parse miss must never be able
-        to imitate that (boot weg2rg5's exit 0).
+        route is expected.  NOT a bound of 0.  0 is not an off switch and never
+        was: the front's two carrier guards read ``self.carrier_max_tokens > 0``
+        (:file:`front.py:561` CARRIER-EXCEEDS and :file:`front.py:624` the
+        post-leg-1 correction), so 0 removes the BYPASS and sends every prompt
+        above the SHORT grant through the leg-1/leg-2 round trip with NO bound on
+        what the store is asked to carry -- the ``#915 PREFETCH REFUSED`` / W16
+        shape of boot weg2ls4b2 (84,027 tokens against a 30,518-token host pool).
+        The front's own help says so in one line (:file:`front.py:1156`, "0 = no
+        CARRIER-EXCEEDS route").  The launcher therefore never ships 0: it is
+        below the floor and is refused like any other bound that cannot carry the
+        route, whether the census produced it or the operator typed it.  A parse
+        miss must be able to imitate neither (boot weg2rg5's exit 0).
     ``disagree``
         the ranks reported different budgets, fractions, host sizes or roles.
         The front routes by ONE number for a group of three lockstep ranks; if
@@ -132,6 +152,21 @@ class CarrierCensus:
     def ok(self) -> bool:
         return self.verdict == "ok"
 
+    def terms(self) -> str:
+        """The measured terms, or the words that say they were NOT measured.
+
+        A census that found no source line has ``role="?"``, ``fraction=0.0``
+        and ``host_size=0`` because a frozen dataclass needs values, and
+        ``fraction=0.0`` on a log line reads as a MEASURED zero rather than as
+        "there was nothing to measure".  The distinction is the whole point of
+        the ``missing`` verdict, so the line that carries the fields says which
+        of the two it is (indicator law: a field is a finding only once it has
+        been checked that it measured anything at all).
+        """
+        if not self.lines:
+            return "role/fraction/host_size=<not measured: no source line in this log>"
+        return f"role={self.role} fraction={self.fraction} host_size={self.host_size}"
+
 
 def tp_size_of(argv: Sequence[str], default: int = 0) -> int:
     """The rank count the census must see, taken from the argv the launcher
@@ -139,70 +174,174 @@ def tp_size_of(argv: Sequence[str], default: int = 0) -> int:
 
     ``--tp-size N`` and ``--tp-size=N`` are both accepted because both forms are
     legal on the command line the launcher hands to ``sglang.launch_server``.
+
+    THE LAST OCCURRENCE WINS, because that is what the SERVER does.  The
+    launcher writes ``--tp-size 3`` into group D's argv and then appends the
+    operator's ``--extra-d`` tail, so ``--extra-d "--tp-size 6"`` is the rank
+    count the group actually runs.  A census that took the FIRST occurrence
+    would check a rank population the group does not have and refuse a healthy
+    carrier as ``missing`` (or, worse, accept a partial one).
     """
     items = list(argv)
+    found = default
     for i, a in enumerate(items):
         if a == "--tp-size" and i + 1 < len(items):
             try:
-                return int(items[i + 1])
+                found = int(items[i + 1])
             except ValueError:
-                return default
-        if a.startswith("--tp-size="):
+                found = default
+        elif a.startswith("--tp-size="):
             try:
-                return int(a.split("=", 1)[1])
+                found = int(a.split("=", 1)[1])
             except ValueError:
-                return default
+                found = default
+    return found
+
+
+def _front_line(anchor: str, default: int) -> int:
+    """The line of :file:`front.py` that currently holds ``anchor``.
+
+    RESOLVED, NEVER TRANSCRIBED (instrument-text law, the same Klasse A this
+    module exists to close).  A hand-typed ``front.py:561`` in a provenance
+    string is an instrument whose text stops describing the code the first time
+    a line is inserted above it, and no test can see the drift because the test
+    can only pin the string.  Resolving the citation at the moment it is printed
+    means the number is either right or the anchor is gone -- and the anchors
+    are the branch texts themselves, so an anchor that disappears means the
+    branch it names disappeared, which is a change this module must not survive
+    quietly.  ``default`` is what the line was when this was written; it is used
+    only if the anchor cannot be found at all.
+    """
+    try:
+        import inspect
+
+        from sglang.srt.weg2 import front
+
+        lines, _ = inspect.getsourcelines(front)
+        for n, line in enumerate(lines, start=1):
+            if anchor in line:
+                return n
+    except Exception:  # noqa: BLE001 - a citation may never break a launch
+        pass
     return default
 
 
 def route_floor() -> Tuple[int, str]:
-    """The smallest carrier bound at which the round trip can still happen.
+    """The largest carrier bound at which the round trip is still unreachable.
 
-    DERIVED FROM WHAT THE ROUTE NEEDS, not chosen.  The front tiles the
-    prompt-length axis with two branches that both bypass the carrier:
+    DERIVED FROM WHAT THE ROUTE NEEDS, and derived IN THE UNIT THE BOUND IS
+    COMPARED IN.  The front tiles the prompt-length axis with two branches that
+    both bypass the carrier, and they do NOT price the same prompt in the same
+    unit:
 
-    * CARRIER-EXCEEDS (:file:`front.py:561`) sends every prompt estimated above
-      ``carrier_max_tokens`` to ONE prefill on D -- no leg 1, no store read;
-    * SHORT (:file:`front.py:279`, :file:`front.py:578`) serves every prompt
-      whose uncached remainder is ``<= front.CHUNK_TOKENS`` straight on D --
-      again no leg 1 and therefore no store read.
+    * SHORT (:file:`front.py:578`) compares ``remainder``, which
+      :func:`front.price_remainder` computes with ``CHARS_PER_TOKEN`` (3.0);
+    * CARRIER-EXCEEDS (:file:`front.py:561`) compares ``carrier_est``, computed
+      with ``CARRIER_CHARS_PER_TOKEN`` (2.4) -- deliberately a lower divisor, so
+      that route cannot UNDER-estimate (the constant's own comment, #1233).
 
-    A prompt can only take the round trip if it is above ``CHUNK_TOKENS`` AND at
-    or below ``carrier_max_tokens``.  That interval is empty unless
-    ``carrier_max_tokens > CHUNK_TOKENS``.  So the floor is exactly
-    ``front.CHUNK_TOKENS`` and the test is strict: a bound at or below it is an
-    off switch wearing a number, which is what a bound of 17 was on boot
-    weg2rg5.
+    ``carrier_max_tokens`` is compared against ``carrier_est``, so the floor has
+    to be expressed in ``carrier_est`` tokens.  ``front.CHUNK_TOKENS`` is not:
+    it is a ``remainder`` number, 1.25x smaller, and taking it as the floor
+    passed every bound in (4096, 5120] as usable when in fact NO prompt of ANY
+    length can round-trip under one -- the same silent capability loss as boot
+    weg2rg5's 17, one order of magnitude up.
 
-    The value is READ from the module that owns it, the same rule
-    ``launcher._front_leg_form`` follows -- a copy here would be a second
-    bookkeeping of the front's own constant and would go stale the moment the
-    chunk grant changes.
+    Both prices are non-decreasing in the prompt's character length, so the set
+    of prompts SHORT will not serve is a suffix ``[L*, inf)`` of that axis, and
+    the cheapest carrier estimate over that suffix is the one at ``L*``.  A
+    bound ``B`` therefore admits a round trip for at least one prompt length iff
+    ``B >= carrier_est(L*)``, and the floor -- the largest ``B`` that admits
+    none -- is ``carrier_est(L*) - 1``.  ``L*`` is found by bisection over
+    :func:`front.price_remainder` itself, with an EMPTY span store: a cached
+    prefix only lowers ``remainder`` and so only makes the round trip harder to
+    reach, which makes the empty store the most permissive cache state and the
+    honest one to derive a floor from.
+
+    SCOPE (the floor is a conservative refusal, never a licence).  SHORT is four
+    conjuncts, not one: ``awake == "D" and admit_d and state == "serving" and
+    remainder <= CHUNK_TOKENS``.  While group D is asleep a sub-chunk prompt
+    falls through to BATCH and DOES take the round trip, so at a bound below
+    this floor the round-trip set is empty only in D's serving steady state --
+    which is the state a boot spends its time in and the state group P's prefill
+    work has to come from.  The direction of the approximation is therefore a
+    false REFUSAL and never a bound that is shipped when it should not be.
+
+    Every number is READ from the module that owns it, the same rule
+    ``launcher._front_leg_form`` follows; a copy here would be a second
+    bookkeeping of the front's own constants and would go stale the moment the
+    chunk grant or either divisor changes.
 
     Returns ``(floor, provenance)``; the provenance string goes on the log line
     so the number is never printed without its derivation.
     """
     from sglang.srt.weg2 import front
 
-    floor = int(front.CHUNK_TOKENS)
+    chunk = int(front.CHUNK_TOKENS)
+    spans = front.SpanLRU()
+
+    def _not_short(n_chars: int) -> bool:
+        remainder, _est, _known = front.price_remainder("x" * n_chars, spans)
+        return remainder > chunk
+
+    # Bisect for L*, the shortest prompt SHORT will not serve.  The seed only
+    # has to bracket it; price_remainder is the authority on where it is.
+    hi = 16
+    while not _not_short(hi):
+        hi *= 2
+        if hi > (chunk + 4) * 64:  # unreachable for any sane divisor; fail loud
+            raise RuntimeError(
+                "#1246 route_floor: no prompt length up to %d chars exceeds "
+                "front.CHUNK_TOKENS=%d under front.price_remainder" % (hi, chunk)
+            )
+    lo = 0
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _not_short(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    l_star = lo
+
+    # The CARRIER-EXCEEDS price of that same prompt, by the front's own
+    # expression at front.py:560 (`int(len(text) / CARRIER_CHARS_PER_TOKEN) + 1`
+    # for a prompt whose exact token count is not yet known -- and at launch
+    # time none is).
+    carrier_est_at_l_star = int(l_star / front.CARRIER_CHARS_PER_TOKEN) + 1
+    floor = carrier_est_at_l_star - 1
+
+    ln_chunk = _front_line("CHUNK_TOKENS = ", 67)
+    ln_carrier = _front_line("and carrier_est > self.carrier_max_tokens:", 561)
+    ln_short = _front_line("and remainder <= CHUNK_TOKENS:", 578)
+    ln_est = _front_line("carrier_est = exact if exact else", 560)
     why = (
-        f"front.CHUNK_TOKENS={floor} (front.py:67) -- the round-trip interval is "
-        f"CHUNK_TOKENS < prompt <= carrier_max, empty unless carrier_max > {floor}: "
-        f"SHORT serves at or below it on D (front.py:279/:578) and CARRIER-EXCEEDS "
-        f"serves above carrier_max on D (front.py:561)"
+        f"floor={floor} tokens of CARRIER-EXCEEDS price, NOT front.CHUNK_TOKENS={chunk}: the two "
+        f"bypass branches price the same prompt in different units -- SHORT (front.py:{ln_short}) "
+        f"compares front.price_remainder's estimate at CHARS_PER_TOKEN={front.CHARS_PER_TOKEN}, "
+        f"CARRIER-EXCEEDS (front.py:{ln_carrier}) compares carrier_est at "
+        f"CARRIER_CHARS_PER_TOKEN={front.CARRIER_CHARS_PER_TOKEN} (front.py:{ln_est}), and "
+        f"carrier_max_tokens is compared against the latter. The shortest prompt SHORT will not "
+        f"serve is {l_star} chars (front.CHUNK_TOKENS={chunk}, front.py:{ln_chunk}, bisected over "
+        f"front.price_remainder with an empty span store = the most permissive cache state), which "
+        f"CARRIER-EXCEEDS prices at {carrier_est_at_l_star} tokens; so every bound <= {floor} "
+        f"bypasses the leg-1/leg-2 round trip for EVERY prompt length. Scope: SHORT is four "
+        f"conjuncts (awake=D, admit_d, state=serving, remainder<=CHUNK_TOKENS), so while D sleeps a "
+        f"sub-chunk prompt does queue to BATCH -- this floor is a conservative refusal in D's "
+        f"serving steady state, never a licence"
     )
     return floor, why
 
 
 def parse_limit_lines(
-    log_path: str, *, site: str = CENSUS_SITE
+    log_path: str, *, sites: Sequence[str] = CENSUS_SITES
 ) -> List[Tuple[int, Dict[str, str], str]]:
-    """Every ``#915 PREFETCH LIMIT`` line of ``log_path`` emitted at ``site``.
+    """Every ``#915 PREFETCH LIMIT`` line of ``log_path`` emitted at ``sites``.
 
     Returns ``(rank, fields, raw_line)`` in file order.  A missing file yields an
     empty list -- the caller turns that into the ``missing`` verdict, never into
     a bound.
     """
+    admitted = tuple(sites or ())
     out: List[Tuple[int, Dict[str, str], str]] = []
     try:
         with open(log_path, errors="replace") as f:
@@ -213,7 +352,7 @@ def parse_limit_lines(
                 if not m:
                     continue
                 d = m.groupdict()
-                if site and d["site"] != site:
+                if admitted and d["site"] not in admitted:
                     continue
                 out.append((int(d["rank"]), d, line.rstrip("\n")))
     except OSError:
@@ -226,10 +365,11 @@ def census(
     *,
     expected_ranks: int,
     floor: int,
-    site: str = CENSUS_SITE,
+    sites: Sequence[str] = CENSUS_SITES,
 ) -> CarrierCensus:
     """Take the carrier census over one group log.  Pure; never raises."""
-    rows = parse_limit_lines(log_path, site=site)
+    rows = parse_limit_lines(log_path, sites=sites)
+    site_names = ",".join(sites) or "<any>"
 
     per_rank: Dict[int, int] = {}
     rank_rows: Dict[int, List[Dict[str, str]]] = {}
@@ -247,7 +387,7 @@ def census(
             role=(first or {}).get("role", "?"),
             fraction=float((first or {}).get("fraction", 0.0) or 0.0),
             host_size=int((first or {}).get("host_size", 0) or 0),
-            site=site,
+            site=site_names,
             expected_ranks=int(expected_ranks),
             lines=tuple(lines),
             verdict=verdict,
@@ -264,7 +404,7 @@ def census(
     if not rows:
         return _mk(
             "missing",
-            f"no '#915 PREFETCH LIMIT ... site={site}' line in {log_path}: the KV carrier host pool "
+            f"no '#915 PREFETCH LIMIT ... site in ({site_names})' line in {log_path}: the KV carrier host pool "
             f"never reported the budget it enforces, so this boot's carrier bound was NOT measured "
             f"(that is not the same fact as a route that was switched off)",
         )
@@ -275,7 +415,7 @@ def census(
     if missing_ranks:
         return _mk(
             "missing",
-            f"only ranks {sorted(per_rank)} reported at site={site}, expected {expected_ranks} "
+            f"only ranks {sorted(per_rank)} reported at site in ({site_names}), expected {expected_ranks} "
             f"(missing TP {missing_ranks}); a bound taken from a partial rank population is not "
             f"the group's bound",
             first=first,

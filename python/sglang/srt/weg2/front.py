@@ -1153,7 +1153,14 @@ def main():
     ap.add_argument("--dc-reserve", default="", help="uuid=mib,uuid=mib")
     ap.add_argument("--fairness-w-s", type=float, default=45.0)
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
-    ap.add_argument("--carrier-max-tokens", type=int, default=0, help="#1233 zero-remainder: longest prompt group D can read from the store (0 = no CARRIER-EXCEEDS route)")
+    ap.add_argument("--carrier-max-tokens", type=int, default=0,
+                    help="#1233 zero-remainder: longest prompt group D can read from the store. "
+                         "0 = no CARRIER-EXCEEDS route -- and that is NOT an off switch for the "
+                         "leg-1/leg-2 round trip but its opposite: both carrier guards are "
+                         "'carrier_max_tokens > 0', so 0 removes the BYPASS and every prompt above the "
+                         "SHORT grant round-trips with no bound at all on what the store is asked to "
+                         "carry (the '#915 PREFETCH REFUSED'/W16 shape of boot weg2ls4b2). The weg2 "
+                         "launcher never ships 0: its census floor refuses it (#1246).")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}

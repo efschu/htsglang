@@ -336,6 +336,18 @@ class MambaPoolHost(HostKVCache):
     ):
         self.device_pool = device_pool
         self.page_size = 1
+        # #1246: THIS POOL'S IDENTITY, set once and used everywhere it is named.
+        # ``HostKVCache`` gives every other host pool a ``budget_label`` in its
+        # ``__init__`` (pool_host/base.py:130); this class does not call that
+        # ``__init__``, so it had none, and the three places that name the pool
+        # said three different things: the "smaller than the device pool"
+        # warning printed the class name, the pinned-host post registered under
+        # the literal "HiCache Mamba anchor host pool", and the teardown at
+        # pool_host/base.py:215 UNREGISTERED under ``type(self).__name__`` --
+        # i.e. under a post that was never registered, leaving the joint budget
+        # charging for a freed buffer (the #550 registry's own failure mode).
+        # One label closes all three.
+        self.budget_label = "HiCache Mamba anchor host pool"
 
         # The restriction here is the WRITE-BACK STAGING kernel, and that is the
         # whole of it. `_init_write_back_staging_buffers` returns immediately
@@ -479,8 +491,8 @@ class MambaPoolHost(HostKVCache):
         if self.size <= device_pool.size:
             # NAME THE POOL THIS IS ABOUT (#1246, instrument-text law, Klasse A:
             # the text did not describe what the code does).  This is the MAMBA
-            # anchor pool -- the very next call registers it as "HiCache Mamba
-            # anchor host pool" -- and it said "HiCache host KV pool".  Measured
+            # anchor pool -- ``budget_label`` below is the post it registers
+            # under -- and it said "HiCache host KV pool".  Measured
             # cost of the lie: on boot weg2rg5 the M=600 ledger arm put this pool
             # at 19 slots against a 20-slot device pool, this warning fired, a
             # launcher census that keyed on the words "KV pool" took min(30518,
@@ -498,7 +510,7 @@ class MambaPoolHost(HostKVCache):
 
         requested_bytes = self.size * self.size_per_token
         check_and_register_pinned_post(
-            name="HiCache Mamba anchor host pool",
+            name=self.budget_label,
             flag="--hicache-mamba-host-mib (or --hicache-size / --hicache-ratio)",
             requested_bytes=requested_bytes,
             reserve_bytes=HICACHE_HOST_MEMORY_RESERVE_BYTES,

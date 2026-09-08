@@ -1305,12 +1305,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--extra-p", default="", help="extra flags for group P (shell-split)")
     ap.add_argument("--extra-d", default="", help="extra flags for group D (shell-split)")
     ap.add_argument("--fairness-w-s", type=float, default=45.0)
-    ap.add_argument("--no-carrier-route", action="store_true",
-                    help="#1246: switch the Weg-2 carrier round trip OFF deliberately -- the front gets "
-                         "--carrier-max-tokens 0 and serves every prompt with ONE prefill on D. This is the "
-                         "ONLY way a bound of 0 can be shipped; without it a bound that cannot be measured, "
-                         "or that the three TP ranks disagree on, or that cannot carry the route, is a W45 "
-                         "Weg2CarrierCensusRefused refusal instead of a silent capability loss.")
+    ap.add_argument("--carrier-max-tokens", type=int, default=None,
+                    help="#1246: ship THIS carrier bound to the front instead of the one the census reads "
+                         "from group D's own '#915 PREFETCH LIMIT' line. The census is still taken and "
+                         "logged, so the log carries the measured number beside the shipped one. The "
+                         "operator's value passes the SAME route floor: a bound at or below it is a W45 "
+                         "Weg2CarrierCensusRefused, because such a bound bypasses the leg-1/leg-2 round "
+                         "trip for EVERY prompt length (boot weg2rg5 shipped 17 and group P ran zero "
+                         "prefill passes at exit 0). In particular 0 is NOT an off switch for the round "
+                         "trip and there is no flag that is: the front's two carrier guards read "
+                         "'carrier_max_tokens > 0' (front.py:561, front.py:624), so 0 removes the "
+                         "CARRIER-EXCEEDS BYPASS and sends every prompt above the SHORT grant through the "
+                         "round trip with no bound at all on what the store is asked to carry -- the "
+                         "'#915 PREFETCH REFUSED' / W16 shape of boot weg2ls4b2.")
     ap.add_argument(
         "--transport", choices=["bar1", "nccl"], default="bar1",
         help="Collective transport for BOTH groups. 'bar1' is the shipping "
@@ -1554,7 +1561,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise Weg2LaunchRefused(f"W9 Weg2StoreIdentityMismatch (launch-time key scheme): P bigram={_p_bigram} D bigram={_d_bigram} -- "
                                 f"the two groups would key the sole carrier by different page-hash schemes")
     # #1246 CARRIER CENSUS.  The bound the front routes by is READ from group D's
-    # own prefetch-limit instrument ('#915 PREFETCH LIMIT ... site=init_hicache'),
+    # own prefetch-limit instrument ('#915 PREFETCH LIMIT ... site=<one of the two
+    # launch-time cache-init sites>', carrier_census.CENSUS_SITES),
     # which names its component and carries the number the runtime ENFORCES.  It
     # is no longer re-derived as 0.9 x min(<a warning that fires for any host
     # pool below its device pool, mamba included>) -- that census had no named
@@ -1564,36 +1572,66 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # zero prefill passes, exit 0.  Full derivation, provenance and the two
     # rejected alternatives: sglang/srt/weg2/carrier_census.py module docstring.
     #
-    # A bound of 0 now means ONE thing only: --no-carrier-route, i.e. the
-    # launcher switched the route off on purpose.  Every way of failing to
-    # MEASURE the bound is a W45 refusal by name, never a silent zero.
+    # THE LAUNCHER NEVER SHIPS 0, and no flag makes it.  0 is not an off switch
+    # for the round trip: the front's two carrier guards read
+    # `carrier_max_tokens > 0` (front.py:561 CARRIER-EXCEEDS, front.py:624 the
+    # post-leg-1 correction), so 0 removes the BYPASS and routes every prompt
+    # above the SHORT grant through leg 1 + a leg-2 store read with NO bound on
+    # what the store is asked to carry -- the '#915 PREFETCH REFUSED' / W16
+    # shape of boot weg2ls4b2 (84,027 tokens against a 30,518-token host pool).
+    # front.py:1156's own help says it in one line.  Fix 1 shipped a
+    # --no-carrier-route flag whose help, log line and refusal-remedy sentence
+    # all asserted the opposite of that; it is gone.  What replaces it is
+    # --carrier-max-tokens: an operator bound that passes the SAME floor, so the
+    # escape hatch from a W45 cannot produce the failure the bound exists to
+    # prevent.  Every way of failing to MEASURE the bound stays a W45 refusal by
+    # name, never a silent zero.
     from sglang.srt.weg2 import carrier_census as _cc
 
-    if ns.no_carrier_route:
-        carrier_max_tokens = 0
-        log("CARRIER BOUND: 0 -- the carrier route is DELIBERATELY disabled by --no-carrier-route; "
-            "no census taken, every prompt is served by ONE prefill on D")
-    else:
-        _floor, _floor_why = _cc.route_floor()
-        _expect_ranks = _cc.tp_size_of(spec_d.argv)
-        _cen = _cc.census(spec_d.log, expected_ranks=_expect_ranks, floor=_floor)
-        log(f"CARRIER BOUND: source='{_cc.SOURCE_MARKER}' in {spec_d.log}; component={_cc.COMPONENT}; "
-            f"per-rank(TP)={_cen.per_rank} expected_ranks={_cen.expected_ranks} (from group D argv --tp-size); "
-            f"role={_cen.role} fraction={_cen.fraction} host_size={_cen.host_size} site={_cen.site}; "
-            f"floor={_cen.floor} [{_floor_why}]; verdict={_cen.verdict}: {_cen.detail}")
-        for _sl in _cen.lines:
-            log(f"CARRIER BOUND source line: {_sl}")
+    _floor, _floor_why = _cc.route_floor()
+    _expect_ranks = _cc.tp_size_of(spec_d.argv)
+    _cen = _cc.census(spec_d.log, expected_ranks=_expect_ranks, floor=_floor)
+    log(f"CARRIER BOUND: source='{_cc.SOURCE_MARKER}' in {spec_d.log}; component={_cc.COMPONENT}; "
+        f"per-rank(TP)={_cen.per_rank} expected_ranks={_cen.expected_ranks} (from group D argv --tp-size); "
+        f"{_cen.terms()} sites={_cen.site}; "
+        f"floor={_cen.floor} [{_floor_why}]; verdict={_cen.verdict}: {_cen.detail}")
+    for _sl in _cen.lines:
+        log(f"CARRIER BOUND source line: {_sl}")
+
+    if ns.carrier_max_tokens is None:
         if not _cen.ok:
             raise Weg2LaunchRefused(
                 f"W45 Weg2CarrierCensusRefused ({_cen.verdict}): {_cen.detail}. "
                 f"Source '{_cc.SOURCE_MARKER}' in {spec_d.log}; component={_cc.COMPONENT}; "
                 f"per-rank(TP)={_cen.per_rank}; floor={_cen.floor} [{_floor_why}]. "
-                f"Pass --no-carrier-route to disable the round trip on purpose; a bound that cannot "
-                f"carry it is never shipped as a silent 0 (boot weg2rg5)."
+                f"Remedy: pass --carrier-max-tokens N with a bound you measured yourself; it is "
+                f"checked against the SAME floor, so there is no way to ship a bound that cannot "
+                f"carry the route (boot weg2rg5 at 17) and no way to ship an unbounded store read "
+                f"(0 removes the front's CARRIER-EXCEEDS bypass, not the round trip -- W16, boot "
+                f"weg2ls4b2)."
             )
         carrier_max_tokens = _cen.bound
-        log(f"CARRIER BOUND: front --carrier-max-tokens {carrier_max_tokens}; prompts above it are served "
-            f"by ONE prefill on D, prompts between {_cen.floor} and it take the leg-1/leg-2 round trip")
+        _bound_src = "census"
+    else:
+        _override = int(ns.carrier_max_tokens)
+        if _override <= _cen.floor:
+            raise Weg2LaunchRefused(
+                f"W45 Weg2CarrierCensusRefused (operator_below_floor): --carrier-max-tokens {_override} "
+                f"is at or below the route floor {_cen.floor} [{_floor_why}], so no prompt of any length "
+                f"could take the leg-1/leg-2 round trip and group P would run zero prefill passes -- the "
+                f"boot weg2rg5 outcome, asked for by hand. 0 is refused by this same check and is not an "
+                f"off switch: the front's carrier guards are 'carrier_max_tokens > 0' (front.py:561, "
+                f"front.py:624), so 0 removes the CARRIER-EXCEEDS bypass and leaves the store read "
+                f"unbounded (W16, boot weg2ls4b2). What the census read: verdict={_cen.verdict}, "
+                f"bound={_cen.bound}, per-rank(TP)={_cen.per_rank}, {_cen.terms()}."
+            )
+        carrier_max_tokens = _override
+        _bound_src = "operator --carrier-max-tokens"
+        log(f"CARRIER BOUND: OPERATOR OVERRIDE {carrier_max_tokens} replaces the census bound "
+            f"(census verdict={_cen.verdict} bound={_cen.bound}); it clears the same floor {_cen.floor}")
+    log(f"CARRIER BOUND: front --carrier-max-tokens {carrier_max_tokens} (source: {_bound_src}); prompts "
+        f"the front prices above it are served by ONE prefill on D, prompts it prices between the floor "
+        f"{_cen.floor} and it take the leg-1/leg-2 round trip")
     state.carrier_max_tokens = carrier_max_tokens
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
