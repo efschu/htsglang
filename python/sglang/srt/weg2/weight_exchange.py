@@ -172,8 +172,7 @@ class StorageGeom:
             # Only a genuinely contiguous block can be flattened to rows; a
             # guessed pitch is exactly the silent defect this module removes.
             flat = stride[-1] == 1 and all(
-                stride[i] == stride[i + 1] * shape[i + 1]
-                for i in range(len(shape) - 1)
+                stride[i] == stride[i + 1] * shape[i + 1] for i in range(len(shape) - 1)
             )
             if not flat:
                 raise Weg2XchgPlanDisagree(
@@ -695,9 +694,7 @@ class XchgPlan:
 
     @property
     def cross_bytes(self) -> int:
-        return sum(
-            d.nbytes for d in self.descs if d.kind != ZEROFILL and not d.on_card
-        )
+        return sum(d.nbytes for d in self.descs if d.kind != ZEROFILL and not d.on_card)
 
     @property
     def zerofill_bytes(self) -> int:
@@ -728,7 +725,9 @@ class XchgPlan:
         )
 
 
-def emit_plan_line(plan: "XchgPlan", direction: Optional[str] = None, logger=None) -> str:
+def emit_plan_line(
+    plan: "XchgPlan", direction: Optional[str] = None, logger=None
+) -> str:
     """Log the acceptance line and return it.
 
     One emitter, so S2 and S6 do not each grow their own format string and drift
@@ -870,12 +869,18 @@ def _emit(
                 if strided:
                     out.append(
                         XchgDesc(
-                            tag=geom.tag, src_rank=s_rank, dst_rank=d_rank,
-                            param_name=geom.name, kind=STRIDED2D,
-                            nbytes=rows * span * itemsize, rows=rows,
+                            tag=geom.tag,
+                            src_rank=s_rank,
+                            dst_rank=d_rank,
+                            param_name=geom.name,
+                            kind=STRIDED2D,
+                            nbytes=rows * span * itemsize,
+                            rows=rows,
                             run_bytes=span * itemsize,
-                            spitch=s_pitch * itemsize, dpitch=d_pitch * itemsize,
-                            src_off=s_dev * itemsize, dst_off=d_dev * itemsize,
+                            spitch=s_pitch * itemsize,
+                            dpitch=d_pitch * itemsize,
+                            src_off=s_dev * itemsize,
+                            dst_off=d_dev * itemsize,
                             src_ptr=ptr(src.name, s_rank),
                             dst_ptr=ptr(dst.name, d_rank),
                         )
@@ -884,9 +889,16 @@ def _emit(
                     nbytes = span * cols * itemsize
                     out.append(
                         XchgDesc(
-                            tag=geom.tag, src_rank=s_rank, dst_rank=d_rank,
-                            param_name=geom.name, kind=FLAT, nbytes=nbytes,
-                            rows=1, run_bytes=nbytes, spitch=0, dpitch=0,
+                            tag=geom.tag,
+                            src_rank=s_rank,
+                            dst_rank=d_rank,
+                            param_name=geom.name,
+                            kind=FLAT,
+                            nbytes=nbytes,
+                            rows=1,
+                            run_bytes=nbytes,
+                            spitch=0,
+                            dpitch=0,
                             src_off=s_dev * cols * itemsize,
                             dst_off=d_dev * cols * itemsize,
                             src_ptr=ptr(src.name, s_rank),
@@ -904,10 +916,15 @@ def _emit(
                 if strided:
                     out.append(
                         XchgDesc(
-                            tag=geom.tag, src_rank=-1, dst_rank=d_rank,
-                            param_name=geom.name, kind=ZEROFILL,
-                            nbytes=rows * span * itemsize, rows=rows,
-                            run_bytes=span * itemsize, spitch=0,
+                            tag=geom.tag,
+                            src_rank=-1,
+                            dst_rank=d_rank,
+                            param_name=geom.name,
+                            kind=ZEROFILL,
+                            nbytes=rows * span * itemsize,
+                            rows=rows,
+                            run_bytes=span * itemsize,
+                            spitch=0,
                             dpitch=d_pitch * itemsize,
                             dst_off=d_dev * itemsize,
                             dst_ptr=ptr(dst.name, d_rank),
@@ -917,9 +934,16 @@ def _emit(
                     nbytes = span * cols * itemsize
                     out.append(
                         XchgDesc(
-                            tag=geom.tag, src_rank=-1, dst_rank=d_rank,
-                            param_name=geom.name, kind=ZEROFILL, nbytes=nbytes,
-                            rows=1, run_bytes=nbytes, spitch=0, dpitch=0,
+                            tag=geom.tag,
+                            src_rank=-1,
+                            dst_rank=d_rank,
+                            param_name=geom.name,
+                            kind=ZEROFILL,
+                            nbytes=nbytes,
+                            rows=1,
+                            run_bytes=nbytes,
+                            spitch=0,
+                            dpitch=0,
                             dst_off=d_dev * cols * itemsize,
                             dst_ptr=ptr(dst.name, d_rank),
                         )

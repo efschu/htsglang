@@ -136,8 +136,13 @@ def _p_layout():
 def _d_layout(ratios):
     """Group D: TP=3 over the same three cards, rank n on cards[n].  Global
     ranks 3..5, so the 6x6 matrix is indexed the same way in both directions."""
-    return GroupLayout(name="D", cards=CARDS, tp_size=3,
-                       ratios=list(ratios) if ratios else None, base=3)
+    return GroupLayout(
+        name="D",
+        cards=CARDS,
+        tp_size=3,
+        ratios=list(ratios) if ratios else None,
+        base=3,
+    )
 
 
 def _mlp_down_geom(**kw):
@@ -308,9 +313,14 @@ class TestTiling(CustomTestCase):
         # 0's last 16 columns per row have no source at all.
         with self.assertRaises(Weg2XchgSourceMissing) as cm:
             build_plan(
-                [_mlp_down_geom(dst_widths=MLP_WIDTHS_WRONG,
-                                dst_extents=MLP_WIDTHS_OK)],
-                src, dst, waves=[["weights_0"]],
+                [
+                    _mlp_down_geom(
+                        dst_widths=MLP_WIDTHS_WRONG, dst_extents=MLP_WIDTHS_OK
+                    )
+                ],
+                src,
+                dst,
+                waves=[["weights_0"]],
             )
         message = str(cm.exception)
         self.assertIn("W58 Weg2XchgSourceMissing", message)
@@ -323,7 +333,9 @@ class TestTiling(CustomTestCase):
         with self.assertRaises(Weg2XchgPlanDisagree) as cm:
             build_plan(
                 [_mlp_down_geom(dst_extents=MLP_WIDTHS_WRONG)],
-                src, dst, waves=[["weights_0"]],
+                src,
+                dst,
+                waves=[["weights_0"]],
             )
         message = str(cm.exception)
         self.assertIn("W52 Weg2XchgPlanDisagree", message)
@@ -351,8 +363,13 @@ class TestTiling(CustomTestCase):
         # stage=None: EVERY P rank holds the whole tensor (the vision tower in
         # D-wake, spec §1.4).  Three candidates per destination unit.
         tower = ParamGeom(
-            name="visual.blocks.0.proj.weight", tag="weights", shard_axis=ROWS,
-            rows_full=3072, cols_full=HIDDEN, itemsize=1, stage=None,
+            name="visual.blocks.0.proj.weight",
+            tag="weights",
+            shard_axis=ROWS,
+            rows_full=3072,
+            cols_full=HIDDEN,
+            itemsize=1,
+            stage=None,
         )
         plan = build_plan([tower], src, dst, waves=[["weights"]])
         self.assertEqual(len(plan.descs), 3)
@@ -363,7 +380,6 @@ class TestTiling(CustomTestCase):
 
 
 class TestVocabPad(CustomTestCase):
-
     def test_vocab_pad_rows_are_zerofill_on_rank2_only(self):
         """D pads the vocab to 64*tp = 192; P at tp=1 pads to 64 and 248320 is
         already a multiple of 64, so the 128 pad rows have no VRAM source and
@@ -374,14 +390,21 @@ class TestVocabPad(CustomTestCase):
 
         def geom(name, itemsize):
             return ParamGeom(
-                name=name, tag="weights", shard_axis=ROWS,
-                rows_full=VOCAB_PADDED_D, cols_full=HIDDEN, itemsize=itemsize,
-                pad_units=VOCAB_PADDED_D - VOCAB_REAL, stage=0,
+                name=name,
+                tag="weights",
+                shard_axis=ROWS,
+                rows_full=VOCAB_PADDED_D,
+                cols_full=HIDDEN,
+                itemsize=itemsize,
+                pad_units=VOCAB_PADDED_D - VOCAB_REAL,
+                stage=0,
             )
 
         plan = build_plan(
             [geom("lm_head.weight", 1), geom("model.embed_tokens.weight", 2)],
-            _p_layout(), _d_layout(None), waves=[["weights"]],
+            _p_layout(),
+            _d_layout(None),
+            waves=[["weights"]],
         )
 
         zf = [d for d in plan.descs if d.kind == ZEROFILL]
@@ -402,8 +425,11 @@ class TestVocabPad(CustomTestCase):
         for r in (0, 1):
             with self.subTest(rank=r):
                 self.assertEqual(
-                    sum(d.nbytes for d in plan.descs
-                        if d.dst_rank == r and d.kind == ZEROFILL),
+                    sum(
+                        d.nbytes
+                        for d in plan.descs
+                        if d.dst_rank == r and d.kind == ZEROFILL
+                    ),
                     0,
                 )
         # The pad is not counted as moved bytes -- it crosses no link.
@@ -414,7 +440,6 @@ class TestVocabPad(CustomTestCase):
 
 
 class TestStridedPitches(CustomTestCase):
-
     def test_strided_classes_carry_pitches(self):
         """The 2-D classes: the FULL side's pitch is the full input dimension,
         the SHARDED side's pitch is its own run (spec §2.2, §1.4 rule 3)."""
@@ -445,9 +470,14 @@ class TestStridedPitches(CustomTestCase):
 
         # The attention 2-D class of spec §2.2: same law, different numbers.
         attn = ParamGeom(
-            name="model.layers.0.o_proj.weight", tag="weights_0",
-            shard_axis=COLS, rows_full=HIDDEN, cols_full=ATTN_IN_FULL,
-            itemsize=1, stage=0, dst_widths=[3072, 1536, 1536],
+            name="model.layers.0.o_proj.weight",
+            tag="weights_0",
+            shard_axis=COLS,
+            rows_full=HIDDEN,
+            cols_full=ATTN_IN_FULL,
+            itemsize=1,
+            stage=0,
+            dst_widths=[3072, 1536, 1536],
         )
         plan = build_plan([attn], src, dst, waves=[["weights_0"]])
         self.assertEqual([d.run_bytes for d in plan.descs], [3072, 1536, 1536])
@@ -459,9 +489,14 @@ class TestStridedPitches(CustomTestCase):
         # pitch and run must DOUBLE.  int8 hides a missing element_size()
         # multiply because its itemsize is 1.
         wide = ParamGeom(
-            name="model.layers.0.o_proj.weight_bf16", tag="weights_0",
-            shard_axis=COLS, rows_full=HIDDEN, cols_full=ATTN_IN_FULL,
-            itemsize=2, stage=0, dst_widths=[3072, 1536, 1536],
+            name="model.layers.0.o_proj.weight_bf16",
+            tag="weights_0",
+            shard_axis=COLS,
+            rows_full=HIDDEN,
+            cols_full=ATTN_IN_FULL,
+            itemsize=2,
+            stage=0,
+            dst_widths=[3072, 1536, 1536],
         )
         wide_plan = build_plan([wide], src, dst, waves=[["weights_0"]])
         self.assertEqual([d.spitch for d in wide_plan.descs], [ATTN_IN_FULL * 2] * 3)
@@ -470,15 +505,18 @@ class TestStridedPitches(CustomTestCase):
 
 
 class TestDeterminism(CustomTestCase):
-
     def _inventory(self):
         return [
             _qkvz_geom(),
             _mlp_down_geom(),
             ParamGeom(
-                name="model.layers.0.input_layernorm.weight", tag="weights_0",
-                shard_axis=REPLICATED, rows_full=1, cols_full=HIDDEN,
-                itemsize=2, stage=0,
+                name="model.layers.0.input_layernorm.weight",
+                tag="weights_0",
+                shard_axis=REPLICATED,
+                rows_full=1,
+                cols_full=HIDDEN,
+                itemsize=2,
+                stage=0,
             ),
         ]
 
@@ -502,7 +540,10 @@ class TestDeterminism(CustomTestCase):
         # different addresses, so an id that moved with the address could never
         # be compared across ranks (spec §7 W52, "plan hash != the front's").
         with_ptrs = build_plan(
-            self._inventory(), src, dst, waves=[["weights_0"]],
+            self._inventory(),
+            src,
+            dst,
+            waves=[["weights_0"]],
             ptr_of=lambda group, rank, name: 0x7F0000000000 + 4096 * rank,
         )
         self.assertEqual(with_ptrs.plan_id, reference.plan_id)
@@ -511,10 +552,12 @@ class TestDeterminism(CustomTestCase):
     def test_plan_id_moves_when_the_geometry_moves(self):
         """A hash that cannot change is not a hash."""
         src = _p_layout()
-        a = build_plan(self._inventory(), src, _d_layout(MLP_RATIO),
-                       waves=[["weights_0"]])
-        b = build_plan(self._inventory(), src, _d_layout([60, 39, 37]),
-                       waves=[["weights_0"]])
+        a = build_plan(
+            self._inventory(), src, _d_layout(MLP_RATIO), waves=[["weights_0"]]
+        )
+        b = build_plan(
+            self._inventory(), src, _d_layout([60, 39, 37]), waves=[["weights_0"]]
+        )
         self.assertNotEqual(a.plan_id, b.plan_id)
         self.assertEqual(len(a.plan_id), 12)
 
@@ -532,9 +575,20 @@ class TestCoalescing(CustomTestCase):
                 dst += 4096
             descs.append(
                 XchgDesc(
-                    tag="weights_0", src_rank=0, dst_rank=1, param_name=f"p{i}",
-                    kind=FLAT, nbytes=n, rows=1, run_bytes=n, spitch=0, dpitch=0,
-                    src_ptr=src, dst_ptr=dst, src_off=0, dst_off=0,
+                    tag="weights_0",
+                    src_rank=0,
+                    dst_rank=1,
+                    param_name=f"p{i}",
+                    kind=FLAT,
+                    nbytes=n,
+                    rows=1,
+                    run_bytes=n,
+                    spitch=0,
+                    dpitch=0,
+                    src_ptr=src,
+                    dst_ptr=dst,
+                    src_off=0,
+                    dst_off=0,
                 )
             )
             src += n
@@ -566,24 +620,35 @@ class TestCoalescing(CustomTestCase):
 
         # A 2-D piece is never merged with anything: its pitches are its shape.
         two_d = XchgDesc(
-            tag="weights_0", src_rank=0, dst_rank=1, param_name="o",
-            kind=STRIDED2D, nbytes=HIDDEN * 1536, rows=HIDDEN, run_bytes=1536,
-            spitch=ATTN_IN_FULL, dpitch=1536, src_ptr=0x1000, dst_ptr=0x9000,
+            tag="weights_0",
+            src_rank=0,
+            dst_rank=1,
+            param_name="o",
+            kind=STRIDED2D,
+            nbytes=HIDDEN * 1536,
+            rows=HIDDEN,
+            run_bytes=1536,
+            spitch=ATTN_IN_FULL,
+            dpitch=1536,
+            src_ptr=0x1000,
+            dst_ptr=0x9000,
         )
-        self.assertEqual(coalesce([two_d, two_d], COALESCE_FLOOR_BYTES),
-                         [two_d, two_d])
+        self.assertEqual(coalesce([two_d, two_d], COALESCE_FLOOR_BYTES), [two_d, two_d])
 
     def test_coalescing_never_crosses_a_pair_or_a_tag(self):
         a = self._pieces([1 << 20, 1 << 20])
-        for changed in (a[1].replace(dst_rank=2), a[1].replace(tag="weights_1"),
-                        a[1].replace(src_rank=1)):
+        for changed in (
+            a[1].replace(dst_rank=2),
+            a[1].replace(tag="weights_1"),
+            a[1].replace(src_rank=1),
+        ):
             with self.subTest(changed=changed.tag + str(changed.dst_rank)):
-                self.assertEqual(len(coalesce([a[0], changed],
-                                              COALESCE_FLOOR_BYTES)), 2)
+                self.assertEqual(
+                    len(coalesce([a[0], changed], COALESCE_FLOOR_BYTES)), 2
+                )
 
     def test_histogram_counts_every_piece(self):
-        descs = self._pieces([84, 256, 4096, 1 << 20, 8 << 20],
-                             gap_before={1, 2, 3, 4})
+        descs = self._pieces([84, 256, 4096, 1 << 20, 8 << 20], gap_before={1, 2, 3, 4})
         hist = piece_histogram(descs)
         self.assertEqual(sum(hist.values()), len(descs))
         self.assertEqual(hist.get("<4K"), 2)
@@ -591,7 +656,6 @@ class TestCoalescing(CustomTestCase):
 
 
 class TestWaves(CustomTestCase):
-
     def _sb4_cards(self):
         return chunk_tag_cards(
             SB4_STAGE_LAYERS, SB4_LAYERS_PER_CHUNK, SB4_CHUNKS, CARDS
@@ -644,10 +708,11 @@ class TestWaves(CustomTestCase):
 
 
 class TestByteMatrixAndLogLine(CustomTestCase):
-
     def _plan(self):
         return build_plan(
-            [_qkvz_geom(), _mlp_down_geom()], _p_layout(), _d_layout(MLP_RATIO),
+            [_qkvz_geom(), _mlp_down_geom()],
+            _p_layout(),
+            _d_layout(MLP_RATIO),
             waves=[["weights_0"]],
         )
 
@@ -672,9 +737,19 @@ class TestByteMatrixAndLogLine(CustomTestCase):
         self.assertEqual(cm.output, [f"INFO:sglang.srt.weg2.weight_exchange:{line}"])
         print("ACCEPTANCE " + line)
         self.assertTrue(line.startswith("WEG2-XCHG-PLAN "))
-        for key in ("dir=P2D", "waves=", "descs=", "coalesced=", "min_piece_mib=",
-                    "bytes_gib=", "oncard_gib=", "cross_gib=", "zerofill_mib=",
-                    "hist=", "plan_id="):
+        for key in (
+            "dir=P2D",
+            "waves=",
+            "descs=",
+            "coalesced=",
+            "min_piece_mib=",
+            "bytes_gib=",
+            "oncard_gib=",
+            "cross_gib=",
+            "zerofill_mib=",
+            "hist=",
+            "plan_id=",
+        ):
             with self.subTest(key=key):
                 self.assertIn(key, line)
         self.assertIn(f"plan_id={plan.plan_id}", line)
@@ -683,8 +758,11 @@ class TestByteMatrixAndLogLine(CustomTestCase):
         # of either group runs on cards[n] (spec §1.3).
         self.assertEqual(
             plan.oncard_bytes,
-            sum(d.nbytes for d in plan.descs
-                if d.kind != ZEROFILL and d.src_rank == d.dst_rank),
+            sum(
+                d.nbytes
+                for d in plan.descs
+                if d.kind != ZEROFILL and d.src_rank == d.dst_rank
+            ),
         )
         self.assertEqual(
             plan.oncard_bytes + plan.cross_bytes,
@@ -718,8 +796,12 @@ class TestAgainstRealModules(CustomTestCase):
             with torch.device("meta"):
                 mods.append(
                     MergedColumnParallelLinear(
-                        input_size=HIDDEN, output_sizes=list(QKVZ_OUTPUT_SIZES),
-                        bias=False, prefix="in_proj_qkvz", tp_rank=r, tp_size=3,
+                        input_size=HIDDEN,
+                        output_sizes=list(QKVZ_OUTPUT_SIZES),
+                        bias=False,
+                        prefix="in_proj_qkvz",
+                        tp_rank=r,
+                        tp_size=3,
                         tp_units=QKVZ_UNITS,
                     )
                 )
@@ -750,16 +832,22 @@ class TestAgainstRealModules(CustomTestCase):
             with torch.device("meta"):
                 mods.append(
                     RowParallelLinear(
-                        MLP_IN_FULL, HIDDEN, bias=False, prefix="down_proj",
-                        tp_rank=r, tp_size=3, tp_units=MLP_UNITS,
+                        MLP_IN_FULL,
+                        HIDDEN,
+                        bias=False,
+                        prefix="down_proj",
+                        tp_rank=r,
+                        tp_size=3,
+                        tp_units=MLP_UNITS,
                     )
                 )
         widths = [m.input_size_per_partition for m in mods]
         self.assertEqual(widths, MLP_WIDTHS_OK)
         self.assertEqual(sum(widths), MLP_IN_FULL)
 
-        plan = build_plan([_mlp_down_geom()], _p_layout(), _d_layout(MLP_RATIO),
-                          waves=[["weights_0"]])
+        plan = build_plan(
+            [_mlp_down_geom()], _p_layout(), _d_layout(MLP_RATIO), waves=[["weights_0"]]
+        )
         self.assertEqual([d.run_bytes for d in plan.descs], widths)
         for r, m in enumerate(mods):
             geom = StorageGeom.of(m.weight)
