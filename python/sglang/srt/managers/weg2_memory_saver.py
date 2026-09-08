@@ -39,7 +39,11 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple, Union
 
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.constants import (
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+    GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1964,7 +1968,23 @@ def _tms_cdll_in_region():
 #: NOT second bookkeeping beside an upstream truth: the upstream truth is
 #: unreadable from here.  Single-threaded by construction (model construction
 #: and the post-load pass), nested by context manager, restored on exit.
+#:
+#: ASYMMETRY, stated rather than assumed (#1273 S2 review F11): the C
+#: ``current_tag_`` this shadows is ``thread_local``, this publisher is
+#: PROCESS-global.  Sound for every load path in the tree today -- the only
+#: ``threading.Thread`` on a load path (model_loader/loader.py:2686) is the
+#: remote-instance loader, which no weights region reaches -- and WRONG the day
+#: a parallel loader opens two weights regions in two threads, where one
+#: thread's exit would restore its base tag over the other's.  A future
+#: parallel loader must make this a ``threading.local``, not merely hope.
 _WEIGHTS_REGION_TAG = GPU_MEMORY_TYPE_WEIGHTS
+
+#: Every tag a WEIGHTS region may legally be opened with.  A weights region
+#: carrying anything else is a naming accident, not a decision: the pause
+#: population, the census and the family predicate all read these names.
+_LEGAL_WEIGHTS_REGION_TAGS = frozenset(
+    (GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_WEIGHTS_DRAFT)
+)
 
 
 def current_weights_region_tag() -> str:
@@ -1982,6 +2002,37 @@ def weights_region_tag(tag: str) -> Iterator[str]:
         yield tag
     finally:
         _WEIGHTS_REGION_TAG = previous
+
+
+@contextmanager
+def weights_region(adapter: Any, tag: str, *, enable_cpu_backup: bool) -> Iterator[str]:
+    """Open a WEIGHTS region AND publish its tag -- the only way to do either.
+
+    #1273 S2 (refuter F6).  Publishing the region tag and opening the region
+    were two statements at two call sites (model_runner's boot load and
+    weight_updater's W57 roll-forward), and one of them adopted the publisher
+    while the other kept a hardcoded ``GPU_MEMORY_TYPE_WEIGHTS``.  That is
+    split brain, not a TODO: the roll-forward's post-load repack runs
+    ``weight_chunk_scope`` (model_loader/loader.py:941), which reads THIS
+    publisher, so a region opened with one tag while the publisher says another
+    tags the reloaded parameters into the wrong family -- silently, and only
+    the NEXT flip fails, with a destination range that has no VRAM source.
+
+    One opener makes the two impossible to disagree.  Nesting order is
+    load-bearing: publish BEFORE the region opens (an allocation inside it must
+    already see the tag) and restore AFTER it closes.
+    """
+    if tag not in _LEGAL_WEIGHTS_REGION_TAGS:
+        raise ValueError(
+            f"a weights region may be opened with {sorted(_LEGAL_WEIGHTS_REGION_TAGS)}, "
+            f"not {tag!r}: the pause population, the per-tag census and "
+            "is_weights_family_tag all read this name. A layer band "
+            "(weights_<n>) is a SCOPE inside the base region, never a region "
+            "of its own -- see weight_chunk_scope."
+        )
+    with weights_region_tag(tag):
+        with adapter.region(tag, enable_cpu_backup=enable_cpu_backup):
+            yield tag
 
 
 @contextmanager
