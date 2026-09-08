@@ -112,35 +112,40 @@ class HostRingStateMachineTest(unittest.TestCase):
         # file it resolved was keyed by that uuid, never by an ordinal.
         self.assertIn(f"{UUID}.ring", r.stderr)
 
-    def test_memfd_form_opens_from_an_inherited_fd(self):
-        d = self._fresh_dir()
-        path = os.path.join(d, f"{UUID}.ring")
-        fd = os.open(path, os.O_RDWR)
-        try:
-            os.set_inheritable(fd, True)
-            env = self._env(d, form="MEMFD")
-            env["TMS_HOST_RING_MAP"] = (
-                f"{UUID}={self.granules * GRANULE}:{(self.granules // 2) * GRANULE}:fd={fd}"
-            )
-            r = subprocess.run([self.probe, "uuid"], env=env, capture_output=True,
-                               text=True, pass_fds=(fd,), timeout=60)
-        finally:
-            os.close(fd)
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        self.assertIn(f"CARD {UUID}", r.stdout)
-        self.assertIn("form=MEMFD", r.stderr)
+    def test_an_unproven_form_name_is_refused_by_name(self):
+        # FIX 1: MAP_SHARED is the only form built.  The step-0 metal probe
+        # (WEG2_BUILD_DECISIONS_0906 section 1p) proved it and retired the memfd
+        # candidate, which was also broken by construction: it addressed the
+        # region by an fd NUMBER, and the ranks are spawn-started scheduler
+        # processes that inherit no descriptor from the launcher.
+        r = self._run("uuid", self._env(self._fresh_dir(), form="MEMFD"))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("W33 Weg2RingFormUnproven", r.stderr)
+        self.assertIn("is not MAP_SHARED", r.stderr)
 
     def test_a_published_ring_without_a_proven_form_is_refused_by_name(self):
         r = self._run("uuid", self._env(self._fresh_dir(), form=""))
         self.assertEqual(r.returncode, 1)
         self.assertIn("W33 Weg2RingFormUnproven", r.stderr)
 
-    def test_memfd_form_without_an_fd_is_refused_by_name(self):
-        env = self._env(self._fresh_dir(), form="MEMFD")
+    def test_a_third_map_field_is_refused_rather_than_ignored(self):
+        env = self._env(self._fresh_dir())
+        env["TMS_HOST_RING_MAP"] = (
+            f"{UUID}={self.granules * GRANULE}:{(self.granules // 2) * GRANULE}:fd=7"
+        )
         r = self._run("uuid", env)
-        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("W33 Weg2RingFormUnproven", r.stderr)
-        self.assertIn("fd=", r.stderr)
+        self.assertIn("third field", r.stderr)
+
+    def test_a_file_shorter_than_the_map_claims_is_refused_before_mmap(self):
+        d = self._fresh_dir()
+        with open(os.path.join(d, f"{UUID}.ring"), "r+b") as f:
+            f.truncate(GRANULE)          # header only: far short of the claim
+        r = self._run("uuid", self._env(d))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("W33 Weg2RingFormUnproven", r.stderr)
+        self.assertIn("refusing to mmap", r.stderr)
 
     def test_a_register_failure_is_refused_by_name_not_worked_around(self):
         r = self._run("register", self._env(self._fresh_dir(),

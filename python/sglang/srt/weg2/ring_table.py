@@ -82,6 +82,21 @@ class Weg2RingCreditRefused(RuntimeError):
     """W32: the R5 inequality fails on some card/direction at the launch check."""
 
 
+class Weg2RingNeedsInterleave(RuntimeError):
+    """W34: the ring was asked to arm under a SERIAL flip form it cannot fund.
+
+    R5's corridor inequality is a statement about two legs CONCURRENTLY in
+    flight (spec C9): W's per-tag releases are what fund S's acquires, so the
+    walk of ``u`` never has to hold both whole images at once.  Under the serial
+    per-tag order the tree actually ships (``front.FLIP_LEG_FORM == "serial"``)
+    S must acquire before W's RPC is even sent, so the requirement is the much
+    larger ``H(c) >= image_W(c) + max_tag_S(c)``.  A blocking ring sized to R5
+    and armed under the serial order does not run slowly -- it wedges the FIRST
+    flip and the acquire budget kills the rank (W31 -> group-fatal W4).  Raised
+    at LAUNCH, before either group starts.
+    """
+
+
 @dataclass
 class CardRing:
     uuid: str
@@ -119,6 +134,30 @@ class CardRing:
     def slack_p2d_mib(self) -> int:
         return self.h_mib - self.need_p2d_mib
 
+    # -- the SERIAL form's requirement (front.FLIP_LEG_FORM == "serial") -----
+    # ``need`` above is the corridor walk of C9's gathered legs, where W's
+    # releases fund S's acquires.  With the legs serialised per tag, S acquires
+    # while W still holds its WHOLE parked image and no device credit can be
+    # spent on the host side: what has to fit is the parked image plus S's
+    # first step.  A strictly larger requirement, and the one this tree runs.
+
+    @property
+    def need_serial_d2p_mib(self) -> int:
+        # S = D (sleeping), W = P (waking, whole image parked on the host).
+        return self.image_p_mib + self.max_tag_d_mib
+
+    @property
+    def need_serial_p2d_mib(self) -> int:
+        return self.image_d_mib + self.max_tag_p_mib
+
+    @property
+    def slack_serial_d2p_mib(self) -> int:
+        return self.h_mib - self.need_serial_d2p_mib
+
+    @property
+    def slack_serial_p2d_mib(self) -> int:
+        return self.h_mib - self.need_serial_p2d_mib
+
     @property
     def complete(self) -> bool:
         return self.image_p_mib > 0 and self.image_d_mib > 0 and self.max_tag_p_mib > 0 and self.max_tag_d_mib > 0
@@ -130,6 +169,13 @@ class RingTable:
     instrument: str
     lines_read: int
     cards: List[CardRing] = field(default_factory=list)
+    #: The largest SINGLE STEP of the flip, summed over cards: ``max_k Sigma_c
+    #: bytes(k, c)`` over the tags the front's interleave actually walks.  This
+    #: is the OLD form's in-flight term -- one tag is one RPC and its shards
+    #: land on every card at once, so the sum is over cards and the max is over
+    #: tags.  ``Sigma_c max_k`` (each card's own largest tag, summed) is a
+    #: different and larger quantity: the maxima need not be the same tag.
+    max_step_total_mib: int = 0
 
     @property
     def total_h_bytes(self) -> int:
@@ -146,15 +192,16 @@ class RingTable:
             "none is a constant in this tree)"
         )
 
-    def env_map(self, fds: Optional[Dict[str, int]] = None) -> str:
-        """``TMS_HOST_RING_MAP`` -- ``<uuid>=<bytes>:<span1>[:fd=<n>],...``"""
-        parts = []
-        for c in self.cards:
-            item = f"{c.uuid}={c.h_mib * MIB}:{c.span1_mib * MIB}"
-            if fds is not None and c.uuid in fds:
-                item += f":fd={fds[c.uuid]}"
-            parts.append(item)
-        return ",".join(parts)
+    def env_map(self) -> str:
+        """``TMS_HOST_RING_MAP`` -- ``<uuid>=<bytes>:<span1>,...``
+
+        A PATH-addressed map only.  There is no ``:fd=<n>`` field: an fd number
+        is meaningless in the process that has to open the region, because the
+        ranks are ``spawn``-started scheduler processes that inherit no
+        descriptor from the launcher (``entrypoints/engine.py`` sets
+        ``mp.set_start_method("spawn", force=True)``).
+        """
+        return ",".join(f"{c.uuid}={c.h_mib * MIB}:{c.span1_mib * MIB}" for c in self.cards)
 
     def format_l6(self) -> List[str]:
         """L6, one line per card, plus the refusal lines (spec section 5)."""
@@ -167,6 +214,9 @@ class RingTable:
                 f"span1={c.span1_mib} credit_d2p={c.credit_d2p_mib} "
                 f"credit_p2d={c.credit_p2d_mib} need_d2p={c.need_d2p_mib} "
                 f"need_p2d={c.need_p2d_mib} slack={c.slack_d2p_mib}/{c.slack_p2d_mib} MiB "
+                f"| SERIAL FORM need_d2p={c.need_serial_d2p_mib} "
+                f"need_p2d={c.need_serial_p2d_mib} "
+                f"slack={c.slack_serial_d2p_mib}/{c.slack_serial_p2d_mib} MiB "
                 f"-- provenance: {prov}"
             )
         return out
@@ -186,6 +236,33 @@ class RingTable:
                         f"image_{w_tag} {image_w} - credit {credit} + max_tag_{s_tag} "
                         f"{c.max_tag_d_mib if s_tag == 'D' else c.max_tag_p_mib} + max_tag_{w_tag} "
                         f"{c.max_tag_p_mib if w_tag == 'P' else c.max_tag_d_mib} = {need} MiB"
+                    )
+        return bad
+
+    def serial_refusals(self) -> List[str]:
+        """Every card/direction the SERIAL flip form cannot walk.  Empty = fundable.
+
+        Read this beside :meth:`refusals`: R5's cases can all pass while every
+        one of these fails, because they price two different flip forms.  A
+        blocking ring armed on the R5 numbers under the serial order wedges at
+        the first acquire -- the ARMED line would then certify an inequality for
+        a form this tree does not contain.
+        """
+        bad = []
+        for c in self.cards:
+            for direction, need, image_w, w_tag, s_tag, step in (
+                ("d2p", c.need_serial_d2p_mib, c.image_p_mib, "P", "D", c.max_tag_d_mib),
+                ("p2d", c.need_serial_p2d_mib, c.image_d_mib, "D", "P", c.max_tag_p_mib),
+            ):
+                if need > c.h_mib:
+                    bad.append(
+                        f"RING NEEDS INTERLEAVE: on card {c.uuid} (nvml{c.nvml_index} "
+                        f"{c.name}, {direction}) the serial form needs image_{w_tag} "
+                        f"{image_w} + max_tag_{s_tag} {step} = {need} MiB but H is "
+                        f"{c.h_mib} MiB -- at flip start the host holds {w_tag}'s whole "
+                        f"parked image and only {c.h_mib - image_w} MiB is free, so "
+                        f"{s_tag}'s first acquire of {step} MiB blocks and no "
+                        f"{w_tag}-release can be issued until it returns"
                     )
         return bad
 
@@ -230,8 +307,25 @@ def _passes(records: Sequence[Tuple[Tuple[str, ...], int]]) -> List[int]:
     return out
 
 
-def parse_group_log(path: str) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int], int, str]:
-    """(image_mib, max_tag_mib, kv_mib) per RANK INDEX, plus lines read + instrument.
+def _family_roots(tags: Sequence[str]) -> set:
+    """The tag names that name a whole FAMILY rather than one step of it.
+
+    ``weights`` is a bulk record exactly as ``['weights_0', ..., 'weights_11']``
+    in one line is: it names the family the chunked tags partition, so its delta
+    is a whole pass and not a corridor step.  The multi-tag guard in
+    :func:`_passes` does not catch it -- the record carries ONE tag name -- and
+    counting it as a step read the 5090's D step as 2 856 instead of 1 608 MiB
+    on boot weg2zr2, which is the "bulk record counted as a max_tag" shape.
+    """
+    names = set(tags)
+    return {t for t in names if any(o != t and o.startswith(t + "_") for o in names)}
+
+
+def parse_group_log(
+    path: str,
+) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int], int, str, Dict[str, int]]:
+    """(image_mib, max_tag_mib, kv_mib) per RANK INDEX, plus lines read,
+    instrument, and the per-tag totals summed over ranks (the flip's step size).
 
     The rank index is the index within its group, which is also its CVD ordinal
     -- the launcher pins ``--rank-gpu-id 0,1,2`` against a CVD ordered by UUID,
@@ -268,16 +362,28 @@ def parse_group_log(path: str) -> Tuple[Dict[int, int], Dict[int, int], Dict[int
                     kv_gb[rank] = kv_gb.get(rank, 0.0) + float(m.group(2)) + float(m.group(3))
     image: Dict[int, int] = {}
     max_tag: Dict[int, int] = {}
+    tag_peak: Dict[str, Dict[int, int]] = {}
     for rank, records in per_rank.items():
         # PEAK pass, never the mean (a ring sized to a mean blocks on the
         # larger pass); population = the passes actually logged.
         image[rank] = max(_passes(records), default=0)
         # max_tag is the corridor STEP SIZE, so only single-tag records may feed
         # it: a bulk record's delta is a whole family, not one tag, and would
-        # read as a step nothing ever takes.
-        max_tag[rank] = max((v for tags, v in records if len(tags) == 1), default=0)
+        # read as a step nothing ever takes.  A family ROOT name is bulk too.
+        singles = [(tags[0], v) for tags, v in records if len(tags) == 1]
+        roots = _family_roots([t for t, _ in singles])
+        steps = [(t, v) for t, v in singles if t not in roots]
+        max_tag[rank] = max((v for _, v in steps), default=0)
+        for tag, mib in steps:
+            slot = tag_peak.setdefault(tag, {})
+            if mib > slot.get(rank, 0):
+                slot[rank] = mib
     kv_mib = {r: int(round(gb * GB / MIB)) for r, gb in kv_gb.items()}
-    return image, max_tag, kv_mib, lines_read, instrument
+    # One tag is ONE RPC of the front's interleave and its shards land on every
+    # card at once, so the step the host must hold in flight is the sum over
+    # ranks of that tag, maximised over tags.
+    tag_totals = {tag: sum(per.values()) for tag, per in tag_peak.items()}
+    return image, max_tag, kv_mib, lines_read, instrument, tag_totals
 
 
 def parse_front_corridor(path: str) -> Dict[str, Dict[int, int]]:
@@ -324,16 +430,33 @@ def solve(
     ``cards`` is the launcher's ORDERED card list (ordinal 0 first): rank ``n``
     of either group runs on ``cards[n]``.
     """
-    stems = [boot_stem] if boot_stem else _boot_stems(evidence_dir)
+    stems = _boot_stems(evidence_dir)
     if not stems:
         return None, f"no boot in {evidence_dir} carries all three of .front/.P/.D log"
+    if boot_stem:
+        # A pin is a SUBSTRING of a stem, not the stem itself: the operator
+        # types the boot TAG (``weg2zr2``) while the files are named
+        # ``boot_weg2_weg2zr2_<sha>_<date>_<time>.{front,P,D}.log``.  An
+        # unmatched or ambiguous pin returns a REASON so the caller prints R22
+        # and runs the OLD form; it never escapes as an OSError out of an
+        # unconditional open (every refusal on this path is named).
+        exact = [s for s in stems if s == boot_stem]
+        hits = exact or [s for s in stems if boot_stem in s]
+        if len(hits) != 1:
+            return None, (
+                f"--ring-table-boot {boot_stem!r} matches {len(hits)} of the "
+                f"{len(stems)} complete boots in {evidence_dir}"
+                + (f" ({', '.join(sorted(hits)[:4])})" if hits else "")
+                + " -- a pin must name exactly one"
+            )
+        stems = hits
     reasons = []
     for stem in stems:
         p_log = os.path.join(evidence_dir, f"{stem}.P.log")
         d_log = os.path.join(evidence_dir, f"{stem}.D.log")
         f_log = os.path.join(evidence_dir, f"{stem}.front.log")
-        image_p, maxtag_p, kv_p, n_p, inst_p = parse_group_log(p_log)
-        image_d, maxtag_d, kv_d, n_d, inst_d = parse_group_log(d_log)
+        image_p, maxtag_p, kv_p, n_p, inst_p, steps_p = parse_group_log(p_log)
+        image_d, maxtag_d, kv_d, n_d, inst_d, steps_d = parse_group_log(d_log)
         if not image_p or not image_d:
             reasons.append(f"{stem}: no sleep-pass lines for {'P' if not image_p else 'D'}")
             continue
@@ -341,7 +464,14 @@ def solve(
         if "P" not in corridor or "D" not in corridor:
             reasons.append(f"{stem}: front carries no WEG2-CORRIDOR phase=P(awake)/D(awake) samples")
             continue
-        table = RingTable(boot=stem, instrument=inst_d or inst_p, lines_read=n_p + n_d)
+        table = RingTable(
+            boot=stem,
+            instrument=inst_d or inst_p,
+            lines_read=n_p + n_d,
+            max_step_total_mib=max(
+                max(steps_p.values(), default=0), max(steps_d.values(), default=0)
+            ),
+        )
         for ordinal, card in enumerate(cards):
             cr = CardRing(uuid=card.uuid, nvml_index=card.nvml_index, name=card.name)
             cr.image_p_mib = int(image_p.get(ordinal, 0))

@@ -29,13 +29,23 @@
 // and is accounted separately without a second implementation.  This header is
 // the API surface for that; the carrier read itself is NOT built here.
 //
-// THE FORM IS NOT ASSUMED (spec R16 / C0(a)(b)): whether the driver accepts
+// THE FORM WAS NOT ASSUMED (spec R16 / C0(a)(b)): whether the driver accepts
 // ``cudaHostRegister`` on a cross-process shared mapping is a METAL question,
-// not a desk one.  Both candidate forms are implemented -- a ``MAP_SHARED``
-// file under a tmpfs directory, and ``memfd_create`` + fd inheritance -- and
-// the launcher SELECTS one by publishing ``TMS_HOST_RING_FORM``.  A ring
-// directory published WITHOUT a proven form is refused by name
-// (W33 Weg2RingFormUnproven) rather than guessed at.
+// not a desk one, and it was settled on the metal -- record
+// WEG2_BUILD_DECISIONS_0906 section 1p, 2026-09-07T23:13:23Z: two processes
+// register the SAME 4 GiB ``/dev/shm`` ``MAP_SHARED`` range with
+// ``cudaSuccess`` in both, the roundtrip is bit-exact in both directions,
+// ``RLIMIT_MEMLOCK`` does not account it, and the verdict is
+// ``BUILD-MAP_SHARED`` with "the memfd fallback is NOT NEEDED".  So there is
+// ONE form: a ``MAP_SHARED`` file under a tmpfs directory, addressed by PATH.
+// The launcher still publishes ``TMS_HOST_RING_FORM`` and anything but
+// ``MAP_SHARED`` is refused by name (W33 Weg2RingFormUnproven) rather than
+// guessed at.  An fd number is never part of the map: the ranks are
+// ``spawn``-started scheduler processes and inherit no descriptor.
+//
+// The header stores NO absolute pointer (section 1p's one build caveat): the
+// two mappings of a region are at unrelated virtual addresses, so a granule is
+// per-process ``base_ + offset``.
 
 #include <pthread.h>
 #include <stdint.h>
@@ -133,7 +143,9 @@ public:
     //: resolved by ``cuDeviceGetUuid`` and NEVER by the CVD ordinal: the two
     //: groups run with different ``CUDA_VISIBLE_DEVICES`` orders and an ordinal
     //: would silently pair the wrong ranks.  Refuses by name (W33) when a ring
-    //: directory is published without a proven registration form.
+    //: directory is published without a form, with a form other than
+    //: MAP_SHARED, or with a map entry that is not exactly
+    //: ``<uuid>=<bytes>:<span1>``.
     static HostBackupRing* open_from_env(CUdevice device);
 
     //: Blocking.  Returns exactly ``ceil(bytes / granule)`` granule pointers,

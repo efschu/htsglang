@@ -94,7 +94,6 @@ struct MapEntry {
     bool found = false;
     uint64_t bytes = 0;
     uint64_t span1_bytes = 0;
-    int fd = -1;
 };
 
 MapEntry parse_map(const char* spec, const std::string& uuid) {
@@ -118,10 +117,16 @@ MapEntry parse_map(const char* spec, const std::string& uuid) {
             size_t c2 = tail.find(':');
             out.span1_bytes = strtoull(tail.substr(0, c2).c_str(), nullptr, 10);
             if (c2 != std::string::npos) {
-                std::string extra = tail.substr(c2 + 1);
-                if (extra.rfind("fd=", 0) == 0) {
-                    out.fd = static_cast<int>(strtol(extra.c_str() + 3, nullptr, 10));
-                }
+                // The map is sizes only.  A third field comes from a publisher
+                // that still believed an fd number survives spawn; refuse by
+                // name rather than ignore it.
+                std::cerr << "[host_ring.cpp] W33 Weg2RingFormUnproven: "
+                          << "TMS_HOST_RING_MAP entry for " << uuid
+                          << " carries a third field '" << tail.substr(c2 + 1)
+                          << "'.  The map is '<uuid>=<bytes>:<span1>' and nothing "
+                          << "else: an fd number cannot address this region from a "
+                          << "spawn-started rank." << std::endl;
+                exit(1);
             }
             out.found = true;
             return out;
@@ -177,18 +182,23 @@ HostBackupRing* HostBackupRing::open_from_env(CUdevice device) {
     const char* form = env_or_null("TMS_HOST_RING_FORM");
     if (form == nullptr) {
         std::cerr << "[host_ring.cpp] W33 Weg2RingFormUnproven: TMS_HOST_RING_DIR is "
-                  << "published but TMS_HOST_RING_FORM is not.  Whether the driver "
-                  << "page-locks a cross-process shared mapping is a METAL fact "
-                  << "(spec R16 / C0(a)(b)); this build implements MAP_SHARED and "
-                  << "MEMFD and refuses to pick one by guessing.  The launcher "
+                  << "published but TMS_HOST_RING_FORM is not.  The launcher "
                   << "publishes the form the step-0 probe proved, or publishes "
                   << "nothing at all and the OLD flip form runs." << std::endl;
         exit(1);
     }
     std::string form_s(form);
-    if (form_s != "MAP_SHARED" && form_s != "MEMFD") {
+    if (form_s != "MAP_SHARED") {
+        // MAP_SHARED is the only form built.  The step-0 metal probe
+        // (WEG2_BUILD_DECISIONS_0906 section 1p, 2026-09-07T23:13:23Z) proved
+        // cudaHostRegister on a cross-process /dev/shm MAP_SHARED range and
+        // recorded that the memfd fallback is NOT NEEDED; a second
+        // implementation of a settled question is a defect surface, not an
+        // option.
         std::cerr << "[host_ring.cpp] W33 Weg2RingFormUnproven: TMS_HOST_RING_FORM="
-                  << form_s << " is neither MAP_SHARED nor MEMFD" << std::endl;
+                  << form_s << " is not MAP_SHARED, the only form this build "
+                  << "implements (spec R16, settled on the metal in section 1p)"
+                  << std::endl;
         exit(1);
     }
     if (map == nullptr) {
@@ -231,26 +241,29 @@ HostBackupRing* HostBackupRing::open_from_env(CUdevice device) {
     ring->form_ = form_s;
     ring->map_bytes_ = TMS_RING_HEADER_BYTES + static_cast<size_t>(granules) * TMS_RING_GRANULE_BYTES;
 
-    if (form_s == "MEMFD") {
-        if (entry.fd < 0) {
-            std::cerr << "[host_ring.cpp] W33 Weg2RingFormUnproven: TMS_HOST_RING_FORM=MEMFD "
-                      << "but the map entry for " << uuid << " carries no ':fd=<n>' -- the "
-                      << "memfd is created by the launcher and INHERITED, so its fd number "
-                      << "is part of the map" << std::endl;
-            exit(1);
-        }
-        ring->fd_ = entry.fd;
-        ring->path_ = "memfd:" + std::to_string(entry.fd);
-    } else {
-        ring->path_ = std::string(dir ? dir : "") + "/" + uuid + ".ring";
-        ring->fd_ = open(ring->path_.c_str(), O_RDWR);
-        if (ring->fd_ < 0) {
-            std::cerr << "[host_ring.cpp] host ring open(" << ring->path_
-                      << ") failed: " << strerror(errno)
-                      << " -- the launcher creates and ftruncates every per-card file "
-                      << "BEFORE either group starts (spec C18)" << std::endl;
-            exit(1);
-        }
+    // A PATH, never an inherited fd number.  The ranks that reach this code are
+    // scheduler processes started with mp.set_start_method("spawn", force=True)
+    // (entrypoints/engine.py), which passes only its own handles: an fd number
+    // published by the launcher names a DIFFERENT object here -- a closed slot,
+    // a socket, a log file -- and mmapping it would write a ring header into
+    // whatever that is.  The map therefore carries sizes only.
+    ring->path_ = std::string(dir ? dir : "") + "/" + uuid + ".ring";
+    ring->fd_ = open(ring->path_.c_str(), O_RDWR);
+    if (ring->fd_ < 0) {
+        std::cerr << "[host_ring.cpp] host ring open(" << ring->path_
+                  << ") failed: " << strerror(errno)
+                  << " -- the launcher creates and ftruncates every per-card file "
+                  << "BEFORE either group starts (spec C18)" << std::endl;
+        exit(1);
+    }
+    struct stat st;
+    if (fstat(ring->fd_, &st) != 0 ||
+        static_cast<uint64_t>(st.st_size) < static_cast<uint64_t>(ring->map_bytes_)) {
+        std::cerr << "[host_ring.cpp] W33 Weg2RingFormUnproven: " << ring->path_
+                  << " is " << st.st_size << " B but the map claims "
+                  << ring->map_bytes_ << " B -- refusing to mmap and initialise an "
+                  << "object whose identity is not established" << std::endl;
+        exit(1);
     }
 
     ring->base_ = mmap(nullptr, ring->map_bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, ring->fd_, 0);

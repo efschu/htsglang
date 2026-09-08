@@ -79,6 +79,25 @@ SPAN_LRU = 512
 SLEEP_TAGS = ["kv_cache", "weights"]
 KV_TAG = "kv_cache"
 
+#: HOW THE FLIP ORDERS ITS TWO LEGS -- the one fact the host-ring launch check
+#: needs and cannot infer, declared HERE because this file is what does it.
+#:
+#: ``"serial"`` is the #1233 one-backup interleave below (:meth:`Weg2Front.flip`
+#: step 3): per weights tag, ``S.pause(tag)`` completes BEFORE ``W.resume(tag)``
+#: is even sent.  S therefore has to acquire host bytes while W still holds its
+#: whole parked image, so the host requirement is ``H(c) >= image_W(c) +
+#: max_tag_S(c)`` -- NOT spec R5's corridor inequality, which assumes the two
+#: legs are concurrently in flight (``asyncio.gather``, spec C9) and lets W's
+#: releases fund S's acquires.  Arming a blocking ring sized to R5 under this
+#: serial order deadlocks at the first flip, which is exactly what R10 means by
+#: "C is not separable"; the launcher checks the SERIAL requirement while this
+#: constant says ``"serial"`` and refuses by name (W34) rather than wedging.
+#:
+#: C9 flips this to ``"interleave"`` in the same commit that replaces the loop
+#: below with one gathered RPC pair per group per leg.  The two must move
+#: together, which is why there is ONE constant and no second copy.
+FLIP_LEG_FORM = "serial"
+
 
 class Weg2Stop(Exception):
     """A named refusal that STOPS the front (spec section 5)."""

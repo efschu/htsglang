@@ -220,10 +220,6 @@ class GroupSpec:
     env: Dict[str, str]
     pid: int = 0
     proc: Optional[subprocess.Popen] = None
-    #: C18, MEMFD form only: the inherited ring fds.  ``memfd_create`` without
-    #: ``MFD_CLOEXEC`` survives exec, and ``pass_fds`` is what keeps Popen's
-    #: ``close_fds`` from shutting them.
-    pass_fds: Tuple[int, ...] = ()
 
 
 @dataclass
@@ -627,22 +623,35 @@ class HostRingPlan:
     env_map: str = ""
     epoch: int = 0
     armed: bool = False
-    fds: Tuple[int, ...] = ()
     table: Optional["ring_table.RingTable"] = None
     lines: List[str] = field(default_factory=list)
 
     @property
     def host_weights_bytes(self) -> int:
         """The RUN-moment host weights charge, from the same measured table for
-        both forms -- the ring's ``Sigma H``, or the old form's ``Sigma H +
-        Sigma max_tag`` (one image resident plus one chunk in flight)."""
+        both forms.
+
+        Armed: ``Sigma_c H(c)``.  The region is fungible, so the tag in flight
+        is drawn from the SAME per-card bytes the dormant image occupies and
+        there is nothing to add (spec C19 / section 7).
+
+        Un-armed (the OLD serial per-tag form): one image plus ONE tag in
+        flight -- ``Sigma_c H(c) + max_k Sigma_c bytes(k, c)``.  This is the
+        parent's ``backup_resident + chunk_gib`` model with the stale constant
+        replaced by the measured table and the AVERAGE chunk replaced by the
+        measured largest one.  It is ONE tag because the front sends one
+        ``/release_memory_occupation`` per tag; the sum is over cards because
+        that tag's shards land on every card at once.  Charging ``Sigma_c
+        max_k`` instead -- each card's own largest tag, summed -- prices a step
+        the flip never takes (the maxima are different tags) and cost the
+        DEFAULT path 5.6 GiB it does not spend, which was enough to make every
+        arm of the ladder refuse with W20.
+        """
         if self.table is None:
             return 0
         total = self.table.total_h_bytes
         if not self.armed:
-            total += sum(
-                max(c.max_tag_p_mib, c.max_tag_d_mib) for c in self.table.cards
-            ) * ring_table.MIB
+            total += self.table.max_step_total_mib * ring_table.MIB
         return total
 
     @property
@@ -657,14 +666,35 @@ class HostRingPlan:
         return f"{self.table.provenance()}; charged for the {form}"
 
 
+def _front_leg_form() -> str:
+    """``front.FLIP_LEG_FORM`` -- read, never restated.
+
+    The launch check has to know how the flip orders its legs, and the only
+    honest source is the module that does the ordering.  A copy here would be a
+    second bookkeeping of the same fact and would go stale the moment C9 lands.
+    """
+    from sglang.srt.weg2 import front
+
+    return front.FLIP_LEG_FORM
+
+
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
-                      evidence_dir: str, boot_stem: str, dry: bool) -> HostRingPlan:
+                      evidence_dir: str, boot_stem: str, dry: bool,
+                      leg_form: str = "") -> HostRingPlan:
     """C20 + C18: solve the table, print L6, REFUSE by name, then arm the region.
 
-    Order is load-bearing: the R5 inequality is checked and the per-card files
+    Order is load-bearing: the inequalities are checked and the per-card files
     are created BEFORE either group starts, so a configuration that cannot walk
-    the corridor never reaches a rank (W32 rather than a mid-flip W31).
+    the corridor never reaches a rank (W32/W34 rather than a mid-flip W31).
+
+    TWO inequalities, because there are two flip forms and only one of them is
+    in this tree.  R5's corridor is checked always (W32).  The SERIAL form's
+    ``H(c) >= image_W(c) + max_tag_S(c)`` is checked whenever
+    ``front.FLIP_LEG_FORM`` is not ``"interleave"`` (W34): under the serial
+    order the ring cannot be funded by W's releases, so arming a ring sized to
+    R5 wedges the first flip instead of running it.
     """
+    leg_form = leg_form or _front_leg_form()
     plan = HostRingPlan(form=form)
     table, reason = ring_table.solve(cards, evidence_dir, boot_stem or None)
     if table is None:
@@ -678,72 +708,96 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
         return plan
     plan.table = table
     plan.lines.extend(table.format_l6())          # L6
-    refusals = table.refusals()
-    plan.lines.extend(refusals)
     for ln in plan.lines:
         log(ln)
-    if refusals:
-        raise ring_table.Weg2RingCreditRefused(
-            "W32 Weg2RingCreditRefused: the R5 corridor inequality fails on "
-            f"{len(refusals)} (card x direction) case(s) BEFORE either group starts.  "
-            "H(c) >= image_W(c) - device_credit(c) + max_tag_S(c) + max_tag_W(c) is "
-            "what makes the blocking ring deadlock-free; a negative slack is a flip "
-            "that would wedge, not one that would be slow.\n" + "\n".join(refusals)
-        )
-    if form not in ("MAP_SHARED", "MEMFD"):
+    if form not in ("auto", "MAP_SHARED"):
         plan.lines.append(
-            "W33 Weg2RingFormUnproven: no registration form proven for this rig, so "
-            "the host ring is NOT armed and the OLD flip form runs.  Whether the "
-            "driver page-locks a cross-process shared mapping (cudaHostRegister on a "
-            "/dev/shm MAP_SHARED file, or on a memfd) is a METAL fact (spec R16); "
-            "both forms are built and either is selected with --ring-form once the "
-            "step-0 probe records its verdict in WEG2_BUILD_DECISIONS_0906 section 1p."
+            f"W33 Weg2RingFormUnproven: --ring-form {form or 'none'} selects no "
+            "registration form, so the host ring is NOT armed and the OLD flip form "
+            "runs.  MAP_SHARED (cudaHostRegister on a /dev/shm MAP_SHARED file) is "
+            "the form the step-0 probe PROVED on this rig "
+            "(WEG2_BUILD_DECISIONS_0906 section 1p, 2026-09-07T23:13:23Z: all three "
+            "gates pass, verdict BUILD-MAP_SHARED, duplex arm KEEP); it is the only "
+            "form built, and the memfd candidate that probe retired is deleted."
         )
         log(plan.lines[-1])
         return plan
+    # TWO launch checks, ONE rule for what a failure does.  W32 is spec R5's
+    # corridor inequality -- the one that makes a blocking ring deadlock-free
+    # when the legs are GATHERED (spec C9).  W34 is the requirement of the form
+    # the front actually runs today: with the legs serialised per tag, S must
+    # acquire while W still holds its whole parked image, and no device credit
+    # can pay for that.  The second check exists because C1-C8 shipped without
+    # C9 although R10 says they are not separable; without it the ARMED line
+    # certifies an inequality for a flip form this tree does not contain, and
+    # the first flip wedges on every card.
+    #
+    # A failure of EITHER check means the same thing -- the ring cannot be armed
+    # for this boot -- so both take the same exit: spec section 10.4's
+    # boot-level, all-or-nothing fallback to the OLD form, printed by name.
+    # Except when a form was named explicitly, where it RAISES: an explicit
+    # request that cannot be honoured is refused, never quietly downgraded.
+    checks = [
+        ("W32 Weg2RingCreditRefused",
+         "the R5 corridor inequality (H(c) >= image_W(c) - device_credit(c) + "
+         "max_tag_S(c) + max_tag_W(c), spec C20) fails on {n} (card x direction) "
+         "case(s); a negative slack is a flip that would wedge, not one that "
+         "would be slow",
+         table.refusals(),
+         ring_table.Weg2RingCreditRefused),
+    ]
+    if leg_form != "interleave":
+        checks.append(
+            ("W34 Weg2RingNeedsInterleave",
+             f"front.FLIP_LEG_FORM is {leg_form!r}, so the serial requirement "
+             "H(c) >= image_W(c) + max_tag_S(c) applies and it fails on {n} "
+             "(card x direction) case(s); S would block in acquire, W's release "
+             "would never be issued because its RPC has not been sent, and the "
+             "acquire budget would expire into W31 -> group-fatal W4",
+             table.serial_refusals(),
+             ring_table.Weg2RingNeedsInterleave))
+    for name, why, bad, exc in checks:
+        if not bad:
+            continue
+        head = (f"{name}: " + why.format(n=len(bad)) +
+                ".  The host ring is NOT armed and the OLD flip form runs "
+                "(spec section 10.4), BEFORE either group starts.")
+        plan.lines.append(head)
+        plan.lines.extend(bad)
+        for ln in plan.lines[-(len(bad) + 1):]:
+            log(ln)
+        if form == "MAP_SHARED":
+            raise exc(head.replace("is NOT armed and the OLD flip form runs "
+                                   "(spec section 10.4)",
+                                   "was asked for explicitly with --ring-form "
+                                   "MAP_SHARED and cannot be armed")
+                      + "\n" + "\n".join(bad))
+        return plan
     plan.epoch = int(time.time())
-    fds: Dict[str, int] = {}
-    if form == "MAP_SHARED":
-        plan.dir = f"{HOST_RING_DIR}-{tag}"
+    plan.dir = f"{HOST_RING_DIR}-{tag}"
+    if not dry:
+        os.makedirs(plan.dir, exist_ok=True)
+    for c in table.cards:
+        path = os.path.join(plan.dir, f"{c.uuid}.ring")
+        size = ring_table.MIB * 2 + c.h_mib * ring_table.MIB  # header granule + data
         if not dry:
-            os.makedirs(plan.dir, exist_ok=True)
-        for c in table.cards:
-            path = os.path.join(plan.dir, f"{c.uuid}.ring")
-            size = ring_table.MIB * 2 + c.h_mib * ring_table.MIB  # header granule + data
-            if not dry:
-                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-                try:
-                    os.ftruncate(fd, size)
-                finally:
-                    os.close(fd)
-            plan.lines.append(
-                f"WEG2-HOST-RING file {path} size={size // ring_table.MIB} MiB "
-                f"(2 MiB header granule + H {c.h_mib} MiB) "
-                + ("DRY-RUN: would be" if dry else "")
-                + " created and ftruncated BEFORE either group starts"
-            )
-    else:
-        plan.dir = f"{HOST_RING_DIR}-{tag}"
-        for c in table.cards:
-            size = ring_table.MIB * 2 + c.h_mib * ring_table.MIB
-            if not dry:
-                fd = os.memfd_create(f"weg2-ring-{c.uuid}", 0)  # no MFD_CLOEXEC: inherited
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
                 os.ftruncate(fd, size)
-                fds[c.uuid] = fd
-            else:
-                fds[c.uuid] = -1
-            plan.lines.append(
-                f"WEG2-HOST-RING memfd for {c.uuid} size={size // ring_table.MIB} MiB "
-                f"fd={fds[c.uuid]} ("
-                + ("DRY-RUN: would be " if dry else "")
-                + "created and ftruncated BEFORE either group starts, "
-                "inherited by both groups)"
-            )
-    plan.env_map = table.env_map(fds if form == "MEMFD" else None)
-    plan.fds = tuple(fd for fd in fds.values() if fd >= 0)
+            finally:
+                os.close(fd)
+        plan.lines.append(
+            f"WEG2-HOST-RING file {path} size={size // ring_table.MIB} MiB "
+            f"(2 MiB header granule + H {c.h_mib} MiB) "
+            + ("DRY-RUN: would be" if dry else "")
+            + " created and ftruncated BEFORE either group starts"
+        )
+    plan.env_map = table.env_map()
+    plan.form = "MAP_SHARED"          # 'auto' resolves to the one proven form
     plan.armed = True
     plan.lines.append(
-        f"WEG2-HOST-RING ARMED form={form} epoch={plan.epoch} dir={plan.dir} "
+        f"WEG2-HOST-RING ARMED form={plan.form} leg_form={leg_form} "
+        f"epoch={plan.epoch} dir={plan.dir} "
         f"Sigma H={table.total_h_bytes // ring_table.MIB} MiB "
         f"Sigma span1={table.total_span1_bytes // ring_table.MIB} MiB granule=2 MiB "
         f"-- provenance: {table.provenance()}"
@@ -856,7 +910,7 @@ def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
     fh.write(f"=== WEG2 group {spec.name} launched {_now()} ===\nargv: {' '.join(shlex.quote(a) for a in spec.argv)}\n".encode())
     fh.flush()
     p = subprocess.Popen(spec.argv, env=spec.env, stdout=fh, stderr=subprocess.STDOUT, cwd=tree,
-                         start_new_session=True, pass_fds=spec.pass_fds)
+                         start_new_session=True)
     spec.pid = p.pid
     spec.proc = p
     log(f"group {spec.name} pid {p.pid} (session id = pid) log {spec.log}")
@@ -959,19 +1013,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "'bar1' nothing about the flip path changes.",
     )
     ap.add_argument(
-        "--ring-form", choices=["none", "MAP_SHARED", "MEMFD"], default="none",
-        help="C18/R16: the PROVEN cross-process registration form for the shared "
-             "host granule ring. 'none' (the default) is not a disable switch, it "
-             "is the honest state before the step-0 metal probe has spoken: the "
-             "launcher then prints W33 Weg2RingFormUnproven and runs the OLD flip "
-             "form. The boot agent passes the verdict recorded in "
-             "WEG2_BUILD_DECISIONS_0906 section 1p. Never a size, never a knob: "
-             "H and both spans are solved from the previous boot's own lines.",
+        "--ring-form", choices=["auto", "none", "MAP_SHARED"], default="auto",
+        help="C18/R16: the cross-process registration form for the shared host "
+             "granule ring. MAP_SHARED (cudaHostRegister on a /dev/shm MAP_SHARED "
+             "file) is the form the step-0 metal probe PROVED on this rig "
+             "(WEG2_BUILD_DECISIONS_0906 section 1p); it is the only form built, "
+             "and the memfd candidate is deleted because that probe retired it. "
+             "'auto' (the default) arms it when the launch checks fund it, and "
+             "otherwise prints the failing check by name (W32 / W34) and runs the "
+             "OLD flip form -- spec section 10.4's boot-level, all-or-nothing "
+             "fallback. Naming MAP_SHARED explicitly turns those checks into a "
+             "RAISE instead: an explicit request is never quietly downgraded. "
+             "'none' never arms. Never a size, never a knob: H and both spans are "
+             "solved from the previous boot's own lines.",
     )
     ap.add_argument("--evidence-dir", default=EVIDENCE_DIR,
                     help="where ring_table reads the previous boot's logs from")
     ap.add_argument("--ring-table-boot", default="",
-                    help="pin the ring table to ONE boot stem instead of the newest usable one")
+                    help="pin the ring table to ONE boot instead of the newest usable "
+                         "one. Matched as a SUBSTRING of the log stem, so the boot TAG "
+                         "('weg2zr2') is enough; it must match exactly one boot, and a "
+                         "pin that matches none or several returns the R22 reason and "
+                         "runs the OLD flip form rather than raising an OSError")
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
     ns = ap.parse_args(argv)
     if ns.teardown:
@@ -1083,7 +1146,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
-    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), ns.transport), state.logs["P"], env_p, pass_fds=ring_plan.fds)
+    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p)), ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     state.deviations = [
         "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
@@ -1109,7 +1172,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d, pass_fds=ring_plan.fds)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
@@ -1145,7 +1208,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     state.budgets["D"] = budgets_d
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d, pass_fds=ring_plan.fds)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d)), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
@@ -1271,8 +1334,7 @@ def teardown(path: str) -> int:
         print(f"store tmpfs {mount} unmounted")
     # C18: the per-card ring files are tmpfs pages charged to this boot's host
     # ledger.  Leaving them behind would carry Sigma H of RAM into the NEXT
-    # boot's baseline, where nothing names it.  (A MEMFD-form ring has no file
-    # to unlink: it dies with the last fd.)
+    # boot's baseline, where nothing names it.
     ring_dir = st.get("ring_dir", "")
     if ring_dir and os.path.isdir(ring_dir):
         for name in os.listdir(ring_dir):

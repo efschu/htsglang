@@ -273,13 +273,16 @@ class R5LaunchCheckTest(unittest.TestCase):
         self.assertIn("boot boot_x", line)
         self.assertIn("42 WEG2-FLIP-TAG bytes", line)
 
-    def test_the_env_map_carries_bytes_span1_and_optionally_the_fd(self):
+    def test_the_env_map_carries_bytes_and_span1_and_never_an_fd(self):
         table = ring_table.RingTable(boot="b", instrument="i", lines_read=1,
                                      cards=[self._card()])
         self.assertEqual(table.env_map(),
                          f"GPU-aaaa={13914 * MIB}:{13860 * MIB}")
-        self.assertEqual(table.env_map({"GPU-aaaa": 7}),
-                         f"GPU-aaaa={13914 * MIB}:{13860 * MIB}:fd=7")
+        # FIX 1: the map is sizes only.  An fd number published here would name
+        # a different object in a spawn-started rank, so the field is gone and
+        # env_map takes no argument that could reintroduce it.
+        with self.assertRaises(TypeError):
+            table.env_map({"GPU-aaaa": 7})
 
 
 class LedgerRingTermsTest(unittest.TestCase):
@@ -396,10 +399,15 @@ class RealBootProvenanceTest(unittest.TestCase):
         self.assertEqual(got["GPU-cccc"], (9370, 8504, 9370))
         self.assertEqual(table.total_h_bytes // MIB, 32964)
         self.assertEqual(table.total_span1_bytes // MIB, 29912)
+        # FIX 1: max_tag is the step of the front's per-tag interleave, so the
+        # unchunked family tag 'weights' -- the launcher's own bulk sleep, which
+        # names the family that 'weights_<k>' partitions -- no longer feeds it.
+        # D's step on the 5090 is weights_0 at 1 608 MiB, which is the figure the
+        # D log carries; 2 856 was the bulk record read as a step.
         max_tags = {c.uuid: (c.max_tag_d_mib, c.max_tag_p_mib) for c in table.cards}
-        self.assertEqual(max_tags["GPU-aaaa"], (2856, 2988))
-        self.assertEqual(max_tags["GPU-bbbb"], (2714, 2986))
-        self.assertEqual(max_tags["GPU-cccc"], (2686, 3336))
+        self.assertEqual(max_tags["GPU-aaaa"], (1608, 2988))
+        self.assertEqual(max_tags["GPU-bbbb"], (1010, 2986))
+        self.assertEqual(max_tags["GPU-cccc"], (982, 2916))
 
     def test_the_launch_check_passes_on_that_boots_own_credit(self):
         # The credit here is the MINIMUM corridor sample, which is tighter than
@@ -449,7 +457,8 @@ class LauncherRingPlanTest(unittest.TestCase):
         card = ring_table.CardRing(uuid="GPU-aaaa", nvml_index=1, name="c",
                                    image_p_mib=100, image_d_mib=200,
                                    max_tag_p_mib=30, max_tag_d_mib=20)
-        table = ring_table.RingTable(boot="b", instrument="i", lines_read=1, cards=[card])
+        table = ring_table.RingTable(boot="b", instrument="i", lines_read=1, cards=[card],
+                                     max_step_total_mib=30)
         armed = launcher.HostRingPlan(form="MAP_SHARED", armed=True, table=table)
         old = launcher.HostRingPlan(form="", armed=False, table=table)
         self.assertEqual(armed.host_weights_bytes, 200 * MIB, "the ring holds Sigma H")
@@ -470,6 +479,275 @@ class LauncherRingPlanTest(unittest.TestCase):
                                ring_bytes=plan.host_weights_bytes,
                                ring_span1_bytes=plan.host_weights_span1_bytes,
                                ring_provenance=plan.provenance)
+
+
+# ---------------------------------------------------------------------------
+# FIX 1 (round 1) -- the defects the reviewer found in ec595b9aa9.
+# ---------------------------------------------------------------------------
+
+
+def _zr2_table():
+    """Boot weg2zr2's own numbers, as a table, without touching the evidence tree."""
+    rows = [
+        ring_table.CardRing(uuid="GPU-aaaa", nvml_index=1, name="RTX 5090",
+                            image_p_mib=13860, image_d_mib=13914,
+                            max_tag_p_mib=2988, max_tag_d_mib=2856,
+                            credit_d2p_mib=13441, credit_p2d_mib=12609),
+        ring_table.CardRing(uuid="GPU-bbbb", nvml_index=0, name="RTX 3080",
+                            image_p_mib=7548, image_d_mib=9680,
+                            max_tag_p_mib=2986, max_tag_d_mib=2714,
+                            credit_d2p_mib=7106, credit_p2d_mib=7741),
+        ring_table.CardRing(uuid="GPU-cccc", nvml_index=2, name="RTX 3080",
+                            image_p_mib=8504, image_d_mib=9370,
+                            max_tag_p_mib=3336, max_tag_d_mib=2686,
+                            credit_d2p_mib=7535, credit_p2d_mib=7033),
+    ]
+    return ring_table.RingTable(boot="weg2zr2", instrument="i", lines_read=1,
+                                cards=rows, max_step_total_mib=3600)
+
+
+class SerialFormLaunchCheckTest(unittest.TestCase):
+    """W34: R5's corridor is not the requirement the SERIAL flip form has.
+
+    RED before FIX 1: ``serial_refusals`` did not exist and ``prepare_host_ring``
+    armed the ring on this very table -- which wedges the FIRST flip on every
+    card, because S must acquire while W still holds its whole parked image.
+    """
+
+    def test_the_serial_requirement_is_the_parked_image_plus_the_first_step(self):
+        c = _zr2_table().cards[0]
+        self.assertEqual(c.need_serial_d2p_mib, 13860 + 2856)
+        self.assertEqual(c.need_serial_p2d_mib, 13914 + 2988)
+        # free at flip start = H - the parked image.  54 MiB against a 2 856 MiB
+        # first acquire: the wedge, in one subtraction.
+        self.assertEqual(c.h_mib - c.image_p_mib, 54)
+        self.assertEqual(c.slack_serial_d2p_mib, 54 - 2856)
+
+    def test_all_six_r5_cases_pass_while_all_six_serial_cases_refuse(self):
+        table = _zr2_table()
+        self.assertEqual(table.refusals(), [],
+                         "R5 passes on this table -- which is exactly why W32 alone "
+                         "let the ring arm into a deadlock")
+        serial = table.serial_refusals()
+        self.assertEqual(len(serial), 6, "\n".join(serial))
+        self.assertIn("RING NEEDS INTERLEAVE", serial[0])
+        for token in ("image_P 13860", "max_tag_D 2856", "H is 13914",
+                      "only 54 MiB is free"):
+            self.assertIn(token, serial[0])
+
+    def test_the_p2d_direction_wedges_structurally_whenever_image_d_is_the_peak(self):
+        # H = max(image_P, image_D).  When image_D is the peak, the host has
+        # exactly ZERO free bytes at the start of P->D, so no step size however
+        # small is funded.  A property of the form, not of a number.
+        for c in _zr2_table().cards:
+            self.assertEqual(c.image_d_mib, c.h_mib)
+            self.assertEqual(c.slack_serial_p2d_mib, -c.max_tag_p_mib)
+
+    def test_the_front_declares_the_leg_form_and_the_launcher_reads_it(self):
+        from sglang.srt.weg2 import front, launcher
+
+        self.assertEqual(front.FLIP_LEG_FORM, "serial")
+        self.assertEqual(launcher._front_leg_form(), "serial",
+                         "the launcher must READ the front's constant, not restate it")
+
+    def _prepare(self, launcher, lines, form, leg_form=""):
+        table = _zr2_table()
+        real = ring_table.solve
+        ring_table.solve = lambda *a, **k: (table, "stubbed")
+        try:
+            return launcher.prepare_host_ring(
+                [], lines.append, "t2", form, "/nonexistent", "", True,
+                leg_form=leg_form)
+        finally:
+            ring_table.solve = real
+
+    def test_auto_prints_w34_and_runs_the_old_form_instead_of_arming(self):
+        from sglang.srt.weg2 import launcher
+
+        lines = []
+        plan = self._prepare(launcher, lines, form="auto")
+        self.assertFalse(plan.armed, "arming here wedges the first flip")
+        joined = "\n".join(lines)
+        self.assertIn("W34 Weg2RingNeedsInterleave", joined)
+        self.assertIn("OLD flip form runs", joined)
+        self.assertNotIn("WEG2-HOST-RING ARMED", joined,
+                         "the ARMED line must never certify a corridor for a flip "
+                         "form this tree does not contain")
+
+    def test_an_explicitly_named_form_raises_rather_than_downgrading(self):
+        from sglang.srt.weg2 import launcher
+
+        lines = []
+        with self.assertRaises(ring_table.Weg2RingNeedsInterleave) as cm:
+            self._prepare(launcher, lines, form="MAP_SHARED")
+        self.assertIn("W34 Weg2RingNeedsInterleave", str(cm.exception))
+        self.assertIn("RING NEEDS INTERLEAVE", str(cm.exception))
+
+    def test_the_check_lifts_when_the_front_gathers_its_legs(self):
+        from sglang.srt.weg2 import launcher
+
+        lines = []
+        plan = self._prepare(launcher, lines, form="auto", leg_form="interleave")
+        self.assertTrue(plan.armed, "\n".join(lines))
+        self.assertEqual(plan.form, "MAP_SHARED")
+        self.assertIn("leg_form=interleave", "\n".join(lines))
+
+    def test_l6_prints_the_serial_row_beside_the_r5_row(self):
+        line = _zr2_table().format_l6()[0]
+        self.assertIn("SERIAL FORM need_d2p=16716", line)
+        self.assertIn("need_d2p=6263", line, "R5's row must still be there")
+
+
+class RingTableBootPinTest(unittest.TestCase):
+    """FIX 1: ``--ring-table-boot`` is a substring pin, and it never raises."""
+
+    def setUp(self):
+        import tempfile
+
+        self.dir = tempfile.mkdtemp(prefix="weg2ringpin-")
+        for stem in ("boot_weg2_zzz1_aaaaaaaaaa_0907_010101",
+                     "boot_weg2_zzz2_bbbbbbbbbb_0907_020202"):
+            for suffix in (".P.log", ".D.log", ".front.log"):
+                open(os.path.join(self.dir, stem + suffix), "w").close()
+
+    def test_a_missing_pin_returns_a_reason_and_never_an_oserror(self):
+        table, reason = ring_table.solve([], self.dir, "weg2zr2")
+        self.assertIsNone(table)
+        self.assertIn("matches 0 of the 2 complete boots", reason)
+
+    def test_an_ambiguous_pin_returns_a_reason_naming_the_candidates(self):
+        table, reason = ring_table.solve([], self.dir, "zzz")
+        self.assertIsNone(table)
+        self.assertIn("matches 2 of the 2 complete boots", reason)
+        self.assertIn("zzz1", reason)
+
+    def test_the_boot_tag_alone_resolves_the_stem(self):
+        # The recorded evidence line quotes '--ring-table-boot weg2zr2'; before
+        # FIX 1 that opened '<dir>/weg2zr2.P.log' and raised FileNotFoundError.
+        table, reason = ring_table.solve([], self.dir, "zzz1")
+        self.assertIsNone(table, "empty logs cannot solve")
+        self.assertIn("boot_weg2_zzz1_aaaaaaaaaa_0907_010101", reason)
+        self.assertNotIn("matches", reason, "the pin itself resolved")
+
+
+class OldFormPriceTest(unittest.TestCase):
+    """FIX 1: the DEFAULT (un-armed) path must still fund an arm.
+
+    RED before FIX 1: the un-armed charge was ``Sigma H + Sigma_c max_k``, which
+    prices a step the flip never takes -- each card's largest tag is a different
+    tag -- and it made every arm of the ladder refuse with W20.
+    """
+
+    def test_one_tag_is_one_rpc_so_the_sum_is_over_cards_and_the_max_over_tags(self):
+        # weights_0 is 100+100+20 = 220; weights_1 is 40+40+280 = 360.  Each
+        # card's own largest tag summed is 100+100+280 = 480, but no single RPC
+        # ever holds 480 -- the maxima are different tags.  The largest step is
+        # 360, and 120 MiB of the difference is a charge nothing ever incurs.
+        rows = [ring_table.CardRing(uuid=f"GPU-{i}", nvml_index=i, name="c",
+                                    image_p_mib=1000, image_d_mib=1000,
+                                    max_tag_p_mib=100, max_tag_d_mib=100)
+                for i in range(3)]
+        rows[2].max_tag_d_mib = 280
+        table = ring_table.RingTable(boot="b", instrument="i", lines_read=1,
+                                     cards=rows, max_step_total_mib=360)
+        from sglang.srt.weg2 import launcher
+
+        old = launcher.HostRingPlan(form="", armed=False, table=table)
+        self.assertEqual(old.host_weights_bytes, (3000 + 360) * MIB)
+        self.assertNotEqual(old.host_weights_bytes,
+                            (3000 + 100 + 100 + 280) * MIB)
+
+    def test_a_family_root_tag_is_a_bulk_record_not_a_step(self):
+        import tempfile
+
+        d = tempfile.mkdtemp(prefix="weg2bulkroot-")
+        path = os.path.join(d, "g.log")
+        with open(path, "w") as f:
+            for rank, records in enumerate((
+                (("weights_0", 1200), ("weights_1", 1100), ("weights", 2856)),
+                (("weights_0", 700), ("weights_1", 900), ("weights", 1600)),
+            )):
+                for tag, mib in records:
+                    f.write(f"[2026-09-07 21:10:23 TP{rank}] WEG2-CHUNK-BYTES sleep "
+                            f"tags=['{tag}'] host_image_delta={mib} MiB\n")
+        _, max_tag, _, _, _, steps = ring_table.parse_group_log(path)
+        self.assertEqual(max_tag[0], 1200,
+                         "'weights' names the family that 'weights_<k>' partitions, "
+                         "so its delta is a whole pass and not a corridor step")
+        self.assertEqual(max_tag[1], 900)
+        self.assertNotIn("weights", steps)
+        # The step total is summed OVER RANKS -- one tag is one RPC whose shards
+        # land on every card at once, so a per-rank maximum is not the step.
+        self.assertEqual(steps["weights_0"], 1200 + 700)
+        self.assertEqual(steps["weights_1"], 1100 + 900)
+
+    @unittest.skipUnless(os.path.isdir(EVIDENCE), "no evidence tree")
+    def test_the_default_path_still_selects_an_arm_at_the_record_box(self):
+        from sglang.srt.weg2 import launcher
+
+        table, reason = ring_table.solve(CARDS, EVIDENCE, ZR2)
+        self.assertIsNotNone(table, reason)
+        old = launcher.HostRingPlan(form="", armed=False, table=table)
+        arm, store, _ = host_ledger.choose(
+            int(118.05 * GIB), int(103.95 * GIB), store_min_gib=8.0,
+            ring_bytes=old.host_weights_bytes,
+            ring_span1_bytes=old.host_weights_span1_bytes,
+            ring_provenance=old.provenance)
+        self.assertGreaterEqual(arm.launch_leftover_gib, 0.0)
+        self.assertGreaterEqual(store, 8.0)
+
+
+class MemfdArmIsDeletedTest(unittest.TestCase):
+    """FIX 1: the step-0 probe retired the memfd form 25 min before the commit.
+
+    It was also broken by construction: the launcher published an fd NUMBER and
+    the ranks are ``spawn``-started scheduler processes, so that number named a
+    different object -- or nothing -- in the process that mmapped it.
+    """
+
+    def test_the_launcher_offers_only_auto_none_and_the_proven_form(self):
+        import argparse
+
+        from sglang.srt.weg2 import launcher
+
+        seen = {}
+        real = argparse.ArgumentParser.add_argument
+
+        def spy(self, *a, **k):
+            if a and a[0] == "--ring-form":
+                seen["choices"] = k.get("choices")
+            return real(self, *a, **k)
+
+        argparse.ArgumentParser.add_argument = spy
+        try:
+            with self.assertRaises(SystemExit):
+                launcher.main(["--help"])
+        finally:
+            argparse.ArgumentParser.add_argument = real
+        self.assertEqual(seen.get("choices"), ["auto", "none", "MAP_SHARED"])
+
+    def test_no_source_of_this_slice_still_creates_or_passes_a_ring_fd(self):
+        from sglang.srt.weg2 import launcher
+
+        src = open(launcher.__file__).read()
+        for token in ("memfd_create", "pass_fds", '"MEMFD"', "'MEMFD'"):
+            self.assertNotIn(token, src, f"{token} survives in the launcher")
+
+    def test_the_c_side_takes_a_path_and_validates_the_object_before_mmap(self):
+        from sglang.srt.weg2 import launcher
+
+        cpp = os.path.join(os.path.dirname(launcher.__file__),
+                           "tms_csrc", "host_ring.cpp")
+        src = open(cpp).read()
+        self.assertNotIn("entry.fd", src)
+        # The exact guard, not just the call: a short-circuited or negated
+        # condition leaves the call in place while the refusal stops firing.
+        guard = ("if (fstat(ring->fd_, &st) != 0 ||\n"
+                 "        static_cast<uint64_t>(st.st_size) < "
+                 "static_cast<uint64_t>(ring->map_bytes_)) {")
+        self.assertIn(guard, src)
+        self.assertLess(src.index(guard), src.index("ring->base_ = mmap("),
+                        "the size check must precede the mapping, not follow it")
 
 
 if __name__ == "__main__":
