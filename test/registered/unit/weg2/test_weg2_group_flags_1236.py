@@ -47,8 +47,15 @@ def d(**kw):
 
 class TestOverlapScheduleIsGroupPsFlag(unittest.TestCase):
     def test_common_flags_no_longer_carry_it(self):
+        # max_kv_per_request IS REQUIRED and was missing here, so this
+        # assertion had been raising TypeError instead of checking anything.
+        # Third instance of the signature-drift class the #1235 argv slice
+        # swept: a required parameter was inserted and a positional caller was
+        # left behind (the first two were _max_running_requests itself and
+        # test_weg2_layer_set_1240's argv_p helper).
         self.assertNotIn(
-            "--disable-overlap-schedule", common_flags(MODEL, 1, 2400, 8.0)
+            "--disable-overlap-schedule",
+            common_flags(MODEL, 1, 2400, 8.0, 262144),
         )
 
     def test_group_P_carries_it(self):
