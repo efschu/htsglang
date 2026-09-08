@@ -162,6 +162,12 @@ _MAX_PREFETCH_REISSUES: int = 3
 #: value; it is reduced as a (tag, -tag) pair so one MIN yields min and max.
 _PREFETCH_VOTE_TAG = 580
 
+# #1276: heartbeat interval for the #1028 ROUND CENSUS line. The counter runs
+# every round; the LINE is written on a state change, or once per this many
+# seconds so a long quiet stretch still leaves a trace. 60 s matches the
+# WEG2-IDLE-CENSUS cadence, so an idle rank writes ~1 line/min instead of ~60.
+_1028_QUIET_S: float = 60.0
+
 _COLLECTIVE_POLL_SPINS = COLLECTIVE_POLL_SPINS
 _COLLECTIVE_POLL_MIN_S = COLLECTIVE_POLL_MIN_S
 _COLLECTIVE_POLL_MAX_S = COLLECTIVE_POLL_MAX_S
@@ -5902,10 +5908,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # carrier has to be the existing per-pass proxy message instead. This
         # counter answers that with data. Purely local, no collective; the
         # comparison is made across the three ranks' logs afterwards.
+        #
+        # #1276: EMITTED ON STATE CHANGE, NOT EVERY 25th ROUND. The counter
+        # still counts every round -- it is the census and nothing about it
+        # changes -- but a line is written only when `ongoing_prefetch`
+        # actually moves (plus one heartbeat per _1028_QUIET_S so a long quiet
+        # stretch is still visible, and the first round after construction).
+        #
+        # The every-25 form wrote 677,214 lines into one boot's P log and
+        # 105,354 into its D log for a run that was idle throughout; at group
+        # P's measured 1,499.8 rounds/s that is ~60 log lines/s/rank of pure
+        # "nothing changed", and every one of them allocates a format tuple, a
+        # formatted string and a LogRecord on the round path. Idle logging is
+        # not free and this line was the loudest per-round allocator in the
+        # loop.
         try:
             self._1028_round = int(getattr(self, "_1028_round", 0)) + 1
-            _every = 25
-            if self._1028_round % _every == 0:
+            _state = len(getattr(self, "ongoing_prefetch", {}) or {})
+            _prev = getattr(self, "_1028_state", None)
+            _now = time.monotonic()
+            _last = getattr(self, "_1028_logged_at", 0.0)
+            if _state != _prev or (_now - _last) >= _1028_QUIET_S:
+                self._1028_state = _state
+                self._1028_logged_at = _now
                 logger.info(
                     "#1028 HICACHE-ROUND n=%d pp_rank=%s pp_size=%s "
                     "attn_reduce_world=%d ongoing_prefetch=%d",
@@ -5913,7 +5938,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     getattr(self, "pp_rank", -1),
                     getattr(self, "pp_size", -1),
                     self._attn_reduce_world(),
-                    len(getattr(self, "ongoing_prefetch", {}) or {}),
+                    _state,
                 )
         except Exception:  # noqa: BLE001 - a probe may never break the round
             pass

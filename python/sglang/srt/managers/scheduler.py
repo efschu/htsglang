@@ -1241,6 +1241,27 @@ class Scheduler(
             logger.warning("load snapshot writer init failed: %s", e)
 
     def init_idle_sleeper(self) -> None:
+        # #1276: THE THIRD WAY IN, and the one that makes the weg-2 form
+        # reachable at all. The #547 ladder below is fully built and correct,
+        # but on boot weg2sb4 it was never CONSTRUCTED: neither
+        # --sleep-on-idle nor SGLANG_IDLE_BLOCKING_POLL was set, so
+        # `idle_sleeper` was None on all six ranks of both groups and the
+        # loop never blocked. Measured on that boot's own logs: group P ran
+        # 1,499.8 HICACHE-ROUND/s and group D 303.1/s with an empty queue and
+        # a live front, for 34 idle minutes.
+        #
+        # The rank gate is NOT the defect and is deliberately kept. Only the
+        # request ORIGIN owns the zmq sockets this ladder polls; ranks above
+        # it take a blocking chain receive / broadcast and are driven at the
+        # origin's cadence (`request_receiver._pull_raw_reqs`: "ranks 1..n-1
+        # from point_to_point_pyobj", woken by the origin's forward). Parking
+        # the origin therefore parks the whole group -- one wait point, not
+        # six, and no rank-local decision (RAENGE-NIE-UNEINS).
+        #
+        # `SGLANG_WEG2_GROUP` is the weg-2 form's own discriminator, published
+        # by the launcher and already established as such (weg2/launcher.py:
+        # "the only thing in either tree that says so"). Arming on it scopes
+        # this to the weg-2 boot form and leaves the stock default untouched.
         if (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
@@ -1249,6 +1270,8 @@ class Scheduler(
                 self.server_args.sleep_on_idle
                 # #547: same mechanism, reachable without the server arg.
                 or envs.SGLANG_IDLE_BLOCKING_POLL.get()
+                # #1276: the weg-2 form arms it by construction.
+                or bool(os.environ.get("SGLANG_WEG2_GROUP", ""))
             )
         ):
             self.idle_sleeper = IdleSleeper(
