@@ -420,7 +420,29 @@ X_RECORDED_R_P_TOKS = 3640.0
 X_RECORDED_FLIP_S = 13.247
 
 
-def derive_x_star(flip_s: float, r_d: float, r_p: float, floor_tokens: int) -> int:
+#: #1271: the UNIT a rate is expressed in. X* divides one rate by another, so
+#: two rates of different units produce a number with no meaning -- and that is
+#: not hypothetical, it is what shipped.
+#:
+#: ``group_throughput``  -- tokens the GROUP moved / the wall it was busy.
+#: ``request_latency``   -- one request's tokens / that request's own wall,
+#:                          which under concurrency includes the time it spent
+#:                          queued behind its peers and is therefore NOT a rate
+#:                          of the group.
+#: ``compute_honest``    -- tokens / rank gpu-ms (compute+wait), the per-rank
+#:                          instrument both groups carry.
+RATE_UNIT_GROUP_THROUGHPUT = "group_throughput"
+RATE_UNIT_REQUEST_LATENCY = "request_latency"
+RATE_UNIT_COMPUTE_HONEST = "compute_honest"
+
+
+class MixedRateUnits(ValueError):
+    """X* was asked for from two rates that are not the same measurement."""
+
+
+def derive_x_star(flip_s: float, r_d: float, r_p: float, floor_tokens: int,
+                  *, unit_d: str = RATE_UNIT_GROUP_THROUGHPUT,
+                  unit_p: str = RATE_UNIT_GROUP_THROUGHPUT) -> int:
     """X* = 2*flip_s / (1/r_D - 1/r_P), floored (spec section 0, K5, A1-4).
 
     THE BREAK-EVEN of the round trip: below X* it is cheaper for D to
@@ -431,6 +453,34 @@ def derive_x_star(flip_s: float, r_d: float, r_p: float, floor_tokens: int) -> i
     Refuses (ValueError) rather than guessing when the inputs cannot
     produce a break-even: a D that is not slower than P has none.
     """
+    # #1271 (a): REFUSE MIXED UNITS BY NAME, before any arithmetic.
+    #
+    # THE SHIPPED DEFECT, measured. `r_P` was
+    # `(prompt_tokens - cached_tokens) / wall` off the front's own
+    # `WEG2-SERVED group=P leg=1` line (launcher.py:445-447, appended at
+    # :485-489) -- a PER-REQUEST wall, taken while the front runs the drain at
+    # `p_concurrency=8`, so it counts the time a leg sat behind its peers.
+    # `r_D` came from `verdict=single_prefill` legs, i.e. concurrency ONE.
+    # The formula therefore divided a concurrent-latency rate by a
+    # single-request rate and called the quotient a break-even.
+    #
+    # What that cost: on sb1's front log the SAME boot yields r_P = 1964 tok/s
+    # under the shipped `unc >= 4096` filter (23 samples), 528 tok/s over all
+    # 79 legs, and ~3.1k tok/s as drain-aggregate. rg6 gave 3096 on 8 samples.
+    # r_P did not halve between boots -- the SAMPLE changed: the filter admits
+    # only large-uncached legs, which are the cold, least-queued ones, and as
+    # more of a drain's later legs qualify the median falls. P's compute-honest
+    # rate was ~6594-8325 tok/s across both boots, i.e. flat.
+    if unit_d != unit_p:
+        raise MixedRateUnits(
+            f"X* would divide r_D measured as {unit_d!r} by r_P measured as "
+            f"{unit_p!r}. These are not the same quantity: a request_latency "
+            f"rate under concurrency counts queueing behind peers, a "
+            f"group_throughput rate does not, and a compute_honest rate counts "
+            f"neither. 1/r_D - 1/r_P is only a time-per-token difference when "
+            f"both sides are the SAME measurement. Refusing rather than "
+            f"returning a number with no unit (#1271)."
+        )
     if flip_s <= 0 or r_d <= 0 or r_p <= 0:
         raise ValueError(f"non-positive input: flip_s={flip_s} r_d={r_d} r_p={r_p}")
     denom = (1.0 / r_d) - (1.0 / r_p)
@@ -445,6 +495,9 @@ _RE_FLIP = re.compile(r"flip_total=(\d+) ms")
 _RE_LEG1 = re.compile(
     r"WEG2-SERVED group=P leg=1 .*?prompt_tokens=(\d+) cached_tokens=(\d+) wall=([0-9.]+)s"
 )
+#: #1271: the front's own P-drain window -- `prefilled` legs over `drain_s`
+#: seconds. This is the denominator r_P was always meant to have.
+_RE_DRAIN = re.compile(r"WEG2 P-DRAIN epoch=(\d+) .*?drain_s=([0-9.]+)")
 _RE_LEG2 = re.compile(
     r"WEG2-SERVED group=D leg=2 .*?uncached=(\d+) verdict=(\S+) wall=([0-9.]+)s"
 )
@@ -469,6 +522,7 @@ def measure_x_inputs(log_path: str, floor_tokens: int) -> Optional[Tuple[float, 
     flips: List[float] = []
     r_d: List[float] = []
     r_p: List[float] = []
+    drain_tokens = 0
     try:
         with open(log_path, errors="replace") as f:
             for line in f:
@@ -482,12 +536,25 @@ def measure_x_inputs(log_path: str, floor_tokens: int) -> Optional[Tuple[float, 
                     if verdict in ("single_prefill", "short_mispriced") and unc >= floor_tokens and wall > 0:
                         r_d.append(unc / wall)
                     continue
+                # #1271 (a): r_P IS A GROUP THROUGHPUT, NOT A REQUEST LATENCY.
+                # The leg-1 wall is per-request and the front drains P at
+                # `p_concurrency=8`, so `unc/wall` charges one leg for the time
+                # it spent queued behind its peers. Accumulate the drain's
+                # uncached tokens instead and divide by the drain's OWN wall,
+                # which the front already prints -- the same shape as r_D
+                # (tokens a group moved / the wall it was busy).
                 m = _RE_LEG1.search(line)
                 if m:
                     unc = int(m.group(1)) - int(m.group(2))
-                    wall = float(m.group(3))
-                    if unc >= floor_tokens and wall > 0:
-                        r_p.append(unc / wall)
+                    if unc > 0:
+                        drain_tokens += unc
+                    continue
+                m = _RE_DRAIN.search(line)
+                if m:
+                    drain_s = float(m.group(2))
+                    if drain_tokens > 0 and drain_s > 0:
+                        r_p.append(drain_tokens / drain_s)
+                    drain_tokens = 0
     except OSError:
         return None
     if not (flips and r_d and r_p):
