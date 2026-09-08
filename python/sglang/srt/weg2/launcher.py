@@ -4285,11 +4285,16 @@ def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str)
 
     * the maxkv law (user 2026-09-08, #1254): the pool-maximal cut and the
       makespan cut differ by 47.7 % of the KV pool on this box, and a boot may
-      not pay that trade by accident.  Hence the ``maxkv`` default;
-    * boot weg2rg6 PROVED one cut on metal (32,18,14 / attention 8,4,4).  A cut
-      nothing has booted is not automatically better than one that has, so the
-      incumbent stays SELECTABLE -- by name, from the ranked field, at its own
-      priced pool -- even though it is no longer the default.
+      not pay that trade by accident.  That is why `makespan` stopped being the
+      default;
+    * boot weg2rg6 PROVED one cut on metal (32,18,14 / attention 8,4,4), and
+      boot weg2tr1 then showed WHY that matters more than the ranking: the pool
+      model does not price PP2's per-stage FIXED POSTS (lm_head, the MTP/draft
+      head, the draft pools) and read that stage at 966,544 tokens against a
+      PROFILED 155,164, while the kv-floor row wants SIXTEEN layers on it.  So
+      `incumbent` is the default until #1259/#1019/#1260 put those posts in the
+      model -- an exception WITH AN EXPIRY, stated at the flag, not a standing
+      disagreement with the law.
 
     The candidate is looked up in the solver's OWN ranked field rather than
     constructed here -- a hand-built row would carry a pool figure this
@@ -4302,15 +4307,22 @@ def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str)
         )
     if objective == "maxkv":
         return decision.kv_floor, (
-            "the pool-maximal kv-floor cut (--pp-solve-objective maxkv, the "
-            "default: the standing maxkv law, #1254)"
+            "the pool-maximal kv-floor cut (--pp-solve-objective maxkv): the "
+            "standing maxkv law #1254 against the pool model AS IT STANDS -- "
+            "which does not yet price PP2's lm_head/MTP/draft posts (#1259, "
+            "#1019, #1260), the reason the shipped default is the incumbent"
         )
     cand = incumbent_candidate(decision, incumbent_layers, incumbent_attn)
     if cand is not None:
         return cand, (
-            "the INCUMBENT cut (--pp-solve-objective incumbent): boot-proven "
-            "on weg2rg6, looked up in the solver's own ranked field so its "
-            "pool is priced by this boot's model and not by that boot's"
+            "the INCUMBENT cut (--pp-solve-objective incumbent, THE DEFAULT "
+            "since boot weg2tr1): boot-proven on weg2rg6, looked up in the "
+            "solver's own ranked field so its pool is priced by this boot's "
+            "model and not by that boot's. Default because the pool model does "
+            "not price PP2's per-stage fixed posts (lm_head + MTP/draft head + "
+            "draft pools; weg2tr1 priced 966,544 against a profiled 155,164), "
+            "so the kv-floor row's 16 layers on PP2 maximise a number that is "
+            "wrong there. Returns to maxkv with #1259/#1019/#1260"
         )
     want_layers = tuple(int(n) for n in incumbent_layers)
     want_attn = tuple(int(a) for a in incumbent_attn)
@@ -4857,32 +4869,57 @@ def build_parser() -> argparse.ArgumentParser:
              "resolved for the chosen layer cut by pp_cut.best_attention_split.",
     )
     ap.add_argument(
+        # THE DEFAULT IS `incumbent`, AND IT IS A MEASURED EXCEPTION TO THE
+        # MAXKV LAW RATHER THAN A DISAGREEMENT WITH IT (boot weg2tr1,
+        # 2026-09-08, BOOT_weg2tr1_0908.md).  The kv-floor solve 31,17,16 puts
+        # SIXTEEN layers on PP2, and PP2 is the binding stage for a reason the
+        # pool model cannot see: it carries the per-stage FIXED POSTS -- lm_head,
+        # the MTP/draft head and the draft pools -- which are not terms in
+        # PhasePoolModel at all.  Measured gap on that boot: the model priced
+        # PP2 at 966,544 tokens against a PROFILED 155,164.  A cut chosen to
+        # maximise a pool the model over-states by ~6x on the binding stage is
+        # not the maxkv law's answer, it is the law applied to the wrong
+        # number, and moving 16 layers onto that stage makes it worse.
+        #
+        # SO THIS IS A DEFAULT WITH AN EXPIRY, not a preference: when the pool
+        # model carries the per-stage fixed posts (#1259 draft/MTP posts,
+        # #1019 lm_head, #1260 joint draft-pool sizing) the kv-floor row becomes
+        # trustworthy on PP2 and this default goes back to 'maxkv'.  Both other
+        # arms stay PRICED on the PP-CUT SHIPPED line of every boot meanwhile,
+        # so the trade this default declines is visible rather than hidden.
         "--pp-solve-objective", choices=["maxkv", "makespan", "incumbent"],
-        default="maxkv",
+        default="incumbent",
         help="#1254. WHICH PRICED CUT group P's layer split SHIPS. "
-             "Default 'maxkv' = the kv-floor row, the pool-maximal cut that "
-             "still clears the one-full-context-prompt floor; that is the "
-             "standing law's default and it is not a preference about this "
-             "rig. 'makespan' takes the smallest compute+crossing total "
-             "instead -- the previous default, under which the solver's own "
-             "dry run chose 44,10,10 attn 11,2,3 at a 499,967-token pool, i.e. "
-             "it paid -47.7 %% of the pool for +33.5 %% of prefill on metal "
-             "without anyone selecting that trade. 'incumbent' ships the "
-             f"rg6-boot-proven contiguous cut {P_PP_INCUMBENT_FMT} -- looked "
-             "up BY NAME in the solver's own ranked field, so its pool is "
-             "priced by this boot's model and an incumbent the solver did not "
-             "rank is a W40 REFUSAL rather than a silent substitution of the "
-             "ranking's winner. ALL THREE arms are priced on the PP-CUT "
-             "SHIPPED: line of EVERY boot with their pool AND their ms/chunk "
-             "whichever is chosen, and the PP-CUT trade: line does the "
-             "division, so a large trade is visible as the defect candidate "
-             "the law calls it. TRAIN 2 reconciled this flag with the train's "
-             "--p-cut-objective, which is GONE: two flags answering 'which cut "
-             "ships' is the second-bookkeeping shape, and the flip-order map "
-             "no longer needs the incumbent to agree with argv -- it is "
-             "derived FROM the shipped cut (flip_order_split) and W46 checks "
-             "that by construction. GAPPED MAPS ARE NOT AN ARM OF THIS FLAG: "
-             "see --pp-layer-set and the #753 gate.",
+             f"Default 'incumbent' = the rg6-boot-proven contiguous cut "
+             f"{P_PP_INCUMBENT_FMT}, looked up BY NAME in the solver's own "
+             "ranked field, so its pool is priced by this boot's model and an "
+             "incumbent the solver did not rank is a W40 REFUSAL rather than a "
+             "silent substitution of the ranking's winner. THAT DEFAULT IS A "
+             "MEASURED EXCEPTION WITH AN EXPIRY, not a preference: boot "
+             "weg2tr1 showed PP2 is the binding stage because it carries the "
+             "per-stage FIXED POSTS (lm_head, the MTP/draft head, the draft "
+             "pools) that PhasePoolModel does not price at all -- it priced "
+             "PP2 at 966,544 tokens against a PROFILED 155,164 -- and 'maxkv' "
+             "would put SIXTEEN layers there. It returns to 'maxkv' once "
+             "#1259/#1019/#1260 put those posts in the model. 'maxkv' = the "
+             "kv-floor row, the pool-maximal cut that still clears the "
+             "one-full-context-prompt floor, i.e. the standing law's answer "
+             "against the pool model as it stands. 'makespan' takes the "
+             "smallest compute+crossing total -- the ORIGINAL default, under "
+             "which the solver's own dry run chose 44,10,10 attn 11,2,3 at a "
+             "499,967-token pool, i.e. it paid -47.7 %% of the pool for "
+             "+33.5 %% of prefill on metal without anyone selecting that "
+             "trade. ALL THREE arms are priced on the PP-CUT SHIPPED: line of "
+             "EVERY boot with their pool AND their ms/chunk whichever is "
+             "chosen, and the PP-CUT trade: line does the division, so a large "
+             "trade is visible as the defect candidate the law calls it. "
+             "TRAIN 2 reconciled this flag with the train's --p-cut-objective, "
+             "which is GONE: two flags answering 'which cut ships' is the "
+             "second-bookkeeping shape, and the flip-order map no longer needs "
+             "the incumbent to agree with argv -- it is derived FROM the "
+             "shipped cut (flip_order_split) and W46 checks that by "
+             "construction. GAPPED MAPS ARE NOT AN ARM OF THIS FLAG: see "
+             "--pp-layer-set and the #753 gate.",
     )
     ap.add_argument(
         "--pp-cut-measured-ms-per-layer", default=MEASURED_MS_PER_LAYER,

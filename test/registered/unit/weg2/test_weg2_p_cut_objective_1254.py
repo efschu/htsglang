@@ -111,18 +111,26 @@ class TestShippedCutObjective(CustomTestCase):
         # pool figure comes back with it.
         self.assertEqual(cand.pool_tokens, INCUMBENT.pool_tokens)
 
-    def test_the_parser_carries_one_objective_flag_defaulting_to_maxkv(self):
+    def test_the_parser_carries_one_objective_flag_defaulting_to_incumbent(self):
         # TRAIN 2: the train's --p-cut-objective is GONE and its third arm
         # lives on the argv slice's flag. Two flags for "which cut ships" is
         # the defect this asserts against, so both halves are pinned: the
         # surviving flag's default AND the absence of the other.
+        #
+        # The DEFAULT is `incumbent` on a measured exception (boot weg2tr1):
+        # PP2 carries per-stage fixed posts -- lm_head, the MTP/draft head,
+        # the draft pools -- that PhasePoolModel does not price, so it read
+        # 966,544 tokens against a PROFILED 155,164, and the kv-floor row puts
+        # SIXTEEN layers on exactly that stage. Pinned here rather than left to
+        # the help text so the return to `maxkv` after #1259/#1019/#1260 is a
+        # visible edit and not a drift.
         dests = {a.dest for a in launcher.build_parser()._actions}
         self.assertNotIn("p_cut_objective", dests)
         act = next(
             a for a in launcher.build_parser()._actions
             if a.dest == "pp_solve_objective"
         )
-        self.assertEqual(act.default, "maxkv")
+        self.assertEqual(act.default, "incumbent")
         self.assertEqual(set(act.choices), {"maxkv", "makespan", "incumbent"})
 
     def test_incumbent_is_not_a_solver_objective_and_is_never_passed_as_one(self):
