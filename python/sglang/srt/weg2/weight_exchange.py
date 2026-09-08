@@ -57,7 +57,9 @@ __all__ = [
     "FLAT",
     "REPLICATED",
     "ROWS",
+    "SHARD_FAMILIES",
     "STRIDED2D",
+    "VOCAB_FAMILY",
     "ZEROFILL",
     "Block",
     "GroupLayout",
@@ -95,6 +97,20 @@ REPLICATED = -1
 #: 256 KiB async costs 4.6-6.4 %.  Only a per-copy SYNC is expensive (2.04x),
 #: which is why this is a coalescing floor and not a refusal.
 COALESCE_FLOOR_BYTES = 2 * 1024 * 1024
+
+#: The one shard family whose vector does NOT fall back to the base plan.
+#: ``distributed/utils.py:1585 tp_vocab_ratios``: "deliberately does NOT fall
+#: back to the base --rank-tp-ratio vector ... the vocab dimension of
+#: VocabParallelEmbedding / ParallelLMHead keeps the classic EVEN split under a
+#: plain uneven-TP plan".  Planning the vocabulary with the base vector puts the
+#: largest single parameter of the model at wrong offsets on both sides
+#: IDENTICALLY, so no tiling check and no handshake can see it (spec §8 R5).
+VOCAB_FAMILY = "vocab"
+
+#: The named families the fork installs beside the base vector
+#: (``layers/linear.py:605,899,2064 tp_family``;
+#: ``layers/moe/fused_moe_triton/layer.py:433 moe_tp_family``).
+SHARD_FAMILIES = (VOCAB_FAMILY, "mlp", "moe")
 
 
 class Weg2XchgPlanDisagree(RuntimeError):
@@ -155,7 +171,7 @@ class StorageGeom:
         return self.pitch == self.cols
 
     @classmethod
-    def of(cls, tensor) -> "StorageGeom":
+    def of(cls, tensor) -> StorageGeom:
         shape = tuple(int(s) for s in tensor.shape)
         stride = tuple(int(s) for s in tensor.stride())
         itemsize = int(tensor.element_size())
@@ -221,17 +237,32 @@ def shard_offsets(
     """``[(start, size)]`` per rank of a sharded dimension of ``total``.
 
     This is ``distributed/utils.py:1808 tp_loaded_shard_start``'s law computed
-    for every rank at once: with no ratio vector installed (or one that does not
-    match ``tp_size``) it is the classic even split ``rank * shard_size``; with
-    one it is the prefix sum over ``partition_sizes``.  A plain prefix sum is
-    what makes every shard a contiguous unit range of the full dimension, and
-    that is the property the tiling in ``build_plan`` rests on.
+    for every rank at once: with no ratio vector it is the classic even split
+    ``rank * shard_size``; with one it is the prefix sum over
+    ``partition_sizes``.  A plain prefix sum is what makes every shard a
+    contiguous unit range of the full dimension, and that is the property the
+    tiling in ``build_plan`` rests on.
+
+    A vector of the WRONG LENGTH is refused, never downgraded.  The fork reads
+    a length mismatch as "this plan does not apply to a group of this size"
+    (``:1539 tp_partition_sizes``), but that is an ACTIVATION law and it belongs
+    where the group's size is known -- ``GroupLayout.ratios_for`` -- not in the
+    arithmetic, where a silently even split is the #1275 class of defect:
+    uneven distribution disabled by an accident of length, on both sides
+    equally, with nothing downstream able to see it.
     """
     if tp_size <= 0:
         raise Weg2XchgPlanDisagree(
             f"W52 Weg2XchgPlanDisagree: tp_size {tp_size} is not a group size."
         )
-    if not ratios or len(ratios) != tp_size:
+    if ratios is not None and len(ratios) and len(ratios) != tp_size:
+        raise Weg2XchgPlanDisagree(
+            f"W52 Weg2XchgPlanDisagree: ratio vector {list(ratios)} has "
+            f"{len(ratios)} entries for a group of {tp_size} ranks. Selecting "
+            f"a vector for a group is GroupLayout.ratios_for's job; one that "
+            f"reaches the shard arithmetic must already apply to this group."
+        )
+    if not ratios:
         if total % tp_size != 0:
             raise Weg2XchgPlanDisagree(
                 f"W52 Weg2XchgPlanDisagree: dimension {total} is not divisible "
@@ -337,7 +368,14 @@ class GroupLayout:
     scope this spec states as a hard limit and is refused rather than guessed.
 
     ``base`` is this group's first GLOBAL rank number, so the 6x6 byte matrix
-    is indexed the same way in both directions.
+    is indexed the same way in both directions.  The two groups' ranges must be
+    DISJOINT: with both at the default 0 the matrix folds to 3x3, P rank n's
+    sends land in D rank n's cell, and the symmetry check of spec §3.3 then
+    passes on a folded matrix.
+
+    ``ratios`` is the base shard vector; ``family_ratios`` the named ones the
+    fork installs beside it (``distributed/utils.py:116``).  Which of the two a
+    parameter gets is ``ratios_for``, and it is not one law but two.
     """
 
     name: str
@@ -345,6 +383,7 @@ class GroupLayout:
     tp_size: int
     ratios: Optional[Sequence[int]] = None
     base: int = 0
+    family_ratios: Optional[Dict[str, Sequence[int]]] = None
 
     @property
     def n_ranks(self) -> int:
@@ -352,6 +391,107 @@ class GroupLayout:
 
     def card_of(self, rank: int) -> int:
         return int(self.cards[rank])
+
+    def ratios_for(self, family: Optional[str]) -> Optional[Sequence[int]]:
+        """The vector that shards a parameter of ``family`` in THIS group.
+
+        Two laws, and reading the second as the first is silent wrongness on
+        the largest single parameter of the model:
+
+        * a NAMED family falls back to the base vector when it has none of its
+          own -- ``distributed/utils.py:1539 tp_partition_sizes`` ->
+          ``:166 get_tp_partition_ratios``;
+        * the VOCABULARY does not -- ``:1585 tp_vocab_ratios``, and a UNIFORM
+          vocab vector IS the even split and reports as inactive, which keeps
+          the classic path byte-identical.  ``VocabParallelEmbedding`` /
+          ``ParallelLMHead`` (``layers/vocab_parallel_embedding.py:299-304``)
+          therefore keep the even split under a plain uneven-TP plan while the
+          MLP of the same model follows the ratio: ONE plan, TWO laws, which is
+          why the vector cannot live on the group alone.
+        """
+        fams = self.family_ratios or {}
+        if family == VOCAB_FAMILY:
+            vec = fams.get(VOCAB_FAMILY)
+            if not vec or len(vec) != self.tp_size or len(set(vec)) == 1:
+                return None
+            return list(vec)
+        if family is not None:
+            vec = fams.get(family)
+            if vec:
+                return list(vec)
+        return self.ratios
+
+    def validate(self) -> None:
+        """Refuse a layout whose shard arithmetic could only be guessed at."""
+        if self.n_ranks <= 0:
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: group {self.name!r} has no cards."
+            )
+        if self.tp_size not in (1, self.n_ranks):
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: group {self.name!r} has tp_size "
+                f"{self.tp_size} over {self.n_ranks} ranks. The V1 scope is "
+                f"pure TP (tp_size == ranks) or the PP form (tp_size == 1)."
+            )
+        if int(self.base) < 0:
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: group {self.name!r} base "
+                f"{self.base} is not a global rank number."
+            )
+        vectors = [("base", self.ratios)] + sorted((self.family_ratios or {}).items())
+        for label, vec in vectors:
+            if vec and len(vec) != self.tp_size:
+                raise Weg2XchgPlanDisagree(
+                    f"W52 Weg2XchgPlanDisagree: group {self.name!r} carries a "
+                    f"{label} shard vector {list(vec)} of {len(vec)} entries "
+                    f"for {self.tp_size} ranks. The fork treats a length "
+                    f"mismatch as 'does not apply' and falls back to the even "
+                    f"split (distributed/utils.py:1539); here it means two "
+                    f"groups' plans were mixed, and it is refused (#1275)."
+                )
+
+    @classmethod
+    def from_installed(
+        cls,
+        name: str,
+        cards: Sequence[int],
+        tp_size: int,
+        base: int = 0,
+    ) -> GroupLayout:
+        """This process's INSTALLED shard plan as a layout.
+
+        The producer of ``family_ratios``: S2/S3 read the plan here instead of
+        re-deriving the two activation laws at their own call sites.
+        """
+        from sglang.srt.distributed.utils import (
+            get_tp_partition_ratios,
+            tp_vocab_ratios,
+        )
+
+        fams: Dict[str, Sequence[int]] = {}
+        for fam in SHARD_FAMILIES:
+            vec = (
+                tp_vocab_ratios(int(tp_size))
+                if fam == VOCAB_FAMILY
+                else get_tp_partition_ratios(fam)
+            )
+            if vec and len(vec) == int(tp_size):
+                fams[fam] = list(vec)
+        base_vec = get_tp_partition_ratios(None)
+        if base_vec and len(base_vec) != int(tp_size):
+            # The fork's own activation law: a vector of another length does
+            # not apply to this group (``distributed/utils.py:1539``).
+            base_vec = None
+        layout = cls(
+            name=name,
+            cards=tuple(int(c) for c in cards),
+            tp_size=int(tp_size),
+            ratios=list(base_vec) if base_vec else None,
+            base=int(base),
+            family_ratios=fams or None,
+        )
+        layout.validate()
+        return layout
 
 
 @dataclass(frozen=True)
@@ -370,6 +510,12 @@ class ParamGeom:
     additionally clips how much of the rest actually has a source; anything
     between it and the pad is a GAP and is refused by name (W58), never zeroed.
 
+    ``family`` selects the shard vector (``GroupLayout.ratios_for``): the
+    vocabulary keeps the even split under an uneven base plan while the MLP of
+    the same model follows the ratio, so the vector cannot be a property of the
+    group alone.  ``None`` is the base vector, which is what every class whose
+    layer passes no ``tp_family`` gets.
+
     ``stage`` is the rank of a ``tp_size == 1`` group that holds this parameter
     (``None`` = every rank of such a group holds it, which is the vision tower
     in D-wake, spec §1.4).  ``dst_widths``/``dst_extents`` exist so a test can
@@ -385,14 +531,137 @@ class ParamGeom:
     blocks: Tuple[int, ...] = ()
     units: Optional[int] = None
     groups: Optional[int] = None
+    family: Optional[str] = None
     pad_units: int = 0
     src_extent: Optional[int] = None
     stage: Optional[int] = None
     dst_widths: Optional[Sequence[int]] = None
     dst_extents: Optional[Sequence[int]] = None
 
-    def replace(self, **kw) -> "ParamGeom":
+    def replace(self, **kw) -> ParamGeom:
         return _dc_replace(self, **kw)
+
+    def validate(self) -> None:
+        """Refuse a geometry that would mis-plan in SILENCE.
+
+        Each of these has a concrete wrong plan behind it, not a type error:
+        ``pad_units`` past the axis makes ``content_units`` negative, the copy
+        loop never runs and the WHOLE parameter becomes ZEROFILL -- the
+        destination then serves zeroed weights with no refusal anywhere;
+        blocks that do not sum to the axis put the block coordinates and the
+        pad in different spaces; a column shard with packed outputs would be
+        routed through ``device_block_offsets``, whose ``dev_row`` is a ROW
+        prefix sum.
+        """
+        if self.rows_full <= 0 or self.cols_full <= 0 or self.itemsize <= 0:
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: {self.name}: extents "
+                f"({self.rows_full}, {self.cols_full}) itemsize "
+                f"{self.itemsize} do not describe a tensor."
+            )
+        if self.shard_axis not in (ROWS, COLS, REPLICATED):
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: {self.name}: shard axis "
+                f"{self.shard_axis} is neither ROWS, COLS nor REPLICATED."
+            )
+        if self.blocks:
+            if self.shard_axis != ROWS:
+                raise Weg2XchgPlanDisagree(
+                    f"W52 Weg2XchgPlanDisagree: {self.name}: packed outputs "
+                    f"{list(self.blocks)} on a non-ROWS shard axis. Spec §2.2 "
+                    f"has no such class, and device_block_offsets' dev_row is "
+                    f"a ROW prefix sum -- it would name the wrong coordinate "
+                    f"space rather than fail."
+                )
+            if any(int(b) <= 0 for b in self.blocks):
+                raise Weg2XchgPlanDisagree(
+                    f"W52 Weg2XchgPlanDisagree: {self.name}: packed output "
+                    f"sizes {list(self.blocks)} are not all positive."
+                )
+            if sum(int(b) for b in self.blocks) != self.shard_total:
+                raise Weg2XchgPlanDisagree(
+                    f"W52 Weg2XchgPlanDisagree: {self.name}: packed outputs "
+                    f"{list(self.blocks)} sum to "
+                    f"{sum(int(b) for b in self.blocks)}, not to the sharded "
+                    f"axis' {self.shard_total}."
+                )
+        if not 0 <= int(self.pad_units) <= self.shard_total:
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: {self.name}: pad_units "
+                f"{self.pad_units} against an axis of {self.shard_total}. A "
+                f"pad past the axis turns the whole parameter into ZEROFILL."
+            )
+        if self.src_extent is not None and not (
+            0 <= int(self.src_extent) <= self.content_units
+        ):
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: {self.name}: src_extent "
+                f"{self.src_extent} against {self.content_units} non-pad "
+                f"units."
+            )
+        if (
+            self.dst_widths is not None
+            and sum(int(w) for w in self.dst_widths) != self.shard_total
+        ):
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: {self.name}: seeded widths "
+                f"{list(self.dst_widths)} sum to "
+                f"{sum(int(w) for w in self.dst_widths)}, not to the sharded "
+                f"axis' {self.shard_total}."
+            )
+
+    @classmethod
+    def of(
+        cls,
+        tensor,
+        *,
+        name: str,
+        tag: str,
+        shard_axis: int,
+        shard_total: int,
+        shard_dim: Optional[int] = None,
+        **kw,
+    ) -> ParamGeom:
+        """The geometry of a LIVE parameter -- the seam S2's walk hands over.
+
+        Everything but the sharded axis' FULL extent (which one rank cannot
+        see) is read from ``stride()``/``element_size()`` through
+        ``StorageGeom``, never from ``shape``: a ``.t()`` view reports
+        ``[K, N_local]`` over storage ``[N_local, K]``, so a geometry taken
+        from the logical shape is transposed-wrong for every column-parallel
+        class (spec §2.4 rule 2).  ``shard_total`` is in the units the storage
+        axis counts in -- storage ROWS for a ROWS shard, storage COLUMNS for a
+        COLS shard.
+        """
+        ndim = int(tensor.dim()) if hasattr(tensor, "dim") else len(tensor.shape)
+        if ndim > 2 and (shard_dim is None or int(shard_dim) not in (0, ndim - 1)):
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: {name} is {ndim}-D and its shard "
+                f"axis is not one a (rows, cols, pitch) triple can name. A "
+                f"contiguous block flattens to storage rows only for a LEADING "
+                f"axis shard (conv1d's [C, 1, K]: pass shard_dim=0) or a "
+                f"trailing one; an expert-major MoE weight [E, N_local, K] "
+                f"sharded on N is E strided bands. TODO(S2): that class needs "
+                f"its own descriptor kind before it can be exchanged."
+            )
+        live = StorageGeom.of(tensor)
+        if shard_axis == COLS:
+            rows_full, cols_full = live.rows, int(shard_total)
+        elif shard_axis == ROWS:
+            rows_full, cols_full = int(shard_total), live.cols
+        else:
+            rows_full, cols_full = live.rows, live.cols
+        geom = cls(
+            name=name,
+            tag=tag,
+            shard_axis=shard_axis,
+            rows_full=rows_full,
+            cols_full=cols_full,
+            itemsize=live.itemsize,
+            **kw,
+        )
+        geom.validate()
+        return geom
 
     @property
     def shard_total(self) -> int:
@@ -446,7 +715,7 @@ class XchgDesc:
     src_ptr: Optional[int] = None
     dst_ptr: Optional[int] = None
 
-    def replace(self, **kw) -> "XchgDesc":
+    def replace(self, **kw) -> XchgDesc:
         return _dc_replace(self, **kw)
 
     @property
@@ -504,6 +773,16 @@ def derive_waves(
         return []
     base, chunk_tags = tags[-1], tags[:-1]
     wanted = {int(c) for c in cards}
+
+    if not tag_cards:
+        # A TP group has no layer split and returns an EMPTY map, and its own
+        # docstring says the caller reads that as UNIFORM
+        # (``weg2_memory_saver.py:1824``).  Read per tag instead, every tag
+        # independently covers every card, the loop below admits exactly one
+        # tag per wave, and the schedule becomes 8 chunk waves + the base --
+        # the nine-wave arm §1.2 refuses on MEASURED transport grounds
+        # (+25.8 %/+36.8 % P->D, +29.8 %/+30.0 % D->P).  Uniform means one.
+        return [list(chunk_tags) + [base]]
 
     def cards_of(tag: str) -> set:
         return {int(c) for c in tag_cards.get(tag, tuple(wanted))}
@@ -569,17 +848,58 @@ def piece_histogram(descs: Sequence[XchgDesc]) -> Dict[str, int]:
     return {k: v for k, v in out.items() if v}
 
 
-def plan_id(descs: Sequence[XchgDesc]) -> str:
-    """A 12-hex digest over the descriptor GEOMETRY, pointers excluded.
+def plan_id(descs: Sequence[XchgDesc], waves: Sequence[Sequence[str]] = ()) -> str:
+    """A 12-hex digest over the descriptor GEOMETRY and the wave partition,
+    pointers excluded.
 
     Two processes hold the same tensors at different addresses, so an id that
     moved with the address could never be compared -- and comparing it is the
     whole job (W52: "the plan hash != the front's").
+
+    TAKE THE **RAW** LIST.  ``XchgDesc.key()`` excludes the pointers, but
+    ``coalesce`` CONSUMES them: which pieces merge is a function of the pointer
+    table, so a digest over the merged list is address-dependent after all.  A
+    rank is producer or consumer, never both (spec §1.1), and the front holds
+    no table at all -- three parties, three different merges, one comparison
+    that could never succeed.
+
+    The WAVE PARTITION is folded in because two partitions can leave the
+    descriptor order untouched, and a schedule disagreement is one of the three
+    things W52 names (spec §3.3).
     """
     h = hashlib.blake2b(digest_size=6)
+    for wave in waves:
+        h.update(repr(tuple(wave)).encode("utf-8"))
+        h.update(b"|")
     for d in descs:
         h.update(repr(d.key()).encode("utf-8"))
     return h.hexdigest()
+
+
+def _side_addr(d: XchgDesc, side: str, delta: int) -> tuple:
+    """A comparable address on one side of a descriptor, ``delta`` bytes in.
+
+    With a pointer it is the address; without one, only offsets WITHIN the same
+    parameter can be compared, so the name is part of the key.  The two spaces
+    never compare equal, which is exactly ``_adjacent``'s rule that a mixed
+    pair (one side pointered, one not) is not adjacent.
+    """
+    ptr, off = (d.src_ptr, d.src_off) if side == "src" else (d.dst_ptr, d.dst_off)
+    if ptr is not None:
+        return ("p", ptr + off + delta)
+    return ("n", d.param_name, off + delta)
+
+
+def _span_key(d: XchgDesc, delta: int) -> tuple:
+    """The pair identity plus both sides' addresses -- what ``_adjacent``
+    compares, as one hashable key."""
+    return (
+        d.tag,
+        d.src_rank,
+        d.dst_rank,
+        _side_addr(d, "src", delta),
+        _side_addr(d, "dst", delta),
+    )
 
 
 def _adjacent(a: XchgDesc, b: XchgDesc, side: str) -> bool:
@@ -652,21 +972,21 @@ def unmergeable_below_floor(
     small piece kept a mergeable neighbour, which is what this reports and what
     the histogram publishes.
     """
+    starts: Dict[tuple, XchgDesc] = {}
+    ends: Dict[tuple, XchgDesc] = {}
+    for d in descs:
+        if d.kind != FLAT:
+            continue
+        starts.setdefault(_span_key(d, 0), d)
+        ends.setdefault(_span_key(d, d.nbytes), d)
     left = []
     for d in descs:
         if d.kind != FLAT or d.nbytes >= floor:
             continue
-        if any(
-            o is not d
-            and o.kind == FLAT
-            and o.tag == d.tag
-            and o.src_rank == d.src_rank
-            and o.dst_rank == d.dst_rank
-            and (
-                (_adjacent(d, o, "src") and _adjacent(d, o, "dst"))
-                or (_adjacent(o, d, "src") and _adjacent(o, d, "dst"))
-            )
-            for o in descs
+        after = starts.get(_span_key(d, d.nbytes))
+        before = ends.get(_span_key(d, 0))
+        if (after is not None and after is not d) or (
+            before is not None and before is not d
         ):
             continue
         left.append(d)
@@ -680,6 +1000,17 @@ def unmergeable_below_floor(
 
 @dataclass(frozen=True)
 class XchgPlan:
+    """One direction's plan.
+
+    ``byte_matrix`` is the 6x6 GLOBAL-rank matrix Gate 0 compares cell by cell
+    (spec §3.3); ``tag_bytes`` is the per-tag total it compares against
+    ``tms_tag_bytes`` (spec §1.3 step 9) -- both are produced here so S3 does
+    not re-derive them from the descriptor list a second time.
+    ``skipped_tags`` names every parameter the plan deliberately did not carry,
+    counted: the draft/MTP family is never exchanged (spec §4.1) and a silent
+    drop is indistinguishable from a typo.
+    """
+
     descs: Tuple[XchgDesc, ...]
     raw_descs: Tuple[XchgDesc, ...]
     waves: Tuple[Tuple[str, ...], ...]
@@ -687,6 +1018,8 @@ class XchgPlan:
     plan_id: str
     src_group: str
     dst_group: str
+    tag_bytes: Tuple[Tuple[str, int], ...] = ()
+    skipped_tags: Tuple[Tuple[str, int], ...] = ()
 
     @property
     def oncard_bytes(self) -> int:
@@ -707,7 +1040,15 @@ class XchgPlan:
 
     def log_line(self, direction: Optional[str] = None) -> str:
         """The acceptance line of spec §6/S1.  Every figure is computed from
-        THIS plan; none is quoted from the spec's projection."""
+        THIS plan; none is quoted from the spec's projection.
+
+        ``unmergeable`` is beside ``min_piece_mib`` because the spec's literal
+        "no piece below 2 MiB survives coalescing" is unreachable (``A_log`` is
+        84 bytes and has no neighbour) and this slice enforces a different
+        invariant -- "no small piece kept a mergeable neighbour".  A published
+        substitute is checkable; an argued one is not, and ``min_piece_mib``
+        alone cannot tell the two apart.
+        """
         if direction is None:
             direction = f"{self.src_group}2{self.dst_group}"
         hist = "/".join(f"{k}:{v}" for k, v in piece_histogram(self.descs).items())
@@ -717,6 +1058,7 @@ class XchgPlan:
             f"dir={direction} waves={len(self.waves)} descs={len(self.raw_descs)} "
             f"coalesced={len(self.descs)} "
             f"min_piece_mib={self.min_piece_bytes / (1 << 20):.6f} "
+            f"unmergeable={len(unmergeable_below_floor(self.descs))} "
             f"bytes_gib={(self.oncard_bytes + self.cross_bytes) / gib:.2f} "
             f"oncard_gib={self.oncard_bytes / gib:.2f} "
             f"cross_gib={self.cross_bytes / gib:.2f} "
@@ -725,9 +1067,7 @@ class XchgPlan:
         )
 
 
-def emit_plan_line(
-    plan: "XchgPlan", direction: Optional[str] = None, logger=None
-) -> str:
+def emit_plan_line(plan: XchgPlan, direction: Optional[str] = None, logger=None) -> str:
     """Log the acceptance line and return it.
 
     One emitter, so S2 and S6 do not each grow their own format string and drift
@@ -747,6 +1087,15 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
     the rank holds nothing of this parameter."""
     if layout.tp_size == 1 and layout.n_ranks >= 1:
         # PP form (or a single-rank group): whole tensors, one holder each.
+        if geom.stage is not None and not 0 <= int(geom.stage) < layout.n_ranks:
+            raise Weg2XchgPlanDisagree(
+                f"W52 Weg2XchgPlanDisagree: {geom.name} names stage "
+                f"{geom.stage} in group {layout.name!r}, which has "
+                f"{layout.n_ranks} ranks. No rank would match, every block "
+                f"list would come back empty and the parameter would vanish "
+                f"from the plan with no refusal at all -- fail-open in the "
+                f"direction where this group is the DESTINATION (spec §1.4)."
+            )
         holders = (
             list(range(layout.n_ranks)) if geom.stage is None else [int(geom.stage)]
         )
@@ -780,12 +1129,19 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
             out.append([Block(block=0, global_start=acc, dev_row=0, size=int(w))])
             acc += int(w)
         return out
+    # THE FAMILY AXIS.  The real shard boundary is a function of (total,
+    # tp_size, units, FAMILY, groups) -- ``distributed/utils.py:1539`` -- and
+    # the vocabulary's vector never falls back to the base one (``:1585``).
+    # One vector per group would plan ``embed_tokens``/``lm_head`` at ratio
+    # offsets under the standing uneven-TP form while the hardware keeps the
+    # even split, on both sides identically.
+    ratios = layout.ratios_for(geom.family)
     if geom.blocks:
         return device_block_offsets(
-            geom.blocks, layout.ratios, layout.tp_size, geom.units, geom.groups
+            geom.blocks, ratios, layout.tp_size, geom.units, geom.groups
         )
     ranges = shard_offsets(
-        geom.shard_total, layout.ratios, layout.tp_size, geom.units, geom.groups
+        geom.shard_total, ratios, layout.tp_size, geom.units, geom.groups
     )
     return [
         [Block(block=0, global_start=start, dev_row=0, size=size)]
@@ -797,13 +1153,106 @@ def _pick_source(
     candidates: Sequence[Tuple[int, Block]], d_rank: int
 ) -> Tuple[int, Block]:
     """Prefer the CO-LOCATED source: rank ``n`` of either group runs on
-    ``cards[n]``, so a same-index pair crosses no link at all (spec §2.2 --
-    the replicated classes are on-card only).  Otherwise the lowest rank, so
-    the choice is deterministic on every rank that derives it."""
+    ``cards[n]`` (checked once per plan by ``_check_cards``), so a same-index
+    pair crosses no link at all (spec §2.2 -- the replicated classes are
+    on-card only).  Otherwise the lowest rank, so the choice is deterministic
+    on every rank that derives it."""
     for s_rank, block in candidates:
         if s_rank == d_rank:
             return s_rank, block
     return min(candidates, key=lambda c: c[0])
+
+
+def _live_storage(
+    geom_of, layout: GroupLayout, rank: int, geom: ParamGeom, blocks, strided: bool
+) -> Optional[StorageGeom]:
+    """This rank's tensor as the HARDWARE has it, or ``None`` when the caller
+    has no table (the hermetic path, and every rank that holds nothing).
+
+    ``StorageGeom`` is the module's answer to spec §2.4 rule 2, and a rule that
+    only the tests apply is not a rule: with no production caller a pitch taken
+    from ``shape`` instead of ``stride()`` leaves every fixture green, because
+    every fixture is contiguous.  Production passes ``param.data_ptr()``'s own
+    tensor here (S3's pointer table walks the same parameters).
+    """
+    if geom_of is None or not blocks:
+        return None
+    live = geom_of(layout.name, rank, geom.name)
+    if live is None:
+        return None
+    if not isinstance(live, StorageGeom):
+        live = StorageGeom.of(live)
+    if live.itemsize != int(geom.itemsize):
+        raise Weg2XchgPlanDisagree(
+            f"W52 Weg2XchgPlanDisagree: {geom.name} on {layout.name!r} rank "
+            f"{rank}: the plan says itemsize {geom.itemsize}, the live tensor "
+            f"says {live.itemsize}. Weight scales are FP32 on device and BF16 "
+            f"in the checkpoint (spec §2.4 rule 3), so this is the exact shape "
+            f"in which every offset is wrong by a constant factor."
+        )
+    fixed_live = live.rows if strided else live.cols
+    fixed_plan = int(geom.rows_full) if strided else int(geom.cols_full)
+    if fixed_live != fixed_plan:
+        raise Weg2XchgPlanDisagree(
+            f"W52 Weg2XchgPlanDisagree: {geom.name} on {layout.name!r} rank "
+            f"{rank}: the UNSHARDED axis is {fixed_plan} in the plan and "
+            f"{fixed_live} in the live tensor's storage."
+        )
+    return live
+
+
+def _shape_piece(
+    strided: bool,
+    contiguous: bool,
+    span: int,
+    cols: int,
+    itemsize: int,
+    rows: int,
+    s_dev: int,
+    d_dev: int,
+    s_pitch: int,
+    d_pitch: int,
+) -> Dict[str, int]:
+    """One piece's BYTE geometry, in the three shapes a copy can take.
+
+    A row-sharded class is FLAT only while BOTH sides' rows are packed at the
+    row width.  A destination whose rows sit in a wider arena has a pitch, and
+    then every row offset is a multiple of the PITCH -- reading it as the row
+    width lands each row short by the padding, silently.
+    """
+    if strided:
+        return dict(
+            kind=STRIDED2D,
+            nbytes=rows * span * itemsize,
+            rows=rows,
+            run_bytes=span * itemsize,
+            spitch=s_pitch * itemsize,
+            dpitch=d_pitch * itemsize,
+            src_off=s_dev * itemsize,
+            dst_off=d_dev * itemsize,
+        )
+    if contiguous:
+        nbytes = span * cols * itemsize
+        return dict(
+            kind=FLAT,
+            nbytes=nbytes,
+            rows=1,
+            run_bytes=nbytes,
+            spitch=0,
+            dpitch=0,
+            src_off=s_dev * cols * itemsize,
+            dst_off=d_dev * cols * itemsize,
+        )
+    return dict(
+        kind=STRIDED2D,
+        nbytes=span * cols * itemsize,
+        rows=span,
+        run_bytes=cols * itemsize,
+        spitch=s_pitch * itemsize,
+        dpitch=d_pitch * itemsize,
+        src_off=s_dev * s_pitch * itemsize,
+        dst_off=d_dev * d_pitch * itemsize,
+    )
 
 
 def _emit(
@@ -811,6 +1260,7 @@ def _emit(
     src: GroupLayout,
     dst: GroupLayout,
     ptr_of: Optional[Callable[[str, int, str], Optional[int]]],
+    geom_of: Optional[Callable[[str, int, str], object]] = None,
 ) -> List[XchgDesc]:
     """Every descriptor of one parameter: intersect the two sides' ranges in
     GLOBAL coordinates, then translate each overlap into both sides' own device
@@ -827,16 +1277,48 @@ def _emit(
     def ptr(group: str, rank: int) -> Optional[int]:
         return None if ptr_of is None else ptr_of(group, rank, geom.name)
 
-    src_extent_of = [sum(b.size for b in blocks) for blocks in src_blocks]
+    src_live = [
+        _live_storage(geom_of, src, r, geom, blocks, strided)
+        for r, blocks in enumerate(src_blocks)
+    ]
+    dst_live = [
+        _live_storage(geom_of, dst, r, geom, blocks, strided)
+        for r, blocks in enumerate(dst_blocks)
+    ]
+    src_extent_of, src_pitch_of = [], []
+    for r, blocks in enumerate(src_blocks):
+        derived = sum(b.size for b in blocks)
+        live = src_live[r]
+        if live is not None:
+            actual = live.cols if strided else live.rows
+            if actual != derived:
+                raise Weg2XchgPlanDisagree(
+                    f"W52 Weg2XchgPlanDisagree: {geom.name} src_rank={r}: the "
+                    f"plan reads {derived} units from a source whose own "
+                    f"storage holds {actual}. The shard vector and the "
+                    f"hardware disagree."
+                )
+        src_extent_of.append(derived)
+        src_pitch_of.append(
+            live.pitch if live is not None else (derived if strided else cols)
+        )
+
     out: List[XchgDesc] = []
     for d_rank, d_blocks in enumerate(dst_blocks):
         if not d_blocks:
             continue
+        live = dst_live[d_rank]
         if geom.dst_extents is not None:
             d_extent = int(geom.dst_extents[d_rank])
+        elif live is not None:
+            # THE DESTINATION'S EXTENT COMES FROM THE HARDWARE.  Derived from
+            # the same block list the descriptors come from, "the plan writes
+            # past the destination's own storage" can only fire through a seed
+            # -- i.e. never in production, which is the one place it matters.
+            d_extent = live.cols if strided else live.rows
         else:
             d_extent = sum(b.size for b in d_blocks)
-        d_pitch = d_extent if strided else cols
+        d_pitch = live.pitch if live is not None else (d_extent if strided else cols)
         covered: List[Tuple[int, int]] = []
         for db in d_blocks:
             cursor = db.global_start
@@ -865,46 +1347,29 @@ def _emit(
                 span = end - cursor
                 s_dev = sb.dev_row + (cursor - sb.global_start)
                 d_dev = db.dev_row + (cursor - db.global_start)
-                s_pitch = src_extent_of[s_rank] if strided else cols
-                if strided:
-                    out.append(
-                        XchgDesc(
-                            tag=geom.tag,
-                            src_rank=s_rank,
-                            dst_rank=d_rank,
-                            param_name=geom.name,
-                            kind=STRIDED2D,
-                            nbytes=rows * span * itemsize,
-                            rows=rows,
-                            run_bytes=span * itemsize,
-                            spitch=s_pitch * itemsize,
-                            dpitch=d_pitch * itemsize,
-                            src_off=s_dev * itemsize,
-                            dst_off=d_dev * itemsize,
-                            src_ptr=ptr(src.name, s_rank),
-                            dst_ptr=ptr(dst.name, d_rank),
-                        )
+                s_pitch = src_pitch_of[s_rank]
+                out.append(
+                    XchgDesc(
+                        tag=geom.tag,
+                        src_rank=s_rank,
+                        dst_rank=d_rank,
+                        param_name=geom.name,
+                        src_ptr=ptr(src.name, s_rank),
+                        dst_ptr=ptr(dst.name, d_rank),
+                        **_shape_piece(
+                            strided,
+                            s_pitch == cols and d_pitch == cols,
+                            span,
+                            cols,
+                            itemsize,
+                            rows,
+                            s_dev,
+                            d_dev,
+                            s_pitch,
+                            d_pitch,
+                        ),
                     )
-                else:
-                    nbytes = span * cols * itemsize
-                    out.append(
-                        XchgDesc(
-                            tag=geom.tag,
-                            src_rank=s_rank,
-                            dst_rank=d_rank,
-                            param_name=geom.name,
-                            kind=FLAT,
-                            nbytes=nbytes,
-                            rows=1,
-                            run_bytes=nbytes,
-                            spitch=0,
-                            dpitch=0,
-                            src_off=s_dev * cols * itemsize,
-                            dst_off=d_dev * cols * itemsize,
-                            src_ptr=ptr(src.name, s_rank),
-                            dst_ptr=ptr(dst.name, d_rank),
-                        )
-                    )
+                )
                 covered.append((d_dev, d_dev + span))
                 cursor = end
             # DECLARED pad: units past the content extent exist on no card and
@@ -913,41 +1378,29 @@ def _emit(
             if pad_lo < db.global_end:
                 d_dev = db.dev_row + (pad_lo - db.global_start)
                 span = db.global_end - pad_lo
-                if strided:
-                    out.append(
-                        XchgDesc(
-                            tag=geom.tag,
-                            src_rank=-1,
-                            dst_rank=d_rank,
-                            param_name=geom.name,
-                            kind=ZEROFILL,
-                            nbytes=rows * span * itemsize,
-                            rows=rows,
-                            run_bytes=span * itemsize,
-                            spitch=0,
-                            dpitch=d_pitch * itemsize,
-                            dst_off=d_dev * itemsize,
-                            dst_ptr=ptr(dst.name, d_rank),
-                        )
+                shape = _shape_piece(
+                    strided,
+                    d_pitch == cols,
+                    span,
+                    cols,
+                    itemsize,
+                    rows,
+                    0,
+                    d_dev,
+                    d_pitch,
+                    d_pitch,
+                )
+                shape.update(kind=ZEROFILL, spitch=0, src_off=0)
+                out.append(
+                    XchgDesc(
+                        tag=geom.tag,
+                        src_rank=-1,
+                        dst_rank=d_rank,
+                        param_name=geom.name,
+                        dst_ptr=ptr(dst.name, d_rank),
+                        **shape,
                     )
-                else:
-                    nbytes = span * cols * itemsize
-                    out.append(
-                        XchgDesc(
-                            tag=geom.tag,
-                            src_rank=-1,
-                            dst_rank=d_rank,
-                            param_name=geom.name,
-                            kind=ZEROFILL,
-                            nbytes=nbytes,
-                            rows=1,
-                            run_bytes=nbytes,
-                            spitch=0,
-                            dpitch=0,
-                            dst_off=d_dev * cols * itemsize,
-                            dst_ptr=ptr(dst.name, d_rank),
-                        )
-                    )
+                )
                 covered.append((d_dev, d_dev + span))
         _check_tiles(geom, d_rank, d_extent, covered)
     return out
@@ -988,13 +1441,55 @@ def _check_tiles(
         )
 
 
+def _check_cards(src: GroupLayout, dst: GroupLayout) -> None:
+    """``on_card`` is ``src_rank == dst_rank``, which means ONE CARD only while
+    both groups run rank ``n`` on ``cards[n]``.
+
+    Both groups receive the same ``CUDA_VISIBLE_DEVICES`` uuid string (spec
+    §1.3), so they do -- but that is an assumption until the two vectors are
+    compared, and the consequence of it being wrong is not a wrong number: S4
+    routes an ``on_card`` pair down the ``cudaIpc`` lane with no PCIe key, for
+    a transfer that actually crosses a link.  Compared here, it is a theorem.
+    """
+    if src.n_ranks != dst.n_ranks or any(
+        src.card_of(r) != dst.card_of(r) for r in range(src.n_ranks)
+    ):
+        raise Weg2XchgPlanDisagree(
+            f"W52 Weg2XchgPlanDisagree: group {src.name!r} runs on cards "
+            f"{list(src.cards)} and group {dst.name!r} on {list(dst.cards)}. "
+            f"on_card is rank equality, which is a statement about ONE card "
+            f"only while the two vectors agree rank by rank."
+        )
+
+
+def _check_bases(src: GroupLayout, dst: GroupLayout) -> None:
+    """The two groups' GLOBAL rank ranges must be disjoint.
+
+    With both at the default ``base=0`` the 6x6 matrix is 3x3: P rank ``n``'s
+    sends and D rank ``n``'s land in the same cell, the symmetry check of spec
+    §3.3 passes on a FOLDED matrix, and Gate 0's #802 discipline is defeated by
+    a dataclass default.
+    """
+    lo_a, hi_a = int(src.base), int(src.base) + src.n_ranks
+    lo_b, hi_b = int(dst.base), int(dst.base) + dst.n_ranks
+    if lo_a < hi_b and lo_b < hi_a:
+        raise Weg2XchgPlanDisagree(
+            f"W52 Weg2XchgPlanDisagree: group {src.name!r} occupies global "
+            f"ranks [{lo_a}, {hi_a}) and {dst.name!r} [{lo_b}, {hi_b}). The "
+            f"base numbers overlap, so the 6x6 byte matrix folds and its "
+            f"symmetry check passes on cells that hold two groups' bytes."
+        )
+
+
 def build_plan(
     inventory: Sequence[ParamGeom],
     src: GroupLayout,
     dst: GroupLayout,
     waves: Sequence[Sequence[str]],
     ptr_of: Optional[Callable[[str, int, str], Optional[int]]] = None,
+    geom_of: Optional[Callable[[str, int, str], object]] = None,
     floor: int = COALESCE_FLOOR_BYTES,
+    skip_tags: Sequence[str] = (),
 ) -> XchgPlan:
     """The plan for one direction.
 
@@ -1004,16 +1499,82 @@ def build_plan(
     depended on it could not be compared across ranks at all.  Descriptors are
     then ordered by (wave, dst_rank, name, dst offset, src_rank), which is the
     order the transport issues them in and the order coalescing needs.
+
+    ``geom_of(group, rank, name)`` returns the live tensor (or its
+    ``StorageGeom``) so every pitch and every destination extent comes from the
+    HARDWARE; without it the plan is derived arithmetic only, which is the
+    hermetic path the tests use.
+
+    NOTHING HERE MAY PASS BY BEING EMPTY.  An empty descriptor list has a fixed
+    ``plan_id`` identical on all six ranks and an all-zero byte matrix, so
+    every Gate 0 comparison succeeds and ``resume`` then leaves the destination
+    with mapped-but-unfilled ACTIVE pages: the boot serves undefined weights,
+    with six ranks in agreement.  Every tag in ``waves`` must produce at least
+    one descriptor, every parameter must produce at least one, and a tag that
+    is carried by no wave must be declared in ``skip_tags`` (the draft/MTP
+    family, spec §4.1) rather than dropped.
     """
-    wave_of = {}
+    src.validate()
+    dst.validate()
+    _check_cards(src, dst)
+    _check_bases(src, dst)
+
+    wave_of: Dict[str, int] = {}
     for w, wave in enumerate(waves):
         for tag in wave:
+            if tag in wave_of:
+                raise Weg2XchgPlanDisagree(
+                    f"W52 Weg2XchgPlanDisagree: tag {tag!r} appears in wave "
+                    f"{wave_of[tag]} and wave {w}. The wave list must be a "
+                    f"PERMUTATION of the weights family; last-write-wins would "
+                    f"accept a schedule the front's own guard "
+                    f"(front.py:2656-2663) refuses."
+                )
             wave_of[tag] = w
+
+    skip = {str(t) for t in skip_tags}
+    emitted: Dict[str, int] = {tag: 0 for tag in wave_of}
+    skipped: Dict[str, int] = {}
     raw: List[XchgDesc] = []
     for geom in sorted(inventory, key=lambda g: g.name):
+        geom.validate()
         if geom.tag not in wave_of:
+            if geom.tag not in skip:
+                raise Weg2XchgSourceMissing(
+                    f"W58 Weg2XchgSourceMissing: {geom.name} carries tag "
+                    f"{geom.tag!r}, which no wave carries and which was not "
+                    f"declared skippable. Dropping it would remove it from the "
+                    f"descriptors AND from the byte matrix, so Gate 0's "
+                    f"per-tag comparison could not see it either."
+                )
+            skipped[geom.tag] = skipped.get(geom.tag, 0) + 1
             continue
-        raw.extend(_emit(geom, src, dst, ptr_of))
+        descs = _emit(geom, src, dst, ptr_of, geom_of)
+        if not descs:
+            raise Weg2XchgSourceMissing(
+                f"W58 Weg2XchgSourceMissing: {geom.name} (tag {geom.tag!r}) "
+                f"produced no descriptor: no rank of group {dst.name!r} holds "
+                f"any of it. A parameter that is in the inventory and in a "
+                f"wave has to move."
+            )
+        emitted[geom.tag] += len(descs)
+        raw.extend(descs)
+
+    barren = sorted(tag for tag, n in emitted.items() if n == 0)
+    if barren:
+        raise Weg2XchgSourceMissing(
+            f"W58 Weg2XchgSourceMissing: wave tags {barren} produced no "
+            f"descriptor at all. A wave that moves nothing is an agreement "
+            f"between six ranks that no byte has to arrive."
+        )
+    if not raw:
+        raise Weg2XchgSourceMissing(
+            "W58 Weg2XchgSourceMissing: the plan is empty. Its plan_id is a "
+            "fixed digest and its byte matrix is all zeros, so every Gate 0 "
+            "comparison would succeed while the destination keeps whatever its "
+            "remapped pages held."
+        )
+
     raw.sort(
         key=lambda d: (
             wave_of[d.tag],
@@ -1027,16 +1588,23 @@ def build_plan(
 
     n = max(src.base + src.n_ranks, dst.base + dst.n_ranks)
     matrix = [[0] * n for _ in range(n)]
+    tag_bytes: Dict[str, int] = {}
     for d in merged:
         if d.kind == ZEROFILL:
             continue
         matrix[src.base + d.src_rank][dst.base + d.dst_rank] += d.nbytes
+        tag_bytes[d.tag] = tag_bytes.get(d.tag, 0) + d.nbytes
     return XchgPlan(
         descs=tuple(merged),
         raw_descs=tuple(raw),
         waves=tuple(tuple(w) for w in waves),
         byte_matrix=tuple(tuple(row) for row in matrix),
-        plan_id=plan_id(merged),
+        # The RAW list, not the merged one: which pieces merge depends on the
+        # pointer table, and the two processes hold different tables while the
+        # front holds none.
+        plan_id=plan_id(raw, waves),
         src_group=src.name,
         dst_group=dst.name,
+        tag_bytes=tuple(sorted(tag_bytes.items())),
+        skipped_tags=tuple(sorted(skipped.items())),
     )

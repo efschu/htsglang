@@ -938,9 +938,7 @@ class TestPlanCoverage(CustomTestCase):
     def test_a_wave_tag_that_emitted_no_descriptor_is_refused(self):
         src, dst = _p_layout(), _d_layout(MLP_RATIO)
         with self.assertRaises(Weg2XchgSourceMissing) as cm:
-            build_plan(
-                [_qkvz_geom()], src, dst, waves=[["weights_0"], ["weights_1"]]
-            )
+            build_plan([_qkvz_geom()], src, dst, waves=[["weights_0"], ["weights_1"]])
         self.assertIn("weights_1", str(cm.exception))
 
     def test_a_tag_in_two_waves_is_refused(self):
@@ -1036,9 +1034,7 @@ class TestShardFamilies(CustomTestCase):
 
         # THE CAN-FAIL: the same parameter planned WITHOUT its family falls
         # back to the base vector and lands at different offsets on every rank.
-        base_planned = build_plan(
-            [self._vocab(None)], src, dst, waves=[["weights"]]
-        )
+        base_planned = build_plan([self._vocab(None)], src, dst, waves=[["weights"]])
         self.assertNotEqual(
             self._widths(base_planned, "model.embed_tokens.weight"),
             [even * HIDDEN * 2] * 3,
@@ -1061,9 +1057,12 @@ class TestShardFamilies(CustomTestCase):
         plan = build_plan(
             [self._vocab(VOCAB_FAMILY)], _p_layout(), dst, waves=[["weights"]]
         )
+        # The fork's own split of the PADDED vocabulary in its 64-row units --
+        # not a restatement of it, so the test cannot agree with a wrong
+        # arithmetic by copying it.
         expect = [
-            s * 64 * HIDDEN * 2
-            for s in partition_sizes(self.VOCAB_UNITS, vocab_vec)
+            w * HIDDEN * 2
+            for w in partition_sizes(VOCAB_PADDED_D, vocab_vec, self.VOCAB_UNITS)
         ]
         self.assertEqual(self._widths(plan, "model.embed_tokens.weight"), expect)
 
@@ -1089,12 +1088,24 @@ class TestShardFamilies(CustomTestCase):
         'a plan of another length does not apply' is an ACTIVATION law that
         belongs where the group size is known -- not a silent downgrade to the
         even split inside the shard arithmetic."""
+        # A dimension the EVEN split can serve, so a silent downgrade would
+        # SUCCEED and hand back three equal shards.  17408 is NOT such a
+        # dimension -- it is not divisible by 3 -- and a test seeded with it
+        # passes on a divisibility accident while proving nothing.
+        total = HIDDEN * 3
+        self.assertEqual(
+            [start for start, _ in shard_offsets(total, None, 3)],
+            [0, HIDDEN, 2 * HIDDEN],
+        )
         with self.assertRaises(Weg2XchgPlanDisagree) as cm:
-            shard_offsets(MLP_IN_FULL, [61, 38], 3, units=MLP_UNITS)
-        self.assertIn("W52 Weg2XchgPlanDisagree", str(cm.exception))
+            shard_offsets(total, [61, 38], 3)
+        message = str(cm.exception)
+        self.assertIn("W52 Weg2XchgPlanDisagree", message)
+        self.assertIn("2 entries", message)
         bad = GroupLayout(name="D", cards=CARDS, tp_size=3, ratios=[61, 38], base=3)
-        with self.assertRaises(Weg2XchgPlanDisagree):
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
             build_plan([_mlp_down_geom()], _p_layout(), bad, waves=[["weights_0"]])
+        self.assertIn("of 2 entries", str(cm.exception))
 
 
 class TestGroupIdentity(CustomTestCase):
@@ -1271,15 +1282,20 @@ class TestLiveStorage(CustomTestCase):
             shard_total=4864 * 3,
             stage=0,
         )
-        self.assertEqual((geom.rows_full, geom.cols_full, geom.itemsize), (14592, HIDDEN, 1))
-        self.assertEqual(geom, ParamGeom.of(
-            storage,
-            name="model.layers.0.mlp.gate_proj.weight",
-            tag="weights_0",
-            shard_axis=ROWS,
-            shard_total=4864 * 3,
-            stage=0,
-        ))
+        self.assertEqual(
+            (geom.rows_full, geom.cols_full, geom.itemsize), (14592, HIDDEN, 1)
+        )
+        self.assertEqual(
+            geom,
+            ParamGeom.of(
+                storage,
+                name="model.layers.0.mlp.gate_proj.weight",
+                tag="weights_0",
+                shard_axis=ROWS,
+                shard_total=4864 * 3,
+                stage=0,
+            ),
+        )
         # THE CAN-FAIL: the logical reading swaps the row width and the axis.
         self.assertNotEqual((geom.rows_full, geom.cols_full), (HIDDEN, 4864))
 
@@ -1357,7 +1373,9 @@ class TestPlanIdIsComparable(CustomTestCase):
             "model.layers.0.input_layernorm.weight": 0,
             "model.layers.0.post_attention_layernorm.weight": HIDDEN * 2,
         }
-        return lambda group, rank, name: 0x7F0000000000 + (1 << 20) * rank + offsets[name]
+        return lambda group, rank, name: (
+            0x7F0000000000 + (1 << 20) * rank + offsets[name]
+        )
 
     def test_plan_id_survives_coalescing_and_therefore_the_pointer_table(self):
         src, dst = _p_layout(), _d_layout(None)
@@ -1371,15 +1389,23 @@ class TestPlanIdIsComparable(CustomTestCase):
         # ... and must not change the id, which is the only thing comparable.
         self.assertEqual(with_ptrs.plan_id, bare.plan_id)
 
-    def test_plan_id_moves_when_the_wave_partition_moves(self):
-        """Two partitions can leave the descriptor ORDER unchanged; a digest
-        over the descriptors alone then cannot see a schedule disagreement,
-        which is one of the three things W52 names."""
+    def test_plan_id_moves_when_the_wave_schedule_moves(self):
+        """A schedule disagreement that the descriptors cannot show.
+
+        The order WITHIN a wave is the order the front pauses and resumes the
+        tags in; two ranks that disagree about it emit the identical descriptor
+        list, because ``wave_of`` maps both tags to the same wave index and the
+        sort key never sees the order.  A digest over the descriptors alone is
+        therefore blind to one of the three things W52 names (spec §3.3)."""
         src, dst = _p_layout(), _d_layout(None)
         inv = self._inventory()
         inv[1] = inv[1].replace(tag="weights_1")
-        one = build_plan(src=src, dst=dst, inventory=inv, waves=[["weights_0", "weights_1"]])
-        two = build_plan(src=src, dst=dst, inventory=inv, waves=[["weights_0"], ["weights_1"]])
+        one = build_plan(
+            src=src, dst=dst, inventory=inv, waves=[["weights_0", "weights_1"]]
+        )
+        two = build_plan(
+            src=src, dst=dst, inventory=inv, waves=[["weights_1", "weights_0"]]
+        )
         self.assertEqual([d.key() for d in one.descs], [d.key() for d in two.descs])
         self.assertNotEqual(one.plan_id, two.plan_id)
 
@@ -1411,9 +1437,7 @@ class TestAcceptanceLineDenominator(CustomTestCase):
         )
         line = plan.log_line()
         self.assertIn("unmergeable=", line)
-        self.assertIn(
-            f"unmergeable={len(unmergeable_below_floor(plan.descs))}", line
-        )
+        self.assertIn(f"unmergeable={len(unmergeable_below_floor(plan.descs))}", line)
         self.assertTrue(line.rstrip().endswith(f"plan_id={plan.plan_id}"))
 
 
