@@ -276,7 +276,10 @@ def test_only_kernel_reaps_count_as_watermark_samples():
 def test_provenance_line_names_watermark_source_margin_and_bound():
     line = watermark_provenance()
     assert line.startswith("WEG2-HOST WATERMARK=")
-    for token in ("source=[", "margin=", "hard bound", "excluded=["):
+    # #1269 fix 4: the line carries TWO bounds now, so the single "hard bound"
+    # token it used to assert is gone on purpose -- W21 grades a prediction
+    # against the boot bound, W22 grades a measurement against the runtime one.
+    for token in ("source=[", "BOOT bound = ", "RUNTIME bound = ", "excluded=["):
         assert token in line, line
     assert "weg2dk5" in line and "weg2dk6" in line
     assert "weg2sb4" in line  # named as EXCLUDED, never silently dropped
