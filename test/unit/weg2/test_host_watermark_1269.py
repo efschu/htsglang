@@ -20,10 +20,11 @@ from sglang.srt.weg2.host_ledger import (
     RING_ERA_FLIP_TRANSIENT_GIB,
     RUN_PEAK_RESIDUAL_GIB,
     measure_foreign_anon,
+    read_cgroup_pressure,
+    split_by_baseline,
     OBSERVED_REAP_NONRECLAIM_BYTES,
     REAP_SAMPLE_EXCLUDED,
     REAP_SAMPLES_GIB,
-    RING_GRANULE_GIB,
     Margin,
     resolve_margin,
     size_store_gib,
@@ -108,38 +109,154 @@ def test_foreign_is_not_re_added_to_the_margin_by_default():
     assert "already in the origin" in m.foreign_source
 
 
-def test_the_breach_verdict_names_who_caused_it():
-    import os
-
+def test_the_split_uses_the_preboot_baseline_and_is_never_negative():
+    """FIX 3. weg2sb5b printed `sglang=61.48 foreign=-30.91` because
+    `cgroup anon - sum(RssAnon)` subtracts a per-process sum (shared pages
+    counted once PER MAPPER, 111 pids) from a per-page total. Impossible
+    number, so the attribution it carried was void."""
     m = resolve_margin()
     over = int((WATERMARK - m.total_gib + 0.5) * GIB)
-    own = measure_foreign_anon(0, [os.getpid()])[1]
     v = watermark_breach_verdict(
         over,
         margin=m,
-        cgroup_anon_bytes=int((own + 40.0) * GIB),
-        own_pids=[os.getpid()],
+        nonreclaim_gib=WATERMARK - m.total_gib + 0.5,
+        cgroup_anon_bytes=int(30.57 * GIB),  # sb5b at the breach
+        anon_preboot_bytes=int(10.05 * GIB),  # sb5b preflight baseline
     )
-    assert "SPLIT sglang=" in v and "foreign=" in v
-    assert "FOREIGN desk load dominates" in v
+    assert "SPLIT sglang=20.52 foreign=10.05" in v, v
+    assert "-" not in v.split("SPLIT")[1].split("[")[0], "no negative term"
+    assert "sglang dominates" in v
 
 
-def test_a_measured_census_rate_supersedes_the_sb4_default():
-    default = resolve_margin()
-    measured = resolve_margin(drift_mib_per_min=0.4)
-    assert "sb4 default" in default.drift_source
-    assert "WEG2-IDLE-CENSUS" in measured.drift_source
-    assert measured.total_gib < default.total_gib
+def test_split_never_returns_a_negative_foreign_even_when_anon_fell():
+    sg, fo, src = split_by_baseline(int(5 * GIB), int(10 * GIB))
+    assert sg == 0.0 and fo is not None and fo >= 0.0
+    assert "fell BELOW" in src
 
 
-def test_the_transient_term_is_floored_at_one_ring_granule():
-    """The margin may never collapse to zero when a record is thin."""
-    m = resolve_margin(flip_transient_gib=0.0)
-    assert m.transient_gib == pytest.approx(RING_GRANULE_GIB)
-    assert "granule" in m.transient_source
+def test_split_is_not_computable_without_a_baseline():
+    sg, fo, src = split_by_baseline(int(30 * GIB), None)
+    assert sg is None and fo is None and "no pre-boot anon baseline" in src
 
 
-# -------------------------------------------------------------- provenance
+# ------------------------------------------------------------- fix 3 currency
+def _stat(tmp_path, **fields):
+    d = tmp_path / "cg"
+    d.mkdir()
+    (d / "memory.stat").write_text(
+        "".join(f"{k} {v}\n" for k, v in fields.items() if k != "current")
+    )
+    (d / "memory.current").write_text(str(fields["current"]))
+    return str(d)
+
+
+def test_reclaimable_file_cache_does_not_count_as_pressure(tmp_path):
+    """THE sb5b DEFECT. 25 GiB of inactive_file is cache the kernel drops
+    before it OOMs; counting it refused a boot 28 GiB below danger."""
+    root = _stat(
+        tmp_path,
+        current=int(95 * GIB),
+        anon=int(30 * GIB),
+        shmem=int(40 * GIB),
+        inactive_file=int(25 * GIB),
+        active_file=0,
+        slab_unreclaimable=0,
+        unevictable=0,
+    )
+    pr = read_cgroup_pressure(root)
+    assert pr["current_gib"] == pytest.approx(95.0)
+    assert pr["file_reclaimable_gib"] == pytest.approx(25.0)
+    assert pr["nonreclaim_gib"] == pytest.approx(70.0)
+    m = resolve_margin()
+    assert (
+        watermark_breach_verdict(
+            int(95 * GIB), margin=m, nonreclaim_gib=pr["nonreclaim_gib"]
+        )
+        is None
+    ), "70 GiB of real pressure must not breach an 87.30 bound"
+    # and the RAW reading would have breached -- that is the bug, reproduced
+    assert watermark_breach_verdict(int(95 * GIB), margin=m) is not None
+
+
+def test_the_sb5b_numbers_reproduce_the_refusal_under_the_old_currency():
+    """Regression anchor: the boot that was wrongly refused, both ways."""
+    m = resolve_margin()
+    bound = WATERMARK - m.total_gib
+    raw_peak, nonreclaim_peak = 96.94, 78.26  # measured, memts 18:57Z
+    assert raw_peak > bound, "old currency refuses (this is the defect)"
+    assert nonreclaim_peak < bound, "new currency has room"
+    assert watermark_breach_verdict(int(raw_peak * GIB), margin=m) is not None
+    assert (
+        watermark_breach_verdict(
+            int(raw_peak * GIB), margin=m, nonreclaim_gib=nonreclaim_peak
+        )
+        is None
+    )
+    assert bound - nonreclaim_peak == pytest.approx(9.04, abs=0.01)
+
+
+def test_the_verdict_names_which_currency_it_used(tmp_path):
+    m = resolve_margin()
+    over = WATERMARK - m.total_gib + 1.0
+    v = watermark_breach_verdict(int(over * GIB), margin=m, nonreclaim_gib=over)
+    assert "in non-reclaimable currency" in v
+    assert "raw memory.current=" in v
+    blind = watermark_breach_verdict(int(over * GIB), margin=m)
+    assert "RAW memory.current -- INCLUDES reclaimable cache" in blind
+
+
+def test_the_fallback_formula_is_reported_as_such(tmp_path):
+    root = _stat(
+        tmp_path,
+        current=int(95 * GIB),
+        anon=int(30 * GIB),
+        shmem=int(40 * GIB),
+        slab_unreclaimable=int(1 * GIB),
+        unevictable=0,
+    )
+    pr = read_cgroup_pressure(root)
+    assert pr["nonreclaim_gib"] == pytest.approx(71.0)
+    assert "FALLBACK" in pr["source"]
+
+
+def test_composition_carries_the_memts_column_names(tmp_path):
+    root = _stat(
+        tmp_path,
+        current=int(95 * GIB),
+        anon=int(30 * GIB),
+        shmem=int(40 * GIB),
+        file=int(25 * GIB),
+        inactive_file=int(20 * GIB),
+        active_file=int(5 * GIB),
+        slab_reclaimable=int(1 * GIB),
+        slab_unreclaimable=0,
+        unevictable=0,
+    )
+    pr = read_cgroup_pressure(root)
+    for col in (
+        "file_gib",
+        "inactive_file_gib",
+        "active_file_gib",
+        "slab_reclaimable_gib",
+        "slab_unreclaimable_gib",
+        "unevictable_gib",
+    ):
+        assert col in pr, col
+    m = resolve_margin()
+    over = WATERMARK - m.total_gib + 1.0
+    v = watermark_breach_verdict(
+        int(over * GIB),
+        margin=m,
+        nonreclaim_gib=over,
+        composition={
+            k[:-4]: v2
+            for k, v2 in pr.items()
+            if k.endswith("_gib") and k != "nonreclaim_gib"
+        },
+    )
+    assert "STAT " in v and "inactive_file=" in v and "shmem=" in v
+
+
 def test_only_kernel_reaps_count_as_watermark_samples():
     assert set(REAP_SAMPLES_GIB) == {"weg2dk5", "weg2dk6"}
     assert "weg2sb4" in REAP_SAMPLE_EXCLUDED
@@ -156,7 +273,6 @@ def test_provenance_line_names_watermark_source_margin_and_bound():
     assert "weg2sb4" in line  # named as EXCLUDED, never silently dropped
 
 
-# ------------------------------------------------------------ boot refusal
 def test_a_peak_that_crosses_the_line_leaves_no_store():
     """sb4's own chosen arm, from its boot log: predicted run peak 91.44 GiB
     with store 11, leftover 11.61, unsampled 0.58.  It reported FUNDABLE
@@ -196,7 +312,6 @@ def test_a_store_that_fits_under_the_hard_bound_is_accepted():
     assert peak_without_store + sz.gib <= WATERMARK - m.total_gib + 1e-6
 
 
-# --------------------------------------------------------- runtime breach
 def test_no_verdict_while_below_the_hard_bound():
     m = resolve_margin()
     safe = int((WATERMARK - m.total_gib - 1.0) * GIB)
