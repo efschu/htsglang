@@ -53,7 +53,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import host_ledger, ring_table
 
@@ -97,6 +97,15 @@ DC_EXPECT_3080_MIB = 1442
 #: ABOVE the spec 1.6 expectations by 380 / 480 MiB.  These carry the
 #: provenance into P's budget until a boot measures them again; the front's
 #: W19 still grades the live measurement against the reserve actually used.
+#: SCOPE OF ALL FOUR NUMBERS ABOVE (FIX 1r/1): every boot behind them -- the
+#: spec 1.6 expectations and these two measurements -- ran group D with
+#: `--disable-overlap-schedule`, hence `no_buffer`, hence ZERO ping-pong mamba
+#: state slots. D now runs the overlap schedule, so its device residue carries
+#: `d_mamba_ping_pong_cost` extra state slots per rank that no boot behind these
+#: constants contained. They are NOT corrected here: a MiB conversion would be a
+#: second accounting of the runtime's own sizing (see `d_overlap_cost_line`).
+#: The term is printed at boot beside the SCHEDULER line, and W19 grades the
+#: live residue rather than these expectations.
 DC_MEASURED_D_5090_MIB = 2228
 DC_MEASURED_D_3080_MIB = 1922
 DC_RESERVE_SLACK_MIB = 64
@@ -345,6 +354,72 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
         f"back, so this is a fallback, never a table (O4)"
     )
 
+#: The operating point both groups are launched at (`--context-length`), and
+#: therefore the longest prompt group P can be asked to prefill. It is the
+#: default floor for P's KV pool: P frees a request's rows once its prefill
+#: completes, but DURING that prefill the whole prefix must be device-resident
+#: for the stage's attention layers, so a pool below this cannot serve the
+#: boot's own admitted maximum.
+CONTEXT_LENGTH = CONTEXT_LENGTH_TOKENS
+
+#: MEASURED per-stage prefill cost, ms per layer, boot `bsscale`
+#: (/spinning/gpu-arb/weg2/BSSCALE_0907.md, tip 37c884b0b0, table under
+#: "The headline of Table A"): per full 4096-token chunk at bs6 PP0 259.1 ms
+#: over 32 layers = 8.10, PP1 632.9 over 18 = 35.16, PP2 470.2 over 14 =
+#: 33.59, with stage 0 on the 5090 and stages 1-2 on the two 3080s. The two
+#: 3080 figures differ by 4.7 %, which is inside the +-10 % per-rank spread
+#: that measurement's own A/A repeat established. Used as the ANCHOR for the
+#: card-rate library's ratios, and as the whole cost model when no measured
+#: library exists.
+MEASURED_MS_PER_LAYER = "8.10,35.16,33.59"
+
+#: Per-rank arming floor for the pool model, MiB. The rig's VRAM corridor is
+#: 819-1229 MiB NVML-free per card under load and the desk pre-flight arming
+#: floor is <= 1229; the ceiling is taken because a floor that under-charges
+#: inflates the pool, which is the unsafe direction for a capacity FLOOR.
+#: pp_cut.PhasePoolModel names the gap this stands in for: the per-layout
+#: solved floor exists only for a layout that has booted.
+ARMING_FLOOR_MIB = 1229.0
+
+#: #1240 -- the DEPTH axis of the cost model, and the two records that pin it.
+#:
+#: A full-attention layer's cost for one chunk grows with the prefix it
+#: attends over; a GDN layer's does not. One number per stage cannot carry
+#: that, so the family split is solved from TWO measurements at TWO depths
+#: (pp_cut.family_costs_from_measurement) and both are named here.
+#:
+#: CALIBRATION DEPTH. MEASURED_MS_PER_LAYER above was taken on boot bsscale,
+#: whose driver sends a ~12,000-token prompt at --chunked-prefill-size 4096,
+#: i.e. THREE full chunks (BSSCALE_0907.md: "A ~12 000-token prompt is 3
+#: chunks"). Those chunks enter at prefix 0, 4096 and 8192, so the mean prefix
+#: of the full chunks the ms/layer figures average over is 4096. Derived, not
+#: chosen: it is the arithmetic mean of the census the calibration ran on.
+CALIBRATION_PREFIX_TOKENS = 4096
+
+#: DEEP ANCHOR. The user's physics note of 2026-09-07 (recorded verbatim in
+#: the GAPPED block of WEG2_BUILD_DECISIONS_0906.md section 1r): at deep
+#: prefixes one full-attention layer costs a 3080 about 0.4 s per chunk at a
+#: 262,144-token prefix. That is the second depth the family split needs; it
+#: is what makes the optimum a FUNCTION of the design prefix rather than a
+#: constant, and it is cited to its record rather than written as a literal.
+ATTN_ANCHOR_MS = 400.0
+ATTN_ANCHOR_PREFIX_TOKENS = 262144
+
+#: DESIGN DEPTH FALLBACK. When no boot log carries a prefill census the design
+#: prefix is one chunk -- the shallowest depth the boot can actually run -- and
+#: the launcher PRINTS that it fell back, so a table read at 4096 is never
+#: mistaken for a table read at this rig's real mean prefix.
+DESIGN_PREFIX_FALLBACK_TOKENS = 4096
+
+#: #1240 decode defaults. MEASURED on boot weg2pp1 (arms table row D2 of
+#: /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md): overlap ON with
+#: --num-continuous-decode-steps 2 and the paired extra_buffer mamba strategy
+#: reads 75.5 tok/s at bs1 and 305.0 at bs6, against the D0 control's 66.2 /
+#: 284.9 -- +14.0 % / +7.1 %. Row D3 (steps 4) REGRESSES to 73.6 / 295.6, so
+#: 2 is an optimum and not a direction. The steps knob is the unconfounded
+#: half of that boot (D1 -> D2 -> D3 all run overlap ON and extra_buffer).
+D_NUM_CONTINUOUS_DECODE_STEPS = 2
+
 
 class Weg2LaunchRefused(RuntimeError):
     pass
@@ -399,6 +474,7 @@ class BootState:
     carrier_max_tokens: int = 0
     weight_chunks: int = 0
     tms_so: str = ""
+    p_depth: int = 0
 
 
 def _now() -> str:
@@ -648,13 +724,29 @@ def store_extra_config(store_gib: float) -> str:
 # --------------------------------------------------------------------------
 
 
-def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float,
-                 max_kv_per_request: int) -> List[str]:
+def common_flags(
+    model: str,
+    s_gb: int,
+    m_mib: int,
+    store_gib: float,
+    max_kv_per_request: int,
+    write_policy: str = "write_through",
+) -> List[str]:
     """Flags BOTH groups share.
 
     ``--max-running-requests`` is NOT here any more (C1/R-12): sharing it
     pinned P and D to one value by construction, and law 2 says the two are
     independent.  It is emitted per group from --p-bs / --d-bs instead.
+
+    ``--disable-overlap-schedule`` is not here either.  It is group P's flag,
+    not a common one: the justification is ``pp_size > 1``
+    (server_args.py:19507, "Pipeline parallelism is not compatible with
+    overlap schedule", plus the same forcing in
+    arg_groups/overrides._pipeline_parallel_overlap_disable), and group D runs
+    pp_size=1.  MEASURED consequence of the old placement: D booted with
+    disable_overlap_schedule=True inheriting a PP-only reason (BSSCALE_0907.md
+    D4), so CPU scheduling of round n+1 could not hide behind GPU work of
+    round n on a group that has no pipeline at all.  See argv_p / argv_d.
     """
     return [
         "--model-path", model,
@@ -662,7 +754,6 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float,
         "--served-model-name", "Qwen3.8-27B",
         "--rank-gpu-id", "0,1,2",
         "--skip-server-warmup",
-        "--disable-overlap-schedule",
         "--kv-cache-dtype", "fp8_e4m3",
         "--context-length", str(CONTEXT_LENGTH_TOKENS),
         # C14/K9: the per-request KV ceiling, decoupled from the model
@@ -678,7 +769,7 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float,
         "--hicache-host-role", "staging",
         "--hicache-size", str(s_gb),
         "--hicache-mamba-host-mib", str(m_mib),
-        "--hicache-write-policy", "write_through",
+        "--hicache-write-policy", write_policy,
         "--hicache-storage-backend", "file",
         "--hicache-mem-layout", "layer_first",
         "--hicache-io-backend", "direct",
@@ -700,15 +791,75 @@ def common_flags(model: str, s_gb: int, m_mib: int, store_gib: float,
     ]
 
 
-def argv_p(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float,
-           extra: List[str], p_bs: int, max_kv_per_request: int) -> List[str]:
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + [
+def argv_p(
+    py: str,
+    model: str,
+    budgets: List[int],
+    s_gb: int,
+    m_mib: int,
+    store_gib: float,
+    extra: List[str],
+    p_bs: int = 8,
+    max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
+    stage_ratio: str = "32,18,14",
+    attn_stage_ratio: str = "8,4,4",
+    write_policy: str = "write_through",
+    depth: int = 0,
+) -> List[str]:
+    # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
+    # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
+    # server_args hands to derive_pp_layer_split, which builds a CONTIGUOUS
+    # split from them. A gapped map is not expressible that way at all:
+    # * the user's own layout (48 GDN on the 5090, 8+8 attention on the 3080s)
+    #   is `48,8,8 / 0,8,8`, and derive_pp_layer_split raises
+    #   "--pp-attn-stage-ratio entries must be positive integers" before a
+    #   single weight loads -- boot weg2pp2 arm P_G1 died exactly there;
+    # * a gapped map whose attention counts are all positive is worse than
+    #   refused, it is ACCEPTED and derives something else (52,6,6 / 4,6,6 ->
+    #   [19,24,21]), so the argv would contradict SGLANG_PP_LAYER_SET.
+    # Under a gapped map the SET published in env_p IS the layout and
+    # make_layers/model_runner resolve ownership from get_pp_layer_set, never
+    # from the count form -- so the count copy is the second set of books and
+    # it is dropped, rather than kept and asserted against.
+    if bool(stage_ratio) != bool(attn_stage_ratio):
+        raise Weg2LaunchRefused(
+            "W40 Weg2PPCutRefused: --pp-stage-ratio %r and "
+            "--pp-attn-stage-ratio %r must be given together or omitted "
+            "together. They are one statement of one layout; half of it "
+            "would let derive_pp_layer_split snap the other half silently "
+            "(the #505(a) class)." % (stage_ratio, attn_stage_ratio)
+        )
+    # SOLVED unless the operator pinned them; the launcher prints the PP-CUT
+    # provenance line either way. Never a hand constant reaching this line
+    # unannounced -- and, since FOLLOW FIX 1, never a SECOND statement of a
+    # layout the --pp-layer-set wire already carries.
+    ratio_flags = (
+        ["--pp-stage-ratio", stage_ratio, "--pp-attn-stage-ratio", attn_stage_ratio]
+        if stage_ratio
+        else []
+    )
+    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request, write_policy) + [
         # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
         # the size of P's req_to_token_pool (R-13), which is why it is
         # resolved before the budget solve and printed with it.
         "--max-running-requests", str(p_bs),
         "--tp-size", "1", "--pp-size", "3",
-        "--pp-stage-ratio", "32,18,14", "--pp-attn-stage-ratio", "8,4,4",
+        # #692 MICROBATCH DEPTH, group P only -- group D runs pp_size=1 and a
+        # pipeline depth is meaningless there. STATED even at 0 so the argv is
+        # an honest statement of what the boot runs, and published ONCE as a
+        # group constant: every rank reads the same token off the same argv,
+        # so no rank can derive a different depth (the ring size is a
+        # collective property -- two ranks disagreeing about pp_loop_size is
+        # the v7pp12 starvation, not a tuning difference). Solved by
+        # solve_p_depth from the previous boot's own PP-BUBBLE line; the
+        # launcher prints the WEG2 P-DEPTH provenance line either way.
+        "--pp-async-batch-depth", str(int(depth)),
+        # P is the pp_size>1 group, so the overlap schedule is refused HERE
+        # and only here (server_args.py:19507). Passing it explicitly rather
+        # than letting the post-process pass force it keeps the argv an
+        # honest statement of what this group runs.
+        "--disable-overlap-schedule",
+    ] + ratio_flags + [
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         "--barlink-bar1-window-mib", "24,PP_0=96",
         "--port", str(PORT_P),
@@ -747,9 +898,23 @@ def w38_armed_line(argv_of_p: Sequence[str]) -> str:
             "'WEG2 P-PREFIX-REUSE' line; the write-through and D's own store read are untouched." % pp)
 
 
-def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store_gib: float,
-           extra: List[str], d_bs: int, max_kv_per_request: int, x_tokens: int) -> List[str]:
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + [
+def argv_d(
+    py: str,
+    model: str,
+    budgets: List[int],
+    s_gb: int,
+    m_mib: int,
+    store_gib: float,
+    extra: List[str],
+    d_bs: int = 8,
+    max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
+    x_tokens: int = 0,
+    num_continuous_decode_steps: int = 1,
+    disable_overlap: bool = False,
+) -> List[str]:
+    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + (
+        ["--disable-overlap-schedule"] if disable_overlap else []
+    ) + [
         # C1/K2: D's own bs, independent of P's by construction.
         "--max-running-requests", str(d_bs),
         # C11/K5: law 4 enforced where the uncached extent is REAL -- after
@@ -758,7 +923,38 @@ def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
         # front-side estimate alone let a 19,401-token uncached extent
         # through a 4,096-token grant (weg2zr2 rid weg2-4-8). 0 = off.
         "--tp-prefill-max-tokens", str(x_tokens),
+        # THE STRATEGY IS STATED, NOT INHERITED (FIX 1r/1). Leaving this at
+        # 'auto' made D's mamba radix-cache strategy a SIDE EFFECT of the
+        # absent disable flag: _mamba_radix_cache_resolution reads
+        # `wants_overlap = not view.disable_overlap_schedule`
+        # (arg_groups/overrides.py:1225-1239), so switching the overlap
+        # schedule on also switched no_buffer -> extra_buffer, and
+        # mamba_pool_floor.mamba_ping_pong_slots then charges 2 state slots
+        # per running request instead of 0 -- DOUBLING D's device mamba floor
+        # (16 -> 32 slots at --max-running-requests 8) out of the FIXED
+        # --rank-gpu-memory-mib budgets. Stated here so the argv is an honest
+        # statement of what D runs, and priced in the SCHEDULER: log line
+        # (d_overlap_cost_line) so the launcher cannot move D's device
+        # residency without the number appearing. The value follows the
+        # overlap choice exactly -- it is not a second knob.
+        "--mamba-radix-cache-strategy", "no_buffer" if disable_overlap else "extra_buffer",
         "--tp-size", "3", "--pp-size", "1",
+        # OVERLAP SCHEDULE ON for D -- by ABSENCE of the disable flag, which
+        # is the only way to have it: there is no --enable-overlap-schedule.
+        # Every gate that forces it off was checked against THIS argv and
+        # none applies: pp_size>1 (D is 1), --enable-pdmux (not passed,
+        # server_args.py:19553), device cpu/mps (cuda), sparse-head
+        # embeddings and dllm (neither), and the hybrid-mamba resolution
+        # (arg_groups/overrides._mamba_radix_cache_resolution), which picks
+        # 'extra_buffer' and LEAVES overlap on for Qwen3_5ForConditional-
+        # Generation on linear_attn_backend=triton -- that arch is in
+        # _MAMBA_EXTRA_BUFFER_ARCHS. If a gate ever does refuse, it is not to
+        # be weakened: the launcher's --d-disable-overlap-schedule puts the
+        # flag back and logs W41.
+        #
+        # #1030's justification is PP-only and does not reach D
+        # (BSSCALE_0907.md D4).
+        "--num-continuous-decode-steps", str(int(num_continuous_decode_steps)),
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         # a per-rank MiB LIST under TP requires the uneven-TP ratio; 'auto'
         # derives the weights from that list (server_args.py rank_tp_ratio).
@@ -1698,7 +1894,1141 @@ def budgets_from_dc(
     return out
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def _max_running_requests(model: str) -> int:
+    """``--max-running-requests`` as this launcher actually passes it."""
+    flags = common_flags(model, 1, 1, 1.0)
+    return int(flags[flags.index("--max-running-requests") + 1])
+
+
+def d_mamba_ping_pong_cost(model: str, disable_overlap: bool) -> Tuple[str, int, int, int]:
+    """What D's overlap choice costs in DEVICE mamba state slots (FIX 1r/1).
+
+    Returns ``(strategy, ping_pong_slots_per_running_request, extra_slots_per
+    _rank, max_running_requests)``.
+
+    THE TERM. ``arg_groups/overrides._mamba_radix_cache_resolution`` reads
+    ``wants_overlap = not view.disable_overlap_schedule``, so turning the
+    overlap schedule on for group D ALSO turns its mamba radix-cache strategy
+    from ``no_buffer`` to ``extra_buffer`` -- and
+    ``mem_cache/mamba_pool_floor.mamba_ping_pong_slots`` then charges 2 slots
+    per running request where it charged 0. That is device residency out of
+    D's FIXED ``--rank-gpu-memory-mib`` budgets on a rig whose corridor law is
+    819-1229 MiB NVML-free per card, and the commit that switched the overlap
+    schedule on priced only the overlap benefit. An unpriced term does not
+    read as unknown, it reads as free (#1009).
+
+    NOT A SECOND ACCOUNTING. The slot count is taken from the runtime's own
+    ``mamba_ping_pong_slots`` against a view carrying exactly the three fields
+    it reads, with ``ServerArgs.enable_mamba_extra_buffer`` itself as the
+    predicate -- so a change to either function moves this number too. Only
+    the PING-PONG term is charged, because it is the only term of
+    ``mamba_slots_per_running_req`` that depends on the overlap choice; the
+    active slot and the donation/pin term are identical in both arms and
+    cancel in the delta. The remaining terms are deliberately NOT reproduced
+    here: ``mamba_slot_reorder_active`` reads an environment variable, and the
+    launcher's environment is not the group's (``build_env``), so evaluating
+    it here would answer about the wrong process.
+    """
+    from sglang.srt.mem_cache.mamba_pool_floor import mamba_ping_pong_slots
+    from sglang.srt.server_args import ServerArgs
+
+    flags = common_flags(model, 1, 1, 1.0)
+
+    class _StrategyView:
+        """Exactly the ServerArgs surface ``mamba_ping_pong_slots`` reads."""
+
+        # The upstream predicate itself, not a restatement of it.
+        enable_mamba_extra_buffer = ServerArgs.enable_mamba_extra_buffer
+
+        def __init__(self, strategy: str, disable_overlap_schedule: bool) -> None:
+            self.mamba_radix_cache_strategy = strategy
+            self.disable_overlap_schedule = disable_overlap_schedule
+            # Read off the argv this launcher builds, never asserted: the day
+            # --disable-radix-cache appears in common_flags the price changes
+            # to 0 and this follows it.
+            self.disable_radix_cache = "--disable-radix-cache" in flags
+
+    strategy = "no_buffer" if disable_overlap else "extra_buffer"
+    per_req = mamba_ping_pong_slots(_StrategyView(strategy, disable_overlap))
+    # The arm this replaces: group D as it booted before the overlap schedule
+    # was turned on, i.e. the arm every DC_MEASURED_D_* number was taken on.
+    baseline = mamba_ping_pong_slots(_StrategyView("no_buffer", True))
+    mrr = _max_running_requests(model)
+    return strategy, per_req, (per_req - baseline) * mrr, mrr
+
+
+def d_overlap_cost_line(model: str, disable_overlap: bool) -> str:
+    """The one line that must appear wherever D's overlap choice is announced.
+
+    The launcher must not be able to change D's device residency without the
+    number appearing (FIX 1r/1), so the price is built from
+    :func:`d_mamba_ping_pong_cost` rather than typed, and the MiB conversion
+    it does NOT make is named rather than left as a silent omission.
+    """
+    strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(model, disable_overlap)
+    baseline_per_req = per_req - (extra // max(1, mrr))
+    return (
+        f"DEVICE PRICE OF THAT CHOICE: --mamba-radix-cache-strategy "
+        f"{strategy} is now STATED on D's argv instead of falling out of the "
+        f"absent disable flag (arg_groups/overrides._mamba_radix_cache_"
+        f"resolution reads `wants_overlap = not view.disable_overlap_"
+        f"schedule`). Derived from the runtime's own mamba_pool_floor."
+        f"mamba_ping_pong_slots against the no_buffer arm this replaces: "
+        f"{per_req} - {baseline_per_req} = {per_req - baseline_per_req} extra "
+        f"ping-pong state slots per running request x --max-running-requests "
+        f"{mrr} = {extra} extra device mamba state slots on EVERY D rank, out "
+        f"of the FIXED --rank-gpu-memory-mib budgets and inside the "
+        f"819-1229 MiB corridor. This term is not converted to MiB here and "
+        f"the refusal is named: per-rank slot bytes follow Mamba2StateShape "
+        f"under --rank-tp-ratio auto, and re-deriving that shape in the "
+        f"launcher would be a second accounting of the runtime's own sizing; "
+        f"the boot prints it as 'mamba_cache_per_req=<x> MB' "
+        f"(model_runner_kv_cache_mixin.py:2529) and the front's W19 grades "
+        f"the live residue. DC_EXPECT_*/DC_MEASURED_D_* were measured on "
+        f"no_buffer boots and do NOT contain this term."
+    )
+
+
+#: The one line ``read_pp_bubble`` understands, emitted per window per rank by
+#: ``scheduler_components/pp_bubble.py:summary_line``. Anchored on the whole
+#: field name including its ``=``: a bare number would match milliseconds
+#: elsewhere in the line, which is the bare-ticket-number trap in miniature.
+_BUBBLE_RE = re.compile(
+    r"PP-BUBBLE rank=(?P<rank>\d+) .*?"
+    r" n=(?P<n>\d+) \(n_gaps=(?P<n_gaps>\d+),"
+    r" forward_ms=(?P<forward>[0-9.]+),"
+    r" bubble_ms=(?P<bubble>[0-9.]+),"
+    r" starved_ms=(?P<starved>[0-9.]+);"
+)
+
+
+@dataclass(frozen=True)
+class BubbleMeasurement:
+    """One stage's PP-BUBBLE totals, summed over every window in one log.
+
+    Summed, never averaged: each window line carries its own numerator AND its
+    own denominator, so a mean of the printed shares would weight a 12-forward
+    window like a 2-forward one. Sum of numerators over sum of denominators is
+    the only aggregation that keeps the denominator honest.
+    """
+
+    source: str
+    rank: int
+    windows: int
+    forward_ms: float
+    bubble_ms: float
+    starved_ms: float
+    n_forwards: int
+
+    @property
+    def denominator_ms(self) -> float:
+        """``gap + forward`` -- the denominator the emitting line names."""
+        return self.bubble_ms + self.forward_ms
+
+    @property
+    def bubble_share(self) -> float:
+        d = self.denominator_ms
+        return 0.0 if d <= 0.0 else self.bubble_ms / d
+
+    @property
+    def forward_share(self) -> float:
+        return 1.0 - self.bubble_share
+
+    @property
+    def stall_share(self) -> float:
+        """The part depth can move.
+
+        ``starved_ms`` is the part of the gap in which this rank visited the
+        loop with NOTHING to launch (fix 1r/2). Depth overlaps a rank's output
+        exchange with its next forward; it cannot manufacture a chunk that the
+        queue never supplied. Charging starvation to depth would buy in-flight
+        slots against a supply problem -- and pay for them out of the KV pool.
+        """
+        d = self.denominator_ms
+        if d <= 0.0:
+            return 0.0
+        return max(0.0, self.bubble_ms - self.starved_ms) / d
+
+
+def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
+    """The BINDING stage's bubble totals from one group-P log, or None.
+
+    The binding stage is the one with the largest forward total: under a
+    pipelined prefill the makespan is that stage's time, so its idle is the
+    idle that costs throughput. Returns None when the file does not exist or
+    carries no PP-BUBBLE line -- absence of the instrument, never a measured
+    zero (#892 / the indicator law: a tool says "I found nothing", never
+    "there is nothing").
+    """
+    per_rank: Dict[int, List[float]] = {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                m = _BUBBLE_RE.search(line)
+                if m is None:
+                    continue
+                acc = per_rank.setdefault(int(m.group("rank")), [0.0] * 4 + [0.0])
+                acc[0] += float(m.group("forward"))
+                acc[1] += float(m.group("bubble"))
+                acc[2] += float(m.group("starved"))
+                acc[3] += float(m.group("n"))
+                acc[4] += 1.0
+    except OSError:
+        return None
+    if not per_rank:
+        return None
+    rank = max(per_rank, key=lambda r: per_rank[r][0])
+    fwd, bub, starved, n_fwd, windows = per_rank[rank]
+    return BubbleMeasurement(
+        source=path,
+        rank=rank,
+        windows=int(windows),
+        forward_ms=fwd,
+        bubble_ms=bub,
+        starved_ms=starved,
+        n_forwards=int(n_fwd),
+    )
+
+
+def newest_bubble_log(evidence_dir: str) -> Optional[str]:
+    """Newest ``*.P.log`` in ``evidence_dir`` that actually CARRIES the line.
+
+    Not simply the newest P log: a boot that died before its first bubble
+    window, or one built before the instrument existed, has no measurement,
+    and taking its silence as ``share=0`` would derive ``depth=0`` from a file
+    rather than from a measurement. Such a log is skipped and an older one
+    that carries the line is preferred; the chosen path is printed, so a
+    reader can see how old the number is.
+    """
+    try:
+        names = [n for n in os.listdir(evidence_dir) if n.endswith(".P.log")]
+    except OSError:
+        return None
+    paths = [os.path.join(evidence_dir, n) for n in names]
+    for path in sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True):
+        if read_pp_bubble(path) is not None:
+            return path
+    return None
+
+
+#: The runtime's transport for an explicit per-stage layer SET. It is READ by
+#: the ranks and WRITTEN by exactly one thing: this launcher, from
+#: ``--pp-layer-set`` or from the solver's own chosen map. An INHERITED value
+#: is refused (W44), never honoured -- see :func:`refuse_inherited_layer_set`.
+PP_LAYER_SET_ENV = "SGLANG_PP_LAYER_SET"
+PP_CROSSING_WIRE_ENV = "SGLANG_PP_CROSSING_WIRE"
+
+_PREFILL_RE = re.compile(
+    r"\b(?P<rank>PP\d+)\] Prefill batch,.*?#new-token: (?P<new>\d+), "
+    r"#cached-token: (?P<cached>\d+)"
+)
+
+
+def refuse_inherited_layer_set(env: Mapping[str, str]) -> None:
+    """W44: a layer set inherited from the environment is REFUSED, never used.
+
+    ``build_env`` starts from ``os.environ``, so before this refusal an
+    exported ``SGLANG_PP_LAYER_SET`` reached group P's ranks without passing
+    through the launcher at all: the solver would rank and print one layout
+    while the boot ran another, and the PP-CUT provenance line would describe
+    a layout that never existed. That is the #505(a) silent-substitution class
+    with a whole stage map as the substituted object.
+
+    ONE KNOB, ONE READER (upstream-minimal). The flag ``--pp-layer-set`` is the
+    only way to configure the map, and the launcher is the only writer of the
+    variable. Not a twin of the env: its REPLACEMENT as the interface, with the
+    variable demoted to the wire that carries the decision to the ranks.
+    """
+    raw = str(env.get(PP_LAYER_SET_ENV, "") or "").strip()
+    if not raw:
+        return
+    raise Weg2LaunchRefused(
+        "W44 Weg2LayerSetEnvRefused: %s=%r is set in this launcher's own "
+        "environment. It is no longer an input: --pp-layer-set is, and the "
+        "launcher is the only writer of the variable (it carries the solved "
+        "or pinned map to group P's ranks). Honouring an inherited value "
+        "would let the boot run a stage map the PP-CUT provenance line does "
+        "not describe. Unset it and pass --pp-layer-set %s instead."
+        % (PP_LAYER_SET_ENV, raw, raw)
+    )
+
+
+def read_mean_prefill_prefix(path: str) -> Optional[Tuple[float, int, str]]:
+    """Mean PREFIX DEPTH over one boot's prefill census. ``(mean, n, rank)``.
+
+    THE PREFIX IS ACCUMULATED, NOT READ. No line states it: a ``Prefill batch``
+    line carries ``#new-token`` (this chunk) and ``#cached-token`` (the
+    prefix-cache hit), never "how much of this request is already computed".
+    But group P admits ONE chunked request per pass, so a request is a maximal
+    run of consecutive lines on one rank and the prefix at chunk *j* is the sum
+    of ``#new-token`` over chunks *0..j-1* plus that run's cache hit. A chunk
+    SHORTER than the run's own maximum ends the request -- the last chunk of a
+    prompt, or the zero-remainder 1-token end anchor -- and the accumulator
+    resets.
+
+    ONE RANK ONLY, and it is named in the answer: every stage prints the same
+    batch, so summing across ranks would triple the denominator without adding
+    a single measurement.
+
+    ``None`` when the file does not exist or carries no census -- absence of
+    the instrument, never a measured zero (#892).
+    """
+    rows: Dict[str, List[Tuple[int, int]]] = {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                m = _PREFILL_RE.search(line)
+                if m is None:
+                    continue
+                rows.setdefault(m.group("rank"), []).append(
+                    (int(m.group("new")), int(m.group("cached")))
+                )
+    except OSError:
+        return None
+    if not rows:
+        return None
+    rank = sorted(rows)[0]
+    seq = rows[rank]
+    full = max(n for n, _ in seq)
+    prefixes: List[int] = []
+    acc = 0
+    for new, cached in seq:
+        prefixes.append(acc + cached)
+        if new < full:
+            acc = 0
+        else:
+            acc += new
+    return (sum(prefixes) / float(len(prefixes)), len(prefixes), rank)
+
+
+def newest_prefill_census_log(evidence_dir: str) -> Optional[str]:
+    """Newest ``*.P.log`` that actually CARRIES a prefill census.
+
+    Same rule and the same reason as :func:`newest_bubble_log`: a boot that
+    died before its first prefill has no census, and reading its silence as
+    "mean prefix 0" would derive the design depth from a file rather than from
+    a measurement.
+    """
+    try:
+        names = [n for n in os.listdir(evidence_dir) if n.endswith(".P.log")]
+    except OSError:
+        return None
+    for path in sorted(
+        (os.path.join(evidence_dir, n) for n in names),
+        key=lambda p: os.path.getmtime(p),
+        reverse=True,
+    ):
+        if read_mean_prefill_prefix(path) is not None:
+            return path
+    return None
+
+
+def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
+    """Current PCIe link width per CUDA ordinal, from NVML. ``None`` if unknown.
+
+    The measured link table this rig owns
+    (``pp_crossing_transport.MEASURED_GBPS_BY_LANES``) is keyed by an edge's
+    BOTTLENECK lane count, so the lane width is the join key -- read here per
+    card rather than assumed, because "GPU0 is the x4 slot" is a fact about
+    today's NVML enumeration and this launcher already refuses to hardcode
+    that kind of fact (``order_cards``).
+    """
+    out: List[Optional[int]] = []
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return [None for _ in cards]
+    try:
+        for c in cards:
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(int(c.nvml_index))
+                out.append(int(pynvml.nvmlDeviceGetCurrPcieLinkWidth(h)))
+            except Exception:
+                out.append(None)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    return out
+
+
+def per_pair_crossing_ms(
+    lanes: Sequence[Optional[int]], payload_bytes: int
+) -> Dict[Tuple[int, int], float]:
+    """``{(src_stage, dst_stage): ms}`` for one crossing of ``payload_bytes``.
+
+    Priced from the MEASURED point-to-point table, at the edge's bottleneck
+    lane count -- ``min`` of the two cards' widths, which is what "bottleneck"
+    means and what those numbers were measured at. A pair whose lane count has
+    no measured entry is OMITTED, never interpolated: ``pp_cut.crossing_price``
+    then refuses to rank the candidates that use it, and an unrankable
+    candidate is reported rather than priced at a guess.
+    """
+    from sglang.srt.distributed.pp_crossing_transport import MEASURED_GBPS_BY_LANES
+
+    out: Dict[Tuple[int, int], float] = {}
+    for a in range(len(lanes)):
+        for b in range(len(lanes)):
+            if a == b or lanes[a] is None or lanes[b] is None:
+                continue
+            gbps = MEASURED_GBPS_BY_LANES.get(min(int(lanes[a]), int(lanes[b])))
+            if gbps is None:
+                continue
+            out[(a, b)] = float(payload_bytes) / (float(gbps) * 1e9) * 1e3
+    return out
+
+
+def chunked_prefill_size_of(argv: Sequence[str]) -> int:
+    """The chunk this launcher's own argv states, read back off it.
+
+    Same rule as ``--max-running-requests`` in the pool model: a second copy of
+    the number here would drift the day the flag moves, and the depth price is
+    linear in it.
+    """
+    argv = list(argv)
+    if "--chunked-prefill-size" not in argv:
+        raise Weg2LaunchRefused(
+            "W42 Weg2DepthUnfunded: group P's argv states no "
+            "--chunked-prefill-size, so one in-flight microbatch has no "
+            "priceable size and the depth cannot be funded against the pool. "
+            "Refusing rather than assuming a chunk."
+        )
+    return int(argv[argv.index("--chunked-prefill-size") + 1])
+
+
+#: THE DERIVATION IS NOT RE-GROUNDED, so a derived depth is not shipped
+#: (#1240 FOLLOW FIX 1, MUST_FIX 3 of BOOT_weg2pp2_0907.md). MEASURED against
+#: this workload, cited to that record's DEPTH VERDICT table: depth 1 cost
+#: +6.9 % on TTFT p50 (3.215 vs 3.008 s, A/A floor 1.7 %) and depth 2 +9.6 %
+#: (3.298), the bubble share on the binding stage did NOT fall (21.8/24.6 % at
+#: depth 0, 26.8 % at depth 1, 24.1 % at depth 2, floor 2.8 pts), duty fell 15
+#: points, and at the ~60 k deep point all depths sat inside the 3.35 % floor
+#: = null. The #692 mechanism overlaps a rank's output exchange with its next
+#: forward; the measurement says this workload's gap is not that exchange --
+#: consistent with the depth line's own stall_share=0.221 against
+#: bubble_share=0.466, i.e. over half the bubble was already queue starvation,
+#: which depth cannot touch, and the remainder is evidently not exchange-bound
+#: either. Re-grounding means a MEASURED exchange-bound share to derive from;
+#: until one exists the arithmetic is printed and the shipped depth is 0. An
+#: explicit --p-microbatch-depth still wins, priced exactly as before.
+DEPTH_DERIVATION_GROUNDED = False
+
+#: The record line the retraction above is read from. Named so the number and
+#: its provenance cannot drift apart.
+DEPTH_RETRACTION_RECORD = "/spinning/gpu-arb/weg2/BOOT_weg2pp2_0907.md"
+
+
+@dataclass(frozen=True)
+class DepthDecision:
+    """Group P's ``--pp-async-batch-depth`` and the ONE provenance line for it."""
+
+    depth: int
+    passes_in_flight: int
+    pinned: bool
+    measured: Optional[BubbleMeasurement]
+    pool_tokens: float
+    pool_after: float
+    cap_tokens: int
+    price_rows: int
+    price_tokens: float
+    price_mib: Tuple[float, ...]
+    act_mib_per_pass: float
+    chunk_tokens: int
+    #: What the bubble ARITHMETIC asks for, before the retraction. Kept beside
+    #: the shipped :attr:`depth` rather than replaced by it: the derivation is
+    #: the thing that has to be re-grounded, so it stays visible and the day a
+    #: measured exchange-bound share exists, ``DEPTH_DERIVATION_GROUNDED``
+    #: flips and this number ships without a second derivation being written.
+    derived_depth: int = 0
+    #: True when the chosen layout is a GAPPED layer set. The depth is then 0
+    #: BY THE LAYOUT, not lowered: a gapped map admits exactly one pass in
+    #: flight, and that is the number the PP-CUT solver already priced the
+    #: candidate at. Printed so the 0 is read as a derivation, not a default.
+    gapped_layout: bool = False
+    #: WHICH rule lowered the shipped depth below the derivation, recorded at
+    #: the point it acts rather than inferred afterwards from the numbers:
+    #: ``""`` (none acted -- the derivation shipped, or there was nothing to
+    #: lower), ``"retraction"`` (the #692 derivation is not re-grounded) or
+    #: ``"layout"`` (a gapped map admits exactly one pass). The two rules are
+    #: branches of ONE ``elif`` in :func:`solve_p_depth`, so at most one can
+    #: act, and :meth:`line` prints exactly one cause for a 0. Inferring it
+    #: from ``derived_depth > depth`` cannot tell them apart, which is how the
+    #: line came to print both.
+    lowered_by: str = ""
+    #: What ONE extra pass costs in pool tokens at the worst-converting stage.
+    #: :attr:`price_tokens` is ``depth * price_tokens_per_pass``; the two are
+    #: kept apart so no sentence can price "one extra pass" with the total
+    #: (fix 3, review finding 2: the W42 text did exactly that at depth 2).
+    price_tokens_per_pass: float = 0.0
+
+    @property
+    def retracted(self) -> bool:
+        """True when the RETRACTION is the rule that lowered the depth."""
+        return self.lowered_by == "retraction"
+
+    @property
+    def lowered_by_layout(self) -> bool:
+        """True when the GAPPED LAYOUT is the rule that lowered the depth."""
+        return self.lowered_by == "layout"
+
+    def line(self) -> str:
+        """THE one line. Format is load-bearing: a reader greps ``P-DEPTH solver:``."""
+        if self.measured is None:
+            src = (
+                "no PP-BUBBLE measurement found, so bubble_share is unknown and "
+                "the depth stays at today's behaviour"
+            )
+            shares = "bubble_share=n/a forward_share=n/a"
+        else:
+            m = self.measured
+            src = (
+                "from %s rank=%d (binding stage, largest forward total) over %d "
+                "window(s), n=%d forwards; starved_ms=%.1f of bubble_ms=%.1f is "
+                "queue starvation and is NOT charged to depth, stall_share=%.3f"
+                % (
+                    m.source,
+                    m.rank,
+                    m.windows,
+                    m.n_forwards,
+                    m.starved_ms,
+                    m.bubble_ms,
+                    m.stall_share,
+                )
+            )
+            shares = "bubble_share=%.3f forward_share=%.3f" % (
+                m.bubble_share,
+                m.forward_share,
+            )
+        if self.retracted:
+            src = (
+                "the #692 DERIVATION IS RETRACTED and NOT re-grounded: it asks "
+                "for depth %d, and %s (DEPTH VERDICT) measured that depth "
+                "against this workload -- +6.9 %% on TTFT p50 at depth 1, "
+                "+9.6 %% at depth 2, the bubble share did NOT fall (21.8/24.6 "
+                "-> 26.8 -> 24.1 %%) and the deep point was inside its floor. "
+                "The shipped depth is 0 until a MEASURED exchange-bound share "
+                "exists to derive from; an explicit --p-microbatch-depth still "
+                "wins and is still priced. " % (self.derived_depth, DEPTH_RETRACTION_RECORD)
+                + src
+            )
+        if self.lowered_by_layout:
+            src = (
+                "the chosen layout is a GAPPED layer set, which admits exactly "
+                "ONE pass in flight (scheduler_pp_mixin.init_pp_loop_state "
+                "refuses the pair: under a gapped set each stage's next layer "
+                "is another's previous one, so every stage must be inside the "
+                "same forward). The depth is 0 BY THE LAYOUT -- the same one "
+                "pass the PP-CUT solver priced that candidate at, which is why "
+                "it is a derivation and not a lowered hand number. " + src
+            )
+        elif self.gapped_layout:
+            # The bound is real and worth printing, but it did NOT act: the
+            # depth was already at or below one pass. Saying "BY THE LAYOUT"
+            # here would name a rule that never ran, which is the same
+            # instrument-text defect as printing two causes for one 0.
+            src = (
+                "the chosen layout is a GAPPED layer set, which admits exactly "
+                "ONE pass in flight; the depth was already 0, so the layout "
+                "bound did not have to lower anything. " + src
+            )
+        # The bracket names TWO pass counts and says which one ships. The
+        # shipped count is depth+1 by definition; the derived count is the
+        # formula's output and ships only when no rule lowered it (fix 3,
+        # review finding 1: printing the formula label over the shipped
+        # value read "ceil(1/(1-stall_share))=1" on a retracted depth whose
+        # formula gave 2).
+        if self.measured is None:
+            derived = "derived passes=n/a (no measurement)"
+        else:
+            derived = "derived passes=ceil(1/(1-stall_share))=%d" % (
+                self.derived_depth + 1
+            )
+            if self.lowered_by:
+                derived += " (NOT shipped: %s)" % self.lowered_by
+            elif self.pinned and self.depth != self.derived_depth:
+                derived += " (NOT shipped: pin overrides)"
+        return (
+            "WEG2 P-DEPTH solver:%s%s %s depth=%d price_rows=%d/stage "
+            "price_mib=%s MiB/stage pool_after=%d (constraint pool >= %d) "
+            "[passes_in_flight (shipped)=%d = depth+1; %s; each extra pass "
+            "costs %d KV rows plus a %.1f MiB crossing frame per stage = %d "
+            "pool tokens at the stage that converts worst, %d in total for "
+            "depth %d; %s]"
+            % (
+                " PINNED (user override)" if self.pinned else "",
+                " RETRACTED (derived %d, shipped %d)" % (self.derived_depth, self.depth)
+                if self.retracted
+                else "",
+                shares,
+                self.depth,
+                self.price_rows,
+                ",".join("%.1f" % v for v in self.price_mib),
+                int(self.pool_after),
+                int(self.cap_tokens),
+                self.passes_in_flight,
+                derived,
+                self.chunk_tokens,
+                self.act_mib_per_pass,
+                int(self.price_tokens_per_pass),
+                int(self.price_tokens),
+                self.depth,
+                src,
+            )
+        )
+
+
+def solve_p_depth(
+    measured: Optional[BubbleMeasurement],
+    pool_tokens: float,
+    attn_counts: Sequence[int],
+    kv_mib_per_token_per_attn_layer: float,
+    hidden_size: int,
+    chunk_tokens: int,
+    cap_tokens: int,
+    gapped_layer_set: str = "",
+    dtype_bytes: int = 2,
+    pinned_depth: Optional[int] = None,
+) -> DepthDecision:
+    """Group P's microbatch depth, DERIVED from the previous boot's own bubble.
+
+    THE MECHANISM. ``init_pp_loop_state`` reads this knob twice: it widens
+    ``pp_loop_size = pp_size + depth``, and -- the half that matters for the
+    bubble -- ``_event_loop_pp_body`` moves
+    ``_pp_commit_send_output_work_and_preprocess_output_tensors`` from AFTER
+    ``_pp_launch_batch`` to BEFORE it when the depth is non-zero. At depth 0
+    a rank's output exchange for pass *i-1* therefore serialises with its
+    launch of pass *i*, and that serialisation is exactly the host time the
+    PP-BUBBLE meter measures between two forwards.
+
+    THE DERIVATION. A stage busy ``forward/(gap+forward)`` of the time needs
+    ``ceil(1/(1-stall_share))`` passes in flight to stay busy across the gap.
+    One of those passes is the one it is forwarding, so the FLAG -- which
+    counts passes BEYOND the ring's own -- is that number minus one. Stated
+    rather than folded in, because it is where this function departs from the
+    briefing's ``depth = ceil(1/(1-bubble_share))``: that form provisions one
+    extra in-flight pass beyond the gap it has to cover, and every extra pass
+    is charged to the KV pool below. Both terms are printed, so a reader who
+    wants the other convention can see the arithmetic rather than infer it.
+
+    THE #692 GATE, RE-READ FOR WEG 2. ``DESIGN_691_bubble_levers.md`` gated
+    this lever on "measure it against the seam, not just against throughput",
+    for two named costs. They do not survive equally here:
+
+    * *"more live KV on cards already failing seam funding at 179 MiB"* -- does
+      NOT apply. That was the one-process flip, where the live set at the seam
+      had to be FUNDED to survive a cutover. In Weg 2 group P is its own
+      process group and carries nothing across: its sleep releases ``kv_cache``
+      and the weight tags wholesale to the memory saver (``sleep_group``), and
+      the carrier between the phases is the HiCache store, which D reads. There
+      is no funded live set for depth to grow. What depth does cost is priced
+      here instead, in the only budget it actually touches: P's own KV pool,
+      against ``--max-kv-per-request``.
+    * *"a deeper pipeline has more state to quiesce, so seam entry takes
+      longer"* -- DOES apply, unchanged, and is not priced here. The front's
+      quiesce witness is ``/flush_cache`` returning 200 only when every
+      in-flight term is zero (``front.py`` witness B), so ``depth`` extra
+      in-flight chunks are ``depth`` extra chunk-forwards of drain before P can
+      sleep. At the measured 369.6 ms per full chunk on the binding stage that
+      is sub-second per unit of depth against a 15-17 s flip, which is why it
+      is named and left to the flip's own measurement rather than converted
+      into a second, unmeasured budget here.
+
+    Refuses W42 rather than lowering the depth: a silently reduced depth is a
+    hand number wearing a derivation.
+    """
+    kv_mib_per_token = [
+        max(1, int(a)) * float(kv_mib_per_token_per_attn_layer) for a in attn_counts
+    ]
+    # The activation the extra pass keeps alive: one PPProxyTensors
+    # hidden-states frame per stage boundary, [chunk, hidden] in the model
+    # dtype. It is NOT in pp_cut.PhasePoolModel (which prices weights, mamba
+    # state, the arming floor and KV only), so it is the one genuinely new
+    # term -- and it is converted into pool tokens rather than charged against
+    # a second MiB budget, because the pool model has already spent every free
+    # MiB into tokens and charging both would be two books for one byte.
+    act_mib_per_pass = float(chunk_tokens) * float(hidden_size) * float(dtype_bytes)
+    act_mib_per_pass /= 1024.0 * 1024.0
+
+    if measured is None:
+        passes = 1
+    else:
+        stall = measured.stall_share
+        passes = int(math.ceil(1.0 / (1.0 - stall))) if stall < 1.0 else 0
+    depth = max(0, passes - 1)
+    derived_depth = depth
+    pinned = pinned_depth is not None
+    if pinned:
+        if int(pinned_depth) < 0:
+            raise Weg2LaunchRefused(
+                "W42 Weg2DepthUnfunded: --p-microbatch-depth %d is negative; "
+                "the flag counts in-flight passes." % int(pinned_depth)
+            )
+        # A pin replaces the derivation, never the PRICE: it is announced and
+        # then funded on exactly the same axis, so an override cannot buy a
+        # depth the pool cannot hold.
+        depth = int(pinned_depth)
+        passes = depth + 1
+
+    gapped_layout = bool(gapped_layer_set)
+    # ONE ZERO, ONE CAUSE. Both rules below produce depth 0, so they are
+    # branches of one ``elif`` and the acting one is RECORDED: a reader
+    # grepping ``P-DEPTH solver:`` for why the depth is 0 gets the rule that
+    # ran, not two candidate explanations. The LAYOUT is tested first because
+    # it is the structural bound -- a gapped map cannot run more than one pass
+    # whatever the measurement later says -- while the retraction is a verdict
+    # on the derivation that a re-grounded #692 will lift.
+    lowered_by = ""
+    if depth > 0 and gapped_layout and not pinned:
+        # DERIVED, not lowered. The bubble measurement asks for more passes,
+        # the layout admits one, and the PP-CUT solver already RANKED this
+        # candidate at one pass (CutCandidate: a gapped map's stages do not
+        # overlap, so its makespan was the SUM). Taking the depth the layout
+        # admits is therefore consistent with the number that chose it; the
+        # line says so rather than printing a bare 0.
+        depth, passes = 0, 1
+        lowered_by = "layout"
+    elif depth > 0 and not pinned and not DEPTH_DERIVATION_GROUNDED:
+        # RETRACTED BY MEASUREMENT, not lowered by taste. The arithmetic above
+        # is unchanged and is printed; what does not ship is its OUTPUT, because
+        # BOOT_weg2pp2_0907.md measured this knob against this workload and it
+        # lost on every column that has a floor (see DEPTH_DERIVATION_GROUNDED).
+        # A derivation whose premise the metal refuted is not a default, and
+        # keeping it would be a hand number wearing a derivation just as much as
+        # silently lowering one would be.
+        depth, passes = 0, 1
+        lowered_by = "retraction"
+
+    # Only a PIN can still be non-zero against a gapped map: the derived path
+    # was taken to 0 by the branch above.
+    if depth > 0 and gapped_layout:
+        raise Weg2LaunchRefused(
+            "W43 Weg2DepthGapped: the layer set %r puts group P on a "
+            "GAPPED layer set, and the PINNED --pp-async-batch-depth %d would "
+            "die at scheduler_pp_mixin.init_pp_loop_state, which refuses the "
+            "pair outright: under a gapped set every stage must be inside the "
+            "SAME forward, because each stage's next layer is another's "
+            "previous one, and async depth lets a rank enter the next forward "
+            "while a peer is still in the last one's output exchange. Refused "
+            "here so the launcher says it, rather than three ranks discovering "
+            "it after the weights are loaded. A DERIVED depth is taken down to "
+            "0 by the layout instead (the solver priced this candidate at one "
+            "pass); an OVERRIDE is refused, because an override the boot cannot "
+            "run is not a tuning choice." % (gapped_layer_set, depth)
+        )
+
+    price_rows = depth * int(chunk_tokens)
+    price_mib = tuple(
+        depth * (float(chunk_tokens) * k + act_mib_per_pass) for k in kv_mib_per_token
+    )
+    # The stage that converts worst is the one with the FEWEST attention
+    # layers: a token costs it less MiB, so the same MiB of crossing frame
+    # costs it MORE tokens. The pool is a MIN over stages, so that stage is
+    # the one that binds it.
+    price_tokens_per_pass = max(
+        float(chunk_tokens) + act_mib_per_pass / k for k in kv_mib_per_token
+    )
+    price_tokens = depth * price_tokens_per_pass if depth > 0 else 0.0
+    pool_after = float(pool_tokens) - price_tokens
+
+    if depth > 0 and pool_after < float(cap_tokens):
+        # WHO ASKED FOR THIS DEPTH decides the first and last sentence. While
+        # DEPTH_DERIVATION_GROUNDED is False a derived depth is always 0, so
+        # the only depth that can reach this floor today is a PIN -- and
+        # opening with "the measured bubble asks for" then attributed the
+        # operator's own override to a measurement, printed that measurement's
+        # stall_share as if it had produced the number, and closed with a
+        # sentence ("a depth the bubble did not ask for is a hand number")
+        # that refutes itself on exactly this path. Both branches below are
+        # live: the derived one the day #692 re-grounds.
+        if pinned:
+            asked = (
+                "--p-microbatch-depth %d was PINNED (the measurement derived "
+                "%d), and %d passes in flight do not fit group P's pool"
+                % (depth, derived_depth, passes)
+            )
+            closing = (
+                "The pin is NOT quietly lowered to what fits: an override "
+                "that silently becomes another number is a hand number "
+                "wearing a pin. Re-pin the depth the pool can hold (0 is a "
+                "pin), or fund this one."
+            )
+        else:
+            asked = (
+                "the measured bubble asks for --pp-async-batch-depth %d (%d "
+                "passes in flight at stall_share %.3f), but group P's pool "
+                "cannot fund it"
+                % (
+                    depth,
+                    passes,
+                    0.0 if measured is None else measured.stall_share,
+                )
+            )
+            closing = (
+                "The depth is NOT quietly lowered to what fits: a depth the "
+                "bubble did not ask for is a hand number. Pin depth 0 to "
+                "accept today's behaviour."
+            )
+        raise Weg2LaunchRefused(
+            "W42 Weg2DepthUnfunded: %s. Pool is %d tokens; EACH extra pass "
+            "costs %d KV rows plus a %.1f MiB crossing frame per stage = %d "
+            "pool tokens at the worst-converting stage, so depth %d costs %d "
+            "in total, leaving %d against the %d-token floor "
+            "(--max-kv-per-request) -- short by %d. Raise the per-rank "
+            "budgets or lower --max-kv-per-request. %s"
+            % (
+                asked,
+                int(pool_tokens),
+                int(chunk_tokens),
+                act_mib_per_pass,
+                int(price_tokens_per_pass),
+                depth,
+                int(price_tokens),
+                int(pool_after),
+                int(cap_tokens),
+                int(float(cap_tokens) - pool_after),
+                closing,
+            )
+        )
+
+    return DepthDecision(
+        depth=depth,
+        derived_depth=derived_depth,
+        passes_in_flight=passes,
+        pinned=pinned,
+        measured=measured,
+        pool_tokens=float(pool_tokens),
+        pool_after=pool_after,
+        cap_tokens=int(cap_tokens),
+        price_rows=price_rows,
+        price_tokens=price_tokens,
+        price_mib=price_mib,
+        act_mib_per_pass=act_mib_per_pass,
+        chunk_tokens=int(chunk_tokens),
+        gapped_layout=gapped_layout,
+        lowered_by=lowered_by,
+        price_tokens_per_pass=price_tokens_per_pass,
+    )
+
+
+def _csv_ints(text: str) -> List[int]:
+    return [int(x.strip()) for x in str(text).split(",") if x.strip()]
+
+
+def _csv_floats(text: str) -> List[float]:
+    return [float(x.strip()) for x in str(text).split(",") if x.strip()]
+
+
+@dataclass(frozen=True)
+class PCutFacts:
+    """What the solved cut knows that the depth price also needs.
+
+    Handed on rather than re-derived: the pool, the attention split and the KV
+    cell are already solved once here, and a second derivation beside them
+    would be a second set of books for one physical fact.
+    """
+
+    stage_ratio: str
+    attn_stage_ratio: str
+    pool_tokens: float
+    attn_counts: Tuple[int, ...]
+    kv_mib_per_token_per_attn_layer: float
+    hidden_size: int
+    cap_tokens: int
+    #: The solver's chosen ownership map in ``--pp-layer-set`` syntax, and
+    #: whether it is GAPPED. Empty string = a contiguous cut, which needs no
+    #: map at all: the count form expresses it and every path below stays
+    #: byte-identical to what it was.
+    layer_set: str = ""
+    gapped: bool = False
+
+
+def solve_p_cut(
+    ns,
+    cards: List[Card],
+    budgets_p: List[int],
+    model: str,
+    log,
+    chunk_tokens: int = 4096,
+) -> PCutFacts:
+    """Group P's layer + attention cut, and the ONE provenance line for it.
+
+    Returns the flag strings plus the pool facts the depth solver prices
+    against (:class:`PCutFacts`). Everything it feeds the solver is either measured on this box
+    (NVML card names, the per-rank budgets this launcher just derived, the
+    checkpoint's own weight headers and KV cell) or a flag whose default
+    carries its provenance in the help text -- no number is chosen here.
+    """
+    from sglang.srt.planner import pp_cut as _pp_cut
+    from sglang.srt.planner import pp_cut_launch as _cut
+
+    cfg_path = os.path.join(model, "config.json")
+    with open(cfg_path) as fh:
+        cfg = json.load(fh)
+    text_cfg = cfg.get("text_config") or cfg
+    n_layers = int(text_cfg["num_hidden_layers"])
+    kinds = text_cfg.get("layer_types") or []
+    n_attn = sum(1 for k in kinds if str(k) == "full_attention")
+    if n_attn <= 0:
+        raise Weg2LaunchRefused(
+            f"W40 Weg2PPCutRefused: {cfg_path} states no full_attention layer "
+            f"in layer_types, so the attention axis cannot be solved and the "
+            f"KV pool cannot be priced. Refusing rather than defaulting."
+        )
+    # The KV cell is CONSUMED from config, never fitted (#704 D1).
+    kv_mib = _pp_cut.kv_mib_per_token_per_attn_layer_from_config(
+        cfg, "fp8_e4m3", n_layers
+    )
+    # Weights from the safetensors HEADERS, not from a parameter formula.
+    terms = _pp_cut.checkpoint_weight_terms(model)
+    n_attn_ckpt = len(terms.attention_layer_indices)
+    mean_layer_mib = (
+        terms.attn_layer_weight_bytes * n_attn_ckpt
+        + terms.linear_layer_weight_bytes * (terms.n_layers - n_attn_ckpt)
+    ) / max(1, terms.n_layers) / _pp_cut.MIB
+    ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
+    model_pool = _pp_cut.PhasePoolModel(
+        free_mib=tuple(float(b) for b in budgets_p),
+        # The FAMILY split of weights is deliberately averaged: a stage's
+        # divisor in stage_pp_capacities is its ATTENTION COUNT, and moving
+        # one attention layer changes that divisor by 1 in 4-8 (12-25 %)
+        # while changing weights by the attn/linear difference of a single
+        # layer against a ~17-28 GiB free -- two orders of magnitude apart.
+        # The total is exact for any cut summing to n_layers.
+        weight_mib_per_layer=mean_layer_mib,
+        kv_mib_per_token_per_attn_layer=kv_mib,
+        arming_floor_mib=tuple(float(ns.pp_cut_arming_floor_mib) for _ in budgets_p),
+        mamba_mib_per_linear_layer_per_slot=float(
+            ns.pp_cut_mamba_mib_per_linear_layer_per_slot
+        ),
+        # Read off the argv this launcher builds rather than restated: a
+        # second copy of --max-running-requests would drift the day the flag
+        # moves, and the mamba residency scales linearly with it.
+        mamba_slots=_max_running_requests(model),
+    )
+    families = tuple(
+        _pp_cut.LAYER_FAMILY_ATTENTION
+        if str(k) == "full_attention"
+        else _pp_cut.LAYER_FAMILY_LINEAR
+        for k in kinds
+    )
+    incumbent = _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else _csv_ints("32,18,14")
+
+    # -- THE DEPTH AXIS (#1240) ------------------------------------------
+    # The design prefix is a MEASUREMENT of this rig's own traffic when one
+    # exists, and a printed fallback when it does not. It is not cosmetic: the
+    # attention/linear cost ratio moves by more than an order of magnitude
+    # between 4,096 and 262,144 tokens of prefix, so "the optimal cut" is a
+    # function of it and a table without it stated is a table about nothing.
+    design_src = ns.pp_cut_design_prefix_from or newest_prefill_census_log(EVIDENCE_DIR)
+    census = read_mean_prefill_prefix(design_src) if design_src else None
+    if ns.pp_cut_design_prefix_tokens is not None:
+        design_prefix = int(ns.pp_cut_design_prefix_tokens)
+        design_prov = "PINNED by --pp-cut-design-prefix-tokens"
+    elif census is not None:
+        design_prefix = int(round(census[0]))
+        design_prov = (
+            "MEASURED mean prefix over %d prefill-batch chunks of %s (rank %s, "
+            "one rank only: every stage prints the same batch)"
+            % (census[1], design_src, census[2])
+        )
+    else:
+        design_prefix = int(DESIGN_PREFIX_FALLBACK_TOKENS)
+        design_prov = (
+            "FALLBACK: no P log in %s carries a prefill census, so the design "
+            "prefix is one chunk -- the shallowest depth this boot can run. "
+            "This is an absence of the instrument, not a measured shallow rig."
+            % EVIDENCE_DIR
+        )
+
+    measured_attn = _pp_cut.attention_counts(families, incumbent)
+    anchor_stage = next(
+        (i for i, c in enumerate(cards) if "5090" not in c.name), len(cards) - 1
+    )
+    family_cost, family_prov = _pp_cut.family_costs_from_measurement(
+        measured_ms_per_layer=ms,
+        measured_counts=incumbent,
+        measured_attn_counts=measured_attn,
+        chunk_tokens=int(chunk_tokens),
+        ref_prefix_tokens=float(ns.pp_cut_calibration_prefix_tokens),
+        anchor_stage=anchor_stage,
+        anchor_attn_ms_per_layer=float(ns.pp_cut_attn_anchor_ms),
+        anchor_prefix_tokens=float(ns.pp_cut_attn_anchor_prefix_tokens),
+    )
+    # THE CROSSING FRAME is the same object the depth price already charges:
+    # one PPProxyTensors hidden-states frame, [chunk, hidden] in the model
+    # dtype. Derived here from the same three numbers rather than restated.
+    payload_bytes = int(chunk_tokens) * int(text_cfg["hidden_size"]) * 2
+    lanes = pcie_lanes(cards)
+    pair_ms = per_pair_crossing_ms(lanes, payload_bytes)
+    log(
+        "PP-CUT depth axis: design_prefix=%d tokens (%s); calibration prefix "
+        "%d (%s); %s"
+        % (
+            design_prefix,
+            design_prov,
+            int(ns.pp_cut_calibration_prefix_tokens),
+            "boot bsscale, ~12k prompt = 3 full chunks at 4096 -> mean 4096, "
+            "BSSCALE_0907.md",
+            family_prov,
+        )
+    )
+    log(
+        "PP-CUT crossing prices: PCIe lanes per ordinal %s, frame %.1f MiB "
+        "(chunk %d x hidden %d x 2 B), measured pair ms %s (pairs absent from "
+        "the measured lane table are OMITTED, and every candidate using one is "
+        "reported UNPRICED rather than ranked at a guess)"
+        % (
+            lanes,
+            payload_bytes / _pp_cut.MIB,
+            int(chunk_tokens),
+            int(text_cfg["hidden_size"]),
+            ", ".join(
+                "%d->%d %.2f" % (a, b, v) for (a, b), v in sorted(pair_ms.items())
+            )
+            or "NONE",
+        )
+    )
+    decision = _cut.solve_launch_cut(
+        layer_families=families,
+        incumbent_layers=incumbent,
+        measured_ms_per_layer=ms,
+        family_cost=family_cost,
+        design_prefix_tokens=design_prefix,
+        per_pair_crossing_ms=pair_ms,
+        pinned_layer_set=ns.pp_layer_set or None,
+        measured_provenance=(
+            "MEASURED per-layer ms %s (boot bsscale, BSSCALE_0907.md tip "
+            "37c884b0b0: PP0 259.1 ms/32 layers, PP1 632.9/18, PP2 470.2/14, "
+            "per full 4096-token chunk at bs6)" % ns.pp_cut_measured_ms_per_layer
+        ),
+        card_names=[c.name for c in cards],
+        pool_model=model_pool,
+        cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
+        pinned_layers=_csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else None,
+        pinned_attn=_csv_ints(ns.pp_attn_stage_ratio) if ns.pp_attn_stage_ratio else None,
+    )
+    log(
+        f"PP-CUT inputs: layers={n_layers} attn={n_attn} "
+        f"kv={kv_mib * 1024 * 1024:.0f} B/token/attn-layer (from config, fp8_e4m3) "
+        f"weights attn {terms.attn_layer_weight_bytes / _pp_cut.MIB:.1f} / linear "
+        f"{terms.linear_layer_weight_bytes / _pp_cut.MIB:.1f} MiB per layer -> mean "
+        f"{mean_layer_mib:.1f} used; free={budgets_p} MiB (this launcher's own "
+        f"per-rank budgets); arming floor {ns.pp_cut_arming_floor_mib} MiB/rank; "
+        f"mamba/linear-layer/slot {ns.pp_cut_mamba_mib_per_linear_layer_per_slot} MiB "
+        f"(0.0 = UNFUNDED, pool is an UPPER bound)"
+    )
+    log(decision.provenance_line())
+    for row in decision.table_lines():
+        log(row)
+    if decision.chosen.kind == "gapped":
+        # A GAPPED map is not expressible as --pp-stage-ratio and does not go
+        # through derive_pp_layer_split at all: it is published as the layer
+        # SET and executed by the #753 mid-loop crossing wire. The round trip
+        # below is therefore skipped by KIND, not by accident -- and the map is
+        # instead round-tripped through the runtime's OWN parser, which is the
+        # matching authority for this form.
+        from sglang.srt.distributed.utils import parse_pp_layer_sets
+
+        back = parse_pp_layer_sets(
+            decision.chosen.layer_set, n_layers, len(budgets_p), allow_gapped=True
+        )
+        realized_counts = tuple(len(x) for x in back)
+        if realized_counts != decision.chosen.layers:
+            raise Weg2LaunchRefused(
+                "W40 Weg2PPCutRefused: the gapped map this launcher solved "
+                "(%s) does not survive parse_pp_layer_sets -- it comes back as "
+                "%s layers per stage. Refusing rather than booting a layout the "
+                "provenance line misdescribes."
+                % (decision.chosen.layer_set, realized_counts)
+            )
+        log(
+            "PP-CUT round trip: parse_pp_layer_sets(%s) = %s layers per stage, "
+            "attn %s, %d crossings per chunk -- the --pp-layer-set argv states "
+            "what the boot will run. --pp-stage-ratio/--pp-attn-stage-ratio are "
+            "OMITTED from group P's argv for this kind: the count form cannot "
+            "state a gapped map (derive_pp_layer_split refuses an attention "
+            "count of 0 and silently re-derives a contiguous split from any "
+            "other), so the map travels once, on the wire."
+            % (
+                decision.chosen.layer_set,
+                realized_counts,
+                ",".join(str(a) for a in decision.chosen.attn),
+                decision.chosen.crossings,
+            )
+        )
+        return PCutFacts(
+            # EMPTY, DELIBERATELY (FOLLOW FIX 1). A gapped map's layout is the
+            # SET, and the count form cannot state it: `48,8,8 / 0,8,8` is
+            # refused by derive_pp_layer_split outright, and a positive-count
+            # gapped map is accepted and derives a DIFFERENT contiguous split.
+            # argv_p omits both flags when these are empty, so the argv states
+            # exactly one layout -- the one on the wire.
+            stage_ratio="",
+            attn_stage_ratio="",
+            pool_tokens=float(decision.chosen.pool_tokens),
+            attn_counts=tuple(int(a) for a in decision.chosen.attn),
+            kv_mib_per_token_per_attn_layer=float(kv_mib),
+            hidden_size=int(text_cfg["hidden_size"]),
+            cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
+            layer_set=decision.chosen.layer_set,
+            gapped=True,
+        )
+    # ROUND TRIP AGAINST THE RUNTIME AUTHORITY, not against our own model.
+    # --pp-stage-ratio entries are SCORES: server_args hands them to
+    # derive_pp_layer_split, which SNAPS the boundary into the window that
+    # realizes the attention target -- and snaps SILENTLY when an attention
+    # vector is given (the #505(a) warning in _handle_pp_stage_ratio only
+    # fires when attn_scores is None). MEASURED: 43,10,11 with attn 5,6,5
+    # comes back as 23,24,17. A solved cut that does not survive this call is
+    # a cut the boot would not run, so it is refused here rather than logged
+    # and departed from.
+    stage_ratio = ",".join(str(n) for n in decision.chosen.layers)
+    attn_ratio = ",".join(str(a) for a in decision.chosen.attn)
+    from sglang.srt.distributed.utils import derive_pp_layer_split
+
+    realized = derive_pp_layer_split(
+        list(decision.chosen.layers),
+        is_full_attention=[str(k) == "full_attention" for k in kinds],
+        attn_scores=list(decision.chosen.attn),
+    )
+    if list(realized) != list(decision.chosen.layers):
+        raise Weg2LaunchRefused(
+            f"W40 Weg2PPCutRefused: the cut this launcher solved "
+            f"({stage_ratio} / attn {attn_ratio}) does not survive "
+            f"derive_pp_layer_split -- it would run as "
+            f"{','.join(str(c) for c in realized)}. Refusing rather than "
+            f"booting a layout the provenance line misdescribes."
+        )
+    log(
+        f"PP-CUT round trip: derive_pp_layer_split({stage_ratio}, attn "
+        f"{attn_ratio}) = {','.join(str(c) for c in realized)} -- the argv "
+        f"states what the boot will run."
+    )
+    return PCutFacts(
+        stage_ratio=stage_ratio,
+        attn_stage_ratio=attn_ratio,
+        pool_tokens=float(decision.chosen.pool_tokens),
+        attn_counts=tuple(int(a) for a in decision.chosen.attn),
+        kv_mib_per_token_per_attn_layer=float(kv_mib),
+        hidden_size=int(text_cfg["hidden_size"]),
+        cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """THE parser, built apart from :func:`main` so the desk can render it.
+
+    ``argparse`` evaluates every ``help=`` string as ``help % params`` when it
+    formats it, so one bare ``%`` in one flag's help makes ``--help`` raise for
+    ALL of them. That is not a cosmetic failure: the boot record cites group
+    D's measured default as readable "verbatim from its own help path", and a
+    channel that cannot be opened is not provenance. Splitting the build out is
+    what lets a unit test call ``format_help()`` once per commit instead of an
+    operator discovering it in a terminal.
+    """
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tree", required=True)
     ap.add_argument("--tag", required=True)
@@ -1813,10 +3143,164 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "rather than raising an OSError -- and since A1-3 leaves no "
                          "feasible form to fall back to, that reason is a named "
                          "refusal (W20) and exit 2, verified on the rig")
+    # -- group P: the layer cut ------------------------------------------
+    ap.add_argument(
+        "--pp-stage-ratio", default=None,
+        help="OVERRIDE the solved layer cut for group P (e.g. '32,18,14'). "
+             "Passing it is announced as 'PINNED (user override)' in the "
+             "PP-CUT provenance line and priced on the same two axes as the "
+             "solved cut. Unset = the solver decides.",
+    )
+    ap.add_argument(
+        "--pp-attn-stage-ratio", default=None,
+        help="OVERRIDE the solved full-attention split for group P (e.g. "
+             "'8,4,4'). Same PINNED provenance. Unset = the attention axis is "
+             "resolved for the chosen layer cut by pp_cut.best_attention_split.",
+    )
+    ap.add_argument(
+        "--pp-cut-measured-ms-per-layer", default=MEASURED_MS_PER_LAYER,
+        help=f"Per-stage prefill ms per layer for the cost model. Default "
+             f"'{MEASURED_MS_PER_LAYER}' is MEASURED on boot bsscale "
+             f"(/spinning/gpu-arb/weg2/BSSCALE_0907.md, tip 37c884b0b0, "
+             f"per full 4096-token chunk at bs6: PP0 259.1 ms/32 layers, PP1 "
+             f"632.9/18, PP2 470.2/14). Used as the ANCHOR when the measured "
+             f"card-rate library supplies the per-card ratios.",
+    )
+    ap.add_argument(
+        "--pp-cut-arming-floor-mib", type=float, default=ARMING_FLOOR_MIB,
+        help=f"Per-rank arming floor subtracted before KV in the pool model. "
+             f"Default {ARMING_FLOOR_MIB} = the top of the rig's VRAM "
+             f"corridor (819-1229 MiB NVML-free per card under load). "
+             f"pp_cut.PhasePoolModel names the gap this stands in for: the "
+             f"solved per-layout floor only exists for a layout that has "
+             f"booted, and the proxy carries about +-500 MiB.",
+    )
+    ap.add_argument(
+        "--p-microbatch-depth", type=int, default=None,
+        help="OVERRIDE group P's solved --pp-async-batch-depth (#692). Unset = "
+             "DERIVED from the previous boot's own PP-BUBBLE line: a stage busy "
+             "forward/(gap+forward) of the time needs ceil(1/(1-stall_share)) "
+             "passes in flight to cover its gap, and the flag counts the passes "
+             "BEYOND the one being forwarded. Priced against P's KV pool -- one "
+             "extra pass costs one chunk of KV rows plus one crossing "
+             "activation frame per stage -- and refused as W42 rather than "
+             "lowered when the pool cannot fund it. Passing it is announced as "
+             "PINNED and priced on the same axis.",
+    )
+    ap.add_argument(
+        "--p-bubble-measured-from", default="",
+        help="Path of the group-P log whose PP-BUBBLE lines feed "
+             f"--p-microbatch-depth. Unset = the newest log in {EVIDENCE_DIR} "
+             "that actually carries the instrument (a log without the line is "
+             "skipped, never read as a measured zero). No measurement anywhere "
+             "= depth 0, i.e. today's behaviour, and the line says so.",
+    )
+    ap.add_argument(
+        "--pp-layer-set", default=None,
+        help="OVERRIDE the solved stage map with an explicit per-stage LAYER "
+             "SET, e.g. '0-2,4-6,...,60-62;3,7,...,31;35,...,63' (stages "
+             "separated by ';'). THE ONLY WAY to configure the map: an "
+             "inherited SGLANG_PP_LAYER_SET in the launcher's environment is "
+             "refused by name (W44), never honoured, because the launcher is "
+             "the only writer of that variable and the solver's provenance "
+             "line must describe the layout the boot actually runs. Unset = "
+             "the solver enumerates gapped maps alongside contiguous cuts and "
+             "publishes its own choice. Passing it is announced as PINNED and "
+             "priced on the same axes.",
+    )
+    ap.add_argument(
+        "--pp-cut-design-prefix-tokens", type=int, default=None,
+        help="OVERRIDE the prefix depth the layout is optimised FOR. Unset = "
+             "DERIVED from the newest P log carrying a prefill census (the "
+             "mean of the accumulated per-chunk prefix on one rank); no census "
+             f"anywhere = {DESIGN_PREFIX_FALLBACK_TOKENS}, and the line says "
+             "FALLBACK. It matters because a full-attention layer's cost per "
+             "chunk grows with the prefix while a GDN layer's does not, so the "
+             "optimal placement of the 16 attention layers is a FUNCTION of "
+             "this number, not a constant.",
+    )
+    ap.add_argument(
+        "--pp-cut-design-prefix-from", default="",
+        help="Path of the P log whose prefill census feeds "
+             f"--pp-cut-design-prefix-tokens. Unset = the newest log in "
+             f"{EVIDENCE_DIR} that actually carries the census (a log without "
+             "it is skipped, never read as a measured prefix of 0).",
+    )
+    ap.add_argument(
+        "--pp-cut-calibration-prefix-tokens", type=float,
+        default=float(CALIBRATION_PREFIX_TOKENS),
+        help=f"The prefix depth --pp-cut-measured-ms-per-layer was MEASURED at. "
+             f"Default {CALIBRATION_PREFIX_TOKENS} is DERIVED: boot bsscale "
+             f"drove a ~12,000-token prompt at chunk 4096, i.e. three full "
+             f"chunks entering at prefix 0/4096/8192, whose mean is 4096 "
+             f"(BSSCALE_0907.md). Half of the two-depth family split.",
+    )
+    ap.add_argument(
+        "--pp-cut-attn-anchor-ms", type=float, default=ATTN_ANCHOR_MS,
+        help=f"MEASURED cost of ONE full-attention layer per chunk at the deep "
+             f"anchor prefix, ms. Default {ATTN_ANCHOR_MS} is the user's "
+             f"physics note of 2026-09-07, recorded in the GAPPED block of "
+             f"WEG2_BUILD_DECISIONS_0906.md section 1r. The other half of the "
+             f"two-depth split: one measurement cannot separate a stage's "
+             f"attention cost from its GDN cost, two at different depths can.",
+    )
+    ap.add_argument(
+        "--pp-cut-attn-anchor-prefix-tokens", type=float,
+        default=float(ATTN_ANCHOR_PREFIX_TOKENS),
+        help=f"The prefix the deep anchor was measured at. Default "
+             f"{ATTN_ANCHOR_PREFIX_TOKENS} = --context-length.",
+    )
+    ap.add_argument(
+        "--pp-cut-mamba-mib-per-linear-layer-per-slot", type=float, default=0.0,
+        help="Device GDN state per linear layer per sequence slot, MiB. "
+             "Default 0.0 = UNFUNDED, and the direction is named rather than "
+             "hidden: omitting it inflates every stage's capacity, more for "
+             "stages holding more linear layers, so the printed pool is an "
+             "UPPER bound and the pool floor is looser than reality. Pass a "
+             "measured value to tighten it.",
+    )
+    # -- group D: the decode knobs ---------------------------------------
+    ap.add_argument(
+        "--num-continuous-decode-steps", type=int,
+        default=D_NUM_CONTINUOUS_DECODE_STEPS,
+        help=f"Group D only. Decode steps run per scheduler visit "
+             f"(server_args.py:1424). Default "
+             f"{D_NUM_CONTINUOUS_DECODE_STEPS} is MEASURED, not chosen: arms "
+             f"table row D2 of /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md "
+             f"reads 75.5 tok/s at bs1 and 305.0 at bs6 against the D0 "
+             f"control's 66.2 / 284.9 (+14.0 %% / +7.1 %%), and row D3 shows 4 "
+             f"REGRESSES to 73.6 / 295.6. Pass 1 to restore the shipped value.",
+    )
+    ap.add_argument(
+        "--d-disable-overlap-schedule", action="store_true",
+        help="Put --disable-overlap-schedule back on group D. The escape "
+             "hatch for a server_args gate that refuses overlap under D's "
+             "combination; taking it logs W41 with the gate named. Not a "
+             "tuning knob.",
+    )
+    # -- measurement arms -------------------------------------------------
+    ap.add_argument(
+        "--p-hicache-write-policy", default="write_through",
+        choices=["write_through", "write_back", "write_through_selective"],
+        help="MEASUREMENT ONLY. Group P's hicache write policy. Default "
+             "write_through = unchanged shipped behaviour. 'off' is NOT "
+             "offered because this runtime has no such policy "
+             "(server_args.py:4318 choices); write_back is the nearest arm "
+             "-- it defers the store write rather than removing it, and the "
+             "structural removal (a shared ring, async ack) belongs to the "
+             "ring slice, not here.",
+    )
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
-    ns = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ns = build_parser().parse_args(argv)
     if ns.teardown:
         return teardown(ns.teardown)
+    # BEFORE build_env(), which starts from os.environ: an inherited stage map
+    # would reach group P's ranks without passing through the solver at all.
+    refuse_inherited_layer_set(os.environ)
 
     tree = os.path.abspath(ns.tree)
     tip = subprocess.run(["git", "-C", tree, "rev-parse", "--short=10", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -1971,7 +3455,97 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
-    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request), ns.transport), state.logs["P"], env_p)
+    chunk_tokens = chunked_prefill_size_of(
+        common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, max_kv_per_request, ns.p_hicache_write_policy)
+    )
+    cut = solve_p_cut(ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens)
+    stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
+    # #1240 THE LAUNCHER IS THE ONLY WRITER. The solved (or pinned) map is
+    # published here, into the environment group P will actually get -- the
+    # flag is the interface, the variable is the wire. A GAPPED map also arms
+    # the #753 mid-loop crossing wire, because that is the executor: without
+    # it a stage runs its own layers back to back and silently skips its
+    # peer's, and get_pp_layer_set refuses a gapped set with the wire off.
+    if cut.layer_set:
+        env_p[PP_LAYER_SET_ENV] = cut.layer_set
+        if cut.gapped:
+            env_p[PP_CROSSING_WIRE_ENV] = "1"
+        log(
+            "WEG2 LAYER-SET published for group P: %s=%s%s (source: %s). The "
+            "#753 mid-loop crossing wire is the executor; nothing is "
+            "duplicated here."
+            % (
+                PP_LAYER_SET_ENV,
+                cut.layer_set,
+                " " + PP_CROSSING_WIRE_ENV + "=1" if cut.gapped else "",
+                "--pp-layer-set (PINNED)" if ns.pp_layer_set else "the solver",
+            )
+        )
+    # #692 MICROBATCH DEPTH. The share is READ from a previous boot's own
+    # PP-BUBBLE line, never written here: an operator-supplied path wins, else
+    # the newest log in EVIDENCE_DIR that actually carries the instrument, else
+    # no measurement at all and the depth is today's 0 -- printed, so the
+    # absence is visible rather than inferred from a missing line.
+    bubble_src = ns.p_bubble_measured_from or newest_bubble_log(EVIDENCE_DIR)
+    if ns.p_bubble_measured_from and read_pp_bubble(ns.p_bubble_measured_from) is None:
+        raise Weg2LaunchRefused(
+            f"W42 Weg2DepthUnfunded: --p-bubble-measured-from "
+            f"{ns.p_bubble_measured_from} carries no PP-BUBBLE line, so it "
+            f"states nothing about the bubble. An explicitly named measurement "
+            f"file that turns out to be empty is refused rather than silently "
+            f"treated as 'no measurement' -- that would read as depth 0 for a "
+            f"reason the operator did not intend."
+        )
+    depth_decision = solve_p_depth(
+        measured=read_pp_bubble(bubble_src) if bubble_src else None,
+        pool_tokens=cut.pool_tokens,
+        attn_counts=cut.attn_counts,
+        kv_mib_per_token_per_attn_layer=cut.kv_mib_per_token_per_attn_layer,
+        hidden_size=cut.hidden_size,
+        chunk_tokens=chunk_tokens,
+        cap_tokens=cut.cap_tokens,
+        # Read from the environment group P will actually get -- which since
+        # #1240 this launcher is the only writer of (W44 refuses an inherited
+        # one), so it is the solver's own decision arriving here rather than
+        # an operator's export sneaking past the flags.
+        gapped_layer_set=env_p.get(PP_LAYER_SET_ENV, "") if cut.gapped else "",
+        pinned_depth=ns.p_microbatch_depth,
+    )
+    log(depth_decision.line())
+    state.p_depth = depth_decision.depth
+    if ns.d_disable_overlap_schedule:
+        log(
+            "W41 Weg2OverlapRefused: --d-disable-overlap-schedule was passed, "
+            "so group D keeps --disable-overlap-schedule. The gate that "
+            "refused must be named in this boot's record; the flag is not a "
+            "tuning knob and no server_args gate is to be weakened to avoid it. "
+            + d_overlap_cost_line(ns.model, True)
+        )
+    else:
+        log(
+            "SCHEDULER: --disable-overlap-schedule is group P's flag only "
+            "(pp_size=3, server_args.py:19507). Group D runs pp_size=1 with "
+            "the overlap scheduler ON; every forcing gate was checked against "
+            "D's argv (pdmux off, device cuda, no sparse-head/dllm, and the "
+            "hybrid-mamba resolution picks extra_buffer for "
+            "Qwen3_5ForConditionalGeneration on linear_attn_backend=triton). "
+            f"--num-continuous-decode-steps {ns.num_continuous_decode_steps} "
+            f"on D (default {D_NUM_CONTINUOUS_DECODE_STEPS} is MEASURED, cited "
+            f"to /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md arms table row "
+            f"D2: 75.5 tok/s bs1 and 305.0 bs6 against the D0 control's 66.2 / "
+            f"284.9 = +14.0 % / +7.1 %, with row D3 showing steps 4 regresses "
+            f"to 73.6 / 295.6 -- an optimum, not a direction). "
+            + d_overlap_cost_line(ns.model, False)
+        )
+    if ns.p_hicache_write_policy != "write_through":
+        log(
+            f"MEASUREMENT ARM: group P --hicache-write-policy "
+            f"{ns.p_hicache_write_policy} (shipped default is write_through; "
+            f"#1016 measured the write_through store tax at +3.9 % @50k / "
+            f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
+            f"arm exists to, and changes nothing else). Group D is unchanged."
+        )
+    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth), ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     log(w38_armed_line(spec_p.argv))
     state.deviations = [
@@ -1998,7 +3572,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -2037,7 +3611,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     state.budgets["D"] = budgets_d
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid

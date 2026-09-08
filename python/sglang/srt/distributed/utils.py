@@ -2014,6 +2014,24 @@ def pp_crossing_wire_enabled() -> bool:
     return os.getenv(PP_CROSSING_WIRE_ENV, "") not in ("", "0", "false", "False")
 
 
+#: #753: the escape hatch for the KNOWN-WRONG gapped forward. Set it to
+#: investigate the defect; it is the only way to reach a gapped forward, and it
+#: says in its own name that what it produces is not to be trusted.
+#:
+#: It lives HERE, beside the layer-set parser, rather than in the scheduler
+#: that raises on it, because two readers need the same condition and only one
+#: of them can import the scheduler: the runtime gate
+#: (``scheduler_pp_mixin._refuse_known_wrong_gapped_forward``) and the LAUNCH
+#: solver, which must not rank a layout the runtime will refuse to serve.
+#: One predicate, one reader of the variable.
+PP_GAPPED_KNOWN_WRONG_ENV = "SGLANG_PP_GAPPED_ALLOW_KNOWN_WRONG"
+
+
+def pp_gapped_forward_known_wrong_allowed() -> bool:
+    """True when the operator has switched the #753 correctness refusal off."""
+    return os.getenv(PP_GAPPED_KNOWN_WRONG_ENV, "") not in ("", "0", "false", "False")
+
+
 
 class PPLayerSetError(ValueError):
     """A layer-set map that cannot be used. Always names the offending layers."""

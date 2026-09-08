@@ -479,10 +479,15 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
-#: The escape hatch for the refusal below. Set it to investigate the defect;
-#: it is the only way to reach the gapped forward, and it says in its own name
-#: that what it produces is not to be trusted.
-PP_GAPPED_KNOWN_WRONG_ENV = "SGLANG_PP_GAPPED_ALLOW_KNOWN_WRONG"
+#: The escape hatch for the refusal below, DEFINED in distributed.utils and
+#: only re-exported here: since #1240 the launch-time PP-cut solver has to ask
+#: the same question (it may not rank a layout this gate will refuse to serve),
+#: and it cannot import this module. Two readers, one predicate, one place the
+#: variable is read.
+from sglang.srt.distributed.utils import (  # noqa: E402
+    PP_GAPPED_KNOWN_WRONG_ENV,
+    pp_gapped_forward_known_wrong_allowed,
+)
 
 
 def _refuse_known_wrong_gapped_forward() -> None:
@@ -506,9 +511,7 @@ def _refuse_known_wrong_gapped_forward() -> None:
     So the gate is a REFUSAL rather than a warning. A warning in a boot log is
     not a control; this configuration must not be reachable by accident.
     """
-    import os
-
-    if os.getenv(PP_GAPPED_KNOWN_WRONG_ENV, "") not in ("", "0", "false", "False"):
+    if pp_gapped_forward_known_wrong_allowed():
         logger.warning(
             "#753: serving a gapped PP layer set with a KNOWN-WRONG forward "
             "because %s is set. Output from this instance is not correct and "
@@ -4961,6 +4964,15 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                else:
+                    # FIX 1r/2: this visit launches NO forward on this
+                    # rank. The gap that is open right now therefore
+                    # contains queue STARVATION, not a pipeline stall,
+                    # and this guard is the only place that knows the
+                    # difference -- the meter sees timestamps only. It
+                    # records no duration; the gap is still measured at
+                    # the next `begin`, this only classifies it.
+                    self._pp_bubble_note_no_batch()
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -5439,6 +5451,15 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                else:
+                    # FIX 1r/2: this visit launches NO forward on this
+                    # rank. The gap that is open right now therefore
+                    # contains queue STARVATION, not a pipeline stall,
+                    # and this guard is the only place that knows the
+                    # difference -- the meter sees timestamps only. It
+                    # records no duration; the gap is still measured at
+                    # the next `begin`, this only classifies it.
+                    self._pp_bubble_note_no_batch()
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -5617,6 +5638,15 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                else:
+                    # FIX 1r/2: this visit launches NO forward on this
+                    # rank. The gap that is open right now therefore
+                    # contains queue STARVATION, not a pipeline stall,
+                    # and this guard is the only place that knows the
+                    # difference -- the meter sees timestamps only. It
+                    # records no duration; the gap is still measured at
+                    # the next `begin`, this only classifies it.
+                    self._pp_bubble_note_no_batch()
 
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -10551,6 +10581,16 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        # THE INTER-FORWARD BUBBLE (pp_bubble.PPBubbleMeter). This is the one
+        # site every PP forward passes through -- all three call sites in the
+        # loop route here -- so it is where "how long did this rank hold no
+        # forward" is answerable at all. The existing `wait` term cannot
+        # answer it: it sums collectives INSIDE a forward window, and on a
+        # tp_size=1 stage there are none (MEASURED 861/861 lines at
+        # `wait 0.0` on boot bsscale, BSSCALE_0907.md P2).
+        _bubble = self._pp_bubble_meter()
+        if _bubble is not None:
+            _bubble.begin(mb_id)
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
@@ -10581,7 +10621,38 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+        if _bubble is not None:
+            _window = _bubble.end()
+            if _window:
+                logger.info("%s", _window)
         return result, event
+
+    def _pp_bubble_meter(self: Scheduler):
+        """The rank's bubble meter, or None when there is no reporter.
+
+        ``getattr`` all the way down and never constructed here: the meter is
+        owned by ``RankPrefillLog`` so the per-batch ``bubble_ms=`` field and
+        the per-window ``PP-BUBBLE`` line read the SAME accumulators, and a
+        scheduler stand-in without a metrics reporter (the PP tests'
+        fixtures) must not grow one.
+        """
+        reporter = getattr(self, "metrics_reporter", None)
+        log = getattr(reporter, "rank_prefill_log", None) if reporter else None
+        return getattr(log, "bubble", None) if log is not None else None
+
+    def _pp_bubble_note_no_batch(self: Scheduler) -> None:
+        """Classify the open gap as queue starvation (FIX 1r/2).
+
+        The share alone cannot separate a pipeline stall from starvation: a
+        rank idle between two forwards contributes its whole idle as bubble
+        either way (MEASURED: 30 s of no work between two 100 ms forwards
+        printed share 99.3 %). The scheduler knows which, at the
+        ``if cur_batch:`` guard, and nowhere else -- so it says so here, and
+        the printed line carries both numerators against the one denominator.
+        """
+        meter = self._pp_bubble_meter()
+        if meter is not None:
+            meter.note_no_batch()
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group
