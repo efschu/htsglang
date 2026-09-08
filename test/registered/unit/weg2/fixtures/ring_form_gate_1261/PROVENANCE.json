@@ -1,0 +1,26 @@
+{
+ "boot_weg2_weg2rg6_7f88b1c75d_0908_070324.P.log": {
+  "source_sha256": "168c99913278721acc1d1c1c1899f556dcfa3d8bda1b9a0dd50d2885c95ff917",
+  "kept": 465,
+  "total": 114524
+ },
+ "boot_weg2_weg2rg6_7f88b1c75d_0908_070324.D.log": {
+  "source_sha256": "2d36f0ad6e149f15b83c52deffe0d67c17e90785a47c64fe622c5c1a26e25c5f",
+  "kept": 600,
+  "total": 401436
+ },
+ "boot_weg2_weg2rg6_7f88b1c75d_0908_070324.front.log": {
+  "source_sha256": "c73bc21a0991e847b724499ee45651b1fd32193119549dfc33c2f68aaeb27bc6",
+  "kept": 146,
+  "total": 1877
+ },
+ "boot_weg2_weg2tr2_d047f8e80b_0908_110126.front.log": {
+  "source_sha256": "a6733b11b6c7d6f5c0e6f61e069305a29c4dcf191e45b4beb8c48ca28acd45e5",
+  "kept": 3,
+  "total": 75
+ },
+ "weg2_measured_record.json": {
+  "source_sha256": "7f36c2f0915bdf9c01f336d22735c4d1b1b18f80ee18945ccc15b57c78b26393",
+  "samples": 2
+ }
+}

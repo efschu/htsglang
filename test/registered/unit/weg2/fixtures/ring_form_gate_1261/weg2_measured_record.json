@@ -1,0 +1,72 @@
+{
+ "samples": [
+  {
+   "group": "P",
+   "at": "2026-09-08T11:54:49Z",
+   "boot_tag": "weg2t2a",
+   "commit": "d7e7df4ed1",
+   "shmem_before_bytes": 5655203840,
+   "shmem_after_bytes": 38717259776,
+   "shmem_delta_gib": 30.791439056396484,
+   "rss_shmem_gib": 36.30790328979492,
+   "weight_tags_gib": 28.833746910095215,
+   "extra_gib": 7.474156379699707,
+   "pids": [
+    4130924,
+    4131232,
+    4131233,
+    4131234,
+    4131235,
+    4131236
+   ],
+   "pids_asked": [
+    4130924,
+    4131232,
+    4131233,
+    4131234,
+    4131235,
+    4131236
+   ],
+   "interleaved": false,
+   "cg_current_bytes": null,
+   "store_used_bytes": null,
+   "arm": null,
+   "run_residual_gib": null,
+   "run_residual_note": "not the run moment (need a cgroup reading, the arm and the store's measured content); NOT derived, and not 0"
+  },
+  {
+   "group": "P",
+   "at": "2026-09-08T12:41:15Z",
+   "boot_tag": "weg2t2b",
+   "commit": "d32e0bb316",
+   "shmem_before_bytes": 4323753984,
+   "shmem_after_bytes": 40349925376,
+   "shmem_delta_gib": 33.55198669433594,
+   "rss_shmem_gib": 37.82841110229492,
+   "weight_tags_gib": 28.833746910095215,
+   "extra_gib": 8.994664192199707,
+   "pids": [
+    128415,
+    128642,
+    128643,
+    128644,
+    128645,
+    128646
+   ],
+   "pids_asked": [
+    128415,
+    128642,
+    128643,
+    128644,
+    128645,
+    128646
+   ],
+   "interleaved": false,
+   "cg_current_bytes": null,
+   "store_used_bytes": null,
+   "arm": null,
+   "run_residual_gib": null,
+   "run_residual_note": "not the run moment (need a cgroup reading, the arm and the store's measured content); NOT derived, and not 0"
+  }
+ ]
+}
