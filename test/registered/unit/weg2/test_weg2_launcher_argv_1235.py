@@ -199,3 +199,98 @@ class TestDecodeStepsProvenance1030(unittest.TestCase):
         self.assertIn("--disable-overlap-schedule", back)
         # the strategy FOLLOWS the overlap choice; it is not a second knob.
         self.assertEqual(_flag_value(back, "--mamba-radix-cache-strategy"), "no_buffer")
+
+
+def _pool_model_and_families():
+    import json as _json
+
+    from sglang.srt.planner import pp_cut as C
+
+    cfg = _json.load(io.open(os.path.join(MODEL, "config.json")))
+    text = cfg.get("text_config") or cfg
+    kinds = text["layer_types"]
+    families = tuple(
+        C.LAYER_FAMILY_ATTENTION if k == "full_attention" else C.LAYER_FAMILY_LINEAR
+        for k in kinds
+    )
+    kv = C.kv_mib_per_token_per_attn_layer_from_config(cfg, "fp8_e4m3", len(kinds))
+    terms = C.checkpoint_weight_terms(MODEL)
+    n_attn = len(terms.attention_layer_indices)
+    mean = (
+        terms.attn_layer_weight_bytes * n_attn
+        + terms.linear_layer_weight_bytes * (terms.n_layers - n_attn)
+    ) / max(1, terms.n_layers) / C.MIB
+    budgets = (28904.0, 17704.0, 17672.0)
+    model = C.PhasePoolModel(
+        free_mib=budgets,
+        weight_mib_per_layer=mean,
+        kv_mib_per_token_per_attn_layer=kv,
+        arming_floor_mib=tuple(1229.0 for _ in budgets),
+        mamba_mib_per_linear_layer_per_slot=0.0,
+        mamba_slots=8,
+    )
+    return families, model
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(MODEL), reason="checkpoint headers not on this box"
+)
+class TestPCutObjective1254(unittest.TestCase):
+    """#1254: group P's cut defaults to the kv-floor, and both cuts are priced."""
+
+    def _solve(self, objective):
+        from sglang.srt.planner.pp_cut_launch import solve_launch_cut
+
+        families, pool = _pool_model_and_families()
+        return solve_launch_cut(
+            layer_families=families,
+            incumbent_layers=[32, 18, 14],
+            measured_ms_per_layer=[8.10, 35.16, 33.59],
+            measured_provenance="test",
+            card_names=[c.name for c in CARDS],
+            pool_model=pool,
+            cap_tokens=262144,
+            objective=objective,
+        )
+
+    def test_default_objective_is_maxkv_at_the_flag_and_in_the_solver(self):
+        ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
+        self.assertEqual(ns.pp_solve_objective, "maxkv")
+        self.assertEqual(self._solve("maxkv").objective, "maxkv")
+
+    def test_maxkv_takes_the_pool_maximal_feasible_cut(self):
+        maxkv = self._solve("maxkv")
+        makespan = self._solve("makespan")
+        self.assertGreater(maxkv.chosen.pool_tokens, makespan.chosen.pool_tokens)
+        self.assertLess(makespan.chosen.total_ms, maxkv.chosen.total_ms)
+        # the two arms name each other, identically, from either side
+        self.assertEqual(maxkv.chosen.layers, makespan.kv_floor.layers)
+        self.assertEqual(makespan.chosen.layers, maxkv.makespan.layers)
+
+    def test_provenance_prints_pool_AND_ms_of_BOTH_objectives_either_way(self):
+        for objective in ("maxkv", "makespan"):
+            line = self._solve(objective).provenance_line()
+            self.assertIn("objective=%s" % objective, line)
+            self.assertIn("BOTH objectives priced:", line)
+            self.assertIn("maxkv cut", line)
+            self.assertIn("makespan cut", line)
+            self.assertEqual(line.count("ms/chunk"), 2)
+            self.assertEqual(line.count("pool"), 3)  # constraint + two rows
+
+    def test_trade_line_does_the_division_in_both_currencies(self):
+        trade = self._solve("maxkv").trade_line()
+        self.assertIn("objective=maxkv", trade)
+        self.assertIn("pool", trade)
+        self.assertIn("time", trade)
+        self.assertIn("--pp-solve-objective", trade)
+
+    def test_the_makespan_row_is_in_the_table_even_when_not_chosen(self):
+        rows = self._solve("maxkv").table_lines()
+        self.assertTrue(any(r.endswith("makespan") for r in rows))
+
+    def test_gapped_is_not_a_default_and_the_753_gate_still_stands(self):
+        # boot weg2gp1 (2026-09-08) probed the gapped layout on metal: 3 of 6
+        # determined answers diverge, and the map loses 45.2 % of the pool.
+        # The verdict is STAYS, so no objective may choose a gapped map here.
+        for objective in ("maxkv", "makespan"):
+            self.assertEqual(self._solve(objective).chosen.kind, "contiguous")

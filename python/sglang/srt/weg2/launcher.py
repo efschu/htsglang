@@ -3837,6 +3837,31 @@ def solve_p_cut(
         for k in kinds
     )
     incumbent = _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else _csv_ints("32,18,14")
+    # THE GAPPED DEFAULT IS NOT TAKEN, AND THE HOOK IS NAMED RATHER THAN LEFT
+    # OPEN (#753 / boot weg2gp1, 2026-09-08, /spinning/gpu-arb/weg2/
+    # BOOT_weg2gp1_0908.md). The user's 0,8,8 layout was probed on metal for
+    # exactly this decision and the verdict is STAYS, twice over:
+    #   * CORRECTNESS. The gate's PREMISE is refuted -- the gapped forward is
+    #     not the '\n\n' garbage its docstring describes, it answers
+    #     byte-identically on the #753 probe verbatim -- but its VERDICT
+    #     survives: 3 of 6 determined-answer probes DIVERGE from the contiguous
+    #     control, in both graph modes, against an A/A floor of 0 divergences.
+    #     A forward that silently changes half the determined answers is the
+    #     'confidently wrong' class the gate names.
+    #   * MOTIVE. The gapped map loses on both axes it was chosen for: world
+    #     pool 391,904 vs the contiguous control's 714,788 (-45.2 %) and
+    #     1097.0 vs 577.9 ms per full chunk on the binding stage (+89.8 %).
+    #     The 1.0M-token aim is CLOSER on the contiguous axis, not further.
+    #   * 0,8,8 itself never reached the forward: stage 0 owns zero attention
+    #     layers, so its KV cell is 0 and the HiCache host-pool constructor
+    #     divides by it -- a third wall, new, and upstream of the gate.
+    # THE HOOK, recorded and deliberately NOT applied (the record spells out
+    # that it is unsupported by this boot): when a forward passes the six-probe
+    # comparison, the predicate to narrow is not `is_gapped` but the composite
+    # `is_gapped AND (flip vector OR speculative decoding)`, warning otherwise.
+    # Until then the default is the CONTIGUOUS kv-floor cut, gapped maps stay
+    # reachable only through --pp-layer-set, and that path still meets the
+    # gate.
 
     # -- THE DEPTH AXIS (#1240) ------------------------------------------
     # The design prefix is a MEASUREMENT of this rig's own traffic when one
@@ -3931,6 +3956,11 @@ def solve_p_cut(
         cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
         pinned_layers=_csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else None,
         pinned_attn=_csv_ints(ns.pp_attn_stage_ratio) if ns.pp_attn_stage_ratio else None,
+        # #1254: the DEFAULT is the kv-floor row. Under the previous makespan
+        # default the solver's own dry run picked 44,10,10 attn 11,2,3 at a
+        # 499,967-token pool -- +33.5 % prefill for -47.7 % pool on metal --
+        # which is a trade nobody selected, taken by a flag nobody passed.
+        objective=ns.pp_solve_objective,
     )
     log(
         f"PP-CUT inputs: layers={n_layers} attn={n_attn} "
@@ -3943,6 +3973,7 @@ def solve_p_cut(
         f"(0.0 = UNFUNDED, pool is an UPPER bound)"
     )
     log(decision.provenance_line())
+    log(decision.trade_line())
     for row in decision.table_lines():
         log(row)
     if decision.chosen.kind == "gapped":
@@ -4178,6 +4209,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="OVERRIDE the solved full-attention split for group P (e.g. "
              "'8,4,4'). Same PINNED provenance. Unset = the attention axis is "
              "resolved for the chosen layer cut by pp_cut.best_attention_split.",
+    )
+    ap.add_argument(
+        "--pp-solve-objective", choices=["maxkv", "makespan"], default="maxkv",
+        help="#1254. WHICH OBJECTIVE group P's layer cut is solved for. "
+             "Default 'maxkv' = the kv-floor row, the pool-maximal cut that "
+             "still clears the one-full-context-prompt floor; that is the "
+             "standing law's default and it is not a preference about this "
+             "rig. 'makespan' takes the smallest compute+crossing total "
+             "instead -- the previous default, under which the solver's own "
+             "dry run chose 44,10,10 attn 11,2,3 at a 499,967-token pool, i.e. "
+             "it paid -47.7 %% of the pool for +33.5 %% of prefill on metal "
+             "without anyone selecting that trade. BOTH cuts are priced on the "
+             "PP-CUT solver: line with their pool AND their ms/chunk whichever "
+             "is chosen, and the PP-CUT trade: line does the division, so a "
+             "large trade is visible as the defect candidate the law calls it. "
+             "GAPPED MAPS ARE NOT AN ARM OF THIS FLAG: see "
+             "--pp-layer-set and the #753 gate.",
     )
     ap.add_argument(
         "--pp-cut-measured-ms-per-layer", default=MEASURED_MS_PER_LAYER,
