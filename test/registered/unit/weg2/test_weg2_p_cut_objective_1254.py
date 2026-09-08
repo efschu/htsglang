@@ -111,26 +111,37 @@ class TestShippedCutObjective(CustomTestCase):
         # pool figure comes back with it.
         self.assertEqual(cand.pool_tokens, INCUMBENT.pool_tokens)
 
-    def test_the_parser_carries_one_objective_flag_defaulting_to_incumbent(self):
+    def test_the_parser_carries_one_objective_flag_defaulting_to_makespan(self):
         # TRAIN 2: the train's --p-cut-objective is GONE and its third arm
         # lives on the argv slice's flag. Two flags for "which cut ships" is
         # the defect this asserts against, so both halves are pinned: the
         # surviving flag's default AND the absence of the other.
         #
-        # The DEFAULT is `incumbent` on a measured exception (boot weg2tr1):
-        # PP2 carries per-stage fixed posts -- lm_head, the MTP/draft head,
-        # the draft pools -- that PhasePoolModel does not price, so it read
-        # 966,544 tokens against a PROFILED 155,164, and the kv-floor row puts
-        # SIXTEEN layers on exactly that stage. Pinned here rather than left to
-        # the help text so the return to `maxkv` after #1259/#1019/#1260 is a
-        # visible edit and not a drift.
+        # THE DEFAULT IS `makespan` SINCE 2026-09-08, BY USER ORDER --
+        # verbatim: "nimm als default ab jetzt makespan". It is the solver's
+        # SPEED cut (42,11,11 / attn 10,3,3 in the perf boots).
+        #
+        # WHAT THAT DEFAULT COSTS, kept here so the trade stays selected rather
+        # than inherited: makespan BUYS TTFT WITH KV -- P pool 587k
+        # solver-priced against the incumbent's 714k measured, for +33.5 %
+        # prefill measured in pp1/pp2 only. #1254 originally took makespan AWAY
+        # from the default for exactly this reason (it was being paid without
+        # anyone selecting it); it returns now because it was selected, and
+        # because all three arms stay priced on the PP-CUT SHIPPED: line of
+        # every boot, so the cost is visible per boot.
+        #
+        # The incumbent's own reason survives on its arm and is unchanged: PP2
+        # carries per-stage fixed posts -- lm_head, the MTP/draft head, the
+        # draft pools -- that PhasePoolModel does not price (966,544 read
+        # against a PROFILED 155,164), which is why `maxkv` putting SIXTEEN
+        # layers there is still wrong.
         dests = {a.dest for a in launcher.build_parser()._actions}
         self.assertNotIn("p_cut_objective", dests)
         act = next(
             a for a in launcher.build_parser()._actions
             if a.dest == "pp_solve_objective"
         )
-        self.assertEqual(act.default, "incumbent")
+        self.assertEqual(act.default, "makespan")
         self.assertEqual(set(act.choices), {"maxkv", "makespan", "incumbent"})
 
     def test_incumbent_is_not_a_solver_objective_and_is_never_passed_as_one(self):
