@@ -15,8 +15,8 @@ THE TWO READINGS THAT ARE WRONG AND LOOK RIGHT:
   ``MergedColumnParallelLinear(output_sizes=[k, k, v, v])``
   (``models/qwen3_5.py:541-553``) whose per-rank sub-block offsets are the
   prefix sum of THIS RANK'S sizes (``layers/linear.py:1088-1101``), not of the
-  full ones. The two agree on rank 0 -- which is why a single-rank check cannot
-  see the defect.
+  full ones. What coincides on rank 0 is the GLOBAL start, not the device row --
+  which is why a single-rank check does not see the defect.
 * **logical shape instead of storage.** ``.t()`` in the int8 quant path is a
   view: the logical shape is ``[K, N_local]`` over storage ``[N_local, K]``. A
   plan built from ``param.shape`` is transposed-wrong for every column-parallel
@@ -202,16 +202,20 @@ class TestDeviceSubBlockLaw(CustomTestCase):
                 )
 
         # THE CAN-FAIL.  The checkpoint reading puts every rank's block b at the
-        # SAME offset, so on ranks 1 and 2 block 1 (`k`) lands where the device
-        # keeps the tail of block 0 (`q`) -- plausible garbage, no error.
+        # SAME offset, so block 1 (`k`) would land where the device keeps the
+        # tail of block 0 (`q`) -- plausible garbage, no error.
         ckpt_rows = [off // HIDDEN for off in CKPT_QKV_OFFSETS]
         self.assertEqual(ckpt_rows, [0, 2048, 4096])
-        for r in (1, 2):
+        for r in range(3):
             with self.subTest(rank=r, reading="checkpoint"):
                 self.assertNotEqual([blk.dev_row for blk in per_rank[r]][:3], ckpt_rows)
-        # ... and it IS equal on rank 0, which is exactly why reading the probe
-        # as device-space evidence survives a single-rank check.
-        self.assertEqual([blk.dev_row for blk in per_rank[0]][:3], ckpt_rows)
+        # CORRECTED BY THIS TEST, 2026-09-08: the two readings do NOT coincide
+        # on rank 0.  The device rows are the prefix of that rank's OWN sizes
+        # ([0, 896, 1792] here), so they differ from the checkpoint's on EVERY
+        # rank beyond block 0.  What coincides on rank 0 is the GLOBAL start --
+        # and that is why reading the probe as device-space evidence survives a
+        # single-rank check.
+        self.assertEqual([blk.global_start for blk in per_rank[0]][:3], ckpt_rows)
 
     def test_global_starts_are_the_checkpoint_prefix_the_device_rows_are_not(self):
         """The two coordinate systems a descriptor has to hold apart."""

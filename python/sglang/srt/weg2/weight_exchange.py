@@ -20,9 +20,10 @@ THE THREE READINGS THAT ARE WRONG AND LOOK RIGHT
    IDENTICAL-SUBBLOCK probe is CHECKPOINT-space; it proves no repack occurs and
    nothing about the device. On the device ``in_proj_qkvz`` is ONE buffer of
    four rank-local sub-blocks whose offsets are the prefix sum of THIS RANK'S
-   sizes (``layers/linear.py:1088-1101``), not of the full ones. The two agree
-   on rank 0 only, so a single-rank check cannot see the defect, and the defect
-   writes ``k`` over ``q`` on ranks 1 and 2 with no error at all.
+   sizes (``layers/linear.py:1088-1101``), not of the full ones. Reading the
+   checkpoint's offsets as device offsets writes ``k`` over ``q`` with no error
+   at all. The two coincide only for block 0; what coincides on rank 0 is the
+   GLOBAL start, which is why a single-rank check does not see the defect.
    ``device_block_offsets`` is that law; ``Block.global_start`` and
    ``Block.dev_row`` are the two coordinate systems held deliberately apart.
 2. **Logical shape instead of storage.** ``.t()`` in the int8 quant path is a
