@@ -100,6 +100,12 @@ def _sched(orphans):
         else []
     )
     s._drain_prefetch_progress = Scheduler._drain_prefetch_progress.__get__(s)
+    # #1268 fix 1b: a real Scheduler always has this; the
+    # stand-in must too, or it tests a shape that cannot exist.
+    s.pp_group = SimpleNamespace(is_last_rank=True)
+    s._weg2_commit_owed_forward = (
+        Scheduler._weg2_commit_owed_forward.__get__(s)
+    )
     s.group_idle_verdict = Scheduler.group_idle_verdict.__get__(s)
     return s, tc
 
