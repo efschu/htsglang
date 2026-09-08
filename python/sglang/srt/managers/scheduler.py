@@ -10452,11 +10452,23 @@ class Scheduler(
         # no longer queued is advanced here too -- check_prefetch_progress
         # terminates it under the configured stop policy (timeout/complete)
         # and inserts what landed for the next matching request, exactly as
-        # for a queued rid. Rank-uniform by the same argument as the drain:
-        # ongoing_prefetch is the participation-voted set and the waiting
-        # queue is replicated, so the orphan set and its order agree on
-        # every rank; a rank without orphans contributes nothing and enters
-        # no collective it would enter alone.
+        # for a queued rid.
+        #
+        # #1272 RETRACTION, measured on boot weg2sb1 (2026-09-08). This comment
+        # used to claim the orphan set was "rank-uniform by the same argument as
+        # the drain: ongoing_prefetch is the participation-voted set and the
+        # waiting queue is replicated, so the orphan set and its order agree on
+        # every rank". THAT IS FALSE, and the log says so at one timestamp: for
+        # rid 43c9af54 PP0 and PP1 both logged `#905 PREFETCH-COMPLETE
+        # free-site` + `HiCache prefetch success` at 14:29:28, and PP2 logged
+        # NEITHER -- so at 14:29:29 the orphan set was {43c9af54} on PP2 and {}
+        # on PP0/PP1. The participation vote makes REGISTRATION uniform; it says
+        # nothing about who later reaches the completion free-site, which is a
+        # rank-local one-shot. So a rank CAN be alone here, and the claim that
+        # it "enters no collective it would enter alone" is unproven -- it holds
+        # today only because the attn groups are world-1 under --tp-size 1
+        # (`attn_reduce_world=1` on those very success lines), which is the
+        # #1028 trap and not a guarantee.
         _ongoing = getattr(self.tree_cache, "ongoing_prefetch", None)
         if _ongoing:
             for _rid in [r for r in list(_ongoing) if r not in verdicts]:
@@ -14759,6 +14771,47 @@ class Scheduler(
         unchanged, so a single-rank engine and every stock path are
         byte-identical.
         """
+        # #1272: COLLECT BEFORE VOTING, and do it HERE because this is the one
+        # point on the quiesce path every rank reaches together.
+        #
+        # The sb1 deadlock, in one sentence: the only collector of an orphaned
+        # storage prefetch is `_drain_prefetch_progress`, which hangs off the
+        # admission path, so at `#queue-req: 0` it is never walked -- and the
+        # orphan is precisely what keeps the queue at 0 from becoming idle.
+        # PP2 polled it 2964 times over 30 s with zero movement, because the
+        # thing it polled (`check_hicache_events`) does not reach the collector.
+        # With #1268 that stops being a death and becomes a W3 refusal LOOP: P
+        # can never sleep until some new admission happens to walk the
+        # collector. The fix is not a new collector -- it is running the
+        # existing one where the group is already in lockstep.
+        #
+        # WHY THIS POINT AND NOT THE IDLE PATH: `_drain_prefetch_progress`
+        # carries a collective (`drain_retired_prefetch` ->
+        # `_all_reduce_attn_groups`), so a rank-local trigger is the #580
+        # failure. `group_idle_verdict` is reached by every rank of the group on
+        # the same broadcast control request -- measured on sb1, where all three
+        # ranks logged their flush verdict inside the same second -- so the
+        # collector's own collective has uniform participation here.
+        #
+        # STATED RESIDUAL RISK, not hidden: the PER-RID `check_prefetch_progress`
+        # calls inside the collector are driven by each rank's OWN orphan set,
+        # and sb1 proves those sets can differ (see the #1272 retraction at the
+        # orphan loop). Those calls carry attn-group collectives which are
+        # world-1 under this form, so they are no-ops today; under a form with
+        # tp_size > 1 this needs a group-agreed per-rid round before it is safe.
+        # That is not introduced here -- the current code already has this
+        # exposure on its admission-path calls -- but it is now written down.
+        if getattr(self, "enable_hicache_storage", False):
+            try:
+                self._drain_prefetch_progress()
+            except Exception as exc:  # noqa: BLE001 - a collection may not kill the vote
+                logger.warning(
+                    "#1272 orphan collection before the idle vote raised %r; "
+                    "the vote proceeds on the uncollected state (which will "
+                    "refuse, not sleep)",
+                    exc,
+                )
+
         my_idle = self.is_fully_idle()
         my_blockers = self.idle_blockers()
         own = ", ".join(my_blockers) or "none"
