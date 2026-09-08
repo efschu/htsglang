@@ -2319,6 +2319,10 @@ def choose_host_ledger(
         # fix 6: only the NON-reclaimable part of that reading is charged --
         # page cache is what the kernel hands back instead of killing for.
         reclaimable_bytes=cg["reclaimable"],
+        # train fix 3: the LIVE slab term the reap watermark's own row lacked.
+        # The store's reap bound subtracts it; passing None here reverts the
+        # bound to the optimistic form and says so on every ARM line.
+        slab_reclaimable_bytes=cg["slab_reclaimable"],
         cg_ceiling_bytes=cg_ceiling,
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
