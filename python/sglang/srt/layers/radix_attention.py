@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.mem_cache import kv_tail_probe
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -220,6 +221,12 @@ class RadixAttention(nn.Module):
                 )
             return output
         else:
+            # #1243 step 1 probe, EXPERIMENT ONLY. ``ACTIVE`` is False on every
+            # normal boot (the env switch is absent), so this is one
+            # module-global bool test and nothing else -- the serving path is
+            # behaviourally unchanged. See mem_cache/kv_tail_probe.py.
+            if kv_tail_probe.ACTIVE:
+                kv_tail_probe.begin_attention(self, forward_batch)
             return get_attn_backend().forward(
                 q,
                 k,

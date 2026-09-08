@@ -54,6 +54,7 @@ from sglang.srt.layers.attention.dsa.quant_k_cache import (
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache import kv_tail_probe
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator, note_924d
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.layout.page_major import (
@@ -4057,6 +4058,13 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        # #1243 step 1 probe, EXPERIMENT ONLY -- the single physical write site
+        # for full-attention K/V, so the one place a "precision tail" can be
+        # emulated storage-side (the read site is inside the FlashInfer kernel).
+        # ``ACTIVE`` is False on every normal boot: one module-global bool test,
+        # serving path behaviourally unchanged. See mem_cache/kv_tail_probe.py.
+        if kv_tail_probe.ACTIVE:
+            kv_tail_probe.after_write(self, layer_id, loc, dcp_kv_mask)
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
