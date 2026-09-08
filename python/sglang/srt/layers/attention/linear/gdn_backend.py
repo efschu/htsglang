@@ -56,6 +56,54 @@ elif is_cpu():
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
+class GdnTargetVerifyRaggedTokens(RuntimeError):
+    """The target-verify token count is not a whole number of draft windows.
+
+    #1233 FIX 4, boot weg2tr1: this branch reshapes the packed ``mixed_qkv``
+    to ``[batch_size, draft_token_num, -1]`` with
+    ``batch_size = seq_len // draft_token_num``. The floor division is only
+    correct while every sequence in the batch carries EXACTLY
+    ``draft_token_num`` candidate tokens; on a token count that is not a
+    multiple it silently drops the remainder and the view then asks for
+    ``batch_size * draft_token_num`` tokens' worth of a tensor that holds
+    ``seq_len``. What reached the log was torch's shape message --
+    ``shape '[2, 3, -1]' is invalid for input of size 81920`` -- which names
+    neither ``seq_len`` (8) nor the remainder (2) nor this backend's
+    uniform-window assumption, so the arithmetic had to be reconstructed from
+    the element count. It is named here instead.
+    """
+
+
+def target_verify_batch_size(seq_len: int, draft_token_num: int) -> int:
+    """``seq_len // draft_token_num``, refusing a non-multiple by name.
+
+    Pure arithmetic on two ints so it is testable without a GPU, a model or a
+    ForwardBatch -- the whole defect is decidable from these two numbers.
+    """
+    if draft_token_num is None or int(draft_token_num) <= 0:
+        raise GdnTargetVerifyRaggedTokens(
+            "GDN target-verify: draft_token_num must be a positive int, got "
+            f"{draft_token_num!r}. A target-verify forward without a candidate "
+            "window has no packed layout to reshape."
+        )
+    seq_len = int(seq_len)
+    draft_token_num = int(draft_token_num)
+    remainder = seq_len % draft_token_num
+    if remainder:
+        raise GdnTargetVerifyRaggedTokens(
+            "GDN target-verify: this backend packs the candidate tokens as "
+            f"[batch_size, draft_token_num, -1] and needs seq_len to be a whole "
+            f"number of draft windows, but seq_len={seq_len} is not a multiple "
+            f"of draft_token_num={draft_token_num} (remainder={remainder}; "
+            f"seq_len // draft_token_num would silently floor to "
+            f"{seq_len // draft_token_num}, i.e. drop {remainder} token(s)). "
+            "Either the batch is RAGGED (per-sequence candidate counts differ, "
+            "which this branch does not implement) or a caller built a "
+            "target-verify forward with a decode-shaped token count."
+        )
+    return seq_len // draft_token_num
+
+
 def maybe_set_default_flashinfer_gdn_prefill(model_runner: ModelRunner) -> None:
     """Use FlashInfer for the narrow SM100 GDN prefill domain we validated."""
     args = model_runner.server_args
@@ -630,8 +678,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache_indices = cache_indices
 
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
+            batch_size = target_verify_batch_size(seq_len, draft_token_num)
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
