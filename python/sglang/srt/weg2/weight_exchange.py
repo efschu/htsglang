@@ -71,6 +71,7 @@ __all__ = [
     "coalesce",
     "derive_waves",
     "device_block_offsets",
+    "emit_plan_line",
     "piece_histogram",
     "plan_id",
     "shard_offsets",
@@ -725,6 +726,21 @@ class XchgPlan:
             f"zerofill_mib={self.zerofill_bytes / (1 << 20):.2f} "
             f"hist={hist} plan_id={self.plan_id}"
         )
+
+
+def emit_plan_line(plan: "XchgPlan", direction: Optional[str] = None, logger=None) -> str:
+    """Log the acceptance line and return it.
+
+    One emitter, so S2 and S6 do not each grow their own format string and drift
+    apart the way the front's docstring drifted from its own constant.
+    """
+    line = plan.log_line(direction)
+    if logger is None:
+        import logging
+
+        logger = logging.getLogger(__name__)
+    logger.info("%s", line)
+    return line
 
 
 def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[Block]]:

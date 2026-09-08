@@ -61,6 +61,7 @@ from sglang.srt.weg2.weight_exchange import (
     coalesce,
     derive_waves,
     device_block_offsets,
+    emit_plan_line,
     piece_histogram,
     shard_offsets,
     unmergeable_below_floor,
@@ -666,7 +667,10 @@ class TestByteMatrixAndLogLine(CustomTestCase):
 
     def test_acceptance_line_is_greppable_and_carries_its_denominators(self):
         plan = self._plan()
-        line = plan.log_line()
+        with self.assertLogs("sglang.srt.weg2.weight_exchange", level="INFO") as cm:
+            line = emit_plan_line(plan)
+        self.assertEqual(cm.output, [f"INFO:sglang.srt.weg2.weight_exchange:{line}"])
+        print("ACCEPTANCE " + line)
         self.assertTrue(line.startswith("WEG2-XCHG-PLAN "))
         for key in ("dir=P2D", "waves=", "descs=", "coalesced=", "min_piece_mib=",
                     "bytes_gib=", "oncard_gib=", "cross_gib=", "zerofill_mib=",
