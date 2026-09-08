@@ -154,13 +154,40 @@ class HostRingStateMachineTest(unittest.TestCase):
         self.assertIn("W33 Weg2RingFormUnproven", r.stderr)
         self.assertIn("cudaHostRegister", r.stderr)
 
-    def test_register_span_is_lazy_and_emits_l2(self):
+    def test_register_span_driven_directly_emits_l2_for_both_spans(self):
+        # This case calls register_span ITSELF.  It fixes the L2 line and the
+        # per-span accounting; it is NOT a test of the lazy path, and its old
+        # name ("is_lazy") claimed a property it never exercised.
         r = self._run("register", self._env(self._fresh_dir()))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("REGISTER spans=2", r.stdout)
         self.assertEqual(r.stderr.count("WEG2-RING-OPEN"), 2)
         self.assertIn("span=1/2", r.stderr)
         self.assertIn("span=2/2", r.stderr)
+
+    def test_acquire_alone_registers_each_span_the_first_time_it_is_reached(self):
+        # FIX 2, and the mutant it was written against: delete
+        # ``ensure_span_for_locked(i);`` from acquire's claim loop and the whole
+        # T1 suite stayed green while cudaHostRegister was never called on any
+        # span -- every D2H/H2D would then run through a pageable bounce buffer
+        # at roughly half link rate, silently.  The ring's entire performance
+        # reason was untested because the only registration case drove
+        # register_span directly.  Nothing here calls it.
+        r = self._run("lazy_register", self._env(self._fresh_dir()))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = re.search(r"LAZY span1_granules=(\d+) before=(\d+) after_span1=(\d+) "
+                      r"after_span2=(\d+) got_a=(\d+) got_b=(\d+)", r.stdout)
+        self.assertIsNotNone(m, r.stdout)
+        span1, before, after1, after2, got_a, got_b = (int(x) for x in m.groups())
+        self.assertEqual(span1, self.granules // 2)
+        self.assertEqual((got_a, got_b), (1, span1))
+        # 0 -> 1 -> 2, through acquire alone.  `before` is the load-bearing
+        # third of it: a ring that registered both spans at attach would read 2
+        # here and buy the M=1200 arm 2.98 GiB it does not have (R7).
+        self.assertEqual(before, 0, "attach must register nothing")
+        self.assertEqual(after1, 1, "the first acquire must page-lock span 1")
+        self.assertEqual(after2, 2, "reaching past span 1 must page-lock span 2")
+        self.assertEqual(r.stderr.count("WEG2-RING-OPEN"), 2)
 
     # ----------------------------------------------------------- accounting --
 

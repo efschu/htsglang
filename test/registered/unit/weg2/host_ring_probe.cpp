@@ -240,12 +240,43 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "register") {
+        // Drives register_span DIRECTLY -- the failure path (W33) and the L2
+        // line.  It says NOTHING about whether anything ever calls it; see
+        // "lazy_register" for that.
         HostBackupRing* r = HostBackupRing::open_from_env(0);
         if (r == nullptr) { printf("NO_RING\n"); return 3; }
         r->register_span(0);
         r->register_span(1);
         HostRingStats s = r->stats();
         printf("REGISTER spans=%u\n", s.spans_registered);
+        return 0;
+    }
+
+    if (cmd == "lazy_register") {
+        // FIX 2: the registration must happen THROUGH acquire, and nothing used
+        // to check that.  Deleting ensure_span_for_locked() from acquire's claim
+        // loop left every span unregistered -- so every D2H/H2D would run
+        // through a pageable bounce buffer at roughly half link rate -- with no
+        // error, no log difference and no failing test.  This case never calls
+        // register_span itself: it acquires bytes that land inside span 1, then
+        // bytes that reach past it, and reports the span count after each.
+        HostBackupRing* r = HostBackupRing::open_from_env(0);
+        if (r == nullptr) { printf("NO_RING\n"); return 3; }
+        HostRingStats s0 = r->stats();
+        std::vector<void*> a = r->acquire(TMS_RING_GRANULE_BYTES,
+                                          TMS_RING_FAMILY_FLIP_BACKUP, "weights_0");
+        HostRingStats s1 = r->stats();
+        // Reach past span 1: claim every granule of span 1 plus one more.  The
+        // claim loop fills from the low end, so this is the first granule of
+        // span 2 and the first time span 2 may be registered.
+        std::vector<void*> b = r->acquire(
+            (size_t)s0.span1_granules * TMS_RING_GRANULE_BYTES,
+            TMS_RING_FAMILY_FLIP_BACKUP, "weights_1");
+        HostRingStats s2 = r->stats();
+        printf("LAZY span1_granules=%u before=%u after_span1=%u after_span2=%u "
+               "got_a=%zu got_b=%zu\n",
+               s0.span1_granules, s0.spans_registered, s1.spans_registered,
+               s2.spans_registered, a.size(), b.size());
         return 0;
     }
 

@@ -613,9 +613,17 @@ def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
 class HostRingPlan:
     """What C18 publishes, and why it may publish nothing.
 
-    ``armed`` False means the ring is NOT in this boot: either no proven
-    registration form (W33) or no measured table (R22).  Both keep the OLD flip
-    form, and both are PRINTED -- the fallback is never silent.
+    ``armed`` False means the ring is NOT in this boot, and there are two very
+    different reasons for it, PRINTED either way -- nothing here is silent:
+
+    * ``table`` is not None -- W33 (no proven registration form), W32 or W34.
+      The measured table exists, so the OLD flip form can be priced and RUNS.
+    * ``table`` is None -- R22, no measured table at all.  Then NOTHING runs:
+      the OLD form's own charge (one image plus one tag in flight) is solved
+      from that same table, so with no table there is no fallback to fall back
+      to and the ledger refuses the launch by name (W20).  FIX 2: this arm used
+      to print "the OLD flip form runs" and then kill the boot two steps later
+      with W20, which told the operator a fallback had run that never did.
     """
 
     form: str = ""
@@ -678,9 +686,25 @@ def _front_leg_form() -> str:
     return front.FLIP_LEG_FORM
 
 
+def _pcie_lock_directional() -> bool:
+    """``weg2_memory_saver.PCIE_LOCK_SEPARATES_DIRECTIONS`` -- read, never restated.
+
+    The rank-local half of the same hazard ``front.FLIP_LEG_FORM`` names at the
+    front: even with the legs GATHERED, a per-card PCIe lock keyed on the card
+    alone and held around a whole tag loop makes the two co-located ranks
+    mutually exclusive, so S blocks in ``acquire`` while holding the lock W would
+    need to issue its funding release.  Reading it here rather than restating it
+    is what stops the gate from opening on the day C9 flips the front's constant
+    while C12/C13 -- a SEPARATE slice -- has not landed.
+    """
+    from sglang.srt.managers import weg2_memory_saver
+
+    return bool(weg2_memory_saver.PCIE_LOCK_SEPARATES_DIRECTIONS)
+
+
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
                       evidence_dir: str, boot_stem: str, dry: bool,
-                      leg_form: str = "") -> HostRingPlan:
+                      leg_form: str = "", pcie_directional: Optional[bool] = None) -> HostRingPlan:
     """C20 + C18: solve the table, print L6, REFUSE by name, then arm the region.
 
     Order is load-bearing: the inequalities are checked and the per-card files
@@ -689,19 +713,32 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
 
     TWO inequalities, because there are two flip forms and only one of them is
     in this tree.  R5's corridor is checked always (W32).  The SERIAL form's
-    ``H(c) >= image_W(c) + max_tag_S(c)`` is checked whenever
-    ``front.FLIP_LEG_FORM`` is not ``"interleave"`` (W34): under the serial
-    order the ring cannot be funded by W's releases, so arming a ring sized to
-    R5 wedges the first flip instead of running it.
+    ``H(c) >= image_W(c) + max_tag_S(c)`` is checked whenever the legs cannot be
+    concurrently in flight on one card (W34), which is TWO facts read from the
+    two modules that own them -- ``front.FLIP_LEG_FORM`` and
+    ``weg2_memory_saver.PCIE_LOCK_SEPARATES_DIRECTIONS`` -- because either one
+    alone serialises them.
+
+    NO TABLE IS NOT A FALLBACK: with ``table`` None this returns an un-armed,
+    unpriceable plan and the ledger refuses the launch (W20).  See
+    :class:`HostRingPlan`.
     """
     leg_form = leg_form or _front_leg_form()
+    directional = _pcie_lock_directional() if pcie_directional is None else pcie_directional
     plan = HostRingPlan(form=form)
     table, reason = ring_table.solve(cards, evidence_dir, boot_stem or None)
     if table is None:
         plan.lines.append(
             "WEG2-HOST-RING R22: no measured per-card byte table -- " + reason +
-            ".  The planner REFUSES to guess H, and the OLD flip form runs "
-            "(TMS_HOST_RING_* unpublished, stock cudaMallocHost)."
+            ".  The planner REFUSES to guess H, and THIS BOOT REFUSES: the OLD "
+            "flip form is not a fallback here, because its own host charge (one "
+            "image plus one tag in flight) is solved from the same table, so the "
+            "ledger has no host weights term and stops the launch by name (W20 "
+            "Weg2HostLedgerRefused, exit 2) before either group starts.  What "
+            "makes a boot priceable again is a predecessor boot in "
+            + (evidence_dir or "the evidence dir") +
+            " that logged WEG2-CHUNK-BYTES / WEG2-FLIP-TAG lines and its own "
+            "NVML -> CUDA ordinal map, or --ring-table-boot naming one."
         )
         for ln in plan.lines:
             log(ln)
@@ -746,14 +783,33 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
          table.refusals(),
          ring_table.Weg2RingCreditRefused),
     ]
-    if leg_form != "interleave":
+    # W34 is keyed to BOTH halves of the hazard, from the two modules that own
+    # them.  FIX 2: keying it to the front's constant ALONE was a gate that
+    # opens at the wrong moment -- the day C9 sets FLIP_LEG_FORM to
+    # "interleave" the check would pass and the ring would arm while the PCIe
+    # lock, keyed on the card with no direction and held around the whole tag
+    # loop of either leg (spec R9), still makes the two co-located ranks
+    # mutually exclusive.  S would block in a bounded acquire WHILE HOLDING that
+    # lock, W's release RPC could make no progress on that card, and the exact
+    # deadlock W34 was invented to prevent would return with no gate in front of
+    # it.  C12/C13 (the direction split) are a SEPARATE slice from C9, so the
+    # two facts must be read separately and BOTH must say yes.
+    if leg_form != "interleave" or not directional:
+        why = (
+            f"front.FLIP_LEG_FORM is {leg_form!r}"
+            if leg_form != "interleave"
+            else "front.FLIP_LEG_FORM is 'interleave' but "
+                 "weg2_memory_saver.PCIE_LOCK_SEPARATES_DIRECTIONS is False, so the "
+                 "per-card PCIe lock still serialises the two legs on one card (R9)"
+        )
         checks.append(
             ("W34 Weg2RingNeedsInterleave",
-             f"front.FLIP_LEG_FORM is {leg_form!r}, so the serial requirement "
-             "H(c) >= image_W(c) + max_tag_S(c) applies and it fails on {n} "
-             "(card x direction) case(s); S would block in acquire, W's release "
-             "would never be issued because its RPC has not been sent, and the "
-             "acquire budget would expire into W31 -> group-fatal W4",
+             why + ", so the legs cannot be concurrently in flight on one card and "
+             "the serial requirement H(c) >= image_W(c) + max_tag_S(c) applies; it "
+             "fails on {n} (card x direction) case(s); S would block in acquire "
+             "holding the per-card lock, W's release would never be issued because "
+             "its RPC has not been sent, and the acquire budget would expire into "
+             "W31 -> group-fatal W4",
              table.serial_refusals(),
              ring_table.Weg2RingNeedsInterleave))
     for name, why, bad, exc in checks:
@@ -797,6 +853,7 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     plan.armed = True
     plan.lines.append(
         f"WEG2-HOST-RING ARMED form={plan.form} leg_form={leg_form} "
+        f"pcie_lock_directional={directional} "
         f"epoch={plan.epoch} dir={plan.dir} "
         f"Sigma H={table.total_h_bytes // ring_table.MIB} MiB "
         f"Sigma span1={table.total_span1_bytes // ring_table.MIB} MiB granule=2 MiB "
@@ -1351,15 +1408,29 @@ def teardown(path: str) -> int:
     return 0
 
 
-if __name__ == "__main__":
+#: Every refusal class that must leave this launcher as the ONE named line and
+#: exit 2, never as a traceback.  ``Weg2RingRefused`` is a BASE class on purpose
+#: (FIX 2): the previous list enumerated its members, ``Weg2RingNeedsInterleave``
+#: was not among them, and an explicitly requested ``--ring-form MAP_SHARED`` on
+#: this rig therefore exited 1 with a stack trace -- which any wrapper keying on
+#: the exit code reads as a crash rather than as the refusal it is.  A refusal
+#: added to ring_table now inherits this handler instead of needing a line here.
+REFUSALS = (Weg2LaunchRefused, ring_table.Weg2RingRefused, host_ledger.Weg2HostLedgerRefused)
+
+
+def cli(argv: Optional[Sequence[str]] = None) -> int:
+    """``main`` plus the one refusal handler.  Returns the exit code.
+
+    A function rather than a bare ``__main__`` block so the handler is
+    REACHABLE FROM A TEST: the defect it fixes was an except list that had gone
+    out of step with the exceptions raised, and nothing could see it.
+    """
     try:
-        raise SystemExit(main())
-    except Weg2LaunchRefused as e:
+        return main(argv)
+    except REFUSALS as e:
         print(f"[{_now()}] WEG2-LAUNCH REFUSED: {e}", flush=True)
-        raise SystemExit(2)
-    except ring_table.Weg2RingCreditRefused as e:
-        print(f"[{_now()}] WEG2-LAUNCH REFUSED: {e}", flush=True)
-        raise SystemExit(2)
-    except host_ledger.Weg2HostLedgerRefused as e:
-        print(f"[{_now()}] WEG2-LAUNCH REFUSED: {e}", flush=True)
-        raise SystemExit(2)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

@@ -45,9 +45,27 @@ CARDS = [
     FakeCard(2, "GPU-cccc", "NVIDIA GeForce RTX 3080"),
 ]
 
+#: FIX 2: the evidence-backed cases must name the cards the SOURCE BOOT names.
+#: The table is keyed by UUID end to end now, so a fake uuid against a real log
+#: no longer "works by position" -- it is refused, which is the point.
+REAL_5090 = "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
+REAL_3080_A = "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7"   # nvml 0 on that boot
+REAL_3080_B = "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"   # nvml 2 on that boot
+REAL_CARDS = [
+    FakeCard(1, REAL_5090, "NVIDIA GeForce RTX 5090", 32607),
+    FakeCard(0, REAL_3080_A, "NVIDIA GeForce RTX 3080"),
+    FakeCard(2, REAL_3080_B, "NVIDIA GeForce RTX 3080"),
+]
 
-def _group_log(prefix: str, passes, kv_gb, bulk=None) -> str:
-    """``passes`` = list of {rank: [(tag, mib), ...]}; ``bulk`` = {rank: mib}."""
+
+def _group_log(prefix: str, passes, kv_gb, bulk=None, rss=None) -> str:
+    """``passes`` = list of {rank: [(tag, mib), ...]}; ``bulk`` = {rank: mib}.
+
+    ``rss`` = {rank: (lowest, highest)} drives the RESIDENT-IMAGE instrument
+    independently of the deltas, so a case can make the two instruments
+    disagree on purpose.  Default (0, 0) = "this boot logged no absolute".
+    """
+    rss = rss or {}
     out = []
     for rank, gb in kv_gb.items():
         out.append(
@@ -60,7 +78,8 @@ def _group_log(prefix: str, passes, kv_gb, bulk=None) -> str:
                 out.append(
                     f"[2026-09-07 21:10:23 {prefix}{rank}] WEG2-CHUNK-BYTES sleep "
                     f"tags=['{tag}'] host_image_delta={mib} MiB "
-                    "(RssShmem 0 -> 0 MiB, /proc/self/status)"
+                    f"(RssShmem {rss.get(rank, (0, 0))[0]} -> "
+                    f"{rss.get(rank, (0, 0))[1]} MiB, /proc/self/status)"
                 )
     if bulk:
         # AFTER the per-tag passes, and carrying tags that did NOT appear in
@@ -71,13 +90,26 @@ def _group_log(prefix: str, passes, kv_gb, bulk=None) -> str:
             out.append(
                 f"[2026-09-07 21:11:00 {prefix}{rank}] WEG2-CHUNK-BYTES sleep "
                 f"tags=['weights_8', 'weights_9'] host_image_delta={mib} MiB "
-                "(RssShmem 0 -> 0 MiB, /proc/self/status)"
+                f"(RssShmem {rss.get(rank, (0, 0))[0]} -> "
+                f"{rss.get(rank, (0, 0))[1]} MiB, /proc/self/status)"
             )
     return "\n".join(out) + "\n"
 
 
-def _front_log(free_by_phase) -> str:
+def _front_log(free_by_phase, cards=None, identity=True) -> str:
     out = []
+    if identity:
+        # Every real launcher prints this; a fixture without it is a boot whose
+        # card identity was never recorded, which is a REFUSAL (see
+        # test_a_source_boot_without_an_identity_line_is_refused_by_name).
+        out.append(
+            "[2026-09-07T21:05:00Z] WEG2-LAUNCH NVML -> CUDA ordinal map: "
+            + ", ".join(
+                f"ordinal {i} = nvml {c.nvml_index} {c.name} {c.uuid} "
+                f"total {c.total_mib} MiB"
+                for i, c in enumerate(cards or CARDS)
+            )
+        )
     for phase, samples in free_by_phase.items():
         for row in samples:
             free = " ".join(f"nvml{i}:free={v}MiB" for i, v in row.items())
@@ -95,13 +127,14 @@ class RingTableSolverTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="weg2ringtable-")
         self.stem = "boot_weg2_t2_0000000000_0907_000000"
 
-    def _write(self, p_passes, d_passes, p_kv, d_kv, corridor, p_bulk=None, d_bulk=None):
+    def _write(self, p_passes, d_passes, p_kv, d_kv, corridor, p_bulk=None,
+               d_bulk=None, identity=True, p_rss=None, d_rss=None):
         with open(os.path.join(self.dir, f"{self.stem}.P.log"), "w") as f:
-            f.write(_group_log("PP", p_passes, p_kv, p_bulk))
+            f.write(_group_log("PP", p_passes, p_kv, p_bulk, p_rss))
         with open(os.path.join(self.dir, f"{self.stem}.D.log"), "w") as f:
-            f.write(_group_log("TP", d_passes, d_kv, d_bulk))
+            f.write(_group_log("TP", d_passes, d_kv, d_bulk, d_rss))
         with open(os.path.join(self.dir, f"{self.stem}.front.log"), "w") as f:
-            f.write(_front_log(corridor))
+            f.write(_front_log(corridor, identity=identity))
 
     def _solve(self, cards=None):
         # ONE card: these cases fix the arithmetic, and a rank that logged
@@ -391,30 +424,43 @@ class RealBootProvenanceTest(unittest.TestCase):
     """The provenance claim itself: spec section 2's table IS boot weg2zr2's lines."""
 
     def test_weg2zr2_yields_the_spec_section_2_images_and_max_tags(self):
-        table, reason = ring_table.solve(CARDS, EVIDENCE, ZR2)
+        table, reason = ring_table.solve(REAL_CARDS, EVIDENCE, ZR2)
         self.assertIsNotNone(table, reason)
         got = {c.uuid: (c.image_d_mib, c.image_p_mib, c.h_mib) for c in table.cards}
-        self.assertEqual(got["GPU-aaaa"], (13914, 13860, 13914))
-        self.assertEqual(got["GPU-bbbb"], (9680, 7548, 9680))
-        self.assertEqual(got["GPU-cccc"], (9370, 8504, 9370))
-        self.assertEqual(table.total_h_bytes // MIB, 32964)
+        # FIX 2: image is now max(weight-tag census, measured resident image).
+        # On this boot the two agree exactly on P and the resident instrument
+        # reads 20 MiB MORE on every D rank -- a backed-up tag the weights
+        # family does not name.  The census numbers are still asserted below.
+        self.assertEqual(got[REAL_5090], (13934, 13860, 13934))
+        self.assertEqual(got[REAL_3080_A], (9700, 7548, 9700))
+        self.assertEqual(got[REAL_3080_B], (9390, 8504, 9390))
+        census = {c.uuid: (c.tags_d_mib, c.tags_p_mib) for c in table.cards}
+        self.assertEqual(census[REAL_5090], (13914, 13860))
+        self.assertEqual(census[REAL_3080_A], (9680, 7548))
+        self.assertEqual(census[REAL_3080_B], (9370, 8504))
+        self.assertEqual(table.total_h_bytes // MIB, 33024)
         self.assertEqual(table.total_span1_bytes // MIB, 29912)
+        self.assertEqual(table.total_tags_mib, 32964)
+        self.assertEqual(table.total_dormant_mib, 33024)
+        # Both instruments in the provenance line, neither quotable alone.
+        self.assertIn("weight-tag census 32964 MiB", table.provenance())
+        self.assertIn("measured resident image 33024 MiB", table.provenance())
         # FIX 1: max_tag is the step of the front's per-tag interleave, so the
         # unchunked family tag 'weights' -- the launcher's own bulk sleep, which
         # names the family that 'weights_<k>' partitions -- no longer feeds it.
         # D's step on the 5090 is weights_0 at 1 608 MiB, which is the figure the
         # D log carries; 2 856 was the bulk record read as a step.
         max_tags = {c.uuid: (c.max_tag_d_mib, c.max_tag_p_mib) for c in table.cards}
-        self.assertEqual(max_tags["GPU-aaaa"], (1608, 2988))
-        self.assertEqual(max_tags["GPU-bbbb"], (1010, 2986))
-        self.assertEqual(max_tags["GPU-cccc"], (982, 2916))
+        self.assertEqual(max_tags[REAL_5090], (1608, 2988))
+        self.assertEqual(max_tags[REAL_3080_A], (1010, 2986))
+        self.assertEqual(max_tags[REAL_3080_B], (982, 2916))
 
     def test_the_launch_check_passes_on_that_boots_own_credit(self):
         # The credit here is the MINIMUM corridor sample, which is tighter than
         # the single sample spec section 2 quoted -- so the needs are larger and
         # the slacks smaller.  All six must still pass; if they did not, the
         # honest answer would be W32, not a looser instrument.
-        table, _ = ring_table.solve(CARDS, EVIDENCE, ZR2)
+        table, _ = ring_table.solve(REAL_CARDS, EVIDENCE, ZR2)
         self.assertEqual(table.refusals(), [], "\n".join(table.refusals()))
         for c in table.cards:
             self.assertGreater(c.slack_d2p_mib, 0, c.uuid)
@@ -550,14 +596,15 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
         self.assertEqual(launcher._front_leg_form(), "serial",
                          "the launcher must READ the front's constant, not restate it")
 
-    def _prepare(self, launcher, lines, form, leg_form=""):
-        table = _zr2_table()
+    def _prepare(self, launcher, lines, form, leg_form="", directional=None,
+                 table=None):
+        table = _zr2_table() if table is None else table
         real = ring_table.solve
         ring_table.solve = lambda *a, **k: (table, "stubbed")
         try:
             return launcher.prepare_host_ring(
                 [], lines.append, "t2", form, "/nonexistent", "", True,
-                leg_form=leg_form)
+                leg_form=leg_form, pcie_directional=directional)
         finally:
             ring_table.solve = real
 
@@ -587,10 +634,41 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
         from sglang.srt.weg2 import launcher
 
         lines = []
-        plan = self._prepare(launcher, lines, form="auto", leg_form="interleave")
+        plan = self._prepare(launcher, lines, form="auto", leg_form="interleave",
+                             directional=True)
         self.assertTrue(plan.armed, "\n".join(lines))
         self.assertEqual(plan.form, "MAP_SHARED")
         self.assertIn("leg_form=interleave", "\n".join(lines))
+        self.assertIn("pcie_lock_directional=True", "\n".join(lines))
+
+    # -- FIX 2: the gate is keyed to BOTH halves of the hazard ---------------
+
+    def test_the_gate_reads_the_lock_fact_from_the_module_that_owns_it(self):
+        from sglang.srt.managers import weg2_memory_saver
+        from sglang.srt.weg2 import launcher
+
+        # The direction split is C12/C13, a LATER slice: today the per-card
+        # PCIe lock is keyed on the uuid alone and held around a whole leg.
+        self.assertFalse(weg2_memory_saver.PCIE_LOCK_SEPARATES_DIRECTIONS)
+        self.assertFalse(launcher._pcie_lock_directional(),
+                         "the launcher must READ the saver's constant, not restate it")
+
+    def test_a_gathered_front_alone_does_not_open_the_gate(self):
+        # The moment C9 flips front.FLIP_LEG_FORM to 'interleave' this is the
+        # ONLY thing standing between the ring and the deadlock W34 exists to
+        # prevent: S blocks in a bounded acquire while holding the per-card lock,
+        # W's release RPC cannot run on that card, and the budget expires into
+        # W31 -> group-fatal W4.
+        from sglang.srt.weg2 import launcher
+
+        lines = []
+        plan = self._prepare(launcher, lines, form="auto", leg_form="interleave",
+                             directional=False)
+        self.assertFalse(plan.armed, "\n".join(lines))
+        joined = "\n".join(lines)
+        self.assertIn("W34 Weg2RingNeedsInterleave", joined)
+        self.assertIn("PCIE_LOCK_SEPARATES_DIRECTIONS is False", joined)
+        self.assertNotIn("WEG2-HOST-RING ARMED", joined)
 
     def test_l6_prints_the_serial_row_beside_the_r5_row(self):
         line = _zr2_table().format_l6()[0]
@@ -670,7 +748,8 @@ class OldFormPriceTest(unittest.TestCase):
                 for tag, mib in records:
                     f.write(f"[2026-09-07 21:10:23 TP{rank}] WEG2-CHUNK-BYTES sleep "
                             f"tags=['{tag}'] host_image_delta={mib} MiB\n")
-        _, max_tag, _, _, _, steps = ring_table.parse_group_log(path)
+        g = ring_table.parse_group_log(path)
+        max_tag, steps = g.max_tag, g.tag_totals
         self.assertEqual(max_tag[0], 1200,
                          "'weights' names the family that 'weights_<k>' partitions, "
                          "so its delta is a whole pass and not a corridor step")
@@ -685,7 +764,7 @@ class OldFormPriceTest(unittest.TestCase):
     def test_the_default_path_still_selects_an_arm_at_the_record_box(self):
         from sglang.srt.weg2 import launcher
 
-        table, reason = ring_table.solve(CARDS, EVIDENCE, ZR2)
+        table, reason = ring_table.solve(REAL_CARDS, EVIDENCE, ZR2)
         self.assertIsNotNone(table, reason)
         old = launcher.HostRingPlan(form="", armed=False, table=table)
         arm, store, _ = host_ledger.choose(
@@ -752,3 +831,203 @@ class MemfdArmIsDeletedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class NoMeasuredTableRefusesTheBootTest(unittest.TestCase):
+    """FIX 2 finding 1: the R22 arm may not promise a fallback it cannot run.
+
+    RED before the fix: the printed line said "the OLD flip form runs" while
+    ``host_weights_bytes`` returned 0 and the ledger killed the boot two steps
+    later with W20 -- the operator was told a fallback had run that never did.
+    """
+
+    def _plan(self, lines):
+        from sglang.srt.weg2 import launcher
+
+        real = ring_table.solve
+        ring_table.solve = lambda *a, **k: (None, "no boot in /x carries all three logs")
+        try:
+            return launcher.prepare_host_ring(
+                [], lines.append, "t2", "auto", "/x", "", True, leg_form="serial")
+        finally:
+            ring_table.solve = real
+
+    def test_the_r22_line_says_the_boot_refuses_and_names_what_follows(self):
+        lines = []
+        plan = self._plan(lines)
+        joined = "\n".join(lines)
+        self.assertIsNone(plan.table)
+        self.assertFalse(plan.armed)
+        self.assertIn("WEG2-HOST-RING R22", joined)
+        self.assertIn("THIS BOOT REFUSES", joined)
+        self.assertIn("W20 Weg2HostLedgerRefused", joined)
+        self.assertNotIn("the OLD flip form runs", joined,
+                         "the OLD form is priced from the SAME table; with no "
+                         "table it cannot run either")
+
+    def test_the_line_and_the_refusal_that_follows_it_agree(self):
+        lines = []
+        plan = self._plan(lines)
+        # What the line promises IS what happens: no host weights term, and the
+        # ledger stops the launch by name rather than pricing a guess.
+        self.assertEqual(plan.host_weights_bytes, 0)
+        self.assertEqual(plan.host_weights_span1_bytes, 0)
+        with self.assertRaises(host_ledger.Weg2HostLedgerRefused) as cm:
+            host_ledger.choose(int(118 * GIB), int(104 * GIB), store_min_gib=8.0,
+                               ring_bytes=plan.host_weights_bytes,
+                               ring_span1_bytes=plan.host_weights_span1_bytes,
+                               ring_provenance=plan.provenance)
+        msg = str(cm.exception)
+        self.assertIn("THIS BOOT REFUSES", msg)
+        self.assertNotIn("and the OLD flip form is what would run.", msg)
+
+
+class RefusalsPropagateAsRefusalsTest(unittest.TestCase):
+    """FIX 2 finding 2: a named refusal may not leave the launcher as a traceback."""
+
+    def test_every_ring_refusal_shares_one_base_class(self):
+        for exc in (ring_table.Weg2RingCreditRefused, ring_table.Weg2RingNeedsInterleave):
+            self.assertTrue(issubclass(exc, ring_table.Weg2RingRefused), exc)
+
+    def test_each_named_refusal_becomes_the_one_line_and_exit_2(self):
+        import io
+        from contextlib import redirect_stdout
+
+        from sglang.srt.weg2 import launcher
+
+        cases = [
+            launcher.Weg2LaunchRefused("W1 test"),
+            ring_table.Weg2RingCreditRefused("W32 test"),
+            # RED before the fix: this one was not in the except list, so it
+            # left as a traceback with exit 1 -- read as a crash by anything
+            # keying on the code.
+            ring_table.Weg2RingNeedsInterleave("W34 test"),
+            host_ledger.Weg2HostLedgerRefused("W20 test"),
+        ]
+        real = launcher.main
+        try:
+            for exc in cases:
+                def boom(argv=None, _e=exc):
+                    raise _e
+
+                launcher.main = boom
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = launcher.cli([])
+                self.assertEqual(rc, 2, type(exc).__name__)
+                self.assertIn("WEG2-LAUNCH REFUSED", buf.getvalue())
+                self.assertIn(str(exc), buf.getvalue())
+        finally:
+            launcher.main = real
+
+
+class CardIdentityIsByUuidTest(unittest.TestCase):
+    """FIX 2 finding 4: rank/nvml positions never name a card across boots."""
+
+    def setUp(self):
+        import tempfile
+
+        self.dir = tempfile.mkdtemp(prefix="weg2ringident-")
+        self.stem = "boot_weg2_t2_0000000000_0907_000000"
+
+    def _write(self, identity=True, flip_tag=False):
+        one = [{0: [("weights_0", 10)]}]
+        for prefix, name in (("PP", "P"), ("TP", "D")):
+            text = _group_log(prefix, one, {0: 1.0})
+            if flip_tag:
+                text += (
+                    f"[2026-09-07 21:10:24 {prefix}0] WEG2-FLIP-TAG group={name} "
+                    f"rank=0 card={CARDS[0].uuid} dir=d2h tag=weights_0 bytes=42 MiB\n"
+                )
+            with open(os.path.join(self.dir, f"{self.stem}.{name}.log"), "w") as f:
+                f.write(text)
+        with open(os.path.join(self.dir, f"{self.stem}.front.log"), "w") as f:
+            f.write(_front_log({"P": [{1: 100}], "D": [{1: 100}]}, identity=identity))
+
+    def test_a_source_boot_without_an_identity_line_is_refused_by_name(self):
+        self._write(identity=False)
+        table, reason = ring_table.solve([CARDS[0]], self.dir, self.stem)
+        self.assertIsNone(table, "positional identity is never assumed")
+        self.assertIn("NVML -> CUDA ordinal map", reason)
+        self.assertIn("never assumes card identity", reason)
+
+    def test_the_flip_tag_line_names_its_own_card(self):
+        self._write(flip_tag=True)
+        table, reason = ring_table.solve([CARDS[0]], self.dir, self.stem)
+        self.assertIsNotNone(table, reason)
+        self.assertEqual(table.cards[0].uuid, CARDS[0].uuid)
+        self.assertIn("WEG2-FLIP-TAG", table.instrument)
+
+    @unittest.skipUnless(os.path.isfile(os.path.join(EVIDENCE, f"{ZR2}.front.log")),
+                         f"{EVIDENCE}/{ZR2} not present")
+    def test_a_re_enumeration_between_two_boots_does_not_swap_two_rows(self):
+        # The rig rules state NVML enumeration can shift between boots.  Same
+        # cards, this boot's indices permuted: every row must follow its UUID.
+        # RED before the fix: the two 3080 rows swapped, H moved by 2.8 GiB, and
+        # the L6 line printed a uuid beside the other card's numbers.
+        straight, _ = ring_table.solve(REAL_CARDS, EVIDENCE, ZR2)
+        # BOTH positional keys moved: the list ORDER (which fed rank -> card)
+        # and the nvml indices (which fed the corridor lookup).
+        shuffled = [
+            FakeCard(0, REAL_3080_B, "NVIDIA GeForce RTX 3080"),
+            FakeCard(2, REAL_5090, "NVIDIA GeForce RTX 5090", 32607),
+            FakeCard(1, REAL_3080_A, "NVIDIA GeForce RTX 3080"),
+        ]
+        moved, _ = ring_table.solve(shuffled, EVIDENCE, ZR2)
+
+        def rows(t):
+            return {c.uuid: (c.image_p_mib, c.image_d_mib, c.max_tag_p_mib,
+                             c.max_tag_d_mib, c.credit_d2p_mib, c.credit_p2d_mib)
+                    for c in t.cards}
+
+        self.assertEqual(rows(straight), rows(moved),
+                         "a row followed a position instead of its card")
+        self.assertEqual(straight.total_h_bytes, moved.total_h_bytes)
+
+
+class ResidentImageInstrumentTest(unittest.TestCase):
+    """FIX 2 finding 5: the census is a lower bound, and the absolute is not the answer."""
+
+    def setUp(self):
+        import tempfile
+
+        self.dir = tempfile.mkdtemp(prefix="weg2ringresident-")
+        self.stem = "boot_weg2_t2_0000000000_0907_000000"
+
+    def _solve(self, p_rss, d_rss):
+        one = [{0: [("weights_0", 300)]}]
+        with open(os.path.join(self.dir, f"{self.stem}.P.log"), "w") as f:
+            f.write(_group_log("PP", one, {0: 1.0}, None, p_rss))
+        with open(os.path.join(self.dir, f"{self.stem}.D.log"), "w") as f:
+            f.write(_group_log("TP", one, {0: 1.0}, None, d_rss))
+        with open(os.path.join(self.dir, f"{self.stem}.front.log"), "w") as f:
+            f.write(_front_log({"P": [{1: 100}], "D": [{1: 100}]}))
+        table, reason = ring_table.solve([CARDS[0]], self.dir, self.stem)
+        self.assertIsNotNone(table, reason)
+        return table.cards[0]
+
+    def test_the_resident_image_wins_when_it_exceeds_the_weight_tag_census(self):
+        # The census sums the tags the sleep loop NAMES; the resident image
+        # holds every backed-up tag.  Record 1p STEP-0 ADDENDUM: size H from the
+        # measured image, never from the weight tags alone.
+        c = self._solve({0: (4000, 5000)}, {0: (4000, 4400)})
+        self.assertEqual(c.tags_p_mib, 300)
+        self.assertEqual(c.dormant_p_mib, 1000)
+        self.assertEqual(c.image_p_mib, 1000, "the larger instrument is charged")
+        self.assertEqual(c.image_d_mib, 400)
+        self.assertEqual(c.h_mib, 1000)
+
+    def test_the_absolute_is_not_charged_because_the_baseline_is_posted_elsewhere(self):
+        # The absolute RssShmem of a sleeping rank also contains that group's
+        # HiCache ring and mamba anchors, which host_ledger posts by name
+        # (rings_gib / anchors_gib).  Charging the absolute here would post the
+        # same bytes twice.  MEASURED on boot weg2dk6 group P: absolute peak
+        # 15 831 MiB, baseline 1 971, delta 13 860 = the census exactly.
+        c = self._solve({0: (4000, 5000)}, {0: (4000, 4400)})
+        self.assertNotEqual(c.image_p_mib, 5000)
+        self.assertEqual(c.image_p_mib, 5000 - 4000)
+
+    def test_a_boot_that_logged_no_absolute_still_solves_from_the_census(self):
+        c = self._solve(None, None)
+        self.assertEqual(c.dormant_p_mib, 0)
+        self.assertEqual(c.image_p_mib, 300, "an absent instrument is not a zero image")

@@ -185,7 +185,11 @@ def price(
             "(ring_table.solve), and there is no third option.  A boot whose "
             "predecessor logged no WEG2-CHUNK-BYTES / WEG2-FLIP-TAG lines cannot be "
             "priced -- the planner REFUSES to guess (R22) rather than inventing a "
-            "number, and the OLD flip form is what would run."
+            "number, and THIS BOOT REFUSES.  (FIX 2: this sentence used to name the "
+            "OLD serial form as the thing that would still run, which was false -- "
+            "that form is priced from the SAME table, one image plus one tag in "
+            "flight, so with no table there is nothing left to fall back to and the "
+            "launch stops here by name.)"
         )
     if ring_span1_bytes > ring_bytes:
         raise ValueError(

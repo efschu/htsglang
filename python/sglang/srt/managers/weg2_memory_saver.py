@@ -55,6 +55,23 @@ DEFAULT_PCIE_LOCK_DIR = "/dev/shm"
 #: has to guess which one a path refers to.
 PCIE_LOCK_PREFIX = "weg2-pcie-serialize"
 
+#: Does the lock KEY separate the two directions?  Published here because this
+#: module owns the key, and read by the launcher's W34 gate -- the launch check
+#: that decides whether a BLOCKING host ring may arm needs both halves of the
+#: same hazard, and this is the rank-local half.
+#:
+#: False, and spec R9 says exactly why it is false today: the key is the card
+#: UUID alone and the lock is held around the WHOLE tag loop of either leg
+#: (weight_updater.py sleep-D2H / wake-H2D), so the two co-located ranks on one
+#: card mutually exclude each other completely.  Under that key a blocking
+#: acquire by the sleeping rank cannot be funded by the waking rank's release on
+#: the same card -- the release RPC can make no progress while the acquire holds
+#: the lock -- and the acquire budget expires into W31 -> group-fatal W4.  The
+#: direction split that flips this to True is spec C12/C13, the NEXT slice; the
+#: constant exists so the gate reads the fact from its owner instead of
+#: inferring it from ``front.FLIP_LEG_FORM``, which is only the OTHER half.
+PCIE_LOCK_SEPARATES_DIRECTIONS = False
+
 #: A sleep-D2H or wake-H2D of a 27 GiB shard runs ~2.1 s measured (campaign (a),
 #: 2026-09-06, n=9).  The default deadline allows a full transfer of the sibling
 #: plus slack; the caller may shorten it.
