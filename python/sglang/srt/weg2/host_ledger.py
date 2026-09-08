@@ -112,6 +112,12 @@ LOAD_TRANSIENT_GIB = 12.0
 #: b0: 10.19 GB MEASURED for six (rank x phase) anchor pools at m_mib=2400
 #: (2.55/1.49/1.06 + 2.55/1.27/1.27 GB).  Scaled linearly with M.
 ANCHORS_AT_2400_BYTES = 10.19 * GB
+#: The SAME measurement, split the way it was measured: three (rank x phase)
+#: pools per group.  Kept beside the total so the two can never say different
+#: things -- ``non_backup_host_bytes`` needs the per-group half and
+#: :func:`price` needs the sum, and a second hand-typed total is how they drift.
+ANCHORS_P_AT_2400_BYTES = (2.55 + 1.49 + 1.06) * GB
+ANCHORS_D_AT_2400_BYTES = (2.55 + 1.27 + 1.27) * GB
 ANCHORS_REFERENCE_M_MIB = 2400
 #: b0: "8xS ring = 16.00 GB at S=2" = PP pool 2.00/1.00/1.00 GB (2xS) plus
 #: TP pool 4.00 GB x3 (6xS).  Per-process pools (record 1e): group P owns the
@@ -154,6 +160,38 @@ def read_meminfo(path: str = "/proc/meminfo") -> Dict[str, int]:
     for key, val in re.findall(r"^(\w+):\s+(\d+) kB", text, re.M):
         out[key] = int(val) * 1024
     return out
+
+
+def non_backup_host_bytes(group: str, s_gb: int, m_mib: int) -> int:
+    """The host bytes ONE group holds that are NOT the flip backup image.
+
+    FIX 1 (round 1) finding 3.  A sleeping group's RssShmem is its whole
+    shared-memory residency: the TMS backup image the ring must hold PLUS the
+    mamba anchor pools PLUS that group's half of the HiCache rings.  The last
+    two are posted by name in :func:`price` (``anchors_gib``, ``rings_gib``) and
+    charged against the same host budget, so a ring sized to an un-netted
+    RssShmem charges them twice -- Sigma H walks from ~32 to ~42 GiB and the
+    ledger W20-refuses at every rung, which is exactly A1-3's state for the old
+    form.  This is not a second bookkeeping: it reads the SAME constants
+    :func:`price` reads, and the split between the groups is the one those
+    constants were measured as.
+
+    * anchors: b0 measured six (rank x phase) pools at M=2400 as
+      ``2.55/1.49/1.06 + 2.55/1.27/1.27 GB`` -- three per group, so a group
+      holds its own triple, scaled linearly with M like :func:`price` does.
+    * rings: record 1e, "group P owns the 2xS half, group D the 6xS half".
+
+    ``group`` is ``"P"`` or ``"D"``; anything else raises rather than guessing.
+    """
+    if group not in ("P", "D"):
+        raise ValueError(f"group must be 'P' or 'D', not {group!r}")
+    scale = m_mib / ANCHORS_REFERENCE_M_MIB
+    anchors = (ANCHORS_P_AT_2400_BYTES if group == "P" else ANCHORS_D_AT_2400_BYTES) * scale
+    ring_mult = RING_P_MULT_GB_PER_S if group == "P" else RING_D_MULT_GB_PER_S
+    rings = ring_mult * s_gb * GB
+    # The pool overhead price() posts on top of anchors+rings is charged against
+    # the same bytes, so it belongs to the same subtrahend.
+    return int(round((anchors + rings) * (1.0 + HOST_POOL_OVERHEAD)))
 
 
 def price(

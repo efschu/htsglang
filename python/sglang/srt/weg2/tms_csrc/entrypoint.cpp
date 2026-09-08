@@ -133,6 +133,18 @@ uint64_t tms_tag_bytes(const char* tag) {
     return TorchMemorySaver::instance().tag_bytes(tag_str);
 }
 
+// C16 / A1-2 (FIX 1 round 1).  ``tms_tag_bytes`` answers "how many device bytes
+// carry this tag"; the ring has to be sized to "how many HOST bytes the dormant
+// image is", and those are exactly the allocations with ``enable_cpu_backup``.
+// Without this entry the census had to be driven off a hand-picked tag list
+// (the weights family), which is a LOWER BOUND that the reader could not tell
+// from a measurement -- boot weg2dk7 measured 38.63 GiB against 28.83 GiB of
+// weight tags.  Writes ``<tag>=<bytes>,...`` NUL terminated; returns the tag
+// count, or -1 when the buffer is too small (never a truncated census).
+int tms_backed_up_tag_bytes(char* out, size_t len) {
+    return TorchMemorySaver::instance().backed_up_tag_bytes(out, len);
+}
+
 //: Returns 0 when this boot published no ring (stock cudaMallocHost path), 1
 //: otherwise.  Every out-pointer may be null.  ``card_uuid`` is written NUL
 //: terminated and truncated to ``card_uuid_len``.

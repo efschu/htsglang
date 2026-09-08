@@ -108,6 +108,15 @@ def _weg2_group_stop_on_leg_failure(fn):
 #: is only the pre-ring reading.
 TMS_RING_GRANULE_BYTES = 2 * 1024 * 1024
 
+#: The POPULATION token every ``WEG2-FLIP-TAG`` line carries, read back by
+#: ``ring_table.parse_group_log``.  The names are imported from the reader so
+#: the emitter and the parser cannot spell them differently -- a mismatch would
+#: read as "weights only" and silently size the ring from a lower bound.
+from sglang.srt.weg2.ring_table import (  # noqa: E402
+    TAG_POPULATION_ALL as WEG2_TAG_POPULATION_ALL,
+    TAG_POPULATION_WEIGHTS as WEG2_TAG_POPULATION_WEIGHTS,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -840,23 +849,76 @@ class SchedulerWeightUpdaterManager:
                 return value
         return -1
 
-    def _weg2_open_credit_for_leg(self):
-        """S's side: the counter for THIS card, opened for THIS leg.
+    def _weg2_backup_census(self, weights_tags, tag_bytes):
+        """``({tag: bytes}, population)`` -- A1-2's per-card dormant image.
+
+        FIX 1 round 1, finding 2.  The population that matters is EVERY tag with
+        a host backup, not the weights family: ``GPU_MEMORY_TYPE_CUDA_GRAPH`` is
+        paused in this same RPC under ``SGLANG_ADAPTIVE_CAPTURE_CPU_BACKUP``, and
+        the draft pools of the parallel slice are the next instance.  The saver's
+        own ``enable_cpu_backup`` metadata is the only place that population
+        exists, so it is asked; ``tag_bytes`` cannot stand in for it, because it
+        counts device bytes whether or not they are ever copied to the host and
+        would charge ``kv_cache`` (paused WITHOUT backup, R20) into the ring.
+
+        When the running hook has no such entry the answer is the weights family
+        and the SECOND element says so -- the caller prints it on every line and
+        the planner reads it back, so a lower bound can never be quoted as a
+        measurement.  That is the floor A1-2 sets on honesty.
+        """
+        weights_only = ({t: int(tag_bytes.get(t, 0)) for t in weights_tags},
+                        WEG2_TAG_POPULATION_WEIGHTS)
+        adapter = getattr(self, "memory_saver_adapter", None)
+        getter = getattr(adapter, "backed_up_tag_bytes", None)
+        if getter is None:
+            return weights_only
+        try:
+            census = getter()
+        except Exception:  # noqa: BLE001
+            return weights_only
+        if not census:
+            return weights_only
+        return {str(t): int(v) for t, v in census.items()}, WEG2_TAG_POPULATION_ALL
+
+    def _weg2_open_credit_for_leg(self, epoch):
+        """S's side: the counter for THIS card, opened for THIS FLIP.
 
         ``None`` (and no waiting anywhere) whenever the card key cannot be
-        resolved or the counter cannot be created -- the credit is a
-        deadlock-avoidance instrument for a co-located pair, and a rank that
-        cannot even name its card has no co-located pair to fund.  The failure
-        is logged, never swallowed into a success value.
+        resolved, the counter cannot be created, or THE FLIP EPOCH IS NOT KNOWN
+        -- the credit is a deadlock-avoidance instrument for a co-located pair,
+        and a rank that cannot even name its card has no co-located pair to fund.
+        The failure is logged, never swallowed into a success value.
+
+        THE EPOCH IS THE FLIP'S, NOT A CLOCK (FIX 1 round 1, finding 4).  The
+        predecessor stamped ``int(time.time())`` and nothing ever read it back,
+        while C9 issues both legs in ONE ``asyncio.gather`` -- so there is no
+        happens-before between this reset and the co-located waking rank's first
+        ``wait_for``, the per-card file alternates writers across flips, and at
+        flip N+1 W typically read flip N's TERMINAL state: ``leg_complete`` with
+        a whole image of credit.  Both outcomes were silent and wrong -- a resume
+        licensed by bytes nobody freed (the CUDA OOM C14 exists to prevent, spec
+        10.5), or an instant W35 killing a flip nothing was wrong with.  The
+        front owns ``self.epoch`` and sends both RPCs, so it carries it; a
+        request without one arms nothing rather than reading a counter it cannot
+        date.
         """
         if not self._weg2_fence_is_armed():
+            return None
+        if epoch is None:
+            logger.warning(
+                "[weg2 credit] the release request carries no flip epoch, so the "
+                "device-side credit is NOT opened for this leg: a counter that "
+                "cannot be dated cannot be told from the previous flip's terminal "
+                "state, and reading one as funding is the silent failure C14 "
+                "exists to prevent"
+            )
             return None
         uuid_key = self._weg2_card_uuid()
         if uuid_key is None:
             return None
         try:
             credit = vram_credit(uuid_key)
-            credit.begin_leg(int(time.time()))
+            credit.begin_leg(int(epoch))
         except OSError as exc:
             logger.warning(
                 "[weg2 credit] no VRAM credit published on %s (%s) -- a "
@@ -867,17 +929,22 @@ class SchedulerWeightUpdaterManager:
             return None
         return credit
 
-    def _weg2_credit_reader(self):
-        """W's side: the same counter, read-only."""
-        if not self._weg2_fence_is_armed():
-            return None
+    def _weg2_credit_reader(self, epoch):
+        """W's side: ``(counter, epoch)``, read-only.  ``(None, None)`` disarms.
+
+        Same epoch rule as :meth:`_weg2_open_credit_for_leg` and for the same
+        reason: without the flip's own epoch this rank cannot tell this leg's
+        counter from the last one's, so it consults none.
+        """
+        if not self._weg2_fence_is_armed() or epoch is None:
+            return None, None
         uuid_key = self._weg2_card_uuid()
         if uuid_key is None:
-            return None
+            return None, None
         try:
-            return vram_credit(uuid_key)
+            return vram_credit(uuid_key), int(epoch)
         except OSError:
-            return None
+            return None, None
 
     def _weg2_free_bytes(self) -> Optional[int]:
         """NVML free on THIS rank's card, or None when it cannot be read.
@@ -897,7 +964,8 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001
             return None
 
-    def _weg2_await_vram_credit(self, credit, tag: str, need_bytes: int) -> None:
+    def _weg2_await_vram_credit(self, credit, tag: str, need_bytes: int,
+                                epoch=None) -> None:
         if credit is None or need_bytes <= 0:
             return
         try:
@@ -906,6 +974,7 @@ class SchedulerWeightUpdaterManager:
                 budget_s=WEG2_GROUP_FENCE_BUDGET_S,
                 tag=tag,
                 free_bytes_now=self._weg2_free_bytes(),
+                epoch=epoch,
             )
         except Weg2VramCreditRefused:
             raise
@@ -1098,10 +1167,16 @@ class SchedulerWeightUpdaterManager:
             # that moves them, and they are metadata reads -- no device call is
             # added after the pause (the prohibition above is intact).
             tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
+            # A1-2 / FIX 1 round 1: the CENSUS is a different population from the
+            # timed loop.  The loop walks the weights family (that is the leg);
+            # the census must name every tag that holds HOST bytes while this
+            # group sleeps, or the ring is sized from a lower bound while the
+            # provenance line says MEASURED.
+            census, population = self._weg2_backup_census(weights_tags, tag_bytes)
             # C14: S opens the device-side credit for this leg BEFORE it frees
-            # anything, so a co-located waking rank can never read a stale
-            # counter from the previous flip as if it were this one's.
-            credit = self._weg2_open_credit_for_leg()
+            # anything.  The epoch is THE FLIP'S, carried on the request by the
+            # front that owns it -- see :meth:`_weg2_open_credit_for_leg`.
+            credit = self._weg2_open_credit_for_leg(getattr(recv_req, "epoch", None))
             weg2_leg_t0 = time.perf_counter()
             with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags), direction="d2h"):
                 for tag in weights_tags:
@@ -1120,13 +1195,23 @@ class SchedulerWeightUpdaterManager:
             if credit is not None:
                 credit.leg_complete()
             card_uuid = self._weg2_card_uuid() or "unknown"
-            for tag, (nbytes, tms) in weg2_per_tag.items():
+            # L1, one line per tag of the CENSUS -- not of the timed loop.  Every
+            # line states the population it belongs to, because the ring planner
+            # that reads them (ring_table.parse_group_log) must be able to tell
+            # A1-2's measured dormant image from a weights-only lower bound, and
+            # it cannot get that from the line's mere existence.  ``ms`` is the
+            # timed pause where the loop above took one and -1 where the tag is
+            # in the census but not in this leg (its bytes are still part of the
+            # dormant image; its pause is not part of this RPC's cost).
+            for tag, nbytes in sorted(census.items()):
+                tms = weg2_per_tag.get(tag, [0.0, -1.0])[1]
                 logger.info(
                     "WEG2-FLIP-TAG group=%s rank=%d card=%s dir=d2h tag=%s bytes=%d MiB "
-                    "(source: tms_tag_bytes, NOT RssShmem) ms=%.0f GB/s=%.2f granules=%d",
+                    "population=%s (source: tms_tag_bytes, NOT RssShmem) ms=%.0f "
+                    "GB/s=%.2f granules=%d",
                     self._weg2_group_name(), self._weg2_rank(), card_uuid, tag,
-                    int(nbytes) // MIB_, tms,
-                    (nbytes / 1e9) / max(1e-6, tms / 1000.0),
+                    int(nbytes) // MIB_, population, tms,
+                    (nbytes / 1e9) / max(1e-6, tms / 1000.0) if tms > 0 else 0.0,
                     int(nbytes) // TMS_RING_GRANULE_BYTES,
                 )
             # RssShmem stays on the line as the CROSS-CHECK it now is, and its
@@ -1233,7 +1318,9 @@ class SchedulerWeightUpdaterManager:
             t_w0 = time.perf_counter()
             shm0 = self._weg2_rss_shmem_mib()
             tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
-            credit = self._weg2_credit_reader()
+            credit, credit_epoch = self._weg2_credit_reader(
+                getattr(recv_req, "epoch", None)
+            )
             with self._weg2_pcie_lock("wake-H2D " + ",".join(weights_tags), direction="h2d"):
                 for tag in weights_tags:
                     # C14: the device bytes this tag needs may only exist once
@@ -1242,7 +1329,9 @@ class SchedulerWeightUpdaterManager:
                     # into a bounded wait whose expiry is a NAMED refusal; when
                     # the card is not short the call returns without waiting at
                     # all, which is every non-co-located boot.
-                    self._weg2_await_vram_credit(credit, tag, tag_bytes.get(tag, 0))
+                    self._weg2_await_vram_credit(
+                        credit, tag, tag_bytes.get(tag, 0), credit_epoch
+                    )
                     t_tag = time.perf_counter()
                     self.memory_saver_adapter.resume(tag)
                     weg2_per_tag[tag] = [
@@ -1254,9 +1343,10 @@ class SchedulerWeightUpdaterManager:
             for tag, (nbytes, tms) in weg2_per_tag.items():
                 logger.info(
                     "WEG2-FLIP-TAG group=%s rank=%d card=%s dir=h2d tag=%s bytes=%d MiB "
-                    "(source: tms_tag_bytes, NOT RssShmem) ms=%.0f GB/s=%.2f granules=%d",
+                    "population=%s (source: tms_tag_bytes, NOT RssShmem) ms=%.0f "
+                    "GB/s=%.2f granules=%d",
                     self._weg2_group_name(), self._weg2_rank(), card_uuid, tag,
-                    int(nbytes) // MIB_, tms,
+                    int(nbytes) // MIB_, WEG2_TAG_POPULATION_WEIGHTS, tms,
                     (nbytes / 1e9) / max(1e-6, tms / 1000.0),
                     int(nbytes) // TMS_RING_GRANULE_BYTES,
                 )

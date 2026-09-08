@@ -265,22 +265,57 @@ def duplex_ratios(published: Optional[str] = None) -> Dict[str, float]:
     is exactly the hand number spec section 10.3 forbids and it would open the
     split on a card nobody measured.
     """
+    return _parse_duplex(published)[0]
+
+
+def duplex_splits(published: Optional[str] = None) -> Dict[str, bool]:
+    """``{card uuid: does its key split}`` as the launcher DECIDED it.
+
+    FIX 1 round 1.  The ratio is an expectation about throughput; whether the
+    key splits is a CORRECTNESS decision, and after boot weg2rg2 the two are no
+    longer the same question.  The launcher makes that decision once, from the
+    ratio AND from the leg form, and publishes it here beside the ratio so the
+    rank that builds the key and the launch check that prices it read one
+    answer.  A card with no published decision falls back to the ratio gate,
+    which is what a pre-decision boot's map carries.
+    """
+    return _parse_duplex(published)[1]
+
+
+def _parse_duplex(published: Optional[str]) -> Tuple[Dict[str, float], Dict[str, bool]]:
+    """``<uuid>=<ratio>[:split|:single]`` rows -> (ratios, decisions).
+
+    The ratio may be empty (``<uuid>=:split``): a card the step-0 probe never
+    measured still needs a decision, and under gathered legs that decision is
+    ``split`` -- see :func:`pcie_lock_separates_directions`.
+    """
     raw = os.environ.get(PCIE_DUPLEX_ENV, "") if published is None else published
-    out: Dict[str, float] = {}
+    ratios: Dict[str, float] = {}
+    splits: Dict[str, bool] = {}
     for item in raw.split(","):
         item = item.strip()
         if not item or "=" not in item:
             continue
         uuid, _, value = item.partition("=")
+        uuid = uuid.strip()
+        ratio_text, _, decision = value.partition(":")
+        decision = decision.strip()
+        if decision in ("split", "single"):
+            splits[uuid] = decision == "split"
+        elif decision:
+            continue
         try:
-            out[uuid.strip()] = float(value)
+            ratios[uuid] = float(ratio_text)
         except ValueError:
             continue
-    return out
+    return ratios, splits
 
 
 def pcie_lock_separates_directions(
-    nvml_uuid: str, *, ratios: Optional[Dict[str, float]] = None
+    nvml_uuid: str,
+    *,
+    ratios: Optional[Dict[str, float]] = None,
+    splits: Optional[Dict[str, bool]] = None,
 ) -> bool:
     """Does the lock KEY separate the two directions ON THIS CARD?
 
@@ -291,12 +326,33 @@ def pcie_lock_separates_directions(
     key is derived from the same answer this returns, and the launcher asks per
     card.
 
-    True only where the card's OWN measured concurrent/serial ratio reaches
-    spec R17's gate.  On a card below it the two directions keep one key and a
-    sleep-D2H still excludes a co-located wake-H2D -- which is not a fallback
-    but the measured truth of that slot (nvml0, x4, 1.316: the split buys 32 %
-    where R17 asks for 50 %, and the flip's critical path is that card).
+    THE PUBLISHED DECISION WINS, AND IT IS NOT THE RATIO (FIX 1 round 1).  R17's
+    ratio answers "is the split worth it"; boot weg2rg2 answered a different
+    question the hard way -- "is the single key SAFE" -- and it is not.  Each
+    leg holds the per-card key across its whole tag loop (weight_updater's
+    sleep-D2H and wake-H2D blocks), so on a card where both legs resolve to ONE
+    key the gathered pair of C9 is serialised again: whichever leg wins the key
+    runs to completion, and if that is the SLEEP leg it blocks in the ring's
+    ``acquire`` with free = H - image_W = 0 while the wake leg that would fund
+    it is queued on the key it holds.  That is W31 Weg2HostRingExhausted
+    need=24 free=12 MiB after 120.189 s on nvml0, then W29 on all three P ranks,
+    then group-fatal W4 -- observed, 2026-09-08 03:06Z.  R5's corridor, which
+    the launcher checks and which passes 6/6 on both tables, has as its PREMISE
+    that W's per-tag releases fund S's acquires; the single key falsifies it.
+
+    So under gathered legs the launcher publishes ``split`` for every card and
+    that decision is read here.  It costs nothing measured: the x4 card's own
+    1.316 is a CONCURRENT-OVER-SERIAL ratio, i.e. concurrency is 32 % faster
+    there too -- R17's 1.5 gate only says the split is not worth a mechanism of
+    its own, which is a statement about value, never about safety (A1-4 says
+    that card gets no benefit from the split, not that it must not have one).
+
+    With no published decision the ratio gate stands, which is a pre-weg2rg2
+    boot's map and the conservative reading of it.
     """
+    decisions = duplex_splits() if splits is None else splits
+    if nvml_uuid in decisions:
+        return decisions[nvml_uuid]
     table = duplex_ratios() if ratios is None else ratios
     ratio = table.get(nvml_uuid)
     return ratio is not None and ratio >= DUPLEX_SPLIT_MIN_RATIO
@@ -308,6 +364,7 @@ def pcie_lock_path(
     lock_dir: Optional[str] = None,
     direction: Optional[str] = None,
     ratios: Optional[Dict[str, float]] = None,
+    splits: Optional[Dict[str, bool]] = None,
 ) -> str:
     """Path of the PCIe serialisation lock for one physical GPU.
 
@@ -324,7 +381,7 @@ def pcie_lock_path(
             raise ValueError(
                 f"direction must be one of {PCIE_DIRECTIONS}, not {direction!r}"
             )
-        if pcie_lock_separates_directions(nvml_uuid, ratios=ratios):
+        if pcie_lock_separates_directions(nvml_uuid, ratios=ratios, splits=splits):
             key = f"{key}.{direction}"
     return os.path.join(directory, f".{PCIE_LOCK_PREFIX}-{key}.lock")
 
@@ -614,8 +671,21 @@ class VramCredit:
         tag: str,
         free_bytes_now: Optional[int] = None,
         poll_s: float = 0.01,
+        epoch: Optional[int] = None,
     ) -> Dict[str, Any]:
         """W waits for the peer to fund ``need_bytes``, or refuses by name.
+
+        ``epoch`` IS LOAD-BEARING (FIX 1 round 1, finding 4).  The per-card file
+        is shared by the two co-located ranks and alternates writers across
+        flips, and C9 issues both legs in ONE ``asyncio.gather``, so there is no
+        happens-before between S's :meth:`begin_leg` and W's first call here: at
+        flip N+1 the state on disk is typically flip N's TERMINAL state --
+        ``leg_complete`` with a whole image of credit.  A state whose epoch is
+        not this flip's is therefore NO CREDIT and NO TERMINATING PREDICATE: it
+        is waited past, exactly as an empty counter is, so a stale full credit
+        cannot license a resume of bytes nobody freed and a stale complete flag
+        cannot refuse a flip nothing is wrong with.  ``None`` accepts any epoch
+        and is for callers that own the ordering themselves (the tests).
 
         Returns a record (never raises) in the two cases where nothing is owed:
 
@@ -645,8 +715,14 @@ class VramCredit:
             }
         deadline = time.monotonic() + float(budget_s)
         t0 = time.perf_counter()
+        stale_epoch = None
         while True:
             state = self.read()
+            if epoch is not None and state and int(state.get("epoch", -1)) != int(epoch):
+                # Not this flip's counter.  Neither its bytes nor its
+                # leg_complete flag say anything about the leg now in flight.
+                stale_epoch = state.get("epoch")
+                state = {}
             credit = int(state.get("credit_bytes", 0))
             if credit >= need:
                 return {
@@ -672,6 +748,12 @@ class VramCredit:
                     f"budget={budget_s:.0f}s EXPIRED -- the peer neither funded "
                     f"this tag nor completed its leg within the caller's own "
                     f"budget (this module owns no timeout constant of its own)"
+                    + (
+                        f"; the only state on the counter was epoch {stale_epoch}, "
+                        f"not this flip's {epoch} -- a PREVIOUS leg's, ignored "
+                        "rather than read as funding"
+                        if stale_epoch is not None else ""
+                    )
                 )
             time.sleep(poll_s)
 

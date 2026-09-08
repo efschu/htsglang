@@ -73,6 +73,9 @@ class TorchMemorySaverAdapter(ABC):
     def tag_bytes(self, tag: str):
         raise NotImplementedError
 
+    def backed_up_tag_bytes(self):
+        raise NotImplementedError
+
     def ring_stats(self):
         raise NotImplementedError
 
@@ -153,6 +156,35 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         fn.argtypes = [ctypes.c_char_p]
         return int(fn(tag.encode()))
 
+    def backed_up_tag_bytes(self):
+        """C16 / A1-2: ``{tag: bytes}`` over EVERY tag with a host backup, or None.
+
+        The population is the saver's own ``enable_cpu_backup`` metadata, which
+        is the only place that fact exists.  :meth:`tag_bytes` cannot stand in
+        for it: it counts a tag's DEVICE bytes whether or not they are ever
+        copied to the host, so a census built by calling it over a tag list
+        would charge ``kv_cache`` -- paused WITHOUT cpu backup (R20) -- into the
+        host ring.  None means the running hook has no such symbol; that is an
+        absence, and the caller must say so rather than call a weights-only
+        census the measured dormant image.
+        """
+        import ctypes
+
+        fn = _weg2_ring_symbol("tms_backed_up_tag_bytes")
+        if fn is None:
+            return None
+        buf = ctypes.create_string_buffer(8192)
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+        if fn(buf, ctypes.c_size_t(len(buf))) < 0:
+            return None
+        out = {}
+        for item in buf.value.decode().split(","):
+            tag, _, value = item.partition("=")
+            if tag and value.isdigit():
+                out[tag] = int(value)
+        return out
+
     def ring_stats(self):
         """C8/C7: the live per-card host-ring counters, or None when this boot
         published no ring (then the stock ``cudaMallocHost`` path is running and
@@ -212,6 +244,9 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         yield
 
     def tag_bytes(self, tag: str):
+        return None
+
+    def backed_up_tag_bytes(self):
         return None
 
     def ring_stats(self):

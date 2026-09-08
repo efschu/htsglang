@@ -116,8 +116,17 @@ def _dormant_line(group: str, rss_gib: float, tags_gib: float) -> str:
     )
 
 
-def _front_log(free_by_phase, cards=None, identity=True, dormant=()) -> str:
+def _front_log(free_by_phase, cards=None, identity=True, dormant=(), arm=None) -> str:
     out = []
+    if arm is not None:
+        # The SOURCE boot's own chosen ledger arm.  Without it the RssShmem
+        # cross-check has no subtrahend and may not raise a census (FIX 1
+        # finding 3) -- so a fixture that wants the netted route must write it.
+        out.append(
+            f"[2026-09-07T21:05:01Z] WEG2-HOST-LEDGER CHOSEN S={arm[0]} GB "
+            f"(--hicache-size, both groups) M={arm[1]} MiB "
+            "(--hicache-mamba-host-mib, both groups) store=4 GiB tmpfs"
+        )
     if identity:
         # Every real launcher prints this; a fixture without it is a boot whose
         # card identity was never recorded, which is a REFUSAL (see
@@ -713,31 +722,113 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
             "GPU-unmeasured", ratios=ratios),
             "an unmeasured card never splits")
 
-        @dataclass
-        class _C:
-            uuid: str
-            nvml_index: int = 0
-            name: str = "x"
+        # FIX 1 round 1: whether the key SPLITS is a decision, not a reading of
+        # the ratio, and the launcher makes it once.  Under gathered legs every
+        # card splits -- one key is a DEADLOCK there, not a slowdown -- so no
+        # card is serialised and R5 is every card's requirement.
+        cards = ["GPU-aaaa", "GPU-bbbb"]
+        gathered = launcher._split_decisions(cards, ratios, "interleave")
+        self.assertEqual(gathered, {"GPU-aaaa": True, "GPU-bbbb": True})
+        self.assertEqual(launcher._serialised_cards(cards, gathered, "interleave"), [])
+        # A front that does NOT gather has no pair in flight to deadlock, so
+        # there the ratio gate stands and the card below it keeps one key.
+        serial = launcher._split_decisions(cards, ratios, "serial")
+        self.assertEqual(serial, {"GPU-aaaa": True, "GPU-bbbb": False})
+        self.assertEqual(
+            launcher._serialised_cards(cards, serial, "serial"), cards,
+            "a front that does not gather serialises every card, whatever its key")
+        # And the RANK reads the same decision the launcher published, through
+        # the module that owns the key -- not the ratio it was derived from.
+        published = "GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        self.assertEqual(weg2_memory_saver.duplex_splits(published),
+                         {"GPU-aaaa": True, "GPU-bbbb": True})
+        self.assertTrue(weg2_memory_saver.pcie_lock_separates_directions(
+            "GPU-bbbb", splits=weg2_memory_saver.duplex_splits(published)),
+            "the published decision outranks the ratio it came from")
+        self.assertTrue(weg2_memory_saver.pcie_lock_path(
+            "GPU-bbbb", lock_dir="/dev/shm", direction="d2h",
+            splits=weg2_memory_saver.duplex_splits(published)).endswith(".d2h.lock"),
+            "and the KEY the rank builds is the one the decision names")
 
-        self.assertFalse(
-            launcher._pcie_lock_directional(ratios, [_C("GPU-aaaa"), _C("GPU-bbbb")]),
-            "the AND over cards: one card below the gate serialises there")
-        self.assertTrue(
-            launcher._pcie_lock_directional(ratios, [_C("GPU-aaaa")]))
+    def test_a_card_below_the_gate_is_checked_against_the_SERIAL_requirement(self):
+        # BOOT weg2rg2, THE KILLER, AS A TEST.  The predecessor computed the
+        # duplex answer, printed it on the ARMED line, and gated NOTHING: "a card
+        # that keeps one key costs time on that card, and nothing else".  The
+        # metal refuted that 20 minutes later.  nvml0 (measured 1.316,
+        # DUPLEX-NULL) passed R5 on both directions, the SAME L6 line said
+        # SERIAL FORM slack=1122/-2986 MiB, the launcher armed, and the FIRST
+        # flip wedged: W31 Weg2HostRingExhausted need=24 free=12 MiB after
+        # 120.189 s in acquire, then W29 on all three P ranks, then W4.
+        from sglang.srt.weg2 import launcher
 
-    def test_a_card_below_the_gate_does_not_stop_the_ring_arming(self):
-        # A1-4, and it is the correction to FIX 2's gate: with the legs gathered
-        # the corridor that funds the ring is R5's, closed by the ring bitmap and
-        # by C14's device credit -- not by the PCIe lock.  A card that keeps one
-        # key costs TIME there; refusing the boot over it would refuse a boot for
-        # being slower on one card.
+        table = _zr2_table()
+        self.assertEqual(table.refusals(), [],
+                         "R5 passes on this table -- the check that armed weg2rg2")
+        lines = []
+        with self.assertRaises(ring_table.Weg2RingNeedsInterleave) as cm:
+            self._prepare(launcher, lines, form="auto", leg_form="interleave",
+                          directional=False)
+        msg = str(cm.exception)
+        self.assertIn("W34 Weg2RingNeedsInterleave", msg)
+        self.assertIn("the measured duplex ratio does not reach R17's gate", msg)
+        self.assertIn("needs image_D 9680 + max_tag_P 2986 = 12666 MiB", msg,
+                      "the arithmetic that would have caught weg2rg2 must be in "
+                      "the refusal, per card and per direction")
+        self.assertNotIn("WEG2-HOST-RING ARMED", "\n".join(lines))
+
+    def test_gathered_legs_split_every_key_so_no_card_is_held_to_the_serial_rule(self):
+        # THE FIX, GREEN.  weg2rg2's own table arms once the key stops
+        # serialising the pair -- R5 passes 6/6 on it, and R5 is the right
+        # requirement precisely because both legs can then be in flight on every
+        # card.  The predecessor armed the same table with nvml0 on ONE key,
+        # which is the state that wedged 120.189 s into the first flip.
         from sglang.srt.weg2 import launcher
 
         lines = []
+        plan = self._prepare(launcher, lines, form="auto", leg_form="interleave")
+        joined = "\n".join(lines)
+        self.assertTrue(plan.armed, joined)
+        self.assertIn("serialised_cards=none", joined)
+        self.assertIn("key=SPLIT per direction", joined)
+        self.assertIn("the R5 corridor (W32) alone", joined)
+        for card in _zr2_table().cards:
+            self.assertIn(f"{card.uuid}=:split", plan.duplex_env,
+                          "the decision is PUBLISHED to the ranks, or the key "
+                          "the metal takes is not the one that was checked")
+
+    def test_the_serial_requirement_can_be_restricted_to_named_cards(self):
+        # ``only`` is what makes the check per card at all.  H = max(image_P,
+        # image_D), so on ANY card one of the two serial directions exceeds H by
+        # a whole max_tag -- the requirement is a property of the FORM.  What
+        # ``only`` decides is which cards have to meet it.
+        table = _zr2_table()
+        self.assertEqual(len(table.serial_refusals()), 6)
+        rows = table.serial_refusals(only=["GPU-bbbb"])
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertIn("GPU-bbbb", row)
+        self.assertEqual(table.serial_refusals(only=[]), [])
+
+    def test_the_armed_line_says_which_cards_were_held_to_which_inequality(self):
+        from sglang.srt.weg2 import launcher
+
+        rows = [ring_table.CardRing(uuid="GPU-aaaa", nvml_index=1, name="c",
+                                    image_p_mib=1000, image_d_mib=1000,
+                                    max_tag_p_mib=100, max_tag_d_mib=100,
+                                    credit_d2p_mib=200, credit_p2d_mib=200)]
+        table = ring_table.RingTable(boot="b", instrument="i", lines_read=1,
+                                     cards=rows, max_step_total_mib=100)
+        lines = []
         plan = self._prepare(launcher, lines, form="auto", leg_form="interleave",
-                             directional=False)
-        self.assertTrue(plan.armed, "\n".join(lines))
-        self.assertIn("pcie_lock_directional_on_every_card=False", "\n".join(lines))
+                             table=table)
+        joined = "\n".join(lines)
+        self.assertTrue(plan.armed, joined)
+        self.assertIn("serialised_cards=none", joined)
+        self.assertIn("WEG2-HOST-RING CHECK card=GPU-aaaa", joined)
+        self.assertIn("the R5 corridor (W32) alone", joined)
+        self.assertNotIn("pcie_lock_directional_on_every_card", joined,
+                         "the printed-but-ungating boolean is gone: what the "
+                         "ARMED line certifies must be what was checked")
 
     def test_l6_prints_the_serial_row_beside_the_r5_row(self):
         line = _zr2_table().format_l6()[0]
@@ -1079,9 +1170,9 @@ class DormantImageInstrumentTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="weg2ringdormant-")
         self.stem = "boot_weg2_t2_0000000000_0907_000000"
 
-    def _solve(self, dormant=(), cards=None, rss=None):
+    def _solve(self, dormant=(), cards=None, rss=None, arm=None, scale=1):
         cards = cards or [CARDS[0]]
-        merged = {i: [("weights_0", 1024 * (i + 1))] for i in range(len(cards))}
+        merged = {i: [("weights_0", 1024 * scale * (i + 1))] for i in range(len(cards))}
         kv = {i: 1.0 for i in range(len(cards))}
         with open(os.path.join(self.dir, f"{self.stem}.P.log"), "w") as f:
             f.write(_group_log("PP", [merged], kv, None, rss))
@@ -1091,7 +1182,7 @@ class DormantImageInstrumentTest(unittest.TestCase):
             f.write(_front_log(
                 {"P": [{c.nvml_index: 100 for c in cards}],
                  "D": [{c.nvml_index: 100 for c in cards}]},
-                cards=cards, dormant=dormant,
+                cards=cards, dormant=dormant, arm=arm,
             ))
         table, reason = ring_table.solve(cards, self.dir, self.stem)
         self.assertIsNotNone(table, reason)
@@ -1107,50 +1198,84 @@ class DormantImageInstrumentTest(unittest.TestCase):
         self.assertEqual(loud.cards[0].image_p_mib, quiet.cards[0].image_p_mib)
         self.assertEqual(loud.cards[0].image_p_mib, 1024)
 
-    def test_a_measurement_above_the_census_is_charged_and_apportioned_by_share(self):
-        # Two cards, censuses 300 and 600 MiB (sum 900).  A measured group image
-        # of 1800 MiB is charged, split 600 / 1200 -- each card's SHARE of the
-        # census it is being corrected against, which is the only attribution
-        # the two instruments jointly support.  Censuses 1024 and 2048 MiB
-        # (sum 3.00 GiB); a measured group image of 6.00 GiB splits 2048 / 4096.
-        cards = [CARDS[0], CARDS[1]]
-        table = self._solve(dormant=[("P", 6.0, 3.0)], cards=cards)
-        by_uuid = {c.uuid: c for c in table.cards}
-        self.assertEqual(by_uuid[cards[0].uuid].tags_p_mib, 1024)
-        self.assertEqual(by_uuid[cards[1].uuid].tags_p_mib, 2048)
-        self.assertEqual(by_uuid[cards[0].uuid].dormant_p_mib, 2048)
-        self.assertEqual(by_uuid[cards[1].uuid].dormant_p_mib, 4096)
-        self.assertEqual(by_uuid[cards[0].uuid].image_p_mib, 2048)
-        self.assertEqual(
-            sum(c.dormant_p_mib for c in table.cards), 6144,
-            "the apportioned rows must sum to the measurement, or bytes are "
-            "either lost or double-charged",
+    def test_the_cross_check_may_not_raise_a_census_before_the_terms_are_netted(self):
+        # FIX 1 round 1, finding 3.  RssShmem is the sleeping group's WHOLE
+        # shared-memory residency, and the ledger already posts the mamba
+        # anchors and the HiCache rings against the same host budget by name.
+        # Scaling a census up to an un-netted RssShmem charges those bytes a
+        # SECOND time -- Sigma H walks from ~32 toward ~42 GiB and the ledger
+        # W20-refuses at every rung, which is A1-3's state for the old form.
+        rows, source, bound = ring_table.apportion_dormant(
+            "P", ring_table.DormantImage("P", 38630, 28830, 9800),
+            {"a": 20000, "b": 8830}, True,
         )
-        self.assertIn("EXCEEDS the per-card census", table.provenance())
+        self.assertEqual(rows, {"a": 20000, "b": 8830},
+                         "with no subtrahend the census stands unraised")
+        self.assertIn("REPORTED but NOT CHARGED", source)
+        self.assertIn("charge those bytes a second time", source)
 
-    def test_a_measurement_at_or_below_the_census_leaves_the_census_standing(self):
-        table = self._solve(dormant=[("P", 0.5, 0.5)])
+    def test_a_netted_measurement_above_the_census_is_charged_and_split_by_share(self):
+        # Subtract, THEN raise.  Census 900, RssShmem 2000, of which 200 is the
+        # group's own anchors + rings: 1800 is chargeable and splits 600 / 1200,
+        # each card's SHARE of the census it is being corrected against.
+        rows, source, bound = ring_table.apportion_dormant(
+            "P", ring_table.DormantImage("P", 2000, 900, 1100),
+            {"a": 300, "b": 600}, True, non_backup_mib=200,
+        )
+        self.assertEqual(rows, {"a": 600, "b": 1200})
+        self.assertEqual(sum(rows.values()), 1800,
+                         "the apportioned rows must sum to the NETTED "
+                         "measurement, or bytes are lost or double-charged")
+        self.assertFalse(bound)
+        self.assertIn("route = netted RssShmem", source)
+        self.assertIn("minus the ledger's own posted non-backup host terms", source)
+
+    def test_the_subtrahend_is_the_source_boot_s_own_arm_not_a_number_typed_here(self):
+        import tempfile
+
+        path = os.path.join(tempfile.mkdtemp(prefix="weg2arm-"), "f.log")
+        with open(path, "w") as f:
+            f.write(_front_log({"P": [{1: 10}], "D": [{1: 10}]}, arm=(1, 2400)))
+        self.assertEqual(ring_table.parse_chosen_arm(path), (1, 2400))
+        # and the terms are host_ledger's OWN, split the way b0 measured them
+        self.assertAlmostEqual(
+            (host_ledger.ANCHORS_P_AT_2400_BYTES + host_ledger.ANCHORS_D_AT_2400_BYTES)
+            / host_ledger.GB, 10.19, places=6,
+            msg="the per-group halves must sum to the measured total, or the "
+                "subtrahend and the ledger's own anchors term are two books")
+        self.assertGreater(host_ledger.non_backup_host_bytes("D", 1, 2400),
+                           host_ledger.non_backup_host_bytes("P", 1, 2400),
+                           "record 1e: group D owns the 6xS ring half, P the 2xS")
+        with self.assertRaises(ValueError):
+            host_ledger.non_backup_host_bytes("X", 1, 2400)
+
+    def test_an_unreadable_arm_leaves_the_measurement_reported_and_uncharged(self):
+        # An absence is not a licence: without the source boot's arm there is no
+        # subtrahend, so the census stands and the line says why.
+        table = self._solve(dormant=[("P", 6.0, 3.0)])
+        self.assertEqual(table.cards[0].image_p_mib, 1024)
+        self.assertIn("REPORTED but NOT CHARGED", table.provenance())
+
+    def test_a_measurement_below_the_netted_line_leaves_the_census_standing(self):
+        table = self._solve(dormant=[("P", 0.5, 0.5)], arm=(1, 600))
         self.assertEqual(table.cards[0].image_p_mib, 1024)
         self.assertIn("does NOT exceed the per-card census", table.provenance())
+        self.assertIn("anchors + rings", table.provenance())
 
-    def test_group_D_is_a_BOUND_from_P_s_excess_until_D_is_measured(self):
+    def test_group_D_borrows_only_the_NETTED_excess_and_stays_a_BOUND(self):
         # A1-2: D's first sleep is a flip and is interleaved, so no un-confounded
-        # D sample exists.  D is charged its own census plus the excess P showed.
-        table = self._solve(dormant=[("P", 6.0, 3.0)])
+        # D sample exists.  D is charged its own census plus the excess P showed
+        # AFTER P's own anchors and rings came out -- an un-netted excess would
+        # double-book on D as well.
+        p_non_backup = host_ledger.non_backup_host_bytes("P", 1, 600) // MIB
+        table = self._solve(dormant=[("P", 40.0, 20.0)], arm=(1, 600), scale=8)
         c = table.cards[0]
-        self.assertEqual(c.tags_d_mib, 1024)
-        self.assertEqual(c.dormant_d_mib, 1024 + 3072)
+        self.assertEqual(c.tags_d_mib, 8192)
+        excess = int(round(20.0 * GIB / MIB)) - p_non_backup
+        self.assertEqual(c.dormant_d_mib, 8192 + excess)
         self.assertTrue(c.dormant_d_bound)
-        self.assertFalse(c.dormant_p_bound)
         self.assertIn("BOUND, NOT A MEASUREMENT, for group(s) D", table.provenance())
-        self.assertIn("dormant 4096 BOUND", table.format_l6()[0])
-
-    def test_no_dormant_line_at_all_leaves_a_weights_only_census_marked_BOUND(self):
-        table = self._solve()
-        self.assertEqual(table.cards[0].image_p_mib, 1024, "an absence is not a zero image")
-        self.assertTrue(table.cards[0].dormant_p_bound)
-        self.assertIn("stands UNCHECKED", table.provenance())
-        self.assertIn("BOUND, NOT A MEASUREMENT, for group(s) P/D", table.provenance())
+        self.assertIn("came out", table.provenance())
 
     def test_a_ring_era_census_is_itself_the_measurement_and_is_not_a_bound(self):
         # C16's WEG2-FLIP-TAG names EVERY backed-up tag, so a boot that carries
@@ -1160,6 +1285,7 @@ class DormantImageInstrumentTest(unittest.TestCase):
                 f.write(
                     f"[2026-09-07 21:10:23 {prefix}0] WEG2-FLIP-TAG group={group} rank=0 "
                     f"card={CARDS[0].uuid} dir=d2h tag=weights_0 bytes={mib} MiB "
+                    f"population={ring_table.TAG_POPULATION_ALL} "
                     "(source: tms_tag_bytes, NOT RssShmem) ms=100 GB/s=3.00 granules=150\n"
                     f"[2026-09-07 21:06:30 {prefix}0] KV Cache is allocated. dtype: "
                     "torch.float8_e4m3fn, #tokens: 1, K size: 0.50 GB, V size: 0.50 GB\n"
@@ -1170,7 +1296,31 @@ class DormantImageInstrumentTest(unittest.TestCase):
         self.assertIsNotNone(table, reason)
         self.assertFalse(table.cards[0].dormant_p_bound)
         self.assertFalse(table.cards[0].dormant_d_bound)
-        self.assertIn("it IS the measured dormant image", table.provenance())
+        self.assertIn("it IS A1-2's measured dormant image", table.provenance())
+
+    def test_a_flip_tag_line_without_a_population_claim_stays_a_LOWER_BOUND(self):
+        # FIX 1 round 1, finding 2.  The predecessor set covers_all on the FIRST
+        # WEG2-FLIP-TAG line it saw, while the emitter looped over the weights
+        # family alone -- so the first ring-era boot would have called a
+        # weights-only census "the measured dormant image" and sized H from a
+        # lower bound (dk7: 38.63 GiB measured against 28.83 of weight tags).
+        # The claim now has to be ON the line.
+        for prefix, group in (("PP", "P"), ("TP", "D")):
+            with open(os.path.join(self.dir, f"{self.stem}.{group}.log"), "w") as f:
+                f.write(
+                    f"[2026-09-07 21:10:23 {prefix}0] WEG2-FLIP-TAG group={group} rank=0 "
+                    f"card={CARDS[0].uuid} dir=d2h tag=weights_0 bytes=300 MiB "
+                    f"population={ring_table.TAG_POPULATION_WEIGHTS} "
+                    "(source: tms_tag_bytes, NOT RssShmem) ms=100 GB/s=3.00 granules=150\n"
+                    f"[2026-09-07 21:06:30 {prefix}0] KV Cache is allocated. dtype: "
+                    "torch.float8_e4m3fn, #tokens: 1, K size: 0.50 GB, V size: 0.50 GB\n"
+                )
+        with open(os.path.join(self.dir, f"{self.stem}.front.log"), "w") as f:
+            f.write(_front_log({"P": [{1: 100}], "D": [{1: 100}]}))
+        table, reason = ring_table.solve([CARDS[0]], self.dir, self.stem)
+        self.assertIsNotNone(table, reason)
+        self.assertTrue(table.cards[0].dormant_p_bound)
+        self.assertIn("a LOWER BOUND", table.provenance())
 
 
 class DuplexTableTest(unittest.TestCase):
@@ -1224,9 +1374,9 @@ class DuplexTableTest(unittest.TestCase):
         table, _ = ring_table.solve_duplex(self.PROBE)
         lines = table.format_lines(REAL_CARDS, 1.5)
         by_card = {ln.split("card=")[1].split()[0]: ln for ln in lines}
-        self.assertIn("split=YES", by_card[REAL_5090])
-        self.assertIn("split=NO", by_card[REAL_3080_A])
-        self.assertIn("critical path", by_card[REAL_3080_A])
+        self.assertIn("reaches_gate=YES", by_card[REAL_5090])
+        self.assertIn("reaches_gate=NO", by_card[REAL_3080_A])
+        self.assertIn("gets no benefit", by_card[REAL_3080_A])
         for ln in lines:
             self.assertIn(self.PROBE, ln, "no ratio without its provenance")
 

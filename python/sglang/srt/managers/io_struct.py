@@ -1963,6 +1963,13 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # transform tensors to hibernate_dir (suspend-to-disk) before pausing.
     destination: Optional[str] = None
     hibernate_dir: Optional[str] = None
+    # C14 (WEG2_FLIPCOST_SPEC_0907), FIX 1 round 1: the FLIP's epoch, owned by
+    # the Weg-2 front and carried on both legs of the gathered pair, so the
+    # per-card VRAM credit counter can be dated.  Without it a waking rank
+    # cannot tell this leg's counter from the previous flip's terminal state and
+    # must consult none (weg2_memory_saver.VramCredit.wait_for).  None on every
+    # non-Weg-2 path -- a stock request is unchanged.
+    epoch: Optional[int] = None
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
@@ -1988,6 +1995,13 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
+    # C14 (WEG2_FLIPCOST_SPEC_0907), FIX 1 round 1: the FLIP's epoch, owned by
+    # the Weg-2 front and carried on both legs of the gathered pair, so the
+    # per-card VRAM credit counter can be dated.  Without it a waking rank
+    # cannot tell this leg's counter from the previous flip's terminal state and
+    # must consult none (weg2_memory_saver.VramCredit.wait_for).  None on every
+    # non-Weg-2 path -- a stock request is unchanged.
+    epoch: Optional[int] = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):

@@ -3,6 +3,10 @@
 #include "macro.h"
 #include "api_forwarder.h"
 
+#include <cstring>
+#include <map>
+#include <string>
+
 #if defined(USE_ROCM)
 #include "hardware_amd_support.h"
 #endif
@@ -133,6 +137,38 @@ uint64_t TorchMemorySaver::tag_bytes(const std::string& tag) {
         }
     }
     return total;
+}
+
+int TorchMemorySaver::backed_up_tag_bytes(char* out, size_t len) {
+    if (out == nullptr || len == 0) {
+        return -1;
+    }
+    std::map<std::string, uint64_t> totals;
+    {
+        const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
+            // THE POPULATION IS enable_cpu_backup, NOT the tag name.  An
+            // allocation without it never reaches a host granule (R20, asserted
+            // in pause/resume), so it holds no host bytes the ring must size
+            // for -- and charging it would over-size H and refuse the boot.
+            if (!it->second.enable_cpu_backup) {
+                continue;
+            }
+            totals[it->second.tag] += static_cast<uint64_t>(it->second.size);
+        }
+    }
+    std::string text;
+    for (auto it = totals.begin(); it != totals.end(); ++it) {
+        if (!text.empty()) {
+            text += ",";
+        }
+        text += it->first + "=" + std::to_string(it->second);
+    }
+    if (text.size() + 1 > len) {
+        return -1;
+    }
+    std::memcpy(out, text.c_str(), text.size() + 1);
+    return static_cast<int>(totals.size());
 }
 
 bool TorchMemorySaver::ring_stats(HostRingStats* out, std::string* card_uuid) {

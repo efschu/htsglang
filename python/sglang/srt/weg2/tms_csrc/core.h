@@ -62,6 +62,15 @@ public:
     //: co-located processes, so RssShmem collapses to ~0 and a per-process sum
     //: double-counts (spec R8).
     uint64_t tag_bytes(const std::string& tag);
+    //: C16 / A1-2, FIX 1 round 1: ``<tag>=<bytes>,...`` over EVERY tag that has
+    //: at least one allocation with ``enable_cpu_backup``, summing only those
+    //: allocations.  ``tag_bytes`` cannot answer this question -- it counts a
+    //: tag's device bytes whether or not they are ever copied to the host, so
+    //: summing it over the tag list would charge ``kv_cache`` (paused WITHOUT
+    //: cpu backup, R20) into the host ring and refuse the boot.  The population
+    //: is the saver's own metadata, which is the only place that fact exists.
+    //: Returns the number of tags written, or -1 when ``len`` is too small.
+    int backed_up_tag_bytes(char* out, size_t len);
     //: C7: the live ring counters of this rank's card, or false when this boot
     //: published no ring.
     bool ring_stats(HostRingStats* out, std::string* card_uuid);

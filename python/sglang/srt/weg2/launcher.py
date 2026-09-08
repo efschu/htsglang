@@ -719,33 +719,87 @@ def _front_leg_form() -> str:
     return front.FLIP_LEG_FORM
 
 
-def _pcie_lock_directional(ratios: Optional[Dict[str, float]] = None,
-                           cards: Optional[Sequence["Card"]] = None) -> bool:
-    """Does the per-card PCIe lock separate the two legs -- ON EVERY CARD?
+def _split_decisions(
+    card_uuids: Sequence[str],
+    ratios: Optional[Dict[str, float]] = None,
+    leg_form: str = "interleave",
+    override: Optional[bool] = None,
+) -> Dict[str, bool]:
+    """Per card: does its PCIe key SPLIT the two directions?  Decided ONCE, here.
 
-    Read from the module that owns the key
-    (``weg2_memory_saver.pcie_lock_separates_directions``), never restated here.
-    That is what stops this gate from opening on the day one half of the hazard
-    moves and the other has not.
+    FIX 1 round 1, and boot weg2rg2 is the reason it is a decision at all rather
+    than a reading of R17's ratio.  R17 asks whether the split BUYS enough
+    (concurrent aggregate >= 1.5x serial); weg2rg2 asked whether the single key
+    is SAFE under C9's gathered legs, and the answer is no.  Each leg holds the
+    per-card key across its whole tag loop, so on a one-key card the pair is
+    serialised again and R5's premise -- W's per-tag releases fund S's acquires
+    -- is false there: the sleep leg blocks in ``acquire`` at free = 0 holding
+    the key the wake leg needs.  Measured cost of that on nvml0: 120.189 s, W31,
+    W29 on three ranks, group-fatal W4.
 
-    A1-4: the answer is PER CARD, and this returns the AND over the cards -- a
-    single card that keeps one key is enough to serialise the pair there, which
-    is the whole hazard, and on this rig that card (nvml0, x4, measured 1.316
-    against R17's 1.5) is also the flip's critical path.  What follows from a
-    False here is NOT "do not arm": with the gathered legs of C9 the corridor
-    that funds the ring is R5's, which the ring bitmap and C14's device credit
-    close on their own; the per-card serialisation costs TIME on that card and
-    nothing else.  The value is printed on the ARMED line so the operator can
-    read the flip's expected critical path off it.
+    So: under GATHERED legs every card splits, whatever its ratio.  That is not
+    free-lunch reasoning -- the x4 card's 1.316 is concurrent OVER serial, so
+    concurrency is 32 % faster there too; R17's gate only ever said the split is
+    not worth a mechanism of its own, and A1-4 says that card gets no BENEFIT
+    from the split, not that it must not have one.  Under a front that does NOT
+    gather (no state of this tree), the ratio gate stands and a card below it
+    keeps one key -- which is correct there, because a serial front never has
+    two legs in flight to deadlock.
+
+    ``override`` is the test injection point: ``True`` = force every key to
+    split, ``False`` = force every key single (the weg2rg2 state).
     """
+    if override is not None:
+        return {uuid: bool(override) for uuid in card_uuids}
+    if leg_form == "interleave":
+        return {uuid: True for uuid in card_uuids}
+    table = ratios or {}
+    return {
+        uuid: table.get(uuid) is not None and table[uuid] >= DUPLEX_GATE
+        for uuid in card_uuids
+    }
+
+
+def _serialised_cards(
+    card_uuids: Sequence[str],
+    splits: Optional[Dict[str, bool]] = None,
+    leg_form: str = "interleave",
+) -> List[str]:
+    """The cards on which the two flip legs are SERIALISED, by UUID.
+
+    FIX 1 (round 1), and boot weg2rg2 is why.  Serialisation is a property of a
+    CARD, not of the flip: C9 puts both legs in flight, but each leg takes the
+    per-card PCIe key for its WHOLE tag loop (weight_updater sleep-D2H at the
+    ``with self._weg2_pcie_lock(...)`` around the pause loop, wake-H2D around
+    the resume loop), and on a card whose measured duplex ratio does not reach
+    R17's gate both directions resolve to the SAME key.  There the gathered pair
+    is serialised again -- W's per-tag releases cannot fund S's acquires,
+    because W is queued behind S on the key, or S behind W.
+
+    The predecessor computed the AND over cards, printed it, and gated nothing;
+    its justification was that "a card that keeps one key costs time on that
+    card, and nothing else".  The metal refuted that 20 minutes later: nvml0
+    (1.316, DUPLEX-NULL) passed R5 on both directions, armed, and wedged
+    120.189 s into the FIRST flip -- W31 Weg2HostRingExhausted need=24 free=12
+    MiB, its peer holding the granules and itself queued on that same single
+    key, ending in W29 on all three P ranks and a group-fatal W4.
+
+    ``splits`` is :func:`_split_decisions`' answer, read back through the module
+    that OWNS the key -- never re-derived here, because a launch check computed
+    from a different number than the key the rank builds is exactly how the
+    predecessor certified a corridor the metal did not walk.
+    """
+    if leg_form != "interleave":
+        # The front itself does not gather: every card is serialised, whatever
+        # its key does.
+        return list(card_uuids)
     from sglang.srt.managers import weg2_memory_saver
 
-    if not cards:
-        return False
-    return all(
-        weg2_memory_saver.pcie_lock_separates_directions(c.uuid, ratios=ratios or {})
-        for c in cards
-    )
+    return [
+        uuid for uuid in card_uuids
+        if not weg2_memory_saver.pcie_lock_separates_directions(
+            uuid, splits=splits or {})
+    ]
 
 
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
@@ -758,13 +812,14 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     are created BEFORE either group starts, so a configuration that cannot walk
     the corridor never reaches a rank (W32/W34 rather than a mid-flip W31).
 
-    TWO inequalities, because there are two flip forms and only one of them is
-    in this tree.  R5's corridor is checked always (W32).  The SERIAL form's
-    ``H(c) >= image_W(c) + max_tag_S(c)`` is checked whenever the legs cannot be
-    concurrently in flight on one card (W34), which is TWO facts read from the
-    two modules that own them -- ``front.FLIP_LEG_FORM`` and
-    ``weg2_memory_saver.PCIE_LOCK_SEPARATES_DIRECTIONS`` -- because either one
-    alone serialises them.
+    TWO inequalities, and WHICH ONE A CARD IS CHECKED AGAINST IS THE CARD'S OWN
+    PROPERTY (FIX 1 round 1).  R5's corridor is checked on every card (W32).
+    The SERIAL form's ``H(c) >= image_W(c) + max_tag_S(c)`` is checked on the
+    cards where the two legs cannot actually overlap (W34) -- see
+    :func:`_serialised_cards`, which reads the leg form from the front and the
+    key from the module that owns it, per card.  ``pcie_directional`` is the
+    test override for that second fact: ``True`` = every card's key splits,
+    ``False`` = none does, ``None`` = ask per card.
 
     NO TABLE IS NOT A FALLBACK: with ``table`` None this returns an un-armed,
     unpriceable plan and the ledger refuses the launch (W20).  See
@@ -779,23 +834,20 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     plan = HostRingPlan(form=form, duplex=duplex)
     if duplex is None:
         plan.lines.append(
-            f"WEG2-PCIE-DUPLEX UNMEASURED: {duplex_why} -- NO card splits its "
-            "lock key this boot, so a sleep-D2H and a co-located wake-H2D "
-            "serialise on every card.  That is slower, never wrong: the "
-            "corridor that funds the ring is R5's, closed by the ring bitmap "
-            "and C14's device credit, not by the lock."
+            f"WEG2-PCIE-DUPLEX UNMEASURED: {duplex_why} -- no card has a RATIO "
+            "this boot, so none of them has an expectation about what the split "
+            "buys.  Under gathered legs every key still SPLITS, and that is a "
+            "correctness decision, not an optimisation: with one key the sleep "
+            "leg blocks in the ring's acquire holding the key the wake leg needs "
+            "(boot weg2rg2, W31 after 120.189 s -> W29 -> W4).  The predecessor "
+            "of this line said an unmeasured card is 'slower, never wrong'; the "
+            "metal refuted that."
         )
     else:
         plan.lines.extend(duplex.format_lines(cards, DUPLEX_GATE))
-        plan.duplex_env = duplex.env_map()
     for ln in plan.lines:
         log(ln)
     logged = len(plan.lines)
-    directional = (
-        _pcie_lock_directional(duplex.ratios if duplex else {}, cards)
-        if pcie_directional is None
-        else pcie_directional
-    )
     table, reason = ring_table.solve(cards, evidence_dir, boot_stem or None)
     if table is None:
         plan.lines.append(
@@ -852,40 +904,80 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
          table.refusals(),
          ring_table.Weg2RingCreditRefused),
     ]
-    # W34 IS UNREACHABLE BY CONSTRUCTION ON THIS TIP, and it stays for exactly
-    # the case that construction cannot cover.  C9 made the gathered pair the
-    # ONLY leg form this module's front contains -- there is no branch left that
-    # produces "serial" -- so ``front.FLIP_LEG_FORM != "interleave"`` can only
-    # be true for a launcher running against a DIFFERENT front than the one it
-    # was built with (a stale worktree on PYTHONPATH, a partial rebase).  The
-    # serial requirement H(c) >= image_W(c) + max_tag_S(c) is what such a pair
-    # would need, it failed on 4 of 6 cases on this rig's own table (boot
-    # weg2rg1), and a blocking ring armed under it wedges the FIRST flip.  So
-    # the check remains and it REFUSES; what changed is that it can no longer be
-    # reached by any state of this tree, and that a raw traceback with exit 1 --
-    # which is how weg2rg1 actually saw it -- is no longer possible, because
-    # every arm here raises a Weg2RingRefused and cli() turns those into the one
-    # WEG2-LAUNCH REFUSED line and exit 2.
+    # W34 IS PER CARD (FIX 1 round 1).  The serial requirement
+    # H(c) >= image_W(c) + max_tag_S(c) applies to a card wherever the two legs
+    # cannot actually overlap ON THAT CARD, and there are two ways for that to
+    # be true:
     #
-    # The PCIe direction split is NOT part of this gate any more, and that is
-    # A1-4: the split's benefit is per card (5090 1.759, nvml2 1.687, nvml0
-    # 1.316 = below R17's gate), so requiring it globally would refuse a boot
-    # over a card that is merely SLOWER.  With the gathered legs the corridor is
-    # funded by the ring bitmap (R11) and by C14's device credit, neither of
-    # which is the lock; a card that keeps one key costs time on that card, and
-    # the WEG2-PCIE-DUPLEX lines above say which card that is.
-    if leg_form != "interleave":
+    #   * the FRONT does not gather at all (``FLIP_LEG_FORM != "interleave"``,
+    #     which no state of this tree produces -- a stale worktree on
+    #     PYTHONPATH, a partial rebase).  Then every card is serialised.
+    #   * the CARD's key does not split (A1-4: 5090 1.759 and nvml2 1.687 reach
+    #     R17's gate, nvml0 measured 1.316 and does not).  Each leg holds that
+    #     key across its whole tag loop, so on that card the gathered pair is
+    #     serialised again and R5's premise -- W's per-tag releases fund S's
+    #     acquires -- is false there.
+    #
+    # The predecessor checked only the first and printed the second, and boot
+    # weg2rg2 is what that cost: nvml0 passed R5 on both directions, the L6 line
+    # said SERIAL FORM slack=1122/-2986 MiB on the SAME card, the launcher armed
+    # anyway, and the first flip wedged for 120.189 s into W31 -> W29 on all
+    # three P ranks -> group-fatal W4.  A refusal 120 s into a flip that has
+    # already mutated VRAM is not the refusal this gate exists to give.
+    card_uuids = [c.uuid for c in table.cards]
+    splits = _split_decisions(
+        card_uuids, duplex.ratios if duplex else {}, leg_form, pcie_directional
+    )
+    # THE DECISION IS PUBLISHED HERE AND NOWHERE ELSE (R19: launcher output).
+    # The ranks build their key from this same string, so the inequality this
+    # module checks and the key the metal takes cannot be two different facts.
+    plan.duplex_env = ",".join(
+        f"{u}={('%.3f' % duplex.ratios[u]) if duplex and u in duplex.ratios else ''}"
+        f":{'split' if splits[u] else 'single'}"
+        for u in card_uuids
+    )
+    serialised = _serialised_cards(card_uuids, splits, leg_form)
+    checks_logged = len(plan.lines)
+    for c in table.cards:
+        is_serial = c.uuid in serialised
+        plan.lines.append(
+            f"WEG2-HOST-RING CHECK card={c.uuid} nvml{c.nvml_index} {c.name} "
+            f"key={'SINGLE (both legs serialise here)' if is_serial else 'SPLIT per direction'} "
+            f"duplex_ratio={(duplex.ratios.get(c.uuid) if duplex else None)} "
+            f"gate={DUPLEX_GATE} leg_form={leg_form} -- checked against "
+            + ("the R5 corridor (W32) AND the SERIAL requirement "
+               "H >= image_W + max_tag_S (W34), because the two legs cannot "
+               "overlap on this card"
+               if is_serial else
+               "the R5 corridor (W32) alone, because both legs can be in flight "
+               "on this card at once")
+        )
+    for ln in plan.lines[checks_logged:]:
+        log(ln)
+    if serialised:
+        why_serial = (
+            f"front.FLIP_LEG_FORM is {leg_form!r}, not 'interleave' -- this "
+            "launcher is running against a front that does not gather its legs, "
+            "which no state of this tree produces (C9), so EVERY card is "
+            "serialised"
+            if leg_form != "interleave" else
+            f"the legs are gathered (C9) but on {len(serialised)} of "
+            f"{len(table.cards)} card(s) -- {', '.join(serialised)} -- the "
+            "measured duplex ratio does not reach R17's gate, so a sleep-D2H and "
+            "the co-located wake-H2D take the SAME per-card PCIe key and each "
+            "holds it across its whole tag loop; on those cards the pair is "
+            "serialised whatever the front does"
+        )
         checks.append(
             ("W34 Weg2RingNeedsInterleave",
-             f"front.FLIP_LEG_FORM is {leg_form!r}, not 'interleave' -- this "
-             "launcher is running against a front that does not gather its legs, "
-             "which no state of this tree produces (C9); the serial requirement "
-             "H(c) >= image_W(c) + max_tag_S(c) therefore applies and fails on "
-             "{n} (card x direction) case(s).  S would block in acquire holding "
-             "the per-card lock, W's release would never be issued because its "
-             "RPC has not been sent, and the acquire budget would expire into "
-             "W31 -> group-fatal W4",
-             table.serial_refusals(),
+             why_serial + "; the serial requirement H(c) >= image_W(c) + "
+             "max_tag_S(c) therefore applies THERE and fails on {n} "
+             "(card x direction) case(s).  S blocks in acquire holding the "
+             "per-card key, W cannot issue the release that would fund it "
+             "because it is queued on that same key, and the acquire budget "
+             "expires into W31 -> W29 on every rank of the group -> "
+             "group-fatal W4.  That is boot weg2rg2, observed, not predicted",
+             table.serial_refusals(only=serialised),
              ring_table.Weg2RingNeedsInterleave))
     for name, why, bad, exc in checks:
         if not bad:
@@ -925,7 +1017,9 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     plan.armed = True
     plan.lines.append(
         f"WEG2-HOST-RING ARMED form={plan.form} leg_form={leg_form} "
-        f"pcie_lock_directional_on_every_card={directional} "
+        f"serialised_cards={serialised or 'none'} "
+        f"(each checked against the SERIAL requirement, not R5's corridor -- "
+        f"see the WEG2-HOST-RING CHECK line per card) "
         f"epoch={plan.epoch} dir={plan.dir} "
         f"Sigma H={table.total_h_bytes // ring_table.MIB} MiB "
         f"Sigma span1={table.total_span1_bytes // ring_table.MIB} MiB granule=2 MiB "

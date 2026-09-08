@@ -97,7 +97,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 MIB = 1024 * 1024
 GIB = float(2**30)
@@ -117,10 +117,30 @@ _DORMANT_RE = re.compile(
     r"WEG2 DORMANT-IMAGE\s+group=(\S+)\s+.*?rss_shmem_gib=([\d.]+)\s+"
     r"weight_tags_gib=([\d.]+)\s+extra_gib=(-?[\d.]+)"
 )
-#: The RING-era instrument (C16, next slice); same shape, honest name.
+#: The RING-era instrument (C16); same shape, honest name.
+#:
+#: FIX 1 (round 1), carried review finding 1 reproduced in the replacement
+#: instrument: the line must state the POPULATION it samples, because the
+#: reader's whole question is whether the census covers every backed-up tag
+#: (A1-2's second route to the dormant image) or the weights family alone (a
+#: LOWER BOUND -- boot weg2dk7 measured 38.63 GiB against 28.83 of weight
+#: tags).  ``population=`` is optional in the regex ON PURPOSE: a boot written
+#: before this field existed carries none, and an absent claim is read as the
+#: weaker one, never as the stronger.
 _TAG_RE = re.compile(
     r"WEG2-FLIP-TAG\s+group=\S+\s+rank=(\d+)\s+card=(\S+)\s+dir=\S+\s+tag=(\S+)\s+"
-    r"bytes=(\d+)\s+MiB"
+    r"bytes=(\d+)\s+MiB(?:\s+population=(\S+))?"
+)
+#: The one token on a WEG2-FLIP-TAG line that licenses ``covers_all_backed_up_tags``.
+TAG_POPULATION_ALL = "all-backed-up-tags"
+TAG_POPULATION_WEIGHTS = "weights-family"
+#: ``WEG2-HOST-LEDGER CHOSEN S=48 GB ... M=2400 MiB ...`` -- the SOURCE boot's
+#: own arm.  It is what makes the non-backup host terms of that boot's RssShmem
+#: computable (FIX 1, finding 3): anchors and rings are pure functions of
+#: ``(S, M)`` in :mod:`host_ledger`, and the boot whose RssShmem is being read
+#: is the boot whose arm must be subtracted from it.
+_CHOSEN_ARM_RE = re.compile(
+    r"WEG2-HOST-LEDGER CHOSEN\s+S=(\d+)\s+GB\b.*?\bM=(\d+)\s+MiB"
 )
 #: ``KV Cache is allocated. ... K size: 5.63 GB, V size: 5.63 GB``
 _KV_RE = re.compile(
@@ -364,7 +384,7 @@ class RingTable:
                     )
         return bad
 
-    def serial_refusals(self) -> List[str]:
+    def serial_refusals(self, only: Optional[Collection[str]] = None) -> List[str]:
         """Every card/direction the SERIAL flip form cannot walk.  Empty = fundable.
 
         Read this beside :meth:`refusals`: R5's cases can all pass while every
@@ -372,9 +392,24 @@ class RingTable:
         blocking ring armed on the R5 numbers under the serial order wedges at
         the first acquire -- the ARMED line would then certify an inequality for
         a form this tree does not contain.
+
+        ``only`` restricts the check to a set of card UUIDs, and that is FIX 1's
+        whole point: serialisation is not a property of the FLIP, it is a
+        property of a CARD.  With C9's gathered legs the two RPCs are in flight
+        together, but on a card whose measured duplex ratio does not reach R17's
+        gate both legs take the SAME per-card PCIe key and that key is held
+        across the whole tag loop (weight_updater sleep-D2H / wake-H2D), so on
+        THAT card the pair is serialised again and this -- not R5's corridor --
+        is the requirement it must meet.  Boot weg2rg2 is the metal proof: nvml0
+        measured 1.316 (DUPLEX-NULL), passed R5 on both directions, armed, and
+        wedged 120 s into the first flip with W31 Weg2HostRingExhausted at
+        free=12 MiB while its P peer sat on the un-split key.  ``None`` checks
+        every card, which is the case where the FRONT itself does not gather.
         """
         bad = []
         for c in self.cards:
+            if only is not None and c.uuid not in only:
+                continue
             for direction, need, image_w, w_tag, s_tag, step in (
                 ("d2p", c.need_serial_d2p_mib, c.image_p_mib, "P", "D", c.max_tag_d_mib),
                 ("p2d", c.need_serial_p2d_mib, c.image_d_mib, "D", "P", c.max_tag_p_mib),
@@ -515,12 +550,31 @@ def parse_group_log(path: str) -> GroupLog:
                     uuid_by_rank[rank] = m.group(2)
                     per_rank.setdefault(rank, []).append(((m.group(3),), int(m.group(4))))
                     lines_read += 1
-                    covers_all = True
-                    instrument = (
-                        "WEG2-FLIP-TAG bytes (tms_tag_bytes, the saver's own "
-                        "accounting, EVERY backed-up tag -- A1-2's measured "
-                        "dormant image per card)"
-                    )
+                    # FIX 1 finding 2: the POPULATION is read off the line, never
+                    # inferred from the line's existence.  The predecessor set
+                    # this True on the first WEG2-FLIP-TAG it saw, while the
+                    # emitter looped over ``weights_tags`` alone -- so the very
+                    # first ring-era boot would have flipped the flag, called a
+                    # weights-only census "the measured dormant image", and sized
+                    # H from a lower bound while the provenance line said
+                    # MEASURED.  A line that does not state its population states
+                    # the weaker claim.
+                    population = m.group(5) or TAG_POPULATION_WEIGHTS
+                    if population == TAG_POPULATION_ALL:
+                        covers_all = True
+                        instrument = (
+                            "WEG2-FLIP-TAG bytes (tms_tag_bytes over the saver's "
+                            "OWN enable_cpu_backup metadata, population="
+                            f"{TAG_POPULATION_ALL} -- A1-2's measured dormant "
+                            "image per card)"
+                        )
+                    elif not covers_all:
+                        instrument = (
+                            "WEG2-FLIP-TAG bytes (tms_tag_bytes, the saver's own "
+                            f"accounting, population={population} -- a LOWER "
+                            "BOUND on the dormant image: boot weg2dk7 measured "
+                            "38.63 GiB against 28.83 of weight tags)"
+                        )
                     continue
             if "WEG2-CHUNK-BYTES sleep" in line:
                 m = _CHUNK_RE.search(line)
@@ -601,6 +655,30 @@ def parse_dormant_images(front_log: str) -> Dict[str, DormantImage]:
     return out
 
 
+def parse_chosen_arm(front_log: str) -> Optional[Tuple[int, int]]:
+    """``(S GB, M MiB)`` of the SOURCE boot's own chosen ledger arm, or None.
+
+    FIX 1 finding 3.  The RssShmem cross-check reads the sleeping group's WHOLE
+    shared-memory residency, which includes host bytes the ledger already posts
+    by name for that same boot -- the mamba anchors and the HiCache rings.
+    Lifting a census to that figure charges those bytes a SECOND time, and the
+    arithmetic of that double book is the A1-3 state: Sigma H walks from ~32 to
+    ~42 GiB and the ledger W20-refuses at every rung.  The subtrahend is a pure
+    function of the arm (:func:`host_ledger.non_backup_host_bytes`), and the
+    right arm is the one the boot being READ ran, not the one this boot will
+    choose -- so it is parsed from that boot's own front log.
+    """
+    try:
+        with open(front_log, errors="replace") as f:
+            for line in f:
+                m = _CHOSEN_ARM_RE.search(line)
+                if m:
+                    return int(m.group(1)), int(m.group(2))
+    except OSError:
+        return None
+    return None
+
+
 def apportion_dormant(
     group: str,
     measured: Optional[DormantImage],
@@ -609,6 +687,8 @@ def apportion_dormant(
     *,
     fallback: Optional[DormantImage] = None,
     fallback_census: Optional[Dict[str, int]] = None,
+    non_backup_mib: Optional[int] = None,
+    fallback_non_backup_mib: Optional[int] = None,
 ) -> Tuple[Dict[str, int], str, bool]:
     """A1-2's cross-check, turned into per-card MiB -- ``(rows, source, is_bound)``.
 
@@ -648,38 +728,74 @@ def apportion_dormant(
             for uuid, value in census.items()
         }
 
+    covers = "all backed-up tags" if census_covers_all_tags else "weights_* only"
     if measured is not None:
-        if measured.rss_mib <= total_census:
+        # SUBTRACT BEFORE YOU MAY RAISE (FIX 1 finding 3).  RssShmem is the
+        # sleeping group's WHOLE shared-memory residency; the backup image is
+        # what is left of it after the host terms the ledger posts by name for
+        # the same ranks -- anchors + rings -- are taken out.  Without that
+        # subtraction the same bytes are charged twice, once in the ledger's own
+        # ``anchors``/``rings`` terms and once in Sigma H.
+        if non_backup_mib is None:
             return (
                 dict(census),
                 (
-                    f"group {group}: measured RssShmem {measured.rss_mib} MiB does NOT "
-                    f"exceed the per-card census {total_census} MiB "
-                    f"({'all backed-up tags' if census_covers_all_tags else 'weights_* only'}), "
-                    "so the census stands and the cross-check corroborates it"
+                    f"group {group}: measured RssShmem {measured.rss_mib} MiB is "
+                    f"REPORTED but NOT CHARGED against the per-card census "
+                    f"{total_census} MiB ({covers}) -- the source boot's own chosen "
+                    "ledger arm could not be read, so the non-backup host terms it "
+                    "posts by name (anchors + rings) cannot be subtracted, and an "
+                    "un-netted RssShmem would charge those bytes a second time.  "
+                    "The census stands; route = per-card tag census"
                 ),
-                False,
+                not census_covers_all_tags,
+            )
+        usable = measured.rss_mib - max(0, int(non_backup_mib))
+        if usable <= total_census:
+            return (
+                dict(census),
+                (
+                    f"group {group}: measured RssShmem {measured.rss_mib} MiB minus "
+                    f"the ledger's own posted non-backup host terms for this "
+                    f"group's ranks {int(non_backup_mib)} MiB (anchors + rings) = "
+                    f"{usable} MiB, which does NOT exceed the per-card census "
+                    f"{total_census} MiB ({covers}), so the census stands and the "
+                    "netted cross-check corroborates it; route = per-card tag census"
+                ),
+                not census_covers_all_tags,
             )
         return (
-            scaled(measured.rss_mib),
+            scaled(usable),
             (
-                f"group {group}: measured RssShmem {measured.rss_mib} MiB EXCEEDS the "
-                f"per-card census {total_census} MiB by {measured.rss_mib - total_census} "
-                f"MiB ({'all backed-up tags' if census_covers_all_tags else 'weights_* only'}); "
-                "the excess is apportioned over the cards by their share of that "
-                "census, which is the only attribution the two instruments jointly "
-                "support (the measurement is a whole-group figure)"
+                f"group {group}: measured RssShmem {measured.rss_mib} MiB minus the "
+                f"ledger's own posted non-backup host terms for this group's ranks "
+                f"{int(non_backup_mib)} MiB (anchors + rings) = {usable} MiB, which "
+                f"EXCEEDS the per-card census {total_census} MiB ({covers}) by "
+                f"{usable - total_census} MiB; the excess is apportioned over the "
+                "cards by their share of that census, which is the only attribution "
+                "the two instruments jointly support (the measurement is a "
+                "whole-group figure); route = netted RssShmem"
             ),
             False,
         )
-    if fallback is not None and fallback_census is not None and fallback.extra_mib > 0:
-        target = total_census + fallback.extra_mib
+    # The D BOUND borrows P's unattributed excess, so it inherits P's netting
+    # problem too: an un-netted excess would charge the ledger's anchors and
+    # rings into D's image as well.  No subtrahend for the lending group -> no
+    # borrowing, and the census stands as the bound it already is.
+    excess = (
+        fallback.extra_mib - max(0, int(fallback_non_backup_mib))
+        if fallback is not None and fallback_non_backup_mib is not None
+        else 0
+    )
+    if fallback is not None and fallback_census is not None and excess > 0:
+        target = total_census + excess
         return (
             scaled(target),
             (
                 f"group {group}: NEVER MEASURED -- BOUND from its own census "
-                f"{total_census} MiB plus the {fallback.extra_mib} MiB group "
-                f"{fallback.group} held beyond ITS census "
+                f"{total_census} MiB plus the {excess} MiB group "
+                f"{fallback.group} held beyond ITS census after its own "
+                f"{int(fallback_non_backup_mib)} MiB of anchors + rings came out "
                 "(A1-2: D's first sleep is a flip and is interleaved, so no "
                 "un-confounded D sample exists yet); replace with a reading as "
                 "soon as one boot logs WEG2 DORMANT-IMAGE group=D"
@@ -692,11 +808,15 @@ def apportion_dormant(
             f"group {group}: no WEG2 DORMANT-IMAGE line in this boot's front log, so "
             "the per-card census stands UNCHECKED "
             + (
-                "(it does cover every backed-up tag -- C16 wrote it, so it IS the "
-                "measured dormant image)"
+                f"(it does cover every backed-up tag -- the lines say population="
+                f"{TAG_POPULATION_ALL}, which C16 writes from the saver's own "
+                "enable_cpu_backup metadata, so it IS A1-2's measured dormant "
+                "image; route = per-card tag census)"
                 if census_covers_all_tags
-                else "(and it is a LOWER BOUND, not a measurement: weights_* only, "
-                     "and boot weg2dk7 measured a real image 34 % above such a census)"
+                else "(and it is a LOWER BOUND, not a measurement: the lines carry "
+                     "no population=" + TAG_POPULATION_ALL + " claim, so weights_* "
+                     "only, and boot weg2dk7 measured a real image 34 % above such "
+                     "a census; route = per-card tag census, BOUND)"
             )
         ),
         # A1-2: what is charged is a MEASUREMENT only when the census itself
@@ -783,10 +903,6 @@ class DuplexTable:
     ratios: Dict[str, float] = field(default_factory=dict)
     verdicts: Dict[str, str] = field(default_factory=dict)
 
-    def env_map(self) -> str:
-        """``SGLANG_WEG2_PCIE_DUPLEX`` -- ``<uuid>=<ratio>,...``, launcher output."""
-        return ",".join(f"{u}={r:.3f}" for u, r in sorted(self.ratios.items()))
-
     def format_lines(self, cards: Sequence, gate: float) -> List[str]:
         out = []
         for card in cards:
@@ -799,17 +915,21 @@ class DuplexTable:
                     "re-creates the overlap R9 forbids)"
                 )
                 continue
-            split = ratio >= gate
+            worth_it = ratio >= gate
             out.append(
                 f"WEG2-PCIE-DUPLEX card={card.uuid} nvml{card.nvml_index} {card.name} "
                 f"ratio={ratio:.3f} gate={gate:.2f} verdict={self.verdicts.get(card.uuid, '?')} "
-                f"split={'YES' if split else 'NO'} -- "
+                f"reaches_gate={'YES' if worth_it else 'NO'} -- "
                 + (
-                    "the two legs take separate lock keys on this card"
-                    if split
-                    else "the two legs keep ONE key and still serialise here; this card "
-                         "is the flip's critical path and gets no benefit from the split "
-                         "(A1-4)"
+                    "the split is expected to pay for itself here"
+                    if worth_it
+                    else "the split is not expected to pay for itself here (A1-4: this "
+                         "card is the flip's critical path and gets no benefit from "
+                         "it) -- but the ratio is still >1, i.e. concurrency is "
+                         "FASTER than serialising even here, and whether the key "
+                         "splits is decided by the WEG2-HOST-RING CHECK line, not by "
+                         "this one: under gathered legs one key is a deadlock, not a "
+                         "slowdown (boot weg2rg2)"
                 )
                 + f" -- provenance: {self.path}, 2 MiB-granule row (the form C3/C4 issue)"
             )
@@ -859,6 +979,24 @@ def _boot_stems(evidence_dir: str) -> List[str]:
     have = [s for s in stems if f"{s}.P.log" in names and f"{s}.D.log" in names]
     have.sort(key=lambda s: os.path.getmtime(os.path.join(evidence_dir, f"{s}.front.log")), reverse=True)
     return have
+
+
+def _non_backup_mib(arm: Optional[Tuple[int, int]]) -> Mapping[str, Optional[int]]:
+    """``{group: MiB}`` of the source boot's posted anchors + rings, or Nones.
+
+    The import is local because :mod:`host_ledger` imports nothing from here and
+    this module is read by the launcher before either is priced; keeping the
+    edge one-directional is what stops the two from becoming one circular unit.
+    """
+    if arm is None:
+        return {"P": None, "D": None}
+    from sglang.srt.weg2 import host_ledger
+
+    s_gb, m_mib = arm
+    return {
+        g: int(host_ledger.non_backup_host_bytes(g, s_gb, m_mib) // MIB)
+        for g in ("P", "D")
+    }
 
 
 def solve(
@@ -947,12 +1085,22 @@ def solve(
         # A1-2: the group-level cross-check, apportioned onto the cards by their
         # share of that group's own census.  See :func:`apportion_dormant`.
         measured = parse_dormant_images(f_log)
+        # FIX 1 finding 3: the subtrahend of the RssShmem cross-check is the
+        # SOURCE boot's own posted non-backup host terms, computed from the arm
+        # that boot chose -- not from the arm this boot is about to choose, and
+        # not from a number typed here.  Unreadable -> None -> the cross-check
+        # reports but never raises a census (see :func:`apportion_dormant`).
+        arm = parse_chosen_arm(f_log)
+        non_backup = _non_backup_mib(arm)
         dorm_p, src_p, bound_p = apportion_dormant(
-            "P", measured.get("P"), pairs["image_p"], gp.covers_all_backed_up_tags
+            "P", measured.get("P"), pairs["image_p"], gp.covers_all_backed_up_tags,
+            non_backup_mib=non_backup.get("P"),
         )
         dorm_d, src_d, bound_d = apportion_dormant(
             "D", measured.get("D"), pairs["image_d"], gd.covers_all_backed_up_tags,
             fallback=measured.get("P"), fallback_census=pairs["image_d"],
+            non_backup_mib=non_backup.get("D"),
+            fallback_non_backup_mib=non_backup.get("P"),
         )
         pairs["dorm_p"], pairs["dorm_d"] = dorm_p, dorm_d
 

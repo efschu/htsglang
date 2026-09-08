@@ -281,6 +281,128 @@ class VramCreditTest(unittest.TestCase):
         self.assertEqual(self.credit.read()["credit_bytes"], 0)
         self.assertEqual(self.credit.read()["epoch"], 2)
 
+    def test_a_previous_legs_TERMINAL_state_is_not_read_as_this_flips_funding(self):
+        # FIX 1 round 1, finding 4.  The epoch was WRITE-ONLY: begin_leg stamped
+        # it and read()/wait_for() never looked.  C9 issues both legs in ONE
+        # asyncio.gather, so there is no happens-before between S's begin_leg
+        # and W's first wait_for; the per-card file is shared by the two
+        # co-located ranks and alternates writers, so at flip N+1 W typically
+        # read flip N's terminal state -- leg_complete with a whole image of
+        # credit -- and resumed on device bytes nobody had freed.  That is the
+        # rank-local CUDA OOM of spec 10.5, silently licensed by the guard that
+        # exists to prevent it.
+        self.credit.begin_leg(7)
+        self.credit.publish("weights_0", 10 * 1024 * MIB)
+        self.credit.leg_complete()
+        with self.assertRaises(ms.Weg2VramCreditRefused) as cm:
+            self.credit.wait_for(2 * 1024 * MIB, budget_s=0.3, tag="weights_0",
+                                 free_bytes_now=0, epoch=8)
+        self.assertIn("EXPIRED", str(cm.exception),
+                      "a stale leg_complete must not refuse instantly either -- "
+                      "it says nothing about the leg now in flight")
+        self.assertIn("epoch 7", str(cm.exception))
+        self.assertIn("not this flip's 8", str(cm.exception))
+
+    def test_a_stale_full_credit_does_not_licence_a_resume(self):
+        self.credit.begin_leg(7)
+        self.credit.publish("weights_0", 10 * 1024 * MIB)
+        with self.assertRaises(ms.Weg2VramCreditRefused):
+            self.credit.wait_for(MIB, budget_s=0.3, tag="weights_0",
+                                 free_bytes_now=0, epoch=8)
+        # ... and THIS flip's credit does
+        self.credit.begin_leg(8)
+        self.credit.publish("weights_0", 4 * MIB)
+        rec = self.credit.wait_for(MIB, budget_s=1.0, tag="weights_0",
+                                   free_bytes_now=0, epoch=8)
+        self.assertIn("funded", rec["reason"])
+
+    def test_the_flip_epoch_rides_on_both_legs_of_the_gathered_pair(self):
+        # The epoch has to be the FLIP's, and the front is the only thing that
+        # owns one.  Asserted on the source so the two RPCs cannot drift apart.
+        import inspect
+
+        from sglang.srt.weg2 import front
+
+        src = inspect.getsource(front.Front.flip)
+        self.assertIn('"/release_memory_occupation",\n                           '
+                      '{"tags": family, "epoch": self.epoch}', src)
+        self.assertIn('"/resume_memory_occupation",\n                           '
+                      '{"tags": family, "epoch": self.epoch}', src)
+
+    def test_a_leg_without_a_flip_epoch_arms_no_credit_rather_than_reading_one(self):
+        # A counter that cannot be dated cannot be told from the previous
+        # flip's, so the honest answer is to consult none -- not to read it and
+        # hope.  The methods are called unbound on a stub: the manager is a
+        # slots dataclass and the only state these two touch is these two hooks.
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        class _Rank:
+            def _weg2_fence_is_armed(self):
+                return True
+
+            def _weg2_card_uuid(self):
+                return "GPU-c14"
+
+        rank = _Rank()
+        self.assertIsNone(
+            wu.SchedulerWeightUpdaterManager._weg2_open_credit_for_leg(rank, None))
+        self.assertEqual(
+            wu.SchedulerWeightUpdaterManager._weg2_credit_reader(rank, None),
+            (None, None))
+
+    def test_the_census_population_is_the_savers_own_backup_metadata(self):
+        # FIX 1 round 1, finding 2.  ``tag_bytes`` cannot answer "which tags
+        # hold HOST bytes" -- it counts a tag's device bytes whether or not they
+        # are ever copied out, so a census built from it over a tag list would
+        # charge kv_cache (paused WITHOUT cpu backup, R20) into the ring.  The
+        # population is the saver's metadata, and where the running hook cannot
+        # answer, the line says weights-family and the planner reads a BOUND.
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        census = wu.SchedulerWeightUpdaterManager._weg2_backup_census
+
+        class _Adapter:
+            def __init__(self, answer):
+                self.answer = answer
+
+            def backed_up_tag_bytes(self):
+                return self.answer
+
+        class _Rank:
+            def __init__(self, adapter):
+                self.memory_saver_adapter = adapter
+
+        rows, population = census(
+            _Rank(_Adapter({"weights_0": 100, "cuda_graph": 25})),
+            ["weights_0"], {"weights_0": 100})
+        self.assertEqual(rows, {"weights_0": 100, "cuda_graph": 25},
+                         "the cuda_graph pause is inside the same RPC and its "
+                         "backup is part of the dormant image")
+        self.assertEqual(population, "all-backed-up-tags")
+
+        for answer in (None, {}):
+            rows, population = census(
+                _Rank(_Adapter(answer)), ["weights_0"], {"weights_0": 100})
+            self.assertEqual(rows, {"weights_0": 100})
+            self.assertEqual(population, "weights-family",
+                             "an absence must degrade the CLAIM, not be hidden")
+
+    def test_the_ring_acquire_budget_is_strictly_inside_the_lock_timeout(self):
+        # Review nb3, PREDICTED then OBSERVED: on boot weg2rg2 both 120 s
+        # budgets expired in the SAME SECOND for one fault, so which named
+        # refusal reached the operator was a race -- and the one that carries
+        # the arithmetic is the ring's.  The acquire runs INSIDE the PCIe lock,
+        # so the inner wait must expire first.
+        import re
+
+        header = open(os.path.join(
+            os.path.dirname(ms.__file__), "..", "weg2", "tms_csrc", "host_ring.h"
+        )).read()
+        m = re.search(r"TMS_RING_ACQUIRE_BUDGET_S\s*=\s*([\d.]+)", header)
+        self.assertIsNotNone(m, "the budget must stay a named constant")
+        self.assertLess(float(m.group(1)), ms.DEFAULT_PCIE_LOCK_TIMEOUT_S,
+                        "equal budgets make the refusal a race (nb3, observed)")
+
     def test_a_funded_wait_returns_and_names_why(self):
         self.credit.begin_leg(1)
         self.credit.publish("weights_0", 100 * MIB)

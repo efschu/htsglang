@@ -889,9 +889,16 @@ class Front:
             return
         family = list(self.weights_tags)
         t_gather0 = time.perf_counter()
+        # C14 / FIX 1 round 1: the FLIP'S epoch rides on BOTH legs.  It is the
+        # only thing that dates the per-card VRAM credit counter, and this
+        # gather is precisely why one is needed -- there is no happens-before
+        # between S's begin_leg and W's first read, so without it W reads the
+        # previous flip's terminal state as this flip's funding.
         (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
-            self.timed_rpc(S, "/release_memory_occupation", {"tags": family}, RPC_TIMEOUT_S),
-            self.timed_rpc(D, "/resume_memory_occupation", {"tags": family}, RPC_TIMEOUT_S),
+            self.timed_rpc(S, "/release_memory_occupation",
+                           {"tags": family, "epoch": self.epoch}, RPC_TIMEOUT_S),
+            self.timed_rpc(D, "/resume_memory_occupation",
+                           {"tags": family, "epoch": self.epoch}, RPC_TIMEOUT_S),
         )
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)

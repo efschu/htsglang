@@ -82,9 +82,19 @@ static const uint8_t TMS_RING_FAMILY_CARRIER = 2u;
 //: (weight_updater.py:527) and ``DEFAULT_PCIE_LOCK_TIMEOUT_S``
 //: (weg2_memory_saver.py) are both 120 s.  A ring wait allowed to outlive them
 //: would surface as a fence expiry naming NOBODY, which is exactly the
-//: rank-local silent failure spec section 10.5 forbids.  Reaching it is W31,
-//: and W31 is provably unreachable given the launch check (R15).
-static const double TMS_RING_ACQUIRE_BUDGET_S = 120.0;
+//: rank-local silent failure spec section 10.5 forbids.
+//:
+//: STRICTLY SMALLER THAN THOSE 120 s, and boot weg2rg2 is why (review note nb3,
+//: predicted, then observed).  The acquire runs INSIDE the PCIe serialisation
+//: lock, so when the pair wedges BOTH deadlines are running on the same wall
+//: clock; equal budgets made which named refusal reached the operator a race,
+//: and on weg2rg2 both expired in the SAME SECOND -- W31 on one rank and
+//: Weg2PcieLockTimeout on another, for one fault.  The inner wait must expire
+//: first so the refusal names the RING (which has the arithmetic) rather than
+//: the lock (which only says a key was busy).  Ten seconds of margin is one
+//: 250 ms sweep slice times forty, i.e. far outside the jitter of the sweep,
+//: and still leaves the whole transfer budget: a measured leg is ~2.1 s.
+static const double TMS_RING_ACQUIRE_BUDGET_S = 110.0;
 
 //: The shared control page.  Every field in it is read and written by BOTH
 //: co-located rank processes; nothing about a granule lives anywhere else.
