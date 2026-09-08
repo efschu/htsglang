@@ -5769,6 +5769,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ring (block 1b- above); only ``env_p`` stays here, because it is the
     # one thing in this step that genuinely needs the armed ring.
     env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", **_env_knobs(ns))
+    # #1269 PUBLICATION: build_env's own comment says the decision is
+    # "published explicitly so the boot log names the decision" -- but it only
+    # SET the variables and logged nothing, so no boot log ever carried them.
+    # A knob that shapes host memory and is never named is exactly the
+    # instrument-that-does-not-report shape; the value is a CEILING derived
+    # from the reset path's thread names, not a live count, and
+    # WEG2-IDLE-CENSUS `threads=` is what confirms or corrects it.
+    log(f"WEG2 MALLOC-ARENAS MALLOC_ARENA_MAX={env_p.get('MALLOC_ARENA_MAX')} "
+        f"SGLANG_IDLE_BLOCKING_POLL={env_p.get('SGLANG_IDLE_BLOCKING_POLL')} "
+        f"(both groups) -- provenance: glibc defaults to 8 x ncores arenas and this "
+        f"box reports affinity 0-31, so the default ceiling is 256; measured growth was "
+        f"64 MiB-aligned [anon] arenas extended in place plus NEW arenas appearing "
+        f"(+5.4 MiB/min on P PP0/PP1, +2.8 on each D rank, +19.0 MiB/min over six ranks "
+        f"against an independently observed +21.3). 4 = the scheduler thread plus the "
+        f"three the reset path names (prefetch, backup, prefetch_io_aux), each with its "
+        f"own arena. A CEILING, not a target. DERIVED FROM THREAD NAMES, NOT A LIVE "
+        f"COUNT -- the rank thread census was never captured before the host OOM took "
+        f"the base down; WEG2-IDLE-CENSUS threads= confirms or corrects it (#1269).")
     # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
     # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
