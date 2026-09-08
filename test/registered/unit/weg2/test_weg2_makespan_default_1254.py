@@ -121,7 +121,7 @@ class ThePriceOfBothAlternativesIsPrintedEveryBoot(CustomTestCase):
     def test_the_shipped_line_prices_all_three_arms(self):
         import inspect
 
-        src = inspect.getsource(launcher.incumbent_candidate)
+        src = inspect.getsource(launcher.solve_p_cut)
         i = src.index("PP-CUT SHIPPED")
         window = src[i:i + 900]
         for token in ("incumbent %s pool %s", "pool-maximal (kv-floor)",
