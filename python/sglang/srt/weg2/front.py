@@ -651,6 +651,11 @@ class Pending:
     fut: asyncio.Future
     reroutes: int = 0
     est_prompt: int = 0
+    #: #1271 (c): the UNCACHED remainder priced at route time -- the
+    #: quantity the flip actually has to redo. `est_prompt` counts the
+    #: cached head too, which P does not recompute, so a backlog summed
+    #: on it over-states the work and flips on prefixes already resident.
+    est_uncached: int = 0
     span_known: bool = False
     leg1_prompt_tokens: int = 0
     skip_leg1: bool = False  # #1233 route CARRIER-EXCEEDS: one prefill on D, no leg 1
@@ -977,6 +982,21 @@ class Front:
             int(flip_min_work_tokens) if flip_min_work_tokens is not None
             else self.tp_prefill_max_tokens
         )
+        # #1271 (b): the live X estimator's state.
+        self._x_min_work_follows = flip_min_work_tokens is None
+        #: The break-even's floor is ONE CHUNK: below it the round trip
+        #: cannot pay whatever the rates say. Deliberately NOT the seed X --
+        #: a floor at the seed would make the re-solve monotonically
+        #: non-decreasing, i.e. unable to correct an X that was too high,
+        #: which is exactly the sb2 direction.
+        self.x_floor_tokens = 4096
+        self._x_samples = {
+            "r_d": collections.deque(maxlen=self.X_SAMPLE_WINDOW),
+            "r_p": collections.deque(maxlen=self.X_SAMPLE_WINDOW),
+            "flip_s": collections.deque(maxlen=self.X_SAMPLE_WINDOW),
+        }
+        self._x_since_resolve = 0
+        self._x_seed_note = f"launcher solve X={self.tp_prefill_max_tokens}"
         # C8/K7: None = derive from the last completed flip in that direction.
         self.min_dwell_ms = None if min_dwell_ms is None else float(min_dwell_ms)
         # law 5 / C6: which group is awake when nothing is pending.
@@ -1592,7 +1612,8 @@ class Front:
                     return await self.leg2(request, rid, payload, text, stream, pending=None,
                                            single_prefill=True, seat=seat)
             fut = asyncio.get_event_loop().create_future()
-            p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt, span_known=known,
+            p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt,
+                        est_uncached=remainder, span_known=known,
                         skip_leg1=True, store_span_est=store_span)
             self.queue.append(p)
             try:
@@ -1628,7 +1649,8 @@ class Front:
             # served by the NEXT P phase, whose epoch this line names.
             logger.info("WEG2 LATE-BATCH rid=%s deferred_to_epoch=%d", rid, self.epoch + 1)
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt, span_known=known,
+        p = Pending(rid, request.path, payload, text, time.time(), fut, est_prompt=est_prompt,
+                        est_uncached=remainder, span_known=known,
                     store_span_est=store_span)
         self.queue.append(p)
         logger.info("WEG2-ROUTE rid=%s BATCH queued (awake=%s admit_d=%s est_prompt=%d remainder=%d queue=%d)",
@@ -2069,6 +2091,15 @@ class Front:
                             "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
                             dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
+                # #1271 (b): r_D SAMPLE, and ONLY from a prefill D ran ALONE.
+                # `single_prefill` is concurrency one, so tokens/wall IS the
+                # group's throughput for that window -- the same unit as the
+                # per-drain r_P above. A concurrent leg-2 wall would be a
+                # latency and must never enter this deque (#1271 (a)).
+                _unc = max(0, pt - ct)
+                _w = time.time() - t0
+                if verdict in ("single_prefill", "short_mispriced") and _unc > 0 and _w > 0:
+                    self.note_x_sample("r_d", _unc / _w)
                 if pt:
                     self.spans.record(text, pt)
                     self._note_exact(text, pt)
@@ -2651,6 +2682,8 @@ class Front:
                "dc_mib": dc, "t": time.time()}
         self.flip_log.append(rec)
         self.counters["flips"] += 1
+        # #1271 (b): this boot's own flip cost feeds the live X.
+        self.note_x_sample("flip_s", float(rec.get("flip_total_ms", 0)) / 1000.0)
         logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms (kv RPC + the %s leg of the gathered pair) "
                     "wake=%d ms (the %s leg + kv RPC) "
                     "interleave=%d ms (NOT sleep+wake: the legs overlap -- gather wall %d ms against %d + %d ms of legs) "
@@ -2701,6 +2734,102 @@ class Front:
                     src, dst, int(awake_ms), int(need), overridden, prov, "flip" if ok else "hold")
         return ok
 
+    # ------------------------------------------------------------------
+    # #1271 (b): X IS RE-SOLVED FROM THIS BOOT'S OWN SAMPLES.
+    #
+    # The shipped X came from the PREVIOUS boot's medians, read once at launch
+    # and never revisited, so a rate change could not act until the boot after
+    # the one that measured it. Worse, the seed itself was unstable for a
+    # reason that had nothing to do with the rig: r_P was a per-request latency
+    # under concurrency (#1271 (a)), so sb1's own log read 1964 or 3180 tok/s
+    # depending only on which legs passed a filter.
+    #
+    # So: seed from the launcher's solve, then keep the boot's OWN samples and
+    # re-solve. Every input is the same unit as its launcher counterpart --
+    # r_P per P-DRAIN window, r_D per single prefill, flip_s per completed
+    # flip -- and the re-solve refuses mixed units before any arithmetic, on
+    # the same rule as the launcher.
+    # ------------------------------------------------------------------
+    #: New r_P samples between re-solves. Eight P-DRAIN windows is ~one agent-
+    #: load minute on the measured cadence: long enough that a median is not
+    #: one outlier, short enough that a real rate change acts inside the boot.
+    X_RESOLVE_EVERY = 8
+    #: Bounded so a long boot re-solves on its RECENT behaviour, not on its
+    #: whole history -- the flip cost and both rates move with the layout.
+    X_SAMPLE_WINDOW = 32
+
+    def note_x_sample(self, kind: str, value: float) -> None:
+        """Record one live X input. ``kind`` in {r_d, r_p, flip_s}."""
+        if value is None or value <= 0:
+            return
+        buf = self._x_samples.get(kind)
+        if buf is None:
+            return
+        buf.append(float(value))
+        if kind == "r_p":
+            self._x_since_resolve += 1
+            if self._x_since_resolve >= self.X_RESOLVE_EVERY:
+                self._x_since_resolve = 0
+                self.resolve_x_live()
+
+    def resolve_x_live(self) -> Optional[int]:
+        """Re-solve X from the boot's own medians; return the new X or None.
+
+        Prints the re-solve WITH ITS PROVENANCE -- an X that changed silently
+        is a routing threshold nobody can account for after the fact.
+        """
+        import statistics as _st
+
+        from sglang.srt.weg2.launcher import (
+            RATE_UNIT_GROUP_THROUGHPUT,
+            MixedRateUnits,
+            derive_x_star,
+        )
+
+        s = self._x_samples
+        if not (s["r_d"] and s["r_p"] and s["flip_s"]):
+            return None
+        r_d = _st.median(s["r_d"])
+        r_p = _st.median(s["r_p"])
+        flip_s = _st.median(s["flip_s"])
+        prev = self.tp_prefill_max_tokens
+        try:
+            # BOTH group_throughput: r_D is tokens/wall of a D prefill that ran
+            # alone, r_P is a drain's tokens over the drain's own wall. Passing
+            # the units explicitly is what makes a future estimator swap fail
+            # loudly instead of silently re-introducing (a).
+            x = derive_x_star(
+                flip_s, r_d, r_p, self.x_floor_tokens,
+                unit_d=RATE_UNIT_GROUP_THROUGHPUT,
+                unit_p=RATE_UNIT_GROUP_THROUGHPUT,
+            )
+        except MixedRateUnits as e:
+            logger.error("WEG2 X RE-SOLVE REFUSED (units): %s", e)
+            return None
+        except ValueError as e:
+            # No break-even (r_D >= r_P) is a real state, not an error: the
+            # round trip does not pay and X stays where it was.
+            logger.warning(
+                "WEG2 X RE-SOLVE held: %s -- X stays %d (n=%d/%d/%d)",
+                e, prev, len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]),
+            )
+            return None
+        self.tp_prefill_max_tokens = x
+        if self._x_min_work_follows:
+            self.flip_min_work_tokens = x
+        self.counters["x_resolves"] += 1
+        logger.info(
+            "WEG2 X RE-SOLVE n=%d X=%d <- X_prev=%d r_D=%.0f r_P=%.0f flip_s=%.2f "
+            "source=live (medians over this boot's own samples: %d r_D, %d r_P "
+            "drains, %d flips, window %d; seeded from %s. Both rates are "
+            "group_throughput -- tokens the group moved over the wall it was "
+            "busy -- so 1/r_D-1/r_P is a time-per-token difference; #1271)",
+            len(s["r_p"]), x, prev, r_d, r_p, flip_s,
+            len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]), self.X_SAMPLE_WINDOW,
+            self._x_seed_note,
+        )
+        return x
+
     def _flip_economics_ok(self, fairness_fired: bool) -> bool:
         """C7/L13: is the queued work worth a round trip?
 
@@ -2708,10 +2837,44 @@ class Front:
         needed.  The threshold is X at aggregate granularity -- the same
         break-even quantity law 4 applies per request.
         """
+        # #1271 (c): THE BACKLOG SUM IS OVER UNCACHED TOKENS, not est_prompt.
+        # `2*flip_s` is amortised ONCE over the whole queued prefill backlog, so
+        # the break-even is the same X* law 4 applies per request -- but the
+        # quantity it is applied to must be the work the flip actually causes.
+        # `est_prompt` includes the cached head, which P does not recompute; a
+        # backlog summed on it flips on prefixes that are already resident.
+        queued_uncached = sum(int(p.est_uncached) for p in self.queue)
         queued_tokens = sum(int(p.est_prompt) for p in self.queue)
-        ok = queued_tokens >= self.flip_min_work_tokens or fairness_fired or not self.admit_d
-        logger.info("WEG2 FLIP-ECONOMICS queued_tokens=%d threshold=%d fairness=%s verdict=%s",
-                    queued_tokens, self.flip_min_work_tokens, fairness_fired, "flip" if ok else "hold")
+        threshold = self.flip_min_work_tokens
+        ok = queued_uncached >= threshold or fairness_fired or not self.admit_d
+
+        # THE STRANDED-DECODE TERM, REPORTED AND NEVER A VETO. Every decode
+        # resident on D stops for the whole P phase; the user accepted unbounded
+        # decode wait under a prefill stream, so this is priced into the log and
+        # not into the verdict. It is printed on BOTH verdicts -- a `hold` that
+        # strands nobody and a `hold` that strands eight are different states and
+        # the line has to tell them apart.
+        now = time.time()
+        try:
+            D = self.groups.get("D")
+            stranded = len(getattr(D, "outstanding", ()) or ()) if D else 0
+            oldest = max(
+                (now - float(getattr(v, "t_arrive", now))
+                 for v in (getattr(D, "outstanding", {}) or {}).values()),
+                default=0.0,
+            )
+        except Exception:  # noqa: BLE001 - a report may never break the verdict
+            stranded, oldest = -1, -1.0
+
+        logger.info(
+            "WEG2 FLIP-ECONOMICS queued_uncached=%d queued_tokens=%d threshold=%d "
+            "(X*, amortising 2*flip_s once over the backlog) fairness=%s "
+            "stranded_decodes=%d oldest_wait_s=%.1f verdict=%s "
+            "(stranded is REPORTED, never a veto -- unbounded decode wait under a "
+            "prefill stream is accepted; -1 means the census could not be taken)",
+            queued_uncached, queued_tokens, threshold, fairness_fired,
+            stranded, oldest, "flip" if ok else "hold",
+        )
         return ok
 
     def _idle_disposition(self, awake: str, at_rest: bool) -> str:
@@ -2886,6 +3049,7 @@ class Front:
                 reuse0 = (self.counters.get("p_prefill_requests", 0),
                           self.counters.get("p_prefix_tokens_in_store", 0),
                           self.counters.get("p_prefix_tokens_reused", 0))
+                _drain_uncached = 0
                 while self.queue and self.state == "serving":
                     passes += 1
                     batch = [self.queue.popleft()
@@ -2906,6 +3070,7 @@ class Front:
                                 return
                             p.leg1_done = True
                     await asyncio.gather(*(one(p) for p in batch))
+                    _drain_uncached += sum(int(q.est_uncached) for q in batch)
                     for p in batch:
                         if not p.fut.done():
                             self._ready_for_d.append(p)
@@ -2915,6 +3080,14 @@ class Front:
                     oldest_short = 0.0
                     if self._ready_for_d:
                         oldest_short = time.time() - self._ready_for_d[0].t_arrive
+                    # #1271 (b): ONE r_P SAMPLE PER DRAIN WINDOW, in the same
+                    # unit the launcher now uses -- the uncached tokens this
+                    # drain moved over the drain's own wall. NOT per request:
+                    # the drain runs at p_concurrency, so a per-request wall
+                    # counts queueing behind peers and is a latency, not a rate.
+                    _drain_s = time.time() - t_drain0
+                    if _drain_s > 0 and _drain_uncached > 0:
+                        self.note_x_sample("r_p", _drain_uncached / _drain_s)
                     logger.info("WEG2 P-DRAIN epoch=%d prefilled=%d arrived_during=%d p_concurrency=%d "
                                 "passes=%d queue_at_exit=%d drain_s=%.1f",
                                 self.epoch, prefilled, max(0, prefilled - queue_at_entry),
