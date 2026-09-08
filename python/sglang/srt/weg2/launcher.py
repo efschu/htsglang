@@ -357,6 +357,45 @@ def derive_p_max_total_tokens() -> int:
 
 P_MAX_TOTAL_TOKENS = derive_p_max_total_tokens()
 assert P_MAX_TOTAL_TOKENS == 428000, P_MAX_TOTAL_TOKENS
+#: #1264 ``--draft-kv-on-p``.  THE WHOLE PRODUCER FORM OF GROUP P, in one
+#: place, so that ``on`` and ``off`` differ by the presence of ONE list and
+#: not by five ``if``s scattered through ``argv_p``.
+#:
+#: The four speculative flags are group D's, BYTE-FOR-BYTE (they hash into the
+#: drafter identity, W5); ``--speculative-draft-kv-only`` is the silencer that
+#: turns that head into a draft-KV PRODUCER instead of a verifier.
+#: ``--max-total-tokens`` is in the SAME list and not beside it, because its
+#: derivation (:func:`derive_p_max_total_tokens`) subtracts
+#: :data:`P_DRAFT_RESIDENT_BUDGET_MIB` -- the MTP head plus the resident
+#: embedding -- from the last stage's pool.  With no head on that stage the
+#: subtrahend is zero and the number is not merely unnecessary but WRONG (it
+#: would hand back 1618 MiB of pool the boot could have used), and the rg6
+#: baseline carried no such flag at all.  A term whose premise is the head
+#: belongs to the head.
+P_DRAFT_KV_FLAGS: Tuple[str, ...] = (
+    "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
+    "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
+    "--speculative-draft-kv-only",
+    "--max-total-tokens", str(P_MAX_TOTAL_TOKENS),
+)
+#: The standing user order of 2026-09-07 is draft KV ACROSS THE FLIP, so the
+#: producer is the default.  ``off`` is the serving-base / A-B form and is
+#: never silent -- see :func:`draft_kv_off_line`.
+DRAFT_KV_ON_P_DEFAULT = "on"
+
+
+def draft_kv_off_line() -> str:
+    """The one line the launcher prints when the producer is switched OFF.
+
+    An A-B arm that reads like the default is how a measurement gets
+    attributed to the wrong tree.  This says, in the boot's own log, exactly
+    which of the two forms ran and what it costs.
+    """
+    return (
+        "WEG2 DRAFT-KV-ON-P: off -- group P boots without the MTP head; "
+        "D reads KV+Mamba from the store, draft state is cold after every "
+        "flip (user order 2026-09-07 stands; this form is the rg6 baseline)"
+    )
 VENV_DEFAULT = "/spinning/htsglang-gpu/.venv"
 #: The model context both groups are launched with.  Named once because K9's
 #: --max-kv-per-request default IS this number (the as-built cap, decoupled
@@ -1374,6 +1413,7 @@ def argv_p(
     random_seed: int = RANDOM_SEED,
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
+    draft_kv_on_p: bool = True,
 ) -> List[str]:
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
@@ -1448,13 +1488,18 @@ def argv_p(
         # D 16+32+40 = 208 of the 224 MiB usable per 3080. That sentence lived
         # only in state.deviations; it is cited at P_BARLINK_BAR1_WINDOW_MIB now.
         "--barlink-bar1-window-mib", window_mib,
-        # #1233 draft KV across the flip (C15): P carries D's four speculative
-        # flags BYTE-FOR-BYTE (they hash into the drafter identity, W5) and is
-        # silenced by the producer flag, which is deliberately not hashed.
-        "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
-        "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
-        "--speculative-draft-kv-only",
-        "--max-total-tokens", str(P_MAX_TOTAL_TOKENS),
+    # #1233 draft KV across the flip (C15): P carries D's four speculative
+    # flags BYTE-FOR-BYTE (they hash into the drafter identity, W5) and is
+    # silenced by the producer flag, which is deliberately not hashed.
+    # #1264: AND IT IS A SWITCH.  This is the ONLY place the two forms differ,
+    # and it is a list rather than five branches, so `off` cannot half-apply.
+    # Everything downstream reads the fact back off this argv through
+    # ring_table.p_carries_drafter -- including the form key, which is a
+    # blacklist and therefore hashes the two forms apart with no code at all.
+    # Group D is NOT touched by this switch: D keeps its own NEXTN head in
+    # both forms (argv_d, below), because `off` removes the PRODUCER, not
+    # speculative decode.
+    ] + (list(P_DRAFT_KV_FLAGS) if draft_kv_on_p else []) + [
         "--port", str(PORT_P),
     ] + extra
 
@@ -4853,6 +4898,26 @@ def build_parser() -> argparse.ArgumentParser:
                          "taken and logged on both paths, so the log always carries the measured number "
                          "beside the shipped one.")
     ap.add_argument(
+        "--draft-kv-on-p", choices=["on", "off"], default=DRAFT_KV_ON_P_DEFAULT,
+        help="#1264. Whether group P is the draft-KV-only PRODUCER. 'on' (the "
+             "default, and the standing user order of 2026-09-07: draft KV "
+             "across the flip) puts the checkpoint's mtp.* head on P's last "
+             "stage under " + " ".join(P_DRAFT_KV_FLAGS) + ", so D re-admits "
+             "with a warm draft KV after a flip. 'off' boots the rg6-proven "
+             "form: group P carries NO speculative flag and no MTP head, and "
+             "the launcher says so in one line -- it is the serving-base / "
+             "A-B arm, never silent. GROUP D IS UNCHANGED BY EITHER VALUE: it "
+             "keeps its own NEXTN head in both forms, because 'off' removes "
+             "the producer, not speculative decode. What follows the switch "
+             "follows it through ONE predicate read off P's argv "
+             "(ring_table.p_carries_drafter), not through a flag re-read at "
+             "each consumer: the group-P FORM KEY (a blacklist, so the two "
+             "forms hash apart by construction), the ring's per-stage drafter "
+             "term (no MTP/embedding/lm_head bytes on the last stage under "
+             "'off'), and the W10 drafter-identity / W11 draft-resident gates "
+             "(which grade a producer that does not exist under 'off' and are "
+             "SKIPPED with a named line rather than refusing the boot).")
+    ap.add_argument(
         "--transport", choices=["bar1", "nccl"], default="bar1",
         help="Collective transport for BOTH groups. 'bar1' is the shipping "
              "default. 'nccl' is the DEVELOPMENT mode of the user's order of "
@@ -5499,12 +5564,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # gated correctly, for a difference that has nothing to do with the ledger
     # sentinels.  Only the three ledger terms and the depth are sentinels; every
     # other flag must be the one that ships.
+    # #1264: THE SWITCH IS APPLIED HERE, ONCE, AND NEVER READ AGAIN.  From this
+    # line on the fact lives in group P's argv and every consumer asks
+    # ring_table.p_carries_drafter of it -- so the form key that gates the ring
+    # is hashed over the form that ships, which is the whole point of the
+    # sentinel round trip below.  The OFF line is printed before the ring is
+    # solved, because the ring's PP2 span is one of the things it changes.
+    draft_kv_on_p = ns.draft_kv_on_p == "on"
+    if not draft_kv_on_p:
+        log(draft_kv_off_line())
     form_argv_p = argv_p(
         py, ns.model, budgets_p, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
         RING_FORM_SENTINEL_STORE_GIB, shlex.split(ns.extra_p), p_bs, max_kv_per_request,
         stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy,
         RING_FORM_SENTINEL_DEPTH, ns.p_barlink_bar1_window_mib, ns.random_seed,
         ns.barlink_bar1_cap_cycles, ns.collective_census_interval,
+        draft_kv_on_p,
     )
     form_key, form_norm = ring_table.p_form_key(form_argv_p)
     log(
@@ -5687,7 +5762,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
             f"arm exists to, and changes nothing else). Group D is unchanged."
         )
-    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval)
+    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, draft_kv_on_p)
     # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
     # gated the ring table was hashed over an argv built with sentinel ledger
     # terms, which is sound only while every flag those sentinels reach is
@@ -5913,18 +5988,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # canonical DRAFT page active` lines must agree, or D fetches
     # `{hash}.draft-<Pid>` pages P never wrote (the weg2zr2 shape, 194,088
     # failed draft fetches). Refused before the front opens.
-    w10 = check_drafter_identity(spec_p.log, spec_d.log)
-    log(f"W10 DRAFTER-IDENTITY P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} layout_D={w10['layout_D']} "
-        f"match={w10['match']} (P lines {w10['n_P']}, D lines {w10['n_D']})")
-    if not w10["match"]:
-        raise Weg2LaunchRefused(f"W10 Weg2DrafterIdentityMismatch: P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} "
-                                f"layout_D={w10['layout_D']} -- the decode group would ask the carrier for draft pages under "
-                                f"an identity the prefill group never writes")
-    # #1233 fix 2: W11 DRAFT-RESIDENT gate. T_P (P_MAX_TOTAL_TOKENS) is derived
-    # from a budgeted residue on P's last stage; the L2 line carries the
-    # MEASURED one. Over budget = the corridor derivation is refuted by this
-    # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
-    gate_w11(spec_p.log, log)
+    # #1264: BOTH GATES GRADE A PRODUCER, so both are asked of THE ONE
+    # PREDICATE first -- read off the argv this boot actually shipped, not off
+    # ns.draft_kv_on_p, so a future change to argv_p carries the gates with it.
+    # Under `off` group P registers no drafter and emits no DRAFT-KV-PRODUCER
+    # line at all, which is the pre-#1233 shape these two gates were written to
+    # refuse; running them there would refuse the rg6 baseline for being the
+    # rg6 baseline. They are SKIPPED with a named line, never silently.
+    # THE ROUTE CONSEQUENCE IS STATED IN THE SAME BREATH: D keeps its own NEXTN
+    # head under `off`, so it still ASKS the carrier for `{hash}.draft-<id>`
+    # pages -- and P writes none, so every one of those reads misses and D's
+    # draft state is cold after each flip. That is the cost of this arm; it is
+    # not a defect of the store and must not be triaged as one.
+    if not ring_table.p_carries_drafter(shipped_argv_p):
+        log("W10/W11 SKIPPED (--draft-kv-on-p off): group P's argv carries no --speculative-* flag, so there is "
+            "no draft-KV producer to grade -- no drafter identity to match against D's and no last-stage draft "
+            "residue to hold against a budget. ROUTE UNDER THIS ARM: group D keeps its own NEXTN head and still "
+            "asks the carrier for draft pages, but group P writes none, so D's draft reads miss and its draft "
+            "state is COLD after every flip. Expect draft_pages=0 on the front's served lines; that is this "
+            "arm, not a carrier fault. KV and Mamba across the flip are untouched.")
+    else:
+        w10 = check_drafter_identity(spec_p.log, spec_d.log)
+        log(f"W10 DRAFTER-IDENTITY P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} layout_D={w10['layout_D']} "
+            f"match={w10['match']} (P lines {w10['n_P']}, D lines {w10['n_D']})")
+        if not w10["match"]:
+            raise Weg2LaunchRefused(f"W10 Weg2DrafterIdentityMismatch: P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} "
+                                    f"layout_D={w10['layout_D']} -- the decode group would ask the carrier for draft pages under "
+                                    f"an identity the prefill group never writes")
+        # #1233 fix 2: W11 DRAFT-RESIDENT gate. T_P (P_MAX_TOTAL_TOKENS) is derived
+        # from a budgeted residue on P's last stage; the L2 line carries the
+        # MEASURED one. Over budget = the corridor derivation is refuted by this
+        # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
+        gate_w11(spec_p.log, log)
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
 
@@ -6030,6 +6125,18 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     # derives its run-moment residual against.  The map is derived after group
     # D launches, so the --dry-run print carries it EMPTY and says so here --
     # every other term is byte-identical to the real boot's.
+    # #1264: NO TERM OF THIS ARGV FOLLOWS --draft-kv-on-p, and that is a
+    # CHECKED fact, not an oversight. Enumerated against the switch:
+    # --src-chunk-cards is the WEIGHTS chunk->card map (derived from P's stage
+    # ratio, which the switch does not move); --measured-record is the
+    # dormant-image sidecar; --commit and --ledger-arm are boot identity and
+    # host accounting. The front's draft handling is purely OBSERVATIONAL --
+    # Front._draft_terms reads D's own draft_l3_hits/misses counters over HTTP
+    # and the W9 census counts '.draft' files by name in the store -- so it
+    # needs no flag to be told which arm ran: under `off` it will simply
+    # report draft_pages=0 and count zero draft files, which is the honest
+    # reading of that arm. The launcher's own W10/W11 SKIPPED line is what
+    # names the arm; the front is not told twice.
     if src_chunk_cards:
         argv += ["--src-chunk-cards", json.dumps(src_chunk_cards, sort_keys=True)]
     if measured_record:
