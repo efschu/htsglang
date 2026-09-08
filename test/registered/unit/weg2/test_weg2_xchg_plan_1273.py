@@ -82,10 +82,12 @@ HIDDEN = 5120
 ATTN_IN_FULL = 6144
 #: The dense-MLP intermediate, spec §2.2 (``down_proj`` spitch 17408).
 MLP_IN_FULL = 17408
-#: The MLP quant-block unit family: 136 units of 128 elements = 17408
-#: (``layers/linear.py:282 _quant_block_aligned_units``; spec §6/S1 cites it as
-#: ``qwen2_moe.py:222``, which is where it used to live -- DRIFT, see the
-#: record).
+#: The MLP quant-block unit family: 136 units of 128 elements = 17408.
+#: DEFINED at ``layers/linear.py:282 _quant_block_aligned_units``; spec §6/S1
+#: cites ``qwen2_moe.py:222``, which is the live CALL SITE that produces this
+#: 136-unit family (imported at ``qwen2_moe.py:59``).  The earlier "DRIFT" note
+#: here was WRONG -- ``git log -S'def _quant_block_aligned_units' --all --
+#: python/sglang/srt/models/qwen2_moe.py`` is empty, so it never lived there.
 MLP_UNITS = 136
 #: The three-rank vector that produces the spec's own per-rank MLP widths
 #: [7808, 4864, 4736] -- 61 / 38 / 37 of the 136 units.
@@ -100,7 +102,10 @@ MLP_WIDTHS_WRONG = [7792, 4816, 4800]
 #: (``models/qwen3_5.py:543``, spec §2.2).
 QKVZ_OUTPUT_SIZES = [2048, 2048, 6144, 6144]
 #: The GDN head-unit family (``gdn_tp_units``): key_dim 2048 in 128-element
-#: k-head units = 16 units, split 7 / 5 / 4 by this rig's vector.
+#: k-head units = 16 units.  [7, 5, 4] is a GEOMETRY fixture, deliberately more
+#: asymmetric than the shipping vector, NOT this rig's cut: boot weg2sb4 runs
+#: ``--pp-attn-stage-ratio 8,4,4`` and ``CAMPAIGN_c2_0906.md:162`` refuses the
+#: whole [7,5,4] family (stage 1 goes to -738.2 MiB runnable).
 QKVZ_UNITS = 16
 QKVZ_RATIO = [7, 5, 4]
 #: SECTION 1af's CHECKPOINT sub-block offsets for ``in_proj_qkv`` -- the wrong
@@ -876,6 +881,540 @@ class TestAgainstRealModules(CustomTestCase):
         set_tp_partition_ratios(None)
         even = shard_offsets(MLP_IN_FULL, None, 4)
         self.assertEqual([s for s, _ in even], [0, 4352, 8704, 13056])
+
+
+# --------------------------------------------------------------------------
+# THE FIX ROUND (#1273 xchg S1 fix): one test per must_fix finding of the
+# review and the refutation.  Every one of these is RED at bac29bbe5f.  The
+# new names are imported INSIDE each test on purpose: a module-level import of
+# a name that does not exist yet collapses the whole file into ONE collection
+# error, which proves only that the module was missing and nothing about which
+# test discriminates (review F9).
+# --------------------------------------------------------------------------
+
+
+class TestPlanCoverage(CustomTestCase):
+    """A plan that moves nothing must not pass Gate 0 (refutation F1).
+
+    ``plan_id`` of an empty descriptor list is a FIXED digest, identical on all
+    six ranks; the 6x6 matrix is all zeros, so ``send[a][b] == recv[b][a]``
+    holds on every cell.  Six ranks then agree on a plan that writes no byte,
+    ``resume`` leaves the destination's ACTIVE pages mapped-but-unfilled, and
+    the boot serves undefined weights -- the exact failure Gate 0 exists to
+    prevent, reached through a zero.
+    """
+
+    def test_a_plan_that_moves_nothing_is_refused(self):
+        src, dst = _p_layout(), _d_layout(MLP_RATIO)
+        with self.assertRaises(Weg2XchgSourceMissing) as cm:
+            build_plan([], src, dst, waves=[["weights_0"]])
+        message = str(cm.exception)
+        self.assertIn("W58 Weg2XchgSourceMissing", message)
+        self.assertIn("weights_0", message)
+
+    def test_a_tag_outside_every_wave_is_refused_not_silently_dropped(self):
+        """``if geom.tag not in wave_of: continue`` drops a mistyped or
+        unlisted tag from the descriptors AND from the byte matrix, so Gate 0's
+        per-tag comparison cannot see it either.  The draft tag (spec §4.1) is
+        the ONE legitimate skip and has to be declared, not assumed."""
+        src, dst = _p_layout(), _d_layout(MLP_RATIO)
+        draft = _mlp_down_geom().replace(
+            name="model.layers.0.mtp.proj.weight", tag="weights_draft"
+        )
+        with self.assertRaises(Weg2XchgSourceMissing) as cm:
+            build_plan([_qkvz_geom(), draft], src, dst, waves=[["weights_0"]])
+        self.assertIn("weights_draft", str(cm.exception))
+
+        plan = build_plan(
+            [_qkvz_geom(), draft],
+            src,
+            dst,
+            waves=[["weights_0"]],
+            skip_tags=("weights_draft",),
+        )
+        self.assertEqual(plan.skipped_tags, (("weights_draft", 1),))
+        self.assertEqual({d.tag for d in plan.descs}, {"weights_0"})
+
+    def test_a_wave_tag_that_emitted_no_descriptor_is_refused(self):
+        src, dst = _p_layout(), _d_layout(MLP_RATIO)
+        with self.assertRaises(Weg2XchgSourceMissing) as cm:
+            build_plan(
+                [_qkvz_geom()], src, dst, waves=[["weights_0"], ["weights_1"]]
+            )
+        self.assertIn("weights_1", str(cm.exception))
+
+    def test_a_tag_in_two_waves_is_refused(self):
+        """``wave_of`` is last-write-wins, so a wave list that is not a
+        permutation of the family is accepted locally; the front's own guard
+        (``front.py:2656-2663``) is on the other side of the RPC."""
+        src, dst = _p_layout(), _d_layout(MLP_RATIO)
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            build_plan(
+                [_qkvz_geom()],
+                src,
+                dst,
+                waves=[["weights_0"], ["weights_0"]],
+            )
+        self.assertIn("weights_0", str(cm.exception))
+
+    def test_per_tag_byte_totals_are_published_for_gate_0(self):
+        """Gate 0 compares a per-tag total against ``tms_tag_bytes``
+        (spec §3.3, §1.3 step 9).  S1 produces it, so S3 does not re-derive
+        it from the descriptor list a second time."""
+        src, dst = _p_layout(), _d_layout(MLP_RATIO)
+        plan = build_plan(
+            [_qkvz_geom(), _mlp_down_geom()], src, dst, waves=[["weights_0"]]
+        )
+        moved = sum(d.nbytes for d in plan.descs if d.kind != ZEROFILL)
+        self.assertEqual(dict(plan.tag_bytes), {"weights_0": moved})
+        self.assertEqual(
+            sum(n for _, n in plan.tag_bytes),
+            plan.oncard_bytes + plan.cross_bytes,
+        )
+
+
+class TestShardFamilies(CustomTestCase):
+    """One plan, two shard laws (refutation F2).
+
+    The real shard boundary is a function of (total, tp_size, units, FAMILY,
+    groups) -- ``distributed/utils.py:1539`` -- and the vocabulary's family
+    vector deliberately does not fall back to the base one (``:1585``).  A plan
+    that applies one vector to every parameter puts ``embed_tokens`` and
+    ``lm_head`` at the wrong offsets under the standing uneven-TP form, on both
+    sides identically, so ``_check_tiles`` is silent and Gate 0 agrees: R5
+    silent wrongness on the largest single parameter of the model.
+    """
+
+    #: The padded vocabulary in 64-row units, so any ratio vector can split it
+    #: (D pads to ``64 * tp``; ``distributed/utils.py:1585``).
+    VOCAB_UNITS = VOCAB_PADDED_D // 64
+
+    def _vocab(self, family):
+        return ParamGeom(
+            name="model.embed_tokens.weight",
+            tag="weights",
+            shard_axis=ROWS,
+            rows_full=VOCAB_PADDED_D,
+            cols_full=HIDDEN,
+            itemsize=2,
+            units=self.VOCAB_UNITS,
+            pad_units=VOCAB_PADDED_D - VOCAB_REAL,
+            stage=0,
+            family=family,
+        )
+
+    def _mlp(self):
+        return _mlp_down_geom().replace(tag="weights")
+
+    def _widths(self, plan, name):
+        per_rank = {}
+        for d in plan.descs:
+            if d.param_name != name:
+                continue
+            per_rank[d.dst_rank] = per_rank.get(d.dst_rank, 0) + d.nbytes
+        return [per_rank[r] for r in sorted(per_rank)]
+
+    def test_the_vocabulary_keeps_the_even_split_under_an_uneven_base_plan(self):
+        from sglang.srt.weg2.weight_exchange import VOCAB_FAMILY
+
+        src = _p_layout()
+        dst = _d_layout(MLP_RATIO)
+        plan = build_plan(
+            [self._mlp(), self._vocab(VOCAB_FAMILY)], src, dst, waves=[["weights"]]
+        )
+        # The MLP follows the ratio vector ...
+        self.assertEqual(
+            [d.run_bytes for d in plan.descs if "down_proj" in d.param_name],
+            MLP_WIDTHS_OK,
+        )
+        # ... and the vocabulary, in the SAME plan, does not.
+        even = VOCAB_PADDED_D // 3
+        self.assertEqual(
+            self._widths(plan, "model.embed_tokens.weight"),
+            [even * HIDDEN * 2] * 3,
+        )
+
+        # THE CAN-FAIL: the same parameter planned WITHOUT its family falls
+        # back to the base vector and lands at different offsets on every rank.
+        base_planned = build_plan(
+            [self._vocab(None)], src, dst, waves=[["weights"]]
+        )
+        self.assertNotEqual(
+            self._widths(base_planned, "model.embed_tokens.weight"),
+            [even * HIDDEN * 2] * 3,
+        )
+
+    def test_an_explicit_vocab_vector_is_honoured(self):
+        """``--rank-vocab-ratio`` opts INTO the ratio-weighted vocab split; the
+        even split is the absence of that vector, not a hard rule."""
+        from sglang.srt.weg2.weight_exchange import VOCAB_FAMILY
+
+        vocab_vec = [2, 1, 1]
+        dst = GroupLayout(
+            name="D",
+            cards=CARDS,
+            tp_size=3,
+            ratios=MLP_RATIO,
+            base=3,
+            family_ratios={VOCAB_FAMILY: vocab_vec},
+        )
+        plan = build_plan(
+            [self._vocab(VOCAB_FAMILY)], _p_layout(), dst, waves=[["weights"]]
+        )
+        expect = [
+            s * 64 * HIDDEN * 2
+            for s in partition_sizes(self.VOCAB_UNITS, vocab_vec)
+        ]
+        self.assertEqual(self._widths(plan, "model.embed_tokens.weight"), expect)
+
+    def test_a_uniform_vocab_vector_is_the_even_split(self):
+        """``tp_vocab_ratios``: a uniform vector IS the even split and reports
+        as inactive, which keeps the classic path byte-identical."""
+        from sglang.srt.weg2.weight_exchange import VOCAB_FAMILY
+
+        layout = GroupLayout(
+            name="D",
+            cards=CARDS,
+            tp_size=3,
+            ratios=MLP_RATIO,
+            base=3,
+            family_ratios={VOCAB_FAMILY: [1, 1, 1]},
+        )
+        self.assertIsNone(layout.ratios_for(VOCAB_FAMILY))
+        self.assertEqual(list(layout.ratios_for("mlp")), MLP_RATIO)
+        self.assertEqual(list(layout.ratios_for(None)), MLP_RATIO)
+
+    def test_a_ratio_vector_of_the_wrong_length_is_refused(self):
+        """#1275: a wrong-length vector is the defect class, and the fork's
+        'a plan of another length does not apply' is an ACTIVATION law that
+        belongs where the group size is known -- not a silent downgrade to the
+        even split inside the shard arithmetic."""
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            shard_offsets(MLP_IN_FULL, [61, 38], 3, units=MLP_UNITS)
+        self.assertIn("W52 Weg2XchgPlanDisagree", str(cm.exception))
+        bad = GroupLayout(name="D", cards=CARDS, tp_size=3, ratios=[61, 38], base=3)
+        with self.assertRaises(Weg2XchgPlanDisagree):
+            build_plan([_mlp_down_geom()], _p_layout(), bad, waves=[["weights_0"]])
+
+
+class TestGroupIdentity(CustomTestCase):
+    def test_overlapping_group_bases_are_refused(self):
+        """The 6x6 matrix is indexed by GLOBAL rank.  With both groups at
+        base 0 it is 3x3, P rank n's sends land in the same cell as D rank n's,
+        and ``send[a][b] == recv[b][a]`` then passes on a FOLDED matrix --
+        Gate 0's #802 discipline defeated by a default."""
+        dst = GroupLayout(name="D", cards=CARDS, tp_size=3, ratios=MLP_RATIO, base=0)
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            build_plan([_mlp_down_geom()], _p_layout(), dst, waves=[["weights_0"]])
+        message = str(cm.exception)
+        self.assertIn("W52 Weg2XchgPlanDisagree", message)
+        self.assertIn("base", message)
+
+    def test_the_two_groups_card_vectors_must_agree(self):
+        """``on_card`` is rank equality, which means ONE CARD only while both
+        groups run rank n on ``cards[n]``.  Unequal orders route a crossing
+        pair down S4's on-card IPC lane with no PCIe key."""
+        dst = GroupLayout(
+            name="D", cards=(2, 1, 0), tp_size=3, ratios=MLP_RATIO, base=3
+        )
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            build_plan([_mlp_down_geom()], _p_layout(), dst, waves=[["weights_0"]])
+        self.assertIn("W52 Weg2XchgPlanDisagree", str(cm.exception))
+
+    def test_a_stage_outside_the_group_is_refused(self):
+        """``holders = [int(geom.stage)]`` is unvalidated: a stage outside the
+        group matches no rank, every block list comes back empty, and the
+        parameter vanishes from the plan with no W58 at all -- fail-open, in
+        the direction where P is the DESTINATION (spec §1.4)."""
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            build_plan(
+                [_mlp_down_geom().replace(stage=3)],
+                _p_layout(),
+                _d_layout(MLP_RATIO),
+                waves=[["weights_0"]],
+            )
+        message = str(cm.exception)
+        self.assertIn("W52 Weg2XchgPlanDisagree", message)
+        self.assertIn("stage", message)
+
+
+class TestParamGeomValidation(CustomTestCase):
+    """Three fields that silently mis-plan when they are not checked
+    (refutation F10)."""
+
+    def test_pad_past_the_axis_would_zerofill_the_whole_parameter(self):
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            build_plan(
+                [_mlp_down_geom().replace(pad_units=MLP_IN_FULL + 1)],
+                _p_layout(),
+                _d_layout(MLP_RATIO),
+                waves=[["weights_0"]],
+            )
+        self.assertIn("pad", str(cm.exception))
+
+    def test_blocks_that_do_not_sum_to_the_axis_are_refused(self):
+        with self.assertRaises(Weg2XchgPlanDisagree):
+            _qkvz_geom().replace(blocks=(2048, 2048, 6144)).validate()
+
+    def test_a_column_shard_with_packed_outputs_is_refused(self):
+        """``device_block_offsets`` returns a ROW prefix sum; no class in
+        spec §2.2 packs outputs along a column shard, and guessing one writes
+        the blocks into the wrong coordinate space."""
+        with self.assertRaises(Weg2XchgPlanDisagree):
+            _mlp_down_geom().replace(blocks=(8704, 8704)).validate()
+
+    def test_a_source_extent_past_the_content_is_refused(self):
+        with self.assertRaises(Weg2XchgPlanDisagree):
+            _mlp_down_geom().replace(src_extent=MLP_IN_FULL + 128).validate()
+
+
+class TestLiveStorage(CustomTestCase):
+    """The seam between a live tensor and the plan (review F2, refutation F4).
+
+    ``StorageGeom`` had no production caller: the descriptors took their pitch
+    from a hand-built ``ParamGeom``, so the storage-vs-logical law of spec §2.4
+    rule 2 was enforced by assertions about a class nothing used.  A pitch read
+    from ``shape`` instead of ``stride()`` left the suite fully green.
+    """
+
+    def _geom_of(self, mapping):
+        return lambda group, rank, name: mapping.get((group, rank))
+
+    def test_the_destination_extent_comes_from_the_live_tensor(self):
+        """``d_extent`` was derived from the same block list the descriptors
+        came from, so 'writes past the destination's storage' could only fire
+        through a test-only seam."""
+        live = {
+            ("D", r): StorageGeom(rows=HIDDEN, cols=w, pitch=w, itemsize=1)
+            for r, w in enumerate(MLP_WIDTHS_WRONG)
+        }
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            build_plan(
+                [_mlp_down_geom()],
+                _p_layout(),
+                _d_layout(MLP_RATIO),
+                waves=[["weights_0"]],
+                geom_of=self._geom_of(live),
+            )
+        message = str(cm.exception)
+        self.assertIn("writes 7808 units", message)
+        self.assertIn("holds 7792", message)
+
+    def test_a_padded_row_pitch_is_read_from_stride_not_from_shape(self):
+        """A destination whose rows sit in a wider arena: the copy is 2-D and
+        every row offset is a multiple of the PITCH, not of the row width."""
+        arena = 8192
+        widths = [
+            sum(b.size for b in blocks)
+            for blocks in device_block_offsets(
+                QKVZ_OUTPUT_SIZES, QKVZ_RATIO, 3, units=QKVZ_UNITS
+            )
+        ]
+        live = {}
+        for r, w in enumerate(widths):
+            padded = torch.empty((w, arena), dtype=torch.int8, device="meta")
+            live[("D", r)] = StorageGeom.of(padded[:, :HIDDEN])
+        self.assertEqual({g.pitch for g in live.values()}, {arena})
+
+        plan = build_plan(
+            [_qkvz_geom()],
+            _p_layout(),
+            _d_layout(QKVZ_RATIO),
+            waves=[["weights_0"]],
+            geom_of=self._geom_of(live),
+        )
+        self.assertEqual({d.kind for d in plan.descs}, {STRIDED2D})
+        self.assertEqual({d.dpitch for d in plan.descs}, {arena})
+        self.assertEqual({d.run_bytes for d in plan.descs}, {HIDDEN})
+        # THE CAN-FAIL: a pitch read from the shape is HIDDEN, and every dst
+        # offset then lands 3072 bytes per row short of the real row.
+        contiguous = build_plan(
+            [_qkvz_geom()], _p_layout(), _d_layout(QKVZ_RATIO), waves=[["weights_0"]]
+        )
+        self.assertEqual({d.kind for d in contiguous.descs}, {FLAT})
+        self.assertNotEqual(
+            [d.dst_off for d in plan.descs], [d.dst_off for d in contiguous.descs]
+        )
+        for d in plan.descs:
+            if d.dst_off:
+                self.assertEqual(d.dst_off % arena, 0)
+
+    def test_a_live_dtype_that_disagrees_with_the_plan_is_refused(self):
+        """Weight scales are FP32 on device and BF16 in the checkpoint
+        (spec §2.4 rule 3); a plan that kept the checkpoint dtype is wrong by
+        2x on every offset it computes."""
+        live = {
+            ("D", r): StorageGeom(rows=HIDDEN, cols=w, pitch=w, itemsize=2)
+            for r, w in enumerate(MLP_WIDTHS_OK)
+        }
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            build_plan(
+                [_mlp_down_geom()],
+                _p_layout(),
+                _d_layout(MLP_RATIO),
+                waves=[["weights_0"]],
+                geom_of=self._geom_of(live),
+            )
+        self.assertIn("itemsize", str(cm.exception))
+
+    def test_param_geom_of_a_transposed_view_uses_storage_not_shape(self):
+        """``ParamGeom.of`` is the constructor S2's walk will use; it must be
+        ``.t()``-blind, which is exactly what reading ``shape`` is not."""
+        storage = torch.empty((4864, HIDDEN), dtype=torch.int8, device="meta")
+        view = storage.t()
+        self.assertEqual(tuple(view.shape), (HIDDEN, 4864))
+        geom = ParamGeom.of(
+            view,
+            name="model.layers.0.mlp.gate_proj.weight",
+            tag="weights_0",
+            shard_axis=ROWS,
+            shard_total=4864 * 3,
+            stage=0,
+        )
+        self.assertEqual((geom.rows_full, geom.cols_full, geom.itemsize), (14592, HIDDEN, 1))
+        self.assertEqual(geom, ParamGeom.of(
+            storage,
+            name="model.layers.0.mlp.gate_proj.weight",
+            tag="weights_0",
+            shard_axis=ROWS,
+            shard_total=4864 * 3,
+            stage=0,
+        ))
+        # THE CAN-FAIL: the logical reading swaps the row width and the axis.
+        self.assertNotEqual((geom.rows_full, geom.cols_full), (HIDDEN, 4864))
+
+    def test_a_three_d_parameter_is_refused_unless_its_shard_axis_is_named(self):
+        """conv1d's ``[C, 1, K]`` flattens to storage rows; an expert-major MoE
+        weight ``[E, N_local, K]`` sharded on N is E strided bands and no
+        (rows, cols, pitch) triple names it."""
+        moe = torch.empty((4, 128, 64), dtype=torch.int8, device="meta")
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            ParamGeom.of(
+                moe,
+                name="model.layers.0.mlp.experts.w13_weight",
+                tag="weights_0",
+                shard_axis=ROWS,
+                shard_total=512,
+            )
+        self.assertIn("W52 Weg2XchgPlanDisagree", str(cm.exception))
+        conv = torch.empty((768, 1, 4), dtype=torch.int8, device="meta")
+        geom = ParamGeom.of(
+            conv,
+            name="model.layers.0.linear_attn.conv1d.weight",
+            tag="weights_0",
+            shard_axis=ROWS,
+            shard_total=768 * 3,
+            shard_dim=0,
+        )
+        self.assertEqual((geom.rows_full, geom.cols_full), (768 * 3, 4))
+
+
+class TestTilingCanFail(CustomTestCase):
+    def test_the_overlap_branch_refuses_two_sources_for_one_byte(self):
+        """The other half of 'exactly one source'.  It is unreachable through
+        ``build_plan`` (both sides' blocks are prefix sums), so it is exercised
+        where it lives -- spec §6/S1's stop-loss: a tiling check that cannot be
+        made to fail on a wrong vector is not a check."""
+        from sglang.srt.weg2.weight_exchange import _check_tiles
+
+        geom = _mlp_down_geom()
+        with self.assertRaises(Weg2XchgPlanDisagree) as cm:
+            _check_tiles(geom, 0, 10, [(0, 6), (5, 10)])
+        message = str(cm.exception)
+        self.assertIn("overlaps", message)
+        self.assertIn("two sources for one destination byte", message)
+        # And the same vector without the overlap is accepted, so the refusal
+        # is about the overlap and not about the shape of the call.
+        _check_tiles(geom, 0, 10, [(0, 5), (5, 10)])
+
+
+class TestPlanIdIsComparable(CustomTestCase):
+    """``plan_id`` exists to be compared between two processes and the front
+    (spec §3.3, W52).  Coalescing consumes ``src_ptr``/``dst_ptr``, so a digest
+    over the COALESCED list is a function of the pointer table -- and a rank is
+    producer or consumer, never both, so the two sides hold different tables
+    and the front holds none.
+    """
+
+    def _inventory(self):
+        return [
+            ParamGeom(
+                name=f"model.layers.0.{n}.weight",
+                tag="weights_0",
+                shard_axis=REPLICATED,
+                rows_full=1,
+                cols_full=HIDDEN,
+                itemsize=2,
+                stage=0,
+            )
+            for n in ("input_layernorm", "post_attention_layernorm")
+        ]
+
+    def _arena(self):
+        # Two replicated norms laid out back to back on every card: the second
+        # starts exactly where the first ends, so they coalesce.
+        offsets = {
+            "model.layers.0.input_layernorm.weight": 0,
+            "model.layers.0.post_attention_layernorm.weight": HIDDEN * 2,
+        }
+        return lambda group, rank, name: 0x7F0000000000 + (1 << 20) * rank + offsets[name]
+
+    def test_plan_id_survives_coalescing_and_therefore_the_pointer_table(self):
+        src, dst = _p_layout(), _d_layout(None)
+        bare = build_plan(self._inventory(), src, dst, waves=[["weights_0"]])
+        with_ptrs = build_plan(
+            self._inventory(), src, dst, waves=[["weights_0"]], ptr_of=self._arena()
+        )
+        # The pointers really do change the descriptor list ...
+        self.assertLess(len(with_ptrs.descs), len(bare.descs))
+        self.assertEqual(len(with_ptrs.raw_descs), len(bare.raw_descs))
+        # ... and must not change the id, which is the only thing comparable.
+        self.assertEqual(with_ptrs.plan_id, bare.plan_id)
+
+    def test_plan_id_moves_when_the_wave_partition_moves(self):
+        """Two partitions can leave the descriptor ORDER unchanged; a digest
+        over the descriptors alone then cannot see a schedule disagreement,
+        which is one of the three things W52 names."""
+        src, dst = _p_layout(), _d_layout(None)
+        inv = self._inventory()
+        inv[1] = inv[1].replace(tag="weights_1")
+        one = build_plan(src=src, dst=dst, inventory=inv, waves=[["weights_0", "weights_1"]])
+        two = build_plan(src=src, dst=dst, inventory=inv, waves=[["weights_0"], ["weights_1"]])
+        self.assertEqual([d.key() for d in one.descs], [d.key() for d in two.descs])
+        self.assertNotEqual(one.plan_id, two.plan_id)
+
+
+class TestUniformWaveMap(CustomTestCase):
+    def test_a_tp_group_with_no_layer_split_is_one_wave(self):
+        """``chunk_tag_cards`` returns an EMPTY map for a TP group and its own
+        docstring says the caller reads that as UNIFORM.  Read per tag instead,
+        every tag independently covers every card and the greedy loop admits
+        exactly one tag per wave: 8 chunk waves + the base -- the nine-wave arm
+        §1.2 refuses on measured transport grounds (+25.8 %/+36.8 % P->D)."""
+        tags = weights_family_tags(SB4_CHUNKS)
+        waves = derive_waves(tags, {}, CARDS)
+        self.assertEqual(len(waves), 1)
+        self.assertEqual(waves[0], tags)
+        self.assertEqual(waves[0][-1], "weights")
+
+
+class TestAcceptanceLineDenominator(CustomTestCase):
+    def test_the_line_publishes_the_invariant_that_replaced_the_spec_s(self):
+        """``min_piece_mib`` alone cannot say whether the smallest piece kept a
+        mergeable neighbour, and the substituted invariant is the one the
+        slice actually enforces -- so it is published, not argued."""
+        plan = build_plan(
+            [_qkvz_geom(), _mlp_down_geom()],
+            _p_layout(),
+            _d_layout(MLP_RATIO),
+            waves=[["weights_0"]],
+        )
+        line = plan.log_line()
+        self.assertIn("unmergeable=", line)
+        self.assertIn(
+            f"unmergeable={len(unmergeable_below_floor(plan.descs))}", line
+        )
+        self.assertTrue(line.rstrip().endswith(f"plan_id={plan.plan_id}"))
 
 
 if __name__ == "__main__":
