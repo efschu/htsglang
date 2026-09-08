@@ -55,6 +55,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
+from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import host_ledger, ring_table
 
 MIB = 1024 * 1024
@@ -747,6 +748,13 @@ class Card:
     uuid: str
     name: str
     total_mib: int
+    #: Bytes the driver holds back out of ``total_mib`` and never hands to any
+    #: allocation (425 MiB on this rig's 3080s, 518 on the 5090).  Carried so
+    #: the free/used readers below can be carve-out honest.  NOTE: ``total_mib``
+    #: is still the full board and the budget arithmetic still spends against
+    #: it -- that the awake budget omits this term is a SEPARATE open finding
+    #: (weg2/refute/lens2.md sec 3), deliberately not changed here.
+    reserved_mib: int = 0
 
 
 @dataclass
@@ -826,25 +834,17 @@ class Log:
 
 
 def resolve_cards() -> List[Card]:
-    import pynvml
+    """The rig's cards, from the registry's ONE NVML reader.
 
-    pynvml.nvmlInit()
-    try:
-        n = pynvml.nvmlDeviceGetCount()
-        cards = []
-        for i in range(n):
-            h = pynvml.nvmlDeviceGetHandleByIndex(i)
-            uuid = pynvml.nvmlDeviceGetUUID(h)
-            name = pynvml.nvmlDeviceGetName(h)
-            if isinstance(uuid, bytes):
-                uuid = uuid.decode()
-            if isinstance(name, bytes):
-                name = name.decode()
-            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-            cards.append(Card(i, uuid, name, int(mem.total // MIB)))
-        return cards
-    finally:
-        pynvml.nvmlShutdown()
+    Was a second pynvml transcript here (init / getCount / getHandle / decode /
+    shutdown).  ``registry.nvml.list_devices`` is that transcript plus the v2
+    carve-out term, which this launcher now needs, so the copy is gone rather
+    than grown.
+    """
+    return [
+        Card(d.index, d.uuid, d.name, d.total_mib, reserved_mib=d.reserved_mib)
+        for d in nvml_registry.list_devices()
+    ]
 
 
 def order_cards(cards: List[Card]) -> List[Card]:
@@ -859,15 +859,26 @@ def order_cards(cards: List[Card]) -> List[Card]:
     return [big[0], small[0], small[1]]
 
 
-def nvml_used_free(cards: List[Card]) -> Dict[str, Tuple[int, int]]:
-    out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=uuid,memory.used,memory.total", "--format=csv,noheader,nounits"],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    res: Dict[str, Tuple[int, int]] = {}
-    for line in out.strip().splitlines():
-        u, used, total = [x.strip() for x in line.split(",")]
-        res[u] = (int(used), int(total))
+def nvml_memory(cards: List[Card]) -> Dict[str, "nvml_registry.MemoryInfo"]:
+    """Live memory per card UUID, from the registry's ONE NVML reader.
+
+    Replaces a local ``nvidia-smi --query-gpu=uuid,memory.used,memory.total``
+    reader.  Two figures the callers below need are not derivable from that
+    pair: ALLOCATABLE FREE (the driver's own ``free``, carve-out already
+    excluded -- ``total - used`` returns free PLUS the carve-out, the form the
+    corridor rule forbids and boot weg2rg6 measured at +424/+518/+424 MiB), and
+    the carve-out itself.  ``MemoryInfo.tenant_used_mib`` is the "is another
+    tenant on this card" figure and is 0-1 MiB on an idle card; the v1
+    ``used_bytes`` is not, and reading it as tenancy is how #539 refused an
+    empty machine.
+    """
+    res = {dev.uuid: mem for dev, mem in nvml_registry.memory_snapshot()}
+    missing = [c.uuid for c in cards if c.uuid not in res]
+    if missing:
+        raise Weg2LaunchRefused(
+            f"NVML has no memory row for {missing} -- the card set changed under the "
+            f"launcher (present: {sorted(res)})"
+        )
     return res
 
 
@@ -1177,13 +1188,44 @@ def host_preflight(log: Log, tag: str, dry: bool) -> None:
     log(f"host preflight PASS: MemAvailable {avail_gib:.1f} GiB; cgroup memory.events baseline: {' '.join(oom.split())}")
 
 
+def _free_instrument(mem: Dict[str, "nvml_registry.MemoryInfo"], cards: List[Card]) -> str:
+    """The ``free`` instrument covering EVERY card in one printed line.
+
+    FIX 2, finding 3: the label used to be the literal ``nvml_v2_free`` typed
+    into the f-string, while the figure came from whichever struct the registry
+    could read.  The weakest card sets the token, because one token stands for
+    the whole line.
+    """
+    rows = [mem[c.uuid] for c in cards if c.uuid in mem]
+    if rows and not all(r.carve_out_known for r in rows):
+        return nvml_registry.FREE_INSTRUMENT_V1
+    return nvml_registry.FREE_INSTRUMENT_V2
+
+
 def cards_free_check(cards: List[Card], log: Log) -> None:
-    uf = nvml_used_free(cards)
+    mem = nvml_memory(cards)
     for c in cards:
-        used, total = uf[c.uuid]
-        if used > 1500:
-            raise Weg2LaunchRefused(f"card {c.nvml_index} ({c.name}) has {used} MiB used (> 1500) -- not free; not killing anything")
-    log("cards free: " + ", ".join(f"idx{c.nvml_index}={uf[c.uuid][0]}/{uf[c.uuid][1]} MiB used" for c in cards))
+        m = mem[c.uuid]
+        if m.tenant_used_mib > 1500:
+            # The instrument is the one this MemoryInfo actually read, not a
+            # literal typed here (FIX 2, finding 3): with no v2 struct the
+            # figure below is the v1 ``used``, which counts the carve-out as
+            # tenancy (#539) -- the refusal must not read as carve-out-aware
+            # when it is not.
+            raise Weg2LaunchRefused(
+                f"card {c.nvml_index} ({c.name}) has {m.tenant_used_mib} MiB held by processes "
+                f"(> 1500; instrument {m.tenant_used_instrument}, i.e. the driver carve-out of "
+                f"{m.reserved_mib} MiB is NOT counted as tenancy) -- not free; not killing anything"
+            )
+    log(
+        f"cards free (instrument: {_free_instrument(mem, cards)}, allocatable): "
+        + ", ".join(
+            f"idx{c.nvml_index}={mem[c.uuid].tenant_used_mib} MiB used by processes / "
+            f"{mem[c.uuid].free_mib} MiB free / {mem[c.uuid].allocatable_mib} MiB allocatable "
+            f"({mem[c.uuid].reserved_mib} MiB driver-reserved, never allocatable)"
+            for c in cards
+        )
+    )
 
 
 # --------------------------------------------------------------------------
@@ -5491,12 +5533,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dc_p = nvml_process_mib(pids_p)
     for c in cards:
         dc_p.setdefault(c.uuid, 0)
-    uf = nvml_used_free(cards)
+    mem = nvml_memory(cards)
     for c in cards:
         exp = DC_EXPECT_5090_MIB if "5090" in c.name else DC_EXPECT_3080_MIB
         log(
             f"WEG2-DC group=P nvml{c.nvml_index} {c.name}: measured {dc_p[c.uuid]} MiB per-process "
-            f"(pids {sorted(pids_p)}) card used {uf[c.uuid][0]} MiB; expectation {exp} + P windows {P_WINDOWS_MIB} = {exp + P_WINDOWS_MIB} MiB "
+            f"(pids {sorted(pids_p)}) card used {mem[c.uuid].tenant_used_mib} MiB by processes "
+            f"(instrument {mem[c.uuid].tenant_used_instrument}; card free {mem[c.uuid].free_mib} MiB allocatable, "
+            f"{mem[c.uuid].reserved_mib} MiB driver-reserved); expectation {exp} + P windows {P_WINDOWS_MIB} = {exp + P_WINDOWS_MIB} MiB "
             f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; the launcher derives D from the MEASUREMENT, record 1f B6)"
         )
     state.dc_measured_p = dc_p
@@ -5819,7 +5863,26 @@ def teardown(path: str) -> int:
                     "another boot's")
     print(f"vram credit counters removed (boot {who}): "
           + str(remove_vram_credit_counters(boot_nonce=nonce)))
-    print(subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader"], capture_output=True, text=True).stdout)
+    # Same one reader as everywhere else, and the line says which figure it is:
+    # a teardown that prints "0 MiB used" from a carve-out-blind subtraction
+    # would be the same lie in the other direction.
+    try:
+        snap = nvml_registry.memory_snapshot()
+        inst = (
+            nvml_registry.FREE_INSTRUMENT_V2
+            if all(m.carve_out_known for _d, m in snap)
+            else nvml_registry.FREE_INSTRUMENT_V1
+        )
+        print(
+            f"cards after teardown (instrument: {inst}, allocatable): "
+            + ", ".join(
+                f"nvml{d.index} {m.tenant_used_mib} MiB used by processes / {m.free_mib} MiB free "
+                f"({m.reserved_mib} MiB driver-reserved)"
+                for d, m in snap
+            )
+        )
+    except Exception as e:  # noqa: BLE001 - a teardown print never fails a teardown
+        print(f"cards after teardown: NVML unreadable ({e})")
     return 0
 
 

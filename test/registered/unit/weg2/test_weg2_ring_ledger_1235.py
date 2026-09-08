@@ -23,7 +23,7 @@ import os
 import unittest
 from dataclasses import dataclass
 
-from sglang.srt.weg2 import host_ledger, ring_table
+from sglang.srt.weg2 import front, host_ledger, ring_table
 
 GIB = host_ledger.GIB
 MIB = ring_table.MIB
@@ -129,7 +129,23 @@ def _write_dormant_sidecar(evidence_dir: str, dormant) -> None:
         })
 
 
-def _front_log(free_by_phase, cards=None, identity=True, arm=None) -> str:
+def _front_log(free_by_phase, cards=None, identity=True, arm=None,
+               instrument=front.CORRIDOR_INSTRUMENT) -> str:
+    """A fixture front log.
+
+    ``instrument`` is the ``instrument=`` token the corridor samples carry, and
+    it DEFAULTS TO WHAT THE TREE EMITS TODAY (allocatable free).  Corridor fix
+    3 made the unit load-bearing: the ring credit converts a pre-fix log's
+    samples before crediting them, so a fixture that silently omitted the token
+    would be asserting ring arithmetic against a converted number.  Pass
+    ``instrument=None`` for the pre-fix shape deliberately.
+
+    MERGE NOTE (train 2): the corridor branch's ``dormant=()`` parameter is NOT
+    carried over.  The train replaced the in-log dormant lines with a SIDECAR
+    file (:func:`_write_dormant_sidecar`), so on this tree that parameter would
+    be a dead knob whose absence of effect reads like a fixture that forgot to
+    write the census.  The instrument token is the corridor concern and stays.
+    """
     out = []
     if arm is not None:
         # The SOURCE boot's own chosen ledger arm.  Without it the RssShmem
@@ -152,12 +168,13 @@ def _front_log(free_by_phase, cards=None, identity=True, arm=None) -> str:
                 for i, c in enumerate(cards or CARDS)
             )
         )
+    token = f"instrument={instrument} " if instrument else ""
     for phase, samples in free_by_phase.items():
         for row in samples:
             free = " ".join(f"nvml{i}:free={v}MiB" for i, v in row.items())
             out.append(
                 f"[2026-09-07 21:07:54,029] INFO weg2.front: WEG2-CORRIDOR "
-                f"phase={phase}(awake) epoch=0 {free} min_so_far={{}}"
+                f"phase={phase}(awake) epoch=0 {token}{free} min_so_far={{}}"
             )
     return "\n".join(out) + "\n"
 
@@ -526,6 +543,174 @@ class RealBootProvenanceTest(unittest.TestCase):
         for c in table.cards:
             self.assertGreater(c.slack_d2p_mib, 0, c.uuid)
             self.assertGreater(c.slack_p2d_mib, 0, c.uuid)
+
+
+class RingCreditIsAllocatableFreeTest(unittest.TestCase):
+    """FIX 3: ``credit(S->W)`` reads its source boot's UNIT, not just its number.
+
+    Disclosed by fix 1 and left open there: a pre-fix boot's WEG2-CORRIDOR
+    samples are allocatable free PLUS that card's driver carve-out, and
+    :func:`ring_table.solve` credited them raw.  Every card was over-credited
+    by 425/518/425 MiB, which UNDERSTATES ``need = image_W - credit + max_tag_S
+    + max_tag_W`` by the same amount -- so an R5 case that should have been
+    refused at launch arms instead, and the flip it funds is short by the
+    carve-out.  The unsafe direction, and the same defect the boot arm had one
+    level up: two readers grading a number against a rule stated in another
+    unit.
+
+    Every assertion here fails on the parent commit 4302724e8b.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.dir = tempfile.mkdtemp(prefix="weg2ringunit-")
+        self.stem = "boot_weg2_unit_0000000000_0908_000000"
+
+    def _write(self, corridor, instrument, cards=REAL_CARDS):
+        one = {0: [("weights_0", 4000)]}
+        with open(os.path.join(self.dir, f"{self.stem}.P.log"), "w") as f:
+            f.write(_group_log("PP", [one], {0: 0.0}))
+        with open(os.path.join(self.dir, f"{self.stem}.D.log"), "w") as f:
+            f.write(_group_log("TP", [one], {0: 0.0}))
+        with open(os.path.join(self.dir, f"{self.stem}.front.log"), "w") as f:
+            f.write(_front_log(corridor, cards=cards, instrument=instrument))
+
+    def _solve(self, cards=None):
+        return ring_table.solve(cards or [REAL_CARDS[0]], self.dir, self.stem)
+
+    #: The 5090 is ordinal 0 = nvml 1 in REAL_CARDS, carve-out 518 MiB.
+    CORRIDOR = {"P": [{1: 1441}], "D": [{1: 993}]}
+
+    def test_a_pre_fix_source_is_credited_minus_the_carve_out(self):
+        self._write(self.CORRIDOR, instrument=None)
+        table, reason = self._solve()
+        self.assertIsNotNone(table, reason)
+        c = table.cards[0]
+        self.assertEqual(c.credit_d2p_mib, 993 - 518)
+        self.assertEqual(c.credit_p2d_mib, 1441 - 518)
+
+    def test_a_post_fix_source_is_credited_as_it_stands(self):
+        self._write(self.CORRIDOR, instrument=front.CORRIDOR_INSTRUMENT)
+        table, reason = self._solve()
+        self.assertIsNotNone(table, reason)
+        c = table.cards[0]
+        self.assertEqual((c.credit_d2p_mib, c.credit_p2d_mib), (993, 1441))
+
+    def test_the_carve_out_blind_v2less_source_is_still_allocatable_free(self):
+        """``nvml_v1_free,allocatable(carve-out-unknown)``: the FREE is fine.
+
+        Both NVML structs report the same allocatable ``free``; only the
+        carve-out beside it is missing in v1.  Subtracting anything here would
+        double-count a carve-out that was never added.
+        """
+        self._write(self.CORRIDOR, instrument=front.CORRIDOR_INSTRUMENT_NO_V2)
+        table, _ = self._solve()
+        self.assertEqual(table.cards[0].credit_d2p_mib, 993)
+
+    def test_the_correction_is_printed_in_the_ring_provenance_line(self):
+        self._write(self.CORRIDOR, instrument=None)
+        table, _ = self._solve()
+        prov = table.provenance()
+        self.assertIn("CREDIT unit: ALLOCATABLE free", prov)
+        self.assertIn(f"source instrument {ring_table.CORRIDOR_INSTRUMENT_PRE_FIX}", prov)
+        self.assertIn("nvml1-518", prov)
+        self.assertIn("keyed by card UUID", prov)
+        # And on the operator-facing L6 line, which carries the provenance.
+        self.assertIn("nvml1-518", table.format_l6()[0])
+
+    def test_a_card_with_no_measured_or_recorded_carve_out_refuses_the_boot(self):
+        """A missing carve-out may never become a zero: that IS the defect."""
+        self._write({"P": [{1: 1441}], "D": [{1: 993}]}, instrument=None, cards=CARDS)
+        table, reason = ring_table.solve([CARDS[0]], self.dir, self.stem)
+        self.assertIsNone(table)
+        self.assertIn("no measured or recorded driver carve-out", reason)
+        self.assertIn("refused rather than graded", reason)
+
+    def test_the_callers_own_measured_carve_out_wins_over_the_record(self):
+        """``Card.reserved_mib`` is this rig's live registry snapshot."""
+        self._write(self.CORRIDOR, instrument=None)
+        measured = FakeCard(1, REAL_5090, "NVIDIA GeForce RTX 5090", 32607)
+        measured.reserved_mib = 500
+        table, reason = self._solve([measured])
+        self.assertIsNotNone(table, reason)
+        self.assertEqual(table.cards[0].credit_d2p_mib, 993 - 500)
+        self.assertIn("matched by UUID", table.provenance())
+
+    def test_an_unknown_instrument_token_refuses_rather_than_credits(self):
+        self._write(self.CORRIDOR, instrument="free_by_some_future_reader")
+        table, reason = self._solve()
+        self.assertIsNone(table)
+        self.assertIn("names neither the allocatable unit", reason)
+
+    def test_the_understatement_is_exactly_the_carve_out(self):
+        """The consequence, stated as the arithmetic R5 actually runs."""
+        self._write(self.CORRIDOR, instrument=None)
+        pre_fix_table, _ = self._solve()
+        self._write(self.CORRIDOR, instrument=front.CORRIDOR_INSTRUMENT)
+        as_if_allocatable, _ = self._solve()
+        self.assertEqual(
+            pre_fix_table.cards[0].need_d2p_mib
+            - as_if_allocatable.cards[0].need_d2p_mib,
+            518,
+            "crediting front units understates need by exactly the carve-out",
+        )
+
+
+@unittest.skipUnless(os.path.isfile(os.path.join(EVIDENCE, f"{ZR2}.front.log")),
+                     f"{EVIDENCE}/{ZR2} not present")
+class RealBootCreditsAreReDerivedTest(unittest.TestCase):
+    """The numbers the next boot's ARMED line is checked against.
+
+    All four candidate source boots are PRE-FIX, so every credit the launcher
+    would compute today moves by that card's carve-out.  These are the
+    re-derived figures, recorded here and in
+    ``/spinning/gpu-arb/weg2/WEG2_BUILD_DECISIONS_0906.md`` so a boot's own
+    RING line can be checked against them rather than re-derived by hand.
+    """
+
+    RG3 = "boot_weg2_weg2rg3_5b015ad139_0908_041053"
+
+    #: ``{uuid: (credit_d2p, credit_p2d, need_d2p, need_p2d, slack_d2p, slack_p2d)}``
+    #: -- allocatable free, i.e. each card's corridor minimum minus its
+    #: carve-out (425/518/425), plus the kv that group releases.
+    RG3_EXPECTED = {
+        REAL_5090: (11756, 11250, 6700, 7260, 7214, 6654),
+        REAL_3080_A: (5779, 7018, 5765, 6658, 3915, 3022),
+        REAL_3080_B: (6157, 6218, 6245, 7050, 3125, 2320),
+    }
+    ZR2_EXPECTED = {
+        REAL_5090: (11652, 11318, 6804, 7192, 7110, 6722),
+        REAL_3080_A: (5803, 6940, 5741, 6736, 3939, 2944),
+        REAL_3080_B: (6179, 6232, 6223, 7036, 3147, 2334),
+    }
+
+    def _check(self, stem, expected):
+        if not os.path.isfile(os.path.join(EVIDENCE, f"{stem}.front.log")):
+            self.skipTest(f"{stem} not in the evidence tree")
+        table, reason = ring_table.solve(REAL_CARDS, EVIDENCE, stem)
+        self.assertIsNotNone(table, reason)
+        got = {
+            c.uuid: (c.credit_d2p_mib, c.credit_p2d_mib, c.need_d2p_mib,
+                     c.need_p2d_mib, c.slack_d2p_mib, c.slack_p2d_mib)
+            for c in table.cards
+        }
+        self.assertEqual(got, expected)
+        self.assertEqual(table.refusals(), [], "\n".join(table.refusals()))
+        self.assertIn("nvml1-518", table.provenance())
+        return table
+
+    def test_rg3_credits_are_the_re_derived_allocatable_numbers(self):
+        table = self._check(self.RG3, self.RG3_EXPECTED)
+        # H is an IMAGE quantity and does not move with the credit: the credit
+        # enters `need`, and an over-credit hid a need that was 425-518 MiB
+        # larger per card.  Stated because "the ring was sized too small" is
+        # the tempting shorthand and it names the wrong term.
+        self.assertEqual(table.total_h_bytes // MIB, 32964)
+        self.assertEqual(table.total_span1_bytes // MIB, 29912)
+
+    def test_zr2_credits_are_the_re_derived_allocatable_numbers(self):
+        self._check(ZR2, self.ZR2_EXPECTED)
 
 
 class LauncherRingPlanTest(unittest.TestCase):

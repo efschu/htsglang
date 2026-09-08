@@ -32,7 +32,7 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, NamedTuple, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +100,22 @@ class DeviceInfo:
         This, not :attr:`total_mib`, is the capacity a memory budget may spend.
         Budgeting against ``total_mib`` overcommits every card by the carve-out
         (measured 425 MiB on a 20 GiB RTX 3080, 518 on a 32 GiB RTX 5090), and
-        the overcommit is invisible in the obvious check because NVML subtracts
-        the carve-out from BOTH ``used`` and ``free`` in the v2 struct -- so
-        ``total - used - free`` reads ~0 and the shortfall only appears when an
-        allocation that the budget said would fit does not.
+        the overcommit is invisible in the obvious check because the v1 struct
+        folds the carve-out into ``used`` -- so ``total - used - free`` reads ~0
+        THERE and the shortfall only appears when an allocation the budget said
+        would fit does not.
+
+        WHICH STRUCT PUTS THE CARVE-OUT WHERE, measured 2026-09-08 on the
+        reference rig with nothing running on the cards (the driver's own
+        numbers, one RTX 3080, MiB): v1 ``total 20480 free 20054 used 425`` --
+        v1 ``used`` INCLUDES the carve-out and ``total - used - free`` = 1;
+        v2 ``total 20480 free 20054 used 0 reserved 425`` -- v2 ``used``
+        EXCLUDES it and ``total - used - free`` = 426, the carve-out itself.
+        BOTH structs' ``free`` is already the allocatable figure. Hence the two
+        traps: ``total - used`` over a v2-style ``used`` (which is what
+        ``nvidia-smi --query-gpu=memory.used`` prints) returns FREE PLUS THE
+        CARVE-OUT, and a v1 ``used`` read as tenancy calls an empty card
+        425 MiB busy (#539).
         """
         return (self.total_bytes - self.reserved_bytes) // MIB
 
@@ -165,28 +177,71 @@ def _decode(value: object) -> str:
     return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
 
-def _memory_info(pynvml, handle):
-    """``(total_bytes, reserved_bytes)`` for one card.
+class _MemoryFields(NamedTuple):
+    """One card's memory as read from the driver, WITH the struct it came from.
+
+    FIX 2, finding 3 (the instrument-name defect this file's own labels had).
+    The predecessor fetched the v2 struct, kept only ``reserved``, threw
+    ``free`` and ``used`` away, and then read them AGAIN from the v1 struct --
+    while every consumer printed the label ``nvml_v2_free`` / ``nvml_v2_used``.
+    On this driver the two structs' ``free`` is the same figure, so the numbers
+    were right and only the label was a shorthand; that is exactly the class
+    the instrument-text law forbids, because the label is what a reader trusts
+    when the two ever diverge (a driver whose v1 ``free`` is derived, a binding
+    that fills one struct and not the other).
+
+    ``carve_out_known`` is the honest half: when the v2 struct is unavailable
+    there IS no v2 ``free`` and no v2 ``used``, ``tenant_used_bytes`` is
+    ``None``, and every label derived from this record says v1 instead of
+    claiming a struct that was never read.
+    """
+
+    total_bytes: int
+    reserved_bytes: int
+    free_bytes: int
+    #: NVML v1 ``used``: the carve-out is INSIDE this figure.
+    used_bytes: int
+    #: NVML v2 ``used``: processes only, carve-out excluded. ``None`` when the
+    #: v2 struct could not be read -- never silently replaced by the v1 value.
+    tenant_used_bytes: Optional[int]
+    carve_out_known: bool
+
+
+def _memory_fields(pynvml, handle) -> _MemoryFields:
+    """Read BOTH memory structs for one card, once each, and keep both.
 
     The reserved figure (driver carve-out) exists only in NVML's v2 memory
     struct. Two distinct absence cases:
 
     * (a) No v2 support -- the pynvml binding lacks ``nvmlMemory_v2`` or the
-      v2 call raises. Returns ``(total, 0)`` and emits a one-time ``logger.warning``
-      per process. Budgets are carve-out-blind in this mode; the warning makes
-      that visible instead of silent.
+      v2 call raises. Returns the v1 figures with ``reserved_bytes=0``,
+      ``tenant_used_bytes=None`` and ``carve_out_known=False``, and emits a
+      one-time ``logger.warning`` per process. Budgets are carve-out-blind in
+      this mode; the warning and the flag make that visible instead of silent.
     * (b) v2 struct exists but lacks the ``reserved`` attribute. This is a
       data error, not an old driver. Raises ``RuntimeError`` naming the struct
       type and the missing field -- the mem_ledger contract treats ``reserved``
       as REQUIRED when v2 is available, and the producer must not be softer
       than the consumer.
 
-    A driver that reports a valid v2 struct with ``reserved`` returns it
-    directly with no warning.
+    A driver that reports a valid v2 struct with ``reserved`` returns the v2
+    ``free``/``used`` with no warning.
     """
     global _nv2_warning_emitted
 
-    total = int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+    v1 = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    total = int(v1.total)
+    v1_free = int(v1.free)
+    v1_used = int(v1.used)
+    blind = _MemoryFields(
+        total_bytes=total,
+        reserved_bytes=0,
+        free_bytes=v1_free,
+        used_bytes=v1_used,
+        tenant_used_bytes=None,
+        carve_out_known=False,
+    )
+
     version = getattr(pynvml, "nvmlMemory_v2", None)
     if version is None:
         if not _nv2_warning_emitted:
@@ -198,7 +253,7 @@ def _memory_info(pynvml, handle):
                 "by the driver carve-out (size varies by card and driver). "
                 "Upgrade nvidia-ml-py to restore the carve-out term."
             )
-        return total, 0
+        return blind
     try:
         v2 = pynvml.nvmlDeviceGetMemoryInfo(handle, version=version)
     except Exception:  # pragma: no cover - driver/binding without v2
@@ -211,7 +266,7 @@ def _memory_info(pynvml, handle):
                 "(size varies by card and driver). The driver or binding "
                 "may not support nvmlMemory_v2."
             )
-        return total, 0
+        return blind
 
     reserved = getattr(v2, "reserved", None)
     if reserved is None:
@@ -221,7 +276,29 @@ def _memory_info(pynvml, handle):
             "between the binding and the driver. The mem_ledger contract requires "
             "this field when v2 is available."
         )
-    return total, int(reserved)
+    # The v2 struct's OWN free and used, not the v1 pair: this is what makes
+    # the ``nvml_v2_free`` / ``nvml_v2_used`` labels below literally true, and
+    # it removes the double floor-division that used to stand in for v2 used
+    # (``(total - reserved)//MiB - free//MiB`` can differ from ``used//MiB``
+    # by 1 MiB, since neither free nor reserved is a round MiB).
+    return _MemoryFields(
+        total_bytes=total,
+        reserved_bytes=int(reserved),
+        free_bytes=int(getattr(v2, "free", v1_free)),
+        used_bytes=v1_used,
+        tenant_used_bytes=int(v2.used) if hasattr(v2, "used") else None,
+        carve_out_known=True,
+    )
+
+
+def _memory_info(pynvml, handle):
+    """``(total_bytes, reserved_bytes)`` for one card -- the two-field view.
+
+    Kept as the narrow contract for callers that only size against the card
+    (:func:`list_devices`); the full read is :func:`_memory_fields`.
+    """
+    fields = _memory_fields(pynvml, handle)
+    return fields.total_bytes, fields.reserved_bytes
 
 
 def list_devices() -> list[DeviceInfo]:
@@ -275,6 +352,24 @@ def total_bytes_for_uuid(uuid: str) -> int:
     return device_by_uuid(uuid).total_bytes
 
 
+#: THE INSTRUMENT NAMES, declared once beside the code that reads them.
+#:
+#: FIX 2, finding 3: these used to be string literals typed at each print site
+#: (``front.CORRIDOR_INSTRUMENT``, three launcher f-strings), naming the v2
+#: struct for a figure this module took from the v1 one. A label that lives
+#: away from its read cannot follow it; these are properties of
+#: :class:`MemoryInfo` so the name is chosen by the same code path that chose
+#: the number.
+FREE_INSTRUMENT_V2 = "nvml_v2_free"
+FREE_INSTRUMENT_V1 = "nvml_v1_free"
+USED_INSTRUMENT_V2 = "nvml_v2_used"
+#: Named in full because this one is a WARNING: with no v2 struct the "held by
+#: processes" figure is the v1 ``used``, which counts the driver carve-out as
+#: tenancy (#539). The label carries that so a refusal message cannot read as
+#: a carve-out-aware one.
+USED_INSTRUMENT_V1 = "nvml_v1_used(carve-out INCLUDED, no v2 struct)"
+
+
 @dataclass(frozen=True)
 class MemoryInfo:
     """One card's memory as the driver sees it, not as any tenant believes it."""
@@ -287,10 +382,38 @@ class MemoryInfo:
     #: ``free_bytes`` excludes it -- so ``total - used - free`` is ~0 here and
     #: is not a way to recover it.
     reserved_bytes: int = 0
+    #: NVML v2 ``used`` -- processes only. ``None`` means it was never read
+    #: (no v2 struct, or a hand-built instance), and then
+    #: :attr:`tenant_used_mib` falls back to the two-struct derivation and
+    #: :attr:`tenant_used_instrument` says which figure that is. FIX 2,
+    #: finding 3: the label must never outrun the read.
+    tenant_used_bytes: Optional[int] = None
+    #: Whether ``reserved_bytes`` (and therefore the whole carve-out-aware
+    #: reading) came from the driver's v2 struct. ``False`` = carve-out-blind
+    #: mode; every instrument label below degrades with it instead of
+    #: continuing to claim a struct that was not read.
+    carve_out_known: bool = True
 
     @property
     def free_mib(self) -> int:
         return self.free_bytes // MIB
+
+    @property
+    def free_instrument(self) -> str:
+        """Which struct's ``free`` :attr:`free_mib` actually is.
+
+        Both structs report the SAME allocatable figure on a healthy driver
+        (measured 2026-09-08 on the reference rig: v1 free 20054 == v2 free
+        20054 on an idle RTX 3080), which is precisely why a wrong label here
+        is invisible until it is not. Printed beside the number, never
+        assumed by the reader.
+        """
+        return FREE_INSTRUMENT_V2 if self.carve_out_known else FREE_INSTRUMENT_V1
+
+    @property
+    def tenant_used_instrument(self) -> str:
+        """Which figure :attr:`tenant_used_mib` is, named for the log line."""
+        return USED_INSTRUMENT_V2 if self.carve_out_known else USED_INSTRUMENT_V1
 
     @property
     def reserved_mib(self) -> int:
@@ -300,6 +423,29 @@ class MemoryInfo:
     def allocatable_mib(self) -> int:
         """See :attr:`DeviceInfo.allocatable_mib`."""
         return (self.total_bytes - self.reserved_bytes) // MIB
+
+    @property
+    def tenant_used_mib(self) -> int:
+        """MiB held by PROCESSES, driver carve-out EXCLUDED -- when v2 was read.
+
+        Not :attr:`used_bytes`, which is NVML's v1 figure and INCLUDES the
+        carve-out: an idle RTX 3080 reads 425 MiB "used" there, and a preflight
+        that reads that as tenancy refuses an empty machine -- measured, and
+        fixed once already in commit ``0d3d973aed`` (#539, "Preflight refused an
+        idle machine: discount the NVML carve-out"). With the v2 struct present
+        this returns the v2 struct's own ``used``, the figure ``nvidia-smi
+        --query-gpu=memory.used`` prints: measured 2026-09-08 on the idle
+        reference rig, v1 used 425 / this 1 / nvidia-smi 1 on each RTX 3080.
+
+        WITHOUT the v2 struct there is no such figure to return. The fallback
+        derivation collapses to the v1 ``used`` (``reserved`` is 0, so
+        ``allocatable - free == total - free``), i.e. the #539 trap is back --
+        which is why :attr:`tenant_used_instrument` then says ``nvml_v1_used``
+        and every caller prints it. The value degrades; the CLAIM does not.
+        """
+        if self.tenant_used_bytes is not None:
+            return self.tenant_used_bytes // MIB
+        return self.allocatable_mib - self.free_mib
 
 
 def memory_info_for_uuid(uuid: str) -> MemoryInfo:
@@ -316,15 +462,70 @@ def memory_info_for_uuid(uuid: str) -> MemoryInfo:
             handle = pynvml.nvmlDeviceGetHandleByIndex(index)
             if _decode(pynvml.nvmlDeviceGetUUID(handle)) != uuid:
                 continue
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            _, reserved_bytes = _memory_info(pynvml, handle)
+            f = _memory_fields(pynvml, handle)
             return MemoryInfo(
-                total_bytes=int(mem.total),
-                free_bytes=int(mem.free),
-                used_bytes=int(mem.used),
-                reserved_bytes=reserved_bytes,
+                total_bytes=f.total_bytes,
+                free_bytes=f.free_bytes,
+                used_bytes=f.used_bytes,
+                reserved_bytes=f.reserved_bytes,
+                tenant_used_bytes=f.tenant_used_bytes,
+                carve_out_known=f.carve_out_known,
             )
     raise DeviceNotFoundError(f"no NVML device with UUID {uuid!r}")
+
+
+def memory_snapshot() -> list[tuple[DeviceInfo, MemoryInfo]]:
+    """Identity AND live memory for EVERY card, from ONE NVML session.
+
+    THE ONE READER for "how much can still be allocated on this card right
+    now". Every repeated sampler -- the Weg-2 corridor sampler in
+    ``srt/weg2/front.py``, the launcher preflight in ``srt/weg2/launcher.py`` --
+    reads here instead of shelling out to ``nvidia-smi`` and doing its own
+    arithmetic, because the arithmetic is where the carve-out is lost.
+
+    THE DEFECT THIS EXISTS TO END (boot weg2rg6, 2026-09-08): a sampler that
+    computed ``total - used`` over ``nvidia-smi --query-gpu=memory.used``
+    printed FREE PLUS THE DRIVER CARVE-OUT and called it free. Measured at one
+    instant, 07:31:30Z, against ``memory.free``: 1454 vs 1030, 859 vs 341,
+    1276 vs 852 MiB -- overstatements of exactly 424 / 518 / 424 MiB, the
+    carve-out of the three cards. The 5090 was 478 MiB below the corridor floor
+    and the operator's line read IN BAND. :attr:`MemoryInfo.free_mib` is that
+    same allocatable ``free``, taken from the driver rather than derived.
+
+    One NVML session for the whole rig, not one per card: the samplers run on a
+    10 s tick and the corridor line must print numbers from a SINGLE instant,
+    not three reads a few milliseconds apart.
+    """
+    with nvml_session() as pynvml:
+        out: list[tuple[DeviceInfo, MemoryInfo]] = []
+        for index in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            # ONE read of each struct per card. The predecessor read the v1
+            # struct twice (once inside the carve-out helper for ``total``,
+            # once here for ``free``/``used``), so the printed free and the
+            # printed total were two different instants on a live card.
+            f = _memory_fields(pynvml, handle)
+            out.append(
+                (
+                    DeviceInfo(
+                        index=index,
+                        uuid=_decode(pynvml.nvmlDeviceGetUUID(handle)),
+                        name=_decode(pynvml.nvmlDeviceGetName(handle)),
+                        total_bytes=f.total_bytes,
+                        reserved_bytes=f.reserved_bytes,
+                        pci_bus_id=_decode(pynvml.nvmlDeviceGetPciInfo(handle).busId),
+                    ),
+                    MemoryInfo(
+                        total_bytes=f.total_bytes,
+                        free_bytes=f.free_bytes,
+                        used_bytes=f.used_bytes,
+                        reserved_bytes=f.reserved_bytes,
+                        tenant_used_bytes=f.tenant_used_bytes,
+                        carve_out_known=f.carve_out_known,
+                    ),
+                )
+            )
+        return out
 
 
 @dataclass(frozen=True)
