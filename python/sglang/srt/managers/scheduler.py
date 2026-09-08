@@ -1282,6 +1282,20 @@ class Scheduler(
             )
         else:
             self.idle_sleeper = None
+        # #1269/#1276: the census runs on EVERY rank, unlike the sleeper. The
+        # per-stage anon question boot weg2sb4 could not answer (PP2 flat while
+        # PP0/PP1 grew 12.5 MiB over 140 s) needs a per-rank series, and a
+        # follower that never sleeps is exactly the rank whose growth matters.
+        # Imported here, not at module scope: `sglang.srt.weg2` reaches back
+        # into managers, and this file is already the import-order chokepoint.
+        from sglang.srt.weg2.idle_census import IdleCensus
+
+        self.idle_census = IdleCensus(
+            group=os.environ.get("SGLANG_WEG2_GROUP", ""),
+            rank=int(getattr(self.ps, "pp_rank", -1) or 0)
+            if int(getattr(self.ps, "pp_size", 1) or 1) > 1
+            else int(getattr(self.ps, "attn_tp_rank", -1) or 0),
+        )
         # #1262 (2): set by `_idle_census_control_hold` when a control message
         # was already queued at the moment `on_idle` wanted to run its pool
         # census, cleared by `process_input_requests` -- the one function every
@@ -14178,7 +14192,16 @@ class Scheduler(
             # as far as the idle poll is concerned -- back to the zero-poll rung.
             if self.idle_sleeper is not None:
                 self.idle_sleeper.reset()
+            if getattr(self, "idle_census", None) is not None:
+                self.idle_census.reset()
             return
+
+        # #1269/#1276: one idle pass. `tick` is a counter increment; `maybe_emit`
+        # does a /proc/self/status read at most once per WEG2_IDLE_CENSUS_S and
+        # never walks smaps.
+        if getattr(self, "idle_census", None) is not None:
+            self.idle_census.tick()
+            self.idle_census.maybe_emit()
 
         if self.enable_unified_memory:
             try:
