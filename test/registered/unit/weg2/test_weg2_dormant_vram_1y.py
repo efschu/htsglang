@@ -692,9 +692,23 @@ def _free(text):
     }
 
 
-def _grade(before=None, after=None, released=_RELEASED_OK, ranks=3,
-           instant_before=_I_BEFORE, instant_after=_I_AFTER, degrades=(), noitem=None):
+_SAME_AS_P = object()  # sentinel: "the D group saw what P saw", the normal boot
+
+
+def _grade(before=None, after=None, released=_RELEASED_OK, released_d=_SAME_AS_P,
+           ranks_per_group=3, instant_before=_I_BEFORE, instant_after=_I_AFTER,
+           degrades=(), degrades_d=(), noitem=None):
+    """Grade one cycle.
+
+    FIX 4: ``released`` is the P group's window and ``released_d`` the D
+    group's, defaulting to the same text -- both groups sleep inside ONE flip
+    (front.handle_manual_flip is a round trip), so the ordinary boot releases in
+    both, and a test that says nothing about D is asking for that ordinary boot.
+    An asymmetric boot has to say so, which is the whole point of the argument.
+    """
     arm = _arm()
+    if released_d is _SAME_AS_P:
+        released_d = released
     return arm.grade(
         before=_free(before or _FREE_STEADY),
         after=_free(after or _FREE_STEADY),
@@ -702,9 +716,12 @@ def _grade(before=None, after=None, released=_RELEASED_OK, ranks=3,
         instant_after=instant_after,
         capture={0: 102, 1: 92, 2: 133},
         capture_prov="boot weg2rg6",
-        released=None if released is None else arm.parse_released(released),
-        degrades=list(degrades),
-        ranks=ranks,
+        released_by_group={
+            "P": None if released is None else arm.parse_released(released, "P"),
+            "D": None if released_d is None else arm.parse_released(released_d, "D"),
+        },
+        degrades_by_group={"P": list(degrades), "D": list(degrades_d)},
+        ranks_per_group=ranks_per_group,
         noitem=noitem if noitem is not None else {0: 1029, 1: 340, 2: 851},
         noitem_prov="boot weg2rg6 (no item)",
     )
@@ -846,6 +863,182 @@ def test_the_boot_arm_stamps_both_readings_with_the_fronts_own_instant():
         "same-phase delivery test"
     )
     assert "plog-window" in src, "delivery needs the released-tag window"
+
+
+# ---------------------------------------------------------------------------
+# FIX 4: SIX sleeping ranks, in TWO groups, graded per group and only then in
+# total.
+#
+# The boot is 3+3 (launcher.py refuses below three ranks per group) and ONE
+# POST /weg2/flip is a ROUND TRIP, not a leg -- front.handle_manual_flip flips
+# awake->other and, whenever that leaves P awake, immediately flips back to D.
+# So both groups sleep inside one cycle and both release the tag.  FIX 3 read
+# only <boot>.P.log, for the A2 window AND for the degrade scan, and carried
+# --ranks 3: a boot in which all three D ranks silently failed to release
+# passed A2 on P's three lines, and the EXIT text claimed six.
+# ---------------------------------------------------------------------------
+
+#: The real line shape, WITH the prefix the rank actually comes from.  P ranks
+#: are labelled PPn and D ranks TPn on this boot form (measured, boot weg2rg6
+#: .P.log / .D.log), but nothing here depends on that: the GROUP is the log the
+#: line was read out of, because the line's own text carries no group token.
+_P_WINDOW = (
+    "[2026-09-08 07:06:31 PP0] WEG2-SLEEP released tags=['cuda_graph'] mib=476.0 ms=44\n"
+    "[2026-09-08 07:06:31 PP1] WEG2-SLEEP released tags=['cuda_graph'] mib=486.0 ms=41\n"
+    "[2026-09-08 07:06:31 PP2] WEG2-SLEEP released tags=['cuda_graph'] mib=517.0 ms=48\n"
+)
+_D_WINDOW = (
+    "[2026-09-08 07:06:52 TP0] WEG2-SLEEP released tags=['cuda_graph'] mib=470.0 ms=39\n"
+    "[2026-09-08 07:06:52 TP1] WEG2-SLEEP released tags=['cuda_graph'] mib=481.0 ms=43\n"
+    "[2026-09-08 07:06:52 TP2] WEG2-SLEEP released tags=['cuda_graph'] mib=505.0 ms=46\n"
+)
+#: A D window with the group asleep and NOTHING released -- the silent
+#: capability loss this fix exists to catch.  It is not an empty file: the group
+#: is plainly alive and logging, it just never released the tag.
+_D_WINDOW_SILENT = (
+    "[2026-09-08 07:06:52 TP0] WEG2-SLEEP-CHUNK tags=['kv_cache'] paused in 43 ms\n"
+    "[2026-09-08 07:06:52 TP1] WEG2-SLEEP-CHUNK tags=['kv_cache'] paused in 27 ms\n"
+    "[2026-09-08 07:06:52 TP2] WEG2-SLEEP-CHUNK tags=['kv_cache'] paused in 28 ms\n"
+)
+
+
+def test_three_of_six_ranks_are_no_longer_graded_as_six(capsys):
+    """THE round-3 blocker, as an executable regression.
+
+    P releases on all three ranks, D on none.  MEASURED against the parent
+    commit 53c0ff0e62 on exactly this input: EXIT 5, "the item DELIVERED on
+    every rank", with the letter D appearing nowhere in the report -- because
+    the arm had no D argument at all and its denominator was 3.
+    """
+    rc, lines = _grade(released=_P_WINDOW, released_d=_D_WINDOW_SILENT)
+    text = "\n".join(lines)
+    assert rc == 4, (
+        "a boot whose whole D group released nothing was graded on P alone:\n" + text
+    )
+    verdict = [ln for ln in lines if ln.startswith("VERDICT:")][0]
+    assert "group D" in verdict, (
+        "the verdict does not name WHICH group failed: %s" % verdict
+    )
+    assert "P 3/3" in verdict and "D 0/3" in verdict, (
+        "the verdict does not print both groups' counts against their own "
+        "denominator: %s" % verdict
+    )
+    assert "DELIVERED on all" not in text and "DELIVERED on every rank" not in text
+
+
+def test_the_six_rank_total_is_claimed_only_when_both_groups_delivered():
+    """A total is a claim about six ranks and needs six ranks' evidence."""
+    rc_ok, lines_ok = _grade(released=_P_WINDOW, released_d=_D_WINDOW)
+    ok = "\n".join(lines_ok)
+    assert rc_ok == 5, "both groups delivered; the only failure left is the 5090 residual"
+    assert "TOTAL: 6/6 sleeping ranks released the tag (P 3/3, D 3/3)." in ok
+    assert "DELIVERED on all 6 sleeping ranks (P 3/3, D 3/3)" in ok
+
+    rc_bad, lines_bad = _grade(released=_P_WINDOW, released_d=_D_WINDOW_SILENT)
+    bad = "\n".join(lines_bad)
+    assert rc_bad == 4
+    assert "TOTAL: 6/6" not in bad, "a six-rank total was claimed off three ranks"
+    assert "TOTAL: NOT CLAIMED" in bad and "group D" in bad
+
+    # ...and the same when the total would be right by accident: six lines, all
+    # of them P's.  Pooling the two windows would pass this; per-group grading
+    # is what refuses it.
+    rc_pooled, lines_pooled = _grade(
+        released=_P_WINDOW + _P_WINDOW.replace("PP", "PX"), released_d=_D_WINDOW_SILENT
+    )
+    assert rc_pooled == 4, (
+        "six released lines that all came from ONE group passed as six ranks -- "
+        "the lines are being pooled instead of attributed"
+    )
+    assert "group D: 0 released-tag line" in "\n".join(lines_pooled)
+
+
+def test_a_released_line_is_attributed_to_its_own_log_and_counted_once():
+    """The group is a property of the LOG, the rank of the LINE, and neither is
+    guessed.  A line parsed out of the P window can never be counted in D."""
+    arm = _arm()
+    p = arm.parse_released(_P_WINDOW, "P")
+    d = arm.parse_released(_D_WINDOW, "D")
+    assert [(x.group, x.rank) for x in p] == [("P", "PP0"), ("P", "PP1"), ("P", "PP2")]
+    assert [(x.group, x.rank) for x in d] == [("D", "TP0"), ("D", "TP1"), ("D", "TP2")]
+    # The emitter writes no group token, so a window parsed under the wrong
+    # label would be silently mis-attributed -- the label has exactly one
+    # source, the file the bytes came from.
+    assert "group" not in _P_WINDOW and " P " not in _P_WINDOW
+
+    rc, lines = _grade(released=_P_WINDOW, released_d=_D_WINDOW)
+    rows = [ln for ln in lines if ln.startswith("| P |") or ln.startswith("| D |")]
+    assert len(rows) == 6, "expected one table row per sleeping rank, got %d" % len(rows)
+    assert len(set(rows)) == 6, "a released line appears twice: %s" % rows
+    for tok in ("| P | PP0 |", "| P | PP2 |", "| D | TP0 |", "| D | TP2 |"):
+        assert any(r.startswith(tok) for r in rows), "%s missing from the table" % tok
+    # A line with no prefix is honest about it rather than borrowing a rank.
+    assert arm.parse_released("WEG2-SLEEP released tags=['cuda_graph'] mib=1.0 ms=1", "P")[
+        0
+    ].rank == "?"
+
+
+def test_an_unreadable_group_window_refuses_by_name_and_does_not_fall_back():
+    """"Could not measure" is per group and says which one.  The group that CAN
+    be read is never promoted to a verdict for the boot."""
+    rc, lines = _grade(released=_P_WINDOW, released_d=None)
+    text = "\n".join(lines)
+    assert rc == 2, "an unmeasurable D window passed on P's evidence"
+    verdict = [ln for ln in lines if ln.startswith("VERDICT:")][0]
+    assert "group(s) D" in verdict and "not promoted" in verdict
+    assert "n/a for group(s) D" in text and "does not pass" in text
+    assert "TOTAL: 6/6" not in text
+
+
+def test_the_arm_cannot_be_invoked_on_one_group_at_all(capsys):
+    """Not a warning, not a default: BOTH logs are required options, so a
+    P-only run dies in argparse naming the missing one, before any grading."""
+    arm = _arm()
+    base = [
+        "--before", "/dev/null", "--after", "/dev/null",
+        "--instant-before", _I_BEFORE, "--instant-after", _I_AFTER,
+        "--plog", "/dev/null", "--plog-window", "/dev/null",
+    ]
+    with pytest.raises(SystemExit) as exc:
+        arm.main(base)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--dlog" in err and "--dlog-window" in err, (
+        "the refusal does not name the missing group log: %s" % err
+    )
+
+
+def test_named_degrades_are_scanned_in_both_logs_and_carry_their_group():
+    """A degrade that names no group sends the reader to the wrong three ranks."""
+    arm = _arm()
+    line = "[2026-09-08 07:03 TP1] WEG2-SLEEP graph tag NOT armed: no_group -- SGLANG_WEG2_GROUP is empty"
+    found_d = arm.find_degrades(line, "D")
+    assert len(found_d) == 1 and found_d[0].startswith("group D: ")
+    assert arm.find_degrades(line) == [line], "the unlabelled form must stay available"
+
+    rc, lines = _grade(released=_P_WINDOW, released_d=_D_WINDOW, degrades_d=found_d)
+    text = "\n".join(lines)
+    assert "NAMED DEGRADES FOUND IN THE GROUP LOGS" in text
+    assert "group D: " in text and "no_group" in text
+
+
+def test_the_boot_arm_reads_both_group_logs_and_takes_two_offsets():
+    """The script half: fix 3 derived only <boot>.P.log and passed --ranks 3."""
+    if not os.path.exists("/spinning/gpu-arb/weg2/arm_dormant_boot.sh"):
+        pytest.skip("evidence-tree-bound: the boot arm lives in /spinning/gpu-arb")
+    src = open("/spinning/gpu-arb/weg2/arm_dormant_boot.sh").read()
+    assert '.D.log' in src and '.P.log' in src, "only one group log is derived"
+    assert "--dlog-window" in src and "--dlog " in src
+    assert "DLOG_OFF" in src, (
+        "the D window needs its OWN byte offset -- reusing P's would slice the "
+        "wrong file at the wrong place"
+    )
+    # The INVOCATION, not the prose: the header names the old `--ranks 3` on
+    # purpose, as the thing that was wrong.
+    assert '--ranks-per-group "' in src and '--ranks "' not in src, (
+        "the denominator passed to the module is still the whole-boot rank "
+        "count, not the per-group one"
+    )
 
 
 # ---------------------------------------------------------------------------

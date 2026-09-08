@@ -39,11 +39,33 @@ WHAT IT GRADES, and what it refuses to grade.
       before the front process exists -- i.e. before anything can attach.  So
       delivery is graded by A2 instead, on the instrument that can see it.
 
-  A2  RELEASED-TAG ACCOUNTING.  The ``WEG2-SLEEP released tags=['cuda_graph']
-      mib=`` lines the sleeping ranks emit INSIDE the cycle window (the window
-      is the bytes appended to the group log between the two instants, so it
-      needs no timestamp parsing and cannot pick up a previous flip).  This is
-      the item's own claim, per rank, at the moment of the release.
+  A2  RELEASED-TAG ACCOUNTING, PER GROUP AND THEN IN TOTAL.  The
+      ``WEG2-SLEEP released tags=['cuda_graph'] mib=`` lines the sleeping ranks
+      emit INSIDE the cycle window (the window is the bytes appended to that
+      group's log between the two instants, so it needs no timestamp parsing
+      and cannot pick up a previous flip).  This is the item's own claim, per
+      rank, at the moment of the release.
+
+      FIX 4, THE FINDING -- SIX RANKS SLEEP, NOT THREE.  The boot is 3+3
+      (``launcher.py`` refuses below three ranks per group) and ONE
+      ``POST /weg2/flip`` is a ROUND TRIP, not a leg (``front.py``
+      ``handle_manual_flip``: it flips awake->other and, whenever that leaves P
+      awake, immediately flips back to D).  So inside ONE cycle BOTH groups
+      sleep and BOTH release the tag.  FIX 3 read only ``<boot>.P.log``, had no
+      D argument at all, and carried ``--ranks 3`` -- so a boot in which all
+      three D ranks silently failed to release scored EXIT 5, "the item
+      DELIVERED on every rank", off P's evidence alone, and the word D appeared
+      nowhere in the report.  MEASURED against the parent commit 53c0ff0e62 on
+      exactly that input (P: 3 lines, D: 0): ``EXIT 5``.
+
+      So delivery is graded PER GROUP against ``ranks_per_group`` first, and a
+      TOTAL (6 of 6) is printed only once BOTH groups delivered.  Every line is
+      attributed to the log it was read from (that is the group -- the line's
+      own text does not carry it) and to the rank token in its own prefix
+      (``[... PP1]`` / ``[... TP1]``); a line is counted in exactly one group,
+      never pooled and never twice.  Both group logs are REQUIRED: a P-only
+      invocation is refused by argparse before any grading happens, and a group
+      whose window could not be read is named in the refusal.
 
   B   WHERE THE CARD SITS.  ``free_after`` against the 819-1229 MiB corridor
       band.  A card that delivered and is still below the floor is a RESIDUAL,
@@ -56,11 +78,13 @@ WHAT IT GRADES, and what it refuses to grade.
   and labelled because a cross-boot number must never be an exit code.
 
 EXIT CODES (the shell propagates them unchanged):
-  0  the item delivered on every card and no card is below the floor
-  2  a refusal, always named -- including "could not measure", never a
-     "probably fine"
-  4  the item did NOT deliver (A2), or the cycle lost a workspace (A1)
-  5  it delivered everywhere and a card is still below the 819 MiB floor
+  0  the item delivered on every rank of BOTH groups and no card is below the
+     floor
+  2  a refusal, always named -- including "could not measure" and "which group
+     could not be measured", never a "probably fine"
+  4  the item did NOT deliver in at least one GROUP (A2, named), or the cycle
+     lost a workspace (A1)
+  5  it delivered in both groups and a card is still below the 819 MiB floor
 """
 
 from __future__ import annotations
@@ -68,7 +92,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 #: The flashinfer FLOAT workspace, MiB.  UNIFORM across ranks -- it is
 #: ``SGLANG_FLASHINFER_WORKSPACE_SIZE``'s default, not a per-rank reading --
@@ -85,6 +109,30 @@ FLOOR_MIB, CEIL_MIB = 819, 1229
 RELEASED_RE = re.compile(
     r"WEG2-SLEEP released tags=\['cuda_graph'\]\s+mib=([0-9.]+)\s+ms=([0-9.]+)"
 )
+
+#: The rank token in the log line's OWN prefix -- ``[2026-09-08 07:06:31 PP1]``
+#: on a P rank, ``[... TP1]`` on a D rank.  The released line's TEXT does not
+#: name the rank and cannot name the group; this is where the rank comes from,
+#: and the GROUP comes from which log the line was read out of.
+RANK_RE = re.compile(r"\[(?:[^\]\n]*?\s)?([A-Z]{2,5}\d+)\]")
+
+#: The two process groups of a Weg-2 boot.  Three ranks each (``launcher.py``
+#: refuses below three per group), six sleeping ranks per flip cycle.
+GROUPS = ("P", "D")
+
+
+class ReleasedLine(NamedTuple):
+    """One released-tag line, carrying WHERE it came from.
+
+    ``group`` is the log it was read out of -- never inferred from the text,
+    which carries no group token at all.  ``rank`` is the token in the line's
+    own prefix, or ``"?"`` when the line has no prefix (a synthetic sample).
+    """
+
+    group: str
+    rank: str
+    mib: float
+    ms: float
 
 #: The named degrades, all of them.  FIX 3, finding 2: the group-gate refusal
 #: is new in this fix; before it, a rank that lost ``SGLANG_WEG2_GROUP`` was
@@ -124,12 +172,28 @@ def parse_capture_map(arg: str) -> Dict[int, int]:
     return out
 
 
-def parse_released(window_text: str) -> List[float]:
-    """Every ``WEG2-SLEEP released tags=['cuda_graph'] mib=`` value in the window."""
-    return [float(m.group(1)) for m in RELEASED_RE.finditer(window_text)]
+def parse_released(window_text: str, group: str = "?") -> List[ReleasedLine]:
+    """Every released-tag line in ONE group's window, attributed to that group.
+
+    The group is a property of the LOG, not of the line: the emitter
+    (``weight_updater.py``) writes no group token, so a pooled parse over two
+    windows could not tell a P rank from a D rank afterwards.  It is therefore
+    stamped here, at the only point that still knows which file the bytes came
+    from, and a line parsed out of one window can never be counted in the other.
+    """
+    out: List[ReleasedLine] = []
+    for ln in window_text.splitlines():
+        m = RELEASED_RE.search(ln)
+        if not m:
+            continue
+        rank = RANK_RE.search(ln)
+        out.append(
+            ReleasedLine(group, rank.group(1) if rank else "?", float(m.group(1)), float(m.group(2)))
+        )
+    return out
 
 
-def find_degrades(text: str) -> List[str]:
+def find_degrades(text: str, group: str = "") -> List[str]:
     """The named degrade lines, deduplicated, in first-seen order.
 
     Searched over the WHOLE group log rather than the cycle window on purpose:
@@ -137,13 +201,73 @@ def find_degrades(text: str) -> List[str]:
     fires at the first sleep, which is the launcher's startup sleep -- long
     before this arm attaches.  A window-only search would report "no degrade"
     on exactly the boot that degraded.
+
+    ``group``, when given, is prefixed to every hit: the scan runs over BOTH
+    group logs (FIX 4) and a degrade that names no group sends the reader to
+    the wrong three ranks.
     """
     seen: List[str] = []
     for ln in text.splitlines():
         for marker in DEGRADE_MARKERS:
-            if marker in ln and ln.strip() not in seen:
-                seen.append(ln.strip())
+            hit = ("group %s: %s" % (group, ln.strip())) if group else ln.strip()
+            if marker in ln and hit not in seen:
+                seen.append(hit)
     return seen
+
+
+def _tally(
+    released_by_group: Dict[str, Optional[List[ReleasedLine]]], ranks_per_group: int
+) -> str:
+    """``P 3/3, D 3/3`` -- the per-group counts, always both, always named."""
+    return ", ".join(
+        "%s %s/%d"
+        % (
+            g,
+            "n/a" if released_by_group.get(g) is None else len(released_by_group[g]),
+            ranks_per_group,
+        )
+        for g in GROUPS
+    )
+
+
+def _group_shortfalls(
+    released_by_group: Dict[str, Optional[List[ReleasedLine]]], ranks_per_group: int
+) -> List[str]:
+    """Why each group failed A2, in group order -- '' when a group delivered.
+
+    Graded PER GROUP on purpose: pooling the two windows and testing the sum
+    against six lets one group cover for the other, which is the same class of
+    error as grading three of six and naming all six.  The order inside a group
+    is count -> sentinel -> short, because "no line at all", "the saver could
+    not answer" and "the rank released 383 of 384 MiB" are three different
+    faults with three different next steps.
+    """
+    out: List[str] = []
+    for group in GROUPS:
+        rel = released_by_group.get(group)
+        if rel is None:
+            continue  # unmeasured is a refusal (exit 2), not a delivery failure
+        if len(rel) < ranks_per_group:
+            out.append(
+                "group %s: %d released-tag line(s) in the cycle window, expected %d "
+                "(one per sleeping rank of that group)" % (group, len(rel), ranks_per_group)
+            )
+        elif any(x.mib <= 0.0 for x in rel):
+            out.append(
+                "group %s: a released-tag line reads mib=0.0, which is the saver's "
+                "'could not answer' sentinel and not an empty tag (rank(s) %s)"
+                % (group, ", ".join(x.rank for x in rel if x.mib <= 0.0))
+            )
+        elif any(x.mib < WORKSPACE_MIB for x in rel):
+            out.append(
+                "group %s: a rank released less than the %d MiB workspace alone (%s)"
+                % (
+                    group,
+                    WORKSPACE_MIB,
+                    ", ".join("%s=%.1f" % (x.rank, x.mib) for x in rel if x.mib < WORKSPACE_MIB),
+                )
+            )
+    return out
 
 
 def _phase_of(instant: str) -> str:
@@ -159,9 +283,9 @@ def grade(
     instant_after: str,
     capture: Dict[int, int],
     capture_prov: str,
-    released: Optional[List[float]],
-    degrades: List[str],
-    ranks: int,
+    released_by_group: Dict[str, Optional[List[ReleasedLine]]],
+    degrades_by_group: Dict[str, List[str]],
+    ranks_per_group: int,
     noitem: Dict[int, int],
     noitem_prov: str,
     p_awake: Optional[Dict[int, Tuple[str, int]]] = None,
@@ -241,55 +365,119 @@ def grade(
             fa = after.get(idx, (name, -1))[1]
             lines.append("| %d | %s | %d | %d | %+d |" % (idx, name, fp, fa, fa - fp))
 
-    # ---- A2: the released-tag accounting ---------------------------------
+    # ---- A2: the released-tag accounting, PER GROUP then in total ---------
+    total_ranks = ranks_per_group * len(GROUPS)
     lines += [
         "",
         "A2. DID THE ITEM DELIVER -- the sleeping ranks' own released-tag lines",
-        "    inside the cycle window (instrument: tms_tag_bytes for the ONE",
-        "    cuda_graph tag, read before the pause).",
+        "    inside each group's OWN cycle window (instrument: tms_tag_bytes for",
+        "    the ONE cuda_graph tag, read before the pause).",
+        "",
+        "    SIX ranks sleep in one cycle, not three: the boot is %d+%d and ONE"
+        % (ranks_per_group, ranks_per_group),
+        "    POST /weg2/flip is a ROUND TRIP, so BOTH groups sleep and both",
+        "    release the tag. Each line below is attributed to the LOG it was",
+        "    read from (the group -- the line's text carries no group token) and",
+        "    to the rank in its own prefix; no line is pooled or counted twice.",
         "",
     ]
-    could_not_measure = released is None
-    if could_not_measure:
-        lines.append(
-            "released tags: n/a -- the group log window could not be read. A probe "
-            "that could not measure prints n/a and exits 2; it does not pass."
-        )
-    else:
-        lines.append(
-            "| line | mib | against floor %d | verdict |" % WORKSPACE_MIB
-        )
-        lines.append("|---:|---:|---:|---|")
-        for i, mib in enumerate(released):
-            if mib <= 0.0:
+    unmeasured = [g for g in GROUPS if released_by_group.get(g) is None]
+    could_not_measure = bool(unmeasured)
+
+    lines.append("| group | rank | mib | against floor %d | verdict |" % WORKSPACE_MIB)
+    lines.append("|---|---|---:|---:|---|")
+    for group in GROUPS:
+        rel = released_by_group.get(group)
+        if rel is None:
+            lines.append(
+                "| %s | n/a | n/a | %d | GROUP LOG WINDOW COULD NOT BE READ |"
+                % (group, WORKSPACE_MIB)
+            )
+            continue
+        if not rel:
+            lines.append(
+                "| %s | n/a | n/a | %d | NO RELEASED LINE IN THIS GROUP'S WINDOW |"
+                % (group, WORKSPACE_MIB)
+            )
+            continue
+        for item in rel:
+            if item.mib <= 0.0:
                 verdict = "SAVER COULD NOT ANSWER (0.0 is the sentinel, not an empty tag)"
-            elif mib < WORKSPACE_MIB:
+            elif item.mib < WORKSPACE_MIB:
                 verdict = "SHORT of the workspace alone"
             else:
                 verdict = "at or above the workspace"
-            lines.append("| %d | %.1f | %d | %s |" % (i + 1, mib, WORKSPACE_MIB, verdict))
+            lines.append(
+                "| %s | %s | %.1f | %d | %s |"
+                % (item.group, item.rank, item.mib, WORKSPACE_MIB, verdict)
+            )
+
+    if could_not_measure:
+        lines.append("")
+        lines.append(
+            "released tags: n/a for group(s) %s -- that group log window could not "
+            "be read. A probe that could not measure prints n/a and exits 2; it "
+            "does not pass, and it does not fall back to the group it CAN read."
+            % ", ".join(unmeasured)
+        )
+
+    # The per-group denominator, stated before any total is claimed.
+    shortfalls: List[str] = _group_shortfalls(released_by_group, ranks_per_group)
+    lines += ["", "DELIVERY PER GROUP (denominator: %d ranks per group):" % ranks_per_group]
+    for group in GROUPS:
+        rel = released_by_group.get(group)
+        if rel is None:
+            lines.append("  %s: n/a -- window unreadable, not graded and not passed" % group)
+        else:
+            lines.append(
+                "  %s: %d/%d released%s"
+                % (
+                    group,
+                    len(rel),
+                    ranks_per_group,
+                    ", min %.1f MiB" % min(x.mib for x in rel) if rel else "",
+                )
+            )
+    if not could_not_measure and not shortfalls:
+        lines.append(
+            "TOTAL: %d/%d sleeping ranks released the tag (%s)."
+            % (total_ranks, total_ranks, _tally(released_by_group, ranks_per_group))
+        )
+    else:
+        lines.append(
+            "TOTAL: NOT CLAIMED -- %s. A six-rank claim carried by one group's "
+            "evidence is exactly the defect FIX 4 closes; the total is printed "
+            "only when both groups delivered."
+            % ("; ".join(shortfalls) if shortfalls else "group(s) %s unmeasured" % ", ".join(unmeasured))
+        )
+
+    all_degrades = [d for group in GROUPS for d in degrades_by_group.get(group, [])]
+    if all_degrades:
+        lines.append("")
+        lines.append(
+            "NAMED DEGRADES FOUND IN THE GROUP LOGS (whole files, both groups, not "
+            "just the windows):"
+        )
+        for d in all_degrades:
+            lines.append("  " + d)
+    elif not could_not_measure:
+        lines.append("")
+        lines.append(
+            "named degrades: none in EITHER group log. The refusal instrument is "
+            "weg2_memory_saver.weg2_graph_tag_armed, which logs "
+            "'WEG2-SLEEP graph tag NOT armed' with the failing conjunct named; "
+            "its absence is evidence only because that line exists (FIX 3, "
+            "finding 2 -- before it, a rank that lost SGLANG_WEG2_GROUP was "
+            "byte-identical to one running the base tree)."
+        )
+
+    if not could_not_measure:
         lines.append("")
         lines.append(
             "expected per rank: %d MiB workspace + this rank's own capture pool "
             "(%s). The pool is per rank and is REPORTED, never a pass/fail edge; "
             "the workspace is uniform and is the edge. Provenance: %s"
             % (WORKSPACE_MIB, ", ".join("nvml%d=%d" % (k, v) for k, v in sorted(capture.items())), capture_prov)
-        )
-
-    if degrades:
-        lines.append("")
-        lines.append("NAMED DEGRADES FOUND IN THE GROUP LOG (whole file, not just the window):")
-        for d in degrades:
-            lines.append("  " + d)
-    elif not could_not_measure:
-        lines.append("")
-        lines.append(
-            "named degrades: none. The refusal instrument is "
-            "weg2_memory_saver.weg2_graph_tag_armed, which logs "
-            "'WEG2-SLEEP graph tag NOT armed' with the failing conjunct named; "
-            "its absence is evidence only because that line exists (FIX 3, "
-            "finding 2 -- before it, a rank that lost SGLANG_WEG2_GROUP was "
-            "byte-identical to one running the base tree)."
         )
 
     # ---- B: where the card sits ------------------------------------------
@@ -334,9 +522,16 @@ def grade(
     )
 
     # ---- the verdict ------------------------------------------------------
+    tally = _tally(released_by_group, ranks_per_group)
     if could_not_measure:
         rc = 2
-        lines += ["", "VERDICT: EXIT 2 -- A2 could not be measured (no group-log window)."]
+        lines += [
+            "",
+            "VERDICT: EXIT 2 -- A2 could not be measured for group(s) %s (no cycle "
+            "window for that group's log). Lines seen: %s. The groups that COULD "
+            "be read are not promoted to a verdict for the boot."
+            % (", ".join(unmeasured), tally),
+        ]
     elif lost:
         rc = 4
         lines += [
@@ -345,35 +540,20 @@ def grade(
             + ", ".join("nvml%d (%+d MiB)" % (i, d) for i, d in lost)
             + ": the pause's pages did not come back at the resume.",
         ]
-    elif len(released) < ranks:
+    elif shortfalls:
         rc = 4
         lines += [
             "",
-            "VERDICT: EXIT 4 -- the item did NOT deliver: %d released-tag line(s) "
-            "in the cycle window, expected %d (one per sleeping rank). Read the "
-            "named degrades above before anything else." % (len(released), ranks),
-        ]
-    elif any(m <= 0.0 for m in released):
-        rc = 4
-        lines += [
-            "",
-            "VERDICT: EXIT 4 -- the item did NOT deliver: a released-tag line "
-            "reads mib=0.0, which is the saver's 'could not answer' sentinel and "
-            "not an empty tag.",
-        ]
-    elif any(m < WORKSPACE_MIB for m in released):
-        rc = 4
-        lines += [
-            "",
-            "VERDICT: EXIT 4 -- the item did NOT deliver: a rank released less "
-            "than the %d MiB workspace alone (%s)."
-            % (WORKSPACE_MIB, ", ".join("%.1f" % m for m in released)),
+            "VERDICT: EXIT 4 -- the item did NOT deliver (lines: %s). %s. Read the "
+            "named degrades above before anything else."
+            % (tally, "; ".join(shortfalls)),
         ]
     elif below:
         rc = 5
         lines += [
             "",
-            "VERDICT: EXIT 5 -- the item DELIVERED on every rank, and "
+            "VERDICT: EXIT 5 -- the item DELIVERED on all %d sleeping ranks (%s), "
+            "and " % (total_ranks, tally)
             + ", ".join("nvml%d is still at %d MiB" % (i, f) for i, f in below)
             + ". The corridor is not solved by this item alone; that is a "
               "residual for the next one, with a number.",
@@ -382,9 +562,9 @@ def grade(
         rc = 0
         lines += [
             "",
-            "VERDICT: EXIT 0 -- every sleeping rank released at least the %d MiB "
-            "workspace, the cycle conserved it, and no card is below the %d MiB "
-            "floor." % (WORKSPACE_MIB, FLOOR_MIB),
+            "VERDICT: EXIT 0 -- all %d sleeping ranks (%s) released at least the "
+            "%d MiB workspace, the cycle conserved it, and no card is below the "
+            "%d MiB floor." % (total_ranks, tally, WORKSPACE_MIB, FLOOR_MIB),
         ]
     return rc, lines
 
@@ -397,8 +577,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--instant-after", required=True)
     ap.add_argument("--free-p-awake", default="")
     ap.add_argument("--instant-p-awake", default="")
-    ap.add_argument("--plog-window", default="", help="bytes appended to the group log during the cycle")
-    ap.add_argument("--plog", default="", help="the whole group log, searched for named degrades")
+    # BOTH group logs are REQUIRED (FIX 4).  Six ranks sleep in one cycle; a
+    # P-only invocation cannot grade the boot, so it is refused HERE, by
+    # argparse, naming the missing option -- not warned about downstream.
+    ap.add_argument("--plog-window", required=True, help="bytes appended to the P group log during the cycle")
+    ap.add_argument("--plog", required=True, help="the whole P group log, searched for named degrades")
+    ap.add_argument("--dlog-window", required=True, help="bytes appended to the D group log during the cycle")
+    ap.add_argument("--dlog", required=True, help="the whole D group log, searched for named degrades")
     ap.add_argument("--report", default="")
     ap.add_argument("--capture-mib", default="0=102,1=92,2=133")
     ap.add_argument(
@@ -411,21 +596,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--noitem-prov",
         default="boot weg2rg6 (7f88b1c75d, no item), NVML memory.free while D served",
     )
-    ap.add_argument("--ranks", type=int, default=3)
+    ap.add_argument(
+        "--ranks-per-group",
+        type=int,
+        default=3,
+        help="sleeping ranks per group (launcher.py refuses below 3); the total "
+             "graded is this x2, because one flip is a round trip and both "
+             "groups sleep inside it",
+    )
     ns = ap.parse_args(argv)
 
-    released: Optional[List[float]] = None
-    if ns.plog_window:
+    windows = {"P": ns.plog_window, "D": ns.dlog_window}
+    whole = {"P": ns.plog, "D": ns.dlog}
+    released_by_group: Dict[str, Optional[List[ReleasedLine]]] = {}
+    degrades_by_group: Dict[str, List[str]] = {}
+    for group in GROUPS:
         try:
-            released = parse_released(open(ns.plog_window, errors="replace").read())
+            released_by_group[group] = parse_released(
+                open(windows[group], errors="replace").read(), group
+            )
         except OSError:
-            released = None
-    degrades: List[str] = []
-    if ns.plog:
+            # Named, never silent: an unreadable window is a refusal for THAT
+            # group, and grade() will not pass the boot on the other one.
+            released_by_group[group] = None
         try:
-            degrades = find_degrades(open(ns.plog, errors="replace").read())
+            degrades_by_group[group] = find_degrades(
+                open(whole[group], errors="replace").read(), group
+            )
         except OSError:
-            degrades = []
+            degrades_by_group[group] = []
 
     p_awake = None
     if ns.free_p_awake:
@@ -441,9 +640,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         instant_after=ns.instant_after,
         capture=parse_capture_map(ns.capture_mib),
         capture_prov=ns.capture_prov,
-        released=released,
-        degrades=degrades,
-        ranks=ns.ranks,
+        released_by_group=released_by_group,
+        degrades_by_group=degrades_by_group,
+        ranks_per_group=ns.ranks_per_group,
         noitem=parse_capture_map(ns.noitem_mib),
         noitem_prov=ns.noitem_prov,
         p_awake=p_awake,
