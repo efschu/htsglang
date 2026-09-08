@@ -297,13 +297,22 @@ class TestPCutObjective1254(unittest.TestCase):
             objective=objective,
         )
 
-    def test_the_flag_defaults_to_the_measured_incumbent_not_to_a_solved_cut(self):
+    def test_the_flag_defaults_to_makespan_by_user_order(self):
+        """USER ORDER 2026-09-08, verbatim: 'nimm als default ab jetzt makespan'.
+
+        This test asserted `incumbent` until that order. The name changed with
+        the value on purpose -- a test called
+        `..._defaults_to_the_measured_incumbent_...` that asserts `makespan`
+        is how a suite starts lying about what it pins.
+        """
         ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
-        self.assertEqual(ns.pp_solve_objective, "incumbent")
-        # ... and the reason is at the flag, not only in this file: a reader
-        # who finds the default must find why it is not the solver's row, and
-        # what has to land before it goes back.
+        self.assertEqual(ns.pp_solve_objective, "makespan")
+        # The COST of the default must be findable at the flag, not only here:
+        # makespan buys TTFT with KV and the help text has to say so.
         help_text = build_parser().format_help()
+        self.assertIn("nimm als default ab jetzt makespan", help_text)
+        self.assertIn("BUYS TTFT", help_text)
+        # and the incumbent's expiry reason stays reachable on its own arm
         self.assertIn("#1259", help_text)
 
     def test_both_solved_arms_stay_selectable_and_the_solver_honours_them(self):

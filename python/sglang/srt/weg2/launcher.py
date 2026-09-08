@@ -4601,7 +4601,13 @@ def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str)
     """
     if objective == "makespan":
         return (decision.makespan or decision.chosen), (
-            "the makespan-optimal cut (--pp-solve-objective makespan)"
+            "the makespan-optimal cut (--pp-solve-objective makespan, THE "
+            "DEFAULT since 2026-09-08 by user order -- verbatim: 'nimm als "
+            "default ab jetzt makespan'). This is the solver's SPEED cut "
+            "(42,11,11 / attn 10,3,3 in the perf boots) and it BUYS TTFT WITH "
+            "KV: the pool it prices is smaller than the incumbent's, and both "
+            "alternatives stay priced on this same line so the cost is visible "
+            "every boot rather than inferred later"
         )
     if objective == "maxkv":
         return decision.kv_floor, (
@@ -4614,7 +4620,8 @@ def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str)
     if cand is not None:
         return cand, (
             "the INCUMBENT cut (--pp-solve-objective incumbent, THE DEFAULT "
-            "since boot weg2tr1): boot-proven on weg2rg6, looked up in the "
+            "from boot weg2tr1 UNTIL 2026-09-08, when the user made makespan "
+            "the default): boot-proven on weg2rg6, looked up in the "
             "solver's own ranked field so its pool is priced by this boot's "
             "model and not by that boot's. Default because the pool model does "
             "not price PP2's per-stage fixed posts (lm_head + MTP/draft head + "
@@ -5206,13 +5213,23 @@ def build_parser() -> argparse.ArgumentParser:
         # arms stay PRICED on the PP-CUT SHIPPED line of every boot meanwhile,
         # so the trade this default declines is visible rather than hidden.
         "--pp-solve-objective", choices=["maxkv", "makespan", "incumbent"],
-        default="incumbent",
+        default="makespan",
         help="#1254. WHICH PRICED CUT group P's layer split SHIPS. "
-             f"Default 'incumbent' = the rg6-boot-proven contiguous cut "
+             "DEFAULT 'makespan' SINCE 2026-09-08, BY USER ORDER -- verbatim: "
+             "'nimm als default ab jetzt makespan'. It is the solver's SPEED "
+             "cut (42,11,11 / attn 10,3,3 in the perf boots) and it BUYS TTFT "
+             "WITH KV: measured, makespan pays pool for prefill (+33.5 %% "
+             "prefill measured in pp1/pp2 only; P pool 587k solver-priced "
+             "against the incumbent's 714k measured). That trade is now "
+             "SELECTED rather than inherited, and both alternatives stay "
+             "priced on the PP-CUT SHIPPED: line of every boot so its cost is "
+             "visible per boot instead of inferred later. "
+             f"'incumbent' = the rg6-boot-proven contiguous cut "
              f"{P_PP_INCUMBENT_FMT}, looked up BY NAME in the solver's own "
              "ranked field, so its pool is priced by this boot's model and an "
              "incumbent the solver did not rank is a W40 REFUSAL rather than a "
-             "silent substitution of the ranking's winner. THAT DEFAULT IS A "
+             "silent substitution of the ranking's winner. IT WAS THE DEFAULT "
+             "FROM weg2tr1 UNTIL 2026-09-08 as a "
              "MEASURED EXCEPTION WITH AN EXPIRY, not a preference: boot "
              "weg2tr1 showed PP2 is the binding stage because it carries the "
              "per-stage FIXED POSTS (lm_head, the MTP/draft head, the draft "
@@ -5223,11 +5240,13 @@ def build_parser() -> argparse.ArgumentParser:
              "kv-floor row, the pool-maximal cut that still clears the "
              "one-full-context-prompt floor, i.e. the standing law's answer "
              "against the pool model as it stands. 'makespan' takes the "
-             "smallest compute+crossing total -- the ORIGINAL default, under "
-             "which the solver's own dry run chose 44,10,10 attn 11,2,3 at a "
-             "499,967-token pool, i.e. it paid -47.7 %% of the pool for "
-             "+33.5 %% of prefill on metal without anyone selecting that "
-             "trade. ALL THREE arms are priced on the PP-CUT SHIPPED: line of "
+             "smallest compute+crossing total. It was the ORIGINAL default and "
+             "was taken away in #1254 because it was paid WITHOUT BEING "
+             "SELECTED -- the solver's own dry run chose 44,10,10 attn 11,2,3 "
+             "at a 499,967-token pool, -47.7 %% of the pool for +33.5 %% of "
+             "prefill, and nobody had picked that. It is the default again "
+             "now because the user picked it, with both alternatives priced "
+             "beside it every boot. ALL THREE arms are priced on the PP-CUT SHIPPED: line of "
              "EVERY boot with their pool AND their ms/chunk whichever is "
              "chosen, and the PP-CUT trade: line does the division, so a large "
              "trade is visible as the defect candidate the law calls it. "
