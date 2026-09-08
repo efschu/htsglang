@@ -100,23 +100,36 @@ def _group_log(prefix: str, passes, kv_gb, bulk=None, rss=None) -> str:
     return "\n".join(out) + "\n"
 
 
-def _dormant_line(group: str, rss_gib: float, tags_gib: float) -> str:
-    """The front's own WEG2 DORMANT-IMAGE line, in the emitter's exact shape.
+def _write_dormant_sidecar(evidence_dir: str, dormant) -> None:
+    """Write the fix-8 JSON sidecar the ring now reads its image cross-check from.
 
-    Copied from ``host_ledger.format_dormant_image`` on the branch that emits
-    it (draft-KV fix 8) rather than re-invented: this module READS that line, so
-    a fixture in any other shape would test a parser against itself.
+    RECONCILIATION 2026-09-08: this fixture used to append a ``WEG2
+    DORMANT-IMAGE`` LINE to the front log, because ring_table scraped that line
+    with a regex.  That regex is deleted -- it was a second reader of a fact the
+    draft-KV line already carries structurally -- so the fixture writes the
+    SIDECAR instead, and it does so through the shipped writer
+    (``host_ledger.append_measured_record``) rather than by hand-rolling JSON,
+    for exactly the reason the old helper copied the emitter's format: a fixture
+    in its own shape would test a reader against itself.
     """
-    return (
-        f"[2026-09-07T21:12:00Z] INFO weg2.front: WEG2 DORMANT-IMAGE group={group} "
-        f"shmem_delta_gib=1.23 rss_shmem_gib={rss_gib:.2f} "
-        f"weight_tags_gib={tags_gib:.2f} extra_gib={rss_gib - tags_gib:.2f} "
-        "(pids [1, 2, 3] of [1, 2, 3]; INTERLEAVED: the shmem delta is confounded"
-        "; run_residual_gib=none (x); boot t2 @ deadbeef at 2026-09-07T21:12:00Z)"
-    )
+    path = os.path.join(evidence_dir, host_ledger.MEASURED_RECORD_NAME)
+    for group, rss_gib, tags_gib in dormant:
+        host_ledger.append_measured_record(path, {
+            "group": group,
+            "at": "2026-09-07T21:12:00Z",
+            "boot": "t2",
+            "commit": "deadbeef",
+            "shmem_delta_gib": 1.23,
+            "rss_shmem_gib": float(rss_gib),
+            "weight_tags_gib": float(tags_gib),
+            "extra_gib": float(rss_gib) - float(tags_gib),
+            "pids": [1, 2, 3],
+            "pids_asked": [1, 2, 3],
+            "interleaved": True,
+        })
 
 
-def _front_log(free_by_phase, cards=None, identity=True, dormant=(), arm=None) -> str:
+def _front_log(free_by_phase, cards=None, identity=True, arm=None) -> str:
     out = []
     if arm is not None:
         # The SOURCE boot's own chosen ledger arm.  Without it the RssShmem
@@ -146,8 +159,6 @@ def _front_log(free_by_phase, cards=None, identity=True, dormant=(), arm=None) -
                 f"[2026-09-07 21:07:54,029] INFO weg2.front: WEG2-CORRIDOR "
                 f"phase={phase}(awake) epoch=0 {free} min_so_far={{}}"
             )
-    for group, rss_gib, tags_gib in dormant:
-        out.append(_dormant_line(group, rss_gib, tags_gib))
     return "\n".join(out) + "\n"
 
 
@@ -1328,8 +1339,9 @@ class DormantImageInstrumentTest(unittest.TestCase):
             f.write(_front_log(
                 {"P": [{c.nvml_index: 100 for c in cards}],
                  "D": [{c.nvml_index: 100 for c in cards}]},
-                cards=cards, dormant=dormant, arm=arm,
+                cards=cards, arm=arm,
             ))
+        _write_dormant_sidecar(self.dir, dormant)
         table, reason = ring_table.solve(cards, self.dir, self.stem)
         self.assertIsNotNone(table, reason)
         return table

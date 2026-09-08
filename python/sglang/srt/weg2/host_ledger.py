@@ -1236,7 +1236,7 @@ def _advisory_line(arm: "Arm", store_gib: float, chosen: bool) -> str:
         f"WEG2-HOST-LEDGER RUN-PEAK ADVISORY: {subject} predicts non-reclaimable memory.current="
         f"{predicted:.2f} GiB at the run peak (run origin {_gib_or_none(arm.terms['run_origin_gib'])} "
         f"[{arm.terms['run_origin_source']}] + heaps + anchors + rings + "
-        f"overhead + draft pools + dormant image + flip_transient + store {store_gib:.0f} "
+        f"overhead + draft pools + the host ring Sigma H + store {store_gib:.0f} "
         f"GiB; the {FLOOR_GIB:.0f} GiB floor is a reserve and is NOT in this sum), "
         f"which is {verdict} the OBSERVED REAP POINT {watermark_gib:.2f} GiB "
         "(boot weg2dk5 21:15:30Z, memory.current 102,998,904,832 B minus the 28,916 kB "
@@ -1412,16 +1412,18 @@ def choose(
         # through -- the term that has to move is the flip transient, and it
         # moves in the ring slice, not here.
         outcome = (
-            "no arm funds a flip on this host budget; the flip transient is removed by "
-            "the host ring slice (weg2/ring-0907)"
+            "no arm funds a flip on this host budget.  The flip transient this sentence "
+            "used to name as the thing that had to move is ALREADY gone: the host ring "
+            "landed (C19), so the run moment charges Sigma H once and there is no "
+            "transient left to cut"
         )
         levers = (
-            "The INT8 checkpoint has only the cpu-backup wake path (W4), and the ledger "
-            "will not shrink another term silently. The levers are NAMED so this refusal "
-            "is actionable: lower --store-min-gib to the run leftover the last arm above "
-            f"actually prints, or cut the flip transient itself ({FLIP_HOST_TRANSIENT_GIB:.2f} "
-            "GiB, boot weg2dk5's 10 interleaves) -- shrinking the store tmpfs is NOT a lever, "
-            "its Shmem was flat across the fatal window."
+            "The levers are NAMED so this refusal is actionable: lower --store-min-gib to "
+            "the run leftover the last arm above actually prints, or cut Sigma H itself -- "
+            "the per-card host ring table, which is solved from the previous boot's own "
+            "measured dormant image (ring_table.solve), so a smaller image is a smaller "
+            "ring.  Shrinking the store tmpfs is NOT a lever, its Shmem was flat across "
+            "the fatal window."
         )
         if peak_bound_any:
             raise Weg2HostRunPeakRefused(
@@ -1438,8 +1440,8 @@ def choose(
             f"(host weights term = {priced[0].terms['host_ring_gib']:.2f} GiB at the run "
             f"moment, span 1 = {priced[0].terms['host_ring_span1_gib']:.2f} GiB at the launch "
             f"moment; {ring_provenance or 'no provenance passed'}). "
-            "The INT8 checkpoint has only the cpu-backup wake path (W4), and "
-            f"the ledger will not shrink another term silently. {outcome}. {levers}\n"
+            "The INT8 checkpoint has only the cpu-backup wake path (W4), and the ledger "
+            f"will not shrink another term silently. {outcome}. {levers}\n"
             + table
         )
     lines.append(

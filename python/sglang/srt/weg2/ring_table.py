@@ -99,6 +99,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from sglang.srt.weg2 import host_ledger
+
 MIB = 1024 * 1024
 GIB = float(2**30)
 GB = 1e9
@@ -108,15 +110,16 @@ _CHUNK_RE = re.compile(
     r"\b(?:TP|PP)(\d+)\]\s+WEG2-CHUNK-BYTES\s+sleep\s+tags=\[([^\]]*)\]\s+"
     r"host_image_delta=(-?\d+)\s+MiB"
 )
-#: ``WEG2 DORMANT-IMAGE group=P shmem_delta_gib=... rss_shmem_gib=38.63
-#: weight_tags_gib=28.83 extra_gib=9.80 (...)`` -- the front's fix-8 line
-#: (host_ledger.format_dormant_image on the draft-KV branch).  ONE line per
-#: group per boot, whole-group bytes, no card attribution: read here as the
-#: cross-check A1-2 names, never as a row key.
-_DORMANT_RE = re.compile(
-    r"WEG2 DORMANT-IMAGE\s+group=(\S+)\s+.*?rss_shmem_gib=([\d.]+)\s+"
-    r"weight_tags_gib=([\d.]+)\s+extra_gib=(-?[\d.]+)"
-)
+#: _DORMANT_RE IS DELETED (reconciliation 2026-09-08) and the deletion is the
+#: point: it scraped ``WEG2 DORMANT-IMAGE`` out of the front's log text, which
+#: made this module a SECOND reader of a fact the draft-KV line already carries
+#: structurally in its fix-8 JSON sidecar.  Two readers of one measurement can
+#: drift, and this pair drifted in the dangerous direction -- a format change
+#: yields no match, no match reads as "not measured", and the ledger silently
+#: falls back to the weight-tag census that A1-2 exists to replace.  See
+#: :func:`dormant_images`, which reads the sidecar through
+#: :func:`host_ledger.read_measured_record`, the same call the ledger's own
+#: provenance line uses.  The LOG LINE still prints; nothing parses it.
 #: The RING-era instrument (C16); same shape, honest name.
 #:
 #: FIX 1 (round 1), carried review finding 1 reproduced in the replacement
@@ -626,32 +629,50 @@ def parse_group_log(path: str) -> GroupLog:
     )
 
 
-def parse_dormant_images(front_log: str) -> Dict[str, DormantImage]:
-    """``{group: DormantImage}`` from the front's own ``WEG2 DORMANT-IMAGE`` lines.
+def dormant_images(record_path: str) -> Dict[str, DormantImage]:
+    """``{group: DormantImage}`` from the LINE'S OWN SIDECAR.
 
-    FIRST sample per group wins, matching the emitter's own contract (it
-    measures once, at that group's first sleep, so a boot's images are its first
-    sleeps' and not a moving average of its flips).  An unreadable file is an
-    ABSENCE -- ``{}`` -- and the caller then charges the census and prints that
-    the cross-check was not available; it is never read as a zero image.
+    ONE READER OF THE DORMANT IMAGE (reconciliation 2026-09-08).  This function
+    used to be ``parse_dormant_images``: a regex over the previous boot's front
+    log, scraping the very ``WEG2 DORMANT-IMAGE`` line that
+    :func:`host_ledger.format_dormant_image` had just printed.  That was a
+    SECOND reader of a fact the draft-KV line already carries structurally --
+    :func:`host_ledger.dormant_image_sample` measures it and
+    :func:`host_ledger.append_measured_record` writes it to a JSON sidecar with
+    its commit, boot and timestamp -- and the two could disagree the moment the
+    log line's format moved, silently, in the optimistic direction (no match ->
+    "no measurement" -> charge the census).
+
+    FLIPCOST A1-2 names the sidecar as the carrier ("D's dormant image is a
+    BOUND until measured (draft-KV fix 8 sidecar 'WEG2 DORMANT-IMAGE')"), and
+    ring fix 1's review item (h) required this module to REUSE that shape rather
+    than re-implement it.  So the regex is deleted and both consumers --
+    :func:`host_ledger.resolve_image_terms` for the provenance line and this
+    module for H(c) -- now read the SAME entries through
+    :func:`host_ledger.read_measured_record`.  They cannot disagree.
+
+    The log line stays: it is the human/evidence instrument.  It is simply no
+    longer parsed by anything.
+
+    An unreadable or absent sidecar is an ABSENCE -- ``{}`` -- and the caller
+    then charges the census and prints that the cross-check was unavailable; it
+    is never read as a zero image.
     """
     out: Dict[str, DormantImage] = {}
-    try:
-        with open(front_log, errors="replace") as f:
-            for line in f:
-                if "WEG2 DORMANT-IMAGE" not in line:
-                    continue
-                m = _DORMANT_RE.search(line)
-                if not m or m.group(1) in out:
-                    continue
-                out[m.group(1)] = DormantImage(
-                    group=m.group(1),
-                    rss_mib=int(round(float(m.group(2)) * GIB / MIB)),
-                    weight_tags_mib=int(round(float(m.group(3)) * GIB / MIB)),
-                    extra_mib=int(round(float(m.group(4)) * GIB / MIB)),
-                )
-    except OSError:
-        return {}
+    for group, rec in host_ledger.read_measured_record(record_path).items():
+        rss = rec.get("rss_shmem_gib")
+        if rss is None:
+            continue
+        tags = rec.get("weight_tags_gib") or 0.0
+        extra = rec.get("extra_gib")
+        if extra is None:
+            extra = float(rss) - float(tags)
+        out[group] = DormantImage(
+            group=group,
+            rss_mib=int(round(float(rss) * GIB / MIB)),
+            weight_tags_mib=int(round(float(tags) * GIB / MIB)),
+            extra_mib=int(round(float(extra) * GIB / MIB)),
+        )
     return out
 
 
@@ -1084,7 +1105,9 @@ def solve(
             continue
         # A1-2: the group-level cross-check, apportioned onto the cards by their
         # share of that group's own census.  See :func:`apportion_dormant`.
-        measured = parse_dormant_images(f_log)
+        measured = dormant_images(
+            os.path.join(evidence_dir, host_ledger.MEASURED_RECORD_NAME)
+        )
         # FIX 1 finding 3: the subtrahend of the RssShmem cross-check is the
         # SOURCE boot's own posted non-backup host terms, computed from the arm
         # that boot chose -- not from the arm this boot is about to choose, and
