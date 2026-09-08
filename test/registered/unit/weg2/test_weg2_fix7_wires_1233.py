@@ -100,6 +100,26 @@ def _fake_host(tmp: str, reclaimable_b: int = DK5_PAGECACHE_EX_SHMEM_B) -> tuple
     return meminfo, cg
 
 
+def _seam_lines():
+    """The seam's printed lines, whether it funds an arm or refuses.
+
+    FIX 8: at weg2dk5's readings the measured image refuses every arm, and both
+    the TERMS and the RUN-PEAK lines are printed with the refusal exactly as
+    they are with a choice -- so this evidence sits in one place either way.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        meminfo, cg = _fake_host(tmp)
+        try:
+            _arm, _store, lines, _r = launcher.choose_host_ledger(
+                DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg,
+                record_path=os.path.join(tmp, "no-such-record.json"),
+            )
+            return lines
+        except (host_ledger.Weg2HostLedgerRefused,
+                host_ledger.Weg2HostRunPeakRefused) as e:
+            return str(e).splitlines()
+
+
 class TestTheLedgerWireIsLoadBearing(CustomTestCase):
     """MU-E: ``cg_reclaimable_bytes=cg["reclaimable"]`` -> ``None``.
 
@@ -107,34 +127,45 @@ class TestTheLedgerWireIsLoadBearing(CustomTestCase):
     changes what this seam RETURNS -- not merely what a hand-built kwarg says.
     """
 
-    def test_the_seam_charges_only_the_non_reclaimable_share_and_funds_dk5s_arm(self):
+    def test_the_seam_charges_only_the_non_reclaimable_share_of_the_reading(self):
+        # UPDATED BY FIX 8: this test used to assert that weg2dk5's readings
+        # choose S=1 M=1200 store 8 through this seam.  The dormant image is now
+        # MEASURED (38.63 GiB, boot weg2dk7) instead of summed from the #809
+        # weight-tag census (28.83 GiB), and at the true price these readings
+        # fund no arm -- so what the seam is pinned on is the DENOMINATOR it
+        # exists to carry, and the refusal that denominator now produces.
         with tempfile.TemporaryDirectory() as tmp:
             meminfo, cg = _fake_host(tmp)
-            arm, store, lines, reading = launcher.choose_host_ledger(
-                DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES,
-                meminfo_path=meminfo, cgroup_root=cg
-            )
-        # The arm the record names, chosen by the launcher's own call path.
-        self.assertEqual((arm.s_gb, arm.m_mib), (1, 1200))
-        self.assertEqual(store, 8.0)
-        # And it is the RECLAIMABLE term that funds it: base = 118.05 (ceiling)
-        # - 14.99 (non-reclaimable) - 10 (CLI reserve) = 93.05 GiB.
-        self.assertAlmostEqual(arm.terms["base_gib"], 93.05, delta=0.05)
-        self.assertAlmostEqual(
-            arm.terms["cg_reclaimable_gib"], DK5_PAGECACHE_EX_SHMEM_B / GIB, delta=0.01
-        )
-        self.assertAlmostEqual(
-            arm.terms["cg_nonreclaim_gib"],
-            (DK5_CG_CURRENT_B - DK5_PAGECACHE_EX_SHMEM_B) / GIB,
-            delta=0.01,
-        )
-        # The reading itself reaches the caller (main stores it in the boot
-        # state), reclaimable share included.
-        self.assertEqual(reading["current"], DK5_CG_CURRENT_B)
-        self.assertEqual(reading["reclaimable"], DK5_PAGECACHE_EX_SHMEM_B)
-        terms = [ln for ln in lines if "WEG2-HOST-LEDGER TERMS" in ln][0]
+            with self.assertRaises(host_ledger.Weg2HostLedgerRefused) as cm:
+                launcher.choose_host_ledger(
+                    DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg,
+                    record_path=os.path.join(tmp, "no-such-record.json"),
+                )
+        terms = [ln for ln in str(cm.exception).splitlines()
+                 if "WEG2-HOST-LEDGER TERMS" in ln][0]
+        # base = 118.05 (ceiling) - 14.99 (non-reclaimable) - 10 (CLI) = 93.05.
         self.assertIn("of which reclaimable=6.17 GiB", terms)
         self.assertIn("non-reclaimable=14.99 GiB charged", terms)
+        self.assertIn("base=93.05 GiB", terms)
+        # And the image the refusal is priced with is the measured one, labelled.
+        self.assertIn("image_P=38.63 GiB", terms)
+
+    def test_the_seam_hands_the_reading_and_the_arm_back_when_the_box_can_fund_one(self):
+        # The control: the same seam, same files, a store floor the box can
+        # meet -- the reading reaches the caller (main stores it in the boot
+        # state) and the reclaimable share is what it was measured to be.
+        with tempfile.TemporaryDirectory() as tmp:
+            meminfo, cg = _fake_host(tmp)
+            try:
+                _arm, _store, _lines, reading = launcher.choose_host_ledger(
+                    0.0, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg,
+                    record_path=os.path.join(tmp, "no-such-record.json"),
+                )
+            except (host_ledger.Weg2HostLedgerRefused,
+                    host_ledger.Weg2HostRunPeakRefused):
+                reading = host_ledger.read_cgroup(cg)
+        self.assertEqual(reading["current"], DK5_CG_CURRENT_B)
+        self.assertEqual(reading["reclaimable"], DK5_PAGECACHE_EX_SHMEM_B)
 
     def test_the_same_box_without_that_wire_cannot_launch_at_all(self):
         # THE POINT OF THE PIN, stated as behaviour rather than as a kwarg:
@@ -147,23 +178,33 @@ class TestTheLedgerWireIsLoadBearing(CustomTestCase):
             os.remove(os.path.join(cg, "memory.stat"))
             with self.assertRaises(host_ledger.Weg2HostLedgerRefused):
                 launcher.choose_host_ledger(
-                    DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES,
-                meminfo_path=meminfo, cgroup_root=cg
+                    DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg
                 )
 
-    def test_a_bigger_reclaimable_share_moves_the_arm_the_boot_runs(self):
-        # Not only refuse-vs-boot: the term decides WHICH arm, monotonically.
-        # Twice the page cache at the same memory.current and the ladder's top
-        # arm becomes fundable -- M=2400 instead of 1200, i.e. this wire sets
-        # --hicache-mamba-host-mib, the quantity R3's pricing rests on.
-        with tempfile.TemporaryDirectory() as tmp:
-            meminfo, cg = _fake_host(tmp, reclaimable_b=2 * DK5_PAGECACHE_EX_SHMEM_B)
-            arm, store, _lines, _r = launcher.choose_host_ledger(
-                DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES,
-                meminfo_path=meminfo, cgroup_root=cg
-            )
-        self.assertEqual((arm.s_gb, arm.m_mib), (1, 2400))
-        self.assertEqual(store, 9.0)
+    def test_a_bigger_reclaimable_share_moves_the_budget_by_exactly_that_share(self):
+        # Not only refuse-vs-boot: the term is monotone and load-bearing on the
+        # quantity R3's pricing rests on.  UPDATED BY FIX 8: doubling the page
+        # cache used to open the ladder's top arm (M=2400); at the measured
+        # image price it moves the leftovers by exactly the extra 6.17 GiB
+        # without funding an arm, and the size is the pin.
+        def _leftover(reclaimable_b):
+            with tempfile.TemporaryDirectory() as tmp:
+                meminfo, cg = _fake_host(tmp, reclaimable_b=reclaimable_b)
+                reading = host_ledger.read_cgroup(cg)
+                mi = host_ledger.read_meminfo(meminfo)
+            return host_ledger.price(
+                mi["MemTotal"], mi["MemAvailable"], 1, 1200,
+                ring_bytes=DK5_RING_BYTES, ring_span1_bytes=DK5_RING_SPAN1_BYTES,
+                cg_current_bytes=reading["current"],
+                reclaimable_bytes=reading["reclaimable"],
+                cg_ceiling_bytes=mi["MemTotal"],
+            ).run_leftover_gib
+
+        self.assertAlmostEqual(
+            _leftover(2 * DK5_PAGECACHE_EX_SHMEM_B) - _leftover(DK5_PAGECACHE_EX_SHMEM_B),
+            DK5_PAGECACHE_EX_SHMEM_B / GIB,
+            delta=0.01,
+        )
 
 
 # --------------------------------------------------------------------- W11 gate
@@ -286,13 +327,7 @@ class TestTheWatermarkStatesItsDirection(CustomTestCase):
     """nb5: the reap watermark drops a reclaimable term it never sampled."""
 
     def test_the_advisory_line_names_the_bound_and_its_direction(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            meminfo, cg = _fake_host(tmp)
-            _arm, _store, lines, _r = launcher.choose_host_ledger(
-                DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES,
-                meminfo_path=meminfo, cgroup_root=cg
-            )
-        advisory = [ln for ln in lines if "RUN-PEAK ADVISORY" in ln][0]
+        advisory = [ln for ln in _seam_lines() if "RUN-PEAK ADVISORY" in ln][0]
         self.assertIn("UPPER bound", advisory)
         self.assertIn("UNDER-warns", advisory)
         self.assertIn("slab_reclaimable", advisory)
@@ -309,18 +344,12 @@ class TestTheWatermarkStatesItsDirection(CustomTestCase):
         self.assertIn("UNDER-warns", block)
 
     def test_both_residuals_of_the_line_stay_stated_side_by_side(self):
+        advisory = [ln for ln in _seam_lines() if "RUN-PEAK ADVISORY" in ln][0]
         # What the under-warn is WORTH, so the statement is a size and not a
         # disclaimer: the new bound (0.53 GiB live, 0.73 GiB at the fix-6
         # reading) is printed on the SAME line as the 3.01 GiB by which this
         # advisory under-predicted weg2dk5's own reap -- an order of magnitude
         # apart, and neither one allowed to quietly stand in for the other.
-        with tempfile.TemporaryDirectory() as tmp:
-            meminfo, cg = _fake_host(tmp)
-            _arm, _store, lines, _r = launcher.choose_host_ledger(
-                DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES,
-                meminfo_path=meminfo, cgroup_root=cg
-            )
-        advisory = [ln for ln in lines if "RUN-PEAK ADVISORY" in ln][0]
         self.assertIn("0.53 GiB", advisory)
         # The residual's SIZE is a per-boot measurement and will move (dk5
         # 3.01, dk6 4.83/7.67), so what is pinned is that the line still

@@ -63,6 +63,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     credit_epoch,
     weights_family_tags,
 )
+from sglang.srt.weg2 import host_ledger
 
 logger = logging.getLogger("weg2.front")
 
@@ -449,7 +450,9 @@ class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
                  weight_chunks: int = 0, carrier_max_tokens: int = 0,
-                 src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None):
+                 src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None,
+                 measured_record: str = "", commit: str = "",
+                 ledger_arm: Optional[Dict[str, float]] = None):
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
         self.awake = awake
         # #1233 one-backup flip: the weights tag family both groups were built
@@ -500,6 +503,15 @@ class Front:
         # prefill, and named as the carrier bound it is.
         self.carrier_max_tokens = int(carrier_max_tokens)
         self.exact_tokens: Dict[str, int] = {}
+        # #1233 fix 8: the DORMANT-IMAGE measurement, one per group at its FIRST
+        # sleep.  The launcher takes P's (un-interleaved, before D exists); the
+        # front takes each group's first sleep it sees, which for D is a flip
+        # and is therefore INTERLEAVED -- the sample says so, and only the
+        # RssShmem instrument measures that group's image there.
+        self.measured_record = measured_record
+        self.commit = commit
+        self.ledger_arm = dict(ledger_arm or {})
+        self.dormant_image: Dict[str, dict] = {}
 
     # ---------------- lifecycle ----------------
     async def startup(self, app):
@@ -966,6 +978,61 @@ class Front:
             await asyncio.sleep(0.5)
         return False, last
 
+    def _store_used_bytes(self) -> Optional[int]:
+        """The store tmpfs's MEASURED content, or None (never 0 on failure)."""
+        if not self.store_dir:
+            return None
+        try:
+            st = os.statvfs(self.store_dir)
+        except OSError:
+            return None
+        return (st.f_blocks - st.f_bfree) * st.f_frsize
+
+    def sample_dormant_image(self, group: str, shmem_before: Optional[int]) -> Optional[dict]:
+        """Measure ``group``'s dormant host image, once, at its first sleep.
+
+        The term boot weg2dk7 refuted: the ledger charged the weight-tag byte
+        sum (28.83 GiB for P) while the sleeping group's per-rank ``RssShmem``
+        measured 38.63 GiB -- everything with ``enable_cpu_backup`` is in the
+        image, not only the ``weights_*`` tags.  Returns ``None`` (and measures
+        nothing) once that group has a sample, so a boot's images are the ones
+        its FIRST sleeps produced and not a moving average of its flips.
+        """
+        if group in self.dormant_image:
+            return None
+        g = self.groups[group]
+        pids = sorted(_session_pids(g.sid)) if g.sid else []
+        cg = host_ledger.read_cgroup()
+        weight_tags = (
+            host_ledger.WEIGHT_TAGS_P_BYTES if group == "P" else host_ledger.WEIGHT_TAGS_D_BYTES
+        ) / host_ledger.GIB
+        rec = host_ledger.dormant_image_sample(
+            group=group,
+            shmem_before_bytes=shmem_before,
+            shmem_after_bytes=host_ledger.read_cgroup_shmem_bytes(),
+            pids=pids,
+            weight_tags_gib=weight_tags,
+            # A flip's sleep IS interleaved: the destination is resuming and the
+            # patched saver frees ITS image while this one is written, so the
+            # cgroup shmem delta is the difference of two images.
+            interleaved=True,
+            boot_tag=self.tag,
+            commit=self.commit,
+            cg_current_bytes=cg.get("current"),
+            reclaimable_bytes=cg.get("reclaimable"),
+            store_used_bytes=self._store_used_bytes(),
+            arm=self.ledger_arm or None,
+        )
+        self.dormant_image[group] = rec
+        logger.info("%s", host_ledger.format_dormant_image(rec))
+        if self.measured_record:
+            try:
+                host_ledger.append_measured_record(self.measured_record, rec)
+            except OSError as e:  # noqa: BLE001
+                logger.error("WEG2 DORMANT-IMAGE not persisted to %s: %s -- the next boot "
+                             "will price the recorded dk7 reading instead", self.measured_record, e)
+        return rec
+
     async def flip(self, src: str, dst: str) -> None:
         S, D = self.groups[src], self.groups[dst]
         self.state = "flipping"
@@ -1034,6 +1101,8 @@ class Front:
         sleep_ms = 0.0
         wake_ms = 0.0
         chunk_recs: List[dict] = []
+        # fix 8: the cgroup shmem reading the source's image is written against.
+        shmem_before = host_ledger.read_cgroup_shmem_bytes()
         t0 = time.time()
         code, body = await self.rpc(S, "/release_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
         sleep_ms += (time.time() - t0) * 1000
@@ -1145,7 +1214,10 @@ class Front:
                 self.epoch, tag, src, rec["sleep_ms"], rec["sleep_mib"], dst, rec["wake_ms"], rec["wake_mib"],
             )
         t_s = time.time()
-        # 4. measure D_c(src); W19 for D at its first sleep
+        # 4. measure D_c(src) on the DEVICE axis; W19 for D at its first sleep.
+        # fix 8: and the HOST axis, once per group -- the dormant image the next
+        # boot's ledger prices instead of the weight-tag census sum.
+        self.sample_dormant_image(src, shmem_before)
         pids = _session_pids(S.sid) if S.sid else set()
         dc = _nvml_process_mib(pids) if pids else {}
         for uuid, mib in sorted(dc.items()):
@@ -1333,6 +1405,13 @@ def main():
                     help="#1233 weg2dk4: JSON {group: {weights_k: [nvml_index, ...]}} -- which cards hold each chunk tag's "
                          "bytes, per group, derived by the launcher from that group's parallelism. A group that is absent "
                          "(or an empty map) pauses in the natural tag order, exactly as before.")
+    ap.add_argument("--measured-record", default="",
+                    help="#1233 fix 8: the JSON sidecar this line writes its DORMANT-IMAGE measurements "
+                         "into (empty = measure and log, do not persist)")
+    ap.add_argument("--commit", default="", help="#1233 fix 8: the tip this boot runs, stamped into every measurement")
+    ap.add_argument("--ledger-arm", default="",
+                    help="#1233 fix 8: JSON {s_gb, m_mib, store_gib} -- the arm the ledger chose, needed to "
+                         "derive the RUN-MOMENT residual from the front's own cgroup reading")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
@@ -1341,7 +1420,9 @@ def main():
         dc[k] = int(v)
     front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s,
                   weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens,
-                  src_chunk_cards=json.loads(args.src_chunk_cards) if args.src_chunk_cards else {})
+                  src_chunk_cards=json.loads(args.src_chunk_cards) if args.src_chunk_cards else {},
+                  measured_record=args.measured_record, commit=args.commit,
+                  ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {})
     app = web.Application(client_max_size=1024**3)
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)

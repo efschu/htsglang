@@ -129,8 +129,13 @@ def test_w20_still_refuses_the_live_box_shape_under_the_DR1_two_image_shape():
                            ring_span1_bytes=RING_SPAN1_BYTES,
                            ring_provenance="boot weg2zr2, DR-1 two-image shape")
     text = str(ei.value)
+    # fix 8: the MEASURED dormant image (`image_P=`/`image_D=`) prints beside the
+    # #809 census sums (`weight_tags_P=`) it used to be confused with -- and on
+    # the ring both are PROVENANCE, not charges: the charge is Sigma H.
     for term in ("heaps=", "RUN MOMENT = the host weights term", "LAUNCH MOMENT = ring span 1",
-                 "load_transient=", "anchors@2400=", "rings=", "floor="):
+                 "image_P=", "image_D=", "weight_tags_P=", "run_origin=",
+                 "load_transient=", "anchors@2400=", "rings=", "floor=",
+                 "memory.current=", "base_cgroup="):
         assert term in text
     # And the deleted constants may not come back through the printed line.
     assert "backup_P=" not in text and "backup_D=" not in text

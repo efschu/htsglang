@@ -164,7 +164,11 @@ class TestTheMoment(CustomTestCase):
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, weight_chunks=DK5_CHUNKS
         )
         endpoint = arm.terms["backup_resident_gib"] / DK5_CHUNKS
-        self.assertAlmostEqual(endpoint, 3.60, delta=0.05)      # what it charged
+        # 4.83 GiB, not the 3.60 this test pinned before fix 8: the resident
+        # image is the MEASURED 38.63 GiB (boot weg2dk7) and no longer the
+        # 28.83 GiB weight-tag census sum.  The relation this test exists for
+        # -- the PEAK beats the endpoint proxy -- holds either way.
+        self.assertAlmostEqual(endpoint, 4.83, delta=0.05)      # what it charged
         self.assertAlmostEqual(
             arm.terms["flip_transient_gib"], host_ledger.FLIP_HOST_TRANSIENT_GIB, delta=1e-9
         )
@@ -200,7 +204,7 @@ class TestTheMoment(CustomTestCase):
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, weight_chunks=0
         )
         self.assertAlmostEqual(
-            arm.terms["flip_transient_gib"], arm.terms["backup_d_gib"], delta=1e-9
+            arm.terms["flip_transient_gib"], arm.terms["image_d_gib"], delta=1e-9
         )
 
 
@@ -216,20 +220,37 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         self.assertIn("--store-min-gib", text)
         self.assertIn("shrinking the store tmpfs is NOT a lever", text)
 
-    def test_it_funds_a_smaller_store_and_that_store_is_smaller_than_the_one_that_died(self):
-        arm, store, lines = _choose(4.0)
-        self.assertGreaterEqual(store, 4.0)
-        self.assertLess(store, DK5_STORE_CHOSEN_GIB)
-        self.assertTrue(any("RUN-PEAK ADVISORY" in ln for ln in lines))
+    def test_fix_8_refuses_that_boot_at_a_4_gib_store_floor_too(self):
+        # UPDATED BY FIX 8 (this test used to assert that a 4 GiB floor FUNDS a
+        # smaller store).  With the image measured at 38.63 GiB instead of the
+        # 28.83 GiB census sum, weg2dk5's readings fund no arm at any floor this
+        # carrier could use -- and its run leftover is short by exactly the
+        # measured image gap.  The boot that died is refused harder, not softer.
+        with self.assertRaises(host_ledger.Weg2HostLedgerRefused):
+            _choose(4.0)
+        arm = host_ledger.price(
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 600,
+            weight_chunks=DK5_CHUNKS,
+            cg_current_bytes=DK5_CG_CURRENT_B,
+            cg_ceiling_bytes=DK5_MEMTOTAL_B,
+        )
+        self.assertLess(arm.run_leftover_gib, 4.0)
 
-    def test_the_advisory_puts_the_chosen_arm_below_the_observed_reap_point(self):
-        arm, store, lines = _choose(4.0)
-        predicted = arm.predicted_run_peak_gib(store)
+    def test_every_arm_of_that_boot_is_above_the_observed_reap_point(self):
+        # The verdict the boot itself delivered: weg2dk5 was reaped at 95.93 GiB.
+        # Under fix 8 EVERY arm of its ladder predicts a run peak above that
+        # point, and the refusal prints the advisory beside the ladder.
+        try:
+            _choose(4.0)
+            self.fail("weg2dk5's readings must not fund an arm under fix 8")
+        except host_ledger.Weg2HostLedgerRefused as e:
+            text = str(e)
         watermark = host_ledger.OBSERVED_REAP_CURRENT_BYTES / GIB
         self.assertAlmostEqual(watermark, 95.93, delta=0.02)
-        self.assertLess(predicted, watermark)
-        advisory = [ln for ln in lines if "RUN-PEAK ADVISORY" in ln][0]
-        self.assertIn("below the OBSERVED REAP POINT", advisory)
+        self.assertIn("RUN-PEAK ADVISORY", text)
+        self.assertIn("ABOVE the OBSERVED REAP POINT", text)
+        for m in (2400, 1200, 600):
+            self.assertIn(f"M={m}", text)
 
     def test_the_advisory_would_have_flagged_the_arm_that_actually_died(self):
         # weg2dk5's own choice: S=1 M=1200 with a 9 GiB store.
@@ -242,9 +263,19 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         predicted = arm.predicted_run_peak_gib(DK5_STORE_CHOSEN_GIB)
         watermark = host_ledger.OBSERVED_REAP_CURRENT_BYTES / GIB
         self.assertGreater(predicted, watermark)
-        # and the measured death sits between the prediction and the endpoint
-        # model that let it through: 95.93 actual, ~99 predicted (conservative).
-        self.assertLess(predicted - watermark, 5.0)
+        # HOW FAR above, and why the margin grew under fix 8: the fix-7 price
+        # put this arm 3.13 GiB over the watermark, and weg2dk5 died anyway --
+        # the advisory's own 3.01 GiB UNDER-prediction.  The measured image
+        # (+9.80 GiB) and the run-moment origin are exactly what that residual
+        # was made of, so the two corrections must account for the whole
+        # difference between the old margin and the new one.
+        self.assertGreater(predicted - watermark, 5.0)
+        self.assertAlmostEqual(
+            predicted - watermark,
+            3.13 + arm.terms["image_extra_p_gib"]
+            + (arm.terms["run_origin_gib"] - arm.terms["cg_nonreclaim_gib"]),
+            delta=0.05,
+        )
 
     def test_the_prediction_is_absent_not_green_without_a_cgroup_sample(self):
         arm, store, lines = _choose(4.0, with_cgroup=False)
@@ -253,7 +284,10 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         self.assertIn("not computed", advisory)
 
     def test_the_terms_line_carries_the_cgroup_reading_and_the_oom_baseline(self):
-        _arm, _store, lines = _choose(4.0)
+        try:
+            _arm, _store, lines = _choose(4.0)
+        except host_ledger.Weg2HostLedgerRefused as e:
+            lines = str(e).splitlines()      # fix 8: the same lines, on refusal
         terms = [ln for ln in lines if "WEG2-HOST-LEDGER TERMS" in ln][0]
         for needle in (
             "memory.current=",

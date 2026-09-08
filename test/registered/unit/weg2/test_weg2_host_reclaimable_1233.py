@@ -74,7 +74,7 @@ def _choose(**over):
         store_min_gib=DK5_STORE_MIN_GIB,
         weight_chunks=DK5_CHUNKS,
         cg_current_bytes=DK5_CG_CURRENT_B,
-        cg_reclaimable_bytes=DK5_CG_RECLAIMABLE_B,
+        reclaimable_bytes=DK5_CG_RECLAIMABLE_B,
         cg_ceiling_bytes=DK5_MEMTOTAL_B,
         cg_ceiling_source="test: lxcfs MemTotal fallback",
         cg_oom_kill=18,
@@ -83,33 +83,75 @@ def _choose(**over):
     return host_ledger.choose(DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, **kw)
 
 
+def _lines(**over):
+    """The ladder's lines whether it funds an arm or refuses.
+
+    FIX 8 (boot weg2dk7): at weg2dk5's readings the MEASURED dormant image
+    (38.63 GiB against the 28.83 GiB weight-tag census this file was written
+    against) refuses every arm, and the TERMS and RUN-PEAK lines are printed
+    with the refusal exactly as they are with a choice -- so the evidence these
+    tests read is at the same place either way.
+    """
+    try:
+        _arm, _store, lines = _choose(**over)
+        return lines
+    except (host_ledger.Weg2HostLedgerRefused, host_ledger.Weg2HostRunPeakRefused) as e:
+        return str(e).splitlines()
+
+
 class TestTheReclaimableTerm(CustomTestCase):
-    def test_dk5_launch_readings_fund_the_arm_that_boot_actually_ran(self):
-        # The regression fix 5 introduced: at these readings every arm refused,
-        # so the branch could not launch from the state it last launched from.
-        arm, store, lines = _choose()
-        self.assertEqual((arm.s_gb, arm.m_mib), (1, 1200))
-        self.assertEqual(store, 8.0)
+    def test_dk5_launch_readings_still_give_the_base_this_term_funds(self):
+        # UPDATED BY FIX 8, and the update is a measurement, not a taste: this
+        # test used to assert that these readings FUND S=1 M=1200 with an 8 GiB
+        # store.  Boot weg2dk7 then measured the dormant image at 38.63 GiB
+        # against the 28.83 GiB weight-tag census the ledger charged, +9.80 GiB
+        # on one image, and at that price weg2dk5's own launch state funds no
+        # arm at its own store floor.  What fix 6 is about -- the DENOMINATOR --
+        # is unchanged and is what this test pins now.
+        arm = host_ledger.price(
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
+            weight_chunks=DK5_CHUNKS,
+            cg_current_bytes=DK5_CG_CURRENT_B,
+            reclaimable_bytes=DK5_CG_RECLAIMABLE_B,
+            cg_ceiling_bytes=DK5_MEMTOTAL_B,
+        )
         # base = 118.05 (ceiling) - 14.99 (non-reclaimable) - 10 (CLI) = 93.05,
         # 6.17 GiB looser than fix 5's 86.89 and still 10.5 GiB tighter than
         # the meminfo arm -- the cgroup still binds.
         self.assertAlmostEqual(arm.terms["base_gib"], 93.05, delta=0.05)
-        self.assertAlmostEqual(arm.run_leftover_gib, 8.16, delta=0.05)
         self.assertIn("cgroup", arm.terms["base_source"])
-        # M=2400 stays refused: the correction re-prices, it does not open the
-        # ladder's top arm by fiat.
+        # The run leftover is the old 8.16 GiB MINUS the measured image gap,
+        # to the decimal -- the only term that moved.
+        self.assertAlmostEqual(
+            arm.run_leftover_gib, 8.16 - arm.terms["image_extra_p_gib"], delta=0.05
+        )
+        lines = _lines()
         self.assertTrue(any("S=1 M=2400" in ln and "refused" in ln for ln in lines))
 
-    def test_charging_the_whole_reading_refuses_that_same_launch(self):
+    def test_charging_the_whole_reading_costs_exactly_the_cache_it_charges(self):
         # Exactly fix 5's arithmetic, reachable through the same seam: with no
-        # memory.stat the ledger charges everything and REFUSES rather than
-        # inventing a reclaimable share.
+        # memory.stat the ledger charges everything rather than inventing a
+        # reclaimable share.  Under fix 8 BOTH readings refuse (the measured
+        # image is 9.80 GiB bigger than the census), so the contrast this test
+        # exists for is stated where it survives -- as a size, not a verdict:
+        # the run leftover moves by EXACTLY the reclaimable share, 6.17 GiB.
         with self.assertRaises(host_ledger.Weg2HostLedgerRefused):
-            _choose(cg_reclaimable_bytes=None)
+            _choose(reclaimable_bytes=None)
+        common = dict(
+            weight_chunks=DK5_CHUNKS, cg_current_bytes=DK5_CG_CURRENT_B,
+            cg_ceiling_bytes=DK5_MEMTOTAL_B,
+        )
+        cached = host_ledger.price(DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
+                                   reclaimable_bytes=DK5_CG_RECLAIMABLE_B, **common)
+        charged = host_ledger.price(DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
+                                    reclaimable_bytes=None, **common)
+        self.assertAlmostEqual(
+            cached.run_leftover_gib - charged.run_leftover_gib,
+            DK5_CG_RECLAIMABLE_B / GIB, delta=0.01,
+        )
 
     def test_the_terms_line_names_the_reclaimable_term_by_name(self):
-        _arm, _store, lines = _choose()
-        terms = lines[0]
+        terms = [ln for ln in _lines() if "WEG2-HOST-LEDGER TERMS" in ln][0]
         self.assertIn("reclaimable=", terms)
         self.assertIn("6.17 GiB", terms)          # the measured share
         self.assertIn("non-reclaimable", terms)
@@ -154,7 +196,7 @@ class TestTheReclaimableTerm(CustomTestCase):
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
             weight_chunks=DK5_CHUNKS,
             cg_current_bytes=DK5_CG_CURRENT_B,
-            cg_reclaimable_bytes=DK5_CG_CURRENT_B * 4,
+            reclaimable_bytes=DK5_CG_CURRENT_B * 4,
             cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
         self.assertEqual(arm.terms["cg_nonreclaim_gib"], 0.0)
@@ -164,7 +206,7 @@ class TestTheReclaimableTerm(CustomTestCase):
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
             weight_chunks=DK5_CHUNKS,
             cg_current_bytes=0,
-            cg_reclaimable_bytes=0,
+            reclaimable_bytes=0,
             cg_ceiling_bytes=DK5_MEMTOTAL_B * 4,
         )
         self.assertAlmostEqual(arm.terms["base_gib"], 103.56, delta=0.05)
@@ -229,7 +271,15 @@ class TestReadCgroupReadsTheStat(CustomTestCase):
 
 
 class TestTheRunPeakAdvisory(CustomTestCase):
-    def test_the_predicted_origin_is_the_non_reclaimable_reading(self):
+    def test_the_predicted_origin_is_the_run_moment_not_the_launch_reading(self):
+        # SUPERSEDED BY FIX 8, and this is the whole point of that fix: this
+        # test used to assert that the predicted peak moves with the LAUNCH
+        # reading (by exactly the reclaimable share).  Boots weg2dk6/dk7 showed
+        # that selector is anti-correlated with safety -- the quieter launch
+        # bought the bigger arm and produced the tighter boot -- so the origin
+        # is now the RUN-moment residual and BOTH of weg2dk5's readings sit
+        # below it.  The base still moves by the reclaimable share (pinned
+        # above); the PEAK deliberately no longer does.
         common = dict(
             weight_chunks=DK5_CHUNKS,
             cg_current_bytes=DK5_CG_CURRENT_B,
@@ -237,23 +287,23 @@ class TestTheRunPeakAdvisory(CustomTestCase):
         )
         cached = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            cg_reclaimable_bytes=DK5_CG_RECLAIMABLE_B, **common
+            reclaimable_bytes=DK5_CG_RECLAIMABLE_B, **common
         )
         charged = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            cg_reclaimable_bytes=0, **common
+            reclaimable_bytes=0, **common
         )
-        # The only difference between the two is cache the kernel would hand
-        # back; the predicted peak must move by exactly that and no more.
+        for arm in (cached, charged):
+            self.assertLess(arm.terms["cg_nonreclaim_gib"], arm.terms["run_origin_gib"])
+            self.assertIn("RUN-MOMENT RESIDUAL FLOOR", arm.terms["run_origin_source"])
         self.assertAlmostEqual(
-            charged.predicted_run_peak_gib(8.0) - cached.predicted_run_peak_gib(8.0),
-            DK5_CG_RECLAIMABLE_B / GIB,
-            delta=0.01,
+            charged.predicted_run_peak_gib(8.0), cached.predicted_run_peak_gib(8.0),
+            delta=1e-9,
         )
+        # The store is still a term of the sum, one GiB for one GiB.
         self.assertAlmostEqual(
-            cached.predicted_run_peak_gib(8.0) - cached.terms["cg_nonreclaim_gib"],
-            cached.predicted_run_peak_gib(0.0) - cached.terms["cg_nonreclaim_gib"] + 8.0,
-            delta=1e-6,
+            cached.predicted_run_peak_gib(8.0) - cached.predicted_run_peak_gib(0.0),
+            8.0, delta=1e-6,
         )
 
     def test_the_watermark_is_stated_in_the_same_currency(self):
@@ -265,8 +315,7 @@ class TestTheRunPeakAdvisory(CustomTestCase):
             host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES,
             host_ledger.OBSERVED_REAP_CURRENT_BYTES - 28_916 * 1024,
         )
-        _arm, _store, lines = _choose()
-        advisory = [ln for ln in lines if "RUN-PEAK ADVISORY" in ln][0]
+        advisory = [ln for ln in _lines() if "RUN-PEAK ADVISORY" in ln][0]
         self.assertIn("non-reclaimable", advisory)
         self.assertIn("95.90 GiB", advisory)
 

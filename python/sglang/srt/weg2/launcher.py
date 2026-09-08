@@ -70,12 +70,33 @@ DUPLEX_PROBE_DEFAULT = f"{GPU_ARB}/weg2/PROBE_RING_0907.md"
 DEADMAN = f"{GPU_ARB}/devtools/boot_deadman.sh"
 MEMTS = f"{GPU_ARB}/devtools/mem_timeseries.sh"
 HOST_PREFLIGHT = f"{GPU_ARB}/devtools/host_ledger_preflight.sh"
-PRESENCE_DIR = "/dev/shm/sglang-phase-flip-presence"
+SHM_DIR = "/dev/shm"
+PRESENCE_DIR = f"{SHM_DIR}/sglang-phase-flip-presence"
 STORE_MOUNT = "/spinning/hicache-weg2-ram"
 #: C18: where the per-card host-ring files live under the MAP_SHARED form.  A
 #: tmpfs, because the granules must be shared PAGES (both co-located rank
 #: processes map the same file), not a disk-backed file.
 HOST_RING_DIR = "/dev/shm/weg2-hostring"
+SHM_ARCHIVE_ROOT = f"{GPU_ARB}/shm_residue"
+#: #1233 fix 8, boot weg2dk7: the /dev/shm NAME FAMILIES THIS LINE'S OWN CODE
+#: CREATES, each traced to the file that writes it.  A name outside this tuple
+#: is FOREIGN and is never touched, whatever it looks like -- /dev/shm on this
+#: box carries hundreds of `sem.mp-*` files belonging to other people's Python
+#: processes, and a sweep that guessed would eat them.
+#:
+#: WHY THE SWEEP EXISTS: weg2dk7 measured 3.23 GiB of host RAM held by
+#: `/dev/shm/hicache-weg2-fix973`, the page store of a boot that had been dead
+#: for ~16 h (BOOT_weg2fix973_0907.md, whose own teardown line claims the
+#: directory was removed).  Nothing mapped it, and every host reading of that
+#: boot -- the ledger's `memory.current`, the shmem attribution, the corridor
+#: -- counted it as occupied.  The #1217 check saw none of it: it looked only
+#: inside the presence directory.
+SHM_OWN_PREFIXES = (
+    "sglang-phase-flip-presence",   # managers/phase_flip_presence.py, #1217
+    "hicache-weg2-",                # the canonical page store when it is put on /dev/shm
+    ".weg2-pcie-serialize-",        # model_loader/hibernate.py:504
+    "sglang_loads_",                # managers/load_snapshot.py:285
+)
 #: The corridor law is 819-1229 MiB NVML-free per card under the awake
 #: group's load.  MEASURED 2026-09-07 boot weg2onebackup2 with this constant
 #: at 1024: the 5090's continuous minimum under group D was 620-684 MiB
@@ -331,6 +352,11 @@ class BootState:
     cgroup: Dict[str, Optional[int]] = field(default_factory=dict)
     #: P's DERIVED PP layer split (empty = refused, reason in the log line).
     p_stage_layers: List[int] = field(default_factory=list)
+    #: #1233 fix 8: what the /dev/shm orphan sweep found and freed.
+    shm_sweep: Dict[str, object] = field(default_factory=dict)
+    #: #1233 fix 8: the DORMANT-IMAGE sample taken at group P's first sleep --
+    #: the term the next boot's ledger prices its image from.
+    dormant_image_p: Dict[str, object] = field(default_factory=dict)
 
 
 def _now() -> str:
@@ -480,29 +506,200 @@ def _alive(pid: int) -> bool:
 # --------------------------------------------------------------------------
 
 
-def presence_sweep(log: Log, tag: str, stamp: str, dry: bool) -> None:
-    if not os.path.isdir(PRESENCE_DIR):
-        log("#1217 presence residue: none")
-        return
-    files = os.listdir(PRESENCE_DIR)
-    if not files:
-        log("#1217 presence residue: none")
-        return
-    live = subprocess.run(["pgrep", "-f", "sglang[.]launch_server"], capture_output=True, text=True).stdout.split()
-    held = subprocess.run(["fuser", "-s"] + [os.path.join(PRESENCE_DIR, f) for f in files], capture_output=True).returncode == 0
-    if live or held:
+def shm_holder_pids(path: str, proc_root: str = "/proc") -> List[int]:
+    """Every LIVE pid that maps or holds open a file at or under ``path``.
+
+    Read out of ``/proc/<pid>/maps`` and ``/proc/<pid>/fd`` rather than from
+    ``fuser``: ``fuser`` is one exit code for a whole argv (the #1217 check
+    could not say WHICH file was held, or by whom), it is not always installed,
+    and it cannot be handed a fake tree by a test.  The pid list this returns is
+    printed in the refusal, so a live holder is actionable instead of a boolean.
+
+    A path that appears with the kernel's ``(deleted)`` suffix still counts: an
+    unlinked-but-mapped region still occupies the memory this sweep exists to
+    free.  Matching is on the full path with a boundary, never a substring, so
+    ``hicache-weg2-fix973`` never matches ``hicache-weg2-fix9730``.
+    """
+    prefix = os.path.realpath(path)
+    holders: List[int] = []
+
+    def _hit(candidate: str) -> bool:
+        p = candidate.strip()
+        if p.endswith(" (deleted)"):
+            p = p[: -len(" (deleted)")]
+        return p == prefix or p.startswith(prefix + "/")
+
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return holders
+    for entry in sorted(entries, key=lambda e: int(e) if e.isdigit() else 0):
+        if not entry.isdigit():
+            continue
+        found = False
+        try:
+            with open(f"{proc_root}/{entry}/maps") as f:
+                for line in f:
+                    parts = line.split(maxsplit=5)
+                    if len(parts) == 6 and _hit(parts[5]):
+                        found = True
+                        break
+        except OSError:
+            pass
+        if not found:
+            fd_dir = f"{proc_root}/{entry}/fd"
+            try:
+                for fd in os.listdir(fd_dir):
+                    try:
+                        if _hit(os.readlink(f"{fd_dir}/{fd}")):
+                            found = True
+                            break
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+        if found:
+            holders.append(int(entry))
+    return holders
+
+
+def _tree_bytes(path: str) -> Tuple[int, int, int]:
+    """(allocated bytes, apparent bytes, entry count) of a file or tree.
+
+    WHICH BYTE COUNT, stated because the two differ here by 0.53 GiB and only
+    one of them is host RAM: ``st_blocks * 512`` is what the tmpfs actually
+    OCCUPIES (and what ``df`` and the cgroup's ``shmem`` count), ``st_size`` is
+    the apparent size ``ls`` shows.  Measured on the real orphan
+    ``/dev/shm/hicache-weg2-fix973`` (2026-09-08): apparent 4,042,810,432 B =
+    3.77 GiB, allocated 3,471,384,576 B = 3.23 GiB -- and 3.23 GiB is the figure
+    boot weg2dk7 attributed and the figure a sweep frees.  Reporting the
+    apparent size as "freed" would over-claim by half a GiB.
+    """
+    def _pair(p: str) -> Tuple[int, int]:
+        st = os.lstat(p)
+        return st.st_blocks * 512, st.st_size
+
+    try:
+        alloc, apparent = _pair(path)
+    except OSError:
+        return 0, 0, 0
+    if not os.path.isdir(path) or os.path.islink(path):
+        return alloc, apparent, 1
+    alloc, apparent, n = 0, 0, 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                a, b = _pair(os.path.join(root, name))
+            except OSError:
+                continue
+            alloc += a
+            apparent += b
+            n += 1
+    return alloc, apparent, n
+
+
+def shm_residue_sweep(
+    log: Log,
+    tag: str,
+    stamp: str,
+    dry: bool,
+    shm_dir: str = SHM_DIR,
+    proc_root: str = "/proc",
+    archive_root: str = SHM_ARCHIVE_ROOT,
+) -> Dict[str, object]:
+    """#1217 + #1233 fix 8: sweep THIS LINE'S dead /dev/shm residue, and only that.
+
+    ONE authority for /dev/shm residue, replacing the #1217 presence-directory
+    check it grew out of: that check swept one directory, called `fuser` once on
+    its files, and answered "none" for a box holding 3.23 GiB of a dead boot's
+    page store two entries away (weg2dk7).  Same defect class, one function.
+
+    The rules, in order:
+
+    * a name outside :data:`SHM_OWN_PREFIXES` is FOREIGN and is never listed,
+      never stat'ed for size, never moved -- /dev/shm here is full of other
+      people's `sem.mp-*`;
+    * any live ``sglang.launch_server`` REFUSES the boot before anything is
+      touched (another boot is up; this is not the moment to tidy /dev/shm);
+    * an entry with a live holder (:func:`shm_holder_pids`) REFUSES the boot,
+      naming the entry and the pids.  Nothing is killed and nothing is swept;
+    * an orphan REGULAR FILE is moved into the archive WITH ITS CONTENT: the
+      #1217 presence flags are the evidence and they are bytes long;
+    * an orphan DIRECTORY TREE is archived as a MANIFEST (name, bytes, entry
+      count, mtime) and then removed.  Copying a dead boot's 3.2 GiB page store
+      of ~100k small files onto spinning disk at preflight would cost minutes
+      and buy nothing -- the evidence of a leaked store is that it existed and
+      how big it was, not the pages inside it.
+    """
+    try:
+        names = sorted(os.listdir(shm_dir))
+    except OSError:
+        log(f"#1217/#1233 shm residue: {shm_dir} unreadable -- NOT swept, and not read as empty")
+        return {"swept": [], "bytes_freed": 0, "refused": {}, "archive": ""}
+    own = [n for n in names if any(n.startswith(p) for p in SHM_OWN_PREFIXES)]
+    foreign = len(names) - len(own)
+    if not own:
+        log(f"#1217/#1233 shm residue: none of ours in {shm_dir} ({foreign} foreign entries untouched)")
+        return {"swept": [], "bytes_freed": 0, "refused": {}, "archive": ""}
+    live = subprocess.run(
+        ["pgrep", "-f", "sglang[.]launch_server"], capture_output=True, text=True
+    ).stdout.split()
+    if live:
         raise Weg2LaunchRefused(
-            f"#1217 presence residue: LIVE HOLDER -- refusing this boot, not sweeping, not killing anything. "
-            f"launch_server pid(s)=[{' '.join(live) or 'none'}] fuser_held={held}"
+            f"#1217 shm residue: LIVE launch_server pid(s)=[{' '.join(live)}] -- refusing this "
+            f"boot, not sweeping, not killing anything (our /dev/shm entries: {own})"
         )
-    archive = f"{GPU_ARB}/shm_residue/{tag}_{stamp}"
+    held = {n: shm_holder_pids(os.path.join(shm_dir, n), proc_root) for n in own}
+    refused = {n: pids for n, pids in held.items() if pids}
+    if refused:
+        raise Weg2LaunchRefused(
+            f"#1217/#1233 shm residue: LIVE HOLDER on our own /dev/shm entries "
+            f"{ {n: pids for n, pids in sorted(refused.items())} } -- refusing this boot, not "
+            f"sweeping, not killing anything"
+        )
+    archive = f"{archive_root}/{tag}_{stamp}"
+    sizes = {n: _tree_bytes(os.path.join(shm_dir, n)) for n in own}
+    total = sum(a for a, _b, _n in sizes.values())
+    apparent = sum(b for _a, b, _n in sizes.values())
     if dry:
-        log(f"#1217 DRY-RUN: would sweep {len(files)} file(s) from {PRESENCE_DIR} -> {archive}")
-        return
+        log(
+            f"#1217/#1233 DRY-RUN: would sweep {len(own)} orphan entr(ies) from {shm_dir} -> "
+            f"{archive}, freeing {total} allocated bytes = {total / host_ledger.GIB:.2f} GiB "
+            f"(apparent {apparent / host_ledger.GIB:.2f} GiB -- allocated is what the tmpfs "
+            f"occupies and what cgroup shmem counts); per entry (allocated): "
+            f"{ {n: sizes[n][0] for n in own} }; {foreign} foreign entries untouched"
+        )
+        return {"swept": own, "bytes_freed": total, "bytes_apparent": apparent,
+                "refused": {}, "archive": archive}
     os.makedirs(archive, exist_ok=True)
-    for f in files:
-        shutil.move(os.path.join(PRESENCE_DIR, f), archive)
-    log(f"#1217 presence residue swept: {len(files)} file(s) from {PRESENCE_DIR} -> {archive}")
+    manifest: List[dict] = []
+    for n in own:
+        src = os.path.join(shm_dir, n)
+        nbytes, napparent, count = sizes[n]
+        try:
+            mtime = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.lstat(src).st_mtime))
+        except OSError:
+            mtime = "?"
+        is_dir = os.path.isdir(src) and not os.path.islink(src)
+        manifest.append(
+            {"name": n, "bytes_allocated": nbytes, "bytes_apparent": napparent,
+             "entries": count, "mtime": mtime,
+             "kind": "dir" if is_dir else "file", "action": "manifest+removed" if is_dir else "moved"}
+        )
+        if is_dir:
+            shutil.rmtree(src, ignore_errors=True)
+        else:
+            shutil.move(src, archive)
+    with open(os.path.join(archive, "MANIFEST.json"), "w") as f:
+        json.dump({"tag": tag, "stamp": stamp, "shm_dir": shm_dir, "entries": manifest}, f, indent=1)
+    log(
+        f"#1217/#1233 shm residue swept: {len(own)} orphan entr(ies), "
+        f"{total} allocated bytes = {total / host_ledger.GIB:.2f} GiB freed "
+        f"(apparent {apparent / host_ledger.GIB:.2f} GiB) -> {archive} "
+        f"({manifest}; {foreign} foreign entries untouched)"
+    )
+    return {"swept": own, "bytes_freed": total, "bytes_apparent": apparent,
+            "refused": {}, "archive": archive}
 
 
 def stale_deadman_sweep(log: Log, ports: Sequence[int], dry: bool) -> None:
@@ -1442,6 +1639,11 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
     return w11
 
 
+def measured_record_path() -> str:
+    """The sidecar this line writes its own dormant-image measurements into."""
+    return f"{EVIDENCE_DIR}/{host_ledger.MEASURED_RECORD_NAME}"
+
+
 def choose_host_ledger(
     store_min_gib: float,
     ring_bytes: int,
@@ -1449,6 +1651,7 @@ def choose_host_ledger(
     ring_provenance: str = "",
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
+    record_path: Optional[str] = None,
 ) -> Tuple[host_ledger.Arm, float, List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -1480,6 +1683,12 @@ def choose_host_ledger(
     mi = host_ledger.read_meminfo(meminfo_path)
     cg = host_ledger.read_cgroup(cgroup_root)
     cg_ceiling, cg_ceiling_source = host_ledger.resolve_cg_ceiling(cg, mi["MemTotal"])
+    # fix 8: this line's OWN previous measurements of the dormant image and of
+    # the run-moment residual.  Absent (first boot, or a wiped sidecar) the
+    # ledger prices the named dk7 reading and prints that it is another boot's.
+    record = host_ledger.read_measured_record(
+        measured_record_path() if record_path is None else record_path
+    )
     arm, store_gib, lines = host_ledger.choose(
         mi["MemTotal"],
         mi["MemAvailable"],
@@ -1490,10 +1699,11 @@ def choose_host_ledger(
         cg_current_bytes=cg["current"],
         # fix 6: only the NON-reclaimable part of that reading is charged --
         # page cache is what the kernel hands back instead of killing for.
-        cg_reclaimable_bytes=cg["reclaimable"],
+        reclaimable_bytes=cg["reclaimable"],
         cg_ceiling_bytes=cg_ceiling,
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
+        measured_record=record,
     )
     return arm, store_gib, lines, cg
 
@@ -1769,7 +1979,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.logs = {"front": front_log or "<dry>", "P": f"{base}.P.log", "D": f"{base}.D.log"}
 
     # 1. preflight
-    presence_sweep(log, ns.tag, stamp, dry)
+    state.shm_sweep = shm_residue_sweep(log, ns.tag, stamp, dry)
     stale_deadman_sweep(log, [PORT_FRONT, PORT_P, PORT_D], dry)
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
@@ -1925,10 +2135,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if n_kv < 3 or n_blob < 3:
         raise Weg2LaunchRefused(f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half): P logged kv x{n_kv} blob x{n_blob}, need 3 each")
 
-    # 4d. sleep P, measure D_c(P)
+    # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
+    # This is the one sleep on this box that is NOT interleaved: group D does
+    # not exist yet, so nothing is resuming and freeing an image while P writes
+    # its own.  The cgroup shmem delta and the per-rank RssShmem sum are
+    # therefore comparable here, and the pair is what the next boot's ledger
+    # prices its image term from (BOOT_weg2dk7_0907.md: the weight-tag census
+    # under-charged the measured image by +9.80 GiB).
+    shmem_before = host_ledger.read_cgroup_shmem_bytes()
     state.sleep_p_ms = sleep_group(PORT_P, log, "P", weights_tags)
     time.sleep(2)
     pids_p = session_pids(spec_p.pid)
+    image_rec = host_ledger.dormant_image_sample(
+        group="P",
+        shmem_before_bytes=shmem_before,
+        shmem_after_bytes=host_ledger.read_cgroup_shmem_bytes(),
+        pids=sorted(pids_p),
+        weight_tags_gib=host_ledger.WEIGHT_TAGS_P_BYTES / host_ledger.GIB,
+        interleaved=False,
+        boot_tag=ns.tag,
+        commit=tip,
+    )
+    log(host_ledger.format_dormant_image(image_rec))
+    host_ledger.append_measured_record(measured_record_path(), image_rec)
+    state.dormant_image_p = image_rec
     dc_p = nvml_process_mib(pids_p)
     for c in cards:
         dc_p.setdefault(c.uuid, 0)
@@ -2050,6 +2280,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--weight-chunks", str(chunk_count),
         "--carrier-max-tokens", str(carrier_max_tokens),
         "--src-chunk-cards", json.dumps(src_chunk_cards, sort_keys=True),
+        # fix 8: the front takes the DORMANT-IMAGE sample at each group's first
+        # sleep (P's is already taken above, un-interleaved); it needs the arm
+        # to derive the run-moment residual from its own reading.
+        "--measured-record", measured_record_path(),
+        "--commit", tip,
+        "--ledger-arm", json.dumps(
+            {"s_gb": arm.s_gb, "m_mib": arm.m_mib, "store_gib": store_gib}, sort_keys=True
+        ),
     ]
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -2169,7 +2407,12 @@ class Weg2RingFormUnproven(ring_table.Weg2RingRefused):
 #: this rig therefore exited 1 with a stack trace -- which any wrapper keying on
 #: the exit code reads as a crash rather than as the refusal it is.  A refusal
 #: added to ring_table now inherits this handler instead of needing a line here.
-REFUSALS = (Weg2LaunchRefused, ring_table.Weg2RingRefused, host_ledger.Weg2HostLedgerRefused)
+#: #1233 fix 8: W21 (Weg2HostRunPeakRefused) is a refusal of the SAME standing
+#: as W20 -- an arm whose predicted RUN PEAK is not below the observed reap
+#: point does not boot -- so it joins this tuple instead of growing a second
+#: `except` clause beside the one handler.
+REFUSALS = (Weg2LaunchRefused, ring_table.Weg2RingRefused,
+            host_ledger.Weg2HostLedgerRefused, host_ledger.Weg2HostRunPeakRefused)
 
 
 def cli(argv: Optional[Sequence[str]] = None) -> int:

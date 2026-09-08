@@ -76,11 +76,41 @@ would be the same bytes twice.  :data:`FLIP_HOST_TRANSIENT_GIB` survives as the
 MEASURED DATUM of the old form (it is what A1-3 compares against), never again
 as a term.
 
+FIX 8 (2026-09-08, after boot weg2dk7's Q2 measurement) changes WHERE the image
+term comes from and WHICH quantity picks the arm:
+
+* the IMAGE TERM IS MEASURED, not summed from the weight tags.  weg2dk7 sampled
+  the dormant group's per-rank ``RssShmem`` with P asleep and D awake:
+  **38.63 GiB against the 28.83 GiB this ledger charged**, a +9.80 GiB (+34 %)
+  under-charge on a single image.  The cause is named rather than fitted:
+  everything with ``enable_cpu_backup`` is in the image (draft weights, graph
+  pools, workspaces, embeddings), not only the ``weights_*`` tags the #809
+  census counted.  :func:`resolve_image_terms` takes the previous boot's own
+  measurement when one exists, falls back to that named dk7 reading for P, and
+  REFUSES to claim a smaller image for D than the one measured for P.  ON THE
+  RING that measurement is not charged directly: it is what SIZES H(c), and
+  :func:`price` charges the resulting ``Sigma H`` once.  Same measurement, one
+  charge -- :mod:`sglang.srt.weg2.ring_table` reads this module's sidecar for
+  it, so there is ONE reader of the dormant image on the line;
+* the RUN PEAK IS THE ARM SELECTOR (W21 ``Weg2HostRunPeakRefused``), not an
+  advisory beside it.  Two boots died and one could not flip while the advisory
+  said "below";
+* the ORIGIN of that prediction is the RUN moment, not the launch moment.
+  ``memory.current`` at launch is a FLOOR: weg2dk7 launched into 15.36 GiB, was
+  handed the bigger arm for it, and idled at 90.1-94.6 GiB with an EMPTY store,
+  while weg2dk6 launched into 46.80 GiB, took the smaller arm and died at 96.06.
+  A quieter launch bought the tighter boot -- the selector was anti-correlated
+  with safety.  :func:`run_origin_gib` charges the LARGER of the launch reading
+  and the measured run-moment residual (what the box holds that this ledger's
+  own term list does not name).
+
 The arm ladder (record section 1c B2: "if the ledger refuses at S=2 the
 launcher sizes S=1 and prints why; if it refuses at S=1 the boot REFUSES") is
 extended by the mamba host pool ``M`` in the same spirit: every arm is printed,
 the first fundable one is taken, and a shrink is never silent.  If no arm funds
-the store floor the launch is refused by name (W20 ``Weg2HostLedgerRefused``).
+the store floor the launch is refused by name (W20 ``Weg2HostLedgerRefused``);
+if an arm funds both moments but its predicted run peak is not below the
+observed reap point, the refusal is W21 (:class:`Weg2HostRunPeakRefused`).
 
 USER RULING 2026-09-07 06:2xZ (record section 1g): the canonical page store --
 the ONE carrier -- lives on a RAM-backed filesystem sized by this ledger's
@@ -95,10 +125,13 @@ indicator-law violation the record forbids.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 GIB = float(2**30)
 GB = 1e9
@@ -141,6 +174,44 @@ HEAP_DORMANT_GIB = 2.36
 #: charge the same bytes twice.  It is kept because it is a MEASUREMENT of this
 #: box with its population named, and because it is the figure FLIPCOST A1-3
 #: compares the ring against (image + transient ~48.7 GiB vs Sigma H ~36 GiB).
+
+#: Spec section 2.6, #809 FLIP IMAGE PREFETCH census: PP image 30.96 GB,
+#: TP image 29.15 GB per group.
+#:
+#: FIX 8 RENAME, and the rename IS the finding: these are the WEIGHT-TAG byte
+#: sums, and the dormant image is NOT that.  Boot weg2dk7 measured the sleeping
+#: group's per-rank ``RssShmem`` at 38.63 GiB against the 28.83 GiB this pair
+#: priced -- everything built with ``enable_cpu_backup`` is in the image (draft
+#: weights, cuda-graph pools, workspaces, embeddings), while the census counted
+#: the ``weights_*`` tags alone.  They are KEPT (the derivation is a real
+#: census, not a hand number) and they are no longer CHARGED as the image: they
+#: are the reference the measured ``extra`` term is stated against, so a reader
+#: sees both halves of the correction instead of one replaced number.
+WEIGHT_TAGS_P_BYTES = 30.96 * GB
+WEIGHT_TAGS_D_BYTES = 29.15 * GB
+#: MEASURED, boot weg2dk7 (`/spinning/gpu-arb/weg2/BOOT_weg2dk7_0907.md`, the
+#: attributed quiet rows 00:29:02Z and 00:31:07Z, tip 402a2df856): with group P
+#: ASLEEP and group D AWAKE, the sum of ``RssShmem`` over P's five worker pids
+#: was **38.63 GiB** in both rows.  The same rows carry cgroup ``shmem``
+#: 48.33 GiB of which **44.56 GiB has no backing file** -- torch_memory_saver's
+#: CPU backup is anonymous ``MAP_SHARED``, so ``df``/``du`` on /dev/shm see
+#: nothing and an attribution that looks for the image AS A FILE concludes it is
+#: not resident.  This is the dormant image of a PP group on this checkpoint.
+DK7_DORMANT_IMAGE_P_GIB = 38.63
+#: The same boot's quiet ``memory.current`` (row 00:29:02Z), with the store
+#: tmpfs holding 0.00 GiB of its 9 GiB and ZERO flips run.  Used to derive the
+#: RUN-MOMENT residual below.  The row carries no reclaimable column; charging
+#: the whole reading as non-reclaimable makes the derived residual LARGER, i.e.
+#: the conservative direction, and that is stated rather than assumed.
+DK7_QUIET_CG_CURRENT_GIB = 90.10
+DK7_QUIET_STORE_USED_GIB = 0.00
+#: The arm weg2dk7 actually ran while measuring the two figures above.
+DK7_ARM_S_GB = 1
+DK7_ARM_M_MIB = 1200
+DK7_PROVENANCE = (
+    "BOOT_weg2dk7_0907.md quiet row 2026-09-08T00:29:02Z (boot weg2dk7 @ 402a2df856), "
+    "per-rank RssShmem of the SLEEPING group"
+)
 #:
 #: The old term was ``backup_resident / weight_chunks`` -- "one chunk in flight"
 #: -- a RESIDENCY model of an interleave whose PEAK is both images partially
@@ -279,6 +350,231 @@ class Weg2HostLedgerRefused(RuntimeError):
     """W20: no arm of the ladder funds both moments plus the store floor."""
 
 
+class Weg2HostRunPeakRefused(RuntimeError):
+    """W21 (fix 8): an arm funds both moments, and its RUN PEAK does not.
+
+    The term this class exists for is the one two boots died on while the
+    advisory said "below": the predicted non-reclaimable ``memory.current`` at
+    the run peak against :data:`OBSERVED_REAP_NONRECLAIM_BYTES`.  It is a
+    SEPARATE class from W20 so the log says which quantity refused -- a store
+    floor and a reap watermark are different findings with different levers.
+    """
+
+
+# --------------------------------------------------------------------------
+# FIX 8: the image term, measured
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ImageTerms:
+    """The dormant host image of each group, with WHERE each number came from.
+
+    ``p_measured`` / ``d_measured`` are False for a value that is a recorded
+    reading of ANOTHER boot or a BOUND -- the printed line says so, because a
+    bound that reads like a measurement is exactly how 28.83 GiB survived three
+    boots.
+    """
+
+    p_gib: float
+    d_gib: float
+    p_source: str
+    d_source: str
+    p_measured: bool
+    d_measured: bool
+    extra_p_gib: float
+    extra_d_gib: float
+
+
+def resolve_image_terms(record: Optional[Dict[str, dict]] = None) -> ImageTerms:
+    """The dormant image per group, in the fix-8 precedence order.
+
+    (a) THIS LINE'S OWN PREVIOUS MEASUREMENT -- an entry written by
+        :func:`dormant_image_sample` at that group's first sleep (the launcher
+        for P, the front for D), carrying ``rss_shmem_gib`` plus the commit,
+        the boot tag and the timestamp it was taken at;
+    (b) absent a measurement for P: the named dk7 reading
+        (:data:`DK7_DORMANT_IMAGE_P_GIB`, :data:`DK7_PROVENANCE`);
+    (c) absent a measurement for D: a BOUND, never a claim.  D's dormant image
+        has NEVER been measured (dk7's 6.71 GiB is D AWAKE -- its live host
+        rings and anchors, not a backup), so the ledger refuses to price it
+        below the one image it HAS measured:
+        ``max(image_P, weight_tags_D + extra_P)``.  Both candidates are stated;
+        the ``extra`` term is what the weight-tag census misses, measured once
+        on P and carried to D because the mechanism (every ``enable_cpu_backup``
+        buffer, not only ``weights_*``) is the same on both groups.
+    """
+    wt_p = WEIGHT_TAGS_P_BYTES / GIB
+    wt_d = WEIGHT_TAGS_D_BYTES / GIB
+    rec = record or {}
+    p_entry = rec.get("P") or {}
+    d_entry = rec.get("D") or {}
+    p_meas = p_entry.get("rss_shmem_gib")
+    d_meas = d_entry.get("rss_shmem_gib")
+
+    if p_meas is not None:
+        p_gib = float(p_meas)
+        p_source = (
+            f"MEASURED by this line: boot {p_entry.get('boot_tag', '?')} @ "
+            f"{p_entry.get('commit', '?')} at {p_entry.get('at', '?')} "
+            f"(RssShmem sum of the sleeping group's {len(p_entry.get('pids') or [])} pids)"
+        )
+        p_measured = True
+    else:
+        p_gib = DK7_DORMANT_IMAGE_P_GIB
+        p_source = f"RECORDED MEASUREMENT of another boot: {DK7_PROVENANCE}"
+        p_measured = False
+    extra_p = p_gib - wt_p
+
+    if d_meas is not None:
+        d_gib = float(d_meas)
+        d_source = (
+            f"MEASURED by this line: boot {d_entry.get('boot_tag', '?')} @ "
+            f"{d_entry.get('commit', '?')} at {d_entry.get('at', '?')} "
+            f"(RssShmem sum of the sleeping group's {len(d_entry.get('pids') or [])} pids)"
+        )
+        d_measured = True
+    else:
+        candidate = wt_d + extra_p
+        d_gib = max(p_gib, candidate)
+        d_source = (
+            f"BOUND, NOT A MEASUREMENT: group D's dormant image has never been measured "
+            f"(dk7's 6.71 GiB is D AWAKE -- live host rings and anchors, not a backup). "
+            f"max(measured_P {p_gib:.2f}, weight_tags_D {wt_d:.2f} + extra_P {extra_p:.2f} "
+            f"= {candidate:.2f}) = {max(p_gib, candidate):.2f} GiB -- the ledger will not "
+            f"claim a SMALLER image for D than the one it has measured for P"
+        )
+        d_measured = False
+    return ImageTerms(
+        p_gib=p_gib,
+        d_gib=d_gib,
+        p_source=p_source,
+        d_source=d_source,
+        p_measured=p_measured,
+        d_measured=d_measured,
+        extra_p_gib=extra_p,
+        extra_d_gib=d_gib - wt_d,
+    )
+
+
+def charge_terms(
+    s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms
+) -> Dict[str, float]:
+    """Everything the BOOT ITSELF adds to ``memory.current``, per term.
+
+    One authority for "what this arm charges": :func:`price` builds the arm
+    from it, :meth:`Arm.predicted_run_peak_gib` adds it to the run origin, and
+    :func:`dk7_run_residual_gib` subtracts it from a measured reading.  Three
+    call sites that used to be able to disagree about the same sum.
+
+    The image terms are NOT in here: which image is resident is a property of
+    the MOMENT (launch charges P's, the run moment charges the dormant one),
+    not of the arm.
+    """
+    anchors_gib = (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
+    rings_gib = (RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S) * s_gb * GB / GIB
+    return {
+        "heaps_gib": ranks_per_group * (HEAP_AWAKE_GIB + HEAP_DORMANT_GIB),
+        "anchors_gib": anchors_gib,
+        "rings_gib": rings_gib,
+        "overhead_gib": HOST_POOL_OVERHEAD * (anchors_gib + rings_gib),
+        "draft_host_p_gib": DRAFT_HOST_P_MIB / 1024.0,
+        "draft_host_d_gib": DRAFT_HOST_D_MIB / 1024.0,
+        "image_p_gib": images.p_gib,
+        "image_d_gib": images.d_gib,
+        "weight_tags_p_gib": WEIGHT_TAGS_P_BYTES / GIB,
+        "weight_tags_d_gib": WEIGHT_TAGS_D_BYTES / GIB,
+        "image_extra_p_gib": images.extra_p_gib,
+        "image_extra_d_gib": images.extra_d_gib,
+    }
+
+
+def _boot_charges_gib(terms: Dict[str, float]) -> float:
+    """The sum of the arm's own charges, image and store EXCLUDED."""
+    return (
+        terms["heaps_gib"] + terms["anchors_gib"] + terms["rings_gib"]
+        + terms["overhead_gib"] + terms["draft_host_p_gib"] + terms["draft_host_d_gib"]
+    )
+
+
+def dk7_run_residual_gib() -> float:
+    """What boot weg2dk7 held at the RUN moment that this ledger does not name.
+
+    DERIVED, not a constant: the measured quiet reading
+    (:data:`DK7_QUIET_CG_CURRENT_GIB`) minus everything the ledger charges for
+    the arm that boot ran (:data:`DK7_ARM_S_GB` / :data:`DK7_ARM_M_MIB`), minus
+    the MEASURED image of the dormant group, minus the store's MEASURED content
+    (0.00 GiB -- the store was empty).  No flip transient: zero flips ran.
+
+    What is in it: the two server processes, the front, the launcher, the
+    sampler and every foreign process on the box -- the boot's 13 processes'
+    non-shmem working set beyond the six ranks' heaps this ledger charges, plus
+    whatever else shares the cgroup.  The ledger does not name those terms, so
+    the honest form is to measure the remainder instead of extending the term
+    list with estimates.
+    """
+    images = resolve_image_terms(None)
+    terms = charge_terms(DK7_ARM_S_GB, DK7_ARM_M_MIB, 3, images)
+    return (
+        DK7_QUIET_CG_CURRENT_GIB
+        - _boot_charges_gib(terms)
+        - images.p_gib
+        - DK7_QUIET_STORE_USED_GIB
+    )
+
+
+def run_origin_gib(
+    cg_nonreclaim_gib: Optional[float], record: Optional[Dict[str, dict]] = None
+) -> Tuple[Optional[float], str]:
+    """The origin the RUN PEAK is predicted from, and where it came from.
+
+    THE FIX-8 CORRECTION: the launch-moment reading is a FLOOR, not the origin.
+    Measured on two boots one night apart -- weg2dk6 launched into 46.80 GiB and
+    took M=600, weg2dk7 launched into 15.36 GiB, was handed M=1200 and a 9 GiB
+    store for it, and idled at 90.1-94.6 GiB with the store EMPTY.  The quieter
+    launch bought the tighter boot, because the box at the run moment holds
+    terms that were simply not there yet at the launch moment.
+
+    So the origin is ``max(launch reading, measured run-moment residual)``: a
+    loaded box at launch still charges what it holds, and a quiet box may not
+    buy an arm the run moment cannot carry.  ``None`` (and the reason) when no
+    cgroup sample was passed -- a prediction without an origin is the reading
+    that made weg2dk5 look fundable.
+    """
+    if cg_nonreclaim_gib is None:
+        return None, "no cgroup sample passed -- no origin to add this arm's charges to"
+    residuals = [
+        (float(e["run_residual_gib"]), g, e)
+        for g, e in (record or {}).items()
+        if isinstance(e, dict) and e.get("run_residual_gib") is not None
+    ]
+    if residuals:
+        floor, group, entry = max(residuals, key=lambda r: r[0])
+        floor_src = (
+            f"MEASURED run-moment residual of boot {entry.get('boot_tag', '?')} @ "
+            f"{entry.get('commit', '?')} ({entry.get('at', '?')}, group {group})"
+        )
+    else:
+        floor = dk7_run_residual_gib()
+        floor_src = (
+            f"DERIVED from {DK7_PROVENANCE}: quiet memory.current "
+            f"{DK7_QUIET_CG_CURRENT_GIB:.2f} GiB minus that boot's own charges at "
+            f"S={DK7_ARM_S_GB} M={DK7_ARM_M_MIB} minus the measured image minus the "
+            f"store's measured content {DK7_QUIET_STORE_USED_GIB:.2f} GiB"
+        )
+    if cg_nonreclaim_gib >= floor:
+        return cg_nonreclaim_gib, (
+            f"the launch-moment non-reclaimable reading {cg_nonreclaim_gib:.2f} GiB, which is "
+            f"AT OR ABOVE the run-moment residual floor {floor:.2f} GiB [{floor_src}]"
+        )
+    return floor, (
+        f"the RUN-MOMENT RESIDUAL FLOOR {floor:.2f} GiB [{floor_src}] -- the launch-moment "
+        f"reading {cg_nonreclaim_gib:.2f} GiB is only a floor and a quieter launch does not "
+        f"buy a bigger arm (weg2dk6 46.80 GiB launch -> M=600 -> died at 96.06; weg2dk7 "
+        f"15.36 GiB launch -> M=1200 + 9 GiB store -> 90.1-94.6 GiB at IDLE, store EMPTY)"
+    )
+
+
 @dataclass
 class Arm:
     s_gb: int
@@ -315,15 +611,17 @@ class Arm:
         ``memory.current`` that carries page cache compares an inflated origin
         with :data:`OBSERVED_REAP_NONRECLAIM_BYTES`, a watermark that carries
         almost none -- two different quantities wearing one unit.
+
+        FIX 8: that origin is the RUN-moment one (:func:`run_origin_gib`), and
+        this number now REFUSES arms (W21) instead of advising about them.
         """
-        cg = self.terms.get("cg_nonreclaim_gib")
-        if cg is None:
+        origin = self.terms.get("run_origin_gib")
+        if origin is None:
             return None
         t = self.terms
         return (
-            float(cg)
-            + t["heaps_gib"] + t["anchors_gib"] + t["rings_gib"] + t["overhead_gib"]
-            + t["draft_host_p_gib"] + t["draft_host_d_gib"]
+            float(origin)
+            + _boot_charges_gib(t)
             + t["host_ring_gib"]
             + float(store_gib)
         )
@@ -469,8 +767,9 @@ def price(
     ring_bytes: int = 0,
     ring_span1_bytes: int = 0,
     cg_current_bytes: Optional[int] = None,
-    cg_reclaimable_bytes: Optional[int] = None,
+    reclaimable_bytes: Optional[int] = None,
     cg_ceiling_bytes: Optional[int] = None,
+    measured_record: Optional[Dict[str, dict]] = None,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -497,12 +796,20 @@ def price(
     hermetic caller, or an unreadable cgroup) prices the meminfo arm alone and
     says so in ``base_source`` -- it never invents a ceiling.
 
-    ``cg_reclaimable_bytes`` is fix 6: what of that reading is page cache and
+    ``reclaimable_bytes`` is fix 6: what of that reading is page cache and
     reclaimable slab (:func:`cg_reclaimable_bytes`).  Only ``current`` MINUS
     that is charged, because only that is memory the reaper has to kill for.
     ``None`` means the ``memory.stat`` terms were unreadable: the whole reading
     is then charged -- the conservative direction -- and ``base_source`` names
-    the absence rather than assuming a cache share.
+    the absence rather than assuming a cache share.  (FIX 8 renamed this
+    parameter: it used to be ``cg_reclaimable_bytes`` and SHADOWED the
+    module-level function of that name inside the very scope whose docstring
+    refers to it -- inert, and a loaded gun in the next edit.)
+
+    ``measured_record`` is fix 8: this line's own previously measured dormant
+    images and run-moment residuals (:func:`read_measured_record`).  ``None``
+    prices the named dk7 reading for P and a BOUND for D, and says which is
+    which -- see :func:`resolve_image_terms`.
     """
     if s_gb < 1 or m_mib < 1:
         raise ValueError(f"arm terms must be >= 1: S={s_gb} M={m_mib}")
@@ -536,13 +843,13 @@ def price(
         # microseconds apart, and a stat that momentarily exceeds the reading
         # must not turn into free memory this box never had.
         reclaim = 0
-        if cg_reclaimable_bytes is None:
+        if reclaimable_bytes is None:
             stat_note = (
                 " [memory.stat unreadable: the WHOLE reading is charged, the "
                 "conservative direction]"
             )
         else:
-            reclaim = max(0, min(int(cg_reclaimable_bytes), int(cg_current_bytes)))
+            reclaim = max(0, min(int(reclaimable_bytes), int(cg_current_bytes)))
         cg_nonreclaim_bytes = int(cg_current_bytes) - reclaim
     if cg_nonreclaim_bytes is not None and cg_ceiling_bytes is not None:
         # The CLI reserve is charged here too and for the same reason as on the
@@ -563,31 +870,45 @@ def price(
     else:
         base_gib = base_meminfo_gib
         base_source = "meminfo (min(memavail, memtotal-cli))"
-    heaps_gib = ranks_per_group * (HEAP_AWAKE_GIB + HEAP_DORMANT_GIB)
-    anchors_gib = (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
-    rings_gib = (RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S) * s_gb * GB / GIB
-    overhead_gib = HOST_POOL_OVERHEAD * (anchors_gib + rings_gib)
+    # FIX 8's ONE AUTHORITY for what this arm charges beside the image -- the
+    # same dict predicted_run_peak_gib adds and dk7_run_residual_gib subtracts,
+    # so those three can no longer disagree about the same sum.  The draft tier
+    # is in it: a HOST tier of its own, charged at BOTH moments, allocated at
+    # load and outliving every flip (that is the point of carrying draft KV
+    # across the flip).  It is NOT part of the flip image -- the ring carries
+    # the weights, this carries the draft pages, never the same bytes.
+    images = resolve_image_terms(measured_record)
+    charges = charge_terms(s_gb, m_mib, ranks_per_group, images)
+    heaps_gib = charges["heaps_gib"]
+    anchors_gib = charges["anchors_gib"]
+    rings_gib = charges["rings_gib"]
+    overhead_gib = charges["overhead_gib"]
+    draft_host_p_gib = charges["draft_host_p_gib"]
+    draft_host_d_gib = charges["draft_host_d_gib"]
     host_ring_gib = ring_bytes / GIB
     host_ring_span1_gib = ring_span1_bytes / GIB
-    # #1233: the draft tier is a HOST tier of its own, one budget per group, and
-    # it is charged at BOTH moments -- it is allocated at load and outlives every
-    # flip (that is the point of carrying draft KV across the flip).  It is NOT
-    # part of the flip image: the ring carries the weights, this carries the
-    # draft pages, and the two are never the same bytes.
-    draft_host_p_gib = DRAFT_HOST_P_MIB / 1024.0
-    draft_host_d_gib = DRAFT_HOST_D_MIB / 1024.0
-    common = (
-        base_gib - FLOOR_GIB - heaps_gib - anchors_gib - rings_gib
-        - overhead_gib - draft_host_p_gib - draft_host_d_gib
-    )
+    # THE MEASURED IMAGE IS REPORTED, NOT CHARGED A SECOND TIME (C19 x fix 8).
+    # fix 8's measurement is right and it is what A1-2 rules the image must come
+    # from -- but on the ring it enters through H(c): ring_table sizes each
+    # card's granule from this module's own sidecar and price charges the
+    # resulting Sigma H once.  Charging images.p/d here as well would charge the
+    # same RssShmem bytes twice, which is precisely the double-charge ring fix 1
+    # finding 3 removed.  They stay in the term list because A1-2 requires both
+    # numbers (measured image and weight-tag census) to print.
+    image_p_gib = images.p_gib
+    image_d_gib = images.d_gib
+    common = base_gib - FLOOR_GIB - _boot_charges_gib(charges)
     # R7: at the launch moment only span 1 is registered (P's first pause is the
     # launcher's sleep(P)); span 2 lands at D's first pause, when D's load
     # transient is gone.  Charging Sigma H at launch is what turns the M=1200
     # arm's leftover from +1.05 into -1.93 GiB.
     launch = common - host_ring_span1_gib - LOAD_TRANSIENT_GIB
-    # Sigma H IS the run peak; there is no flip transient beside it (see price's
-    # docstring and FLIPCOST A1-1/A1-3).
+    # Sigma H IS the run peak; there is no flip transient beside it (A1-1/A1-3).
     run = common - host_ring_gib
+    origin_gib, origin_source = run_origin_gib(
+        None if cg_nonreclaim_bytes is None else cg_nonreclaim_bytes / GIB,
+        measured_record,
+    )
     arm = Arm(
         s_gb=s_gb,
         m_mib=m_mib,
@@ -607,8 +928,8 @@ def price(
             None if cg_current_bytes is None else cg_current_bytes / GIB
         ),
         "cg_reclaimable_gib": (
-            None if cg_reclaimable_bytes is None or cg_current_bytes is None
-            else max(0, min(int(cg_reclaimable_bytes), int(cg_current_bytes))) / GIB
+            None if reclaimable_bytes is None or cg_current_bytes is None
+            else max(0, min(int(reclaimable_bytes), int(cg_current_bytes))) / GIB
         ),
         "cg_nonreclaim_gib": (
             None if cg_nonreclaim_bytes is None else cg_nonreclaim_bytes / GIB
@@ -620,6 +941,18 @@ def price(
         "heaps_gib": heaps_gib,
         "host_ring_gib": host_ring_gib,
         "host_ring_span1_gib": host_ring_span1_gib,
+        "image_p_gib": image_p_gib,
+        "image_d_gib": image_d_gib,
+        "image_p_source": images.p_source,
+        "image_d_source": images.d_source,
+        "image_p_measured": images.p_measured,
+        "image_d_measured": images.d_measured,
+        "weight_tags_p_gib": charges["weight_tags_p_gib"],
+        "weight_tags_d_gib": charges["weight_tags_d_gib"],
+        "image_extra_p_gib": images.extra_p_gib,
+        "image_extra_d_gib": images.extra_d_gib,
+        "run_origin_gib": origin_gib,
+        "run_origin_source": origin_source,
         "load_transient_gib": LOAD_TRANSIENT_GIB,
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
@@ -631,6 +964,224 @@ def price(
     arm.launch_leftover_gib = launch
     arm.run_leftover_gib = run
     return arm
+
+
+# --------------------------------------------------------------------------
+# FIX 8: measuring the dormant image instead of summing tags for it
+# --------------------------------------------------------------------------
+
+#: The sidecar this line writes its own measurements into, under the launcher's
+#: log directory.  There was NO such mechanism before fix 8: the fix-5/6/7
+#: constants are literals in this module carrying their boot and timestamp in a
+#: comment, which is honest but cannot close the loop -- a boot could not hand
+#: its successor a number.  The sidecar is that loop, and it stores WHO measured
+#: (commit, boot tag, timestamp), never a bare figure.
+MEASURED_RECORD_NAME = "weg2_measured_record.json"
+
+
+def read_cgroup_shmem_bytes(root: str = "/sys/fs/cgroup") -> Optional[int]:
+    """``memory.stat shmem`` in bytes, or ``None`` when unreadable.
+
+    This is the whole-cgroup figure the dk7 sampler measured 48.33 GiB of, and
+    it equals ``/proc/meminfo Shmem`` to the byte on this box (see
+    :data:`CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF`).
+    """
+    try:
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "shmem" and parts[1].isdigit():
+                    return int(parts[1])
+    except OSError:
+        return None
+    return None
+
+
+def rss_shmem_bytes(pids: Iterable[int]) -> Tuple[int, List[int]]:
+    """Sum ``RssShmem`` over the given pids; return (bytes, the pids that answered).
+
+    ``RssShmem`` is where the TMS CPU backup IS visible: it is anonymous
+    ``MAP_SHARED``, so it has NO backing file and ``df``/``du`` on /dev/shm show
+    nothing (dk7: 44.56 GiB of 48.33 GiB of cgroup shmem had no file).  A pid
+    that has exited between the listing and the read is skipped and NOT counted
+    as zero -- the returned pid list is the denominator of the sum.
+    """
+    total = 0
+    seen: List[int] = []
+    for pid in pids:
+        try:
+            with open(f"/proc/{int(pid)}/status") as f:
+                text = f.read()
+        except OSError:
+            continue
+        m = re.search(r"^RssShmem:\s+(\d+) kB", text, re.M)
+        if m is None:
+            continue
+        total += int(m.group(1)) * 1024
+        seen.append(int(pid))
+    return total, seen
+
+
+def dormant_image_sample(
+    *,
+    group: str,
+    shmem_before_bytes: Optional[int],
+    shmem_after_bytes: Optional[int],
+    pids: Sequence[int],
+    weight_tags_gib: float,
+    interleaved: bool,
+    boot_tag: str,
+    commit: str,
+    at: Optional[str] = None,
+    cg_current_bytes: Optional[int] = None,
+    reclaimable_bytes: Optional[int] = None,
+    store_used_bytes: Optional[int] = None,
+    arm: Optional[Dict[str, float]] = None,
+    ranks_per_group: int = 3,
+) -> Dict[str, object]:
+    """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
+
+    TWO INSTRUMENTS, and they are not interchangeable:
+
+    * ``rss_shmem_gib`` -- the sum of the now-sleeping group's per-rank
+      ``RssShmem``.  This is the AUTHORITY and the term the ledger charges;
+    * ``shmem_delta_gib`` -- the cgroup ``shmem`` delta across the sleep.  A
+      CROSS-CHECK, and ``interleaved`` says when it is confounded: during a
+      flip the destination group is RESUMING (its own image is being freed by
+      the patched saver) while the source sleeps, so the delta is the
+      difference of two images and NOT this group's image.  The launcher's
+      first sleep of P is un-interleaved (D does not exist yet) and there the
+      two instruments are comparable.
+
+    ``run_residual_gib`` is derived only when the caller supplies the full run
+    moment (a cgroup reading, the arm, and the store's measured content):
+    what the box holds that this ledger's term list does not name.  ``None``
+    with a stated reason otherwise -- never 0.
+    """
+    delta = (
+        None
+        if shmem_before_bytes is None or shmem_after_bytes is None
+        else (int(shmem_after_bytes) - int(shmem_before_bytes)) / GIB
+    )
+    rss, seen = rss_shmem_bytes(pids)
+    rss_gib = rss / GIB
+    residual: Optional[float] = None
+    residual_note = ""
+    if cg_current_bytes is None or arm is None or store_used_bytes is None:
+        residual_note = (
+            "not the run moment (need a cgroup reading, the arm and the store's "
+            "measured content); NOT derived, and not 0"
+        )
+    else:
+        reclaim = 0 if reclaimable_bytes is None else max(
+            0, min(int(reclaimable_bytes), int(cg_current_bytes))
+        )
+        nonreclaim_gib = (int(cg_current_bytes) - reclaim) / GIB
+        images = ImageTerms(
+            p_gib=rss_gib, d_gib=rss_gib, p_source="this sample", d_source="this sample",
+            p_measured=True, d_measured=True, extra_p_gib=0.0, extra_d_gib=0.0,
+        )
+        charges = charge_terms(
+            int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images
+        )
+        residual = (
+            nonreclaim_gib
+            - _boot_charges_gib(charges)
+            - rss_gib
+            - int(store_used_bytes) / GIB
+        )
+    return {
+        "group": group,
+        "at": at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "boot_tag": boot_tag,
+        "commit": commit,
+        "shmem_before_bytes": shmem_before_bytes,
+        "shmem_after_bytes": shmem_after_bytes,
+        "shmem_delta_gib": delta,
+        "rss_shmem_gib": rss_gib,
+        "weight_tags_gib": weight_tags_gib,
+        "extra_gib": rss_gib - weight_tags_gib,
+        "pids": seen,
+        "pids_asked": [int(p) for p in pids],
+        "interleaved": bool(interleaved),
+        "cg_current_bytes": cg_current_bytes,
+        "store_used_bytes": store_used_bytes,
+        "arm": arm,
+        "run_residual_gib": residual,
+        "run_residual_note": residual_note,
+    }
+
+
+def format_dormant_image(rec: Dict[str, object]) -> str:
+    """The one log line the next boot's ledger reads its image term from."""
+    delta = rec.get("shmem_delta_gib")
+    return (
+        f"WEG2 DORMANT-IMAGE group={rec['group']} "
+        f"shmem_delta_gib={'unreadable' if delta is None else f'{float(delta):.2f}'} "
+        f"rss_shmem_gib={float(rec['rss_shmem_gib']):.2f} "
+        f"weight_tags_gib={float(rec['weight_tags_gib']):.2f} "
+        f"extra_gib={float(rec['extra_gib']):.2f} "
+        f"(pids {rec['pids']} of {rec['pids_asked']}; "
+        + (
+            "INTERLEAVED: the shmem delta is confounded -- the destination group was "
+            "resuming (freeing its own image) while this one slept, so only "
+            "rss_shmem_gib measures THIS group's image"
+            if rec.get("interleaved")
+            else "un-interleaved: no other group was resuming, so the two instruments "
+            "are comparable"
+        )
+        + "; run_residual_gib="
+        + (
+            f"{float(rec['run_residual_gib']):.2f}"
+            if rec.get("run_residual_gib") is not None
+            else f"none ({rec.get('run_residual_note', '')})"
+        )
+        + f"; boot {rec['boot_tag']} @ {rec['commit']} at {rec['at']})"
+    )
+
+
+def read_measured_record(path: str) -> Dict[str, dict]:
+    """The NEWEST entry per group from the sidecar, or ``{}``.
+
+    A malformed or missing file is an ABSENCE -- the ledger then prices the
+    named dk7 reading and says so -- never a silent zero.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    entries = data.get("samples") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return {}
+    out: Dict[str, dict] = {}
+    for e in entries:
+        if not isinstance(e, dict) or e.get("rss_shmem_gib") is None:
+            continue
+        g = str(e.get("group", ""))
+        if not g:
+            continue
+        if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
+            out[g] = e
+    return out
+
+
+def append_measured_record(path: str, rec: Dict[str, object]) -> None:
+    """Append one sample to the sidecar (append-only: history is evidence)."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        samples = data.get("samples") if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        samples = None
+    if not isinstance(samples, list):
+        samples = []
+    samples.append(rec)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"samples": samples}, f, indent=1, default=str)
+    os.replace(tmp, path)
 
 
 def resolve_cg_ceiling(
@@ -661,6 +1212,53 @@ def _gib_or_none(value: Optional[float]) -> str:
     return "unreadable" if value is None else f"{value:.2f} GiB"
 
 
+def _advisory_line(arm: "Arm", store_gib: float, chosen: bool) -> str:
+    """The RUN-PEAK line, printed for the CHOSEN arm or -- on a total refusal --
+    for the most frugal arm on the ladder.
+
+    FIX 8 prints it in BOTH cases on purpose: everything this line states about
+    the estimator (its residual on three boots, the watermark's own unsampled
+    slab term, the direction of both) is exactly what a reader of a REFUSAL
+    needs, and a refusal is the outcome on this box today.  Emitting it only on
+    success would delete the explanation at the moment it is wanted.
+    """
+    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    predicted = arm.predicted_run_peak_gib(store_gib)
+    subject = "this arm" if chosen else f"the most frugal arm (S={arm.s_gb} M={arm.m_mib})"
+    if predicted is None:
+        return (
+            "WEG2-HOST-LEDGER RUN-PEAK ADVISORY: not computed -- no cgroup sample was "
+            "passed, so there is no origin to add this arm's charges to. An absent "
+            "prediction is stated, never printed as a pass."
+        )
+    verdict = "ABOVE" if predicted > watermark_gib else "below"
+    return (
+        f"WEG2-HOST-LEDGER RUN-PEAK ADVISORY: {subject} predicts non-reclaimable memory.current="
+        f"{predicted:.2f} GiB at the run peak (run origin {_gib_or_none(arm.terms['run_origin_gib'])} "
+        f"[{arm.terms['run_origin_source']}] + heaps + anchors + rings + "
+        f"overhead + draft pools + dormant image + flip_transient + store {store_gib:.0f} "
+        f"GiB; the {FLOOR_GIB:.0f} GiB floor is a reserve and is NOT in this sum), "
+        f"which is {verdict} the OBSERVED REAP POINT {watermark_gib:.2f} GiB "
+        "(boot weg2dk5 21:15:30Z, memory.current 102,998,904,832 B minus the 28,916 kB "
+        "of that row that was still reclaimable, with oom_kill 18 -> 24 in the same row; "
+        "that row has NO slab_reclaimable column, so this watermark is an UPPER bound and "
+        "this verdict UNDER-warns by that unsampled term -- 0.53 GiB live on this box "
+        "2026-09-07T23:57:35Z, 0.73 GiB at the fix-6 reading). "
+        "FIX 8: THIS LINE IS NO LONGER ONLY ADVISORY -- an arm whose predicted peak is "
+        "not below the watermark is REFUSED by name (W21 Weg2HostRunPeakRefused); the "
+        "sentence below is what that refusal is calibrated against. THE RESIDUAL SERIES, "
+        "all three boots side by side: weg2dk5 predicted 92.89 against 95.90 reached "
+        "(3.01 GiB UNDER-prediction); weg2dk6 predicted 91.23 against 96.06 sampled / 98.90 "
+        "kernel peak (4.83 / 7.67 GiB UNDER) and died the same death; weg2dk7 predicted "
+        "91.92 for the RUN peak and measured 90.10-94.57 GiB AT IDLE with an EMPTY store "
+        "and zero flips. dk7 also EXPLAINED that series rather than extending it: the "
+        "dormant image measures 38.63 GiB against the 28.83 GiB the weight-tag census "
+        "priced (+9.80 GiB on ONE image), which covers dk6's 4.83-7.67 GiB under-"
+        "prediction on its own and with no co-residency needed. That term is priced here "
+        "from this boot on, so this residual is the image correction's own test."
+    )
+
+
 def choose(
     memtotal_bytes: int,
     memavail_bytes: int,
@@ -672,10 +1270,11 @@ def choose(
     ring_span1_bytes: int = 0,
     ring_provenance: str = "",
     cg_current_bytes: Optional[int] = None,
-    cg_reclaimable_bytes: Optional[int] = None,
+    reclaimable_bytes: Optional[int] = None,
     cg_ceiling_bytes: Optional[int] = None,
     cg_ceiling_source: str = "",
     cg_oom_kill: Optional[int] = None,
+    measured_record: Optional[Dict[str, dict]] = None,
 ) -> Tuple[Arm, float, List[str]]:
     """Walk the ladder; return (arm, store_gib, printed lines) or raise W20.
 
@@ -702,8 +1301,9 @@ def choose(
             ring_bytes=ring_bytes,
             ring_span1_bytes=ring_span1_bytes,
             cg_current_bytes=cg_current_bytes,
-            cg_reclaimable_bytes=cg_reclaimable_bytes,
+            reclaimable_bytes=reclaimable_bytes,
             cg_ceiling_bytes=cg_ceiling_bytes,
+            measured_record=measured_record,
         )
         for s, m in arms
     ]
@@ -731,6 +1331,20 @@ def choose(
         "it was a compensation constant for this very denominator) "
         f"heaps={t['heaps_gib']:.2f} GiB ({ranks_per_group}x{HEAP_AWAKE_GIB} awake b0 + "
         f"{ranks_per_group}x{HEAP_DORMANT_GIB} dormant campaign (a)) "
+        f"UNPRICED RESIDUAL, named rather than folded in: `(file - shmem)` also credits file "
+        f"pages in the UNEVICTABLE LRU as reclaimable (measured on this box, fix-6 review: "
+        f"cgroup unevictable 16,384 B against /proc/meminfo Mlocked 309,682,176 B = 0.29 GiB) "
+        f"-- sub-GiB today and in the OPTIMISTIC direction, and this design keeps adding "
+        f"pinned host memory, so it is stated here rather than left to be discovered. "
+        f"image_P={t['image_p_gib']:.2f} GiB [{t['image_p_source']}] "
+        f"image_D={t['image_d_gib']:.2f} GiB [{t['image_d_source']}] "
+        f"weight_tags_P={t['weight_tags_p_gib']:.2f} GiB weight_tags_D={t['weight_tags_d_gib']:.2f} GiB "
+        f"(#809 census -- the tag byte sums, NOT the image) extra_P={t['image_extra_p_gib']:.2f} GiB "
+        f"extra_D={t['image_extra_d_gib']:.2f} GiB (#1233 fix 8: everything with enable_cpu_backup "
+        "is in the image -- draft weights, graph pools, workspaces, embeddings -- and boot weg2dk7 "
+        "measured the dormant group at 38.63 GiB against the 28.83 GiB the tag sum priced) "
+        f"run_origin={_gib_or_none(t['run_origin_gib'])} bound by {t['run_origin_source']} "
+        f"(the image terms above SIZE H(c); they are NOT charged here -- the ring is) "
         f"RUN MOMENT = the host weights term {t['host_ring_gib']:.2f} GiB "
         f"(C19; BACKUP_P_BYTES / BACKUP_D_BYTES / chunk_gib are DELETED, not shrunk) "
         f"LAUNCH MOMENT = ring span 1, Sigma image_P = {t['host_ring_span1_gib']:.2f} GiB (R7) + "
@@ -743,24 +1357,81 @@ def choose(
         f"(#1233 pinned draft host pools, both moments) "
         f"store_draft_fraction={STORE_DRAFT_FRACTION:.4f} (2048 of 32768 B per token)"
     )
+    # FIX 6: origin and watermark in ONE currency -- both non-reclaimable.
+    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
     chosen: Optional[Arm] = None
     store_gib = 0.0
+    peak_bound_any = False
     for arm in priced:
         run_store = math.floor(arm.run_leftover_gib) if arm.run_leftover_gib > 0 else 0.0
-        ok = arm.fundable_moments and run_store >= store_min_gib
+        moments_ok = arm.fundable_moments and run_store >= store_min_gib
+        predicted = arm.predicted_run_peak_gib(float(run_store))
+        # FIX 8: the run peak REFUSES.  Two boots died and one could not flip
+        # while this quantity was printed as an advisory beside the arm it had
+        # already condemned.
+        peak_ok = predicted is None or predicted <= watermark_gib
+        binding: List[str] = []
+        if arm.launch_leftover_gib < 0:
+            binding.append(f"launch moment ({arm.launch_leftover_gib:.2f} GiB)")
+        if arm.run_leftover_gib < 0:
+            binding.append(f"run moment ({arm.run_leftover_gib:.2f} GiB)")
+        if run_store < store_min_gib:
+            binding.append(f"store floor ({run_store:.0f} < {store_min_gib:.0f} GiB)")
+        if not peak_ok:
+            binding.append(
+                f"RUN PEAK ({predicted:.2f} > {watermark_gib:.2f} GiB reap point)"
+            )
+        ok = moments_ok and peak_ok
+        if moments_ok and not peak_ok:
+            peak_bound_any = True
         lines.append(
             f"WEG2-HOST-LEDGER ARM S={arm.s_gb} M={arm.m_mib}: "
             f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
             f"overhead={arm.terms['overhead_gib']:.2f} -> "
             f"leftover launch={arm.launch_leftover_gib:.2f} GiB "
             f"run={arm.run_leftover_gib:.2f} GiB store={run_store:.0f} GiB "
-            f"(floor {store_min_gib:.0f}) => {'FUNDABLE' if ok else 'refused'}"
+            f"(floor {store_min_gib:.0f}) run_peak="
+            + ("unreadable (no cgroup sample)" if predicted is None else f"{predicted:.2f} GiB")
+            + f" vs reap {watermark_gib:.2f} GiB => "
+            + ("FUNDABLE" if ok else "refused (binding: " + ", ".join(binding) + ")")
         )
         if ok and chosen is None:
             chosen = arm
             store_gib = float(run_store)
     if chosen is None:
+        # The advisory's explanatory half belongs in the refusal too -- see
+        # :func:`_advisory_line`.  The most frugal arm is the ladder's last.
+        frugal = priced[-1]
+        frugal_store = (
+            math.floor(frugal.run_leftover_gib) if frugal.run_leftover_gib > 0 else 0.0
+        )
+        lines.append(_advisory_line(frugal, float(frugal_store), chosen=False))
         table = "\n".join(lines)
+        # THE HONEST OUTCOME (fix 8): on today's box every arm may refuse, and
+        # that IS the answer for this tree.  No term is shrunk to get an arm
+        # through -- the term that has to move is the flip transient, and it
+        # moves in the ring slice, not here.
+        outcome = (
+            "no arm funds a flip on this host budget; the flip transient is removed by "
+            "the host ring slice (weg2/ring-0907)"
+        )
+        levers = (
+            "The INT8 checkpoint has only the cpu-backup wake path (W4), and the ledger "
+            "will not shrink another term silently. The levers are NAMED so this refusal "
+            "is actionable: lower --store-min-gib to the run leftover the last arm above "
+            f"actually prints, or cut the flip transient itself ({FLIP_HOST_TRANSIENT_GIB:.2f} "
+            "GiB, boot weg2dk5's 10 interleaves) -- shrinking the store tmpfs is NOT a lever, "
+            "its Shmem was flat across the fatal window."
+        )
+        if peak_bound_any:
+            raise Weg2HostRunPeakRefused(
+                "W21 Weg2HostRunPeakRefused: an arm funds both moments and its PREDICTED RUN "
+                f"PEAK is not below the observed reap point {watermark_gib:.2f} GiB "
+                f"(boot weg2dk5 21:15:30Z). {outcome}. The binding term is printed per arm "
+                "below; the image term is now MEASURED (boot weg2dk7: 38.63 GiB dormant "
+                "against the 28.83 GiB the tag census priced) and the origin is the RUN "
+                f"moment, not the launch moment. {levers}\n" + table
+            )
         raise Weg2HostLedgerRefused(
             "W20 Weg2HostLedgerRefused: no arm of the ladder funds both moments "
             f"plus a {store_min_gib:.0f} GiB store floor on this box "
@@ -768,11 +1439,7 @@ def choose(
             f"moment, span 1 = {priced[0].terms['host_ring_span1_gib']:.2f} GiB at the launch "
             f"moment; {ring_provenance or 'no provenance passed'}). "
             "The INT8 checkpoint has only the cpu-backup wake path (W4), and "
-            "the ledger will not shrink another term silently. The two levers are "
-            "NAMED so this refusal is actionable: lower --store-min-gib to the run "
-            "leftover the last arm above actually prints, or cut Sigma H itself "
-            "(the per-card host ring table, ring_table.solve) -- shrinking the store "
-            "tmpfs is NOT a lever, its Shmem was flat across the fatal window.\n"
+            f"the ledger will not shrink another term silently. {outcome}. {levers}\n"
             + table
         )
     lines.append(
@@ -784,38 +1451,7 @@ def choose(
         "above; expectation from the operator (record 1g) was ~20 GiB without the "
         f"heap term ({chosen.terms['heaps_gib']:.2f} GiB measured)"
     )
-    predicted = chosen.predicted_run_peak_gib(store_gib)
-    # FIX 6: origin and watermark in ONE currency -- both non-reclaimable.
-    watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
-    if predicted is None:
-        lines.append(
-            "WEG2-HOST-LEDGER RUN-PEAK ADVISORY: not computed -- no cgroup sample was "
-            "passed, so there is no origin to add this arm's charges to. An absent "
-            "prediction is stated, never printed as a pass."
-        )
-    else:
-        verdict = "ABOVE" if predicted > watermark_gib else "below"
-        lines.append(
-            "WEG2-HOST-LEDGER RUN-PEAK ADVISORY: this arm predicts non-reclaimable memory.current="
-            f"{predicted:.2f} GiB at the run peak (non-reclaimable cg_current now "
-            f"{_gib_or_none(chosen.terms['cg_nonreclaim_gib'])} + heaps + anchors + rings + "
-            f"overhead + draft pools + dormant image + flip_transient + store {store_gib:.0f} "
-            f"GiB; the {FLOOR_GIB:.0f} GiB floor is a reserve and is NOT in this sum), "
-            f"which is {verdict} the OBSERVED REAP POINT {watermark_gib:.2f} GiB "
-            "(boot weg2dk5 21:15:30Z, memory.current 102,998,904,832 B minus the 28,916 kB "
-            "of that row that was still reclaimable, with oom_kill 18 -> 24 in the same row; "
-            "that row has NO slab_reclaimable column, so this watermark is an UPPER bound and "
-            "this verdict UNDER-warns by that unsampled term -- 0.53 GiB live on this box "
-            "2026-09-07T23:57:35Z, 0.73 GiB at the fix-6 reading). "
-            "ADVISORY, not a refusal: one boot's death is a watermark and this cgroup "
-            "publishes no finite memory.max to check against. WHAT THIS LINE IS WORTH, "
-            "stated rather than implied: priced in the fix-6 currency, weg2dk5's own arm "
-            "(S=1 M=1200 store=9 at its own launch readings) predicts 92.89 GiB against the "
-            "95.90 GiB it reached -- a 3.01 GiB UNDER-prediction, so this line would have "
-            "called that boot 'below' and it died anyway. It is a ~3 % estimator of the run "
-            "peak, not a margin; the refusal that moved on fix 6 is the STORE FLOOR, and "
-            "that 3.01 GiB residual is the next boot's memts series to close."
-        )
+    lines.append(_advisory_line(chosen, store_gib, chosen=True))
     return chosen, store_gib, lines
 
 
@@ -829,6 +1465,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--ring-span1-bytes", type=int, default=0, help="Sigma image_P")
     ap.add_argument("--ring-provenance", default="")
     ap.add_argument("--cgroup", default="/sys/fs/cgroup")
+    ap.add_argument("--weight-chunks", type=int, default=0)
+    ap.add_argument("--measured-record", default="")
     ns = ap.parse_args(argv)
     mi = read_meminfo(ns.meminfo)
     cg = read_cgroup(ns.cgroup)
@@ -842,12 +1480,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ring_span1_bytes=ns.ring_span1_bytes,
             ring_provenance=ns.ring_provenance,
             cg_current_bytes=cg["current"],
-            cg_reclaimable_bytes=cg["reclaimable"],
+            reclaimable_bytes=cg["reclaimable"],
             cg_ceiling_bytes=ceiling,
             cg_ceiling_source=ceiling_source,
             cg_oom_kill=cg["oom_kill"],
+            measured_record=read_measured_record(ns.measured_record) if ns.measured_record else None,
         )
-    except Weg2HostLedgerRefused as e:
+    except (Weg2HostLedgerRefused, Weg2HostRunPeakRefused) as e:
         print(str(e))
         return 2
     print("\n".join(lines))
