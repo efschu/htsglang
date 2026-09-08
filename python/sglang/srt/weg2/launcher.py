@@ -1219,6 +1219,7 @@ def argv_d(
     num_continuous_decode_steps: int = 1,
     disable_overlap: bool = False,
     tp_ratio_flags: Sequence[str] = ("--rank-tp-ratio", "auto"),
+    token_vector_flags: Sequence[str] = (),
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
@@ -1276,7 +1277,15 @@ def argv_d(
         "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
         "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
         "--uneven-dcp", "--uneven-dcp-weighted",
-        "--uneven-token-vector", "29,19,16", "--uneven-token-vector-role", "seed",
+    ] + list(token_vector_flags) + [
+        # NO TOKEN VECTOR BY DEFAULT (#1032). What stood here was
+        # `--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`, the
+        # emitted value of RETRACTED investigation #602. See
+        # RETRACTED_SEED_VECTOR_1032 for what boot weg2rg6 measured the runtime
+        # doing with it (superseding it to 17,7,8, every rank, every boot) and
+        # for why "the install landed" is a reason to stop shipping it rather
+        # than a reason it was harmless. An operator vector arrives through
+        # d_token_vector_decision, which refuses a retracted one BY TICKET.
         # #1234 C1 -- dcp:0 goes 24 -> 40 MiB. MEASURED, and this one
         # number is the whole regression fix.
         #
@@ -2814,6 +2823,155 @@ def d_tp_ratio_decision(
     )
 
 
+@dataclass(frozen=True)
+class DTokenVectorDecision:
+    """Group D's KV-token ownership vector: what is shipped, and why."""
+
+    flags: Tuple[str, ...]
+    line: str
+
+
+#: #1032 THE VECTOR THIS LAUNCHER MUST NEVER SHIP AGAIN, and the boot that
+#: showed what the runtime does with it.
+#:
+#: ``--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`` sat on
+#: group D's argv. 29,19,16 is the emitted value of RETRACTED investigation
+#: #602 (planner/retracted.py REGISTER), so every Weg-2 boot printed the #797
+#: PROVENANCE warning and then spent a supersession undoing it.
+#:
+#: WHAT THE LOG ACTUALLY SHOWS, because the fix must not be justified against
+#: a claim the evidence refutes (boot weg2rg6, D log
+#: /spinning/evidence-665-f1/boot_weg2_weg2rg6_7f88b1c75d_0908_070324.D.log):
+#: the seed did NOT reach the pools. All three "Uneven-DCP token sizing" lines
+#: read ratios 17 / 7 / 8, i.e. partition_units(64, measured P_r) gcd-reduced
+#: from the measured per-rank capacities 364718 / 154980 / 170464; `vector [29`
+#: does not appear on a single sizing line. The install LANDED and superseded
+#: the seed, exactly as role='seed' promises.
+#:
+#: SO THE DEFECT IS NOT "D SERVED ON THE RETRACTED SPLIT" -- it is that a
+#: retracted lineage was shipped at all, and that the runtime spends a
+#: supersession every boot undoing a number the launcher had no business
+#: stating. Normalised to one sum, the seed 29,19,16 against the measured
+#: 34,14,16 is +17 % on rank 0 and -26 % on rank 1: had the install NOT landed,
+#: that is the split D would have served.
+#:
+#: The fix is therefore to state nothing. With no vector on the argv the
+#: runtime derives its own starting point from THIS boot's budgets
+#: (distributed/utils.py:1135, partition_units(64, budget-minus-checkpoint))
+#: and the measured install replaces it after profiling -- the same install
+#: that already ran, now without withdrawn evidence upstream of it.
+#:
+#: WHAT IS GIVEN UP, named rather than left to be discovered: no seed means
+#: nothing arms ``note_seed_awaiting_supersession``, so the
+#: assert_seed_superseded gate does not hold this boot to an install. That
+#: gate exists because a SEED carries foreign lineage; the budget-derived
+#: fallback carries this boot's own numbers, so an install that does not
+#: happen leaves D on its own honest estimate rather than on a withdrawn one.
+#: (And the gate's disarm keys on the VERDICT boolean, not on a changed vector
+#: -- distributed/utils.py:306 says so in its own docstring -- so "the gate did
+#: not fire" was never proof of an install either. The sizing lines are.)
+RETRACTED_SEED_VECTOR_1032 = (29, 19, 16)
+
+
+def d_token_vector_decision(
+    vector: Optional[str],
+    role: str,
+    provenance: Optional[str],
+) -> DTokenVectorDecision:
+    """Group D's token-vector argv, and the refusal that keeps #602 out.
+
+    Default (``vector`` unset): NOTHING is shipped. The line says which branch
+    the boot is on and where the vector will come from instead.
+
+    Operator-supplied: the value is checked against the runtime's OWN
+    retraction register (``planner.retracted.find_retracted_token_vector``, the
+    same authority ``_refuse_retracted_token_vector`` uses) BEFORE the window
+    is spent. The runtime refuses a retracted PIN and only warns about a
+    retracted SEED, because at that point a seed is still going to be
+    superseded; here neither is accepted, because a launcher that types a
+    retracted number has already made the mistake the register exists to
+    catch, and the desk is the cheap place to say so.
+    """
+    role = str(role or "pin")
+    if not vector:
+        return DTokenVectorDecision(
+            flags=(),
+            line=(
+                "WEG2 D-TOKEN-VECTOR: none shipped (default). Group D derives "
+                "its own starting vector from THIS boot's budgets "
+                "(distributed/utils.py:1135) and replaces it with the MEASURED "
+                "per-rank optimum after profiling -- the 'Uneven-DCP token "
+                "sizing' lines are that install. The retracted #602 seed "
+                "%s this launcher used to ship is GONE (#1032): boot weg2rg6 "
+                "showed the runtime superseding it to 17,7,8 every time, so "
+                "the only thing it bought was a #797 PROVENANCE warning and a "
+                "supersession. Nothing arms assert_seed_superseded now, which "
+                "is the point: with no seed there is no foreign lineage to "
+                "hold a boot to."
+                % (",".join(str(v) for v in RETRACTED_SEED_VECTOR_1032),)
+            ),
+        )
+
+    try:
+        parsed = [int(x) for x in str(vector).split(",") if x.strip() != ""]
+    except ValueError:
+        raise Weg2LaunchRefused(
+            "W46 Weg2TokenVectorRefused: --d-uneven-token-vector %r is not a "
+            "comma-separated integer vector." % (vector,)
+        )
+    if not parsed or any(v <= 0 for v in parsed):
+        raise Weg2LaunchRefused(
+            "W46 Weg2TokenVectorRefused: --d-uneven-token-vector %r must be "
+            "positive integers, one per DCP rank." % (vector,)
+        )
+
+    from sglang.srt.planner.retracted import (
+        find_retracted_token_vector,
+        token_vector_refusal_text,
+    )
+
+    entry = find_retracted_token_vector(parsed, provenance)
+    if entry is not None:
+        raise Weg2LaunchRefused(
+            "W46 Weg2TokenVectorRefused: "
+            + token_vector_refusal_text(
+                entry,
+                parsed,
+                "the Weg-2 launcher refuses to ship it in EITHER role. The "
+                "runtime warns about a retracted role='seed' and refuses only "
+                "a 'pin' (distributed/utils.py:704); this launcher refuses "
+                "both, because a boot window is the expensive place to learn "
+                "that a number was withdrawn",
+            )
+        )
+
+    flags = (
+        "--uneven-token-vector",
+        ",".join(str(v) for v in parsed),
+        "--uneven-token-vector-role",
+        role,
+    )
+    if provenance:
+        flags = flags + ("--uneven-token-vector-provenance", str(provenance))
+    return DTokenVectorDecision(
+        flags=flags,
+        line=(
+            "WEG2 D-TOKEN-VECTOR: %s role=%s provenance=%s -- OPERATOR "
+            "ADVISORY, checked against planner.retracted's register at the "
+            "desk and not found withdrawn. role='seed' still promises "
+            "supersession by this boot's measured per-rank capacity; 'pin' "
+            "asserts the value against that measurement. Default is to ship "
+            "nothing at all."
+            % (
+                ",".join(str(v) for v in parsed),
+                role,
+                provenance or "(undeclared -- the value match is what caught "
+                "#602, so state it if you know it)",
+            )
+        ),
+    )
+
+
 #: The one line ``read_pp_bubble`` understands, emitted per window per rank by
 #: ``scheduler_components/pp_bubble.py:summary_line``. Anchored on the whole
 #: field name including its ``=``: a bare number would match milliseconds
@@ -4126,6 +4284,40 @@ def build_parser() -> argparse.ArgumentParser:
              "larger one at depth.",
     )
     ap.add_argument(
+        "--d-uneven-token-vector", default=None,
+        help="#1032. Group D's KV-token ownership vector, e.g. '17,7,8'. "
+             "UNSET IS THE DEFAULT AND THE RIGHT ANSWER: group D derives its "
+             "own starting vector from this boot's budgets and replaces it "
+             "with the measured per-rank optimum after profiling, which is "
+             "what the 'Uneven-DCP token sizing' lines are. This launcher used "
+             "to ship 29,19,16 as a seed -- the emitted value of RETRACTED "
+             "investigation #602 -- and boot weg2rg6 measured the runtime "
+             "superseding it to 17,7,8 on all three ranks, so the seed bought "
+             "a #797 warning and nothing else. A value passed here is checked "
+             "against planner.retracted's register BEFORE the boot: a "
+             "withdrawn vector is a W46 refusal naming its ticket, in EITHER "
+             "role, which is stricter than the runtime (it refuses only a "
+             "retracted 'pin').",
+    )
+    ap.add_argument(
+        "--d-uneven-token-vector-role", choices=["seed", "pin"], default="pin",
+        help="Role of --d-uneven-token-vector. 'pin' (default here) asserts "
+             "the value against the runtime's own measurement; 'seed' declares "
+             "it provisional and promises supersession in-process. The default "
+             "is 'pin' deliberately: an operator who types a vector is "
+             "asserting it, and a 'seed' default would re-create the shape "
+             "#1032 removed -- a number nobody stands behind riding along "
+             "because its role made it look harmless.",
+    )
+    ap.add_argument(
+        "--d-uneven-token-vector-provenance", default=None,
+        help="WHERE --d-uneven-token-vector came from (#797): the "
+             "investigation, task id or tool. Declaring a lineage that is not "
+             "retracted does NOT switch off the value match here -- #900's "
+             "lesson, and the value match is what caught the shipped 29,19,16 "
+             "in the first place.",
+    )
+    ap.add_argument(
         "--d-disable-overlap-schedule", action="store_true",
         help="Put --disable-overlap-schedule back on group D. The escape "
              "hatch for a server_args gate that refuses overlap under D's "
@@ -4155,6 +4347,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # BEFORE build_env(), which starts from os.environ: an inherited stage map
     # would reach group P's ranks without passing through the solver at all.
     refuse_inherited_layer_set(os.environ)
+    # #1032 RESOLVED HERE, BEFORE THE SWEEPS, THE STORE AND ANY LAUNCH: a
+    # retracted token vector is a desk fact, and the whole point of W46 is that
+    # it must not cost a boot window -- nor a mount, nor an shm sweep -- to
+    # discover. Same reason refuse_inherited_layer_set sits one line above.
+    d_tokvec = d_token_vector_decision(
+        ns.d_uneven_token_vector,
+        ns.d_uneven_token_vector_role,
+        ns.d_uneven_token_vector_provenance,
+    )
 
     tree = os.path.abspath(ns.tree)
     tip = subprocess.run(["git", "-C", tree, "rev-parse", "--short=10", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -4455,8 +4656,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
         )
         log(d_ratio.line)
+        log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -4518,8 +4720,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
     )
     log(d_ratio.line)
+    log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid

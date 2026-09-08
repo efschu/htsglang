@@ -105,3 +105,56 @@ class TestDWeightObjective1017(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTokenVector1032(unittest.TestCase):
+    """#1032/#797: the retracted #602 seed leaves the argv, and stays out."""
+
+    def test_default_argv_ships_no_token_vector_at_all(self):
+        argv = argv_d("py", MODEL, BUDGETS, 8, 1024, 8.0, [])
+        self.assertNotIn("--uneven-token-vector", argv)
+        self.assertNotIn("--uneven-token-vector-role", argv)
+        self.assertNotIn("29,19,16", argv)
+        # the uneven-DCP path itself is unchanged: only the vector left.
+        self.assertIn("--uneven-dcp", argv)
+        self.assertIn("--uneven-dcp-weighted", argv)
+
+    def test_default_line_names_the_branch_and_what_it_gives_up(self):
+        line = d_token_vector_decision(None, "pin", None).line
+        self.assertIn("none shipped", line)
+        self.assertIn("assert_seed_superseded", line)
+        self.assertIn("17,7,8", line)
+
+    def test_retracted_vector_is_refused_by_ticket_in_either_role(self):
+        for role in ("seed", "pin"):
+            with self.assertRaises(Weg2LaunchRefused) as ctx:
+                d_token_vector_decision("29,19,16", role, None)
+            text = str(ctx.exception)
+            self.assertIn("W46", text)
+            self.assertIn("#602", text)
+
+    def test_retraction_is_matched_after_gcd_and_despite_a_clean_lineage(self):
+        # 58,38,32 reduces to 29,19,16; a declared non-retracted provenance
+        # must not acquit it (#900).
+        with self.assertRaises(Weg2LaunchRefused) as ctx:
+            d_token_vector_decision("58,38,32", "pin", "planner")
+        self.assertIn("#602", str(ctx.exception))
+
+    def test_a_clean_vector_passes_and_carries_its_provenance(self):
+        got = d_token_vector_decision("17,7,8", "seed", "measured")
+        self.assertEqual(
+            got.flags,
+            (
+                "--uneven-token-vector",
+                "17,7,8",
+                "--uneven-token-vector-role",
+                "seed",
+                "--uneven-token-vector-provenance",
+                "measured",
+            ),
+        )
+
+    def test_operator_role_defaults_to_pin_not_seed(self):
+        ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
+        self.assertIsNone(ns.d_uneven_token_vector)
+        self.assertEqual(ns.d_uneven_token_vector_role, "pin")
