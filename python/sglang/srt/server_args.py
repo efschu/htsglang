@@ -6866,13 +6866,38 @@ class ServerArgs:
     ] = 0.25
 
     def redacted_dict(self) -> dict:
-        """This ServerArgs as a plain dict with every credential replaced.
+        """This ServerArgs as ``dataclasses.asdict`` renders it, credentials
+        replaced and NOTHING ELSE CHANGED.
 
         #1275 fix 3. Use this for anything that SERIALISES ServerArgs -- the
         info endpoints -- because `dataclasses.asdict` does not go through
         `__repr__` and therefore inherits none of its redaction.
+
+        #1275 FIX 4, AND THE BUG WAS MINE. This built the dict with
+        ``dict(vars(self))``, which is NOT the same shape as the
+        ``dataclasses.asdict`` it replaced: ``vars()`` returns every instance
+        attribute (662 on this class) while ``asdict`` returns only the
+        DECLARED FIELDS (661). The one extra is ``model_config``, set in
+        ``__post_init__`` -- and the site I edited said so in a comment I
+        walked straight past: "server_args.model_config is not serializable but
+        should be excluded by asdict".
+
+        So ``/get_server_info`` and ``/server_info`` began handing a live
+        ModelConfig to the encoder and returned HTTP 500 --
+        ``TypeError: 'torch.dtype' object is not iterable`` and
+        ``TypeError: vars() argument must have __dict__ attribute`` -- 7196
+        times on boot weg2sb5d, which took the front's #915 D-pool read down
+        with it (d_pool_read_failed 1130, 1142 requests NOT SERVED) while D
+        itself was healthy.
+
+        THE COERCION WAS NEVER MINE TO DO: ``asdict`` leaves a ``torch.dtype``
+        a ``torch.dtype``, and the CALLERS wrap this in
+        ``msgspec_to_builtins``, which is what renders it. Reproducing that
+        coercion here would be a second encoder that drifts from the first.
+        The fix is to hand the callers exactly the shape they had before --
+        ``asdict``, with only the classified VALUES replaced.
         """
-        out = dict(vars(self))
+        out = dataclasses.asdict(self)
         for name in list(out):
             if is_secret_field(name) and out[name] is not None:
                 out[name] = REDACTED
