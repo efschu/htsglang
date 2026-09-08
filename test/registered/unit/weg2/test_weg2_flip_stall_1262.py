@@ -148,7 +148,16 @@ class TestItFiresAtTheBoundAndNotBefore1262(CustomTestCase):
         self.assertIn("WEG2-FLIP STALL epoch=3", line)
         self.assertIn("elapsed=418.0 s", line)
         self.assertIn("bound=120.0 s", line)
-        self.assertIn("stage=gathered-legs", line)
+        # #1264 fix 2b (1): this assertion used to read `stage=gathered-legs`,
+        # and that spelling was the defect, not a detail of it. `_flip_stage`
+        # names the last stage ENTERED, and on boot weg2t2b the line reported
+        # `stage=sleep-kv` about a stage that had COMPLETED 123 s earlier under
+        # a dead controller -- which is what sent the triage to the HiCache
+        # drain instead of to the front. The field now says what it knows and
+        # carries the age that makes it checkable.
+        self.assertIn("stage_last_known=gathered-legs", line)
+        self.assertRegex(line, r"age_s=(\d+\.\d|unknown)")
+        self.assertNotRegex(line, r"(^|\s)stage=")
         self.assertIn("bound provenance:", line)
 
     def test_the_deadmans_anchor_matches_the_line_the_front_writes(self):

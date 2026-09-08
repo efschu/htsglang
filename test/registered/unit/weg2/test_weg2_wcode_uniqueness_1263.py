@@ -171,6 +171,24 @@ class TestOneWCodePerException(CustomTestCase):
             front.x_refusal_marker_in("... W47 Weg2TpPrefillExceeded ...")
         )
 
+    def test_w4_is_the_wake_refusal_alone(self):
+        """Train2 fix 2 introduced ``W4 Weg2WakeRefused`` across three modules
+        (weight_updater, front, weg2_memory_saver).
+
+        W4 was FREE among Weg2 names before it -- the other ``W4`` tokens on
+        this tree are quantization scheme names (``W4A8``) and PP-obligation
+        prose, neither of which this census can match, because the pattern is
+        ``W<nn> Weg2<Name>`` and not the bare number. That distinction is the
+        whole reason a bare ticket/code number is never a usable grep pattern.
+        """
+        c = census()
+        self.assertIn("W4", c, "the wake refusal must be found by the census")
+        self.assertEqual(set(c["W4"]), {"Weg2WakeRefused"})
+        # It is raised from more than one module, and that is the point of
+        # keying the census on the whole surface rather than one file.
+        files = {loc.split(":")[0] for loc in c["W4"]["Weg2WakeRefused"]}
+        self.assertGreaterEqual(len(files), 2, sorted(files))
+
     def test_the_chosen_number_was_free_and_the_free_ones_are_named(self):
         """W50 is not 'the next one': it is the first free number above the
         highest assigned code, and the census can say which others are free."""

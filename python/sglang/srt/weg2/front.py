@@ -465,6 +465,98 @@ def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
     return "rank idle, front still holds requests"
 
 
+def flip_stage_report(stage: str, age_s: Optional[float]) -> str:
+    """``stage_last_known=<stage> age_s=<n>`` -- NEVER a bare ``stage=``.
+
+    #1264 fix 2b (1).  The weg2t2b stall line said ``stage=sleep-kv`` at
+    12:45:07Z about a stage that had COMPLETED at 12:43:04Z (D logged
+    ``WEG2-DORMANT set`` and the RPC returned 200) and a controller that had
+    been dead since 12:43:04,131Z.  ``_flip_stage`` is only advanced at the
+    NEXT stage, so after an escape it names the last stage ENTERED, not the
+    stage running -- and the bare ``stage=`` spelling asserted the second.
+    That one word sent the triage two minutes and one whole boot analysis down
+    the HiCache drain, which was a consequence and not the cause.
+
+    So the name carries the epistemics: ``stage_last_known`` says "this is the
+    last stage that was entered", and ``age_s`` is what makes it checkable --
+    an age far larger than any stage's plausible duration IS the signal that
+    nothing is advancing it.  On weg2t2b this would have read
+    ``stage_last_known=sleep-kv age_s=123.1``, against a sleep RPC that had
+    answered in 0.6 s.
+
+    ``age_s`` is ``None`` only when no stage was ever stamped; it prints
+    ``unknown`` rather than a zero, because a zero here reads as "just now".
+    """
+    age = "unknown" if age_s is None else f"{age_s:.1f}"
+    return f"stage_last_known={stage} age_s={age}"
+
+
+def controller_dead_line(
+    epoch: int, stage: str, age_s: Optional[float], exc: BaseException
+) -> str:
+    """The one line a controller death must produce, at the moment it dies.
+
+    #1264 fix 2b (2).  On weg2t2b the death produced ``controller error:
+    cannot unpack non-iterable CardFree object`` -- a generic handler message
+    with no marker, no stage and no verdict -- and the loop continued into an
+    idle ``serving`` check forever.  Only the 4x stall timer spoke, 123.7 s
+    later, and it spoke about the wrong thing.  A tool is built only when it is
+    wired: this line is the deadman's tier-3 pattern (boot_deadman.sh), so the
+    death is a VERDICT within one poll instead of a log entry someone reads
+    afterwards.
+
+    Pure, so both the wording and the deadman's pattern can be tested against
+    the same string without a front, a socket or a boot.
+    """
+    return (
+        f"WEG2-FLIP CONTROLLER-DEAD epoch={epoch} "
+        f"{flip_stage_report(stage, age_s)} exc={type(exc).__name__} "
+        f"-- the controller loop raised while a flip was OPEN, so the flip took "
+        f"none of its named exits and `state` stays 'flipping'; the loop's own "
+        f"guard then skips every later iteration. VRAM occupancy is undefined "
+        f"on both groups. No retry; recovery = teardown + relaunch"
+    )
+
+
+def flip_escape_verdict(
+    state: str, stage: str, epoch: int, exc: BaseException
+) -> Optional[Tuple[str, str]]:
+    """``(W-code, detail)`` when an exception escaped an OPEN flip, else None.
+
+    #1264 (A).  ``Weg2Front.flip`` sets ``state="flipping"`` as its first
+    statement and clears it only on its NAMED exits (W1 refusal, W3 witness
+    disagreement, W4 RPC failure, W19, success).  An unexpected exception
+    escapes past every one of them, and the controller's ``except Exception``
+    used to log it and ``continue`` -- but the loop's own first statement is
+    ``if self.state != "serving": continue``, so "continue" means the front
+    does nothing for the rest of the boot while ``/health`` keeps answering
+    200.  Measured weg2t2b (2026-09-08): a ``TypeError`` at 12:43:04,131Z, 0.6 s
+    after ``WEG2-FLIP begin``, and the front never flipped again; weg2t2a held
+    the same shape for seven minutes.
+
+    An exception that escaped mid-flip is not a recoverable error.  The source's
+    kv_cache (and possibly part of its weights family) is paused and the
+    destination is not resumed, so VRAM occupancy is undefined on both groups --
+    exactly the state W4 already names when an RPC fails at the same point.  So
+    the verdict is W4, and the STAGE is carried because it is what says how far
+    the flip got.
+
+    Pure so it can be tested without a front, a session or an event loop: the
+    caller does the stopping.
+    """
+    if state != "flipping":
+        return None
+    return (
+        "W4 Weg2WakeRefused",
+        f"unhandled {type(exc).__name__} during the flip of epoch {epoch} at "
+        f"stage {stage!r}: {exc} -- the flip neither completed nor took one of "
+        f"its named exits, so VRAM occupancy is undefined on both groups and "
+        f"the front would otherwise sit in state='flipping' forever (the "
+        f"controller's own guard skips every iteration while it is not "
+        f"'serving'). No retry; recovery = teardown + relaunch",
+    )
+
+
 def health_is_serving_fact(http_200: bool, process_alive: bool) -> bool:
     """W17: an HTTP 200 is a transport fact; liveness needs the process too."""
     return bool(http_200 and process_alive)
@@ -851,7 +943,11 @@ class Front:
         # measured cost of every completed flip -- so the third signal lives
         # here, in the one process that knows a flip began and has not ended.
         self._flip_t0: Optional[float] = None
-        self._flip_stage: str = "none"
+        #: #1264 fix 2b (1): the stage's VALUE and the monotonic instant it was
+        #: assigned, always written together -- see the `_flip_stage` property.
+        self._flip_stage_value: str = "none"
+        self._flip_stage_t: float = time.monotonic()
+        self._flip_stage = "none"
         #: the epoch a STALL line has already been emitted for; -1 = none, so
         #: it can never collide with a real epoch (which starts at 0). One
         #: line per flip: a repeating alarm is a monitor, and persistent
@@ -1327,6 +1423,38 @@ class Front:
                 t.cancel()
         if self.session:
             await self.session.close()
+
+    # ------------------------------------------------------------------
+    # #1264 fix 2b (1): the stage carries its own timestamp, STRUCTURALLY.
+    #
+    # A property rather than "remember to stamp it at each assignment": there
+    # are seven assignment sites today and the next stage anyone inserts would
+    # otherwise ship unstamped, which is the same shape as the defect -- an
+    # instrument that quietly reports a stale value as a current one. Written
+    # through the setter, the two can never disagree, and `age_s` is a fact
+    # about the WRITE, not about whoever remembered to record one.
+    # ------------------------------------------------------------------
+    @property
+    def _flip_stage(self) -> str:
+        return self._flip_stage_value
+
+    @_flip_stage.setter
+    def _flip_stage(self, stage: str) -> None:
+        self._flip_stage_value = stage
+        self._flip_stage_t = time.monotonic()
+
+    def flip_stage_age_s(self, now: Optional[float] = None) -> Optional[float]:
+        """Seconds since the last stage assignment, on the MONOTONIC clock.
+
+        Monotonic because this is a duration and the wall clock can step; the
+        stall line's own `elapsed` uses `time.time()` for a different reason
+        (it is compared against the flip's start, which the flip log records in
+        wall time). ``None`` when nothing was ever stamped.
+        """
+        t = getattr(self, "_flip_stage_t", None)
+        if t is None:
+            return None
+        return (time.monotonic() if now is None else now) - t
 
     def do_stop(self, name: str, detail: str) -> None:
         if self.state == "STOP":
@@ -2337,7 +2465,24 @@ class Front:
         #
         # The free sample is taken HERE, after the source's kv_cache is already
         # released, so it is the state the flip actually starts from.
-        free_mib = {idx: free for idx, _uuid, free in _nvml_free()}
+        # #1264 (A), THE weg2t2b KILLER, and it is a READER bug not a producer
+        # one: `_nvml_free()` returns `CardFree` FROZEN DATACLASSES, which are
+        # not iterable, so unpacking one as `idx, _uuid, free` raises
+        # `TypeError: cannot unpack non-iterable CardFree object`.  Measured
+        # boot weg2t2b 2026-09-08 12:43:04,131Z, 0.6 s after `WEG2-FLIP begin`
+        # and immediately after D's kv sleep RPC returned 200 -- the controller
+        # caught it, `_flip_stage` was still "sleep-kv", and the front sat in
+        # state="flipping" for the rest of the boot (see the handler in
+        # `controller` for the second half of this fix).
+        #
+        # The two readers of this producer diverged at a MERGE, not in one
+        # edit: `1a1247f8e6` (2026-09-07) added this line against the old
+        # 3-tuple shape while `02d9811adb` (2026-09-08) changed the producer to
+        # `CardFree` and migrated the OTHER reader (`corridor_sample`, which
+        # uses attribute access).  Neither branch was wrong alone.  Attribute
+        # access is now the ONE shape both readers use, so a further field on
+        # `CardFree` cannot break either.
+        free_mib = {c.nvml_index: c.free_mib for c in _nvml_free()}
         pause_order, why = interleave_pause_order(
             self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib
         )
@@ -2781,7 +2926,47 @@ class Front:
             except Weg2Stop as e:
                 self.do_stop(e.name, e.detail)
             except Exception as e:  # noqa: BLE001
-                logger.exception("controller error: %s", e)
+                # #1264 (A), THE CLASS behind the weg2t2b wedge -- the one-line
+                # TypeError above was only its trigger.  `flip()` sets
+                # `state="flipping"` at its first statement and clears it only
+                # on its NAMED exits; an unexpected exception escapes past every
+                # one of them.  Logging and continuing then leaves the front in
+                # "flipping" FOREVER: the guard at the top of this loop is
+                # `if self.state != "serving": continue`, so the controller
+                # spins doing nothing, the queued request is never dispatched,
+                # and /health keeps answering 200.  Measured weg2t2b: 123.7 s to
+                # the stall line, then teardown; weg2t2a held the same shape for
+                # seven minutes.
+                #
+                # A flip that died mid-way is not a recoverable error, it is the
+                # W4 state the RPC-failure paths already name: the source's
+                # kv_cache (and possibly its weights family) is paused and the
+                # destination is not resumed, so VRAM occupancy is undefined on
+                # both sides and no retry is legal.  So STOP BY NAME at the
+                # stage that was open, and keep the plain log-and-continue only
+                # for errors raised outside a flip, where the front's state
+                # really is intact.
+                verdict = flip_escape_verdict(
+                    self.state, self._flip_stage, self.epoch, e
+                )
+                if verdict is not None:
+                    # #1264 fix 2b (2): THE DEATH IS ITS OWN LINE, and it is
+                    # emitted BEFORE the verdict and before this loop continues.
+                    # `logger.exception` alone carried no marker a watcher could
+                    # match, so on weg2t2b the only thing that ever spoke was the
+                    # 4x stall timer, 123.7 s later and about the wrong stage.
+                    # This line is boot_deadman.sh's tier-3 pattern.
+                    logger.error(
+                        "%s",
+                        controller_dead_line(
+                            self.epoch, self._flip_stage, self.flip_stage_age_s(), e
+                        ),
+                    )
+                    self.counters["controller_dead"] += 1
+                    logger.exception("controller error during flip: %s", e)
+                    self.do_stop(*verdict)
+                else:
+                    logger.exception("controller error: %s", e)
 
     async def health_poller(self) -> None:
         while True:
@@ -2909,7 +3094,9 @@ class Front:
         self._flip_stall_reported_epoch = self.epoch
         line = (
             f"WEG2-FLIP STALL epoch={self.epoch} elapsed={elapsed:.1f} s "
-            f"bound={bound:.1f} s stage={self._flip_stage} awake={self.awake} "
+            f"bound={bound:.1f} s "
+            f"{flip_stage_report(self._flip_stage, self.flip_stage_age_s())} "
+            f"awake={self.awake} "
             f"queue={len(self.queue)} flips={len(self.flip_log)} "
             f"(bound provenance: {provenance}). The flip began and has not "
             f"completed; tier 1 (a process exists) and tier 2 "

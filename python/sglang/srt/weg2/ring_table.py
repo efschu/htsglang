@@ -1436,7 +1436,9 @@ def parse_group_log(path: str) -> GroupLog:
     )
 
 
-def dormant_images(record_path: str) -> Dict[str, DormantImage]:
+def dormant_images(
+    record_path: str, boot_tag: Optional[str] = None
+) -> Dict[str, DormantImage]:
     """``{group: DormantImage}`` from the LINE'S OWN SIDECAR.
 
     ONE READER OF THE DORMANT IMAGE (reconciliation 2026-09-08).  This function
@@ -1466,7 +1468,9 @@ def dormant_images(record_path: str) -> Dict[str, DormantImage]:
     is never read as a zero image.
     """
     out: Dict[str, DormantImage] = {}
-    for group, rec in host_ledger.read_measured_record(record_path).items():
+    for group, rec in host_ledger.read_measured_record(
+        record_path, boot_tag=boot_tag
+    ).items():
         rss = rec.get("rss_shmem_gib")
         if rss is None:
             continue
@@ -1859,6 +1863,25 @@ def _boot_stems(evidence_dir: str) -> List[str]:
     return have
 
 
+#: ``boot_weg2_<tag>_<sha10>_<mmdd>_<hhmmss>`` -- the launcher's own stem shape
+#: (``launcher.main``: ``f"{EVIDENCE_DIR}/boot_weg2_{ns.tag}_{tip}_{stamp}"``).
+#: Anchored at both ends so a stem that does not have this shape yields None and
+#: the caller treats the sidecar as ABSENT rather than matching a wrong boot.
+_STEM_RE = re.compile(r"^boot_weg2_(?P<tag>.+)_[0-9a-f]{6,40}_\d{4}_\d{6}$")
+
+
+def boot_tag_of_stem(stem: str) -> Optional[str]:
+    """The ``--tag`` a boot stem was written under, or ``None``.
+
+    #1264 (B): the join key between a boot's LOGS (named by stem) and its
+    DORMANT SAMPLE in the shared sidecar (named by ``boot_tag``). Without it
+    the two halves of the ring's image term come from different boots -- see
+    :func:`host_ledger.read_measured_record`.
+    """
+    m = _STEM_RE.match(stem)
+    return m.group("tag") if m else None
+
+
 def _non_backup_mib(arm: Optional[Tuple[int, int]]) -> Mapping[str, Optional[int]]:
     """``{group: MiB}`` of the source boot's posted anchors + rings, or Nones.
 
@@ -1936,6 +1959,31 @@ def solve(
                 + " -- a pin must name exactly one"
             )
         stems = hits
+    # #1264 (B): SAME FORM FIRST.  This is an ORDERING, not a new refusal -- no
+    # boot that could be solved from before can stop being solvable, and an
+    # explicit --ring-table-boot pin (handled above) still wins outright.
+    #
+    # `stems` is newest-first by mtime, and the loop below returns the FIRST
+    # usable one, so a boot of another form beat a same-form boot for no reason
+    # other than being younger.  That is how boot weg2t2b came to be sized from
+    # weg2rg6 (form 34c3cde716c8) while its own form was 7dde8c2f2aba: the form
+    # gate refused rg6's WEIGHT statement and re-derived it from this boot's
+    # checkpoint (which is right), but the boot was still the source, and the
+    # one term that survives a form change -- the residual -- is precisely the
+    # term that had drifted.  A same-form boot needs no such carry: both halves
+    # of its image statement are a measurement of this form.
+    form_order = ""
+    if p_argv is not None and len(stems) > 1:
+        same_form, other_form = [], []
+        for s in stems:
+            src_argv, _why = parse_p_form(os.path.join(evidence_dir, f"{s}.front.log"))
+            same = src_argv is not None and p_form_key(src_argv)[0] == my_key
+            (same_form if same else other_form).append(s)
+        stems = same_form + other_form
+        form_order = (
+            f"{len(same_form)} same-form candidate(s) ranked ahead of "
+            f"{len(other_form)} of another form (form key {my_key})"
+        )
     reasons = []
     for stem in stems:
         p_log = os.path.join(evidence_dir, f"{stem}.P.log")
@@ -2035,8 +2083,35 @@ def solve(
             continue
         # A1-2: the group-level cross-check, apportioned onto the cards by their
         # share of that group's own census.  See :func:`apportion_dormant`.
+        #
+        # #1264 (B): THE SAMPLE AND ITS CORRECTION ARE ONE BOOT'S PAIR.  This
+        # call used to take the newest entry in the append-only sidecar --
+        # i.e. whatever booted last -- while `non_backup` two lines below is
+        # computed from the arm of the STEM's own front log.  Two boots, one
+        # subtraction, and because the sample counts the host ring's own
+        # MAP_SHARED pages the mismatch RATCHETS: the same source boot weg2rg6
+        # priced the nvml2 residual at 118.2, then 901.2, then 1344.2 MiB
+        # across three consecutive solves.  Binding the sample to the stem is
+        # what makes a re-solve from one source reproduce one table.
+        #
+        # A stem with no sample of its own is an ABSENCE, and the existing path
+        # already handles it: `apportion_dormant` falls back to the census and
+        # says the cross-check was unavailable.  That is strictly better than a
+        # foreign boot's number, which is unfalsifiable here.
+        stem_boot_tag = boot_tag_of_stem(stem)
         measured = dormant_images(
-            os.path.join(evidence_dir, host_ledger.MEASURED_RECORD_NAME)
+            os.path.join(evidence_dir, host_ledger.MEASURED_RECORD_NAME),
+            boot_tag=stem_boot_tag,
+        )
+        dorm_provenance = (
+            f"boot {stem_boot_tag}: {'+'.join(sorted(measured)) or 'NONE'}"
+            if stem_boot_tag
+            else "UNREADABLE stem tag -- sidecar not consulted"
+        ) + (
+            ""
+            if measured
+            else " (ABSENCE, not zero: the census is charged and the RssShmem "
+            "cross-check reports unavailable)"
         )
         # FIX 1 finding 3: the subtrahend of the RssShmem cross-check is the
         # SOURCE boot's own posted non-backup host terms, computed from the arm
@@ -2223,5 +2298,17 @@ def solve(
             f"\nWEG2-HOST-RING SKIPPED (newer than the chosen table) {r}"
             for r in reasons
         )
-        return table, f"solved from {stem}" + skipped
+        # #1264 (B): NAME THE SOURCE AND WHY IT WON.  The predecessor printed
+        # only "solved from <stem>", which cannot be checked: it says nothing
+        # about the form the source was measured in, nothing about whether a
+        # same-form candidate existed, and nothing about which boot's dormant
+        # sample was joined to it -- and that last one was a different boot.
+        chosen = (
+            f"solved from {stem} (form {'SAME' if form_same else 'DIFFERENT'}"
+            + (f", source key {src_key}" if src_key else "")
+            + f"; dormant sample {dorm_provenance}"
+            + (f"; {form_order}" if form_order else "")
+            + ")"
+        )
+        return table, chosen + skipped
     return None, "; ".join(reasons[:4]) or "no usable boot"

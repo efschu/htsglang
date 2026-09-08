@@ -2140,7 +2140,18 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     # FIX 3 round 3: every NEWER boot the solver skipped, with its reason, one
     # line each -- on SUCCESS, not only on failure.  Without them the log shows
     # a well-formed table and no way to ask why that boot and not the newest.
-    plan.lines.extend(ln for ln in reason.split("\n")[1:] if ln.strip())
+    # #1264 (B): PRINT THE CHOSEN SOURCE, not only the rejected ones.  The
+    # predecessor took `reason.split("\n")[1:]`, i.e. it kept every SKIPPED line
+    # and threw away line 0 -- the one that names the boot the table was
+    # actually solved from, the form it was measured in, and (since #1264)
+    # which boot's dormant sample was joined to it.  So a launch log could say
+    # why four boots were NOT used and never say which one was, and the weg2t2b
+    # ring drift had to be reconstructed from the ledger's arithmetic instead of
+    # read off.  Line 0 first, then the skipped ones.
+    _reason_lines = reason.split("\n")
+    if _reason_lines and _reason_lines[0].strip():
+        plan.lines.append("WEG2-HOST-RING SOURCE " + _reason_lines[0].strip())
+    plan.lines.extend(ln for ln in _reason_lines[1:] if ln.strip())
     plan.lines.extend(table.format_l6())          # L6
     for ln in plan.lines[logged:]:
         log(ln)

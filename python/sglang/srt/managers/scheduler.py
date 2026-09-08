@@ -14196,8 +14196,18 @@ class Scheduler(
         # rule as the pool census. `_idle_census_control_hold` is sticky within
         # the iteration, so this re-read costs one attribute compare and cannot
         # disagree with the decision taken above.
+        #
+        # #1264 (C): the control-message yield alone was NOT the whole bound.
+        # With no control message queued, `sanity_check()` walked the entire
+        # radix tree on EVERY idle iteration -- caught on metal, boot weg2t2b
+        # 2026-09-08, PP2 `active+gil` in `sanity_check
+        # (unified_radix_cache.py:6555) <- _check_tree_cache <- on_idle`. It is
+        # the same shape #1262 closed for the pool census and it is bounded the
+        # same way, by the same class: an O(1) comparison first, the walk only
+        # when that disagrees, and a duty cycle derived from the walk's own
+        # measured cost. See `_check_tree_cache_bounded`.
         if not self._idle_census_control_hold():
-            self.invariant_checker._check_tree_cache()
+            self._check_tree_cache_bounded()
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -14216,6 +14226,98 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+
+    #: #1264 (C). The O(1) stage of the tree-cache sanity check.
+    #:
+    #: Every term is a maintained counter or a small dict, so the whole
+    #: fingerprint is O(#component types), never O(#nodes):
+    #:
+    #: * ``UnifiedTreeNode.counter`` is a CLASS-level monotonic id source
+    #:   (unified_radix_cache.py:215) incremented on every node construction,
+    #:   so any insert or split moves it and it never moves back;
+    #: * the evictable/protected size maps move on every insert, evict, lock
+    #:   and unlock that changes an amount;
+    #: * the four ``ongoing_*`` lengths are exactly the sets whose membership
+    #:   `sanity_check`'s last two PARTS cross-check against the tree.
+    #:
+    #: HONEST LIMIT, and it is why the duty cycle below is not optional: this
+    #: is a CHANGE DETECTOR, not a proof of immutability. A lock_ref that moves
+    #: without changing any counted amount is invisible to it. So an unchanged
+    #: fingerprint SKIPS a walk, it does not RETIRE it -- the cadence still
+    #: forces one periodically, and a real violation is found late rather than
+    #: never. The alternative (walking every idle tick to catch it early) is
+    #: the defect this closes.
+    def _tree_cache_fingerprint(self):
+        tc = getattr(self, "tree_cache", None)
+        if tc is None:
+            return None
+        try:
+            from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+
+            return (
+                UnifiedTreeNode.counter,
+                tuple(sorted(getattr(tc, "component_evictable_size_", {}).items())),
+                tuple(sorted(getattr(tc, "component_protected_size_", {}).items())),
+                len(getattr(tc, "ongoing_write_through", ()) or ()),
+                len(getattr(tc, "ongoing_load_back", ()) or ()),
+                len(getattr(tc, "ongoing_prefetch", ()) or ()),
+                len(getattr(tc, "ongoing_backup", ()) or ()),
+            )
+        except Exception:  # noqa: BLE001 - a fingerprint may never break idle
+            # UNKNOWN, not "unchanged": returning None makes the caller walk,
+            # so a fingerprint that cannot be taken costs coverage nothing.
+            return None
+
+    def _check_tree_cache_bounded(self) -> None:
+        """`invariant_checker._check_tree_cache()` under #1262's bound.
+
+        Three stages, in the order that makes the common case free:
+
+        1. the O(1) fingerprint above -- unchanged means the walk cannot find
+           anything the last walk did not, for every violation the fingerprint
+           can see, so it is skipped and counted as an agreement;
+        2. the duty cycle -- after a walk costing ``t`` ms the next is refused
+           until ``t * (1/duty - 1)`` ms have passed, so the diagnostic can
+           never take more than ``IDLE_CENSUS_MAX_DUTY`` of the loop's wall
+           time whatever the tree grows to;
+        3. only then the walk, timed, with its cost fed back into (2).
+
+        The cadence object is the SAME class the pool census uses -- one
+        mechanism, two instruments -- and it is created lazily so this needs no
+        edit in ``__init__`` and no second construction site to keep in step.
+        """
+        cadence = getattr(self, "_idle_tree_cadence", None)
+        if cadence is None:
+            from sglang.srt.managers.scheduler_components.idle_census_cadence import (
+                IdleCensusCadence,
+            )
+
+            cadence = IdleCensusCadence()
+            self._idle_tree_cadence = cadence
+
+        fp = self._tree_cache_fingerprint()
+        last = getattr(self, "_idle_tree_fingerprint", "unset")
+        if fp is not None and fp == last:
+            cadence.note_agreement()
+            return
+        cadence.note_disagreement()
+        if not cadence.may_enumerate():
+            cadence.note_deferred(control=False)
+            return
+
+        t0 = time.perf_counter()
+        self.invariant_checker._check_tree_cache()
+        cost_ms = (time.perf_counter() - t0) * 1000.0
+        # Recorded only after a walk that RETURNED: `sanity_check` raises on a
+        # violation, and a fingerprint stored on the way out of a raise would
+        # let the next pass skip the tree that just failed.
+        self._idle_tree_fingerprint = fp
+        emitted = cadence.record(None, cost_ms)
+        if emitted is not None:
+            is_warning, line = emitted
+            (logger.warning if is_warning else logger.info)(
+                "#1264 IDLE-TREE-SANITY %s", line
+            )
 
     def _pool_phase_probe(self, phase: str) -> None:
         """#1017: read both pools at a named init phase, and name the rows.
