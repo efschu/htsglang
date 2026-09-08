@@ -1257,6 +1257,46 @@ class Scheduler(
             )
         else:
             self.idle_sleeper = None
+        # #1262 (2): set by `_idle_census_control_hold` when a control message
+        # was already queued at the moment `on_idle` wanted to run its pool
+        # census, cleared by `process_input_requests` -- the one function every
+        # loop family reaches once per iteration. While it is set the census is
+        # not re-entered, so a flip/sleep command cannot be made to wait behind
+        # a second census pass after it has already deferred one.
+        self._idle_census_control_held = False
+
+    def _idle_census_control_hold(self) -> bool:
+        """#1262 (2): does a queued control message outrank the idle census?
+
+        THE ORDER THIS ESTABLISHES, and it is the half the O(1) ledger does not
+        cover. `event_loop_normal` (scheduler.py:2769-2800) and
+        `_event_loop_pp_body` (scheduler_pp_mixin.py:4109-5365) both receive
+        BEFORE they call `on_idle`, so a message that is already on the wire at
+        the top of an iteration is served first -- that ordering is unchanged
+        and was never the defect. The defect is a message that arrives DURING
+        `on_idle`: at 410 857 rows the weg2t2a census held the GIL for the
+        whole pass on all six ranks, and `WEG2-FLIP begin epoch=0` never
+        completed. This probe closes that window: the census asks, immediately
+        before it would enumerate, whether the intake is already readable, and
+        yields the pass if it is.
+
+        STICKY UNTIL THE MESSAGE IS HANDLED. Once armed it stays armed until
+        `process_input_requests` runs, so `on_idle` cannot enter the census on
+        the NEXT pass either while the message is still unserved. It cannot
+        latch permanently: the clear is unconditional and sits on the path every
+        loop family takes once per iteration.
+
+        THE CENSUS IS DEFERRED, NEVER THE CHECK. Only the row ENUMERATION is
+        held back -- the O(1) pool ledger of #1262 (1) still runs on every idle
+        pass, on every rank -- so a probe that answered `True` forever could
+        not disarm the leak check, only postpone its diagnostic.
+        """
+        if self._idle_census_control_held:
+            return True
+        probe = getattr(self.request_receiver, "control_message_pending", None)
+        if callable(probe):
+            self._idle_census_control_held = bool(probe())
+        return self._idle_census_control_held
 
     def publish_load_snapshot(self, force: bool = False):
         writer = self.load_snapshot_writer
@@ -2948,6 +2988,12 @@ class Scheduler(
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
+        # #1262 (2): the idle census's control-hold is released HERE, on the
+        # one path every loop family takes once per iteration, and
+        # UNCONDITIONALLY -- an empty list still means the loop has been back
+        # to its intake, so the hold can never outlive the iteration that set
+        # it and can never latch the census off.
+        self._idle_census_control_held = False
         # #800: run any wedge-recovery request the watchdog thread posted, on
         # THIS thread. This function is the one place every loop family reaches
         # once per iteration -- event_loop_normal, event_loop_overlap and the
@@ -14120,8 +14166,13 @@ class Scheduler(
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:
+            # #1262 (2): a queued control message is served BEFORE any census
+            # work. The O(1) ledger still runs; only the row enumeration that
+            # would explain a disagreement is postponed.
+            allow_enumeration = not self._idle_census_control_hold()
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
+                allow_enumeration=allow_enumeration,
             )
             if has_leak:
                 # The ledger names the SIZE of the evictable term, never who
@@ -14139,8 +14190,14 @@ class Scheduler(
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
             self.invariant_checker._check_req_pool()
 
-        # tree cache sanity check
-        self.invariant_checker._check_tree_cache()
+        # tree cache sanity check. #1262 (2): this is the OTHER walk-the-whole-
+        # structure diagnostic on this path (`sanity_check()` traverses the
+        # radix tree), so it yields to a queued control message on the same
+        # rule as the pool census. `_idle_census_control_hold` is sticky within
+        # the iteration, so this re-read costs one attribute compare and cannot
+        # disagree with the decision taken above.
+        if not self._idle_census_control_hold():
+            self.invariant_checker._check_tree_cache()
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()

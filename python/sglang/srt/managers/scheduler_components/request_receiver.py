@@ -153,6 +153,47 @@ class SchedulerRequestReceiver:
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    def control_message_pending(self) -> bool:
+        """#1262 (2): is a frame ALREADY readable on this rank's own intake?
+
+        O(1) and side-effect free -- a zero-timeout ``zmq.Socket.poll``, which
+        is a ``getsockopt(ZMQ_EVENTS)``; nothing is received, nothing is
+        consumed, no ordering is disturbed. The caller (``Scheduler.on_idle``)
+        uses it to give a queued message priority over the idle pool census,
+        which is the half of #1262 the O(1) ledger does not cover: at 410 857
+        rows the census cost the weg2t2a schedulers their flip, and a flip
+        request that arrives DURING such a pass has to wait it out.
+
+        Scope, named rather than implied: the sockets exist on the REQUEST
+        ORIGIN (``pp_rank == 0``, ``attn_tp_rank == 0``); downstream stages
+        receive over the PP chain / TP broadcast and answer ``False`` here.
+        That is the right shape and not a gap -- the origin is where a
+        ``/release_memory_occupation`` enters the group at all, so an origin
+        that cannot be interrupted is the thing that stops the flip; the
+        downstream stages are protected by the O(1) ledger of #1262 (1), which
+        applies on every rank.
+
+        ``recv_from_tokenizer`` may be a ``ScriptedTokenizerRecvProxy`` with no
+        ``poll``; that answers ``False`` rather than raising. A probe that
+        cannot answer must never be read as "a message is waiting" -- that
+        would disarm the census permanently, which is the #606 shape.
+        """
+        for sock in (
+            getattr(self, "recv_from_tokenizer", None),
+            getattr(self, "recv_from_rpc", None),
+        ):
+            if sock is None:
+                continue
+            poll = getattr(sock, "poll", None)
+            if not callable(poll):
+                continue
+            try:
+                if poll(0, zmq.POLLIN):
+                    return True
+            except Exception:  # noqa: BLE001 -- a probe, never a gate
+                continue
+        return False
+
     @scheduler_nvtx_method("scheduler.recv_requests")
     def recv_requests(
         self,

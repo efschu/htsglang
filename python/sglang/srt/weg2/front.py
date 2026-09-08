@@ -119,6 +119,22 @@ D_POOL_MAX_AGE_S = 1.0
 #: decision -- on the critical path, and even with the gate flag off.
 D_POOL_READ_TIMEOUT_S = D_POOL_MAX_AGE_S
 RPC_TIMEOUT_S = 900.0
+#: #1262 TIER 3.  How many times its OWN measured cost a flip may take before
+#: the front says it is not progressing.  Dimensionless on purpose: the bound
+#: itself is this boot's last measured flip in the same direction, so it is
+#: correct on a 3 s flip and on a 17 s one without a second number, and there
+#: is no literal seconds figure anywhere in the rule.  4x is chosen against the
+#: measured spread of this campaign -- weg2rg3 3.1-4.7 s, weg2dk5 13.4/18.4 s,
+#: i.e. under 1.5x between the fast and slow arms of the SAME form -- so 4x is
+#: comfortably outside the population of flips that merely ran slowly, and the
+#: specimen it must catch overran by more than 100x (weg2t2a: 7 min against a
+#: 3-5 s flip).
+FLIP_STALL_SLACK = 4.0
+#: How often the stall watcher LOOKS.  A poll period, never the bound: the
+#: bound is derived per flip by `Front._flip_stall_bound_s`.  Matches the
+#: corridor sampler's existing cadence so the front gains no new timing
+#: behaviour, only a new question asked on the same beat.
+FLIP_STALL_POLL_S = 10.0
 SPAN_LRU = 512
 SLEEP_TAGS = ["kv_cache", "weights"]
 KV_TAG = "kv_cache"
@@ -815,6 +831,22 @@ class Front:
         #: what that read actually was.
         self.corridor_instrument: str = CORRIDOR_INSTRUMENT
         self.flip_log: List[dict] = []
+        # ---- #1262 TIER 3: the flip's own stall detector ------------------
+        # Deadman tier 1 (a process exists) and tier 2 (/health_generate) both
+        # scored boot weg2t2a ALIVE for the seven minutes its first flip hung:
+        # all six schedulers were burning CPU inside an idle-time instrument
+        # and this front answered 200 on all three ports throughout. Neither
+        # tier can see that, and that is a coverage gap, not a deadman fault.
+        # The front CAN see it -- it already owns `state`, `epoch` and the
+        # measured cost of every completed flip -- so the third signal lives
+        # here, in the one process that knows a flip began and has not ended.
+        self._flip_t0: Optional[float] = None
+        self._flip_stage: str = "none"
+        #: the epoch a STALL line has already been emitted for; -1 = none, so
+        #: it can never collide with a real epoch (which starts at 0). One
+        #: line per flip: a repeating alarm is a monitor, and persistent
+        #: monitors are banned on this rig.
+        self._flip_stall_reported_epoch: int = -1
         self.drain_refusals_in_a_row = 0
         self.identity_checked = False
         self.dc_measured_d: Dict[str, int] = {}
@@ -1262,6 +1294,8 @@ class Front:
         app["admitter"] = asyncio.create_task(self.d_admitter())
         app["health"] = asyncio.create_task(self.health_poller())
         app["corridor"] = asyncio.create_task(self.corridor_sampler())
+        # #1262 tier 3 -- the deadman's third signal, see flip_stall_check.
+        app["flip_stall"] = asyncio.create_task(self.flip_stall_sampler())
         logger.info("WEG2-FRONT up tag=%s awake=%s P=%s D=%s W=%.0f s (operator V1 fairness bound, 0 = off) "
                     "carrier_max_tokens=%d p_concurrency=%d d_bs=%d X=%d flip_min_work_tokens=%d "
                     "idle_layout=%s min_dwell_ms=%s drain_deadline_s=%.0f d_admit_max_tokens=%d "
@@ -1277,7 +1311,7 @@ class Front:
                     else "that reading under an operator ceiling")
 
     async def cleanup(self, app):
-        for k in ("controller", "admitter", "health", "corridor"):
+        for k in ("controller", "admitter", "health", "corridor", "flip_stall"):
             t = app.get(k)
             if t:
                 t.cancel()
@@ -2189,6 +2223,12 @@ class Front:
         S, D = self.groups[src], self.groups[dst]
         self.state = "flipping"
         t_flip0 = time.time()
+        # #1262 tier 3: the open flip's identity, for `flip_stall_check`. Not
+        # cleared on the exits below -- every one of them leaves `state` at
+        # "serving" or "STOP", and the detector fires only while it is
+        # "flipping", so there is no path on which a stale t0 can be read.
+        self._flip_t0 = t_flip0
+        self._flip_stage = "drain"
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
         # 1. drain (W1/W2)
         if not await self.drain(S):
@@ -2204,6 +2244,7 @@ class Front:
             return
         self.drain_refusals_in_a_row = 0
         # 2. quiesce + double witness (W3)
+        self._flip_stage = "quiesce"
         idle, msg = await self.quiesce(S)
         wv = witness_verdict(len(S.outstanding), idle)
         if wv is not None:
@@ -2258,6 +2299,7 @@ class Front:
         # fix 8: the cgroup shmem reading the source's image is written against.
         shmem_before = host_ledger.read_cgroup_shmem_bytes()
         t0 = time.time()
+        self._flip_stage = "sleep-kv"
         code, body = await self.rpc(S, "/release_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
         sleep_ms += (time.time() - t0) * 1000
         if code != 200:
@@ -2312,6 +2354,7 @@ class Front:
         # gather is precisely why one is needed -- there is no happens-before
         # between S's begin_leg and W's first read, so without it W reads the
         # previous flip's terminal state as this flip's funding.
+        self._flip_stage = "gathered-legs"
         (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
             self.timed_rpc(S, "/release_memory_occupation",
                            {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
@@ -2385,6 +2428,7 @@ class Front:
                 return
         # 5. wake dst kv (W4)
         t0 = time.time()
+        self._flip_stage = "wake-kv"
         code, body = await self.rpc(D, "/resume_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
         t_w = time.time()
         wake_ms += (t_w - t0) * 1000
@@ -2395,6 +2439,9 @@ class Front:
         self.epoch += 1
         self.admit_d = True
         self.state = "serving"
+        # #1262 tier 3: the flip is closed, so there is nothing open to stall.
+        self._flip_t0 = None
+        self._flip_stage = "none"
         # C8: phase dwell restarts here, and the L2 admission ordinal with it.
         self.t_awake = time.time()
         self._admitted_this_epoch = 0
@@ -2786,6 +2833,90 @@ class Front:
             if self.state != "serving":
                 continue
             self.corridor_sample()
+
+    # ---------------- #1262 TIER 3: the flip stall detector ----------------
+
+    def _flip_stall_bound_s(self) -> Tuple[float, str]:
+        """How long a flip may show no progress before it is named STALLED.
+
+        DERIVED, never a literal, and the provenance travels with the number:
+
+        * **After the first flip in this direction** -- ``FLIP_STALL_SLACK``
+          times that flip's own measured ``flip_ms``.  This is the same
+          quantity ``_derived_min_dwell_ms`` already prices a round trip with,
+          read from the same ``flip_log`` records, so the detector and the
+          scheduler agree on what a flip costs on THIS boot rather than on a
+          recorded one.
+        * **Before it** -- ``self.drain_deadline_s``, the front's OWN declared
+          bound on a single flip phase (the one it refuses W1 against).  Epoch
+          0 is exactly the case weg2t2a died in, so this branch is the
+          load-bearing one and it deliberately reuses an EXISTING published
+          front bound instead of introducing a number of its own.
+
+        Any direction, not just this one: a flip that has not progressed is not
+        a slow flip, and waiting for a same-direction sample before the
+        detector can arm would leave the first flip of each direction
+        unwatched -- which is the specimen.
+        """
+        for rec in reversed(self.flip_log):
+            ms = float(rec.get("flip_ms") or 0.0)
+            if ms > 0:
+                return (
+                    FLIP_STALL_SLACK * ms / 1000.0,
+                    f"{FLIP_STALL_SLACK:.0f}x this boot's last measured flip "
+                    f"({rec.get('sleep')}->{rec.get('wake')}, {ms:.0f} ms)",
+                )
+        return (
+            self.drain_deadline_s,
+            "no flip measured on this boot yet -- the front's own published "
+            "drain deadline (--drain-deadline-s) stands in",
+        )
+
+    def flip_stall_check(self, now: Optional[float] = None) -> Optional[str]:
+        """Emit ``WEG2-FLIP STALL`` once when a flip overruns its derived bound.
+
+        Deadman tier 3.  Tiers 1 and 2 are structurally blind to this state --
+        the processes exist and ``/health`` answers 200 while all six
+        schedulers spin inside an idle-time instrument (boot weg2t2a,
+        2026-09-08) -- so the signal has to come from the process that knows a
+        flip is open.  Returns the line it emitted, or ``None``; the return is
+        for the test, the log line is the product.
+
+        ONCE PER FLIP, keyed on ``self.epoch`` (which does not advance until a
+        flip completes, so it is the flip's identity while it is open).  A
+        repeating alarm would be a persistent monitor, which this rig forbids;
+        one named line is what the deadman needs and all it needs.
+        """
+        if self.state != "flipping" or self._flip_t0 is None:
+            return None
+        now = time.time() if now is None else now
+        elapsed = now - self._flip_t0
+        bound, provenance = self._flip_stall_bound_s()
+        if elapsed < bound:
+            return None
+        if self._flip_stall_reported_epoch == self.epoch:
+            return None
+        self._flip_stall_reported_epoch = self.epoch
+        line = (
+            f"WEG2-FLIP STALL epoch={self.epoch} elapsed={elapsed:.1f} s "
+            f"bound={bound:.1f} s stage={self._flip_stage} awake={self.awake} "
+            f"queue={len(self.queue)} flips={len(self.flip_log)} "
+            f"(bound provenance: {provenance}). The flip began and has not "
+            f"completed; tier 1 (a process exists) and tier 2 "
+            f"(/health_generate) cannot see this state -- boot weg2t2a held it "
+            f"for 7 min with all three ports answering 200"
+        )
+        logger.error("%s", line)
+        self.counters["flip_stall"] += 1
+        return line
+
+    async def flip_stall_sampler(self) -> None:
+        while True:
+            await asyncio.sleep(FLIP_STALL_POLL_S)
+            try:
+                self.flip_stall_check()
+            except Exception as exc:  # noqa: BLE001 -- a detector, never a gate
+                logger.error("WEG2-FLIP STALL check raised: %r", exc)
 
     async def handle_manual_flip(self, request: web.Request) -> web.Response:
         if self.state != "serving":

@@ -19,6 +19,9 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.scheduler_components.idle_census_cadence import (
+    IdleCensusCadence,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
@@ -104,6 +107,10 @@ class SchedulerInvariantChecker:
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
+    #: #1262: how often the ROW-ENUMERATING census under `_check_full_pool`
+    #: may actually run, and what it cost when it did. See the module
+    #: docstring of `idle_census_cadence` for the boot this exists for.
+    idle_census: IdleCensusCadence = field(default_factory=IdleCensusCadence)
 
     def _allocator(self):
         """The KV allocator AS BOUND RIGHT NOW.
@@ -208,7 +215,12 @@ class SchedulerInvariantChecker:
         )
         return leak, msg
 
-    def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+    def _check_full_pool(
+        self,
+        ps: PoolStats,
+        uncached: int = 0,
+        allow_enumeration: bool = True,
+    ) -> Tuple[bool, str]:
         if self.is_hybrid_swa and not self.full_tokens_per_layer:
             return False, ""
         if self.is_hybrid_swa:
@@ -250,6 +262,122 @@ class SchedulerInvariantChecker:
             )
         full_evictable_size = ps.full_evictable_size
         allocator = self._allocator()
+        if getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:
+            # DCP stores logical tokens in widened physical pages.  Prefix cache
+            # counters are logical-token based, while the allocator frees whole
+            # physical pages, so round cached tokens up to physical page units.
+            full_evictable_size = (
+                (full_evictable_size + allocator.page_size - 1)
+                // allocator.page_size
+                * allocator.page_size
+            )
+        withheld = int(getattr(allocator, "residency_withheld_slots", 0) or 0)
+
+        def _ledger(available: int) -> Tuple[bool, str]:
+            return self._check_pool_invariant(
+                "full",
+                available,
+                full_evictable_size,
+                protected,
+                session_held,
+                total,
+                uncached,
+                # Slots the residency controller holds out of the free list
+                # because the pages under them are unmapped (#656 item 12).
+                # Published by KvRowCap in the same unit available_size()
+                # reports.
+                withheld,
+            )
+
+        # ---------------------------------------------------------------
+        # #1262 STEP 1: THE O(1) LEDGER. IT RUNS ON EVERY IDLE PASS.
+        #
+        # `ps.full_available_size` is `allocator.available_size()`, already
+        # computed by `pool_stats_observer.get_pool_stats()` before this method
+        # was called, and it is `len(free_pages) + len(release_pages)`
+        # (allocator/token.py:52-54) -- two tensor lengths, no device sync, no
+        # Python object per row. Comparing it against the same partition of
+        # `total` therefore costs NOTHING that the caller had not already paid.
+        #
+        # If it BALANCES there is nothing for an enumeration to discover: the
+        # union reading below can only ever be <= the sum (it deduplicates), so
+        # the only thing a row census can do to a balanced ledger is turn it
+        # into a deficit -- and it can only do that when the two free lists
+        # genuinely overlap, which is itself the surplus case handled in step 2.
+        #
+        # NAMED RESIDUAL, because this IS a semantic change and pretending
+        # otherwise is how the next reader gets misled: a state in which the
+        # sum-based ledger balances ONLY BECAUSE a double-counted free row
+        # cancels a genuinely missing row elsewhere is no longer detected. That
+        # coincidence was not detected before #912 either (the checker read the
+        # raw sum for years) and it is not detected by `available_size()`'s
+        # other consumers today; what #912 fixed was the OPPOSITE direction --
+        # a surplus misread as a leak -- and that direction is fully preserved,
+        # because every surplus goes to step 2.
+        # ---------------------------------------------------------------
+        leak, msg = _ledger(ps.full_available_size)
+        if not leak:
+            self.idle_census.note_agreement()
+            return False, msg
+
+        self.idle_census.note_disagreement()
+
+        # THE SIGN DECIDES WHETHER THE CENSUS IS EVEN THE QUESTION.
+        #
+        # The enumerated union is `frozenset(free) | frozenset(release)` and
+        # the cheap sum is `len(free) + len(release)`, so the union is ALWAYS
+        # <= the sum: enumerating can only ever LOWER `available`.
+        #
+        # * SURPLUS (accounted > total) -- the census can close it, and on the
+        #   five #912 specimens it did (the sum read exactly 21 high). This is
+        #   the branch that needs the rows.
+        # * DEFICIT (accounted < total) -- rows owned by NOBODY, the #832/#856
+        #   shape. Lowering `available` can only make it deeper, so the census
+        #   cannot explain it away and is not needed to decide it. It raises
+        #   NOW, on the cheap reading, whatever the cadence or a queued control
+        #   message say. A diagnostic may be postponed; a verdict that is
+        #   already decided may not.
+        accounted = (
+            ps.full_available_size
+            + full_evictable_size
+            + protected
+            + session_held
+            + uncached
+            + withheld
+        )
+        if accounted < total:
+            return True, (
+                f"{msg}, census=NOT CONSULTED (deficit of {total - accounted} "
+                f"row(s): the enumerated union is <= this sum by construction, "
+                f"so no row census can close a deficit -- #832/#856 shape, "
+                f"#1262)"
+            )
+
+        # ---------------------------------------------------------------
+        # #1262 STEP 2: THE COUNTERS DISAGREE, so the ROW CENSUS is now the
+        # diagnostic -- exactly the job #912 gave it, and no more. It runs at
+        # most once per bounded cadence (idle_census_cadence.IdleCensusCadence,
+        # the #926 emitter shape with a duty cycle derived from the census's
+        # OWN measured cost), because at 410 857 rows it cost the weg2t2a
+        # schedulers their flip.
+        #
+        # A disagreement the cadence will not let us resolve is INCONCLUSIVE,
+        # never a pass and never a raise: raising on the sum alone would
+        # reinstate #912's false positive, and the enumeration is the only
+        # thing that can tell a list overlap from a real leak. A real leak
+        # persists, so the next permitted pass raises it; the delay is bounded
+        # by the duty cycle and the counters print it.
+        # ---------------------------------------------------------------
+        if not allow_enumeration or not self.idle_census.may_enumerate():
+            self.idle_census.note_deferred(control=not allow_enumeration)
+            gate = "a queued control message" if not allow_enumeration else "the duty cycle"
+            return False, (
+                f"{msg}, census=DEFERRED (the O(1) ledger disagrees; the row "
+                f"census that would say whether this is a free-list overlap "
+                f"(#912) or a real leak was held back by {gate} -- INCONCLUSIVE, "
+                f"re-decided on the next permitted pass, #1262)"
+            )
+
         # #912: read free capacity the SAME way the phase-flip census and the
         # #822 authority already do, instead of re-deriving it from the raw
         # allocator method. `TokenToKVPoolAllocator.available_size()`
@@ -272,38 +400,24 @@ class SchedulerInvariantChecker:
         # this ticket's; only the LEAK CHECK's own comparison is re-pointed at
         # the one authority the census and #822 already share, per that
         # function's own "ONE authority, used by both consumers" rationale.
+        t0 = time.perf_counter()
         free_reading = read_free_rows(allocator)
+        cost_ms = (time.perf_counter() - t0) * 1000.0
+        emit = self.idle_census.record(free_reading.count, cost_ms)
+        if emit is not None:
+            is_warning, line = emit
+            (logger.warning if is_warning else logger.info)("%s", line)
         full_available_size = (
             free_reading.count
             if free_reading.is_enumerable
             else ps.full_available_size
         )
-        if getattr(self.server_args, "dcp_size", 1) > 1 and allocator.page_size > 1:
-            # DCP stores logical tokens in widened physical pages.  Prefix cache
-            # counters are logical-token based, while the allocator frees whole
-            # physical pages, so round cached tokens up to physical page units.
-            full_evictable_size = (
-                (full_evictable_size + allocator.page_size - 1)
-                // allocator.page_size
-                * allocator.page_size
-            )
-        leak, msg = self._check_pool_invariant(
-            "full",
-            full_available_size,
-            full_evictable_size,
-            protected,
-            session_held,
-            total,
-            uncached,
-            # Slots the residency controller holds out of the free list because
-            # the pages under them are unmapped (#656 item 12). Published by
-            # KvRowCap in the same unit available_size() reports.
-            int(getattr(allocator, "residency_withheld_slots", 0) or 0),
-        )
+        leak, msg = _ledger(full_available_size)
         # WHICH READING PAID, in the line that raises. A surplus explained by a
         # snapshot and one explained by a live intersection are different
         # findings, and the boot log has to be able to tell them apart without
         # re-deriving anything (#912 rest).
+        msg = f"{msg}, census={free_reading} in {cost_ms:.1f} ms"
         if (
             leak
             and getattr(self.server_args, "dcp_size", 1) > 1
@@ -754,13 +868,21 @@ class SchedulerInvariantChecker:
         )
 
     def _check_all_pools(
-        self, ps: PoolStats, uncached: int = 0
+        self, ps: PoolStats, uncached: int = 0, allow_enumeration: bool = True
     ) -> Tuple[bool, List[str]]:
-        """Check memory invariant across all pools. Returns (has_leak, messages)."""
+        """Check memory invariant across all pools. Returns (has_leak, messages).
+
+        ``allow_enumeration=False`` is #1262 (2): the caller has a control
+        message already queued, so the O(1) ledger still runs but the row
+        census that would explain a disagreement is postponed rather than
+        made to compete with the loop's service of that message.
+        """
         has_leak = False
         messages = []
 
-        full_leak, full_msg = self._check_full_pool(ps, uncached=uncached)
+        full_leak, full_msg = self._check_full_pool(
+            ps, uncached=uncached, allow_enumeration=allow_enumeration
+        )
         has_leak |= full_leak
         messages.append(full_msg)
 
