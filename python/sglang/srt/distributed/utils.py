@@ -2135,6 +2135,58 @@ def parse_pp_layer_sets(
             f"the model would answer with that layer silently skipped."
         )
 
+    # #1244 THE PIPELINE'S TWO ENDS. Layer 0's input comes from the embedding
+    # and the final layer's output goes to the head, and BOTH of those live on
+    # a stage chosen by RANK, not by ownership: `qwen3_5.py:1566` gives the
+    # embedding to `pp_group.is_first_rank` and `:1642` gives the final norm
+    # and the head to `pp_group.is_last_rank`. The crossing schedule takes the
+    # matching premise from the other side -- `pp_crossing_schedule.py:112`
+    # iterates `range(num_layers - 1)`, so the final layer's output crosses to
+    # NOBODY, "because its output leaves the pipeline for the head".
+    #
+    # THE HAZARD: those are two independent definitions of "the end of the
+    # model", and only contiguous ownership makes them name the same stage.
+    # A set may put the final layer anywhere. When it lands off the last rank,
+    # that layer's output is computed and then dropped -- the stage-boundary
+    # proxy that would otherwise have carried it is deliberately suppressed on
+    # the gapped path (`scheduler_pp_mixin.py:7765`) -- while the last rank
+    # normalises whatever its own last owned layer produced, i.e. a MID-STACK
+    # activation, and samples from it. Nothing raises: the tail of the model is
+    # silently amputated and the logits are fluent and confidently wrong, which
+    # is the exact failure shape this file exists to prevent.
+    #
+    # The mirror case at layer 0 does raise today (the model's entry branch
+    # refuses a non-first stage with neither a proxy nor a wire-delivered
+    # entry), but it raises on three ranks after the weights have loaded. One
+    # invariant, checked once, at the only place ownership is derived.
+    if num_hidden_layers > 0:
+        terminal = num_hidden_layers - 1
+        ends = []
+        if terminal not in parsed[pp_size - 1]:
+            ends.append(
+                f"the FINAL layer {terminal} is owned by stage "
+                f"{seen[terminal]}, but the final norm and the head live on "
+                f"the last stage ({pp_size - 1}); no crossing carries the "
+                f"final layer's output, so it would be computed and dropped "
+                f"while the last stage sampled from a mid-stack activation"
+            )
+        if 0 not in parsed[0]:
+            ends.append(
+                f"layer 0 is owned by stage {seen[0]}, but the token embedding "
+                f"lives on the first stage (0); that stage has no input to "
+                f"compute layer 0 from and no crossing can deliver one"
+            )
+        if ends:
+            raise PPLayerSetError(
+                f"{PP_LAYER_SET_ENV}: {'; and '.join(ends)}. A pipeline's two "
+                f"ends are fixed by RANK -- the embedding on the first stage, "
+                f"the head on the last -- so the layer set must put layer 0 on "
+                f"stage 0 and layer {terminal} on stage {pp_size - 1}. "
+                f"Contiguous ownership satisfies this by construction, which "
+                f"is why nothing checked it before a set could express "
+                f"otherwise."
+            )
+
     if not allow_gapped:
         gapped = []
         for rank, layers in enumerate(parsed):

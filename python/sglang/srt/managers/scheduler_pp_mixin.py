@@ -510,6 +510,31 @@ def _refuse_known_wrong_gapped_forward() -> None:
 
     So the gate is a REFUSAL rather than a warning. A warning in a boot log is
     not a control; this configuration must not be reachable by accident.
+
+    #1244 NARROWING, recorded here so the premise above is not re-litigated
+    from its headline. The '\\n\\n' arm ran the COMPOSITE argv, which carries
+    the phase flip and NEXTN speculation. Later the same day (window 22:16-
+    22:43Z, ``docs/dev/NOTE_753_gapped_probe.md``) the SAME 48/8/8 map under a
+    PLAIN PP=3 -- no flip, no spec -- answered the same determined-answer probe
+    CORRECTLY, with and without CUDA graphs, and did not degenerate over 40
+    tokens; the wire logged the 31 crossings, so the layout was genuinely
+    active. What is MEASURED is therefore narrower than what the text above
+    asserts: the gapped forward is correct on its own, and the defect lives in
+    the interaction with the flip and/or spec. The refusal STANDS -- the
+    composite argv is what this rig serves, and a narrower fault is still a
+    fault -- but the next reader should hunt that interaction rather than the
+    layer set or the wire.
+
+    #1244 also closed one INDEPENDENT silent-wrong shape that the probe map
+    happens not to hit: nothing required a layer set to put the final layer on
+    the last stage, whose head samples it. See the two-ends invariant in
+    ``parse_pp_layer_sets``.
+
+    THE ONE NAMED WAY TO LIFT THIS remains the escape hatch below,
+    ``SGLANG_PP_GAPPED_ALLOW_KNOWN_WRONG``; no second lever is added. It may be
+    retired only after a metal determined-answer probe passes on a gapped map
+    under the COMPOSITE argv -- flip and spec included, since that is the arm
+    the '\\n\\n' was measured on and the plain arm is already green.
     """
     if pp_gapped_forward_known_wrong_allowed():
         logger.warning(
