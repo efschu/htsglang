@@ -374,6 +374,64 @@ class SchedulerWeightUpdaterManager:
             return 0
         return int(value or 0)
 
+    @staticmethod
+    def _weg2_allocator_cache_bytes() -> Optional[Tuple[int, int]]:
+        """``(reserved, allocated)`` of the torch caching allocator, or None.
+
+        NOT an NVML reading and NOT the dormant image: ``memory_reserved`` counts
+        only what THIS process's torch caching allocator holds in cudaMalloc'd
+        segments, and the memory-saver's tagged regions are unmapped by
+        ``tms_pause`` underneath torch, so their bytes are still inside
+        ``reserved`` while being physically gone.  The only quantity this pair
+        licenses is the DELTA of ``reserved`` across ``empty_cache()`` -- the
+        untagged cache actually handed back -- which is what the caller prints.
+
+        None (never a 0) when the counters cannot be read: a cache figure that
+        was not taken must not read as a cache that was empty.
+        """
+        try:
+            module = torch.get_device_module()
+            return int(module.memory_reserved()), int(module.memory_allocated())
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _weg2_log_allocator_cache_released(
+        self,
+        before: Optional[Tuple[int, int]],
+        after: Optional[Tuple[int, int]],
+    ) -> None:
+        """Print what ``empty_cache()`` on the sleep path actually gave back.
+
+        Item `dormant`, record section [1y] row R6.  The line states its
+        instrument in full because the number next to it on every other Weg-2
+        line (``proc_used``) is a DIFFERENT instrument over a DIFFERENT
+        population, and the two must never be added: NVML per-process bytes
+        include the CUDA context, the barlink BAR1 windows and the comm buffers,
+        none of which the torch allocator knows about.
+        """
+        if before is None or after is None:
+            logger.info(
+                "WEG2-SLEEP allocator_cache_released_mib=n/a (torch caching-allocator "
+                "counters unreadable on this rank -- absence of a reading, NOT an "
+                "empty cache)"
+            )
+            return
+        reserved_before, allocated_before = before
+        reserved_after, allocated_after = after
+        logger.info(
+            "WEG2-SLEEP allocator_cache_released_mib=%.1f "
+            "(instrument: torch.cuda.memory_reserved delta across empty_cache() on "
+            "THIS process's caching allocator -- reserved %.1f -> %.1f MiB, allocated "
+            "%.1f -> %.1f MiB; population = the UNTAGGED reserve only, because "
+            "tms_pause unmaps the tagged regions underneath torch and their bytes stay "
+            "inside reserved; NOT NVML, NOT the dormant image, never add it to proc_used)",
+            (reserved_before - reserved_after) / MIB_,
+            reserved_before / MIB_,
+            reserved_after / MIB_,
+            allocated_before / MIB_,
+            allocated_after / MIB_,
+        )
+
     def _weg2_log_sleep_acceptance(
         self, before: Optional[Any] = None, tags: Optional[List[str]] = None
     ) -> None:
@@ -1260,7 +1318,20 @@ class SchedulerWeightUpdaterManager:
             # the request shape: a stock POST /hibernate must stay byte-for-
             # byte the upstream path, and an extra post-pause device call plus
             # two NVML reads on it is not that.
+            #
+            # ITEM `dormant` COMMIT 1.  The paragraph above says the benefit of
+            # this call is UNMEASURED for the untagged remainder, and it has
+            # stayed unmeasured for every Weg-2 boot: the sleep-acceptance
+            # census reads NVML per-process bytes, which is the WHOLE dormant
+            # image and cannot separate the allocator's reserve out of it.
+            # Attribution section [1y] had to leave it inside a 306-358 MiB
+            # UNATTRIBUTED remainder for exactly that reason.  Read the torch
+            # allocator's own counters on both sides of the call, so the row
+            # exists as a number instead of an argument.
+            cache_before = self._weg2_allocator_cache_bytes()
             torch.get_device_module().empty_cache()
+            cache_after = self._weg2_allocator_cache_bytes()
+            self._weg2_log_allocator_cache_released(cache_before, cache_after)
             self._weg2_log_sleep_acceptance(
                 weg2_before_census, sorted(self.offload_tags)
             )
