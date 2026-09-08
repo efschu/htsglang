@@ -913,6 +913,10 @@ class BootState:
     #: The boot nonce (``HostRingPlan.epoch``), so teardown can unlink THIS
     #: boot's VRAM credit counters and no other boot's (FIX 3 round 3).
     ring_epoch: str = ""
+    #: #1275 fix 2: this boot's admin key FILE (never the key), so `--teardown`
+    #: can unlink it. A per-boot secret that outlives its boot is a stale file
+    #: naming a server that no longer exists.
+    admin_key_file: str = ""
     argv: Dict[str, str] = field(default_factory=dict)
     t_ready: Dict[str, float] = field(default_factory=dict)
     sleep_p_ms: float = 0.0
@@ -1035,11 +1039,91 @@ def session_pids(sid: int) -> set:
 # --------------------------------------------------------------------------
 
 
+#: #1275 FIX 2: THE LAUNCHER'S OWN KEY, set ONCE at mint time and read from
+#: here by every RPC. Never re-read from the file per call: two reads are two
+#: sources, and the second one is the one that goes stale.
+_ADMIN_KEY: Optional[str] = None
+#: The path, so teardown (and the refusal handler) can unlink it.
+_ADMIN_KEY_FILE: str = ""
+
+
+def set_admin_key(key: Optional[str], path: str = "") -> None:
+    """Arm every launcher RPC with this boot's key. Idempotent, one source."""
+    global _ADMIN_KEY, _ADMIN_KEY_FILE
+    _ADMIN_KEY = key or None
+    _ADMIN_KEY_FILE = path or ""
+
+
+def drop_admin_key_file() -> str:
+    """Unlink this boot's key file. Returns what happened, never raises.
+
+    #1275 FIX 2 (3): THE KEY DIES WITH THE BOOT. A per-boot key whose file
+    outlives the boot is a stale secret lying in a shared directory naming a
+    server that no longer exists -- and the next boot mints its own, so nothing
+    ever reads it again. Called from BOTH exits: the `--teardown` path and the
+    refusal/killer path.
+    """
+    path = _ADMIN_KEY_FILE
+    if not path:
+        return "no key file for this boot"
+    try:
+        os.unlink(path)
+        return f"removed {path}"
+    except FileNotFoundError:
+        return f"already gone {path}"
+    except OSError as e:
+        return f"could NOT remove {path}: {e}"
+
+
+def rpc_site_count() -> int:
+    """How many call sites go through :func:`http`, counted from the source.
+
+    #1275 FIX 2: THE CALLER ENUMERATION, MADE A NUMBER THE BOOT LOG PRINTS.
+    Boot weg2sb5 died because #1275 secured the ROUTES and taught exactly ONE
+    of the two clients to authenticate; the launcher's own `sleep_group` was
+    never enumerated. Counting the sites here -- rather than trusting a
+    hand-kept list -- is what makes a NEW call site visible, and the desk test
+    asserts this count against the AST so a site added without the helper fails
+    before a boot does.
+    """
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(open(__file__, encoding="utf-8").read())
+    except OSError:  # pragma: no cover - source always readable in practice
+        return -1
+    return sum(
+        1
+        for n in _ast.walk(tree)
+        if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name) and n.func.id == "http"
+    )
+
+
 def http(method: str, url: str, body: Optional[dict] = None, timeout: float = 25.0):
+    """THE ONE HTTP DOOR OUT OF THIS PROCESS, and the only place auth is added.
+
+    #1275 FIX 2, and the class is worth naming: access control was introduced at
+    the SERVER and wired into ONE of its TWO clients. The front authenticates
+    its flip RPCs; the launcher sleeps group P during the START SEQUENCE, before
+    the front process exists, and got 401 on
+    `POST /release_memory_occupation` -- boot weg2sb5, 39 s after P READY.
+    `/release_memory_occupation`, `/flush_cache`, `/abort_request` and
+    `/resume_memory_occupation` are all `ADMIN_OPTIONAL`, which REQUIRES the
+    admin key once one is configured.
+
+    So the header is attached HERE, at the single door, rather than at each call
+    site: a new RPC anywhere in this module is authenticated by construction,
+    which is the only version of this fix that a future call site cannot
+    silently miss. `/health` gets it too -- a bearer on a NORMAL route with no
+    api_key configured is ignored, and a per-path allowlist here would be a
+    second copy of http_server.py's decorators that drifts.
+    """
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    if _ADMIN_KEY:
+        req.add_header("Authorization", f"Bearer {_ADMIN_KEY}")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode(errors="replace")
@@ -5921,6 +6005,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # persisted and the log says which of the two happened.
     if not dry:
         admin_key_mod.write(admin_key_file, admin_api_key)
+    # #1275 FIX 2: ARM THE LAUNCHER'S OWN RPCs. This is the line whose absence
+    # killed weg2sb5 -- the groups demanded the key and this process, their
+    # FIRST client, never sent it. Armed in a dry run too, so the auth line
+    # below reports the real state rather than a special case.
+    set_admin_key(admin_api_key, admin_key_file)
+    state.admin_key_file = admin_key_file
+    log(f"WEG2-LAUNCH RPC auth=bearer sites={rpc_site_count()} "
+        f"(every launcher->group HTTP call goes through one door, `http()`, which "
+        f"attaches the admin bearer; sites counted from this module's own AST, not "
+        f"a hand-kept list. weg2sb5 died with sites=2 and auth on NEITHER: the "
+        f"front authenticated, the launcher's own startup sleep(P) did not, and "
+        f"/release_memory_occupation is ADMIN_OPTIONAL -> 401 at 39 s. #1275 fix 2)")
     log(f"WEG2 ADMIN-KEY {'minted (DRY: not written)' if dry else 'minted'} for this boot -> {admin_key_file} (mode 0600); "
         f"both groups get --admin-api-key, the front authenticates its flip RPCs "
         f"with it, and /hicache/storage-backend/resize is LIVE (#1275). "
@@ -6333,6 +6429,11 @@ def _write_state(state: BootState) -> None:
 def teardown(path: str) -> int:
     st = json.load(open(path))
     print(f"[{_now()}] WEG2-TEARDOWN {path}")
+    # #1275 fix 2 (3): THE KEY DIES WITH THE BOOT. Read from the state json --
+    # a teardown runs in a FRESH process that never minted anything, so the
+    # module global is empty here and the recorded path is the only source.
+    set_admin_key(None, st.get("admin_key_file", ""))
+    print(f"WEG2-TEARDOWN admin key file: {drop_admin_key_file()}")
     pids = set()
     for name, pid in st.get("pids", {}).items():
         if pid:
@@ -6456,6 +6557,10 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
         return main(argv)
     except REFUSALS as e:
         print(f"[{_now()}] WEG2-LAUNCH REFUSED: {e}", flush=True)
+        # #1275 fix 2 (3): the KILLER path drops the key too. weg2sb5 refused
+        # here and left its key file behind -- a boot that never served, whose
+        # secret outlived it. Both exits, or the guarantee is only half true.
+        print(f"[{_now()}] WEG2-LAUNCH admin key file: {drop_admin_key_file()}", flush=True)
         return 2
 
 
