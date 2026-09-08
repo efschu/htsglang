@@ -9793,12 +9793,12 @@ class Scheduler(
         for req in refused:
             uncached = self.weg2_uncached_extent(req, head_inputs)
             message = (
-                f"W47 Weg2TpPrefillExceeded: this group may prefill at most {x} uncached "
+                f"W50 Weg2TpPrefillExceeded: this group may prefill at most {x} uncached "
                 f"tokens itself (--tp-prefill-max-tokens); this request's extent after "
                 f"prefix matching is {uncached}. Refused by name so the caller re-routes it "
                 f"through the prefill group -- never prefilled here silently."
             )
-            logger.warning("W47 Weg2TpPrefillExceeded rid=%s uncached=%d X=%d", req.rid, uncached, x)
+            logger.warning("W50 Weg2TpPrefillExceeded rid=%s uncached=%d X=%d", req.rid, uncached, x)
             if self.enable_hicache_storage:
                 self.tree_cache.release_aborted_request(req.rid)
             elif self.enable_hierarchical_cache:

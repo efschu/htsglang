@@ -1261,7 +1261,7 @@ class ServerArgs:
                 "which the uncached extent exists -- a bound applied at "
                 "intake can only see the prompt and mis-prices exactly the "
                 "same way a router does. A request over the bound is refused "
-                "by name (W47 Weg2TpPrefillExceeded) back to its caller, "
+                "by name (W50 Weg2TpPrefillExceeded) back to its caller, "
                 "which re-routes it through the prefill group; it is never "
                 "silently chunked here. 0 = OFF, which is the default and "
                 "leaves the default path untouched. The value is DERIVED "

@@ -245,7 +245,25 @@ def _pool_model_and_families():
     not os.path.isdir(MODEL), reason="checkpoint headers not on this box"
 )
 class TestPCutObjective1254(unittest.TestCase):
-    """#1254: group P's cut defaults to the kv-floor, and both cuts are priced."""
+    """#1254: ONE objective knob, all arms priced, and the DEFAULT is the
+    measured max-KV cut rather than the solved one.
+
+    TEST DEBT OF THE TRAIN 2 ONE-KNOB DECISION, paid here. This class was
+    written when ``--pp-solve-objective`` defaulted to ``maxkv``; train 2
+    reconciled the train's ``--p-cut-objective`` into this same flag and moved
+    the default to ``incumbent``, and this file's guard was not moved with it.
+
+    THE MAX-KV INTENT IS KEPT -- what is not the default is the UNPROVEN SOLVE.
+    ``incumbent`` (32,18,14 / 8,4,4) is the cut boot weg2rg6 MEASURED at a
+    714,788-token pool. The solver's ``maxkv`` row 31,17,16 is priced by a pool
+    model that carries no per-stage FIXED POSTS -- lm_head, the MTP/draft head,
+    the draft pools -- and boot weg2tr1 priced PP2 at 966,544 tokens against a
+    PROFILED 155,164 (410,857 on the stage above). Defaulting to a cut chosen
+    to maximise a number the model overstates ~6x on the binding stage is the
+    law applied to the wrong quantity, so the default is the cut with a
+    measurement behind it until #1259 puts those posts in the model. Both
+    solved arms stay SELECTABLE and both stay PRICED on every boot.
+    """
 
     def _solve(self, objective):
         from sglang.srt.planner.pp_cut_launch import solve_launch_cut
@@ -262,10 +280,35 @@ class TestPCutObjective1254(unittest.TestCase):
             objective=objective,
         )
 
-    def test_default_objective_is_maxkv_at_the_flag_and_in_the_solver(self):
+    def test_the_flag_defaults_to_the_measured_incumbent_not_to_a_solved_cut(self):
         ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
-        self.assertEqual(ns.pp_solve_objective, "maxkv")
-        self.assertEqual(self._solve("maxkv").objective, "maxkv")
+        self.assertEqual(ns.pp_solve_objective, "incumbent")
+        # ... and the reason is at the flag, not only in this file: a reader
+        # who finds the default must find why it is not the solver's row, and
+        # what has to land before it goes back.
+        help_text = build_parser().format_help()
+        self.assertIn("#1259", help_text)
+
+    def test_both_solved_arms_stay_selectable_and_the_solver_honours_them(self):
+        # The max-KV intent is kept: the arm still exists, still solves, and
+        # still names itself. Only its status as the DEFAULT moved.
+        for objective in ("maxkv", "makespan"):
+            ns = build_parser().parse_args(
+                ["--tree", "/t", "--tag", "x", "--pp-solve-objective", objective]
+            )
+            self.assertEqual(ns.pp_solve_objective, objective)
+            self.assertEqual(self._solve(objective).objective, objective)
+
+    def test_incumbent_is_an_arm_of_this_one_flag_and_not_a_second_flag(self):
+        # Train 2 reconciled two knobs into one; a re-appearing --p-cut-objective
+        # is the second-bookkeeping shape this assertion refuses.
+        act = next(
+            a for a in build_parser()._actions if a.dest == "pp_solve_objective"
+        )
+        self.assertEqual(set(act.choices), {"maxkv", "makespan", "incumbent"})
+        self.assertNotIn(
+            "p_cut_objective", {a.dest for a in build_parser()._actions}
+        )
 
     def test_maxkv_takes_the_pool_maximal_feasible_cut(self):
         maxkv = self._solve("maxkv")

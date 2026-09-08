@@ -269,14 +269,14 @@ class RenumberedCode(unittest.TestCase):
     fatal host-ring exhaustion with a serving-path re-route."""
 
     def test_the_front_refusal_is_no_longer_w31(self):
-        self.assertTrue(front.X_REFUSAL_NAME.startswith("W47 "))
+        self.assertTrue(front.X_REFUSAL_NAME.startswith("W50 "))
         self.assertNotIn("W31", front.X_REFUSAL_NAME)
 
     def test_the_detector_is_keyed_on_the_name_not_the_number(self):
         """The durable half: a wire protocol keyed on a renumberable label
         breaks silently at exactly the renumber that fixes the collision."""
         self.assertEqual(front.X_REFUSAL_MARKER, "Weg2TpPrefillExceeded")
-        self.assertTrue(front.x_refusal_marker_in("... W47 Weg2TpPrefillExceeded ..."))
+        self.assertTrue(front.x_refusal_marker_in("... W50 Weg2TpPrefillExceeded ..."))
         self.assertTrue(front.x_refusal_marker_in("... W31 Weg2TpPrefillExceeded ..."))
         self.assertFalse(front.x_refusal_marker_in("W31 Weg2HostRingExhausted"))
 
