@@ -471,18 +471,37 @@ def host_preflight(log: Log, tag: str, dry: bool) -> None:
     log(f"host preflight PASS: MemAvailable {avail_gib:.1f} GiB; cgroup memory.events baseline: {' '.join(oom.split())}")
 
 
+def _free_instrument(mem: Dict[str, "nvml_registry.MemoryInfo"], cards: List[Card]) -> str:
+    """The ``free`` instrument covering EVERY card in one printed line.
+
+    FIX 2, finding 3: the label used to be the literal ``nvml_v2_free`` typed
+    into the f-string, while the figure came from whichever struct the registry
+    could read.  The weakest card sets the token, because one token stands for
+    the whole line.
+    """
+    rows = [mem[c.uuid] for c in cards if c.uuid in mem]
+    if rows and not all(r.carve_out_known for r in rows):
+        return nvml_registry.FREE_INSTRUMENT_V1
+    return nvml_registry.FREE_INSTRUMENT_V2
+
+
 def cards_free_check(cards: List[Card], log: Log) -> None:
     mem = nvml_memory(cards)
     for c in cards:
         m = mem[c.uuid]
         if m.tenant_used_mib > 1500:
+            # The instrument is the one this MemoryInfo actually read, not a
+            # literal typed here (FIX 2, finding 3): with no v2 struct the
+            # figure below is the v1 ``used``, which counts the carve-out as
+            # tenancy (#539) -- the refusal must not read as carve-out-aware
+            # when it is not.
             raise Weg2LaunchRefused(
                 f"card {c.nvml_index} ({c.name}) has {m.tenant_used_mib} MiB held by processes "
-                f"(> 1500; instrument nvml_v2_used, i.e. the driver carve-out of "
+                f"(> 1500; instrument {m.tenant_used_instrument}, i.e. the driver carve-out of "
                 f"{m.reserved_mib} MiB is NOT counted as tenancy) -- not free; not killing anything"
             )
     log(
-        "cards free (instrument: nvml_v2_free, allocatable): "
+        f"cards free (instrument: {_free_instrument(mem, cards)}, allocatable): "
         + ", ".join(
             f"idx{c.nvml_index}={mem[c.uuid].tenant_used_mib} MiB used by processes / "
             f"{mem[c.uuid].free_mib} MiB free / {mem[c.uuid].allocatable_mib} MiB allocatable "
@@ -1768,7 +1787,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(
             f"WEG2-DC group=P nvml{c.nvml_index} {c.name}: measured {dc_p[c.uuid]} MiB per-process "
             f"(pids {sorted(pids_p)}) card used {mem[c.uuid].tenant_used_mib} MiB by processes "
-            f"(instrument nvml_v2_used; card free {mem[c.uuid].free_mib} MiB allocatable, "
+            f"(instrument {mem[c.uuid].tenant_used_instrument}; card free {mem[c.uuid].free_mib} MiB allocatable, "
             f"{mem[c.uuid].reserved_mib} MiB driver-reserved); expectation {exp} + P windows {P_WINDOWS_MIB} = {exp + P_WINDOWS_MIB} MiB "
             f"({'AT OR BELOW' if dc_p[c.uuid] <= exp + P_WINDOWS_MIB else 'ABOVE'} expectation; the launcher derives D from the MEASUREMENT, record 1f B6)"
         )
@@ -2004,12 +2023,18 @@ def teardown(path: str) -> int:
     # a teardown that prints "0 MiB used" from a carve-out-blind subtraction
     # would be the same lie in the other direction.
     try:
+        snap = nvml_registry.memory_snapshot()
+        inst = (
+            nvml_registry.FREE_INSTRUMENT_V2
+            if all(m.carve_out_known for _d, m in snap)
+            else nvml_registry.FREE_INSTRUMENT_V1
+        )
         print(
-            "cards after teardown (instrument: nvml_v2_free, allocatable): "
+            f"cards after teardown (instrument: {inst}, allocatable): "
             + ", ".join(
                 f"nvml{d.index} {m.tenant_used_mib} MiB used by processes / {m.free_mib} MiB free "
                 f"({m.reserved_mib} MiB driver-reserved)"
-                for d, m in nvml_registry.memory_snapshot()
+                for d, m in snap
             )
         )
     except Exception as e:  # noqa: BLE001 - a teardown print never fails a teardown

@@ -58,6 +58,10 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from aiohttp import ClientSession, ClientTimeout, web
 
+from sglang.srt.managers.corridor_guard import (
+    corridor_band_ceiling_mib,
+    corridor_band_floor_mib,
+)
 from sglang.srt.managers.weg2_memory_saver import credit_epoch, weights_family_tags
 from sglang.srt.registry import nvml as nvml_registry
 
@@ -348,13 +352,23 @@ def _sid_alive(sid: int) -> bool:
         return True
 
 
-#: The corridor law, verbatim: 819-1229 MiB NVML-FREE per card under the awake
-#: group's load.  BELOW the floor = investigate, ABOVE the ceiling = the boot
-#: did not pass (memory ``vram-korridor-regel``).  The band is stated in
-#: ALLOCATABLE free, which is the only quantity the driver will actually hand
-#: to an allocation -- see :data:`CORRIDOR_INSTRUMENT`.
-CORRIDOR_FLOOR_MIB = 819
-CORRIDOR_CEIL_MIB = 1229
+#: THE CORRIDOR BAND IS NOT DECLARED HERE.  ``managers.corridor_guard`` is THE
+#: ONE DECLARATION (``CORRIDOR_LAW_MIB`` +- ``CORRIDOR_BAND_FRACTION``, and the
+#: ``SGLANG_CORRIDOR_LAW_FLOOR_MIB`` override read per call); this module reads
+#: it and never repeats the literal.
+#:
+#: FIX 2, finding 2: the predecessor of this line froze ``819`` / ``1229`` here
+#: with the comment "the corridor law, verbatim" -- a fourth private copy of a
+#: number whose own authority says, at ``corridor_guard.py:141``, that "every
+#: other module that needs the law imports it from here rather than repeating
+#: the literal".  A frozen copy cannot follow the override: with
+#: ``SGLANG_CORRIDOR_LAW_FLOOR_MIB=1536`` the guard grades against 1228-1843
+#: while this file would still have printed ``band=819-1229MiB`` and graded
+#: every ``verdict=`` against a law not in force.  Imported as FUNCTIONS, not
+#: as values, for the same reason the guard reads its env per call.
+#:
+#: The band is stated in ALLOCATABLE free, which is the only quantity the
+#: driver will actually hand to an allocation -- see :data:`CORRIDOR_INSTRUMENT`.
 #: What every WEG2-CORRIDOR line says it measured, printed in the line itself.
 #:
 #: DEFECT THIS NAME EXISTS TO CLOSE (boot weg2rg6, 2026-09-08): this sampler
@@ -368,7 +382,12 @@ CORRIDOR_CEIL_MIB = 1229
 #: corridor rule names that subtraction and forbids it by name; the rule is
 #: older than the sampler (RUNSHEET_363 sec 4.3, and the August corridor
 #: sampler carried the comment "FREE column only -- never total minus used").
-CORRIDOR_INSTRUMENT = "nvml_v2_free,allocatable"
+CORRIDOR_INSTRUMENT = f"{nvml_registry.FREE_INSTRUMENT_V2},allocatable"
+#: The SAME quantity read WITHOUT the v2 struct: still allocatable free (both
+#: structs report it), but the carve-out beside it is unknown, so the line must
+#: not claim v2.  FIX 2, degradation half of finding 3: the predecessor printed
+#: ``reserved=0MiB`` under an ``instrument=nvml_v2_free`` claim in that mode.
+CORRIDOR_INSTRUMENT_NO_V2 = f"{nvml_registry.FREE_INSTRUMENT_V1},allocatable(carve-out-unknown)"
 #: One-shot latch so a rig without NVML says so once instead of every 10 s.
 _nvml_unavailable_logged = False
 
@@ -381,17 +400,44 @@ class CardFree:
     uuid: str
     free_mib: int
     reserved_mib: int
+    #: False when this card's carve-out could not be read (no NVML v2 struct),
+    #: which downgrades the whole line's instrument token.
+    carve_out_known: bool = True
+
+
+def corridor_band_mib() -> Tuple[int, int]:
+    """``(floor, ceiling)`` of the corridor band IN FORCE, per call.
+
+    Reads ``managers.corridor_guard``, the one declaration, every time --
+    never a value frozen at import here.
+    """
+    return corridor_band_floor_mib(), corridor_band_ceiling_mib()
+
+
+def corridor_instrument(cards: List[CardFree]) -> str:
+    """The instrument token for a sample of these cards.
+
+    Degrades to :data:`CORRIDOR_INSTRUMENT_NO_V2` if ANY card in the sample
+    lost its carve-out: one token per line, and the weakest card sets it,
+    because a reader takes the token to cover the whole line.
+    """
+    if cards and not all(c.carve_out_known for c in cards):
+        return CORRIDOR_INSTRUMENT_NO_V2
+    return CORRIDOR_INSTRUMENT
 
 
 def corridor_verdict(free_mib: int) -> str:
-    """``IN`` / ``BELOW`` / ``ABOVE`` against the corridor band.
+    """``IN`` / ``BELOW`` / ``ABOVE`` against the corridor band IN FORCE.
 
-    Graded on ALLOCATABLE free only.  Inclusive at both edges: the band is
-    819-1229 MiB, so 819 and 1229 are IN and 818 / 1230 are not.
+    Graded on ALLOCATABLE free only.  Inclusive at both edges: the default
+    band is 819-1229 MiB, so 819 and 1229 are IN and 818 / 1230 are not --
+    and if the law is moved (``SGLANG_CORRIDOR_LAW_FLOOR_MIB``) this verdict
+    moves with it, because the edges come from the guard on every call.
     """
-    if free_mib < CORRIDOR_FLOOR_MIB:
+    floor, ceil = corridor_band_mib()
+    if free_mib < floor:
         return "BELOW"
-    if free_mib > CORRIDOR_CEIL_MIB:
+    if free_mib > ceil:
         return "ABOVE"
     return "IN"
 
@@ -417,8 +463,21 @@ def _nvml_free() -> List[CardFree]:
                 "was the total-minus-used subtraction the corridor rule forbids.", e,
             )
         return []
+    # FIX 2 (nonblocking sibling): the latch is a RATE LIMIT on one outage, not
+    # a boot-long mute.  A read that succeeds ends the outage, so the NEXT one
+    # that fails warns again -- otherwise a single transient failure silenced
+    # every later one and ``corridor_sample`` returned ``None`` in silence for
+    # the rest of the boot, which is the denominator law's suppressed-count
+    # trap in its worst form: no line at all.
+    _nvml_unavailable_logged = False
     return [
-        CardFree(nvml_index=dev.index, uuid=dev.uuid, free_mib=mem.free_mib, reserved_mib=mem.reserved_mib)
+        CardFree(
+            nvml_index=dev.index,
+            uuid=dev.uuid,
+            free_mib=mem.free_mib,
+            reserved_mib=mem.reserved_mib,
+            carve_out_known=mem.carve_out_known,
+        )
         for dev, mem in snap
     ]
 
@@ -478,6 +537,11 @@ class Front:
         self.session: Optional[ClientSession] = None
         self.counters: Dict[str, int] = collections.Counter()
         self.corridor_min: Dict[str, Dict[int, int]] = {"P": {}, "D": {}}
+        #: The instrument of the LAST corridor sample taken, which is what
+        #: ``/weg2/state`` reports.  Starts at the nominal token so a state read
+        #: before the first sample is not blank; every sample overwrites it with
+        #: what that read actually was.
+        self.corridor_instrument: str = CORRIDOR_INSTRUMENT
         self.flip_log: List[dict] = []
         self.drain_refusals_in_a_row = 0
         self.identity_checked = False
@@ -565,9 +629,13 @@ class Front:
             "counters": dict(self.counters),
             "corridor_min_mib": {k: dict(v) for k, v in self.corridor_min.items()},
             # Same instrument and band as the WEG2-CORRIDOR log line: a reader
-            # of this dict must not have to guess which "free" it holds.
-            "corridor_instrument": CORRIDOR_INSTRUMENT,
-            "corridor_band_mib": [CORRIDOR_FLOOR_MIB, CORRIDOR_CEIL_MIB],
+            # of this dict must not have to guess which "free" it holds.  Both
+            # come from the SAME source the line uses -- the instrument from
+            # the last actual sample (never a nominal constant, which would
+            # claim v2 on a rig whose samples had to fall back), the band from
+            # the corridor guard, read now.
+            "corridor_instrument": self.corridor_instrument,
+            "corridor_band_mib": list(corridor_band_mib()),
             "flips": self.flip_log[-20:],
             "dc_measured_d_mib": self.dc_measured_d,
             "uptime_s": round(time.time() - self.t0, 1),
@@ -1204,10 +1272,13 @@ class Front:
             f"verdict={corridor_verdict(c.free_mib)}"
             for c in cards
         )
+        instrument = corridor_instrument(cards)
+        self.corridor_instrument = instrument
+        floor, ceil = corridor_band_mib()
         line = (
             f"WEG2-CORRIDOR phase={phase}(awake) epoch={self.epoch} "
-            f"instrument={CORRIDOR_INSTRUMENT} band={CORRIDOR_FLOOR_MIB}-{CORRIDOR_CEIL_MIB}MiB "
-            f"{per_card} min_so_far={dict(self.corridor_min[phase])} ({CORRIDOR_INSTRUMENT}, MiB)"
+            f"instrument={instrument} band={floor}-{ceil}MiB "
+            f"{per_card} min_so_far={dict(self.corridor_min[phase])} ({instrument}, MiB)"
         )
         logger.info("%s", line)
         return line

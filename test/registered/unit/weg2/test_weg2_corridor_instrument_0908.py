@@ -40,8 +40,9 @@ import os
 import tempfile
 import unittest
 
+from sglang.srt.managers import corridor_guard
 from sglang.srt.registry import nvml as nvml_registry
-from sglang.srt.weg2 import front, launcher, ring_table
+from sglang.srt.weg2 import corridor_arm, front, launcher, ring_table
 
 MIB = 1024 * 1024
 
@@ -236,7 +237,19 @@ class CorridorVerdictTest(unittest.TestCase):
         self.assertEqual(front.corridor_verdict(1230), "ABOVE")
 
     def test_band_is_the_corridor_law(self):
-        self.assertEqual((front.CORRIDOR_FLOOR_MIB, front.CORRIDOR_CEIL_MIB), (819, 1229))
+        """FIX 2, finding 2: the band is READ from its one declaration.
+
+        The predecessor asserted ``front.CORRIDOR_FLOOR_MIB == 819`` -- which
+        pinned the private copy rather than the law, and would have stayed
+        green while the guard's law moved underneath it.  Same default, but
+        now the identity is what is asserted; the override tests below are
+        what make it a fix rather than a rename.
+        """
+        self.assertEqual(front.corridor_band_mib(), (819, 1229))
+        self.assertEqual(
+            front.corridor_band_mib(),
+            (corridor_guard.corridor_band_floor_mib(), corridor_guard.corridor_band_ceiling_mib()),
+        )
 
 
 def _front():
@@ -492,6 +505,581 @@ class LauncherPreflightTest(unittest.TestCase):
             with self.assertRaises(launcher.Weg2LaunchRefused) as e:
                 launcher.cards_free_check(cards, lambda _m: None)
         self.assertIn("no memory row", str(e.exception))
+
+
+# ===========================================================================
+# FIX 2 -- the four defects the review found IN the fix above.
+# ===========================================================================
+
+#: The rg6 front log's own prose about corridor samples, verbatim from
+#: ``boot_weg2_weg2rg6_7f88b1c75d_0908_070324.front.log`` at 07:03:46Z, 127 s
+#: BEFORE that boot's first real sample.  ``solve()`` writes it on any boot
+#: that skips a newer candidate, so it is a recurring input, not a one-off.
+RG6_PROSE_LINE = (
+    "[2026-09-08T07:03:46Z] WEG2-LAUNCH WEG2-HOST-RING SKIPPED (newer than the "
+    "chosen table) boot_weg2_weg2rg5_15a46a611a_0908_050519: front carries no "
+    "WEG2-CORRIDOR phase=P(awake)/D(awake) samples"
+)
+
+#: One genuine post-fix sample line, as the fixed sampler emits it.
+POST_FIX_LINE = (
+    "[2026-09-08T07:05:53Z] INFO weg2.front: WEG2-CORRIDOR phase=D(awake) epoch=0 "
+    "instrument=nvml_v2_free,allocatable band=819-1229MiB "
+    "nvml0:free=1030MiB reserved=425MiB verdict=IN "
+    "nvml1:free=341MiB reserved=518MiB verdict=BELOW "
+    "nvml2:free=852MiB reserved=425MiB verdict=IN "
+    "min_so_far={0: 1030, 1: 341, 2: 852} (nvml_v2_free,allocatable, MiB)"
+)
+
+#: One genuine PRE-fix sample line (no instrument= token), rg6 front units.
+PRE_FIX_LINE = (
+    "[2026-09-08T07:31:30Z] INFO weg2.front: WEG2-CORRIDOR phase=D(awake) epoch=20 "
+    "nvml0:free=1454MiB nvml1:free=859MiB nvml2:free=1276MiB "
+    "min_so_far={0: 1454, 1: 859, 2: 1276}"
+)
+
+
+def _write_log(case, *lines):
+    fd, path = tempfile.mkstemp(prefix="weg2fix2-", suffix=".front.log")
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    case.addCleanup(os.unlink, path)
+    return path
+
+
+class ProseIsNotASampleTest(unittest.TestCase):
+    """FIX 2, finding 1: the #995 prose trap, inside the instrument-namer.
+
+    ``front_corridor_instrument`` scanned for lines CONTAINING
+    ``WEG2-CORRIDOR`` and classified any line matching the phase regex.  The
+    front log's own skip-reason sentence matches that regex, sits BEFORE the
+    first real sample, and the function returns on the first match -- so a
+    POST-fix boot was labelled ``total_minus_used(carve-out-blind)`` and
+    ``RingTable.provenance()`` appended a warning about an instrument that
+    boot never used.  A printed claim the code did not measure, produced by
+    the one function added to make instrument claims true.
+    """
+
+    def test_prose_before_a_real_sample_does_not_set_the_instrument(self):
+        path = _write_log(self, RG6_PROSE_LINE, POST_FIX_LINE)
+        self.assertEqual(
+            ring_table.front_corridor_instrument(path), "nvml_v2_free,allocatable"
+        )
+
+    def test_prose_before_a_pre_fix_sample_still_reports_pre_fix(self):
+        """The fix must not flip the OTHER way: a real pre-fix boot stays pre-fix."""
+        path = _write_log(self, RG6_PROSE_LINE, PRE_FIX_LINE)
+        self.assertEqual(
+            ring_table.front_corridor_instrument(path),
+            ring_table.CORRIDOR_INSTRUMENT_PRE_FIX,
+        )
+
+    def test_a_log_of_nothing_but_prose_reports_no_samples(self):
+        path = _write_log(self, RG6_PROSE_LINE)
+        self.assertEqual(
+            ring_table.front_corridor_instrument(path), "no WEG2-CORRIDOR samples"
+        )
+
+    def test_prose_creates_no_phase_entry(self):
+        """The nonblocking sibling: an EMPTY 'P' satisfied solve()'s guard.
+
+        ``if "P" not in corridor or "D" not in corridor`` reads a key as "this
+        phase has measurements".  The prose line minted ``{'P': {}}``, the
+        guard passed, and every card's P credit silently became
+        ``free_p.get(uuid, 0) == 0`` instead of the intended refusal.
+        """
+        path = _write_log(self, RG6_PROSE_LINE, POST_FIX_LINE)
+        got = ring_table.parse_front_corridor(path)
+        self.assertEqual(got, {"D": {0: 1030, 1: 341, 2: 852}})
+        self.assertNotIn("P", got)
+
+    def test_a_sample_line_needs_a_measurement_not_just_the_marker(self):
+        self.assertIsNone(ring_table._corridor_sample_phase(RG6_PROSE_LINE))
+        self.assertEqual(ring_table._corridor_sample_phase(POST_FIX_LINE), "D")
+        self.assertEqual(ring_table._corridor_sample_phase(PRE_FIX_LINE), "D")
+
+    def test_a_phase_key_still_appears_for_a_real_P_sample(self):
+        """Can-fail proof for the gate: it must not reject genuine samples."""
+        p_line = POST_FIX_LINE.replace("phase=D(awake)", "phase=P(awake)")
+        got = ring_table.parse_front_corridor(_write_log(self, p_line, POST_FIX_LINE))
+        self.assertEqual(sorted(got), ["D", "P"])
+        self.assertEqual(got["P"], {0: 1030, 1: 341, 2: 852})
+
+    def test_provenance_does_not_claim_a_pre_fix_instrument_for_a_post_fix_boot(self):
+        """The printed consequence, end to end."""
+        warning = "this boot's corridor samples are free PLUS the driver carve-out"
+        post = ring_table.RingTable(
+            boot="b", instrument="i", lines_read=1, image_source="s",
+            credit_instrument=ring_table.front_corridor_instrument(
+                _write_log(self, RG6_PROSE_LINE, POST_FIX_LINE)
+            ),
+        )
+        self.assertNotIn(warning, post.provenance())
+        pre = ring_table.RingTable(
+            boot="b", instrument="i", lines_read=1, image_source="s",
+            credit_instrument=ring_table.front_corridor_instrument(
+                _write_log(self, RG6_PROSE_LINE, PRE_FIX_LINE)
+            ),
+        )
+        self.assertIn(warning, pre.provenance())
+
+
+class TheProseLineIsRealTest(unittest.TestCase):
+    """Evidence-tree bound: the trigger is in a real log, not constructed."""
+
+    RG6 = (
+        "/spinning/evidence-665-f1/"
+        "boot_weg2_weg2rg6_7f88b1c75d_0908_070324.front.log"
+    )
+
+    def _log(self):
+        if not os.path.exists(self.RG6):
+            self.skipTest(f"evidence tree absent: {self.RG6}")
+        return self.RG6
+
+    def test_rg6_front_log_contains_the_prose_line(self):
+        with open(self._log(), errors="replace") as f:
+            hits = [ln for ln in f if "front carries no WEG2-CORRIDOR" in ln]
+        self.assertEqual(len(hits), 1, "the trigger line is not in the rg6 log")
+        self.assertIsNone(ring_table._corridor_sample_phase(hits[0]))
+
+    def test_rg6_is_still_classified_pre_fix_from_its_real_samples(self):
+        """The gate must not have made the real answer worse."""
+        self.assertEqual(
+            ring_table.front_corridor_instrument(self._log()),
+            ring_table.CORRIDOR_INSTRUMENT_PRE_FIX,
+        )
+        got = ring_table.parse_front_corridor(self._log())
+        self.assertEqual(sorted(got), ["D", "P"])
+        self.assertTrue(got["P"] and got["D"], "a real phase lost its samples")
+
+
+class BandHasOneDeclarationTest(unittest.TestCase):
+    """FIX 2, finding 2: the front held a private copy of the corridor band.
+
+    ``corridor_guard.py:141`` states the rule: "THE ONE DECLARATION.  Every
+    other module that needs the law imports it from here rather than repeating
+    the literal."  The commit whose thesis was "ONE reader" froze 819/1229
+    beside it, under the comment "the corridor law, verbatim" -- a copy that
+    cannot follow the law it quotes.
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get(corridor_guard.LAW_ENV)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._saved is None:
+            os.environ.pop(corridor_guard.LAW_ENV, None)
+        else:
+            os.environ[corridor_guard.LAW_ENV] = self._saved
+
+    def _move_the_law(self):
+        os.environ[corridor_guard.LAW_ENV] = "1536"
+        return corridor_guard.corridor_band_floor_mib(), corridor_guard.corridor_band_ceiling_mib()
+
+    def test_front_declares_no_band_literal_of_its_own(self):
+        """AST, not grep: prose may quote 819-1229, code may not hold it."""
+        src = open(front.__file__, errors="replace").read()
+        held = [
+            f"line {n.lineno}: {n.value}"
+            for n in ast.walk(ast.parse(src, filename=front.__file__))
+            if isinstance(n, ast.Constant)
+            and isinstance(n.value, int)
+            and not isinstance(n.value, bool)
+            and n.value in (819, 1229)
+        ]
+        self.assertEqual(held, [], "front.py holds a frozen copy of the corridor band")
+
+    def test_the_band_follows_the_law(self):
+        moved = self._move_the_law()
+        self.assertEqual(moved, (1228, 1843))
+        self.assertEqual(front.corridor_band_mib(), moved)
+
+    def test_the_verdict_follows_the_law(self):
+        self.assertEqual(front.corridor_verdict(1500), "ABOVE")
+        self._move_the_law()
+        self.assertEqual(front.corridor_verdict(1500), "IN")
+        self.assertEqual(front.corridor_verdict(1227), "BELOW")
+
+    def test_the_printed_band_follows_the_law(self):
+        self._move_the_law()
+        f = _front()
+        with _PatchNvml(_fake(_rig({0: 1030, 1: 341, 2: 852}))):
+            line = f.corridor_sample()
+        self.assertIn("band=1228-1843MiB", line)
+        self.assertIn("nvml0:free=1030MiB reserved=425MiB verdict=BELOW", line)
+
+    def test_the_exported_state_follows_the_law(self):
+        self._move_the_law()
+        self.assertEqual(_front().state_dict()["corridor_band_mib"], [1228, 1843])
+
+    def test_the_default_band_is_unchanged(self):
+        """Same numbers as before the fix, by derivation rather than by copy."""
+        self.assertEqual(front.corridor_band_mib(), (819, 1229))
+        self.assertEqual(_front().state_dict()["corridor_band_mib"], [819, 1229])
+
+
+class InstrumentNameFollowsTheReadTest(unittest.TestCase):
+    """FIX 2, finding 3: ``nvml_v2_free`` named a struct the code did not read.
+
+    ``memory_snapshot`` fetched the v2 struct, kept ``reserved``, threw its
+    ``free`` and ``used`` away, and read them again from the V1 struct -- while
+    every consumer printed ``nvml_v2_free`` / ``nvml_v2_used``.  The two agree
+    on this driver (v1 free 20054 == v2 free 20054, measured), so the fake here
+    makes them DISAGREE: only a reader that actually takes the v2 field can
+    pass.
+    """
+
+    class _SplitFake(FakeNvml):
+        """v1 and v2 report different ``free``. No real driver does this."""
+
+        V1_FREE_MIB = 9999
+
+        def nvmlDeviceGetMemoryInfo(self, h, version=None):
+            self.calls += 1
+            total, free, reserved = self.cards[h]
+            if version is None:
+                return _V1(total * MIB, self.V1_FREE_MIB * MIB)
+            return _V2(total * MIB, free * MIB, reserved * MIB)
+
+    def test_free_is_the_v2_field(self):
+        with _PatchNvml(self._SplitFake(_rig({0: 1030, 1: 341, 2: 852}))):
+            snap = nvml_registry.memory_snapshot()
+        self.assertEqual([m.free_mib for _d, m in snap], [1030, 341, 852])
+        for _d, m in snap:
+            self.assertNotEqual(m.free_mib, self._SplitFake.V1_FREE_MIB)
+            self.assertEqual(m.free_instrument, nvml_registry.FREE_INSTRUMENT_V2)
+
+    def test_tenant_used_is_the_v2_used_field_not_a_derivation(self):
+        """``used`` read, not ``(total - reserved)//MiB - free//MiB`` twice-floored."""
+        with _PatchNvml(_fake(_rig({0: 1030, 1: 341, 2: 852}))):
+            snap = nvml_registry.memory_snapshot()
+        for dev, mem in snap:
+            total, free, reserved = _rig({0: 1030, 1: 341, 2: 852})[dev.index]
+            self.assertEqual(mem.tenant_used_bytes // MIB, total - free - reserved)
+            self.assertEqual(mem.tenant_used_mib, total - free - reserved)
+            self.assertEqual(mem.tenant_used_instrument, nvml_registry.USED_INSTRUMENT_V2)
+
+    def test_a_hand_built_MemoryInfo_still_derives(self):
+        """Backwards compatible: no v2 ``used`` supplied means the old path."""
+        m = nvml_registry.MemoryInfo(
+            total_bytes=20480 * MIB, free_bytes=1030 * MIB,
+            used_bytes=19450 * MIB, reserved_bytes=425 * MIB,
+        )
+        self.assertIsNone(m.tenant_used_bytes)
+        self.assertEqual(m.tenant_used_mib, 20480 - 425 - 1030)
+
+
+class CarveOutBlindModeIsNamedTest(unittest.TestCase):
+    """FIX 2, finding 3 (degradation half), and the disclosed nonblocking item.
+
+    With no v2 struct the registry returns ``reserved=0``, ``tenant_used``
+    collapses to the v1 ``used`` (carve-out INCLUDED -- the #539 trap), and the
+    predecessor still printed ``instrument=nvml_v2_free,allocatable`` beside
+    ``reserved=0MiB``.  The value degrades; the CLAIM must degrade with it.
+    """
+
+    class _NoV2(FakeNvml):
+        nvmlMemory_v2 = None
+
+    def _blind(self, free_by_index):
+        return self._NoV2(_rig(free_by_index))
+
+    def test_registry_says_the_carve_out_is_unknown(self):
+        with _PatchNvml(self._blind(IDLE_FREE)):
+            snap = nvml_registry.memory_snapshot()
+        for _d, m in snap:
+            self.assertFalse(m.carve_out_known)
+            self.assertIsNone(m.tenant_used_bytes)
+            self.assertEqual(m.free_instrument, nvml_registry.FREE_INSTRUMENT_V1)
+            self.assertEqual(m.tenant_used_instrument, nvml_registry.USED_INSTRUMENT_V1)
+            self.assertIn("carve-out INCLUDED", m.tenant_used_instrument)
+
+    def test_the_corridor_line_degrades_its_instrument_token(self):
+        f = _front()
+        with _PatchNvml(self._blind({0: 1030, 1: 341, 2: 852})):
+            line = f.corridor_sample()
+        self.assertIn(f"instrument={front.CORRIDOR_INSTRUMENT_NO_V2}", line)
+        self.assertNotIn("instrument=nvml_v2_free", line)
+        self.assertIn("reserved=0MiB", line)
+
+    def test_the_exported_state_degrades_with_the_line(self):
+        f = _front()
+        self.assertEqual(f.state_dict()["corridor_instrument"], front.CORRIDOR_INSTRUMENT)
+        with _PatchNvml(self._blind({0: 1030, 1: 341, 2: 852})):
+            f.corridor_sample()
+        self.assertEqual(
+            f.state_dict()["corridor_instrument"], front.CORRIDOR_INSTRUMENT_NO_V2
+        )
+
+    def test_one_blind_card_downgrades_the_whole_line(self):
+        """One token stands for the line, so the weakest card sets it."""
+        good = front.CardFree(0, "u0", 1030, 425, carve_out_known=True)
+        bad = front.CardFree(1, "u1", 341, 0, carve_out_known=False)
+        self.assertEqual(front.corridor_instrument([good]), front.CORRIDOR_INSTRUMENT)
+        self.assertEqual(
+            front.corridor_instrument([good, bad]), front.CORRIDOR_INSTRUMENT_NO_V2
+        )
+
+    def test_the_launcher_refusal_names_v1_when_v2_is_absent(self):
+        """The #539 trap returns in this mode; the message must not hide it."""
+        busy = {**IDLE_FREE, 0: IDLE_FREE[0] - 2000}
+        with _PatchNvml(self._blind(busy)):
+            cards = launcher.resolve_cards()
+            with self.assertRaises(launcher.Weg2LaunchRefused) as e:
+                launcher.cards_free_check(cards, lambda _m: None)
+        self.assertIn("carve-out INCLUDED", str(e.exception))
+        self.assertNotIn("instrument nvml_v2_used", str(e.exception))
+
+    def test_the_launcher_free_line_names_v1_when_v2_is_absent(self):
+        lines = []
+        with _PatchNvml(self._blind(IDLE_FREE)):
+            cards = launcher.resolve_cards()
+            launcher.cards_free_check(cards, lines.append)
+        self.assertIn("instrument: nvml_v1_free, allocatable", lines[0])
+        self.assertNotIn("nvml_v2_free", lines[0])
+
+
+class LauncherThresholdTest(unittest.TestCase):
+    """The mutant gap the review's own probe found and left open.
+
+    Replacing the guard quantity at ``launcher.py`` ``if m.tenant_used_mib >
+    1500`` with ``m.used_bytes // MIB > 1500`` -- the #539 mirror trap at the
+    threshold, message unchanged -- SURVIVED all 37 tests: the idle case is
+    425 either way and the busy case is 2000 either way.  A 3080 holding
+    1076-1500 MiB of real tenancy reads 1501-1925 in the v1 figure, so the
+    mutant refuses a card the law admits.  1200 is inside that band.
+    """
+
+    def _cards(self):
+        with _PatchNvml(_fake(_rig(IDLE_FREE))):
+            return launcher.resolve_cards()
+
+    def test_a_tenant_inside_the_mutant_band_is_not_refused(self):
+        tenancy = 1200
+        free = {**IDLE_FREE, 0: IDLE_FREE[0] - tenancy}
+        with _PatchNvml(_fake(_rig(free))) as fake:
+            self.assertEqual(
+                fake.nvmlDeviceGetMemoryInfo(0).used // MIB, tenancy + 425,
+                "the v1 figure must be over 1500 or this case proves nothing",
+            )
+            launcher.cards_free_check(self._cards(), lambda _m: None)
+
+    def test_the_threshold_still_bites_just_above_it(self):
+        free = {**IDLE_FREE, 0: IDLE_FREE[0] - 1501}
+        with _PatchNvml(_fake(_rig(free))):
+            with self.assertRaises(launcher.Weg2LaunchRefused) as e:
+                launcher.cards_free_check(self._cards(), lambda _m: None)
+        self.assertIn("1501 MiB held by processes", str(e.exception))
+
+
+class NvmlWarningLatchTest(unittest.TestCase):
+    """Nonblocking: one transient failure muted the warning for the boot."""
+
+    def setUp(self):
+        front._nvml_unavailable_logged = False
+        self.addCleanup(setattr, front, "_nvml_unavailable_logged", False)
+
+    def _fail_once_then(self, results):
+        it = iter(results)
+
+        def snapshot():
+            r = next(it)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        return snapshot
+
+    def test_a_good_read_re_arms_the_warning(self):
+        orig = nvml_registry.memory_snapshot
+        good = None
+        with _PatchNvml(_fake(_rig({0: 1030, 1: 341, 2: 852}))):
+            good = nvml_registry.memory_snapshot()
+        nvml_registry.memory_snapshot = self._fail_once_then(
+            [RuntimeError("transient"), good, RuntimeError("again")]
+        )
+        try:
+            with self.assertLogs("weg2.front", level=logging.WARNING):
+                front._nvml_free()
+            self.assertTrue(front._nvml_free())
+            self.assertFalse(front._nvml_unavailable_logged, "the latch stayed set")
+            with self.assertLogs("weg2.front", level=logging.WARNING):
+                front._nvml_free()
+        finally:
+            nvml_registry.memory_snapshot = orig
+
+
+class BootArmTest(unittest.TestCase):
+    """FIX 2, finding 4: the acceptance [SECTION 1x] pointed at and lacked.
+
+    ``arm_report`` grades a boot's own front log (did it sample, in which
+    unit); ``pair_verdict`` is the proof, because a sampler printing the right
+    LABEL over the wrong NUMBER passes the first and fails the second.
+    """
+
+    def test_a_post_fix_log_passes(self):
+        rep = corridor_arm.arm_report(_write_log(self, RG6_PROSE_LINE, POST_FIX_LINE))
+        self.assertTrue(rep.ok, rep.report())
+        self.assertEqual(rep.instrument, "nvml_v2_free,allocatable")
+        self.assertEqual((rep.samples, rep.prose_mentions), (1, 1))
+        self.assertIn("verdict=PASS", rep.report())
+
+    def test_a_pre_fix_log_fails_and_says_why(self):
+        rep = corridor_arm.arm_report(_write_log(self, PRE_FIX_LINE))
+        self.assertFalse(rep.ok)
+        self.assertIn("pre-fix total-minus-used sampler", " ".join(rep.problems))
+
+    def test_a_log_with_no_samples_fails(self):
+        rep = corridor_arm.arm_report(_write_log(self, RG6_PROSE_LINE))
+        self.assertFalse(rep.ok)
+        self.assertEqual((rep.samples, rep.prose_mentions), (0, 1))
+        self.assertIn("the sampler did not run", " ".join(rep.problems))
+
+    def test_a_carve_out_blind_log_fails_the_arm(self):
+        blind = POST_FIX_LINE.replace(
+            "instrument=nvml_v2_free,allocatable",
+            f"instrument={front.CORRIDOR_INSTRUMENT_NO_V2}",
+        )
+        rep = corridor_arm.arm_report(_write_log(self, blind))
+        self.assertFalse(rep.ok)
+        self.assertIn("carve-out-blind", " ".join(rep.problems))
+
+    def test_band_check_is_opt_in(self):
+        """341 is BELOW the floor: a capacity finding, not an instrument one."""
+        path = _write_log(self, POST_FIX_LINE)
+        self.assertTrue(corridor_arm.arm_report(path).ok)
+        strict = corridor_arm.arm_report(path, require_in_band=True)
+        self.assertFalse(strict.ok)
+        self.assertIn("nvml1 minimum 341 MiB is BELOW", " ".join(strict.problems))
+
+    def test_the_band_check_grades_BOTH_edges(self):
+        """ABOVE the ceiling is "the boot did not pass", not a free pass.
+
+        The corridor rule has two failing sides -- below the floor is a
+        breach, above the ceiling is VRAM buying no tokens -- and a check
+        that only looked down would bless an over-filled card.  (Mutant 4g:
+        dropping ``<= ceil`` survived the first battery.)
+        """
+        above = POST_FIX_LINE.replace("nvml0:free=1030MiB", "nvml0:free=5000MiB")
+        rep = corridor_arm.arm_report(_write_log(self, above), require_in_band=True)
+        self.assertFalse(rep.ok)
+        joined = " ".join(rep.problems)
+        self.assertIn("nvml0 minimum 5000 MiB is ABOVE", joined)
+        self.assertIn("nvml1 minimum 341 MiB is BELOW", joined)
+
+    def test_an_in_band_log_passes_the_strict_check(self):
+        """Can-fail the other way: the strict check must be satisfiable."""
+        good = (
+            POST_FIX_LINE.replace("nvml1:free=341MiB", "nvml1:free=1000MiB")
+            .replace("nvml2:free=852MiB", "nvml2:free=900MiB")
+        )
+        rep = corridor_arm.arm_report(_write_log(self, good), require_in_band=True)
+        self.assertTrue(rep.ok, rep.report())
+
+    def test_the_report_grades_each_minimum(self):
+        rep = corridor_arm.arm_report(_write_log(self, POST_FIX_LINE))
+        self.assertIn("phase=D(awake) nvml1: min_free=341MiB verdict=BELOW", rep.report())
+        self.assertIn("phase=D(awake) nvml0: min_free=1030MiB verdict=IN", rep.report())
+
+    def test_pair_passes_when_the_two_readers_agree(self):
+        res = corridor_arm.pair_verdict({0: 1030, 1: 341, 2: 852}, {0: 1030, 1: 341, 2: 852})
+        self.assertTrue(res.ok, res.report())
+        self.assertIn("verdict=PASS", res.report())
+
+    def test_pair_tolerates_the_one_mib_rounding_spread(self):
+        """pynvml floors 20054 where nvidia-smi prints 20055; measured."""
+        self.assertTrue(corridor_arm.pair_verdict({0: 20054}, {0: 20055}).ok)
+
+    def test_pair_fails_on_the_rg6_instant_and_names_the_defect(self):
+        """The exact form that produced 1030/341/852 vs 1454/859/1276."""
+        res = corridor_arm.pair_verdict(
+            {0: 1454, 1: 859, 2: 1276}, {0: 1030, 1: 341, 2: 852}
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(res.disagree, (0, 1, 2))
+        self.assertEqual([res.rows[i][2] for i in (0, 1, 2)], [424, 518, 424])
+        self.assertTrue(res.looks_like_the_carve_out_defect)
+        self.assertIn("pre-fix `total - used` subtraction", res.report())
+
+    def test_pair_fails_without_calling_every_disagreement_the_carve_out(self):
+        res = corridor_arm.pair_verdict({0: 1030}, {0: 700})
+        self.assertFalse(res.ok)
+        self.assertFalse(res.looks_like_the_carve_out_defect)
+
+    def test_pair_names_a_card_only_one_reader_saw(self):
+        res = corridor_arm.pair_verdict({0: 1030, 1: 341}, {0: 1030})
+        self.assertFalse(res.ok)
+        self.assertEqual(res.only_in_tree, (1,))
+        self.assertIn("cards only the in-tree reader saw: [1]", res.report())
+
+    def test_an_empty_pairing_is_not_a_pass(self):
+        self.assertFalse(corridor_arm.pair_verdict({}, {}).ok)
+
+    def test_smi_rows_parse_and_junk_is_dropped(self):
+        got = corridor_arm.parse_smi_free("0, 1030\n1, 341\nFailed to initialize NVML\n2, 852\n")
+        self.assertEqual(got, {0: 1030, 1: 341, 2: 852})
+
+    def test_the_pairing_cannot_be_widened_past_the_defect(self):
+        """A tolerance at or above the smallest carve-out cannot fail on it."""
+        cli = _cli()
+        with self.assertRaises(SystemExit) as e:
+            cli.main(["--pair", "--tolerance-mib", "424"])
+        self.assertEqual(e.exception.code, 2)
+
+    def test_cli_exit_codes(self):
+        cli = _cli()
+        self.assertEqual(cli.main(["--log", _write_log(self, POST_FIX_LINE)]), 0)
+        self.assertEqual(cli.main(["--log", _write_log(self, PRE_FIX_LINE)]), 1)
+        with self.assertRaises(SystemExit) as e:
+            cli.main([])
+        self.assertEqual(e.exception.code, 2)
+
+    def test_cli_pairs_from_supplied_output_without_touching_a_card(self):
+        cli = _cli()
+        with _PatchNvml(_fake(_rig({0: 1030, 1: 341, 2: 852}))):
+            self.assertEqual(cli.main(["--pair", "--smi-output", "0, 1030\n1, 341\n2, 852\n"]), 0)
+            self.assertEqual(cli.main(["--pair", "--smi-output", "0, 1454\n1, 859\n2, 1276\n"]), 1)
+
+    def test_live_pair_reads_the_in_tree_sampler(self):
+        with _PatchNvml(_fake(_rig({0: 1030, 1: 341, 2: 852}))):
+            res = corridor_arm.live_pair(smi_text="0, 1030\n1, 341\n2, 852\n")
+        self.assertTrue(res.ok, res.report())
+
+
+class BootArmAgainstRealBootsTest(unittest.TestCase):
+    """Evidence-tree bound: the arm must FAIL on all three pre-fix boots.
+
+    A can-fail proof against real inputs -- an acceptance that passes on the
+    boots whose instrument this commit corrects would be measuring nothing.
+    """
+
+    EVIDENCE = RealBootLogsAreProvenPreFixTest.EVIDENCE
+    STEMS = RealBootLogsAreProvenPreFixTest.STEMS
+
+    def test_all_three_pre_fix_boots_fail_the_arm(self):
+        for key, stem in self.STEMS.items():
+            path = os.path.join(self.EVIDENCE, stem + ".front.log")
+            if not os.path.exists(path):
+                self.skipTest(f"evidence tree absent: {path}")
+            rep = corridor_arm.arm_report(path)
+            self.assertFalse(rep.ok, f"{key} passed an arm it must fail")
+            self.assertGreater(rep.samples, 0, key)
+            self.assertIn("pre-fix total-minus-used sampler", " ".join(rep.problems), key)
+
+
+def _cli():
+    """The boot-arm CLI, loaded from its durable path in the tree."""
+    import importlib.util
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(front.__file__)))))
+    path = os.path.join(os.path.dirname(root), "scripts", "weg2", "corridor_arm_check.py")
+    spec = importlib.util.spec_from_file_location("weg2_corridor_arm_check", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 if __name__ == "__main__":

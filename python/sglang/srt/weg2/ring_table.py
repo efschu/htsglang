@@ -174,6 +174,33 @@ _CORRIDOR_FREE_RE = re.compile(r"nvml(\d+):free=(\d+)MiB")
 #: ``instrument=nvml_v2_free,allocatable`` -- present only on boots taken after
 #: the corridor instrument fix (front.CORRIDOR_INSTRUMENT).
 _CORRIDOR_INSTRUMENT_RE = re.compile(r"WEG2-CORRIDOR\s+phase=[A-Z]\(awake\)[^\n]*?instrument=(\S+)")
+
+
+def _corridor_sample_phase(line: str) -> Optional[str]:
+    """The phase letter if this line IS a corridor SAMPLE, else ``None``.
+
+    THE #995 PROSE TRAP, IN THIS MODULE'S OWN OUTPUT (FIX 2, finding 1).  A
+    line that merely CONTAINS ``WEG2-CORRIDOR phase=P(awake)`` is not a
+    sample: :func:`solve` emits exactly such a sentence into the front log as
+    its own skip reason -- ``front carries no WEG2-CORRIDOR phase=P(awake)/
+    D(awake) samples`` -- and it is present verbatim in
+    ``boot_weg2_weg2rg6_7f88b1c75d_0908_070324.front.log`` at 07:03:46Z, 127
+    seconds BEFORE that boot's first real sample.  Read as a sample it did two
+    things: it made :func:`front_corridor_instrument` return early and label a
+    POST-fix boot pre-fix (a printed claim about an instrument the boot did not
+    use), and it made :func:`parse_front_corridor` create an EMPTY phase entry
+    that satisfied the ``"P" not in corridor`` guard, turning an intended
+    refusal into a silent zero credit for every card.
+
+    What separates the two is not the phase token but the MEASUREMENT: a
+    sample carries at least one ``nvmlN:free=<n>MiB`` field, and prose about
+    samples carries none.  A line with no number in it can testify to nothing,
+    which is why the gate is here and not at either call site.
+    """
+    m = _CORRIDOR_PHASE_RE.search(line)
+    if not m or not _CORRIDOR_FREE_RE.search(line):
+        return None
+    return m.group(1)
 #: What a WEG2-CORRIDOR line without an ``instrument=`` token was measuring:
 #: ``total - used`` over nvidia-smi's carve-out-free ``memory.used``, i.e. free
 #: PLUS the driver carve-out.  Named, never silently equated with the new one.
@@ -955,16 +982,20 @@ def parse_front_corridor(path: str) -> Dict[str, Dict[int, int]]:
     The minimum, not the first sample: it is the conservative end of the credit
     (a smaller credit only ever makes R5's requirement larger), and the first
     sample of a phase is taken before the awake group has any load on it.
+
+    Only lines that ARE samples create a phase entry (:func:`_corridor_sample_phase`).
+    A phase key here is therefore a claim that measurements exist for it, which
+    is what :func:`solve`'s ``"P" not in corridor`` guard reads it as.
     """
     out: Dict[str, Dict[int, int]] = {}
     with open(path, errors="replace") as f:
         for line in f:
             if "WEG2-CORRIDOR" not in line:
                 continue
-            m = _CORRIDOR_PHASE_RE.search(line)
-            if not m:
+            letter = _corridor_sample_phase(line)
+            if letter is None:
                 continue
-            phase = out.setdefault(m.group(1), {})
+            phase = out.setdefault(letter, {})
             for idx, free in _CORRIDOR_FREE_RE.findall(line):
                 i, v = int(idx), int(free)
                 if i not in phase or v < phase[i]:
@@ -988,17 +1019,27 @@ def front_corridor_instrument(path: str) -> str:
     proved on metal is built from one of them.  What must not happen is a
     reader quoting a credit without knowing which unit it is in, so this is
     returned and printed beside the number.
+
+    ONLY A SAMPLE MAY TESTIFY (FIX 2, finding 1).  The classification is made
+    from lines that carry a measurement, never from a line that merely mentions
+    the marker -- see :func:`_corridor_sample_phase` for the prose line, in the
+    rg6 front log, that made this function label a post-fix boot pre-fix and
+    :meth:`RingTable.provenance` print a warning about an instrument that boot
+    never used.  Answering from the first MATCHING line is kept: it is the
+    first line that actually measured something, and a boot does not change
+    instrument mid-run.
     """
     try:
         with open(path, errors="replace") as f:
             for line in f:
                 if "WEG2-CORRIDOR" not in line:
                     continue
+                if _corridor_sample_phase(line) is None:
+                    continue
                 m = _CORRIDOR_INSTRUMENT_RE.search(line)
                 if m:
                     return m.group(1)
-                if _CORRIDOR_PHASE_RE.search(line):
-                    return CORRIDOR_INSTRUMENT_PRE_FIX
+                return CORRIDOR_INSTRUMENT_PRE_FIX
     except OSError:
         return "unreadable"
     return "no WEG2-CORRIDOR samples"
