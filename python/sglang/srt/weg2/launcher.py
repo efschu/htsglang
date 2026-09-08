@@ -514,6 +514,24 @@ DESIGN_PREFIX_FALLBACK_TOKENS = 4096
 #: half of that boot (D1 -> D2 -> D3 all run overlap ON and extra_buffer).
 D_NUM_CONTINUOUS_DECODE_STEPS = 2
 
+#: #1017 GROUP D'S WEIGHT-VECTOR OBJECTIVE -- the knob, not a second solver.
+#:
+#: ``--rank-tp-ratio auto`` is the CAPACITY-FIRST split (server_args.py:838
+#: _CAPACITY_FIRST_DEFAULT_NOTICE: "the weights are proportional to each
+#: rank's VRAM budget ... deliberately independent of how fast the cards
+#: are"). Under the maxkv law that is the right DEFAULT, but it was reaching
+#: group D's argv as a bare literal, so no boot ever stated which objective it
+#: had chosen or what the other one costs. This is the knob that states it.
+#:
+#: The launcher does NOT solve the vector. Both arms are upstream mechanisms
+#: and stay upstream: 'maxkv' emits ``--rank-tp-ratio auto`` (resolved by
+#: ServerArgs._resolve_auto_rank_tp_ratio) and 'speed' emits
+#: ``--rank-tp-ratio auto-performance --rank-perf-tune <target>`` (resolved by
+#: uneven_perf.apply_auto_performance). What the launcher adds is the CHOICE,
+#: priced, on one line -- ``d_tp_ratio_decision``.
+D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed")
+D_TP_OBJECTIVE_DEFAULT = "maxkv"
+
 
 class Weg2LaunchRefused(RuntimeError):
     pass
@@ -1200,6 +1218,7 @@ def argv_d(
     x_tokens: int = 0,
     num_continuous_decode_steps: int = 1,
     disable_overlap: bool = False,
+    tp_ratio_flags: Sequence[str] = ("--rank-tp-ratio", "auto"),
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
@@ -1245,9 +1264,15 @@ def argv_d(
         # (BSSCALE_0907.md D4).
         "--num-continuous-decode-steps", str(int(num_continuous_decode_steps)),
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
-        # a per-rank MiB LIST under TP requires the uneven-TP ratio; 'auto'
-        # derives the weights from that list (server_args.py rank_tp_ratio).
-        "--rank-tp-ratio", "auto",
+    ] + list(tp_ratio_flags) + [
+        # THE WEIGHT OBJECTIVE IS STATED, NOT ASSUMED (#1017). A per-rank MiB
+        # LIST under TP requires the uneven-TP ratio, and 'auto' derives the
+        # weights from that list -- but 'auto' is the CAPACITY-FIRST default
+        # (server_args.py:838), so shipping it as a literal meant every Weg-2
+        # boot chose an objective without saying so. The choice now arrives
+        # from d_tp_ratio_decision as --d-tp-objective, priced on the launch
+        # line; the default is still 'auto' because the maxkv law makes
+        # capacity the default objective, not because nothing was decided.
         "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
         "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
         "--uneven-dcp", "--uneven-dcp-weighted",
@@ -2580,6 +2605,215 @@ def d_overlap_cost_line(model: str, disable_overlap: bool) -> str:
     )
 
 
+@dataclass(frozen=True)
+class DTpRatioDecision:
+    """Group D's weight-vector objective, the argv it produces, and its price."""
+
+    objective: str
+    tune: str
+    flags: Tuple[str, ...]
+    line: str
+
+
+def d_tp_ratio_decision(
+    objective: str,
+    tune: str,
+    cards: Sequence[Card],
+    budgets: Sequence[int],
+    model: str,
+    d_bs: int,
+) -> DTpRatioDecision:
+    """Choose group D's weight objective and PRICE the choice on one line.
+
+    NO SECOND SOLVER (upstream-minimal). Both arms are the runtime's own
+    mechanisms and the launcher only names which one this boot took:
+
+      * ``maxkv``  -> ``--rank-tp-ratio auto``              (capacity-first)
+      * ``speed``  -> ``--rank-tp-ratio auto-performance --rank-perf-tune T``
+
+    What is computed here is the COST LINE, and every term in it comes from a
+    source that already exists in the tree and is already used by this
+    launcher:
+
+      * the weight vector is the gcd-reduced budget vector, which is exactly
+        what ``ServerArgs._resolve_auto_rank_tp_ratio`` (server_args.py:11239)
+        derives from the same ``--rank-gpu-memory-mib`` list this launcher is
+        about to pass -- recomputed to be PRINTED, never passed, so there is
+        one writer of the vector and it is the runtime;
+      * the per-rank head partitions come from ``PerfCostModel`` +
+        ``partition_units``, the same pair ``_log_derived_plan_vectors``
+        (server_args.py:11316) uses, so the line quotes the geometry the model
+        actually shards on rather than a second reading of config.json;
+      * the per-card compute score is the MEASURED card-rate library
+        (``planner/card_rate_pass.load_measured_library``), which is already
+        the preferred score source of the PP cut on the P side
+        (``pp_cut_launch.ms_per_layer_from_card_library``). It is keyed by
+        card NAME, so it survives a change of NVML/CUDA ordering, and reading
+        it touches no GPU: a missing library prints UNPRICED and the arm is
+        still chosen, because the objective is the operator's decision and not
+        the estimate's.
+
+    THE SLOWEST-RANK LAW is what the estimate states. Under uneven TP every
+    rank runs the attention of its own q-heads and the barrier waits for the
+    last one, so the cost of the capacity split is
+    ``max_r(q_heads_r / score_r)`` against the compute-proportional split's
+    ``max_r`` -- one number, in relative units, and labelled an ESTIMATE
+    because the launcher has no per-layer measurement of group D.
+
+    AND THE HONEST LIMIT OF THE SPEED ARM, which is the reason this line
+    exists rather than a promise: ``auto-performance`` does NOT move the
+    attention/GDN split. Its docstring says so (uneven_perf.py:6571, "Never
+    touches the base (attention/GDN/DCP) split ... the only vector this
+    function writes to server_args is rank_mlp_ratio"), so the attention
+    barrier priced below is IDENTICAL under both objectives. What the speed
+    arm moves is the dense-MLP family vector, and -- with
+    ``--rank-perf-tune dec`` -- the KV-TOKEN split via ``--rank-kv-ratio
+    speed``, which is the lever the flag's own help calls the larger one at
+    depth (server_args.py:2694, measured -24.5 % of the context-dependent part
+    of the decode step at 120k resident tokens, #210). A reader who takes the
+    attention delta below as the speed arm's yield would be wrong, so the line
+    says which lever each number belongs to.
+    """
+    if objective not in D_TP_OBJECTIVE_CHOICES:
+        raise Weg2LaunchRefused(
+            "W47 Weg2TpObjectiveRefused: --d-tp-objective %r is not one of %s."
+            % (objective, "|".join(D_TP_OBJECTIVE_CHOICES))
+        )
+    if objective == "speed":
+        flags = ("--rank-tp-ratio", "auto-performance", "--rank-perf-tune", str(tune))
+    else:
+        flags = ("--rank-tp-ratio", "auto")
+
+    budgets = [int(b) for b in budgets]
+    g = math.gcd(*budgets) if len(budgets) > 1 else budgets[0]
+    weights = [b // max(1, g) for b in budgets]
+
+    # -- the geometry, from the runtime's own cost model ---------------------
+    heads_note = "geometry UNPRICED"
+    q_heads: List[int] = []
+    gdn_heads: List[int] = []
+    n_q = 0
+    try:
+        from sglang.srt.distributed.utils import partition_units
+        from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+
+        inputs = PlanInputs(
+            tp_size=len(budgets),
+            model_path=model,
+            kv_cache_dtype="fp8_e4m3",
+            speculative_algorithm="NEXTN",
+            speculative_num_draft_tokens=3,
+            max_running_requests=int(d_bs),
+        )
+        pcm = PerfCostModel(inputs, weights, list(budgets))
+        n_q = int(pcm.q_heads)
+        scale = n_q // max(1, int(pcm.attn_units))
+        q_heads = [u * scale for u in partition_units(int(pcm.attn_units), weights)]
+        if int(pcm.gdn_units) > 1:
+            gdn_heads = list(partition_units(int(pcm.gdn_units), weights))
+        heads_note = "attention %s of %d q-heads%s" % (
+            q_heads,
+            n_q,
+            "; GDN %s of %d linear-attention heads" % (gdn_heads, int(pcm.gdn_units))
+            if gdn_heads
+            else "",
+        )
+    except Exception as exc:  # pragma: no cover - geometry is diagnostic
+        heads_note = (
+            "geometry UNPRICED (%s): the per-rank head partition could not be "
+            "derived, so the barrier estimate below is omitted rather than "
+            "guessed" % (exc,)
+        )
+
+    # -- the measured per-card score, or an honest absence -------------------
+    scores: Optional[List[float]] = None
+    try:
+        from sglang.srt.planner.card_rate_pass import load_measured_library
+
+        library = load_measured_library()
+        if library is not None:
+            got: List[float] = []
+            for c in cards:
+                variant = next(
+                    (
+                        v
+                        for v in (library.variants(c.name) or ())
+                        if getattr(v, "gemm_tflops", None)
+                    ),
+                    None,
+                )
+                if variant is None:
+                    got = []
+                    break
+                got.append(float(variant.gemm_tflops))
+            scores = got or None
+    except Exception:
+        scores = None
+
+    if scores and q_heads and len(scores) == len(q_heads):
+        cap_bar = max(h / s for h, s in zip(q_heads, scores))
+        ideal_units = partition_units(
+            int(n_q), [max(1, int(round(s * 1000.0))) for s in scores]
+        )
+        ideal_bar = max(h / s for h, s in zip(ideal_units, scores))
+        idle = [100.0 * (1.0 - (h / s) / cap_bar) for h, s in zip(q_heads, scores)]
+        price = (
+            "PRICE (ESTIMATE, slowest-rank law, attention barrier only): "
+            "measured card GEMM %s TFLOP/s (card-rate library, by card NAME); "
+            "the capacity split's barrier is rank %d at %.4f head/TFLOP-s "
+            "while the others idle %s of every attention barrier. A "
+            "compute-proportional split of the same %d q-heads would be %s at "
+            "%.4f = %+.1f %% -- and that delta is NOT what the speed arm buys: "
+            "auto-performance never moves the attention split "
+            "(uneven_perf.py:6571). Its levers are the dense-MLP family vector "
+            "and, under --rank-perf-tune dec, the KV-TOKEN split "
+            "(--rank-kv-ratio speed, #210, measured -24.5 %% of the "
+            "context-dependent part of the decode step at 120k resident "
+            "tokens). Moving the attention split itself needs an explicit "
+            "--rank-tp-ratio vector, which this knob deliberately does not "
+            "emit."
+            % (
+                ", ".join(
+                    "%s %.1f" % (c.name, s) for c, s in zip(cards, scores)
+                ),
+                max(range(len(q_heads)), key=lambda r: q_heads[r] / scores[r]),
+                cap_bar,
+                ", ".join("%.0f %%" % v for v in idle),
+                int(n_q),
+                ideal_units,
+                ideal_bar,
+                100.0 * (ideal_bar - cap_bar) / cap_bar,
+            )
+        )
+    else:
+        price = (
+            "PRICE UNPRICED: no measured card-rate library on this rig for "
+            "these card names (`python -m sglang.srt.planner.card_rate_pass "
+            "--run` writes one), so the cost of the capacity split at the "
+            "attention barrier is NOT estimated here. An absent estimate is "
+            "reported as absent; it is never a measured zero."
+        )
+
+    line = (
+        "WEG2 D-WEIGHTS objective=%s (default %s, the maxkv law; 'speed' is "
+        "selectable and never silent) -> argv %s. Weights the runtime will "
+        "derive from the SAME --rank-gpu-memory-mib %s: %s (gcd-reduced, "
+        "server_args.py:11239 -- printed here, written there). %s. %s"
+        % (
+            objective,
+            D_TP_OBJECTIVE_DEFAULT,
+            " ".join(flags),
+            budgets,
+            weights,
+            heads_note,
+            price,
+        )
+    )
+    return DTpRatioDecision(
+        objective=objective, tune=str(tune), flags=tuple(flags), line=line
+    )
+
+
 #: The one line ``read_pp_bubble`` understands, emitted per window per rank by
 #: ``scheduler_components/pp_bubble.py:summary_line``. Anchored on the whole
 #: field name including its ``=``: a bare number would match milliseconds
@@ -3863,6 +4097,35 @@ def build_parser() -> argparse.ArgumentParser:
              f"REGRESSES to 73.6 / 295.6. Pass 1 to restore the shipped value.",
     )
     ap.add_argument(
+        "--d-tp-objective", choices=list(D_TP_OBJECTIVE_CHOICES),
+        default=D_TP_OBJECTIVE_DEFAULT,
+        help=f"Group D only (#1017). WHICH OBJECTIVE group D's weight vector "
+             f"is solved for. Default {D_TP_OBJECTIVE_DEFAULT!r} = the "
+             f"capacity-first split, emitted as --rank-tp-ratio auto: weights "
+             f"proportional to the per-rank VRAM budgets, which maximizes the "
+             f"KV pool and is deliberately independent of how fast the cards "
+             f"are (server_args.py:838). That is the DEFAULT because the "
+             f"standing law makes maximum KV the default objective -- not "
+             f"because speed was never considered. 'speed' emits "
+             f"--rank-tp-ratio auto-performance --rank-perf-tune "
+             f"<--d-rank-perf-tune>, the runtime's own per-task optimizer. "
+             f"Either way the launcher prints the WEG2 D-WEIGHTS line naming "
+             f"the objective, the weight vector, the per-rank head partition "
+             f"and the estimated cost at the attention barrier. No arm is "
+             f"silent and no arm is solved here.",
+    )
+    ap.add_argument(
+        "--d-rank-perf-tune", default="both",
+        help="Target handed to --rank-perf-tune when --d-tp-objective is "
+             "'speed'. Ignored otherwise (and saying so is the point: a tune "
+             "target without the speed arm would read as an active setting). "
+             "Choices are the runtime's own "
+             "(server_args._RANK_PERF_TUNE_CHOICES: both|dec|enc|maxkv|"
+             "phase-prefill|phase-decode); 'dec' is the one that also selects "
+             "--rank-kv-ratio speed, i.e. the KV-token lever, which is the "
+             "larger one at depth.",
+    )
+    ap.add_argument(
         "--d-disable-overlap-schedule", action="store_true",
         help="Put --disable-overlap-schedule back on group D. The escape "
              "hatch for a server_args gate that refuses overlap under D's "
@@ -4188,8 +4451,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     launch_group(spec_p, tree, log, dry)
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
+        d_ratio = d_tp_ratio_decision(
+            ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
+        )
+        log(d_ratio.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -4247,8 +4514,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1"
     )
     state.budgets["D"] = budgets_d
+    d_ratio = d_tp_ratio_decision(
+        ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
+    )
+    log(d_ratio.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
