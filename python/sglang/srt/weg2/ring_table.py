@@ -457,6 +457,22 @@ FORM_KEY_EXCLUDED_FLAGS: Tuple[str, ...] = (
     #: The scheduler's own queue ceiling: how many requests may WAIT. Pure
     #: admission bookkeeping, no device allocation at all.
     "--max-queued-requests",
+    #: #1275: THE ADMIN KEY, and it is excluded for TWO independent reasons,
+    #: either of which alone would be enough.
+    #:
+    #: (1) It is minted fresh per boot (`weg2/admin_key.mint`), so keying on it
+    #: would give every boot a form of its own and NO boot could ever match a
+    #: predecessor's image -- the ring would fall back to a foreign-form source
+    #: on every single launch. That is the "a key that depends on its own
+    #: consequence" failure above, in a louder costume.
+    #: (2) The normalised form string is LOGGED (`WEG2-P-FORM ... form=`), so a
+    #: key left in the blacklist's default-include would print the secret into
+    #: a world-readable front log on every boot.
+    #:
+    #: And it moves no weight byte: it unlocks the ADMIN_OPTIONAL routes and
+    #: changes nothing group P loads. This is the blacklist working as designed
+    #: -- the default is inclusion, and the exclusion is argued, not assumed.
+    "--admin-api-key",
     #: NOT EXCLUDED, and the reason is worth keeping: --chunked-prefill-size
     #: looks like an admission cap and is not one. The chunk frame is a real
     #: device allocation -- the launcher prices it as

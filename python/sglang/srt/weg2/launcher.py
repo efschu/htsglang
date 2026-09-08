@@ -55,6 +55,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
+from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import host_ledger, ring_table
 
@@ -1462,6 +1463,20 @@ def common_flags(
     ]
 
 
+def admin_key_flag(admin_api_key: Optional[str]) -> List[str]:
+    """#1275: BOTH groups get the key, or the capability is half-present.
+
+    The front talks to P and D with the same header, and the resize lever is
+    wanted on whichever group holds the store -- so a key on one group only
+    would make the front's flip RPCs succeed against one peer and 401 against
+    the other, which is a worse state than having no key at all. One helper,
+    two call sites, so the two argv builders cannot drift apart.
+
+    Empty list when unkeyed, which keeps every pre-#1275 argv byte-identical.
+    """
+    return ["--admin-api-key", admin_api_key] if admin_api_key else []
+
+
 def argv_p(
     py: str,
     model: str,
@@ -1481,6 +1496,7 @@ def argv_p(
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
     draft_kv_on_p: bool = True,
+    admin_api_key: Optional[str] = None,
 ) -> List[str]:
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
@@ -1568,7 +1584,7 @@ def argv_p(
     # speculative decode.
     ] + (list(P_DRAFT_KV_FLAGS) if draft_kv_on_p else []) + [
         "--port", str(PORT_P),
-    ] + extra
+    ] + admin_key_flag(admin_api_key) + extra
 
 
 def w38_armed_line(argv_of_p: Sequence[str]) -> str:
@@ -1628,6 +1644,7 @@ def argv_d(
     random_seed: int = RANDOM_SEED,
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
+    admin_api_key: Optional[str] = None,
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_gib, max_kv_per_request, "write_through", "D",
@@ -1741,7 +1758,7 @@ def argv_d(
         # half that guards the window this line sits next to.
         "--barlink-uncovered-class", "refuse",
         "--port", str(PORT_D),
-    ] + extra
+    ] + admin_key_flag(admin_api_key) + extra
 
 
 def _import_duplex_gate() -> float:
@@ -2910,11 +2927,16 @@ def count_marker(path: str, marker: str) -> int:
 
 
 def launch_group(spec: GroupSpec, tree: str, log: Log, dry: bool) -> None:
-    log(f"group {spec.name} argv: " + " ".join(shlex.quote(a) for a in spec.argv))
+    # #1275: the LOG copy is redacted; spec.argv itself is untouched and is what
+    # is actually exec'd. A log file outlives the boot and gets pasted into
+    # records -- a strictly worse channel than /proc, which is inherent.
+    log(f"group {spec.name} argv: " + " ".join(
+        shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv)))
     if dry:
         return
     fh = open(spec.log, "ab")
-    fh.write(f"=== WEG2 group {spec.name} launched {_now()} ===\nargv: {' '.join(shlex.quote(a) for a in spec.argv)}\n".encode())
+    _logged_argv = ' '.join(shlex.quote(a) for a in admin_key_mod.redact_argv(spec.argv))
+    fh.write(f"=== WEG2 group {spec.name} launched {_now()} ===\nargv: {_logged_argv}\n".encode())
     fh.flush()
     p = subprocess.Popen(spec.argv, env=spec.env, stdout=fh, stderr=subprocess.STDOUT, cwd=tree,
                          start_new_session=True)
@@ -5839,7 +5861,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
             f"arm exists to, and changes nothing else). Group D is unchanged."
         )
-    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, draft_kv_on_p)
+    # #1275: mint THIS boot's admin key and write it 0600 before either group's
+    # argv is built, so both carry the same one and the front has a path to read
+    # it from. The key never appears in a log line -- only its PATH does (see
+    # admin_key.redact) -- and it is excluded from the P form key by name, or a
+    # fresh random value per boot would give every boot its own form.
+    admin_api_key = admin_key_mod.mint()
+    admin_key_file = admin_key_mod.key_path(GPU_ARB, ns.tag)
+    # A DRY RUN WRITES NOTHING, and that line is a promise this must not break:
+    # `--dry-run` prints "nothing started, mounted, armed or written" a few
+    # dozen lines below. The key is still MINTED so the printed argv is faithful
+    # in shape (and so a reader sees where the flag lands), but it is not
+    # persisted and the log says which of the two happened.
+    if not dry:
+        admin_key_mod.write(admin_key_file, admin_api_key)
+    log(f"WEG2 ADMIN-KEY {'minted (DRY: not written)' if dry else 'minted'} for this boot -> {admin_key_file} (mode 0600); "
+        f"both groups get --admin-api-key, the front authenticates its flip RPCs "
+        f"with it, and /hicache/storage-backend/resize is LIVE (#1275). "
+        f"Direct call: curl -s -X POST http://127.0.0.1:{PORT_D}/hicache/storage-backend/resize "
+        f"-H \"Authorization: Bearer $(cat {admin_key_file})\" "
+        f"-H 'Content-Type: application/json' -d '{{\"max_size_gb\": 8, \"min_free_gb\": 20}}'")
+    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, draft_kv_on_p, admin_api_key=admin_api_key)
     # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
     # gated the ring table was hashed over an argv built with sentinel ledger
     # terms, which is sound only while every flag those sentinels reach is
@@ -5898,11 +5940,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
-            flip_min_work_tokens, idle_layout_front)))
+            flip_min_work_tokens, idle_layout_front, admin_key_file=admin_key_file)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
     state.pids["P"] = spec_p.pid
@@ -5964,7 +6006,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
@@ -6131,6 +6173,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,
         src_chunk_cards=src_chunk_cards, measured_record=measured_record_path(),
         commit=tip, ledger_arm={"s_gb": arm.s_gb, "m_mib": arm.m_mib, "store_gib": store_gib},
+        admin_key_file=admin_key_file,
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -6167,7 +6210,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
                    idle_layout_front: str,
                    src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None,
                    measured_record: str = "", commit: str = "",
-                   ledger_arm: Optional[Dict[str, float]] = None) -> List[str]:
+                   ledger_arm: Optional[Dict[str, float]] = None,
+                   admin_key_file: str = "") -> List[str]:
     """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
 
     C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
@@ -6192,6 +6236,11 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--idle-layout", idle_layout_front,
         "--drain-deadline-s", str(ns.drain_deadline_s),
     ]
+    # #1275: the front is handed the PATH, never the key. Its argv is as
+    # world-readable as any other; the groups have no alternative (server_args
+    # takes only --admin-api-key) but the front does, so it uses it.
+    if admin_key_file:
+        argv += ["--admin-key-file", admin_key_file]
     if ns.min_dwell_ms is not None:
         argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
     if ns.d_admit_max_tokens is not None:

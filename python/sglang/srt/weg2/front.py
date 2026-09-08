@@ -68,6 +68,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     weights_family_tags,
 )
 from sglang.srt.registry import nvml as nvml_registry
+from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
 
 logger = logging.getLogger("weg2.front")
@@ -898,7 +899,17 @@ class Front:
                  d_admit_max_tokens: Optional[int] = None,
                  src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None,
                  measured_record: str = "", commit: str = "",
-                 ledger_arm: Optional[Dict[str, float]] = None):
+                 ledger_arm: Optional[Dict[str, float]] = None,
+                 admin_key_file: str = ""):
+        # #1275: the key arrives as a PATH, never as an argv value. The groups
+        # have no choice (`server_args` offers only `--admin-api-key`, so their
+        # key is world-readable in /proc/<pid>/cmdline), but the front does, and
+        # a secret that appears in one more process's argv for no reason is a
+        # second exposure bought with nothing. None here == the groups are
+        # unkeyed == send no header, which is the pre-#1275 behaviour byte for
+        # byte.
+        self.admin_key_file = admin_key_file or ""
+        self.admin_key = admin_key_mod.read(admin_key_file) if admin_key_file else None
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
         self.awake = awake
         # #1233 one-backup flip: the weights tag family both groups were built
@@ -2293,8 +2304,22 @@ class Front:
 
     # ---------------- flip machinery ----------------
     async def rpc(self, g: Group, path: str, body: Optional[dict], timeout: float) -> Tuple[int, str]:
+        """#1275: EVERY rpc carries the admin bearer token when one is set.
+
+        NOT a security addition -- a LIVENESS one. `/flush_cache`,
+        `/release_memory_occupation`, `/resume_memory_occupation` and
+        `/abort_request` are all `@auth_level(ADMIN_OPTIONAL)`, and that level
+        means "require the ADMIN key once one is configured", not "optional".
+        They answer today only because no key is set. The moment the launcher
+        passes `--admin-api-key` to the groups (which is what buys the live
+        `/hicache/storage-backend/resize` lever), an unauthenticated front gets
+        401 on its very next quiesce and the flip dies. So the token goes on
+        every RPC, and `admin_key` is None exactly when the groups are unkeyed.
+        """
         try:
-            async with self.session.post(f"{g.url}{path}", json=body or {}, timeout=ClientTimeout(total=timeout)) as r:
+            async with self.session.post(f"{g.url}{path}", json=body or {},
+                                         headers=admin_key_mod.auth_headers(self.admin_key),
+                                         timeout=ClientTimeout(total=timeout)) as r:
                 return r.status, (await r.read()).decode(errors="replace")
         except Exception as e:  # noqa: BLE001
             return 0, f"{type(e).__name__}: {e}"
@@ -3387,6 +3412,14 @@ def main():
     ap.add_argument("--measured-record", default="",
                     help="#1233 fix 8: the JSON sidecar this line writes its DORMANT-IMAGE measurements "
                          "into (empty = measure and log, do not persist)")
+    ap.add_argument("--admin-key-file", default="",
+                    help="#1275: path of the 0600 file holding THIS boot's admin API key. "
+                         "The front reads it and sends `Authorization: Bearer <key>` on every "
+                         "group RPC, which is MANDATORY once the groups are started with "
+                         "--admin-api-key: /flush_cache, /release_memory_occupation, "
+                         "/resume_memory_occupation and /abort_request are all ADMIN_OPTIONAL, "
+                         "and that level requires the admin key once one is configured. A path, "
+                         "not a value, so the key does not appear in this process's argv too.")
     ap.add_argument("--commit", default="", help="#1233 fix 8: the tip this boot runs, stamped into every measurement")
     ap.add_argument("--ledger-arm", default="",
                     help="#1233 fix 8: JSON {s_gb, m_mib, store_gib} -- the arm the ledger chose, needed to "
@@ -3407,7 +3440,17 @@ def main():
                   d_admit_max_tokens=args.d_admit_max_tokens,
                   src_chunk_cards=json.loads(args.src_chunk_cards) if args.src_chunk_cards else {},
                   measured_record=args.measured_record, commit=args.commit,
-                  ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {})
+                  ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {},
+                  admin_key_file=args.admin_key_file)
+    # #1275: say ONCE whether this boot has the live levers, and say it with the
+    # PATH and a redaction -- never the key. The front log is world-readable and
+    # is routinely pasted into records.
+    logger.info("WEG2 ADMIN-KEY file=%s key=%s -- admin routes (/hicache/storage-backend/resize, "
+                "attach, detach, clear) are %s on this boot; the front authenticates its own "
+                "flip RPCs with it (#1275)",
+                args.admin_key_file or "(none)",
+                admin_key_mod.redact(front.admin_key),
+                "REACHABLE" if front.admin_key else "unreachable (groups started without --admin-api-key)")
     app = web.Application(client_max_size=1024**3)
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)
