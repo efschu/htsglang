@@ -1314,12 +1314,22 @@ _RESIDENT_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*resident_mib=(-?\d+(?
 _HEAD_RELEASED_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*head_released_mib=(-?\d+(?:\.\d+)?)")
 _NVML_DELTA_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\d+(?:\.\d+)?)")
 #: W11b (#1233 fix 6): how far the BUILD may stay unexplained by the two terms
-#: that claim to explain it.  MEASURED on boot weg2dk5's own L2 line:
-#: nvml_delta 3998.0 against resident 1682.9 + head_released 2425.0 = 4107.9,
-#: i.e. 109.9 MiB of the build is not attributable at this granularity (the
+#: that claim to explain it, IN EITHER DIRECTION.  MEASURED on boot weg2dk5's
+#: own L2 line: nvml_delta 3998.0 against resident 1682.9 + head_released
+#: 2425.0 = 4107.9, i.e. -109.9 MiB, not attributable at this granularity (the
 #: driver's own allocation rounding, and the fact that the two sides are read
 #: at different instants of the build).  The bound is set at the same 256 MiB
 #: as the residue tolerance -- the next tighter measurement replaces it.
+#:
+#: WHICH SIDE HAS BEEN MEASURED, stated rather than implied (#1233 fix 7): the
+#: single calibration sample is NEGATIVE, i.e. the accounting OVER-claims by
+#: 109.9 MiB, while the shape this gate hunts -- a table freed from the graph
+#: only, so the build is larger than residue + release explain -- is POSITIVE
+#: and has NEVER been measured on this box.  The gate can still catch it (a
+#: whole unfreed lm_head is ~2425 MiB, an order of magnitude over the bound),
+#: but the bound's own calibration comes from the other side, and a boot that
+#: lands in 256..~2400 MiB positive would be graded by an extrapolation.  Both
+#: directions are refusals, and both are pinned.
 P_DRAFT_BUILD_ACCOUNTING_TOL_MIB = 256.0
 
 
@@ -1373,12 +1383,119 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         out["resident_ok"] = r >= 0 and r <= budget + tol
     released, delta = out["head_released_mib"], out["nvml_delta_mib"]
     if r is not None and r >= 0 and released is not None and released >= 0 and delta is not None and delta >= 0:
-        # SIGN: positive = build larger than what residue + release explain,
-        # i.e. memory nobody accounted for -- the fix-2 shape.
+        # SIGN, both directions named because both are refused (fix 7):
+        #   POSITIVE = the build is LARGER than residue + release explain, i.e.
+        #     VRAM is held that nobody accounts for -- the fix-2 shape this
+        #     gate exists for (a table unbound from the graph, never freed).
+        #   NEGATIVE = the accounting OVER-claims: the two explaining terms
+        #     together are larger than the build the driver reports, so at
+        #     least one of them is measuring something the build did not do
+        #     (double-counted release, or the two sides read at instants far
+        #     enough apart to disagree).  weg2dk5's -109.9 is this side.
+        # Neither direction is a pass: an explanation that does not add up is
+        # not an explanation, whichever way it fails to add up.
         out["unaccounted_mib"] = delta - (r + released)
         out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
     out["ok"] = bool(out["resident_ok"] and out["accounted"])
     return out
+
+
+def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
+    """THE LAUNCHER'S W11 GATE, both instruments and both refusals.
+
+    Grades group P's last-stage draft build from its log (see
+    :func:`check_draft_resident`) and REFUSES the boot before the front opens
+    when either instrument says no:
+
+    * ``W11 Weg2DraftResidentOverBudget`` -- the residue is over the budget
+      ``T_P`` was derived from, so the corridor derivation is refuted by this
+      boot (weg2dk2's 3994 MiB build).
+    * ``W11b Weg2DraftBuildUnaccounted`` -- the BUILD is not explained by
+      residue + release, the fix-2 shape ``resident_mib`` is blind to.
+
+    #1233 fix 7: a function, for the same reason as :func:`choose_host_ledger`
+    -- the fix-6 review gated the W11b refusal off and the whole slice stayed
+    green, because the only caller sits behind two launched servers.  A gate
+    nothing can reach is a gate nothing can pin.
+    """
+    w11 = check_draft_resident(log_p)
+    log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
+        f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
+        f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
+        f"head_released_mib={w11['head_released_mib']} + unaccounted_mib={w11['unaccounted_mib']} "
+        f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
+        f"ok={w11['ok']} (T_P={P_MAX_TOTAL_TOKENS})")
+    if not w11["resident_ok"]:
+        raise Weg2LaunchRefused(f"W11 Weg2DraftResidentOverBudget: measured resident_mib={w11['resident_mib']} vs budget "
+                                f"{w11['budget_mib']:.1f}+{w11['tol_mib']:.0f} MiB -- T_P={P_MAX_TOTAL_TOKENS} was derived for the "
+                                f"budget and the last stage's corridor target (idle NVML free at {P_CORRIDOR_TOP_MIB:.0f}) cannot hold")
+    if not w11["accounted"]:
+        # #1233 fix 6: the SECOND instrument. resident_mib is a model-graph
+        # quantity, so a table released only from the graph passes it while
+        # still sitting on the card -- the fix-2 failure the W11 gate exists
+        # for. The build must be explained by residue + released.
+        raise Weg2LaunchRefused(f"W11b Weg2DraftBuildUnaccounted: nvml_delta_mib={w11['nvml_delta_mib']} is not explained by "
+                                f"resident_mib={w11['resident_mib']} + head_released_mib={w11['head_released_mib']} "
+                                f"(unaccounted {w11['unaccounted_mib']} MiB, tolerance {w11['accounting_tol_mib']:.0f}) -- either the "
+                                f"never-loaded lm_head was unbound from the graph without being freed (fix 2's shape, invisible to "
+                                f"resident_mib by construction) or one of the three instruments did not measure")
+    return w11
+
+
+def choose_host_ledger(
+    store_min_gib: float,
+    ring_bytes: int,
+    ring_span1_bytes: int,
+    ring_provenance: str = "",
+    meminfo_path: str = "/proc/meminfo",
+    cgroup_root: str = "/sys/fs/cgroup",
+) -> Tuple[host_ledger.Arm, float, List[str], Dict[str, Optional[int]]]:
+    """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
+
+    Returns ``(arm, store_gib, printed lines, the cgroup reading)`` or raises
+    :class:`host_ledger.Weg2HostLedgerRefused` -- ``main`` only logs the lines
+    and carries the reading into the boot state.
+
+    #1233 fix 5: the reaper watches the CGROUP, so the ledger reads it.  The
+    ``oom_kill`` value goes in as the boot's PRE-BOOT BASELINE of a cumulative,
+    timestamp-free counter -- no boot starts without one.
+
+    #1233 fix 7: this is a FUNCTION and not four lines inside ``main`` because
+    it is the only wire that carries fix 6 into a boot, and inside ``main`` --
+    behind NVML, a tmpfs mount and two servers -- nothing could reach it.  The
+    fix-6 review measured exactly that: replacing ``cg["reclaimable"]`` below
+    with ``None`` reverts the whole boot to fix 5's denominator and 152 tests
+    stayed green.  The two paths are the same code from here down, and the
+    ``meminfo_path`` / ``cgroup_root`` arguments exist so a test can hand this
+    seam a fake box whose readings decide a DIFFERENT arm.
+
+    C19 (the ring): the host WEIGHTS term arrives as ``ring_bytes`` /
+    ``ring_span1_bytes`` from :func:`prepare_host_ring`, not as a
+    ``weight_chunks`` count.  That parameter is gone because the term it fed --
+    one image plus one chunk in flight -- is gone: the shared region is the
+    whole host weights cost and it is charged once.  There is deliberately no
+    default: a caller with no measured table must reach the W20 refusal, never
+    a zero that prices the flip as free.
+    """
+    mi = host_ledger.read_meminfo(meminfo_path)
+    cg = host_ledger.read_cgroup(cgroup_root)
+    cg_ceiling, cg_ceiling_source = host_ledger.resolve_cg_ceiling(cg, mi["MemTotal"])
+    arm, store_gib, lines = host_ledger.choose(
+        mi["MemTotal"],
+        mi["MemAvailable"],
+        store_min_gib=store_min_gib,
+        ring_bytes=ring_bytes,
+        ring_span1_bytes=ring_span1_bytes,
+        ring_provenance=ring_provenance,
+        cg_current_bytes=cg["current"],
+        # fix 6: only the NON-reclaimable part of that reading is charged --
+        # page cache is what the kernel hands back instead of killing for.
+        cg_reclaimable_bytes=cg["reclaimable"],
+        cg_ceiling_bytes=cg_ceiling,
+        cg_ceiling_source=cg_ceiling_source,
+        cg_oom_kill=cg["oom_kill"],
+    )
+    return arm, store_gib, lines, cg
 
 
 def count_marker(path: str, marker: str) -> int:
@@ -1716,28 +1833,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
 
     # 2. host ledger
-    mi = host_ledger.read_meminfo()
-    # #1233 fix 5: the reaper watches the CGROUP, so the ledger reads it.  The
-    # oom_kill value goes in as the boot's PRE-BOOT BASELINE of a cumulative,
-    # timestamp-free counter -- no boot starts without one.
-    cg = host_ledger.read_cgroup()
-    cg_ceiling, cg_ceiling_source = host_ledger.resolve_cg_ceiling(cg, mi["MemTotal"])
+    arm, store_gib, lines, cg = choose_host_ledger(
+        ns.store_min_gib, ring_plan.host_weights_bytes,
+        ring_plan.host_weights_span1_bytes, ring_plan.provenance)
     state.cgroup = dict(cg)
-    arm, store_gib, lines = host_ledger.choose(
-        mi["MemTotal"],
-        mi["MemAvailable"],
-        store_min_gib=ns.store_min_gib,
-        ring_bytes=ring_plan.host_weights_bytes,
-        ring_span1_bytes=ring_plan.host_weights_span1_bytes,
-        ring_provenance=ring_plan.provenance,
-        cg_current_bytes=cg["current"],
-        # fix 6: only the NON-reclaimable part of that reading is charged --
-        # page cache is what the kernel hands back instead of killing for.
-        cg_reclaimable_bytes=cg["reclaimable"],
-        cg_ceiling_bytes=cg_ceiling,
-        cg_ceiling_source=cg_ceiling_source,
-        cg_oom_kill=cg["oom_kill"],
-    )
     for ln in lines:
         log(ln)
     state.ledger_lines = lines
@@ -1892,27 +1991,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # from a budgeted residue on P's last stage; the L2 line carries the
     # MEASURED one. Over budget = the corridor derivation is refuted by this
     # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
-    w11 = check_draft_resident(spec_p.log)
-    log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
-        f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
-        f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
-        f"head_released_mib={w11['head_released_mib']} + unaccounted_mib={w11['unaccounted_mib']} "
-        f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
-        f"ok={w11['ok']} (T_P={P_MAX_TOTAL_TOKENS})")
-    if not w11["resident_ok"]:
-        raise Weg2LaunchRefused(f"W11 Weg2DraftResidentOverBudget: measured resident_mib={w11['resident_mib']} vs budget "
-                                f"{w11['budget_mib']:.1f}+{w11['tol_mib']:.0f} MiB -- T_P={P_MAX_TOTAL_TOKENS} was derived for the "
-                                f"budget and the last stage's corridor target (idle NVML free at {P_CORRIDOR_TOP_MIB:.0f}) cannot hold")
-    if not w11["accounted"]:
-        # #1233 fix 6: the SECOND instrument. resident_mib is a model-graph
-        # quantity, so a table released only from the graph passes it while
-        # still sitting on the card -- the fix-2 failure the W11 gate exists
-        # for. The build must be explained by residue + released.
-        raise Weg2LaunchRefused(f"W11b Weg2DraftBuildUnaccounted: nvml_delta_mib={w11['nvml_delta_mib']} is not explained by "
-                                f"resident_mib={w11['resident_mib']} + head_released_mib={w11['head_released_mib']} "
-                                f"(unaccounted {w11['unaccounted_mib']} MiB, tolerance {w11['accounting_tol_mib']:.0f}) -- either the "
-                                f"never-loaded lm_head was unbound from the graph without being freed (fix 2's shape, invisible to "
-                                f"resident_mib by construction) or one of the three instruments did not measure")
+    gate_w11(spec_p.log, log)
     # #1233 zero-remainder: the carrier bound the front routes by -- group D's
     # smallest host staging pool (tokens) x 0.9 (the prefetch rate bound that
     # refused the 84k prompt on boot weg2ls4b2: limit=27466 of pool 30518).

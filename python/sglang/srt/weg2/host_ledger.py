@@ -182,8 +182,23 @@ OBSERVED_REAP_CURRENT_BYTES = 102_998_904_832
 #: box's page cache was ALREADY almost pure shmem (the store tmpfs and the
 #: shm-backed cpu images), so the watermark barely moves; stating that is what
 #: makes the comparison against a non-reclaimable origin legitimate rather than
-#: lucky.  ``slab_reclaimable`` is not in the sampler's columns and is charged
-#: as spent here, which can only make the watermark tighter.
+#: lucky.
+#:
+#: THE DIRECTION OF THE ONE TERM THAT IS MISSING (#1233 fix 7 -- fix 6 wrote
+#: "tighter" here and had the sign backwards).  ``slab_reclaimable`` is not in
+#: the sampler's columns, so it is charged as spent and NOT subtracted.  Not
+#: subtracting a reclaimable term leaves the watermark HIGHER, and a higher
+#: watermark makes the advisory's "ABOVE" verdict LESS likely: this constant is
+#: an UPPER BOUND on the reap point in fix 6's currency, and the advisory
+#: UNDER-warns by at most the unsampled slab term.  How big that is, measured
+#: on this box rather than guessed -- ``/sys/fs/cgroup/memory.stat
+#: slab_reclaimable`` = 564,459,544 B = 0.53 GiB (2026-09-07T23:57:35Z, idle
+#: box) and 0.73 GiB at the pre-fix-6 reading recorded in
+#: :func:`cg_reclaimable_bytes`.  So the under-warn is bounded by ~0.5-0.7 GiB
+#: against a 95.90 GiB watermark, an order of magnitude under the advisory's
+#: own 3.01 GiB under-prediction of weg2dk5 -- it does not move that boot's
+#: verdict, and it is stated rather than corrected by a hand constant, because
+#: the reap row itself carries no slab column to correct it WITH.
 OBSERVED_REAP_NONRECLAIM_BYTES = OBSERVED_REAP_CURRENT_BYTES - 28_916 * 1024
 #: cgroup-v2 semantics MEASURED on this box (2026-09-07, before fix 6) rather
 #: than recalled -- the two readings a wrong formula would silently invert:
@@ -788,7 +803,10 @@ def choose(
             f"GiB; the {FLOOR_GIB:.0f} GiB floor is a reserve and is NOT in this sum), "
             f"which is {verdict} the OBSERVED REAP POINT {watermark_gib:.2f} GiB "
             "(boot weg2dk5 21:15:30Z, memory.current 102,998,904,832 B minus the 28,916 kB "
-            "of that row that was still reclaimable, with oom_kill 18 -> 24 in the same row). "
+            "of that row that was still reclaimable, with oom_kill 18 -> 24 in the same row; "
+            "that row has NO slab_reclaimable column, so this watermark is an UPPER bound and "
+            "this verdict UNDER-warns by that unsampled term -- 0.53 GiB live on this box "
+            "2026-09-07T23:57:35Z, 0.73 GiB at the fix-6 reading). "
             "ADVISORY, not a refusal: one boot's death is a watermark and this cgroup "
             "publishes no finite memory.max to check against. WHAT THIS LINE IS WORTH, "
             "stated rather than implied: priced in the fix-6 currency, weg2dk5's own arm "
