@@ -145,6 +145,15 @@ def _run_ranks(
                 tp_rank=rank,
                 server_args=_capacity_server_args(capacity_mode, solo_rank),
                 is_draft_worker=draft_worker,
+                # #1270: the install gate's LAST conjunct reads
+                # `is_draft_pool_worker`, and until this fix the coupled cases
+                # short-circuited before ever reaching it -- so the stub never
+                # needed the attribute and its absence was invisible. It is
+                # reproduced from model_runner.py:512 rather than hardcoded,
+                # for the same reason `uneven_kv_derived_mode` above is: a
+                # stub that answers only the names the old path happened to
+                # touch is how a newly reachable gate reads as a defect.
+                is_draft_pool_worker=draft_worker and not False,
             )
             # The stub is not a ModelRunner, so bind the mixin helpers the
             # method calls on ``self`` explicitly.
@@ -244,10 +253,38 @@ class TestCapacityInstall(CustomTestCase):
         self.assertEqual(reached, 2)
         self.assertEqual(installed, [2, 1])
 
-    def test_coupled_mode_never_installs(self):
+    def test_coupled_mode_with_an_UNDECLARED_vector_now_installs(self):
+        """#1270 CHANGES THIS CASE, deliberately -- read the reason before
+        reading the rename as a loosened test.
+
+        This asserted that 'coupled' NEVER installs. That was already untrue
+        for a SEEDED vector: boot weg2rg6 ran --rank-kv-ratio coupled with
+        --uneven-token-vector 29,19,16 role=seed, installed the measured
+        [17,7,8] and served 681,856 tokens. The rule was really "coupled +
+        nothing declared does not install", and that case is boot weg2sb1:
+        the same argv WITHOUT the seed, the launcher's own budget estimate
+        left in place, 574,336 tokens -- 15.8 % less, on the same rig.
+
+        #1270 makes an UNDECLARED vector role='estimate', and an estimate
+        arms the install exactly as a seed does. So this case now installs,
+        and the mode's real contract is the one below: coupled honours what
+        the OPERATOR declared, and supersedes what the runtime guessed.
+        """
         _, installed = _run_ranks(
             MEASURED_P, active=ESTIMATE, capacity_mode=False, allow_install=True
         )
+        self.assertEqual(installed, OPTIMAL)
+
+    def test_coupled_mode_still_honours_a_DECLARED_pin(self):
+        """The half that does not move, and the reason the change above is
+        safe: an operator's declared vector is still never overridden, in
+        coupled mode or any other."""
+        with mock.patch.dict(
+            os.environ, {"SGLANG_UNEVEN_TOKEN_VECTOR": ",".join(map(str, ESTIMATE))}
+        ):
+            _, installed = _run_ranks(
+                MEASURED_P, active=ESTIMATE, capacity_mode=False, allow_install=True
+            )
         self.assertEqual(installed, ESTIMATE)
 
     def test_no_install_without_allow_install(self):
@@ -374,7 +411,9 @@ class TestDraftSoloCapacityInstall(CustomTestCase):
         )
         self.assertEqual(installed, SOLO_ACTIVE)
 
-    def test_solo_coupled_mode_never_installs(self):
+    def test_solo_coupled_mode_with_an_UNDECLARED_vector_now_installs(self):
+        """Draft-solo twin of the coupled case above -- same #1270 reason, and
+        renamed together so the pair cannot drift apart."""
         _, installed = _run_ranks(
             list(SOLO_SHADOWS),
             active=SOLO_ACTIVE,
@@ -384,6 +423,25 @@ class TestDraftSoloCapacityInstall(CustomTestCase):
             solo_avail=SOLO_AVAIL,
             solo_cells=(SOLO_T_TARGET, SOLO_T_DRAFT),
         )
+        self.assertNotEqual(
+            installed, SOLO_ACTIVE,
+            "an undeclared solo vector is an estimate and must be superseded",
+        )
+
+    def test_solo_coupled_mode_still_honours_a_DECLARED_pin(self):
+        with mock.patch.dict(
+            os.environ,
+            {"SGLANG_UNEVEN_TOKEN_VECTOR": ",".join(map(str, SOLO_ACTIVE))},
+        ):
+            _, installed = _run_ranks(
+                list(SOLO_SHADOWS),
+                active=SOLO_ACTIVE,
+                capacity_mode=False,
+                allow_install=True,
+                solo_rank=0,
+                solo_avail=SOLO_AVAIL,
+                solo_cells=(SOLO_T_TARGET, SOLO_T_DRAFT),
+            )
         self.assertEqual(installed, SOLO_ACTIVE)
 
     def test_non_solo_install_is_unchanged(self):

@@ -3461,17 +3461,27 @@ def d_token_vector_decision(
         return DTokenVectorDecision(
             flags=(),
             line=(
-                "WEG2 D-TOKEN-VECTOR: none shipped (default). Group D derives "
-                "its own starting vector from THIS boot's budgets "
-                "(distributed/utils.py:1135) and replaces it with the MEASURED "
-                "per-rank optimum after profiling -- the 'Uneven-DCP token "
-                "sizing' lines are that install. The retracted #602 seed "
-                "%s this launcher used to ship is GONE (#1032): boot weg2rg6 "
-                "showed the runtime superseding it to 17,7,8 every time, so "
-                "the only thing it bought was a #797 PROVENANCE warning and a "
-                "supersession. Nothing arms assert_seed_superseded now, which "
-                "is the point: with no seed there is no foreign lineage to "
-                "hold a boot to."
+                "WEG2 D-TOKEN-VECTOR: none shipped (default). SOURCE = "
+                "estimate(budget): group D derives its own starting vector "
+                "from THIS boot's --rank-gpu-memory-mib "
+                "(distributed/utils.py resolve_cp_token_ratios, the "
+                "partition_units(64, budget - weights - 1536 MiB) rung). "
+                "OBJECTIVE = the profiled per-rank capacity optimum: the "
+                "runtime supersedes that estimate IN-PROCESS after profiling "
+                "and prints the pool it moved -- 'installed measured KV-token "
+                "ownership vector [..] (pre-boot estimate was [..]), "
+                "max_total_num_tokens X -> ~Y'. That install is armed by the "
+                "ROLE, and #1270 is why this sentence can be believed again: "
+                "an undeclared vector now reads role='estimate', not 'pin'. "
+                "Boot weg2sb1 is the counter-example -- with the #1032 seed "
+                "gone nothing declared a vector, the estimate [30,17,17] "
+                "inherited 'pin', the install was suppressed and D served "
+                "574,336 tokens against rg6's 681,856 (-15.8 %%) while the "
+                "measured [17,7,8] was printed as an unusable restart hint. "
+                "The retracted #602 seed %s this launcher used to ship stays "
+                "GONE (#1032): the seed was never the right way to arm the "
+                "install, it was only the way that happened to work, and it "
+                "carried a foreign lineage to hold a boot to."
                 % (",".join(str(v) for v in RETRACTED_SEED_VECTOR_1032),)
             ),
         )

@@ -128,11 +128,28 @@ class TestTokenVector1032(unittest.TestCase):
         self.assertIn("--uneven-dcp", argv)
         self.assertIn("--uneven-dcp-weighted", argv)
 
-    def test_default_line_names_the_branch_and_what_it_gives_up(self):
+    def test_default_line_names_source_objective_and_the_pool_it_moves(self):
+        """#1270: the line follows the rule every vector line follows -- SOURCE,
+        OBJECTIVE, and the pool figure the decision moves.
+
+        It no longer cites ``assert_seed_superseded``: that arming belonged to
+        the #1032 seed, and with the seed gone the install is armed by the ROLE
+        instead (an undeclared vector is an ``estimate``, not a ``pin``). The
+        line has to say which mechanism carries it, because the previous
+        wording promised an install that boot weg2sb1 did not get.
+        """
         line = d_token_vector_decision(None, "pin", None).line
         self.assertIn("none shipped", line)
-        self.assertIn("assert_seed_superseded", line)
+        # SOURCE and OBJECTIVE, named as such.
+        self.assertIn("SOURCE = estimate(budget)", line)
+        self.assertIn("OBJECTIVE = the profiled per-rank capacity optimum", line)
+        # The pool the decision moves, from the boot that measured both sides.
+        self.assertIn("574,336", line)
+        self.assertIn("681,856", line)
         self.assertIn("17,7,8", line)
+        # ... and the mechanism that actually arms it now.
+        self.assertIn("#1270", line)
+        self.assertIn("role='estimate'", line)
 
     def test_retracted_vector_is_refused_by_ticket_in_either_role(self):
         for role in ("seed", "pin"):

@@ -5723,11 +5723,17 @@ class ModelRunnerKVCacheMixin:
         (works for FP8 / AWQ / GGUF alike). The optimal vector is
         partition_units(64, [P_r...]) (largest-remainder), gcd-reduced.
 
-        Purely advisory — nothing is resized in-process; the hint asks for a
-        restart with SGLANG_UNEVEN_TOKEN_VECTOR=a,b,c, which resolve_cp_token_
-        ratios honors on the next boot so the pool converges to the optimum.
-        Because P_r is independent of the active vector, this converges in one
-        feedback step. All gating conditions BEFORE the all_gather are
+        Advisory ONLY WHERE THE INSTALL IS NOT ARMED (#1270). When it is --
+        a derived --rank-kv-ratio mode, a seed, or an ESTIMATE, i.e. a vector
+        this runtime derived rather than one anybody declared -- the measured
+        optimum is installed in-process here and no restart is asked for.
+        Where it is not armed the hint names the ROLE that arms it; it must
+        never ask for a bare SGLANG_UNEVEN_TOKEN_VECTOR=a,b,c restart, because
+        an undeclared env vector reads as role='pin' on the next boot and
+        suppresses this calibration permanently -- the operator would have
+        frozen the right numbers into the mechanism that stops recomputing
+        them. Because P_r is independent of the active vector, either route
+        converges in one feedback step. All gating conditions BEFORE the all_gather are
         rank-uniform (server args / installed vector / world size), so every
         rank reaches the collective or none does; the rank-LOCAL capacity
         P_r is gathered unconditionally (clamped to >= 0) and degenerate
@@ -6066,11 +6072,29 @@ class ModelRunnerKVCacheMixin:
         # a log line a human has to act on. `seed_role` is read from the env
         # (not from server_args) so the flip's second stack build, which does
         # not consult this ServerArgs object, reaches the same verdict.
-        seed_role = (
-            str(envs.SGLANG_UNEVEN_TOKEN_VECTOR_ROLE.get() or "pin").strip().lower()
-            == "seed"
+        # #1270: ONE READER FOR THE ROLE, in utils, instead of this method's own
+        # `or "pin"`.  That local copy is where boot weg2sb1 lost 15.8 % of
+        # group D's world pool: with #1032's seed gone nothing declared a
+        # vector, the derived budget estimate inherited the word "pin" HERE,
+        # and the install it should have armed was suppressed.  The env is
+        # still what is consulted (the flip's second stack does not have this
+        # ServerArgs), but the DECISION now lives in one place.
+        from sglang.srt.distributed.utils import (
+            ROLE_ESTIMATE,
+            ROLE_SEED,
+            token_vector_arms_measured_install,
+            token_vector_role,
         )
-        pinned_vector = bool(envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()) and not seed_role
+
+        _role = token_vector_role(self.server_args)
+        seed_role = _role == ROLE_SEED
+        estimate_role = _role == ROLE_ESTIMATE
+        # A vector is PINNED only when someone declared a value AND did not
+        # call it a seed or an estimate.  An estimate can never be pinned --
+        # the role is only reached when nothing was declared.
+        pinned_vector = bool(envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()) and not (
+            seed_role or estimate_role
+        )
         install = (
             allow_install
             # A seeded vector is itself the request for a measured install, so
@@ -6078,7 +6102,19 @@ class ModelRunnerKVCacheMixin:
             # Demanding both would route this through _handle_uneven_tp's
             # silent downgrade to 'coupled' (no --rank-tp-ratio plan on a
             # PP-prefill boot) and the mode would never arrive.
-            and (self.server_args.uneven_kv_derived_mode() or seed_role)
+            #
+            # #1270: and an ESTIMATE asks for it for the same reason, with the
+            # same force.  `token_vector_arms_measured_install` is that whole
+            # question -- seed OR estimate -- asked once.  This is what re-arms
+            # the rg6 [17,7,8] path on an argv carrying no vector, no env and
+            # no --rank-kv-ratio: derived_mode stays False and the install
+            # happens anyway, which is the answer to "is (a) needed" -- it is
+            # NOT.  --rank-kv-ratio capacity remains available and unchanged;
+            # it is simply no longer the only key.
+            and (
+                self.server_args.uneven_kv_derived_mode()
+                or token_vector_arms_measured_install(self.server_args)
+            )
             and not pinned_vector
             # #797 THE LAST GATE. This used to read self.is_draft_worker, and
             # on the flip's TP stack that is the runner which OWNS the real KV
@@ -6275,40 +6311,79 @@ class ModelRunnerKVCacheMixin:
                     p_by_rank,
                 )
             else:
+                # #1270 (d): THE REMEDY MUST NOT WALK INTO THE PIN TRAP.  This
+                # line used to read "restart with
+                # SGLANG_UNEVEN_TOKEN_VECTOR=a,b,c", and following it was a
+                # one-way door: an env vector is a DECLARED vector, a declared
+                # vector with no role defaults to `pin`, and a pin suppresses
+                # the very install that produced the advice.  The operator
+                # would have copied the right numbers into the mechanism that
+                # guarantees they are never recomputed.  So the hint now names
+                # the ROLE that arms the install, and offers the bare env
+                # spelling only WITH the role beside it.
                 logger.warning(
-                    "Uneven DCP: restart with SGLANG_UNEVEN_TOKEN_VECTOR=%s to "
-                    "raise max_total_num_tokens from %d to ~%d (per-rank "
-                    "profiled capacity %s; active vector %s leaves ranks idle).",
-                    ",".join(str(v) for v in optimal),
+                    "Uneven DCP: the profiled optimum is %s, which would raise "
+                    "max_total_num_tokens from %d to ~%d (per-rank profiled "
+                    "capacity %s; active vector %s leaves ranks idle). This "
+                    "boot did NOT install it -- see the role line below. To "
+                    "make the runtime install it ITSELF on the next boot, pass "
+                    "--rank-kv-ratio capacity, or declare the active vector's "
+                    "role honestly (--uneven-token-vector-role seed). Pinning "
+                    "these numbers with a bare SGLANG_UNEVEN_TOKEN_VECTOR=%s "
+                    "would freeze them instead: an undeclared env vector reads "
+                    "as role='pin' and suppresses this calibration for good.",
+                    optimal,
                     c_active,
                     c_optimal,
                     p_by_rank,
                     active,
+                    ",".join(str(v) for v in optimal),
                 )
-                # #797 PROVENANCE. The hint above has been printed on every
-                # boot of this configuration and nothing consumes it, because
-                # a PINNED vector suppresses the install. Say so at the point
-                # of loss, with the size of the loss, and name the one flag
-                # that closes the loop -- an advisory that does not say how to
-                # stop needing it is how a 10 % pool gap survives for months.
-                # Only when a vector is actually pinned: with no explicit
-                # vector at all the remedy is --rank-kv-ratio capacity, which
-                # the hint's own restart line already covers.
-                if pinned_vector and c_active > 0:
+                # #1270 (c): THE LOSS IS PRINTED FOR EVERY ARM, not only for a
+                # pinned one.  The old gate was `if pinned_vector`, and boot
+                # weg2sb1 is exactly the case it excluded: nothing was pinned,
+                # the vector was this module's own budget estimate, the pool
+                # was 15.8 % short, and the one line that says so did not
+                # print.  A loss does not become smaller because nobody
+                # declared the vector that caused it -- and the undeclared case
+                # is the one where the reader has the least other evidence.
+                if c_active > 0:
+                    _pct = 100.0 * (c_optimal - c_active) / c_active
+                    if pinned_vector:
+                        _why = (
+                            "%s was supplied as an assertion "
+                            "(--uneven-token-vector-role pin, the default for a "
+                            "DECLARED vector), so the measured optimum is only "
+                            "advisory and this boot keeps the smaller pool. If "
+                            "that vector is an inherited estimate rather than a "
+                            "claim you are actively making, pass "
+                            "--uneven-token-vector-role seed and the runtime "
+                            "installs the measured vector itself." % (active,)
+                        )
+                    elif estimate_role:
+                        _why = (
+                            "%s is this runtime's own pre-boot BUDGET ESTIMATE "
+                            "(role=estimate: nobody declared a vector), and it "
+                            "should have been superseded here. Reaching this "
+                            "line with role=estimate means the install was "
+                            "declined for another reason -- allow_install=%s, "
+                            "draft-pool worker, or a uniform/short vector -- "
+                            "and that reason, not the role, is the defect to "
+                            "chase." % (active, allow_install)
+                        )
+                    else:
+                        _why = (
+                            "%s is active under role=%r with the install "
+                            "declined; name the declining gate before reading "
+                            "this as a tuning question." % (active, _role)
+                        )
                     logger.warning(
-                        "#797 PINNED VECTOR IS COSTING %.1f %% OF THE KV POOL: "
-                        "%s was supplied as an assertion (--uneven-token-vector"
-                        "-role pin, the default), so the measured optimum %s "
-                        "above is only advisory and this boot will keep the "
-                        "smaller pool. If that vector is an inherited estimate "
-                        "rather than a claim you are actively making -- copied "
-                        "from an older note, or from a study since superseded "
-                        "-- pass --uneven-token-vector-role seed and the "
-                        "runtime installs the measured vector itself, with no "
-                        "restart and no hand-copied numbers.",
-                        100.0 * (c_optimal - c_active) / c_active,
-                        active,
-                        optimal,
+                        "#797/#1270 THE ACTIVE TOKEN VECTOR IS COSTING %.1f %% "
+                        "OF THE KV POOL (%d -> %d tokens). %s",
+                        _pct,
+                        c_active,
+                        c_optimal,
+                        _why,
                     )
 
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:

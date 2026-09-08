@@ -660,8 +660,41 @@ def _checkpoint_size_mib(model_path: Optional[str]) -> int:
     return total // 2**20
 
 
+#: The three roles a token vector can hold, named once (#1270).
+ROLE_PIN = "pin"
+ROLE_SEED = "seed"
+#: #1270: what a LAUNCHER-DERIVED vector is when nobody declared a role.  It is
+#: NOT a pin: a pin is an assertion an operator made, and it suppresses the
+#: measured install for that reason.  An estimate asserts nothing -- it is this
+#: module's own guess from the pre-boot budgets -- so it must be superseded by
+#: the profiled optimum exactly as a seed is.
+ROLE_ESTIMATE = "estimate"
+
+
+def token_vector_is_declared(server_args) -> bool:
+    """Did ANYONE state a token vector, or did this boot derive one itself?
+
+    #1270, and the whole of the role question turns on it.  "Declared" means an
+    operator (or a launcher) put a VALUE somewhere: the env vector, or a
+    ``--rank-kv-ratio a,b,c`` list.  A MODE string (``capacity`` / ``coupled``
+    / ``speed``) is not a value and does not count -- it asks for a derivation
+    rather than supplying one.
+
+    Env first, for the same reason the role is read env-first: the flip's
+    SECOND stack build does not consult this ServerArgs object, and an env
+    vector is what survives into it.
+    """
+    from sglang.srt.environ import envs as _envs
+
+    if str(_envs.SGLANG_UNEVEN_TOKEN_VECTOR.get() or "").strip():
+        return True
+    kv_flag = getattr(server_args, "rank_kv_ratio", None)
+    return isinstance(kv_flag, list) and len(kv_flag) > 0
+
+
 def _token_vector_role(server_args) -> str:
-    """'pin' or 'seed' (#797), read the same way at every gate.
+    """``'pin'``, ``'seed'`` or ``'estimate'`` (#797, #1270), read the same way
+    at every gate.
 
     The env is authoritative because it is what survives into the flip's
     SECOND stack build, where this ServerArgs object is not the one consulted;
@@ -670,13 +703,51 @@ def _token_vector_role(server_args) -> str:
     empty override silently meaning 'pin' is how a stale, blank
     SGLANG_UNEVEN_TOKEN_VECTOR entry once rode along unnoticed, and a gate that
     turns itself off when handed an empty string is the same defect again.
+
+    #1270 -- THE DEFAULT DEPENDS ON WHETHER ANYONE DECLARED A VECTOR.  This
+    used to be a flat ``or "pin"``, and that single word cost boot weg2sb1
+    15.8 % of group D's world pool: with the #1032 removal of the launcher's
+    seed there was no declared vector at all, the derived budget estimate
+    ``[30,17,17]`` inherited the word ``pin``, the pin suppressed the measured
+    install, and the profiled optimum ``[17,7,8]`` was printed as a restart
+    hint nobody could act on (574,336 tokens against rg6's 681,856 on the same
+    rig).  A default is not an assertion.  Only a DECLARED vector defaults to
+    ``pin``; a derived one is an ``estimate`` and arms its own supersession.
     """
     from sglang.srt.environ import envs as _envs
 
     role = str(_envs.SGLANG_UNEVEN_TOKEN_VECTOR_ROLE.get() or "").strip().lower()
     if not role:
         role = str(getattr(server_args, "uneven_token_vector_role", "") or "").lower()
-    return role.strip() or "pin"
+    role = role.strip()
+    if role:
+        return role
+    return ROLE_PIN if token_vector_is_declared(server_args) else ROLE_ESTIMATE
+
+
+def token_vector_role(server_args) -> str:
+    """Public spelling of :func:`_token_vector_role` -- ONE reader for every
+    gate, in this process and in the flip's second stack."""
+    return _token_vector_role(server_args)
+
+
+def token_vector_arms_measured_install(server_args) -> bool:
+    """Does this boot's token-vector role ASK to be superseded by the measured
+    optimum?  #1270: the one predicate the install gate consults.
+
+    ``seed`` and ``estimate`` both do, for the same reason and with the same
+    force: neither is an assertion about what the pool should be, both are
+    guesses made before the ranks were profiled.  ``pin`` does not -- it is the
+    number the operator chose to serve, and overriding it is the thing the pin
+    exists to prevent.
+
+    Written as a function rather than repeated as ``role == "seed"`` at each
+    gate because it WAS repeated: three separate spellings of the default
+    (``utils`` here, ``ServerArgs.uneven_token_vector_is_seed``, and the
+    mixin's own ``or "pin"``) had to agree, and the mixin's copy is where the
+    estimate lost its install.
+    """
+    return token_vector_role(server_args) in (ROLE_SEED, ROLE_ESTIMATE)
 
 
 def _token_vector_provenance(server_args) -> Optional[str]:
