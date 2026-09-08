@@ -572,6 +572,133 @@ D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed")
 D_TP_OBJECTIVE_DEFAULT = "maxkv"
 
 
+@dataclass(frozen=True)
+class EarlyReadFact:
+    """One fact group D states TWICE, and the reader that makes both necessary.
+
+    #1235's inventory called these "double statements of one fact" and read
+    them as second bookkeeping to delete. THEY ARE NOT, and the ordering is the
+    proof: ``ServerArgs.__post_init__`` reads ``os.environ`` for these keys in
+    ``_handle_dcp_validation`` (server_args.py:9631), ``_handle_uneven_tp``
+    (server_args.py:12025) and ``uneven_perf.apply_auto_performance``
+    (uneven_perf.py:4648, reached FROM _handle_uneven_tp), while the FLAG only
+    publishes itself into the environment later, in
+    ``_handle_environment_variables`` -> ``_publish_promoted_781_flags``
+    (server_args.py:18271), called at server_args.py:7186 -- after all three.
+
+    So the environment variable is the statement that reaches those readers and
+    the flag is the statement that reaches everything downstream plus the argv
+    a human reads. Dropping either one changes behaviour or hides it.
+
+    What was WRONG is that they were two independent literals in two functions
+    that could drift apart silently. Here they are one row, consumed by both
+    ``build_env`` and the argv builders, so the pair cannot disagree.
+
+    ``groups`` records an EXISTING asymmetry rather than quietly fixing it:
+    the uneven-DCP keys are exported to BOTH groups' environments while only
+    group D carries the flags. Group P runs tp_size=1, where the weighted-DCP
+    path has nothing to weight, and no boot has ever been run with the export
+    removed -- so it is preserved exactly and named here for the boot that can
+    measure it, instead of being changed by a slice that cannot.
+    """
+
+    env_key: str
+    env_value: str
+    flag: Tuple[str, ...]
+    groups: str
+    reader: str
+
+
+#: THE THREE FACTS, ONCE. See :class:`EarlyReadFact` for why each is stated in
+#: both currencies and why that is not second bookkeeping.
+EARLY_READ_FACTS: Tuple[EarlyReadFact, ...] = (
+    EarlyReadFact(
+        env_key="SGLANG_UNEVEN_DCP",
+        env_value="1",
+        flag=("--uneven-dcp",),
+        groups="D",
+        reader="server_args.py:9631 _handle_dcp_validation / :12025 "
+               "_handle_uneven_tp, both before :7186 _handle_environment_variables",
+    ),
+    EarlyReadFact(
+        env_key="SGLANG_UNEVEN_DCP_WEIGHTED",
+        env_value="1",
+        flag=("--uneven-dcp-weighted",),
+        groups="D",
+        reader="server_args.py:9632 _handle_dcp_validation / :10517 "
+               "uneven_weighted_dcp_enabled, both before :7186",
+    ),
+    EarlyReadFact(
+        env_key="SGLANG_MAMBA_SSM_DTYPE",
+        env_value="bfloat16",
+        flag=("--mamba-ssm-dtype", "bfloat16"),
+        groups="both",
+        reader="uneven_perf.py:4648, reached from _handle_uneven_tp at "
+               "server_args.py:6976 -- before the flag publishes itself at :7186",
+    ),
+)
+
+
+def early_read_flags(group: str) -> List[str]:
+    """The argv half of :data:`EARLY_READ_FACTS` for one group."""
+    out: List[str] = []
+    for fact in EARLY_READ_FACTS:
+        if fact.groups in ("both", group):
+            out.extend(fact.flag)
+    return out
+
+
+def early_read_provenance() -> str:
+    """One line naming every doubly-stated fact and the reader that needs it."""
+    return "WEG2 EARLY-READ ENV (#1235): " + "; ".join(
+        "%s=%s == %s [groups %s, pre-promotion reader %s]"
+        % (f.env_key, f.env_value, " ".join(f.flag), f.groups, f.reader)
+        for f in EARLY_READ_FACTS
+    )
+
+
+#: #1235 THE UNOWNED ENV LITERALS, PROMOTED TO FLAGS AND TO LAUNCHER OUTPUT.
+#:
+#: All four used to be written as ``env.get(KEY, "<literal>")``, which is the
+#: shape the ring family was already fixed out of (R19): an inherited value
+#: from the launcher's own shell wins SILENTLY, and the boot then runs a number
+#: no flag, no record and no log line ever mentioned. They are now flags with
+#: defaults, written unconditionally, exactly like TMS_HOST_RING_* and
+#: SGLANG_WEG2_PCIE_DUPLEX -- launcher OUTPUT, never operator input.
+#:
+#: Their VALUES are unchanged and none of them is measured; they are timeouts
+#: and a census stride, and the help text says so rather than implying a
+#: provenance they do not have.
+BARLINK_BUILD_WINDOW_CAP_S = 60
+PP_CHAIN_RECV_STALL_S = 60
+PP_OCCUPANT_HORIZON_S = 90
+MATCH_REFUSAL_CENSUS_EVERY = 64
+
+#: #1235 THE ARGV LITERALS THAT WERE NOBODY'S.
+#:
+#: RANDOM_SEED is arbitrary and FIXED, and that is its whole provenance: it is
+#: not measured, not solved, and not to be presented as either. What it buys is
+#: that two boots of the same tip sample identically, so a decode difference
+#: between them is a difference in the code. Stated as a flag so a boot that
+#: WANTS a different sample says so.
+RANDOM_SEED = 785500001
+#: BAR1 cap cycles: the ceiling on barlink's build-time cycle budget. Large by
+#: construction (it is a ceiling, not a target) -- the binding gate on this rig
+#: is the aperture, priced at --barlink-bar1-window-mib, not this number.
+BARLINK_BAR1_CAP_CYCLES = 300000000000
+#: How often the collective census prints. A STRIDE, not a measurement: bigger
+#: is quieter, smaller costs log volume, and nothing about the boot depends on
+#: the value except how much of it a reader can see.
+COLLECTIVE_CENSUS_INTERVAL = 50
+#: Group P's BAR1 windows. The provenance is the SAME arithmetic group D's
+#: window carries (#1234 C1) and it lived only in state.deviations: the two
+#: groups' windows are sized to fit TOGETHER -- P 24+96 and D 16+32+40 = 208 of
+#: the 224 MiB usable per 3080, measured Used 224/256 including the RM
+#: carve-out. It is cited here so P's window is not the one number in this file
+#: a reader has to go looking for.
+P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
+
+
 class Weg2LaunchRefused(RuntimeError):
     pass
 
@@ -1063,6 +1190,10 @@ def common_flags(
     store_gib: float,
     max_kv_per_request: int,
     write_policy: str = "write_through",
+    group: str = "both",
+    random_seed: int = RANDOM_SEED,
+    barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
+    census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
 ) -> List[str]:
     """Flags BOTH groups share.
 
@@ -1111,13 +1242,20 @@ def common_flags(
         "--chunked-prefill-size", str(CHUNKED_PREFILL_TOKENS),
         "--scheduler-distributed-teardown",
         "--page-size", "1",
-        "--random-seed", "785500001",
-        "--mamba-ssm-dtype", "bfloat16",
+        # #1235: arbitrary and FIXED, which is the whole provenance -- see
+        # RANDOM_SEED. Overridable by --random-seed.
+        "--random-seed", str(random_seed),
         "--mamba-slot-reorder",
         "--kv-backing-relief",
         "--barlink", "--barlink-transport", "bar1",
-        "--barlink-bar1-cap-cycles", "300000000000",
-        "--collective-census-interval", "50",
+        "--barlink-bar1-cap-cycles", str(barlink_cap_cycles),
+        "--collective-census-interval", str(census_interval),
+    ] + early_read_flags(group) + [
+        # THE DOUBLY-STATED FACTS COME FROM ONE TABLE (#1235). --mamba-ssm-dtype
+        # is here for both groups and the two uneven-DCP flags for group D; the
+        # matching environment keys are written by build_env from the SAME
+        # rows, because ServerArgs reads them from os.environ before the flags
+        # publish themselves. See EarlyReadFact for the ordering evidence.
         "--enable-memory-saver",
         "--enable-weights-cpu-backup",
     ]
@@ -1137,6 +1275,10 @@ def argv_p(
     attn_stage_ratio: str = "8,4,4",
     write_policy: str = "write_through",
     depth: int = 0,
+    window_mib: str = P_BARLINK_BAR1_WINDOW_MIB,
+    random_seed: int = RANDOM_SEED,
+    barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
+    census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
 ) -> List[str]:
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
@@ -1170,7 +1312,10 @@ def argv_p(
         if stage_ratio
         else []
     )
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request, write_policy) + [
+    return [py, "-m", "sglang.launch_server"] + common_flags(
+        model, s_gb, m_mib, store_gib, max_kv_per_request, write_policy, "P",
+        random_seed, barlink_cap_cycles, census_interval,
+    ) + [
         # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
         # the size of P's req_to_token_pool (R-13), which is why it is
         # resolved before the budget solve and printed with it.
@@ -1193,7 +1338,12 @@ def argv_p(
         "--disable-overlap-schedule",
     ] + ratio_flags + [
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
-        "--barlink-bar1-window-mib", "24,PP_0=96",
+        # #1235: P's window had no comment while D's carried the whole #1234 C1
+        # derivation. Its provenance is the SAME arithmetic, from the other
+        # side: the two groups' windows are sized to fit TOGETHER, P 24+96 and
+        # D 16+32+40 = 208 of the 224 MiB usable per 3080. That sentence lived
+        # only in state.deviations; it is cited at P_BARLINK_BAR1_WINDOW_MIB now.
+        "--barlink-bar1-window-mib", window_mib,
         # #1233 draft KV across the flip (C15): P carries D's four speculative
         # flags BYTE-FOR-BYTE (they hash into the drafter identity, W5) and is
         # silenced by the producer flag, which is deliberately not hashed.
@@ -1259,8 +1409,14 @@ def argv_d(
     disable_overlap: bool = False,
     tp_ratio_flags: Sequence[str] = ("--rank-tp-ratio", "auto"),
     token_vector_flags: Sequence[str] = (),
+    random_seed: int = RANDOM_SEED,
+    barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
+    census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
 ) -> List[str]:
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + (
+    return [py, "-m", "sglang.launch_server"] + common_flags(
+        model, s_gb, m_mib, store_gib, max_kv_per_request, "write_through", "D",
+        random_seed, barlink_cap_cycles, census_interval,
+    ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
     ) + [
         # C1/K2: D's own bs, independent of P's by construction.
@@ -1315,7 +1471,6 @@ def argv_d(
         # capacity the default objective, not because nothing was decided.
         "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
         "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
-        "--uneven-dcp", "--uneven-dcp-weighted",
     ] + list(token_vector_flags) + [
         # NO TOKEN VECTOR BY DEFAULT (#1032). What stood here was
         # `--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`, the
@@ -2066,9 +2221,34 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     return plan
 
 
+def _env_knobs(ns) -> Dict[str, object]:
+    """The #1235 flags ``build_env`` takes, gathered once.
+
+    Three call sites build an environment and every one of them must pass the
+    same seven values; spelling them out three times is how the pair of
+    environments would drift the day an eighth arrives.
+    """
+    return {
+        "barlink_build_window_cap_s": ns.barlink_build_window_cap_s,
+        "pp_chain_recv_stall_s": ns.pp_chain_recv_stall_s,
+        "pp_occupant_horizon_s": ns.pp_occupant_horizon_s,
+        "match_refusal_census_every": ns.match_refusal_census_every,
+        "arming_floor_solved": ns.arming_floor_solved,
+        "hicache_bigram_keys": ns.hicache_bigram_keys,
+        "hicache_flush_publish_sweep": ns.hicache_flush_publish_sweep,
+    }
+
+
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
               chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "",
-              transport: str = "bar1", ring: Optional["HostRingPlan"] = None) -> Dict[str, str]:
+              transport: str = "bar1", ring: Optional["HostRingPlan"] = None,
+              barlink_build_window_cap_s: int = BARLINK_BUILD_WINDOW_CAP_S,
+              pp_chain_recv_stall_s: int = PP_CHAIN_RECV_STALL_S,
+              pp_occupant_horizon_s: int = PP_OCCUPANT_HORIZON_S,
+              match_refusal_census_every: int = MATCH_REFUSAL_CENSUS_EVERY,
+              arming_floor_solved: bool = True,
+              hicache_bigram_keys: bool = True,
+              hicache_flush_publish_sweep: bool = True) -> Dict[str, str]:
     env = dict(os.environ)
     # C18: the shared host granule ring (spec C1-C8).  These four variables are
     # LAUNCHER OUTPUT, never operator input (R19): every size in them is solved
@@ -2115,27 +2295,45 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # hashes, group P (no spec) by UNIGRAM -- disjoint chains for the same
     # prompt, D never read P's pages. One key scheme for both groups; a
     # no-op on D (already bigram), forces bigram on P.
-    env["SGLANG_HICACHE_BIGRAM_KEYS"] = "1"
+    if hicache_bigram_keys:
+        env["SGLANG_HICACHE_BIGRAM_KEYS"] = "1"
+    else:
+        env.pop("SGLANG_HICACHE_BIGRAM_KEYS", None)
     # #1233 zero-remainder: /flush_cache (the front's quiesce before a sleep)
     # first publishes every un-backed device node to the store, so a chain
     # the write-through pin budget declined mid-prefill is not lost at the
     # flip (UnifiedRadixCache.publish_unbacked_sweep). Both groups.
-    env["SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP"] = "1"
-    env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
-    env["SGLANG_UNEVEN_DCP"] = "1"
-    env["SGLANG_UNEVEN_DCP_WEIGHTED"] = "1"
-    env["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
-    env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = env.get("SGLANG_BARLINK_BUILD_WINDOW_CAP_S", "60")
+    if hicache_flush_publish_sweep:
+        env["SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP"] = "1"
+    else:
+        env.pop("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", None)
+    if arming_floor_solved:
+        env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
+    else:
+        env.pop("SGLANG_ARMING_FLOOR_SOLVED", None)
+    # THE DOUBLY-STATED FACTS, FROM THE SAME TABLE THE ARGV IS BUILT FROM
+    # (#1235). Not second bookkeeping: ServerArgs reads these keys off
+    # os.environ before the matching flags publish themselves -- see
+    # EarlyReadFact for the file:line ordering. Written for BOTH groups, which
+    # preserves an existing asymmetry the table records rather than hides.
+    for fact in EARLY_READ_FACTS:
+        env[fact.env_key] = fact.env_value
+    env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = str(barlink_build_window_cap_s)
     if str(transport) == "nccl":
         # #1234 C6: half-configuring a transport the group does not run is
         # how a mode switch turns into a mystery. The flags go with
         # strip_barlink_flags(), the env keys go here.
         for key in BARLINK_ENV_KEYS:
             env.pop(key, None)
-    env["SGLANG_PP_CHAIN_RECV_STALL_S"] = env.get("SGLANG_PP_CHAIN_RECV_STALL_S", "60")
-    env["SGLANG_PP_OCCUPANT_HORIZON_S"] = env.get("SGLANG_PP_OCCUPANT_HORIZON_S", "90")
+    # LAUNCHER OUTPUT, NOT env.get (#1235). All four used to read a default
+    # THROUGH the launcher's own environment, so an inherited export won
+    # silently and the boot ran a number no flag and no log line named -- the
+    # R19 shape the ring family was already fixed out of. Now they are flags,
+    # written unconditionally.
+    env["SGLANG_PP_CHAIN_RECV_STALL_S"] = str(pp_chain_recv_stall_s)
+    env["SGLANG_PP_OCCUPANT_HORIZON_S"] = str(pp_occupant_horizon_s)
     env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = store_dir
-    env["SGLANG_MATCH_REFUSAL_CENSUS_EVERY"] = env.get("SGLANG_MATCH_REFUSAL_CENSUS_EVERY", "64")
+    env["SGLANG_MATCH_REFUSAL_CENSUS_EVERY"] = str(match_refusal_census_every)
     for k in list(env):
         if k.startswith("SGLANG_PHASE_FLIP"):
             del env[k]
@@ -4425,6 +4623,93 @@ def build_parser() -> argparse.ArgumentParser:
              "structural removal (a shared ring, async ack) belongs to the "
              "ring slice, not here.",
     )
+    # -- #1235: the literals and env gates that used to be nobody's ------
+    ap.add_argument(
+        "--random-seed", type=int, default=RANDOM_SEED,
+        help=f"Sampling seed for BOTH groups. Default {RANDOM_SEED} is "
+             f"ARBITRARY AND FIXED, and that is the whole provenance -- it is "
+             f"not measured and not solved, and it is a flag so that no reader "
+             f"has to wonder which it was. What it buys is that two boots of "
+             f"one tip sample identically, so a decode difference between them "
+             f"is a difference in the code.",
+    )
+    ap.add_argument(
+        "--barlink-bar1-cap-cycles", type=int, default=BARLINK_BAR1_CAP_CYCLES,
+        help=f"Ceiling on barlink's build-time cycle budget, both groups. "
+             f"Default {BARLINK_BAR1_CAP_CYCLES} is large BY CONSTRUCTION: it "
+             f"is a ceiling, not a target, and the gate that actually binds on "
+             f"this rig is the BAR1 aperture priced at "
+             f"--barlink-bar1-window-mib (#1234 C1), not this number.",
+    )
+    ap.add_argument(
+        "--collective-census-interval", type=int, default=COLLECTIVE_CENSUS_INTERVAL,
+        help=f"How often the collective census prints, both groups. Default "
+             f"{COLLECTIVE_CENSUS_INTERVAL} is a STRIDE and not a measurement: "
+             f"larger is quieter, smaller costs log volume, and nothing about "
+             f"the boot depends on it except how much of it a reader sees.",
+    )
+    ap.add_argument(
+        "--p-barlink-bar1-window-mib", default=P_BARLINK_BAR1_WINDOW_MIB,
+        help=f"Group P's BAR1 windows. Default {P_BARLINK_BAR1_WINDOW_MIB!r} "
+             f"shares group D's provenance from the other side (#1234 C1): the "
+             f"two groups' windows are sized to fit TOGETHER -- P 24+96 and D "
+             f"16+32+40 = 208 of the 224 MiB usable per 3080, measured Used "
+             f"224/256 including the RM carve-out. That sentence lived only in "
+             f"the declared-deviations list while D's window carried the whole "
+             f"derivation in a comment.",
+    )
+    ap.add_argument(
+        "--barlink-build-window-cap-s", type=int, default=BARLINK_BUILD_WINDOW_CAP_S,
+        help=f"SGLANG_BARLINK_BUILD_WINDOW_CAP_S, both groups. Default "
+             f"{BARLINK_BUILD_WINDOW_CAP_S} s. A TIMEOUT, not a measurement. "
+             f"It is now launcher OUTPUT: it used to be written as "
+             f"env.get(KEY, default), so an inherited export from the "
+             f"launcher's own shell won silently and the boot ran a number no "
+             f"flag, record or log line ever named (the R19 shape).",
+    )
+    ap.add_argument(
+        "--pp-chain-recv-stall-s", type=int, default=PP_CHAIN_RECV_STALL_S,
+        help=f"SGLANG_PP_CHAIN_RECV_STALL_S. Default {PP_CHAIN_RECV_STALL_S} s, "
+             f"a timeout, launcher OUTPUT for the same reason as above.",
+    )
+    ap.add_argument(
+        "--pp-occupant-horizon-s", type=int, default=PP_OCCUPANT_HORIZON_S,
+        help=f"SGLANG_PP_OCCUPANT_HORIZON_S. Default {PP_OCCUPANT_HORIZON_S} s, "
+             f"a timeout, launcher OUTPUT for the same reason as above.",
+    )
+    ap.add_argument(
+        "--match-refusal-census-every", type=int, default=MATCH_REFUSAL_CENSUS_EVERY,
+        help=f"SGLANG_MATCH_REFUSAL_CENSUS_EVERY. Default "
+             f"{MATCH_REFUSAL_CENSUS_EVERY} is a census STRIDE. Launcher "
+             f"OUTPUT for the same reason as above -- and note the denominator "
+             f"law applies to what it emits: a rate-limited counter's zero is "
+             f"not a zero.",
+    )
+    ap.add_argument(
+        "--no-arming-floor-solved", dest="arming_floor_solved",
+        action="store_false",
+        help="Drop SGLANG_ARMING_FLOOR_SOLVED=1 (default ON, unchanged "
+             "shipped behaviour). A boolean env gate with no flag was "
+             "indistinguishable from a hard-coded constant (#1235).",
+    )
+    ap.add_argument(
+        "--no-hicache-bigram-keys", dest="hicache_bigram_keys",
+        action="store_false",
+        help="Drop SGLANG_HICACHE_BIGRAM_KEYS=1 (default ON). MEASURED reason "
+             "for ON, boot weg2ls3b3 (#1233): group D (NEXTN) keys the store "
+             "by BIGRAM page hashes and group P (no spec) by UNIGRAM, so the "
+             "two built disjoint chains for the same prompt and D never read "
+             "P's pages. One key scheme for both groups; a no-op on D.",
+    )
+    ap.add_argument(
+        "--no-hicache-flush-publish-sweep", dest="hicache_flush_publish_sweep",
+        action="store_false",
+        help="Drop SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=1 (default ON). Reason "
+             "for ON (#1233 zero-remainder): /flush_cache publishes every "
+             "un-backed device node to the store before the idle witness, so a "
+             "chain the write-through pin budget declined mid-prefill is not "
+             "lost at the flip.",
+    )
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
     return ap
 
@@ -4619,14 +4904,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls2b2"
     )
     state.budgets["P"] = budgets_p
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, **_env_knobs(ns))
     # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
     # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
     chunk_tokens = chunked_prefill_size_of(
-        common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, max_kv_per_request, ns.p_hicache_write_policy)
+        common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, max_kv_per_request, ns.p_hicache_write_policy, "P", ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval)
     )
     cut = solve_p_cut(ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens)
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
@@ -4713,7 +4998,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
             f"arm exists to, and changes nothing else). Group D is unchanged."
         )
-    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth), ns.transport), state.logs["P"], env_p)
+    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     log(w38_armed_line(spec_p.argv))
     state.deviations = [
@@ -4734,6 +5019,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "(front route CARRIER-EXCEEDS, no leg 1) -- served and single-prefill, but NOT a zero-remainder leg 2; the windowed prefetch that would lift it is the next round",
         "zero-remainder: BATCH streams are priced post hoc via stream_options.include_usage (one standard trailing usage chunk reaches the client)",
     ]
+    log(early_read_provenance())
     for d in state.deviations:
         log(f"DEVIATION (declared): {d}")
     launch_group(spec_p, tree, log, dry)
@@ -4744,8 +5030,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         log(d_ratio.line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags), ns.transport), state.logs["D"], env_d)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, **_env_knobs(ns))
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -4808,8 +5094,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     log(d_ratio.line)
     log(d_tokvec.line)
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags), ns.transport), state.logs["D"], env_d)
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, **_env_knobs(ns))
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid

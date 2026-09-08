@@ -294,3 +294,93 @@ class TestPCutObjective1254(unittest.TestCase):
         # The verdict is STAYS, so no objective may choose a gapped map here.
         for objective in ("maxkv", "makespan"):
             self.assertEqual(self._solve(objective).chosen.kind, "contiguous")
+
+
+class TestLiteralsAndEnvGates1235(unittest.TestCase):
+    """#1235: no unowned literal, no env gate whose value can be inherited."""
+
+    def test_the_doubly_stated_facts_come_from_one_table(self):
+        from sglang.srt.weg2.launcher import (
+            EARLY_READ_FACTS,
+            build_env,
+            early_read_flags,
+            early_read_provenance,
+        )
+
+        env = build_env("/t", "/v", "cvd", "/s", False, "tag")
+        for fact in EARLY_READ_FACTS:
+            # both currencies, one row: the env half...
+            self.assertEqual(env[fact.env_key], fact.env_value)
+            # ...and the argv half, for the groups the row names.
+            self.assertTrue(set(fact.flag) <= set(early_read_flags("D")))
+            if fact.groups == "both":
+                self.assertTrue(set(fact.flag) <= set(early_read_flags("P")))
+            # and the reader that makes the env half necessary is NAMED.
+            self.assertIn("server_args.py:", fact.reader + early_read_provenance())
+
+    def test_uneven_dcp_reaches_group_d_and_the_ssm_dtype_reaches_both(self):
+        p = argv_p("py", MODEL, BUDGETS, 8, 1024, 8.0, [])
+        d = argv_d("py", MODEL, BUDGETS, 8, 1024, 8.0, [])
+        self.assertIn("--uneven-dcp", d)
+        self.assertIn("--uneven-dcp-weighted", d)
+        self.assertNotIn("--uneven-dcp", p)  # unchanged: P is tp_size=1
+        self.assertEqual(_flag_value(p, "--mamba-ssm-dtype"), "bfloat16")
+        self.assertEqual(_flag_value(d, "--mamba-ssm-dtype"), "bfloat16")
+
+    def test_the_four_timeouts_are_output_and_an_inherited_export_cannot_win(self):
+        from sglang.srt.weg2.launcher import build_env
+
+        keys = {
+            "SGLANG_BARLINK_BUILD_WINDOW_CAP_S": "60",
+            "SGLANG_PP_CHAIN_RECV_STALL_S": "60",
+            "SGLANG_PP_OCCUPANT_HORIZON_S": "90",
+            "SGLANG_MATCH_REFUSAL_CENSUS_EVERY": "64",
+        }
+        saved = {k: os.environ.get(k) for k in keys}
+        try:
+            for k in keys:
+                os.environ[k] = "999999"
+            env = build_env("/t", "/v", "cvd", "/s", False, "tag")
+            for k, want in keys.items():
+                self.assertEqual(env[k], want, k)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_the_boolean_gates_have_flags_and_default_on(self):
+        from sglang.srt.weg2.launcher import build_env
+
+        ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
+        self.assertTrue(ns.arming_floor_solved)
+        self.assertTrue(ns.hicache_bigram_keys)
+        self.assertTrue(ns.hicache_flush_publish_sweep)
+        on = build_env("/t", "/v", "cvd", "/s", False, "tag")
+        self.assertEqual(on["SGLANG_HICACHE_BIGRAM_KEYS"], "1")
+        off = build_env(
+            "/t", "/v", "cvd", "/s", False, "tag", hicache_bigram_keys=False
+        )
+        self.assertNotIn("SGLANG_HICACHE_BIGRAM_KEYS", off)
+
+    def test_the_argv_literals_became_flags_with_the_same_values(self):
+        ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
+        self.assertEqual(ns.random_seed, 785500001)
+        self.assertEqual(ns.barlink_bar1_cap_cycles, 300000000000)
+        self.assertEqual(ns.collective_census_interval, 50)
+        self.assertEqual(ns.p_barlink_bar1_window_mib, "24,PP_0=96")
+        p = argv_p("py", MODEL, BUDGETS, 8, 1024, 8.0, [], random_seed=7)
+        self.assertEqual(_flag_value(p, "--random-seed"), "7")
+        self.assertEqual(_flag_value(p, "--barlink-bar1-window-mib"), "24,PP_0=96")
+        d = argv_d("py", MODEL, BUDGETS, 8, 1024, 8.0, [], census_interval=3)
+        self.assertEqual(_flag_value(d, "--collective-census-interval"), "3")
+
+    def test_group_ds_measured_window_is_untouched(self):
+        # #1234 C1 is the best-documented number in the file and this slice
+        # must not have moved it while routing its neighbours.
+        d = argv_d("py", MODEL, BUDGETS, 8, 1024, 8.0, [])
+        self.assertEqual(
+            _flag_value(d, "--barlink-bar1-window-mib"), "16,TP_0=32,DCP_0=40"
+        )
+        self.assertEqual(_flag_value(d, "--barlink-uncovered-class"), "refuse")
