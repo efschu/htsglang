@@ -82,7 +82,7 @@ class ThePickerShipsTheMakespanRow(CustomTestCase):
         """--pp-stage-ratio must remain an order, not a suggestion."""
         import inspect
 
-        src = inspect.getsource(launcher.main)
+        src = inspect.getsource(launcher.solve_p_cut)
         i = src.index("if decision.pinned:")
         self.assertIn("PINNED by --pp-stage-ratio", src[i:i + 400])
 
@@ -93,7 +93,7 @@ class TheConsumersReadTheOneSeam(CustomTestCase):
     def test_the_argv_split_comes_from_the_chosen_candidate(self):
         import inspect
 
-        src = inspect.getsource(launcher.main)
+        src = inspect.getsource(launcher.solve_p_cut)
         self.assertIn("stage_ratio = _csv(chosen.layers)", src)
         self.assertIn("attn_ratio = _csv(chosen.attn)", src)
 
@@ -102,25 +102,26 @@ class TheConsumersReadTheOneSeam(CustomTestCase):
         runs -- this is what makes 'the consumers follow' checkable."""
         import inspect
 
-        src = inspect.getsource(launcher.main)
+        src = inspect.getsource(launcher.solve_p_cut)
         self.assertIn("does not survive", src)
         self.assertIn("derive_pp_layer_split", src)
 
     def test_downstream_reads_pcutfacts_not_a_recomputed_incumbent(self):
         import inspect
 
-        src = inspect.getsource(launcher.main)
-        self.assertIn("stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio", src)
+        self.assertIn("stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio",
+                      inspect.getsource(launcher.main))
         # and the incumbent constant is NOT what argv is built from
-        i = src.index("stage_ratio = _csv(chosen.layers)")
-        self.assertNotIn("P_PP_STAGE_RATIO_SCORES", src[i:i + 600])
+        solve = inspect.getsource(launcher.solve_p_cut)
+        i = solve.index("stage_ratio = _csv(chosen.layers)")
+        self.assertNotIn("P_PP_STAGE_RATIO_SCORES", solve[i:i + 600])
 
 
 class ThePriceOfBothAlternativesIsPrintedEveryBoot(CustomTestCase):
     def test_the_shipped_line_prices_all_three_arms(self):
         import inspect
 
-        src = inspect.getsource(launcher.main)
+        src = inspect.getsource(launcher.incumbent_candidate)
         i = src.index("PP-CUT SHIPPED")
         window = src[i:i + 900]
         for token in ("incumbent %s pool %s", "pool-maximal (kv-floor)",
