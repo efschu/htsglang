@@ -252,13 +252,7 @@ class DraftKvProducer:
         # the logits processor -- the draft forward goes through it (C21
         # returns only after `_draft_extend_for_prefill`'s forward).
         self.head_deferred = bool(getattr(draft_model, "lm_head_is_deferred", False))
-        if self.head_deferred and head is None:
-            raise RuntimeError(
-                "draft-KV producer: the MTP head's lm_head was deferred at build "
-                "time (#1259 b) but the co-located target carries no lm_head on "
-                "this stage, so there is nothing to share in. The producer must "
-                "run on the target's LAST pipeline stage."
-            )
+        _refuse_unshareable_head(self.head_deferred, head)
         if head is not None and hasattr(draft_model, "set_lm_head_from_target"):
             draft_model.set_lm_head_from_target(head)
         if (
@@ -344,6 +338,30 @@ def _draft_server_args(server_args):
         disable_draft_cuda_graph=True,
     )
     return draft_args
+
+
+class Weg2DraftHeadUnshareable(RuntimeError):
+    """#1259 (b): the MTP head's ``lm_head`` was deferred at build time and
+    the co-located target has none on this stage to share in."""
+
+
+def _refuse_unshareable_head(head_deferred: bool, target_head) -> None:
+    """With the build deferred there is NO fallback table, so a missing target
+    head is fatal and the honest place to say so is BOOT, not the first chunk.
+
+    The draft forward reaches the logits processor before C21 returns
+    (``_draft_extend_for_prefill`` returns only after
+    ``self.draft_runner.forward(...)``), so without this the same condition
+    surfaces per chunk, inside a forward, as a refusal about a placeholder
+    rather than about the stage the producer was put on.
+    """
+    if head_deferred and target_head is None:
+        raise Weg2DraftHeadUnshareable(
+            "draft-KV producer: the MTP head's lm_head was deferred at build "
+            "time (#1259 b) but the co-located target carries no lm_head on "
+            "this stage, so there is nothing to share in. The producer must "
+            "run on the target's LAST pipeline stage."
+        )
 
 
 def _drop_parameters(module) -> float:

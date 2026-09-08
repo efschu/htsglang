@@ -47,7 +47,11 @@ from sglang.srt.models.qwen3_5_mtp import (
     build_mtp_lm_head,
     lm_head_from_target,
 )
-from sglang.srt.speculative.draft_kv_producer import _drop_parameters
+from sglang.srt.speculative.draft_kv_producer import (
+    Weg2DraftHeadUnshareable,
+    _drop_parameters,
+    _refuse_unshareable_head,
+)
 
 
 VOCAB = 248320
@@ -238,3 +242,103 @@ def test_get_embed_and_head_refuses_while_deferred():
     stub = _stub_mtp(Qwen3_5MtpLmHeadDeferred())
     with pytest.raises(Qwen3_5MtpLmHeadNotShared):
         stub.get_embed_and_head()
+
+
+# ------------------------------------------- the PRODUCER enters the scope ----
+#
+# The model-side tests above all pass with the producer's `with` clause
+# deleted -- measured, mutant M2 of this file's own census SURVIVED the first
+# round at 16/16 green. A helper nobody enters saves nothing, so the entry
+# itself is asserted here, at the seam, by driving the real
+# ``DraftKvProducer.__init__`` with the draft worker stubbed out.
+
+
+class _FakePpGroup:
+    is_last_rank = True
+    rank_in_group = 2
+    world_size = 3
+
+
+class _FakeServerArgs:
+    def __init__(self):
+        self.speculative_draft_kv_only = True
+
+    def override(self, _who, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class _FakeScheduler:
+    def __init__(self):
+        self.server_args = _FakeServerArgs()
+        self.nccl_port = 0
+        self.tp_worker = object()
+        self.ps = types.SimpleNamespace(
+            gpu_id=0, tp_rank=0, dp_rank=0, moe_ep_rank=0, attn_cp_rank=0, moe_dp_rank=0
+        )
+
+
+@pytest.fixture
+def producer_build(monkeypatch):
+    """Build a ``DraftKvProducer`` with the draft worker replaced by a probe
+    that records ``_LM_HEAD_FROM_TARGET`` AT CONSTRUCTION TIME -- which is the
+    only moment the flag can affect what gets allocated."""
+    import contextlib
+
+    from sglang.srt.distributed import parallel_state
+    from sglang.srt.speculative import eagle_worker_v2
+
+    seen = {}
+
+    class _ProbeWorker:
+        def __init__(self, **kw):
+            seen["flag_at_build"] = qwen3_5_mtp._LM_HEAD_FROM_TARGET.get()
+            self.draft_runner = object()
+
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: _FakePpGroup())
+    monkeypatch.setattr(
+        parallel_state, "draft_pp_scope", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(eagle_worker_v2, "EagleDraftWorker", _ProbeWorker)
+    return seen
+
+
+def test_producer_builds_the_draft_inside_lm_head_from_target(producer_build):
+    """THE SEAM. If this reads False the head allocates its own 2425.0 MiB
+    vocab table again and nothing else in this file notices."""
+    from sglang.srt.speculative.draft_kv_producer import DraftKvProducer
+
+    DraftKvProducer(_FakeScheduler(), None)
+
+    assert producer_build["flag_at_build"] is True, (
+        "the draft worker was constructed OUTSIDE lm_head_from_target(): "
+        "Qwen3_5ForCausalLMMTP builds its own ParallelLMHead again."
+    )
+
+
+def test_producer_leaves_the_flag_off_afterwards(producer_build):
+    """The scope must not leak into whatever this process builds next."""
+    from sglang.srt.speculative.draft_kv_producer import DraftKvProducer
+
+    DraftKvProducer(_FakeScheduler(), None)
+    assert qwen3_5_mtp._LM_HEAD_FROM_TARGET.get() is False
+
+
+# -------------------------------------------------- the boot-time refusal ----
+
+
+def test_deferred_head_with_no_target_head_refuses_at_boot():
+    """Without a built table there is no fallback: a producer on a stage that
+    carries no target lm_head must stop here, not inside a per-chunk forward."""
+    with pytest.raises(Weg2DraftHeadUnshareable):
+        _refuse_unshareable_head(True, None)
+
+
+def test_deferred_head_with_a_target_head_is_accepted():
+    assert _refuse_unshareable_head(True, nn.Linear(4, 8, bias=False)) is None
+
+
+def test_undeferred_head_with_no_target_head_is_not_this_guards_business():
+    """Pre-#1259 shape: the head built its own table, so a missing target head
+    is not fatal here and this guard must not invent a refusal for it."""
+    assert _refuse_unshareable_head(False, None) is None
