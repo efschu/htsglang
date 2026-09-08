@@ -305,6 +305,7 @@ from sglang.srt.managers.utils import (
     is_health_check_generate_req,
     validate_input_length,
 )
+from sglang.srt.mem_cache.hicache_collective import bounded_wait
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.mem_cache.common import (
@@ -14654,7 +14655,19 @@ class Scheduler(
             _sweep = getattr(self.tree_cache, "publish_unbacked_sweep", None)
             if _sweep is not None:
                 _sweep()
-        if self.is_fully_idle():
+        # #1268: THE VERDICT IS THE GROUP'S, not this rank's. Boot weg2sb1
+        # (2026-09-08 14:29:29Z) had PP0 and PP1 answer "flushed" while PP2
+        # answered "not-idle because: hicache_prefetch(1: 43c9af54)" in the
+        # same second; only PP0's answer left the group, the front read it as
+        # P's, commanded sleep(P, kv_cache), and PP2 met the rank-side assert
+        # at 14:29:59 -> W29 -> group death. The comment above judged this
+        # verdict rank-uniform "while waiting_queue is replicated", which is
+        # true of the REQUEST clauses and not of the HiCache in-flight ones.
+        # `group_idle_verdict` reduces every rank's own answer into one, so the
+        # entrypoint can no longer answer for a busy peer. World <= 1 keeps the
+        # stock path byte-identical.
+        group_idle, verdict_detail = self.group_idle_verdict()
+        if group_idle:
             self.cur_batch_for_debug = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -14691,10 +14704,128 @@ class Scheduler(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
                 f"#running-req: {len(self.running_batch.reqs)}, "
-                f"not-idle because: {', '.join(self.idle_blockers()) or 'unknown'}"
+                f"not-idle because: {', '.join(self.idle_blockers()) or 'unknown'} "
+                f"| #1268 group verdict: {verdict_detail}"
             )
             success = False
         return success
+
+    def group_idle_verdict(self) -> Tuple[bool, str]:
+        """#1268: is THE GROUP idle -- not "is this rank idle".
+
+        THE DEFECT THIS CLOSES, measured on boot weg2sb1 (2026-09-08). At
+        14:29:29 the front asked group P to quiesce and three ranks answered
+        three different things IN THE SAME SECOND::
+
+            [14:29:29 PP0] Cache flushed successfully!
+            [14:29:29 PP1] Cache flushed successfully!
+            [14:29:29 PP2] Cache not flushed because there are pending
+                           requests. #queue-req: 0, #running-req: 0,
+                           not-idle because: hicache_prefetch(1: 43c9af54)
+
+        Only PP0's answer leaves the group -- it owns the HTTP entrypoint -- so
+        the front read "P is idle", saw its own ledger at ``outstanding=0
+        queue=0``, and commanded ``sleep(P, kv_cache)``. PP2 then met the
+        rank-side assert in ``release_memory_occupation`` and the whole group
+        died by W29 at 14:29:59.
+
+        `flush_cache`'s own comment had judged this verdict "rank-local ...
+        rank-UNIFORM only while waiting_queue is replicated", and that premise
+        is sound for the REQUEST clauses. It does not extend to the HiCache
+        in-flight clauses: ``ongoing_prefetch`` is not a function of the
+        replicated queues, and on sb1 exactly one rank held one orphaned
+        record. The premise was right about its own scope and the clause that
+        diverged sat outside it.
+
+        SO THE FACT IS MADE GROUP-UNIFORM AT ITS SOURCE, which is the
+        one-verdict law: every rank contributes its own answer to ONE reduce,
+        every rank leaves with the same verdict, and the answer the entrypoint
+        returns IS the group's. No rank-local compensation, no retry-until-idle
+        loop on the rank, and the rank-side assert stays exactly as it was --
+        it is the fence, and after this it should never be the thing that
+        fires.
+
+        ONE COLLECTIVE, and it names the rank. ``[idle, blocking_rank]`` reduced
+        with MIN yields both answers in one pass: element 0 is 0 as soon as ANY
+        rank is not idle, and element 1 is the LOWEST rank that was not, so the
+        refusal can say WHO instead of "somebody". A gather would carry the
+        blocker strings too, but gloo's ``all_gather_object`` has no timeout
+        (see ``_weg2_group_fence_impl``'s own note on why its barrier runs
+        first) and this runs on the front's 0.5 s quiesce poll; a two-int
+        reduce under the existing bounded wait is the cheap, bounded shape.
+
+        Returns ``(group_idle, detail)``. With no group to reduce over -- world
+        <= 1, no cpu group, no distributed -- it returns this rank's own answer
+        unchanged, so a single-rank engine and every stock path are
+        byte-identical.
+        """
+        my_idle = self.is_fully_idle()
+        my_blockers = self.idle_blockers()
+        own = ", ".join(my_blockers) or "none"
+
+        cpu_group = getattr(getattr(self, "world_group", None), "cpu_group", None)
+        if cpu_group is None:
+            return my_idle, f"single-rank verdict (no group): blockers=[{own}]"
+        try:
+            world = torch.distributed.get_world_size(group=cpu_group)
+        except Exception as exc:  # noqa: BLE001 - a verdict may not raise
+            # UNDECIDED IS NOT IDLE, here too. A cpu_group EXISTS -- so peers
+            # exist -- and their state could not be read; answering with this
+            # rank's own verdict would be the sb1 failure with a different
+            # producer. Absent group (cpu_group is None) is the only case that
+            # legitimately answers alone, and it is handled above.
+            return False, (
+                f"GROUP VERDICT UNAVAILABLE (world unreadable: "
+                f"{type(exc).__name__}: {exc}); this rank blockers=[{own}] -- "
+                f"refusing rather than answering for peers that exist"
+            )
+        if world <= 1:
+            return my_idle, f"single-rank verdict (world=1): blockers=[{own}]"
+
+        try:
+            rank = torch.distributed.get_rank(group=cpu_group)
+        except Exception:  # noqa: BLE001
+            rank = -1
+        # Sentinel above any real rank, so MIN picks a real blocker when one
+        # exists and the sentinel only when nobody blocks.
+        _NONE = 1 << 20
+        vote = torch.tensor(
+            [1 if my_idle else 0, _NONE if my_idle else max(rank, 0)],
+            dtype=torch.int64,
+        )
+        try:
+            bounded_wait(
+                torch.distributed.all_reduce(
+                    vote,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=cpu_group,
+                    async_op=True,
+                ),
+                "weg2/group_idle_verdict",
+                float(getattr(self, "collective_timeout_s", 0.0) or 0.0),
+                f"rank {rank}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # UNDECIDED is not IDLE. A verdict that could not be taken must
+            # refuse, never fall through to this rank's own optimistic answer --
+            # that is the whole failure being closed here.
+            return False, (
+                f"GROUP VERDICT UNAVAILABLE ({type(exc).__name__}: {exc}); this "
+                f"rank {rank} blockers=[{own}] -- refusing rather than answering "
+                f"for peers that did not reduce"
+            )
+
+        group_idle = bool(int(vote[0].item()))
+        blocking = int(vote[1].item())
+        if group_idle:
+            return True, f"group idle (world={world} ranks agreed)"
+        who = "unknown" if blocking >= _NONE else str(blocking)
+        return False, (
+            f"GROUP NOT IDLE: lowest blocking rank={who} of world={world}; this "
+            f"rank {rank} blockers=[{own}]. The verdict is the GROUP's, reduced "
+            f"over every rank -- an idle entrypoint no longer answers for a busy "
+            f"peer (#1268, boot weg2sb1)"
+        )
 
     def idle_blockers(self) -> List[str]:
         """Which clauses of :meth:`is_fully_idle` are currently false.

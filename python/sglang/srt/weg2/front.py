@@ -2290,8 +2290,17 @@ class Front:
         return True
 
     async def quiesce(self, g: Group) -> Tuple[bool, str]:
-        """Witness B: poll /flush_cache (200 iff the rank's is_fully_idle,
-        including the HiCache in-flight terms) to a deadline."""
+        """Witness B: poll /flush_cache (200 iff the GROUP's is_fully_idle,
+        including the HiCache in-flight terms) to a deadline.
+
+        #1268: this said "the rank's", and it meant it -- the entrypoint rank
+        answered for the group. On boot weg2sb1 PP0 and PP1 said flushed while
+        PP2 said `hicache_prefetch(1: 43c9af54)` in the same second, only PP0's
+        answer left the group, and the sleep that followed killed it by W29.
+        The verdict is now reduced over every rank at its source
+        (`Scheduler.group_idle_verdict`), so this poll is a group fact and the
+        deadline below is the bounded wait that precedes a NAMED refusal (W3)
+        instead of an assert-death on a follower."""
         t0 = time.time()
         last = ""
         while time.time() - t0 < QUIESCE_DEADLINE_S:
@@ -2386,8 +2395,13 @@ class Front:
         idle, msg = await self.quiesce(S)
         wv = witness_verdict(len(S.outstanding), idle)
         if wv is not None:
+            # #1268: name it as the GROUP's verdict, because it now is one --
+            # the reply carries the reduced answer and the lowest blocking rank.
+            # The old wording ("rank(P) flush_cache") described the defect: one
+            # rank's word standing for three.
             self.do_stop("W3 Weg2DrainWitnessDisagreement",
-                         f"{wv}: front ledger {sorted(S.outstanding)} vs rank({src}) flush_cache -> {msg[:400]!r}")
+                         f"{wv}: front ledger {sorted(S.outstanding)} vs group({src}) "
+                         f"flush_cache (reduced over every rank, #1268) -> {msg[:400]!r}")
             return
         t_q = time.time()
         # 3. THE GATHERED LEGS (C9, spec Amendment A1-1).  src.pause(kv_cache)
