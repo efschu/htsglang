@@ -256,11 +256,11 @@ class DirectionKeyTest(unittest.TestCase):
         # DECISION: FIX 2 round 2 makes a published string that names no
         # decision a named refusal, so the rows here carry theirs.
         parsed = ms.duplex_ratios(
-            "v2|GPU-a=1.759:split,GPU-b=nonsense:split,,GPU-c=1.2:split")
+            "format=v2,GPU-a=1.759:split,GPU-b=nonsense:split,,GPU-c=1.2:split")
         self.assertEqual(parsed, {"GPU-a": 1.759, "GPU-c": 1.2})
         self.assertEqual(
             ms.duplex_splits(
-                "v2|GPU-a=1.759:split,GPU-b=nonsense:split,,GPU-c=1.2:split"),
+                "format=v2,GPU-a=1.759:split,GPU-b=nonsense:split,,GPU-c=1.2:split"),
             {"GPU-a": True, "GPU-b": True, "GPU-c": True},
             "a card whose ratio nobody could read still has a decision")
 
@@ -368,9 +368,63 @@ class VramCreditTest(unittest.TestCase):
         credit = ms.VramCredit(self.uuid, credit_dir=self.dir)
         credit.begin_leg(ms.credit_epoch("1757300000", 1))
         self.assertTrue(os.path.exists(credit.path))
-        removed = launcher.remove_vram_credit_counters(self.dir)
+        removed = launcher.remove_vram_credit_counters(
+            self.dir, boot_nonce="1757300000")
         self.assertEqual(len(removed), 1, removed)
         self.assertFalse(os.path.exists(credit.path))
+
+    def test_teardown_unlinks_only_THIS_boots_counters(self):
+        # FIX 3 round 3.  The predecessor unlinked EVERY .weg2-vram-credit-* in
+        # the directory -- so a teardown of boot A takes a LIVE boot B's counter
+        # mid-flip, and B then waits on a file that has gone.  The nonce the
+        # same commit introduced is what identifies a boot; it is used here.
+        from sglang.srt.weg2 import launcher
+
+        mine = ms.VramCredit("GPU-mine", credit_dir=self.dir)
+        mine.begin_leg(ms.credit_epoch("1757300000", 3))
+        theirs = ms.VramCredit("GPU-theirs", credit_dir=self.dir)
+        theirs.begin_leg(ms.credit_epoch("1757399999", 3))
+
+        removed = launcher.remove_vram_credit_counters(
+            self.dir, boot_nonce="1757300000")
+        self.assertEqual(len(removed), 1, removed)
+        self.assertFalse(os.path.exists(mine.path))
+        self.assertTrue(os.path.exists(theirs.path),
+                        "another boot's counter must survive this boot's teardown")
+        # And an UNKNOWN nonce removes nothing at all: "every counter on the
+        # box" is the defect, never the fallback for not knowing which boot.
+        self.assertEqual(launcher.remove_vram_credit_counters(self.dir), [])
+        self.assertTrue(os.path.exists(theirs.path))
+
+    def test_launch_sweeps_DEAD_epoch_counters_and_never_a_live_holder(self):
+        # FIX 3 round 3.  Teardown is exactly what a CRASHED boot does not run,
+        # which is how three weg2rg2 counters were still on this rig when
+        # weg2rg3 launched.  The epoch makes them harmless; the launch sweep
+        # makes them absent -- but a counter whose publisher is ALIVE belongs to
+        # a boot in flight and is named, not removed (presence_sweep's rule).
+        from sglang.srt.weg2 import launcher
+
+        dead = ms.VramCredit("GPU-dead", credit_dir=self.dir)
+        dead.begin_leg(ms.credit_epoch("1757300000", 1), pid=999999)
+        live = ms.VramCredit("GPU-live", credit_dir=self.dir)
+        live.begin_leg(ms.credit_epoch("1757399999", 1), pid=os.getpid())
+
+        lines = []
+        removed = launcher.sweep_dead_credit_counters(lines.append, self.dir)
+        self.assertEqual(len(removed), 1, removed)
+        self.assertFalse(os.path.exists(dead.path))
+        self.assertTrue(os.path.exists(live.path),
+                        "a counter whose publisher is alive is a boot in flight")
+        self.assertTrue(any("LIVE publisher" in ln for ln in lines), lines)
+        # DRY-RUN removes nothing and says what it would have taken.
+        dead2 = ms.VramCredit("GPU-dead2", credit_dir=self.dir)
+        dead2.begin_leg(ms.credit_epoch("1757300000", 2), pid=999999)
+        lines = []
+        self.assertEqual(
+            launcher.sweep_dead_credit_counters(lines.append, self.dir, dry=True),
+            [])
+        self.assertTrue(os.path.exists(dead2.path))
+        self.assertTrue(any("DRY-RUN" in ln for ln in lines), lines)
 
     def test_a_stale_full_credit_does_not_licence_a_resume(self):
         self.credit.begin_leg(7)

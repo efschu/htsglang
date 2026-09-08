@@ -246,6 +246,9 @@ class BootState:
     ring_lines: List[str] = field(default_factory=list)
     ring_form: str = ""
     ring_dir: str = ""
+    #: The boot nonce (``HostRingPlan.epoch``), so teardown can unlink THIS
+    #: boot's VRAM credit counters and no other boot's (FIX 3 round 3).
+    ring_epoch: str = ""
     argv: Dict[str, str] = field(default_factory=dict)
     t_ready: Dict[str, float] = field(default_factory=dict)
     sleep_p_ms: float = 0.0
@@ -698,7 +701,11 @@ class HostRingPlan:
     def provenance(self) -> str:
         if self.table is None:
             return "no measured table"
-        form = f"ring form {self.form}" if self.armed else "OLD flip form (no ring)"
+        # A1-3: un-armed names no form that runs (FIX 3 round 3, same class as
+        # the two sentences fix 2 retracted).  The table is still charged and
+        # printed, because the refusal's arithmetic is what the operator reads.
+        form = (f"ring form {self.form}" if self.armed
+                else "NO ARMED FORM -- this boot refuses (A1-3)")
         return f"{self.table.provenance()}; charged for the {form}"
 
 
@@ -760,10 +767,74 @@ def _split_decisions(
     }
 
 
+#: The launch check's body, run BY THE TREE THE RANKS IMPORT (FIX 3 round 3,
+#: finding 2).  It sets the duplex variable under the NAME THAT TREE USES -- not
+#: the launcher's -- so a tree that renamed it is a failed probe rather than a
+#: silently unconfigured one, and it asks for the KEY, which is the only artefact
+#: the launcher and the rank must agree on.  ``CUDA_VISIBLE_DEVICES=''`` in the
+#: caller's env means no context is bought to answer.
+_KEY_PROBE = (
+    "import json, os, sys\n"
+    "from sglang.srt.managers import weg2_memory_saver as s\n"
+    "os.environ[s.PCIE_DUPLEX_ENV] = sys.argv[1]\n"
+    "out = {}\n"
+    "for u in json.loads(sys.argv[2]):\n"
+    "    try:\n"
+    "        keys = {s.pcie_lock_path(u, direction=d) for d in s.PCIE_DIRECTIONS}\n"
+    "    except TypeError:\n"
+    "        keys = {s.pcie_lock_path(u)}\n"
+    "    out[u] = [len(keys), len(s.PCIE_DIRECTIONS)]\n"
+    "sys.stdout.write('WEG2-KEYS ' + json.dumps(out))\n"
+)
+
+
+def _resolve_keys_in_rank_tree(
+    card_uuids: Sequence[str], published: str, py: str, tree: str
+) -> Tuple[Dict[str, Tuple[int, int]], str]:
+    """``{uuid: (keys THAT tree builds, directions THAT tree has)}``, or ``({}, why)``.
+
+    BOTH halves come from the rank tree, never one from here: a tree with a
+    different :data:`PCIE_DIRECTIONS` would otherwise be compared against this
+    launcher's count and read as split when it is not.
+
+    One interpreter start per boot, in the environment ``build_env`` gives the
+    ranks (``PYTHONPATH=<tree>/python``), because a stale tree on that path is
+    precisely the divergence this check exists to see and precisely the one an
+    in-process import cannot show.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{tree}/python"
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    from sglang.srt.managers import weg2_memory_saver as _s
+
+    env.pop(_s.PCIE_DUPLEX_ENV, None)  # the probe sets the TREE's own name
+    try:
+        proc = subprocess.run(
+            [py, "-c", _KEY_PROBE, published, json.dumps(list(card_uuids))],
+            capture_output=True, text=True, env=env, cwd=tree, timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+    out = proc.stdout or ""
+    marker = "WEG2-KEYS "
+    if proc.returncode != 0 or marker not in out:
+        tail = " | ".join((proc.stderr or "").strip().splitlines()[-3:])
+        return {}, f"rc={proc.returncode} stderr={tail[:400]!r}"
+    try:
+        raw = json.loads(out[out.index(marker) + len(marker):].strip())
+        return {str(k): (int(v[0]), int(v[1])) for k, v in raw.items()}, ""
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
+        return {}, f"unparsable probe answer ({type(exc).__name__}: {exc})"
+
+
 def _serialised_cards(
     card_uuids: Sequence[str],
     published: str = "",
     leg_form: str = "interleave",
+    *,
+    py: str = "",
+    tree: str = "",
+    notes: Optional[List[str]] = None,
 ) -> List[str]:
     """The cards on which the two flip legs are SERIALISED, by UUID.
 
@@ -785,24 +856,64 @@ def _serialised_cards(
     key, ending in W29 on all three P ranks and a group-fatal W4.
 
     IT ASKS THE KEY, NOT ITS OWN DICT (FIX 2 round 2, finding 2).  The
-    predecessor passed :func:`_split_decisions`' answer straight back in as
+    grandparent passed :func:`_split_decisions`' answer straight back in as
     ``splits=``, so the saver returned it verbatim and the check was
     tautological -- it could not see a rank that would resolve the published
     string differently, which is the ONE thing it exists to see.  Here the
-    argument is the PUBLISHED STRING, it is resolved the way a rank resolves it
-    (through :data:`weg2_memory_saver.PCIE_DUPLEX_ENV`), and the answer is read
-    off the KEY ITSELF: the two directions' lock paths, compared.  Any saver on
-    ``PYTHONPATH`` answers that -- including one older than the wire format,
-    which returns ONE path for both directions and is therefore reported here as
-    SERIALISED, refused by W34 before either group starts, instead of taking one
-    key on all three cards at the first flip.
+    argument is the PUBLISHED STRING and the answer is read off the KEY ITSELF:
+    the two directions' lock paths, compared.
+
+    IT ASKS THE TREE THE RANKS IMPORT (FIX 3 round 3, finding 2), and that is
+    the half FIX 2 still owed.  Resolving through the LAUNCHER's own
+    ``weg2_memory_saver`` cannot see a stale worktree on ``PYTHONPATH`` or a
+    partial rebase -- the exact deployment shape the W34 comment names as the
+    reason this arm exists -- because the launcher's import is not the ranks'
+    import.  With ``py`` and ``tree`` given, the key is resolved by one
+    subprocess per boot under ``PYTHONPATH=<tree>/python`` and
+    ``CUDA_VISIBLE_DEVICES=''``; a tree that single-keys a card sends that card
+    to W34, and a probe that DIES (no module, unknown wire format, W36) makes
+    every card serialised, which is the same refusal one step earlier.
+
+    Without them the resolution is IN-PROCESS and says so in ``notes``: that is
+    the desk path, for tests that own both sides of the import themselves.  It is
+    never the boot path -- :func:`prepare_host_ring` always passes both.
     """
     if leg_form != "interleave":
         # The front itself does not gather: every card is serialised, whatever
         # its key does.
+        if notes is not None:
+            notes.append(
+                f"WEG2-HOST-RING KEY-PROBE skipped: leg_form={leg_form!r} is not "
+                "'interleave', so every card is serialised whatever its key does")
         return list(card_uuids)
+    if py and tree:
+        counts, why = _resolve_keys_in_rank_tree(card_uuids, published, py, tree)
+        if not counts:
+            if notes is not None:
+                notes.append(
+                    f"WEG2-HOST-RING KEY-PROBE FAILED in the RANK TREE {tree} "
+                    f"({py}): {why} -- the tree the ranks import cannot resolve "
+                    "the key this launcher published, so EVERY card is reported "
+                    "SERIALISED and this boot refuses (W34) before either group "
+                    "starts, rather than taking one key at the first flip")
+            return list(card_uuids)
+        # A card the probe did not answer for is SERIALISED, never assumed split.
+        serialised = [u for u in card_uuids
+                      if counts.get(u, (0, 1))[0] < counts.get(u, (0, 1))[1]]
+        if notes is not None:
+            notes.append(
+                f"WEG2-HOST-RING KEY-PROBE resolver=RANK TREE {tree} ({py}) "
+                + ", ".join(
+                    f"{u}={counts.get(u, (0, 0))[0]}/{counts.get(u, (0, 0))[1]} "
+                    "key(s) per direction" for u in card_uuids)
+                + f" -- serialised={serialised or 'none'}")
+        return serialised
     from sglang.srt.managers import weg2_memory_saver
 
+    if notes is not None:
+        notes.append(
+            "WEG2-HOST-RING KEY-PROBE resolver=IN-PROCESS (desk path: no --tree "
+            "given) -- this cannot see a stale tree on the ranks' PYTHONPATH")
     serialised: List[str] = []
     saved = os.environ.get(weg2_memory_saver.PCIE_DUPLEX_ENV)
     os.environ[weg2_memory_saver.PCIE_DUPLEX_ENV] = published
@@ -833,15 +944,14 @@ def _serialised_cards(
     return serialised
 
 
-def remove_vram_credit_counters(credit_dir: str = "") -> List[str]:
-    """Unlink this box's per-card VRAM credit counters.  Returns what went.
+def _credit_counter_rows(credit_dir: str = "") -> List[Tuple[str, str, str, int]]:
+    """``(path, name, boot half of the epoch, publisher pid)`` per counter file.
 
-    FIX 2 round 2, finding 1.  ``vram_credit_path`` is keyed by card UUID and
-    nothing else, so the file outlives the boot that wrote it -- and a TERMINAL
-    one (``leg_complete`` plus a whole image of credit) is exactly what a later
-    boot's flip of the same index read as its own funding while the epoch was
-    only the front's flip counter.  Measured on this rig 2026-09-08: three such
-    files from boot weg2rg2, one carrying 13912 MiB of credit.
+    The boot half is everything before the first ``.`` of the stored epoch token
+    (:func:`weg2_memory_saver.credit_epoch` composes ``<boot>.<flip>``).  A
+    LEGACY file whose stamp is a bare integer has no boot half and gets ``""``,
+    which matches no boot -- the conservative direction, since it belongs to a
+    boot that predates the token.
     """
     from sglang.srt.managers import weg2_memory_saver
 
@@ -851,24 +961,105 @@ def remove_vram_credit_counters(credit_dir: str = "") -> List[str]:
                        weg2_memory_saver.DEFAULT_PCIE_LOCK_DIR),
     )
     prefix = "." + weg2_memory_saver.VRAM_CREDIT_PREFIX
-    removed: List[str] = []
+    rows: List[Tuple[str, str, str, int]] = []
     if not os.path.isdir(directory):
-        return removed
+        return rows
     for name in sorted(os.listdir(directory)):
         if not name.startswith(prefix):
             continue
+        path = os.path.join(directory, name)
+        epoch, pid = "", 0
         try:
-            os.unlink(os.path.join(directory, name))
+            with open(path, errors="replace") as fh:
+                state = json.loads(fh.read() or "{}")
+            if isinstance(state, dict):
+                epoch = str(state.get("epoch", ""))
+                pid = int(state.get("publisher_pid", 0) or 0)
+        except (OSError, ValueError, TypeError):
+            # A torn or foreign file names no boot and no holder.  It is swept
+            # as dead residue at launch, never removed as "this boot's".
+            epoch, pid = "", 0
+        rows.append((path, name, epoch.split(".")[0] if "." in epoch else "", pid))
+    return rows
+
+
+def remove_vram_credit_counters(credit_dir: str = "", *,
+                                boot_nonce: str = "") -> List[str]:
+    """Unlink THIS boot's per-card VRAM credit counters.  Returns what went.
+
+    FIX 2 round 2, finding 1.  ``vram_credit_path`` is keyed by card UUID and
+    nothing else, so the file outlives the boot that wrote it -- and a TERMINAL
+    one (``leg_complete`` plus a whole image of credit) is exactly what a later
+    boot's flip of the same index read as its own funding while the epoch was
+    only the front's flip counter.  Measured on this rig 2026-09-08: three such
+    files from boot weg2rg2, one carrying 13912 MiB of credit.
+
+    SCOPED BY THE BOOT NONCE (FIX 3 round 3).  The predecessor unlinked EVERY
+    ``.weg2-vram-credit-*`` in the directory, so a teardown of boot A would
+    delete a live boot B's counters mid-flip -- and B then waits on a counter
+    whose file has gone.  The same commit that introduced the nonce is the one
+    that made a counter identifiable; here it is used.  An EMPTY nonce removes
+    nothing: "this boot" is then unknown, and the unscoped sweep is precisely
+    the defect.  Crash residue is the LAUNCH sweep's job
+    (:func:`sweep_dead_credit_counters`), which can check that no holder lives.
+    """
+    removed: List[str] = []
+    if not boot_nonce:
+        return removed
+    for path, name, boot, _pid in _credit_counter_rows(credit_dir):
+        if boot != str(boot_nonce):
+            continue
+        try:
+            os.unlink(path)
         except OSError:
             continue
         removed.append(name)
     return removed
 
 
+def sweep_dead_credit_counters(log: Log, credit_dir: str = "",
+                               dry: bool = False) -> List[str]:
+    """Remove credit counters of DEAD boots at LAUNCH.  Never a live holder.
+
+    FIX 3 round 3.  Teardown is exactly what a CRASHED boot does not run, and a
+    crash is how three weg2rg2 counters were still on this rig when weg2rg3
+    launched.  The composed epoch makes them harmless; this makes them absent,
+    and the printed line is the evidence a reader wants instead of an inference.
+
+    The holder test is the file's own ``publisher_pid``: a counter whose
+    publisher is ALIVE belongs to a boot in flight, and is left alone and named
+    -- the same rule ``presence_sweep`` applies to its own residue.
+    """
+    rows = _credit_counter_rows(credit_dir)
+    if not rows:
+        log("WEG2-VRAM-CREDIT residue: none")
+        return []
+    live = [n for _p, n, _b, pid in rows if pid and _alive(pid)]
+    dead = [(p, n, b) for p, n, b, pid in rows if not (pid and _alive(pid))]
+    if live:
+        log(f"WEG2-VRAM-CREDIT residue: {len(live)} counter(s) held by a LIVE "
+            f"publisher, left untouched: {live}")
+    if dry:
+        log(f"WEG2-VRAM-CREDIT DRY-RUN: would remove {len(dead)} dead-epoch "
+            f"counter(s): {[n for _p, n, _b in dead]}")
+        return []
+    removed: List[str] = []
+    for path, name, boot in dead:
+        try:
+            os.unlink(path)
+        except OSError:
+            continue
+        removed.append(f"{name} (boot {boot or 'pre-token'})")
+    log(f"WEG2-VRAM-CREDIT residue swept: {len(removed)} dead-epoch counter(s) "
+        f"{removed} -- a crashed boot runs no teardown, so LAUNCH sweeps too")
+    return removed
+
+
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
                       evidence_dir: str, boot_stem: str, dry: bool,
                       leg_form: str = "", pcie_directional: Optional[bool] = None,
-                      duplex_probe: str = "") -> HostRingPlan:
+                      duplex_probe: str = "", tree: str = "",
+                      py: str = "") -> HostRingPlan:
     """C20 + C18: solve the table, print L6, REFUSE by name, then arm the region.
 
     Order is load-bearing: the inequalities are checked and the per-card files
@@ -929,6 +1120,10 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
             log(ln)
         return plan
     plan.table = table
+    # FIX 3 round 3: every NEWER boot the solver skipped, with its reason, one
+    # line each -- on SUCCESS, not only on failure.  Without them the log shows
+    # a well-formed table and no way to ask why that boot and not the newest.
+    plan.lines.extend(ln for ln in reason.split("\n")[1:] if ln.strip())
     plan.lines.extend(table.format_l6())          # L6
     for ln in plan.lines[logged:]:
         log(ln)
@@ -994,18 +1189,29 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     # THE DECISION IS PUBLISHED HERE AND NOWHERE ELSE (R19: launcher output).
     # The ranks build their key from this same string, so the inequality this
     # module checks and the key the metal takes cannot be two different facts.
-    # THE FORMAT NAMES ITS VERSION (FIX 2 round 2).  A reader that does not know
-    # ``v2`` refuses by name (W36) instead of dropping every row and resolving a
-    # single key on every card, which is what the un-versioned predecessor did
-    # to any older saver on PYTHONPATH -- strictly worse than boot weg2rg2, and
-    # silent.
+    # THE FORMAT NAMES ITS VERSION IN A ROW OF ITS OWN (FIX 3 round 3, finding
+    # 1).  A reader that knows the key refuses by name (W36) on an absent or
+    # unknown version instead of resolving a single key on every card; a reader
+    # that does NOT know it drops that one row on float() and still resolves
+    # every real card.  FIX 2's "v2|" PREFIX had neither property -- it mangled
+    # exactly the first card's uuid, which on this rig is the card carrying the
+    # co-located pair, and was therefore a regression against the un-versioned
+    # string it replaced.
     from sglang.srt.managers import weg2_memory_saver as _saver
-    plan.duplex_env = f"{_saver.PCIE_DUPLEX_FORMAT}|" + ",".join(
-        f"{u}={('%.3f' % duplex.ratios[u]) if duplex and u in duplex.ratios else ''}"
-        f":{'split' if splits[u] else 'single'}"
-        for u in card_uuids
+    plan.duplex_env = ",".join(
+        [f"{_saver.PCIE_DUPLEX_VERSION_KEY}={_saver.PCIE_DUPLEX_FORMAT}"]
+        + [
+            f"{u}={('%.3f' % duplex.ratios[u]) if duplex and u in duplex.ratios else ''}"
+            f":{'split' if splits[u] else 'single'}"
+            for u in card_uuids
+        ]
     )
-    serialised = _serialised_cards(card_uuids, plan.duplex_env, leg_form)
+    probe_notes: List[str] = []
+    serialised = _serialised_cards(card_uuids, plan.duplex_env, leg_form,
+                                   py=py, tree=tree, notes=probe_notes)
+    plan.lines.extend(probe_notes)
+    for ln in probe_notes:
+        log(ln)
     checks_logged = len(plan.lines)
     for c in table.cards:
         is_serial = c.uuid in serialised
@@ -1110,9 +1316,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # C18: the shared host granule ring (spec C1-C8).  These four variables are
     # LAUNCHER OUTPUT, never operator input (R19): every size in them is solved
     # by ring_table from the previous boot's own lines, and the whole family is
-    # absent when no form is proven -- which is the ONE boot-level fallback, and
-    # makes the stock cudaMallocHost path plus the OLD serial flip form run
-    # (spec section 10.4 / R22).
+    # absent when no form is proven.  THAT ABSENCE IS NOT A FALLBACK (spec
+    # Amendment A1-3, and FIX 3 round 3 retracting the sentence that said it
+    # was): on this host budget no other flip form is feasible, so a boot that
+    # proves no form REFUSES by name and exits 2 -- the popped family is what a
+    # refused boot leaves behind, never a configuration anything runs under.
     if ring is not None and ring.armed:
         env["TMS_HOST_RING_DIR"] = ring.dir
         env["TMS_HOST_RING_MAP"] = ring.env_map
@@ -1346,8 +1554,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="pin the ring table to ONE boot instead of the newest usable "
                          "one. Matched as a SUBSTRING of the log stem, so the boot TAG "
                          "('weg2zr2') is enough; it must match exactly one boot, and a "
-                         "pin that matches none or several returns the R22 reason and "
-                         "runs the OLD flip form rather than raising an OSError")
+                         "pin that matches none or several returns the R22 reason "
+                         "rather than raising an OSError -- and since A1-3 leaves no "
+                         "feasible form to fall back to, that reason is a named "
+                         "refusal (W20) and exit 2, verified on the rig")
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
     ns = ap.parse_args(argv)
     if ns.teardown:
@@ -1371,6 +1581,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # 1. preflight
     presence_sweep(log, ns.tag, stamp, dry)
+    sweep_dead_credit_counters(log, dry=dry)
     stale_deadman_sweep(log, [PORT_FRONT, PORT_P, PORT_D], dry)
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
@@ -1399,9 +1610,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # per-card region, both BEFORE either group starts.  The table it is solved
     # from also carries the ledger's host weights term, so this runs first.
     ring_plan = prepare_host_ring(cards, log, ns.tag, ns.ring_form, ns.evidence_dir,
-                                  ns.ring_table_boot, dry, duplex_probe=ns.duplex_probe)
+                                  ns.ring_table_boot, dry, duplex_probe=ns.duplex_probe,
+                                  tree=tree, py=py)
     state.ring_lines = ring_plan.lines
-    state.ring_form = ring_plan.form if ring_plan.armed else "none (OLD flip form)"
+    state.ring_epoch = str(ring_plan.epoch)
+    # A1-3: an un-armed ring has no fallback form to name.  The predecessor
+    # named the pre-ring form here instead, which told the reader of a state
+    # file that a form the launcher refuses to start had started.  The claim is
+    # retracted rather than re-quoted -- reprinting it would hand the guard test
+    # a false positive and the next reader a true one.
+    state.ring_form = (ring_plan.form if ring_plan.armed
+                       else "none -- NOT ARMED (A1-3: no fallback form exists on "
+                            "this host budget; this boot refuses by name)")
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
 
     # 2. host ledger
@@ -1675,8 +1895,17 @@ def teardown(path: str) -> int:
     # (leg_complete + a whole image of credit) is what the next boot's flip of
     # the same index used to read as its own funding.  The composed epoch makes
     # that harmless; removing the file makes it absent.  Two halves, because
-    # teardown alone cannot clean up after a boot that crashed.
-    print("vram credit counters removed: " + str(remove_vram_credit_counters()))
+    # teardown alone cannot clean up after a boot that crashed -- the launch
+    # sweep is the other half (sweep_dead_credit_counters).
+    # SCOPED TO THIS BOOT (FIX 3 round 3): the nonce is the ring epoch this
+    # boot's state file recorded, so tearing down boot A cannot unlink a live
+    # boot B's counters.
+    nonce = str(st.get("ring_epoch", ""))
+    who = nonce or ("UNKNOWN -- none removed; a boot whose ring never armed "
+                    "wrote no counters, and an unscoped sweep here would take "
+                    "another boot's")
+    print(f"vram credit counters removed (boot {who}): "
+          + str(remove_vram_credit_counters(boot_nonce=nonce)))
     print(subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader"], capture_output=True, text=True).stdout)
     return 0
 

@@ -5,8 +5,12 @@ returns is read out of the PREVIOUS boot's logs, carries the boot tag and the
 line count it was read from, and is printed beside the arithmetic it feeds
 (spec section 10.3: no hand-sized ring, no ``skew`` constant, no ``--ring-mib``
 flag, no env knob a human sets).  When the lines are absent or short this
-module returns ``None`` with a REASON -- it never guesses, and the launcher then
-runs the OLD flip form and says so (R22).
+module returns ``None`` with a REASON -- it never guesses, and the launcher
+prints that reason as R22.  R22 IS A REFUSAL, NOT A FALLBACK (spec Amendment
+A1-3, and FIX 3 round 3 retracting the sentence that said the OLD form ran
+there): no other flip form is feasible on this host budget, so the launcher
+exits 2 by name -- measured on the rig, a pin matching no boot gives W20 and
+rc=2, never a boot on a different form.
 
 The four quantities, and the exact line each comes from:
 
@@ -127,10 +131,27 @@ _DORMANT_RE = re.compile(
 #: tags).  ``population=`` is optional in the regex ON PURPOSE: a boot written
 #: before this field existed carries none, and an absent claim is read as the
 #: weaker one, never as the stronger.
+#: ``rank`` MAY BE NEGATIVE, and the regex has to say so (FIX 3 round 3, boot
+#: weg2rg5).  ``rank=(\d+)`` cannot match a minus sign, while C9's gathered legs
+#: make ``weight_updater._weg2_rank()`` return ``-1`` -- the front no longer sees
+#: a per-rank tag edge, so the emitter writes ``group=? rank=-1`` and names the
+#: CARD instead.  The instrument built to make MEASURED possible was therefore
+#: the instrument that made every ring-era boot INELIGIBLE: max_tag parsed to
+#: ``{0,0,0}``, ``CardRing.complete`` is false, the boot was skipped, and weg2rg5
+#: solved its table from the pre-ring weg2sc3 and printed BOUND while a ring-era
+#: measurement sat unread in the evidence dir.  A parser that silently rejects
+#: the emitter's current format is the Klasse-A instrument lie: the text claims
+#: to read the line it cannot read.  Two halves, both needed -- the regex accepts
+#: the sign, and :func:`parse_group_log` REFUSES BY NAME (W37) when a log's tag
+#: lines exist and none of them parse, so the next divergence is loud.
 _TAG_RE = re.compile(
-    r"WEG2-FLIP-TAG\s+group=\S+\s+rank=(\d+)\s+card=(\S+)\s+dir=\S+\s+tag=(\S+)\s+"
+    r"WEG2-FLIP-TAG\s+group=\S+\s+rank=(-?\d+)\s+card=(\S+)\s+dir=\S+\s+tag=(\S+)\s+"
     r"bytes=(\d+)\s+MiB(?:\s+population=(\S+))?"
 )
+#: Where the synthetic per-CARD indices start for tag lines that carry no rank.
+#: Far above any real rank index so a gathered-leg record can never be mistaken
+#: for rank 0's, and the card it names still resolves through ``uuid_by_rank``.
+_CARD_RANK_BASE = 1000
 #: The one token on a WEG2-FLIP-TAG line that licenses ``covers_all_backed_up_tags``.
 TAG_POPULATION_ALL = "all-backed-up-tags"
 TAG_POPULATION_WEIGHTS = "weights-family"
@@ -175,6 +196,24 @@ class Weg2RingRefused(RuntimeError):
 
 class Weg2RingCreditRefused(Weg2RingRefused):
     """W32: the R5 inequality fails on some card/direction at the launch check."""
+
+
+class Weg2FlipTagUnparsable(Weg2RingRefused):
+    """W37: a source boot's ``WEG2-FLIP-TAG`` lines exist and NONE of them parse.
+
+    FIX 3 round 3, and boot weg2rg5 is why.  ``_TAG_RE`` required ``rank=(\\d+)``
+    while the gathered-leg emitter had been writing ``rank=-1`` since C9, so every
+    ring-era boot silently produced ``max_tag={0,0,0}``, failed
+    :attr:`CardRing.complete`, and was skipped -- and the launcher, finding an
+    older boot that did parse, reported a perfectly well-formed table solved from
+    a PRE-RING boot and printed BOUND.  Nothing anywhere said "I could not read
+    402 lines of the newest boot's own instrument".
+
+    That silence is the defect this refusal removes, and it is the general form:
+    a parser whose text claims to read an instrument must FAIL LOUDLY when the
+    emitter's format has moved, never degrade to the answer it can still compute.
+    Zero parsed lines out of zero is nothing to say; zero out of N is a refusal.
+    """
 
 
 class Weg2RingNeedsInterleave(Weg2RingRefused):
@@ -535,6 +574,10 @@ def parse_group_log(path: str) -> GroupLog:
     per_rank: Dict[int, List[Tuple[Tuple[str, ...], int]]] = {}
     kv_gb: Dict[int, float] = {}
     uuid_by_rank: Dict[int, str] = {}
+    card_rank: Dict[str, int] = {}
+    tag_lines_seen = 0
+    tag_lines_parsed = 0
+    first_unparsed = ""
     lines_read = 0
     covers_all = False
     instrument = (
@@ -544,10 +587,27 @@ def parse_group_log(path: str) -> GroupLog:
     with open(path, errors="replace") as f:
         for line in f:
             if "WEG2-FLIP-TAG" in line:
+                tag_lines_seen += 1
                 m = _TAG_RE.search(line)
+                if not m:
+                    if not first_unparsed:
+                        first_unparsed = line.strip()[:300]
+                    continue
                 if m:
+                    tag_lines_parsed += 1
                     rank = int(m.group(1))
-                    uuid_by_rank[rank] = m.group(2)
+                    card = m.group(2)
+                    if rank < 0:
+                        # THE CARD IS THE IDENTITY WHEN THE RANK IS NOT (C9).
+                        # A gathered leg has no per-rank tag edge, so the emitter
+                        # writes rank=-1 and names the card -- which is the
+                        # stronger identity anyway (#589: physical GPUs are
+                        # resolved by UUID, never by position).  One synthetic
+                        # index per distinct card keeps every downstream keyed by
+                        # rank, and ``uuid_by_rank`` maps it straight back.
+                        rank = card_rank.setdefault(
+                            card, _CARD_RANK_BASE + len(card_rank))
+                    uuid_by_rank[rank] = card
                     per_rank.setdefault(rank, []).append(((m.group(3),), int(m.group(4))))
                     lines_read += 1
                     # FIX 1 finding 2: the POPULATION is read off the line, never
@@ -591,6 +651,21 @@ def parse_group_log(path: str) -> GroupLog:
                 if m:
                     rank = int(m.group(1))
                     kv_gb[rank] = kv_gb.get(rank, 0.0) + float(m.group(2)) + float(m.group(3))
+    # W37, and it is the half that makes the regex fix a fix rather than a patch
+    # (FIX 3 round 3).  Zero parsed lines out of zero says nothing; zero out of N
+    # says this parser cannot read the emitter that wrote this log, and the only
+    # honest answer is a named stop.  Degrading silently to the numbers it can
+    # still compute is what let weg2rg5 size its ring from a PRE-RING boot while
+    # 402 lines of its predecessor's own instrument sat unread.
+    if tag_lines_seen and not tag_lines_parsed:
+        raise Weg2FlipTagUnparsable(
+            f"W37 Weg2FlipTagUnparsable {path}: {tag_lines_seen} WEG2-FLIP-TAG "
+            f"line(s) and NONE parse against this tree's _TAG_RE.  The emitter's "
+            "format and this parser have diverged, so every per-card byte this "
+            "boot measured is invisible and the planner would silently fall back "
+            "to an older boot -- which is how a ring-era boot came to be sized "
+            "from a pre-ring table.  First unreadable line: " + repr(first_unparsed)
+        )
     image: Dict[int, int] = {}
     max_tag: Dict[int, int] = {}
     tag_peak: Dict[str, Dict[int, int]] = {}
@@ -1017,8 +1092,9 @@ def solve(
         # types the boot TAG (``weg2zr2``) while the files are named
         # ``boot_weg2_weg2zr2_<sha>_<date>_<time>.{front,P,D}.log``.  An
         # unmatched or ambiguous pin returns a REASON so the caller prints R22
-        # and runs the OLD form; it never escapes as an OSError out of an
-        # unconditional open (every refusal on this path is named).
+        # and refuses by name (A1-3 leaves no feasible form to fall back to);
+        # it never escapes as an OSError out of an unconditional open (every
+        # refusal on this path is named).
         exact = [s for s in stems if s == boot_stem]
         hits = exact or [s for s in stems if boot_stem in s]
         if len(hits) != 1:
@@ -1060,13 +1136,22 @@ def solve(
             continue
 
         def rows(group: GroupLog, what: Dict[int, int]) -> Tuple[Dict[str, int], str]:
-            """``what`` re-keyed from rank to card UUID, or a reason."""
+            """``what`` re-keyed from rank to card UUID, or a reason.
+
+            TWO KEYS CAN NAME ONE CARD (FIX 3 round 3): a ring-era boot carries
+            the pre-ring ``WEG2-CHUNK-BYTES`` records under a real rank AND the
+            gathered-leg ``WEG2-FLIP-TAG`` census under that card's synthetic
+            index.  Merging by MAX rather than by last-write is both
+            deterministic and the safe direction for every quantity that reaches
+            here: image and max_tag SIZE the ring, and a ring sized to the
+            smaller of two readings is the one that hits W31 at the first sleep.
+            """
             out: Dict[str, int] = {}
             for rank, value in what.items():
                 uuid = group.uuid_by_rank.get(rank) or by_ordinal.get(rank, "")
                 if not uuid:
                     return {}, f"rank {rank} names no card"
-                out[uuid] = value
+                out[uuid] = max(out.get(uuid, 0), value)
             return out, ""
 
         pairs = {}
@@ -1149,5 +1234,18 @@ def solve(
         if missing:
             reasons.append(f"{stem}: incomplete rows for {missing}")
             continue
-        return table, f"solved from {stem}"
+        # THE SKIPPED BOOTS ARE PART OF THE ANSWER (FIX 3 round 3, boot weg2rg5).
+        # ``stems`` is newest-first, so everything already in ``reasons`` is a
+        # boot NEWER than the one being returned -- and the predecessor dropped
+        # all of it on success, keeping it only for the case where nothing
+        # worked.  That is exactly backwards: when nothing works the operator
+        # gets a refusal to read, and when something works they get a table whose
+        # choice they cannot check.  weg2rg5 solved from a boot five generations
+        # back and its log could not say why.  One line each, through the string
+        # the caller already prints; no new mechanism.
+        skipped = "".join(
+            f"\nWEG2-HOST-RING SKIPPED (newer than the chosen table) {r}"
+            for r in reasons
+        )
+        return table, f"solved from {stem}" + skipped
     return None, "; ".join(reasons[:4]) or "no usable boot"

@@ -546,7 +546,11 @@ class LauncherRingPlanTest(unittest.TestCase):
         self.assertEqual(old.host_weights_bytes, (200 + 30) * MIB,
                          "the old form holds one image PLUS one chunk in flight")
         self.assertEqual(armed.host_weights_span1_bytes, 100 * MIB)
-        self.assertIn("OLD flip form", old.provenance)
+        # FIX 3 round 3: the un-armed charge is still computed and printed --
+        # the arithmetic is what a refusal has to show -- but its provenance no
+        # longer NAMES a form as running, because A1-3 leaves none.
+        self.assertIn("NO ARMED FORM", old.provenance)
+        self.assertIn("refuses", old.provenance)
         self.assertIn("ring form MAP_SHARED", armed.provenance)
 
     def test_no_table_means_no_charge_and_the_ledger_refuses_downstream(self):
@@ -729,7 +733,7 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
         cards = ["GPU-aaaa", "GPU-bbbb"]
         gathered = launcher._split_decisions(cards, ratios, "interleave")
         self.assertEqual(gathered, {"GPU-aaaa": True, "GPU-bbbb": True})
-        published_gathered = "v2|GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        published_gathered = "format=v2,GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
         self.assertEqual(
             launcher._serialised_cards(cards, published_gathered, "interleave"), [])
         # A front that does NOT gather has no pair in flight to deadlock, so
@@ -737,12 +741,12 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
         serial = launcher._split_decisions(cards, ratios, "serial")
         self.assertEqual(serial, {"GPU-aaaa": True, "GPU-bbbb": False})
         self.assertEqual(
-            launcher._serialised_cards(cards, "v2|GPU-aaaa=1.759:split,"
+            launcher._serialised_cards(cards, "format=v2,GPU-aaaa=1.759:split,"
                                        "GPU-bbbb=1.316:single", "serial"), cards,
             "a front that does not gather serialises every card, whatever its key")
         # And the RANK reads the same decision the launcher published, through
         # the module that owns the key -- not the ratio it was derived from.
-        published = "v2|GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        published = "format=v2,GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
         self.assertEqual(weg2_memory_saver.duplex_splits(published),
                          {"GPU-aaaa": True, "GPU-bbbb": True})
         self.assertTrue(weg2_memory_saver.pcie_lock_separates_directions(
@@ -752,6 +756,126 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
             "GPU-bbbb", lock_dir="/dev/shm", direction="d2h",
             splits=weg2_memory_saver.duplex_splits(published)).endswith(".d2h.lock"),
             "and the KEY the rank builds is the one the decision names")
+
+    @staticmethod
+    def _v1_reader(published, uuids):
+        """The PARENT tree's resolution (5b015ad139), verbatim, as a key count.
+
+        This is not a model of an old reader -- it is what
+        ``git show 5b015ad139:...weg2_memory_saver.py`` does: split rows on
+        ``,``, split each on the FIRST ``=``, take ``<ratio>[:decision]``, and
+        build ``<uuid>.<direction>`` when the row resolved.  Every other weg2
+        worktree on this box is that shape, which is why the launcher's wire
+        format has to survive it.
+        """
+        ratios, splits = {}, {}
+        for item in published.split(","):
+            uuid, _, value = item.strip().partition("=")
+            uuid = uuid.strip()
+            ratio_text, _, decision = value.partition(":")
+            if decision.strip() in ("split", "single"):
+                splits[uuid] = decision.strip() == "split"
+            try:
+                ratios[uuid] = float(ratio_text)
+            except ValueError:
+                continue
+        out = {}
+        for u in uuids:
+            if u in splits:
+                separates = splits[u]
+            else:
+                separates = ratios.get(u) is not None and ratios[u] >= 1.5
+            out[u] = 2 if separates else 1
+        return out
+
+    def test_the_version_is_a_ROW_and_an_older_reader_still_resolves_EVERY_card(self):
+        # FIX 3 round 3, BLOCKING FINDING 1, and the mutant fix 2 left alive.
+        #
+        # A version PREFIX ("v2|<uuid>=...") does not make an unknown-format
+        # reader drop everything -- it mangles exactly ONE uuid, the FIRST, and
+        # resolves the rest correctly.  On this rig the first card is the 5090:
+        # the card carrying the co-located P/D pair and the flip's critical
+        # path.  So the prefix gave that one card a SINGLE key while the
+        # launcher printed SPLIT for it and armed -- boot weg2rg2's precondition
+        # verbatim (S blocks in acquire holding the key W's release needs ->
+        # W31 at the 120 s budget -> W29 on every rank -> group-fatal W4), on
+        # the worst card, 120 s into a flip that has already mutated VRAM.  It
+        # was a REGRESSION, not an incomplete fix: the UN-versioned string it
+        # replaced resolved all three cards correctly in that same reader.
+        #
+        # As a ROW the version costs the old reader one dropped line
+        # (float("v2") raises, exactly as an unparsable row already did) and
+        # costs the real cards nothing.
+        from sglang.srt.managers import weg2_memory_saver
+        from sglang.srt.weg2 import launcher
+
+        lines = []
+        plan = self._prepare(launcher, lines, form="auto", leg_form="interleave")
+        published = plan.duplex_env
+        uuids = [c.uuid for c in _zr2_table().cards]
+        self.assertTrue(uuids, "the fixture must publish at least one card")
+
+        # PRODUCER (this is the assertion mutant M4 of the fix-2 review survived:
+        # replacing the version token with "" left every suite green).
+        self.assertTrue(
+            published.startswith(
+                f"{weg2_memory_saver.PCIE_DUPLEX_VERSION_KEY}="
+                f"{weg2_memory_saver.PCIE_DUPLEX_FORMAT},"),
+            f"the published string must lead with the version ROW: {published!r}")
+        self.assertNotIn("|", published,
+                         "a prefix is what mangled the first card; there is no "
+                         f"bar in this format: {published!r}")
+
+        # CONSUMER, this tree: the row is consumed and never mistaken for a card.
+        self.assertEqual(
+            sorted(weg2_memory_saver.duplex_splits(published)), sorted(uuids),
+            "the version row must not appear as a card, and no card may go missing")
+        self.assertNotIn(weg2_memory_saver.PCIE_DUPLEX_VERSION_KEY,
+                         weg2_memory_saver.duplex_ratios(published))
+
+        # CONSUMER, the PARENT tree -- the compatibility claim, as a test that
+        # can fail rather than a docstring.  Every real card resolves to TWO
+        # keys there; nothing is mangled.
+        self.assertEqual(
+            self._v1_reader(published, uuids), {u: 2 for u in uuids},
+            "an older reader must resolve EVERY card from this string")
+
+        # ... and the shape that must never come back: the prefix form, in the
+        # same reader, single-keys exactly the first card.
+        prefixed = (f"{weg2_memory_saver.PCIE_DUPLEX_FORMAT}|"
+                    + published.partition(",")[2])
+        self.assertEqual(
+            self._v1_reader(prefixed, uuids)[uuids[0]], 1,
+            "the regression this test exists for: the prefix costs the FIRST "
+            "card its split, which is the deadlock, not a slowdown")
+
+    def test_a_published_string_with_no_version_ROW_REFUSES(self):
+        # The other direction of the same seam: fix 2's own wire format, and
+        # the un-versioned one before it, reaching THIS reader.  Neither is
+        # guessed at -- a dialect this tree cannot name is a named stop, since
+        # reading it anyway is what mangles a card.
+        from sglang.srt.managers import weg2_memory_saver
+
+        for published in ("GPU-aaaa=1.759:split,GPU-bbbb=1.316:split",
+                          "v2|GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"):
+            with self.assertRaises(
+                    weg2_memory_saver.Weg2DuplexDecisionRefused,
+                    msg=f"{published!r} must not resolve") as cm:
+                weg2_memory_saver.duplex_splits(published)
+            self.assertIn("W36 Weg2DuplexDecisionRefused", str(cm.exception))
+            self.assertIn("No fallback", str(cm.exception))
+            # AND IT MUST DIAGNOSE THE ABSENT ROW, not report a version of
+            # None.  Deleting this arm still refuses -- the unknown-version arm
+            # catches it, since None != "v2" -- so a test that only asserts
+            # "something was raised" cannot tell the two apart.  They have
+            # different fixes: an absent row means an older launcher published
+            # this string, an unknown one means a newer launcher did.
+            self.assertIn(
+                f"carries no {weg2_memory_saver.PCIE_DUPLEX_VERSION_KEY}="
+                f"{weg2_memory_saver.PCIE_DUPLEX_FORMAT} row", str(cm.exception))
+        # The EMPTY string stays the honest "nothing was published", not a
+        # refusal -- the launch check reads it as SERIALISED and refuses there.
+        self.assertEqual(weg2_memory_saver.duplex_splits(""), {})
 
     def test_an_unknown_wire_format_version_REFUSES_instead_of_one_key(self):
         # FIX 2 round 2, finding 2.  The predecessor's format
@@ -764,8 +888,9 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
         from sglang.srt.managers import weg2_memory_saver
 
         with self.assertRaises(weg2_memory_saver.Weg2DuplexDecisionRefused) as cm:
-            weg2_memory_saver.duplex_splits("v3|GPU-aaaa=1.759:split")
+            weg2_memory_saver.duplex_splits("format=v3,GPU-aaaa=1.759:split")
         self.assertIn("W36 Weg2DuplexDecisionRefused", str(cm.exception))
+        self.assertIn("'v3'", str(cm.exception))
         # ... and no fallback is claimed, because there is none.
         self.assertIn("No fallback", str(cm.exception))
 
@@ -804,9 +929,11 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
         cards = ["GPU-aaaa", "GPU-bbbb"]
         ratios = {"GPU-aaaa": 1.759, "GPU-bbbb": 1.316}
         splits = launcher._split_decisions(cards, ratios, "interleave")
-        published = f"{weg2_memory_saver.PCIE_DUPLEX_FORMAT}|" + ",".join(
-            f"{u}={'%.3f' % ratios[u]}:{'split' if splits[u] else 'single'}"
-            for u in cards)
+        published = ",".join(
+            [f"{weg2_memory_saver.PCIE_DUPLEX_VERSION_KEY}="
+             f"{weg2_memory_saver.PCIE_DUPLEX_FORMAT}"]
+            + [f"{u}={'%.3f' % ratios[u]}:{'split' if splits[u] else 'single'}"
+               for u in cards])
         # The check the launch gate was missing: feed the launcher's OWN
         # published string to the saver's parser and compare the resolved key
         # per card against the launcher's decision per card.
@@ -820,18 +947,136 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
                 f"{uuid}: the launcher decided {splits[uuid]} and the rank builds "
                 f"{len(keys)} key(s)")
 
+    # -- FIX 3 round 3, BLOCKING FINDING 2: the check must ask the RANK's TREE --
+
+    @staticmethod
+    def _stub_tree(root, body):
+        """A REAL second tree: ``<root>/python/sglang/srt/managers/``, importable.
+
+        The point of the shape is that nothing here is monkeypatched.  The
+        launch check has to reach this module the way a rank reaches it -- by
+        ``PYTHONPATH=<tree>/python`` in a process of its own -- which is exactly
+        the divergence an in-process import cannot produce.
+        """
+        pkg = os.path.join(root, "python", "sglang", "srt", "managers")
+        os.makedirs(pkg, exist_ok=True)
+        for d in (os.path.join(root, "python", "sglang"),
+                  os.path.join(root, "python", "sglang", "srt"), pkg):
+            open(os.path.join(d, "__init__.py"), "w").close()
+        with open(os.path.join(pkg, "weg2_memory_saver.py"), "w") as fh:
+            fh.write(body)
+        return root
+
+    #: The PARENT tree's saver (5b015ad139) reduced to the two names the probe
+    #: touches, with its resolution verbatim: ``float()`` over the whole
+    #: right-hand side, so every ``<ratio>:<decision>`` row drops, the table is
+    #: empty, and ONE path comes back for both directions.
+    _STALE_SAVER = (
+        "import os\n"
+        "PCIE_DIRECTIONS = ('d2h', 'h2d')\n"
+        "PCIE_DUPLEX_ENV = 'SGLANG_WEG2_PCIE_DUPLEX'\n"
+        "def pcie_lock_path(u, *, lock_dir=None, direction=None,\n"
+        "                   ratios=None, splits=None):\n"
+        "    table = {}\n"
+        "    for item in os.environ.get(PCIE_DUPLEX_ENV, '').split(','):\n"
+        "        k, _, v = item.partition('=')\n"
+        "        try:\n"
+        "            table[k.strip()] = float(v)\n"
+        "        except ValueError:\n"
+        "            continue\n"
+        "    key = u\n"
+        "    r = table.get(u)\n"
+        "    if direction and r is not None and r >= 1.5:\n"
+        "        key = '%s.%s' % (key, direction)\n"
+        "    return '/dev/shm/.weg2-pcie-serialize-%s.lock' % key\n"
+    )
+
+    def test_the_launch_check_asks_THE_TREE_THE_RANKS_IMPORT(self):
+        # FIX 3 round 3, BLOCKING FINDING 2.  Fix 2's check resolved the key
+        # through the LAUNCHER's own weg2_memory_saver, never through the saver
+        # at --tree -- the module the ranks import via PYTHONPATH=<tree>/python
+        # (build_env).  So a stale-tree deployment is exactly what it could not
+        # see, which is the ONE thing the arm exists for, and its pinning test
+        # monkeypatched inside the launcher's own process: not the deployment
+        # shape.  Here the second tree is REAL and the answer comes from a
+        # process that imported it.
+        import sys
+        import tempfile
+
+        from sglang.srt.weg2 import launcher
+
+        cards = ["GPU-aaaa", "GPU-bbbb"]
+        published = "format=v2,GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        with tempfile.TemporaryDirectory() as root:
+            tree = self._stub_tree(root, self._STALE_SAVER)
+            notes = []
+            self.assertEqual(
+                launcher._serialised_cards(cards, published, "interleave",
+                                           py=sys.executable, tree=tree,
+                                           notes=notes),
+                cards,
+                "a tree whose saver cannot read this wire format single-keys "
+                "every card, and the launch check must report that from the "
+                "tree's own answer -- not from its own import")
+            self.assertTrue(any(tree in n for n in notes), notes)
+
+    def test_a_rank_tree_that_cannot_answer_makes_EVERY_card_serialised(self):
+        # The probe dying is itself the named refusal, one step earlier: no
+        # module at --tree (a partial rebase, a tree with no weg2 slice at all)
+        # must not read as "all cards split".  It reads as SERIALISED, which is
+        # W34 and exit 2 before either group starts.
+        import sys
+        import tempfile
+
+        from sglang.srt.weg2 import launcher
+
+        cards = ["GPU-aaaa", "GPU-bbbb"]
+        published = "format=v2,GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "python"), exist_ok=True)
+            notes = []
+            self.assertEqual(
+                launcher._serialised_cards(cards, published, "interleave",
+                                           py=sys.executable, tree=root,
+                                           notes=notes),
+                cards)
+            self.assertTrue(any("KEY-PROBE FAILED" in n for n in notes), notes)
+
+    def test_a_rank_tree_that_CAN_read_the_format_resolves_SPLIT(self):
+        # The can-fail half: the check must not be "everything is serialised".
+        # Pointed at THIS tree -- the one a real boot names with --tree -- the
+        # subprocess resolves two keys per card and no card is serialised.
+        import sys
+
+        from sglang.srt.weg2 import launcher
+
+        root = launcher.__file__
+        for _ in range(5):  # launcher.py -> weg2 -> srt -> sglang -> python -> tree
+            root = os.path.dirname(root)
+        cards = ["GPU-aaaa", "GPU-bbbb"]
+        published = "format=v2,GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        notes = []
+        self.assertEqual(
+            launcher._serialised_cards(cards, published, "interleave",
+                                       py=sys.executable, tree=root,
+                                       notes=notes),
+            [], "\n".join(notes))
+        self.assertTrue(any("RANK TREE" in n for n in notes), notes)
+
     def test_a_saver_that_cannot_read_the_format_is_reported_SERIALISED(self):
-        # And the reason the check must ask the KEY rather than a dict: an older
-        # saver on PYTHONPATH answers the question wrongly and silently.  Here
-        # it is, verbatim -- the parent's duplex_ratios did float() on the whole
-        # right-hand side, so every row dropped, the table was empty, and
-        # pcie_lock_path returned ONE path for both directions.  The launch
-        # check must see that and hand the card to W34, not arm.
+        # The DESK path of the same property (no --tree given): an older saver
+        # answers the question wrongly and silently.  Here it is, verbatim --
+        # the parent's duplex_ratios did float() on the whole right-hand side,
+        # so every row dropped, the table was empty, and pcie_lock_path returned
+        # ONE path for both directions.  The launch check must see that and hand
+        # the card to W34, not arm.  The cross-process shape of this is
+        # test_the_launch_check_asks_THE_TREE_THE_RANKS_IMPORT above; this one
+        # keeps the in-process branch honest.
         from sglang.srt.managers import weg2_memory_saver
         from sglang.srt.weg2 import launcher
 
         cards = ["GPU-aaaa", "GPU-bbbb"]
-        published = "v2|GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
+        published = "format=v2,GPU-aaaa=1.759:split,GPU-bbbb=1.316:split"
         real = weg2_memory_saver.pcie_lock_path
 
         def old_pcie_lock_path(nvml_uuid, *, lock_dir=None, direction=None,
@@ -885,6 +1130,39 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
         banned = ("keeps the single key", "keep the single key",
                   "serialises the legs by design", "still serialise by design",
                   "serialise by design")
+        offenders = []
+        for rel in ("weg2/front.py", "weg2/ring_table.py", "weg2/host_ledger.py",
+                    "weg2/launcher.py", "managers/weg2_memory_saver.py"):
+            path = os.path.join(root, rel)
+            if not os.path.exists(path):
+                continue
+            for n, line in enumerate(open(path, errors="replace"), 1):
+                if any(b in line for b in banned):
+                    offenders.append(f"{rel}:{n}: {line.strip()}")
+        self.assertEqual(offenders, [], "\n".join(offenders))
+
+    def test_no_module_tells_the_reader_the_OLD_FLIP_FORM_RUNS(self):
+        # FIX 3 round 3, the SAME CLASS one seam over, and the survivors the
+        # fix-2 guard could not reach because it banned only key phrases.
+        # Amendment A1-3 rules the OLD flip form INFEASIBLE on this host budget
+        # and every refusal arm now says so -- but four sentences still told the
+        # reader it RUNS when no ring arms: the state file's "none (OLD flip
+        # form)", build_env's popped-family comment, HostRingPlan.provenance,
+        # ring_table's module docstring and its R22 comment.  Verified on the
+        # rig in the fix-2 review: a --ring-table-boot pin matching no boot
+        # gives W20 and rc=2, i.e. the R22 path REFUSES.  A sentence promising a
+        # fallback that does not exist is the class the metal refuted, and it is
+        # worse here than in a docstring: it is what an operator reads while
+        # deciding whether the boot that just exited did something.
+        from sglang.srt.weg2 import launcher
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(launcher.__file__)))
+        # The dead sentences, by their RUN claim -- the bare name "OLD flip
+        # form" stays legal, because every refusal arm has to be able to name
+        # the form it is refusing to run.
+        banned = ("(OLD flip form)", "OLD flip form (no ring)",
+                  "OLD serial flip form run", "runs the OLD flip form",
+                  "runs the OLD form")
         offenders = []
         for rel in ("weg2/front.py", "weg2/ring_table.py", "weg2/host_ledger.py",
                     "weg2/launcher.py", "managers/weg2_memory_saver.py"):
@@ -1563,6 +1841,166 @@ class DuplexTableTest(unittest.TestCase):
         self.assertIn("gets no benefit", by_card[REAL_3080_A])
         for ln in lines:
             self.assertIn(self.PROBE, ln, "no ratio without its provenance")
+
+
+#: One ``WEG2-FLIP-TAG`` line in the GATHERED-LEG shape, copied verbatim from
+#: boot weg2rg5's own P log rather than re-invented -- ``group=?`` and
+#: ``rank=-1`` are what ``weight_updater`` writes once C9 gathers the legs and
+#: ``_weg2_rank()`` has no per-rank tag edge to report.  A fixture in any other
+#: shape would test the parser against itself, which is exactly how the defect
+#: below survived: every fixture wrote a rank the regex could already match.
+RG5_TAG = (
+    "[2026-09-08 05:06:49 PP2] WEG2-FLIP-TAG group=? rank=-1 card={card} "
+    "dir=d2h tag={tag} bytes={mib} MiB population=all-backed-up-tags "
+    "(source: tms_tag_bytes, NOT RssShmem) ms=837 GB/s=4.18 granules=1668"
+)
+RG5_BOOT = "boot_weg2_weg2rg5_15a46a611a_0908_050519"
+
+
+class GatheredLegTagParsingTest(unittest.TestCase):
+    """FIX 3 round 3, boot weg2rg5's finding 2: ``rank=-1`` never parsed."""
+
+    def setUp(self):
+        import tempfile
+
+        self.dir = tempfile.mkdtemp(prefix="weg2tagparse-")
+
+    def _log(self, rows):
+        path = os.path.join(self.dir, "g.log")
+        with open(path, "w") as f:
+            for card, tag, mib in rows:
+                f.write(RG5_TAG.format(card=card, tag=tag, mib=mib) + "\n")
+        return path
+
+    def test_a_gathered_leg_tag_line_is_READ_and_the_card_is_the_identity(self):
+        # THE DEFECT: _TAG_RE required rank=(\d+), which cannot match a minus
+        # sign, while the ring-era emitter has written rank=-1 since C9.  So the
+        # instrument built to make MEASURED possible was the instrument that made
+        # every ring-era boot ineligible -- max_tag parsed to {0,0,0},
+        # CardRing.complete was false, the boot was skipped, and weg2rg5 sized
+        # its ring from the PRE-RING weg2sc3 while printing BOUND.
+        #
+        # The rank is gone because C9 removed the per-rank tag edge, so the CARD
+        # is the identity -- which is the stronger one anyway (#589).
+        path = self._log([
+            ("GPU-aaaa", "weights_0", 100), ("GPU-aaaa", "weights_1", 300),
+            ("GPU-bbbb", "weights_0", 50), ("GPU-bbbb", "weights_1", 70),
+            # second pass on aaaa: repeating a tag opens the next pass
+            ("GPU-aaaa", "weights_0", 110), ("GPU-aaaa", "weights_1", 320),
+        ])
+        gl = ring_table.parse_group_log(path)
+        self.assertEqual(gl.lines_read, 6)
+        self.assertTrue(gl.covers_all_backed_up_tags,
+                        "population=all-backed-up-tags must still be read")
+        by_card = {gl.uuid_by_rank[r]: r for r in gl.image}
+        self.assertEqual(sorted(by_card), ["GPU-aaaa", "GPU-bbbb"],
+                         "each card must get its own row, not one shared bucket")
+        self.assertEqual(gl.image[by_card["GPU-aaaa"]], 430, "the PEAK pass")
+        self.assertEqual(gl.max_tag[by_card["GPU-aaaa"]], 320,
+                         "max_tag must be non-zero -- zero is what made every "
+                         "ring-era boot fail CardRing.complete")
+        self.assertEqual(gl.max_tag[by_card["GPU-bbbb"]], 70)
+
+    def test_tag_lines_that_do_NOT_parse_REFUSE_by_name_instead_of_reading_zero(self):
+        # The half that makes the regex fix a fix rather than a patch, and the
+        # instrument-text law applied to a PARSER: a reader whose text claims to
+        # read an instrument must fail loudly when the emitter has moved, never
+        # degrade to the numbers it can still compute.  Silence is what let 402
+        # lines of weg2rg5's own instrument go unread while the launcher printed
+        # a well-formed table solved from a boot five generations back.
+        path = os.path.join(self.dir, "future.log")
+        with open(path, "w") as f:
+            f.write("[2026-09-09 00:00:00 PP0] WEG2-FLIP-TAG group=P rank=leader "
+                    "card=GPU-aaaa dir=d2h tag=weights_0 bytes=100 MiB\n")
+        with self.assertRaises(ring_table.Weg2FlipTagUnparsable) as cm:
+            ring_table.parse_group_log(path)
+        self.assertIn("W37 Weg2FlipTagUnparsable", str(cm.exception))
+        self.assertIn("rank=leader", str(cm.exception),
+                      "the refusal must quote the line it could not read")
+        # It inherits the launcher's named-refusal handler, so it can never
+        # reach the operator as a bare traceback.
+        self.assertIsInstance(cm.exception, ring_table.Weg2RingRefused)
+        # ZERO OUT OF ZERO IS NOT A REFUSAL: a log with no tag lines at all is a
+        # pre-ring boot, and those are still legal sources.
+        quiet = os.path.join(self.dir, "quiet.log")
+        with open(quiet, "w") as f:
+            f.write("[2026-09-07 21:10:23 PP0] WEG2-CHUNK-BYTES sleep "
+                    "tags=['weights_0'] host_image_delta=100 MiB "
+                    "(RssShmem 0 -> 0 MiB, /proc/self/status)\n")
+        self.assertEqual(ring_table.parse_group_log(quiet).lines_read, 1)
+
+    @unittest.skipUnless(
+        os.path.isfile(os.path.join(EVIDENCE, f"{RG5_BOOT}.P.log")),
+        "boot weg2rg5's logs are not on this box")
+    def test_the_REAL_rg5_logs_now_carry_a_non_zero_max_tag(self):
+        # The postmortem's own determination, as a test: at the parent this read
+        # max_tag={0,0,0} and covers_all=False for both groups.
+        for group, cards in (("P", 3), ("D", 3)):
+            gl = ring_table.parse_group_log(
+                os.path.join(EVIDENCE, f"{RG5_BOOT}.{group}.log"))
+            tags = [v for r, v in gl.max_tag.items() if r >= ring_table._CARD_RANK_BASE]
+            self.assertEqual(len(tags), cards, f"{group}: one row per card")
+            self.assertTrue(all(v > 0 for v in tags), f"{group}: {gl.max_tag}")
+            self.assertTrue(gl.covers_all_backed_up_tags, group)
+
+
+class SkippedBootsAreNamedOnSuccessTest(RingTableSolverTest):
+    """FIX 3 round 3, boot weg2rg5's finding 3: the solver's silent skips."""
+
+    def test_a_newer_boot_that_was_skipped_is_NAMED_when_an_older_one_solves(self):
+        # solve() accumulated rejection reasons and returned them ONLY when no
+        # boot worked.  That is backwards: when nothing works the operator gets a
+        # refusal to read, and when something works they get a table whose choice
+        # they cannot check.  weg2rg5 solved from a boot five generations back
+        # and its own log could not say why.
+        import time
+
+        newer = "boot_weg2_t3_0000000000_0907_235959"
+        self._write(
+            p_passes=[{0: [("weights_0", 100)]}], d_passes=[{0: [("weights_0", 90)]}],
+            p_kv={0: 2.0}, d_kv={0: 2.0},
+            corridor={"P": [{CARDS[0].nvml_index: 900}],
+                      "D": [{CARDS[0].nvml_index: 900}]})
+        # The newer boot has group logs but NO corridor samples in its front log
+        # -- weg2rg5's own real reason for being skipped.
+        for suffix in ("P", "D"):
+            with open(os.path.join(self.dir, f"{newer}.{suffix}.log"), "w") as f:
+                f.write(open(os.path.join(self.dir, f"{self.stem}.{suffix}.log")).read())
+        with open(os.path.join(self.dir, f"{newer}.front.log"), "w") as f:
+            f.write(_front_log({}, identity=True))
+        now = time.time()
+        os.utime(os.path.join(self.dir, f"{newer}.front.log"), (now, now))
+        os.utime(os.path.join(self.dir, f"{self.stem}.front.log"), (now - 600, now - 600))
+
+        table, reason = ring_table.solve([CARDS[0]], self.dir, None)
+        self.assertIsNotNone(table, reason)
+        self.assertEqual(table.boot, self.stem)
+        skipped = [ln for ln in reason.split("\n") if "SKIPPED" in ln]
+        self.assertEqual(len(skipped), 1, reason)
+        self.assertIn(newer, skipped[0])
+        self.assertIn("WEG2-CORRIDOR", skipped[0],
+                      "the line must carry the REASON, not just the name")
+
+    def test_the_launcher_prints_one_line_per_skipped_boot(self):
+        # ... and the reason string is rendered, not merely returned: the whole
+        # point is a log an operator can check the table choice against.
+        from sglang.srt.weg2 import launcher
+
+        lines = []
+        table = _zr2_table()
+        real = ring_table.solve
+        ring_table.solve = lambda *a, **k: (
+            table, "solved from b\nWEG2-HOST-RING SKIPPED (newer than the chosen "
+                   "table) boot_x: front carries no WEG2-CORRIDOR samples")
+        try:
+            launcher.prepare_host_ring([], lines.append, "t3", "auto",
+                                       "/nonexistent", "", True,
+                                       leg_form="interleave")
+        finally:
+            ring_table.solve = real
+        self.assertTrue(
+            any("SKIPPED" in ln and "boot_x" in ln for ln in lines),
+            "\n".join(lines))
 
 
 if __name__ == "__main__":

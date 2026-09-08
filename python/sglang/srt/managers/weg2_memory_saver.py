@@ -277,14 +277,25 @@ def duplex_ratios(published: Optional[str] = None) -> Dict[str, float]:
     return _parse_duplex(published)[0]
 
 
-#: FIX 2 round 2, finding 2.  The wire format of :data:`PCIE_DUPLEX_ENV` carries
-#: its own version, and a reader that does not know the version REFUSES.  The
-#: predecessor's format (``<uuid>=<ratio>:split``) was a silent superset of the
-#: one before it (``<uuid>=<ratio>``): an older parser did ``float("1.759:split")``,
-#: dropped every row, resolved an EMPTY table, and therefore gave one key on ALL
-#: THREE cards -- strictly worse than the boot the split exists to fix, with no
-#: line saying so anywhere.  A format that degrades to the unsafe answer is not a
-#: format; the version token is what makes the degrade a named stop instead.
+#: FIX 3 round 3, finding 1 -- THE VERSION IS A ROW, NEVER A PREFIX.  FIX 2 wrote
+#: it as ``v2|<uuid>=...`` and that is worse than no version at all: a reader
+#: that does not know the token does not drop everything, it mangles exactly the
+#: FIRST card's uuid (on this rig the 5090, which carries the co-located pair and
+#: the flip's critical path) and resolves the other two correctly -- so the card
+#: that matters takes ONE key while the launcher prints SPLIT for it and arms.
+#: That is boot weg2rg2's precondition verbatim, on the worst card, and it was a
+#: REGRESSION: the un-versioned predecessor's own string resolved all three
+#: cards correctly in that same reader.
+#:
+#: As a row (``format=v2,<uuid>=<ratio>:split,...``) every ``<k>=<v>,`` parser in
+#: this family already tolerates it: an older reader takes ``format`` for a card
+#: uuid it does not have, ``float("v2")`` raises, that ONE row is dropped, and
+#: every real card still resolves.  A reader that DOES know the key requires the
+#: row and refuses by name (W36) when it is absent or unknown -- so the degrade
+#: is a named stop in the new reader and a no-op in the old one, which is what a
+#: version is for.  ``format`` is safe as a key because an NVML card id is always
+#: ``GPU-``/``MIG-`` prefixed and can never collide with it.
+PCIE_DUPLEX_VERSION_KEY = "format"
 PCIE_DUPLEX_FORMAT = "v2"
 
 
@@ -297,6 +308,10 @@ class Weg2DuplexDecisionRefused(RuntimeError):
     120 s budget, W29 on every rank, group-fatal W4 -- 120 s into a flip that
     has already mutated VRAM):
 
+    * NO FORMAT ROW AT ALL -- a published string from a launcher older than
+      :data:`PCIE_DUPLEX_VERSION_KEY` (including FIX 2's ``v2|`` prefix form,
+      whose token is not a row and is therefore not one here either).  This
+      reader will not guess which dialect it is holding;
     * an UNKNOWN FORMAT VERSION -- a newer launcher against an older tree on
       ``PYTHONPATH``, the partial-rebase case the launcher's own W34 comment
       names;
@@ -305,9 +320,12 @@ class Weg2DuplexDecisionRefused(RuntimeError):
       gate there is precisely the silent degrade: the ratio gate answers a
       question about VALUE and would leave the x4 card on one key.
 
-    There is no fallback and none is claimed: the launcher's own launch check
-    resolves the key through this same module (``_serialised_cards``), so this
-    refusal is normally raised BEFORE either group starts, and never mid-flip.
+    There is no fallback and none is claimed.  The launcher's own launch check
+    resolves the key IN THE TREE THE RANKS IMPORT -- one subprocess per boot
+    with the ranks' ``PYTHONPATH`` (FIX 3 round 3, finding 2) -- so a tree that
+    raises this is reported SERIALISED and refused by W34 BEFORE either group
+    starts.  Reaching it mid-flip means the rank env and the launch check's env
+    diverged after that check, which nothing in this tree does.
     """
 
 
@@ -328,39 +346,39 @@ def duplex_splits(published: Optional[str] = None) -> Dict[str, bool]:
 
 
 def _parse_duplex(published: Optional[str]) -> Tuple[Dict[str, float], Dict[str, bool]]:
-    """``[v2|]<uuid>=<ratio>[:split|:single]`` rows -> (ratios, decisions).
+    """``format=v2,<uuid>=<ratio>[:split|:single],...`` -> (ratios, decisions).
 
     The ratio may be empty (``<uuid>=:split``): a card the step-0 probe never
     measured still needs a decision, and under gathered legs that decision is
     ``split`` -- see :func:`pcie_lock_separates_directions`.
 
-    Refuses (W36) on an unknown version token, and on a non-empty string that
-    produced no decision at all.  The EMPTY string is not a refusal: it is the
-    honest "nothing was published on this boot", and it resolves to no split,
-    which the launcher's own check then reads as SERIALISED and refuses at
-    launch (W34).
+    THE VERSION IS ONE ROW AMONG THE CARD ROWS (FIX 3 round 3, finding 1), not a
+    prefix on the first card -- see :data:`PCIE_DUPLEX_VERSION_KEY` for why the
+    prefix mangled exactly the first card's uuid instead of failing whole.  It is
+    parsed here like any other row and never reaches ``ratios``/``splits``.
+
+    Refuses (W36) on a MISSING version row, on an unknown version, and on a
+    non-empty string that produced no decision at all.  The EMPTY string is not a
+    refusal: it is the honest "nothing was published on this boot", and it
+    resolves to no split, which the launcher's own check then reads as SERIALISED
+    and refuses at launch (W34).
     """
     raw = os.environ.get(PCIE_DUPLEX_ENV, "") if published is None else published
     raw = (raw or "").strip()
-    if "|" in raw:
-        version, _, raw = raw.partition("|")
-        version = version.strip()
-        if version != PCIE_DUPLEX_FORMAT:
-            raise Weg2DuplexDecisionRefused(
-                f"W36 Weg2DuplexDecisionRefused {PCIE_DUPLEX_ENV} carries format "
-                f"{version!r}, and this tree reads {PCIE_DUPLEX_FORMAT!r} -- the "
-                "launcher and this rank would build DIFFERENT PCIe keys, which is "
-                "the single-key deadlock of boot weg2rg2 (W31 -> W29 -> W4).  No "
-                "fallback: relaunch with one tree on PYTHONPATH."
-            )
+    if not raw:
+        return {}, {}
     ratios: Dict[str, float] = {}
     splits: Dict[str, bool] = {}
+    version: Optional[str] = None
     for item in raw.split(","):
         item = item.strip()
         if not item or "=" not in item:
             continue
         uuid, _, value = item.partition("=")
         uuid = uuid.strip()
+        if uuid == PCIE_DUPLEX_VERSION_KEY:
+            version = value.strip()
+            continue
         ratio_text, _, decision = value.partition(":")
         decision = decision.strip()
         if decision in ("split", "single"):
@@ -371,7 +389,27 @@ def _parse_duplex(published: Optional[str]) -> Tuple[Dict[str, float], Dict[str,
             ratios[uuid] = float(ratio_text)
         except ValueError:
             continue
-    if raw and not splits:
+    if version is None:
+        raise Weg2DuplexDecisionRefused(
+            f"W36 Weg2DuplexDecisionRefused {PCIE_DUPLEX_ENV} is set "
+            f"({raw[:200]!r}) but carries no {PCIE_DUPLEX_VERSION_KEY}="
+            f"{PCIE_DUPLEX_FORMAT} row -- it was published by a launcher whose "
+            "dialect this tree cannot name.  Reading it anyway is what mangles "
+            "one card's key while the other cards resolve (FIX 2's 'v2|' prefix, "
+            "on the FIRST card, which on this rig carries the flip's critical "
+            "path), and one un-split key is the deadlock of boot weg2rg2 "
+            "(W31 -> W29 -> W4).  No fallback: relaunch with one tree on "
+            "PYTHONPATH."
+        )
+    if version != PCIE_DUPLEX_FORMAT:
+        raise Weg2DuplexDecisionRefused(
+            f"W36 Weg2DuplexDecisionRefused {PCIE_DUPLEX_ENV} carries format "
+            f"{version!r}, and this tree reads {PCIE_DUPLEX_FORMAT!r} -- the "
+            "launcher and this rank would build DIFFERENT PCIe keys, which is "
+            "the single-key deadlock of boot weg2rg2 (W31 -> W29 -> W4).  No "
+            "fallback: relaunch with one tree on PYTHONPATH."
+        )
+    if not splits:
         raise Weg2DuplexDecisionRefused(
             f"W36 Weg2DuplexDecisionRefused {PCIE_DUPLEX_ENV} is set "
             f"({raw[:200]!r}) but names no split/single decision for any card.  "
