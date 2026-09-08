@@ -279,14 +279,32 @@ class TestTheRefusals(unittest.TestCase):
         with self.assertRaises(Weg2LaunchRefused):
             depth(measured=m, pool_tokens=float(CAP) + 10.0)
 
-    def test_W43_when_a_gapped_layer_set_is_in_the_environment(self):
-        """init_pp_loop_state raises on gapped + depth>0; say so BEFORE the boot."""
+    def test_W43_when_a_PINNED_depth_meets_a_gapped_layer_set(self):
+        """init_pp_loop_state raises on gapped + depth>0; say so BEFORE the boot.
+
+        REVISED BY #1240. When #692 was built, a gapped layer set could only
+        arrive by an operator's export, so any depth against it was a
+        contradiction and W43 was the whole answer. Since #1240 the SOLVER
+        chooses the map, and it prices a gapped candidate at exactly ONE pass
+        in flight -- so a DERIVED depth against a gapped map is not a
+        contradiction, it is the layout's own bound and is taken (the test
+        below). W43 keeps the half that is still a contradiction: an OVERRIDE
+        asking for a depth the boot cannot run.
+        """
         m = read_pp_bubble(write_log(REAL_LINES))
         with self.assertRaises(Weg2LaunchRefused) as ctx:
-            depth(measured=m, gapped_layer_set="0,1,2:48")
+            depth(measured=m, gapped_layer_set="0,1,2:48", pinned_depth=1)
         msg = str(ctx.exception)
         self.assertIn("W43 Weg2DepthGapped", msg)
-        self.assertIn("SGLANG_PP_LAYER_SET", msg)
+        self.assertIn("init_pp_loop_state", msg)
+
+    def test_a_derived_depth_against_a_gapped_map_is_taken_down_by_the_layout(self):
+        m = read_pp_bubble(write_log(REAL_LINES))
+        self.assertGreater(depth(measured=m).depth, 0)
+        d = depth(measured=m, gapped_layer_set="0,1,2:48")
+        self.assertEqual(d.depth, 0)
+        self.assertTrue(d.gapped_layout)
+        self.assertIn("BY THE LAYOUT", d.line())
 
     def test_a_gapped_set_with_depth_zero_is_not_refused(self):
         self.assertEqual(

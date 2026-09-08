@@ -43,12 +43,25 @@ beside it, so a boot cannot pay the trade by accident.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.planner.pp_cut import (
+    LAYER_FAMILY_ATTENTION,
+    FamilyDepthCost,
+    LayerSets,
     PhasePoolModel,
     PrefillTiming,
+    UnpricedCrossing,
     attention_counts,
+    attn_counts_of,
+    contiguous_layer_sets,
+    counts_of,
+    crossing_price,
+    enumerate_gapped_splits,
+    gapped_layer_sets,
+    gapped_phase_pool,
+    is_gapped,
+    layer_set_flag,
     pipelined_prefill_ms,
     pp_phase_pool,
     solve_pp_cut_for_prefill_speed,
@@ -61,15 +74,57 @@ class PPCutRefused(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class CutCandidate:
+    """One layout, priced on every axis the ranking uses.
+
+    ``makespan_ms`` and ``crossing_ms`` are SEPARATE columns because they are
+    separate physics -- compute on the cards, bytes on the links -- and the
+    whole point of printing a table is that a reader can see which of the two
+    a candidate lost on. The objective is their sum (:attr:`total_ms`).
+
+    ``makespan_ms`` is the compute bound at the number of passes the layout
+    ADMITS, which is not the same rule twice: a contiguous cut may run several
+    passes in flight (``--pp-async-batch-depth``), so its bound is the slowest
+    stage; a gapped map may not (the launcher's own W43, from
+    ``scheduler_pp_mixin.init_pp_loop_state``), so its stages do not overlap
+    and the bound is their sum.
+    """
+
     layers: Tuple[int, ...]
     attn: Tuple[int, ...]
     makespan_ms: float
     pool_tokens: float
+    kind: str = "contiguous"
+    crossing_ms: float = 0.0
+    crossings: int = 0
+    depth_tokens: int = 0
+    owned: Optional[LayerSets] = None
+    layer_set: str = ""
+
+    @property
+    def total_ms(self) -> float:
+        return float(self.makespan_ms) + float(self.crossing_ms)
 
     def fmt(self) -> str:
         return (
             f"{','.join(str(n) for n in self.layers)}"
             f" attn {','.join(str(a) for a in self.attn)}"
+        )
+
+    def line(self, marker: str) -> str:
+        """THE table row. Field names are load-bearing: a reader greps them."""
+        return (
+            "PP-CUT solver: %s layers=%s attn=%s makespan_ms=%.1f "
+            "crossing_ms=%.1f pool_tokens=%d depth_tokens=%d %s"
+            % (
+                self.kind,
+                ",".join(str(n) for n in self.layers),
+                ",".join(str(a) for a in self.attn),
+                self.makespan_ms,
+                self.crossing_ms,
+                int(self.pool_tokens),
+                int(self.depth_tokens),
+                marker,
+            )
         )
 
 
@@ -80,6 +135,80 @@ class CutDecision:
     cap_tokens: int
     pinned: bool
     cost_provenance: str
+    ranked: Tuple[CutCandidate, ...] = ()
+    design_prefix_tokens: int = 0
+    unpriced: Tuple[str, ...] = ()
+
+    def table_lines(self, top: int = 8) -> List[str]:
+        """The chosen candidate and its alternatives, best first.
+
+        Bounded rather than exhaustive: the contiguous enumeration alone is in
+        the hundreds and a boot log is read by people. The bound is stated in
+        the trailing line so a truncated table cannot be read as the whole
+        field -- the same denominator discipline the rest of this strand runs
+        on.
+        """
+
+        def same_as_chosen(c: CutCandidate) -> bool:
+            return (
+                c.kind == self.chosen.kind
+                and c.layers == self.chosen.layers
+                and c.attn == self.chosen.attn
+            )
+
+        out: List[str] = []
+        shown = set()
+        for i, cand in enumerate(self.ranked[: int(top)]):
+            shown.add(i)
+            out.append(cand.line("CHOSEN" if same_as_chosen(cand) else "alt#%d" % i))
+        # THE CHOSEN ROW IS NEVER MISSING. A PINNED map wins the ranking
+        # without necessarily ranking well, so it can sit far outside the
+        # top-N -- and a table whose every row says "alt" while the
+        # provenance line names something else is worse than no table.
+        if not any("CHOSEN" in line for line in out):
+            at = next((i for i, c in enumerate(self.ranked) if same_as_chosen(c)), None)
+            shown.add(at)
+            out.append(
+                self.chosen.line("CHOSEN" if at is None else "CHOSEN (ranked #%d)" % at)
+            )
+        # EVERY KIND GETS A ROW, wherever it ranks. A top-N cut through a
+        # ranking that happens to be swept by one family would print no gapped
+        # candidate at all, and an absent row reads as an absent candidate --
+        # the denominator trap, applied to a whole family. The best of each
+        # kind is therefore always shown, with its true rank index, so the
+        # trade the table exists to expose cannot be hidden by truncation.
+        seen_kinds = {c.kind for c in self.ranked[: int(top)]}
+        for kind in sorted({c.kind for c in self.ranked} - seen_kinds):
+            best = next(
+                (
+                    i
+                    for i, c in enumerate(self.ranked)
+                    if c.kind == kind and i not in shown
+                ),
+                None,
+            )
+            if best is None:
+                continue
+            shown.add(best)
+            out.append(self.ranked[best].line("best-%s#%d" % (kind, best)))
+        # And the pool-maximal candidate, on the same row format as the rest:
+        # it is the other objective, and #1018's rule is that a boot cannot pay
+        # that trade by accident.
+        if not same_as_chosen(self.kv_floor):
+            out.append(self.kv_floor.line("kv-floor"))
+        if len(self.ranked) > int(top):
+            out.append(
+                "PP-CUT solver: %d further candidates ranked and not printed "
+                "(%d contiguous, %d gapped in all)"
+                % (
+                    len(self.ranked) - int(top),
+                    sum(1 for c in self.ranked if c.kind == "contiguous"),
+                    sum(1 for c in self.ranked if c.kind == "gapped"),
+                )
+            )
+        for note in self.unpriced:
+            out.append("PP-CUT solver: UNPRICED %s" % note)
+        return out
 
     def provenance_line(self) -> str:
         """THE one line. Format is load-bearing: a reader greps ``PP-CUT solver:``."""
@@ -155,8 +284,7 @@ def ms_per_layer_from_card_library(
     anchor = measured_total / sum(inv)
     derived = tuple(anchor / r for r in rates)
     residual = ", ".join(
-        "%s %.2f vs measured %.2f ms/layer (%+.1f%%)"
-        % (n, d, m, 100.0 * (d - m) / m)
+        "%s %.2f vs measured %.2f ms/layer (%+.1f%%)" % (n, d, m, 100.0 * (d - m) / m)
         for n, d, m in zip(card_names, derived, measured_ms_per_layer)
     )
     return derived, (
@@ -182,6 +310,11 @@ def solve_launch_cut(
     pinned_layers: Optional[Sequence[int]] = None,
     pinned_attn: Optional[Sequence[int]] = None,
     min_layers_per_stage: int = 1,
+    family_cost: Optional[FamilyDepthCost] = None,
+    design_prefix_tokens: Optional[int] = None,
+    per_pair_crossing_ms: Optional[Mapping[Tuple[int, int], float]] = None,
+    enumerate_gapped: bool = True,
+    pinned_layer_set: Optional[str] = None,
 ) -> CutDecision:
     """Choose the layer + attention cut. Makespan-optimal among the feasible.
 
@@ -249,19 +382,102 @@ def solve_launch_cut(
         min_layers_per_stage=int(min_layers_per_stage),
         pool_fn=pool_fn,
     )
+    # ONE PRICING FUNCTION FOR BOTH FAMILIES (#1240). Without a
+    # ``family_cost`` this is exactly what it always was: ``PrefillTiming``'s
+    # per-stage total, no depth, no crossings, contiguous only. With one, the
+    # SAME function prices every candidate of both kinds, which is the only
+    # way a gapped map and a contiguous cut can be compared rather than merely
+    # listed next to each other.
+    depth = int(
+        design_prefix_tokens
+        if design_prefix_tokens is not None
+        else (family_cost.ref_prefix_tokens if family_cost is not None else 0)
+    )
+    pair_ms: Mapping[Tuple[int, int], float] = per_pair_crossing_ms or {}
+    unpriced: List[str] = []
+
+    def price(
+        owned: LayerSets, kind: str, fallback_ms: Optional[float] = None
+    ) -> Optional[CutCandidate]:
+        counts = counts_of(owned)
+        attn = attn_counts_of(layer_families, owned)
+        try:
+            pool = (
+                gapped_phase_pool(counts, attn, pool_model)
+                if kind == "gapped"
+                else pp_phase_pool(counts, attn, pool_model)
+            )
+        except ValueError:
+            return None
+        if family_cost is None:
+            if fallback_ms is None:
+                return None
+            makespan, cross, n_cross = float(fallback_ms), 0.0, 0
+        else:
+            stage_ms = family_cost.stage_ms(counts, attn, depth)
+            # The in-flight-pass rule, applied per candidate -- see
+            # ``CutCandidate``. Gapped forbids depth, so its stages serialise.
+            makespan = float(sum(stage_ms) if kind == "gapped" else max(stage_ms))
+            try:
+                cp = crossing_price(owned, int(total_layers), pair_ms)
+            except UnpricedCrossing as exc:
+                unpriced.append(
+                    "%s layers=%s attn=%s: %s"
+                    % (
+                        kind,
+                        ",".join(str(n) for n in counts),
+                        ",".join(str(a) for a in attn),
+                        exc,
+                    )
+                )
+                return None
+            cross, n_cross = cp.ms, cp.crossings
+        return CutCandidate(
+            layers=counts,
+            attn=attn,
+            makespan_ms=makespan,
+            pool_tokens=pool,
+            kind=kind,
+            crossing_ms=cross,
+            crossings=n_cross,
+            depth_tokens=depth,
+            owned=owned,
+            layer_set=layer_set_flag(owned),
+        )
+
     candidates: List[CutCandidate] = []
     for cand in ranked:
-        attn, pool = resolve(cand.counts)
+        _, pool = resolve(cand.counts)
         if pool is None:
             continue
-        candidates.append(
-            CutCandidate(
-                layers=tuple(cand.counts),
-                attn=attn,
-                makespan_ms=cand.pipelined_ms,
-                pool_tokens=pool,
-            )
+        priced = price(
+            contiguous_layer_sets(cand.counts), "contiguous", cand.pipelined_ms
         )
+        if priced is not None:
+            candidates.append(priced)
+
+    # THE GAPPED FIELD. All linear layers on ONE stage -- which stage is
+    # enumerated, not assumed, because "the 5090" is a fact about this rig and
+    # not about the solver -- and the attention layers dealt out in ascending
+    # id by every admissible split. That is the family the contiguous
+    # enumeration cannot reach at all, and the user's 0/8/8 and 4/6/6 both
+    # live in it.
+    if enumerate_gapped and family_cost is not None:
+        n_attn_total = sum(1 for f in layer_families if f == LAYER_FAMILY_ATTENTION)
+        for gdn_stage in range(n_stages):
+            for split in enumerate_gapped_splits(n_attn_total, n_stages, gdn_stage):
+                owned = gapped_layer_sets(layer_families, gdn_stage, split)
+                if not is_gapped(owned):
+                    # A "gapped" map whose every stage is an unbroken run IS a
+                    # contiguous cut, already enumerated above. Ranking it
+                    # twice would put the same layout in the table under two
+                    # names and, worse, charge it the crossing schedule of a
+                    # protocol it would not run.
+                    continue
+                priced = price(owned, "gapped")
+                if priced is not None:
+                    candidates.append(priced)
+
     if not candidates:
         raise PPCutRefused(
             "W40 Weg2PPCutRefused: not one cut of %d layers over %d stages is "
@@ -289,13 +505,56 @@ def solve_launch_cut(
                 cost_provenance,
             )
         )
-    chosen = min(feasible, key=lambda c: (c.makespan_ms, -c.pool_tokens))
+    # THE OBJECTIVE IS THE SUM of the two time columns. Ranking on makespan
+    # alone would hand a gapped map the crossings for free -- 31 per chunk at
+    # a 40 MiB frame is not a rounding term -- and ranking on crossings alone
+    # would pick the layout that moves the fewest bytes and computes slowest.
+    candidates.sort(key=lambda c: (c.total_ms, -c.pool_tokens))
+    chosen = min(feasible, key=lambda c: (c.total_ms, -c.pool_tokens))
+
+    if pinned_layer_set:
+        # A PINNED MAP wins the same way a pinned cut does: announced, and
+        # priced on every axis the solved one was, never by skipping the
+        # pricing. Parsed by the RUNTIME's own parser so the string that
+        # reaches the boot is the string this decision was priced on.
+        from sglang.srt.distributed.utils import parse_pp_layer_sets
+
+        owned = tuple(
+            tuple(sorted(int(i) for i in s))
+            for s in parse_pp_layer_sets(
+                str(pinned_layer_set), int(total_layers), n_stages, allow_gapped=True
+            )
+        )
+        kind = "gapped" if is_gapped(owned) else "contiguous"
+        priced = price(owned, kind)
+        if priced is None:
+            raise PPCutRefused(
+                "W40 Weg2PPCutRefused: the pinned --pp-layer-set %r cannot be "
+                "priced (a stage does not fit its weights, mamba state and "
+                "arming floor, no stage holds a full-attention layer, or a "
+                "crossing pair has no measured link price). The refusals above "
+                "name which: %s"
+                % (str(pinned_layer_set), "; ".join(unpriced) or "pool model")
+            )
+        return CutDecision(
+            chosen=priced,
+            kv_floor=kv_floor,
+            cap_tokens=int(cap_tokens),
+            pinned=True,
+            cost_provenance=cost_provenance,
+            ranked=tuple(candidates),
+            design_prefix_tokens=depth,
+            unpriced=tuple(unpriced),
+        )
 
     pinned = pinned_layers is not None
     if pinned:
         layers = tuple(int(n) for n in pinned_layers)
         derived_attn, derived_pool = resolve(layers)
-        if pinned_attn is not None and tuple(int(a) for a in pinned_attn) != derived_attn:
+        if (
+            pinned_attn is not None
+            and tuple(int(a) for a in pinned_attn) != derived_attn
+        ):
             raise PPCutRefused(
                 "W40 Weg2PPCutRefused: the pinned pair layers=%s attn=%s is "
                 "not realizable -- a contiguous cut of those layer counts "
@@ -316,12 +575,18 @@ def solve_launch_cut(
                 "mamba state and arming floor, or holds no attention layer)."
                 % (",".join(str(n) for n in layers),)
             )
-        chosen = CutCandidate(
-            layers=layers,
-            attn=derived_attn,
-            makespan_ms=pipelined_prefill_ms(layers, timing),
-            pool_tokens=derived_pool,
+        priced = price(
+            contiguous_layer_sets(layers),
+            "contiguous",
+            pipelined_prefill_ms(layers, timing),
         )
+        if priced is None:
+            raise PPCutRefused(
+                "W40 Weg2PPCutRefused: the pinned layer cut %s cannot be "
+                "priced on every axis (pool, family compute, crossings)."
+                % (",".join(str(n) for n in layers),)
+            )
+        chosen = priced
 
     return CutDecision(
         chosen=chosen,
@@ -329,4 +594,7 @@ def solve_launch_cut(
         cap_tokens=int(cap_tokens),
         pinned=pinned,
         cost_provenance=cost_provenance,
+        ranked=tuple(candidates),
+        design_prefix_tokens=depth,
+        unpriced=tuple(unpriced),
     )

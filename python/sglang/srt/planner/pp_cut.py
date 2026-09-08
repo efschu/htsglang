@@ -2710,17 +2710,10 @@ def stage_pp_capacities(
     from free first.
     """
     caps: List[float] = []
+    frees = _stage_free_after_residency(counts, attn_counts, model)
     for r, (n, a) in enumerate(zip(counts, attn_counts)):
         n, a = int(n), int(a)
-        linear = n - a
-        free = (
-            float(model.free_mib[r])
-            - float(model.weight_mib_per_layer) * n
-            - float(model.mamba_mib_per_linear_layer_per_slot)
-            * linear
-            * int(model.mamba_slots)
-            - float(model.arming_floor_mib[r])
-        )
+        free = frees[r]
         if free < 0.0:
             raise ValueError(
                 f"cut {tuple(counts)} is infeasible on rank{r}: {n} layers of "
@@ -2926,19 +2919,9 @@ def decoupled_phase_pool(
     """
     if int(total_attn_layers) <= 0:
         raise ValueError("no full-attention layers: there is no KV pool to shard.")
-    n_ranks = len(model.free_mib)
     per_token = float(total_attn_layers) * float(model.kv_mib_per_token_per_attn_layer)
     total = 0.0
-    for r, (n, a) in enumerate(zip(counts, attn_counts)):
-        linear = int(n) - int(a)
-        free = (
-            float(model.free_mib[r])
-            - float(model.weight_mib_per_layer) * int(n)
-            - float(model.mamba_mib_per_linear_layer_per_slot)
-            * linear
-            * int(model.mamba_slots)
-            - float(model.arming_floor_mib[r])
-        )
+    for r, free in enumerate(_stage_free_after_residency(counts, attn_counts, model)):
         if free < 0.0:
             raise ValueError(
                 f"cut {tuple(counts)} is infeasible on rank{r} before any KV is "
@@ -2947,3 +2930,493 @@ def decoupled_phase_pool(
             )
         total += free / per_token
     return total
+
+
+# ---------------------------------------------------------------------------
+# #1240 -- GAPPED layer sets, the crossing term, and the DEPTH axis.
+#
+# WHY THIS SECTION EXISTS. Everything above prices CONTIGUOUS cuts: a stage is
+# a half-open layer range, so its attention count is a consequence of its two
+# boundaries and cannot be chosen (``attention_split_is_realizable`` states
+# exactly that, and it stays true for the contiguous family). The user's
+# decision of 2026-09-07 ("ja mach das so") asks for a layout the contiguous
+# family cannot express at all: the 48 GDN layers on the 5090, the 16
+# interleaved full-attention layers split across the two 3080s. That is an
+# ADDRESSING change, already carried by ``SGLANG_PP_LAYER_SET`` (#735) and
+# executed by the #753 mid-loop crossing wire -- what was missing is a solver
+# that can PRICE it against the contiguous cuts instead of beside them.
+#
+# ONE COST MODEL, THREE TERMS. Ranking a gapped candidate against a contiguous
+# one is only meaningful if both are priced by the same function, so the model
+# here replaces -- not supplements -- ``PrefillTiming`` for candidates of both
+# kinds whenever a :class:`FamilyDepthCost` is supplied:
+#
+#   1. COMPUTE, split by FAMILY. A GDN layer's cost per chunk does not depend
+#      on how much prefix is already resident; a full-attention layer's does,
+#      because it attends over that prefix. One number per stage cannot carry
+#      that, which is why ``PrefillTiming`` cannot answer the depth question.
+#   2. DEPTH. Attention work for one chunk of ``C`` tokens at prefix depth
+#      ``d`` scales with ``C * (d + C/2)`` -- the chunk attends over the whole
+#      prefix plus, on average, half of itself -- while linear/GDN work scales
+#      with ``C`` alone. So the attention term carries the factor
+#      ``(d + C/2) / (d_ref + C/2)`` and the linear term carries none. This is
+#      the SHAPE; the SCALE is calibrated (``family_costs_from_measurement``).
+#   3. CROSSINGS. A contiguous cut sends ``pp_size - 1`` times per chunk; the
+#      0/8/8 gapped map sends 31 times. At a 40 MiB activation frame that is
+#      not a rounding term, so it is priced from the MEASURED per-peer link
+#      map and printed in its own column rather than folded into the makespan
+#      silently.
+#
+# AND ONE STRUCTURAL DIFFERENCE THAT IS NOT A SECOND MODEL. A contiguous cut
+# may run several passes in flight (``--pp-async-batch-depth``), so its bound
+# is the SLOWEST STAGE. A gapped set may not: ``scheduler_pp_mixin``'s
+# ``init_pp_loop_state`` refuses the pair outright (launcher W43), because
+# under a gapped set each stage's next layer is another stage's previous one,
+# so every stage must be inside the same forward. One pass in flight means the
+# stages do NOT overlap and the bound is the SUM. Both are the same rule --
+# "the bound is the sum over the passes' non-overlapping parts" -- evaluated
+# at the number of in-flight passes the layout admits.
+# ---------------------------------------------------------------------------
+
+#: A per-stage ownership map: ``owned[stage]`` is that stage's layer ids, in
+#: ascending order. The contiguous family is the special case in which every
+#: stage's ids form an unbroken run.
+LayerSets = Tuple[Tuple[int, ...], ...]
+
+
+class UnpricedCrossing(ValueError):
+    """A crossing whose rank pair the measured link map does not cover.
+
+    Raised rather than defaulted. ``schedule_cost`` offers a ``default_us``
+    fallback and its own docstring says why a zero would be wrong; this solver
+    does not take that fallback at all, because an invented edge price would
+    change a RANKING -- the one output of this module -- rather than merely
+    blur a number. An unpriceable candidate is reported as unpriceable.
+    """
+
+
+def contiguous_layer_sets(counts: Sequence[int]) -> LayerSets:
+    """The ownership map a contiguous cut ``counts`` produces."""
+    out: List[Tuple[int, ...]] = []
+    start = 0
+    for c in counts:
+        out.append(tuple(range(start, start + int(c))))
+        start += int(c)
+    return tuple(out)
+
+
+def counts_of(owned: Sequence[Sequence[int]]) -> Tuple[int, ...]:
+    """Layers per stage. Kind-agnostic: the pool model takes counts, not maps."""
+    return tuple(len(s) for s in owned)
+
+
+def attn_counts_of(
+    layer_families: Sequence[str], owned: Sequence[Sequence[int]]
+) -> Tuple[int, ...]:
+    """Full-attention layers per stage, for an arbitrary ownership map.
+
+    ``attention_counts`` answers the same question for a CONTIGUOUS cut and is
+    left alone: it walks a running offset, which is only correct while a stage
+    is a range. This one reads the map, so it is right for both families and
+    agrees with ``attention_counts`` on every contiguous map.
+    """
+    return tuple(
+        sum(1 for i in s if layer_families[int(i)] == LAYER_FAMILY_ATTENTION)
+        for s in owned
+    )
+
+
+def is_gapped(owned: Sequence[Sequence[int]]) -> bool:
+    """True when at least one stage's ids are non-contiguous.
+
+    Same test as ``distributed.utils.pp_gapped_ownership_active`` applies to
+    the parsed env, restated here on the map rather than imported, because
+    that function additionally consults the process group and the wire flag --
+    neither of which a planner may reach.
+    """
+    for s in owned:
+        ids = sorted(int(i) for i in s)
+        if ids and len(ids) != ids[-1] - ids[0] + 1:
+            return True
+    return False
+
+
+def layer_set_flag(owned: Sequence[Sequence[int]]) -> str:
+    """Render an ownership map in ``--pp-layer-set`` syntax.
+
+    ``0-2,4-6;3,7`` -- stages separated by ``;``, each stage a comma list of
+    ranges and singletons. This is the exact grammar ``parse_pp_layer_sets``
+    accepts, so the string a solver hands the launcher round-trips through the
+    runtime's own parser rather than through a second one written here.
+    """
+    stages: List[str] = []
+    for s in owned:
+        ids = sorted(int(i) for i in s)
+        pieces: List[str] = []
+        i = 0
+        while i < len(ids):
+            j = i
+            while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1:
+                j += 1
+            pieces.append(str(ids[i]) if j == i else f"{ids[i]}-{ids[j]}")
+            i = j + 1
+        stages.append(",".join(pieces))
+    return ";".join(stages)
+
+
+def gapped_layer_sets(
+    layer_families: Sequence[str], gdn_stage: int, attn_split: Sequence[int]
+) -> LayerSets:
+    """All linear layers on ``gdn_stage``; attention layers split IN ORDER.
+
+    The attention layers are dealt out in ascending id, stage by stage in
+    stage order, so ``0,8,8`` on the reference checkpoint gives stage 1 the
+    layers ``3,7,...,31`` and stage 2 ``35,...,63`` -- the map of the
+    2026-08-18 gapped boot, and the layout the user chose. In-order dealing is
+    not one convention among many: any other assignment interleaves the two
+    attention owners and strictly increases the number of ownership changes,
+    i.e. the crossing term this module then prices. It is the minimiser, not a
+    preference.
+    """
+    n_stages = len(attn_split)
+    if not 0 <= int(gdn_stage) < n_stages:
+        raise ValueError(f"gdn_stage {gdn_stage} is not a stage of {n_stages}.")
+    attn_ids = [i for i, f in enumerate(layer_families) if f == LAYER_FAMILY_ATTENTION]
+    if sum(int(a) for a in attn_split) != len(attn_ids):
+        raise ValueError(
+            f"attn_split {tuple(attn_split)} sums to "
+            f"{sum(int(a) for a in attn_split)} but the checkpoint has "
+            f"{len(attn_ids)} full-attention layers."
+        )
+    owned: List[List[int]] = [[] for _ in range(n_stages)]
+    owned[int(gdn_stage)].extend(
+        i for i, f in enumerate(layer_families) if f != LAYER_FAMILY_ATTENTION
+    )
+    cursor = 0
+    for stage, take in enumerate(attn_split):
+        owned[stage].extend(attn_ids[cursor : cursor + int(take)])
+        cursor += int(take)
+    return tuple(tuple(sorted(s)) for s in owned)
+
+
+def enumerate_gapped_splits(
+    n_attn: int, n_stages: int, gdn_stage: int
+) -> List[Tuple[int, ...]]:
+    """Every way to deal ``n_attn`` attention layers over ``n_stages`` stages.
+
+    A stage that is not the GDN owner must take at least ONE attention layer:
+    a stage owning nothing at all is not a stage, and the runtime's own
+    ``parse_pp_layer_sets`` would refuse the empty set. The GDN owner may take
+    zero -- that is the 0/8/8 case the user named.
+    """
+    lo = [0 if s == int(gdn_stage) else 1 for s in range(int(n_stages))]
+    out: List[Tuple[int, ...]] = []
+
+    def rec(remaining: int, stage: int, acc: Tuple[int, ...]) -> None:
+        if stage == int(n_stages) - 1:
+            if remaining >= lo[stage]:
+                out.append(acc + (remaining,))
+            return
+        hi = remaining - sum(lo[stage + 1 :])
+        for take in range(lo[stage], hi + 1):
+            rec(remaining - take, stage + 1, acc + (take,))
+
+    rec(int(n_attn), 0, ())
+    return out
+
+
+@dataclasses.dataclass(frozen=True)
+class FamilyDepthCost:
+    """Per-stage prefill cost, split by layer FAMILY and carrying the depth axis.
+
+    ``linear_ms_per_layer[r]`` is one GDN layer's cost on stage ``r`` for one
+    full chunk, at any prefix depth. ``attn_ms_per_layer_at_ref[r]`` is one
+    full-attention layer's cost on the same stage for one full chunk at
+    ``ref_prefix_tokens``; at another depth it carries the factor
+    ``(d + C/2) / (d_ref + C/2)``.
+
+    WHY THAT FACTOR AND NOT ``d/d_ref``. At ``d = 0`` -- the first chunk of a
+    fresh prompt -- an attention layer still does work: the chunk attends over
+    itself, ``C^2/2`` pairs. A bare ``d`` ratio prices that first chunk at
+    zero and would rank a layout by a term it makes vanish. ``C/2`` is the
+    chunk's own mean self-prefix and is what keeps the model finite at the
+    shallow end. It is also the whole reason the DESIGN DEPTH has to be named:
+    the ratio between the two families moves by more than an order of
+    magnitude across the depth range this boot admits (4,096 to 262,144), so
+    "the optimal cut" is not a property of the hardware alone.
+    """
+
+    linear_ms_per_layer: Tuple[float, ...]
+    attn_ms_per_layer_at_ref: Tuple[float, ...]
+    chunk_tokens: int
+    ref_prefix_tokens: float
+
+    def depth_factor(self, prefix_tokens: float) -> float:
+        half = 0.5 * float(self.chunk_tokens)
+        return (float(prefix_tokens) + half) / (float(self.ref_prefix_tokens) + half)
+
+    def stage_ms(
+        self,
+        counts: Sequence[int],
+        attn_counts: Sequence[int],
+        prefix_tokens: float,
+    ) -> Tuple[float, ...]:
+        if not len(counts) == len(attn_counts) == len(self.linear_ms_per_layer):
+            raise ValueError(
+                f"counts {tuple(counts)}, attn {tuple(attn_counts)} and the "
+                f"{len(self.linear_ms_per_layer)}-stage cost model disagree on "
+                "the number of stages."
+            )
+        f = self.depth_factor(prefix_tokens)
+        out: List[float] = []
+        for r, (n, a) in enumerate(zip(counts, attn_counts)):
+            linear = int(n) - int(a)
+            if linear < 0:
+                raise ValueError(
+                    f"stage {r} holds {int(n)} layers of which {int(a)} are "
+                    "full attention; a stage cannot hold more attention layers "
+                    "than layers."
+                )
+            out.append(
+                linear * float(self.linear_ms_per_layer[r])
+                + int(a) * float(self.attn_ms_per_layer_at_ref[r]) * f
+            )
+        return tuple(out)
+
+
+def family_costs_from_measurement(
+    *,
+    measured_ms_per_layer: Sequence[float],
+    measured_counts: Sequence[int],
+    measured_attn_counts: Sequence[int],
+    chunk_tokens: int,
+    ref_prefix_tokens: float,
+    anchor_stage: int,
+    anchor_attn_ms_per_layer: float,
+    anchor_prefix_tokens: float,
+) -> Tuple[FamilyDepthCost, str]:
+    """Split the measured per-stage cost into the two families. Closed form.
+
+    THE UNDER-DETERMINATION, AND WHAT CLOSES IT. One measured cut gives ONE
+    number per stage -- its total ms for a chunk -- against TWO unknowns per
+    stage, a linear rate and an attention rate. Fitting both from one number is
+    the same family of arithmetic ``PrefillTiming`` refuses for the
+    slope/intercept pair, and for the same reason: every split reproduces the
+    calibration point exactly, so the measurement cannot choose between them.
+
+    What closes it is a SECOND measurement at a DIFFERENT DEPTH -- one
+    attention layer's cost per chunk at a deep prefix, on one named stage --
+    plus the one assumption stated as an assumption: the family COST RATIO at
+    a given depth is the same on every stage. That is a property of the model's
+    shape (how much work an attention layer is against a GDN layer), not of the
+    card, and both families scale with the card's own rate, which the per-stage
+    total already carries. With it the arithmetic is closed and exact:
+
+        A   = (d_anchor + C/2) / (d_ref + C/2)          the depth factor
+        r   = M * L / (T * A - M * N)                   ratio at d_ref
+        c_r = T_r / (linear_r + r * attn_r)             per-stage linear cost
+
+    where ``T``/``L``/``N`` are the anchor stage's measured chunk total, linear
+    count and attention count and ``M`` is the anchor. Both inputs are
+    reproduced by construction: at ``d_ref`` every stage's total is its
+    measurement, and on the anchor stage at ``d_anchor`` one attention layer
+    costs ``M``. Nothing is fitted.
+
+    A non-positive denominator means the anchor and the calibration cut cannot
+    both be true -- the deep attention cost alone would exceed the whole
+    measured chunk -- and it is REFUSED rather than clamped, because a clamp
+    would silently substitute a layout ranking for the one the numbers imply.
+    """
+    n_stages = len(measured_ms_per_layer)
+    if not n_stages == len(measured_counts) == len(measured_attn_counts):
+        raise ValueError(
+            "measured_ms_per_layer, measured_counts and measured_attn_counts "
+            "must describe the same number of stages."
+        )
+    if not 0 <= int(anchor_stage) < n_stages:
+        raise ValueError(f"anchor_stage {anchor_stage} is not one of {n_stages}.")
+    half = 0.5 * float(chunk_tokens)
+    A = (float(anchor_prefix_tokens) + half) / (float(ref_prefix_tokens) + half)
+    totals = tuple(
+        float(m) * int(n) for m, n in zip(measured_ms_per_layer, measured_counts)
+    )
+    s = int(anchor_stage)
+    N = int(measured_attn_counts[s])
+    L = int(measured_counts[s]) - N
+    T = totals[s]
+    M = float(anchor_attn_ms_per_layer)
+    if N <= 0 or L <= 0:
+        raise ValueError(
+            f"the anchor stage {s} holds {L} linear and {N} attention layers in "
+            "the calibration cut; the family split needs both families present "
+            "on it, because it is the stage the ratio is solved on."
+        )
+    denom = T * A - M * N
+    if denom <= 0.0:
+        raise ValueError(
+            f"family split refused: the anchor says one attention layer costs "
+            f"{M:.1f} ms per chunk at prefix {int(anchor_prefix_tokens)}, so "
+            f"stage {s}'s {N} attention layers alone would cost "
+            f"{M * N:.1f} ms there, while its whole measured chunk scaled to "
+            f"that depth is {T * A:.1f} ms. The two measurements cannot both "
+            "be true; refusing rather than clamping, because a clamp would "
+            "substitute a ranking for the one the numbers imply."
+        )
+    ratio = M * L / denom
+    if ratio <= 0.0:
+        raise ValueError(
+            f"family split refused: derived ratio {ratio} is not positive."
+        )
+    linear: List[float] = []
+    attn: List[float] = []
+    for r, (n, a) in enumerate(zip(measured_counts, measured_attn_counts)):
+        lin = int(n) - int(a)
+        d = lin + ratio * int(a)
+        if d <= 0.0:
+            raise ValueError(
+                f"stage {r} holds no layer in the calibration cut, so its "
+                "per-layer family costs cannot be derived from its total."
+            )
+        c = totals[r] / d
+        linear.append(c)
+        attn.append(c * ratio)
+    cost = FamilyDepthCost(
+        linear_ms_per_layer=tuple(linear),
+        attn_ms_per_layer_at_ref=tuple(attn),
+        chunk_tokens=int(chunk_tokens),
+        ref_prefix_tokens=float(ref_prefix_tokens),
+    )
+    provenance = (
+        "family split: attn/linear ratio %.4f at prefix %d, solved closed-form "
+        "from the calibration cut %s (attn %s, totals %s ms/chunk) and the deep "
+        "anchor %.1f ms per attention layer per chunk at prefix %d on stage %d "
+        "-> linear %s ms/layer, attn %s ms/layer at the reference depth"
+        % (
+            ratio,
+            int(ref_prefix_tokens),
+            ",".join(str(int(n)) for n in measured_counts),
+            ",".join(str(int(a)) for a in measured_attn_counts),
+            ",".join("%.1f" % t for t in totals),
+            M,
+            int(anchor_prefix_tokens),
+            s,
+            ",".join("%.2f" % c for c in linear),
+            ",".join("%.2f" % c for c in attn),
+        )
+    )
+    return cost, provenance
+
+
+@dataclasses.dataclass(frozen=True)
+class CrossingPrice:
+    """One chunk's stage crossings and what the measured link map charges."""
+
+    crossings: int
+    ms: float
+
+
+def crossing_price(
+    owned: Sequence[Sequence[int]],
+    num_layers: int,
+    per_pair_ms: Mapping[Tuple[int, int], float],
+) -> CrossingPrice:
+    """Price one chunk's ownership changes against the MEASURED per-peer map.
+
+    The schedule itself is not recomputed here: ``pp_crossing_schedule`` is the
+    executor's own answer to "where does a crossing fall", built and proved for
+    #753, and a second implementation in the planner would be exactly the
+    twin the upstream-minimal law forbids. This function converts its output
+    into milliseconds and refuses on any pair the measured map does not cover.
+    """
+    from sglang.srt.distributed.pp_crossing_schedule import crossing_schedule
+
+    schedule = crossing_schedule(
+        [frozenset(int(i) for i in s) for s in owned], int(num_layers)
+    )
+    missing = sorted({c.pair for c in schedule if c.pair not in per_pair_ms})
+    if missing:
+        raise UnpricedCrossing(
+            "crossing pair(s) %s carry no measured link price, so this map "
+            "cannot be ranked against the others. The measured table is keyed "
+            "by the edge's bottleneck lane count "
+            "(pp_crossing_transport.MEASURED_GBPS_BY_LANES); a lane count that "
+            "is not in it is deliberately absent rather than interpolated."
+            % (", ".join("%d->%d" % p for p in missing),)
+        )
+    return CrossingPrice(
+        crossings=len(schedule),
+        ms=float(sum(per_pair_ms[c.pair] for c in schedule)),
+    )
+
+
+def _stage_free_after_residency(
+    counts: Sequence[int],
+    attn_counts: Sequence[int],
+    model: PhasePoolModel,
+) -> Tuple[float, ...]:
+    """Free MiB per stage once weights, mamba state and the arming floor are out.
+
+    The one arithmetic ``stage_pp_capacities``, ``decoupled_phase_pool`` and
+    ``gapped_phase_pool`` all need. Extracted rather than written a third time:
+    the three differ in what they DIVIDE by, never in what they subtract, and
+    three copies of a subtraction are three places for the mamba term to be
+    forgotten in.
+    """
+    out: List[float] = []
+    for r, (n, a) in enumerate(zip(counts, attn_counts)):
+        linear = int(n) - int(a)
+        out.append(
+            float(model.free_mib[r])
+            - float(model.weight_mib_per_layer) * int(n)
+            - float(model.mamba_mib_per_linear_layer_per_slot)
+            * linear
+            * int(model.mamba_slots)
+            - float(model.arming_floor_mib[r])
+        )
+    return tuple(out)
+
+
+def gapped_phase_pool(
+    counts: Sequence[int],
+    attn_counts: Sequence[int],
+    model: PhasePoolModel,
+) -> float:
+    """PP-phase pool for a GAPPED map: the MIN over the stages that hold KV.
+
+    THE ONE DIFFERENCE FROM ``pp_phase_pool``, and why it is not a loosened
+    guard. ``stage_pp_capacities`` refuses a stage with zero full-attention
+    layers, and that refusal is RIGHT for a contiguous cut: there, a stage with
+    no attention layer is a degenerate boundary, its token capacity comes out
+    unbounded, and pricing it would rank a cut by a division that did not
+    happen. Under a gapped map it is the DESIGNED shape -- the user's 0/8/8 map
+    puts every full-attention layer on the two 3080s precisely so the 5090 can
+    hold the 48 GDN layers -- and such a stage genuinely holds no token-scaling
+    KV: ``HybridLinearKVPool``'s ``full_kv_pool`` is built with
+    ``layer_num = len(full_attention_layer_ids)``, which is zero there. Its
+    per-sequence mamba residency is already subtracted above; there is nothing
+    left for the token axis to bound.
+
+    So the MIN runs over the stages that actually hold attention layers, and a
+    map with none at all is refused -- that one has no KV pool anywhere and is
+    a checkpoint error, not a layout.
+    """
+    free = _stage_free_after_residency(counts, attn_counts, model)
+    caps: List[float] = []
+    for r, (f, a) in enumerate(zip(free, attn_counts)):
+        if f < 0.0:
+            raise ValueError(
+                f"gapped map {tuple(counts)} is infeasible on rank{r}: its "
+                f"{int(counts[r])} layers of weights, mamba state and arming "
+                f"floor exceed the {float(model.free_mib[r]):,.1f} MiB free by "
+                f"{-f:,.1f} MiB."
+            )
+        if int(a) <= 0:
+            continue
+        caps.append(f / (int(a) * float(model.kv_mib_per_token_per_attn_layer)))
+    if not caps:
+        raise ValueError(
+            f"gapped map {tuple(counts)} with attention counts "
+            f"{tuple(attn_counts)} places no full-attention layer on any "
+            "stage, so the run has no KV pool at all."
+        )
+    return min(caps)

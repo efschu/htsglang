@@ -53,7 +53,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import host_ledger
 
@@ -229,6 +229,45 @@ MEASURED_MS_PER_LAYER = "8.10,35.16,33.59"
 #: pp_cut.PhasePoolModel names the gap this stands in for: the per-layout
 #: solved floor exists only for a layout that has booted.
 ARMING_FLOOR_MIB = 1229.0
+
+#: #1240 -- the DEPTH axis of the cost model, and the two records that pin it.
+#:
+#: A full-attention layer's cost for one chunk grows with the prefix it
+#: attends over; a GDN layer's does not. One number per stage cannot carry
+#: that, so the family split is solved from TWO measurements at TWO depths
+#: (pp_cut.family_costs_from_measurement) and both are named here.
+#:
+#: CALIBRATION DEPTH. MEASURED_MS_PER_LAYER above was taken on boot bsscale,
+#: whose driver sends a ~12,000-token prompt at --chunked-prefill-size 4096,
+#: i.e. THREE full chunks (BSSCALE_0907.md: "A ~12 000-token prompt is 3
+#: chunks"). Those chunks enter at prefix 0, 4096 and 8192, so the mean prefix
+#: of the full chunks the ms/layer figures average over is 4096. Derived, not
+#: chosen: it is the arithmetic mean of the census the calibration ran on.
+CALIBRATION_PREFIX_TOKENS = 4096
+
+#: DEEP ANCHOR. The user's physics note of 2026-09-07 (recorded verbatim in
+#: the GAPPED block of WEG2_BUILD_DECISIONS_0906.md section 1r): at deep
+#: prefixes one full-attention layer costs a 3080 about 0.4 s per chunk at a
+#: 262,144-token prefix. That is the second depth the family split needs; it
+#: is what makes the optimum a FUNCTION of the design prefix rather than a
+#: constant, and it is cited to its record rather than written as a literal.
+ATTN_ANCHOR_MS = 400.0
+ATTN_ANCHOR_PREFIX_TOKENS = 262144
+
+#: DESIGN DEPTH FALLBACK. When no boot log carries a prefill census the design
+#: prefix is one chunk -- the shallowest depth the boot can actually run -- and
+#: the launcher PRINTS that it fell back, so a table read at 4096 is never
+#: mistaken for a table read at this rig's real mean prefix.
+DESIGN_PREFIX_FALLBACK_TOKENS = 4096
+
+#: #1240 decode defaults. MEASURED on boot weg2pp1 (arms table row D2 of
+#: /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md): overlap ON with
+#: --num-continuous-decode-steps 2 and the paired extra_buffer mamba strategy
+#: reads 75.5 tok/s at bs1 and 305.0 at bs6, against the D0 control's 66.2 /
+#: 284.9 -- +14.0 % / +7.1 %. Row D3 (steps 4) REGRESSES to 73.6 / 295.6, so
+#: 2 is an optimum and not a direction. The steps knob is the unconfounded
+#: half of that boot (D1 -> D2 -> D3 all run overlap ON and extra_buffer).
+D_NUM_CONTINUOUS_DECODE_STEPS = 2
 
 
 class Weg2LaunchRefused(RuntimeError):
@@ -1106,6 +1145,176 @@ def newest_bubble_log(evidence_dir: str) -> Optional[str]:
     return None
 
 
+#: The runtime's transport for an explicit per-stage layer SET. It is READ by
+#: the ranks and WRITTEN by exactly one thing: this launcher, from
+#: ``--pp-layer-set`` or from the solver's own chosen map. An INHERITED value
+#: is refused (W44), never honoured -- see :func:`refuse_inherited_layer_set`.
+PP_LAYER_SET_ENV = "SGLANG_PP_LAYER_SET"
+PP_CROSSING_WIRE_ENV = "SGLANG_PP_CROSSING_WIRE"
+
+_PREFILL_RE = re.compile(
+    r"\b(?P<rank>PP\d+)\] Prefill batch,.*?#new-token: (?P<new>\d+), "
+    r"#cached-token: (?P<cached>\d+)"
+)
+
+
+def refuse_inherited_layer_set(env: Mapping[str, str]) -> None:
+    """W44: a layer set inherited from the environment is REFUSED, never used.
+
+    ``build_env`` starts from ``os.environ``, so before this refusal an
+    exported ``SGLANG_PP_LAYER_SET`` reached group P's ranks without passing
+    through the launcher at all: the solver would rank and print one layout
+    while the boot ran another, and the PP-CUT provenance line would describe
+    a layout that never existed. That is the #505(a) silent-substitution class
+    with a whole stage map as the substituted object.
+
+    ONE KNOB, ONE READER (upstream-minimal). The flag ``--pp-layer-set`` is the
+    only way to configure the map, and the launcher is the only writer of the
+    variable. Not a twin of the env: its REPLACEMENT as the interface, with the
+    variable demoted to the wire that carries the decision to the ranks.
+    """
+    raw = str(env.get(PP_LAYER_SET_ENV, "") or "").strip()
+    if not raw:
+        return
+    raise Weg2LaunchRefused(
+        "W44 Weg2LayerSetEnvRefused: %s=%r is set in this launcher's own "
+        "environment. It is no longer an input: --pp-layer-set is, and the "
+        "launcher is the only writer of the variable (it carries the solved "
+        "or pinned map to group P's ranks). Honouring an inherited value "
+        "would let the boot run a stage map the PP-CUT provenance line does "
+        "not describe. Unset it and pass --pp-layer-set %s instead."
+        % (PP_LAYER_SET_ENV, raw, raw)
+    )
+
+
+def read_mean_prefill_prefix(path: str) -> Optional[Tuple[float, int, str]]:
+    """Mean PREFIX DEPTH over one boot's prefill census. ``(mean, n, rank)``.
+
+    THE PREFIX IS ACCUMULATED, NOT READ. No line states it: a ``Prefill batch``
+    line carries ``#new-token`` (this chunk) and ``#cached-token`` (the
+    prefix-cache hit), never "how much of this request is already computed".
+    But group P admits ONE chunked request per pass, so a request is a maximal
+    run of consecutive lines on one rank and the prefix at chunk *j* is the sum
+    of ``#new-token`` over chunks *0..j-1* plus that run's cache hit. A chunk
+    SHORTER than the run's own maximum ends the request -- the last chunk of a
+    prompt, or the zero-remainder 1-token end anchor -- and the accumulator
+    resets.
+
+    ONE RANK ONLY, and it is named in the answer: every stage prints the same
+    batch, so summing across ranks would triple the denominator without adding
+    a single measurement.
+
+    ``None`` when the file does not exist or carries no census -- absence of
+    the instrument, never a measured zero (#892).
+    """
+    rows: Dict[str, List[Tuple[int, int]]] = {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                m = _PREFILL_RE.search(line)
+                if m is None:
+                    continue
+                rows.setdefault(m.group("rank"), []).append(
+                    (int(m.group("new")), int(m.group("cached")))
+                )
+    except OSError:
+        return None
+    if not rows:
+        return None
+    rank = sorted(rows)[0]
+    seq = rows[rank]
+    full = max(n for n, _ in seq)
+    prefixes: List[int] = []
+    acc = 0
+    for new, cached in seq:
+        prefixes.append(acc + cached)
+        if new < full:
+            acc = 0
+        else:
+            acc += new
+    return (sum(prefixes) / float(len(prefixes)), len(prefixes), rank)
+
+
+def newest_prefill_census_log(evidence_dir: str) -> Optional[str]:
+    """Newest ``*.P.log`` that actually CARRIES a prefill census.
+
+    Same rule and the same reason as :func:`newest_bubble_log`: a boot that
+    died before its first prefill has no census, and reading its silence as
+    "mean prefix 0" would derive the design depth from a file rather than from
+    a measurement.
+    """
+    try:
+        names = [n for n in os.listdir(evidence_dir) if n.endswith(".P.log")]
+    except OSError:
+        return None
+    for path in sorted(
+        (os.path.join(evidence_dir, n) for n in names),
+        key=lambda p: os.path.getmtime(p),
+        reverse=True,
+    ):
+        if read_mean_prefill_prefix(path) is not None:
+            return path
+    return None
+
+
+def pcie_lanes(cards: Sequence[Card]) -> List[Optional[int]]:
+    """Current PCIe link width per CUDA ordinal, from NVML. ``None`` if unknown.
+
+    The measured link table this rig owns
+    (``pp_crossing_transport.MEASURED_GBPS_BY_LANES``) is keyed by an edge's
+    BOTTLENECK lane count, so the lane width is the join key -- read here per
+    card rather than assumed, because "GPU0 is the x4 slot" is a fact about
+    today's NVML enumeration and this launcher already refuses to hardcode
+    that kind of fact (``order_cards``).
+    """
+    out: List[Optional[int]] = []
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return [None for _ in cards]
+    try:
+        for c in cards:
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(int(c.nvml_index))
+                out.append(int(pynvml.nvmlDeviceGetCurrPcieLinkWidth(h)))
+            except Exception:
+                out.append(None)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    return out
+
+
+def per_pair_crossing_ms(
+    lanes: Sequence[Optional[int]], payload_bytes: int
+) -> Dict[Tuple[int, int], float]:
+    """``{(src_stage, dst_stage): ms}`` for one crossing of ``payload_bytes``.
+
+    Priced from the MEASURED point-to-point table, at the edge's bottleneck
+    lane count -- ``min`` of the two cards' widths, which is what "bottleneck"
+    means and what those numbers were measured at. A pair whose lane count has
+    no measured entry is OMITTED, never interpolated: ``pp_cut.crossing_price``
+    then refuses to rank the candidates that use it, and an unrankable
+    candidate is reported rather than priced at a guess.
+    """
+    from sglang.srt.distributed.pp_crossing_transport import MEASURED_GBPS_BY_LANES
+
+    out: Dict[Tuple[int, int], float] = {}
+    for a in range(len(lanes)):
+        for b in range(len(lanes)):
+            if a == b or lanes[a] is None or lanes[b] is None:
+                continue
+            gbps = MEASURED_GBPS_BY_LANES.get(min(int(lanes[a]), int(lanes[b])))
+            if gbps is None:
+                continue
+            out[(a, b)] = float(payload_bytes) / (float(gbps) * 1e9) * 1e3
+    return out
+
+
 def chunked_prefill_size_of(argv: Sequence[str]) -> int:
     """The chunk this launcher's own argv states, read back off it.
 
@@ -1140,6 +1349,11 @@ class DepthDecision:
     price_mib: Tuple[float, ...]
     act_mib_per_pass: float
     chunk_tokens: int
+    #: True when the chosen layout is a GAPPED layer set. The depth is then 0
+    #: BY THE LAYOUT, not lowered: a gapped map admits exactly one pass in
+    #: flight, and that is the number the PP-CUT solver already priced the
+    #: candidate at. Printed so the 0 is read as a derivation, not a default.
+    gapped_layout: bool = False
 
     def line(self) -> str:
         """THE one line. Format is load-bearing: a reader greps ``P-DEPTH solver:``."""
@@ -1168,6 +1382,16 @@ class DepthDecision:
             shares = "bubble_share=%.3f forward_share=%.3f" % (
                 m.bubble_share,
                 m.forward_share,
+            )
+        if self.gapped_layout:
+            src = (
+                "the chosen layout is a GAPPED layer set, which admits exactly "
+                "ONE pass in flight (scheduler_pp_mixin.init_pp_loop_state "
+                "refuses the pair: under a gapped set each stage's next layer "
+                "is another's previous one, so every stage must be inside the "
+                "same forward). The depth is 0 BY THE LAYOUT -- the same one "
+                "pass the PP-CUT solver priced that candidate at, which is why "
+                "it is a derivation and not a lowered hand number. " + src
             )
         return (
             "WEG2 P-DEPTH solver:%s %s depth=%d price_rows=%d/stage "
@@ -1284,17 +1508,29 @@ def solve_p_depth(
         depth = int(pinned_depth)
         passes = depth + 1
 
-    if depth > 0 and gapped_layer_set:
+    gapped_layout = bool(gapped_layer_set)
+    if depth > 0 and gapped_layout and not pinned:
+        # DERIVED, not lowered. The bubble measurement asks for more passes,
+        # the layout admits one, and the PP-CUT solver already RANKED this
+        # candidate at one pass (CutCandidate: a gapped map's stages do not
+        # overlap, so its makespan was the SUM). Taking the depth the layout
+        # admits is therefore consistent with the number that chose it; the
+        # line says so rather than printing a bare 0.
+        depth, passes = 0, 1
+    if depth > 0 and gapped_layout:
         raise Weg2LaunchRefused(
-            "W43 Weg2DepthGapped: SGLANG_PP_LAYER_SET=%r puts group P on a "
-            "GAPPED layer set, and a derived --pp-async-batch-depth %d would "
+            "W43 Weg2DepthGapped: the layer set %r puts group P on a "
+            "GAPPED layer set, and the PINNED --pp-async-batch-depth %d would "
             "die at scheduler_pp_mixin.init_pp_loop_state, which refuses the "
             "pair outright: under a gapped set every stage must be inside the "
             "SAME forward, because each stage's next layer is another's "
             "previous one, and async depth lets a rank enter the next forward "
             "while a peer is still in the last one's output exchange. Refused "
             "here so the launcher says it, rather than three ranks discovering "
-            "it after the weights are loaded." % (gapped_layer_set, depth)
+            "it after the weights are loaded. A DERIVED depth is taken down to "
+            "0 by the layout instead (the solver priced this candidate at one "
+            "pass); an OVERRIDE is refused, because an override the boot cannot "
+            "run is not a tuning choice." % (gapped_layer_set, depth)
         )
 
     price_rows = depth * int(chunk_tokens)
@@ -1353,6 +1589,7 @@ def solve_p_depth(
         price_mib=price_mib,
         act_mib_per_pass=act_mib_per_pass,
         chunk_tokens=int(chunk_tokens),
+        gapped_layout=gapped_layout,
     )
 
 
@@ -1380,9 +1617,22 @@ class PCutFacts:
     kv_mib_per_token_per_attn_layer: float
     hidden_size: int
     cap_tokens: int
+    #: The solver's chosen ownership map in ``--pp-layer-set`` syntax, and
+    #: whether it is GAPPED. Empty string = a contiguous cut, which needs no
+    #: map at all: the count form expresses it and every path below stays
+    #: byte-identical to what it was.
+    layer_set: str = ""
+    gapped: bool = False
 
 
-def solve_p_cut(ns, cards: List[Card], budgets_p: List[int], model: str, log) -> PCutFacts:
+def solve_p_cut(
+    ns,
+    cards: List[Card],
+    budgets_p: List[int],
+    model: str,
+    log,
+    chunk_tokens: int = 4096,
+) -> PCutFacts:
     """Group P's layer + attention cut, and the ONE provenance line for it.
 
     Returns the flag strings plus the pool facts the depth solver prices
@@ -1445,10 +1695,90 @@ def solve_p_cut(ns, cards: List[Card], budgets_p: List[int], model: str, log) ->
         for k in kinds
     )
     incumbent = _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else _csv_ints("32,18,14")
+
+    # -- THE DEPTH AXIS (#1240) ------------------------------------------
+    # The design prefix is a MEASUREMENT of this rig's own traffic when one
+    # exists, and a printed fallback when it does not. It is not cosmetic: the
+    # attention/linear cost ratio moves by more than an order of magnitude
+    # between 4,096 and 262,144 tokens of prefix, so "the optimal cut" is a
+    # function of it and a table without it stated is a table about nothing.
+    design_src = ns.pp_cut_design_prefix_from or newest_prefill_census_log(EVIDENCE_DIR)
+    census = read_mean_prefill_prefix(design_src) if design_src else None
+    if ns.pp_cut_design_prefix_tokens is not None:
+        design_prefix = int(ns.pp_cut_design_prefix_tokens)
+        design_prov = "PINNED by --pp-cut-design-prefix-tokens"
+    elif census is not None:
+        design_prefix = int(round(census[0]))
+        design_prov = (
+            "MEASURED mean prefix over %d prefill-batch chunks of %s (rank %s, "
+            "one rank only: every stage prints the same batch)"
+            % (census[1], design_src, census[2])
+        )
+    else:
+        design_prefix = int(DESIGN_PREFIX_FALLBACK_TOKENS)
+        design_prov = (
+            "FALLBACK: no P log in %s carries a prefill census, so the design "
+            "prefix is one chunk -- the shallowest depth this boot can run. "
+            "This is an absence of the instrument, not a measured shallow rig."
+            % EVIDENCE_DIR
+        )
+
+    measured_attn = _pp_cut.attention_counts(families, incumbent)
+    anchor_stage = next(
+        (i for i, c in enumerate(cards) if "5090" not in c.name), len(cards) - 1
+    )
+    family_cost, family_prov = _pp_cut.family_costs_from_measurement(
+        measured_ms_per_layer=ms,
+        measured_counts=incumbent,
+        measured_attn_counts=measured_attn,
+        chunk_tokens=int(chunk_tokens),
+        ref_prefix_tokens=float(ns.pp_cut_calibration_prefix_tokens),
+        anchor_stage=anchor_stage,
+        anchor_attn_ms_per_layer=float(ns.pp_cut_attn_anchor_ms),
+        anchor_prefix_tokens=float(ns.pp_cut_attn_anchor_prefix_tokens),
+    )
+    # THE CROSSING FRAME is the same object the depth price already charges:
+    # one PPProxyTensors hidden-states frame, [chunk, hidden] in the model
+    # dtype. Derived here from the same three numbers rather than restated.
+    payload_bytes = int(chunk_tokens) * int(text_cfg["hidden_size"]) * 2
+    lanes = pcie_lanes(cards)
+    pair_ms = per_pair_crossing_ms(lanes, payload_bytes)
+    log(
+        "PP-CUT depth axis: design_prefix=%d tokens (%s); calibration prefix "
+        "%d (%s); %s"
+        % (
+            design_prefix,
+            design_prov,
+            int(ns.pp_cut_calibration_prefix_tokens),
+            "boot bsscale, ~12k prompt = 3 full chunks at 4096 -> mean 4096, "
+            "BSSCALE_0907.md",
+            family_prov,
+        )
+    )
+    log(
+        "PP-CUT crossing prices: PCIe lanes per ordinal %s, frame %.1f MiB "
+        "(chunk %d x hidden %d x 2 B), measured pair ms %s (pairs absent from "
+        "the measured lane table are OMITTED, and every candidate using one is "
+        "reported UNPRICED rather than ranked at a guess)"
+        % (
+            lanes,
+            payload_bytes / _pp_cut.MIB,
+            int(chunk_tokens),
+            int(text_cfg["hidden_size"]),
+            ", ".join(
+                "%d->%d %.2f" % (a, b, v) for (a, b), v in sorted(pair_ms.items())
+            )
+            or "NONE",
+        )
+    )
     decision = _cut.solve_launch_cut(
         layer_families=families,
         incumbent_layers=incumbent,
         measured_ms_per_layer=ms,
+        family_cost=family_cost,
+        design_prefix_tokens=design_prefix,
+        per_pair_crossing_ms=pair_ms,
+        pinned_layer_set=ns.pp_layer_set or None,
         measured_provenance=(
             "MEASURED per-layer ms %s (boot bsscale, BSSCALE_0907.md tip "
             "37c884b0b0: PP0 259.1 ms/32 layers, PP1 632.9/18, PP2 470.2/14, "
@@ -1471,6 +1801,51 @@ def solve_p_cut(ns, cards: List[Card], budgets_p: List[int], model: str, log) ->
         f"(0.0 = UNFUNDED, pool is an UPPER bound)"
     )
     log(decision.provenance_line())
+    for row in decision.table_lines():
+        log(row)
+    if decision.chosen.kind == "gapped":
+        # A GAPPED map is not expressible as --pp-stage-ratio and does not go
+        # through derive_pp_layer_split at all: it is published as the layer
+        # SET and executed by the #753 mid-loop crossing wire. The round trip
+        # below is therefore skipped by KIND, not by accident -- and the map is
+        # instead round-tripped through the runtime's OWN parser, which is the
+        # matching authority for this form.
+        from sglang.srt.distributed.utils import parse_pp_layer_sets
+
+        back = parse_pp_layer_sets(
+            decision.chosen.layer_set, n_layers, len(budgets_p), allow_gapped=True
+        )
+        realized_counts = tuple(len(x) for x in back)
+        if realized_counts != decision.chosen.layers:
+            raise Weg2LaunchRefused(
+                "W40 Weg2PPCutRefused: the gapped map this launcher solved "
+                "(%s) does not survive parse_pp_layer_sets -- it comes back as "
+                "%s layers per stage. Refusing rather than booting a layout the "
+                "provenance line misdescribes."
+                % (decision.chosen.layer_set, realized_counts)
+            )
+        log(
+            "PP-CUT round trip: parse_pp_layer_sets(%s) = %s layers per stage, "
+            "attn %s, %d crossings per chunk -- the --pp-layer-set argv states "
+            "what the boot will run."
+            % (
+                decision.chosen.layer_set,
+                realized_counts,
+                ",".join(str(a) for a in decision.chosen.attn),
+                decision.chosen.crossings,
+            )
+        )
+        return PCutFacts(
+            stage_ratio=",".join(str(n) for n in decision.chosen.layers),
+            attn_stage_ratio=",".join(str(a) for a in decision.chosen.attn),
+            pool_tokens=float(decision.chosen.pool_tokens),
+            attn_counts=tuple(int(a) for a in decision.chosen.attn),
+            kv_mib_per_token_per_attn_layer=float(kv_mib),
+            hidden_size=int(text_cfg["hidden_size"]),
+            cap_tokens=int(ns.max_kv_per_request),
+            layer_set=decision.chosen.layer_set,
+            gapped=True,
+        )
     # ROUND TRIP AGAINST THE RUNTIME AUTHORITY, not against our own model.
     # --pp-stage-ratio entries are SCORES: server_args hands them to
     # derive_pp_layer_split, which SNAPS the boundary into the window that
@@ -1600,6 +1975,61 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "= depth 0, i.e. today's behaviour, and the line says so.",
     )
     ap.add_argument(
+        "--pp-layer-set", default=None,
+        help="OVERRIDE the solved stage map with an explicit per-stage LAYER "
+             "SET, e.g. '0-2,4-6,...,60-62;3,7,...,31;35,...,63' (stages "
+             "separated by ';'). THE ONLY WAY to configure the map: an "
+             "inherited SGLANG_PP_LAYER_SET in the launcher's environment is "
+             "refused by name (W44), never honoured, because the launcher is "
+             "the only writer of that variable and the solver's provenance "
+             "line must describe the layout the boot actually runs. Unset = "
+             "the solver enumerates gapped maps alongside contiguous cuts and "
+             "publishes its own choice. Passing it is announced as PINNED and "
+             "priced on the same axes.",
+    )
+    ap.add_argument(
+        "--pp-cut-design-prefix-tokens", type=int, default=None,
+        help="OVERRIDE the prefix depth the layout is optimised FOR. Unset = "
+             "DERIVED from the newest P log carrying a prefill census (the "
+             "mean of the accumulated per-chunk prefix on one rank); no census "
+             f"anywhere = {DESIGN_PREFIX_FALLBACK_TOKENS}, and the line says "
+             "FALLBACK. It matters because a full-attention layer's cost per "
+             "chunk grows with the prefix while a GDN layer's does not, so the "
+             "optimal placement of the 16 attention layers is a FUNCTION of "
+             "this number, not a constant.",
+    )
+    ap.add_argument(
+        "--pp-cut-design-prefix-from", default="",
+        help="Path of the P log whose prefill census feeds "
+             f"--pp-cut-design-prefix-tokens. Unset = the newest log in "
+             f"{EVIDENCE_DIR} that actually carries the census (a log without "
+             "it is skipped, never read as a measured prefix of 0).",
+    )
+    ap.add_argument(
+        "--pp-cut-calibration-prefix-tokens", type=float,
+        default=float(CALIBRATION_PREFIX_TOKENS),
+        help=f"The prefix depth --pp-cut-measured-ms-per-layer was MEASURED at. "
+             f"Default {CALIBRATION_PREFIX_TOKENS} is DERIVED: boot bsscale "
+             f"drove a ~12,000-token prompt at chunk 4096, i.e. three full "
+             f"chunks entering at prefix 0/4096/8192, whose mean is 4096 "
+             f"(BSSCALE_0907.md). Half of the two-depth family split.",
+    )
+    ap.add_argument(
+        "--pp-cut-attn-anchor-ms", type=float, default=ATTN_ANCHOR_MS,
+        help=f"MEASURED cost of ONE full-attention layer per chunk at the deep "
+             f"anchor prefix, ms. Default {ATTN_ANCHOR_MS} is the user's "
+             f"physics note of 2026-09-07, recorded in the GAPPED block of "
+             f"WEG2_BUILD_DECISIONS_0906.md section 1r. The other half of the "
+             f"two-depth split: one measurement cannot separate a stage's "
+             f"attention cost from its GDN cost, two at different depths can.",
+    )
+    ap.add_argument(
+        "--pp-cut-attn-anchor-prefix-tokens", type=float,
+        default=float(ATTN_ANCHOR_PREFIX_TOKENS),
+        help=f"The prefix the deep anchor was measured at. Default "
+             f"{ATTN_ANCHOR_PREFIX_TOKENS} = --context-length.",
+    )
+    ap.add_argument(
         "--pp-cut-mamba-mib-per-linear-layer-per-slot", type=float, default=0.0,
         help="Device GDN state per linear layer per sequence slot, MiB. "
              "Default 0.0 = UNFUNDED, and the direction is named rather than "
@@ -1610,10 +2040,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     # -- group D: the decode knobs ---------------------------------------
     ap.add_argument(
-        "--num-continuous-decode-steps", type=int, default=1,
-        help="Group D only. Decode steps run per scheduler visit "
-             "(server_args.py:1424). Default 1 = the shipped value; the "
-             "value that pays is MEASURED in the boot, not chosen here.",
+        "--num-continuous-decode-steps", type=int,
+        default=D_NUM_CONTINUOUS_DECODE_STEPS,
+        help=f"Group D only. Decode steps run per scheduler visit "
+             f"(server_args.py:1424). Default "
+             f"{D_NUM_CONTINUOUS_DECODE_STEPS} is MEASURED, not chosen: arms "
+             f"table row D2 of /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md "
+             f"reads 75.5 tok/s at bs1 and 305.0 at bs6 against the D0 "
+             f"control's 66.2 / 284.9 (+14.0 % / +7.1 %), and row D3 shows 4 "
+             f"REGRESSES to 73.6 / 295.6. Pass 1 to restore the shipped value.",
     )
     ap.add_argument(
         "--d-disable-overlap-schedule", action="store_true",
@@ -1638,6 +2073,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns = ap.parse_args(argv)
     if ns.teardown:
         return teardown(ns.teardown)
+    # BEFORE build_env(), which starts from os.environ: an inherited stage map
+    # would reach group P's ranks without passing through the solver at all.
+    refuse_inherited_layer_set(os.environ)
 
     tree = os.path.abspath(ns.tree)
     tip = subprocess.run(["git", "-C", tree, "rev-parse", "--short=10", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -1731,8 +2169,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
-    cut = solve_p_cut(ns, cards, budgets_p, ns.model, log)
+    chunk_tokens = chunked_prefill_size_of(
+        common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, ns.p_hicache_write_policy)
+    )
+    cut = solve_p_cut(ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens)
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
+    # #1240 THE LAUNCHER IS THE ONLY WRITER. The solved (or pinned) map is
+    # published here, into the environment group P will actually get -- the
+    # flag is the interface, the variable is the wire. A GAPPED map also arms
+    # the #753 mid-loop crossing wire, because that is the executor: without
+    # it a stage runs its own layers back to back and silently skips its
+    # peer's, and get_pp_layer_set refuses a gapped set with the wire off.
+    if cut.layer_set:
+        env_p[PP_LAYER_SET_ENV] = cut.layer_set
+        if cut.gapped:
+            env_p[PP_CROSSING_WIRE_ENV] = "1"
+        log(
+            "WEG2 LAYER-SET published for group P: %s=%s%s (source: %s). The "
+            "#753 mid-loop crossing wire is the executor; nothing is "
+            "duplicated here."
+            % (
+                PP_LAYER_SET_ENV,
+                cut.layer_set,
+                " " + PP_CROSSING_WIRE_ENV + "=1" if cut.gapped else "",
+                "--pp-layer-set (PINNED)" if ns.pp_layer_set else "the solver",
+            )
+        )
     # #692 MICROBATCH DEPTH. The share is READ from a previous boot's own
     # PP-BUBBLE line, never written here: an operator-supplied path wins, else
     # the newest log in EVIDENCE_DIR that actually carries the instrument, else
@@ -1754,14 +2216,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         attn_counts=cut.attn_counts,
         kv_mib_per_token_per_attn_layer=cut.kv_mib_per_token_per_attn_layer,
         hidden_size=cut.hidden_size,
-        chunk_tokens=chunked_prefill_size_of(
-            common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, ns.p_hicache_write_policy)
-        ),
+        chunk_tokens=chunk_tokens,
         cap_tokens=cut.cap_tokens,
-        # build_env() starts from os.environ, so an exported gapped layer set
-        # would reach group P without ever passing through this launcher's
-        # flags. Read it from the environment P will actually get.
-        gapped_layer_set=env_p.get("SGLANG_PP_LAYER_SET", ""),
+        # Read from the environment group P will actually get -- which since
+        # #1240 this launcher is the only writer of (W44 refuses an inherited
+        # one), so it is the solver's own decision arriving here rather than
+        # an operator's export sneaking past the flags.
+        gapped_layer_set=env_p.get(PP_LAYER_SET_ENV, "") if cut.gapped else "",
         pinned_depth=ns.p_microbatch_depth,
     )
     log(depth_decision.line())
@@ -1783,8 +2244,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "hybrid-mamba resolution picks extra_buffer for "
             "Qwen3_5ForConditionalGeneration on linear_attn_backend=triton). "
             f"--num-continuous-decode-steps {ns.num_continuous_decode_steps} "
-            "on D (1 = the shipped value; the value that pays is measured in "
-            "the boot). " + d_overlap_cost_line(ns.model, False)
+            f"on D (default {D_NUM_CONTINUOUS_DECODE_STEPS} is MEASURED, cited "
+            f"to /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md arms table row "
+            f"D2: 75.5 tok/s bs1 and 305.0 bs6 against the D0 control's 66.2 / "
+            f"284.9 = +14.0 % / +7.1 %, with row D3 showing steps 4 regresses "
+            f"to 73.6 / 295.6 -- an optimum, not a direction). "
+            + d_overlap_cost_line(ns.model, False)
         )
     if ns.p_hicache_write_policy != "write_through":
         log(
