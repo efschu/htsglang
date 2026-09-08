@@ -17,10 +17,12 @@ import math
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import pytest
 
 try:
+    from sglang.srt.weg2 import launcher as launcher_mod
     from sglang.srt.weg2.launcher import (
         BubbleMeasurement,
         DepthDecision,
@@ -301,6 +303,40 @@ class TestTheRefusals(unittest.TestCase):
         m = read_pp_bubble(write_log(REAL_LINES))
         with self.assertRaises(Weg2LaunchRefused):
             depth(measured=m, pool_tokens=float(CAP) + 10.0, pinned_depth=1)
+
+    def test_W42_on_a_PIN_names_the_pin_and_not_the_measurement(self):
+        """FOLLOW FIX 2 / finding 2: the only reachable W42 today is a PIN.
+
+        With the #692 derivation retracted a DERIVED depth is always 0, so this
+        refusal can only fire for an override. Attributing the pin to "the
+        measured bubble", printing that measurement's stall_share beside it,
+        and closing with "a depth the bubble did not ask for is a hand number"
+        was three sentences describing a mechanism that did not act.
+        """
+        m = read_pp_bubble(write_log(REAL_LINES))
+        with self.assertRaises(Weg2LaunchRefused) as ctx:
+            depth(measured=m, pool_tokens=float(CAP) + 10.0, pinned_depth=3)
+        msg = str(ctx.exception)
+        self.assertIn("--p-microbatch-depth 3 was PINNED", msg)
+        self.assertNotIn("the measured bubble asks for", msg)
+        self.assertNotIn("a depth the bubble did not ask for", msg)
+        # The derivation is still named -- it is what the pin overrode.
+        self.assertIn("the measurement derived", msg)
+
+    def test_W42_on_a_DERIVED_depth_is_reachable_and_says_the_bubble_asked(self):
+        """The other branch is not dead text: it is live the day #692 re-grounds.
+
+        Proved by flipping the one constant that gates the retraction, rather
+        than by asserting a string nothing can print.
+        """
+        m = read_pp_bubble(write_log(REAL_LINES))
+        with mock.patch.object(launcher_mod, "DEPTH_DERIVATION_GROUNDED", True):
+            with self.assertRaises(Weg2LaunchRefused) as ctx:
+                depth(measured=m, pool_tokens=float(CAP) + 10.0)
+        msg = str(ctx.exception)
+        self.assertIn("the measured bubble asks for", msg)
+        self.assertIn("a depth the bubble did not ask for", msg)
+        self.assertNotIn("was PINNED", msg)
 
     def test_W43_when_a_PINNED_depth_meets_a_gapped_layer_set(self):
         """init_pp_loop_state raises on gapped + depth>0; say so BEFORE the boot.

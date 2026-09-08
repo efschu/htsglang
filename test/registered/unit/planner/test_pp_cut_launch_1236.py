@@ -112,7 +112,11 @@ class TestMakespanMovesLayersUntilThePoolBinds(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("W40", message)
         self.assertIn("5000 tokens", message)  # the cap, printed
-        self.assertIn("best-pool cut", message)
+        # "SERVABLE" since FOLLOW FIX 2 / finding 3: the row is the best pool
+        # among the layouts that can actually be RUN, and a priced-but-
+        # excluded gapped map holding more is now named beside it rather than
+        # dropped.
+        self.assertIn("best servable cut", message)
         self.assertIn("short by", message)
 
     def test_both_objectives_are_printed(self):

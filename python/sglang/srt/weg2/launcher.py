@@ -1411,11 +1411,26 @@ class DepthDecision:
     #: flight, and that is the number the PP-CUT solver already priced the
     #: candidate at. Printed so the 0 is read as a derivation, not a default.
     gapped_layout: bool = False
+    #: WHICH rule lowered the shipped depth below the derivation, recorded at
+    #: the point it acts rather than inferred afterwards from the numbers:
+    #: ``""`` (none acted -- the derivation shipped, or there was nothing to
+    #: lower), ``"retraction"`` (the #692 derivation is not re-grounded) or
+    #: ``"layout"`` (a gapped map admits exactly one pass). The two rules are
+    #: branches of ONE ``elif`` in :func:`solve_p_depth`, so at most one can
+    #: act, and :meth:`line` prints exactly one cause for a 0. Inferring it
+    #: from ``derived_depth > depth`` cannot tell them apart, which is how the
+    #: line came to print both.
+    lowered_by: str = ""
 
     @property
     def retracted(self) -> bool:
-        """True when the arithmetic asked for a depth and measurement said no."""
-        return (not self.pinned) and int(self.derived_depth) > int(self.depth)
+        """True when the RETRACTION is the rule that lowered the depth."""
+        return self.lowered_by == "retraction"
+
+    @property
+    def lowered_by_layout(self) -> bool:
+        """True when the GAPPED LAYOUT is the rule that lowered the depth."""
+        return self.lowered_by == "layout"
 
     def line(self) -> str:
         """THE one line. Format is load-bearing: a reader greps ``P-DEPTH solver:``."""
@@ -1457,7 +1472,7 @@ class DepthDecision:
                 "wins and is still priced. " % (self.derived_depth, DEPTH_RETRACTION_RECORD)
                 + src
             )
-        if self.gapped_layout:
+        if self.lowered_by_layout:
             src = (
                 "the chosen layout is a GAPPED layer set, which admits exactly "
                 "ONE pass in flight (scheduler_pp_mixin.init_pp_loop_state "
@@ -1466,6 +1481,16 @@ class DepthDecision:
                 "same forward). The depth is 0 BY THE LAYOUT -- the same one "
                 "pass the PP-CUT solver priced that candidate at, which is why "
                 "it is a derivation and not a lowered hand number. " + src
+            )
+        elif self.gapped_layout:
+            # The bound is real and worth printing, but it did NOT act: the
+            # depth was already at or below one pass. Saying "BY THE LAYOUT"
+            # here would name a rule that never ran, which is the same
+            # instrument-text defect as printing two causes for one 0.
+            src = (
+                "the chosen layout is a GAPPED layer set, which admits exactly "
+                "ONE pass in flight; the depth was already 0, so the layout "
+                "bound did not have to lower anything. " + src
             )
         return (
             "WEG2 P-DEPTH solver:%s%s %s depth=%d price_rows=%d/stage "
@@ -1586,17 +1611,15 @@ def solve_p_depth(
         depth = int(pinned_depth)
         passes = depth + 1
 
-    if depth > 0 and not pinned and not DEPTH_DERIVATION_GROUNDED:
-        # RETRACTED BY MEASUREMENT, not lowered by taste. The arithmetic above
-        # is unchanged and is printed; what does not ship is its OUTPUT, because
-        # BOOT_weg2pp2_0907.md measured this knob against this workload and it
-        # lost on every column that has a floor (see DEPTH_DERIVATION_GROUNDED).
-        # A derivation whose premise the metal refuted is not a default, and
-        # keeping it would be a hand number wearing a derivation just as much as
-        # silently lowering one would be.
-        depth, passes = 0, 1
-
     gapped_layout = bool(gapped_layer_set)
+    # ONE ZERO, ONE CAUSE. Both rules below produce depth 0, so they are
+    # branches of one ``elif`` and the acting one is RECORDED: a reader
+    # grepping ``P-DEPTH solver:`` for why the depth is 0 gets the rule that
+    # ran, not two candidate explanations. The LAYOUT is tested first because
+    # it is the structural bound -- a gapped map cannot run more than one pass
+    # whatever the measurement later says -- while the retraction is a verdict
+    # on the derivation that a re-grounded #692 will lift.
+    lowered_by = ""
     if depth > 0 and gapped_layout and not pinned:
         # DERIVED, not lowered. The bubble measurement asks for more passes,
         # the layout admits one, and the PP-CUT solver already RANKED this
@@ -1605,6 +1628,20 @@ def solve_p_depth(
         # admits is therefore consistent with the number that chose it; the
         # line says so rather than printing a bare 0.
         depth, passes = 0, 1
+        lowered_by = "layout"
+    elif depth > 0 and not pinned and not DEPTH_DERIVATION_GROUNDED:
+        # RETRACTED BY MEASUREMENT, not lowered by taste. The arithmetic above
+        # is unchanged and is printed; what does not ship is its OUTPUT, because
+        # BOOT_weg2pp2_0907.md measured this knob against this workload and it
+        # lost on every column that has a floor (see DEPTH_DERIVATION_GROUNDED).
+        # A derivation whose premise the metal refuted is not a default, and
+        # keeping it would be a hand number wearing a derivation just as much as
+        # silently lowering one would be.
+        depth, passes = 0, 1
+        lowered_by = "retraction"
+
+    # Only a PIN can still be non-zero against a gapped map: the derived path
+    # was taken to 0 by the branch above.
     if depth > 0 and gapped_layout:
         raise Weg2LaunchRefused(
             "W43 Weg2DepthGapped: the layer set %r puts group P on a "
@@ -1640,20 +1677,51 @@ def solve_p_depth(
     pool_after = float(pool_tokens) - price_tokens
 
     if depth > 0 and pool_after < float(cap_tokens):
+        # WHO ASKED FOR THIS DEPTH decides the first and last sentence. While
+        # DEPTH_DERIVATION_GROUNDED is False a derived depth is always 0, so
+        # the only depth that can reach this floor today is a PIN -- and
+        # opening with "the measured bubble asks for" then attributed the
+        # operator's own override to a measurement, printed that measurement's
+        # stall_share as if it had produced the number, and closed with a
+        # sentence ("a depth the bubble did not ask for is a hand number")
+        # that refutes itself on exactly this path. Both branches below are
+        # live: the derived one the day #692 re-grounds.
+        if pinned:
+            asked = (
+                "--p-microbatch-depth %d was PINNED (the measurement derived "
+                "%d), and %d passes in flight do not fit group P's pool"
+                % (depth, derived_depth, passes)
+            )
+            closing = (
+                "The pin is NOT quietly lowered to what fits: an override "
+                "that silently becomes another number is a hand number "
+                "wearing a pin. Re-pin the depth the pool can hold (0 is a "
+                "pin), or fund this one."
+            )
+        else:
+            asked = (
+                "the measured bubble asks for --pp-async-batch-depth %d (%d "
+                "passes in flight at stall_share %.3f), but group P's pool "
+                "cannot fund it"
+                % (
+                    depth,
+                    passes,
+                    0.0 if measured is None else measured.stall_share,
+                )
+            )
+            closing = (
+                "The depth is NOT quietly lowered to what fits: a depth the "
+                "bubble did not ask for is a hand number. Pin depth 0 to "
+                "accept today's behaviour."
+            )
         raise Weg2LaunchRefused(
-            "W42 Weg2DepthUnfunded: the measured bubble asks for "
-            "--pp-async-batch-depth %d (%d passes in flight at stall_share "
-            "%.3f), but group P's pool cannot fund it. Pool is %d tokens, one "
-            "extra pass costs %d KV rows plus a %.1f MiB crossing frame per "
-            "stage = %d pool tokens at the worst-converting stage, leaving %d "
-            "against the %d-token floor (--max-kv-per-request) -- short by %d. "
-            "Raise the per-rank budgets, lower --max-kv-per-request, or accept "
-            "depth 0 by pinning it. The depth is NOT quietly lowered: a depth "
-            "the bubble did not ask for is a hand number."
+            "W42 Weg2DepthUnfunded: %s. Pool is %d tokens, one extra pass "
+            "costs %d KV rows plus a %.1f MiB crossing frame per stage = %d "
+            "pool tokens at the worst-converting stage, leaving %d against the "
+            "%d-token floor (--max-kv-per-request) -- short by %d. Raise the "
+            "per-rank budgets or lower --max-kv-per-request. %s"
             % (
-                depth,
-                passes,
-                0.0 if measured is None else measured.stall_share,
+                asked,
                 int(pool_tokens),
                 int(chunk_tokens),
                 act_mib_per_pass,
@@ -1661,6 +1729,7 @@ def solve_p_depth(
                 int(pool_after),
                 int(cap_tokens),
                 int(float(cap_tokens) - pool_after),
+                closing,
             )
         )
 
@@ -1679,6 +1748,7 @@ def solve_p_depth(
         act_mib_per_pass=act_mib_per_pass,
         chunk_tokens=int(chunk_tokens),
         gapped_layout=gapped_layout,
+        lowered_by=lowered_by,
     )
 
 
@@ -1987,7 +2057,17 @@ def solve_p_cut(
     )
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """THE parser, built apart from :func:`main` so the desk can render it.
+
+    ``argparse`` evaluates every ``help=`` string as ``help % params`` when it
+    formats it, so one bare ``%`` in one flag's help makes ``--help`` raise for
+    ALL of them. That is not a cosmetic failure: the boot record cites group
+    D's measured default as readable "verbatim from its own help path", and a
+    channel that cannot be opened is not provenance. Splitting the build out is
+    what lets a unit test call ``format_help()`` once per commit instead of an
+    operator discovering it in a terminal.
+    """
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tree", required=True)
     ap.add_argument("--tag", required=True)
@@ -2146,7 +2226,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              f"{D_NUM_CONTINUOUS_DECODE_STEPS} is MEASURED, not chosen: arms "
              f"table row D2 of /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md "
              f"reads 75.5 tok/s at bs1 and 305.0 at bs6 against the D0 "
-             f"control's 66.2 / 284.9 (+14.0 % / +7.1 %), and row D3 shows 4 "
+             f"control's 66.2 / 284.9 (+14.0 %% / +7.1 %%), and row D3 shows 4 "
              f"REGRESSES to 73.6 / 295.6. Pass 1 to restore the shipped value.",
     )
     ap.add_argument(
@@ -2169,7 +2249,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "ring slice, not here.",
     )
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
-    ns = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ns = build_parser().parse_args(argv)
     if ns.teardown:
         return teardown(ns.teardown)
     # BEFORE build_env(), which starts from os.environ: an inherited stage map

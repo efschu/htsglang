@@ -574,31 +574,21 @@ def solve_launch_cut(
     # The kv-floor row is the OTHER objective, so it has to be a layout that
     # could actually be run: a pool on an unservable map is not available.
     kv_floor = max(choosable, key=lambda c: c.pool_tokens)
-    feasible = [c for c in choosable if c.pool_tokens >= float(cap_tokens)]
-    if not feasible:
-        raise PPCutRefused(
-            "W40 Weg2PPCutRefused: no cut holds one full-context prompt. The "
-            "pool floor is %d tokens (--max-kv-per-request); the best-pool cut "
-            "is layers=%s attn=%s at %d tokens (makespan %.1f ms), short by %d. "
-            "Lower --max-kv-per-request, raise the per-rank budgets, or fund "
-            "the unpriced terms named in the cost line: %s"
-            % (
-                int(cap_tokens),
-                ",".join(str(n) for n in kv_floor.layers),
-                ",".join(str(a) for a in kv_floor.attn),
-                int(kv_floor.pool_tokens),
-                kv_floor.makespan_ms,
-                int(cap_tokens) - int(kv_floor.pool_tokens),
-                cost_provenance,
-            )
-        )
     # THE OBJECTIVE IS THE SUM of the two time columns. Ranking on makespan
     # alone would hand a gapped map the crossings for free -- 31 per chunk at
     # a 40 MiB frame is not a rounding term -- and ranking on crossings alone
     # would pick the layout that moves the fewest bytes and computes slowest.
     candidates.sort(key=lambda c: (c.total_ms, -c.pool_tokens))
-    chosen = min(feasible, key=lambda c: (c.total_ms, -c.pool_tokens))
 
+    # THE PINNED PATHS ARE PRICED BEFORE THE SOLVED FIELD IS JUDGED (FOLLOW
+    # FIX 2 / finding 3). A pin decides the layout, so the SOLVED field's
+    # feasibility is not the operator's question and must not preempt the
+    # pin's own refusal: with the floor above every servable candidate, a
+    # pinned map that HOLDS the prompt used to be answered with "no cut holds
+    # one full-context prompt", which is false about the layout that was
+    # actually asked for -- and it hid both the gate that refuses it and the
+    # pinned map's own pool. Each pinned branch still refuses on the same
+    # floor, through ``_refuse_below_pool_floor``; only the ORDER changed.
     if pinned_layer_set:
         # A PINNED MAP wins the same way a pinned cut does: announced, and
         # priced on every axis the solved one was, never by skipping the
@@ -698,6 +688,59 @@ def solve_launch_cut(
             cost_provenance,
         )
         chosen = priced
+    else:
+        feasible = [c for c in choosable if c.pool_tokens >= float(cap_tokens)]
+        if not feasible:
+            # THE POOL QUESTION IS ANSWERED ON THE REFUSAL, NOT ONLY ON
+            # SUCCESS. ``table_lines()`` is reached only when a cut is chosen,
+            # so this raise is the operator's whole view of the field -- and
+            # the case it fires in is exactly the one the gapped family exists
+            # for: the servable (contiguous) maps are too small for the
+            # context, and a priced gapped map holds it. Dropping ``unpriced``
+            # here discarded the gate's own sentence on the one path where it
+            # is the answer.
+            held = [
+                c
+                for c in candidates
+                if c not in choosable and c.pool_tokens >= float(cap_tokens)
+            ]
+            if held:
+                best_held = max(held, key=lambda c: c.pool_tokens)
+                trade = (
+                    " A %s map DOES hold it -- layers=%s attn=%s at %d tokens "
+                    "(makespan %.1f ms, %d crossings) -- and it is EXCLUDED "
+                    "from the choice, not outranked."
+                    % (
+                        best_held.kind,
+                        ",".join(str(n) for n in best_held.layers),
+                        ",".join(str(a) for a in best_held.attn),
+                        int(best_held.pool_tokens),
+                        best_held.makespan_ms,
+                        best_held.crossings,
+                    )
+                )
+            else:
+                trade = ""
+            raise PPCutRefused(
+                "W40 Weg2PPCutRefused: no SERVABLE cut holds one full-context "
+                "prompt. The pool floor is %d tokens (--max-kv-per-request); "
+                "the best servable cut is layers=%s attn=%s at %d tokens "
+                "(makespan %.1f ms), short by %d.%s Lower "
+                "--max-kv-per-request, raise the per-rank budgets, or fund the "
+                "unpriced terms named in the cost line: %s%s"
+                % (
+                    int(cap_tokens),
+                    ",".join(str(n) for n in kv_floor.layers),
+                    ",".join(str(a) for a in kv_floor.attn),
+                    int(kv_floor.pool_tokens),
+                    kv_floor.makespan_ms,
+                    int(cap_tokens) - int(kv_floor.pool_tokens),
+                    trade,
+                    cost_provenance,
+                    (" -- " + "; ".join(unpriced)) if unpriced else "",
+                )
+            )
+        chosen = min(feasible, key=lambda c: (c.total_ms, -c.pool_tokens))
 
     return CutDecision(
         chosen=chosen,

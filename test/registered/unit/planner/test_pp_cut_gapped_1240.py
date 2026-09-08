@@ -684,7 +684,107 @@ class ThePoolFloorBindsEveryPath(unittest.TestCase):
     def test_the_solved_path_still_refuses_the_same_way(self):
         with self.assertRaises(PPCutRefused) as ctx:
             self.decision(cap=10_000_000)
-        self.assertIn("no cut holds one full-context prompt", str(ctx.exception))
+        self.assertIn(
+            "no SERVABLE cut holds one full-context prompt", str(ctx.exception)
+        )
+
+
+class TheFloorRefusalStillNamesTheGappedTrade(unittest.TestCase):
+    """FOLLOW FIX 2 / finding 3: the pool question is answered ON the refusal.
+
+    The user's stated situation is exactly this shape -- the contiguous field
+    is too small for the context they are heading to (370k measured, YaRN 1M
+    later) and a gapped map holds it. On this fixture the best servable
+    (contiguous) pool is 991,232 tokens and the best gapped pool is 1,034,240,
+    so a floor BETWEEN them is the case where the gapped price is the answer
+    and the refusal used to discard it.
+    """
+
+    #: Between the two maxima above. Not a round number by taste: it is the
+    #: only band in which the two families disagree about feasibility.
+    BETWEEN = 1_012_736
+
+    def decision(self, cap, **over):
+        kwargs = dict(
+            layer_families=FAMILIES,
+            incumbent_layers=INCUMBENT,
+            measured_ms_per_layer=MS_PER_LAYER,
+            measured_provenance="synthetic",
+            card_names=CARDS,
+            pool_model=pool_model(),
+            cap_tokens=cap,
+            family_cost=family_cost(),
+            design_prefix_tokens=4096,
+            per_pair_crossing_ms=PAIR_MS,
+        )
+        kwargs.update(over)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(PP_GAPPED_KNOWN_WRONG_ENV, None)
+            return solve_launch_cut(**kwargs)
+
+    def test_the_band_is_the_one_the_two_families_disagree_on(self):
+        """The fixture's own arithmetic, so the constant cannot drift silently."""
+        decision = self.decision(cap=100_000)
+        pools = {"contiguous": 0.0, "gapped": 0.0}
+        for cand in decision.ranked:
+            pools[cand.kind] = max(pools[cand.kind], cand.pool_tokens)
+        self.assertLess(pools["contiguous"], float(self.BETWEEN))
+        self.assertGreaterEqual(pools["gapped"], float(self.BETWEEN))
+
+    def test_the_refusal_names_the_gapped_pool_and_the_gate_that_excluded_it(self):
+        with self.assertRaises(PPCutRefused) as ctx:
+            self.decision(cap=self.BETWEEN)
+        msg = str(ctx.exception)
+        self.assertIn("W40", msg)
+        self.assertIn("991232", msg)
+        # The trade the slice exists to expose: a priced map DOES hold it, and
+        # it is excluded rather than outranked -- with the excluding predicate
+        # named, so the operator knows what unblocks it.
+        self.assertIn("1034240", msg)
+        self.assertIn("_refuse_known_wrong_gapped_forward", msg)
+        self.assertIn(PP_GAPPED_KNOWN_WRONG_ENV, msg)
+
+    def test_a_pinned_gapped_map_over_the_floor_is_refused_BY_THE_GATE(self):
+        """The pin must not be preempted by the solved field's feasibility.
+
+        The pinned map holds the prompt; telling its operator "no SERVABLE cut
+        holds one full-context prompt" is false about the layout they asked for.
+        """
+        pinned = layer_set_flag(gapped_layer_sets(FAMILIES, 0, (4, 6, 6)))
+        with self.assertRaises(PPCutRefused) as ctx:
+            self.decision(cap=self.BETWEEN, pinned_layer_set=pinned)
+        msg = str(ctx.exception)
+        self.assertIn("--pp-layer-set", msg)
+        self.assertIn("_refuse_known_wrong_gapped_forward", msg)
+        self.assertNotIn("no SERVABLE cut holds one full-context prompt", msg)
+
+    def test_a_pinned_gapped_map_over_the_floor_is_TAKEN_with_the_gate_open(self):
+        pinned = layer_set_flag(gapped_layer_sets(FAMILIES, 0, (4, 6, 6)))
+        with mock.patch.dict(os.environ, {PP_GAPPED_KNOWN_WRONG_ENV: "1"}):
+            decision = solve_launch_cut(
+                layer_families=FAMILIES,
+                incumbent_layers=INCUMBENT,
+                measured_ms_per_layer=MS_PER_LAYER,
+                measured_provenance="synthetic",
+                card_names=CARDS,
+                pool_model=pool_model(),
+                cap_tokens=self.BETWEEN,
+                family_cost=family_cost(),
+                design_prefix_tokens=4096,
+                per_pair_crossing_ms=PAIR_MS,
+                pinned_layer_set=pinned,
+            )
+        self.assertTrue(decision.pinned)
+        self.assertEqual(decision.chosen.kind, "gapped")
+        self.assertGreaterEqual(decision.chosen.pool_tokens, float(self.BETWEEN))
+
+    def test_a_pinned_contiguous_cut_under_a_floor_nothing_clears_still_refuses(self):
+        """The pin is priced on its own axis -- it is not excused by the field."""
+        with self.assertRaises(PPCutRefused) as ctx:
+            self.decision(cap=self.BETWEEN, pinned_layers=(42, 11, 11))
+        msg = str(ctx.exception)
+        self.assertIn("the pinned layer cut 42,11,11", msg)
+        self.assertIn("598016", msg)
 
 
 if __name__ == "__main__":

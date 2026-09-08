@@ -35,6 +35,7 @@ try:
         Weg2LaunchRefused,
         argv_d,
         argv_p,
+        build_parser,
         newest_prefill_census_log,
         pcie_lanes,
         per_pair_crossing_ms,
@@ -188,12 +189,19 @@ class TheDepthFollowsTheLayout(unittest.TestCase):
         kwargs.update(over)
         return solve_p_depth(**kwargs)
 
-    def test_a_gapped_layout_takes_the_depth_the_layout_admits(self):
+    def test_a_gapped_layout_states_the_bound_without_claiming_it_acted(self):
+        """FOLLOW FIX 2 / finding 4: no measurement, so the layout lowered nothing.
+
+        The bound is real and is printed -- a gapped map admits one pass -- but
+        the depth here is 0 because there is no bubble measurement to derive
+        from, and saying "BY THE LAYOUT" would name a rule that did not run.
+        """
         d = self.depth(gapped_layer_set="0-2,4-6;3;7")
         self.assertEqual(d.depth, 0)
         self.assertTrue(d.gapped_layout)
+        self.assertEqual(d.lowered_by, "")
         self.assertIn("GAPPED layer set", d.line())
-        self.assertIn("BY THE LAYOUT", d.line())
+        self.assertNotIn("BY THE LAYOUT", d.line())
 
     def test_a_measured_bubble_asking_for_depth_is_taken_down_by_the_layout(self):
         # The bubble says two passes; the gapped layout admits one. That is a
@@ -220,7 +228,33 @@ class TheDepthFollowsTheLayout(unittest.TestCase):
         self.assertEqual(gapped.depth, 0)
         self.assertEqual(gapped.passes_in_flight, 1)
         self.assertTrue(gapped.gapped_layout)
+        # The ACTING RULE, not the presence of a string: the assertion has to
+        # go red when the branch body is emptied, which the string form did not
+        # (FOLLOW FIX 2 / finding 4 -- mutating the body to `pass` left the
+        # whole slice green because the clause printed unconditionally).
+        self.assertEqual(gapped.lowered_by, "layout")
+        self.assertEqual(contiguous.lowered_by, "retraction")
         self.assertIn("BY THE LAYOUT", gapped.line())
+
+    def test_exactly_one_lowering_clause_is_printed_for_one_zero(self):
+        """Two causes for one 0 is the Klasse-A instrument-text defect."""
+        measured = BubbleMeasurement(
+            source="synthetic",
+            rank=0,
+            windows=1,
+            forward_ms=600.0,
+            bubble_ms=400.0,
+            starved_ms=0.0,
+            n_forwards=10,
+        )
+        for over in ({}, {"gapped_layer_set": "0-2,4-6;3;7"}):
+            line = self.depth(measured=measured, **over).line()
+            clauses = ("RETRACTED", "BY THE LAYOUT")
+            self.assertEqual(
+                sum(1 for c in clauses if c in line),
+                1,
+                "one 0 must have exactly one named cause: %s" % line,
+            )
 
     def test_a_pinned_depth_on_a_gapped_layout_is_refused_W43(self):
         with self.assertRaises(Weg2LaunchRefused) as ctx:
@@ -425,6 +459,36 @@ class TheDerivedDepthIsRetractedByMeasurement(unittest.TestCase):
         self.assertEqual(d.depth, 0)
         self.assertTrue(d.pinned)
         self.assertNotIn("RETRACTED", d.line())
+
+
+class TheHelpTextIsPrintable(unittest.TestCase):
+    """FOLLOW FIX 2 / finding 1: argparse renders every help string as a format.
+
+    ``argparse`` always evaluates ``help % params``, so a bare ``%`` anywhere in
+    a help string makes ``--help`` raise for EVERY flag, not just that one. The
+    boot record cites the group-D default as read "verbatim from its own help
+    path"; a channel that cannot be opened is not provenance.
+    """
+
+    def test_the_whole_help_renders(self):
+        build_parser().format_help()
+
+    def test_every_action_renders_on_its_own(self):
+        # Named per flag, so the next bare `%` reports WHICH string, rather
+        # than one opaque ValueError for the whole parser.
+        parser = build_parser()
+        formatter = parser._get_formatter()
+        for action in parser._actions:
+            if not action.help:
+                continue
+            with self.subTest(option=action.option_strings or action.dest):
+                formatter._expand_help(action)
+
+    def test_the_measured_decode_default_is_readable_from_the_help(self):
+        # The exact provenance the boot record points an operator at.
+        text = build_parser().format_help()
+        self.assertIn("--num-continuous-decode-steps", text)
+        self.assertIn("BOOT_weg2pp1_0907.md", text)
 
 
 if __name__ == "__main__":
