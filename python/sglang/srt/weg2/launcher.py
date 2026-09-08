@@ -1421,6 +1421,11 @@ class DepthDecision:
     #: from ``derived_depth > depth`` cannot tell them apart, which is how the
     #: line came to print both.
     lowered_by: str = ""
+    #: What ONE extra pass costs in pool tokens at the worst-converting stage.
+    #: :attr:`price_tokens` is ``depth * price_tokens_per_pass``; the two are
+    #: kept apart so no sentence can price "one extra pass" with the total
+    #: (fix 3, review finding 2: the W42 text did exactly that at depth 2).
+    price_tokens_per_pass: float = 0.0
 
     @property
     def retracted(self) -> bool:
@@ -1492,13 +1497,29 @@ class DepthDecision:
                 "ONE pass in flight; the depth was already 0, so the layout "
                 "bound did not have to lower anything. " + src
             )
+        # The bracket names TWO pass counts and says which one ships. The
+        # shipped count is depth+1 by definition; the derived count is the
+        # formula's output and ships only when no rule lowered it (fix 3,
+        # review finding 1: printing the formula label over the shipped
+        # value read "ceil(1/(1-stall_share))=1" on a retracted depth whose
+        # formula gave 2).
+        if self.measured is None:
+            derived = "derived passes=n/a (no measurement)"
+        else:
+            derived = "derived passes=ceil(1/(1-stall_share))=%d" % (
+                self.derived_depth + 1
+            )
+            if self.lowered_by:
+                derived += " (NOT shipped: %s)" % self.lowered_by
+            elif self.pinned and self.depth != self.derived_depth:
+                derived += " (NOT shipped: pin overrides)"
         return (
             "WEG2 P-DEPTH solver:%s%s %s depth=%d price_rows=%d/stage "
             "price_mib=%s MiB/stage pool_after=%d (constraint pool >= %d) "
-            "[passes_in_flight=ceil(1/(1-stall_share))=%d, the flag is that "
-            "minus the pass being forwarded; one extra pass costs %d KV rows "
-            "plus a %.1f MiB crossing frame per stage, charged as %d pool "
-            "tokens at the stage that converts worst; %s]"
+            "[passes_in_flight (shipped)=%d = depth+1; %s; each extra pass "
+            "costs %d KV rows plus a %.1f MiB crossing frame per stage = %d "
+            "pool tokens at the stage that converts worst, %d in total for "
+            "depth %d; %s]"
             % (
                 " PINNED (user override)" if self.pinned else "",
                 " RETRACTED (derived %d, shipped %d)" % (self.derived_depth, self.depth)
@@ -1511,9 +1532,12 @@ class DepthDecision:
                 int(self.pool_after),
                 int(self.cap_tokens),
                 self.passes_in_flight,
+                derived,
                 self.chunk_tokens,
                 self.act_mib_per_pass,
+                int(self.price_tokens_per_pass),
                 int(self.price_tokens),
+                self.depth,
                 src,
             )
         )
@@ -1666,14 +1690,10 @@ def solve_p_depth(
     # layers: a token costs it less MiB, so the same MiB of crossing frame
     # costs it MORE tokens. The pool is a MIN over stages, so that stage is
     # the one that binds it.
-    price_tokens = (
-        max(
-            depth * (float(chunk_tokens) + act_mib_per_pass / k)
-            for k in kv_mib_per_token
-        )
-        if depth > 0
-        else 0.0
+    price_tokens_per_pass = max(
+        float(chunk_tokens) + act_mib_per_pass / k for k in kv_mib_per_token
     )
+    price_tokens = depth * price_tokens_per_pass if depth > 0 else 0.0
     pool_after = float(pool_tokens) - price_tokens
 
     if depth > 0 and pool_after < float(cap_tokens):
@@ -1715,16 +1735,19 @@ def solve_p_depth(
                 "accept today's behaviour."
             )
         raise Weg2LaunchRefused(
-            "W42 Weg2DepthUnfunded: %s. Pool is %d tokens, one extra pass "
+            "W42 Weg2DepthUnfunded: %s. Pool is %d tokens; EACH extra pass "
             "costs %d KV rows plus a %.1f MiB crossing frame per stage = %d "
-            "pool tokens at the worst-converting stage, leaving %d against the "
-            "%d-token floor (--max-kv-per-request) -- short by %d. Raise the "
-            "per-rank budgets or lower --max-kv-per-request. %s"
+            "pool tokens at the worst-converting stage, so depth %d costs %d "
+            "in total, leaving %d against the %d-token floor "
+            "(--max-kv-per-request) -- short by %d. Raise the per-rank "
+            "budgets or lower --max-kv-per-request. %s"
             % (
                 asked,
                 int(pool_tokens),
                 int(chunk_tokens),
                 act_mib_per_pass,
+                int(price_tokens_per_pass),
+                depth,
                 int(price_tokens),
                 int(pool_after),
                 int(cap_tokens),
@@ -1749,6 +1772,7 @@ def solve_p_depth(
         chunk_tokens=int(chunk_tokens),
         gapped_layout=gapped_layout,
         lowered_by=lowered_by,
+        price_tokens_per_pass=price_tokens_per_pass,
     )
 
 

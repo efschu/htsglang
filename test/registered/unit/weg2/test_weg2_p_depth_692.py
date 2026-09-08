@@ -371,6 +371,78 @@ class TestTheRefusals(unittest.TestCase):
         )
 
 
+class TestFix3TheLineAndTheRefusalPriceWhatShips(unittest.TestCase):
+    """FOLLOW FIX 3 (review findings 1+2 on 558ad4bb6b).
+
+    Finding 1: the bracket printed the formula label over the SHIPPED pass
+    count, so a retracted depth read ``ceil(1/(1-stall_share))=1`` while the
+    formula gave 2. Finding 2: the W42 sentence priced "one extra pass" with
+    the TOTAL for every pass. Both are instrument-text-lies of class A.
+    """
+
+    def test_the_line_names_shipped_and_derived_passes_separately(self):
+        m = read_pp_bubble(write_log(REAL_LINES))
+        d = depth(measured=m)
+        self.assertTrue(d.retracted)
+        line = d.line()
+        self.assertIn("passes_in_flight (shipped)=1 = depth+1", line)
+        self.assertIn(
+            "derived passes=ceil(1/(1-stall_share))=%d (NOT shipped: retraction)"
+            % (d.derived_depth + 1),
+            line,
+        )
+        # The old form must be gone: a formula label over the shipped value.
+        self.assertNotIn("passes_in_flight=ceil", line)
+
+    def test_a_pin_that_ships_the_derived_depth_prints_no_not_shipped(self):
+        m = read_pp_bubble(write_log(REAL_LINES))
+        d = depth(measured=m, pinned_depth=1)
+        self.assertEqual(d.depth, d.derived_depth)
+        self.assertNotIn("NOT shipped", d.line())
+        self.assertIn("passes_in_flight (shipped)=2 = depth+1", d.line())
+
+    def test_a_pin_above_the_derivation_says_the_pin_overrides(self):
+        m = read_pp_bubble(write_log(REAL_LINES))
+        d = depth(measured=m, pool_tokens=1.0e9, pinned_depth=3)
+        self.assertIn("(NOT shipped: pin overrides)", d.line())
+        self.assertIn("passes_in_flight (shipped)=4 = depth+1", d.line())
+
+    def test_no_measurement_prints_no_formula(self):
+        line = depth(measured=None).line()
+        self.assertIn("derived passes=n/a (no measurement)", line)
+        self.assertNotIn("ceil(", line)
+
+    def test_the_price_is_per_pass_times_depth(self):
+        m = read_pp_bubble(write_log(REAL_LINES))
+        one = depth(measured=m, pool_tokens=1.0e9, pinned_depth=1)
+        two = depth(measured=m, pool_tokens=1.0e9, pinned_depth=2)
+        self.assertAlmostEqual(one.price_tokens, one.price_tokens_per_pass, places=3)
+        self.assertAlmostEqual(two.price_tokens, 2 * two.price_tokens_per_pass, places=3)
+        self.assertAlmostEqual(one.price_tokens_per_pass, two.price_tokens_per_pass, places=3)
+        self.assertEqual(depth(measured=m).price_tokens, 0.0)
+
+    def test_the_line_prints_per_pass_and_total(self):
+        m = read_pp_bubble(write_log(REAL_LINES))
+        d = depth(measured=m, pool_tokens=1.0e9, pinned_depth=2)
+        line = d.line()
+        self.assertIn(
+            "= %d pool tokens at the stage that converts worst, %d in total for depth 2"
+            % (int(d.price_tokens_per_pass), int(d.price_tokens)),
+            line,
+        )
+
+    def test_W42_prices_each_pass_and_the_total_separately(self):
+        m = read_pp_bubble(write_log(REAL_LINES))
+        per_pass = depth(measured=m, pool_tokens=1.0e9, pinned_depth=1).price_tokens
+        with self.assertRaises(Weg2LaunchRefused) as ctx:
+            depth(measured=m, pool_tokens=float(CAP) + per_pass + 10.0, pinned_depth=2)
+        msg = str(ctx.exception)
+        self.assertIn("EACH extra pass", msg)
+        self.assertIn("= %d pool tokens at the worst-converting stage" % int(per_pass), msg)
+        self.assertIn("depth 2 costs %d in total" % int(2 * per_pass), msg)
+        self.assertNotIn("one extra pass", msg)
+
+
 class TestThePin(unittest.TestCase):
     """An override replaces the DERIVATION, never the price."""
 
