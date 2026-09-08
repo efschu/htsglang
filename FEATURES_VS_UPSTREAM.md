@@ -1417,6 +1417,23 @@ staging. llama.cpp/ik_llama.cpp have no equivalent.
 
 ---
 
+### 30. Draft KV across the Weg-2 flip (#1233)
+
+`--speculative-draft-kv-only` on the Weg-2 prefill group (PP=3): the checkpoint's own MTP
+head runs on the last attention stage as a draft-KV **producer** (no proposal, no verify),
+its draft KV is persisted in a **geometry-neutral canonical draft page** (2048 B/token,
+written whole under tp 1, cut on read by head extents under tp 3, one key for both groups)
+and the decode group's prefetch reads the draft pages beside the KV pages and the GDN blob,
+deciding full / trim (at most one HiCache chunk of re-prefill) / cold-by-name from the
+presence probe. **Built** (T1-T16 hermetic, red at 7e3a9150b4), boot items open
+(`docs/dev/NOTE_1233_draft_kv_across_the_flip.md`). Branch `weg2/draftkv-0907`.
+
+**Upstream:** sglang refuses speculative decoding under pipeline parallelism and persists
+draft KV, when it does at all, per rank; neither vLLM nor llama.cpp/ik_llama.cpp share a
+draft KV across a prefill/decode layout change.
+
+---
+
 ## Scope note
 
 This matrix lists only capabilities with landed code. Planned or partially prototyped items — a

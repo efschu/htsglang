@@ -70,12 +70,33 @@ DUPLEX_PROBE_DEFAULT = f"{GPU_ARB}/weg2/PROBE_RING_0907.md"
 DEADMAN = f"{GPU_ARB}/devtools/boot_deadman.sh"
 MEMTS = f"{GPU_ARB}/devtools/mem_timeseries.sh"
 HOST_PREFLIGHT = f"{GPU_ARB}/devtools/host_ledger_preflight.sh"
-PRESENCE_DIR = "/dev/shm/sglang-phase-flip-presence"
+SHM_DIR = "/dev/shm"
+PRESENCE_DIR = f"{SHM_DIR}/sglang-phase-flip-presence"
 STORE_MOUNT = "/spinning/hicache-weg2-ram"
 #: C18: where the per-card host-ring files live under the MAP_SHARED form.  A
 #: tmpfs, because the granules must be shared PAGES (both co-located rank
 #: processes map the same file), not a disk-backed file.
 HOST_RING_DIR = "/dev/shm/weg2-hostring"
+SHM_ARCHIVE_ROOT = f"{GPU_ARB}/shm_residue"
+#: #1233 fix 8, boot weg2dk7: the /dev/shm NAME FAMILIES THIS LINE'S OWN CODE
+#: CREATES, each traced to the file that writes it.  A name outside this tuple
+#: is FOREIGN and is never touched, whatever it looks like -- /dev/shm on this
+#: box carries hundreds of `sem.mp-*` files belonging to other people's Python
+#: processes, and a sweep that guessed would eat them.
+#:
+#: WHY THE SWEEP EXISTS: weg2dk7 measured 3.23 GiB of host RAM held by
+#: `/dev/shm/hicache-weg2-fix973`, the page store of a boot that had been dead
+#: for ~16 h (BOOT_weg2fix973_0907.md, whose own teardown line claims the
+#: directory was removed).  Nothing mapped it, and every host reading of that
+#: boot -- the ledger's `memory.current`, the shmem attribution, the corridor
+#: -- counted it as occupied.  The #1217 check saw none of it: it looked only
+#: inside the presence directory.
+SHM_OWN_PREFIXES = (
+    "sglang-phase-flip-presence",   # managers/phase_flip_presence.py, #1217
+    "hicache-weg2-",                # the canonical page store when it is put on /dev/shm
+    ".weg2-pcie-serialize-",        # model_loader/hibernate.py:504
+    "sglang_loads_",                # managers/load_snapshot.py:285
+)
 #: The corridor law is 819-1229 MiB NVML-free per card under the awake
 #: group's load.  MEASURED 2026-09-07 boot weg2onebackup2 with this constant
 #: at 1024: the 5090's continuous minimum under group D was 620-684 MiB
@@ -209,6 +230,79 @@ D_OVERSHOOT_MIB = [489, 0, 0]
 D_WINDOWS_MIB = 16 + 32 + 24
 P_WINDOWS_MIB = 24 + 96
 MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
+#: #1233 draft KV across the flip (spec section 6, Q17): group P's token
+#: capacity is EXPLICIT, never left to the profiler, because the last stage
+#: now carries the MTP head (405.2 MiB) plus a resident INT8 embed_tokens
+#: (1213.0 MiB) = 1618.2 MiB RESIDENT, and a draft device pool at
+#: target-token parity (2048 B/token beside the 8192 B/token target cell).
+#: Measured weg2zr2 on the last stage: KV pool 5584.4 MiB (714,788 tokens),
+#: NVML free minimum 1450 MiB. Target: idle NVML free at the corridor TOP
+#: (1229 MiB) so the draft-extend transient lands inside 819-1229:
+#:   pool_new = 1450 + 5584.4 - 1618.2 - 1229 = 4187 MiB
+#:   T_P      = 4187 x 2^20 / (8192 + 2048) = 428,769 -> 428,000 (uniform over
+#:              the stages; demand bound 8 x 27,466 = 219,728, 1.95x slack).
+#: BOOT weg2dk2 (35bdc9e310, 2026-09-07 18:22:15, PP2 log): the MTP head's
+#: "Load weight end" delta was 3.90 GB = 3994 MiB -- 2376 MiB more than the
+#: resident post. That figure is the BUILD, not the residue: it holds the
+#: head's OWN never-loaded lm_head, a bf16 [248320 x 5120] table (2426 MiB;
+#: "lm_head" is in the checkpoint's quantization ignore list, so it is not
+#: int8), which `Qwen3_5ForCausalLMMTP.__init__` materialises on the scope's
+#: single-rank is_last_rank and which the producer drops when it shares the
+#: target's head (405.2 + 1213.0 + 2426.0 = 4044, 50 MiB from the reading).
+#: No second embedding is budgeted: `load_resident_embedding` loads INTO the
+#: built int8 tensors. The W11 gate below refuses the boot when the measured
+#: residue exceeds this budget by more than the tolerance, so the corridor
+#: claim of this derivation is checked at readiness, never assumed.
+#: BOOT weg2dk3 (bc31554f90, PP2 log :260) measured `resident_mib=3998.0`
+#: against this line and W11 refused. TWO defects, both fixed in fix 3, and
+#: the budget stands unchanged:
+#:  1. fix 2 released the table by swapping the MODULE and calling
+#:     empty_cache(); the upstream release form is `del lm_head.weight`
+#:     (qwen3_5_mtp.py:185-193), because a module swap frees nothing while
+#:     any other holder remains. Fix 3 deletes the parameters.
+#:  2. the instrument could not measure the residue at all: with
+#:     --enable-memory-saver the weights are loaded inside
+#:     `memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS)`, which is
+#:     `torch.cuda.use_mem_pool(...)` (torch_memory_saver/entrypoint.py:89-91),
+#:     and `empty_cache()` does not return a MemPool block to the driver
+#:     (maps/memsaver.md N4). The NVML free delta therefore reads the BUILD
+#:     under this boot form no matter what is released. It is not a loss --
+#:     the KV pools allocate from the SAME primary pool and reuse the block --
+#:     so `resident_mib` is now the draft model's live weight bytes (shared
+#:     target lm_head excluded) and the NVML delta rides beside it as its own
+#:     named term `nvml_delta_mib`.
+#: The next boot's L2 `resident_mib` replaces 1618.2 here, with its tag.
+P_DRAFT_RESIDENT_BUDGET_MIB = 405.2 + 1213.0
+P_DRAFT_RESIDENT_TOL_MIB = 256.0
+P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB = 1450.0
+P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB = 5584.4
+P_CORRIDOR_TOP_MIB = 1229.0
+P_BYTES_PER_TOKEN = 8192 + 2048
+#: Group P's per-stage CAPABILITY SCORES, in stage order (ordinal 0 = the
+#: 5090) -- what ``--pp-stage-ratio`` takes.  NOT a layer split: fix 5, after
+#: the map below was found to restate this vector as one.  ``server_args``
+#: hands these to ``derive_pp_layer_split(scores, is_full_attention=kinds,
+#: attn_scores=...)`` and its hybrid snap decides the real per-stage layer
+#: counts, which agree with the scores for exactly the current (checkpoint,
+#: 32/18/14, 8/4/4) triple and diverge for its neighbours -- measured:
+#: attn_scores 7,5,4 -> [31,19,14]; scores 31,17,16 -> [32,16,16]; scores
+#: 30,20,14 -> [32,18,14].  Anything that needs the SPLIT calls
+#: :func:`p_stage_layers`; nothing reads these as layer counts.
+P_PP_STAGE_RATIO_SCORES = (32, 18, 14)
+#: Group P's per-stage FULL-ATTENTION scores (#485 ``--pp-attn-stage-ratio``),
+#: read twice for the same reason and therefore defined once: by ``argv_p``
+#: (the flag) and by :func:`p_stage_layers` (the split the flag produces).
+P_PP_ATTN_STAGE_RATIO_SCORES = (8, 4, 4)
+
+
+def derive_p_max_total_tokens() -> int:
+    pool_new = (P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB + P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB
+                - P_DRAFT_RESIDENT_BUDGET_MIB - P_CORRIDOR_TOP_MIB)
+    return int(pool_new * 2**20 / P_BYTES_PER_TOKEN) // 1000 * 1000
+
+
+P_MAX_TOTAL_TOKENS = derive_p_max_total_tokens()
+assert P_MAX_TOTAL_TOKENS == 428000, P_MAX_TOTAL_TOKENS
 VENV_DEFAULT = "/spinning/htsglang-gpu/.venv"
 #: The model context both groups are launched with.  Named once because K9's
 #: --max-kv-per-request default IS this number (the as-built cap, decoupled
@@ -475,6 +569,16 @@ class BootState:
     weight_chunks: int = 0
     tms_so: str = ""
     p_depth: int = 0
+    #: #1233 fix 5: the pre-boot cgroup sample, oom_kill baseline included, so
+    #: a later death can be attributed by diff instead of retroactively.
+    cgroup: Dict[str, Optional[int]] = field(default_factory=dict)
+    #: P's DERIVED PP layer split (empty = refused, reason in the log line).
+    p_stage_layers: List[int] = field(default_factory=list)
+    #: #1233 fix 8: what the /dev/shm orphan sweep found and freed.
+    shm_sweep: Dict[str, object] = field(default_factory=dict)
+    #: #1233 fix 8: the DORMANT-IMAGE sample taken at group P's first sleep --
+    #: the term the next boot's ledger prices its image from.
+    dormant_image_p: Dict[str, object] = field(default_factory=dict)
 
 
 def _now() -> str:
@@ -624,29 +728,200 @@ def _alive(pid: int) -> bool:
 # --------------------------------------------------------------------------
 
 
-def presence_sweep(log: Log, tag: str, stamp: str, dry: bool) -> None:
-    if not os.path.isdir(PRESENCE_DIR):
-        log("#1217 presence residue: none")
-        return
-    files = os.listdir(PRESENCE_DIR)
-    if not files:
-        log("#1217 presence residue: none")
-        return
-    live = subprocess.run(["pgrep", "-f", "sglang[.]launch_server"], capture_output=True, text=True).stdout.split()
-    held = subprocess.run(["fuser", "-s"] + [os.path.join(PRESENCE_DIR, f) for f in files], capture_output=True).returncode == 0
-    if live or held:
+def shm_holder_pids(path: str, proc_root: str = "/proc") -> List[int]:
+    """Every LIVE pid that maps or holds open a file at or under ``path``.
+
+    Read out of ``/proc/<pid>/maps`` and ``/proc/<pid>/fd`` rather than from
+    ``fuser``: ``fuser`` is one exit code for a whole argv (the #1217 check
+    could not say WHICH file was held, or by whom), it is not always installed,
+    and it cannot be handed a fake tree by a test.  The pid list this returns is
+    printed in the refusal, so a live holder is actionable instead of a boolean.
+
+    A path that appears with the kernel's ``(deleted)`` suffix still counts: an
+    unlinked-but-mapped region still occupies the memory this sweep exists to
+    free.  Matching is on the full path with a boundary, never a substring, so
+    ``hicache-weg2-fix973`` never matches ``hicache-weg2-fix9730``.
+    """
+    prefix = os.path.realpath(path)
+    holders: List[int] = []
+
+    def _hit(candidate: str) -> bool:
+        p = candidate.strip()
+        if p.endswith(" (deleted)"):
+            p = p[: -len(" (deleted)")]
+        return p == prefix or p.startswith(prefix + "/")
+
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return holders
+    for entry in sorted(entries, key=lambda e: int(e) if e.isdigit() else 0):
+        if not entry.isdigit():
+            continue
+        found = False
+        try:
+            with open(f"{proc_root}/{entry}/maps") as f:
+                for line in f:
+                    parts = line.split(maxsplit=5)
+                    if len(parts) == 6 and _hit(parts[5]):
+                        found = True
+                        break
+        except OSError:
+            pass
+        if not found:
+            fd_dir = f"{proc_root}/{entry}/fd"
+            try:
+                for fd in os.listdir(fd_dir):
+                    try:
+                        if _hit(os.readlink(f"{fd_dir}/{fd}")):
+                            found = True
+                            break
+                    except OSError:
+                        continue
+            except OSError:
+                pass
+        if found:
+            holders.append(int(entry))
+    return holders
+
+
+def _tree_bytes(path: str) -> Tuple[int, int, int]:
+    """(allocated bytes, apparent bytes, entry count) of a file or tree.
+
+    WHICH BYTE COUNT, stated because the two differ here by 0.53 GiB and only
+    one of them is host RAM: ``st_blocks * 512`` is what the tmpfs actually
+    OCCUPIES (and what ``df`` and the cgroup's ``shmem`` count), ``st_size`` is
+    the apparent size ``ls`` shows.  Measured on the real orphan
+    ``/dev/shm/hicache-weg2-fix973`` (2026-09-08): apparent 4,042,810,432 B =
+    3.77 GiB, allocated 3,471,384,576 B = 3.23 GiB -- and 3.23 GiB is the figure
+    boot weg2dk7 attributed and the figure a sweep frees.  Reporting the
+    apparent size as "freed" would over-claim by half a GiB.
+    """
+    def _pair(p: str) -> Tuple[int, int]:
+        st = os.lstat(p)
+        return st.st_blocks * 512, st.st_size
+
+    try:
+        alloc, apparent = _pair(path)
+    except OSError:
+        return 0, 0, 0
+    if not os.path.isdir(path) or os.path.islink(path):
+        return alloc, apparent, 1
+    alloc, apparent, n = 0, 0, 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                a, b = _pair(os.path.join(root, name))
+            except OSError:
+                continue
+            alloc += a
+            apparent += b
+            n += 1
+    return alloc, apparent, n
+
+
+def shm_residue_sweep(
+    log: Log,
+    tag: str,
+    stamp: str,
+    dry: bool,
+    shm_dir: str = SHM_DIR,
+    proc_root: str = "/proc",
+    archive_root: str = SHM_ARCHIVE_ROOT,
+) -> Dict[str, object]:
+    """#1217 + #1233 fix 8: sweep THIS LINE'S dead /dev/shm residue, and only that.
+
+    ONE authority for /dev/shm residue, replacing the #1217 presence-directory
+    check it grew out of: that check swept one directory, called `fuser` once on
+    its files, and answered "none" for a box holding 3.23 GiB of a dead boot's
+    page store two entries away (weg2dk7).  Same defect class, one function.
+
+    The rules, in order:
+
+    * a name outside :data:`SHM_OWN_PREFIXES` is FOREIGN and is never listed,
+      never stat'ed for size, never moved -- /dev/shm here is full of other
+      people's `sem.mp-*`;
+    * any live ``sglang.launch_server`` REFUSES the boot before anything is
+      touched (another boot is up; this is not the moment to tidy /dev/shm);
+    * an entry with a live holder (:func:`shm_holder_pids`) REFUSES the boot,
+      naming the entry and the pids.  Nothing is killed and nothing is swept;
+    * an orphan REGULAR FILE is moved into the archive WITH ITS CONTENT: the
+      #1217 presence flags are the evidence and they are bytes long;
+    * an orphan DIRECTORY TREE is archived as a MANIFEST (name, bytes, entry
+      count, mtime) and then removed.  Copying a dead boot's 3.2 GiB page store
+      of ~100k small files onto spinning disk at preflight would cost minutes
+      and buy nothing -- the evidence of a leaked store is that it existed and
+      how big it was, not the pages inside it.
+    """
+    try:
+        names = sorted(os.listdir(shm_dir))
+    except OSError:
+        log(f"#1217/#1233 shm residue: {shm_dir} unreadable -- NOT swept, and not read as empty")
+        return {"swept": [], "bytes_freed": 0, "refused": {}, "archive": ""}
+    own = [n for n in names if any(n.startswith(p) for p in SHM_OWN_PREFIXES)]
+    foreign = len(names) - len(own)
+    if not own:
+        log(f"#1217/#1233 shm residue: none of ours in {shm_dir} ({foreign} foreign entries untouched)")
+        return {"swept": [], "bytes_freed": 0, "refused": {}, "archive": ""}
+    live = subprocess.run(
+        ["pgrep", "-f", "sglang[.]launch_server"], capture_output=True, text=True
+    ).stdout.split()
+    if live:
         raise Weg2LaunchRefused(
-            f"#1217 presence residue: LIVE HOLDER -- refusing this boot, not sweeping, not killing anything. "
-            f"launch_server pid(s)=[{' '.join(live) or 'none'}] fuser_held={held}"
+            f"#1217 shm residue: LIVE launch_server pid(s)=[{' '.join(live)}] -- refusing this "
+            f"boot, not sweeping, not killing anything (our /dev/shm entries: {own})"
         )
-    archive = f"{GPU_ARB}/shm_residue/{tag}_{stamp}"
+    held = {n: shm_holder_pids(os.path.join(shm_dir, n), proc_root) for n in own}
+    refused = {n: pids for n, pids in held.items() if pids}
+    if refused:
+        raise Weg2LaunchRefused(
+            f"#1217/#1233 shm residue: LIVE HOLDER on our own /dev/shm entries "
+            f"{ {n: pids for n, pids in sorted(refused.items())} } -- refusing this boot, not "
+            f"sweeping, not killing anything"
+        )
+    archive = f"{archive_root}/{tag}_{stamp}"
+    sizes = {n: _tree_bytes(os.path.join(shm_dir, n)) for n in own}
+    total = sum(a for a, _b, _n in sizes.values())
+    apparent = sum(b for _a, b, _n in sizes.values())
     if dry:
-        log(f"#1217 DRY-RUN: would sweep {len(files)} file(s) from {PRESENCE_DIR} -> {archive}")
-        return
+        log(
+            f"#1217/#1233 DRY-RUN: would sweep {len(own)} orphan entr(ies) from {shm_dir} -> "
+            f"{archive}, freeing {total} allocated bytes = {total / host_ledger.GIB:.2f} GiB "
+            f"(apparent {apparent / host_ledger.GIB:.2f} GiB -- allocated is what the tmpfs "
+            f"occupies and what cgroup shmem counts); per entry (allocated): "
+            f"{ {n: sizes[n][0] for n in own} }; {foreign} foreign entries untouched"
+        )
+        return {"swept": own, "bytes_freed": total, "bytes_apparent": apparent,
+                "refused": {}, "archive": archive}
     os.makedirs(archive, exist_ok=True)
-    for f in files:
-        shutil.move(os.path.join(PRESENCE_DIR, f), archive)
-    log(f"#1217 presence residue swept: {len(files)} file(s) from {PRESENCE_DIR} -> {archive}")
+    manifest: List[dict] = []
+    for n in own:
+        src = os.path.join(shm_dir, n)
+        nbytes, napparent, count = sizes[n]
+        try:
+            mtime = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.lstat(src).st_mtime))
+        except OSError:
+            mtime = "?"
+        is_dir = os.path.isdir(src) and not os.path.islink(src)
+        manifest.append(
+            {"name": n, "bytes_allocated": nbytes, "bytes_apparent": napparent,
+             "entries": count, "mtime": mtime,
+             "kind": "dir" if is_dir else "file", "action": "manifest+removed" if is_dir else "moved"}
+        )
+        if is_dir:
+            shutil.rmtree(src, ignore_errors=True)
+        else:
+            shutil.move(src, archive)
+    with open(os.path.join(archive, "MANIFEST.json"), "w") as f:
+        json.dump({"tag": tag, "stamp": stamp, "shm_dir": shm_dir, "entries": manifest}, f, indent=1)
+    log(
+        f"#1217/#1233 shm residue swept: {len(own)} orphan entr(ies), "
+        f"{total} allocated bytes = {total / host_ledger.GIB:.2f} GiB freed "
+        f"(apparent {apparent / host_ledger.GIB:.2f} GiB) -> {archive} "
+        f"({manifest}; {foreign} foreign entries untouched)"
+    )
+    return {"swept": own, "bytes_freed": total, "bytes_apparent": apparent,
+            "refused": {}, "archive": archive}
 
 
 def stale_deadman_sweep(log: Log, ports: Sequence[int], dry: bool) -> None:
@@ -862,6 +1137,13 @@ def argv_p(
     ] + ratio_flags + [
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         "--barlink-bar1-window-mib", "24,PP_0=96",
+        # #1233 draft KV across the flip (C15): P carries D's four speculative
+        # flags BYTE-FOR-BYTE (they hash into the drafter identity, W5) and is
+        # silenced by the producer flag, which is deliberately not hashed.
+        "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
+        "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
+        "--speculative-draft-kv-only",
+        "--max-total-tokens", str(P_MAX_TOTAL_TOKENS),
         "--port", str(PORT_P),
     ] + extra
 
@@ -1793,6 +2075,241 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     return env
 
 
+_DRAFTER_RE = re.compile(r"HiCache draft KV registered: .*drafter=([0-9a-f]{16}|None)")
+_LAYOUT_RE = re.compile(r"#706 canonical DRAFT page active: .*layout=v(\d+) drafter=([0-9a-f]{16}|None)")
+
+
+def check_drafter_identity(log_p: str, log_d: str) -> Dict[str, object]:
+    """W10 (#1233): the drafter identity and canonical draft layout of both
+    groups, read from their logs. ``match`` is False on ANY disagreement or
+    absence -- a group that registered no drafter at all is the pre-fix
+    shape, not a pass."""
+    out: Dict[str, object] = {}
+    for name, path in (("P", log_p), ("D", log_d)):
+        ids, layouts, n = set(), set(), 0
+        try:
+            with open(path, errors="replace") as f:
+                for line in f:
+                    m = _DRAFTER_RE.search(line)
+                    if m:
+                        ids.add(m.group(1))
+                        n += 1
+                    m = _LAYOUT_RE.search(line)
+                    if m:
+                        layouts.add(f"v{m.group(1)}")
+        except OSError:
+            pass
+        out[name] = ",".join(sorted(ids)) if ids else None
+        out[f"layout_{name}"] = ",".join(sorted(layouts)) if layouts else None
+        out[f"n_{name}"] = n
+    out["match"] = bool(
+        out["P"] and out["D"] and out["P"] == out["D"] and "," not in str(out["P"])
+        and out["layout_P"] and out["layout_P"] == out["layout_D"]
+    )
+    return out
+
+
+_RESIDENT_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*resident_mib=(-?\d+(?:\.\d+)?)")
+_HEAD_RELEASED_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*head_released_mib=(-?\d+(?:\.\d+)?)")
+_NVML_DELTA_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\d+(?:\.\d+)?)")
+#: W11b (#1233 fix 6): how far the BUILD may stay unexplained by the two terms
+#: that claim to explain it, IN EITHER DIRECTION.  MEASURED on boot weg2dk5's
+#: own L2 line: nvml_delta 3998.0 against resident 1682.9 + head_released
+#: 2425.0 = 4107.9, i.e. -109.9 MiB, not attributable at this granularity (the
+#: driver's own allocation rounding, and the fact that the two sides are read
+#: at different instants of the build).  The bound is set at the same 256 MiB
+#: as the residue tolerance -- the next tighter measurement replaces it.
+#:
+#: WHICH SIDE HAS BEEN MEASURED, stated rather than implied (#1233 fix 7): the
+#: single calibration sample is NEGATIVE, i.e. the accounting OVER-claims by
+#: 109.9 MiB, while the shape this gate hunts -- a table freed from the graph
+#: only, so the build is larger than residue + release explain -- is POSITIVE
+#: and has NEVER been measured on this box.  The gate can still catch it (a
+#: whole unfreed lm_head is ~2425 MiB, an order of magnitude over the bound),
+#: but the bound's own calibration comes from the other side, and a boot that
+#: lands in 256..~2400 MiB positive would be graded by an extrapolation.  Both
+#: directions are refusals, and both are pinned.
+P_DRAFT_BUILD_ACCOUNTING_TOL_MIB = 256.0
+
+
+def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = None) -> Dict[str, object]:
+    """W11 (#1233 fix 2, second instrument added in fix 6): the producer's
+    build on P's last stage, graded by TWO independent readings of the L2 line.
+
+    1. ``resident_mib`` against the budget T_P was derived from.  This is a
+       model-GRAPH quantity (fix 3 made it ``_live_weight_mib``), which is what
+       it must be for the corridor derivation -- and is exactly why it can no
+       longer catch the fix-2 failure it was built for: a table that
+       ``_drop_parameters`` unbinds while a loader, quant method or backup path
+       still holds a reference LEAVES ``model.parameters()`` while staying on
+       the card, and this reading falls even though nothing was freed.
+    2. THE BUILD ACCOUNTING: ``nvml_delta_mib`` -- which under
+       --enable-memory-saver reads the BUILD, not the residue (the weights live
+       in the saver's MemPool, memsaver.md N4) -- must be explained by
+       ``resident_mib + head_released_mib`` within
+       :data:`P_DRAFT_BUILD_ACCOUNTING_TOL_MIB`.  A release that frees nothing
+       shows up here as an unaccounted remainder the size of the table, on a
+       quantity no graph edit can move.
+
+    ``ok`` requires both.  It is False on absence and on an unmeasured value
+    (-1) in either instrument: silence is not a pass, and a build nobody
+    measured is not a build anybody checked.
+    """
+    budget = P_DRAFT_RESIDENT_BUDGET_MIB if budget_mib is None else float(budget_mib)
+    tol = P_DRAFT_RESIDENT_TOL_MIB if tol_mib is None else float(tol_mib)
+    out: Dict[str, object] = {
+        "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
+        "head_released_mib": None, "nvml_delta_mib": None, "unaccounted_mib": None,
+        "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
+        "resident_ok": False, "accounted": False, "ok": False,
+    }
+    try:
+        with open(log_p, errors="replace") as f:
+            for line in f:
+                for key, rx in (
+                    ("resident_mib", _RESIDENT_RE),
+                    ("head_released_mib", _HEAD_RELEASED_RE),
+                    ("nvml_delta_mib", _NVML_DELTA_RE),
+                ):
+                    m = rx.search(line)
+                    if m:
+                        out[key] = float(m.group(1))
+    except OSError:
+        pass
+    r = out["resident_mib"]
+    if r is not None:
+        out["over_mib"] = r - budget
+        out["resident_ok"] = r >= 0 and r <= budget + tol
+    released, delta = out["head_released_mib"], out["nvml_delta_mib"]
+    if r is not None and r >= 0 and released is not None and released >= 0 and delta is not None and delta >= 0:
+        # SIGN, both directions named because both are refused (fix 7):
+        #   POSITIVE = the build is LARGER than residue + release explain, i.e.
+        #     VRAM is held that nobody accounts for -- the fix-2 shape this
+        #     gate exists for (a table unbound from the graph, never freed).
+        #   NEGATIVE = the accounting OVER-claims: the two explaining terms
+        #     together are larger than the build the driver reports, so at
+        #     least one of them is measuring something the build did not do
+        #     (double-counted release, or the two sides read at instants far
+        #     enough apart to disagree).  weg2dk5's -109.9 is this side.
+        # Neither direction is a pass: an explanation that does not add up is
+        # not an explanation, whichever way it fails to add up.
+        out["unaccounted_mib"] = delta - (r + released)
+        out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
+    out["ok"] = bool(out["resident_ok"] and out["accounted"])
+    return out
+
+
+def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
+    """THE LAUNCHER'S W11 GATE, both instruments and both refusals.
+
+    Grades group P's last-stage draft build from its log (see
+    :func:`check_draft_resident`) and REFUSES the boot before the front opens
+    when either instrument says no:
+
+    * ``W11 Weg2DraftResidentOverBudget`` -- the residue is over the budget
+      ``T_P`` was derived from, so the corridor derivation is refuted by this
+      boot (weg2dk2's 3994 MiB build).
+    * ``W11b Weg2DraftBuildUnaccounted`` -- the BUILD is not explained by
+      residue + release, the fix-2 shape ``resident_mib`` is blind to.
+
+    #1233 fix 7: a function, for the same reason as :func:`choose_host_ledger`
+    -- the fix-6 review gated the W11b refusal off and the whole slice stayed
+    green, because the only caller sits behind two launched servers.  A gate
+    nothing can reach is a gate nothing can pin.
+    """
+    w11 = check_draft_resident(log_p)
+    log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
+        f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
+        f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
+        f"head_released_mib={w11['head_released_mib']} + unaccounted_mib={w11['unaccounted_mib']} "
+        f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
+        f"ok={w11['ok']} (T_P={P_MAX_TOTAL_TOKENS})")
+    if not w11["resident_ok"]:
+        raise Weg2LaunchRefused(f"W11 Weg2DraftResidentOverBudget: measured resident_mib={w11['resident_mib']} vs budget "
+                                f"{w11['budget_mib']:.1f}+{w11['tol_mib']:.0f} MiB -- T_P={P_MAX_TOTAL_TOKENS} was derived for the "
+                                f"budget and the last stage's corridor target (idle NVML free at {P_CORRIDOR_TOP_MIB:.0f}) cannot hold")
+    if not w11["accounted"]:
+        # #1233 fix 6: the SECOND instrument. resident_mib is a model-graph
+        # quantity, so a table released only from the graph passes it while
+        # still sitting on the card -- the fix-2 failure the W11 gate exists
+        # for. The build must be explained by residue + released.
+        raise Weg2LaunchRefused(f"W11b Weg2DraftBuildUnaccounted: nvml_delta_mib={w11['nvml_delta_mib']} is not explained by "
+                                f"resident_mib={w11['resident_mib']} + head_released_mib={w11['head_released_mib']} "
+                                f"(unaccounted {w11['unaccounted_mib']} MiB, tolerance {w11['accounting_tol_mib']:.0f}) -- either the "
+                                f"never-loaded lm_head was unbound from the graph without being freed (fix 2's shape, invisible to "
+                                f"resident_mib by construction) or one of the three instruments did not measure")
+    return w11
+
+
+def measured_record_path() -> str:
+    """The sidecar this line writes its own dormant-image measurements into."""
+    return f"{EVIDENCE_DIR}/{host_ledger.MEASURED_RECORD_NAME}"
+
+
+def choose_host_ledger(
+    store_min_gib: float,
+    ring_bytes: int,
+    ring_span1_bytes: int,
+    ring_provenance: str = "",
+    meminfo_path: str = "/proc/meminfo",
+    cgroup_root: str = "/sys/fs/cgroup",
+    record_path: Optional[str] = None,
+) -> Tuple[host_ledger.Arm, float, List[str], Dict[str, Optional[int]]]:
+    """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
+
+    Returns ``(arm, store_gib, printed lines, the cgroup reading)`` or raises
+    :class:`host_ledger.Weg2HostLedgerRefused` -- ``main`` only logs the lines
+    and carries the reading into the boot state.
+
+    #1233 fix 5: the reaper watches the CGROUP, so the ledger reads it.  The
+    ``oom_kill`` value goes in as the boot's PRE-BOOT BASELINE of a cumulative,
+    timestamp-free counter -- no boot starts without one.
+
+    #1233 fix 7: this is a FUNCTION and not four lines inside ``main`` because
+    it is the only wire that carries fix 6 into a boot, and inside ``main`` --
+    behind NVML, a tmpfs mount and two servers -- nothing could reach it.  The
+    fix-6 review measured exactly that: replacing ``cg["reclaimable"]`` below
+    with ``None`` reverts the whole boot to fix 5's denominator and 152 tests
+    stayed green.  The two paths are the same code from here down, and the
+    ``meminfo_path`` / ``cgroup_root`` arguments exist so a test can hand this
+    seam a fake box whose readings decide a DIFFERENT arm.
+
+    C19 (the ring): the host WEIGHTS term arrives as ``ring_bytes`` /
+    ``ring_span1_bytes`` from :func:`prepare_host_ring`, not as a
+    ``weight_chunks`` count.  That parameter is gone because the term it fed --
+    one image plus one chunk in flight -- is gone: the shared region is the
+    whole host weights cost and it is charged once.  There is deliberately no
+    default: a caller with no measured table must reach the W20 refusal, never
+    a zero that prices the flip as free.
+    """
+    mi = host_ledger.read_meminfo(meminfo_path)
+    cg = host_ledger.read_cgroup(cgroup_root)
+    cg_ceiling, cg_ceiling_source = host_ledger.resolve_cg_ceiling(cg, mi["MemTotal"])
+    # fix 8: this line's OWN previous measurements of the dormant image and of
+    # the run-moment residual.  Absent (first boot, or a wiped sidecar) the
+    # ledger prices the named dk7 reading and prints that it is another boot's.
+    record = host_ledger.read_measured_record(
+        measured_record_path() if record_path is None else record_path
+    )
+    arm, store_gib, lines = host_ledger.choose(
+        mi["MemTotal"],
+        mi["MemAvailable"],
+        store_min_gib=store_min_gib,
+        ring_bytes=ring_bytes,
+        ring_span1_bytes=ring_span1_bytes,
+        ring_provenance=ring_provenance,
+        cg_current_bytes=cg["current"],
+        # fix 6: only the NON-reclaimable part of that reading is charged --
+        # page cache is what the kernel hands back instead of killing for.
+        reclaimable_bytes=cg["reclaimable"],
+        cg_ceiling_bytes=cg_ceiling,
+        cg_ceiling_source=cg_ceiling_source,
+        cg_oom_kill=cg["oom_kill"],
+        measured_record=record,
+    )
+    return arm, store_gib, lines, cg
+
+
 def count_marker(path: str, marker: str) -> int:
     n = 0
     try:
@@ -1849,14 +2366,76 @@ def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> floa
     return dt
 
 
-def model_num_layers(model: str) -> int:
+def _model_config(model: str) -> dict:
     with open(os.path.join(model, "config.json")) as f:
-        cfg = json.load(f)
-    text = cfg.get("text_config", cfg)
-    n = int(text.get("num_hidden_layers") or cfg.get("num_hidden_layers") or 0)
-    if n <= 0:
+        return json.load(f)
+
+
+def model_num_layers(model: str) -> int:
+    """The backbone depth, through the SERVER's own probe order (fix 6)."""
+    from sglang.srt.server_args import declared_num_hidden_layers_from_config
+
+    n = declared_num_hidden_layers_from_config(_model_config(model))
+    if not n or n <= 0:
         raise Weg2LaunchRefused(f"num_hidden_layers not found in {model}/config.json")
-    return n
+    return int(n)
+
+
+def model_layer_kinds(model: str) -> List[bool]:
+    """One flag per layer: True = full attention, False = linear/GDN.
+
+    THE SERVER'S OWN DERIVATION, called rather than re-implemented
+    (``server_args.declared_layer_kinds_from_config``, which
+    ``ServerArgs.declared_layer_kinds`` also calls), so the launcher's
+    chunk->card map and the server's PP split cannot disagree about the
+    checkpoint.
+
+    #1233 fix 6: this used to read ``layer_types`` ONLY and refuse otherwise,
+    which is STRICTER than the authority it claimed to mirror -- that one also
+    accepts ``layers_block_type`` and ``full_attention_interval`` (its own
+    docstring names the latter as the Qwen3.5/3.6 GDN hybrid source).  On such
+    a checkpoint the server derived a real hybrid split while this refused and
+    published NO map, and no map means ``front.interleave_pause_order`` returns
+    the IDENTITY order -- the order that killed boot weg2dk4 with a device OOM
+    in ``cu_mem_create``.  A degradation that is honest about its reason is
+    still a degradation into a known boot killer.
+
+    The one refusal left is the one that has no authority to defer to: a
+    config whose depth cannot be read at all.
+    """
+    from sglang.srt.server_args import declared_layer_kinds_from_config
+
+    return declared_layer_kinds_from_config(_model_config(model), model_num_layers(model))
+
+
+def p_stage_layers(is_full_attention: Sequence[bool]) -> List[int]:
+    """Group P's per-stage LAYER COUNTS -- derived, never restated.
+
+    #1233 fix 5.  The flip-order map used to be built from
+    ``P_PP_STAGE_RATIO_SCORES`` directly, with a comment calling that vector
+    "the pipeline layer split".  It is not: it is the per-stage capability
+    score vector, and the layer counts are what
+    ``derive_pp_layer_split`` makes of it under the hybrid snap.  The two
+    agree for exactly the current (checkpoint, 32/18/14, 8/4/4) triple and
+    diverge for its neighbours, so the old map was right by coincidence and
+    unguarded by construction: ``interleave_pause_order`` refuses only an
+    INCOMPLETE map, and a map that is complete but wrong yields a confident
+    ``why="tightest-card-first"`` order that pauses the wrong card first --
+    the wrong-per-card-accounting class that killed weg2dk4, wearing an
+    instrument that says it is fine.
+
+    This calls the SAME function ``server_args._handle_pp_stage_ratio`` calls
+    (``distributed.utils.derive_pp_layer_split``) with the SAME two score
+    vectors ``argv_p`` passes, so there is one authority for the split and the
+    launcher reads it rather than keeping a second copy.
+    """
+    from sglang.srt.distributed.utils import derive_pp_layer_split
+
+    return derive_pp_layer_split(
+        list(P_PP_STAGE_RATIO_SCORES),
+        is_full_attention=list(is_full_attention),
+        attn_scores=list(P_PP_ATTN_STAGE_RATIO_SCORES),
+    )
 
 
 def build_tms_preload(tree: str, venv: str, log: Log) -> str:
@@ -1870,6 +2449,11 @@ def build_tms_preload(tree: str, venv: str, log: Log) -> str:
         f"freed after resume) -> {so}; SGLANG_WEG2_TMS_PRELOAD_SO set for both groups")
     return so
 
+
+#: The prefetch rate bound the carrier route is derived with: a prompt may be
+#: at most this fraction of the host staging pool that must carry it (it
+#: refused the 84k prompt on boot weg2ls4b2 at limit=27466 of pool 30518).
+CARRIER_PREFETCH_FRACTION = 0.9
 
 def budgets_from_dc(
     cards: List[Card],
@@ -3319,7 +3903,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.logs = {"front": front_log or "<dry>", "P": f"{base}.P.log", "D": f"{base}.D.log"}
 
     # 1. preflight
-    presence_sweep(log, ns.tag, stamp, dry)
+    state.shm_sweep = shm_residue_sweep(log, ns.tag, stamp, dry)
     sweep_dead_credit_counters(log, dry=dry)
     stale_deadman_sweep(log, [PORT_FRONT, PORT_P, PORT_D], dry)
     host_preflight(log, ns.tag, dry)
@@ -3370,12 +3954,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     n_layers = model_num_layers(ns.model)
     chunk_count = max(0, int(ns.weight_chunks))
     chunk_layers = int(math.ceil(n_layers / chunk_count)) if chunk_count > 0 else 0
-    from sglang.srt.managers.weg2_memory_saver import weights_family_tags
+    from sglang.srt.managers.weg2_memory_saver import chunk_tag_cards, weights_family_tags
     weights_tags = weights_family_tags(chunk_count)
     log(f"WEG2-WEIGHT-CHUNKS N={chunk_count} tags (layers per chunk {chunk_layers} of {n_layers}; family {weights_tags}); "
         "flip (C9, gathered legs) = src.pause(kv) -> ONE src.release(family) and ONE dst.resume(family) "
         "in flight together -> dst.resume(kv); the host holds ONE image per card (H(c) = max_g image_g(c)) "
         "and dst's per-tag releases fund src's acquires inside it")
+
+    # 1b'. #1233 fix 5 -- P's PP LAYER SPLIT, derived from the two score vectors
+    # argv_p passes, by the SAME function server_args calls.  Named refusal
+    # instead of a guess: a split that does not sum to the checkpoint's depth
+    # publishes NO map, and the flip falls back to the identity pause order
+    # with the reason printed, rather than to a confident wrong one.
+    p_split: List[int] = []
+    p_kinds: List[bool] = []
+    p_split_note = ""
+    try:
+        p_kinds = model_layer_kinds(ns.model)
+        p_split = p_stage_layers(p_kinds)
+        if sum(p_split) != n_layers:
+            p_split_note = (
+                f"derived split {p_split} sums to {sum(p_split)}, not {n_layers}"
+            )
+            p_split = []
+    except (Weg2LaunchRefused, ValueError, OSError) as e:
+        p_split_note = f"{type(e).__name__}: {e}"
+    log(
+        f"WEG2-PP-SPLIT group=P scores --pp-stage-ratio {list(P_PP_STAGE_RATIO_SCORES)} "
+        f"--pp-attn-stage-ratio {list(P_PP_ATTN_STAGE_RATIO_SCORES)} over {n_layers} layers "
+        f"({sum(p_kinds) if p_split else '?'} full-attention) -> DERIVED layer split "
+        f"{p_split if p_split else 'REFUSED (' + p_split_note + ')'} "
+        "(derive_pp_layer_split, the same authority server_args._handle_pp_stage_ratio "
+        "uses; fix 5: the flip-order map used to restate the SCORE vector as the split, "
+        "which is right only for this checkpoint and this pair of vectors)"
+    )
+    state.p_stage_layers = list(p_split)
     tms_so = "" if dry else build_tms_preload(tree, ns.venv, log)
     state.weight_chunks = chunk_count
     state.tms_so = tms_so
@@ -3399,13 +4012,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
 
     # 2. host ledger
-    mi = host_ledger.read_meminfo()
-    arm, store_gib, lines = host_ledger.choose(
-        mi["MemTotal"], mi["MemAvailable"], store_min_gib=ns.store_min_gib,
-        ring_bytes=ring_plan.host_weights_bytes,
-        ring_span1_bytes=ring_plan.host_weights_span1_bytes,
-        ring_provenance=ring_plan.provenance,
-    )
+    arm, store_gib, lines, cg = choose_host_ledger(
+        ns.store_min_gib, ring_plan.host_weights_bytes,
+        ring_plan.host_weights_span1_bytes, ring_plan.provenance)
+    state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
     state.ledger_lines = lines
@@ -3588,10 +4198,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if n_kv < 3 or n_blob < 3:
         raise Weg2LaunchRefused(f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half): P logged kv x{n_kv} blob x{n_blob}, need 3 each")
 
-    # 4d. sleep P, measure D_c(P)
+    # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
+    # This is the one sleep on this box that is NOT interleaved: group D does
+    # not exist yet, so nothing is resuming and freeing an image while P writes
+    # its own.  The cgroup shmem delta and the per-rank RssShmem sum are
+    # therefore comparable here, and the pair is what the next boot's ledger
+    # prices its image term from (BOOT_weg2dk7_0907.md: the weight-tag census
+    # under-charged the measured image by +9.80 GiB).
+    shmem_before = host_ledger.read_cgroup_shmem_bytes()
     state.sleep_p_ms = sleep_group(PORT_P, log, "P", weights_tags)
     time.sleep(2)
     pids_p = session_pids(spec_p.pid)
+    image_rec = host_ledger.dormant_image_sample(
+        group="P",
+        shmem_before_bytes=shmem_before,
+        shmem_after_bytes=host_ledger.read_cgroup_shmem_bytes(),
+        pids=sorted(pids_p),
+        weight_tags_gib=host_ledger.WEIGHT_TAGS_P_BYTES / host_ledger.GIB,
+        interleaved=False,
+        boot_tag=ns.tag,
+        commit=tip,
+    )
+    log(host_ledger.format_dormant_image(image_rec))
+    host_ledger.append_measured_record(measured_record_path(), image_rec)
+    state.dormant_image_p = image_rec
     dc_p = nvml_process_mib(pids_p)
     for c in cards:
         dc_p.setdefault(c.uuid, 0)
@@ -3703,13 +4333,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"nothing bounded it, and --d-bs {d_bs} seats opened at once overcommitted it on boot "
         f"weg2sc1 (D read available=5418 occupied=25100 limit=27466 -> #915 vote_negative while "
         f"the round-1 front-local tally read 27466 free -- the quantity, not the bound, was wrong)")
+    # #1233 draft KV across the flip: W10 DRAFTER-IDENTITY GATE. Both groups
+    # register a drafter (P: the producer on its last stage, D: the NEXTN
+    # worker on every rank); the identity in their `HiCache draft KV
+    # registered` lines and the canonical draft layout in their `#706
+    # canonical DRAFT page active` lines must agree, or D fetches
+    # `{hash}.draft-<Pid>` pages P never wrote (the weg2zr2 shape, 194,088
+    # failed draft fetches). Refused before the front opens.
+    w10 = check_drafter_identity(spec_p.log, spec_d.log)
+    log(f"W10 DRAFTER-IDENTITY P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} layout_D={w10['layout_D']} "
+        f"match={w10['match']} (P lines {w10['n_P']}, D lines {w10['n_D']})")
+    if not w10["match"]:
+        raise Weg2LaunchRefused(f"W10 Weg2DrafterIdentityMismatch: P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} "
+                                f"layout_D={w10['layout_D']} -- the decode group would ask the carrier for draft pages under "
+                                f"an identity the prefill group never writes")
+    # #1233 fix 2: W11 DRAFT-RESIDENT gate. T_P (P_MAX_TOTAL_TOKENS) is derived
+    # from a budgeted residue on P's last stage; the L2 line carries the
+    # MEASURED one. Over budget = the corridor derivation is refuted by this
+    # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
+    gate_w11(spec_p.log, log)
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
     log(f"BAR1 fit (deviation: transports open): D log 'window clip'/'Bar1WindowRefused' lines = {clips} (0 = both groups fit the aperture)")
 
     # 6. front
+    # #1233 boot weg2dk4 -- WHICH CARD DOES A CHUNK TAG LIVE ON.  Group P is
+    # PP: a weights_<k> tag is a layer band and sits on ONE stage's card (two
+    # when the band straddles a stage boundary).  Group D is TP: every card
+    # holds a shard of every layer, so D has NO map and pauses in the natural
+    # order, exactly as before.  Derived here from the SAME stage ratio argv_p
+    # passes and the SAME chunk geometry both groups were built with; the front
+    # picks the pause order from it per flip, against a live NVML free sample.
+    # fix 5: from the DERIVED layer split (section 1b'), never from the score
+    # vector.  No split -> no map -> the front pauses in the identity order and
+    # prints why, which is the honest degradation; a complete-but-wrong map is
+    # not, because interleave_pause_order only refuses an INCOMPLETE one.
+    p_chunk_cards = chunk_tag_cards(
+        p_split, chunk_layers, chunk_count, card_of_stage=[c.nvml_index for c in cards]
+    ) if p_split else {}
+    src_chunk_cards = {"P": {t: list(v) for t, v in p_chunk_cards.items()}}
+    log(f"WEG2-FLIP-ORDER MAP group=P (scores {list(P_PP_STAGE_RATIO_SCORES)}/"
+        f"{list(P_PP_ATTN_STAGE_RATIO_SCORES)} -> DERIVED layer split "
+        f"{p_split if p_split else 'REFUSED (' + p_split_note + ') -> NO MAP, identity order'} "
+        f"over {n_layers} layers, {chunk_layers} layers per chunk, "
+        f"nvml {[c.nvml_index for c in cards]} in stage order): {src_chunk_cards['P']}; "
+        f"group=D TP -> no map (uniform across cards). Boot weg2dk4 died because the interleave paused P's tag k "
+        f"against D's tag k while P's bytes for k=0..5 were on OTHER cards than the one D was allocating on.")
     front_argv = front_argv_for(
         py, store_dir, spec_p.pid, spec_d.pid, dc_expect_d, cards, ns, chunk_count,
         carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,
+        src_chunk_cards=src_chunk_cards, measured_record=measured_record_path(),
+        commit=tip, ledger_arm={"s_gb": arm.s_gb, "m_mib": arm.m_mib, "store_gib": store_gib},
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -3743,7 +4416,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d: Dict[str, int],
                    cards: List[Card], ns, chunk_count: int, carrier_max_tokens: int,
                    p_bs: int, d_bs: int, x_tokens: int, flip_min_work_tokens: int,
-                   idle_layout_front: str) -> List[str]:
+                   idle_layout_front: str,
+                   src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None,
+                   measured_record: str = "", commit: str = "",
+                   ledger_arm: Optional[Dict[str, float]] = None) -> List[str]:
     """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
 
     C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
@@ -3772,6 +4448,20 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         argv += ["--min-dwell-ms", str(ns.min_dwell_ms)]
     if ns.d_admit_max_tokens is not None:
         argv += ["--d-admit-max-tokens", str(ns.d_admit_max_tokens)]
+    # #1233 weg2dk4/fix 8 (merged into this ONE builder rather than a second
+    # inline argv beside it): the chunk->card map, the measured-record sidecar,
+    # the tip stamped into every measurement, and the ledger arm the front
+    # derives its run-moment residual against.  The map is derived after group
+    # D launches, so the --dry-run print carries it EMPTY and says so here --
+    # every other term is byte-identical to the real boot's.
+    if src_chunk_cards:
+        argv += ["--src-chunk-cards", json.dumps(src_chunk_cards, sort_keys=True)]
+    if measured_record:
+        argv += ["--measured-record", measured_record]
+    if commit:
+        argv += ["--commit", commit]
+    if ledger_arm:
+        argv += ["--ledger-arm", json.dumps(ledger_arm, sort_keys=True)]
     return argv
 
 
@@ -3873,7 +4563,12 @@ class Weg2RingFormUnproven(ring_table.Weg2RingRefused):
 #: this rig therefore exited 1 with a stack trace -- which any wrapper keying on
 #: the exit code reads as a crash rather than as the refusal it is.  A refusal
 #: added to ring_table now inherits this handler instead of needing a line here.
-REFUSALS = (Weg2LaunchRefused, ring_table.Weg2RingRefused, host_ledger.Weg2HostLedgerRefused)
+#: #1233 fix 8: W21 (Weg2HostRunPeakRefused) is a refusal of the SAME standing
+#: as W20 -- an arm whose predicted RUN PEAK is not below the observed reap
+#: point does not boot -- so it joins this tuple instead of growing a second
+#: `except` clause beside the one handler.
+REFUSALS = (Weg2LaunchRefused, ring_table.Weg2RingRefused,
+            host_ledger.Weg2HostLedgerRefused, host_ledger.Weg2HostRunPeakRefused)
 
 
 def cli(argv: Optional[Sequence[str]] = None) -> int:

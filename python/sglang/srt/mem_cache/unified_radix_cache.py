@@ -3053,12 +3053,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         stats["pending"] = len(self.ongoing_write_through) + len(getattr(self, "ongoing_backup", {}) or {})
         n = getattr(UnifiedRadixCache, "_weg2_sweep_n", 0) + 1
         UnifiedRadixCache._weg2_sweep_n = n
+        cc = self.cache_controller
+        stats["draft_issued"] = int(getattr(cc, "_draft_l3_write_issued", 0) or 0)
+        stats["draft_refused"] = int(getattr(cc, "_draft_l3_write_refused", 0) or 0)
         if stats["unbacked"] or n <= 4 or n % 64 == 0:
             logger.warning(
                 "WEG2 PUBLISH-SWEEP n=%d unbacked=%d issued=%d refused=%d skipped_pending=%d "
-                "in_flight_after=%d pins=%d/%d (denominator: un-backed device nodes at this flush poll)",
+                "in_flight_after=%d pins=%d/%d draft_issued=%d draft_refused=%d "
+                "(denominator: un-backed device nodes at this flush poll; the draft terms are "
+                "the controller's CUMULATIVE L3 draft write counts, #1233 C18)",
                 n, stats["unbacked"], stats["issued"], stats["refused"], stats["skipped_pending"],
                 stats["pending"], self._mamba_pins_held(), self._mamba_pin_budget,
+                stats["draft_issued"], stats["draft_refused"],
             )
         return stats
 

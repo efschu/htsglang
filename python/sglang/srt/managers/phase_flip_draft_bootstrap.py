@@ -751,6 +751,12 @@ def _harvest(scheduler):
 #: prefill reaches ``run_batch`` many times with the same request, and each
 #: visit would otherwise re-scrub rows the drafter has since written.
 COLD_ARMED_ATTR = "phase_flip_draft_cold_armed"
+#: #1233 (C14, L6): the span `draft_cold_reason`'s third trigger consumed,
+#: stamped on the request so the admission loop prints it once, by rid.
+COLD_SPAN_ATTR = "weg2_draft_cold_span"
+#: #1233 (L7): a warm request prints its line once; a chunked prefill's
+#: later visits are the same request and stay silent.
+WARM_LOGGED_ATTR = "weg2_draft_warm_logged"
 
 
 # #1233 (WEG 2, S0): the definition moved to ``schedule_batch``; this name
@@ -802,6 +808,24 @@ def draft_cold_reason(scheduler, req, tier_armed: bool) -> Optional[str]:
             f"the draft half of the HiCache tier is disarmed, so this "
             f"{n_prefix}-token cached prefix was restored target-only (#861)"
         )
+    # 3. A CLAIM MADE COLD BY NAME (#1233 Q10). The presence probe found the
+    #    KV prefix but not the draft prefix, and the gap exceeded one HiCache
+    #    chunk, so the fetch claimed the KV pages and named the span whose
+    #    draft rows the #993 zero fill holds. Consumed ONCE, here, by rid.
+    spans = getattr(
+        getattr(getattr(scheduler, "tree_cache", None), "cache_controller", None),
+        "draft_cold_spans",
+        None,
+    )
+    if spans:
+        span = spans.pop(getattr(req, "rid", None), None)
+        if span is not None:
+            d, k = int(span[0]), int(span[1])
+            setattr(req, COLD_SPAN_ATTR, (d, k))
+            return (
+                f"{k - d} of {k} prefix draft pages not in the store (span "
+                f"[{d}, {k})); cold by name, zeros are the fill (#993)"
+            )
     return None
 
 
@@ -896,6 +920,14 @@ def arm_draft_cold_for_admission(scheduler, batch) -> dict:
             continue
         reason = draft_cold_reason(scheduler, req, tier_armed)
         if reason is None:
+            # L7: the probe answered the whole prefix (tier armed, no span,
+            # no seam mark). page_size is 1 here, so pages == prefix tokens.
+            n_warm = prefix_len(req)
+            if n_warm > 0 and tier_armed and not getattr(req, WARM_LOGGED_ATTR, False):
+                setattr(req, WARM_LOGGED_ATTR, True)
+                logger.info(
+                    "WEG2 DRAFT-WARM rid=%s pages=%d miss=0", getattr(req, "rid", "?"), n_warm
+                )
             continue
         n = prefix_len(req)
         if n > 0 and not tier_armed:
@@ -940,8 +972,22 @@ def arm_draft_cold_for_admission(scheduler, batch) -> dict:
         rows, layer_ids = scrub_draft_kv(pool, slot_rows)
 
     for req, _reason in cold:
-        mark_draft_cold(req)
+        owed = mark_draft_cold(req)
         setattr(req, COLD_ARMED_ATTR, True)
+        # L6: one line per request with the span the #993 zeros fill. The
+        # third trigger names its [d, k); the seam and disarmed reasons
+        # cover the whole prefix, [0, n).
+        n_cold = prefix_len(req)
+        d, k = getattr(req, COLD_SPAN_ATTR, None) or (0, n_cold)
+        logger.info(
+            "WEG2 DRAFT-COLD rid=%s span=[%d,%d) of %d prefix pages -- cold by name, "
+            "zeros are the fill (#993), rounds_owed=%d",
+            getattr(req, "rid", "?"),
+            d,
+            k,
+            n_cold,
+            owed,
+        )
 
     # #993 EXECUTION PROOF for the admission link. `kept` is the number of
     # requests marked whose prefix draft rows were LEFT STANDING because the

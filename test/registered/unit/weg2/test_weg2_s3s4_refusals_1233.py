@@ -62,9 +62,13 @@ def test_w16_reroute_once_then_refuse():
 
 def test_w16_reads_cached_tokens_not_loaded():
     # the #1176 defect: a body with cached_tokens in prompt_tokens_details
-    pt, ct, comp = usage_of({"usage": {"prompt_tokens": 9000, "completion_tokens": 5,
-                                       "prompt_tokens_details": {"cached_tokens": 8000}}})
-    assert (pt, ct, comp) == (9000, 8000, 5)
+    # usage_of grew a fourth term (`priced`, #1233 zero-remainder 1j finding 3)
+    # and this pin was not carried with it -- it has been failing to unpack
+    # since, i.e. red at bc31554f90 and at 53bd804e2e, before fix 4 touched
+    # anything.
+    pt, ct, comp, priced = usage_of({"usage": {"prompt_tokens": 9000, "completion_tokens": 5,
+                                               "prompt_tokens_details": {"cached_tokens": 8000}}})
+    assert (pt, ct, comp, priced) == (9000, 8000, 5, True)
     assert double_prefill_verdict(pt, ct, 0, ONE_CHUNK) == "serve"
 
 
@@ -130,12 +134,47 @@ def test_w20_still_refuses_the_live_box_shape_under_the_DR1_two_image_shape():
                            ring_span1_bytes=RING_SPAN1_BYTES,
                            ring_provenance="boot weg2zr2, DR-1 two-image shape")
     text = str(ei.value)
+    # fix 8: the MEASURED dormant image (`image_P=`/`image_D=`) prints beside the
+    # #809 census sums (`weight_tags_P=`) it used to be confused with -- and on
+    # the ring both are PROVENANCE, not charges: the charge is Sigma H.
     for term in ("heaps=", "RUN MOMENT = the host weights term", "LAUNCH MOMENT = ring span 1",
-                 "load_transient=", "anchors@2400=", "rings=", "floor=", "host_headroom="):
+                 "image_P=", "image_D=", "weight_tags_P=", "run_origin=",
+                 "load_transient=", "anchors@2400=", "rings=", "floor=",
+                 "memory.current=", "base_cgroup="):
         assert term in text
     # And the deleted constants may not come back through the printed line.
     assert "backup_P=" not in text and "backup_D=" not in text
+    # fix 5's deletions are deletions on this branch too: the #1232 headroom is
+    # not a charged term (it survives only as the prose naming its own removal),
+    # and the flip transient is not a term beside Sigma H.
+    assert "host_headroom=" not in text
+    assert "flip_transient=" not in text
 
+
+def test_the_cgroup_denominator_binds_and_names_itself():
+    """fix 5 (boot weg2dk5), carried onto the ring: the reaper watches
+    memory.current, so a cgroup sample tighter than meminfo must BIND and the
+    terms must say which reading bound them.
+
+    Driven through price(), not choose(), and that is not a dodge: once a
+    cgroup sample exists the run-peak origin exists too, so W21 becomes
+    reachable and choose() refuses this box before it can return an arm. The
+    DENOMINATOR is what this test pins; W21 has its own tests.
+    """
+    arm = host_ledger.price(
+        118 * GIB, 107 * GIB, 1, 1200,
+        ring_bytes=RING_BYTES, ring_span1_bytes=RING_SPAN1_BYTES,
+        cg_current_bytes=int(60 * GIB), cg_ceiling_bytes=int(118 * GIB),
+    )
+    t = arm.terms
+    assert t["base_source"].startswith("cgroup")
+    # base = 118 (ceiling) - 60 (charged whole, no memory.stat) - 10 (CLI) = 48,
+    # far tighter than the meminfo arm's 107 -- so the cgroup binds.
+    assert abs(t["base_gib"] - 48.0) < 0.05
+    assert abs(t["base_meminfo_gib"] - 107.0) < 0.05
+    assert t["base_cgroup_gib"] is not None and t["base_cgroup_gib"] < t["base_meminfo_gib"]
+    # and the image terms are PROVENANCE here, not a second charge (C19).
+    assert t["host_ring_gib"] > 0 and "image_p_gib" in t
 
 def test_the_ring_is_what_makes_that_same_box_fundable():
     """The whole point of C1-C8, priced: the shared region charges Sigma H once

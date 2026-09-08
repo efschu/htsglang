@@ -2845,6 +2845,15 @@ def broadcast_pyobj(
         else "cpu"
     )
 
+    # A broadcast inside a group of ONE member is the identity: that member
+    # is the source whatever `rank` the caller derived (#1233 draft_pp_scope
+    # publishes single-rank pp/world twins; TpModelWorker.__init__ derives
+    # `rank` as tp_size*pp_rank+tp_rank with the draft's pp_rank forced to
+    # 0, so on a non-first stage rank != src and the receiver branch would
+    # read a size of 0 from a broadcast nobody sends).
+    if dist.is_initialized() and dist.get_world_size(group=dist_group) == 1:
+        return data
+
     if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)

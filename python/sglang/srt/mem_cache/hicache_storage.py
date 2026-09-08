@@ -151,6 +151,12 @@ class HiCacheStorageConfig:
     # prefix to zero (test_mamba_gates_the_hit_706.py), and the device-side
     # MambaRadixCache match advances only at nodes that carry mamba state.
     canonical_mamba_blob: Optional[CanonicalExtentWindow] = None
+    #: #1233 draft KV across the flip: this rank's head window in the whole
+    #: canonical draft page (``canonical_page_store.build_draft_window``).
+    #: Installed late, from ``HiCacheController._maybe_register_draft_with_
+    #: storage``, because the draft pool binds after the storage config is
+    #: built; None keeps every draft key byte-identical to today.
+    canonical_draft_page: Optional[CanonicalExtentWindow] = None
 
 
 @dataclass
@@ -311,6 +317,12 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    #: #1233 draft KV across the flip: a PRESENCE-ONLY pool. Its boundary is
+    #: recorded in ``extra_pool_hit_pages`` like every other pool's, but it
+    #: does not enter the ``min`` that decides the KV claim -- the consumer
+    #: (``HybridCacheController._storage_hit_query``) decides between trim
+    #: and cold-by-name from the two numbers. Default True = upstream.
+    caps_claim: bool = True
 
 
 @dataclass(frozen=True)
@@ -847,6 +859,14 @@ class HiCacheFile(HiCacheStorage):
         self.canonical_mamba_blob = getattr(
             storage_config, "canonical_mamba_blob", None
         )
+        self.canonical_draft_page = getattr(storage_config, "canonical_draft_page", None)
+        if self.canonical_draft_page is not None and self.canonical_kv_page is None:
+            raise NotImplementedError(
+                "The #1233 canonical draft page was configured without the "
+                "canonical KV page. The draft page rides the KV page's key "
+                "rule; a neutral draft page beside geometry-suffixed KV pages "
+                "is a prefix nobody can continue from."
+            )
         # Precomputed once: the KV page's generic (one-extent) form, so the hot
         # path does not rebuild and revalidate it per page.
         self._canonical_kv_extents = (
@@ -1242,15 +1262,17 @@ class HiCacheFile(HiCacheStorage):
         return f"{tensor_path}.tmp.{uuid.uuid4().hex[:min(16, room)]}"
 
     def _is_draft_key(self, key: str) -> bool:
-        """Draft pages, excluded from every neutralisation rule BY NAME.
+        """Draft page keys: ``{hash}.draft`` or ``{hash}.draft-{drafter}``.
 
-        Draft KV is the exact MIRROR of target KV: head-SHARDED and
-        token-COMPLETE, written by every rank under its own suffix. No suffix
-        rule can neutralise that, so the draft pool starts cold after a flip or
-        a reboot -- the designed shape, and the reason a cross-phase hit is
-        expected to be PARTIAL rather than total.
+        The live key carries the drafter identity (#861,
+        ``HiCacheController._draft_component_name``), so the old
+        ``endswith(".draft")`` test was False for every key the generic route
+        writes -- a dead predicate that became load-bearing the moment a
+        canonical draft window existed (#1233). Recognising the identity
+        form is what routes a draft key to its own window and its own
+        suffix; with no window installed both answers fall back to today's.
         """
-        return key.endswith(f".{PoolName.DRAFT}")
+        return f".{PoolName.DRAFT}-" in key or key.endswith(f".{PoolName.DRAFT}")
 
     def _is_shared_kv_key(self, key: str) -> bool:
         """True for the keys whose bytes are geometry-independent.
@@ -1264,15 +1286,15 @@ class HiCacheFile(HiCacheStorage):
         * ``canonical_kv_page`` (#706) -- pages carry every attention layer, so
           a page is complete across PP stages (layer axis).
 
-        DRAFT PAGES ARE EXCLUDED BY NAME, and not as an oversight. Draft KV is
-        the exact MIRROR of target KV: head-SHARDED and token-COMPLETE, written
-        by every rank under its own suffix. No suffix rule can neutralise that,
-        so the draft pool starts cold after a flip or a reboot -- the designed
-        shape, which is why a cross-phase hit is expected to be PARTIAL.
-        Component pools (mamba/SWA) are genuinely per-rank shards for the same
-        kind of reason and keep their suffix too; their cross-geometry form is
-        the offline cut in ``hicache_migrate`` (``MambaBlobSpec.for_layers`` /
-        ``layer_extents`` for the layer axis), never a softened key.
+        Draft pages are not plain KV keys and take their own branch in
+        ``_suffix_for_key``: a canonical draft page (#1233) is full-head and
+        single-layer, so it loses the same terms the KV page does -- but only
+        while the draft window is installed; without it the draft key keeps
+        every term it carries today. Component pools (mamba/SWA) are
+        genuinely per-rank shards and keep their suffix too; their
+        cross-geometry form is the offline cut in ``hicache_migrate``
+        (``MambaBlobSpec.for_layers`` / ``layer_extents`` for the layer
+        axis), never a softened key.
         """
         return "." not in key
 
@@ -1319,7 +1341,11 @@ class HiCacheFile(HiCacheStorage):
         after construction.
         """
         g = self._key_geom
-        self.config_suffix, self.kv_config_suffix = self._build_key_suffixes(g)
+        (
+            self.config_suffix,
+            self.kv_config_suffix,
+            self.draft_config_suffix,
+        ) = self._build_key_suffixes(g)
         # WHICH OF THESE PATHS DOES EVERY RANK OF THE GROUP NAME?
         # Asked by re-deriving the same two strings from the same builder with
         # the rank terms zeroed, and comparing. It is deliberately not a list
@@ -1334,10 +1360,17 @@ class HiCacheFile(HiCacheStorage):
         # carrier that moves nothing (see
         # ``weg2_store_gates.owner_write_covers_whole_file``).
         rank0 = dict(g, tp_rank=0, pp_rank=0, attn_cp_rank=0)
-        rank0_config_suffix, rank0_kv_config_suffix = self._build_key_suffixes(rank0)
+        (
+            rank0_config_suffix,
+            rank0_kv_config_suffix,
+            rank0_draft_config_suffix,
+        ) = self._build_key_suffixes(rank0)
         self._config_suffix_is_group_wide = self.config_suffix == rank0_config_suffix
         self._kv_config_suffix_is_group_wide = (
             self.kv_config_suffix == rank0_kv_config_suffix
+        )
+        self._draft_config_suffix_is_group_wide = (
+            self.draft_config_suffix == rank0_draft_config_suffix
         )
 
     def _group_scan_suffixes(self) -> Tuple[str, ...]:
@@ -1370,7 +1403,7 @@ class HiCacheFile(HiCacheStorage):
         for tp_rank in range(max(1, int(g["tp_size"]))):
             for pp_rank in range(max(1, int(g["pp_size"]))):
                 for cp_rank in range(max(1, int(g["attn_cp_size"]))):
-                    cfg, kv = self._build_key_suffixes(
+                    cfg, kv, draft = self._build_key_suffixes(
                         dict(
                             g,
                             tp_rank=tp_rank,
@@ -1380,32 +1413,48 @@ class HiCacheFile(HiCacheStorage):
                     )
                     suffixes.append(cfg)
                     suffixes.append(kv)
+                    suffixes.append(draft)
         return tuple(dict.fromkeys(s for s in suffixes if s))
 
-    def _build_key_suffixes(self, g: dict) -> Tuple[str, str]:
-        """(config_suffix, kv_config_suffix) for the geometry ``g``.
+    def _build_key_suffixes(self, g: dict) -> Tuple[str, str, str]:
+        """(config_suffix, kv_config_suffix, draft_config_suffix) for ``g``.
 
         Pure in ``g``, so the caller above can run it a second time with the
         rank terms zeroed and learn, from the derivation itself, whether this
         rank's suffix is the group's or its own.
+
+        #1233: the DRAFT suffix drops ``_{tp_rank}_{tp_size}`` and
+        ``_{pp_size}_{pp_rank}`` exactly while the canonical draft window is
+        installed -- the #706 rule ("the key carries exactly the geometry the
+        bytes still depend on") applied to a page that is then full-head and
+        full-draft-layer. Without the window it is byte-identical to
+        ``config_suffix``, which is what every draft key carried before.
         """
         config_suffix = f"_{g['model_name']}"
         kv_config_suffix = f"_{g['model_name']}"
+        draft_config_suffix = f"_{g['model_name']}"
+        draft_neutral = self.canonical_draft_page is not None
         if g["identity_hash"]:
             config_suffix += f"_{g['identity_hash']}"
             kv_config_suffix += f"_{g['identity_hash']}"
+            draft_config_suffix += f"_{g['identity_hash']}"
         if not g["is_mla_model"]:
             config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
             if not self.dcp_owner_mode and self.canonical_kv_page is None:
                 kv_config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
+            if not draft_neutral:
+                draft_config_suffix += f"_{g['tp_rank']}_{g['tp_size']}"
         if g["enable_pp"]:
             config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
             if self.canonical_kv_page is None:
                 kv_config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
+            if not draft_neutral:
+                draft_config_suffix += f"_{g['pp_size']}_{g['pp_rank']}"
         if g["attn_cp_size"] > 1:
             config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
             kv_config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
-        return config_suffix, kv_config_suffix
+            draft_config_suffix += f"_cp{g['attn_cp_rank']}_{g['attn_cp_size']}"
+        return config_suffix, kv_config_suffix, draft_config_suffix
 
     def _suffix_for_key(self, key: str) -> Tuple[str, bool]:
         """The suffix this key carries, and whether every rank names that path.
@@ -1416,7 +1465,7 @@ class HiCacheFile(HiCacheStorage):
         the bytes landed on the kv-suffixed path, or the reverse.
         """
         if self._is_draft_key(key):
-            return self.config_suffix, self._config_suffix_is_group_wide
+            return self.draft_config_suffix, self._draft_config_suffix_is_group_wide
         if (
             self.dcp_owner_mode or self.canonical_kv_page is not None
         ) and self._is_shared_kv_key(key):
@@ -1568,13 +1617,15 @@ class HiCacheFile(HiCacheStorage):
     def _canonical_window(self, key: str):
         """The canonical window serving this key, or None for the normal path.
 
-        One dispatch for both pools: the KV page's window in its generic
-        one-extent form, or the mamba blob's extent window. Draft keys never
-        reach either (excluded by name), and any other component pool keeps its
-        per-rank key because no canonical form is defined for it.
+        One dispatch for three pools: the KV page's window in its generic
+        one-extent form, the mamba blob's extent window, or (#1233) the draft
+        page's head window while one is installed. A draft key NEVER takes
+        the KV window -- without a draft window it stays on the per-rank
+        path -- and any other component pool keeps its per-rank key because
+        no canonical form is defined for it.
         """
         if self._is_draft_key(key):
-            return None
+            return self.canonical_draft_page
         if self._canonical_kv_extents is not None and self._is_shared_kv_key(key):
             return self._canonical_kv_extents
         if self._is_shared_mamba_key(key):
@@ -1711,7 +1762,7 @@ class HiCacheFile(HiCacheStorage):
         """
         return self._evictor.rescan()
 
-    def install_canonical_windows(self, kv_page, mamba_blob) -> None:
+    def install_canonical_windows(self, kv_page, mamba_blob, draft_page=None) -> None:
         """#706 x #719 (0828): swap this backend's read/write-time cut.
 
         Called by ``HiCacheController.rebind_canonical_windows`` at the flip
@@ -1727,9 +1778,20 @@ class HiCacheFile(HiCacheStorage):
         other rule. Likewise the canonical TOTAL is a model constant: a
         different total is a different page format, not another phase's cut
         of the same one.
+
+        The DRAFT slot has one more legal transition: its FIRST install
+        (None -> window). The draft pool binds after the storage config is
+        built (`HiCacheStorageConfig.canonical_draft_page` has no writer in
+        the tree), so `HiCacheController._install_canonical_draft_window`
+        installs the third slot from `set_draft_kv_pool`, at registration,
+        before this process wrote a single page -- there is no live store to
+        re-key yet (spec G1/Q8; boot weg2dk1 review). Switching the slot OFF
+        over an installed window, and a `total_bytes` change, stay refusals.
         """
-        if (kv_page is None) != (self.canonical_kv_page is None) or (
-            (mamba_blob is None) != (self.canonical_mamba_blob is None)
+        if (
+            (kv_page is None) != (self.canonical_kv_page is None)
+            or ((mamba_blob is None) != (self.canonical_mamba_blob is None))
+            or (draft_page is None and self.canonical_draft_page is not None)
         ):
             raise CanonicalPageError(
                 "refusing to switch the canonical format on or off at a "
@@ -1756,9 +1818,20 @@ class HiCacheFile(HiCacheStorage):
                 f"{mamba_blob.total_bytes}-byte blob over a store keyed for "
                 f"{self.canonical_mamba_blob.total_bytes}-byte blobs."
             )
+        if (
+            draft_page is not None
+            and self.canonical_draft_page is not None
+            and int(draft_page.total_bytes) != int(self.canonical_draft_page.total_bytes)
+        ):
+            raise CanonicalPageError(
+                f"refusing to install a draft window of a "
+                f"{draft_page.total_bytes}-byte page over a store keyed for "
+                f"{self.canonical_draft_page.total_bytes}-byte draft pages."
+            )
         self.canonical_kv_page = kv_page
         self._canonical_kv_extents = kv_page.as_extents()
         self.canonical_mamba_blob = mamba_blob
+        self.canonical_draft_page = draft_page
         # #969F: THE FACT THE KEY SUFFIX DEPENDS ON JUST CHANGED. Re-derive it
         # here, at the one place that changes it, so there is a single
         # derivation function and no second moment. Without this the store
@@ -1955,6 +2028,8 @@ class HiCacheFile(HiCacheStorage):
             f".{PoolName.MAMBA}"
         ):
             return int(self.canonical_mamba_blob.total_bytes)
+        if self.canonical_draft_page is not None and self._is_draft_key(bare):
+            return int(self.canonical_draft_page.total_bytes)
         if "." not in bare:
             return int(self._canonical_kv_extents.total_bytes)
         return None
@@ -2114,7 +2189,12 @@ class HiCacheFile(HiCacheStorage):
                         break
             if boundary:
                 hit_count[name] = boundary
-            else:
+            if not getattr(transfer, "caps_claim", True):
+                # #1233: presence-only pool (the draft page). Its boundary is
+                # reported above; the consumer decides trim vs. cold-by-name
+                # from it, so it must not pull the KV claim down here.
+                continue
+            if not boundary:
                 # THE ABSENCE THAT LOOKS LIKE CONSENT. `hit_count` records only
                 # non-zero boundaries, so a pool capped to exactly 0 vanishes
                 # from it and its `caps={}` reads as "nothing capped this" when

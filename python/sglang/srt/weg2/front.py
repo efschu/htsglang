@@ -58,7 +58,12 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-from sglang.srt.managers.weg2_memory_saver import credit_epoch, weights_family_tags
+from sglang.srt.managers.weg2_memory_saver import (
+    WEIGHT_CHUNK_PREFIX,
+    credit_epoch,
+    weights_family_tags,
+)
+from sglang.srt.weg2 import host_ledger
 
 logger = logging.getLogger("weg2.front")
 
@@ -421,6 +426,62 @@ def fairness_reached(oldest_arrival: Optional[float], now: float, w_s: float) ->
     return oldest_arrival is not None and (now - oldest_arrival) >= w_s
 
 
+def interleave_pause_order(
+    tags: List[str],
+    tag_cards: Dict[str, Any],
+    free_mib: Dict[int, int],
+) -> Tuple[List[str], str]:
+    """The order the SOURCE group pauses its weights family in: TIGHTEST CARD
+    FIRST.  Returns ``(order, why)``; ``why`` names the reason in the log.
+
+    The interleave (``flip``) pauses one source tag and resumes one destination
+    tag per step, so per card the destination's demand is only paid for by the
+    source's release IF the two tags name the same card.  They do not when the
+    two groups have different parallelism: the source's chunk tag is a LAYER
+    band (PP: one card), the destination's is a shard of every layer (TP: all
+    cards).  Boot weg2dk4 measured the consequence on the PP source's LAST
+    stage -- 4,511 -> 277.8 MiB driver_free in five steps, then CUDA OOM in
+    ``cu_mem_create`` on the sixth resume, group D fatal.
+
+    The order below is the only free variable that fixes it without touching a
+    budget: the ENDPOINT of the flip is unchanged (the same tags are paused and
+    resumed), only the PATH is.  Releasing the tightest card's bands first pays
+    that card's demand up front and moves the drawdown onto the cards that have
+    the free memory to absorb it -- which is measured here, per flip, not
+    assumed.
+
+    Contracts kept: the base weights tag closes the sleep (``weights_family_tags``),
+    the result is always a permutation of ``tags``, and an incomplete input is a
+    NAMED refusal to reorder (identity), never a partial order.
+    """
+    tags = list(tags)
+    chunks = [t for t in tags if t.startswith(WEIGHT_CHUNK_PREFIX)]
+    rest = [t for t in tags if not t.startswith(WEIGHT_CHUNK_PREFIX)]
+    if not tag_cards:
+        return tags, "identity: the source has no chunk->card map (uniform/TP source, or no map passed)"
+    if not free_mib:
+        return tags, "identity: no NVML free sample for this flip"
+    # #1233 fix 6: an EMPTY card list is as unusable as an absent tag, and the
+    # difference used to be a crash instead of a refusal -- ``min()`` over an
+    # empty sequence raises ValueError inside ``flip``, i.e. at the one moment
+    # the flip must not fail.  ``chunk_tag_cards`` cannot emit an empty tuple
+    # today (a tag exists only once a layer lands in it), so this is a latent
+    # shape, and a latent shape guarded by nothing is how weg2dk4's order came
+    # to be trusted.
+    missing = [t for t in chunks if not tag_cards.get(t)]
+    if missing:
+        return tags, (
+            "identity REFUSED to reorder: chunk tags absent from the map or with "
+            f"no cards {missing}"
+        )
+    unknown = sorted({int(c) for t in chunks for c in tag_cards[t]} - set(free_mib))
+    if unknown:
+        return tags, f"identity REFUSED to reorder: cards {unknown} absent from the NVML free sample {sorted(free_mib)}"
+    index = {t: i for i, t in enumerate(chunks)}
+    order = sorted(chunks, key=lambda t: (min(free_mib[int(c)] for c in tag_cards[t]), index[t]))
+    return order + rest, "tightest-card-first"
+
+
 # --------------------------------------------------------------------------
 # runtime
 # --------------------------------------------------------------------------
@@ -574,13 +635,21 @@ class Front:
                  min_dwell_ms: Optional[float] = None,
                  idle_layout: str = "D",
                  drain_deadline_s: float = DRAIN_DEADLINE_DEFAULT_S,
-                 d_admit_max_tokens: Optional[int] = None):
+                 d_admit_max_tokens: Optional[int] = None,
+                 src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None,
+                 measured_record: str = "", commit: str = "",
+                 ledger_arm: Optional[Dict[str, float]] = None):
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
         self.awake = awake
         # #1233 one-backup flip: the weights tag family both groups were built
         # with (launcher: SGLANG_WEG2_WEIGHT_CHUNKS), chunks first, base last.
         self.weight_chunks = int(weight_chunks)
         self.weights_tags = weights_family_tags(self.weight_chunks)
+        # #1233 boot weg2dk4: per group, which cards (NVML index) hold each
+        # chunk tag's bytes -- derived by the launcher from that group's
+        # parallelism, EMPTY for a group whose tags are uniform across cards
+        # (TP).  Read by interleave_pause_order when that group is the source.
+        self.src_chunk_cards: Dict[str, Dict[str, List[int]]] = dict(src_chunk_cards or {})
         self.tag = tag
         self.store_dir = store_dir
         self.dc_reserve = dc_reserve
@@ -661,6 +730,15 @@ class Front:
         # prefill, and named as the carrier bound it is.
         self.carrier_max_tokens = int(carrier_max_tokens)
         self.exact_tokens: Dict[str, int] = {}
+        # #1233 fix 8: the DORMANT-IMAGE measurement, one per group at its FIRST
+        # sleep.  The launcher takes P's (un-interleaved, before D exists); the
+        # front takes each group's first sleep it sees, which for D is a flip
+        # and is therefore INTERLEAVED -- the sample says so, and only the
+        # RssShmem instrument measures that group's image there.
+        self.measured_record = measured_record
+        self.commit = commit
+        self.ledger_arm = dict(ledger_arm or {})
+        self.dormant_image: Dict[str, dict] = {}
         # FIX 4a (round 1), boot weg2sc1 LINK 1 -- D's CONCURRENCY IS A
         # TOKEN BUDGET, NOT ONLY A COUNT.
         #
@@ -1637,9 +1715,11 @@ class Front:
                     if pt:
                         self.spans.record(text, pt)
                         self._note_exact(text, pt)
+                    dterms = await self._draft_terms(g, None)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
-                                "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d", rid, r.status, pt, ct, comp, max(0, pt - ct),
-                                verdict, priced, time.time() - t0, self.epoch)
+                                "uncached=%d verdict=%s priced=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
+                                rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, priced, time.time() - t0, self.epoch,
+                                dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
                     if pending is not None and ct > 0:
                         self.counters["cross_group_prefix_hits"] += 1
                     return resp
@@ -1662,9 +1742,11 @@ class Front:
                     return web.json_response({"error": f"W28 Weg2Leg2Unpriced rid={rid}"}, status=503)
                 verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, False, rid)
                 g.served += 1
+                dterms = await self._draft_terms(g, js)
                 logger.info("WEG2-SERVED group=D leg=2 rid=%s status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
-                            "uncached=%d verdict=%s wall=%.2fs epoch=%d", rid, r.status, pt, ct, comp, max(0, pt - ct),
-                            verdict, time.time() - t0, self.epoch)
+                            "uncached=%d verdict=%s wall=%.2fs epoch=%d draft_pages=%d draft_miss=%d accept_len=%.3f accept_src=%s",
+                            rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
+                            dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
                 if pt:
                     self.spans.record(text, pt)
                     self._note_exact(text, pt)
@@ -1772,20 +1854,87 @@ class Front:
         self._mark_posted(p)
         return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
 
-    def check_identity(self) -> None:
-        """W9 from the store directory: exactly ONE identity suffix on disk."""
-        self.identity_checked = True
+    async def _draft_terms(self, g, body) -> dict:
+        """#1233 (C16, L12): the draft terms of one served request.
+
+        ``accept_len`` comes from ``meta_info.spec_accept_length`` when the
+        body carries it (``/generate``), else from the ``/get_server_info``
+        ``avg_spec_accept_length`` (cumulative average, named as such);
+        ``draft_pages``/``draft_miss`` are the DELTA of D's L3 draft read
+        counters (``internal_states[0]`` of the body) between this call and the previous one (one request in
+        flight at a time on the leg-2 route, so the delta is this request's).
+        Never raises: a missing instrument is ``accept_src=none``.
+        """
+        out = {"draft_pages": 0, "draft_miss": 0, "accept_len": 0.0, "accept_src": "none"}
         try:
-            names = [n for n in os.listdir(self.store_dir) if n.endswith(".bin")][:20000]
+            mi = (body or {}).get("meta_info") if isinstance(body, dict) else None
+            if isinstance(mi, dict) and mi.get("spec_accept_length") is not None:
+                out["accept_len"] = float(mi["spec_accept_length"])
+                out["accept_src"] = "meta"
+            async with self.session.get(f"{g.url}/get_server_info") as r:
+                info = await r.json() if r.status == 200 else {}
+            if isinstance(info, list) and info:
+                info = info[0]
+            if not isinstance(info, dict):
+                return out
+            # /server_info (http_server.py) puts the server_args at the top
+            # level and the SCHEDULER's counters -- these -- one level down
+            # under `internal_states[0]` (fix 2: read at the top level, the
+            # terms were always 0 and accept_len never reached its fallback).
+            st = info.get("internal_states") or []
+            if isinstance(st, list) and st and isinstance(st[0], dict):
+                info = st[0]
+            hits = int(info.get("draft_l3_hits", 0) or 0)
+            miss = int(info.get("draft_l3_misses", 0) or 0)
+            prev = getattr(self, "_draft_prev", (0, 0))
+            self._draft_prev = (hits, miss)
+            out["draft_pages"] = max(0, hits - prev[0])
+            out["draft_miss"] = max(0, miss - prev[1])
+            if out["accept_src"] == "none" and info.get("avg_spec_accept_length") is not None:
+                out["accept_len"] = float(info["avg_spec_accept_length"])
+                out["accept_src"] = "server_info_avg"
+        except Exception as e:  # noqa: BLE001 - an instrument never breaks serving
+            logger.debug("draft terms unavailable: %s: %s", type(e).__name__, e)
+        return out
+
+    def check_identity(self) -> None:
+        """W9 from the store directory: exactly ONE identity suffix on disk.
+
+        #1233 draft KV across the flip (C16): walks the ``page_shard``
+        subdirectories (``hicache_storage.page_shard``: the first two hex
+        characters of the key) instead of the flat listdir that saw no page
+        at all, and censuses kv / mamba / draft files by name (L11).
+        """
+        self.identity_checked = True
+        names = []
+        try:
+            for root, _dirs, files in os.walk(self.store_dir):
+                for n in files:
+                    if n.endswith(".bin"):
+                        names.append(n)
+                        if len(names) >= 200000:
+                            break
+                if len(names) >= 200000:
+                    break
         except OSError:
             return
-        ids = set()
+        ids, suffixes = set(), set()
+        kv = mamba = draft = 0
         for n in names:
             stem = n[:-4]
+            head, _, tail = stem.partition("_")
+            if ".draft" in head:
+                draft += 1
+            elif ".mamba" in head:
+                mamba += 1
+            elif "." not in head:
+                kv += 1
             parts = stem.split("_")
             if len(parts) >= 3:
                 ids.add(parts[-1])
-        logger.info("W9 identity check from store dir %s: %d files, identity suffixes %s", self.store_dir, len(names), sorted(ids))
+            suffixes.add("_" + tail if tail else "")
+        logger.info("W9 store census (shard-walked) files=%d kv=%d mamba=%d draft=%d suffixes=%s identity suffixes %s (store dir %s)",
+                    len(names), kv, mamba, draft, sorted(suffixes)[:8], sorted(ids), self.store_dir)
         if len(ids) > 1:
             self.do_stop("W9 Weg2StoreIdentityMismatch", f"identity suffixes on the sole carrier: {sorted(ids)}")
 
@@ -1830,6 +1979,61 @@ class Front:
             last = body
             await asyncio.sleep(0.5)
         return False, last
+
+    def _store_used_bytes(self) -> Optional[int]:
+        """The store tmpfs's MEASURED content, or None (never 0 on failure)."""
+        if not self.store_dir:
+            return None
+        try:
+            st = os.statvfs(self.store_dir)
+        except OSError:
+            return None
+        return (st.f_blocks - st.f_bfree) * st.f_frsize
+
+    def sample_dormant_image(self, group: str, shmem_before: Optional[int]) -> Optional[dict]:
+        """Measure ``group``'s dormant host image, once, at its first sleep.
+
+        The term boot weg2dk7 refuted: the ledger charged the weight-tag byte
+        sum (28.83 GiB for P) while the sleeping group's per-rank ``RssShmem``
+        measured 38.63 GiB -- everything with ``enable_cpu_backup`` is in the
+        image, not only the ``weights_*`` tags.  Returns ``None`` (and measures
+        nothing) once that group has a sample, so a boot's images are the ones
+        its FIRST sleeps produced and not a moving average of its flips.
+        """
+        if group in self.dormant_image:
+            return None
+        g = self.groups[group]
+        pids = sorted(_session_pids(g.sid)) if g.sid else []
+        cg = host_ledger.read_cgroup()
+        weight_tags = (
+            host_ledger.WEIGHT_TAGS_P_BYTES if group == "P" else host_ledger.WEIGHT_TAGS_D_BYTES
+        ) / host_ledger.GIB
+        rec = host_ledger.dormant_image_sample(
+            group=group,
+            shmem_before_bytes=shmem_before,
+            shmem_after_bytes=host_ledger.read_cgroup_shmem_bytes(),
+            pids=pids,
+            weight_tags_gib=weight_tags,
+            # A flip's sleep IS interleaved: the destination is resuming and the
+            # patched saver frees ITS image while this one is written, so the
+            # cgroup shmem delta is the difference of two images.
+            interleaved=True,
+            boot_tag=self.tag,
+            commit=self.commit,
+            cg_current_bytes=cg.get("current"),
+            reclaimable_bytes=cg.get("reclaimable"),
+            store_used_bytes=self._store_used_bytes(),
+            arm=self.ledger_arm or None,
+        )
+        self.dormant_image[group] = rec
+        logger.info("%s", host_ledger.format_dormant_image(rec))
+        if self.measured_record:
+            try:
+                host_ledger.append_measured_record(self.measured_record, rec)
+            except OSError as e:  # noqa: BLE001
+                logger.error("WEG2 DORMANT-IMAGE not persisted to %s: %s -- the next boot "
+                             "will price the recorded dk7 reading instead", self.measured_record, e)
+        return rec
 
     async def flip(self, src: str, dst: str) -> None:
         S, D = self.groups[src], self.groups[dst]
@@ -1901,6 +2105,8 @@ class Front:
         sleep_ms = 0.0
         wake_ms = 0.0
         chunk_recs: List[dict] = []
+        # fix 8: the cgroup shmem reading the source's image is written against.
+        shmem_before = host_ledger.read_cgroup_shmem_bytes()
         t0 = time.time()
         code, body = await self.rpc(S, "/release_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
         sleep_ms += (time.time() - t0) * 1000
@@ -1908,6 +2114,44 @@ class Front:
             self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
             return
         family = list(self.weights_tags)
+        # #1233 fix 4 ON THE RING FORM.  The tight-card-first order survives the
+        # move to gathered legs (C9); the serial per-tag RPC loop it used to
+        # drive does NOT.  Under the gathered legs the front issues ONE
+        # /release_memory_occupation per group, so the pause ORDER is no longer
+        # an RPC sequence the front controls step by step -- it is the ORDER OF
+        # THE TAG LIST that leg carries, which the group walks unchanged
+        # (`weights_tags = [t for t in tags if is_weights_family_tag(t)]` in
+        # weight_updater, both legs).  So the ordering is applied HERE, to the
+        # source leg's list, and the destination keeps the natural order.  That
+        # is ONE flip mechanism and ONE ordering function, not two.
+        #
+        # Why the order still matters with the legs gathered: the two legs now
+        # run CONCURRENTLY, so the destination's demand on a card overlaps the
+        # source's release on that same card.  Pausing the tightest card's
+        # bands first is what makes the source's bytes come free on the card
+        # the destination is about to want them on.  boot weg2dk4 died in
+        # cu_mem_create on exactly that card (driver_free 4,511 -> 277.8 MiB
+        # in five steps, BOOT_weg2dk4_0907.md).
+        #
+        # The free sample is taken HERE, after the source's kv_cache is already
+        # released, so it is the state the flip actually starts from.
+        free_mib = {idx: free for idx, _uuid, free in _nvml_free()}
+        pause_order, why = interleave_pause_order(
+            self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib
+        )
+        logger.info(
+            "WEG2-FLIP-ORDER epoch=%d src=%s driver_free=%s pause_order=%s resume_order=%s (%s) "
+            "-- applied to the GATHERED sleep leg's tag list (C9), not to a per-tag RPC loop",
+            self.epoch, src, free_mib, pause_order, self.weights_tags, why,
+        )
+        if sorted(pause_order) != sorted(self.weights_tags):
+            self.do_stop(
+                "W4 Weg2WakeRefused",
+                f"pause order {pause_order} is not a permutation of the weights family "
+                f"{self.weights_tags} -- a tag would be resumed on {dst} that was never "
+                f"paused on {src}; VRAM state untouched, no flip",
+            )
+            return
         # FIX 2 round 2: the token names the BOOT and the flip, not the flip
         # alone -- see weg2_memory_saver.credit_epoch for the leftover counters
         # a bare flip index made this boot inherit.
@@ -1920,7 +2164,7 @@ class Front:
         # previous flip's terminal state as this flip's funding.
         (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
             self.timed_rpc(S, "/release_memory_occupation",
-                           {"tags": family, "epoch": flip_epoch}, RPC_TIMEOUT_S),
+                           {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
             self.timed_rpc(D, "/resume_memory_occupation",
                            {"tags": family, "epoch": flip_epoch}, RPC_TIMEOUT_S),
         )
@@ -1974,7 +2218,10 @@ class Front:
                 self.epoch, tag, src, rec["sleep_ms"], rec["sleep_mib"], dst, rec["wake_ms"], rec["wake_mib"],
             )
         t_s = time.time()
-        # 4. measure D_c(src); W19 for D at its first sleep
+        # 4. measure D_c(src) on the DEVICE axis; W19 for D at its first sleep.
+        # fix 8: and the HOST axis, once per group -- the dormant image the next
+        # boot's ledger prices instead of the weight-tag census sum.
+        self.sample_dormant_image(src, shmem_before)
         pids = _session_pids(S.sid) if S.sid else set()
         dc = _nvml_process_mib(pids) if pids else {}
         for uuid, mib in sorted(dc.items()):
@@ -2436,6 +2683,17 @@ def main():
                          "count-only admitter that overcommitted the pool on boot weg2sc1 (#915 "
                          "vote_negative -> a mis-priced X gate -> a store-resident rid re-queued "
                          "to P).")
+    ap.add_argument("--src-chunk-cards", default="",
+                    help="#1233 weg2dk4: JSON {group: {weights_k: [nvml_index, ...]}} -- which cards hold each chunk tag's "
+                         "bytes, per group, derived by the launcher from that group's parallelism. A group that is absent "
+                         "(or an empty map) pauses in the natural tag order, exactly as before.")
+    ap.add_argument("--measured-record", default="",
+                    help="#1233 fix 8: the JSON sidecar this line writes its DORMANT-IMAGE measurements "
+                         "into (empty = measure and log, do not persist)")
+    ap.add_argument("--commit", default="", help="#1233 fix 8: the tip this boot runs, stamped into every measurement")
+    ap.add_argument("--ledger-arm", default="",
+                    help="#1233 fix 8: JSON {s_gb, m_mib, store_gib} -- the arm the ledger chose, needed to "
+                         "derive the RUN-MOMENT residual from the front's own cgroup reading")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}
@@ -2449,7 +2707,10 @@ def main():
                   flip_min_work_tokens=args.flip_min_work_tokens,
                   min_dwell_ms=args.min_dwell_ms, idle_layout=args.idle_layout,
                   drain_deadline_s=args.drain_deadline_s,
-                  d_admit_max_tokens=args.d_admit_max_tokens)
+                  d_admit_max_tokens=args.d_admit_max_tokens,
+                  src_chunk_cards=json.loads(args.src_chunk_cards) if args.src_chunk_cards else {},
+                  measured_record=args.measured_record, commit=args.commit,
+                  ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {})
     app = web.Application(client_max_size=1024**3)
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)
@@ -2465,7 +2726,8 @@ def main():
         app.router.add_get(path, front.handle_passthrough_get)
     for path in FORWARD_PATHS:
         app.router.add_post(path, front.handle_generate)
-    logger.info("WEG2-FRONT %s:%s -> P=%s D=%s awake=%s weights_tags=%s", args.host, args.port, args.prefill, args.decode, args.awake, front.weights_tags)
+    logger.info("WEG2-FRONT %s:%s -> P=%s D=%s awake=%s weights_tags=%s src_chunk_cards=%s", args.host, args.port,
+                args.prefill, args.decode, args.awake, front.weights_tags, front.src_chunk_cards)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
 

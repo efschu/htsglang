@@ -592,6 +592,60 @@ def _query_gpu_total_mib(gpu_ids, flag: str) -> Dict[int, int]:
     return totals
 
 
+#: The layer-count keys ``config.json`` spells the backbone depth with.
+_NUM_LAYER_CONFIG_KEYS = ("num_hidden_layers", "n_layer", "num_layers")
+
+
+def _probe_declared(cfg: dict, key):
+    """One key out of a ``config.json``: TOP LEVEL first, then ``text_config``.
+
+    The probe order is a fact both readers must share.  #1233 fix 6: the Weg-2
+    launcher probed ``text_config`` first, so a config carrying a key at both
+    levels with different values gave the launcher's chunk->card map and the
+    server's own PP split two different checkpoints -- with no disagreement
+    anywhere to see, because each side was self-consistent.
+    """
+    value = cfg.get(key)
+    return value if value is not None else (cfg.get("text_config") or {}).get(key)
+
+
+def declared_num_hidden_layers_from_config(cfg: dict) -> Optional[int]:
+    """The backbone depth ``cfg`` declares, or None.  Advisory (see
+    :meth:`ServerArgs.declared_num_hidden_layers` for why it is never
+    authoritative)."""
+    for key in _NUM_LAYER_CONFIG_KEYS:
+        value = _probe_declared(cfg, key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def declared_layer_kinds_from_config(cfg: dict, depth: int) -> List[bool]:
+    """Per-layer full-attention markers, as ``config.json`` declares them.
+
+    THE one derivation, called by :meth:`ServerArgs.declared_layer_kinds` and
+    by the Weg-2 launcher's ``model_layer_kinds`` -- #1233 fix 6, after the two
+    were found to disagree about which checkpoints are hybrid at all.
+
+    Sources, in probe order (mirroring configs/qwen3_next.py: layers_block_type
+    and configs/model_config.py):
+
+    * an explicit ``layer_types`` / ``layers_block_type`` list of length
+      ``depth`` ("full_attention" marks the KV-bearing layers);
+    * ``full_attention_interval`` (Qwen3.5/3.6 GDN hybrids: every interval-th
+      layer, 1-based, is full attention);
+    * neither present: a homogeneous all-attention model -- every layer True.
+    """
+    for key in ("layer_types", "layers_block_type"):
+        kinds = _probe_declared(cfg, key)
+        if isinstance(kinds, list) and len(kinds) == depth:
+            return [k == "full_attention" for k in kinds]
+    interval = _probe_declared(cfg, "full_attention_interval")
+    if isinstance(interval, int) and interval > 0:
+        return [(i + 1) % interval == 0 for i in range(depth)]
+    return [True] * depth
+
+
 @dataclasses.dataclass(frozen=True)
 class _RankGpuCard:
     """The physical card one ``--rank-gpu-id`` ordinal actually binds to.
@@ -3681,6 +3735,23 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_draft_kv_only: A[
+        bool,
+        Arg(
+            help="#1233 (Weg 2 draft KV across the flip): run the drafter as a "
+            "draft-KV PRODUCER only (no proposal, no verify): every prefill "
+            "chunk on the LAST pipeline stage writes the draft layer's KV rows "
+            "so HiCache can persist them in the canonical draft page that the "
+            "decode group reads. Requires the full speculative flag set "
+            "(--speculative-algorithm/--speculative-num-steps/"
+            "--speculative-eagle-topk/--speculative-num-draft-tokens, carried "
+            "byte-for-byte from the decode group so both compute the same "
+            "drafter identity); valid only under pp_size>1, tp_size==1, "
+            "page_size==1, --hicache-canonical-kv-page, and no dp/ep. "
+            "Deliberately NOT part of the drafter identity hash: it decides "
+            "whether the drafter PROPOSES, not what a draft KV byte MEANS.",
+        ),
+    ] = False
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
@@ -8195,6 +8266,61 @@ class ServerArgs:
                     canonical,
                     canonical,
                 )
+
+    def _refuse_proposing_drafter_under_pp(self):
+        """C2 (#1233): under pp_size>1 a drafter may exist only as the
+        draft-KV producer of ``--speculative-draft-kv-only``."""
+        if self.pp_size <= 1:
+            return
+        assert self.speculative_algorithm is None or self.speculative_draft_kv_only, (
+            "Pipeline parallelism is not compatible with speculative decoding "
+            "(a PROPOSING drafter). Weg 2's prefill group may carry a draft-KV "
+            "producer instead: --speculative-draft-kv-only."
+        )
+
+    def _handle_speculative_draft_kv_only(self):
+        """C1 (#1233): the producer mode's scope, refused by name at parse time.
+
+        The producer is the Weg-2 prefill group's last PP stage writing the
+        draft layer's KV rows into the canonical draft page. Everything the
+        page format and the identity need is checked here so an unusable
+        shape fails the boot, not the first store write.
+        """
+        if not self.speculative_draft_kv_only:
+            return
+        flag = "--speculative-draft-kv-only"
+
+        def refuse(what):
+            raise ValueError(f"{flag} {what}")
+
+        if self.pp_size <= 1:
+            refuse(f"is the PP prefill group's producer mode and needs pp_size > 1 (got pp_size={self.pp_size})")
+        if self.tp_size != 1:
+            refuse(f"needs tp_size == 1 (got tp_size={self.tp_size}): the producer writes the WHOLE canonical draft page from one rank")
+        if self.dp_size > 1:
+            refuse(f"does not support data parallelism (dp_size={self.dp_size})")
+        if self.ep_size > 1:
+            refuse(f"does not support expert parallelism (ep_size={self.ep_size})")
+        if self.page_size != 1:
+            refuse(f"needs page_size == 1 (got page_size={self.page_size}): a canonical draft page is ONE token's draft layer")
+        if not self.hicache_canonical_kv_page:
+            refuse("needs --hicache-canonical-kv-page: the draft page rides the canonical page format's geometry-free key")
+        for name in (
+            "speculative_algorithm",
+            "speculative_num_steps",
+            "speculative_eagle_topk",
+            "speculative_num_draft_tokens",
+        ):
+            if getattr(self, name, None) is None:
+                refuse(
+                    f"needs --{name.replace('_', '-')} (the decode group's value, byte-for-byte): "
+                    "the drafter identity is hashed from the full speculative flag set and "
+                    "the producer must compute the decode group's identity"
+                )
+        if getattr(self, "speculative_draft_placement", "split") == "solo":
+            refuse("does not support --speculative-draft-placement solo")
+        if getattr(self, "speculative_cross_algorithm", None):
+            refuse("does not support --speculative-cross-algorithm")
 
     def _handle_speculative_algorithm_name(self):
         """Resolve and validate --speculative-algorithm at parse time (#379).
@@ -16106,9 +16232,6 @@ class ServerArgs:
         self._handle_pp_stage_ratio()
         self._handle_pp_layer_ratio()
 
-    #: Config keys that carry a model's backbone depth, in probe order.
-    _NUM_LAYER_CONFIG_KEYS = ("num_hidden_layers", "n_layer", "num_layers")
-
     def declared_config_path(self) -> Optional[str]:
         """Path of the ``config.json`` that describes ``--model-path``.
 
@@ -16162,14 +16285,7 @@ class ServerArgs:
         cfg = self._read_declared_config()
         if cfg is None:
             return None
-        text_cfg = cfg.get("text_config") or {}
-        for key in self._NUM_LAYER_CONFIG_KEYS:
-            value = cfg.get(key)
-            if not isinstance(value, int):
-                value = text_cfg.get(key)
-            if isinstance(value, int) and value > 0:
-                return value
-        return None
+        return declared_num_hidden_layers_from_config(cfg)
 
     def _model_path_is_gguf(self) -> bool:
         """True when --model-path names (or contains) a GGUF checkpoint."""
@@ -16204,20 +16320,7 @@ class ServerArgs:
         cfg = self._read_declared_config()
         if cfg is None:  # pragma: no cover - advisory only
             return None
-        text_cfg = cfg.get("text_config") or {}
-
-        def probe(key):
-            value = cfg.get(key)
-            return value if value is not None else text_cfg.get(key)
-
-        for key in ("layer_types", "layers_block_type"):
-            kinds = probe(key)
-            if isinstance(kinds, list) and len(kinds) == depth:
-                return [k == "full_attention" for k in kinds]
-        interval = probe("full_attention_interval")
-        if isinstance(interval, int) and interval > 0:
-            return [(i + 1) % interval == 0 for i in range(depth)]
-        return [True] * depth
+        return declared_layer_kinds_from_config(cfg, depth)
 
     def _handle_pp_solve_cut(self):
         """--pp-solve-cut: solve the layer cut from a measured census (#485).
@@ -19528,18 +19631,13 @@ class ServerArgs:
             assert self.disable_overlap_schedule, (
                 "Pipeline parallelism is not compatible with overlap schedule"
             )
-            # #1233 (WEG 2, S0): back to the plain upstream refusal. The
-            # waiver that used to sit here existed because ONE process was
-            # both the PP prefill stack and the TP decode stack, and
-            # speculation was armed on the second one. Weg 2 splits those
-            # into two process groups: the prefill group is pure PP and
-            # carries no draft worker (no constructor here takes a pp_rank),
-            # and the decode group is TP with pp_size 1, so it never reaches
-            # this branch at all.
-            assert self.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with speculative "
-                "decoding."
-            )
+            # #1233 (Weg 2 draft KV across the flip): Weg 2's prefill group
+            # may carry a draft-KV PRODUCER on its last stage
+            # (--speculative-draft-kv-only); a PROPOSING drafter under PP is
+            # still refused -- no draft worker takes a pp_rank, and the
+            # decode group is TP with pp_size 1, so it never reaches here.
+            self._refuse_proposing_drafter_under_pp()
+        self._handle_speculative_draft_kv_only()
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

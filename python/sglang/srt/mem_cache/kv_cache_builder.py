@@ -132,6 +132,9 @@ def drafter_identity_hash(server_args) -> str:
     """
     import hashlib
 
+    # #1233: speculative_draft_kv_only is deliberately not hashed: it decides
+    # whether the drafter PROPOSES, not what a draft KV byte MEANS; P and D
+    # must compute the same identity by construction (W5).
     parts = [
         str(getattr(server_args, "speculative_algorithm", "") or ""),
         str(getattr(server_args, "speculative_draft_model_path", "") or ""),

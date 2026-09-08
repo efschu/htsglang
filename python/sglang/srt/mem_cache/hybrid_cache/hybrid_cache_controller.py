@@ -800,12 +800,19 @@ class HybridCacheController(BaseHiCacheController):
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
-        if operation.pool_transfers:
+        draft_probe = self._draft_presence_transfer()
+        if operation.pool_transfers or draft_probe is not None:
             self._hitq_v2_n = getattr(self, "_hitq_v2_n", 0) + 1
             _arm = "v2"
+            tree_transfers = list(operation.pool_transfers or [])
+            probe_transfers = tree_transfers + ([draft_probe] if draft_probe else [])
             hit_result = self.storage_backend.batch_exists_v2(
-                hash_value, operation.pool_transfers, extra_info
+                hash_value, probe_transfers, extra_info
             )
+            if draft_probe is not None:
+                hit_result = self._apply_draft_claim(
+                    operation, hash_value, tree_transfers, draft_probe, hit_result, extra_info
+                )
         elif getattr(self, "extra_host_mem_release_entries", None):
             # #1035 -- THE SILENT DEGRADATION, NAMED AND REFUSED.
             #
@@ -938,6 +945,89 @@ class HybridCacheController(BaseHiCacheController):
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
+
+    def _draft_presence_transfer(self) -> Optional[PoolTransfer]:
+        """C13 (#1233): the draft page as a PRESENCE-ONLY ALL_PAGES pool of the
+        probe, asked in the same round trip as the KV pages and the mamba
+        anchor. ``caps_claim=False``: its boundary is reported, never min-ed
+        into the KV claim -- ``resolve_draft_claim`` decides from both."""
+        if not self.draft_tier_armed("admission"):
+            return None
+        return PoolTransfer(
+            name=self._draft_component_name(),
+            keys=[],
+            hit_policy=PoolHitPolicy.ALL_PAGES,
+            caps_claim=False,
+        )
+
+    def _draft_chunk_pages(self) -> int:
+        """The #939 bound in pages: ``chunked_prefill_size / page_size``."""
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            chunk = int(getattr(get_server_args(), "chunked_prefill_size", 0) or 0)
+        except Exception:  # noqa: BLE001 - bare controllers (unit tests)
+            chunk = 0
+        if chunk <= 0:
+            chunk = 4096
+        return max(1, chunk // max(1, int(self.page_size)))
+
+    def _apply_draft_claim(
+        self, operation, hash_value, tree_transfers, draft_probe, hit_result, extra_info
+    ):
+        """Q10/Q12: full | trim | cold-by-name, from ``kv_hit_pages`` and the
+        draft boundary. Emits L5. A trim re-asks the store about the shorter
+        span with the TREE's transfers only, so the claim ends on a page the
+        mamba anchor also covers (the #873 shape otherwise)."""
+        from sglang.srt.managers.cache_controller import resolve_draft_claim
+
+        k = int(hit_result.kv_hit_pages)
+        d = int(hit_result.extra_pool_hit_pages.get(str(draft_probe.name), 0) or 0)
+        if k == 0:
+            return hit_result
+
+        def reprobe(depth: int) -> int:
+            if depth <= 0:
+                return 0
+            if not tree_transfers:
+                return depth
+            return int(
+                self.storage_backend.batch_exists_v2(
+                    hash_value[:depth], tree_transfers, extra_info
+                ).kv_hit_pages
+            )
+
+        claim, draft_claim, mode, span = resolve_draft_claim(
+            k, d, self._draft_chunk_pages(), reprobe
+        )
+        operation.draft_claim_pages = draft_claim
+        operation.draft_cold_span = span
+        rid = getattr(operation, "request_id", "?")
+        if mode == "trim":
+            self._draft_trim_requests += 1
+        elif mode == "cold":
+            self._draft_cold_requests += 1
+            self.draft_cold_spans[rid] = (
+                span[0] * int(self.page_size),
+                span[1] * int(self.page_size),
+            )
+        self._draft_presence_n += 1
+        n = self._draft_presence_n
+        if mode != "full" or n <= 16 or n % 64 == 0:
+            logger.info(
+                "WEG2 DRAFT-PRESENCE rid=%s rank=TP%d kv_pages=%d draft_pages=%d "
+                "claim=%d mode=%s (denominator kv_pages; n=%d)",
+                rid,
+                int(self.tp_rank),
+                k,
+                d,
+                claim,
+                mode,
+                n,
+            )
+        if claim != k:
+            hit_result.kv_hit_pages = claim
+        return hit_result
 
     def move_hybrid_indices(
         self, operation: CacheOperation

@@ -100,23 +100,36 @@ def _group_log(prefix: str, passes, kv_gb, bulk=None, rss=None) -> str:
     return "\n".join(out) + "\n"
 
 
-def _dormant_line(group: str, rss_gib: float, tags_gib: float) -> str:
-    """The front's own WEG2 DORMANT-IMAGE line, in the emitter's exact shape.
+def _write_dormant_sidecar(evidence_dir: str, dormant) -> None:
+    """Write the fix-8 JSON sidecar the ring now reads its image cross-check from.
 
-    Copied from ``host_ledger.format_dormant_image`` on the branch that emits
-    it (draft-KV fix 8) rather than re-invented: this module READS that line, so
-    a fixture in any other shape would test a parser against itself.
+    RECONCILIATION 2026-09-08: this fixture used to append a ``WEG2
+    DORMANT-IMAGE`` LINE to the front log, because ring_table scraped that line
+    with a regex.  That regex is deleted -- it was a second reader of a fact the
+    draft-KV line already carries structurally -- so the fixture writes the
+    SIDECAR instead, and it does so through the shipped writer
+    (``host_ledger.append_measured_record``) rather than by hand-rolling JSON,
+    for exactly the reason the old helper copied the emitter's format: a fixture
+    in its own shape would test a reader against itself.
     """
-    return (
-        f"[2026-09-07T21:12:00Z] INFO weg2.front: WEG2 DORMANT-IMAGE group={group} "
-        f"shmem_delta_gib=1.23 rss_shmem_gib={rss_gib:.2f} "
-        f"weight_tags_gib={tags_gib:.2f} extra_gib={rss_gib - tags_gib:.2f} "
-        "(pids [1, 2, 3] of [1, 2, 3]; INTERLEAVED: the shmem delta is confounded"
-        "; run_residual_gib=none (x); boot t2 @ deadbeef at 2026-09-07T21:12:00Z)"
-    )
+    path = os.path.join(evidence_dir, host_ledger.MEASURED_RECORD_NAME)
+    for group, rss_gib, tags_gib in dormant:
+        host_ledger.append_measured_record(path, {
+            "group": group,
+            "at": "2026-09-07T21:12:00Z",
+            "boot": "t2",
+            "commit": "deadbeef",
+            "shmem_delta_gib": 1.23,
+            "rss_shmem_gib": float(rss_gib),
+            "weight_tags_gib": float(tags_gib),
+            "extra_gib": float(rss_gib) - float(tags_gib),
+            "pids": [1, 2, 3],
+            "pids_asked": [1, 2, 3],
+            "interleaved": True,
+        })
 
 
-def _front_log(free_by_phase, cards=None, identity=True, dormant=(), arm=None) -> str:
+def _front_log(free_by_phase, cards=None, identity=True, arm=None) -> str:
     out = []
     if arm is not None:
         # The SOURCE boot's own chosen ledger arm.  Without it the RssShmem
@@ -146,8 +159,6 @@ def _front_log(free_by_phase, cards=None, identity=True, dormant=(), arm=None) -
                 f"[2026-09-07 21:07:54,029] INFO weg2.front: WEG2-CORRIDOR "
                 f"phase={phase}(awake) epoch=0 {free} min_so_far={{}}"
             )
-    for group, rss_gib, tags_gib in dormant:
-        out.append(_dormant_line(group, rss_gib, tags_gib))
     return "\n".join(out) + "\n"
 
 
@@ -359,16 +370,30 @@ class LedgerRingTermsTest(unittest.TestCase):
     def _common_box(self):
         """A box whose ``common`` is the spec section 2 boot-of-record 42.26 GiB.
 
-        Solved, not guessed: common = base - floor - headroom - heaps - anchors
-        - rings - overhead at M=1200, so base = 42.26 + the rest.
+        Solved, not guessed: common = base - floor - the boot's own charges at
+        M=1200, so base = 42.26 + the rest.
+
+        RE-DERIVED ON THE RING (rebase 0908).  The term list this solver has to
+        invert changed under it, in both directions, and 42.26 is held FIXED
+        because it is the spec section 2 boot-of-record that the assertions
+        below are stated against:
+          - ``HOST_HEADROOM_GIB`` is GONE from the sum: fix 5 DELETED the
+            constant (a compensation layer for the wrong denominator), and
+            test_weg2_host_budget_1233 pins that deletion by name.  Adding a
+            term price() no longer subtracts would have solved for the wrong
+            box.
+          - the DRAFT HOST TIER (draft_host_P + draft_host_D) is now IN the
+            sum: price() charges it at both moments (#1233), so the box must
+            carry it for `common` to still come out at 42.26.
         """
         m = 1200
         heaps = 3 * (host_ledger.HEAP_AWAKE_GIB + host_ledger.HEAP_DORMANT_GIB)
         anchors = (host_ledger.ANCHORS_AT_2400_BYTES * (m / 2400)) / GIB
         rings = (host_ledger.RING_P_MULT_GB_PER_S + host_ledger.RING_D_MULT_GB_PER_S) * 1 * 1e9 / GIB
         overhead = host_ledger.HOST_POOL_OVERHEAD * (anchors + rings)
-        base = (42.26 + host_ledger.FLOOR_GIB + host_ledger.HOST_HEADROOM_GIB
-                + heaps + anchors + rings + overhead)
+        draft = (host_ledger.DRAFT_HOST_P_MIB + host_ledger.DRAFT_HOST_D_MIB) / 1024.0
+        base = (42.26 + host_ledger.FLOOR_GIB
+                + heaps + anchors + rings + overhead + draft)
         memtotal = int((base + host_ledger.CLI_RESERVE_GIB + 50) * GIB)
         return memtotal, int(base * GIB)
 
@@ -410,9 +435,10 @@ class LedgerRingTermsTest(unittest.TestCase):
                               ring_span1_bytes=self.SIGMA_H)
 
     def test_the_deleted_constants_are_gone_from_the_module(self):
-        for name in ("BACKUP_P_BYTES", "BACKUP_D_BYTES", "HOST_HEADROOM_GIB_CHUNK"):
-            if name == "HOST_HEADROOM_GIB_CHUNK":
-                continue
+        # HOST_HEADROOM_GIB joins the list on the ring rebase: fix 5 deleted it
+        # for the same reason C19 deleted the other two -- a stale constant
+        # standing in for a quantity that is now measured.
+        for name in ("BACKUP_P_BYTES", "BACKUP_D_BYTES", "HOST_HEADROOM_GIB"):
             self.assertFalse(hasattr(host_ledger, name),
                              f"C19 deletes {name}; a survivor is a second, stale "
                              "source for the host weights term")
@@ -1606,8 +1632,9 @@ class DormantImageInstrumentTest(unittest.TestCase):
             f.write(_front_log(
                 {"P": [{c.nvml_index: 100 for c in cards}],
                  "D": [{c.nvml_index: 100 for c in cards}]},
-                cards=cards, dormant=dormant, arm=arm,
+                cards=cards, arm=arm,
             ))
+        _write_dormant_sidecar(self.dir, dormant)
         table, reason = ring_table.solve(cards, self.dir, self.stem)
         self.assertIsNotNone(table, reason)
         return table
