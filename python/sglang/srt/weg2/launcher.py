@@ -288,15 +288,49 @@ P_BYTES_PER_TOKEN = 8192 + 2048
 #: attn_scores 7,5,4 -> [31,19,14]; scores 31,17,16 -> [32,16,16]; scores
 #: 30,20,14 -> [32,18,14].  Anything that needs the SPLIT calls
 #: :func:`p_stage_layers`; nothing reads these as layer counts.
+#:
+#: FIX 2 (#1233 fix 5, second instance).  WHICH cut this vector is, stated so
+#: no third consumer can adopt it for the wrong one: it is the INCUMBENT --
+#: the cut ``MEASURED_MS_PER_LAYER`` was taken under on boot bsscale (PP0
+#: 259.1 ms/32 layers, PP1 632.9/18, PP2 470.2/14), hence the cost model's
+#: incumbent in :func:`solve_p_cut` and the default ``argv_p`` renders when
+#: nobody solved or pinned one.  It is NOT the cut the boot runs: since
+#: ``solve_p_cut`` was wired into ``main`` that is ``PCutFacts.stage_ratio``
+#: and its round-tripped ``PCutFacts.layer_counts``, and every consumer that
+#: describes THIS boot -- argv, the flip-order map, the provenance lines --
+#: reads those.  Exactly three functions may name this vector: ``argv_p``
+#: (the flag default), ``solve_p_cut`` (the incumbent) and
+#: :func:`p_stage_layers` (what a score pair derives to); the registered
+#: guard in test_weg2_host_budget_1233 pins that set.
 P_PP_STAGE_RATIO_SCORES = (32, 18, 14)
 #: Group P's per-stage FULL-ATTENTION scores (#485 ``--pp-attn-stage-ratio``),
-#: read for the same reason and therefore defined once: by ``argv_p`` (the
-#: flag), by :func:`p_stage_layers` (the split the flag produces) and -- since
-#: the merge train brought a solver -- by :func:`solve_p_cut`, for which this
-#: vector is the INCUMBENT the candidate cuts are scored against.  Three
-#: readers, one statement; ``test_weg2_host_budget_1233`` pins that set so a
-#: fourth cannot appear silently and a bare literal cannot drift back in.
+#: the incumbent's other half, defined once for the same three readers.
 P_PP_ATTN_STAGE_RATIO_SCORES = (8, 4, 4)
+
+
+def _csv(values: Sequence[int]) -> str:
+    """One vector, one rendering: the CSV form the two count flags take.
+
+    FIX 2.  ``argv_p`` used to carry ``"32,18,14"`` / ``"8,4,4"`` as bare
+    default arguments -- a THIRD statement of the constants above, which the
+    #1233 fix 5 one-definition property had already closed once and which
+    ``test_neither_score_vector_survives_anywhere_as_a_bare_literal`` was
+    written to catch.  It caught it; the reading was wrong, not the guard.
+    """
+    return ",".join(str(int(v)) for v in values)
+
+
+#: The incumbent cut RENDERED for help text, DERIVED from the one definition
+#: above rather than retyped.  It exists so ``build_parser`` can name the
+#: numbers without becoming a fourth reader of the score constants -- the
+#: registered guard in ``test_weg2_host_budget_1233`` pins that reader set to
+#: ``{argv_p, p_stage_layers, solve_p_cut}`` and walks FUNCTION bodies, so a
+#: module-level derivation is the honest way to keep both properties: one
+#: statement of the vector, and a help text that prints it.
+P_PP_INCUMBENT_FMT = "%s / attention %s" % (
+    _csv(P_PP_STAGE_RATIO_SCORES),
+    _csv(P_PP_ATTN_STAGE_RATIO_SCORES),
+)
 
 
 def derive_p_max_total_tokens() -> int:
@@ -509,14 +543,198 @@ ATTN_ANCHOR_PREFIX_TOKENS = 262144
 #: mistaken for a table read at this rig's real mean prefix.
 DESIGN_PREFIX_FALLBACK_TOKENS = 4096
 
-#: #1240 decode defaults. MEASURED on boot weg2pp1 (arms table row D2 of
-#: /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md): overlap ON with
-#: --num-continuous-decode-steps 2 and the paired extra_buffer mamba strategy
-#: reads 75.5 tok/s at bs1 and 305.0 at bs6, against the D0 control's 66.2 /
-#: 284.9 -- +14.0 % / +7.1 %. Row D3 (steps 4) REGRESSES to 73.6 / 295.6, so
-#: 2 is an optimum and not a direction. The steps knob is the unconfounded
-#: half of that boot (D1 -> D2 -> D3 all run overlap ON and extra_buffer).
+#: #1240/#1030 decode defaults, MEASURED on boot weg2pp1.
 D_NUM_CONTINUOUS_DECODE_STEPS = 2
+
+#: THE PROVENANCE OF THAT 2, WRITTEN ONCE (#1030).
+#:
+#: It used to be written three times -- in this constant's comment, in
+#: --num-continuous-decode-steps' help, and in the boot's SCHEDULER: line --
+#: and the three copies had already drifted: only the comment carried the
+#: CONFOUND that the measuring boot recorded about its own headline number.
+#: That is the shape the operator's own briefing rule names (a paragraph
+#: retyped into N places degrades by the third); a provenance sentence that
+#: degrades is worse than none, because it reads as evidence.
+#:
+#: So there is one sentence and three readers. The help escapes its percent
+#: signs (argparse evaluates every help string as `help % params`, so one bare
+#: '%' makes --help raise for ALL flags); the log line and this comment take it
+#: verbatim.
+#:
+#: WHAT THE RECORD /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md ACTUALLY
+#: SUPPORTS, arms table rows D0-D3:
+#:   * D2 (overlap ON, steps 2, extra_buffer) 75.5 tok/s bs1 / 305.0 bs6
+#:     against the D0 control (overlap OFF, steps 1, no_buffer) 66.2 / 284.9 =
+#:     +14.0 % / +7.1 %. That is the PAIR, and it is what the default buys.
+#:   * It is NOT an overlap-alone number and the record says so in its own
+#:     words: "The overlap delta is CONFOUNDED and must not be quoted as an
+#:     overlap-alone number" -- D0 runs --mamba-radix-cache-strategy no_buffer
+#:     and D1/D2/D3 run extra_buffer, so D1-D0 is overlap+buffer jointly, and
+#:     it measured NEGATIVE: 61.4 vs 66.2 = -7.35 % at bs1, -1.68 % at bs6.
+#:   * The UNCONFOUNDED half is the steps knob alone (D1 -> D2 -> D3, all
+#:     overlap ON, all extra_buffer): D2 vs D1 = +23.1 % bs1 / +8.9 % bs6, and
+#:     D3 (steps 4) regresses to 73.6 / 295.6. So 2 is an optimum, not a
+#:     direction, and the steps knob is the half carrying the pair's gain.
+D_DECODE_STEPS_PROVENANCE = (
+    "MEASURED, not chosen (boot weg2pp1, /spinning/gpu-arb/weg2/"
+    "BOOT_weg2pp1_0907.md arms table). THE PAIR overlap ON + "
+    "--num-continuous-decode-steps 2 + the paired extra_buffer mamba strategy "
+    "(row D2) reads 75.5 tok/s at bs1 and 305.0 at bs6 against the D0 control "
+    "(overlap OFF, steps 1, no_buffer) 66.2 / 284.9 = +14.0 % / +7.1 %. THAT "
+    "IS A PAIR AND NOT AN OVERLAP NUMBER, in the record's own words: 'The "
+    "overlap delta is CONFOUNDED and must not be quoted as an overlap-alone "
+    "number' -- D1 vs D0 moves the buffer strategy with the schedule and "
+    "measured NEGATIVE, 61.4 vs 66.2 = -7.35 % at bs1. The UNCONFOUNDED half "
+    "is the steps knob alone (D1 -> D2 -> D3, all overlap ON, all "
+    "extra_buffer): D2 vs D1 = +23.1 % bs1 / +8.9 % bs6, and row D3 (steps 4) "
+    "REGRESSES to 73.6 / 295.6 -- so 2 is an optimum, not a direction, and the "
+    "steps knob is the half that carries the pair's gain."
+)
+
+#: #1017 GROUP D'S WEIGHT-VECTOR OBJECTIVE -- the knob, not a second solver.
+#:
+#: ``--rank-tp-ratio auto`` is the CAPACITY-FIRST split (server_args.py:838
+#: _CAPACITY_FIRST_DEFAULT_NOTICE: "the weights are proportional to each
+#: rank's VRAM budget ... deliberately independent of how fast the cards
+#: are"). Under the maxkv law that is the right DEFAULT, but it was reaching
+#: group D's argv as a bare literal, so no boot ever stated which objective it
+#: had chosen or what the other one costs. This is the knob that states it.
+#:
+#: The launcher does NOT solve the vector. Both arms are upstream mechanisms
+#: and stay upstream: 'maxkv' emits ``--rank-tp-ratio auto`` (resolved by
+#: ServerArgs._resolve_auto_rank_tp_ratio) and 'speed' emits
+#: ``--rank-tp-ratio auto-performance --rank-perf-tune <target>`` (resolved by
+#: uneven_perf.apply_auto_performance). What the launcher adds is the CHOICE,
+#: priced, on one line -- ``d_tp_ratio_decision``.
+D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed")
+D_TP_OBJECTIVE_DEFAULT = "maxkv"
+
+
+@dataclass(frozen=True)
+class EarlyReadFact:
+    """One fact group D states TWICE, and the reader that makes both necessary.
+
+    #1235's inventory called these "double statements of one fact" and read
+    them as second bookkeeping to delete. THEY ARE NOT, and the ordering is the
+    proof: ``ServerArgs.__post_init__`` reads ``os.environ`` for these keys in
+    ``_handle_dcp_validation`` (server_args.py:9631), ``_handle_uneven_tp``
+    (server_args.py:12025) and ``uneven_perf.apply_auto_performance``
+    (uneven_perf.py:4648, reached FROM _handle_uneven_tp), while the FLAG only
+    publishes itself into the environment later, in
+    ``_handle_environment_variables`` -> ``_publish_promoted_781_flags``
+    (server_args.py:18271), called at server_args.py:7186 -- after all three.
+
+    So the environment variable is the statement that reaches those readers and
+    the flag is the statement that reaches everything downstream plus the argv
+    a human reads. Dropping either one changes behaviour or hides it.
+
+    What was WRONG is that they were two independent literals in two functions
+    that could drift apart silently. Here they are one row, consumed by both
+    ``build_env`` and the argv builders, so the pair cannot disagree.
+
+    ``groups`` records an EXISTING asymmetry rather than quietly fixing it:
+    the uneven-DCP keys are exported to BOTH groups' environments while only
+    group D carries the flags. Group P runs tp_size=1, where the weighted-DCP
+    path has nothing to weight, and no boot has ever been run with the export
+    removed -- so it is preserved exactly and named here for the boot that can
+    measure it, instead of being changed by a slice that cannot.
+    """
+
+    env_key: str
+    env_value: str
+    flag: Tuple[str, ...]
+    groups: str
+    reader: str
+
+
+#: THE THREE FACTS, ONCE. See :class:`EarlyReadFact` for why each is stated in
+#: both currencies and why that is not second bookkeeping.
+EARLY_READ_FACTS: Tuple[EarlyReadFact, ...] = (
+    EarlyReadFact(
+        env_key="SGLANG_UNEVEN_DCP",
+        env_value="1",
+        flag=("--uneven-dcp",),
+        groups="D",
+        reader="server_args.py:9631 _handle_dcp_validation / :12025 "
+               "_handle_uneven_tp, both before :7186 _handle_environment_variables",
+    ),
+    EarlyReadFact(
+        env_key="SGLANG_UNEVEN_DCP_WEIGHTED",
+        env_value="1",
+        flag=("--uneven-dcp-weighted",),
+        groups="D",
+        reader="server_args.py:9632 _handle_dcp_validation / :10517 "
+               "uneven_weighted_dcp_enabled, both before :7186",
+    ),
+    EarlyReadFact(
+        env_key="SGLANG_MAMBA_SSM_DTYPE",
+        env_value="bfloat16",
+        flag=("--mamba-ssm-dtype", "bfloat16"),
+        groups="both",
+        reader="uneven_perf.py:4648, reached from _handle_uneven_tp at "
+               "server_args.py:6976 -- before the flag publishes itself at :7186",
+    ),
+)
+
+
+def early_read_flags(group: str) -> List[str]:
+    """The argv half of :data:`EARLY_READ_FACTS` for one group."""
+    out: List[str] = []
+    for fact in EARLY_READ_FACTS:
+        if fact.groups in ("both", group):
+            out.extend(fact.flag)
+    return out
+
+
+def early_read_provenance() -> str:
+    """One line naming every doubly-stated fact and the reader that needs it."""
+    return "WEG2 EARLY-READ ENV (#1235): " + "; ".join(
+        "%s=%s == %s [groups %s, pre-promotion reader %s]"
+        % (f.env_key, f.env_value, " ".join(f.flag), f.groups, f.reader)
+        for f in EARLY_READ_FACTS
+    )
+
+
+#: #1235 THE UNOWNED ENV LITERALS, PROMOTED TO FLAGS AND TO LAUNCHER OUTPUT.
+#:
+#: All four used to be written as ``env.get(KEY, "<literal>")``, which is the
+#: shape the ring family was already fixed out of (R19): an inherited value
+#: from the launcher's own shell wins SILENTLY, and the boot then runs a number
+#: no flag, no record and no log line ever mentioned. They are now flags with
+#: defaults, written unconditionally, exactly like TMS_HOST_RING_* and
+#: SGLANG_WEG2_PCIE_DUPLEX -- launcher OUTPUT, never operator input.
+#:
+#: Their VALUES are unchanged and none of them is measured; they are timeouts
+#: and a census stride, and the help text says so rather than implying a
+#: provenance they do not have.
+BARLINK_BUILD_WINDOW_CAP_S = 60
+PP_CHAIN_RECV_STALL_S = 60
+PP_OCCUPANT_HORIZON_S = 90
+MATCH_REFUSAL_CENSUS_EVERY = 64
+
+#: #1235 THE ARGV LITERALS THAT WERE NOBODY'S.
+#:
+#: RANDOM_SEED is arbitrary and FIXED, and that is its whole provenance: it is
+#: not measured, not solved, and not to be presented as either. What it buys is
+#: that two boots of the same tip sample identically, so a decode difference
+#: between them is a difference in the code. Stated as a flag so a boot that
+#: WANTS a different sample says so.
+RANDOM_SEED = 785500001
+#: BAR1 cap cycles: the ceiling on barlink's build-time cycle budget. Large by
+#: construction (it is a ceiling, not a target) -- the binding gate on this rig
+#: is the aperture, priced at --barlink-bar1-window-mib, not this number.
+BARLINK_BAR1_CAP_CYCLES = 300000000000
+#: How often the collective census prints. A STRIDE, not a measurement: bigger
+#: is quieter, smaller costs log volume, and nothing about the boot depends on
+#: the value except how much of it a reader can see.
+COLLECTIVE_CENSUS_INTERVAL = 50
+#: Group P's BAR1 windows. The provenance is the SAME arithmetic group D's
+#: window carries (#1234 C1) and it lived only in state.deviations: the two
+#: groups' windows are sized to fit TOGETHER -- P 24+96 and D 16+32+40 = 208 of
+#: the 224 MiB usable per 3080, measured Used 224/256 including the RM
+#: carve-out. It is cited here so P's window is not the one number in this file
+#: a reader has to go looking for.
+P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
 
 
 class Weg2LaunchRefused(RuntimeError):
@@ -1010,6 +1228,10 @@ def common_flags(
     store_gib: float,
     max_kv_per_request: int,
     write_policy: str = "write_through",
+    group: str = "both",
+    random_seed: int = RANDOM_SEED,
+    barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
+    census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
 ) -> List[str]:
     """Flags BOTH groups share.
 
@@ -1058,13 +1280,20 @@ def common_flags(
         "--chunked-prefill-size", str(CHUNKED_PREFILL_TOKENS),
         "--scheduler-distributed-teardown",
         "--page-size", "1",
-        "--random-seed", "785500001",
-        "--mamba-ssm-dtype", "bfloat16",
+        # #1235: arbitrary and FIXED, which is the whole provenance -- see
+        # RANDOM_SEED. Overridable by --random-seed.
+        "--random-seed", str(random_seed),
         "--mamba-slot-reorder",
         "--kv-backing-relief",
         "--barlink", "--barlink-transport", "bar1",
-        "--barlink-bar1-cap-cycles", "300000000000",
-        "--collective-census-interval", "50",
+        "--barlink-bar1-cap-cycles", str(barlink_cap_cycles),
+        "--collective-census-interval", str(census_interval),
+    ] + early_read_flags(group) + [
+        # THE DOUBLY-STATED FACTS COME FROM ONE TABLE (#1235). --mamba-ssm-dtype
+        # is here for both groups and the two uneven-DCP flags for group D; the
+        # matching environment keys are written by build_env from the SAME
+        # rows, because ServerArgs reads them from os.environ before the flags
+        # publish themselves. See EarlyReadFact for the ordering evidence.
         "--enable-memory-saver",
         "--enable-weights-cpu-backup",
     ]
@@ -1080,16 +1309,14 @@ def argv_p(
     extra: List[str],
     p_bs: int = 8,
     max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
-    # DERIVED FROM THE CONSTANT, NOT RETYPED (train fix 2).  These two defaults
-    # arrived as the bare literals "32,18,14" / "8,4,4" from the solver branch
-    # while merge 5 moved the vector into P_PP_*_SCORES -- one fact with two
-    # statements, which is the exact defect #1233 fix 5 closed and which
-    # test_weg2_host_budget_1233 refuses.  argv_p reading the constant is also
-    # what that constant's own docstring says it is for.
-    stage_ratio: str = ",".join(str(n) for n in P_PP_STAGE_RATIO_SCORES),
-    attn_stage_ratio: str = ",".join(str(n) for n in P_PP_ATTN_STAGE_RATIO_SCORES),
+    stage_ratio: Optional[str] = None,
+    attn_stage_ratio: Optional[str] = None,
     write_policy: str = "write_through",
     depth: int = 0,
+    window_mib: str = P_BARLINK_BAR1_WINDOW_MIB,
+    random_seed: int = RANDOM_SEED,
+    barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
+    census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
 ) -> List[str]:
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
@@ -1106,6 +1333,15 @@ def argv_p(
     # make_layers/model_runner resolve ownership from get_pp_layer_set, never
     # from the count form -- so the count copy is the second set of books and
     # it is dropped, rather than kept and asserted against.
+    # FIX 2: THE INCUMBENT IS READ, NOT RESTATED. ``None`` (nobody solved or
+    # pinned a cut) renders the incumbent score vectors from their ONE
+    # definition, at call time -- so patching the constant moves the flag, and
+    # a bare "32,18,14" here cannot drift away from it again. ``""`` still
+    # means OMIT BOTH FLAGS (the gapped kind, FOLLOW FIX 1) and is left alone.
+    if stage_ratio is None:
+        stage_ratio = _csv(P_PP_STAGE_RATIO_SCORES)
+    if attn_stage_ratio is None:
+        attn_stage_ratio = _csv(P_PP_ATTN_STAGE_RATIO_SCORES)
     if bool(stage_ratio) != bool(attn_stage_ratio):
         raise Weg2LaunchRefused(
             "W40 Weg2PPCutRefused: --pp-stage-ratio %r and "
@@ -1123,7 +1359,10 @@ def argv_p(
         if stage_ratio
         else []
     )
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request, write_policy) + [
+    return [py, "-m", "sglang.launch_server"] + common_flags(
+        model, s_gb, m_mib, store_gib, max_kv_per_request, write_policy, "P",
+        random_seed, barlink_cap_cycles, census_interval,
+    ) + [
         # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
         # the size of P's req_to_token_pool (R-13), which is why it is
         # resolved before the budget solve and printed with it.
@@ -1146,7 +1385,12 @@ def argv_p(
         "--disable-overlap-schedule",
     ] + ratio_flags + [
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
-        "--barlink-bar1-window-mib", "24,PP_0=96",
+        # #1235: P's window had no comment while D's carried the whole #1234 C1
+        # derivation. Its provenance is the SAME arithmetic, from the other
+        # side: the two groups' windows are sized to fit TOGETHER, P 24+96 and
+        # D 16+32+40 = 208 of the 224 MiB usable per 3080. That sentence lived
+        # only in state.deviations; it is cited at P_BARLINK_BAR1_WINDOW_MIB now.
+        "--barlink-bar1-window-mib", window_mib,
         # #1233 draft KV across the flip (C15): P carries D's four speculative
         # flags BYTE-FOR-BYTE (they hash into the drafter identity, W5) and is
         # silenced by the producer flag, which is deliberately not hashed.
@@ -1210,8 +1454,16 @@ def argv_d(
     x_tokens: int = 0,
     num_continuous_decode_steps: int = 1,
     disable_overlap: bool = False,
+    tp_ratio_flags: Sequence[str] = ("--rank-tp-ratio", "auto"),
+    token_vector_flags: Sequence[str] = (),
+    random_seed: int = RANDOM_SEED,
+    barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
+    census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
 ) -> List[str]:
-    return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, max_kv_per_request) + (
+    return [py, "-m", "sglang.launch_server"] + common_flags(
+        model, s_gb, m_mib, store_gib, max_kv_per_request, "write_through", "D",
+        random_seed, barlink_cap_cycles, census_interval,
+    ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
     ) + [
         # C1/K2: D's own bs, independent of P's by construction.
@@ -1255,13 +1507,26 @@ def argv_d(
         # (BSSCALE_0907.md D4).
         "--num-continuous-decode-steps", str(int(num_continuous_decode_steps)),
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
-        # a per-rank MiB LIST under TP requires the uneven-TP ratio; 'auto'
-        # derives the weights from that list (server_args.py rank_tp_ratio).
-        "--rank-tp-ratio", "auto",
+    ] + list(tp_ratio_flags) + [
+        # THE WEIGHT OBJECTIVE IS STATED, NOT ASSUMED (#1017). A per-rank MiB
+        # LIST under TP requires the uneven-TP ratio, and 'auto' derives the
+        # weights from that list -- but 'auto' is the CAPACITY-FIRST default
+        # (server_args.py:838), so shipping it as a literal meant every Weg-2
+        # boot chose an objective without saying so. The choice now arrives
+        # from d_tp_ratio_decision as --d-tp-objective, priced on the launch
+        # line; the default is still 'auto' because the maxkv law makes
+        # capacity the default objective, not because nothing was decided.
         "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
         "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
-        "--uneven-dcp", "--uneven-dcp-weighted",
-        "--uneven-token-vector", "29,19,16", "--uneven-token-vector-role", "seed",
+    ] + list(token_vector_flags) + [
+        # NO TOKEN VECTOR BY DEFAULT (#1032). What stood here was
+        # `--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`, the
+        # emitted value of RETRACTED investigation #602. See
+        # RETRACTED_SEED_VECTOR_1032 for what boot weg2rg6 measured the runtime
+        # doing with it (superseding it to 17,7,8, every rank, every boot) and
+        # for why "the install landed" is a reason to stop shipping it rather
+        # than a reason it was harmless. An operator vector arrives through
+        # d_token_vector_decision, which refuses a retracted one BY TICKET.
         # #1234 C1 -- dcp:0 goes 24 -> 40 MiB. MEASURED, and this one
         # number is the whole regression fix.
         #
@@ -2003,9 +2268,34 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     return plan
 
 
+def _env_knobs(ns) -> Dict[str, object]:
+    """The #1235 flags ``build_env`` takes, gathered once.
+
+    Three call sites build an environment and every one of them must pass the
+    same seven values; spelling them out three times is how the pair of
+    environments would drift the day an eighth arrives.
+    """
+    return {
+        "barlink_build_window_cap_s": ns.barlink_build_window_cap_s,
+        "pp_chain_recv_stall_s": ns.pp_chain_recv_stall_s,
+        "pp_occupant_horizon_s": ns.pp_occupant_horizon_s,
+        "match_refusal_census_every": ns.match_refusal_census_every,
+        "arming_floor_solved": ns.arming_floor_solved,
+        "hicache_bigram_keys": ns.hicache_bigram_keys,
+        "hicache_flush_publish_sweep": ns.hicache_flush_publish_sweep,
+    }
+
+
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
               chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "",
-              transport: str = "bar1", ring: Optional["HostRingPlan"] = None) -> Dict[str, str]:
+              transport: str = "bar1", ring: Optional["HostRingPlan"] = None,
+              barlink_build_window_cap_s: int = BARLINK_BUILD_WINDOW_CAP_S,
+              pp_chain_recv_stall_s: int = PP_CHAIN_RECV_STALL_S,
+              pp_occupant_horizon_s: int = PP_OCCUPANT_HORIZON_S,
+              match_refusal_census_every: int = MATCH_REFUSAL_CENSUS_EVERY,
+              arming_floor_solved: bool = True,
+              hicache_bigram_keys: bool = True,
+              hicache_flush_publish_sweep: bool = True) -> Dict[str, str]:
     env = dict(os.environ)
     # C18: the shared host granule ring (spec C1-C8).  These four variables are
     # LAUNCHER OUTPUT, never operator input (R19): every size in them is solved
@@ -2052,27 +2342,45 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # hashes, group P (no spec) by UNIGRAM -- disjoint chains for the same
     # prompt, D never read P's pages. One key scheme for both groups; a
     # no-op on D (already bigram), forces bigram on P.
-    env["SGLANG_HICACHE_BIGRAM_KEYS"] = "1"
+    if hicache_bigram_keys:
+        env["SGLANG_HICACHE_BIGRAM_KEYS"] = "1"
+    else:
+        env.pop("SGLANG_HICACHE_BIGRAM_KEYS", None)
     # #1233 zero-remainder: /flush_cache (the front's quiesce before a sleep)
     # first publishes every un-backed device node to the store, so a chain
     # the write-through pin budget declined mid-prefill is not lost at the
     # flip (UnifiedRadixCache.publish_unbacked_sweep). Both groups.
-    env["SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP"] = "1"
-    env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
-    env["SGLANG_UNEVEN_DCP"] = "1"
-    env["SGLANG_UNEVEN_DCP_WEIGHTED"] = "1"
-    env["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
-    env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = env.get("SGLANG_BARLINK_BUILD_WINDOW_CAP_S", "60")
+    if hicache_flush_publish_sweep:
+        env["SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP"] = "1"
+    else:
+        env.pop("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", None)
+    if arming_floor_solved:
+        env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
+    else:
+        env.pop("SGLANG_ARMING_FLOOR_SOLVED", None)
+    # THE DOUBLY-STATED FACTS, FROM THE SAME TABLE THE ARGV IS BUILT FROM
+    # (#1235). Not second bookkeeping: ServerArgs reads these keys off
+    # os.environ before the matching flags publish themselves -- see
+    # EarlyReadFact for the file:line ordering. Written for BOTH groups, which
+    # preserves an existing asymmetry the table records rather than hides.
+    for fact in EARLY_READ_FACTS:
+        env[fact.env_key] = fact.env_value
+    env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = str(barlink_build_window_cap_s)
     if str(transport) == "nccl":
         # #1234 C6: half-configuring a transport the group does not run is
         # how a mode switch turns into a mystery. The flags go with
         # strip_barlink_flags(), the env keys go here.
         for key in BARLINK_ENV_KEYS:
             env.pop(key, None)
-    env["SGLANG_PP_CHAIN_RECV_STALL_S"] = env.get("SGLANG_PP_CHAIN_RECV_STALL_S", "60")
-    env["SGLANG_PP_OCCUPANT_HORIZON_S"] = env.get("SGLANG_PP_OCCUPANT_HORIZON_S", "90")
+    # LAUNCHER OUTPUT, NOT env.get (#1235). All four used to read a default
+    # THROUGH the launcher's own environment, so an inherited export won
+    # silently and the boot ran a number no flag and no log line named -- the
+    # R19 shape the ring family was already fixed out of. Now they are flags,
+    # written unconditionally.
+    env["SGLANG_PP_CHAIN_RECV_STALL_S"] = str(pp_chain_recv_stall_s)
+    env["SGLANG_PP_OCCUPANT_HORIZON_S"] = str(pp_occupant_horizon_s)
     env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = store_dir
-    env["SGLANG_MATCH_REFUSAL_CENSUS_EVERY"] = env.get("SGLANG_MATCH_REFUSAL_CENSUS_EVERY", "64")
+    env["SGLANG_MATCH_REFUSAL_CENSUS_EVERY"] = str(match_refusal_census_every)
     for k in list(env):
         if k.startswith("SGLANG_PHASE_FLIP"):
             del env[k]
@@ -2429,8 +2737,12 @@ def model_layer_kinds(model: str) -> List[bool]:
     return declared_layer_kinds_from_config(_model_config(model), model_num_layers(model))
 
 
-def p_stage_layers(is_full_attention: Sequence[bool]) -> List[int]:
-    """Group P's per-stage LAYER COUNTS -- derived, never restated.
+def p_stage_layers(
+    is_full_attention: Sequence[bool],
+    scores: Optional[Sequence[int]] = None,
+    attn_scores: Optional[Sequence[int]] = None,
+) -> List[int]:
+    """The per-stage LAYER COUNTS a score pair derives to -- never restated.
 
     #1233 fix 5.  The flip-order map used to be built from
     ``P_PP_STAGE_RATIO_SCORES`` directly, with a comment calling that vector
@@ -2446,16 +2758,29 @@ def p_stage_layers(is_full_attention: Sequence[bool]) -> List[int]:
     instrument that says it is fine.
 
     This calls the SAME function ``server_args._handle_pp_stage_ratio`` calls
-    (``distributed.utils.derive_pp_layer_split``) with the SAME two score
-    vectors ``argv_p`` passes, so there is one authority for the split and the
-    launcher reads it rather than keeping a second copy.
+    (``distributed.utils.derive_pp_layer_split``), so there is one authority
+    for the split and the launcher reads it rather than keeping a second copy.
+
+    FIX 2 -- WHICH SCORE PAIR.  Fix 5 hard-wired the module constants here,
+    which was right while they were the only cut in the file.  They stopped
+    being that when ``solve_p_cut`` was wired into ``main``: the boot then ran
+    the SOLVED pair while this function still answered for the INCUMBENT, so
+    ``main`` published a flip-order map and a WEG2-PP-SPLIT line for a layout
+    group P was not launched with -- complete, confident, and wrong, which is
+    precisely the failure mode fix 5 names and the one
+    ``interleave_pause_order`` cannot refuse.  The pair is a PARAMETER now and
+    every caller states which cut it is asking about; the constants remain the
+    default because they are the incumbent, and ``solve_p_cut`` round-trips
+    its own candidate through this same seam.
     """
     from sglang.srt.distributed.utils import derive_pp_layer_split
 
     return derive_pp_layer_split(
-        list(P_PP_STAGE_RATIO_SCORES),
+        list(P_PP_STAGE_RATIO_SCORES if scores is None else scores),
         is_full_attention=list(is_full_attention),
-        attn_scores=list(P_PP_ATTN_STAGE_RATIO_SCORES),
+        attn_scores=list(
+            P_PP_ATTN_STAGE_RATIO_SCORES if attn_scores is None else attn_scores
+        ),
     )
 
 
@@ -2547,31 +2872,26 @@ def budgets_from_dc(
 def _max_running_requests(model: str, group: str = "D", bs: int = 8) -> int:
     """``--max-running-requests`` as this launcher actually passes it, per GROUP.
 
-    TRAIN FIX 2, and a BOOT KILLER the merge produced: this read the flag out
-    of :func:`common_flags`, and it was wrong twice over there, both raising
-    rather than answering, two frames below ``solve_p_cut`` (launcher.py:3400)
-    and ``d_overlap_cost_line`` (launcher.py:2559) -- i.e. on the path of every
-    Weg-2 boot from the train tip, before group P ever launches:
+    PRE-EXISTING BOOT KILLER, found by this slice's own --dry-run and fixed
+    here rather than left for the next window (it is two frames below
+    ``solve_p_cut``, so no boot from the merge-train tip reached group P's
+    launch). It read the flag out of ``common_flags``, and the flag LEFT
+    ``common_flags`` when C1/R-12 made P's and D's bs independent -- so this
+    reader was wrong twice over, and both raise rather than answer:
 
-      * ``common_flags(model, 1, 1, 1.0)`` raised TypeError, because merge 3's
-        UNION SIGNATURE (slice A's ``max_kv_per_request`` beside prefill-perf's
-        ``write_policy``) made ``max_kv_per_request`` a fifth REQUIRED
-        positional ahead of the ones this call passed.  Each parent was
-        self-consistent -- ``weg2/prefill-perf-0907`` had four required
-        positionals and this caller worked against it -- so the defect is the
-        resolution, not either branch.
-      * Given the arguments it would STILL have raised ValueError, because the
-        flag is not in ``common_flags`` at all any more.  That function's own
-        docstring says so: "NOT here any more (C1/R-12) ... emitted per group
-        from --p-bs / --d-bs instead".
+      * ``common_flags(model, 1, 1, 1.0)`` is missing ``max_kv_per_request``
+        (TypeError), because a fifth required parameter was added ahead of it;
+      * even given the arguments, ``flags.index("--max-running-requests")``
+        raises ValueError, because common_flags' own docstring says the flag is
+        "NOT here any more ... emitted per group from --p-bs / --d-bs instead".
 
-    THE CLASS: a flag MOVED and its only consumer was not moved with it.  The
-    fix keeps the property the original was reaching for -- the number is READ
-    OFF THE ARGV this launcher builds, never restated -- by reading it off the
-    GROUP's argv, which is where the flag now lives.  The two callers ask about
-    different groups and now say which: the P pool model's mamba slots are P's
-    ``--p-bs``, D's ping-pong price is D's ``--d-bs``.  Answering both from one
-    list would have re-created exactly the coupling C1/R-12 removed.
+    THE CLASS, so the sweep is on the record: a flag MOVED and one consumer was
+    not moved with it. The fix keeps the property the original was reaching for
+    -- the number is READ OFF THE ARGV this launcher builds, never restated --
+    by reading it off the GROUP's argv, which is where the flag now lives. The
+    two callers ask about different groups and now say which: the P pool
+    model's mamba slots are P's ``--p-bs``, and D's ping-pong price is D's
+    ``--d-bs``. Sharing one value was the very coupling C1/R-12 removed.
     """
     if str(group) == "P":
         flags = argv_p("py", model, [1, 1, 1], 1, 1, 1.0, [], p_bs=int(bs))
@@ -2580,9 +2900,7 @@ def _max_running_requests(model: str, group: str = "D", bs: int = 8) -> int:
     return int(flags[flags.index("--max-running-requests") + 1])
 
 
-def d_mamba_ping_pong_cost(
-    model: str, disable_overlap: bool, d_bs: int = 8
-) -> Tuple[str, int, int, int]:
+def d_mamba_ping_pong_cost(model: str, disable_overlap: bool, d_bs: int = 8) -> Tuple[str, int, int, int]:
     """What D's overlap choice costs in DEVICE mamba state slots (FIX 1r/1).
 
     Returns ``(strategy, ping_pong_slots_per_running_request, extra_slots_per
@@ -2614,10 +2932,9 @@ def d_mamba_ping_pong_cost(
     from sglang.srt.mem_cache.mamba_pool_floor import mamba_ping_pong_slots
     from sglang.srt.server_args import ServerArgs
 
-    # Group D's OWN argv, for the same reason and with the same defect history
-    # as _max_running_requests above (train fix 2): this list is read for the
-    # PRESENCE of a flag, so it must be the list the group actually gets, not
-    # the shared prefix the per-group flags left.
+    # Group D's own argv, for the same reason and with the same defect history
+    # as _max_running_requests above: this list is read for the presence of a
+    # flag, so it must be the list the group actually gets.
     flags = argv_d("py", model, [1, 1, 1], 1, 1, 1.0, [], d_bs=int(d_bs))
 
     class _StrategyView:
@@ -2672,6 +2989,364 @@ def d_overlap_cost_line(model: str, disable_overlap: bool, d_bs: int = 8) -> str
         f"(model_runner_kv_cache_mixin.py:2529) and the front's W19 grades "
         f"the live residue. DC_EXPECT_*/DC_MEASURED_D_* were measured on "
         f"no_buffer boots and do NOT contain this term."
+    )
+
+
+@dataclass(frozen=True)
+class DTpRatioDecision:
+    """Group D's weight-vector objective, the argv it produces, and its price."""
+
+    objective: str
+    tune: str
+    flags: Tuple[str, ...]
+    line: str
+
+
+def d_tp_ratio_decision(
+    objective: str,
+    tune: str,
+    cards: Sequence[Card],
+    budgets: Sequence[int],
+    model: str,
+    d_bs: int,
+) -> DTpRatioDecision:
+    """Choose group D's weight objective and PRICE the choice on one line.
+
+    NO SECOND SOLVER (upstream-minimal). Both arms are the runtime's own
+    mechanisms and the launcher only names which one this boot took:
+
+      * ``maxkv``  -> ``--rank-tp-ratio auto``              (capacity-first)
+      * ``speed``  -> ``--rank-tp-ratio auto-performance --rank-perf-tune T``
+
+    What is computed here is the COST LINE, and every term in it comes from a
+    source that already exists in the tree and is already used by this
+    launcher:
+
+      * the weight vector is the gcd-reduced budget vector, which is exactly
+        what ``ServerArgs._resolve_auto_rank_tp_ratio`` (server_args.py:11239)
+        derives from the same ``--rank-gpu-memory-mib`` list this launcher is
+        about to pass -- recomputed to be PRINTED, never passed, so there is
+        one writer of the vector and it is the runtime;
+      * the per-rank head partitions come from ``PerfCostModel`` +
+        ``partition_units``, the same pair ``_log_derived_plan_vectors``
+        (server_args.py:11316) uses, so the line quotes the geometry the model
+        actually shards on rather than a second reading of config.json;
+      * the per-card compute score is the MEASURED card-rate library
+        (``planner/card_rate_pass.load_measured_library``), which is already
+        the preferred score source of the PP cut on the P side
+        (``pp_cut_launch.ms_per_layer_from_card_library``). It is keyed by
+        card NAME, so it survives a change of NVML/CUDA ordering, and reading
+        it touches no GPU: a missing library prints UNPRICED and the arm is
+        still chosen, because the objective is the operator's decision and not
+        the estimate's.
+
+    THE SLOWEST-RANK LAW is what the estimate states. Under uneven TP every
+    rank runs the attention of its own q-heads and the barrier waits for the
+    last one, so the cost of the capacity split is
+    ``max_r(q_heads_r / score_r)`` against the compute-proportional split's
+    ``max_r`` -- one number, in relative units, and labelled an ESTIMATE
+    because the launcher has no per-layer measurement of group D.
+
+    AND THE HONEST LIMIT OF THE SPEED ARM, which is the reason this line
+    exists rather than a promise: ``auto-performance`` does NOT move the
+    attention/GDN split. Its docstring says so (uneven_perf.py:6571, "Never
+    touches the base (attention/GDN/DCP) split ... the only vector this
+    function writes to server_args is rank_mlp_ratio"), so the attention
+    barrier priced below is IDENTICAL under both objectives. What the speed
+    arm moves is the dense-MLP family vector, and -- with
+    ``--rank-perf-tune dec`` -- the KV-TOKEN split via ``--rank-kv-ratio
+    speed``, which is the lever the flag's own help calls the larger one at
+    depth (server_args.py:2694, measured -24.5 % of the context-dependent part
+    of the decode step at 120k resident tokens, #210). A reader who takes the
+    attention delta below as the speed arm's yield would be wrong, so the line
+    says which lever each number belongs to.
+    """
+    if objective not in D_TP_OBJECTIVE_CHOICES:
+        raise Weg2LaunchRefused(
+            "W47 Weg2TpObjectiveRefused: --d-tp-objective %r is not one of %s."
+            % (objective, "|".join(D_TP_OBJECTIVE_CHOICES))
+        )
+    if objective == "speed":
+        flags = ("--rank-tp-ratio", "auto-performance", "--rank-perf-tune", str(tune))
+    else:
+        flags = ("--rank-tp-ratio", "auto")
+
+    budgets = [int(b) for b in budgets]
+    g = math.gcd(*budgets) if len(budgets) > 1 else budgets[0]
+    weights = [b // max(1, g) for b in budgets]
+
+    # -- the geometry, from the runtime's own cost model ---------------------
+    heads_note = "geometry UNPRICED"
+    q_heads: List[int] = []
+    gdn_heads: List[int] = []
+    n_q = 0
+    try:
+        from sglang.srt.distributed.utils import partition_units
+        from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+
+        inputs = PlanInputs(
+            tp_size=len(budgets),
+            model_path=model,
+            kv_cache_dtype="fp8_e4m3",
+            speculative_algorithm="NEXTN",
+            speculative_num_draft_tokens=3,
+            max_running_requests=int(d_bs),
+        )
+        pcm = PerfCostModel(inputs, weights, list(budgets))
+        n_q = int(pcm.q_heads)
+        scale = n_q // max(1, int(pcm.attn_units))
+        q_heads = [u * scale for u in partition_units(int(pcm.attn_units), weights)]
+        if int(pcm.gdn_units) > 1:
+            gdn_heads = list(partition_units(int(pcm.gdn_units), weights))
+        heads_note = "attention %s of %d q-heads%s" % (
+            q_heads,
+            n_q,
+            "; GDN %s of %d linear-attention heads" % (gdn_heads, int(pcm.gdn_units))
+            if gdn_heads
+            else "",
+        )
+    except Exception as exc:  # pragma: no cover - geometry is diagnostic
+        heads_note = (
+            "geometry UNPRICED (%s): the per-rank head partition could not be "
+            "derived, so the barrier estimate below is omitted rather than "
+            "guessed" % (exc,)
+        )
+
+    # -- the measured per-card score, or an honest absence -------------------
+    scores: Optional[List[float]] = None
+    try:
+        from sglang.srt.planner.card_rate_pass import load_measured_library
+
+        library = load_measured_library()
+        if library is not None:
+            got: List[float] = []
+            for c in cards:
+                variant = next(
+                    (
+                        v
+                        for v in (library.variants(c.name) or ())
+                        if getattr(v, "gemm_tflops", None)
+                    ),
+                    None,
+                )
+                if variant is None:
+                    got = []
+                    break
+                got.append(float(variant.gemm_tflops))
+            scores = got or None
+    except Exception:
+        scores = None
+
+    if scores and q_heads and len(scores) == len(q_heads):
+        cap_bar = max(h / s for h, s in zip(q_heads, scores))
+        ideal_units = partition_units(
+            int(n_q), [max(1, int(round(s * 1000.0))) for s in scores]
+        )
+        ideal_bar = max(h / s for h, s in zip(ideal_units, scores))
+        idle = [100.0 * (1.0 - (h / s) / cap_bar) for h, s in zip(q_heads, scores)]
+        price = (
+            "PRICE (ESTIMATE, slowest-rank law, attention barrier only): "
+            "measured card GEMM %s TFLOP/s (card-rate library, by card NAME); "
+            "the capacity split's barrier is rank %d at %.4f head/TFLOP-s "
+            "while the others idle %s of every attention barrier. A "
+            "compute-proportional split of the same %d q-heads would be %s at "
+            "%.4f = %+.1f %% -- and that delta is NOT what the speed arm buys: "
+            "auto-performance never moves the attention split "
+            "(uneven_perf.py:6571). Its levers are the dense-MLP family vector "
+            "and, under --rank-perf-tune dec, the KV-TOKEN split "
+            "(--rank-kv-ratio speed, #210, measured -24.5 %% of the "
+            "context-dependent part of the decode step at 120k resident "
+            "tokens). Moving the attention split itself needs an explicit "
+            "--rank-tp-ratio vector, which this knob deliberately does not "
+            "emit."
+            % (
+                ", ".join(
+                    "%s %.1f" % (c.name, s) for c, s in zip(cards, scores)
+                ),
+                max(range(len(q_heads)), key=lambda r: q_heads[r] / scores[r]),
+                cap_bar,
+                ", ".join("%.0f %%" % v for v in idle),
+                int(n_q),
+                ideal_units,
+                ideal_bar,
+                100.0 * (ideal_bar - cap_bar) / cap_bar,
+            )
+        )
+    else:
+        price = (
+            "PRICE UNPRICED: no measured card-rate library on this rig for "
+            "these card names (`python -m sglang.srt.planner.card_rate_pass "
+            "--run` writes one), so the cost of the capacity split at the "
+            "attention barrier is NOT estimated here. An absent estimate is "
+            "reported as absent; it is never a measured zero."
+        )
+
+    line = (
+        "WEG2 D-WEIGHTS objective=%s (default %s, the maxkv law; 'speed' is "
+        "selectable and never silent) -> argv %s. Weights the runtime will "
+        "derive from the SAME --rank-gpu-memory-mib %s: %s (gcd-reduced, "
+        "server_args.py:11239 -- printed here, written there). %s. %s"
+        % (
+            objective,
+            D_TP_OBJECTIVE_DEFAULT,
+            " ".join(flags),
+            budgets,
+            weights,
+            heads_note,
+            price,
+        )
+    )
+    return DTpRatioDecision(
+        objective=objective, tune=str(tune), flags=tuple(flags), line=line
+    )
+
+
+@dataclass(frozen=True)
+class DTokenVectorDecision:
+    """Group D's KV-token ownership vector: what is shipped, and why."""
+
+    flags: Tuple[str, ...]
+    line: str
+
+
+#: #1032 THE VECTOR THIS LAUNCHER MUST NEVER SHIP AGAIN, and the boot that
+#: showed what the runtime does with it.
+#:
+#: ``--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`` sat on
+#: group D's argv. 29,19,16 is the emitted value of RETRACTED investigation
+#: #602 (planner/retracted.py REGISTER), so every Weg-2 boot printed the #797
+#: PROVENANCE warning and then spent a supersession undoing it.
+#:
+#: WHAT THE LOG ACTUALLY SHOWS, because the fix must not be justified against
+#: a claim the evidence refutes (boot weg2rg6, D log
+#: /spinning/evidence-665-f1/boot_weg2_weg2rg6_7f88b1c75d_0908_070324.D.log):
+#: the seed did NOT reach the pools. All three "Uneven-DCP token sizing" lines
+#: read ratios 17 / 7 / 8, i.e. partition_units(64, measured P_r) gcd-reduced
+#: from the measured per-rank capacities 364718 / 154980 / 170464; `vector [29`
+#: does not appear on a single sizing line. The install LANDED and superseded
+#: the seed, exactly as role='seed' promises.
+#:
+#: SO THE DEFECT IS NOT "D SERVED ON THE RETRACTED SPLIT" -- it is that a
+#: retracted lineage was shipped at all, and that the runtime spends a
+#: supersession every boot undoing a number the launcher had no business
+#: stating. Normalised to one sum, the seed 29,19,16 against the measured
+#: 34,14,16 is +17 % on rank 0 and -26 % on rank 1: had the install NOT landed,
+#: that is the split D would have served.
+#:
+#: The fix is therefore to state nothing. With no vector on the argv the
+#: runtime derives its own starting point from THIS boot's budgets
+#: (distributed/utils.py:1135, partition_units(64, budget-minus-checkpoint))
+#: and the measured install replaces it after profiling -- the same install
+#: that already ran, now without withdrawn evidence upstream of it.
+#:
+#: WHAT IS GIVEN UP, named rather than left to be discovered: no seed means
+#: nothing arms ``note_seed_awaiting_supersession``, so the
+#: assert_seed_superseded gate does not hold this boot to an install. That
+#: gate exists because a SEED carries foreign lineage; the budget-derived
+#: fallback carries this boot's own numbers, so an install that does not
+#: happen leaves D on its own honest estimate rather than on a withdrawn one.
+#: (And the gate's disarm keys on the VERDICT boolean, not on a changed vector
+#: -- distributed/utils.py:306 says so in its own docstring -- so "the gate did
+#: not fire" was never proof of an install either. The sizing lines are.)
+RETRACTED_SEED_VECTOR_1032 = (29, 19, 16)
+
+
+def d_token_vector_decision(
+    vector: Optional[str],
+    role: str,
+    provenance: Optional[str],
+) -> DTokenVectorDecision:
+    """Group D's token-vector argv, and the refusal that keeps #602 out.
+
+    Default (``vector`` unset): NOTHING is shipped. The line says which branch
+    the boot is on and where the vector will come from instead.
+
+    Operator-supplied: the value is checked against the runtime's OWN
+    retraction register (``planner.retracted.find_retracted_token_vector``, the
+    same authority ``_refuse_retracted_token_vector`` uses) BEFORE the window
+    is spent. The runtime refuses a retracted PIN and only warns about a
+    retracted SEED, because at that point a seed is still going to be
+    superseded; here neither is accepted, because a launcher that types a
+    retracted number has already made the mistake the register exists to
+    catch, and the desk is the cheap place to say so.
+    """
+    role = str(role or "pin")
+    if not vector:
+        return DTokenVectorDecision(
+            flags=(),
+            line=(
+                "WEG2 D-TOKEN-VECTOR: none shipped (default). Group D derives "
+                "its own starting vector from THIS boot's budgets "
+                "(distributed/utils.py:1135) and replaces it with the MEASURED "
+                "per-rank optimum after profiling -- the 'Uneven-DCP token "
+                "sizing' lines are that install. The retracted #602 seed "
+                "%s this launcher used to ship is GONE (#1032): boot weg2rg6 "
+                "showed the runtime superseding it to 17,7,8 every time, so "
+                "the only thing it bought was a #797 PROVENANCE warning and a "
+                "supersession. Nothing arms assert_seed_superseded now, which "
+                "is the point: with no seed there is no foreign lineage to "
+                "hold a boot to."
+                % (",".join(str(v) for v in RETRACTED_SEED_VECTOR_1032),)
+            ),
+        )
+
+    try:
+        parsed = [int(x) for x in str(vector).split(",") if x.strip() != ""]
+    except ValueError:
+        raise Weg2LaunchRefused(
+            "W46 Weg2TokenVectorRefused: --d-uneven-token-vector %r is not a "
+            "comma-separated integer vector." % (vector,)
+        )
+    if not parsed or any(v <= 0 for v in parsed):
+        raise Weg2LaunchRefused(
+            "W46 Weg2TokenVectorRefused: --d-uneven-token-vector %r must be "
+            "positive integers, one per DCP rank." % (vector,)
+        )
+
+    from sglang.srt.planner.retracted import (
+        find_retracted_token_vector,
+        token_vector_refusal_text,
+    )
+
+    entry = find_retracted_token_vector(parsed, provenance)
+    if entry is not None:
+        raise Weg2LaunchRefused(
+            "W46 Weg2TokenVectorRefused: "
+            + token_vector_refusal_text(
+                entry,
+                parsed,
+                "the Weg-2 launcher refuses to ship it in EITHER role. The "
+                "runtime warns about a retracted role='seed' and refuses only "
+                "a 'pin' (distributed/utils.py:704); this launcher refuses "
+                "both, because a boot window is the expensive place to learn "
+                "that a number was withdrawn",
+            )
+        )
+
+    flags = (
+        "--uneven-token-vector",
+        ",".join(str(v) for v in parsed),
+        "--uneven-token-vector-role",
+        role,
+    )
+    if provenance:
+        flags = flags + ("--uneven-token-vector-provenance", str(provenance))
+    return DTokenVectorDecision(
+        flags=flags,
+        line=(
+            "WEG2 D-TOKEN-VECTOR: %s role=%s provenance=%s -- OPERATOR "
+            "ADVISORY, checked against planner.retracted's register at the "
+            "desk and not found withdrawn. role='seed' still promises "
+            "supersession by this boot's measured per-rank capacity; 'pin' "
+            "asserts the value against that measurement. Default is to ship "
+            "nothing at all."
+            % (
+                ",".join(str(v) for v in parsed),
+                role,
+                provenance or "(undeclared -- the value match is what caught "
+                "#602, so state it if you know it)",
+            )
+        ),
     )
 
 
@@ -3429,40 +4104,138 @@ class PCutFacts:
     #: byte-identical to what it was.
     layer_set: str = ""
     gapped: bool = False
+    #: FIX 2: THE REALIZED PER-STAGE LAYER COUNTS OF THIS CUT -- the one fact
+    #: the flip-order map needs and the only one that may not be re-derived
+    #: from a score vector somewhere else. Not a convenience field: it is
+    #: already ROUND-TRIPPED here against the runtime's own authority
+    #: (``derive_pp_layer_split`` for the count form, ``parse_pp_layer_sets``
+    #: for a gapped map) and a cut that fails that round trip is refused, so
+    #: this is the split the boot provably runs. ``main`` reads it instead of
+    #: asking ``p_stage_layers`` about the incumbent again.
+    layer_counts: Tuple[int, ...] = ()
+
+
+def flip_order_split(cut: PCutFacts, n_layers: int) -> Tuple[List[int], str]:
+    """The per-stage layer counts the FLIP-ORDER MAP may be built from.
+
+    FIX 2.  ``main`` used to derive this from the module score constants, at a
+    point that runs before ``solve_p_cut`` -- so it answered for the INCUMBENT
+    while group P was launched on the SOLVED cut, and the front got a map that
+    was complete, confident and wrong (measured on this tip: incumbent
+    ``[32,18,14]`` against the shipped maxkv cut's ``[31,17,16]``, which moves
+    ``weights_3`` and ``weights_6`` onto other cards).  It comes off the cut
+    now, and this function is the whole decision -- extracted from ``main`` so
+    it can be tested by CALLING it rather than by reading main's AST, which is
+    the only reason the previous instance of this defect had to be found by a
+    reviewer instead of by a test.
+
+    Returns ``([], reason)`` in the three cases where no honest map exists.
+    NO MAP is the honest degradation: ``interleave_pause_order`` refuses an
+    INCOMPLETE map and the front falls back to the identity pause order with
+    the reason printed.  It does NOT refuse a complete-but-wrong one, which is
+    the weg2dk4 death, so every case that cannot be stated exactly is stated
+    as nothing.
+    """
+    split = list(cut.layer_counts)
+    if not split:
+        return [], "solve_p_cut published no layer counts"
+    if sum(split) != n_layers:
+        return [], f"solved split {split} sums to {sum(split)}, not {n_layers}"
+    if cut.gapped:
+        # A gapped cut's stages own NON-CONTIGUOUS layer bands, and
+        # chunk_tag_cards walks cumulative per-stage counts -- that walk IS the
+        # contiguous assumption, so no count vector can state this map.  Before
+        # this fix a gapped boot silently got the incumbent's CONTIGUOUS map
+        # here: the same wrong-map class, one layer deeper.
+        return [], (
+            f"the solved cut is GAPPED ({cut.layer_set}); its stages own "
+            f"non-contiguous layer bands and chunk_tag_cards walks cumulative "
+            f"contiguous counts, so no count vector can state this map"
+        )
+    return split, ""
+
+
+#: WHICH OBJECTIVE THE SOLVER IS ASKED, per arm of ``--pp-solve-objective``.
+#: ``incumbent`` is not a solver objective and must never be passed as one:
+#: it names a CANDIDATE, not a ranking, and it is answered here by looking
+#: that candidate up in the solver's own ranked field
+#: (:func:`pick_shipped_cut`).  The ranking it is looked up in stays the
+#: standing law's ``maxkv``, so the priced alternatives beside it are the
+#: same rows every other arm prints.
+P_SOLVER_OBJECTIVE_OF = {
+    "maxkv": "maxkv",
+    "makespan": "makespan",
+    "incumbent": "maxkv",
+}
 
 
 def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str):
     """WHICH priced candidate group P ships, and why.  Pure.
 
-    The solver ranks by makespan; that is a QUESTION, not an order.  Three
-    things go wrong when its answer ships unasked, and all three are measured:
+    ONE mechanism, reconciled on train 2 from two that had grown in parallel:
+    the argv slice made the OBJECTIVE the solver's own argument (``maxkv`` by
+    default, the standing law), while the train added a shipped-candidate
+    picker over the solver's ranked field.  Both answered the same question --
+    which of the priced rows the boot pays for -- and two answers to one
+    question is the second-bookkeeping shape.  The flag name and default are
+    the argv slice's; the ranked-field lookup and its refusal are the train's;
+    ``incumbent`` becomes a third value of the one flag rather than a second
+    flag.
+
+    Why the picker is needed at all, measured, not asserted:
 
     * the maxkv law (user 2026-09-08, #1254): the pool-maximal cut and the
-      speed cut differ by 47.7 % of the KV pool on this box, and a boot may not
-      pay that trade by accident;
-    * boot weg2rg6 PROVED one cut on metal (32,18,14 / attention 8,4,4, pool
-      714,788).  A cut nothing has booted is not a better default than one that
-      has, however it ranks;
-    * and the one that makes this a REFUSAL rather than a preference: ``main``
-      derives the WEG2-FLIP-ORDER MAP from the incumbent score constants via
-      :func:`p_stage_layers`, while ``argv_p`` ships whatever this function
-      returns.  A divergence leaves the map complete but WRONG PER CARD (a
-      weights tag mapped to one card while its bytes straddle two) -- the
-      wrong-per-card-accounting class that killed boot weg2dk4.
-
-    So the SHIPPED cut is chosen by objective, and ``incumbent`` is the
-    default: the same vector the map is derived from, agreeing by identity.
-    Every objective's candidate stays priced and printed either way.
+      makespan cut differ by 47.7 % of the KV pool on this box, and a boot may
+      not pay that trade by accident.  Hence the ``maxkv`` default;
+    * boot weg2rg6 PROVED one cut on metal (32,18,14 / attention 8,4,4).  A cut
+      nothing has booted is not automatically better than one that has, so the
+      incumbent stays SELECTABLE -- by name, from the ranked field, at its own
+      priced pool -- even though it is no longer the default.
 
     The candidate is looked up in the solver's OWN ranked field rather than
     constructed here -- a hand-built row would carry a pool figure this
     launcher invented.  An incumbent the solver did not rank is a REFUSAL (W40)
     naming it, never a silent fallback to the ranking's winner.
     """
-    if objective == "speed":
-        return decision.chosen, "the makespan-optimal cut (--p-cut-objective speed)"
+    if objective == "makespan":
+        return (decision.makespan or decision.chosen), (
+            "the makespan-optimal cut (--pp-solve-objective makespan)"
+        )
     if objective == "maxkv":
-        return decision.kv_floor, "the pool-maximal cut (--p-cut-objective maxkv)"
+        return decision.kv_floor, (
+            "the pool-maximal kv-floor cut (--pp-solve-objective maxkv, the "
+            "default: the standing maxkv law, #1254)"
+        )
+    cand = incumbent_candidate(decision, incumbent_layers, incumbent_attn)
+    if cand is not None:
+        return cand, (
+            "the INCUMBENT cut (--pp-solve-objective incumbent): boot-proven "
+            "on weg2rg6, looked up in the solver's own ranked field so its "
+            "pool is priced by this boot's model and not by that boot's"
+        )
+    want_layers = tuple(int(n) for n in incumbent_layers)
+    want_attn = tuple(int(a) for a in incumbent_attn)
+    raise Weg2LaunchRefused(
+        "W40 Weg2PPCutRefused: --pp-solve-objective incumbent asks for the cut "
+        f"{','.join(str(n) for n in want_layers)} / attention "
+        f"{','.join(str(a) for a in want_attn)}, and the solver did not rank it "
+        f"as a choosable candidate ({len(decision.ranked)} ranked). Refusing "
+        "rather than shipping the ranking's winner under the incumbent's name "
+        "-- that substitution is exactly what would desynchronise argv from the "
+        "flip-order map."
+    )
+
+
+def incumbent_candidate(decision, incumbent_layers, incumbent_attn):
+    """The incumbent's row in the solver's ranked field, or ``None``.
+
+    Split out of :func:`pick_shipped_cut` because the PP-CUT SHIPPED line
+    prices the incumbent on EVERY boot, including the boots that do not ship
+    it -- an alternative that is not priced is an alternative nobody can
+    compare, which is how the makespan default came to be paid unnoticed.  A
+    missing row is printed as "not ranked"; only ASKING for it and not
+    finding it is a refusal.
+    """
     want_layers = tuple(int(n) for n in incumbent_layers)
     want_attn = tuple(int(a) for a in incumbent_attn)
     for cand in decision.ranked:
@@ -3471,20 +4244,8 @@ def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str)
             and tuple(cand.layers) == want_layers
             and tuple(cand.attn) == want_attn
         ):
-            return cand, (
-                "the INCUMBENT cut (--p-cut-objective incumbent, the default): "
-                "boot-proven on weg2rg6 and identical to the vector the "
-                "flip-order map is derived from"
-            )
-    raise Weg2LaunchRefused(
-        "W40 Weg2PPCutRefused: --p-cut-objective incumbent asks for the cut "
-        f"{','.join(str(n) for n in want_layers)} / attention "
-        f"{','.join(str(a) for a in want_attn)}, and the solver did not rank it "
-        f"as a choosable candidate ({len(decision.ranked)} ranked). Refusing "
-        "rather than shipping the ranking's winner under the incumbent's name "
-        "-- that substitution is exactly what would desynchronise argv from the "
-        "flip-order map."
-    )
+            return cand
+    return None
 
 
 def solve_p_cut(
@@ -3547,10 +4308,8 @@ def solve_p_cut(
         ),
         # Read off the argv this launcher builds rather than restated: a
         # second copy of --max-running-requests would drift the day the flag
-        # moves, and the mamba residency scales linearly with it.  The flag
-        # DID move (C1/R-12 made it per group), so this names P's OWN --p-bs:
-        # this is P's pool model, and answering it from a shared value would
-        # re-couple the two bs knobs slice A separated.
+        # moves, and the mamba residency scales linearly with it.
+        # P's OWN bs (C1/R-12): this is P's pool model.
         mamba_slots=_max_running_requests(model, "P", int(getattr(ns, "p_bs", 8) or 8)),
     )
     families = tuple(
@@ -3559,17 +4318,37 @@ def solve_p_cut(
         else _pp_cut.LAYER_FAMILY_LINEAR
         for k in kinds
     )
-    # The unpinned incumbent is the SHIPPED cut, read off the module constant
-    # rather than retyped as "32,18,14" (train fix 2, same one-statement rule
-    # as argv_p's defaults above).  Note what this vector is NOT: it is the
-    # per-stage SCORE vector, and p_stage_layers is the authority on the layer
-    # counts it derives -- the two agree for exactly the current triple. That
-    # conflation is the solver branch's, pre-existing, and untouched here.
-    incumbent = (
-        _csv_ints(ns.pp_stage_ratio)
-        if ns.pp_stage_ratio
-        else list(P_PP_STAGE_RATIO_SCORES)
-    )
+    # FIX 2: the incumbent is the cost model's MEASUREMENT BASIS -- the cut
+    # MEASURED_MS_PER_LAYER was taken under -- and that is what
+    # P_PP_STAGE_RATIO_SCORES is defined to be. It was restated here as a bare
+    # "32,18,14", a fourth copy of a vector whose whole point is one
+    # definition; an operator pin still overrides it.
+    incumbent = _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else list(P_PP_STAGE_RATIO_SCORES)
+    # THE GAPPED DEFAULT IS NOT TAKEN, AND THE HOOK IS NAMED RATHER THAN LEFT
+    # OPEN (#753 / boot weg2gp1, 2026-09-08, /spinning/gpu-arb/weg2/
+    # BOOT_weg2gp1_0908.md). The user's 0,8,8 layout was probed on metal for
+    # exactly this decision and the verdict is STAYS, twice over:
+    #   * CORRECTNESS. The gate's PREMISE is refuted -- the gapped forward is
+    #     not the '\n\n' garbage its docstring describes, it answers
+    #     byte-identically on the #753 probe verbatim -- but its VERDICT
+    #     survives: 3 of 6 determined-answer probes DIVERGE from the contiguous
+    #     control, in both graph modes, against an A/A floor of 0 divergences.
+    #     A forward that silently changes half the determined answers is the
+    #     'confidently wrong' class the gate names.
+    #   * MOTIVE. The gapped map loses on both axes it was chosen for: world
+    #     pool 391,904 vs the contiguous control's 714,788 (-45.2 %) and
+    #     1097.0 vs 577.9 ms per full chunk on the binding stage (+89.8 %).
+    #     The 1.0M-token aim is CLOSER on the contiguous axis, not further.
+    #   * 0,8,8 itself never reached the forward: stage 0 owns zero attention
+    #     layers, so its KV cell is 0 and the HiCache host-pool constructor
+    #     divides by it -- a third wall, new, and upstream of the gate.
+    # THE HOOK, recorded and deliberately NOT applied (the record spells out
+    # that it is unsupported by this boot): when a forward passes the six-probe
+    # comparison, the predicate to narrow is not `is_gapped` but the composite
+    # `is_gapped AND (flip vector OR speculative decoding)`, warning otherwise.
+    # Until then the default is the CONTIGUOUS kv-floor cut, gapped maps stay
+    # reachable only through --pp-layer-set, and that path still meets the
+    # gate.
 
     # -- THE DEPTH AXIS (#1240) ------------------------------------------
     # The design prefix is a MEASUREMENT of this rig's own traffic when one
@@ -3664,6 +4443,11 @@ def solve_p_cut(
         cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
         pinned_layers=_csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else None,
         pinned_attn=_csv_ints(ns.pp_attn_stage_ratio) if ns.pp_attn_stage_ratio else None,
+        # #1254: the DEFAULT is the kv-floor row. Under the previous makespan
+        # default the solver's own dry run picked 44,10,10 attn 11,2,3 at a
+        # 499,967-token pool -- +33.5 % prefill for -47.7 % pool on metal --
+        # which is a trade nobody selected, taken by a flag nobody passed.
+        objective=P_SOLVER_OBJECTIVE_OF[str(ns.pp_solve_objective)],
     )
     log(
         f"PP-CUT inputs: layers={n_layers} attn={n_attn} "
@@ -3676,41 +4460,59 @@ def solve_p_cut(
         f"(0.0 = UNFUNDED, pool is an UPPER bound)"
     )
     log(decision.provenance_line())
+    log(decision.trade_line())
     for row in decision.table_lines():
         log(row)
-    # WHICH of those priced rows this boot actually SHIPS (#1254 + the
-    # flip-order-map identity -- see :func:`pick_shipped_cut`).  An operator pin
-    # outranks the objective: it IS the chosen candidate, and overriding it here
-    # would make --pp-stage-ratio a suggestion.
+    # WHICH of those priced rows this boot actually SHIPS (#1254 -- see
+    # :func:`pick_shipped_cut`).  An operator pin outranks the objective: it IS
+    # the chosen candidate, and overriding it here would make --pp-stage-ratio
+    # a suggestion.
     if decision.pinned:
         chosen, ship_why = decision.chosen, (
             "PINNED by --pp-stage-ratio (the operator's own cut, which outranks "
-            "--p-cut-objective)"
+            "--pp-solve-objective)"
         )
     else:
         chosen, ship_why = pick_shipped_cut(
             decision,
             P_PP_STAGE_RATIO_SCORES,
             P_PP_ATTN_STAGE_RATIO_SCORES,
-            str(getattr(ns, "p_cut_objective", "incumbent")),
+            str(ns.pp_solve_objective),
         )
+    # ALL THREE ARMS PRICED ON EVERY BOOT, the shipped one named.  The two the
+    # boot did NOT take are the whole reason this line exists: the makespan
+    # default was paid for weeks because its alternative was never printed
+    # beside it, and a trade nobody can see is a trade nobody selected.
+    incumbent_row = incumbent_candidate(
+        decision, P_PP_STAGE_RATIO_SCORES, P_PP_ATTN_STAGE_RATIO_SCORES
+    )
+    makespan_row = decision.makespan or decision.chosen
     log(
         "PP-CUT SHIPPED: layers=%s attn=%s pool_tokens=%d makespan_ms=%.1f -- %s. "
-        "The other two objectives stay priced on the rows above and are NOT paid "
-        "by accident: makespan-optimal %s pool %d makespan %.1f, pool-maximal %s "
-        "pool %d makespan %.1f (--p-cut-objective speed|maxkv ships them)."
+        "The two objectives this boot did NOT take stay priced beside it and are "
+        "therefore not paid by accident: incumbent %s pool %s makespan %s, "
+        "pool-maximal (kv-floor) %s pool %d makespan %.1f, makespan-optimal %s "
+        "pool %d makespan %.1f (--pp-solve-objective incumbent|maxkv|makespan "
+        "ships them)."
         % (
             ",".join(str(n) for n in chosen.layers),
             ",".join(str(a) for a in chosen.attn),
             int(chosen.pool_tokens),
             chosen.makespan_ms,
             ship_why,
-            decision.chosen.fmt(),
-            int(decision.chosen.pool_tokens),
-            decision.chosen.makespan_ms,
+            incumbent_row.fmt() if incumbent_row is not None else "%s / %s" % (
+                _csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)
+            ),
+            "%d" % int(incumbent_row.pool_tokens) if incumbent_row is not None
+            else "n/a (NOT RANKED by this solve)",
+            "%.1f" % incumbent_row.makespan_ms if incumbent_row is not None
+            else "n/a",
             decision.kv_floor.fmt(),
             int(decision.kv_floor.pool_tokens),
             decision.kv_floor.makespan_ms,
+            makespan_row.fmt(),
+            int(makespan_row.pool_tokens),
+            makespan_row.makespan_ms,
         )
     )
     if chosen.kind == "gapped":
@@ -3765,6 +4567,7 @@ def solve_p_cut(
             cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
             layer_set=chosen.layer_set,
             gapped=True,
+            layer_counts=tuple(int(c) for c in realized_counts),
         )
     # ROUND TRIP AGAINST THE RUNTIME AUTHORITY, not against our own model.
     # --pp-stage-ratio entries are SCORES: server_args hands them to
@@ -3775,13 +4578,19 @@ def solve_p_cut(
     # comes back as 23,24,17. A solved cut that does not survive this call is
     # a cut the boot would not run, so it is refused here rather than logged
     # and departed from.
-    stage_ratio = ",".join(str(n) for n in chosen.layers)
-    attn_ratio = ",".join(str(a) for a in chosen.attn)
-    from sglang.srt.distributed.utils import derive_pp_layer_split
-
-    realized = derive_pp_layer_split(
-        list(chosen.layers),
-        is_full_attention=[str(k) == "full_attention" for k in kinds],
+    # THE SHIPPED candidate, not the ranking's winner: train 2 reconciled the
+    # objective knob into ONE flag, so ``chosen`` and ``decision.chosen`` are
+    # the same row only when the arm is the solver's own objective. Everything
+    # below -- the round trip, the argv strings, PCutFacts -- must describe the
+    # cut the boot RUNS.
+    stage_ratio = _csv(chosen.layers)
+    attn_ratio = _csv(chosen.attn)
+    # FIX 2: through ``p_stage_layers``, the launcher's ONE score-pair ->
+    # split seam, rather than a second direct call to the same upstream
+    # function. Same authority, one caller of it.
+    realized = p_stage_layers(
+        [str(k) == "full_attention" for k in kinds],
+        scores=list(chosen.layers),
         attn_scores=list(chosen.attn),
     )
     if list(realized) != list(chosen.layers):
@@ -3805,6 +4614,7 @@ def solve_p_cut(
         kv_mib_per_token_per_attn_layer=float(kv_mib),
         hidden_size=int(text_cfg["hidden_size"]),
         cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
+        layer_counts=tuple(int(c) for c in realized),
     )
 
 
@@ -3948,19 +4758,32 @@ def build_parser() -> argparse.ArgumentParser:
              "resolved for the chosen layer cut by pp_cut.best_attention_split.",
     )
     ap.add_argument(
-        "--p-cut-objective", default="incumbent",
-        choices=("incumbent", "maxkv", "speed"),
-        help="WHICH priced cut group P actually SHIPS. 'incumbent' (default) "
-             f"is the rg6-proven contiguous kv-floor cut "
-             f"{','.join(str(n) for n in P_PP_STAGE_RATIO_SCORES)} / attention "
-             f"{','.join(str(a) for a in P_PP_ATTN_STAGE_RATIO_SCORES)} -- the "
-             "SAME vector p_stage_layers derives the flip-order map from, so "
-             "argv and map agree by identity rather than by coincidence. "
-             "'speed' ships the makespan-optimal cut and 'maxkv' the "
-             "pool-maximal one; both are priced and printed on EVERY boot "
-             "either way, so the trade is visible without being paid by "
-             "accident (maxkv law, user 2026-09-08 / #1254). An explicit "
-             "--pp-stage-ratio pin outranks this flag.",
+        "--pp-solve-objective", choices=["maxkv", "makespan", "incumbent"],
+        default="maxkv",
+        help="#1254. WHICH PRICED CUT group P's layer split SHIPS. "
+             "Default 'maxkv' = the kv-floor row, the pool-maximal cut that "
+             "still clears the one-full-context-prompt floor; that is the "
+             "standing law's default and it is not a preference about this "
+             "rig. 'makespan' takes the smallest compute+crossing total "
+             "instead -- the previous default, under which the solver's own "
+             "dry run chose 44,10,10 attn 11,2,3 at a 499,967-token pool, i.e. "
+             "it paid -47.7 %% of the pool for +33.5 %% of prefill on metal "
+             "without anyone selecting that trade. 'incumbent' ships the "
+             f"rg6-boot-proven contiguous cut {P_PP_INCUMBENT_FMT} -- looked "
+             "up BY NAME in the solver's own ranked field, so its pool is "
+             "priced by this boot's model and an incumbent the solver did not "
+             "rank is a W40 REFUSAL rather than a silent substitution of the "
+             "ranking's winner. ALL THREE arms are priced on the PP-CUT "
+             "SHIPPED: line of EVERY boot with their pool AND their ms/chunk "
+             "whichever is chosen, and the PP-CUT trade: line does the "
+             "division, so a large trade is visible as the defect candidate "
+             "the law calls it. TRAIN 2 reconciled this flag with the train's "
+             "--p-cut-objective, which is GONE: two flags answering 'which cut "
+             "ships' is the second-bookkeeping shape, and the flip-order map "
+             "no longer needs the incumbent to agree with argv -- it is "
+             "derived FROM the shipped cut (flip_order_split) and W46 checks "
+             "that by construction. GAPPED MAPS ARE NOT AN ARM OF THIS FLAG: "
+             "see --pp-layer-set and the #753 gate.",
     )
     ap.add_argument(
         "--pp-cut-measured-ms-per-layer", default=MEASURED_MS_PER_LAYER,
@@ -4070,11 +4893,76 @@ def build_parser() -> argparse.ArgumentParser:
         default=D_NUM_CONTINUOUS_DECODE_STEPS,
         help=f"Group D only. Decode steps run per scheduler visit "
              f"(server_args.py:1424). Default "
-             f"{D_NUM_CONTINUOUS_DECODE_STEPS} is MEASURED, not chosen: arms "
-             f"table row D2 of /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md "
-             f"reads 75.5 tok/s at bs1 and 305.0 at bs6 against the D0 "
-             f"control's 66.2 / 284.9 (+14.0 %% / +7.1 %%), and row D3 shows 4 "
-             f"REGRESSES to 73.6 / 295.6. Pass 1 to restore the shipped value.",
+             f"{D_NUM_CONTINUOUS_DECODE_STEPS}: "
+             # ONE sentence, three readers -- see D_DECODE_STEPS_PROVENANCE.
+             # argparse renders every help as `help % params`, so the percent
+             # signs are escaped HERE rather than kept doubled in the constant,
+             # which the log line prints verbatim.
+             + D_DECODE_STEPS_PROVENANCE.replace("%", "%%")
+             + " Pass 1 to restore the shipped value.",
+    )
+    ap.add_argument(
+        "--d-tp-objective", choices=list(D_TP_OBJECTIVE_CHOICES),
+        default=D_TP_OBJECTIVE_DEFAULT,
+        help=f"Group D only (#1017). WHICH OBJECTIVE group D's weight vector "
+             f"is solved for. Default {D_TP_OBJECTIVE_DEFAULT!r} = the "
+             f"capacity-first split, emitted as --rank-tp-ratio auto: weights "
+             f"proportional to the per-rank VRAM budgets, which maximizes the "
+             f"KV pool and is deliberately independent of how fast the cards "
+             f"are (server_args.py:838). That is the DEFAULT because the "
+             f"standing law makes maximum KV the default objective -- not "
+             f"because speed was never considered. 'speed' emits "
+             f"--rank-tp-ratio auto-performance --rank-perf-tune "
+             f"<--d-rank-perf-tune>, the runtime's own per-task optimizer. "
+             f"Either way the launcher prints the WEG2 D-WEIGHTS line naming "
+             f"the objective, the weight vector, the per-rank head partition "
+             f"and the estimated cost at the attention barrier. No arm is "
+             f"silent and no arm is solved here.",
+    )
+    ap.add_argument(
+        "--d-rank-perf-tune", default="both",
+        help="Target handed to --rank-perf-tune when --d-tp-objective is "
+             "'speed'. Ignored otherwise (and saying so is the point: a tune "
+             "target without the speed arm would read as an active setting). "
+             "Choices are the runtime's own "
+             "(server_args._RANK_PERF_TUNE_CHOICES: both|dec|enc|maxkv|"
+             "phase-prefill|phase-decode); 'dec' is the one that also selects "
+             "--rank-kv-ratio speed, i.e. the KV-token lever, which is the "
+             "larger one at depth.",
+    )
+    ap.add_argument(
+        "--d-uneven-token-vector", default=None,
+        help="#1032. Group D's KV-token ownership vector, e.g. '17,7,8'. "
+             "UNSET IS THE DEFAULT AND THE RIGHT ANSWER: group D derives its "
+             "own starting vector from this boot's budgets and replaces it "
+             "with the measured per-rank optimum after profiling, which is "
+             "what the 'Uneven-DCP token sizing' lines are. This launcher used "
+             "to ship 29,19,16 as a seed -- the emitted value of RETRACTED "
+             "investigation #602 -- and boot weg2rg6 measured the runtime "
+             "superseding it to 17,7,8 on all three ranks, so the seed bought "
+             "a #797 warning and nothing else. A value passed here is checked "
+             "against planner.retracted's register BEFORE the boot: a "
+             "withdrawn vector is a W46 refusal naming its ticket, in EITHER "
+             "role, which is stricter than the runtime (it refuses only a "
+             "retracted 'pin').",
+    )
+    ap.add_argument(
+        "--d-uneven-token-vector-role", choices=["seed", "pin"], default="pin",
+        help="Role of --d-uneven-token-vector. 'pin' (default here) asserts "
+             "the value against the runtime's own measurement; 'seed' declares "
+             "it provisional and promises supersession in-process. The default "
+             "is 'pin' deliberately: an operator who types a vector is "
+             "asserting it, and a 'seed' default would re-create the shape "
+             "#1032 removed -- a number nobody stands behind riding along "
+             "because its role made it look harmless.",
+    )
+    ap.add_argument(
+        "--d-uneven-token-vector-provenance", default=None,
+        help="WHERE --d-uneven-token-vector came from (#797): the "
+             "investigation, task id or tool. Declaring a lineage that is not "
+             "retracted does NOT switch off the value match here -- #900's "
+             "lesson, and the value match is what caught the shipped 29,19,16 "
+             "in the first place.",
     )
     ap.add_argument(
         "--d-disable-overlap-schedule", action="store_true",
@@ -4095,6 +4983,93 @@ def build_parser() -> argparse.ArgumentParser:
              "structural removal (a shared ring, async ack) belongs to the "
              "ring slice, not here.",
     )
+    # -- #1235: the literals and env gates that used to be nobody's ------
+    ap.add_argument(
+        "--random-seed", type=int, default=RANDOM_SEED,
+        help=f"Sampling seed for BOTH groups. Default {RANDOM_SEED} is "
+             f"ARBITRARY AND FIXED, and that is the whole provenance -- it is "
+             f"not measured and not solved, and it is a flag so that no reader "
+             f"has to wonder which it was. What it buys is that two boots of "
+             f"one tip sample identically, so a decode difference between them "
+             f"is a difference in the code.",
+    )
+    ap.add_argument(
+        "--barlink-bar1-cap-cycles", type=int, default=BARLINK_BAR1_CAP_CYCLES,
+        help=f"Ceiling on barlink's build-time cycle budget, both groups. "
+             f"Default {BARLINK_BAR1_CAP_CYCLES} is large BY CONSTRUCTION: it "
+             f"is a ceiling, not a target, and the gate that actually binds on "
+             f"this rig is the BAR1 aperture priced at "
+             f"--barlink-bar1-window-mib (#1234 C1), not this number.",
+    )
+    ap.add_argument(
+        "--collective-census-interval", type=int, default=COLLECTIVE_CENSUS_INTERVAL,
+        help=f"How often the collective census prints, both groups. Default "
+             f"{COLLECTIVE_CENSUS_INTERVAL} is a STRIDE and not a measurement: "
+             f"larger is quieter, smaller costs log volume, and nothing about "
+             f"the boot depends on it except how much of it a reader sees.",
+    )
+    ap.add_argument(
+        "--p-barlink-bar1-window-mib", default=P_BARLINK_BAR1_WINDOW_MIB,
+        help=f"Group P's BAR1 windows. Default {P_BARLINK_BAR1_WINDOW_MIB!r} "
+             f"shares group D's provenance from the other side (#1234 C1): the "
+             f"two groups' windows are sized to fit TOGETHER -- P 24+96 and D "
+             f"16+32+40 = 208 of the 224 MiB usable per 3080, measured Used "
+             f"224/256 including the RM carve-out. That sentence lived only in "
+             f"the declared-deviations list while D's window carried the whole "
+             f"derivation in a comment.",
+    )
+    ap.add_argument(
+        "--barlink-build-window-cap-s", type=int, default=BARLINK_BUILD_WINDOW_CAP_S,
+        help=f"SGLANG_BARLINK_BUILD_WINDOW_CAP_S, both groups. Default "
+             f"{BARLINK_BUILD_WINDOW_CAP_S} s. A TIMEOUT, not a measurement. "
+             f"It is now launcher OUTPUT: it used to be written as "
+             f"env.get(KEY, default), so an inherited export from the "
+             f"launcher's own shell won silently and the boot ran a number no "
+             f"flag, record or log line ever named (the R19 shape).",
+    )
+    ap.add_argument(
+        "--pp-chain-recv-stall-s", type=int, default=PP_CHAIN_RECV_STALL_S,
+        help=f"SGLANG_PP_CHAIN_RECV_STALL_S. Default {PP_CHAIN_RECV_STALL_S} s, "
+             f"a timeout, launcher OUTPUT for the same reason as above.",
+    )
+    ap.add_argument(
+        "--pp-occupant-horizon-s", type=int, default=PP_OCCUPANT_HORIZON_S,
+        help=f"SGLANG_PP_OCCUPANT_HORIZON_S. Default {PP_OCCUPANT_HORIZON_S} s, "
+             f"a timeout, launcher OUTPUT for the same reason as above.",
+    )
+    ap.add_argument(
+        "--match-refusal-census-every", type=int, default=MATCH_REFUSAL_CENSUS_EVERY,
+        help=f"SGLANG_MATCH_REFUSAL_CENSUS_EVERY. Default "
+             f"{MATCH_REFUSAL_CENSUS_EVERY} is a census STRIDE. Launcher "
+             f"OUTPUT for the same reason as above -- and note the denominator "
+             f"law applies to what it emits: a rate-limited counter's zero is "
+             f"not a zero.",
+    )
+    ap.add_argument(
+        "--no-arming-floor-solved", dest="arming_floor_solved",
+        action="store_false",
+        help="Drop SGLANG_ARMING_FLOOR_SOLVED=1 (default ON, unchanged "
+             "shipped behaviour). A boolean env gate with no flag was "
+             "indistinguishable from a hard-coded constant (#1235).",
+    )
+    ap.add_argument(
+        "--no-hicache-bigram-keys", dest="hicache_bigram_keys",
+        action="store_false",
+        help="Drop SGLANG_HICACHE_BIGRAM_KEYS=1 (default ON). MEASURED reason "
+             "for ON, boot weg2ls3b3 (#1233): group D (NEXTN) keys the store "
+             "by BIGRAM page hashes and group P (no spec) by UNIGRAM, so the "
+             "two built disjoint chains for the same prompt and D never read "
+             "P's pages. One key scheme for both groups; a no-op on D.",
+    )
+    ap.add_argument(
+        "--no-hicache-flush-publish-sweep", dest="hicache_flush_publish_sweep",
+        action="store_false",
+        help="Drop SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=1 (default ON). Reason "
+             "for ON (#1233 zero-remainder): /flush_cache publishes every "
+             "un-backed device node to the store before the idle witness, so a "
+             "chain the write-through pin budget declined mid-prefill is not "
+             "lost at the flip.",
+    )
     ap.add_argument("--teardown", default="", help="path of a boot state json to tear down")
     return ap
 
@@ -4106,6 +5081,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # BEFORE build_env(), which starts from os.environ: an inherited stage map
     # would reach group P's ranks without passing through the solver at all.
     refuse_inherited_layer_set(os.environ)
+    # #1032 RESOLVED HERE, BEFORE THE SWEEPS, THE STORE AND ANY LAUNCH: a
+    # retracted token vector is a desk fact, and the whole point of W46 is that
+    # it must not cost a boot window -- nor a mount, nor an shm sweep -- to
+    # discover. Same reason refuse_inherited_layer_set sits one line above.
+    d_tokvec = d_token_vector_decision(
+        ns.d_uneven_token_vector,
+        ns.d_uneven_token_vector_role,
+        ns.d_uneven_token_vector_provenance,
+    )
 
     tree = os.path.abspath(ns.tree)
     tip = subprocess.run(["git", "-C", tree, "rev-parse", "--short=10", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -4182,34 +5166,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "in flight together -> dst.resume(kv); the host holds ONE image per card (H(c) = max_g image_g(c)) "
         "and dst's per-tag releases fund src's acquires inside it")
 
-    # 1b'. #1233 fix 5 -- P's PP LAYER SPLIT, derived from the two score vectors
-    # argv_p passes, by the SAME function server_args calls.  Named refusal
-    # instead of a guess: a split that does not sum to the checkpoint's depth
-    # publishes NO map, and the flip falls back to the identity pause order
-    # with the reason printed, rather than to a confident wrong one.
-    p_split: List[int] = []
-    p_kinds: List[bool] = []
-    p_split_note = ""
-    try:
-        p_kinds = model_layer_kinds(ns.model)
-        p_split = p_stage_layers(p_kinds)
-        if sum(p_split) != n_layers:
-            p_split_note = (
-                f"derived split {p_split} sums to {sum(p_split)}, not {n_layers}"
-            )
-            p_split = []
-    except (Weg2LaunchRefused, ValueError, OSError) as e:
-        p_split_note = f"{type(e).__name__}: {e}"
-    log(
-        f"WEG2-PP-SPLIT group=P scores --pp-stage-ratio {list(P_PP_STAGE_RATIO_SCORES)} "
-        f"--pp-attn-stage-ratio {list(P_PP_ATTN_STAGE_RATIO_SCORES)} over {n_layers} layers "
-        f"({sum(p_kinds) if p_split else '?'} full-attention) -> DERIVED layer split "
-        f"{p_split if p_split else 'REFUSED (' + p_split_note + ')'} "
-        "(derive_pp_layer_split, the same authority server_args._handle_pp_stage_ratio "
-        "uses; fix 5: the flip-order map used to restate the SCORE vector as the split, "
-        "which is right only for this checkpoint and this pair of vectors)"
-    )
-    state.p_stage_layers = list(p_split)
+    # 1b'. P's PP LAYER SPLIT is NOT derived here any more (FIX 2).  It was,
+    # from the two module score constants, at a point in main that runs BEFORE
+    # solve_p_cut -- so from the moment the solver was wired in, this line
+    # answered for the INCUMBENT while group P launched on the SOLVED cut, and
+    # the flip-order map built from it was complete, confident and wrong for
+    # every boot whose solve moved the cut (measured on this tip: constants ->
+    # [32,18,14], solved maxkv 31,17,16/7,5,4 -> [31,17,16]).  The split now
+    # comes off PCutFacts.layer_counts, next to the argv it belongs to.
     tms_so = "" if dry else build_tms_preload(tree, ns.venv, log)
     state.weight_chunks = chunk_count
     state.tms_so = tms_so
@@ -4280,29 +5244,65 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls2b2"
     )
     state.budgets["P"] = budgets_p
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, **_env_knobs(ns))
     # #1233 zero-remainder: group P ends every prefill's last chunk at N-1 and
     # publishes the recurrent anchor there (schedule_policy END-OF-PREFILL
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
     chunk_tokens = chunked_prefill_size_of(
-        common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, max_kv_per_request, ns.p_hicache_write_policy)
+        common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, max_kv_per_request, ns.p_hicache_write_policy, "P", ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval)
     )
     cut = solve_p_cut(ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens)
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
-    # #1254 W46: THE MAP AND THE ARGV MUST BE THE SAME SPLIT.  The WEG2-FLIP-
-    # ORDER MAP above is derived from the incumbent score constants
-    # (p_stage_layers); argv_p ships whatever solve_p_cut returned.  While the
-    # solver's winner differs from the incumbent those two halves describe
-    # DIFFERENT layouts, and the map is then complete but WRONG PER CARD -- a
-    # weights tag charged to one card while its bytes straddle two, which is
-    # the accounting class that killed boot weg2dk4.  Neither half can see the
-    # other, and interleave_pause_order refuses only an INCOMPLETE map, so a
-    # confident wrong pause order is exactly what a silent divergence buys.
-    # Checked here, by name, before either group starts.
+    # 1b' (moved here by the argv slice's FIX 2) -- P's PP LAYER SPLIT, of the
+    # cut group P is ACTUALLY LAUNCHED WITH.  Read off PCutFacts, where
+    # solve_p_cut has already round-tripped it through the runtime's own
+    # authority and refused anything that would not survive it, rather than
+    # re-derived from the module constants at a point in main that cannot see
+    # the solve yet.  The flip-order map below is the consumer, and a map that
+    # is complete but WRONG is the failure mode this whole seam exists for:
+    # interleave_pause_order refuses only an INCOMPLETE map, so a confident
+    # wrong one pauses the wrong card first -- the weg2dk4 class.
+    #
+    # The decision itself lives in flip_order_split, which names its three
+    # NO-MAP refusals -- and lives OUTSIDE main so a test can call it.
+    p_split, p_split_note = flip_order_split(cut, n_layers)
+    log(
+        f"WEG2-PP-SPLIT group=P cut --pp-stage-ratio {cut.stage_ratio or '(omitted: gapped)'} "
+        f"--pp-attn-stage-ratio {cut.attn_stage_ratio or '(omitted: gapped)'} "
+        f"over {n_layers} layers -> REALIZED layer split "
+        f"{p_split if p_split else 'NO MAP (' + p_split_note + ')'} "
+        f"(source: solve_p_cut's own round trip against "
+        f"{'parse_pp_layer_sets' if cut.gapped else 'derive_pp_layer_split'}, the "
+        f"authority the runtime itself uses. FIX 2: this line used to state the "
+        f"INCUMBENT score vectors -- main does not name them any more, in code "
+        f"or in prose; the PP-CUT solver: line above prints the incumbent and "
+        f"what the solve moved)"
+    )
+    state.p_stage_layers = list(p_split)
+    # W46 (#1254): THE MAP AND THE ARGV MUST BE THE SAME SPLIT -- kept as a
+    # REFUSAL on train 2 even though the two halves now come from one source.
+    # It was written when they did not: the map was derived from the incumbent
+    # score constants while argv_p shipped whatever solve_p_cut returned, and a
+    # map built for one split while another runs is COMPLETE BUT WRONG PER CARD
+    # (a weights tag charged to one card while its bytes straddle two) -- the
+    # accounting class that killed boot weg2dk4, which interleave_pause_order
+    # cannot catch because it refuses only an INCOMPLETE map.
+    #
+    # It passes BY CONSTRUCTION now, and that is exactly why it stays: the two
+    # sides are still derived along INDEPENDENT paths -- p_split off
+    # cut.layer_counts (solve_p_cut's round trip through the runtime authority),
+    # shipped_split by RE-PARSING the argv strings this launcher is about to
+    # hand group P, through the same runtime parser the boot will use.  A guard
+    # that can only pass is not the same thing as a guard whose two inputs
+    # cannot disagree; deleting it would remove the only place that reads P's
+    # argv back and compares it to the map, and the next time those paths part
+    # (a pin, a gapped map, a flag that stops being forwarded) nothing would
+    # say so.  Checked before either group starts.
     shipped_split = shipped_layer_split(
-        stage_ratio, attn_stage_ratio, cut.layer_set, p_kinds, len(budgets_p)
+        stage_ratio, attn_stage_ratio, cut.layer_set,
+        model_layer_kinds(ns.model), len(budgets_p),
     )
     if p_split and shipped_split and list(shipped_split) != list(p_split):
         raise Weg2LaunchRefused(
@@ -4311,26 +5311,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"--pp-stage-ratio {stage_ratio or '(none)'} --pp-attn-stage-ratio "
             f"{attn_stage_ratio or '(none)'}"
             + (f" --pp-layer-set {cut.layer_set}" if cut.layer_set else "")
-            + f"), while the WEG2-FLIP-ORDER MAP was derived from "
-            f"{','.join(str(n) for n in p_split)} (p_stage_layers over the "
-            f"incumbent scores {list(P_PP_STAGE_RATIO_SCORES)} / "
-            f"{list(P_PP_ATTN_STAGE_RATIO_SCORES)}). A map built for one split "
-            "and an argv running another is COMPLETE BUT WRONG PER CARD -- the "
-            "weg2dk4 accounting class -- and interleave_pause_order refuses "
-            "only an INCOMPLETE map, so it would pause the wrong card first "
-            "with a confident reason. Ship the incumbent (--p-cut-objective "
-            "incumbent, the default), or pin the map's split explicitly with "
-            "--pp-stage-ratio; the flip-order map must be derived from the same "
-            "cut before another objective can ship."
+            + f"), while the WEG2-FLIP-ORDER MAP was built from "
+            f"{','.join(str(n) for n in p_split)} (flip_order_split over "
+            "solve_p_cut's own round-tripped layer counts). Those two are the "
+            "same cut by construction, so a mismatch here means one of the two "
+            "paths stopped describing the shipped cut -- the argv strings are "
+            "no longer what the solve returned, or the counts are no longer "
+            "what the argv parses to. A map built for one split and an argv "
+            "running another is COMPLETE BUT WRONG PER CARD -- the weg2dk4 "
+            "accounting class -- and interleave_pause_order refuses only an "
+            "INCOMPLETE map, so it would pause the wrong card first with a "
+            "confident reason. Refusing rather than booting that."
         )
     log(
         "WEG2-PP-SPLIT CHECK: argv split "
         f"{','.join(str(n) for n in shipped_split) if shipped_split else 'NOT STATED'} "
         f"== flip-order map split "
         f"{','.join(str(n) for n in p_split) if p_split else 'MAP REFUSED (see above)'} "
-        "-- W46 checks the premise p_stage_layers' docstring used to be able to "
-        "assume (that argv_p passes the same two score vectors), which the "
-        "solver made checkable rather than true"
+        "-- W46, the two independent derivations of one cut: P's argv re-parsed "
+        "through the runtime's own parser against the counts the map was built "
+        "from"
     )
     # #1240 THE LAUNCHER IS THE ONLY WRITER. The solved (or pinned) map is
     # published here, into the environment group P will actually get -- the
@@ -4402,11 +5402,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "hybrid-mamba resolution picks extra_buffer for "
             "Qwen3_5ForConditionalGeneration on linear_attn_backend=triton). "
             f"--num-continuous-decode-steps {ns.num_continuous_decode_steps} "
-            f"on D (default {D_NUM_CONTINUOUS_DECODE_STEPS} is MEASURED, cited "
-            f"to /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md arms table row "
-            f"D2: 75.5 tok/s bs1 and 305.0 bs6 against the D0 control's 66.2 / "
-            f"284.9 = +14.0 % / +7.1 %, with row D3 showing steps 4 regresses "
-            f"to 73.6 / 295.6 -- an optimum, not a direction). "
+            f"on D (default {D_NUM_CONTINUOUS_DECODE_STEPS}). "
+            + D_DECODE_STEPS_PROVENANCE
+            + " "
             + d_overlap_cost_line(ns.model, False, d_bs)
         )
     if ns.p_hicache_write_policy != "write_through":
@@ -4417,7 +5415,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
             f"arm exists to, and changes nothing else). Group D is unchanged."
         )
-    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth), ns.transport), state.logs["P"], env_p)
+    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     log(w38_armed_line(spec_p.argv))
     state.deviations = [
@@ -4438,13 +5436,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "(front route CARRIER-EXCEEDS, no leg 1) -- served and single-prefill, but NOT a zero-remainder leg 2; the windowed prefetch that would lift it is the next round",
         "zero-remainder: BATCH streams are priced post hoc via stream_options.include_usage (one standard trailing usage chunk reaches the client)",
     ]
+    log(early_read_provenance())
     for d in state.deviations:
         log(f"DEVIATION (declared): {d}")
     launch_group(spec_p, tree, log, dry)
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule), ns.transport), state.logs["D"], env_d)
+        d_ratio = d_tp_ratio_decision(
+            ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
+        )
+        log(d_ratio.line)
+        log(d_tokvec.line)
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, **_env_knobs(ns))
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -4502,8 +5506,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1"
     )
     state.budgets["D"] = budgets_d
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan)
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule), ns.transport), state.logs["D"], env_d)
+    d_ratio = d_tp_ratio_decision(
+        ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
+    )
+    log(d_ratio.line)
+    log(d_tokvec.line)
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, **_env_knobs(ns))
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
@@ -4628,15 +5637,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # passes and the SAME chunk geometry both groups were built with; the front
     # picks the pause order from it per flip, against a live NVML free sample.
     # fix 5: from the DERIVED layer split (section 1b'), never from the score
-    # vector.  No split -> no map -> the front pauses in the identity order and
-    # prints why, which is the honest degradation; a complete-but-wrong map is
-    # not, because interleave_pause_order only refuses an INCOMPLETE one.
+    # vector.  FIX 2: and from the SOLVED cut's split, never from the
+    # incumbent's -- the two are the same vector only when the solve happens
+    # to land back on the incumbent, and on this tip they do not.  No split ->
+    # no map -> the front pauses in the identity order and prints why, which is
+    # the honest degradation; a complete-but-wrong map is not, because
+    # interleave_pause_order only refuses an INCOMPLETE one.
     p_chunk_cards = chunk_tag_cards(
         p_split, chunk_layers, chunk_count, card_of_stage=[c.nvml_index for c in cards]
     ) if p_split else {}
     src_chunk_cards = {"P": {t: list(v) for t, v in p_chunk_cards.items()}}
-    log(f"WEG2-FLIP-ORDER MAP group=P (scores {list(P_PP_STAGE_RATIO_SCORES)}/"
-        f"{list(P_PP_ATTN_STAGE_RATIO_SCORES)} -> DERIVED layer split "
+    log(f"WEG2-FLIP-ORDER MAP group=P (SOLVED cut {cut.stage_ratio or '(gapped)'}/"
+        f"{cut.attn_stage_ratio or '(gapped)'} -> REALIZED layer split "
         f"{p_split if p_split else 'REFUSED (' + p_split_note + ') -> NO MAP, identity order'} "
         f"over {n_layers} layers, {chunk_layers} layers per chunk, "
         f"nvml {[c.nvml_index for c in cards]} in stage order): {src_chunk_cards['P']}; "

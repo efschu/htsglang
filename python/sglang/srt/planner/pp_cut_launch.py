@@ -35,9 +35,18 @@ attention layers, so P's pool must hold at least ONE full-context prompt. That
 is a FLOOR on capacity, and makespan is minimised subject to it -- not traded
 against it.
 
-THE TWO OBJECTIVES ARE BOTH PRINTED (#1018). ``makespan`` is what is chosen;
-the pool-maximal cut ("kv-floor") is priced on the same axes and printed
-beside it, so a boot cannot pay the trade by accident.
+THE TWO OBJECTIVES ARE BOTH PRINTED (#1018), AND THE DEFAULT IS ``maxkv``
+(#1254). Both cuts are priced on the same axes and both appear on the
+provenance line with their pool AND their ms, so a boot cannot pay the trade by
+accident in EITHER direction.
+
+Which one is CHOSEN is the ``objective`` argument, and its default is the
+pool-maximal cut. That is the standing law -- trades live behind one objective
+knob whose default is maximum KV -- and it is not a preference about this rig:
+on the perf branch the makespan default measured 44,10,10 attn 11,2,3 with a
+499,967-token pool, i.e. it was paying -47.7 % of the pool for +33.5 % of
+prefill without anyone selecting that trade. ``makespan`` remains one flag
+away, and its row is printed on every boot that does not take it.
 """
 
 from __future__ import annotations
@@ -191,6 +200,12 @@ class CutDecision:
     ranked: Tuple[CutCandidate, ...] = ()
     design_prefix_tokens: int = 0
     unpriced: Tuple[str, ...] = ()
+    #: WHICH OBJECTIVE PICKED ``chosen`` (#1254). Default ``maxkv``.
+    objective: str = "maxkv"
+    #: The makespan-optimal feasible cut. Always populated, whether or not it
+    #: was chosen, so the trade is visible in BOTH directions -- the kv-floor
+    #: row alone only exposed the trade a makespan default was making.
+    makespan: Optional[CutCandidate] = None
 
     def table_lines(self, top: int = 8) -> List[str]:
         """The chosen candidate and its alternatives, best first.
@@ -249,6 +264,12 @@ class CutDecision:
         # that trade by accident.
         if not same_as_chosen(self.kv_floor):
             out.append(self.kv_floor.line("kv-floor"))
+        # ... and the makespan-optimal one, for exactly the same reason with
+        # the sign flipped. With the default at maxkv the row a reader needs in
+        # order to see the trade is the FAST one; printing only kv-floor would
+        # be the old asymmetry pointing the other way.
+        if self.makespan is not None and not same_as_chosen(self.makespan):
+            out.append(self.makespan.line("makespan"))
         if len(self.ranked) > int(top):
             out.append(
                 "PP-CUT solver: %d further candidates ranked and not printed "
@@ -264,23 +285,77 @@ class CutDecision:
         return out
 
     def provenance_line(self) -> str:
-        """THE one line. Format is load-bearing: a reader greps ``PP-CUT solver:``."""
+        """THE one line. Format is load-bearing: a reader greps ``PP-CUT solver:``.
+
+        BOTH objectives' cuts appear with pool AND ms (#1254), always, whichever
+        was chosen. A line that priced only the alternative it did not take
+        could not be read as a trade at all -- only as a defence of the choice.
+        """
         pin = " PINNED (user override)" if self.pinned else ""
         return (
-            "PP-CUT solver:%s layers=%s attn=%s makespan_ms=%.1f "
-            "pool_tokens=%d (constraint pool >= %d; alternatives: kv-floor cut "
-            "%s pool %d makespan %.1f) [%s]"
+            "PP-CUT solver:%s objective=%s layers=%s attn=%s makespan_ms=%.1f "
+            "crossing_ms=%.1f pool_tokens=%d (constraint pool >= %d; BOTH "
+            "objectives priced: maxkv cut %s pool %d total %.1f ms/chunk | "
+            "makespan cut %s pool %d total %.1f ms/chunk) [%s]"
             % (
                 pin,
+                self.objective,
                 ",".join(str(n) for n in self.chosen.layers),
                 ",".join(str(a) for a in self.chosen.attn),
                 self.chosen.makespan_ms,
+                self.chosen.crossing_ms,
                 int(self.chosen.pool_tokens),
                 int(self.cap_tokens),
                 self.kv_floor.fmt(),
                 int(self.kv_floor.pool_tokens),
-                self.kv_floor.makespan_ms,
+                self.kv_floor.total_ms,
+                (self.makespan or self.chosen).fmt(),
+                int((self.makespan or self.chosen).pool_tokens),
+                (self.makespan or self.chosen).total_ms,
                 self.cost_provenance,
+            )
+        )
+
+    def trade_line(self) -> str:
+        """What taking the OTHER objective would have cost, in both currencies.
+
+        Separate from the provenance line on purpose: that line is greppable
+        and its shape is depended on, while this one is arithmetic over it and
+        exists so nobody has to do the division in their head to see whether
+        the trade is small (a preference) or large (a defect candidate -- the
+        law's own words).
+        """
+        other = self.makespan if self.objective == "maxkv" else self.kv_floor
+        if other is None or (
+            other.layers == self.chosen.layers and other.attn == self.chosen.attn
+        ):
+            return (
+                "PP-CUT trade: none -- the maxkv and makespan objectives choose "
+                "the SAME cut %s at %d tokens / %.1f ms per chunk, so this boot "
+                "pays nothing for its default." % (
+                    self.chosen.fmt(), int(self.chosen.pool_tokens),
+                    self.chosen.total_ms,
+                )
+            )
+        d_pool = (other.pool_tokens - self.chosen.pool_tokens) / max(
+            1.0, self.chosen.pool_tokens
+        )
+        d_ms = (other.total_ms - self.chosen.total_ms) / max(1.0, self.chosen.total_ms)
+        return (
+            "PP-CUT trade: objective=%s chose %s (pool %d, %.1f ms/chunk); the "
+            "%s cut %s would be pool %+.1f %% and time %+.1f %% (%d tokens, "
+            "%.1f ms/chunk). Selectable with --pp-solve-objective."
+            % (
+                self.objective,
+                self.chosen.fmt(),
+                int(self.chosen.pool_tokens),
+                self.chosen.total_ms,
+                "makespan" if self.objective == "maxkv" else "maxkv",
+                other.fmt(),
+                100.0 * d_pool,
+                100.0 * d_ms,
+                int(other.pool_tokens),
+                other.total_ms,
             )
         )
 
@@ -368,8 +443,14 @@ def solve_launch_cut(
     per_pair_crossing_ms: Optional[Mapping[Tuple[int, int], float]] = None,
     enumerate_gapped: bool = True,
     pinned_layer_set: Optional[str] = None,
+    objective: str = "maxkv",
 ) -> CutDecision:
-    """Choose the layer + attention cut. Makespan-optimal among the feasible.
+    """Choose the layer + attention cut, for ``objective``, among the feasible.
+
+    ``objective`` is ``"maxkv"`` (default) or ``"makespan"``. maxkv takes the
+    pool-maximal feasible cut; makespan takes the one with the smallest
+    compute+crossing total. BOTH are priced and BOTH appear on the provenance
+    line either way, so the trade is a decision and not a side effect.
 
     ``pinned_layers``/``pinned_attn``: when the operator passed the existing
     flags explicitly, they WIN -- but they win by being announced with the
@@ -574,6 +655,16 @@ def solve_launch_cut(
     # The kv-floor row is the OTHER objective, so it has to be a layout that
     # could actually be run: a pool on an unservable map is not available.
     kv_floor = max(choosable, key=lambda c: c.pool_tokens)
+    # THE MAKESPAN ROW IS COMPUTED HERE TOO, over the same set, so it exists on
+    # every return path -- including the PINNED ones, which return before the
+    # feasible set is formed. Restricted to the cuts that clear the pool floor
+    # when any do, because an alternative a boot could not run is not an
+    # alternative; when none do, the whole field is the honest set to name and
+    # the refusal below is what the operator actually sees.
+    _floor_ok = [c for c in choosable if c.pool_tokens >= float(cap_tokens)]
+    makespan_row = min(
+        _floor_ok or choosable, key=lambda c: (c.total_ms, -c.pool_tokens)
+    )
     # THE OBJECTIVE IS THE SUM of the two time columns. Ranking on makespan
     # alone would hand a gapped map the crossings for free -- 31 per chunk at
     # a 40 MiB frame is not a rounding term -- and ranking on crossings alone
@@ -640,6 +731,8 @@ def solve_launch_cut(
             ranked=tuple(candidates),
             design_prefix_tokens=depth,
             unpriced=tuple(unpriced),
+            objective=str(objective),
+            makespan=makespan_row,
         )
 
     pinned = pinned_layers is not None
@@ -740,7 +833,16 @@ def solve_launch_cut(
                     (" -- " + "; ".join(unpriced)) if unpriced else "",
                 )
             )
-        chosen = min(feasible, key=lambda c: (c.total_ms, -c.pool_tokens))
+        # THE OBJECTIVE PICKS, AND BOTH ROWS ARE KEPT (#1254). maxkv is the
+        # default because the standing law puts the default at maximum KV;
+        # makespan is one flag away and is priced on the same line either way.
+        # Ties break on the OTHER axis in both arms, so an objective never
+        # spends capacity or time it did not have to.
+        chosen = (
+            max(feasible, key=lambda c: (c.pool_tokens, -c.total_ms))
+            if objective == "maxkv"
+            else min(feasible, key=lambda c: (c.total_ms, -c.pool_tokens))
+        )
 
     return CutDecision(
         chosen=chosen,
@@ -751,4 +853,6 @@ def solve_launch_cut(
         ranked=tuple(candidates),
         design_prefix_tokens=depth,
         unpriced=tuple(unpriced),
+        objective=str(objective),
+        makespan=makespan_row,
     )

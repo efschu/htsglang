@@ -327,15 +327,14 @@ class TheGappedArgvOmitsTheCountFlags(unittest.TestCase):
 
     def argv(self, stage_ratio, attn_stage_ratio):
         # BY KEYWORD, and that is the fix rather than a style choice. This
-        # helper passed the two ratios POSITIONALLY, and merge 3's union
-        # signature inserted --p-bs and --max-kv-per-request AHEAD of them in
-        # argv_p -- so slots 8 and 9 bound p_bs and max_kv_per_request while
-        # stage_ratio/attn_stage_ratio silently kept their defaults, and all
-        # four tests in this class were asserting about a call they never
-        # made. On weg2/prefill-perf-0907 the positional form was correct, so
-        # the defect is the merge resolution. Same signature-drift class as
-        # the _max_running_requests boot killer train fix 2 closed; keywords
-        # cannot drift that way.
+        # helper passed the two ratios POSITIONALLY, and --p-bs and
+        # --max-kv-per-request had since been inserted ahead of them in
+        # argv_p's signature -- so slots 8 and 9 were binding p_bs and
+        # max_kv_per_request while stage_ratio/attn_stage_ratio kept their
+        # defaults, and all four tests in this class were asserting about a
+        # call they never made. Same class as the _max_running_requests boot
+        # killer found in the #1235 argv slice: a signature grew and a
+        # positional caller was left behind. Keywords cannot drift that way.
         return argv_p(
             PY,
             MODEL,
