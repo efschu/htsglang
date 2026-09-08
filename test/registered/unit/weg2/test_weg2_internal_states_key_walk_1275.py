@@ -106,11 +106,13 @@ class TheRoutesRefuseWithoutTheBearer(CustomTestCase):
 
         # no Authorization header, admin key configured -> DENIED
         d = decide_request_auth(
+            method="GET", path="/get_server_info",
             auth_level=AuthLevel.ADMIN_OPTIONAL, authorization_header=None,
             api_key=None, admin_api_key=KEY)
         self.assertFalse(d.allowed)
         # correct bearer -> allowed
         d2 = decide_request_auth(
+            method="GET", path="/get_server_info",
             auth_level=AuthLevel.ADMIN_OPTIONAL,
             authorization_header=f"Bearer {KEY}", api_key=None, admin_api_key=KEY)
         self.assertTrue(d2.allowed)
