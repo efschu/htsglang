@@ -1842,6 +1842,9 @@ class SchedulerWeightUpdaterManager:
             t_w0 = time.perf_counter()
             shm0 = self._weg2_rss_shmem_mib()
             tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
+            # S7 (#1273): tag -> the saver's own pass-1/pass-2 decomposition of
+            # that tag's resume, or None where the instrument is absent.
+            weg2_map_stats: Dict[str, Optional[Dict[str, float]]] = {}
             credit, credit_epoch = self._weg2_credit_reader(
                 getattr(recv_req, "epoch", None)
             )
@@ -1862,17 +1865,56 @@ class SchedulerWeightUpdaterManager:
                         float(tag_bytes.get(tag, 0)),
                         (time.perf_counter() - t_tag) * 1000,
                     ]
+                    # S7 (#1273): READ THE MAP COST WHILE IT IS STILL THIS TAG'S.
+                    # Resume pass 1 maps every allocation of the tag one at a
+                    # time, so its wall is proportional to an allocation count
+                    # that no log has ever carried -- and with the count absent,
+                    # pass 1's time was charged to the copy rate, which is the
+                    # unexplained remainder of ADDENDUM 3 section 4 and risk R2
+                    # of #1273.  The read is a metadata call on the saver (no
+                    # device call), and it is issued INSIDE the loop because the
+                    # recorder holds ONE record: read after the next tag's resume
+                    # and the number would belong to that tag.  The adapter
+                    # returns None -- never a fabricated 0 -- when the running
+                    # hook has no such symbol or the record names another tag.
+                    weg2_map_stats[tag] = self.memory_saver_adapter.resume_stats(tag)
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
             card_uuid = self._weg2_card_uuid() or "unknown"
             for tag, (nbytes, tms) in weg2_per_tag.items():
+                # S7 (#1273): THREE FIELDS APPENDED, and the ring planner's
+                # parser is unaffected because they are appended -- its regex
+                # (ring_table._TAG_RE) anchors on the fields before them and
+                # ends at the optional population token.
+                #
+                # ``allocations`` is the DENOMINATOR of ``map_ms``: pass 1 does
+                # one cu_mem_create + cuMemMap + cu_mem_set_access per
+                # allocation of the tag, and that count appeared in no log.
+                # ``map_ms`` is pass 1 alone, ``copy_ms`` is pass 2's H2D issue
+                # plus pass 3's single synchronise; pass 4's granule release is
+                # in neither, so ``map_ms + copy_ms`` is a LOWER bound on ``ms``
+                # and not a partition of it.  ``n/a`` means the instrument is
+                # ABSENT -- hook without the symbol, a record naming another
+                # tag, or a ROCm build, whose resume path never records at all.
+                # The absence and a measured zero are different findings and
+                # this is the whole denominator law: a 0 printed for an absent
+                # instrument would read as "the remap was free", which is the
+                # claim under test.  A tag whose resume matched no allocation
+                # DOES print ``allocations=0 map_ms=0.0`` -- that is a real
+                # measurement of "nothing was mapped", not an absence, and the
+                # guard above deliberately does not hide it (round-2 refuter
+                # F8: the earlier wording claimed a 0 was never printed).
+                st = weg2_map_stats.get(tag)
                 logger.info(
                     "WEG2-FLIP-TAG group=%s rank=%d card=%s dir=h2d tag=%s bytes=%d MiB "
                     "population=%s (source: tms_tag_bytes, NOT RssShmem) ms=%.0f "
-                    "GB/s=%.2f granules=%d",
+                    "GB/s=%.2f granules=%d allocations=%s map_ms=%s copy_ms=%s",
                     self._weg2_group_name(), self._weg2_rank(), card_uuid, tag,
                     int(nbytes) // MIB_, WEG2_TAG_POPULATION_WEIGHTS, tms,
                     (nbytes / 1e9) / max(1e-6, tms / 1000.0),
                     int(nbytes) // TMS_RING_GRANULE_BYTES,
+                    "n/a" if st is None else int(st["allocations"]),
+                    "n/a" if st is None else "%.1f" % st["map_ms"],
+                    "n/a" if st is None else "%.1f" % st["copy_ms"],
                 )
             logger.info(
                 "WEG2-CHUNK-BYTES wake tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, "

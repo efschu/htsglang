@@ -1,6 +1,8 @@
 #pragma once
 #include <sys/types.h>
 #include <stdio.h>
+#include <chrono>
+#include <cstring>
 #include <unordered_map>
 #include <mutex>
 #include <string>
@@ -75,7 +77,61 @@ public:
     //: published no ring.
     bool ring_stats(HostRingStats* out, std::string* card_uuid);
 
+    //: S7 (#1273): THE LAST ``resume`` CALL'S PASS-1 COST AND ITS DENOMINATOR.
+    //:
+    //: Resume pass 1 (``cu_mem_create`` + ``cuMemMap`` + ``cu_mem_set_access``,
+    //: once per ALLOCATION of the tag) is proportional to an allocation count
+    //: that is logged nowhere, so its wall has always been charged to the copy
+    //: rate -- ADDENDUM 3 section 4's one unexplained remainder, and risk R2 of
+    //: the #1273 spec.  The weight exchange does not change that cost in either
+    //: arm, which is exactly why both arms must be able to measure it.
+    //:
+    //: ``tag_out`` is the tag the recorded numbers BELONG TO.  It is returned
+    //: rather than assumed because the reader is a separate call: a caller that
+    //: printed these numbers beside a tag it did not verify would be publishing
+    //: a previous tag's cost under this tag's name, which is the instrument lie
+    //: this fork catalogues as class A.  Returns the record sequence number, and
+    //: **0 when no resume has ever been recorded** -- an absence, never a zero.
+    inline uint64_t resume_stats(char* tag_out, size_t tag_len,
+                                 uint64_t* allocations, double* map_ms, double* copy_ms) {
+        const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        if (tag_out != nullptr && tag_len > 0) {
+            size_t n = last_resume_tag_.size() < (tag_len - 1) ? last_resume_tag_.size() : (tag_len - 1);
+            memcpy(tag_out, last_resume_tag_.c_str(), n);
+            tag_out[n] = '\0';
+        }
+        if (allocations != nullptr) *allocations = last_resume_allocations_;
+        if (map_ms != nullptr) *map_ms = last_resume_map_ms_;
+        if (copy_ms != nullptr) *copy_ms = last_resume_copy_ms_;
+        return last_resume_seq_;
+    }
+
 private:
+    //: The recorder S7 calls from ``resume``, between the passes it separates.
+    //: ``t0`` is taken before pass 1 and ``t1`` between pass 1 and pass 2, so
+    //: ``map_ms`` is the MAP phase alone and ``copy_ms`` is pass 2's issue plus
+    //: pass 3's single synchronise -- pass 4's granule release is deliberately
+    //: outside both, because it is host bookkeeping and not a device cost.
+    //: Called under the metadata mutex, which ``resume`` already holds.
+    inline void note_resume(const std::string& tag, size_t allocations,
+                            const std::chrono::steady_clock::time_point& t0,
+                            const std::chrono::steady_clock::time_point& t1) {
+        last_resume_tag_ = tag;
+        last_resume_allocations_ = (uint64_t) allocations;
+        last_resume_map_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        last_resume_copy_ms_ =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        ++last_resume_seq_;
+    }
+
+    std::string last_resume_tag_;
+    uint64_t last_resume_allocations_ = 0;
+    double last_resume_map_ms_ = 0.0;
+    double last_resume_copy_ms_ = 0.0;
+    //: 0 means NO resume has been recorded in this process.  The reader turns
+    //: that into "n/a", never into a zero cost.
+    uint64_t last_resume_seq_ = 0;
+
     TorchMemorySaver();
     ~TorchMemorySaver() = default;
     TorchMemorySaver(const TorchMemorySaver&) = delete;
