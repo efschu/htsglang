@@ -2483,6 +2483,44 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
                "the R5 corridor (W32) alone, because both legs can be in flight "
                "on this card at once")
         )
+        # #1284: SAY WHAT THE WAIVER COSTS, per card, at launch.
+        #
+        # boot weg2sb5e armed with `serialised_cards=none` and printed
+        # `SERIAL FORM ... slack=-1608/-2509`, `-881/-2986`, `-982/-2622` on
+        # its three L6 rows -- the serial requirement failed on EVERY card and
+        # the waiver was silent about it, because the CHECK line above says
+        # only WHICH inequality was used, never what the unused one would have
+        # demanded. Thirty flips later the wake leg did not run, the sleeping
+        # leg met exactly that shortfall, and the C++ acquire burned its full
+        # 110 s budget before dying with a line that blames L6.
+        #
+        # The debt is stated, not funded: paying it costs +8117 MiB of shmem on
+        # these numbers and the host ledger's chosen arm is already ON its
+        # store floor, so funding it would trade this wedge for a W21 refusal.
+        # What covers it is the runtime guard named on the line.
+        if not is_serial and c.serial_debt_mib > 0:
+            plan.lines.append(
+                f"WEG2-HOST-RING SERIAL-DEBT card={c.uuid} nvml{c.nvml_index} "
+                f"debt_mib={c.serial_debt_mib} H={c.h_mib} "
+                f"need_serial_d2p={c.need_serial_d2p_mib} "
+                f"need_serial_p2d={c.need_serial_p2d_mib} -- this card is armed "
+                "under the INTERLEAVE waiver, so R5's corridor was checked and "
+                "the serial requirement H >= image_W + max_tag_S was NOT. If "
+                "the two legs ever fail to overlap on this card the ring is "
+                f"short by AT LEAST {c.serial_debt_mib} MiB and the sleeping "
+                "leg cannot complete however long it waits -- at least, because "
+                "image_W + max_tag_S prices a serial order in which S places "
+                "only its largest tag, while a peer that releases NOTHING makes "
+                "the requirement image_W + image_S, which no ring this box can "
+                "fund. R5's premise is a RACE, not an "
+                "invariant -- the front's own gather carries no happens-before "
+                "between the sleeping leg's first acquire and the waking leg's "
+                "first release. COVERED AT RUNTIME by W51 Weg2HostRingUnfunded "
+                "(weg2/ring_guard.py), which emits the WEG2-RING NEED series per "
+                "tag and refuses in ~2 s when free stops rising, instead of "
+                "wedging for the C++ acquire budget (weg2sb5e: 110 s). A "
+                "non-zero debt here with no W51 in the sleeping leg is weg2sb5e."
+            )
     for ln in plan.lines[checks_logged:]:
         log(ln)
     if serialised:
@@ -2549,9 +2587,24 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     plan.lines.append(
         f"WEG2-HOST-RING ARMED form={plan.form} leg_form={leg_form} "
         f"serialised_cards={serialised or 'none'} "
-        f"(each checked against the SERIAL requirement, not R5's corridor -- "
-        f"see the WEG2-HOST-RING CHECK line per card) "
-        f"epoch={plan.epoch} dir={plan.dir} "
+        # #1284: this parenthetical used to read "each checked against the
+        # SERIAL requirement, not R5's corridor" UNCONDITIONALLY, which is the
+        # exact opposite of what the per-card CHECK lines say whenever
+        # `serialised` is empty -- and it was empty on weg2sb5e, the boot that
+        # then died of the un-checked serial requirement. A summary line that
+        # contradicts its own detail lines sends every reader to the wrong
+        # half of the arithmetic. It now states which inequality was used and
+        # what debt that leaves.
+        + (f"(SERIAL requirement H >= image_W + max_tag_S checked on "
+           f"{len(serialised)}/{len(table.cards)} card(s); the rest were armed "
+           f"on R5's corridor alone, carrying "
+           f"{sum(c.serial_debt_mib for c in table.cards if c.uuid not in serialised)}"
+           f" MiB of SERIAL-DEBT covered at runtime by W51 -- see the "
+           f"WEG2-HOST-RING CHECK and SERIAL-DEBT lines per card) "
+           if len(serialised) < len(table.cards) else
+           "(SERIAL requirement H >= image_W + max_tag_S checked on every card "
+           "-- see the WEG2-HOST-RING CHECK line per card) ")
+        + f"epoch={plan.epoch} dir={plan.dir} "
         f"Sigma H={table.total_h_bytes // ring_table.MIB} MiB "
         f"Sigma span1={table.total_span1_bytes // ring_table.MIB} MiB granule=2 MiB "
         f"register_est_ms={int(table.total_span1_bytes / float(2**30) * 44)} "

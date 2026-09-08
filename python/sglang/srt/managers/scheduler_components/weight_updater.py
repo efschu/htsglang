@@ -118,6 +118,18 @@ from sglang.srt.weg2.ring_table import (  # noqa: E402
     TAG_POPULATION_WEIGHTS as WEG2_TAG_POPULATION_WEIGHTS,
 )
 
+#: #1284: the NEED series and the W51 refusal that reads it.  Imported here
+#: rather than inlined because the guard is pure arithmetic over a clock and a
+#: stats callable, and that is the half that can be tested with no ring, no
+#: CUDA and no boot.
+#:
+#: Only the guard is imported.  ``Weg2HostRingUnfunded`` is deliberately NOT
+#: caught here: it must propagate out of :meth:`release_memory_occupation` so
+#: the leg's RPC answers non-200 and the front issues its own named stop, the
+#: same way any other leg failure is reported.  Catching it would turn a
+#: refusal into a silent partial sleep.
+from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -351,6 +363,29 @@ class SchedulerWeightUpdaterManager:
             uuid_key = None
         self.weg2_card_uuid_cache = uuid_key
         return uuid_key
+
+    def _weg2_ring_stats(self) -> Optional[dict]:
+        """#1284: the live host-ring counters, or ``None`` for ABSENCE.
+
+        ``None`` covers every way there is no reading to be had -- no adapter,
+        the no-op adapter (which RAISES ``NotImplementedError`` rather than
+        returning anything), no ring published on this boot, or a saver too old
+        to export ``tms_ring_stats``.  It is deliberately NOT a zero: a zero
+        free would make :class:`RingNeedGuard` refuse every leg on a boot that
+        simply has no ring, which is the ordinary non-Weg-2 path.
+        """
+        adapter = getattr(self, "memory_saver_adapter", None)
+        getter = getattr(adapter, "ring_stats", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except NotImplementedError:
+            return None
+        except Exception:  # noqa: BLE001
+            # A broken stats path must not decide a flip.  The acquire keeps
+            # whatever behaviour it had; only the guard stands down.
+            return None
 
     def _weg2_tag_bytes(self, tag: str) -> int:
         """C7/C16: the saver's OWN byte sum for one tag, or 0 with a reason.
@@ -1322,8 +1357,29 @@ class SchedulerWeightUpdaterManager:
             # front that owns it -- see :meth:`_weg2_open_credit_for_leg`.
             credit = self._weg2_open_credit_for_leg(getattr(recv_req, "epoch", None))
             weg2_leg_t0 = time.perf_counter()
+            # #1284: the NEED series, and the refusal that reads it.  The pause
+            # below is what enters ``host_ring.cpp``'s blocking acquire, and on
+            # weg2sb5e that acquire sat out its whole 110 s budget in silence
+            # and then died blaming L6.  The guard runs IMMEDIATELY BEFORE the
+            # pause so that (a) every tag's need/free/delta reaches the log
+            # whether or not anything goes wrong -- that series is what answers
+            # "creep or launch arithmetic" without an archaeologist -- and (b) a
+            # leg whose peer is not releasing is refused in ~2 s with the series
+            # attached, before any waiter is parked and while this tag's device
+            # bytes are still mapped.  See ring_guard.RingNeedGuard.
+            weg2_ring_guard = RingNeedGuard(
+                self._weg2_card_uuid() or "unknown",
+                group=self._weg2_group_name(),
+                rank=self._weg2_rank(),
+            )
             with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags), direction="d2h"):
                 for tag in weights_tags:
+                    weg2_ring_guard.guard_tag(
+                        tag,
+                        int(tag_bytes.get(tag, 0)),
+                        self._weg2_ring_stats,
+                        peer_hint="the group waking on this card",
+                    )
                     t_tag = time.perf_counter()
                     self.memory_saver_adapter.pause(tag)
                     weg2_per_tag[tag] = [
