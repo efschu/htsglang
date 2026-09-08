@@ -370,16 +370,30 @@ class LedgerRingTermsTest(unittest.TestCase):
     def _common_box(self):
         """A box whose ``common`` is the spec section 2 boot-of-record 42.26 GiB.
 
-        Solved, not guessed: common = base - floor - headroom - heaps - anchors
-        - rings - overhead at M=1200, so base = 42.26 + the rest.
+        Solved, not guessed: common = base - floor - the boot's own charges at
+        M=1200, so base = 42.26 + the rest.
+
+        RE-DERIVED ON THE RING (rebase 0908).  The term list this solver has to
+        invert changed under it, in both directions, and 42.26 is held FIXED
+        because it is the spec section 2 boot-of-record that the assertions
+        below are stated against:
+          - ``HOST_HEADROOM_GIB`` is GONE from the sum: fix 5 DELETED the
+            constant (a compensation layer for the wrong denominator), and
+            test_weg2_host_budget_1233 pins that deletion by name.  Adding a
+            term price() no longer subtracts would have solved for the wrong
+            box.
+          - the DRAFT HOST TIER (draft_host_P + draft_host_D) is now IN the
+            sum: price() charges it at both moments (#1233), so the box must
+            carry it for `common` to still come out at 42.26.
         """
         m = 1200
         heaps = 3 * (host_ledger.HEAP_AWAKE_GIB + host_ledger.HEAP_DORMANT_GIB)
         anchors = (host_ledger.ANCHORS_AT_2400_BYTES * (m / 2400)) / GIB
         rings = (host_ledger.RING_P_MULT_GB_PER_S + host_ledger.RING_D_MULT_GB_PER_S) * 1 * 1e9 / GIB
         overhead = host_ledger.HOST_POOL_OVERHEAD * (anchors + rings)
-        base = (42.26 + host_ledger.FLOOR_GIB + host_ledger.HOST_HEADROOM_GIB
-                + heaps + anchors + rings + overhead)
+        draft = (host_ledger.DRAFT_HOST_P_MIB + host_ledger.DRAFT_HOST_D_MIB) / 1024.0
+        base = (42.26 + host_ledger.FLOOR_GIB
+                + heaps + anchors + rings + overhead + draft)
         memtotal = int((base + host_ledger.CLI_RESERVE_GIB + 50) * GIB)
         return memtotal, int(base * GIB)
 
@@ -421,9 +435,10 @@ class LedgerRingTermsTest(unittest.TestCase):
                               ring_span1_bytes=self.SIGMA_H)
 
     def test_the_deleted_constants_are_gone_from_the_module(self):
-        for name in ("BACKUP_P_BYTES", "BACKUP_D_BYTES", "HOST_HEADROOM_GIB_CHUNK"):
-            if name == "HOST_HEADROOM_GIB_CHUNK":
-                continue
+        # HOST_HEADROOM_GIB joins the list on the ring rebase: fix 5 deleted it
+        # for the same reason C19 deleted the other two -- a stale constant
+        # standing in for a quantity that is now measured.
+        for name in ("BACKUP_P_BYTES", "BACKUP_D_BYTES", "HOST_HEADROOM_GIB"):
             self.assertFalse(hasattr(host_ledger, name),
                              f"C19 deletes {name}; a survivor is a second, stale "
                              "source for the host weights term")

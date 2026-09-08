@@ -64,7 +64,7 @@ def _choose(store_min_gib, *, with_cgroup=True, **over):
     exercised exactly as it ran on weg2dk5 -- and fails these assertions on the
     numbers, not on a signature.
     """
-    kw = dict(store_min_gib=store_min_gib, weight_chunks=DK5_CHUNKS)
+    kw = dict(store_min_gib=store_min_gib, **RING_KW)
     params = inspect.signature(host_ledger.choose).parameters
     if with_cgroup and "cg_current_bytes" in params:
         kw.update(
@@ -77,11 +77,18 @@ def _choose(store_min_gib, *, with_cgroup=True, **over):
     return host_ledger.choose(DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, **kw)
 
 
+#: C19 (ring rebase 0908): the host weights term is the measured per-card ring
+#: table (Sigma H / Sigma image_P), not a chunk count.  Same figures the s3s4
+#: and ring_ledger suites pin.
+DK5_RING_BYTES = 32964 * 1024 * 1024
+DK5_RING_SPAN1_BYTES = 29912 * 1024 * 1024
+RING_KW = dict(ring_bytes=DK5_RING_BYTES, ring_span1_bytes=DK5_RING_SPAN1_BYTES)
+
 class TestTheDenominator(CustomTestCase):
     def test_base_is_bound_by_the_cgroup_on_the_weg2dk5_box_and_names_it(self):
         arm = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            weight_chunks=DK5_CHUNKS,
+            **RING_KW,
             cg_current_bytes=DK5_CG_CURRENT_B,
             cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
@@ -95,7 +102,7 @@ class TestTheDenominator(CustomTestCase):
     def test_a_roomy_cgroup_leaves_meminfo_binding_and_says_so(self):
         arm = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            weight_chunks=DK5_CHUNKS,
+            **RING_KW,
             cg_current_bytes=0,
             cg_ceiling_bytes=DK5_MEMTOTAL_B * 4,
         )
@@ -104,7 +111,7 @@ class TestTheDenominator(CustomTestCase):
 
     def test_no_cgroup_sample_is_named_not_priced_as_zero(self):
         arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, weight_chunks=DK5_CHUNKS
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
         )
         self.assertIsNone(arm.terms["base_cgroup_gib"])
         self.assertIsNone(arm.terms["cg_current_gib"])
@@ -116,7 +123,7 @@ class TestTheDenominator(CustomTestCase):
         # measures.  A tree that still carries it is still compensating.
         self.assertFalse(hasattr(host_ledger, "HOST_HEADROOM_GIB"))
         arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, weight_chunks=DK5_CHUNKS
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
         )
         self.assertNotIn("host_headroom_gib", arm.terms)
 
@@ -161,7 +168,7 @@ class TestTheDenominator(CustomTestCase):
 class TestTheMoment(CustomTestCase):
     def test_the_run_moment_charges_the_measured_peak_not_the_endpoint(self):
         arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, weight_chunks=DK5_CHUNKS
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
         )
         endpoint = arm.terms["backup_resident_gib"] / DK5_CHUNKS
         # 4.83 GiB, not the 3.60 this test pinned before fix 8: the resident
@@ -178,7 +185,7 @@ class TestTheMoment(CustomTestCase):
         # One chunk = the whole image: coarse chunking must not price BELOW its
         # own arithmetic just because the measured population used N=8.
         arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, weight_chunks=1
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
         )
         self.assertAlmostEqual(
             arm.terms["flip_transient_gib"], arm.terms["backup_resident_gib"], delta=1e-9
@@ -201,7 +208,7 @@ class TestTheMoment(CustomTestCase):
 
     def test_zero_chunks_is_still_the_two_image_dr1_shape(self):
         arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, weight_chunks=0
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
         )
         self.assertAlmostEqual(
             arm.terms["flip_transient_gib"], arm.terms["image_d_gib"], delta=1e-9
@@ -230,7 +237,7 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
             _choose(4.0)
         arm = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 600,
-            weight_chunks=DK5_CHUNKS,
+            **RING_KW,
             cg_current_bytes=DK5_CG_CURRENT_B,
             cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
@@ -256,7 +263,7 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         # weg2dk5's own choice: S=1 M=1200 with a 9 GiB store.
         arm = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            weight_chunks=DK5_CHUNKS,
+            **RING_KW,
             cg_current_bytes=DK5_CG_CURRENT_B,
             cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )

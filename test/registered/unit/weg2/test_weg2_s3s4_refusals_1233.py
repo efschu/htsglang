@@ -146,19 +146,30 @@ def test_w20_still_refuses_the_live_box_shape_under_the_DR1_two_image_shape():
     assert "flip_transient=" not in text
 
 
-def test_the_cgroup_denominator_binds_and_names_itself(capsys):
+def test_the_cgroup_denominator_binds_and_names_itself():
     """fix 5 (boot weg2dk5), carried onto the ring: the reaper watches
     memory.current, so a cgroup sample tighter than meminfo must BIND and the
-    printed line must say which reading bound it."""
-    arm, _store, lines = host_ledger.choose(
-        118 * GIB, 107 * GIB, store_min_gib=4.0,
-        cg_current_bytes=int(60 * GIB), cg_ceiling_bytes=int(118 * GIB),
-        cg_ceiling_source="memory.max", cg_oom_kill=18, **RING)
-    text = "\n".join(lines)
-    assert "memory.current=" in text and "base_cgroup=" in text
-    assert "oom_kill_baseline=18" in text
-    assert arm.terms["base_source"].startswith("cgroup")
+    terms must say which reading bound them.
 
+    Driven through price(), not choose(), and that is not a dodge: once a
+    cgroup sample exists the run-peak origin exists too, so W21 becomes
+    reachable and choose() refuses this box before it can return an arm. The
+    DENOMINATOR is what this test pins; W21 has its own tests.
+    """
+    arm = host_ledger.price(
+        118 * GIB, 107 * GIB, 1, 1200,
+        ring_bytes=RING_BYTES, ring_span1_bytes=RING_SPAN1_BYTES,
+        cg_current_bytes=int(60 * GIB), cg_ceiling_bytes=int(118 * GIB),
+    )
+    t = arm.terms
+    assert t["base_source"].startswith("cgroup")
+    # base = 118 (ceiling) - 60 (charged whole, no memory.stat) - 10 (CLI) = 48,
+    # far tighter than the meminfo arm's 107 -- so the cgroup binds.
+    assert abs(t["base_gib"] - 48.0) < 0.05
+    assert abs(t["base_meminfo_gib"] - 107.0) < 0.05
+    assert t["base_cgroup_gib"] is not None and t["base_cgroup_gib"] < t["base_meminfo_gib"]
+    # and the image terms are PROVENANCE here, not a second charge (C19).
+    assert t["host_ring_gib"] > 0 and "image_p_gib" in t
 
 def test_the_ring_is_what_makes_that_same_box_fundable():
     """The whole point of C1-C8, priced: the shared region charges Sigma H once

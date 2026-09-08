@@ -401,15 +401,22 @@ class TestFlipUsesTheOrder(CustomTestCase):
         f = self._front({"P": m})
         self._run(f)
         self.assertIsNone(f.stop, f.stop)
-        paused = [t[0] for g, p, t in f.calls if g == "P" and p == "/release_memory_occupation"]
-        resumed = [t[0] for g, p, t in f.calls if g == "D" and p == "/resume_memory_occupation"]
-        self.assertEqual(paused[0], "kv_cache")
+        # ON THE RING (C9): the family travels as ONE gathered leg per group,
+        # so the pause ORDER is the ORDER OF THAT LEG'S TAG LIST, not a sequence
+        # of per-tag RPCs.  The asserted permutation is UNCHANGED -- only where
+        # it is read from.  (This used to take t[0] of each call, which was the
+        # whole tag when every call carried exactly one.)
+        paused = [list(t) for g, p, t in f.calls if g == "P" and p == "/release_memory_occupation"]
+        resumed = [list(t) for g, p, t in f.calls if g == "D" and p == "/resume_memory_occupation"]
+        self.assertEqual(paused[0], ["kv_cache"])
+        self.assertEqual(len(paused), 2, "C9: kv, then ONE gathered family leg")
         self.assertEqual(
-            paused[1:],
+            paused[1],
             ["weights_6", "weights_7", "weights_4", "weights_5",
              "weights_0", "weights_1", "weights_2", "weights_3", "weights"],
         )
-        self.assertEqual(resumed, weights_family_tags(CHUNK_COUNT) + ["kv_cache"])
+        # D resumes the family in the NATURAL order, then its kv.
+        self.assertEqual(resumed, [weights_family_tags(CHUNK_COUNT), ["kv_cache"]])
         self.assertEqual(f.epoch, 1)
         self.assertEqual(f.awake, "D")
 
@@ -427,12 +434,17 @@ class TestFlipUsesTheOrder(CustomTestCase):
         self.assertEqual(weights_calls, [])
         self.assertEqual(f.epoch, 0)
 
-    def test_without_a_map_the_flip_is_byte_for_byte_the_old_sequence(self):
+    def test_without_a_map_the_order_is_the_natural_one(self):
+        # Renamed on the ring rebase: there is no per-tag "sequence" left to be
+        # byte-for-byte with.  The invariant that survives is the one that
+        # mattered -- with no chunk->card map the gathered leg carries the
+        # family in its natural order, so a source the launcher could not map
+        # is never reordered on a guess.
         f = self._front({})
         self._run(f)
         self.assertIsNone(f.stop, f.stop)
-        paused = [t[0] for g, p, t in f.calls if g == "P" and p == "/release_memory_occupation"]
-        self.assertEqual(paused, ["kv_cache"] + weights_family_tags(CHUNK_COUNT))
+        paused = [list(t) for g, p, t in f.calls if g == "P" and p == "/release_memory_occupation"]
+        self.assertEqual(paused, [["kv_cache"], weights_family_tags(CHUNK_COUNT)])
 
 
 class TestCarrierBoundPopulation(CustomTestCase):

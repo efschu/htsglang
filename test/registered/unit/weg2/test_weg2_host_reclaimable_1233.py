@@ -65,14 +65,19 @@ DK5_CG_CURRENT_B = 22_719_148_032
 #: sampler carries no slab column, so ``slab_reclaimable`` is charged as spent
 #: here -- a conservative reading of a term that was 0.73 GiB on this box.
 DK5_CG_RECLAIMABLE_B = 6_466_440 * 1024
-DK5_CHUNKS = 8
+#: C19 (ring rebase 0908): the host weights term is the measured per-card ring
+#: table (Sigma H / Sigma image_P), not a chunk count.  Same figures the s3s4
+#: and ring_ledger suites pin.
+DK5_RING_BYTES = 32964 * 1024 * 1024
+DK5_RING_SPAN1_BYTES = 29912 * 1024 * 1024
+RING_KW = dict(ring_bytes=DK5_RING_BYTES, ring_span1_bytes=DK5_RING_SPAN1_BYTES)
 DK5_STORE_MIN_GIB = 8.0
 
 
 def _choose(**over):
     kw = dict(
         store_min_gib=DK5_STORE_MIN_GIB,
-        weight_chunks=DK5_CHUNKS,
+        **RING_KW,
         cg_current_bytes=DK5_CG_CURRENT_B,
         reclaimable_bytes=DK5_CG_RECLAIMABLE_B,
         cg_ceiling_bytes=DK5_MEMTOTAL_B,
@@ -110,7 +115,7 @@ class TestTheReclaimableTerm(CustomTestCase):
         # is unchanged and is what this test pins now.
         arm = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            weight_chunks=DK5_CHUNKS,
+            **RING_KW,
             cg_current_bytes=DK5_CG_CURRENT_B,
             reclaimable_bytes=DK5_CG_RECLAIMABLE_B,
             cg_ceiling_bytes=DK5_MEMTOTAL_B,
@@ -120,10 +125,18 @@ class TestTheReclaimableTerm(CustomTestCase):
         # the meminfo arm -- the cgroup still binds.
         self.assertAlmostEqual(arm.terms["base_gib"], 93.05, delta=0.05)
         self.assertIn("cgroup", arm.terms["base_source"])
-        # The run leftover is the old 8.16 GiB MINUS the measured image gap,
-        # to the decimal -- the only term that moved.
+        # RE-DERIVED ON THE RING (rebase 0908); the delta is the ring's whole
+        # reason for existing, not a fitted number.  Fix 8 charged the run
+        # moment the dormant image (38.63) PLUS the flip transient (9.97) =
+        # 48.60 GiB; C19 charges Sigma H (32.19) ONCE instead, because the
+        # region is preallocated and the legs copy through it.  The run
+        # leftover rises by EXACTLY 48.60 - 32.19 = 16.41 GiB, from fix 8's
+        # -1.64 (no arm) to 14.77 (funded) -- FLIPCOST A1-3 as arithmetic.
+        ring_saving_gib = (38.63 + 9.97) - 32.19
         self.assertAlmostEqual(
-            arm.run_leftover_gib, 8.16 - arm.terms["image_extra_p_gib"], delta=0.05
+            arm.run_leftover_gib,
+            (8.16 - arm.terms["image_extra_p_gib"]) + ring_saving_gib,
+            delta=0.05,
         )
         lines = _lines()
         self.assertTrue(any("S=1 M=2400" in ln and "refused" in ln for ln in lines))
@@ -135,10 +148,14 @@ class TestTheReclaimableTerm(CustomTestCase):
         # image is 9.80 GiB bigger than the census), so the contrast this test
         # exists for is stated where it survives -- as a size, not a verdict:
         # the run leftover moves by EXACTLY the reclaimable share, 6.17 GiB.
-        with self.assertRaises(host_ledger.Weg2HostLedgerRefused):
-            _choose(reclaimable_bytes=None)
+        # RING REBASE 0908: under fix 8 BOTH readings refused; on the ring both
+        # FUND (Sigma H 32.19 replaces image + transient 48.60, 16.41 cheaper).
+        # The VERDICT has flipped twice and is not what this test pins -- the
+        # comment above already said so.  The SIZE is the pin and it is
+        # invariant under both changes.  The refusal behaviour still has a
+        # home: test_weg2_fix7_wires drives it from files through the seam.
         common = dict(
-            weight_chunks=DK5_CHUNKS, cg_current_bytes=DK5_CG_CURRENT_B,
+            **RING_KW, cg_current_bytes=DK5_CG_CURRENT_B,
             cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
         cached = host_ledger.price(DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
@@ -164,7 +181,7 @@ class TestTheReclaimableTerm(CustomTestCase):
     def test_an_unreadable_memory_stat_is_named_never_priced_as_zero_cache(self):
         arm = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            weight_chunks=DK5_CHUNKS,
+            **RING_KW,
             cg_current_bytes=DK5_CG_CURRENT_B,
             cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
@@ -194,7 +211,7 @@ class TestTheReclaimableTerm(CustomTestCase):
         # into a negative occupancy, i.e. free memory this ledger never had.
         arm = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            weight_chunks=DK5_CHUNKS,
+            **RING_KW,
             cg_current_bytes=DK5_CG_CURRENT_B,
             reclaimable_bytes=DK5_CG_CURRENT_B * 4,
             cg_ceiling_bytes=DK5_MEMTOTAL_B,
@@ -204,7 +221,7 @@ class TestTheReclaimableTerm(CustomTestCase):
     def test_base_is_still_the_tighter_of_the_two_readings(self):
         arm = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            weight_chunks=DK5_CHUNKS,
+            **RING_KW,
             cg_current_bytes=0,
             reclaimable_bytes=0,
             cg_ceiling_bytes=DK5_MEMTOTAL_B * 4,
@@ -281,7 +298,7 @@ class TestTheRunPeakAdvisory(CustomTestCase):
         # below it.  The base still moves by the reclaimable share (pinned
         # above); the PEAK deliberately no longer does.
         common = dict(
-            weight_chunks=DK5_CHUNKS,
+            **RING_KW,
             cg_current_bytes=DK5_CG_CURRENT_B,
             cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
@@ -321,7 +338,7 @@ class TestTheRunPeakAdvisory(CustomTestCase):
 
     def test_no_cgroup_sample_still_states_the_absence(self):
         arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, weight_chunks=DK5_CHUNKS
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
         )
         self.assertIsNone(arm.predicted_run_peak_gib(8.0))
 
