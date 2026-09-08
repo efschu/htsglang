@@ -11,21 +11,46 @@ runs the OLD flip form and says so (R22).
 The four quantities, and the exact line each comes from:
 
 ``image_g(c)``
-    The host bytes group ``g`` parks for card ``c``, read with TWO instruments
-    and charged as the LARGER of them (FIX 2, record 1p STEP-0 ADDENDUM):
+    The host bytes group ``g`` parks for card ``c`` -- spec Amendment A1-2's
+    MEASURED DORMANT IMAGE, read with TWO instruments that are NOT equals:
 
-    * the WEIGHT-TAG CENSUS -- ``WEG2-CHUNK-BYTES sleep tags=[...]
-      host_image_delta=N MiB`` (weight_updater.py), grouped into passes by tag
-      repetition and taken as the PEAK pass, never the mean: a ring sized to a
-      mean is a ring that blocks on the pass that was larger.  It is a LOWER
-      BOUND: it sums the tags the sleep loop names.
-    * the RESIDENT IMAGE -- the PEAK minus the PRE-SLEEP BASELINE of the
-      absolute ``RssShmem`` the same line carries.  That holds every tag with
-      ``enable_cpu_backup``, not only the ``weights_*`` family.  Peak minus
-      baseline, and deliberately NOT the raw absolute the addendum quotes: the
-      absolute also contains the group's HiCache host ring and mamba anchors,
-      which :mod:`sglang.srt.weg2.host_ledger` already posts by name, and
-      charging them here would be two books for the same bytes.
+    * THE PER-CARD CENSUS, and it is the one that is charged: ``WEG2-FLIP-TAG
+      ... card=<uuid> ... bytes=N MiB`` (C16), summed over ALL BACKED-UP TAGS
+      of that card in one pass and taken as the PEAK pass, never the mean -- a
+      ring sized to a mean blocks on the pass that was larger.  Every tag whose
+      allocation carries ``enable_cpu_backup`` emits one, so this sum IS the
+      dormant image and not a proxy for it.  A boot older than C16 carries only
+      ``WEG2-CHUNK-BYTES sleep ... host_image_delta=`` instead, which names the
+      ``weights_*`` family alone and is therefore a LOWER BOUND, marked as such.
+    * THE GROUP CROSS-CHECK: ``WEG2 DORMANT-IMAGE group=g ... rss_shmem_gib=``
+      -- the sleeping group's summed per-rank ``RssShmem`` at its first sleep,
+      emitted by the front (``host_ledger.format_dormant_image``, the draft-KV
+      branch's fix-8 sidecar mechanism, REUSED here rather than twinned).  It is
+      a WHOLE-GROUP figure with no card attribution, so it can never key a row
+      by itself; what it can do is refute a census that is short, and where it
+      is larger the excess is apportioned over the cards BY THEIR SHARE OF THAT
+      CENSUS -- the only attribution the two instruments jointly support, and
+      the line says so.  Boot weg2dk7 measured group P at 38.63 GiB against a
+      28.83 GiB weight-tag census, +34 %: that gap is exactly what this
+      cross-check exists to charge.
+
+    WHAT THIS REPLACES, and why it had to go (carried review finding 1 of the
+    ring fix-2 tip).  The predecessor read a "resident image" as the peak minus
+    the baseline of the two absolute ``RssShmem`` readings on the
+    ``WEG2-CHUNK-BYTES`` line -- but the emitter takes BOTH of those readings
+    immediately before and immediately after the ``weights_*`` pause loop, so
+    the span brackets that loop and nothing else, and the "resident image" was
+    the weight-tag census a second time plus baseline drift.  Any tag paused
+    outside that bracket was structurally invisible to it, which is precisely
+    the population A1-2 is about.  Two instruments that are really one is worse
+    than one, because the agreement reads as corroboration.
+
+``dormant_D(c)`` -- A BOUND, NOT A MEASUREMENT, until D sleeps with the
+    instrument on.  D's first sleep is a flip, so its ``WEG2 DORMANT-IMAGE``
+    sample is INTERLEAVED and only its RssShmem term measures D at all; when no
+    D sample exists the row is charged ``max(image_P(c), tags_D(c) + extra_P(c))``
+    -- D's own census plus the same unattributed excess P showed -- and the
+    provenance line prints the word BOUND.
 
 ``max_tag_g(c)``
     The largest single tag of that same population -- the step size of R5's
@@ -75,19 +100,22 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 MIB = 1024 * 1024
+GIB = float(2**30)
 GB = 1e9
 
 #: ``[2026-09-07 21:10:23 TP2] WEG2-CHUNK-BYTES sleep tags=['weights_0'] host_image_delta=982 MiB``
 _CHUNK_RE = re.compile(
     r"\b(?:TP|PP)(\d+)\]\s+WEG2-CHUNK-BYTES\s+sleep\s+tags=\[([^\]]*)\]\s+"
     r"host_image_delta=(-?\d+)\s+MiB"
-    #: The two ABSOLUTE RssShmem readings the same line already carries.  From
-    #: them comes the RESIDENT-IMAGE instrument (FIX 2): peak reading minus the
-    #: pre-sleep baseline, which is the whole image the sleeping rank holds --
-    #: every tag with ``enable_cpu_backup``, not only the ``weights_*`` the pass
-    #: sum adds up.  Optional, because a log written before the instrument
-    #: carried it must still parse; absent reads as "not measured", never as 0.
-    r"(?:\s+\(RssShmem\s+(-?[\d.]+)\s*->\s*(-?[\d.]+)\s+MiB)?"
+)
+#: ``WEG2 DORMANT-IMAGE group=P shmem_delta_gib=... rss_shmem_gib=38.63
+#: weight_tags_gib=28.83 extra_gib=9.80 (...)`` -- the front's fix-8 line
+#: (host_ledger.format_dormant_image on the draft-KV branch).  ONE line per
+#: group per boot, whole-group bytes, no card attribution: read here as the
+#: cross-check A1-2 names, never as a row key.
+_DORMANT_RE = re.compile(
+    r"WEG2 DORMANT-IMAGE\s+group=(\S+)\s+.*?rss_shmem_gib=([\d.]+)\s+"
+    r"weight_tags_gib=([\d.]+)\s+extra_gib=(-?[\d.]+)"
 )
 #: The RING-era instrument (C16, next slice); same shape, honest name.
 _TAG_RE = re.compile(
@@ -158,20 +186,20 @@ class CardRing:
     credit_d2p_mib: int = 0
     credit_p2d_mib: int = 0
     # -- the TWO instruments behind image_*, kept apart and both printed ------
-    # FIX 2, record 1p STEP-0 ADDENDUM (boot weg2dk7, 2026-09-08 00:19-00:32Z):
-    # "the dormant image is BIGGER than the weight tags".  The pass sum of
-    # ``host_image_delta`` counts the ``weights_*`` tags only, while the sleeping
-    # group's resident image holds everything with ``enable_cpu_backup`` (draft
-    # weights, graph pools, workspaces, embeddings); dk7 measured 38.63 GiB
-    # against a 28.83 GiB census, +34 %.  A ring sized to the smaller number
-    # hits W31 at the first sleep, and the LAUNCH charge -- the tightest moment,
-    # where LOAD_TRANSIENT sits on top -- is short by the same margin.  So both
-    # are read, both are printed, and the LARGER is charged.  Zero means "this
-    # boot's log did not carry that instrument", never "measured zero".
+    # A1-2.  ``tags_*`` is the PER-CARD census of this boot's own per-tag lines
+    # -- every backed-up tag when the source boot carried C16's WEG2-FLIP-TAG,
+    # the weights family alone (a LOWER BOUND) when it carried only the older
+    # WEG2-CHUNK-BYTES.  ``dormant_*`` is that card's SHARE of the group's
+    # measured RssShmem dormant image, apportioned by its share of the census
+    # because the measurement itself is a whole-group figure.  Zero means "this
+    # boot's log did not carry that instrument", never "measured zero", and
+    # ``dormant_bound_*`` says when the number is a bound rather than a reading.
     tags_p_mib: int = 0
     tags_d_mib: int = 0
     dormant_p_mib: int = 0
     dormant_d_mib: int = 0
+    dormant_p_bound: bool = False
+    dormant_d_bound: bool = False
 
     @property
     def h_mib(self) -> int:
@@ -259,20 +287,28 @@ class RingTable:
         """``Sigma_c max_g dormant_g(c)`` -- the measured sleeping-group image."""
         return sum(max(c.dormant_p_mib, c.dormant_d_mib) for c in self.cards)
 
+    #: Which groups' dormant image is a MEASUREMENT and which is a BOUND, and
+    #: what the source boot's RssShmem cross-check actually said.  Filled by
+    #: :func:`solve`; printed verbatim in :meth:`provenance` so no number on
+    #: the RING line can be quoted without the instrument that produced it.
+    image_source: str = "no WEG2 DORMANT-IMAGE line in the source boot"
+    bound_groups: Tuple[str, ...] = ()
+
     def provenance(self) -> str:
+        bound = (
+            f"; BOUND, NOT A MEASUREMENT, for group(s) {'/'.join(self.bound_groups)}"
+            if self.bound_groups
+            else "; both groups' dormant images are MEASURED"
+        )
         return (
-            f"boot {self.boot}, {self.lines_read} {self.instrument} lines "
-            f"(instrument: {self.instrument}; every MiB below is that boot's own, "
-            "none is a constant in this tree); Sigma H "
-            f"{self.total_h_bytes // MIB} MiB = per card the LARGER of "
-            f"[weight-tag census {self.total_tags_mib} MiB, measured resident "
-            f"image {self.total_dormant_mib} MiB (peak-minus-baseline RssShmem "
-            "of the sleeping group, record 1p STEP-0 ADDENDUM)] -- both are "
-            "printed because the census names only the weights family, while "
-            "the resident image holds every backed-up tag; the addendum's raw "
-            "ABSOLUTE is deliberately not charged here, it also contains the "
-            "group's HiCache ring and mamba anchors, which the host ledger "
-            "already posts by name"
+            f"boot {self.boot}, {self.lines_read} lines, instrument: {self.instrument} "
+            "(every MiB below is that boot's own, none is a constant in this tree); "
+            f"Sigma H {self.total_h_bytes // MIB} MiB = per card the LARGER of "
+            f"[per-card tag census {self.total_tags_mib} MiB, measured dormant "
+            f"image {self.total_dormant_mib or 'unmeasured'} MiB] -- A1-2: the charged image is "
+            "the tag census over ALL BACKED-UP tags, cross-checked against the "
+            "sleeping group's summed per-rank RssShmem from that boot's own "
+            f"WEG2 DORMANT-IMAGE line ({self.image_source}){bound}"
         )
 
     def env_map(self) -> str:
@@ -293,8 +329,12 @@ class RingTable:
         for c in self.cards:
             out.append(
                 f"WEG2-HOST-LEDGER RING card={c.uuid} nvml{c.nvml_index} {c.name} "
-                f"image_D={c.image_d_mib}(tags {c.tags_d_mib}/resident {c.dormant_d_mib}) "
-                f"image_P={c.image_p_mib}(tags {c.tags_p_mib}/resident {c.dormant_p_mib}) "
+                f"image_D={c.image_d_mib}(tags {c.tags_d_mib}/dormant "
+                f"{c.dormant_d_mib or 'unmeasured'}"
+                f"{' BOUND' if c.dormant_d_bound else ''}) "
+                f"image_P={c.image_p_mib}(tags {c.tags_p_mib}/dormant "
+                f"{c.dormant_p_mib or 'unmeasured'}"
+                f"{' BOUND' if c.dormant_p_bound else ''}) "
                 f"H={c.h_mib} "
                 f"span1={c.span1_mib} credit_d2p={c.credit_d2p_mib} "
                 f"credit_p2d={c.credit_p2d_mib} need_d2p={c.need_d2p_mib} "
@@ -421,11 +461,31 @@ class GroupLog:
     image: Dict[int, int] = field(default_factory=dict)
     max_tag: Dict[int, int] = field(default_factory=dict)
     kv_mib: Dict[int, int] = field(default_factory=dict)
-    dormant: Dict[int, int] = field(default_factory=dict)
     uuid_by_rank: Dict[int, str] = field(default_factory=dict)
     lines_read: int = 0
     instrument: str = ""
     tag_totals: Dict[str, int] = field(default_factory=dict)
+    #: True when ``instrument`` names EVERY backed-up tag (C16's WEG2-FLIP-TAG),
+    #: False when it names the weights family alone and the census is therefore
+    #: a lower bound on the dormant image.
+    covers_all_backed_up_tags: bool = False
+
+
+@dataclass
+class DormantImage:
+    """One group's measured dormant image -- WHOLE GROUP, no card attribution.
+
+    From the front's ``WEG2 DORMANT-IMAGE`` line (the draft-KV branch's fix-8
+    sidecar mechanism; this module READS that line, it does not emit a second
+    one).  ``extra_mib`` is what the group held beyond the weight-tag census it
+    priced itself against -- the +9.80 GiB of boot weg2dk7 -- and it is the term
+    that bounds group D until D's own sample exists.
+    """
+
+    group: str
+    rss_mib: int
+    weight_tags_mib: int
+    extra_mib: int
 
 
 def parse_group_log(path: str) -> GroupLog:
@@ -439,12 +499,13 @@ def parse_group_log(path: str) -> GroupLog:
     """
     per_rank: Dict[int, List[Tuple[Tuple[str, ...], int]]] = {}
     kv_gb: Dict[int, float] = {}
-    dormant: Dict[int, int] = {}
-    #: rank -> [lowest RssShmem seen, highest RssShmem seen], MiB.
-    _rss_span: Dict[int, List[int]] = {}
     uuid_by_rank: Dict[int, str] = {}
     lines_read = 0
-    instrument = "WEG2-CHUNK-BYTES sleep host_image_delta (RssShmem; DEAD once the ring lands, R8)"
+    covers_all = False
+    instrument = (
+        "WEG2-CHUNK-BYTES sleep host_image_delta (RssShmem delta, weights_* ONLY "
+        "-- a LOWER BOUND on the dormant image, and DEAD once the ring lands, R8)"
+    )
     with open(path, errors="replace") as f:
         for line in f:
             if "WEG2-FLIP-TAG" in line:
@@ -454,7 +515,12 @@ def parse_group_log(path: str) -> GroupLog:
                     uuid_by_rank[rank] = m.group(2)
                     per_rank.setdefault(rank, []).append(((m.group(3),), int(m.group(4))))
                     lines_read += 1
-                    instrument = "WEG2-FLIP-TAG bytes (tms_tag_bytes, the saver's own accounting)"
+                    covers_all = True
+                    instrument = (
+                        "WEG2-FLIP-TAG bytes (tms_tag_bytes, the saver's own "
+                        "accounting, EVERY backed-up tag -- A1-2's measured "
+                        "dormant image per card)"
+                    )
                     continue
             if "WEG2-CHUNK-BYTES sleep" in line:
                 m = _CHUNK_RE.search(line)
@@ -464,28 +530,6 @@ def parse_group_log(path: str) -> GroupLog:
                         t.strip().strip("'\"") for t in m.group(2).split(",") if t.strip()
                     )
                     per_rank.setdefault(rank, []).append((tags, int(m.group(3))))
-                    if m.group(4) is not None:
-                        # The resident image: PEAK reading minus the group's
-                        # pre-sleep BASELINE.  Peak, not last, for the same
-                        # reason the pass is the peak.  Baseline-subtracted, and
-                        # NOT the raw absolute the record's addendum quotes,
-                        # because that absolute also contains the group's host
-                        # pools -- the HiCache ring and the mamba anchors, which
-                        # this rank maps as shm and which the ledger already
-                        # charges by name (host_ledger.rings_gib / anchors_gib).
-                        # Charging the absolute here would post those bytes
-                        # twice, which is the one thing the ring may not do.
-                        # MEASURED on this rig, boot weg2dk6 group P: absolute
-                        # peak 15 831 MiB, baseline 1 971, delta 13 860 = the
-                        # pass sum exactly, while the addendum's +9.80 GiB
-                        # "under-charge" is that baseline summed over ranks.
-                        # The instrument is still not redundant: on weg2zr2's D
-                        # log it reads 20 MiB per rank ABOVE the pass sum, which
-                        # is a backed-up tag the weights family does not name.
-                        before = int(round(float(m.group(4))))
-                        after = int(round(float(m.group(5))))
-                        low, high = _rss_span.setdefault(rank, [before, after])
-                        _rss_span[rank] = [min(low, before), max(high, after)]
                     lines_read += 1
                 continue
             if "KV Cache is allocated" in line:
@@ -511,7 +555,6 @@ def parse_group_log(path: str) -> GroupLog:
             slot = tag_peak.setdefault(tag, {})
             if mib > slot.get(rank, 0):
                 slot[rank] = mib
-    dormant = {r: max(0, high - low) for r, (low, high) in _rss_span.items()}
     kv_mib = {r: int(round(gb * GB / MIB)) for r, gb in kv_gb.items()}
     # One tag is ONE RPC of the front's interleave and its shards land on every
     # card at once, so the step the host must hold in flight is the sum over
@@ -521,11 +564,146 @@ def parse_group_log(path: str) -> GroupLog:
         image=image,
         max_tag=max_tag,
         kv_mib=kv_mib,
-        dormant=dormant,
         uuid_by_rank=uuid_by_rank,
         lines_read=lines_read,
         instrument=instrument,
         tag_totals=tag_totals,
+        covers_all_backed_up_tags=covers_all,
+    )
+
+
+def parse_dormant_images(front_log: str) -> Dict[str, DormantImage]:
+    """``{group: DormantImage}`` from the front's own ``WEG2 DORMANT-IMAGE`` lines.
+
+    FIRST sample per group wins, matching the emitter's own contract (it
+    measures once, at that group's first sleep, so a boot's images are its first
+    sleeps' and not a moving average of its flips).  An unreadable file is an
+    ABSENCE -- ``{}`` -- and the caller then charges the census and prints that
+    the cross-check was not available; it is never read as a zero image.
+    """
+    out: Dict[str, DormantImage] = {}
+    try:
+        with open(front_log, errors="replace") as f:
+            for line in f:
+                if "WEG2 DORMANT-IMAGE" not in line:
+                    continue
+                m = _DORMANT_RE.search(line)
+                if not m or m.group(1) in out:
+                    continue
+                out[m.group(1)] = DormantImage(
+                    group=m.group(1),
+                    rss_mib=int(round(float(m.group(2)) * GIB / MIB)),
+                    weight_tags_mib=int(round(float(m.group(3)) * GIB / MIB)),
+                    extra_mib=int(round(float(m.group(4)) * GIB / MIB)),
+                )
+    except OSError:
+        return {}
+    return out
+
+
+def apportion_dormant(
+    group: str,
+    measured: Optional[DormantImage],
+    census: Dict[str, int],
+    census_covers_all_tags: bool,
+    *,
+    fallback: Optional[DormantImage] = None,
+    fallback_census: Optional[Dict[str, int]] = None,
+) -> Tuple[Dict[str, int], str, bool]:
+    """A1-2's cross-check, turned into per-card MiB -- ``(rows, source, is_bound)``.
+
+    THE ATTRIBUTION PROBLEM, stated rather than papered over.  ``measured`` is
+    ONE number for the whole group: the sum of that group's per-rank RssShmem at
+    its first sleep.  The ring is per card.  There is no line anywhere that
+    attributes those bytes to cards, so the only join the two instruments
+    support is each card's SHARE OF THE GROUP'S OWN CENSUS -- the same
+    proportions the per-card lines already state, applied to a total measured by
+    a different instrument.  That is a derivation, and the returned ``source``
+    string says so on the RING line.
+
+    Three outcomes:
+
+    * no measurement -> the census stands alone and ``source`` says the
+      cross-check was unavailable.  Not a zero image: an absence.
+    * a measurement no larger than the census -> the census stands (it is
+      already per card and already covers every backed-up tag when C16 wrote
+      it); ``source`` reports both numbers so the agreement is visible.
+    * a measurement larger than the census -> every card is scaled by the same
+      ratio, so ``sum(rows) == measured.rss_mib`` and no card is charged bytes
+      another card's line accounts for.
+
+    ``fallback`` is the D BOUND of A1-2: with no D sample, D is charged its own
+    census plus the unattributed excess P showed -- ``tags_D(c) + extra_P(c)``,
+    apportioned the same way -- and the third element of the tuple is True so
+    the caller prints the word BOUND rather than letting a bound read as a
+    reading.
+    """
+    total_census = sum(int(v) for v in census.values())
+    if total_census <= 0:
+        return {}, f"group {group}: no per-card census to apportion onto", False
+
+    def scaled(target_mib: int) -> Dict[str, int]:
+        return {
+            uuid: int(round(int(value) * target_mib / total_census))
+            for uuid, value in census.items()
+        }
+
+    if measured is not None:
+        if measured.rss_mib <= total_census:
+            return (
+                dict(census),
+                (
+                    f"group {group}: measured RssShmem {measured.rss_mib} MiB does NOT "
+                    f"exceed the per-card census {total_census} MiB "
+                    f"({'all backed-up tags' if census_covers_all_tags else 'weights_* only'}), "
+                    "so the census stands and the cross-check corroborates it"
+                ),
+                False,
+            )
+        return (
+            scaled(measured.rss_mib),
+            (
+                f"group {group}: measured RssShmem {measured.rss_mib} MiB EXCEEDS the "
+                f"per-card census {total_census} MiB by {measured.rss_mib - total_census} "
+                f"MiB ({'all backed-up tags' if census_covers_all_tags else 'weights_* only'}); "
+                "the excess is apportioned over the cards by their share of that "
+                "census, which is the only attribution the two instruments jointly "
+                "support (the measurement is a whole-group figure)"
+            ),
+            False,
+        )
+    if fallback is not None and fallback_census is not None and fallback.extra_mib > 0:
+        target = total_census + fallback.extra_mib
+        return (
+            scaled(target),
+            (
+                f"group {group}: NEVER MEASURED -- BOUND from its own census "
+                f"{total_census} MiB plus the {fallback.extra_mib} MiB group "
+                f"{fallback.group} held beyond ITS census "
+                "(A1-2: D's first sleep is a flip and is interleaved, so no "
+                "un-confounded D sample exists yet); replace with a reading as "
+                "soon as one boot logs WEG2 DORMANT-IMAGE group=D"
+            ),
+            True,
+        )
+    return (
+        {},
+        (
+            f"group {group}: no WEG2 DORMANT-IMAGE line in this boot's front log, so "
+            "the per-card census stands UNCHECKED "
+            + (
+                "(it does cover every backed-up tag -- C16 wrote it, so it IS the "
+                "measured dormant image)"
+                if census_covers_all_tags
+                else "(and it is a LOWER BOUND, not a measurement: weights_* only, "
+                     "and boot weg2dk7 measured a real image 34 % above such a census)"
+            )
+        ),
+        # A1-2: what is charged is a MEASUREMENT only when the census itself
+        # covers every backed-up tag.  A weights-only census with no cross-check
+        # is a BOUND, and the line must say so or the operator reads a lower
+        # bound as the image.
+        not census_covers_all_tags,
     )
 
 
@@ -579,6 +757,97 @@ def parse_front_corridor(path: str) -> Dict[str, Dict[int, int]]:
                 if i not in phase or v < phase[i]:
                     phase[i] = v
     return out
+
+
+#: ``PROBE start mode=card ... uuid=GPU-...`` opens a card's section of the
+#: step-0 probe record; ``PROBE granule tag=... ratio=1.316 verdict=DUPLEX-NULL``
+#: is the measurement in the FORM C3/C4 actually issue (2 MiB granules), which
+#: is why the granule row is read and the one-block row is not.
+_PROBE_START_RE = re.compile(r"PROBE start mode=(\S+)\s+.*?uuid=(GPU-[0-9a-fA-F-]+)")
+_PROBE_GRANULE_RE = re.compile(r"PROBE granule tag=\S+\s+.*?\bratio=([\d.]+)\s+verdict=(\S+)")
+
+
+@dataclass
+class DuplexTable:
+    """Per-card concurrent/serial PCIe ratio, from the step-0 probe's own lines.
+
+    Amendment A1-4: the direction split of C12/C13 carries a PER-CARD ratio and
+    the flip's critical path is exactly the card that does not earn it.  A
+    global ratio would open the split on the x4-linked 3080, where the metal
+    measured 1.316 against R17's 1.5 gate -- the two legs there share the link
+    whatever the key says, and a split key would only remove the serialisation
+    that keeps them from halving each other.
+    """
+
+    path: str
+    ratios: Dict[str, float] = field(default_factory=dict)
+    verdicts: Dict[str, str] = field(default_factory=dict)
+
+    def env_map(self) -> str:
+        """``SGLANG_WEG2_PCIE_DUPLEX`` -- ``<uuid>=<ratio>,...``, launcher output."""
+        return ",".join(f"{u}={r:.3f}" for u, r in sorted(self.ratios.items()))
+
+    def format_lines(self, cards: Sequence, gate: float) -> List[str]:
+        out = []
+        for card in cards:
+            ratio = self.ratios.get(card.uuid)
+            if ratio is None:
+                out.append(
+                    f"WEG2-PCIE-DUPLEX card={card.uuid} nvml{card.nvml_index} {card.name} "
+                    f"ratio=UNMEASURED split=NO -- this card has no row in {self.path}, "
+                    "and an unmeasured card never splits (a split that is not earned "
+                    "re-creates the overlap R9 forbids)"
+                )
+                continue
+            split = ratio >= gate
+            out.append(
+                f"WEG2-PCIE-DUPLEX card={card.uuid} nvml{card.nvml_index} {card.name} "
+                f"ratio={ratio:.3f} gate={gate:.2f} verdict={self.verdicts.get(card.uuid, '?')} "
+                f"split={'YES' if split else 'NO'} -- "
+                + (
+                    "the two legs take separate lock keys on this card"
+                    if split
+                    else "the two legs keep ONE key and still serialise here; this card "
+                         "is the flip's critical path and gets no benefit from the split "
+                         "(A1-4)"
+                )
+                + f" -- provenance: {self.path}, 2 MiB-granule row (the form C3/C4 issue)"
+            )
+        return out
+
+
+def solve_duplex(probe_path: str) -> Tuple[Optional[DuplexTable], str]:
+    """The per-card duplex ratio, SOLVED from the step-0 probe's own lines.
+
+    Same law as the ring table (spec section 10.3): not a constant a human
+    chose, not an env knob -- a measured file, parsed, with its path printed
+    beside every number it produces.  ``(None, reason)`` when the file is
+    unreadable or carries no card row; the caller then splits NOTHING, which is
+    the conservative direction.
+    """
+    current: Optional[str] = None
+    table = DuplexTable(path=probe_path)
+    try:
+        with open(probe_path, errors="replace") as f:
+            for line in f:
+                m = _PROBE_START_RE.search(line)
+                if m:
+                    current = m.group(2)
+                    continue
+                if current is None:
+                    continue
+                g = _PROBE_GRANULE_RE.search(line)
+                if g and current not in table.ratios:
+                    table.ratios[current] = float(g.group(1))
+                    table.verdicts[current] = g.group(2)
+    except OSError as exc:
+        return None, f"step-0 probe record {probe_path} unreadable: {exc}"
+    if not table.ratios:
+        return None, (
+            f"step-0 probe record {probe_path} carries no "
+            "'PROBE granule ... ratio=' row under a 'PROBE start ... uuid=' header"
+        )
+    return table, f"{len(table.ratios)} card row(s) from {probe_path}"
 
 
 def _boot_stems(evidence_dir: str) -> List[str]:
@@ -668,7 +937,6 @@ def solve(
             ("image_p", gp, gp.image), ("image_d", gd, gd.image),
             ("maxtag_p", gp, gp.max_tag), ("maxtag_d", gd, gd.max_tag),
             ("kv_p", gp, gp.kv_mib), ("kv_d", gd, gd.kv_mib),
-            ("dorm_p", gp, gp.dormant), ("dorm_d", gd, gd.dormant),
         ):
             pairs[key], why = rows(group, what)
             if why:
@@ -676,11 +944,26 @@ def solve(
         if why:
             reasons.append(f"{stem}: {why} (no ordinal map entry and no WEG2-FLIP-TAG card=)")
             continue
+        # A1-2: the group-level cross-check, apportioned onto the cards by their
+        # share of that group's own census.  See :func:`apportion_dormant`.
+        measured = parse_dormant_images(f_log)
+        dorm_p, src_p, bound_p = apportion_dormant(
+            "P", measured.get("P"), pairs["image_p"], gp.covers_all_backed_up_tags
+        )
+        dorm_d, src_d, bound_d = apportion_dormant(
+            "D", measured.get("D"), pairs["image_d"], gd.covers_all_backed_up_tags,
+            fallback=measured.get("P"), fallback_census=pairs["image_d"],
+        )
+        pairs["dorm_p"], pairs["dorm_d"] = dorm_p, dorm_d
 
         table = RingTable(
             boot=stem,
             instrument=gd.instrument or gp.instrument,
             lines_read=gp.lines_read + gd.lines_read,
+            image_source=f"P: {src_p} | D: {src_d}",
+            bound_groups=tuple(
+                g for g, b in (("P", bound_p), ("D", bound_d)) if b
+            ),
             max_step_total_mib=max(
                 max(gp.tag_totals.values(), default=0),
                 max(gd.tag_totals.values(), default=0),
@@ -696,11 +979,16 @@ def solve(
             cr.tags_d_mib = int(pairs["image_d"].get(card.uuid, 0))
             cr.dormant_p_mib = int(pairs["dorm_p"].get(card.uuid, 0))
             cr.dormant_d_mib = int(pairs["dorm_d"].get(card.uuid, 0))
-            # The charged image is the LARGER of the two instruments (record 1p
-            # STEP-0 ADDENDUM): the weight-tag census is a lower bound on what
-            # the sleeping group actually holds resident, because a pass sums
-            # the tags the sleep loop names and the resident image holds every
-            # tag that was backed up.
+            cr.dormant_p_bound = bound_p
+            cr.dormant_d_bound = bound_d
+            # A1-2: charge the LARGER of the per-card tag census and that card's
+            # apportioned share of the group's MEASURED dormant image.  When the
+            # source boot carried C16 the census already names every backed-up
+            # tag and the two agree; where it did not, the census is a lower
+            # bound and the measurement is what stops the ring being sized ~34 %
+            # short (boot weg2dk7).  A ring sized to the smaller number hits W31
+            # at the first sleep, and the LAUNCH charge -- the tightest moment,
+            # where LOAD_TRANSIENT sits on top -- is short by the same margin.
             cr.image_p_mib = max(cr.tags_p_mib, cr.dormant_p_mib)
             cr.image_d_mib = max(cr.tags_d_mib, cr.dormant_d_mib)
             cr.max_tag_p_mib = int(pairs["maxtag_p"].get(card.uuid, 0))

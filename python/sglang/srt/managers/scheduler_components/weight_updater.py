@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import functools
 import logging
 import time
 import traceback
@@ -43,6 +44,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.weg2_memory_saver import (
     WEG2_SLEEP_MIN_RELEASED_FRACTION,
     WEG2_SLEEP_TAGS,
+    Weg2FlipRankDisagree,
+    Weg2VramCreditRefused,
     Weg2WakeRefused,
     assert_backup_off_wake_refill_is_defined,
     assert_memory_saver_active,
@@ -51,7 +54,59 @@ from sglang.srt.managers.weg2_memory_saver import (
     resolve_pcie_lock_key,
     is_weights_family_tag,
     sleep_acceptance_census,
+    vram_credit,
 )
+
+#: C21 / spec R13.  The group fence's budget, named so the ONE place that owns
+#: it can be re-justified and so C14's credit wait can be bounded by the SAME
+#: number instead of inventing a second one (spec section 10.9 forbids a new
+#: timeout constant for the credit).
+#:
+#: PROVENANCE, and it is the re-justification R13 demands.  The 120 s was chosen
+#: against "the largest single pause measured is ~1.5 s (3336 MiB D2H)".  That
+#: basis DIED with C9: the fence now closes once per LEG, not once per tag, and
+#: a leg is the whole weights family -- measured 11.4 s of D2H on this rig
+#: (WEG2_FLIPCOST_SPEC_0907 section 2, from the per-tag byte table), against a
+#: flip whose measured sleep leg was 14 481 ms on boot weg2dk5.  120 s is
+#: therefore ~8x the measured whole-leg payload rather than ~80x a single tag,
+#: which is still a fence budget and no longer a number justified by an
+#: obsolete unit.  It is NOT a performance bound: a leg that needs more than
+#: this is a wedged leg, and the barrier names the rank that did not join.
+WEG2_GROUP_FENCE_BUDGET_S = 120.0
+
+MIB_ = 1024 * 1024
+
+
+def _weg2_group_stop_on_leg_failure(fn):
+    """C15: a rank that could not finish its half of a leg VOTES, then re-raises.
+
+    A DECORATOR rather than a try inside each body, for two reasons.  The
+    exception may come from ANY statement of the leg -- the pause itself, the
+    device credit, the static-state export -- and a group STOP that only covers
+    the statements someone remembered to wrap is exactly the rank-local silent
+    failure spec section 10.5 forbids.  And ``functools.wraps`` keeps the
+    method's name and its ``__wrapped__``, so the AST and ``inspect.getsource``
+    gates that pin the ORDER of statements inside these handlers keep reading
+    the real body: a wrapper that made those gates read an empty shim would
+    disarm them while looking green, which is the same class of defect.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, recv_req):
+        try:
+            return fn(self, recv_req)
+        except Exception as exc:
+            self._weg2_leg_failed(f"{fn.__name__} FAILED on this rank", exc)
+            raise
+
+    return wrapper
+
+#: The ring's granule, spec C1 ("2 MiB granules") -- a fixed GEOMETRY of the
+#: region, not a measured size, so it is written here rather than solved.  L1's
+#: ``granules=`` is derived from it; when a ring is actually published the
+#: saver's own ``ring_stats()['granule_bytes']`` is the authority and this value
+#: is only the pre-ring reading.
+TMS_RING_GRANULE_BYTES = 2 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +155,15 @@ class SchedulerWeightUpdaterManager:
     #: WEG2_SLEEP_TAGS population).  A slots dataclass: a field, not an
     #: ad-hoc attribute.
     weg2_sleep_before: Any = None
+    #: C15: set by :meth:`_weg2_group_fence` when the fence itself raised, read
+    #: and cleared by :meth:`_weg2_leg_failed`.  A FIELD, not an ad-hoc
+    #: attribute -- this is a ``slots=True`` dataclass, and the comment above
+    #: already learnt that lesson once.
+    weg2_fence_raised: bool = False
+    #: C16: this rank's card, resolved once.  ``"unset"`` is distinct from
+    #: ``None``, which is the resolved answer "no card key" -- so an
+    #: unresolvable card is not re-resolved (and re-logged) on every tag.
+    weg2_card_uuid_cache: Any = "unset"
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -222,7 +286,7 @@ class SchedulerWeightUpdaterManager:
         return -1.0
 
     @contextmanager
-    def _weg2_pcie_lock(self, label: str) -> Iterator[None]:
+    def _weg2_pcie_lock(self, label: str, direction: Optional[str] = None) -> Iterator[None]:
         """Serialise this card's host<->device transfer against its sibling.
 
         Two failure modes, kept apart on purpose:
@@ -257,8 +321,49 @@ class SchedulerWeightUpdaterManager:
             )
             yield
             return
-        with pcie_transfer_lock(nvml_uuid=uuid_key, label=label):
+        # C13: the leg's DIRECTION goes to the key's owner.  On a card whose
+        # measured duplex ratio reaches R17's gate the key becomes
+        # ``<uuid>.<d2h|h2d>`` and a sleep no longer excludes a co-located
+        # wake; below the gate the key is unchanged and they still serialise.
+        # This module states the direction, weg2_memory_saver decides what the
+        # key does with it -- one fact, one owner.
+        with pcie_transfer_lock(nvml_uuid=uuid_key, label=label, direction=direction):
             yield
+
+    def _weg2_card_uuid(self) -> Optional[str]:
+        """This rank's physical card, or None with the reason logged once."""
+        if self.weg2_card_uuid_cache != "unset":
+            return self.weg2_card_uuid_cache
+        try:
+            uuid_key = resolve_pcie_lock_key()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[weg2] card key unresolved (%s) -- L1 lines carry card=unknown", exc)
+            uuid_key = None
+        self.weg2_card_uuid_cache = uuid_key
+        return uuid_key
+
+    def _weg2_tag_bytes(self, tag: str) -> int:
+        """C7/C16: the saver's OWN byte sum for one tag, or 0 with a reason.
+
+        THE INSTRUMENT, and the reason RssShmem is no longer it (spec R8): the
+        shared host ring's granules are tmpfs pages mapped by BOTH co-located
+        processes, so an RssShmem delta across a pause collapses to ~0 the
+        moment the ring lands and the old ``WEG2-CHUNK-BYTES host_image_delta``
+        would read a real 13 GiB image as nothing.  ``tms_tag_bytes`` reads the
+        allocator's own metadata and is indifferent to where the backup lives.
+
+        A 0 here means "the saver could not answer", printed as such by the
+        caller -- never "this tag is empty".
+        """
+        adapter = getattr(self, "memory_saver_adapter", None)
+        getter = getattr(adapter, "tag_bytes", None)
+        if getter is None:
+            return 0
+        try:
+            value = getter(tag)
+        except Exception:  # noqa: BLE001
+            return 0
+        return int(value or 0)
 
     def _weg2_log_sleep_acceptance(
         self, before: Optional[Any] = None, tags: Optional[List[str]] = None
@@ -471,8 +576,60 @@ class SchedulerWeightUpdaterManager:
                 "but their content is undefined; this group is fatal."
             )
 
-    def _weg2_group_fence(self, what: str) -> None:
+    def _weg2_group_fence(
+        self,
+        what: str,
+        *,
+        ok: bool = True,
+        failure: str = "",
+        per_tag: Optional[Dict[str, List[float]]] = None,
+        leg_ms: float = 0.0,
+    ) -> Dict[str, Any]:
+        """:meth:`_weg2_group_fence_impl`, plus the marker that stops re-entry.
+
+        THE RE-ENTRY HAZARD is a HANG, not an error: the fence takes two
+        collectives, so an exception raised inside it -- a W29 from a peer's
+        vote, a ``monitored_barrier`` expiry -- has already consumed this rank's
+        turn in them.  ``_weg2_leg_failed`` would then vote again and post a
+        third collective the other ranks are not in, and gloo would sit there.
+        The marker is set here and read (and cleared) there.
+        """
+        self.weg2_fence_raised = False
+        try:
+            return self._weg2_group_fence_impl(
+                what, ok=ok, failure=failure, per_tag=per_tag, leg_ms=leg_ms
+            )
+        except BaseException:
+            self.weg2_fence_raised = True
+            raise
+
+    def _weg2_group_fence_impl(
+        self,
+        what: str,
+        *,
+        ok: bool = True,
+        failure: str = "",
+        per_tag: Optional[Dict[str, List[float]]] = None,
+        leg_ms: float = 0.0,
+    ) -> Dict[str, Any]:
         """Every rank of the group joins here before the owner rank answers.
+
+        C15 -- THE OK-BIT, AND WHY IT IS SECOND.  After the barrier every rank
+        also contributes ``ok`` (did MY half of this leg complete?) through one
+        ``all_gather_object``, and any False makes EVERY rank raise
+        :class:`Weg2FlipRankDisagree` (W29).  The order is ruled, not stylistic
+        (spec R15): gloo's ``all_gather_object`` has NO timeout, so a rank that
+        died mid-leg would hang the survivors in it forever; the existing
+        ``monitored_barrier`` runs FIRST because it is bounded and NAMES the
+        rank that did not join.  The gather is only ever reached by ranks that
+        are all present.
+
+        The same gather carries the leg's per-tag report (C16/C17) and each
+        rank's own leg cost, so the answering rank can name the CRITICAL PATH
+        (L5) without a second collective and without a second bookkeeping of
+        the same numbers.  Returns that reduction; ``{}`` when there is no
+        group to gather over (world <= 1, or no cpu group -- a single-rank
+        engine cannot disagree with itself).
 
         The RPC answer is ONE rank's: scheduler.py process_input_requests
         sends the output from the rank that owns the tokenizer socket (PP0 /
@@ -500,14 +657,14 @@ class SchedulerWeightUpdaterManager:
         """
         scheduler = self.scheduler
         if scheduler is None:
-            return
+            return {}
         world_group = getattr(scheduler, "world_group", None)
         cpu_group = getattr(world_group, "cpu_group", None)
         if cpu_group is None:
-            return
+            return {}
         world = torch.distributed.get_world_size(group=cpu_group)
         if world <= 1:
-            return
+            return {}
         t0 = time.perf_counter()
         ps = getattr(scheduler, "ps", None)
         joined = "n/a"
@@ -521,20 +678,86 @@ class SchedulerWeightUpdaterManager:
             if pending:
                 scheduler._pp_join_comm_work(pending)
         # gloo-only monitored barrier: bounded, and on expiry it NAMES the
-        # ranks that did not join (a plain barrier on this group would sit
-        # for the group's two-hour timeout).  120 s is the #973 budget class;
-        # the largest single pause measured is ~1.5 s (3336 MiB D2H).
+        # ranks that did not join (a plain barrier on this group would sit for
+        # the group's two-hour timeout).
+        #
+        # C21 / R13 -- THE BUDGET, RE-JUSTIFIED AGAINST A WHOLE-LEG PAYLOAD.
+        # Its old basis was "the largest single pause measured is ~1.5 s
+        # (3336 MiB D2H)", which was true while the front sent one RPC PER TAG
+        # and this fence closed once per tag.  C9 sends one RPC per FAMILY, so
+        # what has to fit inside this budget is now an entire leg: 11.4 s of
+        # D2H by the spec's per-tag byte table, and 14 481 ms measured for the
+        # sleep leg of boot weg2dk5.  The number did not move; its
+        # justification did, from ~80x a single tag to ~8x the measured leg.
+        # See WEG2_GROUP_FENCE_BUDGET_S for the whole argument -- it is stated
+        # once, at the constant, and this fence and C14's credit wait both read
+        # it so there is no second timeout constant anywhere on this path.
         torch.distributed.monitored_barrier(
-            group=cpu_group, timeout=timedelta(seconds=120), wait_all_ranks=True
+            group=cpu_group,
+            timeout=timedelta(seconds=WEG2_GROUP_FENCE_BUDGET_S),
+            wait_all_ranks=True,
         )
+        # C15: the ok-bit, strictly AFTER the barrier that names a non-joiner.
+        rank = torch.distributed.get_rank(group=cpu_group)
+        mine = {
+            "rank": rank,
+            "ok": bool(ok),
+            "failure": str(failure or ""),
+            "card": self._weg2_card_uuid() or "unknown",
+            "leg_ms": float(leg_ms),
+            "per_tag": dict(per_tag or {}),
+        }
+        gathered: List[Optional[Dict[str, Any]]] = [None] * world
+        torch.distributed.all_gather_object(gathered, mine, group=cpu_group)
+        votes = [v for v in gathered if isinstance(v, dict)]
+        bad = [v for v in votes if not v.get("ok", False)]
         logger.info(
             "WEG2-GROUP-FENCE %s joined in %.0f ms (world=%d ranks, chain sends joined=%s; "
-            "the RPC answer now means every rank finished this tag)",
+            "the RPC answer now means every rank finished this WHOLE LEG) "
+            "ok=%d/%d (denominator: the ranks that answered the gather)",
             what,
             (time.perf_counter() - t0) * 1000,
             world,
             joined,
+            len(votes) - len(bad),
+            len(votes),
         )
+        if bad:
+            named = ", ".join(
+                f"rank {v.get('rank')} card={v.get('card')}: {v.get('failure') or 'no reason given'}"
+                for v in bad
+            )
+            line = (
+                f"W29 Weg2FlipRankDisagree rank={rank} tag={what} "
+                f"exc={named} -- every rank stops in this fence"
+            )
+            logger.error("%s", line)
+            raise Weg2FlipRankDisagree(line)
+        # The reduction the answering rank turns into C17's per_tag / L5's
+        # critical path.  Per tag: the MAXIMUM ms over ranks, because the leg
+        # is finished when its slowest holder is -- the same rule the tokenizer
+        # side applies over engines, stated once here and once there because
+        # they reduce over two different populations and both must name theirs.
+        merged: Dict[str, List[float]] = {}
+        for v in votes:
+            for tag_name, pair in (v.get("per_tag") or {}).items():
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    continue
+                cand = [float(pair[0]), float(pair[1])]
+                have = merged.get(str(tag_name))
+                if have is None or cand[1] > have[1]:
+                    merged[str(tag_name)] = cand
+        slowest = max(votes, key=lambda v: float(v.get("leg_ms", 0.0)), default=None)
+        critical = (
+            ""
+            if slowest is None
+            else (
+                f"rank={slowest.get('rank')} card={slowest.get('card')} "
+                f"ms={float(slowest.get('leg_ms', 0.0)):.0f} "
+                f"(slowest of {len(votes)} rank(s) in this leg)"
+            )
+        )
+        return {"per_tag": merged, "critical_path": critical}
 
     def _weg2_drain_hicache_before_sleep(self, bound_s: float = 30.0) -> None:
         """Drain HiCache in-flight terms (write-through / storage backup /
@@ -563,7 +786,149 @@ class SchedulerWeightUpdaterManager:
             time.time() - t0, polls, first, list(sch.idle_blockers()),
         )
 
+    # ------------------------------------------------------------------
+    # C15 -- ranks never disagree: a rank that could not finish its half of a
+    # leg joins the SAME fence the others are in and votes False, so the group
+    # stops together (W29) instead of the front reading one rank's success as
+    # the group's.  The two public handlers are these wrappers; the work is in
+    # the ``_weg2_*`` bodies.  Written as a wrapper rather than as a try inside
+    # the body because the exception may come from ANY statement of the leg
+    # (the pause itself, the credit, the static-state export), and a group STOP
+    # that only covers the statements someone remembered to wrap is the exact
+    # rank-local-silent-failure shape spec section 10.5 forbids.
+    # ------------------------------------------------------------------
+
+    def _weg2_fence_is_armed(self) -> bool:
+        server_args = self._weg2_server_args()
+        return server_args is None or bool(
+            getattr(server_args, "enable_memory_saver", False)
+        )
+
+    def _weg2_leg_failed(self, what: str, exc: BaseException) -> None:
+        """Join the fence with a False vote -- unless the fence is where we died.
+
+        THE RE-ENTRY HAZARD, and it is a hang rather than an error: the fence
+        takes two collectives, so an exception raised INSIDE it (a W29 from a
+        peer's vote, a monitored_barrier expiry) has already consumed this
+        rank's turn in them.  Voting again would post a third collective the
+        other ranks are not in, and gloo would sit there.  So a failure that
+        came from the fence propagates untouched -- the group has already
+        stopped, which is the outcome this method exists to produce.
+        """
+        if self.weg2_fence_raised:
+            self.weg2_fence_raised = False
+            return
+        if not self._weg2_fence_is_armed():
+            return
+        self._weg2_group_fence(
+            what, ok=False, failure=f"{type(exc).__name__}: {exc}"
+        )
+
+    # ------------------------------------------------------------------
+    # C14 -- the device-side credit, from this rank's side of the corridor
+    # ------------------------------------------------------------------
+
+    def _weg2_group_name(self) -> str:
+        server_args = self._weg2_server_args()
+        return str(getattr(server_args, "weg2_group", "") or "?")
+
+    def _weg2_rank(self) -> int:
+        scheduler = self.scheduler
+        for attr in ("tp_rank", "pp_rank"):
+            value = getattr(scheduler, attr, None)
+            if isinstance(value, int):
+                return value
+        return -1
+
+    def _weg2_open_credit_for_leg(self):
+        """S's side: the counter for THIS card, opened for THIS leg.
+
+        ``None`` (and no waiting anywhere) whenever the card key cannot be
+        resolved or the counter cannot be created -- the credit is a
+        deadlock-avoidance instrument for a co-located pair, and a rank that
+        cannot even name its card has no co-located pair to fund.  The failure
+        is logged, never swallowed into a success value.
+        """
+        if not self._weg2_fence_is_armed():
+            return None
+        uuid_key = self._weg2_card_uuid()
+        if uuid_key is None:
+            return None
+        try:
+            credit = vram_credit(uuid_key)
+            credit.begin_leg(int(time.time()))
+        except OSError as exc:
+            logger.warning(
+                "[weg2 credit] no VRAM credit published on %s (%s) -- a "
+                "co-located waking rank will fall back to the card's own free "
+                "bytes and refuse by name if they are short",
+                uuid_key, exc,
+            )
+            return None
+        return credit
+
+    def _weg2_credit_reader(self):
+        """W's side: the same counter, read-only."""
+        if not self._weg2_fence_is_armed():
+            return None
+        uuid_key = self._weg2_card_uuid()
+        if uuid_key is None:
+            return None
+        try:
+            return vram_credit(uuid_key)
+        except OSError:
+            return None
+
+    def _weg2_free_bytes(self) -> Optional[int]:
+        """NVML free on THIS rank's card, or None when it cannot be read.
+
+        None is load-bearing: :meth:`VramCredit.wait_for` then cannot take the
+        "the card already holds the bytes" exit and waits on the peer, which is
+        the conservative direction.  A blind reading must never license a
+        resume that has no bytes.
+        """
+        uuid_key = self._weg2_card_uuid()
+        if uuid_key is None:
+            return None
+        try:
+            from sglang.srt.registry import nvml as nvml_registry
+
+            return int(nvml_registry.memory_info_for_uuid(uuid_key).free_bytes)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _weg2_await_vram_credit(self, credit, tag: str, need_bytes: int) -> None:
+        if credit is None or need_bytes <= 0:
+            return
+        try:
+            rec = credit.wait_for(
+                need_bytes,
+                budget_s=WEG2_GROUP_FENCE_BUDGET_S,
+                tag=tag,
+                free_bytes_now=self._weg2_free_bytes(),
+            )
+        except Weg2VramCreditRefused:
+            raise
+        except OSError as exc:
+            logger.warning("[weg2 credit] unreadable on %s: %s -- not waiting", tag, exc)
+            return
+        if rec.get("waited_s", 0.0) > 0.0:
+            logger.info(
+                "WEG2-VRAM-CREDIT card=%s tag=%s waited=%.0f ms credit=%d MiB "
+                "requested=%d MiB (%s)",
+                self._weg2_card_uuid() or "unknown", tag,
+                float(rec["waited_s"]) * 1000,
+                int(rec.get("credit_bytes", 0)) // MIB_,
+                int(need_bytes) // MIB_,
+                rec.get("reason", ""),
+            )
+
+    @_weg2_group_stop_on_leg_failure
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        # C16/C17: this rank's own per-tag report of THIS leg, filled by the
+        # weights block below and reduced over the group at the fence.
+        weg2_per_tag: Dict[str, List[float]] = {}
+        weg2_leg_ms = 0.0
         # W12 Weg2MemorySaverInactive, BEFORE anything is mutated: with the
         # no-op adapter every pause() below is `pass` and this RPC returns
         # success having released nothing.  A refusal that has already paused
@@ -729,13 +1094,50 @@ class SchedulerWeightUpdaterManager:
             # unmapped pages, which is the campaign (a) fault on the sibling
             # tag.  Pinned by test_weights_block_pause_is_the_last_statement.
             shm0 = self._weg2_rss_shmem_mib()
-            with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags)):
+            # C16: the per-tag bytes are read from the SAVER, before the pause
+            # that moves them, and they are metadata reads -- no device call is
+            # added after the pause (the prohibition above is intact).
+            tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
+            # C14: S opens the device-side credit for this leg BEFORE it frees
+            # anything, so a co-located waking rank can never read a stale
+            # counter from the previous flip as if it were this one's.
+            credit = self._weg2_open_credit_for_leg()
+            weg2_leg_t0 = time.perf_counter()
+            with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags), direction="d2h"):
                 for tag in weights_tags:
+                    t_tag = time.perf_counter()
                     self.memory_saver_adapter.pause(tag)
-            # The MEASURED bytes of this tag set's host image (the ledger's
-            # chunk term is image / N, derived; this is the instrument).
+                    weg2_per_tag[tag] = [
+                        float(tag_bytes.get(tag, 0)),
+                        (time.perf_counter() - t_tag) * 1000,
+                    ]
+                    if credit is not None:
+                        # The device bytes this tag's pause just gave back --
+                        # the same number, from the same instrument, that the
+                        # waking rank is waiting on.
+                        credit.publish(tag, tag_bytes.get(tag, 0))
+            weg2_leg_ms = (time.perf_counter() - weg2_leg_t0) * 1000
+            if credit is not None:
+                credit.leg_complete()
+            card_uuid = self._weg2_card_uuid() or "unknown"
+            for tag, (nbytes, tms) in weg2_per_tag.items():
+                logger.info(
+                    "WEG2-FLIP-TAG group=%s rank=%d card=%s dir=d2h tag=%s bytes=%d MiB "
+                    "(source: tms_tag_bytes, NOT RssShmem) ms=%.0f GB/s=%.2f granules=%d",
+                    self._weg2_group_name(), self._weg2_rank(), card_uuid, tag,
+                    int(nbytes) // MIB_, tms,
+                    (nbytes / 1e9) / max(1e-6, tms / 1000.0),
+                    int(nbytes) // TMS_RING_GRANULE_BYTES,
+                )
+            # RssShmem stays on the line as the CROSS-CHECK it now is, and its
+            # own death is stated: once the ring lands both co-located ranks map
+            # the same tmpfs granules and this delta collapses to ~0 while the
+            # bytes above are unchanged (spec R8).  A reader comparing the two
+            # must know which one is the instrument.
             logger.info(
-                "WEG2-CHUNK-BYTES sleep tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, /proc/self/status)",
+                "WEG2-CHUNK-BYTES sleep tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, "
+                "/proc/self/status; CROSS-CHECK ONLY -- tms_tag_bytes above is the instrument, and this "
+                "delta reads ~0 once the shared ring carries the backup)",
                 weights_tags, self._weg2_rss_shmem_mib() - shm0, shm0, self._weg2_rss_shmem_mib(),
             )
 
@@ -779,12 +1181,33 @@ class SchedulerWeightUpdaterManager:
             )
             self.weg2_sleep_before = None
 
+        report: Dict[str, Any] = {}
         if weg2_memory_saver_on:
-            self._weg2_group_fence("release tags=%s" % (list(tags),))
+            report = self._weg2_group_fence(
+                "release tags=%s" % (list(tags),),
+                per_tag=weg2_per_tag,
+                leg_ms=weg2_leg_ms,
+            )
 
-        return ReleaseMemoryOccupationReqOutput()
+        # C17: the group's answer carries what the group moved.  ``per_tag``
+        # falls back to THIS rank's own numbers when there was no group to
+        # gather over (a single-rank engine), and is None on the stock path so
+        # that answer is byte-identical to what it always was.
+        return ReleaseMemoryOccupationReqOutput(
+            per_tag=(report.get("per_tag") or weg2_per_tag or None)
+            if weg2_memory_saver_on
+            else None,
+            critical_path=(report.get("critical_path") or None)
+            if weg2_memory_saver_on
+            else None,
+        )
 
+    @_weg2_group_stop_on_leg_failure
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        # C16/C17: this rank's own per-tag report of THIS leg, filled by the
+        # weights block below and reduced over the group at the fence.
+        weg2_per_tag: Dict[str, List[float]] = {}
+        weg2_leg_ms = 0.0
         # Same gate as the release path: the Weg-2 fence below runs only on
         # a --enable-memory-saver engine (a stock resume stays upstream).
         server_args = self._weg2_server_args()
@@ -809,11 +1232,38 @@ class SchedulerWeightUpdaterManager:
             # Same lock, same reason as the sleep leg above.
             t_w0 = time.perf_counter()
             shm0 = self._weg2_rss_shmem_mib()
-            with self._weg2_pcie_lock("wake-H2D " + ",".join(weights_tags)):
+            tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
+            credit = self._weg2_credit_reader()
+            with self._weg2_pcie_lock("wake-H2D " + ",".join(weights_tags), direction="h2d"):
                 for tag in weights_tags:
+                    # C14: the device bytes this tag needs may only exist once
+                    # the co-located SLEEPING rank has released them, and with
+                    # C9 both legs are in flight.  Waiting here turns a race
+                    # into a bounded wait whose expiry is a NAMED refusal; when
+                    # the card is not short the call returns without waiting at
+                    # all, which is every non-co-located boot.
+                    self._weg2_await_vram_credit(credit, tag, tag_bytes.get(tag, 0))
+                    t_tag = time.perf_counter()
                     self.memory_saver_adapter.resume(tag)
+                    weg2_per_tag[tag] = [
+                        float(tag_bytes.get(tag, 0)),
+                        (time.perf_counter() - t_tag) * 1000,
+                    ]
+            weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
+            card_uuid = self._weg2_card_uuid() or "unknown"
+            for tag, (nbytes, tms) in weg2_per_tag.items():
+                logger.info(
+                    "WEG2-FLIP-TAG group=%s rank=%d card=%s dir=h2d tag=%s bytes=%d MiB "
+                    "(source: tms_tag_bytes, NOT RssShmem) ms=%.0f GB/s=%.2f granules=%d",
+                    self._weg2_group_name(), self._weg2_rank(), card_uuid, tag,
+                    int(nbytes) // MIB_, tms,
+                    (nbytes / 1e9) / max(1e-6, tms / 1000.0),
+                    int(nbytes) // TMS_RING_GRANULE_BYTES,
+                )
             logger.info(
-                "WEG2-CHUNK-BYTES wake tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, /proc/self/status; negative = the patched saver freed it)",
+                "WEG2-CHUNK-BYTES wake tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, "
+                "/proc/self/status; negative = the patched saver freed it; CROSS-CHECK ONLY -- "
+                "tms_tag_bytes above is the instrument)",
                 weights_tags, self._weg2_rss_shmem_mib() - shm0, shm0, self._weg2_rss_shmem_mib(),
             )
             torch.distributed.barrier(self.tp_cpu_group)
@@ -899,10 +1349,22 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.resume_memory_occupation()
 
+        report: Dict[str, Any] = {}
         if weg2_memory_saver_on:
-            self._weg2_group_fence("resume tags=%s" % (list(tags),))
+            report = self._weg2_group_fence(
+                "resume tags=%s" % (list(tags),),
+                per_tag=weg2_per_tag,
+                leg_ms=weg2_leg_ms,
+            )
 
-        return ResumeMemoryOccupationReqOutput()
+        return ResumeMemoryOccupationReqOutput(
+            per_tag=(report.get("per_tag") or weg2_per_tag or None)
+            if weg2_memory_saver_on
+            else None,
+            critical_path=(report.get("critical_path") or None)
+            if weg2_memory_saver_on
+            else None,
+        )
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:

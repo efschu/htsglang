@@ -63,6 +63,10 @@ PORT_P = 30031
 PORT_D = 30032
 EVIDENCE_DIR = "/spinning/evidence-665-f1"
 GPU_ARB = "/spinning/gpu-arb"
+#: The step-0 metal probe's RECORD (C0, WEG2_BUILD_DECISIONS_0906 section 1p).
+#: A FILE, not a number: the per-card duplex ratios C12/C13 gate on are parsed
+#: out of its own measured rows and printed with this path beside them.
+DUPLEX_PROBE_DEFAULT = f"{GPU_ARB}/weg2/PROBE_RING_0907.md"
 DEADMAN = f"{GPU_ARB}/devtools/boot_deadman.sh"
 MEMTS = f"{GPU_ARB}/devtools/mem_timeseries.sh"
 HOST_PREFLIGHT = f"{GPU_ARB}/devtools/host_ledger_preflight.sh"
@@ -609,21 +613,40 @@ def argv_d(py: str, model: str, budgets: List[int], s_gb: int, m_mib: int, store
     ] + extra
 
 
+def _import_duplex_gate() -> float:
+    from sglang.srt.managers import weg2_memory_saver
+
+    return float(weg2_memory_saver.DUPLEX_SPLIT_MIN_RATIO)
+
+
 @dataclass
 class HostRingPlan:
     """What C18 publishes, and why it may publish nothing.
 
-    ``armed`` False means the ring is NOT in this boot, and there are two very
-    different reasons for it, PRINTED either way -- nothing here is silent:
+    ``armed`` False means the ring is NOT in this boot, and THERE IS NO
+    FALLBACK -- spec Amendment A1-3, measured, not argued:
 
-    * ``table`` is not None -- W33 (no proven registration form), W32 or W34.
-      The measured table exists, so the OLD flip form can be priced and RUNS.
-    * ``table`` is None -- R22, no measured table at all.  Then NOTHING runs:
-      the OLD form's own charge (one image plus one tag in flight) is solved
-      from that same table, so with no table there is no fallback to fall back
-      to and the ledger refuses the launch by name (W20).  FIX 2: this arm used
-      to print "the OLD flip form runs" and then kill the boot two steps later
-      with W20, which told the operator a fallback had run that never did.
+        the OLD flip form is INFEASIBLE on this host budget on the default
+        table (W20 at every rung: host weights 38.77 GiB run / 33.12 GiB
+        launch, boot weg2rg1) -- no Weg-2 boot may pin --ring-table-boot
+        weg2zr2 to get past it; the ring with gathered legs is the only route.
+
+    So every un-armed arm below REFUSES BY NAME and the launcher exits 2.  The
+    predecessor of this text said "the host ring is NOT armed and the OLD flip
+    form runs (spec section 10.4)" in the W32, W33 and W34 arms, and the metal
+    had refuted it twenty minutes before that commit was written: those lines
+    are printed at ``prepare_host_ring`` (launcher.py step 1b) and the arm that
+    decides whether the un-armed form is fundable is ``host_ledger.choose`` one
+    step LATER, so the sentence was an assertion made before its own check --
+    and the check said no.  A refusal that names a fallback must HAVE one.
+
+    Two reasons remain, and both are printed:
+
+    * ``table`` is not None -- W33 (no proven registration form), W32, or W34
+      (the launcher found itself without gathered legs).  The table exists, so
+      the un-armed charge CAN be priced; it just cannot be funded.
+    * ``table`` is None -- R22, no measured table at all.  Then it cannot even
+      be priced, and the ledger refuses by name (W20) for that reason instead.
     """
 
     form: str = ""
@@ -633,6 +656,11 @@ class HostRingPlan:
     armed: bool = False
     table: Optional["ring_table.RingTable"] = None
     lines: List[str] = field(default_factory=list)
+    #: C12/C13: the per-card duplex table and the ``SGLANG_WEG2_PCIE_DUPLEX``
+    #: string built from it.  Launcher OUTPUT (spec R19), solved from the
+    #: step-0 probe record; empty means no card splits its lock key.
+    duplex: Optional["ring_table.DuplexTable"] = None
+    duplex_env: str = ""
 
     @property
     def host_weights_bytes(self) -> int:
@@ -674,6 +702,11 @@ class HostRingPlan:
         return f"{self.table.provenance()}; charged for the {form}"
 
 
+#: R17's gate, read from the module that owns the key so the launcher's printed
+#: verdict and the rank's actual key can never be computed from two numbers.
+DUPLEX_GATE = _import_duplex_gate()
+
+
 def _front_leg_form() -> str:
     """``front.FLIP_LEG_FORM`` -- read, never restated.
 
@@ -686,25 +719,39 @@ def _front_leg_form() -> str:
     return front.FLIP_LEG_FORM
 
 
-def _pcie_lock_directional() -> bool:
-    """``weg2_memory_saver.PCIE_LOCK_SEPARATES_DIRECTIONS`` -- read, never restated.
+def _pcie_lock_directional(ratios: Optional[Dict[str, float]] = None,
+                           cards: Optional[Sequence["Card"]] = None) -> bool:
+    """Does the per-card PCIe lock separate the two legs -- ON EVERY CARD?
 
-    The rank-local half of the same hazard ``front.FLIP_LEG_FORM`` names at the
-    front: even with the legs GATHERED, a per-card PCIe lock keyed on the card
-    alone and held around a whole tag loop makes the two co-located ranks
-    mutually exclusive, so S blocks in ``acquire`` while holding the lock W would
-    need to issue its funding release.  Reading it here rather than restating it
-    is what stops the gate from opening on the day C9 flips the front's constant
-    while C12/C13 -- a SEPARATE slice -- has not landed.
+    Read from the module that owns the key
+    (``weg2_memory_saver.pcie_lock_separates_directions``), never restated here.
+    That is what stops this gate from opening on the day one half of the hazard
+    moves and the other has not.
+
+    A1-4: the answer is PER CARD, and this returns the AND over the cards -- a
+    single card that keeps one key is enough to serialise the pair there, which
+    is the whole hazard, and on this rig that card (nvml0, x4, measured 1.316
+    against R17's 1.5) is also the flip's critical path.  What follows from a
+    False here is NOT "do not arm": with the gathered legs of C9 the corridor
+    that funds the ring is R5's, which the ring bitmap and C14's device credit
+    close on their own; the per-card serialisation costs TIME on that card and
+    nothing else.  The value is printed on the ARMED line so the operator can
+    read the flip's expected critical path off it.
     """
     from sglang.srt.managers import weg2_memory_saver
 
-    return bool(weg2_memory_saver.PCIE_LOCK_SEPARATES_DIRECTIONS)
+    if not cards:
+        return False
+    return all(
+        weg2_memory_saver.pcie_lock_separates_directions(c.uuid, ratios=ratios or {})
+        for c in cards
+    )
 
 
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
                       evidence_dir: str, boot_stem: str, dry: bool,
-                      leg_form: str = "", pcie_directional: Optional[bool] = None) -> HostRingPlan:
+                      leg_form: str = "", pcie_directional: Optional[bool] = None,
+                      duplex_probe: str = "") -> HostRingPlan:
     """C20 + C18: solve the table, print L6, REFUSE by name, then arm the region.
 
     Order is load-bearing: the inequalities are checked and the per-card files
@@ -724,8 +771,31 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     :class:`HostRingPlan`.
     """
     leg_form = leg_form or _front_leg_form()
-    directional = _pcie_lock_directional() if pcie_directional is None else pcie_directional
-    plan = HostRingPlan(form=form)
+    # C12/C13 + A1-4: the per-card duplex ratio, SOLVED from the step-0 probe's
+    # own lines and published to the ranks as launcher output.  Printed per card
+    # BEFORE either group starts, beside H(c), because the split's benefit is
+    # per card and the flip's critical path is the card that does not get it.
+    duplex, duplex_why = ring_table.solve_duplex(duplex_probe) if duplex_probe else (None, "no --duplex-probe given")
+    plan = HostRingPlan(form=form, duplex=duplex)
+    if duplex is None:
+        plan.lines.append(
+            f"WEG2-PCIE-DUPLEX UNMEASURED: {duplex_why} -- NO card splits its "
+            "lock key this boot, so a sleep-D2H and a co-located wake-H2D "
+            "serialise on every card.  That is slower, never wrong: the "
+            "corridor that funds the ring is R5's, closed by the ring bitmap "
+            "and C14's device credit, not by the lock."
+        )
+    else:
+        plan.lines.extend(duplex.format_lines(cards, DUPLEX_GATE))
+        plan.duplex_env = duplex.env_map()
+    for ln in plan.lines:
+        log(ln)
+    logged = len(plan.lines)
+    directional = (
+        _pcie_lock_directional(duplex.ratios if duplex else {}, cards)
+        if pcie_directional is None
+        else pcie_directional
+    )
     table, reason = ring_table.solve(cards, evidence_dir, boot_stem or None)
     if table is None:
         plan.lines.append(
@@ -740,40 +810,39 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
             " that logged WEG2-CHUNK-BYTES / WEG2-FLIP-TAG lines and its own "
             "NVML -> CUDA ordinal map, or --ring-table-boot naming one."
         )
-        for ln in plan.lines:
+        for ln in plan.lines[logged:]:
             log(ln)
         return plan
     plan.table = table
     plan.lines.extend(table.format_l6())          # L6
-    for ln in plan.lines:
+    for ln in plan.lines[logged:]:
         log(ln)
     if form not in ("auto", "MAP_SHARED"):
-        plan.lines.append(
+        head = (
             f"W33 Weg2RingFormUnproven: --ring-form {form or 'none'} selects no "
-            "registration form, so the host ring is NOT armed and the OLD flip form "
-            "runs.  MAP_SHARED (cudaHostRegister on a /dev/shm MAP_SHARED file) is "
-            "the form the step-0 probe PROVED on this rig "
+            "registration form, so the host ring cannot be armed -- AND THERE IS NO "
+            "FALLBACK TO RUN INSTEAD (spec Amendment A1-3: the OLD flip form is "
+            "INFEASIBLE on this host budget, W20 at every rung on the default "
+            "table, boot weg2rg1).  This boot REFUSES, exit 2, before either group "
+            "starts.  MAP_SHARED (cudaHostRegister on a /dev/shm MAP_SHARED file) "
+            "is the form the step-0 probe PROVED on this rig "
             "(WEG2_BUILD_DECISIONS_0906 section 1p, 2026-09-07T23:13:23Z: all three "
             "gates pass, verdict BUILD-MAP_SHARED, duplex arm KEEP); it is the only "
             "form built, and the memfd candidate that probe retired is deleted."
         )
-        log(plan.lines[-1])
-        return plan
-    # TWO launch checks, ONE rule for what a failure does.  W32 is spec R5's
-    # corridor inequality -- the one that makes a blocking ring deadlock-free
-    # when the legs are GATHERED (spec C9).  W34 is the requirement of the form
-    # the front actually runs today: with the legs serialised per tag, S must
-    # acquire while W still holds its whole parked image, and no device credit
-    # can pay for that.  The second check exists because C1-C8 shipped without
-    # C9 although R10 says they are not separable; without it the ARMED line
-    # certifies an inequality for a flip form this tree does not contain, and
-    # the first flip wedges on every card.
+        plan.lines.append(head)
+        log(head)
+        raise Weg2RingFormUnproven(head)
+    # TWO launch checks, ONE rule for what a failure does: the ring cannot be
+    # armed, and per Amendment A1-3 there is nothing to fall back to, so the
+    # launcher REFUSES BY NAME and exits 2 -- whether or not a form was asked
+    # for explicitly.  The predecessor downgraded silently to "the OLD flip form
+    # runs (spec section 10.4)" unless --ring-form named a form; boot weg2rg1
+    # then died of W20 two steps later, having told the operator a fallback had
+    # run that never did.
     #
-    # A failure of EITHER check means the same thing -- the ring cannot be armed
-    # for this boot -- so both take the same exit: spec section 10.4's
-    # boot-level, all-or-nothing fallback to the OLD form, printed by name.
-    # Except when a form was named explicitly, where it RAISES: an explicit
-    # request that cannot be honoured is refused, never quietly downgraded.
+    # W32 is spec R5's corridor inequality -- the one that makes a blocking ring
+    # deadlock-free when the legs are GATHERED (spec C9).  It is checked always.
     checks = [
         ("W32 Weg2RingCreditRefused",
          "the R5 corridor inequality (H(c) >= image_W(c) - device_credit(c) + "
@@ -783,32 +852,38 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
          table.refusals(),
          ring_table.Weg2RingCreditRefused),
     ]
-    # W34 is keyed to BOTH halves of the hazard, from the two modules that own
-    # them.  FIX 2: keying it to the front's constant ALONE was a gate that
-    # opens at the wrong moment -- the day C9 sets FLIP_LEG_FORM to
-    # "interleave" the check would pass and the ring would arm while the PCIe
-    # lock, keyed on the card with no direction and held around the whole tag
-    # loop of either leg (spec R9), still makes the two co-located ranks
-    # mutually exclusive.  S would block in a bounded acquire WHILE HOLDING that
-    # lock, W's release RPC could make no progress on that card, and the exact
-    # deadlock W34 was invented to prevent would return with no gate in front of
-    # it.  C12/C13 (the direction split) are a SEPARATE slice from C9, so the
-    # two facts must be read separately and BOTH must say yes.
-    if leg_form != "interleave" or not directional:
-        why = (
-            f"front.FLIP_LEG_FORM is {leg_form!r}"
-            if leg_form != "interleave"
-            else "front.FLIP_LEG_FORM is 'interleave' but "
-                 "weg2_memory_saver.PCIE_LOCK_SEPARATES_DIRECTIONS is False, so the "
-                 "per-card PCIe lock still serialises the two legs on one card (R9)"
-        )
+    # W34 IS UNREACHABLE BY CONSTRUCTION ON THIS TIP, and it stays for exactly
+    # the case that construction cannot cover.  C9 made the gathered pair the
+    # ONLY leg form this module's front contains -- there is no branch left that
+    # produces "serial" -- so ``front.FLIP_LEG_FORM != "interleave"`` can only
+    # be true for a launcher running against a DIFFERENT front than the one it
+    # was built with (a stale worktree on PYTHONPATH, a partial rebase).  The
+    # serial requirement H(c) >= image_W(c) + max_tag_S(c) is what such a pair
+    # would need, it failed on 4 of 6 cases on this rig's own table (boot
+    # weg2rg1), and a blocking ring armed under it wedges the FIRST flip.  So
+    # the check remains and it REFUSES; what changed is that it can no longer be
+    # reached by any state of this tree, and that a raw traceback with exit 1 --
+    # which is how weg2rg1 actually saw it -- is no longer possible, because
+    # every arm here raises a Weg2RingRefused and cli() turns those into the one
+    # WEG2-LAUNCH REFUSED line and exit 2.
+    #
+    # The PCIe direction split is NOT part of this gate any more, and that is
+    # A1-4: the split's benefit is per card (5090 1.759, nvml2 1.687, nvml0
+    # 1.316 = below R17's gate), so requiring it globally would refuse a boot
+    # over a card that is merely SLOWER.  With the gathered legs the corridor is
+    # funded by the ring bitmap (R11) and by C14's device credit, neither of
+    # which is the lock; a card that keeps one key costs time on that card, and
+    # the WEG2-PCIE-DUPLEX lines above say which card that is.
+    if leg_form != "interleave":
         checks.append(
             ("W34 Weg2RingNeedsInterleave",
-             why + ", so the legs cannot be concurrently in flight on one card and "
-             "the serial requirement H(c) >= image_W(c) + max_tag_S(c) applies; it "
-             "fails on {n} (card x direction) case(s); S would block in acquire "
-             "holding the per-card lock, W's release would never be issued because "
-             "its RPC has not been sent, and the acquire budget would expire into "
+             f"front.FLIP_LEG_FORM is {leg_form!r}, not 'interleave' -- this "
+             "launcher is running against a front that does not gather its legs, "
+             "which no state of this tree produces (C9); the serial requirement "
+             "H(c) >= image_W(c) + max_tag_S(c) therefore applies and fails on "
+             "{n} (card x direction) case(s).  S would block in acquire holding "
+             "the per-card lock, W's release would never be issued because its "
+             "RPC has not been sent, and the acquire budget would expire into "
              "W31 -> group-fatal W4",
              table.serial_refusals(),
              ring_table.Weg2RingNeedsInterleave))
@@ -816,19 +891,16 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
         if not bad:
             continue
         head = (f"{name}: " + why.format(n=len(bad)) +
-                ".  The host ring is NOT armed and the OLD flip form runs "
-                "(spec section 10.4), BEFORE either group starts.")
+                ".  The host ring is NOT armed, and per spec Amendment A1-3 "
+                "there is NO fallback flip form to run on this host budget "
+                "(the OLD form refuses W20 at every rung on the default table, "
+                "boot weg2rg1) -- so this boot REFUSES by name and exits 2, "
+                "BEFORE either group starts.")
         plan.lines.append(head)
         plan.lines.extend(bad)
         for ln in plan.lines[-(len(bad) + 1):]:
             log(ln)
-        if form == "MAP_SHARED":
-            raise exc(head.replace("is NOT armed and the OLD flip form runs "
-                                   "(spec section 10.4)",
-                                   "was asked for explicitly with --ring-form "
-                                   "MAP_SHARED and cannot be armed")
-                      + "\n" + "\n".join(bad))
-        return plan
+        raise exc(head + "\n" + "\n".join(bad))
     plan.epoch = int(time.time())
     plan.dir = f"{HOST_RING_DIR}-{tag}"
     if not dry:
@@ -853,10 +925,14 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     plan.armed = True
     plan.lines.append(
         f"WEG2-HOST-RING ARMED form={plan.form} leg_form={leg_form} "
-        f"pcie_lock_directional={directional} "
+        f"pcie_lock_directional_on_every_card={directional} "
         f"epoch={plan.epoch} dir={plan.dir} "
         f"Sigma H={table.total_h_bytes // ring_table.MIB} MiB "
         f"Sigma span1={table.total_span1_bytes // ring_table.MIB} MiB granule=2 MiB "
+        f"register_est_ms={int(table.total_span1_bytes / float(2**30) * 44)} "
+        "(38-49 ms/GiB measured on the step-0 probe at ONE size point, 4 GiB -- "
+        "an extrapolation, and it is a LAUNCH-moment charge: span 1 is "
+        "registered at P's first pause, R7) "
         f"-- provenance: {table.provenance()}"
     )
     for ln in plan.lines[-(len(table.cards) + 1):]:
@@ -883,6 +959,15 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         for key in ("TMS_HOST_RING_DIR", "TMS_HOST_RING_MAP", "TMS_HOST_RING_EPOCH",
                     "TMS_HOST_RING_FORM"):
             env.pop(key, None)
+    # C12/C13: the per-card duplex ratio, same class of variable and the same
+    # rule -- launcher OUTPUT solved from a measured file, never operator input.
+    # Absent means no card splits its PCIe lock key, which is the conservative
+    # direction; it is popped rather than left inherited so a stale value from
+    # the launcher's own environment can never open a split nobody measured.
+    if ring is not None and ring.duplex_env:
+        env["SGLANG_WEG2_PCIE_DUPLEX"] = ring.duplex_env
+    else:
+        env.pop("SGLANG_WEG2_PCIE_DUPLEX", None)
     # #1233 one-backup flip: chunked weights tags (weg2_memory_saver.py) and
     # the patched torch_memory_saver preload hook (tms_csrc/PATCH.md).
     if chunk_layers > 0 and chunk_count > 0:
@@ -1077,15 +1162,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "(WEG2_BUILD_DECISIONS_0906 section 1p); it is the only form built, "
              "and the memfd candidate is deleted because that probe retired it. "
              "'auto' (the default) arms it when the launch checks fund it, and "
-             "otherwise prints the failing check by name (W32 / W34) and runs the "
-             "OLD flip form -- spec section 10.4's boot-level, all-or-nothing "
-             "fallback. Naming MAP_SHARED explicitly turns those checks into a "
-             "RAISE instead: an explicit request is never quietly downgraded. "
-             "'none' never arms. Never a size, never a knob: H and both spans are "
-             "solved from the previous boot's own lines.",
+             "otherwise prints the failing check by name (W32 / W34) and REFUSES "
+             "the boot, exit 2 -- spec Amendment A1-3: the OLD flip form is "
+             "infeasible on this host budget, so an un-armed ring has nothing to "
+             "fall back to. 'none' never arms and therefore never launches. Never "
+             "a size, never a knob: H and both spans are solved from the previous "
+             "boot's own lines.",
     )
     ap.add_argument("--evidence-dir", default=EVIDENCE_DIR,
                     help="where ring_table reads the previous boot's logs from")
+    ap.add_argument("--duplex-probe", default=DUPLEX_PROBE_DEFAULT,
+                    help="C12/C13 + A1-4: the step-0 probe RECORD the per-card PCIe "
+                         "duplex ratio is solved from. A measured FILE, never a "
+                         "number: the launcher parses its 'PROBE granule ... ratio=' "
+                         "rows per card UUID, prints one WEG2-PCIE-DUPLEX line per "
+                         "card with the R17 gate beside it, and publishes the table "
+                         "to the ranks as SGLANG_WEG2_PCIE_DUPLEX. An unreadable or "
+                         "rowless file means NO card splits its lock key")
     ap.add_argument("--ring-table-boot", default="",
                     help="pin the ring table to ONE boot instead of the newest usable "
                          "one. Matched as a SUBSTRING of the log stem, so the boot TAG "
@@ -1132,7 +1225,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from sglang.srt.managers.weg2_memory_saver import weights_family_tags
     weights_tags = weights_family_tags(chunk_count)
     log(f"WEG2-WEIGHT-CHUNKS N={chunk_count} tags (layers per chunk {chunk_layers} of {n_layers}; family {weights_tags}); "
-        "flip = src.pause(kv) -> per tag: src.pause(w_k), dst.resume(w_k) -> dst.resume(kv); host holds one image + one chunk")
+        "flip (C9, gathered legs) = src.pause(kv) -> ONE src.release(family) and ONE dst.resume(family) "
+        "in flight together -> dst.resume(kv); the host holds ONE image per card (H(c) = max_g image_g(c)) "
+        "and dst's per-tag releases fund src's acquires inside it")
     tms_so = "" if dry else build_tms_preload(tree, ns.venv, log)
     state.weight_chunks = chunk_count
     state.tms_so = tms_so
@@ -1141,7 +1236,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # per-card region, both BEFORE either group starts.  The table it is solved
     # from also carries the ledger's host weights term, so this runs first.
     ring_plan = prepare_host_ring(cards, log, ns.tag, ns.ring_form, ns.evidence_dir,
-                                  ns.ring_table_boot, dry)
+                                  ns.ring_table_boot, dry, duplex_probe=ns.duplex_probe)
     state.ring_lines = ring_plan.lines
     state.ring_form = ring_plan.form if ring_plan.armed else "none (OLD flip form)"
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
@@ -1406,6 +1501,15 @@ def teardown(path: str) -> int:
         print(f"host ring dir {ring_dir} removed")
     print(subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader"], capture_output=True, text=True).stdout)
     return 0
+
+
+class Weg2RingFormUnproven(ring_table.Weg2RingRefused):
+    """W33: ``--ring-form`` named no form this tree has a proven build for.
+
+    A subclass of the ring's own refusal base, so it inherits ``cli()``'s
+    handler -- the one named line and exit 2 -- without being enumerated
+    anywhere (FIX 2's lesson, applied to the new member rather than repeated).
+    """
 
 
 #: Every refusal class that must leave this launcher as the ONE named line and

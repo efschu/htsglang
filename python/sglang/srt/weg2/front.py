@@ -79,24 +79,66 @@ SPAN_LRU = 512
 SLEEP_TAGS = ["kv_cache", "weights"]
 KV_TAG = "kv_cache"
 
+MIB = 1024 * 1024
+
 #: HOW THE FLIP ORDERS ITS TWO LEGS -- the one fact the host-ring launch check
 #: needs and cannot infer, declared HERE because this file is what does it.
 #:
-#: ``"serial"`` is the #1233 one-backup interleave below (:meth:`Weg2Front.flip`
-#: step 3): per weights tag, ``S.pause(tag)`` completes BEFORE ``W.resume(tag)``
-#: is even sent.  S therefore has to acquire host bytes while W still holds its
-#: whole parked image, so the host requirement is ``H(c) >= image_W(c) +
-#: max_tag_S(c)`` -- NOT spec R5's corridor inequality, which assumes the two
-#: legs are concurrently in flight (``asyncio.gather``, spec C9) and lets W's
-#: releases fund S's acquires.  Arming a blocking ring sized to R5 under this
-#: serial order deadlocks at the first flip, which is exactly what R10 means by
-#: "C is not separable"; the launcher checks the SERIAL requirement while this
-#: constant says ``"serial"`` and refuses by name (W34) rather than wedging.
+#: ``"interleave"`` (C9, spec Amendment A1-1): :meth:`Weg2Front.flip` step 3
+#: sends ONE ``/release_memory_occupation`` to S and ONE
+#: ``/resume_memory_occupation`` to W, both carrying the WHOLE weights family,
+#: in a single :func:`asyncio.gather`.  The two legs are therefore concurrently
+#: in flight, which is the premise of spec R5's corridor inequality: W's per-tag
+#: releases are what fund S's acquires, so the host never has to hold both whole
+#: images and ``H(c) = max_g image_g(c)`` suffices.
 #:
-#: C9 flips this to ``"interleave"`` in the same commit that replaces the loop
-#: below with one gathered RPC pair per group per leg.  The two must move
-#: together, which is why there is ONE constant and no second copy.
-FLIP_LEG_FORM = "serial"
+#: The predecessor value ``"serial"`` -- one RPC per tag, ``S.pause(tag)``
+#: completing before ``W.resume(tag)`` was even sent -- required the strictly
+#: larger ``H(c) >= image_W(c) + max_tag_S(c)``, and boot weg2rg1 (2026-09-08
+#: 01:2xZ) REFUSED the ring by name on 4 of 6 (card x direction) cases under it
+#: (W34).  There is no longer a code path in this module that produces it: the
+#: gathered pair below is the only leg form, and the launcher's W34 arm survives
+#: only as the assertion that a launcher which finds this constant saying
+#: anything else refuses instead of arming a ring the flip cannot walk.
+#:
+#: This constant is READ by ``weg2/launcher.py`` and must never be copied: it is
+#: the single bookkeeping of the fact, and its value changing is what a launch
+#: check is allowed to key on.
+FLIP_LEG_FORM = "interleave"
+
+
+def completed_tags(body: str) -> Tuple[List[str], Dict[str, List[float]], str]:
+    """``(tags this group completed, the per-tag map, the critical-path note)``.
+
+    C10/C17: the group's answer now carries ``per_tag`` -- ``{tag: [bytes, ms]}``
+    reduced over the group's ranks by the fence's own ``all_gather_object``, and
+    ``critical_path``, the rank and card that took longest.  A W4 that says only
+    "HTTP 500" cannot tell the operator whether the family was half-parked; the
+    tag list is what makes the "VRAM state undefined" sentence checkable.
+
+    DENOMINATOR, stated because this is a population figure: the list is the
+    tags the ANSWERING group reported, which with a gathered leg is every tag of
+    the family it finished, and it is EMPTY -- never "none completed" -- when the
+    body is not the JSON this tree emits (an upstream error page, a connection
+    error string from :meth:`Weg2Front.rpc`, or a build without C17).  The caller
+    prints the reason rather than a bare empty list.
+    """
+    try:
+        payload = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return [], {}, "no per-tag report (the answer is not JSON)"
+    if not isinstance(payload, dict):
+        return [], {}, "no per-tag report (the answer is not an object)"
+    per_tag = payload.get("per_tag")
+    crit = payload.get("critical_path") or ""
+    if not isinstance(per_tag, dict) or not per_tag:
+        return [], {}, crit or "no per-tag report in the answer (C17 field empty)"
+    clean = {
+        str(k): [float(v[0]), float(v[1])]
+        for k, v in per_tag.items()
+        if isinstance(v, (list, tuple)) and len(v) >= 2
+    }
+    return sorted(clean), clean, str(crit)
 
 
 class Weg2Stop(Exception):
@@ -744,6 +786,19 @@ class Front:
         except Exception as e:  # noqa: BLE001
             return 0, f"{type(e).__name__}: {e}"
 
+    async def timed_rpc(self, g: Group, path: str, body: Optional[dict],
+                        timeout: float) -> Tuple[int, str, float]:
+        """:meth:`rpc` plus the wall time of THIS leg alone.
+
+        C9 gathers the two legs, so the flip's own ``interleave`` wall clock is
+        no longer the sum of the parts and neither leg's cost can be read off
+        it.  Each leg times itself; the sum and the wall are then two different
+        measured quantities and L5 prints both plus their difference (spec C11).
+        """
+        t0 = time.perf_counter()
+        code, text = await self.rpc(g, path, body, timeout)
+        return code, text, (time.perf_counter() - t0) * 1000
+
     async def drain(self, g: Group) -> bool:
         t0 = time.time()
         while g.outstanding:
@@ -789,13 +844,40 @@ class Front:
                          f"{wv}: front ledger {sorted(S.outstanding)} vs rank({src}) flush_cache -> {msg[:400]!r}")
             return
         t_q = time.time()
-        # 3. THE ONE-BACKUP INTERLEAVE (#1233, record 1h): src.pause(kv_cache),
-        # then per weights tag k: src.pause(w_k) -> dst.resume(w_k) (the
-        # patched saver frees dst's chunk image on resume), then
-        # dst.resume(kv_cache).  The host holds at most ONE full image (the
-        # dormant group's) plus ONE chunk at any moment.  Serial by
-        # construction: the D2H of chunk k+1 never overlaps the H2D of chunk
-        # k (the rank-side PCIe lock would serialise them anyway).
+        # 3. THE GATHERED LEGS (C9, spec Amendment A1-1).  src.pause(kv_cache)
+        # first, then ONE /release_memory_occupation to S and ONE
+        # /resume_memory_occupation to W, both carrying the WHOLE weights
+        # family, issued together and awaited together; dst.resume(kv_cache)
+        # last.
+        #
+        # WHAT ORDERS THE LEGS, now that this driver no longer does.  The old
+        # per-tag loop ordered them here, at the cost of the strictly larger
+        # host requirement H(c) >= image_W(c) + max_tag_S(c) -- which boot
+        # weg2rg1 refused by name on 4 of 6 (card x direction) cases (W34).
+        # With both legs in flight the ordering is enforced where the bytes
+        # actually are, by two mechanisms that are checked at launch, not
+        # assumed here:
+        #
+        #   * THE RING BITMAP (spec R11, tms_csrc/host_ring.cpp).  A granule is
+        #     TAKEN from W's pause until ring_->release() runs, strictly after
+        #     the leg's cudaStreamSynchronize; acquire() only ever returns bits
+        #     that are 0.  So S can never take host bytes whose H2D is still in
+        #     flight, and S's blocking acquire is funded by W's releases as they
+        #     land -- the corridor walk of R5, whose inequality the launcher
+        #     checks per card per direction BEFORE either group starts (W32).
+        #   * THE VRAM CREDIT (C14, weg2_memory_saver.vram_credit).  The mirror
+        #     of the same argument on the DEVICE axis: W may need device bytes
+        #     that only S's release frees.  S publishes the bytes it released
+        #     per tag and a leg_complete flag; W waits on the counter and
+        #     REFUSES BY NAME (W35/W30) when S's leg finishes without ever
+        #     funding it, instead of turning into a CUDA OOM or a hang.
+        #
+        # And the per-card PCIe lock, which used to serialise the two legs into
+        # each other whatever this driver did, now keys on <uuid>.<d2h|h2d>
+        # (C12/C13) -- on the cards whose MEASURED duplex ratio earns it.  The
+        # x4-linked card measured 1.316 and keeps the single key, so on THAT
+        # card the two legs still serialise by design; that is a per-card
+        # property printed by the launcher, never a global assumption.
         sleep_ms = 0.0
         wake_ms = 0.0
         chunk_recs: List[dict] = []
@@ -805,22 +887,61 @@ class Front:
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
             return
-        for tag in self.weights_tags:
-            t0 = time.time()
-            code, body = await self.rpc(S, "/release_memory_occupation", {"tags": [tag]}, RPC_TIMEOUT_S)
-            t1 = time.time()
-            if code != 200:
-                self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {tag}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
-                return
-            code, body = await self.rpc(D, "/resume_memory_occupation", {"tags": [tag]}, RPC_TIMEOUT_S)
-            t2 = time.time()
-            if code != 200:
-                self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {tag}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
-                return
-            sleep_ms += (t1 - t0) * 1000
-            wake_ms += (t2 - t1) * 1000
-            chunk_recs.append({"tag": tag, "sleep_ms": round((t1 - t0) * 1000), "wake_ms": round((t2 - t1) * 1000)})
-            logger.info("WEG2-FLIP-CHUNK epoch=%d tag=%s %s.pause=%d ms %s.resume=%d ms", self.epoch, tag, src, chunk_recs[-1]["sleep_ms"], dst, chunk_recs[-1]["wake_ms"])
+        family = list(self.weights_tags)
+        t_gather0 = time.perf_counter()
+        (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
+            self.timed_rpc(S, "/release_memory_occupation", {"tags": family}, RPC_TIMEOUT_S),
+            self.timed_rpc(D, "/resume_memory_occupation", {"tags": family}, RPC_TIMEOUT_S),
+        )
+        legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
+        s_done, s_per_tag, s_crit = completed_tags(s_body)
+        w_done, w_per_tag, w_crit = completed_tags(w_body)
+        sleep_ms += s_ms
+        wake_ms += w_ms
+        if s_code != 200 or w_code != 200:
+            # C10.  Both legs were in flight, so BOTH groups' completion state
+            # is part of the fault and both are named -- "VRAM state undefined"
+            # is now a statement about a whole family on each side, and the tag
+            # lists are what make it checkable rather than a slogan.
+            which = []
+            if s_code != 200:
+                which.append(f"sleep({src}, family) HTTP {s_code}: {s_body[:400]!r}")
+            if w_code != 200:
+                which.append(f"wake({dst}, family) HTTP {w_code}: {w_body[:400]!r}")
+            self.do_stop(
+                "W4 Weg2WakeRefused",
+                "; ".join(which)
+                + f" -- gathered legs (C9), family={family}; "
+                + f"{src} completed {s_done or '[]'} ({s_crit}); "
+                + f"{dst} completed {w_done or '[]'} ({w_crit}); "
+                + "VRAM state undefined on BOTH sides, no retry, "
+                + "recovery = teardown + relaunch",
+            )
+            return
+        if not s_per_tag and not w_per_tag:
+            # DENOMINATOR: no group reported per-tag, so there are no chunk
+            # records to print.  Printing zeros here would read as "this tag
+            # moved nothing", which is the opposite of "nobody measured".
+            logger.info(
+                "WEG2-FLIP-CHUNK epoch=%d SUPPRESSED for all %d tags: neither group "
+                "returned a per-tag report (%s / %s) -- absence, not zero",
+                self.epoch, len(family), s_crit, w_crit,
+            )
+        for tag in family if (s_per_tag or w_per_tag) else ():
+            rec = {
+                "tag": tag,
+                "sleep_ms": round(s_per_tag.get(tag, [0.0, 0.0])[1]),
+                "wake_ms": round(w_per_tag.get(tag, [0.0, 0.0])[1]),
+                "sleep_mib": round(s_per_tag.get(tag, [0.0, 0.0])[0] / MIB),
+                "wake_mib": round(w_per_tag.get(tag, [0.0, 0.0])[0] / MIB),
+            }
+            chunk_recs.append(rec)
+            logger.info(
+                "WEG2-FLIP-CHUNK epoch=%d tag=%s %s.pause=%d ms %d MiB %s.resume=%d ms %d MiB "
+                "(source: the group's own per-tag report, NOT a front-side RPC boundary -- "
+                "the legs are gathered, so the front no longer sees a tag edge)",
+                self.epoch, tag, src, rec["sleep_ms"], rec["sleep_mib"], dst, rec["wake_ms"], rec["wake_mib"],
+            )
         t_s = time.time()
         # 4. measure D_c(src); W19 for D at its first sleep
         pids = _session_pids(S.sid) if S.sid else set()
@@ -846,16 +967,41 @@ class Front:
         self.epoch += 1
         self.admit_d = True
         self.state = "serving"
+        # C11 / L5.  interleave_ms IS NOT sleep+wake any more, and saying so is
+        # the point of the line: with the legs gathered the two are different
+        # measured quantities and their difference is the achieved overlap.
+        #   sleep_ms / wake_ms  -- each leg's OWN wall time, timed_rpc
+        #   legs_wall_ms        -- the wall time of the gather, both in flight
+        #   overlap_ms          -- (sleep leg + wake leg) - gather wall, i.e.
+        #                          the part of the shorter leg the longer one
+        #                          hid.  Its denominator is the SHORTER leg:
+        #                          100 % means the shorter leg cost nothing in
+        #                          wall time, and it can never exceed that.
+        # Zero overlap is a READING, not a fault: on a card whose measured
+        # duplex ratio did not earn the direction split (the x4-linked 3080,
+        # 1.316) the per-card PCIe lock serialises the legs by design.
+        legs_ms = [("sleep/" + src, s_ms, s_crit), ("wake/" + dst, w_ms, w_crit)]
+        crit_leg, crit_ms, crit_note = max(legs_ms, key=lambda x: x[1])
+        overlap_ms = max(0.0, s_ms + w_ms - legs_wall_ms)
+        overlap_pct = 100.0 * overlap_ms / max(1.0, min(s_ms, w_ms))
         rec = {"epoch": self.epoch, "sleep": src, "wake": dst, "drain_quiesce_ms": round((t_q - t_flip0) * 1000),
                "sleep_ms": round(sleep_ms), "wake_ms": round(wake_ms), "flip_ms": round((t_w - t_flip0) * 1000),
                "interleave_ms": round((t_s - t_q) * 1000), "chunks": chunk_recs,
+               "legs_wall_ms": round(legs_wall_ms), "sleep_leg_ms": round(s_ms), "wake_leg_ms": round(w_ms),
+               "overlap_ms": round(overlap_ms), "overlap_pct": round(overlap_pct, 1),
+               "critical_path": f"{crit_leg} {crit_note}",
                "dc_mib": dc, "t": time.time()}
         self.flip_log.append(rec)
         self.counters["flips"] += 1
-        logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms (sum of %d %s RPCs) wake=%d ms (sum of %d %s RPCs) "
-                    "interleave=%d ms flip_total=%d ms weights_tags=%d dc=%s",
-                    rec["epoch"], src, dst, rec["drain_quiesce_ms"], rec["sleep_ms"], len(self.weights_tags) + 1, src,
-                    rec["wake_ms"], len(self.weights_tags) + 1, dst, rec["interleave_ms"], rec["flip_ms"], len(self.weights_tags), dc)
+        logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms (kv RPC + the %s leg of the gathered pair) "
+                    "wake=%d ms (the %s leg + kv RPC) "
+                    "interleave=%d ms (NOT sleep+wake: the legs overlap -- gather wall %d ms against %d + %d ms of legs) "
+                    "overlap=%d ms (%.0f%% of the shorter leg) critical_path=%s "
+                    "flip_total=%d ms weights_tags=%d dc=%s",
+                    rec["epoch"], src, dst, rec["drain_quiesce_ms"], rec["sleep_ms"], src,
+                    rec["wake_ms"], dst, rec["interleave_ms"], rec["legs_wall_ms"],
+                    rec["sleep_leg_ms"], rec["wake_leg_ms"], rec["overlap_ms"], rec["overlap_pct"],
+                    rec["critical_path"], rec["flip_ms"], len(self.weights_tags), dc)
 
     async def controller(self) -> None:
         sem = asyncio.Semaphore(8)

@@ -136,6 +136,40 @@ _COMMUNICATOR_SPECS = [
 ]
 
 
+def _merge_memory_occupation_reports(results) -> Optional[Dict[str, Any]]:
+    """C17: the per-tag report of a release/resume, merged over the engines.
+
+    ``None`` -- and therefore an unchanged, bodyless answer on the wire -- when
+    no engine filled the field, which is every path except the Weg-2 flip.  A
+    stock ``/release_memory_occupation`` is byte-identical to what it was.
+
+    Merge rule and its denominator: over engines (dp ranks), a tag's cost is the
+    MAXIMUM, because the flip is finished when the SLOWEST holder of that tag is
+    finished -- an average would price a barrier by its mean, which is the
+    ms/round fallacy the campaign records. Byte sums are equal across engines by
+    construction (same shard shape) and the max is a no-op on them; taking the
+    max there too keeps ONE rule rather than two.
+    """
+    per_tag: Dict[str, List[float]] = {}
+    crit: List[str] = []
+    for r in results or ():
+        rep = getattr(r, "per_tag", None)
+        if isinstance(rep, dict):
+            for tag, pair in rep.items():
+                if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                    continue
+                have = per_tag.get(str(tag))
+                cand = [float(pair[0]), float(pair[1])]
+                if have is None or cand[1] > have[1]:
+                    per_tag[str(tag)] = cand
+        note = getattr(r, "critical_path", None)
+        if note:
+            crit.append(str(note))
+    if not per_tag and not crit:
+        return None
+    return {"per_tag": per_tag, "critical_path": "; ".join(crit)}
+
+
 class TokenizerControlMixin:
     """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
     profile, internal state, etc.) -- everything that talks to the scheduler via
@@ -922,7 +956,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
+        results = await self.release_memory_occupation_communicator(obj)
+        return _merge_memory_occupation_reports(results)
 
     async def resume_memory_occupation(
         self: TokenizerManager,
@@ -930,7 +965,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
+        results = await self.resume_memory_occupation_communicator(obj)
+        return _merge_memory_occupation_reports(results)
 
     async def check_weights(
         self: TokenizerManager,

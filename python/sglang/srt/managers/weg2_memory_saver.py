@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import json
 import logging
 import os
 import re
@@ -55,22 +56,29 @@ DEFAULT_PCIE_LOCK_DIR = "/dev/shm"
 #: has to guess which one a path refers to.
 PCIE_LOCK_PREFIX = "weg2-pcie-serialize"
 
-#: Does the lock KEY separate the two directions?  Published here because this
-#: module owns the key, and read by the launcher's W34 gate -- the launch check
-#: that decides whether a BLOCKING host ring may arm needs both halves of the
-#: same hazard, and this is the rank-local half.
-#:
-#: False, and spec R9 says exactly why it is false today: the key is the card
-#: UUID alone and the lock is held around the WHOLE tag loop of either leg
-#: (weight_updater.py sleep-D2H / wake-H2D), so the two co-located ranks on one
-#: card mutually exclude each other completely.  Under that key a blocking
-#: acquire by the sleeping rank cannot be funded by the waking rank's release on
-#: the same card -- the release RPC can make no progress while the acquire holds
-#: the lock -- and the acquire budget expires into W31 -> group-fatal W4.  The
-#: direction split that flips this to True is spec C12/C13, the NEXT slice; the
-#: constant exists so the gate reads the fact from its owner instead of
-#: inferring it from ``front.FLIP_LEG_FORM``, which is only the OTHER half.
-PCIE_LOCK_SEPARATES_DIRECTIONS = False
+#: C12: WHERE THE PER-CARD DUPLEX RATIO COMES FROM.  Launcher output, never
+#: operator input (spec R19), in the same shape as ``TMS_HOST_RING_MAP``:
+#: ``<uuid>=<ratio>,<uuid>=<ratio>,...``.  The launcher solves it from the
+#: step-0 probe's own measured lines (``ring_table.solve_duplex``) and every
+#: rank reads only its OWN card's row.  Absent means "not measured on this
+#: boot", and then no card splits -- the conservative direction, because a
+#: split that is not earned re-creates exactly the overlap R9 forbids.
+PCIE_DUPLEX_ENV = "SGLANG_WEG2_PCIE_DUPLEX"
+
+#: Spec R17's gate, verbatim: "if concurrent aggregate < 1.5x serial, S1's
+#: direction split is a null".  A threshold ruled by the spec, not a size
+#: guessed here -- and the numbers it grades are measured, per card.  The
+#: step-0 probe of 2026-09-07T23:13Z measured 1.759 on the 5090 (nvml1) and
+#: 1.687 on nvml2, both DUPLEX-OK, against 1.316 on nvml0 (the x4 slot) which
+#: is DUPLEX-NULL and therefore keeps the single key and keeps serialising.
+#: Amendment A1-4: the benefit is PER CARD and the flip's critical path is
+#: exactly the card that does not get it.
+DUPLEX_SPLIT_MIN_RATIO = 1.5
+
+#: The two direction tokens the key may carry.  ``d2h`` is a sleep's copy to the
+#: host, ``h2d`` a wake's copy back -- named from the DEVICE's point of view,
+#: which is the direction the PCIe link sees.
+PCIE_DIRECTIONS = ("d2h", "h2d")
 
 #: A sleep-D2H or wake-H2D of a 27 GiB shard runs ~2.1 s measured (campaign (a),
 #: 2026-09-06, n=9).  The default deadline allows a full transfer of the sibling
@@ -249,10 +257,76 @@ def _sanitize(uuid: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", uuid)
 
 
-def pcie_lock_path(nvml_uuid: str, *, lock_dir: Optional[str] = None) -> str:
-    """Path of the PCIe serialisation lock for one physical GPU."""
+def duplex_ratios(published: Optional[str] = None) -> Dict[str, float]:
+    """``{card uuid: measured duplex ratio}`` as the launcher published it.
+
+    Parsed permissively and REPORTED as empty when nothing was published -- an
+    unparsable row is dropped rather than defaulted, because a defaulted ratio
+    is exactly the hand number spec section 10.3 forbids and it would open the
+    split on a card nobody measured.
+    """
+    raw = os.environ.get(PCIE_DUPLEX_ENV, "") if published is None else published
+    out: Dict[str, float] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        uuid, _, value = item.partition("=")
+        try:
+            out[uuid.strip()] = float(value)
+        except ValueError:
+            continue
+    return out
+
+
+def pcie_lock_separates_directions(
+    nvml_uuid: str, *, ratios: Optional[Dict[str, float]] = None
+) -> bool:
+    """Does the lock KEY separate the two directions ON THIS CARD?
+
+    THE FACT LIVES WITH THE KEY (review nb1 of the ring fix-2 tip): this used to
+    be a hand-typed module boolean sitting beside :func:`pcie_lock_path`, which
+    had no direction parameter at all -- so the launcher's gate read a constant
+    while the function that owns the key could not have honoured it.  Now the
+    key is derived from the same answer this returns, and the launcher asks per
+    card.
+
+    True only where the card's OWN measured concurrent/serial ratio reaches
+    spec R17's gate.  On a card below it the two directions keep one key and a
+    sleep-D2H still excludes a co-located wake-H2D -- which is not a fallback
+    but the measured truth of that slot (nvml0, x4, 1.316: the split buys 32 %
+    where R17 asks for 50 %, and the flip's critical path is that card).
+    """
+    table = duplex_ratios() if ratios is None else ratios
+    ratio = table.get(nvml_uuid)
+    return ratio is not None and ratio >= DUPLEX_SPLIT_MIN_RATIO
+
+
+def pcie_lock_path(
+    nvml_uuid: str,
+    *,
+    lock_dir: Optional[str] = None,
+    direction: Optional[str] = None,
+    ratios: Optional[Dict[str, float]] = None,
+) -> str:
+    """Path of the PCIe serialisation lock for one physical GPU.
+
+    C12: the key is ``<uuid>.<d2h|h2d>`` on a card whose measured duplex ratio
+    earns the split, and the bare ``<uuid>`` everywhere else -- so two holders
+    of the SAME direction on one card still serialise (that is one link
+    direction and it is genuinely shared), while opposite directions stop
+    excluding each other on the cards where the metal says they need not.
+    """
     directory = lock_dir or os.environ.get(PCIE_LOCK_DIR_ENV, DEFAULT_PCIE_LOCK_DIR)
-    return os.path.join(directory, f".{PCIE_LOCK_PREFIX}-{_sanitize(nvml_uuid)}.lock")
+    key = _sanitize(nvml_uuid)
+    if direction:
+        if direction not in PCIE_DIRECTIONS:
+            raise ValueError(
+                f"direction must be one of {PCIE_DIRECTIONS}, not {direction!r}"
+            )
+        if pcie_lock_separates_directions(nvml_uuid, ratios=ratios):
+            key = f"{key}.{direction}"
+    return os.path.join(directory, f".{PCIE_LOCK_PREFIX}-{key}.lock")
 
 
 def _resolve_uuid(nvml_uuid: Optional[str]) -> str:
@@ -303,6 +377,8 @@ def pcie_transfer_lock(
     timeout_s: float = DEFAULT_PCIE_LOCK_TIMEOUT_S,
     poll_s: float = 0.01,
     label: str = "transfer",
+    direction: Optional[str] = None,
+    ratios: Optional[Dict[str, float]] = None,
 ) -> Iterator[str]:
     """Serialise host<->device transfers per PHYSICAL GPU.
 
@@ -314,9 +390,14 @@ def pcie_transfer_lock(
     ``flock`` is held on this open file description only, so two threads or two
     processes contend correctly and the lock dies with the holder.  Bounded:
     the deadline's expiry raises, it never waits longer.
+
+    C12: pass ``direction`` (``"d2h"`` on a sleep, ``"h2d"`` on a wake) and the
+    key splits ON THE CARDS WHOSE MEASURED DUPLEX RATIO EARNS IT -- see
+    :func:`pcie_lock_path`.  Passing no direction keeps the old single key,
+    which is what every caller that is not a flip leg wants.
     """
     uuid = _resolve_uuid(nvml_uuid)
-    path = pcie_lock_path(uuid, lock_dir=lock_dir)
+    path = pcie_lock_path(uuid, lock_dir=lock_dir, direction=direction, ratios=ratios)
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -346,17 +427,263 @@ def pcie_transfer_lock(
             yield path
         finally:
             held_s = time.perf_counter() - t_held
-            logger.debug(
-                "[weg2 pcie] %s on %s: waited %.3fs, held %.3fs (denominator: "
-                "one physical GPU, all processes on this host)",
+            logger.info(
+                "WEG2-PCIE-LOCK %s on %s dir=%s key=%s waited=%.3fs held=%.3fs "
+                "(denominator: one physical GPU, all processes on this host; "
+                "a key WITHOUT a direction suffix means this card did not reach "
+                "R17's 1.5x gate and both directions share it by measurement)",
                 label,
                 uuid,
+                direction or "none",
+                os.path.basename(path),
                 waited_s,
                 held_s,
             )
             fcntl.flock(handle, fcntl.LOCK_UN)
     finally:
         handle.close()
+
+
+# ---------------------------------------------------------------------------
+# C14 -- the per-card VRAM credit (spec section 4 C14, F5)
+# ---------------------------------------------------------------------------
+
+
+class Weg2FlipRankDisagree(RuntimeError):
+    """W29 -- one rank of the group could not complete this leg, so NO rank may.
+
+    The law (memory ``raenge-nie-uneins``, spec section 10.5): a state-changing
+    decision is taken once for the whole group, and a detected disagreement is a
+    STOP, never a compensation.  The flip's legs are exactly that shape -- the
+    front reads one rank's HTTP answer as "the GROUP moved these pages" and
+    immediately moves the OTHER group's pages onto the same cards, so a leg that
+    succeeded on two ranks of three is worse than one that failed on all three.
+
+    Raised on EVERY rank, with the failing rank and tag named, from the ok-bit
+    gather that spec C15 puts AFTER the existing ``monitored_barrier`` (R15:
+    gloo's ``all_gather_object`` has no timeout of its own, so the barrier --
+    which NAMES a non-joiner -- must run first).
+    """
+
+
+class Weg2VramCreditRefused(RuntimeError):
+    """W35 -- the waking rank needs device bytes the sleeping rank will not free.
+
+    NAMED TWICE ON PURPOSE.  Spec section 6 lists this refusal as ``W30
+    Weg2VramCreditRefused``; the builder briefing of 2026-09-08 renames it
+    ``W35``.  It is ONE refusal, and both codes appear once each in the message
+    so that section 9.3's trap-safe count finds it under either name and neither
+    count is doubled.
+    """
+
+
+#: Deliberately a THIRD name beside ``weg2-pcie-serialize`` (this module) and
+#: ``weg2-l2-`` (the host ring): three mechanisms, three prefixes, so a path in
+#: a log never has to be guessed at.
+VRAM_CREDIT_PREFIX = "weg2-vram-credit"
+VRAM_CREDIT_DIR_ENV = "SGLANG_WEG2_VRAM_CREDIT_DIR"
+
+
+def vram_credit_path(nvml_uuid: str, *, credit_dir: Optional[str] = None) -> str:
+    """Path of the per-card credit counter.  Keyed exactly like the PCIe lock."""
+    directory = credit_dir or os.environ.get(
+        VRAM_CREDIT_DIR_ENV, os.environ.get(PCIE_LOCK_DIR_ENV, DEFAULT_PCIE_LOCK_DIR)
+    )
+    return os.path.join(directory, f".{VRAM_CREDIT_PREFIX}-{_sanitize(nvml_uuid)}.json")
+
+
+class VramCredit:
+    """The device-side mirror of the host ring's bitmap, per physical GPU.
+
+    WHY IT EXISTS.  C9 puts both flip legs in flight at once, so on a card with
+    two co-located ranks the waking rank may need device bytes that only the
+    sleeping rank's release frees.  The host side of that corridor is funded by
+    the ring's own bitmap (spec R11).  The device side has no such structure:
+    without this counter the waking rank either wins the race or dies of a CUDA
+    OOM, which is a rank-local silent failure (spec section 10.5).
+
+    THE PREDICATE IS THE PEER'S OWN LEG, NOT A CLOCK (spec section 10.9, no new
+    timeout constant).  S publishes what it released, tag by tag, and marks
+    ``leg_complete`` when its whole leg is done; W waits until the credit covers
+    what it needs, and the moment S's leg is complete WITHOUT that cover the
+    answer is known and W refuses by name.  The absolute bound is the caller's
+    existing budget -- the group fence's -- passed in, never a constant of this
+    module.
+
+    MONOTONE WITHIN A LEG: :meth:`publish` only ever adds, so a concurrent
+    reader can never see the counter go backwards mid-leg.  :meth:`begin_leg`
+    resets it and stamps a new epoch, which is the ONLY non-monotone step and is
+    taken by the publisher before it releases anything.
+
+    Second bookkeeping?  No: these bytes are not recorded anywhere else.  The
+    NVML free figure is the card's, not the peer's intent, and it cannot say
+    "the peer has finished and will free no more" -- which is the whole
+    terminating predicate.
+    """
+
+    def __init__(self, nvml_uuid: str, *, credit_dir: Optional[str] = None) -> None:
+        self.uuid = nvml_uuid
+        self.path = vram_credit_path(nvml_uuid, credit_dir=credit_dir)
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+    # -- state file, always under flock on ONE open fd -----------------------
+
+    @contextmanager
+    def _locked(self, exclusive: bool) -> Iterator[Any]:
+        handle = open(self.path, "a+")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield handle
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    @staticmethod
+    def _load(handle: Any) -> Dict[str, Any]:
+        handle.seek(0)
+        text = handle.read()
+        if not text.strip():
+            return {}
+        try:
+            state = json.loads(text)
+        except ValueError:
+            # A torn or foreign file is treated as NO CREDIT, never as credit:
+            # the failure direction of an unreadable counter must be "wait and
+            # then refuse", not "proceed as if funded".
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    @staticmethod
+    def _store(handle: Any, state: Dict[str, Any]) -> None:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps(state))
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    # -- the sleeping rank's side -------------------------------------------
+
+    def begin_leg(self, epoch: int, *, pid: Optional[int] = None) -> None:
+        """S opens a leg: the counter is zeroed and stamped."""
+        with self._locked(True) as handle:
+            self._store(
+                handle,
+                {
+                    "epoch": int(epoch),
+                    "credit_bytes": 0,
+                    "leg_complete": False,
+                    "publisher_pid": int(pid if pid is not None else os.getpid()),
+                    "tags": [],
+                },
+            )
+
+    def publish(self, tag: str, released_bytes: int) -> int:
+        """S adds the device bytes one tag's release freed.  Returns the total."""
+        with self._locked(True) as handle:
+            state = self._load(handle)
+            total = int(state.get("credit_bytes", 0)) + max(0, int(released_bytes))
+            state["credit_bytes"] = total
+            tags = list(state.get("tags", []))
+            tags.append(str(tag))
+            state["tags"] = tags
+            self._store(handle, state)
+            return total
+
+    def leg_complete(self) -> None:
+        """S closes its leg.  This is W's terminating predicate."""
+        with self._locked(True) as handle:
+            state = self._load(handle)
+            state["leg_complete"] = True
+            self._store(handle, state)
+
+    # -- the waking rank's side ---------------------------------------------
+
+    def read(self) -> Dict[str, Any]:
+        with self._locked(False) as handle:
+            return self._load(handle)
+
+    def wait_for(
+        self,
+        need_bytes: int,
+        *,
+        budget_s: float,
+        tag: str,
+        free_bytes_now: Optional[int] = None,
+        poll_s: float = 0.01,
+    ) -> Dict[str, Any]:
+        """W waits for the peer to fund ``need_bytes``, or refuses by name.
+
+        Returns a record (never raises) in the two cases where nothing is owed:
+
+        * the card ALREADY has the bytes -- ``free_bytes_now >= need_bytes``.
+          This is what makes a single-group boot cost nothing and wait for
+          nobody: with no co-located peer the card is not short, so there is no
+          credit to wait for and none is invented.  It is also the honest test:
+          the credit exists to cover a SHORTFALL, and where there is none the
+          peer's leg is irrelevant.
+        * the peer funded it before the first poll.
+
+        Raises :class:`Weg2VramCreditRefused` when the peer's leg completes
+        without cover, and when ``budget_s`` expires -- a bounded wait whose
+        expiry is a refusal, never a longer wait.
+        """
+        need = max(0, int(need_bytes))
+        if need == 0:
+            return {"waited_s": 0.0, "reason": "this tag needs no device bytes"}
+        if free_bytes_now is not None and int(free_bytes_now) >= need:
+            return {
+                "waited_s": 0.0,
+                "free_bytes": int(free_bytes_now),
+                "reason": (
+                    "the card already holds the bytes, so no peer release funds "
+                    "this tag and none is waited for"
+                ),
+            }
+        deadline = time.monotonic() + float(budget_s)
+        t0 = time.perf_counter()
+        while True:
+            state = self.read()
+            credit = int(state.get("credit_bytes", 0))
+            if credit >= need:
+                return {
+                    "waited_s": time.perf_counter() - t0,
+                    "credit_bytes": credit,
+                    "reason": "the peer's releases funded this tag",
+                }
+            if bool(state.get("leg_complete")):
+                raise Weg2VramCreditRefused(
+                    f"W35 Weg2VramCreditRefused (spec section 6 lists it as W30) "
+                    f"card={self.uuid} tag={tag} credit={credit // MIB} MiB "
+                    f"requested={need // MIB} MiB peer_leg_complete=True "
+                    f"free_bytes_now={free_bytes_now} -- the sleeping rank has "
+                    f"finished its whole leg and will release nothing further, so "
+                    f"these bytes are never coming; refusing by name rather than "
+                    f"waiting out the budget or walking into a CUDA OOM"
+                )
+            if time.monotonic() >= deadline:
+                raise Weg2VramCreditRefused(
+                    f"W35 Weg2VramCreditRefused (spec section 6 lists it as W30) "
+                    f"card={self.uuid} tag={tag} credit={credit // MIB} MiB "
+                    f"requested={need // MIB} MiB peer_leg_complete=False "
+                    f"budget={budget_s:.0f}s EXPIRED -- the peer neither funded "
+                    f"this tag nor completed its leg within the caller's own "
+                    f"budget (this module owns no timeout constant of its own)"
+                )
+            time.sleep(poll_s)
+
+
+def vram_credit(card: Optional[str] = None, *, credit_dir: Optional[str] = None) -> VramCredit:
+    """The credit counter of ``card``, or of THIS process's card.
+
+    The key is :func:`resolve_pcie_lock_key`'s, so the credit and the PCIe lock
+    name the same physical GPU by construction and neither can drift onto a
+    different card than the other.
+    """
+    return VramCredit(card or resolve_pcie_lock_key(), credit_dir=credit_dir)
 
 
 # ---------------------------------------------------------------------------

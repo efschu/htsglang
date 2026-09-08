@@ -1966,7 +1966,22 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    #: C17 (WEG2_FLIPCOST_SPEC_0907): what THIS leg actually moved, per tag --
+    #: ``{tag: [bytes, ms]}``, reduced over the group's ranks by the group
+    #: fence's own ``all_gather_object`` (weight_updater), so the answer speaks
+    #: for the whole group and not for the rank that happened to reply.  Bytes
+    #: come from ``tms_tag_bytes`` (the saver's own accounting), NEVER from
+    #: RssShmem, which dies the moment the shared host ring lands (spec R8).
+    #:
+    #: It exists because the Weg-2 front now sends ONE RPC per family per leg
+    #: and both legs are in flight at once (C9): the front no longer sees a tag
+    #: edge, so a refusal that says only "HTTP 500" cannot tell the operator
+    #: which half of the family is parked.  ``None`` on every non-Weg-2 path --
+    #: a stock ``/release_memory_occupation`` answer is unchanged.
+    per_tag: Optional[Dict[str, List[float]]] = None
+    #: The rank and card that took longest in this leg, as a printable note --
+    #: the critical path of L5.  Same collective, same denominator.
+    critical_path: Optional[str] = None
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
@@ -1976,7 +1991,22 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    #: C17 (WEG2_FLIPCOST_SPEC_0907): what THIS leg actually moved, per tag --
+    #: ``{tag: [bytes, ms]}``, reduced over the group's ranks by the group
+    #: fence's own ``all_gather_object`` (weight_updater), so the answer speaks
+    #: for the whole group and not for the rank that happened to reply.  Bytes
+    #: come from ``tms_tag_bytes`` (the saver's own accounting), NEVER from
+    #: RssShmem, which dies the moment the shared host ring lands (spec R8).
+    #:
+    #: It exists because the Weg-2 front now sends ONE RPC per family per leg
+    #: and both legs are in flight at once (C9): the front no longer sees a tag
+    #: edge, so a refusal that says only "HTTP 500" cannot tell the operator
+    #: which half of the family is parked.  ``None`` on every non-Weg-2 path --
+    #: a stock ``/release_memory_occupation`` answer is unchanged.
+    per_tag: Optional[Dict[str, List[float]]] = None
+    #: The rank and card that took longest in this leg, as a printable note --
+    #: the critical path of L5.  Same collective, same denominator.
+    critical_path: Optional[str] = None
 
 
 class CheckWeightsReqInput(BaseReq, kw_only=True):

@@ -1955,7 +1955,14 @@ async def release_memory_occupation(
 ):
     """Release GPU memory occupation temporarily."""
     try:
-        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
+        # C17: the per-tag report, when the engine filled one.  ``None`` (the
+        # stock path) returns exactly what it returned before -- no body -- so
+        # this is a superset on the wire, not a shape change.
+        report = await _global_state.tokenizer_manager.release_memory_occupation(
+            obj, request
+        )
+        if report is not None:
+            return ORJSONResponse(report, status_code=200)
     except Exception as e:
         return _create_error_response(e)
 
@@ -1967,7 +1974,11 @@ async def resume_memory_occupation(
 ):
     """Resume GPU memory occupation."""
     try:
-        await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
+        report = await _global_state.tokenizer_manager.resume_memory_occupation(
+            obj, request
+        )
+        if report is not None:
+            return ORJSONResponse(report, status_code=200)
     except Exception as e:
         return _create_error_response(e)
 
