@@ -6943,6 +6943,17 @@ class Scheduler(
         vals = vals + tp_head_congruence.build_head_order_payload(
             _head_canonical, _head_local_matches
         )
+        # FIX 7 (round 7): THE COMPLETION ARM, on the SAME canonical head and
+        # the SAME reduce. `_admission_held_for_deferred_prefetch`'s own
+        # docstring names this as the honest close of #1203 family A3 ("a
+        # group-uniform defer budget or a second per-rid ballot arm"); this is
+        # the second arm, and it is here rather than beside the ballot because
+        # the ballot is indexed by QUEUE ORDER while the X gate reads the
+        # canonical head. No new collective (MUST NOT 6).
+        _xpend_at = len(vals)
+        vals = vals + tp_head_congruence.build_x_pending_payload(
+            _head_canonical, self._weg2_local_store_read_pending_ages(_head_canonical)
+        )
         _ballot_rids = [
             req.rid
             for req in self.waiting_queue[: prefetch_ballot.PREFETCH_BALLOT_SLOTS]
@@ -6964,6 +6975,22 @@ class Scheduler(
         _head_match_lens = t[
             _head_at : _head_at + tp_head_congruence.TP_HEAD_SLOTS
         ].tolist()
+        # FIX 7: read back by its own captured head index, before the ballot,
+        # under exactly the discipline the corridor width and the head block
+        # are read under -- so a later change to the ballot layout cannot
+        # silently move it.
+        _xpend_lens = t[
+            _xpend_at : _xpend_at + tp_head_congruence.TP_HEAD_SLOTS
+        ].tolist()
+        if len(_xpend_lens) != tp_head_congruence.TP_HEAD_SLOTS:
+            raise RuntimeError(
+                "#1234 W37 X-COMPLETION LAYOUT STOP: the reduced payload carries "
+                f"no completion slice (head={_xpend_at}, "
+                f"expected={tp_head_congruence.TP_HEAD_SLOTS}, "
+                f"available={len(vals) - _xpend_at}). Pricing law 4 on a slice "
+                "of the wrong width would read another arm's numbers as store-read "
+                "ages, so the group stops here by name instead."
+            )
         _admit_limit = int(t[_limit_at])
         # #1203: read back by its captured head index, before the ballot, under
         # the same discipline as the corridor width and the head block.
@@ -7030,6 +7057,7 @@ class Scheduler(
             _head_match_lens,
             _admit_limit,
             self._uniform_prefetch_ballot is not None,
+            _xpend_lens,
         )
         self._uniform_min_avail = int(t[0].item())
         # >= 0: the local budget can only exceed the group minimum.
@@ -9343,6 +9371,242 @@ class Scheduler(
         pool = getattr(ctrl, "mem_pool_host", None) if ctrl is not None else None
         return int(getattr(pool, "size", 0) or 0)
 
+    def _weg2_store_read_is_pending(self, req) -> bool:
+        """Does THIS rank expect a store read for ``req`` that has not landed?
+
+        Narrower than ``check_prefetch_progress``, and the difference IS the
+        FIX-7 defect.  That method answers True at its first line for a rid
+        that is not in ``ongoing_prefetch`` (hiradix_cache.py:1914) -- so
+        "nothing was ever registered", "the record was just reaped" and "the
+        read completed and landed" are ONE answer, and the X gate read all
+        three as *landed*.  Two of them are not.
+
+        The two states this returns True on, and nothing else:
+
+        * an ``ongoing_prefetch`` record exists -- the read is in flight;
+        * the #1068 (A12.2) ``prefetch_deferred`` mark stands -- the read was
+          rate-limited out of registration and ``_retry_deferred_prefetches``
+          will re-issue it at the top of a coming pass.
+
+        A read that terminated having loaded nothing (``#915 PREFETCH
+        REFUSED``, an undeferrable span) is in NEITHER state, so it prices
+        immediately and W31 fires honestly.  That is the point: the defer is
+        for reads that are still coming, never for reads that are not.
+
+        RANK-LOCAL BY CONSTRUCTION, and never consumed as such -- the caller
+        reads the MIN-reduced group value.  Both terms are per-rank: the
+        record set is this rank's, and the mark is timed off this rank's
+        clock and set from this rank's prefetch budget
+        (``_admission_held_for_deferred_prefetch`` states that, and states
+        that its own hold is therefore inert in the TP phase, which is group
+        D).  A vote is exactly what a rank-local reading is allowed to be.
+        """
+        rid = str(getattr(req, "rid", "") or "")
+        if not rid:
+            return False
+        if getattr(req, "prefetch_deferred", None) is not None:
+            return True
+        ongoing = getattr(getattr(self, "tree_cache", None), "ongoing_prefetch", None)
+        try:
+            return bool(ongoing) and rid in ongoing
+        except TypeError:
+            return False
+
+    def _weg2_local_store_read_pending_ages(self, canonical) -> Dict[str, int]:
+        """This rank's pending-age vote for the canonical head, in ms.
+
+        The stamp is taken the first pass a rid is seen pending and dropped
+        the pass it stops being pending, so the age measures THE WAIT and not
+        the request's life.  LIFECYCLE TABLE for ``_weg2_x_defer_since``
+        (the rule for every new state field):
+
+          WRITER   this method, one entry per canonical rid observed pending.
+          READER   this method only, on the next pass (the age is emitted
+                   into the payload; nothing else reads the dict).
+          DELETER  this method, in the same call: a rid that is no longer
+                   pending, or no longer in the canonical head, is dropped.
+                   The canonical head is derived from the waiting queue, so a
+                   request that leaves the queue takes its stamp with it and
+                   the dict cannot outgrow the head.
+
+        Separating event: none -- writer, reader and deleter are one call per
+        pass, which is why no cutover can delete a stamp its consumer still
+        needs.
+
+        A VOTE MAY NEVER BREAK THE REDUCE, and this one sits on the
+        collective path on every rank -- the same guard and the same reason
+        as ``_local_head_prefix_matches``: an exception here would leave one
+        rank out of an ``all_reduce`` its peers are already in, which is the
+        #580 split this arm exists to prevent, arriving through the door
+        marked "safety".  An empty vote is neutral (:data:`NOT_PENDING_MS`
+        everywhere), so the failure mode is "nobody defers", never "the
+        ranks disagree".
+        """
+        stamps = getattr(self, "_weg2_x_defer_since", None)
+        if stamps is None:
+            stamps = {}
+            self._weg2_x_defer_since = stamps
+        ages: Dict[str, int] = {}
+        try:
+            now = time.monotonic()
+            by_rid = {req.rid: req for req in self.waiting_queue}
+            alive = set()
+            for rid in canonical:
+                req = by_rid.get(rid)
+                if req is None or not self._weg2_store_read_is_pending(req):
+                    continue
+                alive.add(rid)
+                if rid not in stamps:
+                    stamps[rid] = now
+                ages[rid] = max(0, int((now - stamps[rid]) * 1000.0))
+            for rid in [r for r in stamps if r not in alive]:
+                stamps.pop(rid, None)
+        except Exception as exc:  # noqa: BLE001 - a vote may never break the reduce
+            n = getattr(self, "_weg2_x_pending_unvoted", 0) + 1
+            self._weg2_x_pending_unvoted = n
+            if n <= 5 or n % 64 == 0:
+                logger.warning(
+                    "FIX 7 completion arm: could not price this rank's pending "
+                    "head (%s); contributing an empty vote, which can only make "
+                    "the gate price as it did before this arm (occurrence=%d)",
+                    exc, n,
+                )
+            return {}
+        return ages
+
+    def _weg2_local_store_read_pending_ms(self, req) -> Optional[int]:
+        """This rank's OWN wait for ``req``'s store read in ms, or ``None``.
+
+        Read-only on purpose, and that is not a style point: the payload
+        builder above both stamps and REAPS, so calling it for a single rid
+        would drop every other rid's stamp and reset the group's clock on
+        each pass. One writer, one reader, and the reader may not be the
+        writer under another name.
+
+        ``0`` (not ``None``) for a rid that is pending but unstamped: it
+        became pending after this pass's vote, and a zero age is the truthful
+        reading of a wait that has just started.
+        """
+        if not self._weg2_store_read_is_pending(req):
+            return None
+        stamps = getattr(self, "_weg2_x_defer_since", None) or {}
+        t0 = stamps.get(str(getattr(req, "rid", "") or ""))
+        if t0 is None:
+            return 0
+        return max(0, int((time.monotonic() - t0) * 1000.0))
+
+    def _weg2_x_store_read_bound_s(self, req) -> float:
+        """The length-priced store-read timeout for ``req``, or 0.0.
+
+        DERIVED, NOT PICKED.  It is ``_deferred_prefetch_bound_s`` -- the
+        tree's own ``prefetch_timeout_base + pages * prefetch_timeout_per_page``
+        -- which is the price the #1068 deferral machinery already puts on
+        "how long may this span's store read take".  Two consumers, one
+        derivation: a defer that outlived the deferral's own bound is a read
+        that is not coming back, and there is no second number to keep in
+        step.
+
+        0.0 on a tree that cannot price it (``_deferred_prefetch_bound_s``
+        reads all three terms WITHOUT defaults, by design), which the caller
+        turns into "price it now".  A missing bound must never mean an
+        unbounded wait -- that is the wedge this defer exists to avoid,
+        wearing the other costume.
+        """
+        span = len(getattr(req, "full_untruncated_fill_ids", None) or
+                   getattr(req, "origin_input_ids", None) or ())
+        try:
+            return max(0.0, float(self._deferred_prefetch_bound_s(span)))
+        except Exception:  # noqa: BLE001 - an unpriceable bound is not a wait
+            return 0.0
+
+    def _weg2_x_defers(self, req: Req, head_inputs=None) -> bool:
+        """LAW 4's COMPLETION PREDICATE: must the X gate WAIT to price this?
+
+        WHAT BOOT weg2sc3 MEASURED (2026-09-08).  The seat gate FIX 4/5 built
+        holds the head of D's arrival queue until D *has room* to issue the
+        store read -- ``available >= need``, ``occupied < limit``,
+        ``held_passes`` up to 200.  It does exactly that, on D's own #915
+        terms (``WEG2 D-SEAT-WAIT ... occupied=23282``).  And W31 still fired
+        25 times on servable 8.6-11.2k prompts, W35 10 times, because HAVING
+        ROOM TO ISSUE A READ IS NOT THE READ HAVING COMPLETED.  The refused
+        requests were priced at their whole extent (``X-GATE uncached=8866
+        X=8192 verdict=W31``); the six that got through, same prompts and
+        same route, priced at ``uncached = 2``.  The only difference was
+        whether the read had LANDED when the gate ran.  A capacity condition
+        stood where a completion condition was required.
+
+        So: TRUE to leave ``req`` in the queue for this pass (the caller
+        ``continue``s, nothing is deleted, nothing is answered), FALSE to let
+        the pricing gate below have it.
+
+        THE FACT IS THE GROUP'S OR IT IS NOT TAKEN -- the same rule
+        :meth:`_weg2_x_refuses` states for the extent, for the same reason:
+        the decision downstream DELETES the request from this rank's
+        ``waiting_queue``, so a rank-local term makes the deletion
+        rank-local, and that is permanent.  The value read here is the
+        MIN-reduced pending arm of the packed reduce
+        (``build_x_pending_payload``); this rank's own timer is a VOTE into
+        that reduce and never an input to this verdict.  No group opinion
+        (single rank, no vote taken, rid outside the canonical head) is
+        ``X_PRICE``: abstain-never-defer, which restores exactly the
+        behaviour that existed before this arm.
+
+        BOUNDED, so a read that never lands cannot wedge the request: past
+        :meth:`_weg2_x_store_read_bound_s` the verdict is
+        ``X_BOUND_EXPIRED``, the request IS priced, and W31 may fire --
+        honestly this time, on an extent nothing further was going to
+        improve.  Both outcomes speak a line with the same denominators, so
+        an absence of defers reads as an absence of pending reads rather than
+        as a silenced emitter.
+        """
+        pending_ms = tp_head_congruence.group_store_read_pending_ms(
+            head_inputs, str(getattr(req, "rid", "") or "")
+        )
+        if pending_ms is None:
+            return False
+        # W37: MIN can only ever be <= this rank's own vote. A group age ABOVE
+        # it means the ranks reduced over different slots under one rid -- a
+        # head-mapping split, not a completion question -- and the group stops
+        # by name rather than deferring or pricing on a term it cannot trust.
+        # Same detector shape and same W number as the X-TERM split above.
+        local_ms = self._weg2_local_store_read_pending_ms(req)
+        if local_ms is not None and pending_ms > local_ms + 1:
+            raise RuntimeError(
+                f"#1234 W37 X-COMPLETION SPLIT STOP rid={getattr(req, 'rid', '?')}: "
+                f"the group published a store-read age of {pending_ms} ms for a "
+                f"request this rank has been waiting {local_ms} ms for. The arm is "
+                "MIN-reduced, so the group's value can never exceed a voting "
+                "rank's own -- the ranks indexed the canonical head differently. "
+                "The group stops here by name (MUST NOT 7) instead of deferring "
+                "or pricing on a term it cannot trust."
+            )
+        bound_s = self._weg2_x_store_read_bound_s(req)
+        verdict = tp_head_congruence.x_completion_verdict(pending_ms, bound_s)
+        n = getattr(self, "_weg2_x_defer_passes", 0) + 1
+        self._weg2_x_defer_passes = n
+        if verdict == tp_head_congruence.X_DEFER:
+            if n <= 5 or n % 200 == 0:
+                logger.info(
+                    "WEG2 X-DEFER rid=%s reason=prefetch_pending age_s=%.2f "
+                    "bound_s=%.2f replicated_term=group verdict=defer "
+                    "held_passes=%d (the store read for this request is still in "
+                    "flight on at least one rank; pricing it now is the "
+                    "uncached=whole-prompt W31 of boot weg2sc3. Denominator: "
+                    "every pass in which any request was found pending)",
+                    str(getattr(req, "rid", "?"))[:16], pending_ms / 1000.0,
+                    bound_s, n,
+                )
+            return True
+        logger.info(
+            "WEG2 X-DEFER rid=%s reason=prefetch_pending age_s=%.2f bound_s=%.2f "
+            "replicated_term=group verdict=bound_expired held_passes=%d (the "
+            "group's youngest store-read timer outlived the span's own "
+            "length-priced bound, so the request is priced as it stands and W31 "
+            "may fire honestly)",
+            str(getattr(req, "rid", "?"))[:16], pending_ms / 1000.0, bound_s, n,
+        )
+        return False
+
     def _weg2_x_refuses(self, req: Req, head_inputs=None) -> bool:
         """W31 verdict for one request, with L9 printed on both outcomes.
 
@@ -11605,6 +11869,19 @@ class Scheduler(
             # against the raw prompt instead would refuse exactly the
             # requests the flip exists to serve, and the re-route would put
             # them back in front of the same gate for ever.
+            # FIX 7 (round 7): THE COMPLETION PREDICATE, AND IT SITS DIRECTLY
+            # ON TOP OF THE PRICING ONE. Boot weg2sc3: W31 = 25 on servable
+            # prompts, every one of them priced at its FULL extent while six
+            # identical requests that got through priced at `uncached = 2`.
+            # The difference was never the prompt and never the bound -- it
+            # was whether D's store read had LANDED when the gate ran. A
+            # request whose read is still in flight is left in the queue here
+            # (no deletion, no answer, no seat given up), bounded by the span's
+            # own length-priced store-read timeout so a read that never lands
+            # is priced rather than waited on for ever.
+            if self._weg2_x_defers(req, _head_inputs):
+                _note_skip("weg2_x_defer", req.rid)
+                continue
             if self._weg2_x_refuses(req, _head_inputs):
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)

@@ -266,6 +266,37 @@ def double_prefill_verdict(
     return "reroute"
 
 
+#: Provenance of the seat gate's ``need``, printed on its own L-line.
+NEED_REALISED = "realised"
+NEED_ESTIMATE = "estimate"
+
+
+def d_seat_need(est_tokens: int, realised_tokens: int = 0):
+    """``(need, source)`` for the D seat gate -- FIX 7 (round 7), half 2.
+
+    THE OVER-PRICE, MEASURED.  Boot weg2sc3 held requests at ``need=15047``
+    whose realised extent was 8,865 tokens: 1.71x, because ``need`` was the
+    front's ``len(text)/3`` arrival estimate and nothing ever replaced it.
+    Two of those charge 30,094 against a 27,466-token limit, so the effective
+    concurrency of a six-seat group was TWO -- the estimate, not the pool,
+    was the binding constraint.
+
+    THE REALISED COUNT IS ALREADY IN HAND and costs nothing to use: group P's
+    leg 1 answers with the tokenizer's own ``prompt_tokens`` for this exact
+    prompt (``WEG2-SERVED group=P leg=1 ... prompt_tokens=``), and a
+    re-queued request has been through leg 1 by definition.  So the estimate
+    is what a COLD arrival is priced at, and only that.
+
+    The source is RETURNED rather than inferred at the log site, because
+    "estimate" and "realised" are the same integer with different error bars
+    and a line that cannot say which cannot be read at all.
+    """
+    realised = max(0, int(realised_tokens or 0))
+    if realised > 0:
+        return realised, NEED_REALISED
+    return max(0, int(est_tokens or 0)), NEED_ESTIMATE
+
+
 #: The name D's own gate refuses with (C11).  The front never re-prices the
 #: body -- D's gate is the authority -- so the only question anywhere on the
 #: leg-2 path is whether this NAME is present.
@@ -793,7 +824,8 @@ class Front:
         return await self._d_pool_reading()
 
     def _d_token_budget_blocks(self, rid: str, est_tokens: int,
-                               reading: Optional[Dict[str, Any]]) -> bool:
+                               reading: Optional[Dict[str, Any]],
+                               realised_tokens: int = 0) -> bool:
         """Would granting this request a seat ask D for a store read it cannot
         issue?
 
@@ -838,14 +870,30 @@ class Front:
         (named above), or whenever it fits.
 
         L-LINE ``WEG2 D-SEAT-WAIT`` with every denominator named and its
-        PROVENANCE on the line: ``need`` is this request's own front estimate
-        (the L10 ESTIMATE convention), ``available`` is what D last reported
-        its pool could still allocate MINUS the grants made since, ``limit``
-        is D's own prefetch capacity, and ``reading_age_s`` says how old the
-        numbers are.  Rate-limited to one line per newly-held rid, then every
-        200th pass, and the SUPPRESSED count rides on the line
-        (``held_passes``), so an absence of lines is readable as an absence of
-        waits rather than as a silenced emitter.
+        PROVENANCE on the line: ``need`` carries ``source=realised|estimate``
+        (:func:`d_seat_need`), ``available`` is what D last reported its pool
+        could still allocate MINUS the grants made since, ``limit`` is D's own
+        prefetch capacity, and ``reading_age_s`` says how old the numbers are.
+        Rate-limited to one line per newly-held rid, then every 200th pass,
+        and the SUPPRESSED count rides on the line (``held_passes``), so an
+        absence of lines is readable as an absence of waits rather than as a
+        silenced emitter.
+
+        FIX 7 (round 7), TWO CORRECTIONS TO THE LEFT-HAND SIDE.  Round 4
+        fixed the RIGHT-hand side of this comparison (``available`` became
+        D's own #915 reading rather than a front tally) and left the left one
+        alone; boot weg2sc3 measured what that costs.
+
+        * ``need`` is the REALISED count once leg 1 has answered.  The 1.71x
+          arrival estimate (15,047 for a realised 8,865) made two requests
+          charge 30,094 against a 27,466 limit, so effective concurrency was
+          2 of 6 -- the estimate was the binding constraint, not the pool.
+        * ``available`` CLAMPS AT 0.  It read ``-1663`` on metal, which is
+          ``reading["available"] - charged_since_reading`` extrapolated past
+          the reading it is anchored to.  A negative availability is not a
+          physical quantity; the honest statement is "none, and the
+          extrapolation says we are ``over_charged`` beyond that", and the
+          over-charge is PRINTED rather than folded into a sign.
 
         THIS IS THE HONEST INTERIM.  The wall itself is the #974 host-pool
         bound; it lifts when the shared-ring carrier gives D a windowed store
@@ -863,14 +911,23 @@ class Front:
         if reading is None:
             self._d_token_hold_rid = None
             return False
-        need = max(0, int(est_tokens))
+        need, need_source = d_seat_need(est_tokens, realised_tokens)
         charged = self._d_charged_since(reading["t"])
-        available = int(reading["available"]) - charged
+        raw_available = int(reading["available"]) - charged
         limit = int(reading["limit"])
         occupied = int(reading["occupied"]) + charged
         if self.d_admit_max_tokens is not None:
             # The operator ceiling bounds the SAME quantity, never replaces it.
-            available = min(available, self.d_admit_max_tokens - occupied)
+            raw_available = min(raw_available, self.d_admit_max_tokens - occupied)
+        # THE CLAMP, and the over-charge kept rather than swallowed by it: the
+        # comparison below wants "rows this request may have", which cannot be
+        # less than none, while the diagnosis wants "by how much the
+        # extrapolation has overshot the reading it hangs on".  Two questions,
+        # so two numbers -- folding them into one signed integer is what put
+        # `available=-1663` on a line whose reader had no way to tell an
+        # exhausted pool from a stale anchor.
+        available = max(0, raw_available)
+        over_charged = max(0, -raw_available)
         if need <= available and occupied < limit:
             self._d_token_hold_rid = None
             return False
@@ -879,16 +936,18 @@ class Front:
         if self._d_token_hold_rid != rid or held % 200 == 0:
             self._d_token_hold_rid = rid
             logger.info(
-                "WEG2 D-SEAT-WAIT rid=%s need=%d available=%d limit=%d occupied=%d "
+                "WEG2 D-SEAT-WAIT rid=%s need=%d source=%s available=%d "
+                "over_charged=%d limit=%d occupied=%d "
                 "charged_since_reading=%d reading_age_s=%.2f inflight_tokens=%d "
                 "seats_free=%d held_passes=%d (group D's own #915 terms, read from "
                 "/server_info; the store read for this request cannot be issued yet, "
                 "so it keeps the head of the arrival queue and takes no seat -- "
                 "admitting it here is the #915 vote_negative shape that mis-prices "
-                "the X gate)",
-                rid, need, available, limit, occupied, charged,
-                max(0.0, time.time() - reading["t"]), self._d_inflight_tokens(),
-                self.seats_free(), held,
+                "the X gate. need names its own provenance; available is clamped at "
+                "0 and the extrapolation's overshoot rides beside it)",
+                rid, need, need_source, available, over_charged, limit, occupied,
+                charged, max(0.0, time.time() - reading["t"]),
+                self._d_inflight_tokens(), self.seats_free(), held,
             )
         return True
 
@@ -1222,8 +1281,13 @@ class Front:
                     self._sync_batch_gate()
                     self.counters["d_admit_skipped_done"] += 1
                     continue
+                # FIX 7: the realised count when leg 1 has answered for this
+                # rid, the arrival estimate only for a cold one -- and the
+                # SAME number is charged to the seat below, so the gate and
+                # `_d_charged_since` cannot price one request two ways.
                 if self._d_token_budget_blocks(p.rid, p.est_prompt,
-                                               await self._d_reading_if_armed()):
+                                               await self._d_reading_if_armed(),
+                                               p.leg1_prompt_tokens):
                     # FIX 4a: the seat is not even reached -- taking one and
                     # holding it while the tokens are unavailable would block
                     # the refill the budget is waiting for.  `continue` and
@@ -1247,7 +1311,8 @@ class Front:
                     continue
                 self._ready_for_d.popleft()
                 self._sync_batch_gate()
-                p.seat = Seat(self, p.rid, "batch", tokens=p.est_prompt)
+                p.seat = Seat(self, p.rid, "batch",
+                              tokens=d_seat_need(p.est_prompt, p.leg1_prompt_tokens)[0])
                 p.posted_evt = asyncio.Event()
                 self._log_admit(p.rid, source="batch", t_arrive=p.t_arrive)
                 p.fut.set_result(True)

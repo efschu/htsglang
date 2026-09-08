@@ -102,6 +102,23 @@ TP_HEAD_SLOTS = 32
 #: missing a request removes it from the group's head.
 _ABSENT_MATCH = -1
 
+#: "This rank expects no store read for this rid, or its read has landed."
+#: Deliberately LARGE, because the pending arm is MIN-reduced like every
+#: other arm of this payload: a rank with nothing pending must be the
+#: NEUTRAL element, so one rank that IS still reading pulls the group's
+#: value down and the group defers.  MIN == "pending on ANY rank", which is
+#: the delay-never-force direction the ballot already uses.
+NOT_PENDING_MS = 1 << 40
+
+#: FIX 7 verdicts of the completion predicate (WEG2_SCHEDULING_SPEC_0907
+#: law 4).  Named strings rather than a bool pair, because "price it, the
+#: read landed" and "price it, the read never will" are the same ACTION and
+#: different EVIDENCE, and a log that cannot tell them apart cannot say
+#: whether a W31 is honest.
+X_PRICE = "price"
+X_DEFER = "defer"
+X_BOUND_EXPIRED = "bound_expired"
+
 
 def canonical_head_rids(rids: Sequence[str], slots: int = TP_HEAD_SLOTS) -> List[str]:
     """The slot->rid mapping, derived from the rid SET alone.
@@ -128,6 +145,99 @@ def build_head_order_payload(
     for i, rid in enumerate(canonical[:slots]):
         payload[i] = int(local_match_lens.get(rid, _ABSENT_MATCH))
     return payload
+
+
+def build_x_pending_payload(
+    canonical: Sequence[str],
+    local_pending_age_ms: Dict[str, int],
+    slots: int = TP_HEAD_SLOTS,
+) -> List[int]:
+    """This rank's STORE-READ COMPLETION vote, one slot per canonical rid.
+
+    FIX 7 (round 7) -- THE X GATE'S PREDICATE WAS CAPACITY, NOT COMPLETION.
+    Boot weg2sc3 measured the whole shape: ``X-GATE uncached=8866 X=8192
+    verdict=W31`` on requests whose peers, served moments later, priced at
+    ``uncached = 2``.  Same prompts, same route, same gate -- the only
+    difference was whether D's store read for that rid had LANDED when the
+    gate priced it.  The front's seat gate holds the head until D HAS ROOM
+    to issue the read (``available >= need``, ``occupied < limit``); having
+    room to issue a read is not the read having completed.
+
+    ``local_pending_age_ms`` maps rid -> how long THIS rank has been waiting
+    for that rid's store read, in milliseconds.  A rid absent from the map
+    rides :data:`NOT_PENDING_MS`, which is the MIN-neutral element, so:
+
+    * a rank that is still reading pulls the group's value down and the
+      group DEFERS -- pending on ANY rank is pending for the group, the same
+      delay-never-force direction as the #791b ballot's MIN == AND;
+    * a rank that does not hold the rid at all contributes neutrally and
+      never forces a defer of its own.
+
+    The reduced value is therefore the YOUNGEST pending timer in the group,
+    which is the conservative age to price a bound against: the group gives
+    up waiting only once even the rank that started latest is past it.
+
+    NO NEW COLLECTIVE (MUST NOT 6).  These slots ride the packed MIN reduce
+    ``_update_uniform_pool_budget`` already takes once per TP-loop
+    iteration, beside the head-order arm and indexed by the SAME canonical
+    head -- so the slot -> rid mapping is the one derived from the rid SET
+    alone and needs no second agreement.
+    """
+    payload = [NOT_PENDING_MS] * slots
+    for i, rid in enumerate(canonical[:slots]):
+        payload[i] = int(local_pending_age_ms.get(rid, NOT_PENDING_MS))
+    return payload
+
+
+def group_store_read_pending_ms(
+    inputs: Optional["UniformHeadInputs"], rid: str
+) -> Optional[int]:
+    """The GROUP's pending age for one rid, or ``None`` for "nothing pending".
+
+    ``None`` on four counts, every one of them group-uniform for the same
+    reasons :func:`group_match_for` gives: no verdict published this pass,
+    no pending arm in the payload at all (a caller that does not vote), the
+    rid outside the canonical head, or every rank neutral on it.  A caller
+    that gets ``None`` may price; it must never fall back to its own timer,
+    which is rank-local and would split the ranks on the one decision that
+    DELETES a request from a queue.
+    """
+    if inputs is None or not inputs.canonical or not inputs.pending_age_ms:
+        return None
+    try:
+        slot = inputs.canonical.index(rid)
+    except ValueError:
+        return None
+    if slot >= len(inputs.pending_age_ms):
+        return None
+    value = int(inputs.pending_age_ms[slot])
+    return None if value >= NOT_PENDING_MS else max(0, value)
+
+
+def x_completion_verdict(
+    group_pending_ms: Optional[int], bound_s: float
+) -> str:
+    """May the X gate price this request yet?
+
+    :data:`X_PRICE` when the group holds no pending store read for it,
+    :data:`X_DEFER` while one is in flight inside the bound, and
+    :data:`X_BOUND_EXPIRED` once the group's YOUNGEST timer is past the
+    bound -- at which point the request IS priced and W31 may fire, honestly
+    this time, on an extent nothing further is going to improve.
+
+    THE BOUND IS WHY THIS IS NOT A WEDGE.  Deferring for ever on a read that
+    never lands is the livelock the defer exists to prevent, wearing the
+    other costume; ``bound_s`` is the caller's length-priced store-read
+    timeout, so a read that has outlived its own price is over whether or
+    not anyone reported it.  A non-positive bound therefore never defers.
+    """
+    if group_pending_ms is None:
+        return X_PRICE
+    if bound_s <= 0:
+        return X_BOUND_EXPIRED
+    if group_pending_ms >= bound_s * 1000.0:
+        return X_BOUND_EXPIRED
+    return X_DEFER
 
 
 def uniform_head_order(
@@ -385,6 +495,11 @@ class UniformHeadInputs:
     group_match_lens: Tuple[int, ...]
     admit_limit: Optional[int]
     digest_agreed: bool
+    #: FIX 7: the pending arm, same canonical indexing as ``group_match_lens``.
+    #: Empty when the caller took no pending vote, which reads as "no opinion"
+    #: rather than "nothing pending" -- the difference matters, because the
+    #: second would license pricing on a read nobody asked about.
+    pending_age_ms: Tuple[int, ...] = ()
 
 
 def build_uniform_head_inputs(
@@ -392,6 +507,7 @@ def build_uniform_head_inputs(
     group_match_lens: Sequence[int],
     admit_limit: Optional[int],
     digest_agreed: bool,
+    pending_age_ms: Sequence[int] = (),
 ) -> UniformHeadInputs:
     """Freeze this pass's reduce results into the value the pass hands down."""
     return UniformHeadInputs(
@@ -399,6 +515,7 @@ def build_uniform_head_inputs(
         group_match_lens=tuple(int(v) for v in (group_match_lens or ())),
         admit_limit=None if admit_limit is None else int(admit_limit),
         digest_agreed=bool(digest_agreed),
+        pending_age_ms=tuple(int(v) for v in (pending_age_ms or ())),
     )
 
 
@@ -573,6 +690,13 @@ def head_order_is_uniform(orders: Sequence[Sequence[str]]) -> bool:
 
 __all__ = [
     "TP_HEAD_SLOTS",
+    "NOT_PENDING_MS",
+    "X_PRICE",
+    "X_DEFER",
+    "X_BOUND_EXPIRED",
+    "build_x_pending_payload",
+    "group_store_read_pending_ms",
+    "x_completion_verdict",
     "SOURCE_GROUP",
     "SOURCE_RANK_LOCAL",
     "ARM_ORDER",
