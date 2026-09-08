@@ -35,7 +35,7 @@ import logging
 import os
 import re
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple, Union
 
@@ -121,6 +121,31 @@ WEG2_SLEEP_MIN_RELEASED_FRACTION = 0.5
 #: PROPER SUBSET and cannot be graded against the whole; see
 #: :func:`sleep_acceptance_census`.
 WEG2_SLEEP_TAGS = frozenset((GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS))
+
+#: Item `dormant`: the smallest allocation that may be routed into the graph
+#: tag's private pool.  NOT a tuning knob -- it is #102's ``MIN_TAGGED_BYTES``
+#: (``adaptive_graph_memory.py:269``) and it is a CORRECTNESS gate with a
+#: measured reason: the caching allocator splits large blocks, so a tagged
+#: segment can carry a free tail of up to ~2 MiB, a later sub-2MiB allocation
+#: of another tag can be served from that tail, and once the first tag is
+#: paused the tail is UNMAPPED -- first touch is then an illegal memory access
+#: (observed live on the 5-state high-accept boot: state k2's ~1.5 MiB
+#: custom_mask in paused k5's segment tail).  Allocations at or above this size
+#: always get their own segment.  Same number, same reason, not a second one.
+WEG2_GRAPH_SCRATCH_MIN_BYTES = 2 * 1024 * 1024
+
+#: Item `dormant`: whether this rank's sleep also releases the CUDA-graph tag.
+#: Resolved ONCE per process, deliberately: the sleep adds the tag to
+#: ``offload_tags`` and the wake removes it, so a resolver that could change
+#: answer between the two legs would raise ``KeyError`` on a tag that was never
+#: paused.  A cached read cannot drift.
+_GRAPH_TAG_ARMED: Optional[bool] = None
+
+#: Item `dormant`: ONE private ``torch.cuda.MemPool`` for the graph tag's
+#: non-capture scratch, created on first use and kept for the process lifetime
+#: (#102's rule: a tag's free space must only ever be visible to allocations of
+#: that same tag).
+_GRAPH_SCRATCH_POOL: Any = None
 
 
 class Weg2MemorySaverInactive(RuntimeError):
@@ -1322,6 +1347,164 @@ def sleep_acceptance_census(
 
 #: The one string a dormant refusal carries, so a log grep for the marker and
 #: the client-visible error name the same event.
+# ---------------------------------------------------------------------------
+# ITEM `dormant`: THE CUDA-GRAPH TAG ON THE WEG-2 SLEEP PATH
+# (record section [1y], 2026-09-08)
+# ---------------------------------------------------------------------------
+#
+# The dormant group holds 1820 / 1368 / 1422 MiB per rank (rg6, NVML
+# per-process bytes on the sleep-acceptance line).  Section [1y] attributes it;
+# two of its rows are releasable and the mechanism for both already exists
+# upstream, unwired:
+#
+#   R4  the CUDA-graph CAPTURE POOL (92 / 102 / 133 MiB).  Captures already
+#       route through `memory_saver_adapter.cuda_graph(tag=cuda_graph)` when
+#       `enable_memory_saver` AND `SGLANG_MEMORY_SAVER_CUDA_GRAPH`
+#       (full_cuda_graph_backend.py:78-81, :132-139), and both RPC handlers
+#       already have their `GPU_MEMORY_TYPE_CUDA_GRAPH in tags` branch.  What
+#       is missing is that NOTHING SENDS THE TAG: the front's sleep RPC carries
+#       [kv_cache] alone.
+#   R3a the flashinfer FLOAT workspace (384 MiB/rank -- env default
+#       384*1024*1024, and Qwen3_5ForConditionalGeneration is deliberately NOT
+#       in HIGH_WORKSPACE_ARCHITECTURES, flashinfer_workspace.py:59-67).  It is
+#       the one workspace on this path with a stated content contract, and the
+#       contract is ZERO: `zero_flashinfer_workspaces()` wipes it after every
+#       finished request, and its docstring carries the #50 GPU bisection
+#       verbatim -- zeroing exactly the FLOAT workspace flattens the
+#       request-ordinal output, "int workspace / kv_lens wipes do not".  So a
+#       pause that unmaps it and a resume that maps fresh pages destroys
+#       nothing, PROVIDED the resume restores the zero.
+#
+# WHAT IS DELIBERATELY LEFT RESIDENT, with its size, because it holds content
+# a remap would destroy or content the wake needs:
+#
+#   * the flashinfer INT workspace (inside [1y] R3b, 87 MiB/rank together with
+#     cuBLAS and the graph static buffers).  The decode backend is `full`, i.e.
+#     "attention metadata is captured INSIDE the graph"
+#     (full_cuda_graph_backend.py:54-57), so the plan the wrapper wrote there at
+#     capture time is what the replay reads: a capture-time constant.  The #50
+#     bisection is the positive evidence that this is NOT the zero-contract
+#     buffer.  It stays tagged-out.
+#   * the CUDA context ([1y] R1, 492 / 205 / 205 MiB) and the communicator
+#     buffers ([1y] R2, 307 / 184 / 184 MiB, of which 120 MiB/rank is the
+#     barlink BAR1 windows).  Untouchable by the item's own terms; BAR1
+#     re-registration is a collective and its extension is a JIT build, which
+#     RESTORE-NEVER-REBUILD forbids inside a cutover.
+#   * the `_export_static_state` clones ([1y] R5, >= 100 MiB/rank).  They ARE
+#     what the wake imports back.
+#
+# NO SECOND MECHANISM IS BUILT.  #102 ("Capture-Pools + IO-Buffer taggbar",
+# htsglang:078feed5ea34 / :0195ffb3e1325) already owns the shape -- one private
+# MemPool per tag plus `region_config`, with the size gate above -- but every
+# one of its wrap sites is scoped to an ADAPTIVE DRAFT state build
+# (`_ACTIVE_MANAGER`), and group P runs speculative_algorithm=None, so on this
+# path they are all `nullcontext()`.  What follows reuses that shape keyed to
+# the UPSTREAM `cuda_graph` tag, so there is exactly one tag and one ledger.
+
+
+def weg2_graph_tag_armed() -> bool:
+    """True when this rank's sleep also releases ``GPU_MEMORY_TYPE_CUDA_GRAPH``.
+
+    The gate is the SAME pair the capture path already reads
+    (``full_cuda_graph_backend.py:78-81``): the memory saver must be on and
+    ``SGLANG_MEMORY_SAVER_CUDA_GRAPH`` must be set.  Reading the same pair here
+    is what makes the two sides agree without a second flag -- if the capture
+    did not route into the tag, the pause has nothing to release and the tag
+    must not be added.
+
+    Cached on first call.  The sleep ADDS the tag to ``offload_tags`` and the
+    wake REMOVES it; a resolver that could answer differently between those two
+    legs would ``KeyError`` on a tag that was never paused.
+    """
+    global _GRAPH_TAG_ARMED
+    if _GRAPH_TAG_ARMED is None:
+        raw = os.environ.get("SGLANG_MEMORY_SAVER_CUDA_GRAPH", "")
+        _GRAPH_TAG_ARMED = raw.strip().lower() in ("1", "true", "yes", "on")
+    return _GRAPH_TAG_ARMED
+
+
+@contextmanager
+def weg2_graph_scratch_region(nbytes: int, adapter: Any = None) -> Iterator[bool]:
+    """Route ONE large, content-free graph-side allocation into the graph tag.
+
+    Yields True when the enclosed allocation is tagged, False when it is not --
+    the caller may need to know, and a silent no-op is how a region that never
+    ran gets reported as one that did.
+
+    Three refusals to tag, each for a stated reason:
+
+    * the tag is not armed (``weg2_graph_tag_armed``) -- then the capture path
+      did not route into the tag either, and a workspace alone in a paused tag
+      would be released while the graph that reads it is not;
+    * ``nbytes`` is below :data:`WEG2_GRAPH_SCRATCH_MIN_BYTES` -- #102's
+      correctness gate, see the constant;
+    * ``torch.cuda.MemPool`` / ``use_mem_pool`` or the adapter's
+      ``region_config`` is unavailable -- the pool is the thing that makes
+      cross-tag free-list reuse impossible, so without it the allocation stays
+      in the default pool rather than landing untracked in a shared segment.
+
+    The caller is responsible for restoring the allocation's content contract
+    after a resume; for the flashinfer float workspace that is
+    ``zero_flashinfer_workspaces()``, which the wake path calls.
+    """
+    if not weg2_graph_tag_armed() or int(nbytes) < WEG2_GRAPH_SCRATCH_MIN_BYTES:
+        yield False
+        return
+    import torch
+
+    from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+
+    if adapter is None:
+        from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+        adapter = TorchMemorySaverAdapter.create(enable=True)
+    region_config = getattr(adapter, "region_config", None)
+    mempool_cls = getattr(torch.cuda, "MemPool", None)
+    use_mem_pool = getattr(torch.cuda, "use_mem_pool", None)
+    if region_config is None or mempool_cls is None or use_mem_pool is None:
+        logger.warning(
+            "WEG2-SLEEP graph scratch NOT tagged (%d bytes): "
+            "region_config=%s MemPool=%s use_mem_pool=%s -- the allocation stays "
+            "in the default pool, which is resident across the sleep",
+            int(nbytes),
+            region_config is not None,
+            mempool_cls is not None,
+            use_mem_pool is not None,
+        )
+        yield False
+        return
+    global _GRAPH_SCRATCH_POOL
+    stack = ExitStack()
+    try:
+        if _GRAPH_SCRATCH_POOL is None:
+            _GRAPH_SCRATCH_POOL = mempool_cls()
+        stack.enter_context(use_mem_pool(_GRAPH_SCRATCH_POOL))
+        stack.enter_context(region_config(tag=GPU_MEMORY_TYPE_CUDA_GRAPH))
+    except Exception as exc:  # noqa: BLE001
+        # The fourth refusal, and the only one that is a FAILURE rather than a
+        # decision: the pool or the region could not be entered (no CUDA, an
+        # uninitialised saver, a torch that refuses the pool).  Degrade to
+        # untagged -- which is exactly the behaviour before this change, so the
+        # allocation is correct and merely resident -- but say so with the
+        # exception named.  Raising instead would turn a VRAM optimisation into
+        # a boot killer at attention-backend build time.
+        stack.close()
+        logger.warning(
+            "WEG2-SLEEP graph scratch NOT tagged (%d bytes): %s: %s -- the "
+            "allocation stays in the default pool and is RESIDENT across the "
+            "sleep (pre-change behaviour, not a silent success)",
+            int(nbytes),
+            type(exc).__name__,
+            exc,
+        )
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        stack.close()
+
+
 # ---------------------------------------------------------------------------
 # #1233 ONE-BACKUP FLIP: chunked weight tags (record section 1h, 2026-09-07)
 # ---------------------------------------------------------------------------

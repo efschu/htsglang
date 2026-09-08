@@ -1363,6 +1363,26 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # the write-through pin budget declined mid-prefill is not lost at the
     # flip (UnifiedRadixCache.publish_unbacked_sweep). Both groups.
     env["SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP"] = "1"
+    # Item `dormant` (record [1y]): the ONE switch that puts the CUDA-graph
+    # capture pool and the flashinfer FLOAT workspace inside the memory saver's
+    # `cuda_graph` region, so the sleeping group hands their physical pages
+    # back and the wake remaps them at stable virtual addresses -- no
+    # recapture, which RESTORE-NEVER-REBUILD forbids inside a cutover.
+    # Upstream's own flag, read at the CAPTURE site
+    # (full_cuda_graph_backend.py:78-81) and, since commit 2, at the SLEEP site
+    # (weg2_memory_saver.weg2_graph_tag_armed); both groups get it so the two
+    # sides can never disagree.  Expected release per rank from [1y]:
+    # 384 MiB workspace + 92-133 MiB capture pool, measured on the boot by
+    # `WEG2-SLEEP released tags=['cuda_graph'] mib=`.
+    #
+    # Compatible with this boot's spec config: adaptive graph memory is the one
+    # mechanism declared mutually exclusive with this flag
+    # (adaptive_graph_memory.py:390-394), and it resolves through `auto`, which
+    # LOGS and degrades to 'offload-scratch' rather than raising -- and is not
+    # even reached here, since both groups run speculative_adaptive=False.
+    env["SGLANG_MEMORY_SAVER_CUDA_GRAPH"] = env.get(
+        "SGLANG_MEMORY_SAVER_CUDA_GRAPH", "1"
+    )
     env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     env["SGLANG_UNEVEN_DCP"] = "1"
     env["SGLANG_UNEVEN_DCP_WEIGHTED"] = "1"

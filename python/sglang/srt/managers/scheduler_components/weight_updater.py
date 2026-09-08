@@ -8,7 +8,7 @@ import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -55,6 +55,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     is_weights_family_tag,
     sleep_acceptance_census,
     vram_credit,
+    weg2_graph_tag_armed,
 )
 
 #: C21 / spec R13.  The group fence's budget, named so the ONE place that owns
@@ -373,6 +374,52 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001
             return 0
         return int(value or 0)
+
+    @staticmethod
+    def _weg2_with_graph_tag(
+        tags: Sequence[str], weg2_memory_saver_on: bool
+    ) -> List[str]:
+        """Add ``cuda_graph`` to a Weg-2 kv_cache RPC, or return ``tags`` as-is.
+
+        Item `dormant` commit 2.  THE COUPLING IS RANK-LOCAL ON PURPOSE.  The
+        front could have been taught to send the tag, but then the sleep and
+        the wake would read two different processes' idea of whether it is
+        armed, and the wake's ``offload_tags.remove`` raises ``KeyError`` on a
+        tag the sleep never added -- a group-fatal fault from an env drift.
+        Both legs call this, both read ``weg2_graph_tag_armed()``, which is
+        cached per process, so the pair cannot disagree.
+
+        Three ways this returns the input untouched, each of them the correct
+        answer rather than a fallback: the stock (non-Weg-2) path, a request
+        that is not the kv_cache carrier (the weights family legs, the #89
+        disk park), and a request that already names the tag (``tags=None`` ->
+        ``GPU_MEMORY_ALL_TYPES``, which contains it).
+        """
+        if not weg2_memory_saver_on or not weg2_graph_tag_armed():
+            return list(tags)
+        if GPU_MEMORY_TYPE_KV_CACHE not in tags:
+            return list(tags)
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            return list(tags)
+        return list(tags) + [GPU_MEMORY_TYPE_CUDA_GRAPH]
+
+    @staticmethod
+    def _weg2_zero_graph_scratch() -> Optional[int]:
+        """Re-zero the registered flashinfer FLOAT workspaces; count, or None.
+
+        None means the helper could not be reached -- printed as ``n/a`` by the
+        caller, never as ``0``, because "no workspace was zeroed" and "the
+        zeroing never ran" are the difference between a restored contract and
+        a silent one.
+        """
+        try:
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                zero_flashinfer_workspaces,
+            )
+
+            return int(zero_flashinfer_workspaces())
+        except Exception:  # noqa: BLE001
+            return None
 
     @staticmethod
     def _weg2_allocator_cache_bytes() -> Optional[Tuple[int, int]]:
@@ -1121,6 +1168,17 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        # ITEM `dormant` COMMIT 2, the SLEEP half of the coupling.  The graph
+        # tag rides the kv_cache RPC, and it is added HERE, rank-locally, not
+        # by the front: both legs then read the same process-local resolver, so
+        # a tag can never be paused by one side and not removed by the other
+        # (the wake does `offload_tags.remove`, which raises on a tag that was
+        # never added).  kv_cache is the right carrier because it is the one
+        # RPC with the same shape -- no cpu backup, content-free, and already
+        # ordered first on the sleep and last on the wake, which is exactly
+        # upstream's pause/resume order for cuda_graph.
+        tags = self._weg2_with_graph_tag(tags, weg2_memory_saver_on)
+
         # #1233 one-backup flip: the weights are a FAMILY of tags (the base
         # GPU_MEMORY_TYPE_WEIGHTS plus weights_<k> per layer chunk, see
         # weg2_memory_saver.weights_family_tags) and one sleep may arrive as
@@ -1285,7 +1343,26 @@ class SchedulerWeightUpdaterManager:
             )
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            # ITEM `dormant` COMMIT 2: the pause is upstream's, unchanged.  What
+            # is added is the byte count, read from the saver's own metadata
+            # BEFORE the pause that moves it -- the same instrument and the same
+            # ordering rule as the weights family above (a metadata read, no
+            # device call after a pause).
+            graph_bytes = self._weg2_tag_bytes(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            t_graph = time.perf_counter()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            logger.info(
+                "WEG2-SLEEP released tags=['%s'] mib=%.1f ms=%.0f "
+                "(instrument: tms_tag_bytes for this ONE tag, read before the pause; "
+                "population = whatever was allocated inside region_config(cuda_graph) "
+                "-- the capture pool plus the flashinfer FLOAT workspace; the int "
+                "workspace, the CUDA context and the barlink BAR1 windows are NOT in "
+                "this denominator and are not released by it. 0.0 = the saver could "
+                "not answer, not an empty tag)",
+                GPU_MEMORY_TYPE_CUDA_GRAPH,
+                graph_bytes / MIB_,
+                (time.perf_counter() - t_graph) * 1000,
+            )
 
         torch.get_device_module().synchronize()
         sleep_complete = WEG2_SLEEP_TAGS.issubset(self.offload_tags)
@@ -1375,11 +1452,45 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        # ITEM `dormant` COMMIT 2, the WAKE half of the coupling.  Same resolver,
+        # same carrier tag, so `offload_tags.remove` below sees exactly what the
+        # sleep added.  It runs BEFORE the remove loop for that reason.
+        tags = self._weg2_with_graph_tag(tags, weg2_memory_saver_on)
+
         for tag in tags:
             self.offload_tags.remove(tag)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            t_graph = time.perf_counter()
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            graph_ms = (time.perf_counter() - t_graph) * 1000
+            graph_bytes = self._weg2_tag_bytes(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            # WAKE INVARIANT FOR THE GRAPH TAG, the exact mirror of the
+            # kv_cache one further down and for the same reason: the resume maps
+            # FRESH physical pages under this region -- on the two-group form
+            # they are pages the other group just released -- and this tag has
+            # no cpu backup.  The flashinfer FLOAT workspace lives in that
+            # region (flashinfer_backend.py, item `dormant` R3a) and its
+            # kernels' contract is that unwritten regions read ZERO (NOTE(#50):
+            # "fresh cudaMalloc pages read as zeros ... the zeroed state is the
+            # contract they were validated against").  Recycled pages are not
+            # zero.  zero_flashinfer_workspaces() is the fork's own restore of
+            # that state; here it runs after the resume instead of at a request
+            # boundary, so the FIRST forward after a wake sees the boot
+            # contract rather than the other group's residue.
+            zeroed = self._weg2_zero_graph_scratch()
+            logger.info(
+                "WEG2-RESUME remapped mib=%.1f ms=%.0f workspaces_zeroed=%s "
+                "(instrument: tms_tag_bytes for tag '%s' read AFTER the resume, so it "
+                "is the bytes now mapped again, not a copy figure -- this tag has no "
+                "cpu backup and no H2D leg; workspaces_zeroed counts the registered "
+                "flashinfer FLOAT workspaces re-zeroed to the NOTE(#50) contract, "
+                "n/a = the helper was unavailable, never 0)",
+                graph_bytes / MIB_,
+                graph_ms,
+                "n/a" if zeroed is None else zeroed,
+                GPU_MEMORY_TYPE_CUDA_GRAPH,
+            )
 
         weights_tags = [t for t in tags if is_weights_family_tag(t)]
         if weights_tags:
