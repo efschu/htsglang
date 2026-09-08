@@ -435,6 +435,33 @@ FORM_KEY_EXCLUDED_FLAGS: Tuple[str, ...] = (
     "--hicache-storage-backend-extra-config",
     "--pp-async-batch-depth",
     "--port",
+    # #1267: SCHEDULER-ONLY CAPS. The key answers ONE question -- "does group P
+    # LOAD the same thing" -- because that is what makes a predecessor's
+    # measured image a measurement of THIS boot. A flag that only bounds what
+    # the scheduler ADMITS changes no weight, no pool geometry and no
+    # allocation, so keying on it splits the form for two boots whose images are
+    # byte-identical and sends the solver to an older, foreign-form source for
+    # nothing. Each one is listed with the reason it cannot move the image;
+    # anything whose effect on what the ranks LOAD is not obviously nil stays
+    # IN the key, because the blacklist's whole point is that the default is
+    # inclusion.
+    #: Per-request admission ceiling. Bounds how many KV tokens ONE request may
+    #: claim; the pool it claims them from is sized by --max-total-tokens and
+    #: the cut, neither of which this touches.
+    "--max-kv-per-request",
+    #: Admission concurrency. Caps how many requests run at once. It sizes
+    #: req_to_token_pool bookkeeping, not any weight or KV allocation, and the
+    #: launcher already varies it per arm (--p-bs/--d-bs) between boots whose
+    #: loaded image is identical.
+    "--max-running-requests",
+    #: The scheduler's own queue ceiling: how many requests may WAIT. Pure
+    #: admission bookkeeping, no device allocation at all.
+    "--max-queued-requests",
+    #: NOT EXCLUDED, and the reason is worth keeping: --chunked-prefill-size
+    #: looks like an admission cap and is not one. The chunk frame is a real
+    #: device allocation -- the launcher prices it as
+    #: "frame 40.0 MiB (chunk 4096 x hidden 5120 x 2 B)" -- so changing it
+    #: changes what a rank LOADS. It stays IN the key.
 )
 #: Every flag that is NOT in :data:`FORM_KEY_EXCLUDED_FLAGS` is in the key.  A
 #: BLACKLIST on purpose: a whitelist silently stops discriminating the day a
