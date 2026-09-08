@@ -100,10 +100,22 @@ class DeviceInfo:
         This, not :attr:`total_mib`, is the capacity a memory budget may spend.
         Budgeting against ``total_mib`` overcommits every card by the carve-out
         (measured 425 MiB on a 20 GiB RTX 3080, 518 on a 32 GiB RTX 5090), and
-        the overcommit is invisible in the obvious check because NVML subtracts
-        the carve-out from BOTH ``used`` and ``free`` in the v2 struct -- so
-        ``total - used - free`` reads ~0 and the shortfall only appears when an
-        allocation that the budget said would fit does not.
+        the overcommit is invisible in the obvious check because the v1 struct
+        folds the carve-out into ``used`` -- so ``total - used - free`` reads ~0
+        THERE and the shortfall only appears when an allocation the budget said
+        would fit does not.
+
+        WHICH STRUCT PUTS THE CARVE-OUT WHERE, measured 2026-09-08 on the
+        reference rig with nothing running on the cards (the driver's own
+        numbers, one RTX 3080, MiB): v1 ``total 20480 free 20054 used 425`` --
+        v1 ``used`` INCLUDES the carve-out and ``total - used - free`` = 1;
+        v2 ``total 20480 free 20054 used 0 reserved 425`` -- v2 ``used``
+        EXCLUDES it and ``total - used - free`` = 426, the carve-out itself.
+        BOTH structs' ``free`` is already the allocatable figure. Hence the two
+        traps: ``total - used`` over a v2-style ``used`` (which is what
+        ``nvidia-smi --query-gpu=memory.used`` prints) returns FREE PLUS THE
+        CARVE-OUT, and a v1 ``used`` read as tenancy calls an empty card
+        425 MiB busy (#539).
         """
         return (self.total_bytes - self.reserved_bytes) // MIB
 
@@ -301,6 +313,21 @@ class MemoryInfo:
         """See :attr:`DeviceInfo.allocatable_mib`."""
         return (self.total_bytes - self.reserved_bytes) // MIB
 
+    @property
+    def tenant_used_mib(self) -> int:
+        """MiB held by PROCESSES, driver carve-out EXCLUDED.
+
+        Not :attr:`used_bytes`, which is NVML's v1 figure and INCLUDES the
+        carve-out: an idle RTX 3080 reads 425 MiB "used" there, and a preflight
+        that reads that as tenancy refuses an empty machine -- measured, and
+        fixed once already in commit ``0d3d973aed`` (#539, "Preflight refused an
+        idle machine: discount the NVML carve-out"). This is the v2 struct's
+        ``used``, the figure ``nvidia-smi --query-gpu=memory.used`` prints:
+        measured 2026-09-08 on the idle reference rig, v1 used 425 / this 1 /
+        nvidia-smi 1 on each RTX 3080.
+        """
+        return self.allocatable_mib - self.free_mib
+
 
 def memory_info_for_uuid(uuid: str) -> MemoryInfo:
     """Total, free and used for one card.
@@ -325,6 +352,55 @@ def memory_info_for_uuid(uuid: str) -> MemoryInfo:
                 reserved_bytes=reserved_bytes,
             )
     raise DeviceNotFoundError(f"no NVML device with UUID {uuid!r}")
+
+
+def memory_snapshot() -> list[tuple[DeviceInfo, MemoryInfo]]:
+    """Identity AND live memory for EVERY card, from ONE NVML session.
+
+    THE ONE READER for "how much can still be allocated on this card right
+    now". Every repeated sampler -- the Weg-2 corridor sampler in
+    ``srt/weg2/front.py``, the launcher preflight in ``srt/weg2/launcher.py`` --
+    reads here instead of shelling out to ``nvidia-smi`` and doing its own
+    arithmetic, because the arithmetic is where the carve-out is lost.
+
+    THE DEFECT THIS EXISTS TO END (boot weg2rg6, 2026-09-08): a sampler that
+    computed ``total - used`` over ``nvidia-smi --query-gpu=memory.used``
+    printed FREE PLUS THE DRIVER CARVE-OUT and called it free. Measured at one
+    instant, 07:31:30Z, against ``memory.free``: 1454 vs 1030, 859 vs 341,
+    1276 vs 852 MiB -- overstatements of exactly 424 / 518 / 424 MiB, the
+    carve-out of the three cards. The 5090 was 478 MiB below the corridor floor
+    and the operator's line read IN BAND. :attr:`MemoryInfo.free_mib` is that
+    same allocatable ``free``, taken from the driver rather than derived.
+
+    One NVML session for the whole rig, not one per card: the samplers run on a
+    10 s tick and the corridor line must print numbers from a SINGLE instant,
+    not three reads a few milliseconds apart.
+    """
+    with nvml_session() as pynvml:
+        out: list[tuple[DeviceInfo, MemoryInfo]] = []
+        for index in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            total_bytes, reserved_bytes = _memory_info(pynvml, handle)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            out.append(
+                (
+                    DeviceInfo(
+                        index=index,
+                        uuid=_decode(pynvml.nvmlDeviceGetUUID(handle)),
+                        name=_decode(pynvml.nvmlDeviceGetName(handle)),
+                        total_bytes=total_bytes,
+                        reserved_bytes=reserved_bytes,
+                        pci_bus_id=_decode(pynvml.nvmlDeviceGetPciInfo(handle).busId),
+                    ),
+                    MemoryInfo(
+                        total_bytes=int(mem.total),
+                        free_bytes=int(mem.free),
+                        used_bytes=int(mem.used),
+                        reserved_bytes=reserved_bytes,
+                    ),
+                )
+            )
+        return out
 
 
 @dataclass(frozen=True)

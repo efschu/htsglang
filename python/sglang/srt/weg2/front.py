@@ -59,6 +59,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from aiohttp import ClientSession, ClientTimeout, web
 
 from sglang.srt.managers.weg2_memory_saver import credit_epoch, weights_family_tags
+from sglang.srt.registry import nvml as nvml_registry
 
 logger = logging.getLogger("weg2.front")
 
@@ -347,19 +348,79 @@ def _sid_alive(sid: int) -> bool:
         return True
 
 
-def _nvml_free() -> List[Tuple[int, str, int]]:
+#: The corridor law, verbatim: 819-1229 MiB NVML-FREE per card under the awake
+#: group's load.  BELOW the floor = investigate, ABOVE the ceiling = the boot
+#: did not pass (memory ``vram-korridor-regel``).  The band is stated in
+#: ALLOCATABLE free, which is the only quantity the driver will actually hand
+#: to an allocation -- see :data:`CORRIDOR_INSTRUMENT`.
+CORRIDOR_FLOOR_MIB = 819
+CORRIDOR_CEIL_MIB = 1229
+#: What every WEG2-CORRIDOR line says it measured, printed in the line itself.
+#:
+#: DEFECT THIS NAME EXISTS TO CLOSE (boot weg2rg6, 2026-09-08): this sampler
+#: used to shell out to ``nvidia-smi --query-gpu=memory.used,memory.total`` and
+#: print ``total - used``.  That subtraction is FREE PLUS THE DRIVER CARVE-OUT,
+#: because nvidia-smi's ``memory.used`` (like NVML's v2 ``used``) already
+#: EXCLUDES the carve-out.  Measured at one instant, 07:31:30Z, this line
+#: against ``memory.free``: nvml0 1454 vs 1030, nvml1 859 vs 341, nvml2 1276 vs
+#: 852 -- overstatements of exactly 424 / 518 / 424 MiB.  The 5090 was 478 MiB
+#: BELOW the corridor floor while this line showed it inside the band.  The
+#: corridor rule names that subtraction and forbids it by name; the rule is
+#: older than the sampler (RUNSHEET_363 sec 4.3, and the August corridor
+#: sampler carried the comment "FREE column only -- never total minus used").
+CORRIDOR_INSTRUMENT = "nvml_v2_free,allocatable"
+#: One-shot latch so a rig without NVML says so once instead of every 10 s.
+_nvml_unavailable_logged = False
+
+
+@dataclass(frozen=True)
+class CardFree:
+    """One card's allocatable free at one instant, with its carve-out beside it."""
+
+    nvml_index: int
+    uuid: str
+    free_mib: int
+    reserved_mib: int
+
+
+def corridor_verdict(free_mib: int) -> str:
+    """``IN`` / ``BELOW`` / ``ABOVE`` against the corridor band.
+
+    Graded on ALLOCATABLE free only.  Inclusive at both edges: the band is
+    819-1229 MiB, so 819 and 1229 are IN and 818 / 1230 are not.
+    """
+    if free_mib < CORRIDOR_FLOOR_MIB:
+        return "BELOW"
+    if free_mib > CORRIDOR_CEIL_MIB:
+        return "ABOVE"
+    return "IN"
+
+
+def _nvml_free() -> List[CardFree]:
+    """Allocatable free per card, from the registry's ONE NVML reader.
+
+    No second reader and no local arithmetic: ``nvml_registry.memory_snapshot``
+    returns the driver's own ``free`` (which already excludes the carve-out)
+    plus the carve-out itself, all cards in one NVML session so the printed
+    numbers come from a single instant.
+    """
+    global _nvml_unavailable_logged
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10,
-        ).stdout
-    except Exception:  # noqa: BLE001
+        snap = nvml_registry.memory_snapshot()
+    except Exception as e:  # noqa: BLE001 - a corridor sample never kills the front
+        if not _nvml_unavailable_logged:
+            _nvml_unavailable_logged = True
+            logger.warning(
+                "WEG2-CORRIDOR unavailable: NVML could not be read (%s). No corridor "
+                "samples will be printed this boot -- and there is deliberately no "
+                "nvidia-smi fallback, because the only fallback this sampler ever had "
+                "was the total-minus-used subtraction the corridor rule forbids.", e,
+            )
         return []
-    res = []
-    for line in out.strip().splitlines():
-        idx, uuid, used, total = [x.strip() for x in line.split(",")]
-        res.append((int(idx), uuid, int(total) - int(used)))
-    return res
+    return [
+        CardFree(nvml_index=dev.index, uuid=dev.uuid, free_mib=mem.free_mib, reserved_mib=mem.reserved_mib)
+        for dev, mem in snap
+    ]
 
 
 def _nvml_process_mib(pids: set) -> Dict[str, int]:
@@ -503,6 +564,10 @@ class Front:
             "served": {g.name: g.served for g in self.groups.values()},
             "counters": dict(self.counters),
             "corridor_min_mib": {k: dict(v) for k, v in self.corridor_min.items()},
+            # Same instrument and band as the WEG2-CORRIDOR log line: a reader
+            # of this dict must not have to guess which "free" it holds.
+            "corridor_instrument": CORRIDOR_INSTRUMENT,
+            "corridor_band_mib": [CORRIDOR_FLOOR_MIB, CORRIDOR_CEIL_MIB],
             "flips": self.flip_log[-20:],
             "dc_measured_d_mib": self.dc_measured_d,
             "uptime_s": round(time.time() - self.t0, 1),
@@ -1115,18 +1180,44 @@ class Front:
                 if g.health_fail_streak >= 2 and not health_is_serving_fact(ok, alive):
                     self.do_stop("W17 Weg2GroupDead", f"group {g.name}: /health failed {g.health_fail_streak}x and process_alive={alive} (a 200 alone is a transport fact)")
 
+    def corridor_sample(self) -> Optional[str]:
+        """One corridor sample: read, fold into ``min_so_far``, log, return the line.
+
+        Split out of the 10 s loop so the instrument can be tested without a
+        boot.  Returns ``None`` when NVML could not be read (no sample was
+        taken and nothing was folded in) -- never a partial or a stale line.
+        """
+        phase = self.awake
+        # ONE read per sample.  The pre-fix form called the reader TWICE --
+        # once to fold into min_so_far and once to print -- so the printed
+        # numbers and the accumulated minimum were two different instants.
+        cards = _nvml_free()
+        if not cards:
+            return None
+        for c in cards:
+            cur = self.corridor_min[phase].get(c.nvml_index)
+            self.corridor_min[phase][c.nvml_index] = (
+                c.free_mib if cur is None else min(cur, c.free_mib)
+            )
+        per_card = " ".join(
+            f"nvml{c.nvml_index}:free={c.free_mib}MiB reserved={c.reserved_mib}MiB "
+            f"verdict={corridor_verdict(c.free_mib)}"
+            for c in cards
+        )
+        line = (
+            f"WEG2-CORRIDOR phase={phase}(awake) epoch={self.epoch} "
+            f"instrument={CORRIDOR_INSTRUMENT} band={CORRIDOR_FLOOR_MIB}-{CORRIDOR_CEIL_MIB}MiB "
+            f"{per_card} min_so_far={dict(self.corridor_min[phase])} ({CORRIDOR_INSTRUMENT}, MiB)"
+        )
+        logger.info("%s", line)
+        return line
+
     async def corridor_sampler(self) -> None:
         while True:
             await asyncio.sleep(10)
             if self.state != "serving":
                 continue
-            phase = self.awake
-            for idx, uuid, free in _nvml_free():
-                cur = self.corridor_min[phase].get(idx)
-                self.corridor_min[phase][idx] = free if cur is None else min(cur, free)
-            logger.info("WEG2-CORRIDOR phase=%s(awake) epoch=%d %s min_so_far=%s", phase, self.epoch,
-                        " ".join(f"nvml{idx}:free={free}MiB" for idx, _, free in _nvml_free()),
-                        dict(self.corridor_min[phase]))
+            self.corridor_sample()
 
     async def handle_manual_flip(self, request: web.Request) -> web.Response:
         if self.state != "serving":

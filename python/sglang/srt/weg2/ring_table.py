@@ -171,6 +171,13 @@ _KV_RE = re.compile(
 #: ``WEG2-CORRIDOR phase=D(awake) ... nvml0:free=2474MiB nvml1:free=1987MiB ...``
 _CORRIDOR_PHASE_RE = re.compile(r"WEG2-CORRIDOR\s+phase=([A-Z])\(awake\)")
 _CORRIDOR_FREE_RE = re.compile(r"nvml(\d+):free=(\d+)MiB")
+#: ``instrument=nvml_v2_free,allocatable`` -- present only on boots taken after
+#: the corridor instrument fix (front.CORRIDOR_INSTRUMENT).
+_CORRIDOR_INSTRUMENT_RE = re.compile(r"WEG2-CORRIDOR\s+phase=[A-Z]\(awake\)[^\n]*?instrument=(\S+)")
+#: What a WEG2-CORRIDOR line without an ``instrument=`` token was measuring:
+#: ``total - used`` over nvidia-smi's carve-out-free ``memory.used``, i.e. free
+#: PLUS the driver carve-out.  Named, never silently equated with the new one.
+CORRIDOR_INSTRUMENT_PRE_FIX = "total_minus_used(carve-out-blind)"
 #: ``NVML -> CUDA ordinal map: ordinal 0 = nvml 1 NVIDIA GeForce RTX 5090
 #: GPU-31d7ef41-... total 32607 MiB, ordinal 1 = nvml 0 ...`` (launcher.py).
 #: The SOURCE boot's own ordinal/nvml -> UUID map, and the reason this module
@@ -352,6 +359,9 @@ class RingTable:
     #: the RING line can be quoted without the instrument that produced it.
     image_source: str = "no WEG2 DORMANT-IMAGE line in the source boot"
     bound_groups: Tuple[str, ...] = ()
+    #: Which "free" the per-card credits are in -- see
+    #: :func:`front_corridor_instrument`.  Printed with them, never assumed.
+    credit_instrument: str = CORRIDOR_INSTRUMENT_PRE_FIX
 
     def provenance(self) -> str:
         bound = (
@@ -368,6 +378,14 @@ class RingTable:
             "the tag census over ALL BACKED-UP tags, cross-checked against the "
             "sleeping group's summed per-rank RssShmem from that boot's own "
             f"WEG2 DORMANT-IMAGE line ({self.image_source}){bound}"
+            f"; per-card CREDIT instrument: {self.credit_instrument}"
+            + (
+                " -- this boot's corridor samples are free PLUS the driver "
+                "carve-out, so every credit is over-stated by that card's "
+                "carve-out and the resulting H is the optimistic end"
+                if self.credit_instrument == CORRIDOR_INSTRUMENT_PRE_FIX
+                else ""
+            )
         )
 
     def env_map(self) -> str:
@@ -954,6 +972,38 @@ def parse_front_corridor(path: str) -> Dict[str, Dict[int, int]]:
     return out
 
 
+def front_corridor_instrument(path: str) -> str:
+    """Which "free" the WEG2-CORRIDOR samples in this front log actually are.
+
+    The credit below (``credit(S->W) = NVML free while S is awake + released
+    kv``) is only as honest as that free, and the unit changed mid-campaign:
+    boots up to weg2rg6 printed ``total - used``, which is free PLUS the driver
+    carve-out (424 MiB per 3080, 518 per 5090 on the reference rig), so their
+    samples OVER-credit every card by that much -- the unsafe direction, since
+    a larger credit makes R5's host requirement smaller.  Boots after the fix
+    print ``instrument=nvml_v2_free,allocatable`` in the line itself.
+
+    Deliberately NOT a refusal and NOT a correction: the pre-fix number is
+    still the best (only) sample those boots carry, and the table that rg6
+    proved on metal is built from one of them.  What must not happen is a
+    reader quoting a credit without knowing which unit it is in, so this is
+    returned and printed beside the number.
+    """
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if "WEG2-CORRIDOR" not in line:
+                    continue
+                m = _CORRIDOR_INSTRUMENT_RE.search(line)
+                if m:
+                    return m.group(1)
+                if _CORRIDOR_PHASE_RE.search(line):
+                    return CORRIDOR_INSTRUMENT_PRE_FIX
+    except OSError:
+        return "unreadable"
+    return "no WEG2-CORRIDOR samples"
+
+
 #: ``PROBE start mode=card ... uuid=GPU-...`` opens a card's section of the
 #: step-0 probe record; ``PROBE granule tag=... ratio=1.316 verdict=DUPLEX-NULL``
 #: is the measurement in the FORM C3/C4 actually issue (2 MiB granules), which
@@ -1192,6 +1242,7 @@ def solve(
         table = RingTable(
             boot=stem,
             instrument=gd.instrument or gp.instrument,
+            credit_instrument=front_corridor_instrument(f_log),
             lines_read=gp.lines_read + gd.lines_read,
             image_source=f"P: {src_p} | D: {src_d}",
             bound_groups=tuple(
