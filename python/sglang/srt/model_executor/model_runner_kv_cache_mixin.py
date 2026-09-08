@@ -221,6 +221,25 @@ def mamba_post_total_gb(posts) -> float:
     )
 
 
+def _is_draft_kv_only_producer(runner) -> bool:
+    """#1233 FIX 4: the ``ModelRunner.is_draft_kv_only_producer`` predicate,
+    reached duck-typed.
+
+    Module-level and getattr-guarded for the same reason
+    :func:`_note_mamba_component` is (the #624 stub-drift class): the sizing
+    functions below are driven directly by unit suites whose runner doubles
+    have no reason to grow a property from a Weg-2 feature. A double without
+    it is not a producer.
+    """
+    got = getattr(runner, "is_draft_kv_only_producer", None)
+    if got is not None:
+        return bool(got)
+    server_args = getattr(runner, "server_args", None)
+    return bool(
+        getattr(server_args, "speculative_draft_kv_only", False)
+    ) and not bool(getattr(runner, "is_draft_worker", False))
+
+
 def _note_mamba_component(runner, name: str, gb: float) -> None:
     """Record one NAMED sub-term of the lumped mamba budget post (#704).
 
@@ -2183,7 +2202,18 @@ class ModelRunnerKVCacheMixin:
         server_args = self.server_args
         assert config is not None
 
-        has_spec_dec = not self.spec_algorithm.is_none()
+        # #1233 FIX 4 (boot weg2tr1): the draft-KV PRODUCER never runs a
+        # target-verify step, so the "speculative intermediate state" post --
+        # the per-draft-token intermediate SSM / conv-window VERIFY workspace
+        # (MambaPool.SpeculativeState) -- reserves memory for a forward this
+        # group cannot execute. Measured on weg2tr1's P log against the same
+        # cut on weg2rg6: 0.877 / 0.511 / 0.365 GiB taken out of PP0/PP1/PP2's
+        # KV budget for a workspace that was never touched. The allocation
+        # itself is dropped in the same breath (max_spec_draft_tokens below),
+        # so this is not a post going missing from a live tensor.
+        has_spec_dec = (
+            not self.spec_algorithm.is_none()
+        ) and not _is_draft_kv_only_producer(self)
         if has_spec_dec:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
@@ -2918,7 +2948,14 @@ class ModelRunnerKVCacheMixin:
             # by draft-token step; adaptive rungs (k4/k5 -> 5/6 tokens) and
             # the cross-algorithm DFLASH rung (16 tokens) exceed the boot
             # shape's value -- sizing with it would OOB the step axis.
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            # #1233 FIX 4: None on the draft-KV producer -- it never verifies,
+            # so the intermediate verify caches are not built (see the twin
+            # carve at the req_to_token_pool construction below).
+            speculative_num_draft_tokens=(
+                None
+                if _is_draft_kv_only_producer(self)
+                else self.server_args.max_speculative_num_draft_tokens
+            ),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
             mamba_full_memory_ratio=self.server_args.mamba_full_memory_ratio,
@@ -3696,6 +3733,14 @@ class ModelRunnerKVCacheMixin:
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
+            if _is_draft_kv_only_producer(self):
+                # #1233 FIX 4: no target-verify on the producer -> no
+                # SpeculativeState. `None` is the pool's own "plain State"
+                # signal (memory_pool.py:1117), so the intermediate SSM +
+                # conv-window verify caches are never built. Paired with the
+                # `has_spec_dec` carve above: the post and the tensor move
+                # together, never one without the other.
+                max_spec_draft_tokens = None
             extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
             if self.server_args.disaggregation_mode == "decode":

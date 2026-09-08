@@ -715,6 +715,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     # if there is no aux layer, set to None
                     self.eagle_aux_hidden_state_layer_ids = None
 
+        # #1233 FIX 4 / #1025 class (boot weg2tr1): put the PRODUCER's draft KV
+        # pool into the ledger the profile sees.
+        #
+        # The block above is the joint-sizing hook -- pool_configurator inflates
+        # the per-token cell to `t_target * (1 + L_draft/L_target)` so the draft
+        # KV pool is paid for out of the SAME budget as the main pool. It is
+        # gated on `speculative_draft_model_path`, which an in-checkpoint MTP
+        # head does not set (measured weg2tr1: `speculative_draft_model_path=
+        # None`), so `eagle_draft_num_layers` stayed None, the cell stayed at
+        # the target's 8192 B/token on PP2 -- and the producer's draft KV pool
+        # (measured 0.15 GB K + 0.15 GB V at 155,164 tokens = ~2048 B/token,
+        # i.e. exactly one attention layer) was then allocated ON TOP of a
+        # budget the main pool had already spent in full.
+        #
+        # Only the LAST pipeline stage builds a producer, so only that stage
+        # carries the draft pool and only that stage may be charged for it
+        # (draft_kv_producer.py::Weg2DraftRegistrationOffStage).
+        if (
+            self.is_draft_kv_only_producer
+            and self.eagle_draft_num_layers is None
+            and self.pp_rank == self.pp_size - 1
+        ):
+            # An MTP/NEXTN head is one predictor layer unless the checkpoint
+            # says otherwise; the number is LOGGED rather than assumed silently
+            # so the next boot's "KV pool sizing" line can be checked against it.
+            self.eagle_draft_num_layers = int(
+                getattr(self.model_config, "num_nextn_predict_layers", None) or 1
+            )
+            logger.info(
+                "#1233 draft-KV PRODUCER: charging the draft KV pool to this "
+                "stage's per-token cell (eagle_draft_num_layers=%d, from "
+                "num_nextn_predict_layers=%s). Without this the producer's "
+                "draft pool is allocated OUTSIDE the profiled budget "
+                "(#1025 class): the two pools now share one budget instead of "
+                "the draft one being paid twice.",
+                self.eagle_draft_num_layers,
+                getattr(self.model_config, "num_nextn_predict_layers", None),
+            )
+
         # T156 stage 2 (--speculative-cross-algorithm): when the FORCED rung is
         # NEXTN, spec_algorithm is EAGLE but a DFLASH rung is co-resident; the
         # target still needs the DFLASH planning fields (draft layer count for
@@ -1498,6 +1537,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = 0
         logger.info(reason)
 
+    @property
+    def is_draft_kv_only_producer(self) -> bool:
+        """#1233 FIX 4: is this the TARGET runner of Weg 2's draft-KV PRODUCER?
+
+        ``--speculative-draft-kv-only`` names a PREFILL-ONLY group: its last
+        pipeline stage runs the checkpoint's MTP head after every target chunk
+        so the draft KV rows exist, and NOTHING in this process ever decodes,
+        proposes or verifies (draft_kv_producer.py's module docstring: "There
+        is no verify, no draft round, no draft cuda graph, no proposal loop").
+
+        The runner nevertheless reads its capture shape and its speculative
+        memory posts off ``server_args.speculative_algorithm``, which the
+        producer must carry byte-for-byte (it is hashed into the drafter
+        identity, server_args.py:8311). So the flag set that exists ONLY to
+        make the draft KV bytes mean the same thing on both groups also
+        switched this runner into TARGET_VERIFY shape -- and boot weg2tr1 died
+        there (PP1+PP2, ``gdn_backend.py`` target-verify branch, 63 s in).
+
+        False on the draft runner itself: that one is already eager through
+        ``--disable-draft-cuda-graph`` in ``_draft_server_args``
+        (draft_kv_producer.py::init_cuda_graphs), and its OWN pools must keep
+        being sized as the draft's.
+        """
+        return bool(
+            getattr(self.server_args, "speculative_draft_kv_only", False)
+        ) and not self.is_draft_worker
+
     @time_startup_latency(name="cuda_graph_capture")
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
@@ -1505,6 +1571,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Spec draft runners pass capture_decode_cuda_graph=False
         because they capture their own decode-style graphs separately.
         """
+        # #1233 FIX 4 (boot weg2tr1), STRUCTURAL, same shape as the #631 carve
+        # below: the draft-KV producer group is PREFILL-ONLY. It never runs a
+        # decode step and never runs a target-verify step, so the decode /
+        # target-verify graph set -- and with it the capture memory pool and
+        # the verify workspaces those graphs touch -- is dead weight that only
+        # ever produced a boot killer. Skipped by CONSTRUCTION here rather
+        # than configured off, because the shape is not a tuning choice: it
+        # follows from "this group never decodes".
+        #
+        # The PREFILL graph is deliberately left alone (init_prefill_cuda_graph
+        # runs below exactly as before, and routes itself to the eager runner
+        # when the prefill backend is disabled, which is what this rig's
+        # cuda_graph_config resolves to).
+        if capture_decode_cuda_graph and self.is_draft_kv_only_producer:
+            capture_decode_cuda_graph = False
+            logger.info(
+                "#1233 draft-KV PRODUCER (--speculative-draft-kv-only): "
+                "SKIPPING decode + target-verify CUDA-graph capture on this "
+                "runner (and with it the decode capture memory pool and the "
+                "target-verify workspaces). Reason: this group is "
+                "prefill-only -- it writes draft KV rows during prefill and "
+                "never decodes, proposes or verifies, so a TARGET_VERIFY "
+                "graph set (num_draft_tokens=%s) records a forward that can "
+                "never be replayed here. The PREFILL graph path is "
+                "unaffected. Boot weg2tr1 died capturing exactly this set.",
+                getattr(self.server_args, "speculative_num_draft_tokens", None),
+            )
 
         # #631 operator pin 2, STRUCTURAL: the phase flip's PP stack captures
         # NO graphs at all -- it runs eager prefill exactly like the measured
