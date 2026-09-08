@@ -2190,9 +2190,28 @@ class Front:
             # This is the weg2zr2 `weg2-4-8` shape (front log line 186:
             # est remainder 0, realised uncached 19,401) -- served through a
             # 4,096-token grant then, refused by name now.
+            # #1271 (c) FOLLOW-UP -- THE THIRD CONSTRUCTION SITE. #1271's own
+            # commit body says `est_uncached` is "set at BOTH construction
+            # sites"; there are THREE, and this one was missed. Since
+            # `_flip_economics_ok` sums `est_uncached`, a rid re-queued here
+            # contributed 0 to the backlog -- so a W31 re-queue arriving on an
+            # otherwise empty queue could never clear the threshold and simply
+            # sat until the drain deadline. Found by test_t9c, which hung for
+            # 30 s waiting for a 200 that a held flip could never produce.
+            #
+            # AND THIS IS THE WORST SITE TO MISS: D refused this rid with W31
+            # precisely BECAUSE its uncached extent after match_prefix exceeded
+            # X, so the one Pending whose uncached work is provably large was
+            # the one contributing zero.
+            #
+            # The value is the whole estimate, not a store-credited remainder,
+            # for the same evidence the `store_span_est=0` note below gives:
+            # the prefix the span LRU would price as resident demonstrably did
+            # not come back on D. `span_known=False` says that is an estimate.
+            _est = len(text) // int(CHARS_PER_TOKEN) + 1
             p = Pending(rid, request.path, payload, text, time.time(),
                         asyncio.get_event_loop().create_future(),
-                        est_prompt=len(text) // int(CHARS_PER_TOKEN) + 1, span_known=False)
+                        est_prompt=_est, est_uncached=_est, span_known=False)
             # MF-3: `store_span_est` stays 0 on this path ON PURPOSE, and the
             # reason is evidence, not caution: D has just refused this rid
             # with W31, i.e. its uncached extent AFTER match_prefix was larger

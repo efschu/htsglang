@@ -533,15 +533,28 @@ def test_t9d_all_four_front_sites_read_one_x():
 
 # -------------------------------------------------------------- T10, R-5
 def test_t10_a_trickle_below_the_threshold_does_not_buy_a_round_trip():
-    """T10: queued work below --flip-min-work-tokens does not flip; crossing
-    it, or the fairness bound firing, does.  The weg2zr2 4.3 s P phase (29.4
-    s round trip to prefill 5 requests) must not recur."""
+    """T10, ADAPTED TO #1271 RULE (c): THE BACKLOG SUM IS OVER UNCACHED TOKENS.
+
+    The behaviour asserted is unchanged -- queued work below
+    --flip-min-work-tokens does not flip, crossing it or the fairness bound
+    does, and the weg2zr2 4.3 s P phase must not recur. What changed is the
+    QUANTITY the threshold is applied to: `_flip_economics_ok` summed
+    `est_prompt`, which counts the cached head P never recomputes, so a backlog
+    could flip on prefixes already resident. It now sums `est_uncached`.
+
+    The old fixture set only `est_prompt`, leaving `est_uncached` at its default
+    0, so under the new rule the backlog read 0 and the test went red. It is
+    adapted rather than deleted, and STRENGTHENED to pin the rule it now
+    depends on: the cached-head case below (huge est_prompt, tiny uncached) is
+    the one #1271 exists to hold, and would flip under the old sum.
+    """
     f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
               tp_prefill_max_tokens=22000)
     loop = asyncio.new_event_loop()
     try:
-        mk = lambda est: Pending("r", "/generate", {}, "x", time.time(),
-                                 loop.create_future(), est_prompt=est)
+        mk = lambda est, unc=None: Pending(
+            "r", "/generate", {}, "x", time.time(), loop.create_future(),
+            est_prompt=est, est_uncached=est if unc is None else unc)
         f.queue.append(mk(5000))
         assert f._flip_economics_ok(fairness_fired=False) is False
         f.queue.append(mk(18000))
@@ -550,6 +563,17 @@ def test_t10_a_trickle_below_the_threshold_does_not_buy_a_round_trip():
         f.queue.append(mk(10))
         assert f._flip_economics_ok(fairness_fired=False) is False
         assert f._flip_economics_ok(fairness_fired=True) is True
+
+        # RULE (c) ITSELF: a backlog that is huge on est_prompt and tiny on
+        # uncached must HOLD. On the pre-#1271 sum this flips.
+        f.queue.clear()
+        f.queue.append(mk(40000, unc=100))
+        assert f._flip_economics_ok(fairness_fired=False) is False, \
+            "a backlog of resident prefixes must not buy a round trip"
+        # and the same est_prompt with the work actually uncached must flip
+        f.queue.clear()
+        f.queue.append(mk(40000, unc=40000))
+        assert f._flip_economics_ok(fairness_fired=False) is True
     finally:
         loop.close()
 
@@ -600,17 +624,43 @@ def test_c10_x_is_derived_with_a_provenance_line_naming_its_three_inputs():
 
 
 def test_c10_x_prefers_this_rigs_own_measured_lines(tmp_path):
+    """C10, ADAPTED TO #1271 RULE (a): r_P IS A GROUP THROUGHPUT, NOT A LATENCY.
+
+    The behaviour asserted is unchanged -- X prefers this rig's own measured
+    front log over the recorded PRE-BARLINK pair, and names it. What changed is
+    what r_P MEANS: the leg-1 `wall` is one request's latency and the front
+    drains P at p_concurrency=8, so `uncached/wall` charged a leg for the time
+    it sat queued behind its peers. r_P now accumulates a drain's uncached
+    tokens and divides by that drain's OWN `drain_s`, read from the new
+    `WEG2 P-DRAIN` line -- the same shape as r_D.
+
+    The old fixture carried no P-DRAIN line at all, so the log no longer
+    carried "all three instruments" and resolve_x correctly fell through to the
+    PRE-BARLINK fallback -- which is why this went red. The fixture is brought
+    up to the contract, and the two leg-1 walls are deliberately DIFFERENT from
+    drain_s so that the aggregate and the old per-request reading cannot
+    coincide: this asserts the drain denominator, not just that a number came
+    back.
+    """
     log = tmp_path / "boot_weg2_x_0907_000000.front.log"
     log.write_text(
         "WEG2-FLIP done epoch=1 slept=D woke=P ... flip_total=13247 ms weights_tags=8 dc={}\n"
         "WEG2-FLIP done epoch=2 slept=P woke=D ... flip_total=13247 ms weights_tags=8 dc={}\n"
         "WEG2-SERVED group=P leg=1 rid=a prompt_tokens=30100 cached_tokens=0 wall=8.27s epoch=1\n"
+        "WEG2-SERVED group=P leg=1 rid=c prompt_tokens=30100 cached_tokens=100 wall=9.00s epoch=1\n"
+        "WEG2 P-DRAIN epoch=1 prefilled=2 drain_s=12.000\n"
         "WEG2-SERVED group=D leg=2 rid=b status=200 prompt_tokens=30100 cached_tokens=0 "
         "completion_tokens=5 uncached=30100 verdict=single_prefill wall=43.62s epoch=2\n"
     )
     x, prov = launcher_mod.resolve_x(None, str(tmp_path), 4096)
     assert "source=boot:" in prov and log.name in prov
-    assert x == launcher_mod.derive_x_star(13.247, 30100 / 43.62, 30100 / 8.27, 4096)
+    # r_P is the DRAIN aggregate: (30100 + 30000) uncached over drain_s=12.0,
+    # NOT the median of 30100/8.27 and 30000/9.00.
+    r_p_drain = (30100 + 30000) / 12.000
+    assert x == launcher_mod.derive_x_star(13.247, 30100 / 43.62, r_p_drain, 4096)
+    per_request = launcher_mod.derive_x_star(
+        13.247, 30100 / 43.62, launcher_mod._median([30100 / 8.27, 30000 / 9.00]), 4096)
+    assert x != per_request, "the drain aggregate must not coincide with the old latency reading"
 
 
 # =====================================================================
