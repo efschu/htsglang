@@ -455,6 +455,45 @@ def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
     return "rank idle, front still holds requests"
 
 
+def flip_escape_verdict(
+    state: str, stage: str, epoch: int, exc: BaseException
+) -> Optional[Tuple[str, str]]:
+    """``(W-code, detail)`` when an exception escaped an OPEN flip, else None.
+
+    #1264 (A).  ``Weg2Front.flip`` sets ``state="flipping"`` as its first
+    statement and clears it only on its NAMED exits (W1 refusal, W3 witness
+    disagreement, W4 RPC failure, W19, success).  An unexpected exception
+    escapes past every one of them, and the controller's ``except Exception``
+    used to log it and ``continue`` -- but the loop's own first statement is
+    ``if self.state != "serving": continue``, so "continue" means the front
+    does nothing for the rest of the boot while ``/health`` keeps answering
+    200.  Measured weg2t2b (2026-09-08): a ``TypeError`` at 12:43:04,131Z, 0.6 s
+    after ``WEG2-FLIP begin``, and the front never flipped again; weg2t2a held
+    the same shape for seven minutes.
+
+    An exception that escaped mid-flip is not a recoverable error.  The source's
+    kv_cache (and possibly part of its weights family) is paused and the
+    destination is not resumed, so VRAM occupancy is undefined on both groups --
+    exactly the state W4 already names when an RPC fails at the same point.  So
+    the verdict is W4, and the STAGE is carried because it is what says how far
+    the flip got.
+
+    Pure so it can be tested without a front, a session or an event loop: the
+    caller does the stopping.
+    """
+    if state != "flipping":
+        return None
+    return (
+        "W4 Weg2WakeRefused",
+        f"unhandled {type(exc).__name__} during the flip of epoch {epoch} at "
+        f"stage {stage!r}: {exc} -- the flip neither completed nor took one of "
+        f"its named exits, so VRAM occupancy is undefined on both groups and "
+        f"the front would otherwise sit in state='flipping' forever (the "
+        f"controller's own guard skips every iteration while it is not "
+        f"'serving'). No retry; recovery = teardown + relaunch",
+    )
+
+
 def health_is_serving_fact(http_200: bool, process_alive: bool) -> bool:
     """W17: an HTTP 200 is a transport fact; liveness needs the process too."""
     return bool(http_200 and process_alive)
@@ -2327,7 +2366,24 @@ class Front:
         #
         # The free sample is taken HERE, after the source's kv_cache is already
         # released, so it is the state the flip actually starts from.
-        free_mib = {idx: free for idx, _uuid, free in _nvml_free()}
+        # #1264 (A), THE weg2t2b KILLER, and it is a READER bug not a producer
+        # one: `_nvml_free()` returns `CardFree` FROZEN DATACLASSES, which are
+        # not iterable, so unpacking one as `idx, _uuid, free` raises
+        # `TypeError: cannot unpack non-iterable CardFree object`.  Measured
+        # boot weg2t2b 2026-09-08 12:43:04,131Z, 0.6 s after `WEG2-FLIP begin`
+        # and immediately after D's kv sleep RPC returned 200 -- the controller
+        # caught it, `_flip_stage` was still "sleep-kv", and the front sat in
+        # state="flipping" for the rest of the boot (see the handler in
+        # `controller` for the second half of this fix).
+        #
+        # The two readers of this producer diverged at a MERGE, not in one
+        # edit: `1a1247f8e6` (2026-09-07) added this line against the old
+        # 3-tuple shape while `02d9811adb` (2026-09-08) changed the producer to
+        # `CardFree` and migrated the OTHER reader (`corridor_sample`, which
+        # uses attribute access).  Neither branch was wrong alone.  Attribute
+        # access is now the ONE shape both readers use, so a further field on
+        # `CardFree` cannot break either.
+        free_mib = {c.nvml_index: c.free_mib for c in _nvml_free()}
         pause_order, why = interleave_pause_order(
             self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib
         )
@@ -2771,7 +2827,34 @@ class Front:
             except Weg2Stop as e:
                 self.do_stop(e.name, e.detail)
             except Exception as e:  # noqa: BLE001
-                logger.exception("controller error: %s", e)
+                # #1264 (A), THE CLASS behind the weg2t2b wedge -- the one-line
+                # TypeError above was only its trigger.  `flip()` sets
+                # `state="flipping"` at its first statement and clears it only
+                # on its NAMED exits; an unexpected exception escapes past every
+                # one of them.  Logging and continuing then leaves the front in
+                # "flipping" FOREVER: the guard at the top of this loop is
+                # `if self.state != "serving": continue`, so the controller
+                # spins doing nothing, the queued request is never dispatched,
+                # and /health keeps answering 200.  Measured weg2t2b: 123.7 s to
+                # the stall line, then teardown; weg2t2a held the same shape for
+                # seven minutes.
+                #
+                # A flip that died mid-way is not a recoverable error, it is the
+                # W4 state the RPC-failure paths already name: the source's
+                # kv_cache (and possibly its weights family) is paused and the
+                # destination is not resumed, so VRAM occupancy is undefined on
+                # both sides and no retry is legal.  So STOP BY NAME at the
+                # stage that was open, and keep the plain log-and-continue only
+                # for errors raised outside a flip, where the front's state
+                # really is intact.
+                verdict = flip_escape_verdict(
+                    self.state, self._flip_stage, self.epoch, e
+                )
+                if verdict is not None:
+                    logger.exception("controller error during flip: %s", e)
+                    self.do_stop(*verdict)
+                else:
+                    logger.exception("controller error: %s", e)
 
     async def health_poller(self) -> None:
         while True:
