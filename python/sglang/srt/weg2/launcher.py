@@ -290,8 +290,12 @@ P_BYTES_PER_TOKEN = 8192 + 2048
 #: :func:`p_stage_layers`; nothing reads these as layer counts.
 P_PP_STAGE_RATIO_SCORES = (32, 18, 14)
 #: Group P's per-stage FULL-ATTENTION scores (#485 ``--pp-attn-stage-ratio``),
-#: read twice for the same reason and therefore defined once: by ``argv_p``
-#: (the flag) and by :func:`p_stage_layers` (the split the flag produces).
+#: read for the same reason and therefore defined once: by ``argv_p`` (the
+#: flag), by :func:`p_stage_layers` (the split the flag produces) and -- since
+#: the merge train brought a solver -- by :func:`solve_p_cut`, for which this
+#: vector is the INCUMBENT the candidate cuts are scored against.  Three
+#: readers, one statement; ``test_weg2_host_budget_1233`` pins that set so a
+#: fourth cannot appear silently and a bare literal cannot drift back in.
 P_PP_ATTN_STAGE_RATIO_SCORES = (8, 4, 4)
 
 
@@ -1076,8 +1080,14 @@ def argv_p(
     extra: List[str],
     p_bs: int = 8,
     max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
-    stage_ratio: str = "32,18,14",
-    attn_stage_ratio: str = "8,4,4",
+    # DERIVED FROM THE CONSTANT, NOT RETYPED (train fix 2).  These two defaults
+    # arrived as the bare literals "32,18,14" / "8,4,4" from the solver branch
+    # while merge 5 moved the vector into P_PP_*_SCORES -- one fact with two
+    # statements, which is the exact defect #1233 fix 5 closed and which
+    # test_weg2_host_budget_1233 refuses.  argv_p reading the constant is also
+    # what that constant's own docstring says it is for.
+    stage_ratio: str = ",".join(str(n) for n in P_PP_STAGE_RATIO_SCORES),
+    attn_stage_ratio: str = ",".join(str(n) for n in P_PP_ATTN_STAGE_RATIO_SCORES),
     write_policy: str = "write_through",
     depth: int = 0,
 ) -> List[str]:
@@ -2485,13 +2495,45 @@ def budgets_from_dc(
     return out
 
 
-def _max_running_requests(model: str) -> int:
-    """``--max-running-requests`` as this launcher actually passes it."""
-    flags = common_flags(model, 1, 1, 1.0)
+def _max_running_requests(model: str, group: str = "D", bs: int = 8) -> int:
+    """``--max-running-requests`` as this launcher actually passes it, per GROUP.
+
+    TRAIN FIX 2, and a BOOT KILLER the merge produced: this read the flag out
+    of :func:`common_flags`, and it was wrong twice over there, both raising
+    rather than answering, two frames below ``solve_p_cut`` (launcher.py:3400)
+    and ``d_overlap_cost_line`` (launcher.py:2559) -- i.e. on the path of every
+    Weg-2 boot from the train tip, before group P ever launches:
+
+      * ``common_flags(model, 1, 1, 1.0)`` raised TypeError, because merge 3's
+        UNION SIGNATURE (slice A's ``max_kv_per_request`` beside prefill-perf's
+        ``write_policy``) made ``max_kv_per_request`` a fifth REQUIRED
+        positional ahead of the ones this call passed.  Each parent was
+        self-consistent -- ``weg2/prefill-perf-0907`` had four required
+        positionals and this caller worked against it -- so the defect is the
+        resolution, not either branch.
+      * Given the arguments it would STILL have raised ValueError, because the
+        flag is not in ``common_flags`` at all any more.  That function's own
+        docstring says so: "NOT here any more (C1/R-12) ... emitted per group
+        from --p-bs / --d-bs instead".
+
+    THE CLASS: a flag MOVED and its only consumer was not moved with it.  The
+    fix keeps the property the original was reaching for -- the number is READ
+    OFF THE ARGV this launcher builds, never restated -- by reading it off the
+    GROUP's argv, which is where the flag now lives.  The two callers ask about
+    different groups and now say which: the P pool model's mamba slots are P's
+    ``--p-bs``, D's ping-pong price is D's ``--d-bs``.  Answering both from one
+    list would have re-created exactly the coupling C1/R-12 removed.
+    """
+    if str(group) == "P":
+        flags = argv_p("py", model, [1, 1, 1], 1, 1, 1.0, [], p_bs=int(bs))
+    else:
+        flags = argv_d("py", model, [1, 1, 1], 1, 1, 1.0, [], d_bs=int(bs))
     return int(flags[flags.index("--max-running-requests") + 1])
 
 
-def d_mamba_ping_pong_cost(model: str, disable_overlap: bool) -> Tuple[str, int, int, int]:
+def d_mamba_ping_pong_cost(
+    model: str, disable_overlap: bool, d_bs: int = 8
+) -> Tuple[str, int, int, int]:
     """What D's overlap choice costs in DEVICE mamba state slots (FIX 1r/1).
 
     Returns ``(strategy, ping_pong_slots_per_running_request, extra_slots_per
@@ -2523,7 +2565,11 @@ def d_mamba_ping_pong_cost(model: str, disable_overlap: bool) -> Tuple[str, int,
     from sglang.srt.mem_cache.mamba_pool_floor import mamba_ping_pong_slots
     from sglang.srt.server_args import ServerArgs
 
-    flags = common_flags(model, 1, 1, 1.0)
+    # Group D's OWN argv, for the same reason and with the same defect history
+    # as _max_running_requests above (train fix 2): this list is read for the
+    # PRESENCE of a flag, so it must be the list the group actually gets, not
+    # the shared prefix the per-group flags left.
+    flags = argv_d("py", model, [1, 1, 1], 1, 1, 1.0, [], d_bs=int(d_bs))
 
     class _StrategyView:
         """Exactly the ServerArgs surface ``mamba_ping_pong_slots`` reads."""
@@ -2544,11 +2590,11 @@ def d_mamba_ping_pong_cost(model: str, disable_overlap: bool) -> Tuple[str, int,
     # The arm this replaces: group D as it booted before the overlap schedule
     # was turned on, i.e. the arm every DC_MEASURED_D_* number was taken on.
     baseline = mamba_ping_pong_slots(_StrategyView("no_buffer", True))
-    mrr = _max_running_requests(model)
+    mrr = _max_running_requests(model, "D", d_bs)
     return strategy, per_req, (per_req - baseline) * mrr, mrr
 
 
-def d_overlap_cost_line(model: str, disable_overlap: bool) -> str:
+def d_overlap_cost_line(model: str, disable_overlap: bool, d_bs: int = 8) -> str:
     """The one line that must appear wherever D's overlap choice is announced.
 
     The launcher must not be able to change D's device residency without the
@@ -2556,7 +2602,7 @@ def d_overlap_cost_line(model: str, disable_overlap: bool) -> str:
     :func:`d_mamba_ping_pong_cost` rather than typed, and the MiB conversion
     it does NOT make is named rather than left as a silent omission.
     """
-    strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(model, disable_overlap)
+    strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(model, disable_overlap, d_bs)
     baseline_per_req = per_req - (extra // max(1, mrr))
     return (
         f"DEVICE PRICE OF THAT CHOICE: --mamba-radix-cache-strategy "
@@ -3396,8 +3442,11 @@ def solve_p_cut(
         ),
         # Read off the argv this launcher builds rather than restated: a
         # second copy of --max-running-requests would drift the day the flag
-        # moves, and the mamba residency scales linearly with it.
-        mamba_slots=_max_running_requests(model),
+        # moves, and the mamba residency scales linearly with it.  The flag
+        # DID move (C1/R-12 made it per group), so this names P's OWN --p-bs:
+        # this is P's pool model, and answering it from a shared value would
+        # re-couple the two bs knobs slice A separated.
+        mamba_slots=_max_running_requests(model, "P", int(getattr(ns, "p_bs", 8) or 8)),
     )
     families = tuple(
         _pp_cut.LAYER_FAMILY_ATTENTION
@@ -3405,7 +3454,17 @@ def solve_p_cut(
         else _pp_cut.LAYER_FAMILY_LINEAR
         for k in kinds
     )
-    incumbent = _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else _csv_ints("32,18,14")
+    # The unpinned incumbent is the SHIPPED cut, read off the module constant
+    # rather than retyped as "32,18,14" (train fix 2, same one-statement rule
+    # as argv_p's defaults above).  Note what this vector is NOT: it is the
+    # per-stage SCORE vector, and p_stage_layers is the authority on the layer
+    # counts it derives -- the two agree for exactly the current triple. That
+    # conflation is the solver branch's, pre-existing, and untouched here.
+    incumbent = (
+        _csv_ints(ns.pp_stage_ratio)
+        if ns.pp_stage_ratio
+        else list(P_PP_STAGE_RATIO_SCORES)
+    )
 
     # -- THE DEPTH AXIS (#1240) ------------------------------------------
     # The design prefix is a MEASUREMENT of this rig's own traffic when one
@@ -4136,7 +4195,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "so group D keeps --disable-overlap-schedule. The gate that "
             "refused must be named in this boot's record; the flag is not a "
             "tuning knob and no server_args gate is to be weakened to avoid it. "
-            + d_overlap_cost_line(ns.model, True)
+            + d_overlap_cost_line(ns.model, True, d_bs)
         )
     else:
         log(
@@ -4152,7 +4211,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"D2: 75.5 tok/s bs1 and 305.0 bs6 against the D0 control's 66.2 / "
             f"284.9 = +14.0 % / +7.1 %, with row D3 showing steps 4 regresses "
             f"to 73.6 / 295.6 -- an optimum, not a direction). "
-            + d_overlap_cost_line(ns.model, False)
+            + d_overlap_cost_line(ns.model, False, d_bs)
         )
     if ns.p_hicache_write_policy != "write_through":
         log(

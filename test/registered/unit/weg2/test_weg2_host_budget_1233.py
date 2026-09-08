@@ -390,7 +390,17 @@ class TestTheLauncherCallSites(CustomTestCase):
             for n in ast.walk(fn):
                 if isinstance(n, ast.Name) and n.id == "P_PP_STAGE_RATIO_SCORES":
                     holders.add(fn.name)
-        self.assertEqual(holders, {"argv_p", "p_stage_layers", "main"})
+        # ``solve_p_cut`` JOINED THE SET on the merge train, and that is a
+        # decision rather than a leak: merges 3/4 gave the launcher a P-cut
+        # solver, whose unpinned INCUMBENT is by definition the shipped score
+        # vector.  It arrived restating that vector as the bare literal
+        # "32,18,14" -- the two-definitions defect this class exists to catch,
+        # and the sibling assertion below did catch it -- so train fix 2 made
+        # it read the constant instead.  The set stays EXACT: a fourth reader
+        # still fails here.
+        self.assertEqual(
+            holders, {"argv_p", "p_stage_layers", "main", "solve_p_cut"}
+        )
 
     def test_the_ledger_call_site_passes_the_cgroup_denominator(self):
         tree, _L = self._launcher_ast()
