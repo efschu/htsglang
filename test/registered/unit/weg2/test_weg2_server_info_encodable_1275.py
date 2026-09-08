@@ -59,10 +59,17 @@ def bare_server_args():
     a.model_path = "/model"
     a.admin_api_key = SECRET
     a.api_key = None
-    # the two shapes that blew up on sb5d
-    a.dtype = torch.bfloat16                       # a DECLARED field holding a torch.dtype
-    a.model_config = SimpleNamespace(              # a NON-field attribute vars() would leak
-        dtype=torch.bfloat16, hf_config=object())
+    # THE PRODUCTION SHAPE, corrected after the first run of this file caught my
+    # own fixture: `dtype` is a CLI STRING ("--dtype bfloat16"), never a
+    # torch.dtype. Putting a torch.dtype there invented a failure production
+    # cannot reach -- and `asdict` includes that declared field, so the guard
+    # below reported `dtype: dtype -> ValueError` and the endpoint 500'd for a
+    # reason sb5d never had.
+    a.dtype = "bfloat16"
+    # THE ACTUAL sb5d TRIGGER: a NON-FIELD attribute set in __post_init__, which
+    # `vars()` leaks and `asdict` excludes. Its torch.dtype members are what the
+    # encoder choked on -- reached THROUGH this object, never directly.
+    a.model_config = SimpleNamespace(dtype=torch.bfloat16, hf_config=object())
     return a
 
 
@@ -109,9 +116,17 @@ class TheEndpointStillEncodes(CustomTestCase):
         self.assertNotIn("model_config", r.json())
 
     def test_the_dtype_field_renders_as_it_did_before(self):
+        """`--dtype` is a string in production; it must survive verbatim."""
         r = self._get()
         self.assertEqual(r.status_code, 200, r.text[:400])
-        self.assertEqual(r.json()["dtype"], str(torch.bfloat16))
+        self.assertEqual(r.json()["dtype"], "bfloat16")
+
+    def test_a_torch_dtype_reached_only_through_model_config_is_excluded(self):
+        """The sb5d shape exactly: the encoder never sees it, because the
+        attribute carrying it is not a dataclass field."""
+        sa = bare_server_args()
+        self.assertIsInstance(sa.model_config.dtype, torch.dtype)
+        self.assertNotIn("model_config", sa.redacted_dict())
 
     def test_the_shape_is_the_asdict_shape(self):
         """Field-for-field parity with the pre-fix-3 serialisation."""
