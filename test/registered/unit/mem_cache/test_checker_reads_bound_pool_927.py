@@ -27,17 +27,27 @@ the rebind silently leaves behind."
 WHAT THAT MANUFACTURES. After the first cutover, ``cache_controller.load``
 allocates load-back rows from the INCOMING allocator while the ledger reads the
 BOOT one. Both address the same id space, so those rows read as FREE to the
-checker while the tree legitimately names them, and
-``_live_double_claimed_rows`` reports the overlap as ``double_owned src=live``
--- in the magnitude of the loaded-back prefix, at the moment ``load_back`` fills
-the nodes' ``value``.
+checker while the tree legitimately names them, and the checker's double-claim
+reader reported the overlap as ``double_owned src=live`` -- in the magnitude of
+the loaded-back prefix, at the moment ``load_back`` fills the nodes' ``value``.
 
 SO #927 IS A FALSE POSITIVE. The rows were never doubly owned; the guard read
 the wrong object. That is the indicator law in its purest form, and it is why
 the fix touches no pool: the checker resolves the allocator PER ACCESS.
 
+THE READER THAT REPORTED IT IS GONE, THE FALSE POSITIVE IS NOT. #969 CUT C
+(``77b42d6d0a`` + ``7f88b49a08``) deleted
+``SchedulerInvariantChecker._live_double_claimed_rows`` and the ``double_owned``
+ledger term it fed -- it was rebuilding two frozensets over the whole pool and
+the whole tree on every idle lap and GIL-wedged the PP ring (py-spy,
+``boot_969cut_55fdfa5e7a_0829_133212.log``). The CHARACTERISATION below is
+therefore expressed against ``read_free_rows`` and the tree directly, which is
+what that method did internally: it is the same arithmetic, one indirection
+shorter, and it keeps this file's evidence for ``_allocator()`` intact without
+resurrecting the deleted symbol.
+
 Hermetic: two real allocators over one id space, a real cache, real
-``read_free_rows``/``_live_double_claimed_rows``. No CUDA.
+``read_free_rows``. No CUDA.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -107,8 +117,12 @@ class TheCheckerFollowsTheRebind927(CustomTestCase):
         """CHARACTERISATION -- the crash, reproduced as arithmetic.
 
         Rows allocated from the INCOMING allocator and held by the tree read as
-        FREE against the BOOT allocator, so the overlap the ledger calls
-        `double_owned` appears without a single row being doubly owned."""
+        FREE against the BOOT allocator, so the overlap the ledger used to call
+        `double_owned` appears without a single row being doubly owned.
+
+        The intersection is taken here rather than through the deleted
+        `_live_double_claimed_rows` (#969 CUT C) -- same arithmetic, and this
+        file's subject is `_allocator()`, not that reader."""
         cache, boot_alloc, incoming_alloc = self._two_phases()
 
         value = incoming_alloc.alloc(ROWS)
@@ -120,12 +134,17 @@ class TheCheckerFollowsTheRebind927(CustomTestCase):
             )
         )
 
-        stale = SchedulerInvariantChecker._live_double_claimed_rows(
-            read_free_rows(boot_alloc), cache
-        )
-        live = SchedulerInvariantChecker._live_double_claimed_rows(
-            read_free_rows(incoming_alloc), cache
-        )
+        def _double_claimed(alloc):
+            reading = read_free_rows(alloc)
+            self.assertTrue(
+                reading.is_enumerable,
+                "the fixture allocator must be able to enumerate its free rows",
+            )
+            held = frozenset(int(v) for v in cache.all_values_flatten().tolist())
+            return len(reading.rows & held)
+
+        stale = _double_claimed(boot_alloc)
+        live = _double_claimed(incoming_alloc)
 
         self.assertEqual(
             stale,

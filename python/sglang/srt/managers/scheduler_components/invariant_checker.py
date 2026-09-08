@@ -136,7 +136,10 @@ class SchedulerInvariantChecker:
         allocated read as FREE here, while the tree named them -- and
         ``_live_double_claimed_rows`` reported that overlap as ``double_owned``,
         ``src=live``, in the exact magnitude of the loaded-back prefix, at the
-        exact moment ``load_back`` filled the nodes' ``value``. That is the
+        exact moment ``load_back`` filled the nodes' ``value``. (That reporter
+        and the ledger term it fed were DELETED by #969 CUT C, ``77b42d6d0a`` +
+        ``7f88b49a08``; the sentence stays because it names why THIS method
+        exists, not because the symbol still does.) That is the
         on-idle raise, and it is a FALSE POSITIVE of the watchdog against the
         wrong object rather than a real double claim.
 
@@ -164,7 +167,7 @@ class SchedulerInvariantChecker:
         withheld: int = 0,
     ) -> Tuple[bool, str]:
         """Check: available + evictable + protected + session_held + uncached
-        + withheld - double_owned == total.
+        + withheld == total.
 
         ``withheld`` is capacity the #656 residency controller has DELIBERATELY
         taken out of circulation: slot ids above the KV pool's backed watermark,
@@ -177,28 +180,33 @@ class SchedulerInvariantChecker:
         or removes pool slots must be named in this ledger, or the next
         unexplained delta gets attributed to the wrong holder.
 
-        ``double_owned`` is #912's posten, and it is SUBTRACTED rather than
-        added because it does not occupy anything -- it is the count of rows
-        the #822 ``RowOwnershipAuthority`` found claimed by MORE THAN ONE of
-        the other terms at once (e.g. a row the free list still lists in
-        ``available`` while the prefix tree also counts it in ``evictable``,
-        or a resident request also counts it in ``session_held``). Each such
-        row is a genuine ownership defect ("silent corruption, not a crash",
-        kv_row_ownership.py's own EXCLUSIVITY wording) and is reported
-        separately by the authority; here it is only subtracted so that a
-        SURPLUS against ``total`` is not misread as an unexplained leak. Five
-        specimens across two boots (2026-08-26,
-        /spinning/evidence-665-f1/boot_accept0826_0826_1754.log:1861,1886,1911
-        and boot_accept0826r2_0826_1748.log:2360,2385,2411) all showed
-        ``available + evictable + withheld`` exceeding ``total`` by exactly
-        22 -- never a deficit -- while the SAME boot's own "PHASE-FLIP POOL
-        CENSUS" line balanced ``free + withheld == total`` exactly, because
-        that census's ``free`` figure is the authority's deduplicated
-        enumeration and the checker's ``available`` was the raw, non-
-        deduplicating ``available_size()``. A deficit (rows with NO owner,
-        e.g. #832/#856) is the opposite sign and stays fatal -- this term
-        never turns a real leak into a pass, because a real leak's
-        ``double_owned`` reading is zero.
+        THERE IS NO ``double_owned`` TERM AND ONE MUST NOT BE ADDED BACK.
+        #912 gave this equation a subtracted ``double_owned`` posten fed by
+        an enumerated double-claim census; #969 CUT C DELETED it (``77b42d6d0a``
+        term + producer + consumer, ``7f88b49a08`` the mamba twins) on a
+        MEASURED wedge -- py-spy on boot ``969cut_55fdfa5e7a`` caught PP0
+        GIL-bound rebuilding two frozensets over the whole pool and the whole
+        tree on every idle lap, so it never returned to post its proxy and the
+        PP ring stopped; the second independent measurement of that class.
+        Upstream's ``_check_pool_invariant`` is count-based and has no such
+        term: ours was second bookkeeping whose only product was a correction
+        to itself. This docstring still described the deleted term for ten days
+        after the code stopped implementing it, which is the whole reason the
+        sentence above is phrased as a prohibition.
+
+        WHAT REPLACED IT, so the #912 surplus is still not misread as a leak:
+        ``_check_full_pool`` takes ``available`` from ``read_free_rows()`` --
+        a UNION over free + release pages, which counts a row present in both
+        lists ONCE where ``available_size()``'s raw SUM counts it twice (21 of
+        the measured 22 on the five #912 specimens) -- and #927 made this class
+        resolve its allocator PER ACCESS, so the remaining overlap the flip
+        used to manufacture by auditing the BOOT phase's pool is not
+        manufactured at all. Both are one pass, not the two-frozenset
+        intersection that spun.
+
+        A DEFICIT (rows with NO owner, e.g. #832/#856) is the opposite sign
+        and stays fatal; with no subtracted term in the equation nothing here
+        can turn one into a pass.
         """
         total_accounted = (
             available
