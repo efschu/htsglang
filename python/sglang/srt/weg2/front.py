@@ -96,6 +96,18 @@ POST_BARRIER_S = 30.0
 #: ON DEMAND (the admitter refreshes a stale reading before it decides), never
 #: a background poller -- there is no sampler task to leave running.
 D_POOL_MAX_AGE_S = 1.0
+#: FIX 5 (round 5): the request timeout of that read, DERIVED from its own
+#: freshness bound rather than picked.  `t` is stamped BEFORE the request goes
+#: out, so a reply that takes longer than `D_POOL_MAX_AGE_S` describes a pool
+#: state already older than the age bound above -- it would be discarded by
+#: the very next freshness check, and waiting for it only adds its own latency
+#: to an admission decision.  A read that cannot answer inside its own
+#: usefulness window is therefore a FAILED read by construction, and the
+#: honest response is the named `WEG2 D-POOL UNREADABLE` refusal (gate off),
+#: not a longer wait.  This replaces the bare `ClientTimeout(total=5)` of
+#: round 4, which was a hand number and could add 5 s to a D admission
+#: decision -- on the critical path, and even with the gate flag off.
+D_POOL_READ_TIMEOUT_S = D_POOL_MAX_AGE_S
 RPC_TIMEOUT_S = 900.0
 SPAN_LRU = 512
 SLEEP_TAGS = ["kv_cache", "weights"]
@@ -588,6 +600,14 @@ class Front:
         # grant made during the round trip is charged rather than lost.
         self._d_pool: Optional[Dict[str, Any]] = None
         self._d_pool_unreadable: bool = False
+        # FIX 5 (round 5): NEGATIVE CACHING.  A failed read used to leave
+        # `_d_pool = None`, so the next admission decision re-issued the
+        # request immediately -- a silent or slow group D then charged its
+        # timeout to EVERY D admission, one after the other.  Until this
+        # stamp passes, the front answers "no reading" from memory and issues
+        # no HTTP at all.  Bounded by the same age constant: a failure is
+        # remembered exactly as long as a success would have been.
+        self._d_pool_retry_after: float = 0.0
         self._d_token_hold_rid: Optional[str] = None
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
@@ -644,19 +664,51 @@ class Front:
         satisfies ``t_taken >= t`` and is charged, which is the conservative
         direction (the gate may delay, never admit on a stale reading).
 
-        A failed read does NOT clobber the last one; it ages out instead, and
-        a reading older than the age bound is treated as no reading at all.
+        ONE BOUND, ONE MEANING: a reading older than ``D_POOL_MAX_AGE_S`` is
+        treated as no reading at all, and reaching the read below therefore
+        already means the last one has aged out.  A failed read leaves no
+        reading and the gate goes off by name.
+
+        FIX 5 (round 5), TWO WINDOWS THIS METHOD MUST NOT OPEN, both on the D
+        admission critical path:
+
+        * it is now called only when :meth:`_d_gate_armed` is true, so a
+          disabled gate (`--d-admit-max-tokens 0`) and the never-starve exit
+          (no seat in use) cost NO round trip -- see the two call sites;
+        * a FAILED read is remembered for ``D_POOL_MAX_AGE_S``
+          (``_d_pool_retry_after``) instead of being retried at the next
+          decision, so a silent group D charges its timeout once per age
+          window rather than once per admission.
         """
         r = self._d_pool
         now = time.time()
         if r is not None and now - r["t"] <= D_POOL_MAX_AGE_S:
+            # THE AGE TERM IS THE SAFETY PROPERTY, not a refinement, and this
+            # is its ONLY site.  Drop it and the front decides for ever on an
+            # arbitrarily old residency -- a number that cannot see what
+            # actually refuses the store read, which is the indicator class
+            # round 3 killed.  Reaching past this check therefore ALREADY
+            # means "the last reading has aged out", which is why the failure
+            # path below drops to the named refusal instead of re-testing the
+            # same bound: round 4 wrote that second test with `t0 = now`, so
+            # it could never be true and the "a failed read does not clobber
+            # the last one" half of this docstring was dead code.
             return r
+        if now < self._d_pool_retry_after:
+            # A read failed less than one age window ago and the last reading
+            # (if any) has aged out with it: no reading, and no HTTP to find
+            # that out again.  Counted separately from a failure so the
+            # UNREADABLE line's denominators stay honest (a suppressed read
+            # is not evidence that D answered, nor that it did not).
+            self.counters["d_pool_read_suppressed"] += 1
+            return None
         t0 = now
         got = None
         try:
             g = self.groups["D"]
-            async with self.session.get(f"{g.url}/server_info",
-                                        timeout=ClientTimeout(total=5)) as resp:
+            async with self.session.get(
+                    f"{g.url}/server_info",
+                    timeout=ClientTimeout(total=D_POOL_READ_TIMEOUT_S)) as resp:
                 if resp.status == 200:
                     body = await resp.json()
                     for st in (body.get("internal_states") or []):
@@ -669,6 +721,7 @@ class Front:
             self.counters["d_pool_reads"] += 1
             self._d_pool = dict(got)
             self._d_pool["t"] = t0
+            self._d_pool_retry_after = 0.0
             if self._d_pool_unreadable:
                 self._d_pool_unreadable = False
                 logger.info("WEG2 D-POOL READABLE again: available=%d occupied=%d limit=%d "
@@ -677,8 +730,7 @@ class Front:
                             self._d_pool["limit"])
             return self._d_pool
         self.counters["d_pool_read_failed"] += 1
-        if r is not None and t0 - r["t"] <= D_POOL_MAX_AGE_S:
-            return r
+        self._d_pool_retry_after = t0 + D_POOL_MAX_AGE_S
         self._d_pool = None
         if not self._d_pool_unreadable:
             self._d_pool_unreadable = True
@@ -688,12 +740,50 @@ class Front:
             # they did before this coupling existed -- never worse -- and D's
             # own #915 gate remains the enforcement point.
             logger.warning("WEG2 D-POOL UNREADABLE: group D published no `hicache_prefetch` "
-                           "reading within %.1f s (reads=%d failed=%d); the aggregate "
-                           "seats-vs-pool gate is OFF until it answers -- the front will not "
-                           "substitute its own admission tally for the pool's residency",
-                           D_POOL_MAX_AGE_S, self.counters["d_pool_reads"],
-                           self.counters["d_pool_read_failed"])
+                           "reading within %.1f s (timeout=%.1f s reads=%d failed=%d "
+                           "suppressed=%d); the aggregate seats-vs-pool gate is OFF until it "
+                           "answers -- the front will not substitute its own admission tally "
+                           "for the pool's residency, and it will not re-issue the read "
+                           "before %.1f s have passed",
+                           D_POOL_MAX_AGE_S, D_POOL_READ_TIMEOUT_S,
+                           self.counters["d_pool_reads"],
+                           self.counters["d_pool_read_failed"],
+                           self.counters["d_pool_read_suppressed"],
+                           D_POOL_MAX_AGE_S)
         return None
+
+    def _d_gate_armed(self) -> bool:
+        """Can the seats-vs-pool gate refuse anything at all, right now?
+
+        FIX 5 (round 5).  THE READ IS AN ARGUMENT, AND PYTHON EVALUATES
+        ARGUMENTS FIRST.  Both admission paths used to call
+        ``_d_token_budget_blocks(rid, est, await self._d_pool_reading())``, so
+        the `/server_info` round trip happened BEFORE the two cheap guards
+        inside that method could decline to use it.  Consequence measured on
+        the desk: ``--d-admit-max-tokens 0``, documented in ``front.py`` and
+        ``launcher.py`` as "0 disables the gate", still paid a full
+        `/server_info` GET per admission decision -- and so did the gate's own
+        never-starve exit, which is the path taken at every epoch's FIRST
+        admission and at every unblock, i.e. exactly inside the 0.05 s window
+        the admitter races ``controller()``'s D->P arm in.
+
+        The two terms are the disabling conditions of
+        :meth:`_d_token_budget_blocks`, kept there as well: this method is the
+        cheap PRE-check that decides whether to pay for a reading, never a
+        second copy of the decision.  Synchronous by design -- a guard that
+        may await is a guard that can cost what it exists to avoid.
+        """
+        return self.d_admit_max_tokens != 0 and bool(self._d_seats_live)
+
+    async def _d_reading_if_armed(self) -> Optional[Dict[str, Any]]:
+        """The reading, or ``None`` without a round trip when the gate is off.
+
+        ONE helper rather than the same conditional at both call sites, so the
+        BATCH admitter and the SHORT path cannot drift apart on it.
+        """
+        if not self._d_gate_armed():
+            return None
+        return await self._d_pool_reading()
 
     def _d_token_budget_blocks(self, rid: str, est_tokens: int,
                                reading: Optional[Dict[str, Any]]) -> bool:
@@ -756,6 +846,11 @@ class Front:
         fires, with no code to remove.
         """
         if self.d_admit_max_tokens == 0 or not self._d_seats_live:
+            # The same two terms as :meth:`_d_gate_armed`, which is what the
+            # call sites consult BEFORE paying for a reading (FIX 5).  Kept
+            # here too because this method is called directly, and because a
+            # guard whose only copy lives at the call site is a guard the next
+            # call site forgets.
             self._d_token_hold_rid = None
             return False
         if reading is None:
@@ -1027,7 +1122,7 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
-        if self._d_token_budget_blocks(rid, est_tokens, await self._d_pool_reading()):
+        if self._d_token_budget_blocks(rid, est_tokens, await self._d_reading_if_armed()):
             # FIX 4a: the same aggregate bound the BATCH admitter obeys.  A
             # SHORT arrival that does not fit falls through to route BATCH
             # rather than overcommitting the staging pool -- the return
@@ -1110,7 +1205,7 @@ class Front:
                     self.counters["d_admit_skipped_done"] += 1
                     continue
                 if self._d_token_budget_blocks(p.rid, p.est_prompt,
-                                               await self._d_pool_reading()):
+                                               await self._d_reading_if_armed()):
                     # FIX 4a: the seat is not even reached -- taking one and
                     # holding it while the tokens are unavailable would block
                     # the refill the budget is waiting for.  `continue` and

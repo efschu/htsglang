@@ -46,6 +46,7 @@ three ranks build the same geometry") is not observable in one.
 
 import ast
 import asyncio
+import builtins
 import inspect
 import json
 import logging
@@ -192,38 +193,58 @@ def test_b1b_the_refusals_are_answered_after_the_loop():
     assert guards, "guarded by `if _x_refused:` so an empty pass sends nothing"
 
 
+def _consults_state(test) -> bool:
+    """Can this ``if`` test possibly depend on anything the loop varies?
+
+    True only when the test reaches for STATE -- a call or an attribute.  A
+    test built solely from bare names, constants and operators between them
+    (``True``, ``req is not None``, ``1 == 1``) consults nothing the scheduler
+    can change, so an ``if`` of that shape whose body jumps is an
+    unconditional skip wearing a condition.
+    """
+    return any(isinstance(n, (ast.Call, ast.Attribute)) for n in ast.walk(test))
+
+
 def _always_jumps(stmt) -> bool:
     """Does control ALWAYS leave the enclosing loop body at this statement?
 
-    A jump statement itself, or an ``if`` that cannot fall through: either its
-    test is a truthy constant and its body jumps (the measured mutant
-    ``if True: ... continue``), or both of its branches jump.  Deliberately
-    conservative -- anything it cannot prove is treated as fall-through, so
-    this only ever reports a jump that really is unconditional.
+    A jump statement itself, or an ``if`` that cannot fall through: both of
+    its branches jump, or its body jumps and its test consults no state.
+
+    ROUND 5 -- WHY THE ROUND-4 VERSION WAS ONE LITERAL FROM VOID.  It required
+    ``isinstance(test, ast.Constant)``, so it saw ``if True: ... continue``
+    and missed ``if req is not None: ... continue`` -- a guard that is always
+    true IN FACT rather than literally.  The measured mutant, inserted
+    immediately above the gate inside the same loop body, left the suite at
+    the baseline 1 failed / 90 passed.  :func:`_consults_state` closes that
+    literal, but ONLY that literal: ``if req.rid is not None`` would walk
+    around it too.  NO AST PREDICATE CAN SEPARATE "the statement is present"
+    FROM "the statement runs" -- that separation needs execution, and it is
+    ``test_b1e``/``test_b1f`` below, not this function, that provides it.
     """
     if isinstance(stmt, (ast.Continue, ast.Break, ast.Return, ast.Raise)):
         return True
     if isinstance(stmt, ast.If):
         body = any(_always_jumps(x) for x in stmt.body)
         orelse = any(_always_jumps(x) for x in stmt.orelse)
-        const = isinstance(stmt.test, ast.Constant) and bool(stmt.test.value)
-        return (body and const) or (body and orelse)
+        return (body and not _consults_state(stmt.test)) or (body and orelse)
     return False
 
 
-def test_b1d_nothing_unconditional_skips_the_request_before_the_x_gate():
-    """BLOCKING 1 as it was actually stated -- REACH, not placement.
+def test_b1d_no_stateless_guard_skips_the_request_before_the_x_gate():
+    """BLOCKING 1, the CHEAP STRUCTURAL COMPANION -- explicitly NOT the reach
+    proof (that is ``test_b1e``/``test_b1f``, which execute the loop).
 
-    ``test_b1a`` asserts an AST property AT the gate, and a guard anywhere
-    ABOVE it in the same loop body leaves that property intact while law 4 is
-    dead.  Measured mutant, inserted immediately above the gate:
-    ``if True:`` / ``_note_skip('mut_unreachable', req.rid)`` / ``continue``
-    -> the whole file stayed 18/18 green.
+    What it still buys, in one call and without a stub: the gate must be a
+    DIRECT statement of the ``for req in self.waiting_queue`` body, so no
+    outer condition wraps it; and no statement above it in that body jumps
+    unconditionally in the shapes an AST can actually recognise (a bare
+    ``continue``/``break``/``return``, an if/else where both arms jump, or a
+    jump under a test that consults no state at all).
 
-    Two structural facts give reach for any request that enters the loop: the
-    gate is a DIRECT statement of the ``for req in self.waiting_queue`` body
-    (nothing nests it behind a second condition), and no statement before it
-    in that body always jumps."""
+    Its LIMIT is the round-5 finding and is stated here so no future reader
+    mistakes it for reach again: a guard whose test consults state and is
+    nonetheless always true passes this check untouched."""
     tree = _fn_ast(Scheduler._get_new_batch_prefill_raw)
     gates = [
         node
@@ -251,6 +272,205 @@ def test_b1d_nothing_unconditional_skips_the_request_before_the_x_gate():
         "an unconditional continue/break/return above the gate makes law 4 "
         "unreachable with the suite green: "
         + ", ".join(f"{type(st).__name__}@line {st.lineno}" for st in dominating)
+    )
+
+
+# ------------- law 4's reach, PROVEN BY EXECUTION rather than by AST -------
+class _No:
+    """Answers every question with "no", and every call with another ``_No``.
+
+    The stand-in the reach slice runs on.  Every guard above law 4's gate asks
+    the scheduler for a reason to SKIP this request; this object gives all of
+    them the answer that does NOT skip, so the only thing that can still keep
+    control from arriving at the gate is a statement that skips no matter what
+    it is told -- which is exactly the property under test.  Overrides passed
+    to the constructor win, and are how the slice gets its waiting queue and
+    its spy.
+    """
+
+    def __init__(self, **over):
+        self.__dict__["_over"] = over
+
+    def __getattr__(self, name):
+        return self.__dict__["_over"].get(name, _NO)
+
+    def __call__(self, *a, **k):
+        return _NO
+
+    def __bool__(self):
+        return False
+
+    def __len__(self):
+        return 0
+
+    def __iter__(self):
+        return iter(())
+
+    def __eq__(self, other):
+        return False
+
+    def __ne__(self, other):
+        return True
+
+    def __lt__(self, other):
+        return False
+
+    __le__ = __gt__ = __ge__ = __lt__
+
+    def __hash__(self):
+        return 0
+
+
+_NO = _No()
+
+
+def _law4_reach_slice():
+    """Compile the REAL waiting-queue loop, truncated at law 4's gate, into a
+    function that can be RUN -- the separation an AST proxy cannot make.
+
+    Built from ``inspect.getsource`` at call time, so it is the shipping
+    source that executes, not a transcription of it.  Three deliberate
+    surgeries, each of which only ever makes the test STRICTER:
+
+    * the body is cut after the gate, because everything below it is the PP
+      admission machinery and none of it bears on whether the gate was
+      reached;
+    * one synthetic statement is appended after the gate,
+      ``_reach_past_gate.append(req)``, so "the refusal actually skipped the
+      request" is observable rather than inferred from the AST;
+    * every FREE NAME of the slice becomes a parameter, computed from the
+      source instead of listed.  A future edit that reaches for one more local
+      therefore fails loudly with an unexpected keyword rather than silently
+      binding a module global.
+    """
+    tree = _fn_ast(Scheduler._get_new_batch_prefill_raw)
+    gates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Call)
+        and isinstance(node.test.func, ast.Attribute)
+        and node.test.func.attr == "_weg2_x_refuses"
+    ]
+    assert len(gates) == 1, "law 4's gate must be exactly one `if` (see test_b1a)"
+    gate = gates[0]
+    loops = [n for n in ast.walk(tree) if isinstance(n, ast.For) and gate in n.body]
+    assert len(loops) == 1, "and a direct statement of the waiting-queue loop"
+    loop = loops[0]
+    idx = loop.body.index(gate)
+    sentinel = ast.parse("_reach_past_gate.append(req)").body[0]
+    trunc = ast.For(
+        target=loop.target,
+        iter=loop.iter,
+        body=loop.body[: idx + 1] + [sentinel],
+        orelse=[],
+        type_comment=None,
+    )
+    bound = {
+        n.id
+        for n in ast.walk(trunc)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del))
+    }
+    free = sorted(
+        {
+            n.id
+            for n in ast.walk(trunc)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+        }
+        - bound
+        - set(dir(builtins))
+    )
+    fn = ast.FunctionDef(
+        name="_law4_reach",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg=n) for n in free],
+            vararg=None,
+            kwonlyargs=[],
+            kw_defaults=[],
+            kwarg=None,
+            defaults=[],
+        ),
+        body=[trunc],
+        decorator_list=[],
+        returns=None,
+        type_params=[],
+    )
+    mod = ast.Module(body=[fn], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    ns = {}
+    exec(compile(mod, inspect.getsourcefile(Scheduler), "exec"), ns)
+    return ns["_law4_reach"], free
+
+
+def _run_law4_reach(refuses: bool):
+    """Run that slice for ONE request and report what the loop actually did."""
+    fn, free = _law4_reach_slice()
+    skips, refused, past, seen = [], [], [], []
+    req = SimpleNamespace(
+        rid="weg2-1-7",
+        init_next_round_input=lambda *a, **k: None,
+    )
+
+    def _spy(r, head=None):
+        seen.append(r)
+        return refuses
+
+    kw = {name: _NO for name in free}
+    kw["self"] = _No(waiting_queue=[req], _weg2_x_refuses=_spy)
+    kw["_note_skip"] = lambda kind, rid: skips.append((kind, rid))
+    kw["_x_refused"] = refused
+    kw["_reach_past_gate"] = past
+    fn(**kw)
+    return SimpleNamespace(req=req, entered=seen, skips=skips,
+                           refused=refused, past=past)
+
+
+def test_b1e_the_x_gate_is_ENTERED_when_the_real_loop_runs():
+    """BLOCKING 1 (round 3), CLOSED BY EXECUTION.
+
+    The round-4 answer was an AST reach proxy, and it was one literal from
+    void: ``_always_jumps`` only recognised a truthy ``ast.Constant`` test, so
+    the measured round-5 mutant -- ``if req is not None: _note_skip("mutant",
+    req.rid); continue``, inserted immediately above the gate inside the same
+    loop body -- left the suite at its baseline 1 failed / 90 passed while
+    law 4's D-side enforcement was dead.  ``req`` is the loop variable and is
+    never None.
+
+    THE ONLY THING THAT SEPARATES "the statement is present" FROM "the
+    statement runs" IS RUNNING IT.  This test executes the real loop source
+    with a spy in place of ``_weg2_x_refuses`` and asserts the spy was
+    ENTERED -- a counter, not an AST shape.  Any statement above the gate that
+    skips the request, under any test and with any literal, makes this red."""
+    got = _run_law4_reach(refuses=False)
+    assert len(got.entered) == 1 and got.entered[0] is got.req, (
+        "law 4's D-side gate was never entered for a request that walked the "
+        "whole waiting-queue loop body -- something above it skipped the "
+        "request, so the X bound is not enforced on D at all"
+    )
+    assert got.past == [got.req], (
+        "and a request the gate does NOT refuse must fall through to the rest "
+        "of the pass rather than be skipped"
+    )
+    assert got.skips == [] and got.refused == []
+
+
+def test_b1f_a_refused_request_is_skipped_and_collected_by_the_real_loop():
+    """The behavioural half of the same execution: when the gate refuses, the
+    request must leave THIS pass and be collected for the named answer.
+
+    ``test_b1c`` proves what that answer is on the wire (an ``AbortReq``
+    naming W31 reaching ``send_to_tokenizer``, which is what lets C12 re-route
+    it through P exactly once).  This proves the loop actually hands it over
+    -- the ``continue`` is observed by a statement that did NOT run, not read
+    off the AST."""
+    got = _run_law4_reach(refuses=True)
+    assert len(got.entered) == 1
+    assert got.refused == [got.req], "collected for _weg2_answer_x_refusals"
+    assert got.skips == [("weg2_x_refused", "weg2-1-7")], "and named in the trace"
+    assert got.past == [], (
+        "a refused request must not continue into the rest of the pass -- the "
+        "gate's `continue` is what keeps it out of this batch"
     )
 
 
@@ -727,9 +947,224 @@ def test_a6_no_reading_means_the_gate_is_off_and_says_so(caplog):
         assert f._d_token_budget_blocks("r", 10 ** 9, None) is False, (
             "gate OFF, not a fallback to the front-local tally")
         assert caplog.text.count("WEG2 D-POOL UNREADABLE") == 1, "once, not per pass"
-        assert f.counters["d_pool_read_failed"] == 2
+        # FIX 5: the SECOND decision inside the age window does not re-issue
+        # the read at all (test_a10) -- it is answered from the negative
+        # cache, which is a different event from a failure and is counted as
+        # one.  Round 4 asserted `failed == 2` here, i.e. it asserted the
+        # round trip that a silent group D charged to every admission.
+        assert f.counters["d_pool_read_failed"] == 1
+        assert f.counters["d_pool_read_suppressed"] == 1
 
     asyncio.run(body())
+
+
+class _Resp:
+    def __init__(self, body, status=200):
+        self.status = status
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _CountingSession:
+    """Answers the first ``ok`` reads and fails afterwards, counting GETs."""
+
+    def __init__(self, reading, ok=1):
+        self.calls = 0
+        self.ok = ok
+        self._body = {"internal_states": [{"hicache_prefetch": reading}]}
+
+    def get(self, *a, **k):
+        self.calls += 1
+        if self.calls > self.ok:
+            raise RuntimeError("group D went silent")
+        return _Resp(self._body)
+
+
+def _pool_front(session, **kw):
+    f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
+              d_bs=6, carrier_max_tokens=27466, **kw)
+    f.session = session
+    return f
+
+
+def test_a9_a_reading_that_has_aged_out_is_no_reading(caplog):
+    """FIX 5, finding 3.  The safety property both the docstring and the round-4
+    commit message ASSERTED and nothing ASSERTED ON.
+
+    Deleting the age term from the freshness check leaves the front deciding
+    for ever on an arbitrarily old residency -- a stale pool number that
+    cannot see what actually refuses the store read, the same indicator class
+    round 3 killed -- and the named ``WEG2 D-POOL UNREADABLE`` refusal never
+    fires again.  Round 4's test_a6 only ever exercised the FIRST-read-fails
+    case (no prior reading at all), so that mutant survived: the whole suite
+    stayed at the baseline 1 failed / 90 passed.
+
+    Both arms, because one without the other is half a property:
+
+    * WITHIN the bound the reading is reused and costs NO round trip;
+    * PAST the bound it is not a reading at all -- ``None``, the named
+      refusal, and a gate that is consequently off.
+    """
+
+    async def body():
+        t0 = time.time()
+        sess = _CountingSession(_reading(27466, 0, 27466, t0), ok=1)
+        f = _pool_front(sess)
+        Seat(f, "running", "batch", tokens=1)
+        with caplog.at_level(logging.WARNING, logger=front_mod.logger.name):
+            first = await f._d_pool_reading()
+            assert first is not None and first["available"] == 27466
+            assert sess.calls == 1
+
+            # ARM ONE: inside the age bound, reused without asking D again.
+            again = await f._d_pool_reading()
+            assert again is first, "a fresh reading is reused, not re-read"
+            assert sess.calls == 1, "and costs no round trip"
+            assert "WEG2 D-POOL UNREADABLE" not in caplog.text
+
+            # ARM TWO: the same reading, now older than its own bound.
+            f._d_pool["t"] = time.time() - (front_mod.D_POOL_MAX_AGE_S + 5.0)
+            f._d_pool_retry_after = 0.0
+            aged = await f._d_pool_reading()
+            assert aged is None, (
+                "a reading older than D_POOL_MAX_AGE_S must not be handed to "
+                "the gate -- that is the whole age term"
+            )
+            assert sess.calls == 2, "it tried to refresh first"
+            assert f._d_pool is None
+        assert caplog.text.count("WEG2 D-POOL UNREADABLE") == 1
+        assert f._d_token_budget_blocks("r", 10 ** 9, None) is False, (
+            "and with no reading the gate is OFF, never a fallback tally")
+
+    asyncio.run(body())
+
+
+def test_a10_a_failed_read_is_remembered_for_one_age_window(caplog):
+    """FIX 5, finding 2, third consequence: NEGATIVE CACHING.
+
+    Round 4 left ``_d_pool = None`` on a failure, so the next admission
+    decision re-issued the request immediately.  A silent or slow group D then
+    charged its request timeout to EVERY D admission decision, on both the
+    BATCH admitter and the SHORT path.  A failure is now remembered exactly as
+    long as a success would have been."""
+
+    async def body():
+        sess = _CountingSession(None, ok=0)
+        f = _pool_front(sess)
+        Seat(f, "running", "batch", tokens=1)
+        with caplog.at_level(logging.WARNING, logger=front_mod.logger.name):
+            assert await f._d_pool_reading() is None
+            assert sess.calls == 1 and f.counters["d_pool_read_failed"] == 1
+            for _ in range(9):
+                assert await f._d_pool_reading() is None
+            assert sess.calls == 1, (
+                "nine further decisions inside the age window must not each "
+                "pay a round trip to a group that is not answering")
+            assert f.counters["d_pool_read_suppressed"] == 9
+            assert f.counters["d_pool_read_failed"] == 1, (
+                "a suppressed read is counted apart from a failed one -- the "
+                "UNREADABLE line's denominators name what they count")
+
+            # The window is BOUNDED: it retries, it does not give up.
+            f._d_pool_retry_after = time.time() - 0.001
+            assert await f._d_pool_reading() is None
+            assert sess.calls == 2
+
+    asyncio.run(body())
+
+
+def test_a11_the_reading_is_not_fetched_when_the_gate_cannot_refuse():
+    """FIX 5, finding 2, THE ROOT: the read was a call ARGUMENT.
+
+    ``_d_token_budget_blocks(rid, est, await self._d_pool_reading())`` makes
+    Python evaluate the round trip BEFORE the callee's own two cheap guards
+    can decline to use it.  So ``--d-admit-max-tokens 0`` -- documented in
+    ``front.py`` and ``launcher.py`` as "0 disables the gate" -- still paid a
+    full ``/server_info`` GET per admission decision, and so did the gate's
+    never-starve exit, which is the path taken at every epoch's FIRST
+    admission and at every unblock.  ``/server_info`` is not cheap
+    (``dataclasses.asdict(server_args)`` plus a scheduler RPC), and its RTT
+    lands inside the 0.05 s window the admitter races the controller's D->P
+    arm in.
+
+    The arming pre-check is SYNCHRONOUS by construction: a guard that may
+    await is a guard that can cost what it exists to avoid."""
+
+    async def body():
+        # (a) the flag that says "disabled" disables the READ, not just the verdict.
+        sess = _CountingSession(_reading(27466, 0, 27466, time.time()))
+        off = _pool_front(sess, d_admit_max_tokens=0)
+        Seat(off, "running", "batch", tokens=1)
+        assert off._d_gate_armed() is False
+        for _ in range(5):
+            assert await off._d_reading_if_armed() is None
+        assert sess.calls == 0, "a disabled gate must not poll group D at all"
+
+        # (b) the never-starve exit: no seat in use, no reading needed.
+        sess2 = _CountingSession(_reading(27466, 0, 27466, time.time()))
+        idle = _pool_front(sess2)
+        assert idle._d_gate_armed() is False, "no seat in use"
+        assert await idle._d_reading_if_armed() is None
+        assert sess2.calls == 0, (
+            "the epoch's first admission and every unblock take this path")
+
+        # (c) armed: the reading is fetched, and the gate can refuse on it.
+        seat = Seat(idle, "running", "batch", tokens=1)
+        assert idle._d_gate_armed() is True
+        assert await idle._d_reading_if_armed() is not None
+        assert sess2.calls == 1
+        seat.release("test")
+
+    asyncio.run(body())
+
+
+def test_a12_neither_admission_path_awaits_the_read_as_an_argument():
+    """The anti-regression for a11, at the two call sites themselves.
+
+    A test that only exercises ``_d_reading_if_armed`` cannot see a call site
+    that goes back to awaiting ``_d_pool_reading`` inline -- and that inline
+    await is the entire defect, because argument evaluation happens first."""
+    for meth in (Front._acquire_short_seat, Front.d_admitter):
+        tree = _fn_ast(meth)
+        assert not _calls_named(tree, "_d_pool_reading"), (
+            f"{meth.__name__} must obtain the reading through "
+            "_d_reading_if_armed, so the arming pre-check runs BEFORE the "
+            "round trip rather than inside the callee"
+        )
+        assert _calls_named(tree, "_d_reading_if_armed"), (
+            f"{meth.__name__} still has to price the pool")
+
+
+def test_a13_the_read_timeout_is_derived_from_its_own_freshness_bound():
+    """No hand numbers on this path.  Round 4 carried a bare
+    ``ClientTimeout(total=5)``: with the gate off and a silent group D that is
+    up to 5 s added to every D admission decision.  A reply that arrives later
+    than ``D_POOL_MAX_AGE_S`` describes a pool state the next freshness check
+    would discard anyway, so the timeout IS that bound."""
+    assert front_mod.D_POOL_READ_TIMEOUT_S == front_mod.D_POOL_MAX_AGE_S
+    tree = _fn_ast(Front._d_pool_reading)
+    timeouts = [
+        kw.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        for kw in node.keywords
+        if kw.arg == "timeout"
+    ]
+    assert timeouts, "the read must carry a timeout at all"
+    for value in timeouts:
+        names = {n.id for n in ast.walk(value) if isinstance(n, ast.Name)}
+        assert "D_POOL_READ_TIMEOUT_S" in names, (
+            "the timeout must be the derived constant, not a literal: "
+            + ast.dump(value)
+        )
 
 
 def test_a7_the_reading_is_group_d_s_own_915_terms():
