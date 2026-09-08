@@ -165,6 +165,13 @@ _WEG2_GROUP_NAME: Optional[str] = None
 #: that same tag).
 _GRAPH_SCRATCH_POOL: Any = None
 
+#: Item `dormant` FIX 3, finding 2: how often each conjunct of
+#: :func:`weg2_graph_tag_armed` refused, by reason.  The line is rate-limited
+#: (see :func:`_refuse_graph_tag`), so this is the DENOMINATOR the log's
+#: ``occurrence=`` field is drawn from -- a reader must never take "one line"
+#: for "one refusal".
+_GRAPH_TAG_REFUSALS: Dict[str, int] = {}
+
 
 class Weg2MemorySaverInactive(RuntimeError):
     """W12: the memory-saver adapter is a no-op, so every sleep is a lie."""
@@ -1433,6 +1440,79 @@ def weg2_group_name() -> str:
     return _WEG2_GROUP_NAME
 
 
+def weg2_env_present() -> bool:
+    """True when SOME ``SGLANG_WEG2_*`` variable other than the group is set.
+
+    FIX 3, finding 2.  The refusal below has to distinguish two things that
+    look identical from inside one rank:
+
+    * a STOCK engine, which never had :data:`WEG2_GROUP_ENV` and must stay
+      byte-identical -- including in its log, so no new line may be printed
+      there, and
+    * a WEG-2 rank whose group name did not arrive, which is a silent
+      capability loss (the #1246 shape) and must be loud.
+
+    ``launcher.build_env`` publishes the group beside a family of other
+    ``SGLANG_WEG2_*`` variables (``SGLANG_WEG2_WEIGHT_CHUNK_LAYERS``,
+    ``SGLANG_WEG2_WEIGHT_CHUNKS``, ``SGLANG_WEG2_TMS_PRELOAD_SO``,
+    ``SGLANG_WEG2_PCIE_DUPLEX``, ...), so the presence of any of them with the
+    group ABSENT is the signature of the second case.  A stock engine has none
+    of them and stays silent.
+
+    HONEST LIMIT: the family is conditional (a boot with no chunking, no
+    preload and no duplex publishes none of them), so this is a sufficient
+    signal for the loud case, not a necessary one.  It never produces a FALSE
+    loud line on a stock engine, which is the direction that would change
+    upstream behaviour; it can miss a Weg-2 rank that had lost the whole
+    family, and such a rank is not a Weg-2 rank in any other respect either.
+    """
+    for key in os.environ:
+        if key.startswith("SGLANG_WEG2_") and key != WEG2_GROUP_ENV:
+            return True
+    return False
+
+
+def _refuse_graph_tag(reason: str, detail: str) -> None:
+    """Name a graph-tag refusal in the log, rate-limited, with its denominator.
+
+    FIX 3, finding 2.  Before this, every conjunct of
+    :func:`weg2_graph_tag_armed` refused SILENTLY: a rank that lost
+    :data:`WEG2_GROUP_ENV` produced no line at the gate, no line at the region
+    (``yield False`` with no logger call), no line at the sleep (the tag list
+    came back unchanged) -- and therefore was byte-identical in the logs to a
+    rank running the tree from before this item.  The boot arm looked for a
+    degrade line that could only be emitted by ONE of the refusal paths (the
+    adapter-build failure), so the one degrade it could not see was the one
+    that silently disarmed the whole item.
+
+    RATE LIMIT AND ITS DENOMINATOR: this is called once per sleep leg and once
+    per attention-backend build, so it is not hot, but it must not scroll
+    either.  The line fires on occurrence 1, 2, 4, 8, ... per reason and always
+    prints ``occurrence=`` -- a reader can therefore tell "refused once" from
+    "refused on every leg", which a plain once-per-process line cannot, and
+    :data:`_GRAPH_TAG_REFUSALS` carries the exact count for a test.
+    """
+    n = _GRAPH_TAG_REFUSALS.get(reason, 0) + 1
+    _GRAPH_TAG_REFUSALS[reason] = n
+    if n & (n - 1):  # not a power of two -- suppressed, but counted above
+        return
+    logger.warning(
+        "WEG2-SLEEP graph tag NOT armed: %s -- %s. occurrence=%d for this reason "
+        "in this process (the line is rate-limited to occurrences 1,2,4,8,...; "
+        "the count is the denominator, the line is not). The sleeping rank keeps "
+        "the CUDA-graph capture pool and the flashinfer FLOAT workspace resident "
+        "(pre-item behaviour, not a silent success)",
+        reason,
+        detail,
+        n,
+    )
+
+
+def weg2_graph_tag_refusals() -> Dict[str, int]:
+    """A copy of :data:`_GRAPH_TAG_REFUSALS` -- the rate limit's denominator."""
+    return dict(_GRAPH_TAG_REFUSALS)
+
+
 def weg2_graph_tag_armed(memory_saver_on: bool) -> bool:
     """True when this rank's sleep also releases ``GPU_MEMORY_TYPE_CUDA_GRAPH``.
 
@@ -1485,14 +1565,51 @@ def weg2_graph_tag_armed(memory_saver_on: bool) -> bool:
     answered differently between the legs would ``KeyError`` on a tag that was
     never paused.  (1) is a per-call argument because it is a per-caller fact,
     and both legs read it from the same ``server_args`` object.
+
+    FIX 3, finding 2: every one of the three refuses BY NAME through
+    :func:`_refuse_graph_tag` -- except on a stock engine, where the whole
+    point is that nothing changes, including the log.  :func:`weg2_env_present`
+    is what tells the two apart.
     """
-    if not memory_saver_on or not weg2_group_name():
+    group = weg2_group_name()
+    if not memory_saver_on:
+        if group or weg2_env_present():
+            _refuse_graph_tag(
+                "no_memory_saver",
+                "the caller's server_args.enable_memory_saver is False on a "
+                "Weg-2 rank (group=%r); launcher.common_flags passes "
+                "--enable-memory-saver, so this rank was launched by something "
+                "else" % (group,),
+            )
+        return False
+    if not group:
+        # THE condition FIX 2 added and FIX 3 gave an instrument to.  A stock
+        # engine legitimately has no group and must stay silent; a Weg-2 rank
+        # that lost the variable is a silent capability loss, and this is the
+        # only place in either tree that can say so.
+        if weg2_env_present():
+            _refuse_graph_tag(
+                "no_group",
+                "%s is empty or unset on a rank that carries other SGLANG_WEG2_* "
+                "variables -- launcher.build_env publishes it at every launch "
+                "site, so it was lost between the launcher and this process"
+                % WEG2_GROUP_ENV,
+            )
         return False
     global _GRAPH_TAG_ARMED
     if _GRAPH_TAG_ARMED is None:
         from sglang.srt.utils.common import get_bool_env_var
 
         _GRAPH_TAG_ARMED = bool(get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH"))
+    if not _GRAPH_TAG_ARMED:
+        _refuse_graph_tag(
+            "env_off",
+            "SGLANG_MEMORY_SAVER_CUDA_GRAPH is not truthy to get_bool_env_var "
+            "(the CAPTURE site's own reader, so the capture did not route into "
+            "the tag either -- releasing it alone would pause a workspace the "
+            "graph still reads). An operator override of this variable is a "
+            "legitimate input; this line says what it costs",
+        )
     return _GRAPH_TAG_ARMED
 
 

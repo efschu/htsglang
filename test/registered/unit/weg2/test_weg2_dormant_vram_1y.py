@@ -653,3 +653,373 @@ def test_captured_graph_static_buffers_keep_their_addresses_across_pause_resume(
     assert torch.equal(static_out, before_val), (
         "replay after pause/resume produced a different result"
     )
+
+
+# ---------------------------------------------------------------------------
+# FIX 3, FINDING 1: the boot arm's two instants, and the criterion that is
+# satisfiable by a perfect run.
+#
+# Commit 3 sampled NVML free at both ends of the cycle IN THE SAME PHASE and
+# then graded `free_after - free_before >= 384` as "did the item deliver".  A
+# perfect run reads ~0, so it scored every card UNDER FLOOR and exited 4 -- it
+# failed a working boot by 384 MiB per card.  Moving one sample to the other
+# phase does not repair it: the cross-phase delta is `P_release - D_release`,
+# in which this item's contribution CANCELS, because both groups release the
+# same tag when they sleep.  So the same-phase delta grades CONSERVATION and
+# delivery is graded on the ranks' own released-tag lines.
+# ---------------------------------------------------------------------------
+
+_FREE_STEADY = "0, RTX 3080, 1515\n1, RTX 5090, 816\n2, RTX 3080, 1368\n"
+_I_BEFORE = "phase=D(awake) epoch=41 state=serving"
+_I_AFTER = "phase=D(awake) epoch=45 state=serving"
+_RELEASED_OK = (
+    "WEG2-SLEEP released tags=['cuda_graph'] mib=486.0 ms=44 (instrument: ...)\n"
+    "WEG2-SLEEP released tags=['cuda_graph'] mib=476.0 ms=41 (instrument: ...)\n"
+    "WEG2-SLEEP released tags=['cuda_graph'] mib=517.0 ms=48 (instrument: ...)\n"
+)
+
+
+def _arm():
+    from sglang.srt.weg2 import dormant_arm
+
+    return dormant_arm
+
+
+def _free(text):
+    return {
+        int(ln.split(",")[0]): (ln.split(",")[1].strip(), int(ln.split(",")[2]))
+        for ln in text.strip().splitlines()
+    }
+
+
+def _grade(before=None, after=None, released=_RELEASED_OK, ranks=3,
+           instant_before=_I_BEFORE, instant_after=_I_AFTER, degrades=(), noitem=None):
+    arm = _arm()
+    return arm.grade(
+        before=_free(before or _FREE_STEADY),
+        after=_free(after or _FREE_STEADY),
+        instant_before=instant_before,
+        instant_after=instant_after,
+        capture={0: 102, 1: 92, 2: 133},
+        capture_prov="boot weg2rg6",
+        released=None if released is None else arm.parse_released(released),
+        degrades=list(degrades),
+        ranks=ranks,
+        noitem=noitem if noitem is not None else {0: 1029, 1: 340, 2: 851},
+        noitem_prov="boot weg2rg6 (no item)",
+    )
+
+
+def test_a_perfect_run_is_not_graded_as_a_failure_by_a_same_phase_delta():
+    """THE round-2 blocker, as an executable regression.
+
+    Both readings in the same phase, a 2 MiB jitter between them, and all three
+    ranks releasing their full workspace + pool.  Commit 3's block returned
+    EXIT 4 ("the item did NOT deliver") on exactly this input -- measured, with
+    the heredoc extracted: `delta +0 / +0 / +0 -> UNDER FLOOR` on all three
+    cards.  The only honest failure left on this input is the 5090's residual.
+    """
+    rc, lines = _grade(after="0, RTX 3080, 1517\n1, RTX 5090, 814\n2, RTX 3080, 1368\n")
+    text = "\n".join(lines)
+    assert rc != 4, (
+        "a perfect run is graded as 'the item did not deliver' -- the same-phase "
+        "delta is being used as a delivery test again:\n" + text
+    )
+    assert rc == 5, "the 5090 sits at 814 MiB, which is the named residual (exit 5)"
+    assert "UNDER FLOOR" not in text
+
+
+def test_the_delivery_criterion_is_the_released_tag_lines_not_the_free_delta():
+    """Delivery has exactly one instrument, and it is not NVML free."""
+    rc_missing, lines = _grade(released="")
+    assert rc_missing == 4 and "0 released-tag line" in "\n".join(lines)
+    rc_short, _ = _grade(released=_RELEASED_OK.replace("486.0", "383.0"))
+    assert rc_short == 4, "a rank that released less than the workspace alone passed"
+    rc_two, _ = _grade(released="\n".join(_RELEASED_OK.splitlines()[:2]))
+    assert rc_two == 4, "two lines for three sleeping ranks passed"
+
+
+def test_the_savers_could_not_answer_sentinel_is_not_read_as_an_empty_tag():
+    """`mib=0.0` is the saver failing to answer; the line's own text says so.
+
+    Not enough that the exit code is 4 -- "the saver could not answer" and "the
+    rank released 380 of 384 MiB" are different faults with different next
+    steps, so the VERDICT (not only the per-line table) has to say which one
+    happened.
+    """
+    rc, lines = _grade(released=_RELEASED_OK.replace("486.0", "0.0"))
+    assert rc == 4
+    verdict = [ln for ln in lines if ln.startswith("VERDICT:")]
+    assert verdict and "sentinel" in verdict[0], (
+        "the verdict blamed the wrong thing for a mib=0.0 line: %s" % verdict
+    )
+
+
+def test_two_instants_in_different_phases_are_refused_rather_than_graded():
+    rc, lines = _grade(instant_after="phase=P(awake) epoch=44 state=serving")
+    assert rc == 2
+    text = "\n".join(lines)
+    assert "DIFFERENT front phases" in text
+    assert "cancels" in text, "the refusal must say WHY, not just that it refuses"
+
+
+def test_a_reading_without_its_instant_is_refused():
+    """A free number without its phase is a comparison of two unknown states."""
+    rc, lines = _grade(instant_before="epoch=41")
+    assert rc == 2 and "does not name its phase" in "\n".join(lines)
+
+
+def test_the_one_free_delta_that_does_fail_is_a_lost_workspace():
+    """The hazard this item can introduce: a pause whose resume did not hand
+    the pages back.  That is a LOSS of one whole workspace across a cycle that
+    ends in the phase it started in."""
+    rc, lines = _grade(after="0, RTX 3080, 1131\n1, RTX 5090, 816\n2, RTX 3080, 1368\n")
+    assert rc == 4 and "LOST A WORKSPACE" in "\n".join(lines)
+
+
+def test_a_gain_is_named_and_handed_to_the_answer_probe_not_silently_dropped():
+    rc, lines = _grade(after="0, RTX 3080, 1915\n1, RTX 5090, 816\n2, RTX 3080, 1368\n")
+    text = "\n".join(lines)
+    assert "gained >= one workspace" in text
+    assert rc != 4, "a gain is the answer probe's finding, not this table's"
+
+
+def test_an_unreadable_window_prints_n_a_and_exits_2_rather_than_passing():
+    rc, lines = _grade(released=None)
+    text = "\n".join(lines)
+    assert rc == 2 and "n/a" in text and "does not pass" in text
+
+
+def test_the_cross_boot_baseline_is_an_indicator_and_never_an_exit_code():
+    """It pairs THIS boot's reading with ANOTHER boot's, so it may inform and
+    must not grade -- the class the record calls out for cross-boot numbers."""
+    in_band = "0, RTX 3080, 1000\n1, RTX 5090, 900\n2, RTX 3080, 1100\n"
+    rc_a, lines = _grade(before=in_band, after=in_band)
+    assert rc_a == 0, "the sample is in band on every card and delivered"
+    rc_b, _ = _grade(before=in_band, after=in_band, noitem={0: 1, 1: 1, 2: 1})
+    assert rc_a == rc_b, (
+        "a cross-boot baseline below the floor changed THIS boot's verdict from "
+        "%d to %d -- another boot's number is now an exit code" % (rc_a, rc_b)
+    )
+    assert "INDICATOR, never an exit code" in "\n".join(lines)
+
+
+def test_named_degrades_are_searched_over_the_whole_log_not_only_the_window():
+    """The group-gate refusal is rate-limited and fires at the launcher's
+    STARTUP sleep -- before this arm attaches.  A window-only search would
+    report 'no degrade' on exactly the boot that degraded."""
+    arm = _arm()
+    whole = (
+        "[boot] WEG2-SLEEP graph tag NOT armed: no_group -- SGLANG_WEG2_GROUP is empty\n"
+        "[boot] ... a thousand lines ...\n"
+        "[boot] WEG2-SLEEP released tags=['cuda_graph'] mib=486.0 ms=44\n"
+    )
+    found = arm.find_degrades(whole)
+    assert len(found) == 1 and "no_group" in found[0]
+    assert arm.find_degrades("nothing here") == []
+    rc, lines = _grade(degrades=found)
+    assert "NAMED DEGRADES FOUND" in "\n".join(lines)
+
+
+def test_the_module_names_the_cancellation_that_forbids_a_cross_phase_grade():
+    """Instrument-text law: the reason a cross-phase delta cannot grade
+    delivery is arithmetic, and it has to be written where the grading is, not
+    only in a record file."""
+    arm = _arm()
+    doc = arm.__doc__
+    assert "P_release - D_release" in doc
+    assert "CANCELS" in doc
+    assert "before the front process exists" in doc
+
+
+@pytest.mark.skipif(
+    not os.path.exists("/spinning/gpu-arb/weg2/arm_dormant_boot.sh"),
+    reason="evidence-tree-bound: the boot arm lives in /spinning/gpu-arb, not in the repo",
+)
+def test_the_boot_arm_stamps_both_readings_with_the_fronts_own_instant():
+    src = open("/spinning/gpu-arb/weg2/arm_dormant_boot.sh").read()
+    assert "/weg2/state" in src, "the instants must come from the front, not from a comment"
+    assert "--instant-before" in src and "--instant-after" in src
+    assert "dormant_arm.py" in src, "the grading must be the tested module"
+    assert "PYCORRIDOR" not in src, (
+        "the untested heredoc is back; it is the artifact that shipped the "
+        "same-phase delivery test"
+    )
+    assert "plog-window" in src, "delivery needs the released-tag window"
+
+
+# ---------------------------------------------------------------------------
+# FIX 3, FINDING 2: the group gate refuses BY NAME.
+#
+# FIX 2 made the whole item depend on a NEW necessary condition --
+# `weg2_group_name()` non-empty, i.e. SGLANG_WEG2_GROUP published by
+# launcher.build_env -- and gave it no instrument.  When it was absent the item
+# degraded SILENTLY: no line at the gate, none at the region (`yield False`),
+# none at the sleep (the tag list came back unchanged).  A rank that had lost
+# the variable was byte-identical in the logs to a rank running the pre-item
+# tree, and the boot arm's degrade grep could not fire for it.  That is the
+# #1246 shape: silent capability loss, exit 0, no W-code.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def weg2_env():
+    """Snapshot/restore the variables these tests write directly."""
+    keys = ("SGLANG_WEG2_GROUP", "SGLANG_WEG2_WEIGHT_CHUNKS",
+            "SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+    saved = {k: os.environ.get(k) for k in keys}
+    yield
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+def _rank(group, armed=True, family=True):
+    """A rank with/without its group name, with/without the rest of the family."""
+    ms = _saver(armed=armed, group=group)
+    if family:
+        os.environ["SGLANG_WEG2_WEIGHT_CHUNKS"] = "4"
+    else:
+        for key in list(os.environ):
+            if key.startswith("SGLANG_WEG2_") and key != ms.WEG2_GROUP_ENV:
+                os.environ.pop(key, None)
+    ms._GRAPH_TAG_REFUSALS.clear()
+    return ms
+
+
+def test_a_lost_group_name_refuses_by_name_instead_of_disarming_silently(caplog, weg2_env):
+    ms = _rank(group="", family=True)
+    with caplog.at_level("WARNING"):
+        assert ms.weg2_graph_tag_armed(True) is False
+    text = caplog.text
+    assert "WEG2-SLEEP graph tag NOT armed" in text, (
+        "the item disarmed with no line at all -- the silent-capability-loss "
+        "shape this fix exists to close"
+    )
+    assert "no_group" in text and ms.WEG2_GROUP_ENV in text, (
+        "the line must name WHICH conjunct failed, not merely that one did"
+    )
+    assert ms.weg2_graph_tag_refusals() == {"no_group": 1}
+
+
+def test_the_refusal_is_silent_when_the_group_name_is_there(caplog, weg2_env):
+    ms = _rank(group="P", family=True)
+    with caplog.at_level("WARNING"):
+        assert ms.weg2_graph_tag_armed(True) is True
+    assert "NOT armed" not in caplog.text
+    assert ms.weg2_graph_tag_refusals() == {}
+
+
+def test_a_stock_engine_gains_no_line_and_no_counter(caplog, weg2_env):
+    """The stock path must stay byte-identical -- including its log.  A stock
+    engine never had SGLANG_WEG2_GROUP, so its absence there is not a degrade
+    and must not be reported as one."""
+    ms = _rank(group="", family=False)
+    with caplog.at_level("WARNING"):
+        assert ms.weg2_graph_tag_armed(True) is False
+    assert "NOT armed" not in caplog.text, (
+        "a stock --enable-memory-saver engine now prints a Weg-2 warning it can "
+        "do nothing about"
+    )
+    assert ms.weg2_graph_tag_refusals() == {}
+
+
+def test_the_rate_limited_refusal_prints_its_own_denominator(caplog, weg2_env):
+    """DENOMINATOR LAW: a rate-limited emitter that does not print its
+    suppressed count turns 'refused on every leg' into 'refused once'."""
+    ms = _rank(group="", family=True)
+    with caplog.at_level("WARNING"):
+        for _ in range(5):
+            ms.weg2_graph_tag_armed(True)
+    fired = [r for r in caplog.records if "NOT armed" in r.getMessage()]
+    assert len(fired) == 3, "expected occurrences 1, 2 and 4 to fire, got %d" % len(fired)
+    assert "occurrence=1" in fired[0].getMessage()
+    assert "occurrence=4" in fired[-1].getMessage()
+    assert ms.weg2_graph_tag_refusals() == {"no_group": 5}, (
+        "the count is the denominator the line's occurrence= is drawn from"
+    )
+
+
+def test_the_env_conjunct_also_refuses_by_name(caplog, weg2_env):
+    ms = _rank(group="P", armed=False, family=True)
+    with caplog.at_level("WARNING"):
+        assert ms.weg2_graph_tag_armed(True) is False
+    assert "env_off" in caplog.text and "SGLANG_MEMORY_SAVER_CUDA_GRAPH" in caplog.text
+
+
+def test_the_memory_saver_conjunct_also_refuses_by_name(caplog, weg2_env):
+    ms = _rank(group="P", family=True)
+    with caplog.at_level("WARNING"):
+        assert ms.weg2_graph_tag_armed(False) is False
+    assert "no_memory_saver" in caplog.text
+
+
+def test_the_regions_disarmed_path_is_no_longer_a_silent_yield(caplog, weg2_env):
+    """weg2_memory_saver.py's region took `yield False; return` with no log
+    when the tag was not armed -- one of the three sites that made a lost group
+    name invisible.  It calls the gate, so the gate's line is its line."""
+    ms = _rank(group="", family=True)
+    with caplog.at_level("WARNING"):
+        with ms.weg2_graph_scratch_region(384 * 1024 * 1024, True) as tagged:
+            assert tagged is False
+    assert "WEG2-SLEEP graph tag NOT armed" in caplog.text
+    assert "no_group" in caplog.text
+
+
+def test_the_size_gate_stays_a_silent_decision(caplog, weg2_env):
+    """Carried from FIX 2: the #102 size gate is a DECISION, not a degrade, and
+    must not start printing now that its neighbour does."""
+    from sglang.srt.speculative.adaptive_graph_memory import MIN_TAGGED_BYTES
+
+    ms = _rank(group="P", family=True)
+    with caplog.at_level("WARNING"):
+        with ms.weg2_graph_scratch_region(MIN_TAGGED_BYTES - 1, True) as tagged:
+            assert tagged is False
+    assert "NOT armed" not in caplog.text and "NOT tagged" not in caplog.text
+
+
+def test_the_stock_discriminator_is_the_rest_of_the_weg2_family(weg2_env):
+    """`weg2_env_present` is what tells a stock engine from a Weg-2 rank that
+    lost its name, and its limit is stated rather than hidden: it is sufficient
+    for the loud case, not necessary."""
+    ms = _rank(group="", family=False)
+    assert ms.weg2_env_present() is False
+    os.environ["SGLANG_WEG2_WEIGHT_CHUNKS"] = "4"
+    assert ms.weg2_env_present() is True
+    os.environ[ms.WEG2_GROUP_ENV] = "P"
+    os.environ.pop("SGLANG_WEG2_WEIGHT_CHUNKS")
+    assert ms.weg2_env_present() is False, (
+        "the group variable must not count as its own corroboration"
+    )
+    assert "HONEST LIMIT" in ms.weg2_env_present.__doc__
+
+
+def test_launcher_publishes_the_group_beside_that_family_on_both_groups(weg2_env):
+    """The refusal above is only correct if the launcher really does publish
+    both halves on both groups: the group name, and at least one other
+    SGLANG_WEG2_* variable to corroborate it."""
+    from sglang.srt.managers import weg2_memory_saver as ms
+    from sglang.srt.weg2 import launcher
+
+    src = inspect.getsource(launcher)
+    family = set(re.findall(r'"(SGLANG_WEG2_[A-Z_]+)"', src)) - {ms.WEG2_GROUP_ENV}
+    assert family, "no corroborating SGLANG_WEG2_* variable exists in the launcher"
+
+    saved = os.environ.pop(ms.WEG2_GROUP_ENV, None)
+    try:
+        for group in ("P", "D"):
+            env = launcher.build_env(tree="/tmp/t", venv="/tmp/v", cvd="0",
+                                     store_dir="/tmp/s", debug_hold=False,
+                                     tag="probe", chunk_layers=4, chunk_count=2,
+                                     group=group)
+            assert env[ms.WEG2_GROUP_ENV] == group
+            assert family & set(env), (
+                "group %s is published without any corroborating variable, so a "
+                "rank that lost the group name cannot be told from a stock "
+                "engine" % group
+            )
+    finally:
+        if saved is not None:
+            os.environ[ms.WEG2_GROUP_ENV] = saved
