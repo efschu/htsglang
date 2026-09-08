@@ -386,7 +386,7 @@ class XchgInstrumentTest(CustomTestCase):
 
     def test_armed_line_carries_the_spec_tokens(self):
         """The acceptance line, in the spec's token order, with real numbers."""
-        from sglang.srt.weg2 import launcher, xchg_residency
+        from sglang.srt.weg2 import launcher
 
         lines = []
         with _census_file(_sb4_census()) as path:
