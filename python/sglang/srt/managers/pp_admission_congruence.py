@@ -1385,6 +1385,11 @@ LOAD_BACK_EXTENT_ATTR = "pp_load_back_extent"
 #:   (spend)        DELETED with the delivery chain (#1046) -- there is no
 #:                  row consumption left for a fact to be retired by
 #:   retract        the request was retracted; the fact is void        (deleter)
+#:   undistributable  #1245: this rank holds a fact it cannot TELL. On a
+#:                  multi-stage PP form without a row carrier every term that
+#:                  makes PP0 authoritative over the prefix is disarmed, so an
+#:                  extent adopted here moves ONE rank's prefix and manufactures
+#:                  the W27 width divergence. Dropped, on every rank alike.
 #:
 #: BOOT 10 MEASURED WHY A HITLESS MATCH MUST NOT CLEAR *UNDER DELIVERY*. It nulled the
 #: field on every hitless match, so a request stamped 4618 on one pass reached
@@ -1393,7 +1398,12 @@ LOAD_BACK_EXTENT_ATTR = "pp_load_back_extent"
 #: rid. Writer, eraser and reader separated by an ordinary intervening match --
 #: the lifecycle shape the pre-boot table exists to catch, reproduced inside the
 #: mechanism that was supposed to fix it.
-_1042_LIFECYCLE = {"set": 0, "hitless_clear": 0, "retract": 0}
+_1042_LIFECYCLE = {
+    "set": 0,
+    "hitless_clear": 0,
+    "retract": 0,
+    "undistributable": 0,
+}
 
 
 def _1042_note(kind: str, req, extent=None) -> None:
@@ -1405,11 +1415,17 @@ def _1042_note(kind: str, req, extent=None) -> None:
     # "the contract was never exercised". The `set` and `retract` transitions
     # are rare and now print unconditionally; only `hitless_clear`, which fires
     # on ordinary traffic, is sampled -- and it says how many it skipped.
-    _suppressed = 0 if kind != "hitless_clear" else max(0, n - 1 - ((n - 1) // 256) * 256)
-    if kind != "hitless_clear" or n <= 3 or n % 256 == 0:
+    # #1245: `undistributable` fires on ordinary traffic exactly like
+    # `hitless_clear`, so it joins the SAMPLED set -- and therefore also the
+    # set that must print its own suppressed count (#1047's rule: sample with
+    # a denominator or do not sample at all).
+    _sampled = kind in ("hitless_clear", "undistributable")
+    _suppressed = 0 if not _sampled else max(0, n - 1 - ((n - 1) // 256) * 256)
+    if not _sampled or n <= 3 or n % 256 == 0:
         logger.info(
             "#1042 EXTENT LIFECYCLE %s rid=%s extent=%s held=%s -- set=%d "
-            "hitless_clear=%d retract=%d (suppressed_since_last_print=%d)",
+            "hitless_clear=%d retract=%d undistributable=%d "
+            "(suppressed_since_last_print=%d)",
             kind,
             getattr(req, "rid", None),
             extent,
@@ -1417,6 +1433,7 @@ def _1042_note(kind: str, req, extent=None) -> None:
             _1042_LIFECYCLE["set"],
             _1042_LIFECYCLE["hitless_clear"],
             _1042_LIFECYCLE["retract"],
+            _1042_LIFECYCLE["undistributable"],
             _suppressed,
         )
 
@@ -1431,6 +1448,64 @@ def clear_state_aligned_extent_on_retract(req) -> None:
         setattr(req, LOAD_BACK_EXTENT_ATTR, None)
     except Exception:  # noqa: BLE001
         pass
+
+
+def clear_state_aligned_extent_undistributable(req) -> Optional[int]:
+    """#1245 transition UNDISTRIBUTABLE: drop an extent this rank cannot TELL.
+
+    Returns the extent that was dropped, or ``None`` when there was nothing to
+    drop -- so the caller can instrument the real events and not the visits.
+
+    THE DEFECT, MEASURED ON METAL (boot weg2rg3, tip 5b015ad139, group P,
+    2026-09-08 04:23:45/46Z). Same rid, same slot, same ``fwd_ct=37``, same
+    pass ``n=38``, two extents::
+
+        [04:23:45 PP0] #969 EXTENT n=38 reqs=[('bc39b188',15400,15401,15400,1),
+                                              ('0cf64713', 0, 4095, 0, 4095)]
+        [04:23:46 PP1] #969 EXTENT n=38 reqs=[('bc39b188',15400,15401,15400,1),
+                                              ('0cf64713', 6009, 6108, 6009, 99)]
+
+    4096 rows against 100 tokens, and ``W27 PPWidthDivergenceRefused`` stopped
+    the group. The ONE difference is an asynchronous event: PP1's HiCache
+    prefetch for that rid completed at 04:23:45 (``#988 LOADBACK ... prefix
+    moved to 6009``), PP0's at 04:23:46 -- one second AFTER PP0 had already
+    built and launched that pass with prefix 0.
+
+    WHY THE STANDING SAFETY ARGUMENT DOES NOT COVER IT. ``_pp_load_back_extent``
+    (#1046) rests uniformity on "the DERIVATION being identical, not one rank
+    shipping a value to the others". The derivation IS identical; its INPUT is
+    not. ``host_hit_length`` is stamped at the match from a prefetch that
+    terminates on wall-clock time PER RANK, so the same expression evaluated on
+    two ranks 200 ms apart returns 0 and 6009. ``stamp_state_aligned_extent``
+    above still carries the argument that DID cover this -- "only PP0's is ever
+    published ... every other rank reads the told value off the row" -- and
+    #1046 deleted that row consumption. What is left is the surviving half of a
+    deleted mechanism, which UPSTREAM-MINIMAL makes a DELETION candidate rather
+    than a repair candidate.
+
+    THE CALLER OWNS THE PREDICATE, and it is `pp_row_carrier_present`: on the
+    carrierless multi-stage form EVERY term that makes PP0 authoritative over
+    the prefix is already disarmed by design -- the #631 row (scheduler_pp_mixin
+    `_pp_proxy_frame_pending` -> None -> '#631 ROW AUTHORITY DISABLED'), #1039's
+    learned-floor clamp, #1066's withhold and #1175's group-completion verdict
+    -- precisely so PP0 cannot decide differently from its followers (#969Z).
+    This extent was the one prefix mover left outside that rule, and it is a
+    mover no rank can tell its peers about.
+
+    NOT A FOLLOWER-SIDE COMPENSATION: PP0 evaluates the identical predicate and
+    drops its own extent too, so the ranks are held equal BY CONSTRUCTION and no
+    rank waits for, or corrects for, another. Uniform means every rank runs the
+    same line, not that one rank patches up the difference.
+    """
+    extent = getattr(req, LOAD_BACK_EXTENT_ATTR, None)
+    if not extent:
+        return None
+    _1042_note("undistributable", req, extent)
+    try:
+        setattr(req, LOAD_BACK_EXTENT_ATTR, None)
+    except Exception:  # noqa: BLE001 - never break an admission walk
+        pass
+    return int(extent)
 
 
 def stamp_state_aligned_extent(req) -> Optional[int]:

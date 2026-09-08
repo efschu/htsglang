@@ -218,6 +218,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     PPAdmissionCongruenceGuard,
     PPScheduleRefused,
     build_pp_admission_decision,
+    clear_state_aligned_extent_undistributable,
     forwarded_fill_carry,
     forwarded_last_chunk,
     pp_admission_verdict_is_vacuous,
@@ -11276,6 +11277,56 @@ class Scheduler(
                     # this truncation -- that check is named open. WHOEVER
                     # MOVES EITHER SITE MUST RE-CHECK THIS ORDER FIRST.
                     req.truncate_prefix_to(told)
+
+                # #1245 THE UNDISTRIBUTABLE LOAD-BACK, DROPPED WHERE IT CANNOT
+                # BE TOLD -- the sibling of #1039's clamp, one mover later, found
+                # by the identical argument and gated on the identical predicate.
+                #
+                # W27 KILLED BOOT weg2rg3 HERE (5b015ad139, group P, 2026-09-08
+                # 04:23:46Z). PP0 and PP1 admitted the SAME rids at the SAME
+                # slot=1 and the SAME fwd_ct=37 for pass n=38, and built 4096
+                # rows against 100 tokens, because PP1's HiCache prefetch for
+                # 0cf64713 completed at 04:23:45 and PP0's at 04:23:46 -- one
+                # second after PP0 had already launched that pass at prefix 0.
+                # The full log proof and the falsified premise are in
+                # `clear_state_aligned_extent_undistributable`'s docstring.
+                #
+                # WHY HERE AND NOT IN THE ADDER: this is the only place that
+                # holds BOTH the request and `self.ps`. `PrefillAdder` has no
+                # PP topology at all, and `_pp_load_back_extent(req)` therefore
+                # cannot ask the question it needs to ask.
+                #
+                # SELF-LIFTING, and that is the point of reusing the predicate:
+                # the moment a row carrier exists, `truncate_prefix_to(told)`
+                # above governs the prefix from PP0's published number again and
+                # this drop stops firing on its own. A gate keyed on the flip,
+                # or on pp_size alone, would have to be remembered and removed by
+                # hand -- this one cannot silently outlive its reason.
+                if not pp_row_carrier_present(self):
+                    _dropped = clear_state_aligned_extent_undistributable(req)
+                    if _dropped:
+                        _n45 = getattr(self, "_1245_loadback_dropped", 0) + 1
+                        self._1245_loadback_dropped = _n45
+                        if _n45 <= 5 or _n45 % 256 == 0:
+                            logger.info(
+                                "#1245 UNDISTRIBUTABLE LOAD-BACK DROPPED rid=%s "
+                                "extent=%d prefix=%d pp_rank=%d: no #631 row "
+                                "carrier on this boot form, so this rank's "
+                                "asynchronously-completed host hit cannot be told "
+                                "to its peers; adopting it would move THIS rank's "
+                                "prefix alone and rebuild the W27 width "
+                                "divergence (weg2rg3: PP0 0..4095 vs PP1 "
+                                "6009..6108, same rid, same slot, same fwd_ct). "
+                                "occurrence=%d (denominator: every pp_size>1 "
+                                "admission visit on a carrierless form that "
+                                "arrived carrying a nonzero extent; visits with "
+                                "no extent are not counted and are not events)",
+                                str(getattr(req, "rid", "?"))[:8],
+                                _dropped,
+                                len(req.prefix_indices),
+                                int(self.ps.pp_rank),
+                                _n45,
+                            )
 
                 # #968/#1035 THE LOAD-BACK EXTENT, DELIVERED TO THE SITE THAT
                 # APPLIES IT. Two separate quantities travel on the same row and
