@@ -332,6 +332,23 @@ HOST_POOL_OVERHEAD = 0.04
 #: MiB in total.  Both are pinned at launch and charged at BOTH moments; D's
 #: term used to sit implicitly inside RING_D_MULT_GB_PER_S and is explicit
 #: from here on.
+#: #1264 ``--draft-kv-on-p off`` DOES NOT REACH THIS TERM, deliberately, and
+#: the reason is named here rather than left for a reader to rediscover.  Under
+#: ``off`` group P builds no draft host pool at all, so ``draft_host_p_gib``
+#: (119.2 MiB = 0.116 GiB) is charged against a pool that does not exist.  It
+#: is left charged because the error is CONSERVATIVE in the only direction that
+#: matters: an over-charge makes the ledger stricter (a smaller store, an
+#: earlier refusal), never looser, and 0.116 GiB against a ~90 GiB idle boot is
+#: below the resolution of every arm decision the ladder makes.  Threading the
+#: predicate through ``charge_terms`` -> ``price`` -> ``choose`` for it would
+#: put a boolean in three signatures that ``predicted_run_peak_gib`` and
+#: ``dk7_run_residual_gib`` must then agree about -- the second-bookkeeping
+#: shape, for a term smaller than the rounding.  The ledger DOES follow the
+#: switch where it is material, and through the ring rather than a flag: an
+#: ``off`` boot's ring is 643 MiB smaller (Sigma H 38306 -> 37663 MiB, measured
+#: dry-run 2026-09-08), and the ledger hands that back as store 8 -> 9 GiB.
+#: If this term is ever made switch-aware, make it aware in ``charge_terms``
+#: only, so those three call sites keep their single authority.
 DRAFT_PAGE_BYTES = 2048
 DRAFT_HOST_SLOTS_P = 61037
 DRAFT_HOST_SLOTS_D = 30519

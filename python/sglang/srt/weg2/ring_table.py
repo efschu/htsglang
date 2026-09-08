@@ -607,6 +607,38 @@ def _tie_word_embeddings(model_path: str) -> bool:
     return bool(text.get("tie_word_embeddings", cfg.get("tie_word_embeddings", False)))
 
 
+def p_carries_drafter(argv: Sequence[str]) -> bool:
+    """THE ONE PREDICATE: does THIS group-P argv run the draft-KV producer?
+
+    #1264 ``--draft-kv-on-p``.  Group P is the draft-KV producer only while the
+    launcher puts the speculative family on its argv; ``off`` boots the rg6
+    form, where P carries no MTP head at all.  Every downstream consumer of
+    that fact -- the ring's drafter term
+    (:func:`stage_weights_from_argv`), the launcher's W10 drafter-identity and
+    W11 draft-resident gates, and its carrier/route statement -- asks THIS
+    function, and asks it of the argv the launcher is about to run rather than
+    of the CLI value.  Two reasons, both measured shapes in this file's own
+    history:
+
+    * a switch read five times is five chances to disagree; read off the argv
+      it is one fact with one producer (:func:`launcher.argv_p`), and a
+      consumer cannot drift away from what the boot actually launches -- the
+      same discipline ``launcher.w38_armed_line`` uses for ``--pp-size``;
+    * the FORM KEY needs no consumer at all: ``FORM_KEY_POLICY`` is a
+      blacklist and the ``--speculative-*`` family is not excluded, so an
+      ``off`` argv hashes to a different form BY CONSTRUCTION rather than by a
+      sixth conditional somebody has to remember to add.
+
+    Deliberately a prefix test over the whole family and not a test for
+    ``--speculative-draft-kv-only``: the producer flag is the SILENCER, the
+    algorithm flag is what makes a head land on the last stage.  A group D
+    argv carries the family WITHOUT the producer flag and must still answer
+    True here, which is why :func:`stage_weights_from_argv` asks a second,
+    narrower question (``drafter_head_from_target``) beside this one.
+    """
+    return any(str(t).startswith("--speculative-") for t in argv)
+
+
 def checkpoint_stage_weights(
     model_path: str,
     layer_split: Sequence[int],
@@ -746,7 +778,12 @@ def stage_weights_from_argv(argv: Sequence[str]) -> Tuple[Optional[List[StageWei
         attn_split = [int(x) for x in attn.split(",")]
     except ValueError as exc:
         return None, f"its cut flags do not parse as integer lists: {exc}"
-    carries = any(str(t).startswith("--speculative-") for t in argv)
+    # #1264: THE ONE PREDICATE, not a second inline copy of it.  Under
+    # ``--draft-kv-on-p off`` the launcher emits no --speculative-* flag on
+    # group P at all, so this reads False and the last stage is priced with NO
+    # drafter term -- the rg6-form derivation, reached without a second
+    # conditional in this module.
+    carries = p_carries_drafter(argv)
     # #1259 b x #1261: DOES THAT DRAFTER BUILD ITS OWN OUTPUT TABLE?  The flag
     # is the same one the scheduler gates the producer on
     # (scheduler.py: `if not server_args.speculative_draft_kv_only: return`
