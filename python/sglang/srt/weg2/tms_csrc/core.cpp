@@ -333,6 +333,7 @@ void TorchMemorySaver::resume(const std::string& tag) {
     }
 
     // --- pass 1: map every allocation of the tag ---
+    const auto weg2_map_t0 = std::chrono::steady_clock::now();   // S7 (#1273)
     for (size_t m = 0; m < matched_ptrs.size(); ++m) {
         void* ptr = matched_ptrs[m];
         AllocationMetadata& metadata = allocation_metadata_[ptr];
@@ -353,6 +354,8 @@ void TorchMemorySaver::resume(const std::string& tag) {
                   << std::endl;
 #endif
     }
+
+    const auto weg2_map_t1 = std::chrono::steady_clock::now();   // S7 (#1273)
 
     // --- pass 2: async H2D per granule ---
     bool any_copy = false;
@@ -385,6 +388,7 @@ void TorchMemorySaver::resume(const std::string& tag) {
     if (any_copy) {
         CUDA_ERROR_CHECK(cudaStreamSynchronize(backup_stream_));
     }
+    note_resume(tag, matched_ptrs.size(), weg2_map_t0, weg2_map_t1);   // S7 (#1273)
 
     // --- pass 4: give the host bytes back ---
     for (size_t m = 0; m < matched_ptrs.size(); ++m) {

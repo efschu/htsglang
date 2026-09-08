@@ -73,6 +73,7 @@ from sglang.srt.weg2 import (
     host_ledger,
     ring_table,
     weight_exchange_region,
+    xchg_residency,
 )
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_SOLVE_POOL_FLOOR
 
@@ -914,6 +915,48 @@ P_MAMBA_AUTO_SAFETY_MARGIN = 1.25
 #: charges is ``ceil(--p-bs x this x safety)`` and is printed with its inputs
 #: in the PP-CUT budget posts line, where --p-bs appears as a resolved value.
 P_MAMBA_SLOTS_PER_RUNNING_REQUEST = 2
+#: #1273: where a waking group's weight bytes come from. ``ring`` is today's
+#: path, byte for byte, and stays the default until S6 has booted the other
+#: one; ``exchange`` moves them card-to-card and is what W55 prices.
+WEIGHT_SOURCE_CHOICES = ("ring", "exchange")
+WEIGHT_SOURCE_DEFAULT = "ring"
+
+#: The /dev/shm staging region's layout terms, spec section 6/S3: 2 slots per
+#: DIRECTED cross-card pair (double buffering), 32 MiB per slot (evidence E2
+#: measured 32/64/128 MiB indistinguishable below 0.6 %, so the smallest is
+#: taken and the carve-out halves for free), 1 MiB of header + gate rows + the
+#: n x n matrix + the pointer directory. Inputs to
+#: ``xchg_residency.region_mib_from_layout``, never a literal 385.
+#: TODO(S7->S3): S3 owns the region; when weight_exchange creates it, these move
+#: there and the launcher reads the size back off the created file.
+XCHG_REGION_SLOTS_PER_PAIR = 2
+XCHG_REGION_SLOT_MIB = 32
+XCHG_REGION_HEADER_MIB = 1
+
+
+def xchg_region_pairs(n_cards: int) -> int:
+    """DIRECTED cross-card pairs on ``n_cards`` cards: ``n * (n - 1)``.
+
+    Round-2 review F8: this was typed as ``6``, which is that arithmetic
+    evaluated on THIS rig and nowhere stated as arithmetic -- on any other card
+    count the region size would have been silently wrong while every test that
+    grades it still passed, because the tests were handed the same 6.  The
+    count comes from the boot's own card list now.
+    """
+    n = int(n_cards)
+    return n * (n - 1) if n > 1 else 0
+
+
+#: #1273 S7 round-2 review F2: does the ``exchange`` arm change any RANK
+#: behaviour yet?  No -- S7 arms the W55 gate and nothing else, so a boot
+#: launched with ``--weg2-weight-source exchange`` still runs the ring path
+#: byte for byte.  The arming line SAYS so rather than leaving a later reader
+#: of the log to infer it from a non-zero ``ring_H_mib``.
+#: TODO(S7->S6): S6 flips this to True in the same commit that propagates the
+#: flag into the two groups' argv, the request structs and the saver's region
+#: flag.  One name, one place.
+XCHG_RANK_BEHAVIOUR_WIRED = False
+XCHG_UNWIRED_REASON = "S7-gate-only-no-rank-behaviour-until-S6"
 
 #: #1240 -- the DEPTH axis of the cost model, and the two records that pin it.
 #:
@@ -1275,6 +1318,10 @@ class BootState:
     dc_expect_d: Dict[str, int] = field(default_factory=dict)
     ledger_lines: List[str] = field(default_factory=list)
     ring_lines: List[str] = field(default_factory=list)
+    #: #1273 S7: the W55 residency rows, empty on the default `ring` arm --
+    #: an empty list there means "the exchange did not run", never "it was
+    #: checked and found nothing".
+    xchg_lines: List[str] = field(default_factory=list)
     ring_form: str = ""
     ring_dir: str = ""
     #: The boot nonce (``HostRingPlan.epoch``), so teardown can unlink THIS
@@ -3159,6 +3206,76 @@ def teardown_xchg_region(log: Log, boot_nonce: str) -> Dict[str, int]:
     :data:`SHM_OWN_PREFIXES` entry close at the NEXT launch.
     """
     return weight_exchange_region.teardown_region(boot_nonce, log=log)
+
+
+def prepare_weight_exchange(
+    cards: List[Card],
+    log: Log,
+    weight_source: str,
+    census_path: str,
+    epoch: object,
+    ring_h_mib: int,
+    floor_mib: float = ARMING_FLOOR_MIB,
+) -> Optional["xchg_residency.XchgResidency"]:
+    """W55 (#1273 S7): price the exchange's VRAM peak BEFORE either group starts.
+
+    Returns None on the ``ring`` arm, where nothing about this boot changes --
+    the check is not merely skipped there, it has no subject: no wave schedule
+    runs, so there is no co-residency window to price.
+
+    On the ``exchange`` arm it solves spec section 5's table per card, per
+    direction, per wave from a MEASURED census plus this boot's own live NVML
+    totals, logs one ``WEG2-XCHG-CHECK`` row per (card, direction) and then
+    either the ``WEG2-XCHG-ARMED`` line or raises
+    :class:`xchg_residency.Weg2XchgResidencyUnarmable` -- exit 2, the same
+    contract and the same launch position as W32/W34/W49 above, and for the
+    same reason: a refusal that arrives mid-flip arrives after VRAM has already
+    been mutated.
+
+    W55 REPLACES W49's ROLE HERE rather than joining it (spec section 0.4,
+    finding R1-1): under ``exchange`` the launcher publishes no
+    ``TMS_HOST_RING_*``, Sigma H is 0 and every ring inequality reads ``0 > 0``
+    -- false, i.e. a gate that passes because it has nothing to grade.  An
+    unarmed gate must never be read as a passed one, so the arming line carries
+    ``ring_H_mib`` beside the peaks, and (round-2 review F2) a ``wired=`` token
+    saying in words that no rank behaviour hangs off this arm until S6.
+
+    THE REFUSAL EXITS 2 BECAUSE IT IS ENROLLED, NOT BECAUSE IT SAYS SO
+    (round-2 review F1): :class:`xchg_residency.Weg2XchgRefused` is in
+    ``REFUSALS``, which is what ``cli()`` catches; the first cut of this slice
+    raised a bare ``RuntimeError`` and exited 1 with a traceback while three
+    docstrings, this one included, promised exit 2.
+    """
+    if weight_source != "exchange":
+        return None
+    census = xchg_residency.load_census(census_path)   # raises W55 by name
+    res = xchg_residency.solve(cards, census, floor_mib)
+    for ln in res.lines:
+        log(ln)
+    if not res.armed:
+        head = xchg_residency.refusal_head(res)
+        log(head)
+        for ln in res.refusals:
+            log(ln)
+        raise xchg_residency.Weg2XchgResidencyUnarmable(
+            head + "\n" + "\n".join(res.refusals)
+        )
+    log(
+        xchg_residency.armed_line(
+            res,
+            epoch,
+            xchg_residency.region_mib_from_layout(
+                xchg_region_pairs(len(cards)),
+                XCHG_REGION_SLOTS_PER_PAIR,
+                XCHG_REGION_SLOT_MIB,
+                XCHG_REGION_HEADER_MIB,
+            ),
+            ring_h_mib,
+            XCHG_RANK_BEHAVIOUR_WIRED,
+            XCHG_UNWIRED_REASON,
+        )
+    )
+    return res
 
 
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
@@ -7368,6 +7485,30 @@ def build_parser() -> argparse.ArgumentParser:
                          "card with the R17 gate beside it, and publishes the table "
                          "to the ranks as SGLANG_WEG2_PCIE_DUPLEX. An unreadable or "
                          "rowless file means NO card splits its lock key")
+    ap.add_argument(
+        "--weg2-weight-source", choices=WEIGHT_SOURCE_CHOICES,
+        default=WEIGHT_SOURCE_DEFAULT,
+        help="#1273: where a waking group's weight BYTES come from. 'ring' (the "
+             "default, and today's path byte for byte) refills them from the "
+             "shared host granule ring. 'exchange' moves them card-to-card from "
+             "the sleeping group's still-mapped pages, which removes the ring's "
+             "whole Sigma H from host RAM and pays for it with a VRAM peak while "
+             "both groups' bytes are resident on one card. In THIS slice (S7) "
+             "the flag arms one thing only -- the W55 residency check on that "
+             "peak, before either group starts. "
+             "TODO(S7->S6): S6 owns propagating it into the two groups' argv, "
+             "the request structs and the memory saver's region flag; until "
+             "then 'exchange' arms the gate and changes no rank behaviour.",
+    )
+    ap.add_argument(
+        "--weg2-xchg-census", default="",
+        help="#1273 S7: the per-card, per-tag, per-group census W55 prices the "
+             "exchange's VRAM peak from -- a JSON FILE with its own provenance "
+             "string, the same kind of measured input --duplex-probe already is, "
+             "never a number on this command line. Required by "
+             "--weg2-weight-source exchange; absent, the launcher REFUSES by "
+             "name (W55) rather than invent a table",
+    )
     ap.add_argument("--ring-table-boot", default="",
                     help="pin the ring table to ONE boot instead of the newest usable "
                          "one. Matched as a SUBSTRING of the log stem, so the boot TAG "
@@ -8298,6 +8439,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        else "none -- NOT ARMED (A1-3: no fallback form exists on "
                             "this host budget; this boot refuses by name)")
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
+
+    # 1c. #1273 S7: W55, the exchange's VRAM residency, per card per direction
+    # per wave -- HERE, beside the ring's own inequalities, because it grades
+    # the same kind of claim (a peak nobody can observe once the flip is
+    # running) and must refuse in the same place (before either group starts).
+    # On the default `ring` arm this returns None and logs nothing at all.
+    #
+    # ``ring_H_mib`` is reported from THIS boot's ring plan rather than assumed
+    # to be 0: S6 is what stops publishing TMS_HOST_RING_* under `exchange`,
+    # and until it lands a non-zero value on the arming line is the truth about
+    # this boot, not a formatting default.  An unarmed gate must never read as a
+    # passed one, and neither may an un-disarmed ring read as a disarmed one.
+    #
+    # TODO(S7->S6), round-2 refuter F12: ``epoch`` is the RING's epoch because
+    # today the ring is what publishes one.  When S6 stops publishing
+    # TMS_HOST_RING_* under `exchange`, this token goes empty unless the
+    # exchange mints its own epoch -- the arming line must not lose its boot
+    # identity in the same commit that makes the arm real.
+    xchg_res = prepare_weight_exchange(
+        cards, log, ns.weg2_weight_source, ns.weg2_xchg_census,
+        ring_plan.epoch,
+        (ring_plan.table.total_h_bytes // ring_table.MIB) if ring_plan.table else 0,
+    )
+    state.xchg_lines = list(xchg_res.lines) if xchg_res is not None else []
 
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
@@ -9237,8 +9402,14 @@ class Weg2CarrierFloorUnreachable(Weg2LaunchRefused):
 #: as W20 -- an arm whose predicted RUN PEAK is not below the observed reap
 #: point does not boot -- so it joins this tuple instead of growing a second
 #: `except` clause beside the one handler.
+#: #1273 S7 round-2 review F1: ``xchg_residency.Weg2XchgRefused`` (W55) joins
+#: it for the SAME reason W34 once did not -- it shipped outside this tuple and
+#: therefore exited 1 with a traceback and dropped no admin key. It is the
+#: module's BASE class, not the leaf, so the FIX 2 lesson holds one module on:
+#: a future exchange refusal inherits the handler instead of needing a line.
 REFUSALS = (Weg2LaunchRefused, ring_table.Weg2RingRefused,
-            host_ledger.Weg2HostLedgerRefused, host_ledger.Weg2HostRunPeakRefused)
+            host_ledger.Weg2HostLedgerRefused, host_ledger.Weg2HostRunPeakRefused,
+            xchg_residency.Weg2XchgRefused)
 
 
 def cli(argv: Optional[Sequence[str]] = None) -> int:
