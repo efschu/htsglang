@@ -398,7 +398,14 @@ class TestResidentEmbeddingLoad(CustomTestCase):
 class TestHostLedgerDraftTerms(CustomTestCase):
     def test_t16_price_carries_both_draft_terms_and_choose_steps_down(self):
         gib = host_ledger.GIB
-        arm = host_ledger.price(int(200 * gib), int(150 * gib), 1, 2400, weight_chunks=8)
+        # C19 (ring rebase 0908): the host weights term is the measured
+        # per-card ring table, not a chunk count -- same Sigma H / Sigma image_P
+        # the s3s4, ring_ledger, host_budget and fix8 suites pin.  The draft
+        # terms this test is about are untouched by that: they are a HOST TIER
+        # OF THEIR OWN, charged at both moments, never part of the flip image.
+        ring_kw = dict(ring_bytes=32964 * 1024 * 1024,
+                       ring_span1_bytes=29912 * 1024 * 1024)
+        arm = host_ledger.price(int(200 * gib), int(150 * gib), 1, 2400, **ring_kw)
         self.assertIn("draft_host_p_gib", arm.terms)
         self.assertIn("draft_host_d_gib", arm.terms)
         self.assertAlmostEqual(arm.terms["draft_host_p_gib"] * 1024, 119.2, delta=0.2)
@@ -413,7 +420,7 @@ class TestHostLedgerDraftTerms(CustomTestCase):
         # below the break-even of the priced form above.
         memavail = int((150 - arm.launch_leftover_gib - draft_terms / 2) * gib)
         chosen, _store, _lines = host_ledger.choose(
-            int(200 * gib), memavail, store_min_gib=0.0, weight_chunks=8
+            int(200 * gib), memavail, store_min_gib=0.0, **ring_kw
         )
         self.assertNotEqual((chosen.s_gb, chosen.m_mib), (1, 2400))
 

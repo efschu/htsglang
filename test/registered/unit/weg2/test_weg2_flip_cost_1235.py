@@ -393,10 +393,20 @@ class VramCreditTest(unittest.TestCase):
         from sglang.srt.weg2 import front
 
         src = inspect.getsource(front.Front.flip)
+        # RING REBASE 0908: the SOURCE leg now carries `pause_order` instead of
+        # `family`.  That is not a drift between the two legs -- it is the SAME
+        # tag set in the tight-card-first ORDER (#1233 fix 4, whose serial RPC
+        # loop the gathered legs replaced), and front.flip refuses the flip
+        # outright unless sorted(pause_order) == sorted(self.weights_tags), so
+        # the two legs still cannot name different tags.  What this test pins is
+        # unchanged: the FLIP's epoch rides on BOTH legs.
         self.assertIn('"/release_memory_occupation",\n                           '
-                      '{"tags": family, "epoch": flip_epoch}', src)
+                      '{"tags": pause_order, "epoch": flip_epoch}', src)
         self.assertIn('"/resume_memory_occupation",\n                           '
                       '{"tags": family, "epoch": flip_epoch}', src)
+        # and the permutation guard that makes the two equivalent is present,
+        # so "different variable" can never quietly become "different tags".
+        self.assertIn("if sorted(pause_order) != sorted(self.weights_tags):", src)
         # FIX 2 round 2: and the token both legs carry names the BOOT as well as
         # the flip, because the counter file outlives the boot.
         self.assertIn("flip_epoch = credit_epoch(self.boot_epoch, self.epoch)", src)

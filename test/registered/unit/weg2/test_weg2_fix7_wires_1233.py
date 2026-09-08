@@ -136,7 +136,18 @@ class TestTheLedgerWireIsLoadBearing(CustomTestCase):
         # exists to carry, and the refusal that denominator now produces.
         with tempfile.TemporaryDirectory() as tmp:
             meminfo, cg = _fake_host(tmp)
-            with self.assertRaises(host_ledger.Weg2HostLedgerRefused) as cm:
+            # RING REBASE 0908: the refusal is still a refusal and still by
+            # name, but the NAME moved W20 -> W21, and the move is derived:
+            # Sigma H (32.19) replaces fix 8's image + transient (38.63 + 9.97
+            # = 48.60), so every arm now FUNDS both moments -- W20's condition
+            # is "no arm funds them", and it no longer holds.  What binds
+            # instead is the run PEAK: at M=600 the prediction is
+            #   origin 21.38 (the dk7 run-residual floor, above this box's
+            #   14.99 launch reading) + charges 27.62 (heaps 17.23 + anchors
+            #   2.37 + rings 7.45 + overhead 0.39 + draft 0.18) + Sigma H 32.19
+            #   + store 17 = 98.19 GiB, against the 95.90 GiB reap point.
+            # That is exactly what fix 8 built W21 for, so the pin follows it.
+            with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
                 launcher.choose_host_ledger(
                     DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg,
                     record_path=os.path.join(tmp, "no-such-record.json"),
@@ -167,19 +178,57 @@ class TestTheLedgerWireIsLoadBearing(CustomTestCase):
         self.assertEqual(reading["current"], DK5_CG_CURRENT_B)
         self.assertEqual(reading["reclaimable"], DK5_PAGECACHE_EX_SHMEM_B)
 
-    def test_the_same_box_without_that_wire_cannot_launch_at_all(self):
-        # THE POINT OF THE PIN, stated as behaviour rather than as a kwarg:
-        # fix 5's denominator (the whole memory.current charged) is not a
-        # different arm at these readings, it is NO arm -- so a wire that stops
-        # carrying the reclaimable share turns a bootable box into a refusal,
-        # and the test above turns from green to an exception.
-        with tempfile.TemporaryDirectory() as tmp:
-            meminfo, cg = _fake_host(tmp)
-            os.remove(os.path.join(cg, "memory.stat"))
-            with self.assertRaises(host_ledger.Weg2HostLedgerRefused):
-                launcher.choose_host_ledger(
-                    DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg
-                )
+    def test_the_same_box_without_that_wire_budgets_exactly_that_share_less(self):
+        # THE PREMISE OF THIS TEST INVERTED ON THE RING, and it is re-derived
+        # from the ledger rather than flipped.  It used to read: drop the
+        # reclaimable wire and a bootable box becomes a refusal.  Measured on
+        # the ring at these same readings, the mutant does the OPPOSITE -- with
+        # memory.stat the seam raises W21, without it the seam FUNDS S=1 M=600
+        # with an 11 GiB store.
+        #
+        # That is not the wire becoming harmless; it is the STORE being both a
+        # leftover AND a charge in the run-peak prediction.  Charging the whole
+        # reading shrinks base by the reclaimable share, which shrinks the store
+        # the ladder hands out, which lowers the predicted peak back under the
+        # 95.90 GiB watermark.  (Named as a finding in the record: the ledger
+        # will give the whole leftover to the store and then refuse itself on
+        # the peak that store creates.)
+        #
+        # So the VERDICT cannot pin this wire on the ring, and a verdict that
+        # flips with the slice was never the durable pin anyway.  The SIZE is,
+        # it is monotone, and it is what fix 6 actually claims: the wire is
+        # worth EXACTLY the reclaimable share on the budget, 6.17 GiB
+        # (93.05 with it, 86.89 without -- fix 5's own figure), driven through
+        # the seam FROM FILES, which is what fix 7 exists to make reachable.
+        def _base(drop_stat):
+            with tempfile.TemporaryDirectory() as tmp:
+                meminfo, cg = _fake_host(tmp)
+                if drop_stat:
+                    os.remove(os.path.join(cg, "memory.stat"))
+                try:
+                    arm, _s, lines, _r = launcher.choose_host_ledger(
+                        DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES,
+                        meminfo_path=meminfo, cgroup_root=cg,
+                        record_path=os.path.join(tmp, "no-such-record.json"),
+                    )
+                    return arm.terms["base_gib"], lines
+                except (host_ledger.Weg2HostLedgerRefused,
+                        host_ledger.Weg2HostRunPeakRefused) as e:
+                    lines = str(e).splitlines()
+                    terms = [ln for ln in lines if "WEG2-HOST-LEDGER TERMS" in ln][0]
+                    return float(terms.split("-> base=")[1].split(" GiB")[0]), lines
+
+        with_wire, with_lines = _base(False)
+        without_wire, without_lines = _base(True)
+        self.assertAlmostEqual(with_wire, 93.05, delta=0.05)
+        self.assertAlmostEqual(without_wire, 86.89, delta=0.05)
+        self.assertAlmostEqual(
+            with_wire - without_wire, DK5_PAGECACHE_EX_SHMEM_B / GIB, delta=0.02
+        )
+        # and each path SAYS which denominator it used, so the difference is
+        # never silent.
+        self.assertTrue(any("of which reclaimable=6.17 GiB" in ln for ln in with_lines))
+        self.assertTrue(any("reclaimable=unreadable" in ln for ln in without_lines))
 
     def test_a_bigger_reclaimable_share_moves_the_budget_by_exactly_that_share(self):
         # Not only refuse-vs-boot: the term is monotone and load-bearing on the

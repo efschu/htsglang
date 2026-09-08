@@ -58,6 +58,12 @@ DK6_CG_RECLAIM_B = int(2.03 * GIB)          # -> non-reclaimable 15.80 GiB
 DK6_DEATH_CURRENT_GIB = 96.06
 
 CHUNKS = 8
+#: C19 (ring rebase 0908): the host weights term is the measured per-card ring
+#: table (Sigma H / Sigma image_P), not a chunk count.  Same figures the s3s4,
+#: ring_ledger and host_budget suites pin.
+RING_BYTES = 32964 * 1024 * 1024
+RING_SPAN1_BYTES = 29912 * 1024 * 1024
+RING_KW = dict(ring_bytes=RING_BYTES, ring_span1_bytes=RING_SPAN1_BYTES)
 STORE_MIN_GIB = 8.0
 
 
@@ -68,7 +74,7 @@ def _ladder(memtotal, memavail, current, reclaim, *, store_min=STORE_MIN_GIB,
         memtotal,
         memavail,
         store_min_gib=store_min,
-        weight_chunks=CHUNKS,
+        **RING_KW,
         cg_current_bytes=current,
         reclaimable_bytes=reclaim,
         cg_ceiling_bytes=memtotal if ceiling is None else ceiling,
@@ -94,7 +100,7 @@ def _fundable_ladder():
         store_min_gib=4.0,
         arms=((1, 600),),
         ranks_per_group=1,
-        weight_chunks=CHUNKS,
+        **RING_KW,
         cg_current_bytes=int(22.45 * GIB),
         reclaimable_bytes=0,
         cg_ceiling_bytes=DK7_MEMTOTAL_B,
@@ -162,10 +168,21 @@ class TestTheImageTermIsMeasuredNotSummedFromTags(CustomTestCase):
         # And D's bound follows the newer measurement, not the old constant.
         self.assertAlmostEqual(it.d_gib, 41.5, delta=1e-9)
 
-    def test_the_ledger_charges_the_image_at_both_moments(self):
-        arm = host_ledger.price(DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 1200, weight_chunks=CHUNKS)
+    def test_the_ledger_reports_the_measured_image_and_charges_the_ring(self):
+        # RENAMED ON THE RING (rebase 0908).  Fix 8's finding -- the image is
+        # MEASURED (38.63) and is NOT the weight-tag census (28.83) -- is
+        # unchanged and is still pinned here.  What moved is which of the two
+        # numbers price() SUBTRACTS: C19 charges Sigma H once, sized from this
+        # very measurement by ring_table, so charging images.p as well would
+        # charge the same RssShmem bytes twice.  The image therefore appears in
+        # `terms` as PROVENANCE (FLIPCOST A1-2 requires both numbers to print)
+        # and `host_ring_gib` / `host_ring_span1_gib` are what the two moments
+        # actually pay.
+        arm = host_ledger.price(DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 1200, **RING_KW)
         self.assertAlmostEqual(arm.terms["image_p_gib"], DK7_IMAGE_P_GIB, delta=0.005)
-        self.assertAlmostEqual(arm.terms["backup_resident_gib"], DK7_IMAGE_P_GIB, delta=0.005)
+        self.assertNotIn("backup_resident_gib", arm.terms)
+        self.assertAlmostEqual(arm.terms["host_ring_gib"], 32.19, delta=0.01)
+        self.assertAlmostEqual(arm.terms["host_ring_span1_gib"], 29.21, delta=0.01)
         # The census sums are KEPT, and they are no longer the image.
         self.assertAlmostEqual(arm.terms["weight_tags_p_gib"], 28.83, delta=0.01)
         self.assertNotAlmostEqual(arm.terms["image_p_gib"], arm.terms["weight_tags_p_gib"], delta=1.0)
@@ -282,22 +299,31 @@ class TestTheRunPeakRefusesInsteadOfAdvising(CustomTestCase):
         self.assertIn("binding:", msg)
         self.assertIn("RUN PEAK", msg)
 
-    def test_the_flip_transient_is_in_the_predicted_peak(self):
+    def test_the_host_weights_term_is_in_the_predicted_peak_exactly_once(self):
+        # RE-DERIVED ON THE RING (rebase 0908).  This test used to pin the flip
+        # transient as a real SUMMAND of the peak rather than a number printed
+        # beside it.  That intent is exactly what still needs pinning -- a term
+        # silently dropped from (or double-counted in) this sum is the defect
+        # class -- but the term itself is now Sigma H: C19 removed the transient
+        # by preallocating the region and copying the legs through it, so the
+        # peak charges the host weights ONCE and 9.97 is no longer a term.
         arm = host_ledger.price(
-            int(200 * GIB), int(190 * GIB), 1, 600, weight_chunks=CHUNKS,
+            int(200 * GIB), int(190 * GIB), 1, 600, **RING_KW,
             cg_current_bytes=int(2 * GIB), reclaimable_bytes=0,
             cg_ceiling_bytes=int(200 * GIB),
         )
         peak = arm.predicted_run_peak_gib(0.0)
-        self.assertAlmostEqual(arm.terms["flip_transient_gib"], 9.97, delta=1e-9)
-        # And it is a real part of the sum, not a term printed beside it.
         origin = arm.terms["run_origin_gib"]
         self.assertAlmostEqual(
             peak,
             origin + host_ledger._boot_charges_gib(arm.terms)
-            + arm.terms["backup_resident_gib"] + 9.97,
+            + arm.terms["host_ring_gib"],
             delta=1e-6,
         )
+        # ONCE, not twice: the measured image sizes the ring, it is not a second
+        # charge beside it (ring fix 1 finding 3).
+        self.assertLess(peak, origin + host_ledger._boot_charges_gib(arm.terms)
+                        + arm.terms["host_ring_gib"] + arm.terms["image_p_gib"])
 
 
 class TestTheOriginIsTheRunMomentNotTheLaunchMoment(CustomTestCase):
@@ -306,12 +332,12 @@ class TestTheOriginIsTheRunMomentNotTheLaunchMoment(CustomTestCase):
         # predicted peak is identical, because what the box holds at the run
         # moment does not depend on how quiet it was at launch.
         a = host_ledger.price(
-            DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 600, weight_chunks=CHUNKS,
+            DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 600, **RING_KW,
             cg_current_bytes=int(2 * GIB), reclaimable_bytes=0,
             cg_ceiling_bytes=DK7_MEMTOTAL_B,
         )
         b = host_ledger.price(
-            DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 600, weight_chunks=CHUNKS,
+            DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 600, **RING_KW,
             cg_current_bytes=int(14 * GIB), reclaimable_bytes=0,
             cg_ceiling_bytes=DK7_MEMTOTAL_B,
         )
@@ -325,7 +351,7 @@ class TestTheOriginIsTheRunMomentNotTheLaunchMoment(CustomTestCase):
         # The floor is a floor, not a replacement: above it, the live reading
         # binds and says so.
         arm = host_ledger.price(
-            DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 600, weight_chunks=CHUNKS,
+            DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 600, **RING_KW,
             cg_current_bytes=int(60 * GIB), reclaimable_bytes=0,
             cg_ceiling_bytes=DK7_MEMTOTAL_B,
         )
@@ -362,10 +388,10 @@ class TestTheOriginIsTheRunMomentNotTheLaunchMoment(CustomTestCase):
         for msg in (dk7, dk6):
             self.assertIn("RUN PEAK", msg)
         # Same origin, so the selector can no longer reward a quiet launch.
-        a = host_ledger.price(DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 600, weight_chunks=CHUNKS,
+        a = host_ledger.price(DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 600, **RING_KW,
                               cg_current_bytes=DK7_CG_CURRENT_B, reclaimable_bytes=DK7_CG_RECLAIM_B,
                               cg_ceiling_bytes=DK7_MEMTOTAL_B)
-        b = host_ledger.price(DK6_MEMTOTAL_B, DK6_MEMAVAIL_B, 1, 600, weight_chunks=CHUNKS,
+        b = host_ledger.price(DK6_MEMTOTAL_B, DK6_MEMAVAIL_B, 1, 600, **RING_KW,
                               cg_current_bytes=DK6_CG_CURRENT_B, reclaimable_bytes=DK6_CG_RECLAIM_B,
                               cg_ceiling_bytes=DK6_MEMTOTAL_B)
         self.assertAlmostEqual(a.terms["run_origin_gib"], b.terms["run_origin_gib"], delta=1e-9)
@@ -383,9 +409,17 @@ class TestTheHonestOutcomeIsPrintedInsteadOfShrinkingATerm(CustomTestCase):
     def test_the_refusal_names_the_ring_slice_as_the_term_that_has_to_move(self):
         msg = _refusal(memtotal=DK7_MEMTOTAL_B, memavail=DK7_MEMAVAIL_B,
                        current=DK7_CG_CURRENT_B, reclaim=DK7_CG_RECLAIM_B)
+        # RING REBASE 0908: fix 8 wrote this refusal while the ring was still
+        # a FUTURE slice ("the flip transient is removed by the host ring slice
+        # (weg2/ring-0907)").  The ring has since landed and is the base of this
+        # branch, so the sentence that named it as pending would now be false.
+        # The refusal still names the ring -- as the term that HAS moved, and as
+        # the remaining lever -- which is the same job, told in the present.
         self.assertIn("no arm funds a flip on this host budget", msg)
-        self.assertIn("the flip transient is removed by the host ring slice", msg)
-        self.assertIn("weg2/ring-0907", msg)
+        self.assertIn("the host ring landed (C19)", msg)
+        self.assertIn("there is no transient left to cut", msg)
+        self.assertIn("cut Sigma H itself", msg)
+        self.assertIn("ring_table.solve", msg)
 
     def test_no_term_was_shrunk_to_get_an_arm_through(self):
         # The three terms the refusal would be tempting to trim.  Each is a

@@ -166,30 +166,29 @@ class TestTheDenominator(CustomTestCase):
 
 
 class TestTheMoment(CustomTestCase):
-    def test_the_run_moment_charges_the_measured_peak_not_the_endpoint(self):
-        arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
-        )
-        endpoint = arm.terms["backup_resident_gib"] / DK5_CHUNKS
-        # 4.83 GiB, not the 3.60 this test pinned before fix 8: the resident
-        # image is the MEASURED 38.63 GiB (boot weg2dk7) and no longer the
-        # 28.83 GiB weight-tag census sum.  The relation this test exists for
-        # -- the PEAK beats the endpoint proxy -- holds either way.
-        self.assertAlmostEqual(endpoint, 4.83, delta=0.05)      # what it charged
-        self.assertAlmostEqual(
-            arm.terms["flip_transient_gib"], host_ledger.FLIP_HOST_TRANSIENT_GIB, delta=1e-9
-        )
-        self.assertGreater(arm.terms["flip_transient_gib"], endpoint)
+    """RING REBASE 0908 -- three of this class's four tests are DELETED, not
+    weakened, because the mechanism they asserted no longer exists.
 
-    def test_the_endpoint_arithmetic_is_the_floor_of_the_term_never_the_term(self):
-        # One chunk = the whole image: coarse chunking must not price BELOW its
-        # own arithmetic just because the measured population used N=8.
-        arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
-        )
-        self.assertAlmostEqual(
-            arm.terms["flip_transient_gib"], arm.terms["backup_resident_gib"], delta=1e-9
-        )
+    They pinned the run moment as ``one image + flip_transient``, with the
+    ``image / weight_chunks`` endpoint as that term's floor:
+      * test_the_run_moment_charges_the_measured_peak_not_the_endpoint
+      * test_the_endpoint_arithmetic_is_the_floor_of_the_term_never_the_term
+      * test_zero_chunks_is_still_the_two_image_dr1_shape
+    C19's shared host ring removes the quantity all three measure: the region is
+    preallocated at Sigma H and the legs copy THROUGH it, so ``price`` charges
+    Sigma H ONCE and there is no transient, no chunk-in-flight and no
+    ``weight_chunks`` knob left to be the floor of.  ``terms`` no longer carries
+    ``backup_resident_gib`` / ``flip_transient_gib`` at all, so these could only
+    have been kept by re-introducing the double-charge ring fix 1 finding 3
+    removed.  The DR-1 two-image shape they also covered survives, priced from
+    the ring table, in test_weg2_s3s4_refusals'
+    ``test_w20_still_refuses_the_live_box_shape_under_the_DR1_two_image_shape``.
+
+    What SURVIVES here is the one test that is about a MEASUREMENT rather than
+    about that mechanism: FLIP_HOST_TRANSIENT_GIB is kept as the measured datum
+    of the old form (the figure FLIPCOST A1-3 compares the ring against), and
+    its provenance is still pinned below.
+    """
 
     def test_the_measured_transient_is_the_max_of_its_named_population(self):
         # The ten interleaves of weg2dk5, cg_current at the interleave peak minus
@@ -206,83 +205,113 @@ class TestTheMoment(CustomTestCase):
         self.assertLess(max(population[6:]), max(population))
         self.assertEqual(population.index(max(population)), 5)
 
-    def test_zero_chunks_is_still_the_two_image_dr1_shape(self):
-        arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
-        )
-        self.assertAlmostEqual(
-            arm.terms["flip_transient_gib"], arm.terms["image_d_gib"], delta=1e-9
-        )
-
 
 class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
-    def test_the_arm_that_died_is_refused_at_that_boots_own_store_floor(self):
-        # THE RED-FIRST FACT.  On weg2dk5 this exact call FUNDED S=1/M=1200 with
-        # a 9 GiB store and the box was reaped 9 minutes later.
-        with self.assertRaises(host_ledger.Weg2HostLedgerRefused) as ei:
-            _choose(DK5_STORE_MIN_GIB)
-        text = str(ei.exception)
-        self.assertIn("W20 Weg2HostLedgerRefused", text)
-        # the refusal is ACTIONABLE: it names both levers and rules one out
-        self.assertIn("--store-min-gib", text)
-        self.assertIn("shrinking the store tmpfs is NOT a lever", text)
+    """RING REBASE 0908 -- the class's claim SURVIVES, re-derived, and it is
+    worth stating why rather than editing four numbers quietly.
 
-    def test_fix_8_refuses_that_boot_at_a_4_gib_store_floor_too(self):
-        # UPDATED BY FIX 8 (this test used to assert that a 4 GiB floor FUNDS a
-        # smaller store).  With the image measured at 38.63 GiB instead of the
-        # 28.83 GiB census sum, weg2dk5's readings fund no arm at any floor this
-        # carrier could use -- and its run leftover is short by exactly the
-        # measured image gap.  The boot that died is refused harder, not softer.
-        with self.assertRaises(host_ledger.Weg2HostLedgerRefused):
-            _choose(4.0)
-        arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 600,
-            **RING_KW,
-            cg_current_bytes=DK5_CG_CURRENT_B,
-            cg_ceiling_bytes=DK5_MEMTOTAL_B,
+    weg2dk5 chose S=1 M=1200 with a 9 GiB store and was reaped nine minutes
+    later.  Under fix 8 the ledger refused that boot OUTRIGHT: every arm was
+    unfundable and every arm's predicted run peak sat above the reap point.
+    On the ring neither of those is true any more, and the reason is the ring
+    rather than a softened test: Sigma H (32.19 GiB) replaces the dormant image
+    plus the flip transient (38.63 + 9.97 = 48.60), so every moment is 16.41 GiB
+    cheaper -- far more than the 3.13 GiB by which dk5's arm was over the
+    watermark.
+
+    So the box is no longer refused outright.  But THE ARM THAT DIED IS STILL
+    REFUSED, which is the sentence this class is named for: at M=1200 the LAUNCH
+    moment is -0.42 GiB, so the ladder skips it (and M=2400 at -5.35) and hands
+    out M=600 instead, whose predicted peak is 92.19 GiB against the 95.90 GiB
+    watermark.  weg2dk5 would still have been named before it booted -- by the
+    launch moment now instead of by a blanket refusal, and it would have been
+    given a smaller, survivable arm rather than nothing.
+    """
+
+    #: The ladder at weg2dk5's own readings on the ring, from the printed lines.
+    #: launch/run leftovers per arm; the first arm fundable at BOTH moments wins.
+    DK5_LADDER_ON_THE_RING = {2400: (-5.35, 3.67), 1200: (-0.42, 8.60), 600: (2.05, 11.07)}
+
+    def test_the_arm_that_died_is_still_refused_at_that_boots_own_store_floor(self):
+        # THE RED-FIRST FACT, unchanged: on weg2dk5 this exact call FUNDED
+        # S=1/M=1200 with a 9 GiB store and the box was reaped 9 minutes later.
+        # On the ring the call still does not hand back that arm.
+        arm, store, lines = _choose(DK5_STORE_MIN_GIB)
+        self.assertEqual((arm.s_gb, arm.m_mib), (1, 600), "the ladder must fall past M=1200")
+        self.assertEqual(store, 11.0)
+        # and M=1200 -- the arm that died -- is refused by name, at the LAUNCH
+        # moment, which is the term the ring does NOT make free (it charges
+        # Sigma span1 = 29.21 GiB there plus the 12 GiB load transient).
+        died = host_ledger.price(
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW,
+            cg_current_bytes=DK5_CG_CURRENT_B, cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
-        self.assertLess(arm.run_leftover_gib, 4.0)
+        self.assertLess(died.launch_leftover_gib, 0.0)
+        self.assertAlmostEqual(died.launch_leftover_gib, -0.42, delta=0.05)
+        self.assertFalse(died.fundable_moments)
+        ladder = [ln for ln in lines if "ARM S=1 M=1200" in ln][0]
+        self.assertIn("refused", ladder)
+        self.assertIn("launch moment", ladder)
 
-    def test_every_arm_of_that_boot_is_above_the_observed_reap_point(self):
-        # The verdict the boot itself delivered: weg2dk5 was reaped at 95.93 GiB.
-        # Under fix 8 EVERY arm of its ladder predicts a run peak above that
-        # point, and the refusal prints the advisory beside the ladder.
-        try:
-            _choose(4.0)
-            self.fail("weg2dk5's readings must not fund an arm under fix 8")
-        except host_ledger.Weg2HostLedgerRefused as e:
-            text = str(e)
+    def test_the_ring_is_what_moved_that_verdict_and_by_exactly_how_much(self):
+        # Fix 8 refused this box at every arm; the ring funds M=600.  The whole
+        # difference is one term, and it is stated as arithmetic rather than as
+        # a changed expectation: the run moment charged image + transient
+        # (38.63 + 9.97 = 48.60 GiB) and now charges Sigma H (32.19) once.
+        saving = (38.63 + 9.97) - 32.19
+        self.assertAlmostEqual(saving, 16.41, delta=0.01)
+        arm = host_ledger.price(
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 600, **RING_KW,
+            cg_current_bytes=DK5_CG_CURRENT_B, cg_ceiling_bytes=DK5_MEMTOTAL_B,
+        )
+        # fix 8's run leftover at this arm was 11.07 - 16.41 = -5.34, i.e. no arm.
+        self.assertAlmostEqual(arm.run_leftover_gib, 11.07, delta=0.05)
+        self.assertLess(arm.run_leftover_gib - saving, 0.0)
+        self.assertAlmostEqual(arm.terms["host_ring_gib"], 32.19, delta=0.01)
+
+    def test_the_whole_ladder_of_that_boot_is_now_below_the_observed_reap_point(self):
+        # THE INVERTED VERDICT, re-derived rather than flipped.  Under fix 8
+        # EVERY arm predicted a peak ABOVE the reap point; on the ring every arm
+        # is BELOW it, because the ring took 16.41 GiB out of the run moment and
+        # dk5's worst arm was only 3.13 GiB over.  The advisory still prints
+        # beside the whole ladder, which is what made the verdict checkable.
+        arm, store, lines = _choose(DK5_STORE_MIN_GIB)
         watermark = host_ledger.OBSERVED_REAP_CURRENT_BYTES / GIB
         self.assertAlmostEqual(watermark, 95.93, delta=0.02)
-        self.assertIn("RUN-PEAK ADVISORY", text)
-        self.assertIn("ABOVE the OBSERVED REAP POINT", text)
+        for m, (_launch, run) in self.DK5_LADDER_ON_THE_RING.items():
+            priced = host_ledger.price(
+                DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, m, **RING_KW,
+                cg_current_bytes=DK5_CG_CURRENT_B, cg_ceiling_bytes=DK5_MEMTOTAL_B,
+            )
+            self.assertAlmostEqual(priced.run_leftover_gib, run, delta=0.05)
+            peak = priced.predicted_run_peak_gib(max(0.0, float(int(run))))
+            self.assertLess(peak, watermark, f"M={m} predicts {peak:.2f}")
+        self.assertIn("RUN-PEAK ADVISORY", "\n".join(lines))
         for m in (2400, 1200, 600):
-            self.assertIn(f"M={m}", text)
+            self.assertIn(f"M={m}", "\n".join(lines))
 
-    def test_the_advisory_would_have_flagged_the_arm_that_actually_died(self):
-        # weg2dk5's own choice: S=1 M=1200 with a 9 GiB store.
+    def test_the_launch_moment_is_what_names_the_arm_that_actually_died(self):
+        # weg2dk5's own choice: S=1 M=1200 with a 9 GiB store.  Under fix 8 the
+        # RUN PEAK named it (3.13 GiB over the watermark, plus the measured image
+        # and the run-moment origin).  On the ring the peak no longer does --
+        # 92.66 GiB against 95.93 -- and that is correct, because the cost that
+        # killed it is the one the ring removed.  The LAUNCH moment names it
+        # instead, and the ledger is therefore still not handing out that arm.
         arm = host_ledger.price(
-            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200,
-            **RING_KW,
-            cg_current_bytes=DK5_CG_CURRENT_B,
-            cg_ceiling_bytes=DK5_MEMTOTAL_B,
+            DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW,
+            cg_current_bytes=DK5_CG_CURRENT_B, cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
-        predicted = arm.predicted_run_peak_gib(DK5_STORE_CHOSEN_GIB)
         watermark = host_ledger.OBSERVED_REAP_CURRENT_BYTES / GIB
-        self.assertGreater(predicted, watermark)
-        # HOW FAR above, and why the margin grew under fix 8: the fix-7 price
-        # put this arm 3.13 GiB over the watermark, and weg2dk5 died anyway --
-        # the advisory's own 3.01 GiB UNDER-prediction.  The measured image
-        # (+9.80 GiB) and the run-moment origin are exactly what that residual
-        # was made of, so the two corrections must account for the whole
-        # difference between the old margin and the new one.
-        self.assertGreater(predicted - watermark, 5.0)
-        self.assertAlmostEqual(
-            predicted - watermark,
-            3.13 + arm.terms["image_extra_p_gib"]
-            + (arm.terms["run_origin_gib"] - arm.terms["cg_nonreclaim_gib"]),
-            delta=0.05,
-        )
+        predicted = arm.predicted_run_peak_gib(DK5_STORE_CHOSEN_GIB)
+        self.assertAlmostEqual(predicted, 92.66, delta=0.05)
+        self.assertLess(predicted, watermark)
+        # the margin the ring bought, at that arm and that store, is Sigma H's
+        # saving against fix 8's image + transient: 92.66 + 16.41 = 109.07, which
+        # is where fix 8 predicted this arm and why it refused.
+        self.assertGreater(predicted + ((38.63 + 9.97) - 32.19), watermark)
+        # and the arm is still refused -- by the launch moment.
+        self.assertLess(arm.launch_leftover_gib, 0.0)
+        self.assertFalse(arm.fundable_moments)
 
     def test_the_prediction_is_absent_not_green_without_a_cgroup_sample(self):
         arm, store, lines = _choose(4.0, with_cgroup=False)
@@ -302,8 +331,11 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
             "oom_kill_baseline=18",
             "base_cgroup=",
             "bound by",
-            "flip_transient",
-            "MEASURED over the 10 interleaves of boot weg2dk5",
+            # RING REBASE: the run moment's term is Sigma H, so the line names
+            # that instead of the flip transient it no longer charges.
+            "RUN MOMENT = the host weights term",
+            "LAUNCH MOMENT = ring span 1",
+            "image_P=38.63 GiB",
         ):
             self.assertIn(needle, terms)
         self.assertNotIn("host_headroom=", terms)
