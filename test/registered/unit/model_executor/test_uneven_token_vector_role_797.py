@@ -305,13 +305,26 @@ class TheInstallSurvivesTheCutover797(CustomTestCase):
         self.assertEqual(installed, _ACTIVE)
 
 
+#: #1270b RENAMED THE ADVISORY AND ORPHANED THREE ASSERTIONS HERE.
+#: The emitter now says "#797/#1270 THE ACTIVE TOKEN VECTOR IS COSTING ..."
+#: (model_runner_kv_cache_mixin.py, the `logger.warning` in the costing block),
+#: because under #1270b the vector being blamed is no longer necessarily a PIN
+#: -- an argv-resolved role can be `seed` or `capacity` and still be active.
+#: The old literal "#797 PINNED VECTOR IS COSTING" matched nothing after that
+#: rename: the one `assertTrue` went red, and the TWO `assertFalse` checks went
+#: GREEN BY VACANCY -- they would have passed whatever the emitter printed.
+#: One literal, one place, so the next rename breaks all three loudly instead
+#: of silencing two of them.
+_COSTING_MARKER = "#797/#1270 THE ACTIVE TOKEN VECTOR IS COSTING"
+
+
 class TheProvenanceWarning797(CustomTestCase):
     """An advisory that does not say how to stop needing it is how a 10 % pool
     gap survives for months."""
 
     def test_a_beaten_pin_is_named_with_the_size_of_the_loss(self):
         _, warns, _env = _run(_CAPS, _ACTIVE, env_vector="29,19,16", role="pin")
-        self.assertTrue(any("#797 PINNED VECTOR IS COSTING" in w for w in warns), warns)
+        self.assertTrue(any(_COSTING_MARKER in w for w in warns), warns)
 
     def test_the_warning_names_the_flag_that_closes_the_loop(self):
         _, warns, _env = _run(_CAPS, _ACTIVE, env_vector="29,19,16", role="pin")
@@ -321,7 +334,7 @@ class TheProvenanceWarning797(CustomTestCase):
     def test_the_warning_is_silent_once_the_loop_is_closed(self):
         _, warns, _env = _run(_CAPS, _ACTIVE, env_vector="29,19,16", role="seed")
         self.assertFalse(
-            any("#797 PINNED VECTOR IS COSTING" in w for w in warns), warns
+            any(_COSTING_MARKER in w for w in warns), warns
         )
 
     def test_no_warning_when_there_is_no_pin_to_blame(self):
@@ -330,7 +343,7 @@ class TheProvenanceWarning797(CustomTestCase):
         not exist would be noise."""
         _, warns, _env = _run(_CAPS, _ACTIVE, env_vector=None, role=None)
         self.assertFalse(
-            any("#797 PINNED VECTOR IS COSTING" in w for w in warns), warns
+            any(_COSTING_MARKER in w for w in warns), warns
         )
 
 
