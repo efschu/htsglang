@@ -636,6 +636,38 @@ def argv_p(
     write_policy: str = "write_through",
     depth: int = 0,
 ) -> List[str]:
+    # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
+    # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
+    # server_args hands to derive_pp_layer_split, which builds a CONTIGUOUS
+    # split from them. A gapped map is not expressible that way at all:
+    # * the user's own layout (48 GDN on the 5090, 8+8 attention on the 3080s)
+    #   is `48,8,8 / 0,8,8`, and derive_pp_layer_split raises
+    #   "--pp-attn-stage-ratio entries must be positive integers" before a
+    #   single weight loads -- boot weg2pp2 arm P_G1 died exactly there;
+    # * a gapped map whose attention counts are all positive is worse than
+    #   refused, it is ACCEPTED and derives something else (52,6,6 / 4,6,6 ->
+    #   [19,24,21]), so the argv would contradict SGLANG_PP_LAYER_SET.
+    # Under a gapped map the SET published in env_p IS the layout and
+    # make_layers/model_runner resolve ownership from get_pp_layer_set, never
+    # from the count form -- so the count copy is the second set of books and
+    # it is dropped, rather than kept and asserted against.
+    if bool(stage_ratio) != bool(attn_stage_ratio):
+        raise Weg2LaunchRefused(
+            "W40 Weg2PPCutRefused: --pp-stage-ratio %r and "
+            "--pp-attn-stage-ratio %r must be given together or omitted "
+            "together. They are one statement of one layout; half of it "
+            "would let derive_pp_layer_split snap the other half silently "
+            "(the #505(a) class)." % (stage_ratio, attn_stage_ratio)
+        )
+    # SOLVED unless the operator pinned them; the launcher prints the PP-CUT
+    # provenance line either way. Never a hand constant reaching this line
+    # unannounced -- and, since FOLLOW FIX 1, never a SECOND statement of a
+    # layout the --pp-layer-set wire already carries.
+    ratio_flags = (
+        ["--pp-stage-ratio", stage_ratio, "--pp-attn-stage-ratio", attn_stage_ratio]
+        if stage_ratio
+        else []
+    )
     return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, write_policy) + [
         "--tp-size", "1", "--pp-size", "3",
         # #692 MICROBATCH DEPTH, group P only -- group D runs pp_size=1 and a
@@ -653,10 +685,7 @@ def argv_p(
         # than letting the post-process pass force it keeps the argv an
         # honest statement of what this group runs.
         "--disable-overlap-schedule",
-        # SOLVED unless the operator pinned them; the launcher prints the
-        # PP-CUT provenance line either way. Never a hand constant reaching
-        # this line unannounced.
-        "--pp-stage-ratio", stage_ratio, "--pp-attn-stage-ratio", attn_stage_ratio,
+    ] + ratio_flags + [
         "--rank-gpu-memory-mib", ",".join(str(b) for b in budgets),
         "--barlink-bar1-window-mib", "24,PP_0=96",
         "--port", str(PORT_P),
@@ -1333,6 +1362,28 @@ def chunked_prefill_size_of(argv: Sequence[str]) -> int:
     return int(argv[argv.index("--chunked-prefill-size") + 1])
 
 
+#: THE DERIVATION IS NOT RE-GROUNDED, so a derived depth is not shipped
+#: (#1240 FOLLOW FIX 1, MUST_FIX 3 of BOOT_weg2pp2_0907.md). MEASURED against
+#: this workload, cited to that record's DEPTH VERDICT table: depth 1 cost
+#: +6.9 % on TTFT p50 (3.215 vs 3.008 s, A/A floor 1.7 %) and depth 2 +9.6 %
+#: (3.298), the bubble share on the binding stage did NOT fall (21.8/24.6 % at
+#: depth 0, 26.8 % at depth 1, 24.1 % at depth 2, floor 2.8 pts), duty fell 15
+#: points, and at the ~60 k deep point all depths sat inside the 3.35 % floor
+#: = null. The #692 mechanism overlaps a rank's output exchange with its next
+#: forward; the measurement says this workload's gap is not that exchange --
+#: consistent with the depth line's own stall_share=0.221 against
+#: bubble_share=0.466, i.e. over half the bubble was already queue starvation,
+#: which depth cannot touch, and the remainder is evidently not exchange-bound
+#: either. Re-grounding means a MEASURED exchange-bound share to derive from;
+#: until one exists the arithmetic is printed and the shipped depth is 0. An
+#: explicit --p-microbatch-depth still wins, priced exactly as before.
+DEPTH_DERIVATION_GROUNDED = False
+
+#: The record line the retraction above is read from. Named so the number and
+#: its provenance cannot drift apart.
+DEPTH_RETRACTION_RECORD = "/spinning/gpu-arb/weg2/BOOT_weg2pp2_0907.md"
+
+
 @dataclass(frozen=True)
 class DepthDecision:
     """Group P's ``--pp-async-batch-depth`` and the ONE provenance line for it."""
@@ -1349,11 +1400,22 @@ class DepthDecision:
     price_mib: Tuple[float, ...]
     act_mib_per_pass: float
     chunk_tokens: int
+    #: What the bubble ARITHMETIC asks for, before the retraction. Kept beside
+    #: the shipped :attr:`depth` rather than replaced by it: the derivation is
+    #: the thing that has to be re-grounded, so it stays visible and the day a
+    #: measured exchange-bound share exists, ``DEPTH_DERIVATION_GROUNDED``
+    #: flips and this number ships without a second derivation being written.
+    derived_depth: int = 0
     #: True when the chosen layout is a GAPPED layer set. The depth is then 0
     #: BY THE LAYOUT, not lowered: a gapped map admits exactly one pass in
     #: flight, and that is the number the PP-CUT solver already priced the
     #: candidate at. Printed so the 0 is read as a derivation, not a default.
     gapped_layout: bool = False
+
+    @property
+    def retracted(self) -> bool:
+        """True when the arithmetic asked for a depth and measurement said no."""
+        return (not self.pinned) and int(self.derived_depth) > int(self.depth)
 
     def line(self) -> str:
         """THE one line. Format is load-bearing: a reader greps ``P-DEPTH solver:``."""
@@ -1383,6 +1445,18 @@ class DepthDecision:
                 m.bubble_share,
                 m.forward_share,
             )
+        if self.retracted:
+            src = (
+                "the #692 DERIVATION IS RETRACTED and NOT re-grounded: it asks "
+                "for depth %d, and %s (DEPTH VERDICT) measured that depth "
+                "against this workload -- +6.9 %% on TTFT p50 at depth 1, "
+                "+9.6 %% at depth 2, the bubble share did NOT fall (21.8/24.6 "
+                "-> 26.8 -> 24.1 %%) and the deep point was inside its floor. "
+                "The shipped depth is 0 until a MEASURED exchange-bound share "
+                "exists to derive from; an explicit --p-microbatch-depth still "
+                "wins and is still priced. " % (self.derived_depth, DEPTH_RETRACTION_RECORD)
+                + src
+            )
         if self.gapped_layout:
             src = (
                 "the chosen layout is a GAPPED layer set, which admits exactly "
@@ -1394,7 +1468,7 @@ class DepthDecision:
                 "it is a derivation and not a lowered hand number. " + src
             )
         return (
-            "WEG2 P-DEPTH solver:%s %s depth=%d price_rows=%d/stage "
+            "WEG2 P-DEPTH solver:%s%s %s depth=%d price_rows=%d/stage "
             "price_mib=%s MiB/stage pool_after=%d (constraint pool >= %d) "
             "[passes_in_flight=ceil(1/(1-stall_share))=%d, the flag is that "
             "minus the pass being forwarded; one extra pass costs %d KV rows "
@@ -1402,6 +1476,9 @@ class DepthDecision:
             "tokens at the stage that converts worst; %s]"
             % (
                 " PINNED (user override)" if self.pinned else "",
+                " RETRACTED (derived %d, shipped %d)" % (self.derived_depth, self.depth)
+                if self.retracted
+                else "",
                 shares,
                 self.depth,
                 self.price_rows,
@@ -1495,6 +1572,7 @@ def solve_p_depth(
         stall = measured.stall_share
         passes = int(math.ceil(1.0 / (1.0 - stall))) if stall < 1.0 else 0
     depth = max(0, passes - 1)
+    derived_depth = depth
     pinned = pinned_depth is not None
     if pinned:
         if int(pinned_depth) < 0:
@@ -1507,6 +1585,16 @@ def solve_p_depth(
         # depth the pool cannot hold.
         depth = int(pinned_depth)
         passes = depth + 1
+
+    if depth > 0 and not pinned and not DEPTH_DERIVATION_GROUNDED:
+        # RETRACTED BY MEASUREMENT, not lowered by taste. The arithmetic above
+        # is unchanged and is printed; what does not ship is its OUTPUT, because
+        # BOOT_weg2pp2_0907.md measured this knob against this workload and it
+        # lost on every column that has a floor (see DEPTH_DERIVATION_GROUNDED).
+        # A derivation whose premise the metal refuted is not a default, and
+        # keeping it would be a hand number wearing a derivation just as much as
+        # silently lowering one would be.
+        depth, passes = 0, 1
 
     gapped_layout = bool(gapped_layer_set)
     if depth > 0 and gapped_layout and not pinned:
@@ -1578,6 +1666,7 @@ def solve_p_depth(
 
     return DepthDecision(
         depth=depth,
+        derived_depth=derived_depth,
         passes_in_flight=passes,
         pinned=pinned,
         measured=measured,
@@ -1827,7 +1916,11 @@ def solve_p_cut(
         log(
             "PP-CUT round trip: parse_pp_layer_sets(%s) = %s layers per stage, "
             "attn %s, %d crossings per chunk -- the --pp-layer-set argv states "
-            "what the boot will run."
+            "what the boot will run. --pp-stage-ratio/--pp-attn-stage-ratio are "
+            "OMITTED from group P's argv for this kind: the count form cannot "
+            "state a gapped map (derive_pp_layer_split refuses an attention "
+            "count of 0 and silently re-derives a contiguous split from any "
+            "other), so the map travels once, on the wire."
             % (
                 decision.chosen.layer_set,
                 realized_counts,
@@ -1836,8 +1929,14 @@ def solve_p_cut(
             )
         )
         return PCutFacts(
-            stage_ratio=",".join(str(n) for n in decision.chosen.layers),
-            attn_stage_ratio=",".join(str(a) for a in decision.chosen.attn),
+            # EMPTY, DELIBERATELY (FOLLOW FIX 1). A gapped map's layout is the
+            # SET, and the count form cannot state it: `48,8,8 / 0,8,8` is
+            # refused by derive_pp_layer_split outright, and a positive-count
+            # gapped map is accepted and derives a DIFFERENT contiguous split.
+            # argv_p omits both flags when these are empty, so the argv states
+            # exactly one layout -- the one on the wire.
+            stage_ratio="",
+            attn_stage_ratio="",
             pool_tokens=float(decision.chosen.pool_tokens),
             attn_counts=tuple(int(a) for a in decision.chosen.attn),
             kv_mib_per_token_per_attn_layer=float(kv_mib),

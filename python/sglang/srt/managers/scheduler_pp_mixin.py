@@ -479,10 +479,15 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
-#: The escape hatch for the refusal below. Set it to investigate the defect;
-#: it is the only way to reach the gapped forward, and it says in its own name
-#: that what it produces is not to be trusted.
-PP_GAPPED_KNOWN_WRONG_ENV = "SGLANG_PP_GAPPED_ALLOW_KNOWN_WRONG"
+#: The escape hatch for the refusal below, DEFINED in distributed.utils and
+#: only re-exported here: since #1240 the launch-time PP-cut solver has to ask
+#: the same question (it may not rank a layout this gate will refuse to serve),
+#: and it cannot import this module. Two readers, one predicate, one place the
+#: variable is read.
+from sglang.srt.distributed.utils import (  # noqa: E402
+    PP_GAPPED_KNOWN_WRONG_ENV,
+    pp_gapped_forward_known_wrong_allowed,
+)
 
 
 def _refuse_known_wrong_gapped_forward() -> None:
@@ -506,9 +511,7 @@ def _refuse_known_wrong_gapped_forward() -> None:
     So the gate is a REFUSAL rather than a warning. A warning in a boot log is
     not a control; this configuration must not be reachable by accident.
     """
-    import os
-
-    if os.getenv(PP_GAPPED_KNOWN_WRONG_ENV, "") not in ("", "0", "false", "False"):
+    if pp_gapped_forward_known_wrong_allowed():
         logger.warning(
             "#753: serving a gapped PP layer set with a KNOWN-WRONG forward "
             "because %s is set. Output from this instance is not correct and "

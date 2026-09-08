@@ -19,11 +19,17 @@ The table is synthetic on purpose (same discipline as
 arithmetic rather than a second run of the solver.
 """
 
+import os
 import unittest
+from unittest import mock
 
 import pytest
 
 try:
+    from sglang.srt.distributed.utils import (
+        PP_GAPPED_KNOWN_WRONG_ENV,
+        pp_gapped_forward_known_wrong_allowed,
+    )
     from sglang.srt.planner.pp_cut import (
         LAYER_FAMILY_ATTENTION,
         LAYER_FAMILY_LINEAR,
@@ -435,7 +441,12 @@ class TheOneCostModel(unittest.TestCase):
 
     def test_a_pinned_layer_set_wins_but_is_priced_on_the_same_axes(self):
         owned = gapped_layer_sets(FAMILIES, 0, (0, 8, 8))
-        decision = self.decision(pinned_layer_set=layer_set_flag(owned))
+        # The escape hatch is armed because a pinned GAPPED map is otherwise
+        # refused outright by the #753 runtime gate (FOLLOW FIX 1; the refusal
+        # itself is pinned in TheRuntimeGateBoundsTheChoice). What this test
+        # is about is the PRICING, which the gate must not change.
+        with mock.patch.dict(os.environ, {PP_GAPPED_KNOWN_WRONG_ENV: "1"}):
+            decision = self.decision(pinned_layer_set=layer_set_flag(owned))
         self.assertTrue(decision.pinned)
         self.assertEqual(decision.chosen.kind, "gapped")
         self.assertEqual(decision.chosen.layers, (48, 8, 8))
@@ -452,8 +463,11 @@ class TheOneCostModel(unittest.TestCase):
 
     def test_an_unpriceable_pinned_layer_set_is_refused(self):
         owned = gapped_layer_sets(FAMILIES, 1, (1, 0, 15))
-        with self.assertRaises(PPCutRefused):
-            self.decision(pinned_layer_set=layer_set_flag(owned))
+        with mock.patch.dict(os.environ, {PP_GAPPED_KNOWN_WRONG_ENV: "1"}):
+            with self.assertRaises(PPCutRefused) as ctx:
+                self.decision(pinned_layer_set=layer_set_flag(owned))
+        # ...as UNPRICEABLE, which is a different sentence from the gate's.
+        self.assertIn("cannot be priced", str(ctx.exception))
 
     def test_without_a_family_cost_nothing_changes(self):
         # The #1236 behaviour, byte for byte: contiguous only, no crossings.
@@ -468,6 +482,209 @@ class TheOneCostModel(unittest.TestCase):
         )
         self.assertTrue(all(c.kind == "contiguous" for c in decision.ranked))
         self.assertTrue(all(c.crossing_ms == 0.0 for c in decision.ranked))
+
+
+#: A cost table on which the GAPPED family genuinely WINS the ranking: the two
+#: slow cards are ruinous per LINEAR layer, so every contiguous cut that gives
+#: them a share of the GDN stack loses to a map that gives them attention only.
+#: Written to make the gate observable -- at the rig's own measured table the
+#: gapped maps rank #498/#654 (BOOT_weg2pp2_0907.md gapped verdict), so a
+#: fixture that never lets one win cannot tell "excluded" from "outranked".
+GAPPED_WINS_COST = FamilyDepthCost(
+    linear_ms_per_layer=(10.0, 400.0, 400.0),
+    attn_ms_per_layer_at_ref=(1.0, 4.0, 4.0),
+    chunk_tokens=4096,
+    ref_prefix_tokens=4096.0,
+)
+CHEAP_PAIRS = {(a, b): 1.0 for a in range(3) for b in range(3) if a != b}
+
+
+class TheRuntimeGateBoundsTheChoice(unittest.TestCase):
+    """FOLLOW FIX 1 / MUST_FIX 2: never rank a layout the runtime will not serve.
+
+    ``scheduler_pp_mixin._refuse_known_wrong_gapped_forward`` refuses a gapped
+    forward outright (measured 2026-08-18: 'Paris' becomes '\\n\\n'). Boot
+    weg2pp2 hit it on all three ranks AFTER the weights were loaded, on a map
+    this solver had priced and published. The solver therefore consults the
+    same condition the runtime does: gapped candidates are still PRICED and
+    still PRINTED -- their prices are the answer to the user's question -- but
+    they are not choosable while the gate stands, and the reason is named.
+    """
+
+    def decision(self, cap=100_000, **over):
+        kwargs = dict(
+            layer_families=FAMILIES,
+            incumbent_layers=INCUMBENT,
+            measured_ms_per_layer=MS_PER_LAYER,
+            measured_provenance="synthetic",
+            card_names=CARDS,
+            pool_model=pool_model(),
+            cap_tokens=cap,
+            family_cost=GAPPED_WINS_COST,
+            design_prefix_tokens=4096,
+            per_pair_crossing_ms=CHEAP_PAIRS,
+        )
+        kwargs.update(over)
+        return solve_launch_cut(**kwargs)
+
+    def test_the_fixture_really_does_let_a_gapped_map_win(self):
+        """Otherwise the test below proves nothing -- it would pass by absence."""
+        with mock.patch.dict(os.environ, {PP_GAPPED_KNOWN_WRONG_ENV: "1"}):
+            decision = self.decision()
+        self.assertEqual(decision.chosen.kind, "gapped")
+
+    def test_a_gapped_candidate_is_not_chosen_while_the_forward_is_refused(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(PP_GAPPED_KNOWN_WRONG_ENV, None)
+            decision = self.decision()
+        self.assertEqual(decision.chosen.kind, "contiguous")
+        best_gapped = min(
+            (c for c in decision.ranked if c.kind == "gapped"),
+            key=lambda c: c.total_ms,
+        )
+        # The gapped map is still the cheaper layout on this table; it is
+        # excluded because it is UNSERVABLE, not because it lost.
+        self.assertLess(best_gapped.total_ms, decision.chosen.total_ms)
+
+    def test_the_exclusion_is_reported_with_the_gate_named(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(PP_GAPPED_KNOWN_WRONG_ENV, None)
+            decision = self.decision()
+        notes = " ".join(decision.unpriced)
+        self.assertIn("REFUSED", notes)
+        self.assertIn("_refuse_known_wrong_gapped_forward", notes)
+        self.assertIn(PP_GAPPED_KNOWN_WRONG_ENV, notes)
+        self.assertTrue(
+            any("REFUSED" in ln for ln in decision.table_lines()),
+            decision.table_lines(),
+        )
+
+    def test_the_gapped_rows_are_still_priced_and_still_printed(self):
+        """The slice exists to PRICE them; a refusal is not a reason to hide it."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(PP_GAPPED_KNOWN_WRONG_ENV, None)
+            decision = self.decision()
+        gapped = [c for c in decision.ranked if c.kind == "gapped"]
+        self.assertTrue(gapped)
+        self.assertTrue(all(c.crossing_ms > 0.0 for c in gapped))
+        self.assertTrue(any(" gapped layers=" in ln for ln in decision.table_lines()))
+
+    def test_the_escape_hatch_makes_them_choosable_again(self):
+        with mock.patch.dict(os.environ, {PP_GAPPED_KNOWN_WRONG_ENV: "1"}):
+            self.assertTrue(pp_gapped_forward_known_wrong_allowed())
+            decision = self.decision()
+        self.assertEqual(decision.chosen.kind, "gapped")
+
+    def test_a_pinned_gapped_map_is_refused_by_the_gate_not_by_the_boot(self):
+        pinned = layer_set_flag(gapped_layer_sets(FAMILIES, 0, (0, 8, 8)))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(PP_GAPPED_KNOWN_WRONG_ENV, None)
+            with self.assertRaises(PPCutRefused) as ctx:
+                self.decision(pinned_layer_set=pinned)
+        self.assertIn("_refuse_known_wrong_gapped_forward", str(ctx.exception))
+
+    def test_a_pinned_contiguous_map_is_untouched_by_the_gate(self):
+        pinned = layer_set_flag(contiguous_layer_sets((42, 11, 11)))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(PP_GAPPED_KNOWN_WRONG_ENV, None)
+            decision = self.decision(pinned_layer_set=pinned)
+        self.assertEqual(decision.chosen.kind, "contiguous")
+        self.assertEqual(decision.chosen.layers, (42, 11, 11))
+
+    def test_the_kv_floor_row_is_a_layout_that_could_be_run(self):
+        """A pool on an unservable layout is not available (postmortem)."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(PP_GAPPED_KNOWN_WRONG_ENV, None)
+            decision = self.decision()
+        self.assertEqual(decision.kv_floor.kind, "contiguous")
+
+
+class ThePoolFloorBindsEveryPath(unittest.TestCase):
+    """FOLLOW FIX 1 / finding 2: the pinned paths were the hole in the floor.
+
+    ``--max-kv-per-request`` is the floor the solved path refuses on (W40, "no
+    cut holds one full-context prompt"). Boot weg2pp2's dry run printed
+    ``pool_tokens=153611 (constraint pool >= 262144)`` beside a PINNED map and
+    proceeded to build the argv: a boot that cannot admit one full-context
+    prompt is a wasted window, and the sentence that names it already existed.
+    """
+
+    def decision(self, cap=100_000, **over):
+        kwargs = dict(
+            layer_families=FAMILIES,
+            incumbent_layers=INCUMBENT,
+            measured_ms_per_layer=MS_PER_LAYER,
+            measured_provenance="synthetic",
+            card_names=CARDS,
+            pool_model=pool_model(),
+            cap_tokens=cap,
+            family_cost=family_cost(),
+            design_prefix_tokens=4096,
+            per_pair_crossing_ms=PAIR_MS,
+        )
+        kwargs.update(over)
+        return solve_launch_cut(**kwargs)
+
+    def pinned_gapped(self, cap):
+        pinned = layer_set_flag(gapped_layer_sets(FAMILIES, 0, (14, 1, 1)))
+        with mock.patch.dict(os.environ, {PP_GAPPED_KNOWN_WRONG_ENV: "1"}):
+            return self.decision(cap=cap, pinned_layer_set=pinned)
+
+    #: A floor the PINNED map misses while OTHER candidates clear it -- the
+    #: only shape that isolates the pinned check. Pushing the floor above every
+    #: candidate would be refused by the solved path's own ``feasible`` filter
+    #: before the pinned branch is ever reached, and would prove nothing.
+    #: Pinned gapped 62,1,1 holds 163,840 tokens, pinned contiguous 42,11,11
+    #: holds 598,016, and the best candidate on this fixture holds 1,034,240.
+    GAPPED_MISSES = 300_000
+    CONTIGUOUS_MISSES = 700_000
+
+    def test_a_pinned_layer_set_under_the_floor_is_refused_W40(self):
+        with self.assertRaises(PPCutRefused) as ctx:
+            self.pinned_gapped(cap=self.GAPPED_MISSES)
+        msg = str(ctx.exception)
+        self.assertIn("W40", msg)
+        self.assertIn("300000", msg)
+        self.assertIn("163840", msg)
+        self.assertIn("short by 136160", msg)
+        # ...and it is the PINNED path's sentence, not the solved path's: on
+        # this floor the solver itself has plenty of feasible candidates.
+        self.assertIn("--pp-layer-set", msg)
+        self.assertGreater(
+            max(c.pool_tokens for c in self.decision(cap=100_000).ranked),
+            float(self.GAPPED_MISSES),
+        )
+
+    def test_a_pinned_layer_set_over_the_floor_is_taken(self):
+        decision = self.pinned_gapped(cap=100_000)
+        self.assertTrue(decision.pinned)
+        self.assertGreaterEqual(decision.chosen.pool_tokens, 100_000)
+
+    def test_a_pinned_contiguous_cut_under_the_floor_is_refused_W40(self):
+        with self.assertRaises(PPCutRefused) as ctx:
+            self.decision(cap=self.CONTIGUOUS_MISSES, pinned_layers=(42, 11, 11))
+        msg = str(ctx.exception)
+        self.assertIn("W40", msg)
+        self.assertIn("the pinned layer cut 42,11,11", msg)
+        self.assertIn("598016", msg)
+
+    def test_a_pinned_contiguous_layer_set_under_the_floor_is_refused_W40(self):
+        pinned = layer_set_flag(contiguous_layer_sets((42, 11, 11)))
+        with self.assertRaises(PPCutRefused) as ctx:
+            self.decision(cap=self.CONTIGUOUS_MISSES, pinned_layer_set=pinned)
+        self.assertIn("W40", str(ctx.exception))
+        self.assertIn("598016", str(ctx.exception))
+
+    def test_a_pinned_cut_that_clears_the_floor_is_still_taken(self):
+        """The floor refuses; it must not become a second ranking."""
+        decision = self.decision(cap=500_000, pinned_layers=(42, 11, 11))
+        self.assertTrue(decision.pinned)
+        self.assertEqual(decision.chosen.layers, (42, 11, 11))
+
+    def test_the_solved_path_still_refuses_the_same_way(self):
+        with self.assertRaises(PPCutRefused) as ctx:
+            self.decision(cap=10_000_000)
+        self.assertIn("no cut holds one full-context prompt", str(ctx.exception))
 
 
 if __name__ == "__main__":

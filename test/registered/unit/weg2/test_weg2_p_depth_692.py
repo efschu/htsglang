@@ -144,9 +144,13 @@ class TestTheDerivation(unittest.TestCase):
         d = depth(measured=m)
         # 1/(1-0.220) = 1.282 -> 2 passes must be in flight to cover the gap;
         # one of them is the pass being forwarded, so the FLAG (extra passes)
-        # is 1.
-        self.assertEqual(d.passes_in_flight, 2)
-        self.assertEqual(d.depth, 1)
+        # is 1. What SHIPS is 0: BOOT_weg2pp2_0907.md measured that depth on
+        # this workload and it lost (+6.9 % TTFT p50, bubble unmoved), so the
+        # derivation is retracted until a measured exchange-bound share exists
+        # to re-ground it. The arithmetic stays visible in derived_depth.
+        self.assertEqual(d.derived_depth, 1)
+        self.assertEqual(d.depth, 0)
+        self.assertTrue(d.retracted)
 
     def test_the_formula_is_the_reciprocal_of_the_forward_share(self):
         for share in (0.10, 0.213, 0.35, 0.55, 0.70):
@@ -161,9 +165,24 @@ class TestTheDerivation(unittest.TestCase):
             )
             d = depth(measured=m, pool_tokens=1.0e9)
             self.assertEqual(
-                d.passes_in_flight, math.ceil(1.0 / (1.0 - share)), f"share={share}"
+                d.derived_depth + 1,
+                math.ceil(1.0 / (1.0 - share)),
+                f"share={share}",
             )
-            self.assertEqual(d.depth, d.passes_in_flight - 1)
+            # And a PIN of the derived number ships it, unpriced by nothing:
+            # the retraction is about what the launcher chooses, never about
+            # what the arithmetic says.
+            pinned = depth(measured=m, pool_tokens=1.0e9, pinned_depth=d.derived_depth)
+            self.assertEqual(pinned.depth, d.derived_depth)
+            self.assertEqual(pinned.passes_in_flight, d.derived_depth + 1)
+
+    def test_the_retraction_is_not_a_silent_zero(self):
+        """The line has to SAY it, or a 0 reads as 'no bubble was measured'."""
+        m = read_pp_bubble(write_log(REAL_LINES))
+        line = depth(measured=m).line()
+        self.assertIn("RETRACTED (derived 1, shipped 0)", line)
+        self.assertIn("BOOT_weg2pp2_0907.md", line)
+        self.assertIn("bubble_share=", line)
 
     def test_a_bubble_that_is_all_starvation_buys_no_depth(self):
         """Depth overlaps stages; it cannot manufacture work that is not queued."""
@@ -177,7 +196,9 @@ class TestTheDerivation(unittest.TestCase):
             n_forwards=1,
         )
         d = depth(measured=m)
+        self.assertEqual(d.derived_depth, 0)
         self.assertEqual(d.depth, 0)
+        self.assertFalse(d.retracted)
         self.assertIn("starved", d.line())
 
     def test_a_boot_with_no_bubble_buys_no_depth(self):
@@ -190,7 +211,7 @@ class TestTheDerivation(unittest.TestCase):
             starved_ms=0.0,
             n_forwards=1,
         )
-        self.assertEqual(depth(measured=m).depth, 0)
+        self.assertEqual(depth(measured=m).derived_depth, 0)
 
     def test_absent_measurement_is_todays_behaviour_and_says_so(self):
         d = depth(measured=None)
@@ -226,14 +247,16 @@ class TestThePrice(unittest.TestCase):
     """One currency: pool tokens. No second budget beside the pool model."""
 
     def test_kv_rows_are_charged_per_stage_per_extra_pass(self):
+        # PINNED, because since FOLLOW FIX 1 that is the only path that ships
+        # a depth > 0 -- and the price is what a shipped depth costs.
         m = read_pp_bubble(write_log(REAL_LINES))
-        d = depth(measured=m)
+        d = depth(measured=m, pinned_depth=1)
         self.assertEqual(d.price_rows, d.depth * CHUNK)
 
     def test_the_crossing_frame_is_charged_too(self):
         """The activation frame is NOT in the pool model, so it must be added."""
         m = read_pp_bubble(write_log(REAL_LINES))
-        d = depth(measured=m)
+        d = depth(measured=m, pinned_depth=1)
         act_mib = CHUNK * HIDDEN * 2 / (1024.0 * 1024.0)
         self.assertAlmostEqual(d.act_mib_per_pass, act_mib, places=3)
         # 40 MiB at chunk 4096 -- the same order as the measured 40 MiB per
@@ -245,19 +268,19 @@ class TestThePrice(unittest.TestCase):
     def test_the_binding_stage_of_the_price_is_the_one_with_least_attention(self):
         """A stage with fewer attention layers pays more TOKENS per MiB."""
         m = read_pp_bubble(write_log(REAL_LINES))
-        wide = depth(measured=m, attn=(10, 10, 10))
-        narrow = depth(measured=m, attn=(10, 3, 3))
+        wide = depth(measured=m, attn=(10, 10, 10), pinned_depth=1)
+        narrow = depth(measured=m, attn=(10, 3, 3), pinned_depth=1)
         self.assertGreater(narrow.price_tokens, wide.price_tokens)
 
     def test_pool_after_is_the_pool_minus_the_price(self):
         m = read_pp_bubble(write_log(REAL_LINES))
-        d = depth(measured=m)
+        d = depth(measured=m, pinned_depth=1)
         self.assertAlmostEqual(d.pool_after, POOL_TOKENS - d.price_tokens, places=3)
 
     def test_the_measured_boot_can_fund_one_extra_pass(self):
         """373,785 - one pass is still above the 262,144 floor."""
         m = read_pp_bubble(write_log(REAL_LINES))
-        d = depth(measured=m)
+        d = depth(measured=m, pinned_depth=1)
         self.assertEqual(d.depth, 1)
         self.assertGreater(d.pool_after, float(CAP))
 
@@ -266,7 +289,7 @@ class TestTheRefusals(unittest.TestCase):
     def test_W42_when_the_pool_cannot_fund_the_depth(self):
         m = read_pp_bubble(write_log(REAL_LINES))
         with self.assertRaises(Weg2LaunchRefused) as ctx:
-            depth(measured=m, pool_tokens=float(CAP) + 10.0)
+            depth(measured=m, pool_tokens=float(CAP) + 10.0, pinned_depth=1)
         msg = str(ctx.exception)
         self.assertIn("W42 Weg2DepthUnfunded", msg)
         # Fail fast NAMING the numbers, per the launcher's own refusal style.
@@ -277,7 +300,7 @@ class TestTheRefusals(unittest.TestCase):
         """A refusal, not a cap: a quietly reduced depth is a hand number."""
         m = read_pp_bubble(write_log(REAL_LINES))
         with self.assertRaises(Weg2LaunchRefused):
-            depth(measured=m, pool_tokens=float(CAP) + 10.0)
+            depth(measured=m, pool_tokens=float(CAP) + 10.0, pinned_depth=1)
 
     def test_W43_when_a_PINNED_depth_meets_a_gapped_layer_set(self):
         """init_pp_loop_state raises on gapped + depth>0; say so BEFORE the boot.
@@ -300,7 +323,7 @@ class TestTheRefusals(unittest.TestCase):
 
     def test_a_derived_depth_against_a_gapped_map_is_taken_down_by_the_layout(self):
         m = read_pp_bubble(write_log(REAL_LINES))
-        self.assertGreater(depth(measured=m).depth, 0)
+        self.assertGreater(depth(measured=m).derived_depth, 0)
         d = depth(measured=m, gapped_layer_set="0,1,2:48")
         self.assertEqual(d.depth, 0)
         self.assertTrue(d.gapped_layout)

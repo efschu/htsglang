@@ -31,8 +31,10 @@ try:
         DESIGN_PREFIX_FALLBACK_TOKENS,
         PP_LAYER_SET_ENV,
         BubbleMeasurement,
+        PCutFacts,
         Weg2LaunchRefused,
         argv_d,
+        argv_p,
         newest_prefill_census_log,
         pcie_lanes,
         per_pair_crossing_ms,
@@ -209,7 +211,11 @@ class TheDepthFollowsTheLayout(unittest.TestCase):
             n_forwards=10,
         )
         contiguous = self.depth(measured=measured, gapped_layer_set="")
-        self.assertGreater(contiguous.depth, 0)
+        # The bubble's ARITHMETIC still asks for a depth; what ships is 0,
+        # because BOOT_weg2pp2_0907.md measured that depth against this very
+        # workload and it lost (FOLLOW FIX 1 / MUST_FIX 3).
+        self.assertGreater(contiguous.derived_depth, 0)
+        self.assertEqual(contiguous.depth, 0)
         gapped = self.depth(measured=measured, gapped_layer_set="0-2,4-6;3;7")
         self.assertEqual(gapped.depth, 0)
         self.assertEqual(gapped.passes_in_flight, 1)
@@ -269,6 +275,156 @@ class GroupDDefaultsAreMeasured(unittest.TestCase):
             argv = self.argv(disable_overlap=disable)
             want = "no_buffer" if disable else "extra_buffer"
             self.assertEqual(argv[argv.index("--mamba-radix-cache-strategy") + 1], want)
+
+
+class TheGappedArgvOmitsTheCountFlags(unittest.TestCase):
+    """FOLLOW FIX 1 / finding 1: a gapped map travels on the SET, not on counts.
+
+    ``--pp-stage-ratio``/``--pp-attn-stage-ratio`` are per-stage COUNTS, and
+    ``derive_pp_layer_split`` re-derives a CONTIGUOUS split from them. For the
+    layout the user bound on 2026-09-07 -- 48 GDN layers on the 5090, 8+8
+    attention on the two 3080s -- the pair is ``48,8,8 / 0,8,8`` and the server
+    refuses it outright before a weight loads (boot weg2pp2 arm P_G1). For a
+    gapped map whose attention counts are all positive it is worse than a
+    refusal: the flags are ACCEPTED and derive a DIFFERENT layout, so the argv
+    contradicts ``SGLANG_PP_LAYER_SET``. Both halves are the same defect --
+    a second set of books for one fact -- so the counts copy is dropped.
+    """
+
+    def argv(self, stage_ratio, attn_stage_ratio):
+        return argv_p(
+            PY,
+            MODEL,
+            [1000, 1000, 1000],
+            8,
+            1024,
+            8.0,
+            [],
+            stage_ratio,
+            attn_stage_ratio,
+        )
+
+    def test_a_contiguous_cut_still_states_both_flags(self):
+        argv = self.argv("42,11,11", "10,3,3")
+        self.assertIn("--pp-stage-ratio", argv)
+        self.assertEqual(argv[argv.index("--pp-stage-ratio") + 1], "42,11,11")
+        self.assertIn("--pp-attn-stage-ratio", argv)
+        self.assertEqual(argv[argv.index("--pp-attn-stage-ratio") + 1], "10,3,3")
+
+    def test_a_gapped_cut_omits_both_flags(self):
+        argv = self.argv("", "")
+        self.assertNotIn("--pp-stage-ratio", argv)
+        self.assertNotIn("--pp-attn-stage-ratio", argv)
+        # And nothing else moved: the argv is still a launchable one.
+        self.assertIn("--pp-size", argv)
+        self.assertIn("--pp-async-batch-depth", argv)
+
+    def test_half_an_omission_is_refused_rather_than_guessed(self):
+        for pair in (("48,8,8", ""), ("", "0,8,8")):
+            with self.assertRaises(Weg2LaunchRefused) as ctx:
+                self.argv(*pair)
+            self.assertIn("W40", str(ctx.exception))
+
+    def test_the_solver_hands_a_gapped_cut_the_empty_pair(self):
+        """PCutFacts is where the omission is DECIDED; argv_p only obeys it."""
+        gapped = PCutFacts(
+            stage_ratio="",
+            attn_stage_ratio="",
+            pool_tokens=1.0,
+            attn_counts=(0, 8, 8),
+            kv_mib_per_token_per_attn_layer=1.0,
+            hidden_size=5120,
+            cap_tokens=1,
+            layer_set="0-2;3;4-7",
+            gapped=True,
+        )
+        self.assertTrue(gapped.gapped)
+        self.assertEqual(gapped.stage_ratio, "")
+        self.assertNotIn(
+            "--pp-stage-ratio", self.argv(gapped.stage_ratio, gapped.attn_stage_ratio)
+        )
+
+    def test_the_flag_pair_the_user_map_would_have_needed_is_refused_by_the_server(
+        self,
+    ):
+        """WHY the omission, pinned against the runtime's own parser."""
+        from sglang.srt.distributed.utils import derive_pp_layer_split
+
+        kinds = [(i % 4) == 3 for i in range(64)]
+        with self.assertRaises(ValueError) as ctx:
+            derive_pp_layer_split(
+                [48, 8, 8], is_full_attention=kinds, attn_scores=[0, 8, 8]
+            )
+        self.assertIn("positive integers", str(ctx.exception))
+        # And the second half: a positive-count gapped map is accepted and
+        # derives something else entirely, which is the silent version.
+        self.assertNotEqual(
+            list(
+                derive_pp_layer_split(
+                    [52, 6, 6], is_full_attention=kinds, attn_scores=[4, 6, 6]
+                )
+            ),
+            [52, 6, 6],
+        )
+
+
+class TheDerivedDepthIsRetractedByMeasurement(unittest.TestCase):
+    """FOLLOW FIX 1 / MUST_FIX 3: the #692 derivation is not re-grounded yet."""
+
+    def depth(self, **over):
+        kwargs = dict(
+            measured=BubbleMeasurement(
+                source="synthetic",
+                rank=0,
+                windows=1,
+                forward_ms=780.0,
+                bubble_ms=220.0,
+                starved_ms=0.0,
+                n_forwards=10,
+            ),
+            pool_tokens=500_000.0,
+            attn_counts=(10, 3, 3),
+            kv_mib_per_token_per_attn_layer=2048.0 / (1024.0 * 1024.0),
+            hidden_size=5120,
+            chunk_tokens=4096,
+            cap_tokens=262_144,
+        )
+        kwargs.update(over)
+        return solve_p_depth(**kwargs)
+
+    def test_the_derivation_still_runs_and_is_still_printed(self):
+        d = self.depth()
+        self.assertEqual(d.derived_depth, 1)
+        self.assertIn("bubble_share=", d.line())
+
+    def test_what_ships_is_zero_and_the_line_says_why(self):
+        d = self.depth()
+        self.assertEqual(d.depth, 0)
+        self.assertEqual(d.passes_in_flight, 1)
+        line = d.line()
+        self.assertIn("RETRACTED", line)
+        self.assertIn("BOOT_weg2pp2_0907.md", line)
+        self.assertNotIn("PINNED", line)
+
+    def test_the_retraction_costs_the_pool_nothing(self):
+        d = self.depth()
+        self.assertEqual(d.price_rows, 0)
+        self.assertEqual(d.pool_after, d.pool_tokens)
+
+    def test_a_pin_still_ships_and_is_still_priced(self):
+        d = self.depth(pinned_depth=2)
+        self.assertEqual(d.depth, 2)
+        self.assertEqual(d.passes_in_flight, 3)
+        self.assertTrue(d.pinned)
+        self.assertGreater(d.price_rows, 0)
+        self.assertIn("PINNED", d.line())
+        self.assertNotIn("RETRACTED", d.line())
+
+    def test_a_pin_of_zero_is_a_pin_not_a_retraction(self):
+        d = self.depth(pinned_depth=0)
+        self.assertEqual(d.depth, 0)
+        self.assertTrue(d.pinned)
+        self.assertNotIn("RETRACTED", d.line())
 
 
 if __name__ == "__main__":

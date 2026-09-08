@@ -72,6 +72,59 @@ class PPCutRefused(RuntimeError):
     """W40: no cut satisfies the pool floor. Never a silent fallback."""
 
 
+def _gapped_forward_gate() -> Tuple[bool, str]:
+    """Would the RUNTIME serve a gapped forward if this solver chose one?
+
+    Returns the answer and the NAME of the escape hatch that changes it, both
+    fetched from the runtime's own module rather than restated here: a second
+    copy of the condition -- or even of the variable's name -- is a second set
+    of books, and the day the #753 forward is fixed the gate moves in one place
+    and this solver follows it without an edit. Imported lazily because this
+    module is imported by the launcher long before any distributed import is
+    wanted.
+    """
+    from sglang.srt.distributed.utils import (
+        PP_GAPPED_KNOWN_WRONG_ENV,
+        pp_gapped_forward_known_wrong_allowed,
+    )
+
+    return pp_gapped_forward_known_wrong_allowed(), PP_GAPPED_KNOWN_WRONG_ENV
+
+
+def _refuse_below_pool_floor(
+    candidate: "CutCandidate", what: str, cap_tokens: int, cost_provenance: str
+) -> None:
+    """W40 when a chosen layout cannot hold one full-context prompt.
+
+    The SOLVED path has refused this since #1236 (``feasible`` is the set that
+    clears the floor). The PINNED paths returned without ever asking, so boot
+    weg2pp2's dry run printed ``pool_tokens=153611 (constraint pool >=
+    262144)`` beside a pinned map and went on to build the argv -- a boot that
+    cannot admit one full-context prompt is a spent window, and the sentence
+    that names it already existed. One writer of that sentence, three callers.
+    """
+    if float(candidate.pool_tokens) >= float(cap_tokens):
+        return
+    raise PPCutRefused(
+        "W40 Weg2PPCutRefused: %s does not hold one full-context prompt. The "
+        "pool floor is %d tokens (--max-kv-per-request); this layout is "
+        "layers=%s attn=%s at %d tokens (makespan %.1f ms, crossings %.1f ms), "
+        "short by %d. Lower --max-kv-per-request, raise the per-rank budgets, "
+        "or pin a layout that holds it. Cost model: %s"
+        % (
+            what,
+            int(cap_tokens),
+            ",".join(str(n) for n in candidate.layers),
+            ",".join(str(a) for a in candidate.attn),
+            int(candidate.pool_tokens),
+            candidate.makespan_ms,
+            candidate.crossing_ms,
+            int(cap_tokens) - int(candidate.pool_tokens),
+            cost_provenance,
+        )
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class CutCandidate:
     """One layout, priced on every axis the ranking uses.
@@ -486,8 +539,42 @@ def solve_launch_cut(
             % (int(total_layers), n_stages, max_rank0)
         )
 
-    kv_floor = max(candidates, key=lambda c: c.pool_tokens)
-    feasible = [c for c in candidates if c.pool_tokens >= float(cap_tokens)]
+    # THE RUNTIME GATE BOUNDS THE CHOICE (#1240 FOLLOW FIX 1, boot weg2pp2).
+    # A gapped map is priced and printed -- its prices are the answer to the
+    # question this slice exists to ask -- but it may not be CHOSEN while
+    # scheduler_pp_mixin._refuse_known_wrong_gapped_forward stands, because
+    # that refusal fires on all three ranks after the weights are loaded and
+    # turns a solved layout into a dead window. The condition is not restated
+    # here: the same predicate both readers use is imported. Only the ranking's
+    # accident (#498 and #654 of 1,531 at the design prefix that boot measured)
+    # kept the launcher from publishing an unservable layout, and a deeper
+    # design prefix -- the direction the user is heading -- makes a gapped
+    # candidate win. An accident is not a gate.
+    gapped_servable, gate_env = _gapped_forward_gate()
+    n_gapped = sum(1 for c in candidates if c.kind == "gapped")
+    if n_gapped and not gapped_servable:
+        unpriced.append(
+            "REFUSED (unservable, not outranked): %d gapped candidate(s) are "
+            "priced and printed but excluded from the choice by "
+            "scheduler_pp_mixin._refuse_known_wrong_gapped_forward, which "
+            "refuses a gapped forward as NUMERICALLY WRONG (measured "
+            "2026-08-18: 'Paris' becomes '\\n\\n'). Fixing that forward is "
+            "what unblocks this family; %s=1 prices them as choosable for "
+            "debugging it." % (n_gapped, gate_env)
+        )
+    choosable = [c for c in candidates if gapped_servable or c.kind != "gapped"]
+    if not choosable:
+        raise PPCutRefused(
+            "W40 Weg2PPCutRefused: every priceable candidate is a GAPPED map "
+            "and the runtime refuses a gapped forward "
+            "(scheduler_pp_mixin._refuse_known_wrong_gapped_forward), so there "
+            "is nothing servable to choose between. %s" % (unpriced[-1],)
+        )
+
+    # The kv-floor row is the OTHER objective, so it has to be a layout that
+    # could actually be run: a pool on an unservable map is not available.
+    kv_floor = max(choosable, key=lambda c: c.pool_tokens)
+    feasible = [c for c in choosable if c.pool_tokens >= float(cap_tokens)]
     if not feasible:
         raise PPCutRefused(
             "W40 Weg2PPCutRefused: no cut holds one full-context prompt. The "
@@ -536,6 +623,24 @@ def solve_launch_cut(
                 "name which: %s"
                 % (str(pinned_layer_set), "; ".join(unpriced) or "pool model")
             )
+        if kind == "gapped" and not gapped_servable:
+            raise PPCutRefused(
+                "W40 Weg2PPCutRefused: the pinned --pp-layer-set %r is a "
+                "GAPPED map, and the runtime refuses a gapped forward as "
+                "NUMERICALLY WRONG "
+                "(scheduler_pp_mixin._refuse_known_wrong_gapped_forward; "
+                "measured 2026-08-18, 'Paris' becomes '\\n\\n'). Boot weg2pp2 "
+                "reached that refusal on all three ranks AFTER the weights "
+                "were loaded, which is a spent window rather than a decision. "
+                "Refused here instead. %s=1 reaches it anyway while debugging "
+                "the forward." % (str(pinned_layer_set), gate_env)
+            )
+        _refuse_below_pool_floor(
+            priced,
+            "the pinned --pp-layer-set %r" % (str(pinned_layer_set),),
+            int(cap_tokens),
+            cost_provenance,
+        )
         return CutDecision(
             chosen=priced,
             kv_floor=kv_floor,
@@ -586,6 +691,12 @@ def solve_launch_cut(
                 "priced on every axis (pool, family compute, crossings)."
                 % (",".join(str(n) for n in layers),)
             )
+        _refuse_below_pool_floor(
+            priced,
+            "the pinned layer cut %s" % (",".join(str(n) for n in layers),),
+            int(cap_tokens),
+            cost_provenance,
+        )
         chosen = priced
 
     return CutDecision(
