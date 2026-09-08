@@ -14456,6 +14456,15 @@ class Scheduler(
         ret["effective_max_running_requests_per_dp"] = self.admission_limiter.current
         ret["admission_limiter"] = self.admission_limiter.snapshot()
 
+        # FIX 4 (round 4), boot weg2sc1: the host-pool terms the #915 prefetch
+        # gate applies, published on the endpoint an out-of-process scheduler
+        # (the Weg-2 front's D-admission gate) already polls. A READING, not a
+        # verdict -- see `prefetch_residency` for what each term binds and why
+        # the reader must treat it as an estimate that D enforces for real.
+        from sglang.srt.mem_cache.prefetch_budget import prefetch_residency
+
+        ret["hicache_prefetch"] = prefetch_residency(self.tree_cache)
+
         if (
             not self.spec_algorithm.is_none()
             and self.metrics_reporter.spec_total_num_forward_ct > 0

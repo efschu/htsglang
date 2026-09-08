@@ -97,3 +97,84 @@ def log_prefetch_limit(cache_controller: Any, *, site: str) -> None:
         )
     except Exception:  # noqa: BLE001 - an instrument may never break a boot or a rebind
         logger.warning("#915 PREFETCH LIMIT line could not be formed at %s", site)
+
+
+def prefetch_residency(tree_cache: Any) -> Any:
+    """The host-pool terms the #915 prefetch gate ITSELF applies, for a reader
+    outside this process (FIX 4, round 4).
+
+    WHY THIS EXISTS.  The Weg-2 front hands group D ``--d-bs`` seats at once
+    and had no channel carrying D's real host-tier state, so its aggregate
+    admission gate priced the pool by "budget minus what I admitted" -- a
+    number that is back to zero at every D epoch and therefore blind to the
+    standing residency that actually refuses the store read.  Measured, boot
+    weg2sc1 2026-09-07 20:14:17Z, the same second on both logs: the front's
+    proxy said 27,466 rows were free while D printed ``#915 PREFETCH REFUSED
+    reason=vote_negative need=8629 available=5418 occupied=25100 limit=27466``.
+    The indicator was 25,100 rows optimistic.  This function publishes the
+    terms of THAT line, so the front prices the pool by the pool.
+
+    WHICH TERMS BIND, in the order the gate applies them
+    (``unified_radix_cache._prefetch_from_storage``):
+
+    * ``available`` -- ``mem_pool_host.available_size()``.  The ALLOC term:
+      a prefetch of ``need`` rows calls ``alloc(need)`` and, under the #580
+      participation vote, a failure on ANY rank lowers the group vote to
+      ``vote_negative`` with no truncation.  This is the term that refused
+      boot weg2sc1 (5418 < 8629), and it is the only one of the three that
+      sees rows retained by earlier requests as well as rows locked by
+      registered prefetches.
+    * ``occupied``/``limit`` -- the RATE brake
+      (``HiCacheController.prefetch_rate_limited``): registered-but-not-yet-
+      completed prefetch tokens against ``prefetch_capacity_limit``.  It
+      bounds CONCURRENT spans, not residency (that method's own docstring).
+
+    RANK-UNIFORMITY, honestly.  ``limit`` is rank-uniform BY CONSTRUCTION
+    with ``--hicache-size`` (``sync_fixed_hicache_size`` MIN-syncs the pool;
+    see ``prefetch_capacity_limit``'s docstring).  ``available`` and
+    ``occupied`` are not guaranteed uniform -- they are per-rank readings,
+    and only the control rank answers ``/server_info``.  So this is a
+    READING, never a verdict: the front's use of it is an ESTIMATE in exactly
+    the sense law 4's X already is (the front estimates, D enforces).  When
+    the estimate is optimistic the request meets D's own gate and is refused
+    there, which is the behaviour that existed before this channel -- the
+    reading can make the front more conservative, never less correct.
+
+    THE TWIN, NAMED (Ein-Job-ein-Mover).  ``UnifiedRadixCache._prefetch_line_terms``
+    reads the same three terms for the ``#915`` log lines and is NOT folded
+    into this function: it degrades PER TERM (a missing one prints -1 and the
+    other two still speak), while a reading that is only partly true is worse
+    than no reading for a caller that decides on it, so this one is
+    all-or-nothing.  The two are pinned against each other by
+    ``test_a7_the_reading_is_group_d_s_own_915_terms`` -- if they ever drift,
+    the front would decide on one arithmetic while D refuses on another.
+
+    Diagnostic form (#1035): a collaborator that lacks a term is reported as
+    ``None`` rather than raising.  ``prefetch_capacity_limit`` RAISES with no
+    pool bound (A12.4), which is exactly a moment when there is nothing to
+    publish, so the whole reading is ``None`` then.
+    """
+    cc = getattr(tree_cache, "cache_controller", None)
+    if cc is None:
+        return None
+    try:
+        pool = host_pool_anchor(cc)
+        if pool is None:
+            return None
+        from sglang.srt.mem_cache.hicache_phase_binding import (
+            bound_phase,
+            current_generation,
+        )
+
+        return {
+            "available": int(pool.available_size()),
+            "occupied": int(cc.prefetch_tokens_occupied),
+            "limit": int(cc.prefetch_capacity_limit),
+            "size": int(getattr(pool, "size", 0) or 0),
+            "threshold": int(getattr(tree_cache, "prefetch_threshold", 0) or 0),
+            "pool_id": host_pool_identity(cc),
+            "phase": bound_phase(),
+            "generation": int(current_generation()),
+        }
+    except Exception:  # noqa: BLE001 - an instrument may never break a poll
+        return None

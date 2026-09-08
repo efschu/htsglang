@@ -54,7 +54,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from aiohttp import ClientSession, ClientTimeout, web
 
@@ -87,6 +87,15 @@ QUIESCE_DEADLINE_S = 90.0
 #: named refusal (W36) instead of stalling the whole queue.  O9 leaves it a
 #: constant rather than a flag until a boot shows T5 firing in practice.
 POST_BARRIER_S = 30.0
+#: FIX 4 (round 4): how fresh D's host-pool reading must be before the front
+#: decides an admission on it.  Provenance, boot weg2sc1: the front granted 16
+#: admissions across a 42.1 s drain with six seats per epoch, i.e. GRANTS ARE
+#: SECONDS APART, while a `/server_info` round trip on loopback is
+#: milliseconds.  1.0 s sits two orders above the cost of the read and an
+#: order below the interval between the decisions it informs.  The read is
+#: ON DEMAND (the admitter refreshes a stale reading before it decides), never
+#: a background poller -- there is no sampler task to leave running.
+D_POOL_MAX_AGE_S = 1.0
 RPC_TIMEOUT_S = 900.0
 SPAN_LRU = 512
 SLEEP_TAGS = ["kv_cache", "weights"]
@@ -360,7 +369,7 @@ class Seat:
     seat twice and inflate D's concurrency past its own bs.
     """
 
-    __slots__ = ("front", "rid", "source", "held", "tokens")
+    __slots__ = ("front", "rid", "source", "held", "tokens", "t_taken")
 
     def __init__(self, front: Front, rid: str, source: str, tokens: int = 0):
         self.front = front
@@ -368,19 +377,28 @@ class Seat:
         self.source = source
         self.held = True
         # FIX 4a (round 1): a seat is a COUNT of one AND a charge against
-        # D's host staging pool.  Charged where the seat is taken, refunded
-        # where it is returned, so the two can never drift.
+        # D's host staging pool.
+        #
+        # FIX 4 (round 4) -- THE CHARGE IS DERIVED, NOT RECORDED.  Round 1
+        # kept a `_d_inflight_tokens` counter here, and a counter written
+        # only by this class is by construction back to 0 at the start of
+        # every D epoch: it could never see the standing residency that
+        # actually refuses the store read (the INDIKATOR-GESETZ finding of
+        # round 3).  The front now prices the pool by D's OWN reading and
+        # uses the live seats only for the grants that reading cannot yet
+        # contain, so what a seat needs to carry is its size and the MOMENT
+        # it was granted -- both immutable, both read by summation over the
+        # live set.  No counter, no reconcile, no drift.
         self.tokens = max(0, int(tokens))
-        self.front._d_inflight_tokens += self.tokens
+        self.t_taken = time.time()
+        self.front._d_seats_live.add(self)
 
     def release(self, freed_by: str) -> None:
         if not self.held:
             return
         self.held = False
         self.front._d_seat.release()
-        self.front._d_inflight_tokens = max(
-            0, self.front._d_inflight_tokens - self.tokens
-        )
+        self.front._d_seats_live.discard(self)
         self.front.counters["d_seat_released"] += 1
         # L3: the "wenn ein slot frei wird, wird nachgezogen" instrument.
         logger.info(
@@ -539,19 +557,37 @@ class Front:
         # store-resident rid, and P's PP ranks then diverged on its
         # re-admission extent (W27, the boot killer).
         #
-        # This is the measured #974 host-pool wall (record 1l) lifted from
-        # PER-REQUEST -- which CARRIER-EXCEEDS does bound, at
-        # `carrier_max_tokens` -- to AGGREGATE, which nothing bounded.  The
-        # bound is the same pool, so the default is the same number; 0 = off,
-        # and the flag is the override.  It only ever DELAYS an admission,
-        # never forces one, and never starves: a request alone in flight is
-        # admitted whatever it costs (the truly-oversized case is
-        # CARRIER-EXCEEDS's, not this one).
+        # FIX 4 (round 4) -- WHICH QUANTITY.  Round 1 compared a front-local
+        # admission tally against `carrier_max_tokens`, and boot weg2sc1's own
+        # two logs refute that pairing in the same second: at the FIRST
+        # admission of the epoch the tally is 0, so the gate read 27,466 rows
+        # free while D read `available=5418 occupied=25100`.  Replayed, the
+        # round-1 gate admits three of the burst and every one of them is
+        # still #915-refused -- exactly the failure it exists to remove.  The
+        # front therefore no longer prices the pool at all: it READS D's own
+        # `#915` terms off `/server_info` (`prefetch_residency`) and charges
+        # only the grants that reading cannot yet contain.
+        #
+        # `--d-admit-max-tokens` survives as the OPERATOR CEILING it always
+        # was, no longer as the budget: 0 = gate off, >0 = an extra bound on
+        # the group's own reading, None = the reading alone.  The gate only
+        # ever DELAYS an admission, never forces one, and never starves: a
+        # request with no seat in use is admitted whatever it costs (the
+        # truly-oversized case is CARRIER-EXCEEDS's, not this one).
         self.d_admit_max_tokens = (
-            self.carrier_max_tokens if d_admit_max_tokens is None
-            else max(0, int(d_admit_max_tokens))
+            None if d_admit_max_tokens is None else max(0, int(d_admit_max_tokens))
         )
-        self._d_inflight_tokens = 0
+        # The live seats, the ONLY thing the front counts itself.  A set, not
+        # a counter: `Seat.__init__` adds and `Seat.release` discards, so the
+        # charge is a SUM over live seats at read time and cannot drift out of
+        # step with the seats it describes (round 3's "reconciled at each
+        # D-epoch start rather than assumed 0", satisfied structurally).
+        self._d_seats_live: Set[Seat] = set()
+        # D's last published host-pool reading: the terms of its own #915
+        # gate plus `t`, the moment the READ WAS ISSUED (not answered), so a
+        # grant made during the round trip is charged rather than lost.
+        self._d_pool: Optional[Dict[str, Any]] = None
+        self._d_pool_unreadable: bool = False
         self._d_token_hold_rid: Optional[str] = None
 
     # ---------------- seat / gate bookkeeping (C4, C5) ----------------
@@ -583,45 +619,157 @@ class Front:
         """
         return max(0, self._seats_in_use() - len(self.groups["D"].outstanding))
 
-    def _d_token_budget_blocks(self, rid: str, est_tokens: int) -> bool:
-        """Would admitting this request overcommit D's host staging pool?
+    def _d_charged_since(self, t: float) -> int:
+        """Tokens of the seats granted at or after ``t``.
 
-        THE AGGREGATE SEATS-VS-POOL COUPLING (FIX 4a, round 1; the L-line and
-        its denominators, round 3).  ``--d-bs`` seats are a COUNT and the
-        store read is a TOKEN budget, so six seats times one prompt can
-        exceed the pool the group has to prefetch into -- and a request whose
-        prefix IS in the store then prices as wholly uncached (`#915 PREFETCH
-        REFUSED reason=vote_negative`, `cached_tokens=0`) and is W31-refused
-        for a reason that is not its own.  EFFECTIVE SEATS ARE THEREFORE
-        ``min(d_bs, what the pool can still prefetch)``: the head of
+        The ONLY quantity the front counts itself, and it is DERIVED from the
+        live seats rather than accumulated (see :class:`Seat`).  Its whole job
+        is to cover the window a reading cannot: a seat granted after D
+        sampled its pool is a store read D has not yet registered, so it is
+        invisible in the reading and must be charged on top of it.
+        """
+        return sum(s.tokens for s in self._d_seats_live if s.t_taken >= t)
+
+    def _d_inflight_tokens(self) -> int:
+        """Tokens of ALL live seats -- the L-line denominator, never a bound."""
+        return sum(s.tokens for s in self._d_seats_live)
+
+    async def _d_pool_reading(self) -> Optional[Dict[str, Any]]:
+        """D's host-pool reading, refreshed ON DEMAND when it is stale.
+
+        Called from the two admission paths immediately before they decide,
+        so the read happens exactly as often as decisions are taken near the
+        bound and never as a background poller.  ``t`` is stamped BEFORE the
+        request goes out: a grant made while the reply is in flight then
+        satisfies ``t_taken >= t`` and is charged, which is the conservative
+        direction (the gate may delay, never admit on a stale reading).
+
+        A failed read does NOT clobber the last one; it ages out instead, and
+        a reading older than the age bound is treated as no reading at all.
+        """
+        r = self._d_pool
+        now = time.time()
+        if r is not None and now - r["t"] <= D_POOL_MAX_AGE_S:
+            return r
+        t0 = now
+        got = None
+        try:
+            g = self.groups["D"]
+            async with self.session.get(f"{g.url}/server_info",
+                                        timeout=ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    for st in (body.get("internal_states") or []):
+                        got = st.get("hicache_prefetch")
+                        if got:
+                            break
+        except Exception:  # noqa: BLE001 - an instrument may never break admission
+            got = None
+        if got:
+            self.counters["d_pool_reads"] += 1
+            self._d_pool = dict(got)
+            self._d_pool["t"] = t0
+            if self._d_pool_unreadable:
+                self._d_pool_unreadable = False
+                logger.info("WEG2 D-POOL READABLE again: available=%d occupied=%d limit=%d "
+                            "(the seats-vs-pool gate is back on)",
+                            self._d_pool["available"], self._d_pool["occupied"],
+                            self._d_pool["limit"])
+            return self._d_pool
+        self.counters["d_pool_read_failed"] += 1
+        if r is not None and t0 - r["t"] <= D_POOL_MAX_AGE_S:
+            return r
+        self._d_pool = None
+        if not self._d_pool_unreadable:
+            self._d_pool_unreadable = True
+            # NAMED REFUSAL, not a silent fallback: the round-1 gate's
+            # front-local proxy is exactly the wrong quantity, so with no
+            # reading the gate is OFF and says so.  Admissions then behave as
+            # they did before this coupling existed -- never worse -- and D's
+            # own #915 gate remains the enforcement point.
+            logger.warning("WEG2 D-POOL UNREADABLE: group D published no `hicache_prefetch` "
+                           "reading within %.1f s (reads=%d failed=%d); the aggregate "
+                           "seats-vs-pool gate is OFF until it answers -- the front will not "
+                           "substitute its own admission tally for the pool's residency",
+                           D_POOL_MAX_AGE_S, self.counters["d_pool_reads"],
+                           self.counters["d_pool_read_failed"])
+        return None
+
+    def _d_token_budget_blocks(self, rid: str, est_tokens: int,
+                               reading: Optional[Dict[str, Any]]) -> bool:
+        """Would granting this request a seat ask D for a store read it cannot
+        issue?
+
+        THE AGGREGATE SEATS-VS-POOL COUPLING (FIX 4a round 1; the L-line and
+        its denominators round 3; THE QUANTITY, round 4).  ``--d-bs`` seats
+        are a COUNT and the store read is a ROW budget, so six seats times one
+        prompt can exceed the pool the group has to prefetch into -- and a
+        request whose prefix IS in the store then prices as wholly uncached
+        (`#915 PREFETCH REFUSED reason=vote_negative`, `cached_tokens=0`) and
+        is W31-refused for a reason that is not its own.  EFFECTIVE SEATS ARE
+        THEREFORE ``min(d_bs, what the pool can still prefetch)``: the head of
         ``_ready_for_d`` WAITS in arrival order (law 2 is "oldest first", not
-        "six at once"), it is never skipped over, and its seat is not taken
-        while its store read cannot be issued.
+        "six at once"), IT IS NEVER SKIPPED OVER -- the admitter peeks and
+        `continue`s, so no younger request can take the seat the head is
+        waiting for -- and its seat is not taken while its store read cannot
+        be issued.
 
-        False whenever the budget is off, whenever nothing is in flight (a
-        sole request is never starved by a bound its own size -- the truly
-        oversized case is CARRIER-EXCEEDS's, R-3), or whenever it fits.
+        THE TWO TERMS ARE D'S OWN, in the order D applies them:
 
-        L-LINE ``WEG2 D-SEAT-WAIT`` with its three denominators named:
-        ``need`` is this request's own estimate (front pricing, the L10
-        ESTIMATE convention), ``available`` is what is left of the pool right
-        now, ``limit`` is the pool bound itself.  Rate-limited to one line
-        per newly-held rid, then every 200th pass, and the SUPPRESSED count
-        rides on the line (`held_passes`), so an absence of lines is
-        readable as an absence of waits rather than as a silenced emitter.
+        * ALLOC -- ``need <= available``.  ``available`` is D's
+          ``mem_pool_host.available_size()``, the reading that refused boot
+          weg2sc1 (5418 rows against need 8629); it is the only term that
+          sees rows retained by earlier requests, which is precisely what a
+          front-local admission tally can never see.
+        * RATE -- ``occupied < limit``, D's ``prefetch_rate_limited``.
+
+        Both are charged with ``_d_charged_since(reading["t"])``: the grants
+        this front made after D sampled, which its reading cannot contain.
+
+        THE RESIDUAL WINDOW, NAMED.  A grant made BEFORE the read was issued
+        whose prefetch had not yet registered when D sampled is in neither
+        term.  That window is D's intake latency (front resolve -> client POST
+        -> tokenizer -> scheduler intake), it is bounded by the age bound
+        above, and its only effect is that ONE request may still meet D's own
+        #915 gate -- the behaviour that existed before this coupling.  The
+        gate can therefore be optimistic by at most one in-flight grant and is
+        never pessimistic about rows that exist.
+
+        False whenever no seat is in use (a sole request is never starved by a
+        bound its own size -- the truly oversized case is CARRIER-EXCEEDS's,
+        R-3), whenever the ceiling flag is 0, whenever there is no reading
+        (named above), or whenever it fits.
+
+        L-LINE ``WEG2 D-SEAT-WAIT`` with every denominator named and its
+        PROVENANCE on the line: ``need`` is this request's own front estimate
+        (the L10 ESTIMATE convention), ``available`` is what D last reported
+        its pool could still allocate MINUS the grants made since, ``limit``
+        is D's own prefetch capacity, and ``reading_age_s`` says how old the
+        numbers are.  Rate-limited to one line per newly-held rid, then every
+        200th pass, and the SUPPRESSED count rides on the line
+        (``held_passes``), so an absence of lines is readable as an absence of
+        waits rather than as a silenced emitter.
 
         THIS IS THE HONEST INTERIM.  The wall itself is the #974 host-pool
         bound; it lifts when the shared-ring carrier gives D a windowed store
-        read (WEG2_CARRIER_SPEC_0907 Amendment 2), and this gate then reduces
-        to `budget <= 0` -- off, by the same flag, with no code to remove.
+        read (WEG2_CARRIER_SPEC_0907 Amendment 2), and this gate then never
+        fires, with no code to remove.
         """
-        budget = self.d_admit_max_tokens
-        if budget <= 0 or self._d_inflight_tokens <= 0:
+        if self.d_admit_max_tokens == 0 or not self._d_seats_live:
+            self._d_token_hold_rid = None
+            return False
+        if reading is None:
             self._d_token_hold_rid = None
             return False
         need = max(0, int(est_tokens))
-        available = max(0, budget - self._d_inflight_tokens)
-        if self._d_inflight_tokens + need <= budget:
+        charged = self._d_charged_since(reading["t"])
+        available = int(reading["available"]) - charged
+        limit = int(reading["limit"])
+        occupied = int(reading["occupied"]) + charged
+        if self.d_admit_max_tokens is not None:
+            # The operator ceiling bounds the SAME quantity, never replaces it.
+            available = min(available, self.d_admit_max_tokens - occupied)
+        if need <= available and occupied < limit:
             self._d_token_hold_rid = None
             return False
         self.counters["d_admit_token_held"] += 1
@@ -629,13 +777,15 @@ class Front:
         if self._d_token_hold_rid != rid or held % 200 == 0:
             self._d_token_hold_rid = rid
             logger.info(
-                "WEG2 D-SEAT-WAIT rid=%s need=%d available=%d limit=%d "
-                "inflight_tokens=%d seats_free=%d held_passes=%d (the store "
-                "read for this request cannot be issued yet; it keeps the "
-                "head of the arrival queue and takes no seat -- admitting it "
-                "here is the #915 vote_negative shape that mis-prices the X "
-                "gate)",
-                rid, need, available, budget, self._d_inflight_tokens,
+                "WEG2 D-SEAT-WAIT rid=%s need=%d available=%d limit=%d occupied=%d "
+                "charged_since_reading=%d reading_age_s=%.2f inflight_tokens=%d "
+                "seats_free=%d held_passes=%d (group D's own #915 terms, read from "
+                "/server_info; the store read for this request cannot be issued yet, "
+                "so it keeps the head of the arrival queue and takes no seat -- "
+                "admitting it here is the #915 vote_negative shape that mis-prices "
+                "the X gate)",
+                rid, need, available, limit, occupied, charged,
+                max(0.0, time.time() - reading["t"]), self._d_inflight_tokens(),
                 self.seats_free(), held,
             )
         return True
@@ -669,9 +819,11 @@ class Front:
                     self.carrier_max_tokens, self.p_concurrency, self.d_bs, self.tp_prefill_max_tokens,
                     self.flip_min_work_tokens, self.idle_layout,
                     "derived" if self.min_dwell_ms is None else f"{self.min_dwell_ms:.0f}",
-                    self.drain_deadline_s, self.d_admit_max_tokens,
-                    "carrier_max_tokens" if self.d_admit_max_tokens == self.carrier_max_tokens
-                    else "flag")
+                    self.drain_deadline_s,
+                    -1 if self.d_admit_max_tokens is None else self.d_admit_max_tokens,
+                    "group D's own #915 reading (/server_info hicache_prefetch), "
+                    "no operator ceiling" if self.d_admit_max_tokens is None
+                    else "that reading under an operator ceiling")
 
     async def cleanup(self, app):
         for k in ("controller", "admitter", "health", "corridor"):
@@ -875,7 +1027,7 @@ class Front:
             return None
         if not (self.awake == "D" and self.admit_d and self.state == "serving"):
             return None
-        if self._d_token_budget_blocks(rid, est_tokens):
+        if self._d_token_budget_blocks(rid, est_tokens, await self._d_pool_reading()):
             # FIX 4a: the same aggregate bound the BATCH admitter obeys.  A
             # SHORT arrival that does not fit falls through to route BATCH
             # rather than overcommitting the staging pool -- the return
@@ -957,10 +1109,13 @@ class Front:
                     self._sync_batch_gate()
                     self.counters["d_admit_skipped_done"] += 1
                     continue
-                if self._d_token_budget_blocks(p.rid, p.est_prompt):
+                if self._d_token_budget_blocks(p.rid, p.est_prompt,
+                                               await self._d_pool_reading()):
                     # FIX 4a: the seat is not even reached -- taking one and
                     # holding it while the tokens are unavailable would block
-                    # the refill the budget is waiting for.
+                    # the refill the budget is waiting for.  `continue` and
+                    # not a pop: the head STAYS the head (law 2), so a younger
+                    # request that would fit cannot be admitted past it.
                     continue
                 await self._d_seat.acquire()
                 if not (self.awake == "D" and self.admit_d and self.state == "serving"):
@@ -1758,12 +1913,15 @@ def main():
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
     ap.add_argument("--carrier-max-tokens", type=int, default=0, help="#1233 zero-remainder: longest prompt group D can read from the store (0 = no CARRIER-EXCEEDS route)")
     ap.add_argument("--d-admit-max-tokens", type=int, default=None,
-                    help="FIX 4a: AGGREGATE bound on the estimated prompt tokens D may hold in "
-                         "flight at once, i.e. its host staging pool read as the TOKEN budget it "
-                         "is. Derived default: --carrier-max-tokens, the same pool at per-request "
-                         "granularity. 0 disables the bound and restores the count-only admitter "
-                         "that overcommitted the pool on boot weg2sc1 (#915 vote_negative -> a "
-                         "mis-priced X gate -> a store-resident rid re-queued to P).")
+                    help="FIX 4 (round 4): OPERATOR CEILING on the AGGREGATE store-read budget "
+                         "group D may hold in flight. The budget itself is not this flag and is "
+                         "never front-derived: the front READS group D's own #915 terms "
+                         "(available/occupied/limit) off /server_info and charges the grants that "
+                         "reading cannot yet contain. Unset = that reading alone. >0 = the same "
+                         "reading under this extra bound. 0 disables the gate and restores the "
+                         "count-only admitter that overcommitted the pool on boot weg2sc1 (#915 "
+                         "vote_negative -> a mis-priced X gate -> a store-resident rid re-queued "
+                         "to P).")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     dc = {}

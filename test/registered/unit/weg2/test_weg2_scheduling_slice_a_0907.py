@@ -22,7 +22,8 @@ from aiohttp.test_utils import TestServer
 
 from sglang.srt.weg2 import front as front_mod
 from sglang.srt.weg2 import launcher as launcher_mod
-from sglang.srt.weg2.front import Front, Pending, double_prefill_verdict, is_x_refusal
+from sglang.srt.weg2.front import (Front, Pending, Seat, double_prefill_verdict,
+                                   is_x_refusal)
 
 
 # ------------------------------------------------------------------ fakes
@@ -855,7 +856,19 @@ def test_f4a_the_d_admitter_bounds_the_aggregate_host_staging_tokens():
     async def body():
         f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
                   d_bs=6, carrier_max_tokens=27466)
-        assert f.d_admit_max_tokens == 27466, "derived from the same pool"
+        # ROUND 4: the bound is no longer a front-side derivation at all --
+        # `--d-admit-max-tokens` is an operator CEILING (unset here) and the
+        # budget is group D's own #915 reading, stubbed below at the pool
+        # size this boot measured.
+        assert f.d_admit_max_tokens is None, "no front-side proxy for D's pool"
+        t0 = time.time()
+
+        async def _reading():
+            return {"available": 27466, "occupied": 0, "limit": 27466,
+                    "size": 30518, "threshold": 256, "pool_id": 1,
+                    "phase": "TP", "generation": 1, "t": t0}
+
+        f._d_pool_reading = _reading
         ps = []
         for i in range(4):
             p = _bare_pending(f"r{i}")
@@ -893,6 +906,18 @@ def test_f4b_a_sole_request_is_never_starved_by_the_token_budget():
     async def body():
         f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
                   d_bs=6, carrier_max_tokens=1000)
+        t0 = time.time()
+
+        async def _reading():
+            # A pool with ten rows left: the request cannot possibly fit, and
+            # it is admitted anyway BECAUSE NO SEAT IS IN USE -- with nothing
+            # running on D nothing would ever free a row, so a refusal here
+            # would wedge the queue rather than delay it.
+            return {"available": 10, "occupied": 0, "limit": 1000,
+                    "size": 1000, "threshold": 256, "pool_id": 1,
+                    "phase": "TP", "generation": 1, "t": t0}
+
+        f._d_pool_reading = _reading
         p = _bare_pending("huge")
         p.est_prompt = 900000
         f._ready_for_d.append(p)
@@ -911,8 +936,11 @@ def test_f4c_zero_disables_the_token_budget_and_it_is_a_flag():
     f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0,
               d_bs=6, carrier_max_tokens=27466, d_admit_max_tokens=0)
     assert f.d_admit_max_tokens == 0
-    f._d_inflight_tokens = 10 ** 9
-    assert f._d_token_budget_blocks("r", 10 ** 9) is False
+    Seat(f, "running", "batch", tokens=10 ** 9)
+    empty = {"available": 0, "occupied": 27466, "limit": 27466, "size": 30518,
+             "threshold": 256, "pool_id": 1, "phase": "TP", "generation": 1,
+             "t": time.time()}
+    assert f._d_token_budget_blocks("r", 10 ** 9, empty) is False
     # and the launcher forwards it only when the operator set it, so the
     # derivation stays with the one place that knows D's pool size.
     src = launcher_mod.front_argv_for.__doc__ or ""

@@ -52,6 +52,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -59,7 +60,7 @@ import pytest
 from sglang.srt.managers import tp_head_congruence as thc
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.weg2 import front as front_mod
-from sglang.srt.weg2.front import Front, Pending
+from sglang.srt.weg2.front import Front, Pending, Seat
 
 
 # --------------------------------------------------------------- helpers
@@ -189,6 +190,68 @@ def test_b1b_the_refusals_are_answered_after_the_loop():
         and node.test.id == "_x_refused"
     ]
     assert guards, "guarded by `if _x_refused:` so an empty pass sends nothing"
+
+
+def _always_jumps(stmt) -> bool:
+    """Does control ALWAYS leave the enclosing loop body at this statement?
+
+    A jump statement itself, or an ``if`` that cannot fall through: either its
+    test is a truthy constant and its body jumps (the measured mutant
+    ``if True: ... continue``), or both of its branches jump.  Deliberately
+    conservative -- anything it cannot prove is treated as fall-through, so
+    this only ever reports a jump that really is unconditional.
+    """
+    if isinstance(stmt, (ast.Continue, ast.Break, ast.Return, ast.Raise)):
+        return True
+    if isinstance(stmt, ast.If):
+        body = any(_always_jumps(x) for x in stmt.body)
+        orelse = any(_always_jumps(x) for x in stmt.orelse)
+        const = isinstance(stmt.test, ast.Constant) and bool(stmt.test.value)
+        return (body and const) or (body and orelse)
+    return False
+
+
+def test_b1d_nothing_unconditional_skips_the_request_before_the_x_gate():
+    """BLOCKING 1 as it was actually stated -- REACH, not placement.
+
+    ``test_b1a`` asserts an AST property AT the gate, and a guard anywhere
+    ABOVE it in the same loop body leaves that property intact while law 4 is
+    dead.  Measured mutant, inserted immediately above the gate:
+    ``if True:`` / ``_note_skip('mut_unreachable', req.rid)`` / ``continue``
+    -> the whole file stayed 18/18 green.
+
+    Two structural facts give reach for any request that enters the loop: the
+    gate is a DIRECT statement of the ``for req in self.waiting_queue`` body
+    (nothing nests it behind a second condition), and no statement before it
+    in that body always jumps."""
+    tree = _fn_ast(Scheduler._get_new_batch_prefill_raw)
+    gates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Call)
+        and isinstance(node.test.func, ast.Attribute)
+        and node.test.func.attr == "_weg2_x_refuses"
+    ]
+    assert len(gates) == 1
+    gate = gates[0]
+    loops = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.For) and gate in node.body
+    ]
+    assert len(loops) == 1, (
+        "law 4's gate must be a DIRECT statement of the waiting-queue loop -- "
+        "nested one level deeper it is reachable only under whatever condition "
+        "wraps it, and the AST placement check at the gate cannot see that"
+    )
+    before = loops[0].body[: loops[0].body.index(gate)]
+    dominating = [st for st in before if _always_jumps(st)]
+    assert not dominating, (
+        "an unconditional continue/break/return above the gate makes law 4 "
+        "unreachable with the suite green: "
+        + ", ".join(f"{type(st).__name__}@line {st.lineno}" for st in dominating)
+    )
 
 
 def test_b1c_the_answer_removes_the_request_and_names_w31_on_the_wire():
@@ -491,20 +554,46 @@ def test_b4d_the_gate_still_abstains_without_a_group_value():
 
 
 # ======================================= a: the aggregate seats-vs-pool gate
+def _reading(available: int, occupied: int, limit: int, t: float):
+    """A group-D host-pool reading in the shape `prefetch_residency` publishes."""
+    return {"available": available, "occupied": occupied, "limit": limit,
+            "size": limit, "threshold": 256, "pool_id": 1, "phase": "TP",
+            "generation": 1, "t": t}
+
+
+def _front_with_reading(reading, **kw):
+    f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, **kw)
+
+    async def _stub():
+        return reading
+
+    f._d_pool_reading = _stub
+    return f
+
+
 def test_a1_a_seat_is_taken_only_when_the_store_read_can_be_issued(caplog):
     """(A) The coupling the postmortem named unaddressed: six seats x ~9k
     tokens against a 27,466-token pool bound.  The head WAITS in arrival
     order -- it is not skipped over, and it takes no seat -- and it is served
     the moment a running request frees its tokens.  The wait prints
-    ``WEG2 D-SEAT-WAIT`` with need/available/limit."""
+    ``WEG2 D-SEAT-WAIT`` with need/available/limit.
+
+    ROUND 4, the coverage half.  The round-3 version of this test asserted
+    "it is not skipped over" at a moment when the deque held exactly ONE
+    entry, so no mutation that lets a younger request overtake the oldest
+    could be seen: ``self._ready_for_d.rotate(-1)`` inside the blocked branch
+    left the suite 18/18 green.  There are now TWO waiters at the block, the
+    head does not fit and the younger one does, and the assertion is that the
+    younger one is STILL not admitted."""
 
     async def body():
-        f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=6,
-                  carrier_max_tokens=27466)
+        t0 = time.time()
+        f = _front_with_reading(_reading(27466, 0, 27466, t0), d_bs=6,
+                                carrier_max_tokens=27466)
         ps = []
-        for i in range(4):
+        for i, est in enumerate([8400, 8400, 8400, 8400, 100]):
             p = _bare_pending(f"r{i}")
-            p.est_prompt = 8400
+            p.est_prompt = est
             ps.append(p)
         f._ready_for_d.extend(ps)
         f._sync_batch_gate()
@@ -515,14 +604,21 @@ def test_a1_a_seat_is_taken_only_when_the_store_read_can_be_issued(caplog):
         with caplog.at_level(logging.INFO, logger=front_mod.logger.name):
             await asyncio.sleep(0.3)
             assert not ps[3].fut.done(), "3 x 8400 = 25200 of 27466; the 4th does not fit"
+            # LAW 2 WITH A REAL ALTERNATIVE PRESENT: r4 needs 100 tokens and
+            # 2266 are free, so only the arrival order keeps it waiting.
+            assert not ps[4].fut.done(), (
+                "law 2: a younger request that FITS may not overtake the blocked "
+                "head -- the admitter peeks and continues, it does not rotate")
+            assert list(f._ready_for_d) == [ps[3], ps[4]], (
+                "law 2: the head of the arrival queue is not skipped over and the "
+                "order behind it is untouched")
             assert f.seats_free() == 3, "and the COUNT alone would have admitted it"
-            assert f._ready_for_d and f._ready_for_d[0] is ps[3], (
-                "law 2: it keeps the head of the arrival queue, it is not skipped")
         text = caplog.text
         assert "WEG2 D-SEAT-WAIT" in text, text[-400:]
         assert "rid=r3" in text and "need=8400" in text
         assert "available=2266" in text and "limit=27466" in text
         assert "held_passes=" in text, "the suppressed-pass denominator"
+        assert "reading_age_s=" in text, "and the age of the numbers it decided on"
         ps[0].seat.release("leg2_finished")
         assert await _until(lambda: ps[3].fut.done()), (
             "a freed seat's tokens must come back with it, or the gate wedges")
@@ -533,15 +629,144 @@ def test_a1_a_seat_is_taken_only_when_the_store_read_can_be_issued(caplog):
 
 
 def test_a2_the_gate_never_starves_and_is_a_flag():
-    """It only ever DELAYS: a request alone in flight is admitted whatever it
-    costs (the oversized case is CARRIER-EXCEEDS's), and 0 disables it."""
+    """It only ever DELAYS: a request with no seat in use is admitted whatever
+    it costs (the oversized case is CARRIER-EXCEEDS's), and 0 disables it.
+
+    The no-seat term is load-bearing and not a courtesy: with nothing running
+    on D nothing will ever free a host row, so a gate that refused there would
+    wedge the queue for good."""
+    t0 = time.time()
+    r = _reading(available=10, occupied=0, limit=27466, t=t0)
     f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=6,
               carrier_max_tokens=1000)
-    assert f._d_token_budget_blocks("solo", 900000) is False
+    assert f._d_token_budget_blocks("solo", 900000, r) is False, "no seat in use"
+    Seat(f, "running", "batch", tokens=100)
+    assert f._d_token_budget_blocks("second", 900000, r) is True, "now it bounds"
     off = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=6,
                 carrier_max_tokens=27466, d_admit_max_tokens=0)
-    off._d_inflight_tokens = 10 ** 9
-    assert off._d_token_budget_blocks("r", 10 ** 9) is False
+    Seat(off, "running", "batch", tokens=10 ** 9)
+    assert off._d_token_budget_blocks("r", 10 ** 9, r) is False
+
+
+def test_a3_the_gate_prices_the_pool_by_the_pool_not_by_its_own_tally():
+    """ROUND 4, THE ROOT.  The round-1 gate compared ``_d_inflight_tokens``
+    (a counter written only by ``Seat``, therefore 0 at every D-epoch start)
+    against ``carrier_max_tokens``.  That indicator cannot see the STANDING
+    RESIDENCY that actually refuses the store read, and boot weg2sc1 refutes
+    it in the same second on both logs: the front's proxy said 27,466 rows
+    were free while group D printed ``#915 PREFETCH REFUSED
+    reason=vote_negative need=8629 available=5418 occupied=25100
+    limit=27466``.
+
+    The scenario below is that boot's shape: 25,100 rows of residency the
+    FRONT DID NOT CREATE, one small request running, and a 8,629-token head.
+    The round-1 arithmetic (100 + 8629 <= 27466) admits it and D refuses it;
+    the reading (8629 > 5418) holds it."""
+    t0 = time.time()
+    r = _reading(available=5418, occupied=25100, limit=27466, t=t0)
+    f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=6,
+              carrier_max_tokens=27466)
+    Seat(f, "small", "batch", tokens=100)
+    assert f._d_inflight_tokens() == 100, (
+        "the front's own tally is 100 -- the number round 1 decided on")
+    assert f._d_token_budget_blocks("weg2-0-4", 8629, r) is True, (
+        "the ALLOC term is D's available_size(), not budget-minus-my-tally")
+
+
+def test_a4_the_rate_term_is_d_s_own_brake():
+    """The second of D's two terms: ``prefetch_rate_limited`` refuses once the
+    REGISTERED prefetches hold the capacity, even with rows still free."""
+    t0 = time.time()
+    f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=6,
+              carrier_max_tokens=27466)
+    Seat(f, "small", "batch", tokens=100)
+    roomy = _reading(available=100000, occupied=27466, limit=27466, t=t0)
+    assert f._d_token_budget_blocks("r", 10, roomy) is True, "occupied >= limit"
+    assert f._d_token_budget_blocks("r", 10, _reading(100000, 0, 27466, t0)) is False
+
+
+def test_a5_grants_made_after_the_reading_are_charged_on_top_of_it():
+    """The window a reading cannot contain: a seat granted AFTER D sampled is
+    a store read D has not yet registered.  It is charged; a seat granted
+    before the reading is already in D's own numbers and is not charged
+    twice."""
+    t0 = time.time()
+    f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=6,
+              carrier_max_tokens=27466)
+    Seat(f, "before", "batch", tokens=9000)  # t_taken < t_reading
+    time.sleep(0.002)
+    t_read = time.time()
+    time.sleep(0.002)
+    r = _reading(available=10000, occupied=0, limit=27466, t=t_read)
+    assert f._d_charged_since(t_read) == 0, "already inside D's reading"
+    assert f._d_token_budget_blocks("r", 9000, r) is False
+    later = Seat(f, "after", "batch", tokens=9000)
+    assert later.t_taken >= t_read
+    assert f._d_charged_since(t_read) == 9000
+    assert f._d_token_budget_blocks("r", 9000, r) is True, (
+        "9000 of the 10000 rows are already promised to a grant D has not seen")
+
+
+def test_a6_no_reading_means_the_gate_is_off_and_says_so(caplog):
+    """A NAMED refusal, never a silent fallback.  With no reading the front
+    must NOT substitute its own admission tally -- that is the exact quantity
+    round 3 found wrong -- so the gate goes off and prints why, once."""
+
+    class _DeadSession:
+        def get(self, *a, **k):
+            raise RuntimeError("group D is not answering")
+
+    async def body():
+        f = Front("http://p", "http://d", "D", "t", "", 0, 0, {}, 45.0, d_bs=6,
+                  carrier_max_tokens=27466)
+        f.session = _DeadSession()
+        Seat(f, "running", "batch", tokens=27466)
+        with caplog.at_level(logging.WARNING, logger=front_mod.logger.name):
+            assert await f._d_pool_reading() is None
+            assert await f._d_pool_reading() is None
+        assert f._d_token_budget_blocks("r", 10 ** 9, None) is False, (
+            "gate OFF, not a fallback to the front-local tally")
+        assert caplog.text.count("WEG2 D-POOL UNREADABLE") == 1, "once, not per pass"
+        assert f.counters["d_pool_read_failed"] == 2
+
+    asyncio.run(body())
+
+
+def test_a7_the_reading_is_group_d_s_own_915_terms():
+    """ANTI-DRIFT.  What the front reads must be what D's own #915 line
+    prints, term for term -- otherwise the front decides on one arithmetic and
+    D refuses on another, which is the round-3 finding one layer down."""
+    from sglang.srt.mem_cache.prefetch_budget import prefetch_residency
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    pool = SimpleNamespace(size=30518, available_size=lambda: 5418, anchor_entry=None)
+    cc = SimpleNamespace(mem_pool_host=pool, prefetch_tokens_occupied=25100,
+                         prefetch_capacity_limit=27466)
+    cache = SimpleNamespace(cache_controller=cc, prefetch_threshold=256)
+    got = prefetch_residency(cache)
+    line = UnifiedRadixCache._prefetch_line_terms(cache, 8629)
+    for term in ("available", "occupied", "limit"):
+        assert got[term] == line[term], f"{term} drifted from the #915 line"
+    assert (got["available"], got["occupied"], got["limit"]) == (5418, 25100, 27466)
+    assert prefetch_residency(SimpleNamespace()) is None, "no controller, no reading"
+
+
+def test_a8_the_reading_is_published_on_the_endpoint_the_front_polls():
+    """The channel itself.  Without this assignment the front has no number
+    and the gate is permanently off -- green suite, dead coupling."""
+    tree = _fn_ast(Scheduler.get_internal_state)
+    calls = _calls_named(tree, "prefetch_residency") + [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id == "prefetch_residency"
+    ]
+    assert calls, "get_internal_state must publish the host-pool reading"
+    keys = [
+        n.slice.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
+    ]
+    assert "hicache_prefetch" in keys, "under the key the front reads"
 
 
 # ================================= bb: the W27 root, carrier-less PP admission
