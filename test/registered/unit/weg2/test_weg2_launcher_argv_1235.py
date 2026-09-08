@@ -158,3 +158,44 @@ class TestTokenVector1032(unittest.TestCase):
         ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
         self.assertIsNone(ns.d_uneven_token_vector)
         self.assertEqual(ns.d_uneven_token_vector_role, "pin")
+
+
+class TestDecodeStepsProvenance1030(unittest.TestCase):
+    """#1030: one provenance sentence, three readers, and it keeps the confound.
+
+    Group D's overlap + decode-steps defaults are CLOSED on the train (overlap
+    is P-only by justification and D gets it by absence; the steps default is
+    measured). What was open is the CITATION: the constant's comment carried
+    the confound the measuring boot recorded about its own headline number and
+    the other two copies -- ``--help`` and the boot's SCHEDULER: line -- had
+    dropped it. A provenance sentence that degrades between copies reads as
+    evidence while being less than the record supports.
+    """
+
+    def test_the_sentence_states_the_pair_and_refuses_the_overlap_alone_reading(self):
+        from sglang.srt.weg2.launcher import D_DECODE_STEPS_PROVENANCE as prov
+
+        self.assertIn("+14.0 %", prov)  # the pair, D2 vs D0
+        self.assertIn("CONFOUNDED", prov)  # the record's own word
+        self.assertIn("-7.35 %", prov)  # overlap+buffer measured NEGATIVE
+        self.assertIn("+23.1 %", prov)  # the unconfounded steps knob, D2 vs D1
+        self.assertIn("73.6", prov)  # D3 regresses -- an optimum, not a direction
+
+    def test_help_quotes_the_same_sentence_and_still_renders(self):
+        from sglang.srt.weg2.launcher import D_DECODE_STEPS_PROVENANCE as prov
+
+        # argparse evaluates help as `help % params`; one bare '%' would make
+        # --help raise for every flag, so the escape is part of the mechanism.
+        text = build_parser().format_help()
+        for fragment in ("CONFOUNDED", "+23.1 %", "-7.35 %"):
+            self.assertIn(fragment, text)
+        self.assertNotIn("%%", prov)
+
+    def test_overlap_stays_group_p_s_flag_and_d_gets_it_by_absence(self):
+        argv = argv_d("py", MODEL, BUDGETS, 8, 1024, 8.0, [])
+        self.assertNotIn("--disable-overlap-schedule", argv)
+        self.assertEqual(_flag_value(argv, "--mamba-radix-cache-strategy"), "extra_buffer")
+        back = argv_d("py", MODEL, BUDGETS, 8, 1024, 8.0, [], disable_overlap=True)
+        self.assertIn("--disable-overlap-schedule", back)
+        # the strategy FOLLOWS the overlap choice; it is not a second knob.
+        self.assertEqual(_flag_value(back, "--mamba-radix-cache-strategy"), "no_buffer")

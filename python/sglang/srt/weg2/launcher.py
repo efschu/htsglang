@@ -505,14 +505,53 @@ ATTN_ANCHOR_PREFIX_TOKENS = 262144
 #: mistaken for a table read at this rig's real mean prefix.
 DESIGN_PREFIX_FALLBACK_TOKENS = 4096
 
-#: #1240 decode defaults. MEASURED on boot weg2pp1 (arms table row D2 of
-#: /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md): overlap ON with
-#: --num-continuous-decode-steps 2 and the paired extra_buffer mamba strategy
-#: reads 75.5 tok/s at bs1 and 305.0 at bs6, against the D0 control's 66.2 /
-#: 284.9 -- +14.0 % / +7.1 %. Row D3 (steps 4) REGRESSES to 73.6 / 295.6, so
-#: 2 is an optimum and not a direction. The steps knob is the unconfounded
-#: half of that boot (D1 -> D2 -> D3 all run overlap ON and extra_buffer).
+#: #1240/#1030 decode defaults, MEASURED on boot weg2pp1.
 D_NUM_CONTINUOUS_DECODE_STEPS = 2
+
+#: THE PROVENANCE OF THAT 2, WRITTEN ONCE (#1030).
+#:
+#: It used to be written three times -- in this constant's comment, in
+#: --num-continuous-decode-steps' help, and in the boot's SCHEDULER: line --
+#: and the three copies had already drifted: only the comment carried the
+#: CONFOUND that the measuring boot recorded about its own headline number.
+#: That is the shape the operator's own briefing rule names (a paragraph
+#: retyped into N places degrades by the third); a provenance sentence that
+#: degrades is worse than none, because it reads as evidence.
+#:
+#: So there is one sentence and three readers. The help escapes its percent
+#: signs (argparse evaluates every help string as `help % params`, so one bare
+#: '%' makes --help raise for ALL flags); the log line and this comment take it
+#: verbatim.
+#:
+#: WHAT THE RECORD /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md ACTUALLY
+#: SUPPORTS, arms table rows D0-D3:
+#:   * D2 (overlap ON, steps 2, extra_buffer) 75.5 tok/s bs1 / 305.0 bs6
+#:     against the D0 control (overlap OFF, steps 1, no_buffer) 66.2 / 284.9 =
+#:     +14.0 % / +7.1 %. That is the PAIR, and it is what the default buys.
+#:   * It is NOT an overlap-alone number and the record says so in its own
+#:     words: "The overlap delta is CONFOUNDED and must not be quoted as an
+#:     overlap-alone number" -- D0 runs --mamba-radix-cache-strategy no_buffer
+#:     and D1/D2/D3 run extra_buffer, so D1-D0 is overlap+buffer jointly, and
+#:     it measured NEGATIVE: 61.4 vs 66.2 = -7.35 % at bs1, -1.68 % at bs6.
+#:   * The UNCONFOUNDED half is the steps knob alone (D1 -> D2 -> D3, all
+#:     overlap ON, all extra_buffer): D2 vs D1 = +23.1 % bs1 / +8.9 % bs6, and
+#:     D3 (steps 4) regresses to 73.6 / 295.6. So 2 is an optimum, not a
+#:     direction, and the steps knob is the half carrying the pair's gain.
+D_DECODE_STEPS_PROVENANCE = (
+    "MEASURED, not chosen (boot weg2pp1, /spinning/gpu-arb/weg2/"
+    "BOOT_weg2pp1_0907.md arms table). THE PAIR overlap ON + "
+    "--num-continuous-decode-steps 2 + the paired extra_buffer mamba strategy "
+    "(row D2) reads 75.5 tok/s at bs1 and 305.0 at bs6 against the D0 control "
+    "(overlap OFF, steps 1, no_buffer) 66.2 / 284.9 = +14.0 % / +7.1 %. THAT "
+    "IS A PAIR AND NOT AN OVERLAP NUMBER, in the record's own words: 'The "
+    "overlap delta is CONFOUNDED and must not be quoted as an overlap-alone "
+    "number' -- D1 vs D0 moves the buffer strategy with the schedule and "
+    "measured NEGATIVE, 61.4 vs 66.2 = -7.35 % at bs1. The UNCONFOUNDED half "
+    "is the steps knob alone (D1 -> D2 -> D3, all overlap ON, all "
+    "extra_buffer): D2 vs D1 = +23.1 % bs1 / +8.9 % bs6, and row D3 (steps 4) "
+    "REGRESSES to 73.6 / 295.6 -- so 2 is an optimum, not a direction, and the "
+    "steps knob is the half that carries the pair's gain."
+)
 
 #: #1017 GROUP D'S WEIGHT-VECTOR OBJECTIVE -- the knob, not a second solver.
 #:
@@ -4248,11 +4287,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=D_NUM_CONTINUOUS_DECODE_STEPS,
         help=f"Group D only. Decode steps run per scheduler visit "
              f"(server_args.py:1424). Default "
-             f"{D_NUM_CONTINUOUS_DECODE_STEPS} is MEASURED, not chosen: arms "
-             f"table row D2 of /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md "
-             f"reads 75.5 tok/s at bs1 and 305.0 at bs6 against the D0 "
-             f"control's 66.2 / 284.9 (+14.0 %% / +7.1 %%), and row D3 shows 4 "
-             f"REGRESSES to 73.6 / 295.6. Pass 1 to restore the shipped value.",
+             f"{D_NUM_CONTINUOUS_DECODE_STEPS}: "
+             # ONE sentence, three readers -- see D_DECODE_STEPS_PROVENANCE.
+             # argparse renders every help as `help % params`, so the percent
+             # signs are escaped HERE rather than kept doubled in the constant,
+             # which the log line prints verbatim.
+             + D_DECODE_STEPS_PROVENANCE.replace("%", "%%")
+             + " Pass 1 to restore the shipped value.",
     )
     ap.add_argument(
         "--d-tp-objective", choices=list(D_TP_OBJECTIVE_CHOICES),
@@ -4611,11 +4652,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "hybrid-mamba resolution picks extra_buffer for "
             "Qwen3_5ForConditionalGeneration on linear_attn_backend=triton). "
             f"--num-continuous-decode-steps {ns.num_continuous_decode_steps} "
-            f"on D (default {D_NUM_CONTINUOUS_DECODE_STEPS} is MEASURED, cited "
-            f"to /spinning/gpu-arb/weg2/BOOT_weg2pp1_0907.md arms table row "
-            f"D2: 75.5 tok/s bs1 and 305.0 bs6 against the D0 control's 66.2 / "
-            f"284.9 = +14.0 % / +7.1 %, with row D3 showing steps 4 regresses "
-            f"to 73.6 / 295.6 -- an optimum, not a direction). "
+            f"on D (default {D_NUM_CONTINUOUS_DECODE_STEPS}). "
+            + D_DECODE_STEPS_PROVENANCE
+            + " "
             + d_overlap_cost_line(ns.model, False)
         )
     if ns.p_hicache_write_policy != "write_through":
