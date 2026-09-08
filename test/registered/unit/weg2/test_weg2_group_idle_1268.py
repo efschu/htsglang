@@ -108,10 +108,11 @@ class TheVerdictOnAScheduler(CustomTestCase):
         )
         # #1268 fix 1b: a real Scheduler always has this; the
         # stand-in must too, or it tests a shape that cannot exist.
-        s.pp_group = SimpleNamespace(is_last_rank=True)
-        s._weg2_commit_owed_forward = (
-            Scheduler._weg2_commit_owed_forward.__get__(s)
-        )
+        s.pp_group = SimpleNamespace(is_last_rank=True, is_first_rank=True)
+        # #1268 fix 1c: the verdict is decided from `ps`, not from a cpu_group
+        # -- there is no collective on this path any more (see the WITHDRAWN
+        # blocks in `group_idle_verdict`'s docstring).
+        s.ps = SimpleNamespace(pp_rank=0, pp_size=1)
         s.group_idle_verdict = Scheduler.group_idle_verdict.__get__(s)
         return s
 
@@ -126,20 +127,23 @@ class TheVerdictOnAScheduler(CustomTestCase):
         self.assertFalse(ok)
         self.assertIn("43c9af54", detail)
 
-    def test_an_unavailable_verdict_refuses_rather_than_assumes_idle(self):
-        """UNDECIDED IS NOT IDLE. If the reduce cannot be taken, answering with
-        this rank's own optimistic verdict is the whole defect again."""
+    def test_an_undecided_verdict_refuses_rather_than_assumes_idle(self):
+        """UNDECIDED IS NOT IDLE -- restated for the shape that replaced the
+        reduce.
 
-        class Boom:
-            pass
-
+        ADAPTED, not deleted: the old body built an unreadable `cpu_group` and
+        asserted the reduce refused rather than falling through to this rank's
+        own answer. Fix 1c removes the collective entirely, so "the reduce
+        could not be taken" is no longer a reachable state; the state that
+        replaced it is "the lap has not come home yet", and it must refuse for
+        exactly the same reason.
+        """
         s = self._sched(True, [])
-        s.world_group = SimpleNamespace(cpu_group=Boom())
+        s.ps = SimpleNamespace(pp_rank=0, pp_size=3)
         ok, detail = s.group_idle_verdict()
-        self.assertFalse(ok, "an unreadable group must not answer 'idle'")
-        self.assertTrue(
-            "UNAVAILABLE" in detail or "single-rank" in detail, detail
-        )
+        self.assertFalse(ok, "an undecided group must not answer 'idle'")
+        self.assertIn("PENDING", detail)
+        self.assertIn("UNDECIDED IS NOT IDLE", detail)
 
 
 class TheWiring(CustomTestCase):
@@ -174,91 +178,52 @@ class TheWiring(CustomTestCase):
         )
 
 
-class TheSb2RingShape(CustomTestCase):
-    """FIX 1b, red-first: only rank 0 receives the RPC.
+class TheSb2RingShapeIsWithdrawn(CustomTestCase):
+    """FIX 1B'S FIVE TESTS ARE REPLACED, AND THIS SAYS WHY RATHER THAN VANISHING.
 
-    THE METAL REFUTATION of fix 1 (boot weg2sb2, bb3617e2aa). Gate (a) held --
-    assert 0, W29 0, first flip 3215 ms -- and the SECOND flip deadlocked in the
-    reduce. py-spy, two passes 60 s apart, identical: PP0 in `bounded_wait <-
-    group_idle_verdict <- flush_cache`, PP1 in `join`, PP2 in `_join
-    (pp_object_recv)`.
+    What stood here asserted that `_weg2_commit_owed_forward` delivers the
+    forwarded RPC to rank+1 before the blocking reduce, and therefore that the
+    reduce terminates (#631 clause (ii)). Every one of those five was GREEN,
+    and boot weg2sb3 deadlocked anyway, identically to sb2.
 
-    Fix 1's premise -- "flush_cache is a broadcast control request every rank
-    processes" -- was argued from three ranks logging their verdict inside one
-    second on sb1. That evidence is equally consistent with the PP RING
-    FORWARDING them one after another, which is what happens: `/flush_cache` is
-    an RPC only PP0 receives; the followers get it over the #791 ring lap.
+    THE TESTS WERE GREEN BECAUSE THE MODEL WAS WRONG, not because the code was
+    right: the ring they built made rank k+1 reachable exactly when rank k
+    committed its request-chain forward. The six py-spy stacks say the
+    followers were never in the request-chain receive at all -- they were in
+    `_pp_recv_dict_from_prev_stage`, the hidden-states/proxy channel, waiting
+    for a send PP0 issues LATER IN ITS OWN PASS. A model that cannot express
+    "the peer is blocked on a different channel" cannot fail on the defect,
+    and #631's own docstring had already named that shape as `variant B`.
 
-    `_pp_forward_and_process_input_requests` does forward BEFORE
-    `process_input_requests`, so ordering was never the gap. The gap is that the
-    forward is an ASYNC send committed only at the next pass's top (or by
-    `_pp_commit_pending_req_work` at iteration end, #788) -- neither of which a
-    rank blocked in the reduce ever reaches. That is #631 clause (ii), whose own
-    comment names this as the measured `variant A`.
+    So the helper is DELETED (it has no work to do once nothing blocks) and
+    the topology is modelled honestly in
+    `test_weg2_idle_vote_lap_1268.py::build_ring`, where a follower becomes
+    reachable only when its predecessor FINISHES A PASS.
     """
 
-    def _ring(self, world=3, idle=(True, True, True)):
-        """A three-rank ring: rank 0 holds the RPC, the others are reached only
-        by the forwarded message, and a rank that has not been forwarded to
-        cannot join the reduce."""
-        state = {"forwarded": set(), "joined": set()}
+    def test_the_fix1b_helper_is_deleted(self):
+        self.assertFalse(
+            hasattr(Scheduler, "_weg2_commit_owed_forward"),
+            "fix 1b's helper must not survive the shape it existed to support",
+        )
 
-        def make(rank):
-            s = SimpleNamespace(
-                is_fully_idle=lambda r=rank: idle[r],
-                idle_blockers=lambda r=rank: ([] if idle[r] else [f"blocker_r{r}"]),
-                world_group=SimpleNamespace(cpu_group=None),
-                collective_timeout_s=5.0,
-                send_req_work=object() if rank < world - 1 else None,
-                pp_group=SimpleNamespace(is_last_rank=(rank == world - 1)),
-            )
-            # committing the owed forward is what delivers to rank+1
-            s._pp_commit_comm_work = lambda w, r=rank: state["forwarded"].add(r + 1)
-            s._weg2_commit_owed_forward = Scheduler._weg2_commit_owed_forward.__get__(s)
-            return s
-
-        return [make(r) for r in range(world)], state
-
-    def test_red_first_a_rank_that_never_forwards_strands_its_followers(self):
-        """THE SB2 DEADLOCK, as a property: if rank 0 joins without committing
-        its forward, rank 1 was never delivered to and cannot join."""
-        ranks, state = self._ring()
-        # rank 0 joins WITHOUT committing -- fix 1's behaviour
-        self.assertNotIn(1, state["forwarded"], "rank 1 has not been delivered to")
-
-    def test_committing_the_owed_forward_delivers_to_the_next_rank(self):
-        ranks, state = self._ring()
-        ranks[0]._weg2_commit_owed_forward()
-        self.assertIn(1, state["forwarded"], "clause (ii): the send is completed")
-        self.assertIsNone(ranks[0].send_req_work, "and the handle is cleared")
-
-    def test_the_last_stage_owes_no_forward(self):
-        """#631 clause (iii): it joins directly and must not block on a commit."""
-        ranks, state = self._ring()
-        ranks[2]._weg2_commit_owed_forward()
-        self.assertEqual(state["forwarded"], set(), "last rank forwards nothing")
-
-    def test_a_commit_that_raises_does_not_kill_the_verdict(self):
-        """The reduce refuses by name; the commit must not raise past it."""
-        ranks, _ = self._ring()
-
-        def boom(w):
-            raise RuntimeError("send handle already consumed")
-
-        ranks[0]._pp_commit_comm_work = boom
-        ranks[0]._weg2_commit_owed_forward()  # must not raise
-
-    def test_the_commit_precedes_the_join_in_the_verdict(self):
-        """WIRING: the commit is worthless after the block."""
+    def test_the_answer_path_takes_no_collective(self):
+        """The one property all five old tests were trying to buy."""
         import inspect
 
         src = inspect.getsource(Scheduler.group_idle_verdict)
-        self.assertIn("_weg2_commit_owed_forward()", src)
-        self.assertLess(
-            src.index("_weg2_commit_owed_forward()"),
-            src.index("all_reduce("),
-            "clause (ii): commit the owed forward BEFORE joining",
-        )
+        for banned in ("all_reduce", "bounded_wait", "barrier", "all_gather"):
+            self.assertNotIn(banned, src, f"{banned} is back on the answer path")
+
+    def test_the_replacement_ring_test_exists_and_models_the_other_channel(self):
+        import os
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        repl = os.path.join(here, "test_weg2_idle_vote_lap_1268.py")
+        self.assertTrue(os.path.exists(repl), "the replacement suite is missing")
+        body = open(repl, encoding="utf-8").read()
+        self.assertIn("HIDDEN-STATES", body)
+        self.assertIn("FINISHED ITS PASS", body)
 
 
 class ParticipationIsAFact(CustomTestCase):
@@ -292,26 +257,49 @@ class ParticipationIsAFact(CustomTestCase):
         self.assertNotEqual(out[1], 3)
 
     def test_the_verdict_refuses_on_short_participation(self):
+        """ADAPTED to fix 1c's carrier: the same fact, now counted from the
+        slots on the object instead of from a reduce's output vector."""
+        from sglang.srt.managers.weg2_idle_vote import Weg2IdleVoteReq, attach_slot, tally
+
+        vote = Weg2IdleVoteReq(epoch=1, origin=0, world=3)
+        attach_slot(vote, 0, True, "none")
+        attach_slot(vote, 1, True, "none")
+        t = tally(vote)
+        self.assertFalse(t.complete)
+        self.assertFalse(t.idle, "a subset must never answer for the whole")
+        self.assertEqual(list(t.missing_ranks), [2])
         import inspect
 
         src = inspect.getsource(Scheduler.group_idle_verdict)
         self.assertIn("GROUP VERDICT SHORT", src)
-        self.assertIn("n_present < world", src)
 
     def test_every_rank_emits_the_verdict_line(self):
-        """sb2's reduce printed NOTHING on any rank."""
-        import inspect
+        """sb2's reduce printed NOTHING on any rank. The line now has a REAL
+        epoch: `weg2_flip_epoch` had one reader and zero writers, so every
+        boot's verdict line printed the literal `epoch=?`."""
+        from sglang.srt.managers.weg2_idle_vote import Weg2IdleVoteReq, attach_slot, log_verdict
 
-        src = inspect.getsource(Scheduler.group_idle_verdict)
-        self.assertIn("WEG2-P-IDLE-VERDICT", src)
-        for field in ("epoch=", "idle=", "blocking_rank=", "blockers=[", "participation="):
-            self.assertIn(field, src)
+        vote = Weg2IdleVoteReq(epoch=42, origin=0, world=3)
+        for r in range(3):
+            attach_slot(vote, r, True, "none")
+        line = log_verdict(vote, 1)
+        self.assertIn("WEG2-P-IDLE-VERDICT", line)
+        self.assertIn("epoch=42", line)
+        self.assertNotIn("epoch=?", line)
+        for field in ("idle=", "blocking_rank=", "blockers=[", "participation="):
+            self.assertIn(field, line)
 
-    def test_no_bare_timeout_error_reaches_the_front(self):
-        import inspect
+    def test_no_bare_refusal_reaches_the_front(self):
+        """ADAPTED: sb3 stopped the front on the literal `'TimeoutError: '`.
+        There is no gloo timeout on this path any more, so the property is
+        restated against the refusal that replaced it -- it must name the
+        ranks whose slot is missing."""
+        from sglang.srt.managers.weg2_idle_vote import Weg2IdleVoteReq, refusal_detail, tally
 
-        src = inspect.getsource(Scheduler.group_idle_verdict)
-        self.assertIn("no message: gloo timeouts carry none", src)
+        vote = Weg2IdleVoteReq(epoch=5, origin=0, world=3)
+        detail = refusal_detail(vote, tally(vote), "GROUP VERDICT SHORT:")
+        self.assertIn("[0, 1, 2]", detail)
+        self.assertNotEqual(detail.strip(), "TimeoutError:")
 
 
 register_cpu_ci(__file__)

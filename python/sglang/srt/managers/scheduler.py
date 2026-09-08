@@ -106,6 +106,7 @@ from sglang.srt.managers.corridor_admission import (
     guard_prefill_admission,
 )
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.weg2_idle_vote import refusal_detail, tally
 from sglang.srt.managers.wedge_recovery import drain_recovery_request
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -14675,9 +14676,15 @@ class Scheduler(
         # at 14:29:59 -> W29 -> group death. The comment above judged this
         # verdict rank-uniform "while waiting_queue is replicated", which is
         # true of the REQUEST clauses and not of the HiCache in-flight ones.
-        # `group_idle_verdict` reduces every rank's own answer into one, so the
-        # entrypoint can no longer answer for a busy peer. World <= 1 keeps the
-        # stock path byte-identical.
+        #
+        # #1268 FIX 1C -- WHAT IS AND IS NOT MADE GROUP-WIDE. The FACT THAT
+        # LEAVES THE GROUP is reduced over every rank; the flush ACTION below
+        # stays rank-local, exactly as upstream has it. sb1 did not die of a
+        # divergent flush -- three ranks flushing their own pools on their own
+        # idleness is correct and always was. It died because the front took
+        # PP0's answer for P's and commanded sleep(P, kv_cache) on it. So the
+        # one-verdict law binds the ANSWER, and only the rank that answers the
+        # RPC has to take it. World <= 1 keeps the stock path byte-identical.
         group_idle, verdict_detail = self.group_idle_verdict()
         if group_idle:
             self.cur_batch_for_debug = None
@@ -14722,40 +14729,6 @@ class Scheduler(
             success = False
         return success
 
-    def _weg2_commit_owed_forward(self) -> None:
-        """#631 clause (ii): complete the forward this rank owes, then join.
-
-        A no-op off PP, on the last stage (which owes no forward), and when no
-        send handle is outstanding. Targeted: it commits the ONE handle
-        `_pp_forward_and_process_input_requests` just issued, never a blanket
-        synchronous barrier -- clause (ii) forbids the latter by name.
-
-        Failure here is deliberately NOT fatal: it is reported and the caller
-        proceeds to the reduce, which now carries a participation slot and will
-        refuse by name if a peer is missing. A commit that raised is exactly the
-        case where the peer may not have the message, so the refusal is the
-        right outcome and a raise would only lose the reason.
-        """
-        try:
-            pp_group = getattr(self, "pp_group", None)
-            if pp_group is None or getattr(pp_group, "is_last_rank", True):
-                return
-            work = getattr(self, "send_req_work", None)
-            if work is None:
-                return
-            commit = getattr(self, "_pp_commit_comm_work", None)
-            if commit is None:
-                return
-            commit(work)
-            self.send_req_work = None
-        except Exception as exc:  # noqa: BLE001 - the reduce refuses, not this
-            logger.warning(
-                "#1268 fix 1b: committing the owed ring forward before the idle "
-                "reduce raised %r; joining anyway -- the participation slot is "
-                "what decides, and a missing peer is now a NAMED refusal",
-                exc,
-            )
-
     def group_idle_verdict(self) -> Tuple[bool, str]:
         """#1268: is THE GROUP idle -- not "is this rank idle".
 
@@ -14775,268 +14748,98 @@ class Scheduler(
         rank-side assert in ``release_memory_occupation`` and the whole group
         died by W29 at 14:29:59.
 
-        `flush_cache`'s own comment had judged this verdict "rank-local ...
-        rank-UNIFORM only while waiting_queue is replicated", and that premise
-        is sound for the REQUEST clauses. It does not extend to the HiCache
-        in-flight clauses: ``ongoing_prefetch`` is not a function of the
-        replicated queues, and on sb1 exactly one rank held one orphaned
-        record. The premise was right about its own scope and the clause that
-        diverged sat outside it.
+        TWO CLAIMS THIS DOCSTRING USED TO MAKE ARE WITHDRAWN, both refuted on
+        metal, and both are quoted here rather than deleted because a reader
+        who only sees the current text cannot tell which shapes were already
+        tried.
 
-        SO THE FACT IS MADE GROUP-UNIFORM AT ITS SOURCE, which is the
-        one-verdict law: every rank contributes its own answer to ONE reduce,
-        every rank leaves with the same verdict, and the answer the entrypoint
-        returns IS the group's. No rank-local compensation, no retry-until-idle
-        loop on the rank, and the rank-side assert stays exactly as it was --
-        it is the fence, and after this it should never be the thing that
-        fires.
+        WITHDRAWN (fix 1): *"this method is reached by every rank of the group
+        on the same broadcast control request"*. ``/flush_cache`` is an RPC
+        only PP0 receives; the followers get it over the #791 ring lap, and
+        sb1's three log lines inside one second were that ring forwarding
+        sequentially. Boot weg2sb2 deadlocked on this.
 
-        ONE COLLECTIVE, three exact answers. ``[n_idle, n_present, mask]``
-        reduced with SUM: element 0 counts the idle votes, element 1 counts who
-        ARRIVED, and element 2 is a bitmask whose bits are disjoint by
-        construction (one per rank), so its set bits name every blocking rank
-        and its lowest bit the first. SUM rather than MIN because MIN cannot
-        COUNT -- three ranks each contributing -1 reduce to -1, not -3 -- and
-        participation is the fact fix 1b exists to carry. A gather would bring
-        the blocker strings too, but gloo's ``all_gather_object`` has no timeout
-        (see ``_weg2_group_fence_impl``'s own note on why its barrier runs
-        first) and this runs on the front's 0.5 s quiesce poll; a three-int
-        reduce under the existing bounded wait is the cheap, bounded shape.
+        WITHDRAWN (fix 1b): *"The reduce is now safe ... because this rank
+        COMMITS THE FORWARD IT OWES before joining (#631 clause (ii)), after
+        which that invariant's own induction delivers the peers."* Boot
+        weg2sb3 deadlocked IDENTICALLY, and the six py-spy stacks say why: the
+        followers were never waiting on that forward. They were parked in
+        ``_pp_recv_dict_from_prev_stage`` -- the HIDDEN-STATES / proxy
+        tensor-dict channel, one channel over -- waiting for a proxy send PP0
+        issues LATER IN ITS OWN PASS. Committing the request-chain handle
+        cannot open that cycle. #631's docstring had already named this exact
+        shape as its measured ``variant B``: "deadlocks against the
+        HIDDEN-STATES exchange, because a peer need not be in the chain recv
+        at all".
 
-        FIX 1B, AND THE CLAIM IT WITHDRAWS. Fix 1 asserted here that this method
-        "is reached by every rank of the group on the same broadcast control
-        request", citing sb1's three flush verdicts inside one second. Boot
-        weg2sb2 refuted it: ``/flush_cache`` is an RPC only PP0 receives, the
-        followers get it over the #791 ring lap, and those three log lines were
-        the ring forwarding sequentially -- evidence equally consistent with
-        both readings, and the wrong one was taken. The reduce is now safe not
-        because every rank arrives simultaneously but because this rank COMMITS
-        THE FORWARD IT OWES before joining (#631 clause (ii),
-        :meth:`_weg2_commit_owed_forward`), after which that invariant's own
-        induction delivers the peers. Participation is then MEASURED rather than
-        assumed, and a short reduce refuses by name.
+        SO THE ANSWER PATH NO LONGER BLOCKS AT ALL. The vote is a control
+        object that rides the request-chain arc the group is already running,
+        gathers one rank-local slot per hop, and comes home to PP0 on a
+        dedicated stream (:mod:`sglang.srt.managers.weg2_idle_vote`, which
+        carries the full argument and the six stacks' reading). This method
+        only STAMPS a want and READS a landed lap; it never waits for a peer.
 
-        Returns ``(group_idle, detail)``. With no group to reduce over -- world
-        <= 1, no cpu group, no distributed -- it returns this rank's own answer
-        unchanged, so a single-rank engine and every stock path are
+        Returns ``(group_idle, detail)``. Off PP, at ``pp_size <= 1``, and on
+        every rank that is not the entrypoint, it returns this rank's own
+        answer unchanged -- so a single-rank engine and every stock path are
         byte-identical.
         """
-        # #1272: COLLECT BEFORE VOTING, and do it HERE because this is the one
-        # point on the quiesce path every rank reaches together.
-        #
-        # The sb1 deadlock, in one sentence: the only collector of an orphaned
-        # storage prefetch is `_drain_prefetch_progress`, which hangs off the
-        # admission path, so at `#queue-req: 0` it is never walked -- and the
-        # orphan is precisely what keeps the queue at 0 from becoming idle.
-        # PP2 polled it 2964 times over 30 s with zero movement, because the
-        # thing it polled (`check_hicache_events`) does not reach the collector.
-        # With #1268 that stops being a death and becomes a W3 refusal LOOP: P
-        # can never sleep until some new admission happens to walk the
-        # collector. The fix is not a new collector -- it is running the
-        # existing one where the group is already in lockstep.
-        #
-        # WHY THIS POINT AND NOT THE IDLE PATH: `_drain_prefetch_progress`
-        # carries a collective (`drain_retired_prefetch` ->
-        # `_all_reduce_attn_groups`), so a rank-local trigger is the #580
-        # failure.
-        #
-        # #1268 FIX 1B CORRECTION: this used to justify the placement with
-        # "reached by every rank on the same broadcast control request --
-        # measured on sb1, where all three ranks logged their flush verdict
-        # inside the same second". THAT IS WITHDRAWN -- sb2 deadlocked on it.
-        # The three lines were the #791 ring forwarding one rank after another,
-        # not a simultaneous broadcast. What makes BOTH this collector and the
-        # vote below safe is the owed-forward commit above (#631 clause (ii)),
-        # which is why the collector must stay AFTER it and before the vote.
-        #
-        # STATED RESIDUAL RISK, not hidden: the PER-RID `check_prefetch_progress`
-        # calls inside the collector are driven by each rank's OWN orphan set,
-        # and sb1 proves those sets can differ (see the #1272 retraction at the
-        # orphan loop). Those calls carry attn-group collectives which are
-        # world-1 under this form, so they are no-ops today; under a form with
-        # tp_size > 1 this needs a group-agreed per-rid round before it is safe.
-        # That is not introduced here -- the current code already has this
-        # exposure on its admission-path calls -- but it is now written down.
-        if getattr(self, "enable_hicache_storage", False):
-            try:
-                self._drain_prefetch_progress()
-            except Exception as exc:  # noqa: BLE001 - a collection may not kill the vote
-                logger.warning(
-                    "#1272 orphan collection before the idle vote raised %r; "
-                    "the vote proceeds on the uncollected state (which will "
-                    "refuse, not sleep)",
-                    exc,
-                )
-
-        # #1268 FIX 1b -- CLAUSE (ii) OF #631, WHICH FIX 1 VIOLATED.
-        #
-        # THE METAL VERDICT, boot weg2sb2 (bb3617e2aa): gate (a) held -- assert
-        # 0, W29 0, first flip 3215 ms -- and the SECOND flip deadlocked in this
-        # reduce. py-spy, two passes 60 s apart, identical: PP0 in
-        # `bounded_wait <- group_idle_verdict <- flush_cache`, PP1 in
-        # `join (hicache_collective.py:491)`, PP2 in `_join (pp_object_recv)`.
-        #
-        # MY PREMISE WAS FALSE AND THE TREE ALREADY SAID SO. Fix 1 argued
-        # "`flush_cache` is a broadcast control request every rank processes",
-        # on the strength of three ranks logging their flush verdict inside one
-        # second on sb1. That evidence is equally consistent with the PP RING
-        # FORWARDING them one after another, which is what actually happens:
-        # `/flush_cache` is an RPC only PP0 receives, and the followers get it
-        # over the #791 ring lap.
-        #
-        # `_pp_forward_and_process_input_requests` DOES forward before it calls
-        # `process_input_requests`, so the ordering was never the gap. The gap
-        # is that the forward is an ASYNC send whose handle is committed only at
-        # the TOP OF THE NEXT PASS (or by `_pp_commit_pending_req_work` at the
-        # end of the iteration, #788) -- and a rank blocked in here never
-        # reaches either. That is `#631` clause (ii) verbatim: "before joining,
-        # a rank that owes an arm forward must have THAT SPECIFIC send completed
-        # -- a targeted commit of the one work handle". Its own comment names my
-        # failure as the measured `variant A`: "rank 0 issued an async forward,
-        # armed, and blocked in the reduction before the send was ever
-        # progressed ... py-spy: rank 0 in bounded_collective".
-        #
-        # So the fix is not a new site. It is the commit the invariant already
-        # prescribes, taken HERE, before the join -- after which the induction in
-        # that docstring makes the blocking reduce safe: rank k+1 already HAS the
-        # message in its recv buffer and joins within its own pass.
-        self._weg2_commit_owed_forward()
-
         my_idle = self.is_fully_idle()
-        my_blockers = self.idle_blockers()
-        own = ", ".join(my_blockers) or "none"
+        own = ", ".join(self.idle_blockers()) or "none"
 
-        cpu_group = getattr(getattr(self, "world_group", None), "cpu_group", None)
-        if cpu_group is None:
-            return my_idle, f"single-rank verdict (no group): blockers=[{own}]"
-        try:
-            world = torch.distributed.get_world_size(group=cpu_group)
-        except Exception as exc:  # noqa: BLE001 - a verdict may not raise
-            # UNDECIDED IS NOT IDLE, here too. A cpu_group EXISTS -- so peers
-            # exist -- and their state could not be read; answering with this
-            # rank's own verdict would be the sb1 failure with a different
-            # producer. Absent group (cpu_group is None) is the only case that
-            # legitimately answers alone, and it is handled above.
-            return False, (
-                f"GROUP VERDICT UNAVAILABLE (world unreadable: "
-                f"{type(exc).__name__}: {exc}); this rank blockers=[{own}] -- "
-                f"refusing rather than answering for peers that exist"
-            )
-        if world <= 1:
-            return my_idle, f"single-rank verdict (world=1): blockers=[{own}]"
-
-        try:
-            rank = torch.distributed.get_rank(group=cpu_group)
-        except Exception:  # noqa: BLE001
-            rank = -1
-        # Sentinel above any real rank, so MIN picks a real blocker when one
-        # exists and the sentinel only when nobody blocks.
-        # #1268 FIX 1b (2): PARTICIPATION IS A FACT, NOT AN ASSUMPTION.
-        #
-        # sb2 stopped the front on a bare `TimeoutError: ` -- no rank, no
-        # blocker, no rid. A bound that expires must name WHO was missing or the
-        # next reader learns nothing from it. So presence is CARRIED, not
-        # assumed, and the reduce is SUM rather than MIN because MIN cannot
-        # count: three ranks each contributing -1 reduce to -1, not to -3.
-        #
-        # ONE collective, three exact answers, because the terms are additive
-        # and the mask's bits are DISJOINT by construction (one bit per rank):
-        #   [0] n_idle   -- how many ranks voted idle
-        #   [1] n_present-- how many ranks reached the reduce at all
-        #   [2] mask     -- bit r set iff rank r is NOT idle; lowest set bit is
-        #                   the lowest blocking rank, and popcount names them all
-        vote = torch.tensor(
-            [
-                1 if my_idle else 0,
-                1,
-                0 if my_idle else (1 << max(rank, 0)),
-            ],
-            dtype=torch.int64,
-        )
-        try:
-            bounded_wait(
-                torch.distributed.all_reduce(
-                    vote,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=cpu_group,
-                    async_op=True,
-                ),
-                "weg2/group_idle_verdict",
-                float(getattr(self, "collective_timeout_s", 0.0) or 0.0),
-                f"rank {rank}",
-            )
-        except Exception as exc:  # noqa: BLE001
-            # UNDECIDED is not IDLE. A verdict that could not be taken must
-            # refuse, never fall through to this rank's own optimistic answer --
-            # that is the whole failure being closed here.
-            # #1268 FIX 1b (2): NEVER A BARE TimeoutError. sb2 stopped the
-            # front on the literal string `TimeoutError: ` -- gloo's timeout
-            # carries an empty message, so formatting `{exc}` alone produced a
-            # verdict with no rank, no peer and no blocker in it. Everything
-            # this rank KNOWS is stated instead, and what it cannot know is
-            # named as unknowable rather than omitted.
-            detail = str(exc) or "(no message: gloo timeouts carry none)"
-            return False, (
-                f"GROUP VERDICT UNAVAILABLE: {type(exc).__name__}: {detail}. "
-                f"This rank is {rank} of world={world} on group "
-                f"{getattr(self, 'weg2_group_name', '?')}; its own blockers are "
-                f"[{own}]. WHICH peers failed to join is NOT knowable from this "
-                f"side -- the reduce carries the participation slot only when it "
-                f"COMPLETES -- so read the WEG2-P-IDLE-VERDICT lines: a rank that "
-                f"reached the reduce printed one, and a rank that did not is "
-                f"missing from that census. Refusing rather than answering for "
-                f"peers that did not reduce"
+        pp_size = int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1)
+        pp_rank = int(getattr(getattr(self, "ps", None), "pp_rank", 0) or 0)
+        if pp_size <= 1:
+            return my_idle, f"single-rank verdict (pp_size={pp_size}): blockers=[{own}]"
+        if pp_rank != 0:
+            # A FOLLOWER'S ANSWER NEVER LEAVES THE GROUP, so there is nothing
+            # here for the one-verdict law to bind. It flushes its own pools on
+            # its own idleness, which is upstream's behaviour and was never the
+            # defect; its contribution to the GROUP fact is the slot it attaches
+            # to the vote object on the lap (`_weg2_vote_attach_own_slot`).
+            return my_idle, (
+                f"rank-local verdict (pp_rank={pp_rank} is not the entrypoint; "
+                f"this answer does not leave the group): blockers=[{own}]"
             )
 
-        n_idle = int(vote[0].item())
-        n_present = int(vote[1].item())
-        mask = int(vote[2].item())
-        blockers_ranks = [r for r in range(world) if mask & (1 << r)]
-        who = str(blockers_ranks[0]) if blockers_ranks else "none"
-        participation = f"{n_present}/{world}"
-
-        # #1268 FIX 1b (3): ONE LINE PER VERDICT ON EVERY RANK. The sb2 reduce
-        # printed NOTHING anywhere -- an instrument that deadlocks silently is
-        # not an instrument. This is emitted by every rank that reaches the
-        # reduce, so a missing rank is visible as a missing LINE as well as a
-        # short participation count.
-        epoch = getattr(self, "weg2_flip_epoch", None)
-        logger.info(
-            "WEG2-P-IDLE-VERDICT epoch=%s idle=%s blocking_rank=%s blockers=[%s] "
-            "participation=%s",
-            "?" if epoch is None else epoch,
-            bool(n_idle == world and n_present == world),
-            who,
-            own,
-            participation,
-        )
-
-        # A SHORT REDUCE IS A NAMED REFUSAL. If fewer ranks arrived than the
-        # group has, the answer covers nobody: the absent ranks contributed no
-        # idle vote and no blocker bit, so "all present voted idle" would be a
-        # claim about a subset presented as the whole -- the #1268 defect in a
-        # new costume.
-        if n_present < world:
-            missing = [r for r in range(world) if r not in blockers_ranks]
-            return False, (
-                f"GROUP VERDICT SHORT: participation={participation} -- only "
-                f"{n_present} of {world} ranks reached the reduce, so this "
-                f"answer covers a SUBSET and is refused. Ranks that voted "
-                f"not-idle: {blockers_ranks or 'none'}; ranks unaccounted for "
-                f"(voted idle or never arrived, indistinguishable from here): "
-                f"{missing}. This rank {rank} blockers=[{own}]"
+        # PP0, the one place the group's answer is decided (Raenge-nie-uneins).
+        vote = getattr(self, "_weg2_vote_verdict", None)
+        if vote is not None:
+            # CONSUMED ON READ. A verdict describes the lap it came from and
+            # nothing later; reusing it across polls would let a stale "idle"
+            # outlive the state that produced it.
+            self._weg2_vote_verdict = None
+            t = tally(vote)
+            if t.idle:
+                return True, (
+                    f"group idle (epoch={vote.epoch}, "
+                    f"participation={t.n_present}/{t.world}, every rank agreed)"
+                )
+            if not t.complete:
+                self._weg2_vote_wanted = True
+                return False, refusal_detail(
+                    vote, t, "GROUP VERDICT SHORT: the lap came home incomplete."
+                )
+            self._weg2_vote_wanted = True
+            return False, refusal_detail(
+                vote, t, "GROUP NOT IDLE: the lap is complete and a rank blocks."
             )
 
-        if n_idle == world:
-            return True, (
-                f"group idle (participation={participation}, every rank agreed)"
-            )
+        # No lap has landed yet: ask for one and answer `pending`. The front
+        # polls /flush_cache every 0.5 s to its own quiesce deadline
+        # (`weg2/front.py`, `Front.quiesce`), so a non-200 simply keeps the
+        # poll going and the LAST body is what a W3 refusal prints.
+        self._weg2_vote_wanted = True
+        outstanding = getattr(self, "_weg2_vote_outstanding", None)
+        epoch = int(getattr(self, "_weg2_vote_epoch", 0))
         return False, (
-            f"GROUP NOT IDLE: blocking ranks={blockers_ranks} (lowest={who}) of "
-            f"world={world}, participation={participation}; this rank {rank} "
-            f"blockers=[{own}]. The verdict is the GROUP's, reduced over every "
-            f"rank -- an idle entrypoint no longer answers for a busy peer "
-            f"(#1268, boot weg2sb1)"
+            f"GROUP VERDICT PENDING: the idle vote is on the ring "
+            f"(epoch={outstanding if outstanding is not None else epoch + 1}, "
+            f"world={pp_size}, outstanding={outstanding is not None}). This rank "
+            f"{pp_rank} blockers=[{own}]. UNDECIDED IS NOT IDLE: the front keeps "
+            f"polling and a deadline that expires refuses by name, listing the "
+            f"ranks whose slot never came home -- it never falls through to this "
+            f"rank's own optimistic answer, which is the #1268 defect itself."
         )
 
     def idle_blockers(self) -> List[str]:

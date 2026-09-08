@@ -51,6 +51,11 @@ from types import SimpleNamespace
 
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.managers.weg2_idle_vote import (
+    Weg2IdleVoteReq,
+    blockers_of,
+    tally,
+)
 from sglang.test.test_utils import CustomTestCase
 
 RID = "43c9af54b69a4822ad0bf507a1f1a9a4"
@@ -100,13 +105,30 @@ def _sched(orphans):
         else []
     )
     s._drain_prefetch_progress = Scheduler._drain_prefetch_progress.__get__(s)
-    # #1268 fix 1b: a real Scheduler always has this; the
-    # stand-in must too, or it tests a shape that cannot exist.
-    s.pp_group = SimpleNamespace(is_last_rank=True)
-    s._weg2_commit_owed_forward = (
-        Scheduler._weg2_commit_owed_forward.__get__(s)
+    # #1268 fix 1c: the collector's site MOVED. It used to sit in
+    # `group_idle_verdict` "because this is the one point on the quiesce path
+    # every rank reaches together" -- a premise that only held while a blocking
+    # collective made them arrive together, and boots weg2sb2/sb3 killed that
+    # collective. It now runs once per rank per lap, at the point where each
+    # rank attaches its own slot to the vote object, which is where it was
+    # always in fact rank-local.
+    s.pp_group = SimpleNamespace(is_last_rank=True, is_first_rank=True)
+    s.ps = SimpleNamespace(
+        pp_rank=0, pp_size=3, tp_size=1, attn_tp_size=1,
+        attn_tp_rank=0, attn_cp_rank=0, attn_dp_rank=0, attn_cp_size=1,
     )
+    s._weg2_vote_attach_own_slot = Scheduler._weg2_vote_attach_own_slot.__get__(s)
     s.group_idle_verdict = Scheduler.group_idle_verdict.__get__(s)
+
+    def _collect_and_vote():
+        """What one lap does on this rank: collect, then read, then attach."""
+        vote = Weg2IdleVoteReq(epoch=1, origin=0, world=3)
+        s._weg2_vote_attach_own_slot(vote)
+        t = tally(vote)
+        blockers = blockers_of(vote, 0)
+        return bool(t.n_idle == 1), blockers
+
+    s.collect_and_vote = _collect_and_vote
     return s, tc
 
 
@@ -123,22 +145,22 @@ class TheSb1ShapeIsCollected(CustomTestCase):
         self.assertEqual(list(tc.ongoing_prefetch), [RID], "still orphaned")
         self.assertEqual(tc.collected, [], "check_hicache_events collects nothing")
 
-    def test_the_verdict_collects_the_orphan_in_one_round(self):
+    def test_the_slot_collects_the_orphan_in_one_lap(self):
         s, tc = _sched([RID])
         self.assertFalse(s.is_fully_idle(), "the sb1 entry state")
-        idle, detail = s.group_idle_verdict()
-        self.assertEqual(tc.collected, [RID], "collected at the quiesce point")
-        self.assertTrue(idle, "and the group is idle in the SAME round")
-        self.assertNotIn("43c9af54", detail)
+        idle, blockers = s.collect_and_vote()
+        self.assertEqual(tc.collected, [RID], "collected at the slot point")
+        self.assertTrue(idle, "and this rank is idle in the SAME lap")
+        self.assertNotIn("43c9af54", blockers)
 
     def test_an_uncollectable_blocker_still_refuses(self):
         """The fix must not turn a real blocker into a false idle: a record the
         collector declines stays in the verdict."""
         s, tc = _sched([RID])
         tc.check_prefetch_progress = lambda rid: False  # declines to terminate
-        idle, detail = s.group_idle_verdict()
+        idle, blockers = s.collect_and_vote()
         self.assertFalse(idle)
-        self.assertIn("43c9af54", detail)
+        self.assertIn("43c9af54", blockers)
 
     def test_collection_runs_before_the_idle_reading(self):
         """ORDER is the fix. Reading idle first and collecting after would
@@ -151,27 +173,42 @@ class TheSb1ShapeIsCollected(CustomTestCase):
         tc.check_prefetch_progress = lambda rid: (
             order.append("collect"), base_collect(rid)
         )[1]
-        s.group_idle_verdict()
+        s.collect_and_vote()
         self.assertEqual(order[0], "collect", f"order was {order}")
 
     def test_no_storage_no_collection(self):
         """Off HiCache storage this must touch nothing -- byte-identical."""
         s, tc = _sched([RID])
         s.enable_hicache_storage = False
-        s.group_idle_verdict()
+        s.collect_and_vote()
         self.assertEqual(tc.collected, [])
 
 
 class TheWiring(CustomTestCase):
-    def test_the_collector_is_called_from_the_group_uniform_point(self):
+    def test_the_collector_is_called_from_the_per_lap_slot_point(self):
+        """ADAPTED, and the premise it used to encode is WITHDRAWN.
+
+        The old name was `..._from_the_group_uniform_point` and it asserted the
+        collector sat in `group_idle_verdict`, justified as "the one point on
+        the quiesce path every rank reaches together". That togetherness was
+        manufactured by the blocking reduce, which deadlocked on metal twice
+        and is gone. The collector is rank-local and now runs where a rank
+        attaches its own slot -- still strictly BEFORE that rank reads its own
+        idleness, which is the ordering the fix was always about.
+        """
         import inspect
 
-        src = inspect.getsource(Scheduler.group_idle_verdict)
+        src = inspect.getsource(Scheduler._weg2_vote_attach_own_slot)
         self.assertIn("_drain_prefetch_progress()", src)
         self.assertLess(
             src.index("_drain_prefetch_progress()"),
-            src.index("my_idle = self.is_fully_idle()"),
+            src.index("self.is_fully_idle()"),
             "collect before voting",
+        )
+        # and it is NOT back on the answer path
+        self.assertNotIn(
+            "_drain_prefetch_progress",
+            inspect.getsource(Scheduler.group_idle_verdict),
         )
 
     def test_the_refuted_rank_uniformity_claim_is_retracted(self):

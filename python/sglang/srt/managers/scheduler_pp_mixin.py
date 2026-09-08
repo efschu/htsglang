@@ -23,7 +23,18 @@ from sglang.srt.distributed.pp_typed_channel import (
     stash_typed,
     typed_inbox,
 )
+from sglang.srt.distributed.pp_object_recv import get_or_create_frame
 from sglang.srt.distributed.utils import pp_gapped_ownership_active
+from sglang.srt.managers.weg2_idle_vote import (
+    VOTE_HOME_STEP_BUDGET_S,
+    WEG2_VOTE_TAG,
+    Weg2IdleVoteReq,
+    attach_slot,
+    home_ranks,
+    log_verdict,
+    send_home,
+    tally,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -5861,6 +5872,12 @@ class SchedulerPPMixin:
         # manual has only ever been exercised UNDER TRAFFIC, where the loop
         # keeps cycling and the commit happens naturally.
 
+        # #1268 fix 1c: the idle vote is a CONTROL OBJECT and this is where it
+        # joins the lap -- BEFORE the forward below, so PP0's stamp and every
+        # follower's slot are already on the object when the arc carries it.
+        # Nothing here blocks: see `_weg2_vote_pass_hook`.
+        self._weg2_vote_pass_hook(recv_reqs)
+
         # #631 REQ-TRACE (bounded): the check-2 wedge's open question is
         # where a relayed request dies between the consumed chain hop and
         # the downstream waiting queue (boot 631row16: s0=150=c1 balanced,
@@ -5948,9 +5965,222 @@ class SchedulerPPMixin:
             # poll loop (PhaseFlipRuntime._await_group_presence), which
             # delivers it without this rank blocking on anything.
 
+        # #1268 fix 1c: the last stage closes the ring, and the vote object
+        # leaves `recv_reqs` before dispatch on EVERY rank -- it is a lap, not
+        # a request, and `process_input_requests` has no handler for it.
+        recv_reqs = self._weg2_vote_after_forward(recv_reqs)
+
         # (i): arm in this same pass; the flip hook at the end of this
         # microbatch iteration then joins without an intervening recv.
         self.process_input_requests(recv_reqs)
+
+    # ------------------------------------------------------------------
+    # #1268 fix 1c: the idle vote travels home on the ring lap
+    # ------------------------------------------------------------------
+
+    def _weg2_vote_dp_offset(self: Scheduler) -> int:
+        return self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+
+    def _weg2_vote_is_wire_rank(self: Scheduler) -> bool:
+        """Only the rank that owns the p2p wire participates.
+
+        The same test ``_pp_send_pyobj_to_next_stage`` applies before it
+        sends: off it, the object is carried by the attn-TP broadcast, not by
+        this arc.
+        """
+        return self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
+
+    def _weg2_vote_pass_hook(self: Scheduler, recv_reqs: List) -> None:
+        """Harvest a landed lap, stamp a new one, attach THIS rank's slot.
+
+        Called at the top of ``_pp_forward_and_process_input_requests``, on
+        every rank, before the request-chain forward -- so a vote PP0 stamps
+        and a slot a follower attaches are both on the object by the time the
+        arc carries it onward.
+
+        NOTHING IN HERE BLOCKS, and that is the whole fix. Fix 1 and fix 1b
+        both put a blocking collective on this path and both deadlocked
+        identically against the hidden-states exchange one channel over
+        (``weg2_idle_vote``'s module docstring has the six py-spy stacks'
+        reading). The home receive is a bounded, resumable step on a posted
+        frame; an expired step leaves the receive posted and simply tries
+        again next pass.
+        """
+        if int(getattr(self.ps, "pp_size", 1) or 1) <= 1:
+            return
+        if not self._weg2_vote_is_wire_rank():
+            return
+        if self.pp_group.is_first_rank:
+            self._weg2_vote_harvest_home()
+            self._weg2_vote_maybe_stamp(recv_reqs)
+            return
+        for req in recv_reqs:
+            if isinstance(req, Weg2IdleVoteReq):
+                self._weg2_vote_attach_own_slot(req)
+
+    def _weg2_vote_attach_own_slot(self: Scheduler, vote: Weg2IdleVoteReq) -> None:
+        """This rank's own answer, rank-locally, with the orphan collector run
+        first.
+
+        #1272 KEPT, AND MOVED TO WHERE IT IS ACTUALLY RANK-LOCAL. The collector
+        used to sit in ``group_idle_verdict`` "because this is the one point on
+        the quiesce path every rank reaches together" -- a premise that only
+        held while a collective made them arrive together, and that collective
+        is what is being removed. Here it runs once per rank per lap, on the
+        rank's own orphan set, which is what it always actually did.
+
+        THE #1028 TRAP IS NAMED, NOT SILENT. The per-rid
+        ``check_prefetch_progress`` calls inside the collector carry attn-group
+        collectives. Under this form (group P is ``--tp-size 1``) the attn group
+        is world-1 and they are no-ops. Under any form where it is not, a
+        rank-local trigger of a group collective is the #580 failure, so this
+        refuses by name rather than running it.
+        """
+        attn_world = int(getattr(self.ps, "attn_tp_size", 1) or 1)
+        if attn_world > 1:
+            raise RuntimeError(
+                "#1268 fix 1c REFUSED: the per-lap orphan collector "
+                "(_drain_prefetch_progress) carries attn-group collectives and "
+                f"this rank's attn world is {attn_world} > 1. Triggering a group "
+                "collective from a rank-local point is the #580 failure class. "
+                "The vote itself is rank-local and safe; the collector is not, "
+                "and it needs a group-agreed per-rid round before this form can "
+                "run with tp_size > 1 on P (#1028, stated as a residual risk in "
+                "the fix-1b docstring and now enforced)."
+            )
+        if getattr(self, "enable_hicache_storage", False):
+            try:
+                self._drain_prefetch_progress()
+            except Exception as exc:  # noqa: BLE001 - a collection may not kill the vote
+                logger.warning(
+                    "#1272 orphan collection before the idle slot raised %r; the "
+                    "slot is attached on the uncollected state (which votes "
+                    "not-idle and names its blocker, rather than sleeping)",
+                    exc,
+                )
+        rank = int(self.ps.pp_rank)
+        if attach_slot(vote, rank, self.is_fully_idle(), ", ".join(self.idle_blockers()) or "none"):
+            log_verdict(vote, rank)
+
+    def _weg2_vote_maybe_stamp(self: Scheduler, recv_reqs: List) -> None:
+        """PP0 only: mint a numbered vote when one is wanted and none is out.
+
+        THE EPOCH IS THE FIX, not the format. Every ``WEG2-P-IDLE-VERDICT``
+        line of every boot in this campaign printed the literal ``epoch=?``,
+        because the source was ``getattr(self, "weg2_flip_epoch", None)`` and
+        NOTHING IN THE TREE EVER ASSIGNED ``weg2_flip_epoch`` (one read, zero
+        writes). The number is minted here, travels ON the object, and is what
+        a follower's line and PP0's line for one lap share.
+        """
+        if not getattr(self, "_weg2_vote_wanted", False):
+            return
+        if getattr(self, "_weg2_vote_outstanding", None) is not None:
+            return
+        self._weg2_vote_epoch = int(getattr(self, "_weg2_vote_epoch", 0)) + 1
+        vote = Weg2IdleVoteReq(
+            epoch=self._weg2_vote_epoch,
+            origin=int(self.ps.pp_rank),
+            world=int(self.ps.pp_size),
+        )
+        self._weg2_vote_attach_own_slot(vote)
+        self._weg2_vote_outstanding = vote.epoch
+        self._weg2_vote_wanted = False
+        recv_reqs.append(vote)
+
+    def _weg2_vote_after_forward(self: Scheduler, recv_reqs: List) -> List:
+        """Close the ring on the last stage; take the vote out of the dispatch.
+
+        THE HOME HOP IS THE ONLY THING ADDED TO THE WIRE, and it fires ONLY
+        while a lap is actually homebound. The last stage sends nothing on an
+        ordinary idle pass, so #973's ring commit/join cadence is untouched
+        outside a quiesce -- the arc simply does not exist unless a vote is on
+        it. (The DOWNWARD arc needed no change at all: the forward at
+        ``if not self.pp_group.is_last_rank:`` above is unconditional per pass,
+        armed or not, by #969 §W3.)
+        """
+        if not any(isinstance(r, Weg2IdleVoteReq) for r in recv_reqs):
+            return recv_reqs
+        votes = [r for r in recv_reqs if isinstance(r, Weg2IdleVoteReq)]
+        rest = [r for r in recv_reqs if not isinstance(r, Weg2IdleVoteReq)]
+        if self.pp_group.is_last_rank and self._weg2_vote_is_wire_rank():
+            src_global, dst_global = home_ranks(
+                int(self.ps.pp_rank),
+                int(self.ps.pp_size),
+                int(self.ps.tp_size),
+                self._weg2_vote_dp_offset(),
+            )
+            for vote in votes:
+                # Post the previous home send before issuing the next one --
+                # the same discipline the request-chain forward uses at the top
+                # of its own block, and for the same reason.
+                self._pp_commit_comm_work(getattr(self, "_weg2_vote_home_work", None) or [])
+                self._weg2_vote_home_work = send_home(
+                    vote, self.world_group.cpu_group, src_global, dst_global
+                )
+                logger.info(
+                    "#1268 fix 1c VOTE HOMEBOUND epoch=%d participation=%d/%d "
+                    "src_global=%d dst_global=%d tag=%d",
+                    vote.epoch,
+                    tally(vote).n_present,
+                    vote.world,
+                    src_global,
+                    dst_global,
+                    WEG2_VOTE_TAG,
+                )
+        return rest
+
+    def _weg2_vote_harvest_home(self: Scheduler) -> None:
+        """PP0 only: one bounded step on the standing home receive.
+
+        NEVER JOINED. ``advance`` returns False with the receive STILL POSTED
+        and resumable, so a lap that has not landed costs this pass the step
+        budget and nothing else. The two alternatives are measured dead on this
+        build and must not be reintroduced here -- ``Work.is_completed()``
+        never reports True ("corpse F"), and ``Work.wait(timeout=...)`` closes
+        the gloo pair on expiry, taking both sides down. See
+        ``weg2_idle_vote``'s module docstring.
+        """
+        if getattr(self, "_weg2_vote_outstanding", None) is None:
+            return
+        src_global, _dst = home_ranks(
+            int(self.ps.pp_rank),
+            int(self.ps.pp_size),
+            int(self.ps.tp_size),
+            self._weg2_vote_dp_offset(),
+        )
+        frames = getattr(self, "_pp_object_recv_frames", None)
+        if frames is None:
+            frames = self._pp_object_recv_frames = {}
+        frame = get_or_create_frame(
+            frames,
+            (src_global, WEG2_VOTE_TAG),
+            self.world_group.cpu_group,
+            src_global,
+            WEG2_VOTE_TAG,
+            "weg2/idle-vote-home",
+            f"pp_rank={self.ps.pp_rank}",
+        )
+        try:
+            if not frame.advance(VOTE_HOME_STEP_BUDGET_S):
+                return
+            vote = frame.take()
+        except Exception as exc:  # noqa: BLE001 - a harvest may not kill the pass
+            logger.warning(
+                "#1268 fix 1c: the homebound idle vote raised %r on its receive; "
+                "the quiesce keeps polling and refuses by name on its deadline",
+                exc,
+            )
+            return
+        if not isinstance(vote, Weg2IdleVoteReq):
+            logger.warning(
+                "#1268 fix 1c: object on the vote stream is %s, not a vote; "
+                "dropped rather than read as one",
+                type(vote).__name__,
+            )
+            return
+        log_verdict(vote, int(self.ps.pp_rank))
+        self._weg2_vote_verdict = vote
+        self._weg2_vote_outstanding = None
 
     def _pp_commit_pending_req_work(self: Scheduler) -> None:
         """#788: flush the outstanding request-chain send from the END of
