@@ -278,6 +278,7 @@ class BootState:
     carrier_max_tokens: int = 0
     weight_chunks: int = 0
     tms_so: str = ""
+    p_depth: int = 0
 
 
 def _now() -> str:
@@ -594,9 +595,20 @@ def argv_p(
     stage_ratio: str = "32,18,14",
     attn_stage_ratio: str = "8,4,4",
     write_policy: str = "write_through",
+    depth: int = 0,
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(model, s_gb, m_mib, store_gib, write_policy) + [
         "--tp-size", "1", "--pp-size", "3",
+        # #692 MICROBATCH DEPTH, group P only -- group D runs pp_size=1 and a
+        # pipeline depth is meaningless there. STATED even at 0 so the argv is
+        # an honest statement of what the boot runs, and published ONCE as a
+        # group constant: every rank reads the same token off the same argv,
+        # so no rank can derive a different depth (the ring size is a
+        # collective property -- two ranks disagreeing about pp_loop_size is
+        # the v7pp12 starvation, not a tuning difference). Solved by
+        # solve_p_depth from the previous boot's own PP-BUBBLE line; the
+        # launcher prints the WEG2 P-DEPTH provenance line either way.
+        "--pp-async-batch-depth", str(int(depth)),
         # P is the pp_size>1 group, so the overlap schedule is refused HERE
         # and only here (server_args.py:19507). Passing it explicitly rather
         # than letting the post-process pass force it keeps the argv an
@@ -972,6 +984,378 @@ def d_overlap_cost_line(model: str, disable_overlap: bool) -> str:
     )
 
 
+#: The one line ``read_pp_bubble`` understands, emitted per window per rank by
+#: ``scheduler_components/pp_bubble.py:summary_line``. Anchored on the whole
+#: field name including its ``=``: a bare number would match milliseconds
+#: elsewhere in the line, which is the bare-ticket-number trap in miniature.
+_BUBBLE_RE = re.compile(
+    r"PP-BUBBLE rank=(?P<rank>\d+) .*?"
+    r" n=(?P<n>\d+) \(n_gaps=(?P<n_gaps>\d+),"
+    r" forward_ms=(?P<forward>[0-9.]+),"
+    r" bubble_ms=(?P<bubble>[0-9.]+),"
+    r" starved_ms=(?P<starved>[0-9.]+);"
+)
+
+
+@dataclass(frozen=True)
+class BubbleMeasurement:
+    """One stage's PP-BUBBLE totals, summed over every window in one log.
+
+    Summed, never averaged: each window line carries its own numerator AND its
+    own denominator, so a mean of the printed shares would weight a 12-forward
+    window like a 2-forward one. Sum of numerators over sum of denominators is
+    the only aggregation that keeps the denominator honest.
+    """
+
+    source: str
+    rank: int
+    windows: int
+    forward_ms: float
+    bubble_ms: float
+    starved_ms: float
+    n_forwards: int
+
+    @property
+    def denominator_ms(self) -> float:
+        """``gap + forward`` -- the denominator the emitting line names."""
+        return self.bubble_ms + self.forward_ms
+
+    @property
+    def bubble_share(self) -> float:
+        d = self.denominator_ms
+        return 0.0 if d <= 0.0 else self.bubble_ms / d
+
+    @property
+    def forward_share(self) -> float:
+        return 1.0 - self.bubble_share
+
+    @property
+    def stall_share(self) -> float:
+        """The part depth can move.
+
+        ``starved_ms`` is the part of the gap in which this rank visited the
+        loop with NOTHING to launch (fix 1r/2). Depth overlaps a rank's output
+        exchange with its next forward; it cannot manufacture a chunk that the
+        queue never supplied. Charging starvation to depth would buy in-flight
+        slots against a supply problem -- and pay for them out of the KV pool.
+        """
+        d = self.denominator_ms
+        if d <= 0.0:
+            return 0.0
+        return max(0.0, self.bubble_ms - self.starved_ms) / d
+
+
+def read_pp_bubble(path: str) -> Optional[BubbleMeasurement]:
+    """The BINDING stage's bubble totals from one group-P log, or None.
+
+    The binding stage is the one with the largest forward total: under a
+    pipelined prefill the makespan is that stage's time, so its idle is the
+    idle that costs throughput. Returns None when the file does not exist or
+    carries no PP-BUBBLE line -- absence of the instrument, never a measured
+    zero (#892 / the indicator law: a tool says "I found nothing", never
+    "there is nothing").
+    """
+    per_rank: Dict[int, List[float]] = {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                m = _BUBBLE_RE.search(line)
+                if m is None:
+                    continue
+                acc = per_rank.setdefault(int(m.group("rank")), [0.0] * 4 + [0.0])
+                acc[0] += float(m.group("forward"))
+                acc[1] += float(m.group("bubble"))
+                acc[2] += float(m.group("starved"))
+                acc[3] += float(m.group("n"))
+                acc[4] += 1.0
+    except OSError:
+        return None
+    if not per_rank:
+        return None
+    rank = max(per_rank, key=lambda r: per_rank[r][0])
+    fwd, bub, starved, n_fwd, windows = per_rank[rank]
+    return BubbleMeasurement(
+        source=path,
+        rank=rank,
+        windows=int(windows),
+        forward_ms=fwd,
+        bubble_ms=bub,
+        starved_ms=starved,
+        n_forwards=int(n_fwd),
+    )
+
+
+def newest_bubble_log(evidence_dir: str) -> Optional[str]:
+    """Newest ``*.P.log`` in ``evidence_dir`` that actually CARRIES the line.
+
+    Not simply the newest P log: a boot that died before its first bubble
+    window, or one built before the instrument existed, has no measurement,
+    and taking its silence as ``share=0`` would derive ``depth=0`` from a file
+    rather than from a measurement. Such a log is skipped and an older one
+    that carries the line is preferred; the chosen path is printed, so a
+    reader can see how old the number is.
+    """
+    try:
+        names = [n for n in os.listdir(evidence_dir) if n.endswith(".P.log")]
+    except OSError:
+        return None
+    paths = [os.path.join(evidence_dir, n) for n in names]
+    for path in sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True):
+        if read_pp_bubble(path) is not None:
+            return path
+    return None
+
+
+def chunked_prefill_size_of(argv: Sequence[str]) -> int:
+    """The chunk this launcher's own argv states, read back off it.
+
+    Same rule as ``--max-running-requests`` in the pool model: a second copy of
+    the number here would drift the day the flag moves, and the depth price is
+    linear in it.
+    """
+    argv = list(argv)
+    if "--chunked-prefill-size" not in argv:
+        raise Weg2LaunchRefused(
+            "W42 Weg2DepthUnfunded: group P's argv states no "
+            "--chunked-prefill-size, so one in-flight microbatch has no "
+            "priceable size and the depth cannot be funded against the pool. "
+            "Refusing rather than assuming a chunk."
+        )
+    return int(argv[argv.index("--chunked-prefill-size") + 1])
+
+
+@dataclass(frozen=True)
+class DepthDecision:
+    """Group P's ``--pp-async-batch-depth`` and the ONE provenance line for it."""
+
+    depth: int
+    passes_in_flight: int
+    pinned: bool
+    measured: Optional[BubbleMeasurement]
+    pool_tokens: float
+    pool_after: float
+    cap_tokens: int
+    price_rows: int
+    price_tokens: float
+    price_mib: Tuple[float, ...]
+    act_mib_per_pass: float
+    chunk_tokens: int
+
+    def line(self) -> str:
+        """THE one line. Format is load-bearing: a reader greps ``P-DEPTH solver:``."""
+        if self.measured is None:
+            src = (
+                "no PP-BUBBLE measurement found, so bubble_share is unknown and "
+                "the depth stays at today's behaviour"
+            )
+            shares = "bubble_share=n/a forward_share=n/a"
+        else:
+            m = self.measured
+            src = (
+                "from %s rank=%d (binding stage, largest forward total) over %d "
+                "window(s), n=%d forwards; starved_ms=%.1f of bubble_ms=%.1f is "
+                "queue starvation and is NOT charged to depth, stall_share=%.3f"
+                % (
+                    m.source,
+                    m.rank,
+                    m.windows,
+                    m.n_forwards,
+                    m.starved_ms,
+                    m.bubble_ms,
+                    m.stall_share,
+                )
+            )
+            shares = "bubble_share=%.3f forward_share=%.3f" % (
+                m.bubble_share,
+                m.forward_share,
+            )
+        return (
+            "WEG2 P-DEPTH solver:%s %s depth=%d price_rows=%d/stage "
+            "price_mib=%s MiB/stage pool_after=%d (constraint pool >= %d) "
+            "[passes_in_flight=ceil(1/(1-stall_share))=%d, the flag is that "
+            "minus the pass being forwarded; one extra pass costs %d KV rows "
+            "plus a %.1f MiB crossing frame per stage, charged as %d pool "
+            "tokens at the stage that converts worst; %s]"
+            % (
+                " PINNED (user override)" if self.pinned else "",
+                shares,
+                self.depth,
+                self.price_rows,
+                ",".join("%.1f" % v for v in self.price_mib),
+                int(self.pool_after),
+                int(self.cap_tokens),
+                self.passes_in_flight,
+                self.chunk_tokens,
+                self.act_mib_per_pass,
+                int(self.price_tokens),
+                src,
+            )
+        )
+
+
+def solve_p_depth(
+    measured: Optional[BubbleMeasurement],
+    pool_tokens: float,
+    attn_counts: Sequence[int],
+    kv_mib_per_token_per_attn_layer: float,
+    hidden_size: int,
+    chunk_tokens: int,
+    cap_tokens: int,
+    gapped_layer_set: str = "",
+    dtype_bytes: int = 2,
+    pinned_depth: Optional[int] = None,
+) -> DepthDecision:
+    """Group P's microbatch depth, DERIVED from the previous boot's own bubble.
+
+    THE MECHANISM. ``init_pp_loop_state`` reads this knob twice: it widens
+    ``pp_loop_size = pp_size + depth``, and -- the half that matters for the
+    bubble -- ``_event_loop_pp_body`` moves
+    ``_pp_commit_send_output_work_and_preprocess_output_tensors`` from AFTER
+    ``_pp_launch_batch`` to BEFORE it when the depth is non-zero. At depth 0
+    a rank's output exchange for pass *i-1* therefore serialises with its
+    launch of pass *i*, and that serialisation is exactly the host time the
+    PP-BUBBLE meter measures between two forwards.
+
+    THE DERIVATION. A stage busy ``forward/(gap+forward)`` of the time needs
+    ``ceil(1/(1-stall_share))`` passes in flight to stay busy across the gap.
+    One of those passes is the one it is forwarding, so the FLAG -- which
+    counts passes BEYOND the ring's own -- is that number minus one. Stated
+    rather than folded in, because it is where this function departs from the
+    briefing's ``depth = ceil(1/(1-bubble_share))``: that form provisions one
+    extra in-flight pass beyond the gap it has to cover, and every extra pass
+    is charged to the KV pool below. Both terms are printed, so a reader who
+    wants the other convention can see the arithmetic rather than infer it.
+
+    THE #692 GATE, RE-READ FOR WEG 2. ``DESIGN_691_bubble_levers.md`` gated
+    this lever on "measure it against the seam, not just against throughput",
+    for two named costs. They do not survive equally here:
+
+    * *"more live KV on cards already failing seam funding at 179 MiB"* -- does
+      NOT apply. That was the one-process flip, where the live set at the seam
+      had to be FUNDED to survive a cutover. In Weg 2 group P is its own
+      process group and carries nothing across: its sleep releases ``kv_cache``
+      and the weight tags wholesale to the memory saver (``sleep_group``), and
+      the carrier between the phases is the HiCache store, which D reads. There
+      is no funded live set for depth to grow. What depth does cost is priced
+      here instead, in the only budget it actually touches: P's own KV pool,
+      against ``--max-kv-per-request``.
+    * *"a deeper pipeline has more state to quiesce, so seam entry takes
+      longer"* -- DOES apply, unchanged, and is not priced here. The front's
+      quiesce witness is ``/flush_cache`` returning 200 only when every
+      in-flight term is zero (``front.py`` witness B), so ``depth`` extra
+      in-flight chunks are ``depth`` extra chunk-forwards of drain before P can
+      sleep. At the measured 369.6 ms per full chunk on the binding stage that
+      is sub-second per unit of depth against a 15-17 s flip, which is why it
+      is named and left to the flip's own measurement rather than converted
+      into a second, unmeasured budget here.
+
+    Refuses W42 rather than lowering the depth: a silently reduced depth is a
+    hand number wearing a derivation.
+    """
+    kv_mib_per_token = [
+        max(1, int(a)) * float(kv_mib_per_token_per_attn_layer) for a in attn_counts
+    ]
+    # The activation the extra pass keeps alive: one PPProxyTensors
+    # hidden-states frame per stage boundary, [chunk, hidden] in the model
+    # dtype. It is NOT in pp_cut.PhasePoolModel (which prices weights, mamba
+    # state, the arming floor and KV only), so it is the one genuinely new
+    # term -- and it is converted into pool tokens rather than charged against
+    # a second MiB budget, because the pool model has already spent every free
+    # MiB into tokens and charging both would be two books for one byte.
+    act_mib_per_pass = float(chunk_tokens) * float(hidden_size) * float(dtype_bytes)
+    act_mib_per_pass /= 1024.0 * 1024.0
+
+    if measured is None:
+        passes = 1
+    else:
+        stall = measured.stall_share
+        passes = int(math.ceil(1.0 / (1.0 - stall))) if stall < 1.0 else 0
+    depth = max(0, passes - 1)
+    pinned = pinned_depth is not None
+    if pinned:
+        if int(pinned_depth) < 0:
+            raise Weg2LaunchRefused(
+                "W42 Weg2DepthUnfunded: --p-microbatch-depth %d is negative; "
+                "the flag counts in-flight passes." % int(pinned_depth)
+            )
+        # A pin replaces the derivation, never the PRICE: it is announced and
+        # then funded on exactly the same axis, so an override cannot buy a
+        # depth the pool cannot hold.
+        depth = int(pinned_depth)
+        passes = depth + 1
+
+    if depth > 0 and gapped_layer_set:
+        raise Weg2LaunchRefused(
+            "W43 Weg2DepthGapped: SGLANG_PP_LAYER_SET=%r puts group P on a "
+            "GAPPED layer set, and a derived --pp-async-batch-depth %d would "
+            "die at scheduler_pp_mixin.init_pp_loop_state, which refuses the "
+            "pair outright: under a gapped set every stage must be inside the "
+            "SAME forward, because each stage's next layer is another's "
+            "previous one, and async depth lets a rank enter the next forward "
+            "while a peer is still in the last one's output exchange. Refused "
+            "here so the launcher says it, rather than three ranks discovering "
+            "it after the weights are loaded." % (gapped_layer_set, depth)
+        )
+
+    price_rows = depth * int(chunk_tokens)
+    price_mib = tuple(
+        depth * (float(chunk_tokens) * k + act_mib_per_pass) for k in kv_mib_per_token
+    )
+    # The stage that converts worst is the one with the FEWEST attention
+    # layers: a token costs it less MiB, so the same MiB of crossing frame
+    # costs it MORE tokens. The pool is a MIN over stages, so that stage is
+    # the one that binds it.
+    price_tokens = (
+        max(
+            depth * (float(chunk_tokens) + act_mib_per_pass / k)
+            for k in kv_mib_per_token
+        )
+        if depth > 0
+        else 0.0
+    )
+    pool_after = float(pool_tokens) - price_tokens
+
+    if depth > 0 and pool_after < float(cap_tokens):
+        raise Weg2LaunchRefused(
+            "W42 Weg2DepthUnfunded: the measured bubble asks for "
+            "--pp-async-batch-depth %d (%d passes in flight at stall_share "
+            "%.3f), but group P's pool cannot fund it. Pool is %d tokens, one "
+            "extra pass costs %d KV rows plus a %.1f MiB crossing frame per "
+            "stage = %d pool tokens at the worst-converting stage, leaving %d "
+            "against the %d-token floor (--max-kv-per-request) -- short by %d. "
+            "Raise the per-rank budgets, lower --max-kv-per-request, or accept "
+            "depth 0 by pinning it. The depth is NOT quietly lowered: a depth "
+            "the bubble did not ask for is a hand number."
+            % (
+                depth,
+                passes,
+                0.0 if measured is None else measured.stall_share,
+                int(pool_tokens),
+                int(chunk_tokens),
+                act_mib_per_pass,
+                int(price_tokens),
+                int(pool_after),
+                int(cap_tokens),
+                int(float(cap_tokens) - pool_after),
+            )
+        )
+
+    return DepthDecision(
+        depth=depth,
+        passes_in_flight=passes,
+        pinned=pinned,
+        measured=measured,
+        pool_tokens=float(pool_tokens),
+        pool_after=pool_after,
+        cap_tokens=int(cap_tokens),
+        price_rows=price_rows,
+        price_tokens=price_tokens,
+        price_mib=price_mib,
+        act_mib_per_pass=act_mib_per_pass,
+        chunk_tokens=int(chunk_tokens),
+    )
+
+
 def _csv_ints(text: str) -> List[int]:
     return [int(x.strip()) for x in str(text).split(",") if x.strip()]
 
@@ -980,11 +1364,29 @@ def _csv_floats(text: str) -> List[float]:
     return [float(x.strip()) for x in str(text).split(",") if x.strip()]
 
 
-def solve_p_cut(ns, cards: List[Card], budgets_p: List[int], model: str, log) -> Tuple[str, str]:
+@dataclass(frozen=True)
+class PCutFacts:
+    """What the solved cut knows that the depth price also needs.
+
+    Handed on rather than re-derived: the pool, the attention split and the KV
+    cell are already solved once here, and a second derivation beside them
+    would be a second set of books for one physical fact.
+    """
+
+    stage_ratio: str
+    attn_stage_ratio: str
+    pool_tokens: float
+    attn_counts: Tuple[int, ...]
+    kv_mib_per_token_per_attn_layer: float
+    hidden_size: int
+    cap_tokens: int
+
+
+def solve_p_cut(ns, cards: List[Card], budgets_p: List[int], model: str, log) -> PCutFacts:
     """Group P's layer + attention cut, and the ONE provenance line for it.
 
-    Returns ``(stage_ratio, attn_stage_ratio)`` as the launcher's own flag
-    strings. Everything it feeds the solver is either measured on this box
+    Returns the flag strings plus the pool facts the depth solver prices
+    against (:class:`PCutFacts`). Everything it feeds the solver is either measured on this box
     (NVML card names, the per-rank budgets this launcher just derived, the
     checkpoint's own weight headers and KV cell) or a flag whose default
     carries its provenance in the help text -- no number is chosen here.
@@ -1100,7 +1502,15 @@ def solve_p_cut(ns, cards: List[Card], budgets_p: List[int], model: str, log) ->
         f"{attn_ratio}) = {','.join(str(c) for c in realized)} -- the argv "
         f"states what the boot will run."
     )
-    return stage_ratio, attn_ratio
+    return PCutFacts(
+        stage_ratio=stage_ratio,
+        attn_stage_ratio=attn_ratio,
+        pool_tokens=float(decision.chosen.pool_tokens),
+        attn_counts=tuple(int(a) for a in decision.chosen.attn),
+        kv_mib_per_token_per_attn_layer=float(kv_mib),
+        hidden_size=int(text_cfg["hidden_size"]),
+        cap_tokens=int(ns.max_kv_per_request),
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1168,6 +1578,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              f"pp_cut.PhasePoolModel names the gap this stands in for: the "
              f"solved per-layout floor only exists for a layout that has "
              f"booted, and the proxy carries about +-500 MiB.",
+    )
+    ap.add_argument(
+        "--p-microbatch-depth", type=int, default=None,
+        help="OVERRIDE group P's solved --pp-async-batch-depth (#692). Unset = "
+             "DERIVED from the previous boot's own PP-BUBBLE line: a stage busy "
+             "forward/(gap+forward) of the time needs ceil(1/(1-stall_share)) "
+             "passes in flight to cover its gap, and the flag counts the passes "
+             "BEYOND the one being forwarded. Priced against P's KV pool -- one "
+             "extra pass costs one chunk of KV rows plus one crossing "
+             "activation frame per stage -- and refused as W42 rather than "
+             "lowered when the pool cannot fund it. Passing it is announced as "
+             "PINNED and priced on the same axis.",
+    )
+    ap.add_argument(
+        "--p-bubble-measured-from", default="",
+        help="Path of the group-P log whose PP-BUBBLE lines feed "
+             f"--p-microbatch-depth. Unset = the newest log in {EVIDENCE_DIR} "
+             "that actually carries the instrument (a log without the line is "
+             "skipped, never read as a measured zero). No measurement anywhere "
+             "= depth 0, i.e. today's behaviour, and the line says so.",
     )
     ap.add_argument(
         "--pp-cut-mamba-mib-per-linear-layer-per-slot", type=float, default=0.0,
@@ -1301,7 +1731,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
-    stage_ratio, attn_stage_ratio = solve_p_cut(ns, cards, budgets_p, ns.model, log)
+    cut = solve_p_cut(ns, cards, budgets_p, ns.model, log)
+    stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
+    # #692 MICROBATCH DEPTH. The share is READ from a previous boot's own
+    # PP-BUBBLE line, never written here: an operator-supplied path wins, else
+    # the newest log in EVIDENCE_DIR that actually carries the instrument, else
+    # no measurement at all and the depth is today's 0 -- printed, so the
+    # absence is visible rather than inferred from a missing line.
+    bubble_src = ns.p_bubble_measured_from or newest_bubble_log(EVIDENCE_DIR)
+    if ns.p_bubble_measured_from and read_pp_bubble(ns.p_bubble_measured_from) is None:
+        raise Weg2LaunchRefused(
+            f"W42 Weg2DepthUnfunded: --p-bubble-measured-from "
+            f"{ns.p_bubble_measured_from} carries no PP-BUBBLE line, so it "
+            f"states nothing about the bubble. An explicitly named measurement "
+            f"file that turns out to be empty is refused rather than silently "
+            f"treated as 'no measurement' -- that would read as depth 0 for a "
+            f"reason the operator did not intend."
+        )
+    depth_decision = solve_p_depth(
+        measured=read_pp_bubble(bubble_src) if bubble_src else None,
+        pool_tokens=cut.pool_tokens,
+        attn_counts=cut.attn_counts,
+        kv_mib_per_token_per_attn_layer=cut.kv_mib_per_token_per_attn_layer,
+        hidden_size=cut.hidden_size,
+        chunk_tokens=chunked_prefill_size_of(
+            common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, ns.p_hicache_write_policy)
+        ),
+        cap_tokens=cut.cap_tokens,
+        # build_env() starts from os.environ, so an exported gapped layer set
+        # would reach group P without ever passing through this launcher's
+        # flags. Read it from the environment P will actually get.
+        gapped_layer_set=env_p.get("SGLANG_PP_LAYER_SET", ""),
+        pinned_depth=ns.p_microbatch_depth,
+    )
+    log(depth_decision.line())
+    state.p_depth = depth_decision.depth
     if ns.d_disable_overlap_schedule:
         log(
             "W41 Weg2OverlapRefused: --d-disable-overlap-schedule was passed, "
@@ -1330,7 +1794,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
             f"arm exists to, and changes nothing else). Group D is unchanged."
         )
-    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy), ns.transport), state.logs["P"], env_p)
+    spec_p = GroupSpec("P", PORT_P, transport_argv(argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth), ns.transport), state.logs["P"], env_p)
     state.argv["P"] = " ".join(shlex.quote(a) for a in spec_p.argv)
     state.deviations = [
         "transports stay OPEN across sleep (barlink_reopen() unwired this round; BAR1 windows sized to fit both groups: P 24+96, D 16+32+40 MiB "
