@@ -385,7 +385,9 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.server_args)
+        # #1275 fix 3: same channel class as /get_server_info -- `asdict` does
+        # not inherit the repr's redaction, so ask for it.
+        result: Dict[str, Any] = self.server_args.redacted_dict()
         result.update(self.scheduler_info)
         return json.dumps(msgspec_to_builtins(result), default=str)
 

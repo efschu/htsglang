@@ -15540,7 +15540,9 @@ class Scheduler(
                 get_server_args().override(source="update_server_args", **remaining)
             logger.info(f"Global server args updated! {get_server_args()=}")
 
-        server_args = dict(vars(get_server_args()))
+        # #1275 fix 3: `vars()` bypasses `__repr__` exactly as `asdict` does, so
+        # this response needs the explicit redaction too.
+        server_args = get_server_args().redacted_dict()
         # This field is not serializable.
         server_args.pop("model_config", None)
         return SetInternalStateReqOutput(

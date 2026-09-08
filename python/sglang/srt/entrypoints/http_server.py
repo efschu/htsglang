@@ -1094,9 +1094,17 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     # server_args.model_config is not serializable but should be excluded by asdict.
+    # #1275 fix 3: REDACTED, and this endpoint is the WORSE half of that leak.
+    # `/get_server_info` carries no @auth_level, so under an admin-key-only
+    # boot `decide_request_auth`'s NORMAL branch returns allowed=True and this
+    # body is readable by anyone who can reach the port -- including
+    # `admin_api_key` itself, which would hand out the very credential the
+    # ADMIN_OPTIONAL routes are gated on. `asdict` does not go through
+    # `__repr__`, so the repr redaction does not reach here; this needs its own
+    # call.
     return msgspec_to_builtins(
         {
-            **dataclasses.asdict(server_args),
+            **server_args.redacted_dict(),
             **_global_state.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,

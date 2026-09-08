@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import random
+import re
 import socket
 import tempfile
 import uuid
@@ -865,6 +866,36 @@ def registered_storage_backends() -> tuple:
     from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
 
     return tuple(StorageBackendFactory._registry)
+
+
+#: #1275 fix 3: the fields whose VALUE is a credential. Everything here is
+#: replaced by :data:`REDACTED` in every rendering of ServerArgs -- the repr the
+#: startup log prints, and the dicts the info endpoints serialise. The SHIPPED
+#: values are never touched; only the copies that leave this process as text.
+SECRET_FIELD_NAMES = frozenset({"api_key", "admin_api_key", "ssl_keyfile_password"})
+
+#: Pattern for fields added LATER, so a new credential is redacted before anyone
+#: notices it exists. SINGULAR `_key`/`_secret`/`_password`/`_credential` only.
+#:
+#: `_token` AND `_tokens` ARE DELIBERATELY ABSENT, and this is measured rather
+#: than assumed: on this ServerArgs a `*_token*` name is a token COUNT, not a
+#: credential. Sixteen of them -- `max_total_tokens`, `max_prefill_tokens`,
+#: `num_reserved_decode_tokens`, `bucket_time_to_first_token`,
+#: `kt_max_deferred_experts_per_token`, the whole `kv_session_offload_*_tokens`
+#: family -- match a naive `*_token` rule, and redacting them would destroy the
+#: diagnostic value of every boot log and every /get_server_info response while
+#: hiding no secret at all. `ssl_keyfile` is likewise a PATH and stays visible;
+#: `ssl_keyfile_password` is the credential beside it and is listed above.
+_SECRET_FIELD_RE = re.compile(r"_(key|secret|password|passwd|credential)$")
+
+#: What a redacted value renders as. A constant, so a test can assert presence
+#: rather than absence-of-a-particular-string.
+REDACTED = "<redacted>"
+
+
+def is_secret_field(name: str) -> bool:
+    """Does this ServerArgs field hold a credential?"""
+    return name in SECRET_FIELD_NAMES or bool(_SECRET_FIELD_RE.search(name))
 
 
 @dataclasses.dataclass
@@ -6833,6 +6864,37 @@ class ServerArgs:
         "consumer in grace as soon as it goes quiet; 1 disables the grace "
         "window and keeps only the declare-dead step.",
     ] = 0.25
+
+    def redacted_dict(self) -> dict:
+        """This ServerArgs as a plain dict with every credential replaced.
+
+        #1275 fix 3. Use this for anything that SERIALISES ServerArgs -- the
+        info endpoints -- because `dataclasses.asdict` does not go through
+        `__repr__` and therefore inherits none of its redaction.
+        """
+        out = dict(vars(self))
+        for name in list(out):
+            if is_secret_field(name) and out[name] is not None:
+                out[name] = REDACTED
+        return out
+
+    def redacted_repr(self) -> str:
+        """The dataclass repr with every credential replaced.
+
+        THE REPR ITSELF IS REDACTED (``__repr__ = redacted_repr`` below), not
+        merely a helper the startup log happens to call. That is the fix-2
+        lesson applied to a second channel: boot weg2sb5b leaked
+        ``admin_api_key='<key>'`` once in P.log and once in D.log through
+        ``logger.info(f"{server_args=}")``, and there are THREE such sites
+        (engine.py twice, scheduler.py's "Global server args updated!"). Fixing
+        the three known ones leaves the fourth -- the one someone adds next
+        month -- leaking again. Redacting at the door makes every present and
+        future f-string, print and log safe by construction.
+        """
+        inner = ", ".join(f"{k}={v!r}" for k, v in self.redacted_dict().items())
+        return f"{type(self).__name__}({inner})"
+
+    __repr__ = redacted_repr
 
     def __post_init__(self):
         """
