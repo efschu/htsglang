@@ -379,7 +379,7 @@ class TestTheLauncherCallSites(CustomTestCase):
         self.assertIsInstance(first, ast.Name)
         self.assertEqual(first.id, "p_split")   # not the score vector
 
-    def test_the_score_vector_is_read_only_by_argv_and_by_the_derivation(self):
+    def _score_vector_holders(self):
         import ast
 
         tree, _L = self._launcher_ast()
@@ -390,7 +390,87 @@ class TestTheLauncherCallSites(CustomTestCase):
             for n in ast.walk(fn):
                 if isinstance(n, ast.Name) and n.id == "P_PP_STAGE_RATIO_SCORES":
                     holders.add(fn.name)
-        self.assertEqual(holders, {"argv_p", "p_stage_layers", "main"})
+        return holders
+
+    def test_the_score_vector_is_read_only_by_argv_and_by_the_derivation(self):
+        # FIX 2 moved this set by one in each direction, and both moves are the
+        # point of the fix.  ``solve_p_cut`` JOINS it: its incumbent was a bare
+        # "32,18,14", a fourth copy of a vector defined once.  ``main`` LEAVES
+        # it: the constants are the INCUMBENT cut, and main describes the cut
+        # the boot actually runs -- it read them to build the flip-order map
+        # and the WEG2-PP-SPLIT line while argv_p was launched with the SOLVED
+        # cut, which is the complete-but-wrong map class, one level up from the
+        # one fix 5 closed.
+        self.assertEqual(
+            self._score_vector_holders(),
+            {"argv_p", "p_stage_layers", "solve_p_cut"},
+        )
+
+    def test_main_never_names_the_incumbent_score_vector(self):
+        # The B3/B4 tripwire, stated as its own failure: any reappearance of
+        # the incumbent inside main is a consumer describing THIS boot with the
+        # PREVIOUS boot's cut.  Prose too -- the log lines were the visible
+        # half of the defect, asserting a derivation that had stopped happening.
+        self.assertNotIn("main", self._score_vector_holders())
+
+    def test_the_flip_order_split_comes_off_the_solved_cut(self):
+        # The positive half: main's ``p_split`` -- the vector handed to
+        # chunk_tag_cards by the test above -- is read off PCutFacts, which
+        # solve_p_cut has already round-tripped through the runtime's own
+        # authority, and is not re-derived from anything.
+        import ast
+
+        tree, _L = self._launcher_ast()
+        main = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "main"
+        )
+        sources = []
+        for n in ast.walk(main):
+            targets = (
+                [n.target] if isinstance(n, ast.AnnAssign)
+                else list(n.targets) if isinstance(n, ast.Assign)
+                else []
+            )
+            names = {
+                t2.id for t in targets for t2 in ast.walk(t)
+                if isinstance(t2, ast.Name)
+            }
+            if "p_split" in names:
+                sources.append(ast.dump(n.value) if n.value is not None else "")
+        self.assertTrue(sources, "main must assign p_split")
+        self.assertIn(
+            "id='cut'",
+            sources[0],
+            "p_split must come off the SOLVED cut, not from a re-derivation "
+            "of the incumbent score vectors",
+        )
+
+    def test_both_cut_returns_publish_the_round_tripped_split(self):
+        # Emptying ``layer_counts`` on either return is invisible to every
+        # behavioural test below -- main would just print NO MAP and pause in
+        # the identity order, quietly losing the fix.  Matched to that class:
+        # both PCutFacts constructions must pass a non-empty layer_counts.
+        import ast
+
+        tree, _L = self._launcher_ast()
+        solver = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "solve_p_cut"
+        )
+        returns = [
+            n for n in ast.walk(solver)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "PCutFacts"
+        ]
+        self.assertEqual(len(returns), 2, "the gapped kind and the count form")
+        for call in returns:
+            kw = {k.arg: k.value for k in call.keywords}
+            self.assertIn("layer_counts", kw)
+            self.assertNotEqual(
+                ast.dump(kw["layer_counts"]), ast.dump(ast.parse("()").body[0].value)
+            )
+
 
     def test_the_ledger_call_site_passes_the_cgroup_denominator(self):
         tree, _L = self._launcher_ast()
@@ -419,3 +499,107 @@ class TestTheLauncherCallSites(CustomTestCase):
             if isinstance(n, ast.Constant) and isinstance(n.value, str)
         }
         self.assertEqual(literals & forbidden, set())
+
+
+class TestTheFlipOrderSplitIsTheSolvedOne(CustomTestCase):
+    """FIX 2, called rather than parsed.
+
+    The previous instance of this defect was found by a reviewer because the
+    decision lived inside ``main`` and only an AST test could reach it.  It is
+    ``flip_order_split`` now, so these are behavioural.
+    """
+
+    @staticmethod
+    def _cut(**kw):
+        from sglang.srt.weg2.launcher import PCutFacts
+
+        base = dict(
+            stage_ratio="31,17,16", attn_stage_ratio="7,5,4", pool_tokens=0.0,
+            attn_counts=(7, 5, 4), kv_mib_per_token_per_attn_layer=0.0,
+            hidden_size=0, cap_tokens=0, layer_counts=(31, 17, 16),
+        )
+        base.update(kw)
+        return PCutFacts(**base)
+
+    def test_a_contiguous_cut_yields_its_own_counts(self):
+        from sglang.srt.weg2.launcher import flip_order_split
+
+        split, note = flip_order_split(self._cut(), 64)
+        self.assertEqual(split, [31, 17, 16])
+        self.assertEqual(note, "")
+
+    def test_the_incumbent_is_not_what_comes_back(self):
+        # The defect, stated as its own assertion: the shipped maxkv cut is
+        # 31,17,16 and the incumbent derives to 32,18,14.  A map built on the
+        # latter puts weights_3 and weights_6 on other cards than the boot's.
+        from sglang.srt.weg2 import launcher as L
+
+        split, _ = L.flip_order_split(self._cut(), 64)
+        self.assertNotEqual(split, list(L.P_PP_STAGE_RATIO_SCORES))
+
+    def test_a_gapped_cut_publishes_no_map_and_says_why(self):
+        from sglang.srt.weg2.launcher import flip_order_split
+
+        split, note = flip_order_split(
+            self._cut(stage_ratio="", attn_stage_ratio="", gapped=True,
+                      layer_set="0-47:0,48-55:1,56-63:2",
+                      layer_counts=(48, 8, 8)),
+            64,
+        )
+        self.assertEqual(split, [])
+        self.assertIn("GAPPED", note)
+        self.assertIn("non-contiguous", note)
+
+    def test_a_split_that_does_not_cover_the_checkpoint_publishes_no_map(self):
+        from sglang.srt.weg2.launcher import flip_order_split
+
+        split, note = flip_order_split(self._cut(layer_counts=(31, 17, 15)), 64)
+        self.assertEqual(split, [])
+        self.assertIn("63, not 64", note)
+
+    def test_an_absent_split_publishes_no_map_rather_than_a_guess(self):
+        from sglang.srt.weg2.launcher import flip_order_split
+
+        split, note = flip_order_split(self._cut(layer_counts=()), 64)
+        self.assertEqual(split, [])
+        self.assertIn("no layer counts", note)
+
+    def test_the_map_the_front_gets_follows_the_cut(self):
+        # End of the chain: the two cuts put weights_3 on different cards, and
+        # the pause order is built from exactly that.
+        from sglang.srt.managers.weg2_memory_saver import chunk_tag_cards
+        from sglang.srt.weg2 import launcher as L
+
+        nvml_of_stage = [1, 0, 2]
+        solved, _ = L.flip_order_split(self._cut(), 64)
+        incumbent = L.p_stage_layers([(i % 4) == 3 for i in range(64)])
+        a = chunk_tag_cards(solved, 8, 8, card_of_stage=nvml_of_stage)
+        b = chunk_tag_cards(incumbent, 8, 8, card_of_stage=nvml_of_stage)
+        self.assertNotEqual(list(a["weights_3"]), list(b["weights_3"]))
+
+    def test_the_cut_carries_the_split_it_round_tripped(self):
+        # PCutFacts.layer_counts is not decoration: it is the ONE field that
+        # makes a second derivation unnecessary, so it must exist and default
+        # to the empty tuple (absent = no map, never a guess).
+        from sglang.srt.weg2.launcher import PCutFacts
+
+        self.assertIn("layer_counts", PCutFacts.__dataclass_fields__)
+        facts = PCutFacts(
+            stage_ratio="", attn_stage_ratio="", pool_tokens=0.0, attn_counts=(),
+            kv_mib_per_token_per_attn_layer=0.0, hidden_size=0, cap_tokens=0,
+        )
+        self.assertEqual(facts.layer_counts, ())
+
+    def test_p_stage_layers_follows_the_pair_it_is_given(self):
+        # The seam FIX 2 parameterised: asked about a cut, it must answer for
+        # THAT cut and not for the module incumbent.  31,17,16 / 7,5,4 is the
+        # maxkv cut this tip solves; the incumbent derives to [32,18,14].
+        from sglang.srt.weg2 import launcher as L
+
+        kinds = [(i % 4) == 3 for i in range(64)]
+        self.assertEqual(L.p_stage_layers(kinds), [32, 18, 14])
+        self.assertEqual(
+            L.p_stage_layers(kinds, scores=[31, 17, 16], attn_scores=[7, 5, 4]),
+            [31, 17, 16],
+        )
+

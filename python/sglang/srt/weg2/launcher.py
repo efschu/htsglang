@@ -288,11 +288,36 @@ P_BYTES_PER_TOKEN = 8192 + 2048
 #: attn_scores 7,5,4 -> [31,19,14]; scores 31,17,16 -> [32,16,16]; scores
 #: 30,20,14 -> [32,18,14].  Anything that needs the SPLIT calls
 #: :func:`p_stage_layers`; nothing reads these as layer counts.
+#:
+#: FIX 2 (#1233 fix 5, second instance).  WHICH cut this vector is, stated so
+#: no third consumer can adopt it for the wrong one: it is the INCUMBENT --
+#: the cut ``MEASURED_MS_PER_LAYER`` was taken under on boot bsscale (PP0
+#: 259.1 ms/32 layers, PP1 632.9/18, PP2 470.2/14), hence the cost model's
+#: incumbent in :func:`solve_p_cut` and the default ``argv_p`` renders when
+#: nobody solved or pinned one.  It is NOT the cut the boot runs: since
+#: ``solve_p_cut`` was wired into ``main`` that is ``PCutFacts.stage_ratio``
+#: and its round-tripped ``PCutFacts.layer_counts``, and every consumer that
+#: describes THIS boot -- argv, the flip-order map, the provenance lines --
+#: reads those.  Exactly three functions may name this vector: ``argv_p``
+#: (the flag default), ``solve_p_cut`` (the incumbent) and
+#: :func:`p_stage_layers` (what a score pair derives to); the registered
+#: guard in test_weg2_host_budget_1233 pins that set.
 P_PP_STAGE_RATIO_SCORES = (32, 18, 14)
 #: Group P's per-stage FULL-ATTENTION scores (#485 ``--pp-attn-stage-ratio``),
-#: read twice for the same reason and therefore defined once: by ``argv_p``
-#: (the flag) and by :func:`p_stage_layers` (the split the flag produces).
+#: the incumbent's other half, defined once for the same three readers.
 P_PP_ATTN_STAGE_RATIO_SCORES = (8, 4, 4)
+
+
+def _csv(values: Sequence[int]) -> str:
+    """One vector, one rendering: the CSV form the two count flags take.
+
+    FIX 2.  ``argv_p`` used to carry ``"32,18,14"`` / ``"8,4,4"`` as bare
+    default arguments -- a THIRD statement of the constants above, which the
+    #1233 fix 5 one-definition property had already closed once and which
+    ``test_neither_score_vector_survives_anywhere_as_a_bare_literal`` was
+    written to catch.  It caught it; the reading was wrong, not the guard.
+    """
+    return ",".join(str(int(v)) for v in values)
 
 
 def derive_p_max_total_tokens() -> int:
@@ -1271,8 +1296,8 @@ def argv_p(
     extra: List[str],
     p_bs: int = 8,
     max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
-    stage_ratio: str = "32,18,14",
-    attn_stage_ratio: str = "8,4,4",
+    stage_ratio: Optional[str] = None,
+    attn_stage_ratio: Optional[str] = None,
     write_policy: str = "write_through",
     depth: int = 0,
     window_mib: str = P_BARLINK_BAR1_WINDOW_MIB,
@@ -1295,6 +1320,15 @@ def argv_p(
     # make_layers/model_runner resolve ownership from get_pp_layer_set, never
     # from the count form -- so the count copy is the second set of books and
     # it is dropped, rather than kept and asserted against.
+    # FIX 2: THE INCUMBENT IS READ, NOT RESTATED. ``None`` (nobody solved or
+    # pinned a cut) renders the incumbent score vectors from their ONE
+    # definition, at call time -- so patching the constant moves the flag, and
+    # a bare "32,18,14" here cannot drift away from it again. ``""`` still
+    # means OMIT BOTH FLAGS (the gapped kind, FOLLOW FIX 1) and is left alone.
+    if stage_ratio is None:
+        stage_ratio = _csv(P_PP_STAGE_RATIO_SCORES)
+    if attn_stage_ratio is None:
+        attn_stage_ratio = _csv(P_PP_ATTN_STAGE_RATIO_SCORES)
     if bool(stage_ratio) != bool(attn_stage_ratio):
         raise Weg2LaunchRefused(
             "W40 Weg2PPCutRefused: --pp-stage-ratio %r and "
@@ -2686,8 +2720,12 @@ def model_layer_kinds(model: str) -> List[bool]:
     return declared_layer_kinds_from_config(_model_config(model), model_num_layers(model))
 
 
-def p_stage_layers(is_full_attention: Sequence[bool]) -> List[int]:
-    """Group P's per-stage LAYER COUNTS -- derived, never restated.
+def p_stage_layers(
+    is_full_attention: Sequence[bool],
+    scores: Optional[Sequence[int]] = None,
+    attn_scores: Optional[Sequence[int]] = None,
+) -> List[int]:
+    """The per-stage LAYER COUNTS a score pair derives to -- never restated.
 
     #1233 fix 5.  The flip-order map used to be built from
     ``P_PP_STAGE_RATIO_SCORES`` directly, with a comment calling that vector
@@ -2703,16 +2741,29 @@ def p_stage_layers(is_full_attention: Sequence[bool]) -> List[int]:
     instrument that says it is fine.
 
     This calls the SAME function ``server_args._handle_pp_stage_ratio`` calls
-    (``distributed.utils.derive_pp_layer_split``) with the SAME two score
-    vectors ``argv_p`` passes, so there is one authority for the split and the
-    launcher reads it rather than keeping a second copy.
+    (``distributed.utils.derive_pp_layer_split``), so there is one authority
+    for the split and the launcher reads it rather than keeping a second copy.
+
+    FIX 2 -- WHICH SCORE PAIR.  Fix 5 hard-wired the module constants here,
+    which was right while they were the only cut in the file.  They stopped
+    being that when ``solve_p_cut`` was wired into ``main``: the boot then ran
+    the SOLVED pair while this function still answered for the INCUMBENT, so
+    ``main`` published a flip-order map and a WEG2-PP-SPLIT line for a layout
+    group P was not launched with -- complete, confident, and wrong, which is
+    precisely the failure mode fix 5 names and the one
+    ``interleave_pause_order`` cannot refuse.  The pair is a PARAMETER now and
+    every caller states which cut it is asking about; the constants remain the
+    default because they are the incumbent, and ``solve_p_cut`` round-trips
+    its own candidate through this same seam.
     """
     from sglang.srt.distributed.utils import derive_pp_layer_split
 
     return derive_pp_layer_split(
-        list(P_PP_STAGE_RATIO_SCORES),
+        list(P_PP_STAGE_RATIO_SCORES if scores is None else scores),
         is_full_attention=list(is_full_attention),
-        attn_scores=list(P_PP_ATTN_STAGE_RATIO_SCORES),
+        attn_scores=list(
+            P_PP_ATTN_STAGE_RATIO_SCORES if attn_scores is None else attn_scores
+        ),
     )
 
 
@@ -3991,6 +4042,55 @@ class PCutFacts:
     #: byte-identical to what it was.
     layer_set: str = ""
     gapped: bool = False
+    #: FIX 2: THE REALIZED PER-STAGE LAYER COUNTS OF THIS CUT -- the one fact
+    #: the flip-order map needs and the only one that may not be re-derived
+    #: from a score vector somewhere else. Not a convenience field: it is
+    #: already ROUND-TRIPPED here against the runtime's own authority
+    #: (``derive_pp_layer_split`` for the count form, ``parse_pp_layer_sets``
+    #: for a gapped map) and a cut that fails that round trip is refused, so
+    #: this is the split the boot provably runs. ``main`` reads it instead of
+    #: asking ``p_stage_layers`` about the incumbent again.
+    layer_counts: Tuple[int, ...] = ()
+
+
+def flip_order_split(cut: PCutFacts, n_layers: int) -> Tuple[List[int], str]:
+    """The per-stage layer counts the FLIP-ORDER MAP may be built from.
+
+    FIX 2.  ``main`` used to derive this from the module score constants, at a
+    point that runs before ``solve_p_cut`` -- so it answered for the INCUMBENT
+    while group P was launched on the SOLVED cut, and the front got a map that
+    was complete, confident and wrong (measured on this tip: incumbent
+    ``[32,18,14]`` against the shipped maxkv cut's ``[31,17,16]``, which moves
+    ``weights_3`` and ``weights_6`` onto other cards).  It comes off the cut
+    now, and this function is the whole decision -- extracted from ``main`` so
+    it can be tested by CALLING it rather than by reading main's AST, which is
+    the only reason the previous instance of this defect had to be found by a
+    reviewer instead of by a test.
+
+    Returns ``([], reason)`` in the three cases where no honest map exists.
+    NO MAP is the honest degradation: ``interleave_pause_order`` refuses an
+    INCOMPLETE map and the front falls back to the identity pause order with
+    the reason printed.  It does NOT refuse a complete-but-wrong one, which is
+    the weg2dk4 death, so every case that cannot be stated exactly is stated
+    as nothing.
+    """
+    split = list(cut.layer_counts)
+    if not split:
+        return [], "solve_p_cut published no layer counts"
+    if sum(split) != n_layers:
+        return [], f"solved split {split} sums to {sum(split)}, not {n_layers}"
+    if cut.gapped:
+        # A gapped cut's stages own NON-CONTIGUOUS layer bands, and
+        # chunk_tag_cards walks cumulative per-stage counts -- that walk IS the
+        # contiguous assumption, so no count vector can state this map.  Before
+        # this fix a gapped boot silently got the incumbent's CONTIGUOUS map
+        # here: the same wrong-map class, one layer deeper.
+        return [], (
+            f"the solved cut is GAPPED ({cut.layer_set}); its stages own "
+            f"non-contiguous layer bands and chunk_tag_cards walks cumulative "
+            f"contiguous counts, so no count vector can state this map"
+        )
+    return split, ""
 
 
 def solve_p_cut(
@@ -4063,7 +4163,12 @@ def solve_p_cut(
         else _pp_cut.LAYER_FAMILY_LINEAR
         for k in kinds
     )
-    incumbent = _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else _csv_ints("32,18,14")
+    # FIX 2: the incumbent is the cost model's MEASUREMENT BASIS -- the cut
+    # MEASURED_MS_PER_LAYER was taken under -- and that is what
+    # P_PP_STAGE_RATIO_SCORES is defined to be. It was restated here as a bare
+    # "32,18,14", a fourth copy of a vector whose whole point is one
+    # definition; an operator pin still overrides it.
+    incumbent = _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else list(P_PP_STAGE_RATIO_SCORES)
     # THE GAPPED DEFAULT IS NOT TAKEN, AND THE HOOK IS NAMED RATHER THAN LEFT
     # OPEN (#753 / boot weg2gp1, 2026-09-08, /spinning/gpu-arb/weg2/
     # BOOT_weg2gp1_0908.md). The user's 0,8,8 layout was probed on metal for
@@ -4255,6 +4360,7 @@ def solve_p_cut(
             cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
             layer_set=decision.chosen.layer_set,
             gapped=True,
+            layer_counts=tuple(int(c) for c in realized_counts),
         )
     # ROUND TRIP AGAINST THE RUNTIME AUTHORITY, not against our own model.
     # --pp-stage-ratio entries are SCORES: server_args hands them to
@@ -4265,13 +4371,14 @@ def solve_p_cut(
     # comes back as 23,24,17. A solved cut that does not survive this call is
     # a cut the boot would not run, so it is refused here rather than logged
     # and departed from.
-    stage_ratio = ",".join(str(n) for n in decision.chosen.layers)
-    attn_ratio = ",".join(str(a) for a in decision.chosen.attn)
-    from sglang.srt.distributed.utils import derive_pp_layer_split
-
-    realized = derive_pp_layer_split(
-        list(decision.chosen.layers),
-        is_full_attention=[str(k) == "full_attention" for k in kinds],
+    stage_ratio = _csv(decision.chosen.layers)
+    attn_ratio = _csv(decision.chosen.attn)
+    # FIX 2: through ``p_stage_layers``, the launcher's ONE score-pair ->
+    # split seam, rather than a second direct call to the same upstream
+    # function. Same authority, one caller of it.
+    realized = p_stage_layers(
+        [str(k) == "full_attention" for k in kinds],
+        scores=list(decision.chosen.layers),
         attn_scores=list(decision.chosen.attn),
     )
     if list(realized) != list(decision.chosen.layers):
@@ -4295,6 +4402,7 @@ def solve_p_cut(
         kv_mib_per_token_per_attn_layer=float(kv_mib),
         hidden_size=int(text_cfg["hidden_size"]),
         cap_tokens=int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS),
+        layer_counts=tuple(int(c) for c in realized),
     )
 
 
@@ -4835,34 +4943,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "in flight together -> dst.resume(kv); the host holds ONE image per card (H(c) = max_g image_g(c)) "
         "and dst's per-tag releases fund src's acquires inside it")
 
-    # 1b'. #1233 fix 5 -- P's PP LAYER SPLIT, derived from the two score vectors
-    # argv_p passes, by the SAME function server_args calls.  Named refusal
-    # instead of a guess: a split that does not sum to the checkpoint's depth
-    # publishes NO map, and the flip falls back to the identity pause order
-    # with the reason printed, rather than to a confident wrong one.
-    p_split: List[int] = []
-    p_kinds: List[bool] = []
-    p_split_note = ""
-    try:
-        p_kinds = model_layer_kinds(ns.model)
-        p_split = p_stage_layers(p_kinds)
-        if sum(p_split) != n_layers:
-            p_split_note = (
-                f"derived split {p_split} sums to {sum(p_split)}, not {n_layers}"
-            )
-            p_split = []
-    except (Weg2LaunchRefused, ValueError, OSError) as e:
-        p_split_note = f"{type(e).__name__}: {e}"
-    log(
-        f"WEG2-PP-SPLIT group=P scores --pp-stage-ratio {list(P_PP_STAGE_RATIO_SCORES)} "
-        f"--pp-attn-stage-ratio {list(P_PP_ATTN_STAGE_RATIO_SCORES)} over {n_layers} layers "
-        f"({sum(p_kinds) if p_split else '?'} full-attention) -> DERIVED layer split "
-        f"{p_split if p_split else 'REFUSED (' + p_split_note + ')'} "
-        "(derive_pp_layer_split, the same authority server_args._handle_pp_stage_ratio "
-        "uses; fix 5: the flip-order map used to restate the SCORE vector as the split, "
-        "which is right only for this checkpoint and this pair of vectors)"
-    )
-    state.p_stage_layers = list(p_split)
+    # 1b'. P's PP LAYER SPLIT is NOT derived here any more (FIX 2).  It was,
+    # from the two module score constants, at a point in main that runs BEFORE
+    # solve_p_cut -- so from the moment the solver was wired in, this line
+    # answered for the INCUMBENT while group P launched on the SOLVED cut, and
+    # the flip-order map built from it was complete, confident and wrong for
+    # every boot whose solve moved the cut (measured on this tip: constants ->
+    # [32,18,14], solved maxkv 31,17,16/7,5,4 -> [31,17,16]).  The split now
+    # comes off PCutFacts.layer_counts, next to the argv it belongs to.
     tms_so = "" if dry else build_tms_preload(tree, ns.venv, log)
     state.weight_chunks = chunk_count
     state.tms_so = tms_so
@@ -4944,6 +5032,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     cut = solve_p_cut(ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens)
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
+
+    # 1b' (moved here by FIX 2) -- P's PP LAYER SPLIT, of the cut group P is
+    # ACTUALLY LAUNCHED WITH.  Read off PCutFacts, where solve_p_cut has
+    # already round-tripped it through the runtime's own authority and refused
+    # anything that would not survive it, rather than re-derived from the
+    # module constants at a point in main that cannot see the solve yet.  The
+    # flip-order map below is the consumer, and a map that is complete but
+    # WRONG is the failure mode this whole seam exists for:
+    # interleave_pause_order refuses only an INCOMPLETE map, so a confident
+    # wrong one pauses the wrong card first -- the weg2dk4 class.
+    #
+    # The decision itself lives in flip_order_split, which names its three
+    # NO-MAP refusals -- and lives OUTSIDE main so a test can call it.
+    p_split, p_split_note = flip_order_split(cut, n_layers)
+    log(
+        f"WEG2-PP-SPLIT group=P cut --pp-stage-ratio {cut.stage_ratio or '(omitted: gapped)'} "
+        f"--pp-attn-stage-ratio {cut.attn_stage_ratio or '(omitted: gapped)'} "
+        f"over {n_layers} layers -> REALIZED layer split "
+        f"{p_split if p_split else 'NO MAP (' + p_split_note + ')'} "
+        f"(source: solve_p_cut's own round trip against "
+        f"{'parse_pp_layer_sets' if cut.gapped else 'derive_pp_layer_split'}, the "
+        f"authority the runtime itself uses. FIX 2: this line used to state the "
+        f"INCUMBENT score vectors -- main does not name them any more, in code "
+        f"or in prose; the PP-CUT solver: line above prints the incumbent and "
+        f"what the solve moved)"
+    )
+    state.p_stage_layers = list(p_split)
     # #1240 THE LAUNCHER IS THE ONLY WRITER. The solved (or pinned) map is
     # published here, into the environment group P will actually get -- the
     # flag is the interface, the variable is the wire. A GAPPED map also arms
@@ -5249,15 +5364,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # passes and the SAME chunk geometry both groups were built with; the front
     # picks the pause order from it per flip, against a live NVML free sample.
     # fix 5: from the DERIVED layer split (section 1b'), never from the score
-    # vector.  No split -> no map -> the front pauses in the identity order and
-    # prints why, which is the honest degradation; a complete-but-wrong map is
-    # not, because interleave_pause_order only refuses an INCOMPLETE one.
+    # vector.  FIX 2: and from the SOLVED cut's split, never from the
+    # incumbent's -- the two are the same vector only when the solve happens
+    # to land back on the incumbent, and on this tip they do not.  No split ->
+    # no map -> the front pauses in the identity order and prints why, which is
+    # the honest degradation; a complete-but-wrong map is not, because
+    # interleave_pause_order only refuses an INCOMPLETE one.
     p_chunk_cards = chunk_tag_cards(
         p_split, chunk_layers, chunk_count, card_of_stage=[c.nvml_index for c in cards]
     ) if p_split else {}
     src_chunk_cards = {"P": {t: list(v) for t, v in p_chunk_cards.items()}}
-    log(f"WEG2-FLIP-ORDER MAP group=P (scores {list(P_PP_STAGE_RATIO_SCORES)}/"
-        f"{list(P_PP_ATTN_STAGE_RATIO_SCORES)} -> DERIVED layer split "
+    log(f"WEG2-FLIP-ORDER MAP group=P (SOLVED cut {cut.stage_ratio or '(gapped)'}/"
+        f"{cut.attn_stage_ratio or '(gapped)'} -> REALIZED layer split "
         f"{p_split if p_split else 'REFUSED (' + p_split_note + ') -> NO MAP, identity order'} "
         f"over {n_layers} layers, {chunk_layers} layers per chunk, "
         f"nvml {[c.nvml_index for c in cards]} in stage order): {src_chunk_cards['P']}; "
