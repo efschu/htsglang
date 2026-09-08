@@ -4939,75 +4939,6 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _carrierless_pp_store_read_refused(self) -> bool:
-        """#1234 W38: is a store READ a rank-local geometry on this boot form?
-
-        THE ROOT OF THE weg2sc1 BOOT KILLER, and it is the third member of a
-        class this tree has already closed twice.  On a PP group WITHOUT the
-        #631 row carrier the followers plan rank-locally ('#631 ROW AUTHORITY
-        DISABLED': `pp_row_carrier_present` is False because the
-        `pp_flip_counters` side channel does not exist on the no-flip PP=3
-        form, which is exactly Weg 2's group P).  Every term that lets one
-        rank decide differently from another has therefore been DISARMED on
-        that form rather than compensated: PP0's #1066 prefetch wait (#973)
-        and PP0's #794 corridor width cut (#1233).  The storage READ is the
-        third, and the one that was left armed.
-
-        WHY IT IS A GEOMETRY AND NOT A CREDIT.  A completed prefetch inserts
-        its KV into THIS rank's radix tree, so from the next
-        `init_next_round_input` on it is indistinguishable from an ordinary
-        device match and it lengthens `prefix_indices` -- the very quantity
-        `ScheduleBatch.prepare_for_extend` sizes the cross-stage tensor from.
-        Storage completion is per-rank and per-pass (each rank's backend
-        finishes at its own speed); on the TP axis the existing MIN reduce
-        makes that uniform (`prefetch_ballot`, and the reduce
-        `weg2_uncached_extent` prices with), on the PP axis there is NOTHING,
-        and #631's wire was reverted twice on metal after deadlocks
-        (d7618425a4, #1015) -- a new PP collective on the admission path is a
-        recorded fatal, not an option.
-
-        MEASURED, boot weg2sc1 (2026-09-07): a W31-refused request was
-        re-queued to P; PP2's prefetch and MAMBA-HOST-RESUME had completed,
-        PP0's and PP1's had not, so PP2 admitted `(8747, 8748)` while its
-        peers admitted `(0, 4096)` -- '#1233 W27 PP WIDTH DIVERGENCE REFUSED:
-        received hidden_states with 4096 rows for a batch of 1 token', the
-        group STOP, on the re-admission path C12 had just created.
-
-        WHAT THIS COSTS, priced rather than waved past: group P forgoes L3
-        prefix reuse.  Its DEVICE tier is untouched and is fed by P's own
-        prefills, which every rank of the group runs identically, so
-        within-epoch prefix sharing is unaffected; what is lost is a hit that
-        would have had to come back from the store, and a re-queued request
-        is re-prefilled instead of read back.  WRITE-THROUGH IS UNTOUCHED --
-        P still publishes everything it prefills, which is what the flip
-        hands to D -- and D is TP-only (`pp_size == 1`), so this predicate is
-        False there and D's store read, the one Weg 2 actually depends on,
-        is unchanged.  The exemption lifts itself the moment a carrier
-        exists: it keys on the same `pp_row_carrier_present` fact as the
-        other two disarmed terms, so all three re-arm together (#1039's
-        lesson: two halves armed off different memos diverge).
-        """
-        ps = getattr(self, "ps", None)
-        if ps is None or int(getattr(ps, "pp_size", 1) or 1) <= 1:
-            return False
-        if pp_row_carrier_present(self):
-            return False
-        n = getattr(self, "_w38_carrierless_store_reads", 0) + 1
-        self._w38_carrierless_store_reads = n
-        if n == 1 or n % 512 == 0:
-            logger.warning(
-                "#1234 W38 Weg2CarrierlessPpStoreRead REFUSED (n=%d, every "
-                "store read this group would have issued): no #631 row "
-                "carrier on this PP form, so a prefetch completing on one "
-                "rank and not another lengthens that rank's prefix_indices "
-                "alone -- the W27 width divergence that killed boot weg2sc1 "
-                "on the C12 re-admission path. Device-tier prefix reuse and "
-                "the write-through are unaffected; the L3 READ returns with "
-                "the carrier.",
-                n,
-            )
-        return True
-
     def _prefetch_kvcache(self, req: Req) -> str:
         """Issue a storage prefetch for ``req``. Returns WHAT ACTUALLY HAPPENED.
 
@@ -5072,9 +5003,22 @@ class Scheduler(
         if not self.enable_hicache_storage:
             _note_prefetch_gate("storage_disabled")
             return "declined:storage_disabled"
-        if self._carrierless_pp_store_read_refused():
-            _note_prefetch_gate("carrierless_pp")
-            return "declined:carrierless_pp"
+        # #1234 W38 Weg2CarrierlessPpStoreRead WAS REFUSED HERE, AND IS NOT ANY
+        # MORE (weg2 train 0908, W38-vs-#1245 reconciliation). W38 and #1245's
+        # `undistributable` drop were TWO ARMS FOR ONE FACT -- both keyed on
+        # `pp_row_carrier_present(self) is False` on a pp_size>1 group, both to
+        # stop an asynchronously-completed host hit moving one rank's
+        # prefix_indices alone (the W27 width divergence). #1245 is the arm that
+        # BOOTED: weg2rg6 (2026-09-08, tip 7f88b1c75d) drove 141 group-P prefill
+        # passes and 20 leg-1 legs with the store read LIVE, fired the drop three
+        # times on real divergences, and measured W27 genuine 0 over that
+        # population. W38 refused the read outright and was desk-only; kept
+        # beside #1245 it would have made group P read no store at all, giving
+        # #1245's boot-proven drop a population of zero and paying the whole L3
+        # prefix-reuse cost §1q priced as MF-3. The surviving arm is
+        # `clear_state_aligned_extent_undistributable` at
+        # scheduler.py:12157 (`if not pp_row_carrier_present(self):`), one mover
+        # later, where the request and `self.ps` are both in hand.
         req.init_next_round_input(self.tree_cache, cow_mamba=False)
         last_host_node = req.last_host_node
         # RANK-LOCAL: `backuped` means "full KV present in THIS rank's host

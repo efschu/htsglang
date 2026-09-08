@@ -1149,15 +1149,21 @@ def argv_p(
 
 
 def w38_armed_line(argv_of_p: Sequence[str]) -> str:
-    """MF-3 (b): state group P's disarmed store read AT LAUNCH, once.
+    """State group P's carrierless-PP arm AT LAUNCH, once.
 
-    The cost is structural and permanent for this boot form, so it may not be
-    something a reader has to reconstruct from a rank log at 3 a.m.  It is
-    READ OFF THE ARGV THIS LAUNCHER IS ABOUT TO RUN rather than asserted from
-    memory: ``--pp-size N`` with N > 1 on group P is exactly the predicate
-    ``Scheduler._carrierless_pp_store_read_refused`` keys on (a PP group, and
-    the no-flip PP form has no #631 row carrier), so if that flag ever changes
-    the line changes with it instead of lying.
+    RECONCILED 2026-09-08 (weg2 train, W38 vs #1245): there is ONE arm for the
+    carrierless PP fact now, and it is #1245's ``undistributable`` drop --
+    ``clear_state_aligned_extent_undistributable`` at scheduler.py:12157, gated
+    on ``pp_row_carrier_present(self)`` exactly as W38 was.  W38's own gate at
+    ``Scheduler._prefetch_kvcache`` is DELETED: it refused the store READ
+    outright and was desk-only, while #1245 is BOOT-PROVEN (weg2rg6, 141 group-P
+    prefill passes, 20 leg-1 legs, three real drops, W27 genuine 0 over that
+    population).  So group P DOES read the store again; what it may not do is
+    ADOPT a host hit that landed on this rank alone.
+
+    Read off the argv this launcher is about to run rather than asserted from
+    memory: ``--pp-size N`` with N > 1 is the predicate's own precondition, so
+    if that flag ever changes the line changes with it instead of lying.
     """
     pp = 1
     for i, a in enumerate(argv_of_p):
@@ -1167,18 +1173,19 @@ def w38_armed_line(argv_of_p: Sequence[str]) -> str:
             except ValueError:
                 pp = 1
     if pp <= 1:
-        return ("WEG2 W38 NOT ARMED: group P is launched with --pp-size %d, so the store read is "
-                "not refused on it and P keeps its L3 prefix reuse" % pp)
-    return ("WEG2 W38 ARMED: group P reads no store; the PP0-authoritative materialisation (#968) "
-            "is the named remedy. Group P is launched --pp-size %d and the no-flip PP form carries "
-            "no #631 row carrier, so every storage read on P is refused by name "
-            "(#1234 W38 Weg2CarrierlessPpStoreRead) -- a prefetch completing on one rank and not "
-            "another would lengthen that rank's prefix_indices alone (the W27 width divergence that "
-            "killed boot weg2sc1). WHAT IT COSTS: a multi-turn follow-up whose prefix has left P's "
-            "device tier is prefilled WHOLE again, which is the user's soft no-double-prefill law "
-            "paying for a hard correctness refusal. Measured per drain epoch by the front's "
-            "'WEG2 P-PREFIX-REUSE' line; the write-through and D's own store read are untouched." % pp)
-
+        return ("WEG2 #1245 NOT ARMED: group P is launched with --pp-size %d, so no rank can hold a "
+                "fact it cannot tell its peers and nothing is dropped" % pp)
+    return ("WEG2 #1245 ARMED (W38 RETIRED INTO IT): group P is launched --pp-size %d and the no-flip "
+            "PP form carries no #631 row carrier, so an asynchronously-completed host hit that landed "
+            "on ONE rank is DROPPED at admission (#1245 UNDISTRIBUTABLE LOAD-BACK DROPPED) instead of "
+            "moving that rank's prefix_indices alone -- the W27 width divergence that killed boots "
+            "weg2sc1 and weg2rg3. THE STORE READ ITSELF IS NOT REFUSED any more: W38 "
+            "Weg2CarrierlessPpStoreRead disarmed it entirely and was the desk-only half of the same "
+            "fact; the two arms were reconciled to the boot-proven one. WHAT IT COSTS: only the "
+            "extents actually dropped, counted by that log line, not P's whole L3 prefix reuse. "
+            "Measured per drain epoch by the front's 'WEG2 P-PREFIX-REUSE' line; the write-through "
+            "and D's own store read are untouched, and the drop lifts itself the moment a carrier "
+            "exists (#968 PP0-authoritative materialisation is the named remedy)." % pp)
 
 def argv_d(
     py: str,

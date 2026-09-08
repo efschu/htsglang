@@ -289,12 +289,6 @@ PREFETCH_DECLINE_ORDER = (
 PREFETCH_INTAKE_PARTITION = (
     "issued",
     "storage_disabled",
-    # #1234 W38: the PP form without a #631 row carrier refuses the store
-    # READ outright (a completion that lands on one rank alone IS a geometry
-    # there). An exit of `_prefetch_kvcache` like any other, so it belongs in
-    # the partition or the `intake == sum(...)` identity breaks by exactly
-    # these calls.
-    "carrierless_pp",
     "store_absent",
     "anchor_no_vote",
     "unobservable",

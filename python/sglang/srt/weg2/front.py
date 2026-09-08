@@ -2412,10 +2412,13 @@ class Front:
         avail = self.counters.get("p_prefix_tokens_in_store", 0) - before[1]
         reused = self.counters.get("p_prefix_tokens_reused", 0) - before[2]
         logger.info("WEG2 P-PREFIX-REUSE epoch=%d requests=%d prefix_tokens_available_in_store=%d "
-                    "prefix_tokens_reused=%d forgone_tokens=%d (W38 carrierless: P reads no store; "
-                    "available= is the front's own routing probe, a text-span ESTIMATE and a LOWER "
-                    "bound; reused= is MEASURED from P's leg-1 cached_tokens, device tier only; "
-                    "the remedy is the PP0-authoritative materialisation, #968)",
+                    "prefix_tokens_reused=%d forgone_tokens=%d (#1245 carrierless PP: P READS the "
+                    "store, but a host hit that lands on one rank alone is dropped at admission -- "
+                    "W38, which refused the read outright, was retired into this arm on the 0908 "
+                    "train; available= is the front's own routing probe, a text-span ESTIMATE and a "
+                    "LOWER bound; reused= is MEASURED from P's leg-1 cached_tokens; forgone= is an "
+                    "UPPER bound on what the drop costs, not a refused read; the remedy that ends "
+                    "the drop is the PP0-authoritative materialisation, #968)",
                     self.epoch, n, avail, reused, max(0, avail - reused))
 
     def _fairness_switch(self, oldest_arrival: Optional[float], queue_name: str) -> bool:

@@ -1319,7 +1319,7 @@ def test_a14_the_forgone_prefix_reuse_is_priced_by_the_routing_probe(caplog):
     assert f"forgone_tokens={span - 7}" in line[0], (
         "forgone = what the store held minus what P's device tier saved; that "
         "difference IS the double prefill W38 buys the geometry with")
-    assert "W38" in line[0] and "#968" in line[0], (
+    assert "#1245" in line[0] and "#968" in line[0], (
         "the line must name the refusal it prices and the remedy that ends it")
 
 
@@ -1377,137 +1377,14 @@ def test_a8_the_reading_is_published_on_the_endpoint_the_front_polls():
 
 
 # ================================= bb: the W27 root, carrier-less PP admission
-def _pp_stub(pp_rank: int, carrier: bool):
-    return SimpleNamespace(
-        enable_hicache_storage=True,
-        ps=SimpleNamespace(pp_size=3, pp_rank=pp_rank, tp_size=1),
-        pp_flip_counters=SimpleNamespace() if carrier else None,
-    )
 
 
-def test_bb1_a_carrierless_pp_group_refuses_the_store_read():
-    """(B) THE W27 ROOT.  Boot weg2sc1: a W31-refused request was re-queued to
-    P; PP2's prefetch had completed and PP0/PP1's had not, so PP2 admitted
-    ``(8747, 8748)`` and its peers ``(0, 4096)`` -- '#1233 W27 PP WIDTH
-    DIVERGENCE REFUSED'.  A completed prefetch is not a credit but a
-    GEOMETRY: it inserts into this rank's radix tree and lengthens
-    ``prefix_indices``, which is what sizes the cross-stage tensor.  The TP
-    axis MIN-reduces that completion; the PP axis has nothing, and #631's
-    wire was reverted twice on metal.  So on a PP form without the row
-    carrier the READ is refused by name -- the third member of the class
-    that already disarmed PP0's #1066 wait (#973) and PP0's width cut
-    (#1233)."""
-    for rank in (0, 1, 2):
-        assert Scheduler._carrierless_pp_store_read_refused(_pp_stub(rank, False)) is True, (
-            "every rank of the group, or the disarm is itself an asymmetry")
-    assert Scheduler._carrierless_pp_store_read_refused(_pp_stub(0, True)) is False, (
-        "with the carrier the followers execute PP0's row; the read returns")
-    tp_only = SimpleNamespace(ps=SimpleNamespace(pp_size=1, pp_rank=0), pp_flip_counters=None)
-    assert Scheduler._carrierless_pp_store_read_refused(tp_only) is False, (
-        "group D is TP-only: its store read is what Weg 2 depends on")
-
-
-def test_bb2_the_refusal_is_the_first_exit_of_the_prefetch_and_is_counted():
-    """It sits at ``_prefetch_kvcache``'s own gate, so all three issue sites
-    (intake, the A12.2 retry, the #946 escape) are covered by one exit, and
-    it is a member of the #915 intake partition -- an exit outside it would
-    break ``intake == sum(partition)``."""
-    from sglang.srt.mem_cache import match_refusal_census as census
-
-    stub = _pp_stub(2, carrier=False)
-    stub.tree_cache = None  # any use beyond the gate would raise
-    stub._carrierless_pp_store_read_refused = MethodType(
-        Scheduler._carrierless_pp_store_read_refused, stub
-    )
-    verdict = Scheduler._prefetch_kvcache(stub, SimpleNamespace(rid="requeued-1"))
-    assert verdict == "declined:carrierless_pp"
-    assert "carrierless_pp" in census.PREFETCH_INTAKE_PARTITION
-    tree = _fn_ast(Scheduler._prefetch_kvcache)
-    names = [n.func.attr for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
-    assert names.index("_carrierless_pp_store_read_refused") < 3, (
-        "before anything that touches the tree")
-
-
-def _geometry_worker(rank, init_file, out_dir, carrier):
-    """One PP rank: build the admission geometry the way production does and
-    all_gather it.  Rank 2's store read has completed; ranks 0 and 1's has
-    not -- the order the metal produced."""
-    import torch  # noqa: F401
-    import torch.distributed as dist
-
-    res = {"rank": rank, "error": None, "geom": None, "refused": None}
-    try:
-        dist.init_process_group(
-            "gloo", init_method=f"file://{init_file}", rank=rank, world_size=3
-        )
-        from sglang.srt.managers.pp_admission_congruence import (
-            PPWidthDivergenceRefused,
-            refuse_pp_width_divergence,
-        )
-        from sglang.srt.managers.scheduler import Scheduler as S
-
-        stub = SimpleNamespace(
-            enable_hicache_storage=True,
-            ps=SimpleNamespace(pp_size=3, pp_rank=rank, tp_size=1),
-            pp_flip_counters=SimpleNamespace() if carrier else None,
-        )
-        read_refused = S._carrierless_pp_store_read_refused(stub)
-        # The prompt: 8748 tokens, of which 8747 are in the store. The store
-        # read has landed on rank 2 only (the metal's arrival order).
-        store_span = 8747 if rank == 2 else 0
-        prefix = 0 if read_refused else store_span
-        extent = min(4096, 8748 - prefix)
-        res["geom"] = [prefix, extent]
-        res["refused"] = bool(read_refused)
-        gathered = [None, None, None]
-        dist.all_gather_object(gathered, [prefix, extent])
-        res["all"] = gathered
-        # the production width guard, on the group's own numbers
-        try:
-            refuse_pp_width_divergence(gathered[0][1], gathered[rank][1], "fix3 gloo")
-            res["w27"] = False
-        except PPWidthDivergenceRefused:
-            res["w27"] = True
-        dist.barrier()
-        dist.destroy_process_group()
-    except Exception as exc:  # noqa: BLE001
-        res["error"] = f"{type(exc).__name__}: {exc}"
-    with open(os.path.join(out_dir, f"r{rank}.json"), "w") as fh:
-        json.dump(res, fh)
-
-
-def _run_geometry(carrier: bool):
-    import torch.multiprocessing as mp
-
-    with tempfile.TemporaryDirectory() as tmp:
-        init_file = os.path.join(tmp, "store")
-        mp.spawn(_geometry_worker, args=(init_file, tmp, carrier), nprocs=3, join=True)
-        return [json.load(open(os.path.join(tmp, f"r{r}.json"))) for r in range(3)]
-
-
-def test_bb3_three_real_ranks_build_the_same_geometry_without_a_carrier():
-    """(B), on three REAL processes, because "the ranks agree" is not
-    observable in one.  Rank 2's store read completes first, as it did on
-    metal.  WITHOUT the carrier every rank refuses the read and all three
-    build ``(0, 4096)`` -- the width guard passes.  WITH a carrier present
-    the read is taken and the same inputs produce ``(8747, 1)`` on rank 2
-    against ``(0, 4096)`` on its peers, which is the W27 the boot died on --
-    that arm is the can-fail proof for this test, and it is also why the
-    disarm keys on the carrier rather than on the form."""
-    out = _run_geometry(carrier=False)
-    assert all(r["error"] is None for r in out), [r["error"] for r in out]
-    geoms = [tuple(r["geom"]) for r in out]
-    assert len(set(geoms)) == 1, geoms
-    assert geoms[0] == (0, 4096), geoms
-    assert all(r["refused"] for r in out)
-    assert not any(r["w27"] for r in out), "no width divergence to refuse"
-
-    div = _run_geometry(carrier=True)
-    assert all(r["error"] is None for r in div), [r["error"] for r in div]
-    dgeoms = [tuple(r["geom"]) for r in div]
-    assert len(set(dgeoms)) == 3 - 1, dgeoms  # rank 2 apart from its two peers
-    assert dgeoms[2] == (8747, 1), dgeoms
-    assert div[2]["w27"] is True, (
-        "the control arm must reproduce the boot killer, or the green arm "
-        "proves nothing")
+# ---------------------------------------------------------------- W38, RETIRED
+# The three tests that stood here (bb1 the predicate, bb2 its place in the
+# #915 intake partition, bb3 the three-real-rank gloo geometry) proved
+# `Scheduler._carrierless_pp_store_read_refused` -- W38's arm, DELETED on the
+# 0908 merge train because it was the desk-only second arm for the fact #1245's
+# `undistributable` drop already carries and BOOT-PROVED (weg2rg6: 141 group-P
+# prefill passes, 20 leg-1 legs, three real drops, W27 genuine 0). They are
+# removed with the code they pinned; the surviving arm's own tests are
+# test/registered/unit/managers/test_1245_pp_width_divergence.py.

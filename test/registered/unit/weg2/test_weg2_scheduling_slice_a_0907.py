@@ -1387,20 +1387,23 @@ def test_g2_every_drain_prices_what_the_disarmed_store_read_cost_p(caplog):
     asyncio.run(body())
 
 
-def test_g3_the_launcher_states_w38_at_launch_from_the_argv_it_runs():
+def test_g3_the_launcher_states_the_carrierless_pp_arm_at_launch_from_the_argv_it_runs():
     """MF-3 (b): the cost is stated ONCE AT LAUNCH, so it is never silent --
     and it is read off the P argv this launcher is about to run rather than
     asserted from memory, so a group P that stopped being a PP group would
     change the line instead of leaving it lying."""
     argv = launcher_mod.argv_p("py", "/m", [1, 2, 3], 8, 512, 1.0, [], 4, 30000)
     line = launcher_mod.w38_armed_line(argv)
-    assert line.startswith("WEG2 W38 ARMED"), (
-        "group P ships --pp-size 3, so the store read IS refused on it")
+    # RECONCILED on the 0908 train: W38's own gate is deleted and the banner
+    # states the ONE surviving arm, #1245's undistributable drop.
+    assert line.startswith("WEG2 #1245 ARMED"), (
+        "group P ships --pp-size 3, so the undistributable load-back IS dropped on it")
+    assert "W38 RETIRED INTO IT" in line, "and it says which arm was retired into which"
     assert "#968" in line and "PP0-authoritative" in line, "name the remedy"
     assert "P-PREFIX-REUSE" in line, "and where the interim cost is measured"
     # the other polarity is not hypothetical: it is what a carrier or a TP-only
     # group P would produce, and the line must then stop claiming the cost.
-    assert launcher_mod.w38_armed_line(["--pp-size", "1"]).startswith("WEG2 W38 NOT ARMED")
+    assert launcher_mod.w38_armed_line(["--pp-size", "1"]).startswith("WEG2 #1245 NOT ARMED")
     # WIRED, not merely written (desk-written-never-executed): main logs it.
     main_src = inspect.getsource(launcher_mod.main)
     assert "log(w38_armed_line(spec_p.argv))" in main_src
