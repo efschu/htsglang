@@ -335,13 +335,32 @@ class TheProvenanceWarning797(CustomTestCase):
 
 
 class TheFlagItself797(CustomTestCase):
-    def test_the_default_role_is_pin(self):
+    def test_the_default_role_is_unstated_and_resolves_to_pin_for_a_pin(self):
+        """#1270b CHANGED THIS TEST'S SUBJECT, not its guarantee.
+
+        It used to assert the FIELD default was the string ``"pin"``. That
+        literal was the #1270b root: the field is published into
+        ``SGLANG_UNEVEN_TOKEN_VECTOR_ROLE`` unconditionally and the consumer
+        reads that env first, so a boot which declared nothing still asserted
+        'pin' about its own budget estimate and suppressed the measured
+        install (weg2sb4s, group D: 574,336 tokens against a profiled
+        ~670,720).
+
+        What #797 actually needs is unchanged and is what is asserted now: a
+        vector somebody DECLARED, with no role stated, is still a pin.
+        """
+        from sglang.srt.distributed.utils import ROLE_PIN, token_vector_role_from_args
         from sglang.srt.server_args import ServerArgs
 
-        self.assertEqual(
-            ServerArgs.__dataclass_fields__["uneven_token_vector_role"].default,
-            "pin",
+        self.assertIsNone(
+            ServerArgs.__dataclass_fields__["uneven_token_vector_role"].default
         )
+
+        class _Declared:
+            uneven_token_vector_role = None
+            rank_kv_ratio = [30, 17, 17]
+
+        self.assertEqual(token_vector_role_from_args(_Declared()), ROLE_PIN)
 
     def test_only_pin_and_seed_are_accepted(self):
         import argparse
