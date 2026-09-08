@@ -1232,11 +1232,34 @@ def format_dormant_image(rec: Dict[str, object]) -> str:
     )
 
 
-def read_measured_record(path: str) -> Dict[str, dict]:
-    """The NEWEST entry per group from the sidecar, or ``{}``.
+def read_measured_record(
+    path: str, boot_tag: Optional[str] = None
+) -> Dict[str, dict]:
+    """The newest entry per group from the sidecar, or ``{}``.
 
     A malformed or missing file is an ABSENCE -- the ledger then prices the
     named dk7 reading and says so -- never a silent zero.
+
+    ``boot_tag`` RESTRICTS THE ANSWER TO ONE BOOT'S SAMPLES, and #1264 (B) is
+    why the parameter exists. This sidecar is APPEND-ONLY across boots, so
+    "the newest entry" is a sample from whatever booted last -- while the
+    consumer that corrects it (:func:`non_backup_host_bytes`, fed by the arm
+    that :func:`ring_table.parse_chosen_arm` reads out of the SOURCE boot's own
+    front log) is keyed to a different boot entirely. Measured drift from that
+    mispaired join, three consecutive solves of the SAME source boot weg2rg6:
+    the nvml2 residual read 118.2 -> 901.2 -> 1344.2 MiB.
+
+    It is a RATCHET, not noise. The sample is the sleeping group's whole
+    ``RssShmem``, which includes the host ring's own MAP_SHARED pages; a bigger
+    ring makes a bigger sample, which sizes a bigger ring for the next boot.
+    Boot weg2t2a measured ``extra_gib`` 7.474, weg2t2b 8.995, on identical
+    ``weight_tags_gib`` 28.834. That is what walked Sigma span1 +2755 MiB
+    between two boots that were supposed to differ only in an idle census, took
+    the ledger from M=1200 to M=600, and left 0.74 GiB to the reap watermark.
+
+    Passing the tag makes sample and correction ONE boot's pair, which is what
+    the correction was always documented to be, and makes a re-solve from the
+    same source deterministic forever.
     """
     try:
         with open(path) as f:
@@ -1252,6 +1275,8 @@ def read_measured_record(path: str) -> Dict[str, dict]:
             continue
         g = str(e.get("group", ""))
         if not g:
+            continue
+        if boot_tag is not None and str(e.get("boot_tag", "")) != boot_tag:
             continue
         if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
             out[g] = e
