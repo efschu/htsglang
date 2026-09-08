@@ -33,10 +33,15 @@ PATTERNS = (
 
 
 def srt_root():
+    """The srt tree, found from the REPO ROOT rather than by walking for a
+    `python` ancestor -- the test dir has none, so the old walk ran to `/` and
+    the guard read an empty tree (green by vacancy, on the remote only)."""
     p = pathlib.Path(__file__).resolve()
-    while p.name != "python" and p.parent != p:
+    while p.parent != p and not (p / "python" / "sglang" / "srt").is_dir():
         p = p.parent
-    return p / "sglang" / "srt"
+    root = p / "python" / "sglang" / "srt"
+    assert root.is_dir(), f"srt tree not found from {__file__}"
+    return root
 
 
 class NoRawServerArgsSerialisation(CustomTestCase):
@@ -72,7 +77,12 @@ class NoRawServerArgsSerialisation(CustomTestCase):
 
         src = inspect.getsource(Scheduler.get_internal_state)
         self.assertIn("get_server_args().redacted_dict()", src)
-        self.assertNotIn("dict(vars(", src)
+        # CODE ONLY: my own explanatory comment in that method quotes
+        # `dict(vars(...))`, so a raw substring search matched the prose and
+        # not the statement -- the #995 self-matching-marker trap, in a test.
+        code = "\n".join(l for l in src.split("\n")
+                          if not l.lstrip().startswith("#"))
+        self.assertNotIn("dict(vars(", code)
 
 
 class TheInfoRoutesRequireTheBearer(CustomTestCase):
