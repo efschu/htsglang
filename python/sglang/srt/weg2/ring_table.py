@@ -1050,6 +1050,47 @@ class CardRing:
         return self.h_mib - self.need_serial_p2d_mib
 
     @property
+    def serial_debt_mib(self) -> int:
+        """#1284: MiB this card would need for the SERIAL requirement to hold.
+
+        ``0`` means the ring already satisfies ``H >= image_W + max_tag_S`` in
+        BOTH directions and the interleave premise costs nothing.  A positive
+        value is the DEBT the launcher takes on when it arms this card under
+        ``leg_form=interleave`` and checks R5's corridor alone: the number of
+        MiB by which the ring falls short if the two legs ever fail to overlap.
+
+        This is the term weg2sb5e died of.  It was computed and printed on the
+        L6 row of all three cards (-1608 / -881 / -982 MiB of serial slack) and
+        then waived, and 30 flips later the wake leg did not run, the sleeping
+        leg met exactly this shortfall and the C++ acquire spent its whole
+        110 s budget before dying with a message pointing at L6.
+
+        IT IS A LOWER BOUND, and calling it the requirement would understate the
+        exposure.  ``need_serial_* = image_W + max_tag_S`` prices a serial order
+        in which S places only its LARGEST tag before W releases.  A leg whose
+        peer never releases at all -- weg2sb5e's 31st flip -- has to place its
+        WHOLE image beside the parked one, i.e. ``image_W + image_S``.  On that
+        boot's measured weights-family census that is 13860+13914 = 27774 MiB
+        against a 17540 MiB ring on nvml1, 17228 against 9680 on nvml0 and
+        17874 against 10766 on nvml2 -- roughly 25 GiB of extra shmem across the
+        three cards.  So NO ring this box can afford removes the dependency on
+        the peer's release: the interleave is not an optimisation of a
+        self-sufficient design, it is load-bearing, and the only sound response
+        to it failing is to detect and refuse, which is what W51 does.
+
+        The debt is REPORTED, not funded.  Funding it on weg2sb5e's own numbers
+        costs +8117 MiB of shmem across the three cards, which the host ledger
+        cannot pay: the chosen arm already sits ON its ``--store-min-gib``
+        floor, so the ring would take the store below it and the next launch
+        would refuse with W21.  What covers the debt instead is the RUNTIME
+        guard (W51 ``Weg2HostRingUnfunded``, ``weg2/ring_guard.py``), which
+        turns the wedge into a named refusal in ~2 s with the need series
+        printed.  A reader who sees a non-zero debt here and no W51 wired into
+        the sleeping leg is looking at weg2sb5e again.
+        """
+        return max(0, -min(self.slack_serial_d2p_mib, self.slack_serial_p2d_mib))
+
+    @property
     def complete(self) -> bool:
         return self.image_p_mib > 0 and self.image_d_mib > 0 and self.max_tag_p_mib > 0 and self.max_tag_d_mib > 0
 
