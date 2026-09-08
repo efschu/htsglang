@@ -3,6 +3,62 @@ schedulers on an accounting SURPLUS, not a leak. Root-cause fix, red-first.
 
 Every number below was measured on this rig; none is illustrative.
 
+READ THIS FIRST: MECHANISM 2's LEDGER TERM WAS DELETED BY #969 CUT C
+====================================================================
+
+#912 shipped TWO mechanisms (see "THE FIX" below). Mechanism 1 -- reading
+``available`` through ``read_free_rows()``'s UNION instead of
+``available_size()``'s raw SUM -- IS ALIVE and is tested here. Mechanism 2 --
+a ``double_owned`` parameter on ``_check_pool_invariant``, subtracted from the
+ledger equation -- IS GONE, deliberately, and this file no longer tests it:
+
+* ``77b42d6d0a`` "[#969 CUT C] Delete the double-claim census term: it was
+  GIL-spinning the rank that had to post the proxy" -- deleted
+  ``_live_double_claimed_rows``, the ``double_owned`` parameter, its
+  subtraction, its message field, the census/live resolution block and the
+  ``double_owned_src`` suffix on the full pool, as ONE change (producer, term
+  and consumer are coupled; deleting the producer alone silently changes the
+  equation instead of raising).
+* ``7f88b49a08`` "[#969 CUT C fixup]" -- restored the truncated ledger call and
+  swept the mamba twins ``_check_mamba_pool`` / ``_check_mamba_pool_with_int8``.
+
+THE EVIDENCE FOR THE DELETION was measured, not argued: py-spy on the three
+ranks of ``boot_969cut_55fdfa5e7a_0829_133212.log``, taken while the group was
+wedged, put PP0 GIL-bound in this very term's generator expression
+(``invariant_checker.py:207``, ``_live_double_claimed_rows`` <-
+``_check_full_pool`` <- ``_check_all_pools`` <- ``on_idle``) while PP1 and PP2
+waited in ``_pp_recv_proxy_tensors`` for a proxy PP0 never returned to post.
+Second independent measurement of that class (first:
+SPECIMEN-2026-08-27T0611Z-CENSUS-AUDIT-CPU-WEDGE.txt). Upstream's
+``_check_pool_invariant`` is count-based and carries no such term, so under the
+upstream-minimal law the fork-own compensation layer was a deletion candidate,
+not a repair order.
+
+WHAT STILL COVERS THE #912 CRASH CLASS, and is tested below:
+
+1. mechanism 1, the union reader (``TestAvailableSizeUnionVsSum912``) -- 21 of
+   the measured 22;
+2. #927's per-access allocator resolution
+   (``test_checker_reads_bound_pool_927.py``) -- the flip was manufacturing the
+   remaining overlap by auditing the BOOT phase's pool, so it is a false
+   positive removed at its root rather than subtracted;
+3. the #822 authority's own EXCLUSIVITY discrimination
+   (``TestExclusivityDoubleOwned912``), which is ALIVE: the census still
+   reports doubly-claimed rows separately in
+   ``phase_flip_runtime.py::_census_ownership_audit``. What #969 CUT C removed
+   is only the SUBTRACTION of that population from the ledger equation, never
+   its detection;
+4. on the mamba side, ``_mamba_double_claimed`` still sets ``leak = True`` on a
+   genuine free-list duplicate (the #924 double-free family).
+
+ALSO FOLDED IN HERE: the ``reservation + page_size`` refutation that used to
+live in ``test_pool_invariant_live_double_912b.py``
+(``TestNoPageSizePaddingInTheLedger912``, bottom of this file). That file was
+deleted with the same cut -- every one of its other classes drove
+``_live_double_claimed_rows`` or the deleted parameter -- but its refutation is
+a property of the ALLOCATOR's id space, still true, and worth keeping so the
+hypothesis is not re-run as a new finding.
+
 SPECIMENS
 =========
 
@@ -89,7 +145,11 @@ Two independent, additive terms in ``SchedulerInvariantChecker``:
    byte for byte as before.
 2. ``_check_pool_invariant`` gained a ``double_owned`` term, subtracted,
    sourced from ``allocator.double_owned_slots`` -- the #822 authority's
-   EXCLUSIVITY "claimed by more than one owner" row count.
+   EXCLUSIVITY "claimed by more than one owner" row count. **DELETED BY #969
+   CUT C -- see the section at the top of this docstring. The paragraphs below
+   describe mechanism 2 as it stood while it existed; they are kept because
+   they are the record of WHY it was built and of the two review defects it
+   went through, and because the census half they describe is still live.**
 
 Neither is a tolerance or an epsilon: both name a REAL, independently
 detectable population of rows and subtract exactly that population. A
@@ -149,17 +209,17 @@ both are fixed here, not deferred:
 
    Whether staleness alone -- absent the cutover-clearing fix above -- could
    ever turn a real leak into a silent pass was checked directly rather than
-   asserted: ``test_stale_double_owned_cannot_mask_a_genuine_deficit`` below
-   shows it analytically cannot, for any non-negative reading, current or
-   stale: ``double_owned`` is SUBTRACTED, so it can only push
-   ``total_accounted`` further BELOW ``total`` (deficit's direction is
-   already "less accounted than total"), never closer to it. Subtraction can
-   mask a SURPLUS (this ticket's own shape) if the stale reading is fed
-   against a *different, coincidentally-sized* surplus; it cannot mask a
-   DEFICIT. The cutover-clearing fix closes the remaining gap (a stale
-   reading surviving into a new id space) as a matter of hygiene, not
-   because the deficit-masking scenario the review raised was reproducible
-   -- it was checked and is not.
+   asserted, in a class this file used to carry: it analytically cannot, for
+   any non-negative reading, current or stale, because ``double_owned`` was
+   SUBTRACTED and could only push ``total_accounted`` further BELOW ``total``
+   (a deficit's direction is already "less accounted than total"), never
+   closer to it. Subtraction could mask a SURPLUS if a stale reading were fed
+   against a *different, coincidentally-sized* one; it could not mask a
+   DEFICIT. Those two tests went with the term in #969 CUT C -- with no
+   subtracted posten left in the equation there is nothing to mask with, which
+   is a stronger guarantee than the tests were making. What remains is
+   ``test_the_signature_carries_no_double_owned_term_969`` below, which pins
+   the deletion itself so the term cannot be re-added without a decision.
 """
 
 import inspect
@@ -209,16 +269,23 @@ def _check_pool_invariant(*args, **kwargs):
 
 
 class TestFiveSpecimensClose912(CustomTestCase):
-    """The equation, exercised at exactly the five measured tuples."""
+    """The equation, exercised at exactly the five measured tuples.
 
-    def test_red_without_the_new_term(self):
-        """Every specimen reproduces the field crash when double_owned=0.
+    Since #969 CUT C this class no longer shows the term CLOSING the five --
+    there is no term. It pins the specimen premise (the raw sum overcounts by
+    exactly 22, which is what mechanism 1 and #927 between them account for)
+    and the shape of the surviving signature.
+    """
 
-        This IS the pre-fix behaviour: before this ticket,
-        ``_check_pool_invariant`` had no ``double_owned`` parameter at all, so
-        every caller was implicitly at 0. Capturing that as an explicit,
-        still-reachable case is the red-first proof without needing to check
-        out the pre-fix file.
+    def test_the_raw_sum_reproduces_the_field_crash(self):
+        """Every specimen reads as a leak when ``available`` is the RAW sum.
+
+        This is the premise of the whole ticket, and it is also the behaviour
+        of the shipped equation today: nothing is subtracted, so a specimen fed
+        the raw ``available_size()`` reading raises. What stops it in
+        production is mechanism 1 -- ``_check_full_pool`` does not pass the raw
+        sum, it passes ``read_free_rows().count`` -- and #927, not a correction
+        term inside this function.
         """
         for label, total, available, evictable, withheld in SPECIMENS_912:
             with self.subTest(specimen=label):
@@ -234,57 +301,19 @@ class TestFiveSpecimensClose912(CustomTestCase):
                     "premise of this ticket, not just this test",
                 )
 
-    def test_green_with_the_single_double_owned_term(self):
-        """Feeding the measured 22 as one posten closes every specimen."""
-        for label, total, available, evictable, withheld in SPECIMENS_912:
-            with self.subTest(specimen=label):
-                leak, msg = _check_pool_invariant(
-                    "full",
-                    available,
-                    evictable,
-                    0,
-                    0,
-                    total,
-                    0,
-                    withheld,
-                    OVERCOUNT,
-                )
-                self.assertFalse(leak, f"expected the invariant to close: {msg}")
+    def test_mechanism_one_alone_leaves_the_one_row_927_removes(self):
+        """The 22 decomposes 21 + 1, and only the 21 is this function's to fix.
 
-    def test_green_with_the_measured_decomposition(self):
-        """The SAME closure, split exactly as the two mechanisms measure it.
-
-        ``available`` reduced by the 21 the union reader would have reported
-        (mechanism 1) and ``double_owned=1`` for the free/radix double claim
-        (mechanism 2, mechanism 1 already removed from ``available`` so it is
-        not counted twice).
+        Feeding the union reader's ``available`` (mechanism 1) still leaves a
+        one-row surplus on every specimen. That row is #927's false positive --
+        the checker auditing the BOOT phase's allocator while load-back
+        allocated from the incoming one -- and it is removed at its root by the
+        per-access resolution in ``_allocator()``, not by a subtracted term
+        here. This test is what makes the split explicit now that the term that
+        used to absorb the 1 is gone.
         """
         for label, total, available, evictable, withheld in SPECIMENS_912:
             with self.subTest(specimen=label):
-                deduped_available = available - MECH1_ROWS
-                leak, msg = _check_pool_invariant(
-                    "full",
-                    deduped_available,
-                    evictable,
-                    0,
-                    0,
-                    total,
-                    0,
-                    withheld,
-                    MECH2_ROWS,
-                )
-                self.assertFalse(leak, f"expected the invariant to close: {msg}")
-
-    def test_mutant_each_mechanism_alone_is_insufficient(self):
-        """Neither term alone closes the equation -- both are load-bearing.
-
-        This is the can-fail proof in the danger direction for the SPLIT
-        fix: a change that wired only the ``available`` correction, or only
-        ``double_owned``, would leave a 1-row (or 21-row) leak reported as
-        real, and this test catches either half going missing.
-        """
-        for label, total, available, evictable, withheld in SPECIMENS_912:
-            with self.subTest(specimen=label, mechanism="available_only"):
                 deduped_available = available - MECH1_ROWS
                 leak, _ = _check_pool_invariant(
                     "full",
@@ -295,38 +324,54 @@ class TestFiveSpecimensClose912(CustomTestCase):
                     total,
                     0,
                     withheld,
-                    0,  # double_owned not applied
                 )
                 self.assertTrue(
-                    leak, "mechanism 1 alone must leave a 1-row residual leak"
+                    leak, "mechanism 1 alone must leave a 1-row residual"
                 )
-            with self.subTest(specimen=label, mechanism="double_owned_only"):
-                leak, _ = _check_pool_invariant(
-                    "full",
-                    available,  # raw, mechanism 1 not applied
-                    evictable,
-                    0,
-                    0,
-                    total,
-                    0,
-                    withheld,
+                self.assertEqual(
+                    deduped_available + evictable + withheld - total,
                     MECH2_ROWS,
-                )
-                self.assertTrue(
-                    leak, "mechanism 2 alone must leave a 21-row residual leak"
+                    "the residual must be exactly the one double-claimed row",
                 )
 
     def test_preexisting_callers_are_unaffected(self):
-        """The five other ``_check_pool_invariant`` call sites pass at most 7
-        positional args (verified by inspection of the four callers in
+        """The other ``_check_pool_invariant`` call sites pass at most 7
+        positional args (verified by inspection of the callers in
         ``invariant_checker.py``: ``_check_swa_pool``, ``_check_mamba_pool``,
         and both branches of ``_check_mamba_pool_with_int8``). None of them
-        must be made to pass ``withheld``/``double_owned`` by this change.
+        must be made to pass ``withheld`` by this change.
         """
         leak, msg = _check_pool_invariant("swa", 100, 0, 0, 0, 100)
         self.assertFalse(leak, msg)
         leak, msg = _check_pool_invariant("mamba", 90, 5, 5, 0, 100)
         self.assertFalse(leak, msg)
+
+    def test_the_signature_carries_no_double_owned_term_969(self):
+        """#969 CUT C, pinned so it cannot be undone by accident.
+
+        The term is not merely unused -- it is GONE from the signature, so a
+        caller that tries to pass it raises instead of silently changing the
+        equation, which is the coupling ``77b42d6d0a`` names (producer, term
+        and consumer go together). This is the same assertion that commit's own
+        one-tool check made.
+        """
+        params = inspect.signature(
+            SchedulerInvariantChecker._check_pool_invariant
+        ).parameters
+        self.assertNotIn(
+            "double_owned",
+            params,
+            "the #969 CUT C deletion has been reverted; if that is intended, "
+            "the GIL-spin measurement in this file's docstring has to be "
+            "answered first",
+        )
+        self.assertIn("withheld", params, "the #656 posten must survive")
+        self.assertFalse(
+            hasattr(SchedulerInvariantChecker, "_live_double_claimed_rows"),
+            "the deleted producer is back; the term's consumer will follow",
+        )
+        with self.assertRaises(TypeError):
+            _check_pool_invariant("full", 1, 0, 0, 0, 1, 0, 0, 0)
 
 
 class TestAvailableSizeUnionVsSum912(unittest.TestCase):
@@ -545,78 +590,97 @@ class TestExclusivityDoubleOwned912(CustomTestCase):
         )
 
 
-class TestStaleDoubleOwnedCannotMaskADeficit912(CustomTestCase):
-    """Answers, directly rather than by assertion, whether a stale (or just
-    plain wrong) ``double_owned`` reading can turn a genuine deficit-type
-    leak (#832/#856-shape: rows missing, not doubled) into a false pass.
+class TestADeficitStaysFatal912(CustomTestCase):
+    """The #832/#856 direction -- rows with NO owner -- must never pass.
+
+    This used to need a class of its own arguing that a stale ``double_owned``
+    reading could not mask a deficit. #969 CUT C removed the subtracted term,
+    so the equation is a plain sum and the property is structural rather than
+    argued; one test is enough to keep it pinned.
     """
 
-    def test_stale_double_owned_cannot_mask_a_genuine_deficit(self):
-        """Feed a large, wholly unrelated stale double_owned against a
-        manufactured 100-row deficit on a real #912 specimen. It must still
-        read as a leak, for every stale value tried, including one as large
-        as test_free_group_lifecycle_827's own 16384-row specimen.
-        """
+    def test_a_manufactured_deficit_reads_as_a_leak(self):
         label, total, available, evictable, withheld = SPECIMENS_912[0]
         deficit_available = available - 100  # a genuine, separate 100-row hole
-        for stale_double_owned in (0, 1, MECH2_ROWS, 22, 16384, 10**6):
-            with self.subTest(stale_double_owned=stale_double_owned):
-                leak, msg = _check_pool_invariant(
-                    "full",
-                    deficit_available,
-                    evictable,
-                    0,
-                    0,
-                    total,
-                    0,
-                    withheld,
-                    stale_double_owned,
-                )
-                self.assertTrue(
-                    leak,
-                    f"a {stale_double_owned}-row double_owned reading must "
-                    f"never mask a genuine 100-row deficit: {msg}",
-                )
+        leak, msg = _check_pool_invariant(
+            "full", deficit_available, evictable, 0, 0, total, 0, withheld
+        )
+        self.assertTrue(leak, f"a 100-row deficit must stay fatal: {msg}")
 
-    def test_a_correctly_sized_double_owned_can_still_mask_an_UNRELATED_surplus(
-        self,
-    ):
-        """The honest boundary of the safety property above: subtraction
-        cannot mask a DEFICIT, but a stale reading CAN cancel a different,
-        coincidentally-equal-sized SURPLUS it was never measured against.
-        This is not a defect in the arithmetic -- the term IS a real reader
-        of a real cause of surplus; nothing can distinguish "the same cause,
-        measured late" from "a different cause of the same size" by the
-        integers alone. That is exactly why the cutover-clearing fix exists:
-        to bound how long a stale reading can stay in circulation, since the
-        integers alone cannot prove staleness.
-        """
-        label, total, available, evictable, withheld = SPECIMENS_912[0]
-        # An unrelated surplus of exactly MECH2_ROWS, wholly independent of
-        # the free-list/radix-cache condition the stale reading came from.
-        unrelated_surplus_available = available + MECH2_ROWS
-        leak, _ = _check_pool_invariant(
-            "full",
-            unrelated_surplus_available,
-            evictable,
-            0,
-            0,
-            total,
-            0,
-            withheld,
-            OVERCOUNT + MECH2_ROWS,  # the stale reading, sized for the OLD surplus
+
+class TestNoPageSizePaddingInTheLedger912(CustomTestCase):
+    """Refutation, red-first, of the ``reservation + page_size`` framing.
+
+    MOVED HERE from ``test_pool_invariant_live_double_912b.py``, which #969
+    CUT C deleted along with the ``_live_double_claimed_rows`` producer its
+    other four classes drove. The refutation itself survives the cut because it
+    is a property of the ALLOCATOR's id space, not of the deleted term.
+
+    THE FRAMING IT REFUTES. Boot 2 of the 2c acceptance died on all three ranks
+    at ``/spinning/evidence-665-f1/boot_accept2c0827_0827_0049.log:21372`` with
+    a surplus of exactly ONE row (``total=432089, available=133120,
+    evictable=1, withheld=298969``). The acceptance note's hypothesis was that
+    the 1 is structural -- "``total`` is the reservation while
+    available/withheld enumerate over reservation + page_size", the same ``+1``
+    observable B2 measured as ``store_bound_rows - reserved_backing_rows ==
+    page_size`` on 435 of 435 dial lines. It is not:
+    ``TokenToKVPoolAllocator.clear()`` builds ``torch.arange(1, self.size + 1)``
+    (``mem_cache/allocator/token.py:44-45``), so the id space is ``1 .. size``,
+    exactly ``size`` ids, and ``total`` for that branch is the same
+    ``allocator.size``. Row 0 is never in a free list and never handed out.
+    Both sides are the same id space; there is no ``page_size`` padding on
+    either. The pool tensor's extra row is real and is what
+    ``store_bound_rows`` describes, but it is not an id the ledger ever counts.
+
+    WHAT THE 1 ACTUALLY WAS: the same boot's post-cutover census one second
+    earlier (:21367) partitions the id space with nothing left over --
+    ``size=432089 free=133120 cached=0 withheld=298969 unaccounted=0`` -- so
+    ``free + withheld == size`` exactly and the ``evictable=1`` read a second
+    later is a row the tree took on between the two readings (the boot's own
+    OUTTRACE names the arrival, ``HEALTH_C n=1 (new) off=1 tail=[49276]`` at
+    :21340, and 49276 is inside the free range). One row, two owners -- which
+    is #927's shape, and #927 answered it by resolving the allocator per
+    access rather than by subtracting the row.
+    """
+
+    #: The measured firing, identical on PP0/PP1/PP2.
+    SPECIMEN_TOTAL = 432089
+    SPECIMEN_AVAILABLE = 133120
+    SPECIMEN_EVICTABLE = 1
+    SPECIMEN_WITHHELD = 298969
+    #: The census one second earlier, same ranks.
+    CENSUS_FREE = 133120
+    CENSUS_CACHED = 0
+
+    def test_the_free_list_spans_exactly_size_ids_starting_at_one(self):
+        alloc = TestAvailableSizeUnionVsSum912._Alloc(1000)
+        self.assertEqual(int(alloc.free_pages.numel()), 1000)
+        self.assertEqual(int(alloc.free_pages.min()), 1)
+        self.assertEqual(int(alloc.free_pages.max()), 1000)
+
+    def test_row_zero_is_not_an_id_the_ledger_counts(self):
+        alloc = TestAvailableSizeUnionVsSum912._Alloc(1000)
+        reading = read_free_rows(alloc)
+        self.assertTrue(reading.is_enumerable)
+        self.assertNotIn(0, set(reading.rows))
+        self.assertEqual(
+            reading.count,
+            alloc.size,
+            "the enumerated free space and `total` are the SAME id space, so "
+            "no page_size term can be missing from one side of the ledger",
         )
-        # This documents the boundary rather than asserting a false safety
-        # claim: it is expected to pass (masked) here, which is exactly why
-        # staleness is bounded by the cutover-clearing fix instead of relied
-        # on to self-resolve.
-        self.assertFalse(
-            leak,
-            "documents the known boundary: a coincidentally-equal stale "
-            "surplus reading is not distinguishable from a fresh one by "
-            "the integers alone -- this is what the cutover-clearing fix "
-            "bounds, not what this arithmetic can rule out",
+
+    def test_the_surplus_is_one_and_page_size_cannot_account_for_it(self):
+        """The specimen arithmetic, stated so the refutation is concrete."""
+        accounted = (
+            self.SPECIMEN_AVAILABLE + self.SPECIMEN_EVICTABLE + self.SPECIMEN_WITHHELD
         )
+        self.assertEqual(accounted - self.SPECIMEN_TOTAL, 1)
+        # And the census a second earlier leaves NO room for an unclaimed id:
+        self.assertEqual(
+            self.CENSUS_FREE + self.SPECIMEN_WITHHELD, self.SPECIMEN_TOTAL
+        )
+        self.assertEqual(self.CENSUS_CACHED, 0)
 
 
 if __name__ == "__main__":

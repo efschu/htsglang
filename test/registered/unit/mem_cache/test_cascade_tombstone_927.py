@@ -103,8 +103,10 @@ class TestACascadeThatFreesFullTombstonesIt(CustomTestCase):
         allocator's free list with the rows the tree still names. A node that
         kept a tombstone-less value puts its freed ids in both sets.
 
-        This is exactly the population `_live_double_claimed_rows` counts as
-        `double_owned`, computed here from the same two sources."""
+        This is exactly the population the checker's `_live_double_claimed_rows`
+        used to count as `double_owned` (deleted by #969 CUT C, `77b42d6d0a`),
+        computed here from the same two sources -- which is why this test still
+        stands: it reads the sources, not the deleted reader."""
         cache, allocator, _ = self._fixture()
         self._insert(cache, allocator, range(1, 33))
 
