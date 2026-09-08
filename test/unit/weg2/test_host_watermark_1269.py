@@ -35,6 +35,15 @@ from sglang.srt.weg2.host_ledger import (
 WATERMARK = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
 
 
+def _boot_bound():
+    return WATERMARK - resolve_margin().boot_total_gib
+
+
+def _runtime_bound():
+    """#1269 fix 4: W22 grades a MEASUREMENT, so it carries no residual."""
+    return WATERMARK - resolve_margin().runtime_total_gib
+
+
 # ------------------------------------------------------------------ margin
 def test_margin_is_named_terms_not_a_hand_number():
     m = resolve_margin()
@@ -115,11 +124,11 @@ def test_the_split_uses_the_preboot_baseline_and_is_never_negative():
     counted once PER MAPPER, 111 pids) from a per-page total. Impossible
     number, so the attribution it carried was void."""
     m = resolve_margin()
-    over = int((WATERMARK - m.total_gib + 0.5) * GIB)
+    over = int((_runtime_bound() + 0.5) * GIB)
     v = watermark_breach_verdict(
         over,
         margin=m,
-        nonreclaim_gib=WATERMARK - m.total_gib + 0.5,
+        nonreclaim_gib=_runtime_bound() + 0.5,
         cgroup_anon_bytes=int(30.57 * GIB),  # sb5b at the breach
         anon_preboot_bytes=int(10.05 * GIB),  # sb5b preflight baseline
     )
@@ -197,7 +206,7 @@ def test_the_sb5b_numbers_reproduce_the_refusal_under_the_old_currency():
 
 def test_the_verdict_names_which_currency_it_used(tmp_path):
     m = resolve_margin()
-    over = WATERMARK - m.total_gib + 1.0
+    over = _runtime_bound() + 1.0
     v = watermark_breach_verdict(int(over * GIB), margin=m, nonreclaim_gib=over)
     assert "in non-reclaimable currency" in v
     assert "raw memory.current=" in v
@@ -243,7 +252,7 @@ def test_composition_carries_the_memts_column_names(tmp_path):
     ):
         assert col in pr, col
     m = resolve_margin()
-    over = WATERMARK - m.total_gib + 1.0
+    over = _runtime_bound() + 1.0
     v = watermark_breach_verdict(
         int(over * GIB),
         margin=m,
@@ -267,7 +276,10 @@ def test_only_kernel_reaps_count_as_watermark_samples():
 def test_provenance_line_names_watermark_source_margin_and_bound():
     line = watermark_provenance()
     assert line.startswith("WEG2-HOST WATERMARK=")
-    for token in ("source=[", "margin=", "hard bound", "excluded=["):
+    # #1269 fix 4: the line carries TWO bounds now, so the single "hard bound"
+    # token it used to assert is gone on purpose -- W21 grades a prediction
+    # against the boot bound, W22 grades a measurement against the runtime one.
+    for token in ("source=[", "BOOT bound = ", "RUNTIME bound = ", "excluded=["):
         assert token in line, line
     assert "weg2dk5" in line and "weg2dk6" in line
     assert "weg2sb4" in line  # named as EXCLUDED, never silently dropped
@@ -314,13 +326,13 @@ def test_a_store_that_fits_under_the_hard_bound_is_accepted():
 
 def test_no_verdict_while_below_the_hard_bound():
     m = resolve_margin()
-    safe = int((WATERMARK - m.total_gib - 1.0) * GIB)
+    safe = int((_runtime_bound() - 1.0) * GIB)
     assert watermark_breach_verdict(safe, margin=m) is None
 
 
 def test_breach_issues_the_named_teardown_verdict():
     m = resolve_margin()
-    over = int((WATERMARK - m.total_gib + 0.5) * GIB)
+    over = int((_runtime_bound() + 0.5) * GIB)
     v = watermark_breach_verdict(over, margin=m)
     assert v is not None
     assert v.startswith("W22 Weg2HostWatermarkBreached")
@@ -417,3 +429,95 @@ def test_the_ring_form_DOES_fit_but_not_on_the_arm_sb4_chose():
     # arm itself is never the impossible part -- the store size is.
     for name, (peak, store, _) in arms.items():
         assert peak - store < hard, f"{name}: peak without store must fit"
+
+
+# ============================ #1269 FIX 4 =====================================
+# The runtime bound carries no model-error term. `residual` is
+# (measured - predicted): it reserves for how wrong a PREDICTION can be. W21
+# grades a prediction and must carry it; W22 grades a MEASUREMENT, which has
+# already realised whatever error the residual reserved for. Boot weg2sb5c was
+# refused at 87.67 GiB non-reclaimable against the 87.30 boot bound -- crossed
+# by 0.37 -- with the actual reap point 8.2 GiB away. That refusal was the
+# double-charge, not danger.
+
+
+def test_the_runtime_margin_omits_the_residual_and_the_boot_margin_keeps_it():
+    m = resolve_margin()
+    assert m.boot_total_gib == pytest.approx(
+        m.transient_gib + m.residual_gib + m.drift_gib + m.foreign_gib
+    )
+    assert m.runtime_total_gib == pytest.approx(
+        m.transient_gib + m.drift_gib + m.foreign_gib
+    )
+    assert m.boot_total_gib - m.runtime_total_gib == pytest.approx(m.residual_gib)
+    # total_gib stays the BOOT margin: W21 and the store sizing are its callers
+    assert m.total_gib == pytest.approx(m.boot_total_gib)
+
+
+def test_the_two_bounds_have_the_expected_values():
+    assert _boot_bound() == pytest.approx(87.30, abs=0.01)
+    assert _runtime_bound() == pytest.approx(92.46, abs=0.01)
+    assert _runtime_bound() > _boot_bound()
+
+
+def test_sb5c_passes_the_runtime_bound_it_was_refused_against():
+    """THE RE-GRADE. sb5c measured 87.72 GiB non-reclaimable under load."""
+    m = resolve_margin()
+    assert (
+        watermark_breach_verdict(int(96.39 * GIB), margin=m, nonreclaim_gib=87.72)
+        is None
+    )
+    assert _runtime_bound() - 87.72 == pytest.approx(4.74, abs=0.02)
+    # and it WAS over the boot bound -- which is why it was refused before
+    assert 87.72 > _boot_bound()
+
+
+def test_a_real_breach_of_the_runtime_bound_still_tears_down():
+    m = resolve_margin()
+    v = watermark_breach_verdict(int(99.0 * GIB), margin=m, nonreclaim_gib=92.6)
+    assert v is not None
+    assert "CONTROLLED TEARDOWN" in v
+
+
+def test_the_verdict_says_which_bound_it_grades_and_prints_the_other():
+    m = resolve_margin()
+    v = watermark_breach_verdict(int(99.0 * GIB), margin=m, nonreclaim_gib=92.6)
+    assert "graded against the RUNTIME bound" in v
+    assert "the BOOT bound is" in v
+    assert "W21 grades predictions, W22 grades measurements" in v
+    # the omission is stated, so a reader cannot mistake it for a missing term
+    assert "DELIBERATELY NOT CHARGED" in v
+    assert f"margin={m.runtime_total_gib:.2f}" in v
+
+
+def test_the_watermark_line_prints_both_bounds():
+    line = watermark_provenance()
+    assert "BOOT bound = " in line and "RUNTIME bound = " in line
+    assert f"{_boot_bound():.2f}" in line and f"{_runtime_bound():.2f}" in line
+
+
+def test_the_sb5c_residual_sample_is_recorded_but_does_not_move_the_term():
+    """Max-over-samples is the rule, so 5.16 still binds. The row is kept
+    because a table that stores only its maximum cannot show the estimator
+    improving -- and sb5c is the FIRST ring-era sample whose two sides are in
+    the same currency."""
+    assert RUN_PEAK_RESIDUAL_GIB["weg2sb5c"] == pytest.approx(1.54)
+    assert resolve_margin().residual_gib == pytest.approx(5.16)
+    assert max(RUN_PEAK_RESIDUAL_GIB.values()) == pytest.approx(5.16)
+
+
+def test_the_residual_still_shrinks_nothing_at_boot():
+    """W21 and the store sizing are unchanged: they still carry the boot
+    margin, so the sb4 arm table from fix 3 must reproduce exactly."""
+    m = resolve_margin()
+    arms = {
+        "M=2400": (91.44, 11.0, 11.61),
+        "M=1200": (91.50, 16.0, 16.54),
+        "M=600": (92.04, 19.0, 19.01),
+    }
+    stores = {
+        n: size_store_gib(left, peak - store, 0.58, margin_gib=m.total_gib).gib
+        for n, (peak, store, left) in arms.items()
+    }
+    assert stores["M=2400"] < 8.0
+    assert stores["M=1200"] >= 8.0 and stores["M=600"] >= 8.0

@@ -282,7 +282,16 @@ RING_ERA_FLIP_TRANSIENT_GIB = {"weg2rg2": 1.10, "weg2rg3": 2.88}
 #: those boots carried, and the estimator's own error. Re-adding any of those in
 #: full would double-charge; that is why the drift term is charged only on the
 #: EXCESS window and the foreign term is measured and PRINTED but not re-added.
-RUN_PEAK_RESIDUAL_GIB = {"weg2sb4": 5.16, "weg2rg6": -0.11}
+#: FIX 4 adds the FIRST HONEST RING-ERA SAMPLE: weg2sb5c predicted 86.18 and
+#: measured 87.72 non-reclaimable = +1.54, and unlike every earlier row BOTH
+#: sides are in the same currency (sb4's +5.16 compares a prediction against a
+#: raw memory.current that happened to carry ~0 file cache at idle -- true, but
+#: true by luck rather than by construction). The rule is MAX-over-samples, so
+#: the term does not move: 5.16 still binds. It is recorded because the next
+#: in-currency sample is what will eventually retire the sb4 row, and because a
+#: provenance table that only keeps the maximum cannot show that the estimator
+#: is improving.
+RUN_PEAK_RESIDUAL_GIB = {"weg2sb4": 5.16, "weg2rg6": -0.11, "weg2sb5c": 1.54}
 RESIDUAL_WINDOW_MIN = 60.0
 
 #: #1269 / user order 2026-09-08 ("kein uebertreten mehr der schwelle. fuehrt
@@ -375,17 +384,63 @@ class Margin:
 
     @property
     def total_gib(self) -> float:
+        """The BOOT margin. Kept as the default name because W21 and the store
+        sizing -- the two callers that grade a PREDICTION -- are its users."""
+        return self.boot_total_gib
+
+    @property
+    def boot_total_gib(self) -> float:
         return (
             self.transient_gib + self.residual_gib + self.drift_gib + self.foreign_gib
         )
 
-    def terms(self) -> str:
+    @property
+    def runtime_total_gib(self) -> float:
+        """The RUNTIME margin: the boot margin MINUS the model-error term.
+
+        #1269 FIX 4, and it is a design correction rather than a relaxation.
+        ``residual`` is (measured - predicted): it exists to cover how wrong the
+        PREDICTION can be. W21 grades a prediction, so it must carry it. W22
+        grades a MEASUREMENT -- `memory.current` net of reclaimable cache, the
+        real number -- and a measurement has already realised whatever error the
+        residual was reserving for. Charging it there subtracts the same error
+        twice and refuses a box that is nowhere near the reap point.
+
+        Boot weg2sb5c is what made this concrete: it was refused at
+        87.67 GiB non-reclaimable against the 87.30 boot bound -- crossed by
+        0.37 -- while the actual reap point sat **8.2 GiB** away. The transient
+        and the drift still belong here: neither has happened yet at the moment
+        of the reading, so both are still future spend the box must have room
+        for.
+        """
+        return self.transient_gib + self.drift_gib + self.foreign_gib
+
+    def _drift_note(self) -> str:
+        return (
+            f"{self.drift_mib_per_min:.1f} MiB/min x "
+            f"{max(0.0, self.window_min - RESIDUAL_WINDOW_MIN):.0f} min beyond the "
+            f"residual's own {RESIDUAL_WINDOW_MIN:.0f} min, {self.drift_source}"
+        )
+
+    def terms(self, scope: str = "boot") -> str:
+        """The terms of one bound. ``scope`` is 'boot' or 'runtime'; the runtime
+        form OMITS the residual and says so, so a reader of a W22 line can see
+        that the omission was deliberate and not a missing term."""
+        head = (
+            f"transient {self.transient_gib:.2f} [{self.transient_source}] "
+            f"+ drift {self.drift_gib:.2f} [{self._drift_note()}] "
+            f"+ foreign {self.foreign_gib:.2f} [{self.foreign_source}]"
+        )
+        if scope == "runtime":
+            return (
+                head + f" GiB; residual {self.residual_gib:.2f} DELIBERATELY NOT "
+                "CHARGED here -- it is model error and this bound grades a "
+                "MEASUREMENT, not a prediction (#1269 fix 4)"
+            )
         return (
             f"transient {self.transient_gib:.2f} [{self.transient_source}] "
             f"+ residual {self.residual_gib:.2f} [{self.residual_source}] "
-            f"+ drift {self.drift_gib:.2f} [{self.drift_mib_per_min:.1f} MiB/min x "
-            f"{max(0.0, self.window_min - RESIDUAL_WINDOW_MIN):.0f} min beyond the "
-            f"residual's own {RESIDUAL_WINDOW_MIN:.0f} min, {self.drift_source}] "
+            f"+ drift {self.drift_gib:.2f} [{self._drift_note()}] "
             f"+ foreign {self.foreign_gib:.2f} [{self.foreign_source}] GiB"
         )
 
@@ -549,8 +604,11 @@ def watermark_provenance(margin: Optional[Margin] = None,
         f"(= memory.current at a reap, because the kernel has ALREADY reclaimed the "
         f"file cache by then: dk5's own reap row carries 0.03 GiB of it; dk6's "
         f"memory.stat was not captured, so that half is inference from one row) "
-        f"source=[{events}] margin={m.total_gib:.2f} GiB "
-        f"({m.terms()}); hard bound = {w - m.total_gib:.2f} GiB; excluded=[{excl}].{cur}"
+        f"source=[{events}] "
+        f"BOOT bound = {w - m.boot_total_gib:.2f} GiB (margin {m.boot_total_gib:.2f}: "
+        f"{m.terms()}) | RUNTIME bound = {w - m.runtime_total_gib:.2f} GiB "
+        f"(margin {m.runtime_total_gib:.2f}: {m.terms('runtime')}); "
+        f"excluded=[{excl}].{cur}"
     )
 
 
@@ -593,7 +651,13 @@ def watermark_breach_verdict(
     """
     m = margin if margin is not None else resolve_margin()
     w = watermark_gib if watermark_gib is not None else OBSERVED_REAP_NONRECLAIM_BYTES / GIB
-    bound = w - m.total_gib
+    # #1269 FIX 4: the RUNTIME bound, which carries no model-error term. This
+    # call grades a MEASUREMENT; the residual reserves for how wrong a
+    # PREDICTION can be, and the measurement has already realised that error.
+    # Boot weg2sb5c was refused at 87.67 against the boot bound 87.30 with the
+    # reap point 8.2 GiB away -- that refusal was the double-charge, not danger.
+    bound = w - m.runtime_total_gib
+    boot_bound = w - m.boot_total_gib
     current = float(current_bytes) / GIB
     if nonreclaim_gib is not None:
         tested = float(nonreclaim_gib)
@@ -622,7 +686,10 @@ def watermark_breach_verdict(
             )
     return (
         f"W22 Weg2HostWatermarkBreached current={tested:.2f} watermark={w:.2f} "
-        f"margin={m.total_gib:.2f} ({m.terms()}); hard bound {bound:.2f} GiB "
+        f"margin={m.runtime_total_gib:.2f} ({m.terms('runtime')}); "
+        f"graded against the RUNTIME bound {bound:.2f} GiB "
+        f"(the BOOT bound is {boot_bound:.2f}, and it is NOT what this line "
+        f"grades: W21 grades predictions, W22 grades measurements) "
         f"crossed by {tested - bound:.2f} GiB in {currency} currency "
         f"[raw memory.current={current:.2f}{cache}].{split} CONTROLLED TEARDOWN "
         "down the killer path. Standing order 2026-09-08: the threshold is never "
