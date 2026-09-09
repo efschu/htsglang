@@ -135,7 +135,11 @@ class ThePriceOfBothAlternativesIsPrintedEveryBoot(CustomTestCase):
         import inspect
 
         src = inspect.getsource(launcher.shipped_line)
-        i = src.index("PP-CUT SHIPPED")
+        # ANCHOR ON THE FORMAT LITERAL, not on any mention of the marker: the
+        # extracted function names it in its own docstring one screen above,
+        # and a bare `index("PP-CUT SHIPPED")` lands there and then reports the
+        # format's fields missing from a window of prose.
+        i = src.index('"PP-CUT SHIPPED: layers=')
         window = src[i:i + 900]
         for token in ("incumbent %s pool %s", "pool-maximal (kv-floor)",
                       "makespan-optimal", "chosen_pool=%d", "pool_floor=%s",
