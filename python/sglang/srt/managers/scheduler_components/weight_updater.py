@@ -1023,12 +1023,58 @@ class SchedulerWeightUpdaterManager:
         return weg2_group_name() or "?"
 
     def _weg2_rank(self) -> int:
+        """THIS RANK's 0..2 index inside its Weg-2 group, or ``-1``.
+
+        MEASURED-BY-BOOT DEFECT (weg2shadowC, #1273 S6 fix C).  This read
+        ``getattr(scheduler, "tp_rank")`` then ``"pp_rank"`` -- and **the
+        Scheduler has neither**.  It keeps its parallel identity on the
+        ``ParallelState`` wrapper, which the tree already states in three
+        places, each written after the same read raised somewhere else
+        (``scheduler.py:1766``, ``:8157-8161``, ``:14502-14504``).  Here it
+        could not raise: the read is ``getattr(..., None)`` behind an
+        ``isinstance(..., int)`` test, so it degraded SILENTLY to -1 on every
+        rank of every Weg-2 boot.  Two consequences, one root:
+
+        * every ``WEG2-FLIP-TAG`` line ever emitted printed ``rank=-1`` --
+          210 of 210 in boot weg2shadowC's four rank logs -- and instead of
+          the emitter being fixed, ``ring_table`` WIDENED its parser to
+          ``rank=(-?\\d+)`` and grew a synthetic per-card index for it
+          (``ring_table.py:159-166``, W37's docstring at ``:866``);
+        * ``_weg2_shadow_hook``'s ``rank < 0`` gate returned before
+          ``run_leg_hook`` on all four flips of both shadow arms, so the whole
+          observer -- plan, sems, on-card refusals, the byte compare -- was a
+          single silent ``return``.
+
+        THE IDENTITY IS THE WORLD GROUP'S, NOT ``ps``.  ``scheduler.ps`` is
+        PHASE state: the cutover REPLACES it with ``pp_rank=0`` on every rank
+        (``phase_flip_runtime.py:3366-3374``, stated verbatim at ``:12235``),
+        so it cannot tell ranks apart on a flip boot.  ``world_group`` is bound
+        once (``scheduler.py:1867``) and the cutover rebinds the tp/attn/pp
+        handles beside it but never this one; it is also the identity the
+        cutover itself reads (``:3323``).
+
+        AND ``ps.tp_rank`` ALONE WOULD BE WORSE THAN -1.  Group P runs
+        ``pp_size=3, tp_size=1`` and group D ``pp_size=1, tp_size=3``
+        (``launcher.py:6525``), so on P ``ps.tp_rank`` is 0 on all three ranks:
+        three publishers on row 0 of the six-row gate matrix -- silently WRONG
+        where -1 was merely silently absent.  The ``ps`` fallback below is
+        therefore the FLAT world rank, the same arithmetic
+        ``Scheduler._admin_world_rank`` uses, which reduces correctly on both
+        group shapes and in both ``ps`` states.
+
+        ``-1`` survives as the answer where there is genuinely no identity to
+        read.  It may not become 0: rank 0 is a real row another rank owns.
+        """
         scheduler = self.scheduler
-        for attr in ("tp_rank", "pp_rank"):
-            value = getattr(scheduler, attr, None)
-            if isinstance(value, int):
-                return value
-        return -1
+        world_rank = getattr(
+            getattr(scheduler, "world_group", None), "rank_in_group", None)
+        if isinstance(world_rank, int):
+            return world_rank
+        ps = getattr(scheduler, "ps", None)
+        try:
+            return int(ps.pp_rank) * int(ps.tp_size) + int(ps.tp_rank)
+        except Exception:  # noqa: BLE001 -- an unreadable identity is -1
+            return -1
 
     def _weg2_backup_census(self, weights_tags, tag_bytes):
         """``({tag: bytes}, population)`` -- A1-2's per-card dormant image.
@@ -1292,6 +1338,23 @@ class SchedulerWeightUpdaterManager:
             group = self._weg2_group_name()
             rank = self._weg2_rank()
             if group not in ("P", "D") or rank < 0:
+                # THE DISCRIMINATOR BOOT weg2shadowC DID NOT HAVE.  Both
+                # pre-flight gates used to return without a word, so "the arm
+                # never reached this rank" and "this rank has no identity"
+                # produced byte-identical evidence -- nothing -- and the boot
+                # could not separate the two readings that mattered.  The ARM
+                # gate above stays silent on purpose: it fires on every ring
+                # boot, i.e. every boot that has ever run.  THIS one fires only
+                # under an armed shadow, where a silent return is the defect;
+                # it is the same W63 line every other rank-local refusal on
+                # this path already uses, so no reader learns a new shape.
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-identity", rank=rank,
+                    leg=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
+                    epoch=str(getattr(recv_req, "epoch", "") or ""),
+                    detail=f"hook={hook} group={group} rank={rank} -- the "
+                           f"rank's own index inside its Weg-2 group is what "
+                           f"xr.rank_row keys the six gate rows by"))
                 return
             device = self._weg2_device_index()
             if device < 0:
