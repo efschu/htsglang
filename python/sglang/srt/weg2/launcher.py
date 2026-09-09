@@ -1854,7 +1854,10 @@ def arc_preflight_line(
 
     arc_max = arc.get("arc_max")
     unbounded = arc_max is None or arc_max == 0
-    store_budget_gib = plan.needed_bytes / host_ledger.GIB
+    # THE STORE'S OWN BYTES, not `needed_bytes`: `min_free` is free space the
+    # store never writes into, so counting it here would over-state both the
+    # RAM this move freed and the most an uncapped ARC could absorb from us.
+    store_budget_gib = plan.max_size_bytes / host_ledger.GIB
     head = (
         f"WEG2-STORE ARC: zfs_arc_max={_g(arc_max)}"
         + ("" if arc_max else " (0/unreadable = NO EXPLICIT CAP)")
@@ -6785,8 +6788,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"at 0.54x). extra_config={store_cfg}"
     )
     log(
-        f"WEG2-STORE LEDGER DELTA: {store_plan.needed_bytes / host_ledger.GIB:.2f} GiB of "
-        f"store budget left the HOST RAM ledger entirely (max_size + min_free), because "
+        f"WEG2-STORE LEDGER DELTA: {store_plan.max_size_bytes / host_ledger.GIB:.2f} GiB of "
+        f"store budget left the HOST RAM ledger entirely (max_size; min_free is free "
+        f"space the store never writes into and was never a RAM post), because "
         f"this store is a directory on disk and its host cost is page cache plus the ZFS "
         f"ARC -- both reclaimable, neither in cgroup anon, neither what the reaper kills "
         f"for. The reap headroom the ledger now reports is "
