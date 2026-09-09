@@ -647,10 +647,12 @@ def test_the_checksum_seam_is_opt_in_at_every_entry_point():
 # ===========================================================================
 
 
-def _vote_rows(region, rows, *, leg, vote=True, classes_hash=0, need_mib=0):
+def _vote_rows(region, rows, *, leg, vote=True, classes_hash=0, need_mib=0,
+               plan_digest=0, card_digest=0):
     for row in rows:
         sh.write_shadow_vote(region, row, leg=leg, vote=vote,
-                             classes_hash=classes_hash, need_mib=need_mib)
+                             classes_hash=classes_hash, need_mib=need_mib,
+                             plan_digest=plan_digest, card_digest=card_digest)
 
 
 def test_the_shadow_area_is_disjoint_from_s4s_and_inside_the_region():
@@ -2942,6 +2944,12 @@ class _FakeParam:
         self._stride = (cols, 1)
         self._itemsize = int(itemsize)
         self._ptr = int(ptr)
+        # ``walk_live_tensors`` records a dtype and a shape on every
+        # ``LiveTensor`` (S5c-fix must_fix 5: the population comes from that
+        # producer now).  A double that cannot answer is refused BY NAME --
+        # ``population-refused:AttributeError`` -- which is how this line got
+        # written, and is itself the proof that the derivation never raises.
+        self.dtype = "fake.bfloat16"
 
     def dim(self):
         return 2
@@ -2958,18 +2966,39 @@ class _FakeParam:
     def is_contiguous(self):
         return True
 
+    def numel(self):
+        # ``walk_live_tensors`` -> ``_nbytes`` reads this when a double has no
+        # ``untyped_storage()`` (S5c-fix must_fix 5: the derivation now asks
+        # the ring's three-population producer, which sizes every member).
+        return self.shape[0] * self.shape[1]
+
 
 class _FakeModel:
-    """A model that is only its ``named_parameters()``, which is all that is read."""
+    """A model with the THREE populations ``walk_live_tensors`` enumerates.
 
-    def __init__(self, params):
+    It used to be "only its ``named_parameters()``, which is all that is read",
+    and that sentence was the test-side half of S5c refuter must_fix 5: the
+    derivation read one population and the acceptance line's ``undescribed=0``
+    read as "nothing was left out".  Buffers under a chunk tag are real bytes
+    the ring restores -- the rope ``cos_sin_cache`` is the measured example --
+    so the double can carry them and the plan must COUNT them.
+    """
+
+    def __init__(self, params, buffers=()):
         self._params = list(params)
+        self._buffers = list(buffers)
 
     def named_parameters(self, *_a, **_k):
         return iter(self._params)
 
+    def named_buffers(self, *_a, **_k):
+        return iter(self._buffers)
 
-def _sb4_model(*, layers=32, base_ptr=0x10000000, cols=32):
+    def named_modules(self, *_a, **_k):
+        return iter((("", self),))
+
+
+def _sb4_model(*, layers=32, base_ptr=0x10000000, cols=32, buffers=()):
     """Two classes per layer plus the base tag's embedding, the sb4 shape."""
     out = []
     for layer in range(layers):
@@ -2979,7 +3008,7 @@ def _sb4_model(*, layers=32, base_ptr=0x10000000, cols=32):
                     _FakeParam(32, cols, ptr=base_ptr + layer * 0x10000 + 0x8000)))
     out.append(("model.embed_tokens.weight",
                 _FakeParam(128, cols, ptr=base_ptr + 0x900000)))
-    return _FakeModel(out)
+    return _FakeModel(out, buffers=buffers)
 
 
 @pytest.fixture()
@@ -3204,8 +3233,6 @@ def test_a_rank_reading_a_different_boot_configuration_diverges(chunked):
     variants = {
         "layers per chunk": dict(chunk_geometry=lambda: (16, 4)),
         "the card vector": dict(n_cards=2),
-        "class rotation": dict(model=_FakeModel([
-            ("model.layers.0.mlp.down_proj.weight", _FakeParam(32, 32))])),
         "wave partition": dict(waves_of=lambda t, m, c: [
             list(t)[:2], list(t)[2:]]),
     }
@@ -3214,6 +3241,33 @@ def test_a_rank_reading_a_different_boot_configuration_diverges(chunked):
         assert other is not None, (what, why)
         assert other.facts.digest != base.facts.digest, what
     assert wx.derive_waves is not None  # the producer this reads is the real one
+
+
+def test_the_class_rotation_moves_the_card_digest_and_not_the_group_one(chunked):
+    """S5c refuter, must_fix 4: the one live-tensor fact is out of the GROUP digest.
+
+    ``classes`` is built from THIS rank's ``named_parameters()``, filtered by
+    ``ParamGeom.of`` succeeding on THIS rank's live tensors.  Under P=PP a
+    rank's inventory is its own stage's layer band, so on a hybrid layer stack
+    a band that lacks one layer type yields a different class set -- and the
+    old digest hashed that assertion instead of checking it, which would have
+    surfaced as W64 ``scope=group`` under a cause sentence naming a stale chunk
+    geometry.  Wrong place, wrong cause, and the reader sent to the wrong file.
+
+    So the class set must move ``card_digest`` (a per-card reading by
+    construction) and must NOT move ``plan_digest``.  Nothing is lost: the
+    class agreement is already gated by ``classes_hash``, whose own refusal
+    sentence says "the ranks chose different class subsets".
+    """
+    base, _ = _derive()
+    fewer, why = _derive(model=_FakeModel([
+        ("model.layers.0.mlp.down_proj.weight", _FakeParam(32, 32))]))
+    assert fewer is not None, why
+    assert fewer.classes != base.classes, "the control: the rotation moved"
+    assert fewer.facts.digest == base.facts.digest, (
+        "a per-rank fact must not sit in the group digest")
+    assert fewer.card_digest != base.card_digest, (
+        "and it must still be visible where it belongs")
 
 
 def test_two_readers_of_the_chunk_geometry_that_disagree_are_refused(chunked):
@@ -3452,47 +3506,86 @@ def test_the_compare_names_the_class_the_stripes_and_the_bytes(
 
 # --- item 5: the block across the flip span is bounded AND priced ---------
 
-def test_the_block_on_slot_drain_is_measured_and_printed(region, tmp_path,
-                                                         boot, no_active_leg):
-    """ITEM 5 / S5b UNPROVEN 3: the transport is unchanged, the wait is PRICED.
+def test_the_block_on_slot_drain_is_measured_when_the_wait_TIMES_OUT(tmp_path,
+                                                                    region,
+                                                                    boot):
+    """S5c refuter, must_fix 1 AND must_fix 7 -- the defect and the harness bug.
 
-    The two ends of the on-card lane sit at opposite ends of one flip, so the
-    producer's terminal drain can span it.  This round does not redesign the
-    transport; it makes the block measurable, so a boot can decide whether it
-    needs redesigning instead of the next round guessing.
+    THE DEFECT, proven on the remote desk before this test existed: the
+    accumulation ``stats.drain_wait_s += perf_counter() - _blocked`` sat AFTER
+    the call that raises, so the one wait that ever costs the leg anything --
+    the one that ran to the budget and threw -- was the one wait never priced.
+    A leg that spent 402.0 of its 402.9 ms blocked in ``drain-final`` printed
+    ``blocked_ms=0.004``: the microseconds of the ``seq<0`` early return, which
+    never blocked at all.  The field this round exists to add read as its own
+    opposite on the path it was added for.
 
-    The peer never arrives, so the source spends its whole (tiny) budget in the
-    drain and ``blocked_ms`` must be the number that says so.
+    THE OLD TEST COULD NOT SEE IT, and that is the second finding: it asserted
+    ``blocked_ms > 0.0`` and ``<= hook_budget_ms`` (3000 ms) against a payload
+    whose only accumulating call was the no-op.  4 us and 400 ms both pass.
+    An instrument-that-cannot-go-red, in the field the round exists to add --
+    so this test grades the MAGNITUDE against the budget that produced it.
+
+    AND IT NO LONGER STARTS A PEERLESS LEG ON THE DOUBLE, which S5b's own
+    record forbids by name after a SIGSEGV cost a whole remote run its
+    ``junit.xml`` (run ``7f3825bfb5_20260909T084353Z``, VERDICT JUNIT-MISSING):
+    the fake's device storage is an ``mmap`` whose base is handed out raw and a
+    leg's diagonal thread outlives the fixture.  This drives
+    ``run_oncard_producer`` DIRECTLY -- one thread, synchronous, returns before
+    teardown -- which is also the tighter test: it names the function whose
+    ``finally`` is the fix.
     """
-    xr.create_semaphores(boot)
-    sems = tp.SemSet(boot)
-    ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    ops = FakeDeviceOps(str(tmp_path / "blk"), rank=0)
     try:
         payload = pattern(29, 1200)
         src = dev_ptr(0, 0x10000)
         write(ops, src, payload)
         descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=0,
                            name="model.layers.0.mlp.down_proj.weight")]
-        _vote_rows(region, [1, 2], leg=0, vote=True,
-                   classes_hash=sh.classes_hash(["down_proj"]), need_mib=0)
-        lines = []
-        result = sh.run_leg_hook(
-            _inputs(sh.HOOK_SOURCE, row=0, peer_row=3, gate_rows=(0, 1, 2)),
-            log=lines.append,
-            descs=descs, region=region, sems=sems, ops=ops, armed=True,
-            slot_bytes=SLOT, stripe_bytes=1 << 20,
-            budget_s=0.4, hook_budget_s=3.0, oncard_slot_bytes=SLOT)
+        assert len(tp.batch_descs(descs, SLOT)) == 1, "one batch: only the terminal drain blocks"
+        bounce = tp.OnCardBounce(ops, 0, slots=tp.ONCARD_SLOTS, slot_bytes=SLOT)
+        stats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_IPC)
+        budget = 0.4
+        t0 = time.perf_counter()
+        with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
+            # Row 3 never votes: the terminal drain runs to the budget and
+            # raises, which is EXACTLY the path the old accumulation skipped.
+            tp.run_oncard_producer(region, ops, ops.create_stream(0), bounce,
+                                   row=0, peer_row=3, wave=WAVE, descs=descs,
+                                   stats=stats, budget_s=budget)
+        wall = time.perf_counter() - t0
+        assert "what=drain-final" in str(excinfo.value), str(excinfo.value)
+        bounce.close()
     finally:
         ops.close()
-        sems.close()
-        xr.unlink_semaphores(boot)
-    line = result.line()
-    assert "blocked_ms=" in line, line
-    assert result.blocked_ms > 0.0, line
-    # BOUNDED BY THE BUDGET THAT ALREADY EXISTS, never by a new constant: the
-    # block cannot outlive the transport budget the hook carved from its own
-    # deadline.
-    assert result.blocked_ms <= result.hook_budget_ms, line
+    # THE MAGNITUDE, graded against the budget that produced it -- not against
+    # zero, and not against a 3 s ceiling that 4 us also satisfies.
+    assert stats.drain_wait_s >= 0.8 * budget, (stats.drain_wait_s, budget)
+    assert stats.drain_wait_s <= wall, (stats.drain_wait_s, wall)
+    # The terminal drain is OUTSIDE ``elapsed_s`` by design, so the field that
+    # ``issue_ms`` subtracts must carry it too.
+    assert stats.drain_wait_outside_s >= 0.8 * budget, stats.drain_wait_outside_s
+
+
+def test_the_blocked_wall_reaches_the_shadow_line_from_a_failed_leg(tmp_path,
+                                                                   region):
+    """The same wall, one seam further: the carry, end to end, no leg started.
+
+    ``run_leg`` puts its partial ``LegResult`` on the exception
+    (``weg2_leg_result``) and ``shadow_transport``'s handler reads it.  With
+    must_fix 1 unfixed that object carried a zero, so the carry was live and
+    the number it carried was wrong -- the reason a mutant that removed the
+    carry still died while the product lied.
+    """
+    stats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_HOST)
+    stats.drain_wait_s = 0.402
+    result = tp.LegResult()
+    result.oncard = stats
+    exc = tp.Weg2XchgGateTimeout("W53 Weg2XchgGateTimeout oncard -- synthetic")
+    setattr(exc, "weg2_leg_result", result)
+    got = getattr(exc, "weg2_leg_result", None)
+    assert got is not None and got.oncard is stats
+    assert got.oncard.drain_wait_s * 1e3 == pytest.approx(402.0)
 
 
 def test_the_issue_remainder_does_not_absorb_the_terminal_drain():
@@ -3553,3 +3646,307 @@ def test_w64_is_the_next_free_code_and_names_one_exception():
         field="plan_digest")
     assert message.startswith(sh.PLAN_DIVERGED_MARKER)
     assert "the flip proceeds on the ring" in message
+
+
+# ===========================================================================
+# S5c-FIX -- the seven must_fix and two findings of the S5c refutation.
+# Every test below names the defect it was written red against.
+# ===========================================================================
+
+
+def test_the_leg_budget_is_a_deadline_and_not_a_per_wait_ceiling():
+    """must_fix 2: ``budget_s`` bounds ONE wait; a leg performs many.
+
+    ``run_leg`` handed its one number to every ``_await_oncard``, and each
+    restarts its own clock -- so a source leg's worst case was
+    ``(batches + slots + 1) x budget``, while
+    ``SHADOW_HOOK_BUDGET_S``'s docstring said in as many words that "the two
+    together can never exceed this number no matter how the sub-budgets are
+    tuned".  That constant is the one place the user law "never delays the
+    leg's own completion beyond a named bound" is meant to be readable, so the
+    gap was between the bound and its own statement of itself.
+
+    The fix is a CALLABLE, not a smaller number: a deadline sampled once at
+    entry is the identical defect one level up.
+    """
+    # The clamp itself: what is LEFT wins whenever it is smaller.
+    assert tp._wait_budget(5.0, None) == 5.0, "no deadline -> pre-S5c semantics"
+    assert tp._wait_budget(5.0, lambda: 0.25) == 0.25
+    assert tp._wait_budget(0.1, lambda: 9.0) == 0.1
+    assert tp._wait_budget(5.0, lambda: -3.0) == 0.0, "an expired deadline is 0, never negative"
+    # And it is threaded, not merely present: every wait of the diagonal takes
+    # its ceiling through the clamp rather than from the raw budget.
+    for fn in (tp.run_oncard_producer, tp.run_oncard_consumer,
+               tp.run_producer_pair, tp.run_consumer_pair, tp.run_leg):
+        assert "budget_left" in inspect.signature(fn).parameters, fn.__name__
+    src = inspect.getsource(tp.run_oncard_producer)
+    assert src.count("_wait_budget(budget, budget_left)") == 2, src
+    assert "_await_oncard(region, DIR_ONCARD_CONS_OFF, peer_row,\n" in src
+    # THE CAN-FAIL CONTROL: a raw ``budget`` reaching a wait is the defect.
+    for fn in (tp.run_oncard_producer, tp.run_oncard_consumer):
+        body = inspect.getsource(fn)
+        assert ", budget," not in body, (fn.__name__, "a raw per-wait budget")
+
+
+def test_the_deadline_shrinks_across_successive_waits():
+    """The same fix, as behaviour rather than as shape.
+
+    A deadline that is re-evaluated gives the SECOND wait less than the first.
+    Sampling it once -- the defect -- gives both the same number.
+    """
+    deadline = time.perf_counter() + 0.30
+    left = lambda: max(0.0, deadline - time.perf_counter())  # noqa: E731
+    first = tp._wait_budget(5.0, left)
+    time.sleep(0.12)
+    second = tp._wait_budget(5.0, left)
+    assert second < first, (first, second)
+    assert first + second < 2 * 5.0
+    time.sleep(0.25)
+    assert tp._wait_budget(5.0, left) == 0.0, "past the deadline nothing is granted"
+
+
+def test_the_hook_hands_the_transport_the_deadline_itself(chunked):
+    """must_fix 2 at the shadow seam: the callable reaches ``tp.run_leg``."""
+    src = inspect.getsource(sh.run_leg_hook)
+    assert "budget_left=left," in src, src
+    assert "budget_s=min(float(budget_s), left())" in src
+    forwarded = inspect.getsource(sh.shadow_transport)
+    assert "budget_s=budget_s, budget_left=budget_left," in forwarded
+    assert "budget_left" in inspect.signature(sh.shadow_transport).parameters
+
+
+# --- must_fix 3: the lane whose peer cannot run -----------------------------
+
+
+def test_the_product_adapter_declares_its_lane_undrainable():
+    """must_fix 3: on ``weight_updater``'s placement the peer is DOWNSTREAM.
+
+    The source hook is upstream of the pause loop; ``credit.publish`` is inside
+    it; the co-located waking rank's ``resume`` is fenced (C14) on that credit
+    and its destination hook runs after the resume.  So the consumer of this
+    bounce cannot exist while the producer blocks on it, and with a real plan
+    -- S5c's whole addition -- every armed source leg would fill a bounce,
+    block in ``drain-final`` to the budget, vote its PROD row FAILED and take
+    the destination down with it: seconds on the critical path of that credit,
+    zero bytes ever compared.
+
+    The default is ``True`` because it is the truth for every CONCURRENT caller
+    (S6's handler, and every hermetic test that drives both ends at once); the
+    adapter is what knows its own placement, so the adapter is what says False.
+    """
+    assert sh.ShadowLegInputs(
+        leg=0, epoch="e", direction="d2h", hook=sh.HOOK_SOURCE, rank=0, row=0,
+        peer_row=3, device=0, card_uuid="u").oncard_drainable is True
+    hook = _wu_source("_weg2_shadow_hook")
+    assert "oncard_drainable=False," in hook, hook
+    # And it is stated where a reader looking for the cause will be.
+    assert "C14" in hook
+
+
+def test_an_undrainable_lane_compares_digests_and_moves_no_bytes(region, boot,
+                                                                 tmp_path,
+                                                                 no_active_leg,
+                                                                 chunked):
+    """must_fix 3, and refuter finding 9 answered in the same run.
+
+    The refusal is placed AFTER the gate on purpose: the rendezvous is the only
+    part of the shadow that needs no lane, and it is where ``plan_digest`` and
+    ``card_digest`` are compared.  Refusing before it would leave the source
+    exporting under a plan its consumer never saw -- finding 9 with the sign
+    flipped.  So the gate must have run, the refusal must be on the log by
+    name, and ``run_leg`` must never have been entered.
+    """
+    plan, why = _derive("source", rank=0, group="P")
+    assert plan is not None, why
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "nd"), rank=0)
+    # The three rows this source hook expects, all voting yes, with the digests
+    # it derived: the gate opens, and only then is the lane refused.
+    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
+               need_mib=0, plan_digest=plan.facts.digest)
+    entered = []
+    try:
+        lines = []
+        real = tp.run_leg
+        tp.run_leg = lambda *a, **k: entered.append(1)  # noqa: E731
+        try:
+            result = sh.run_leg_hook(
+                _inputs(sh.HOOK_SOURCE, row=0, peer_row=3, gate_rows=(0, 1, 2),
+                        oncard_drainable=False),
+                log=lines.append, plan=plan, region=region, sems=sems, ops=ops,
+                armed=True, gate_budget_s=2.0, hook_budget_s=5.0,
+                slot_bytes=SLOT, oncard_slot_bytes=SLOT)
+        finally:
+            tp.run_leg = real
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+    assert entered == [], "an undrainable lane must not reach the transport"
+    assert result.reason == "oncard-not-drainable", result.line()
+    assert result.ran is False
+    refusal = [ln for ln in lines
+               if ln.startswith(sh.ONCARD_NOT_DRAINABLE_PREFIX)]
+    assert len(refusal) == 1, lines
+    for token in ("hook=source", "row=0", "peer_row=3", "oncard_descs="):
+        assert token in refusal[0], (token, refusal[0])
+    assert "C14 credit" in refusal[0]
+    # THE GATE RAN, which is the whole point of refusing here and not earlier.
+    gate = [ln for ln in lines if ln.startswith(sh.SHADOW_GATE_LINE_PREFIX)]
+    assert len(gate) == 1 and "run=yes" in gate[0], lines
+    # ... and nothing blocked, which is the cost this refusal removes.
+    assert result.blocked_ms == 0.0, result.line()
+
+
+def test_a_drainable_lane_is_unchanged_by_the_refusal(region, boot, tmp_path,
+                                                      no_active_leg, chunked):
+    """The can-fail control: ``oncard_drainable=True`` still reaches ``run_leg``."""
+    plan, why = _derive("source", rank=0, group="P")
+    assert plan is not None, why
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "dr"), rank=0)
+    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
+               need_mib=0, plan_digest=plan.facts.digest)
+    entered = []
+    try:
+        real = tp.run_leg
+        tp.run_leg = lambda *a, **k: entered.append(1)  # noqa: E731
+        try:
+            result = sh.run_leg_hook(
+                _inputs(sh.HOOK_SOURCE, row=0, peer_row=3, gate_rows=(0, 1, 2)),
+                log=[].append, plan=plan, region=region, sems=sems, ops=ops,
+                armed=True, gate_budget_s=2.0, hook_budget_s=5.0,
+                slot_bytes=SLOT, oncard_slot_bytes=SLOT)
+        finally:
+            tp.run_leg = real
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+    assert entered == [1], result.line()
+    assert result.reason != "oncard-not-drainable"
+
+
+# --- must_fix 5: the population has a producer, and the omission is counted --
+
+
+def test_the_population_comes_from_the_rings_own_walk_and_is_counted(chunked):
+    """must_fix 5: ``walk_live_tensors``, not a second enumeration.
+
+    ``undescribed=`` counted ``ParamGeom.of`` refusals only, so a boot printed
+    ``undescribed=0`` while an entire population -- buffers, plain module
+    attributes -- had never been enumerated at all.  Those bytes carry CHUNK
+    tags (the tags this plan claims to cover) and the ring restores them; the
+    largest named one is the rope ``cos_sin_cache``, measured by
+    ``walk_live_tensors``' own docstring at +300/+181/+210 MiB on D's
+    ``weights_0``.
+    """
+    buf = ("model.layers.0.self_attn.rotary_emb.cos_sin_cache",
+           _FakeParam(64, 64))
+    plain, _ = _derive()
+    withbuf, why = _derive(model=_sb4_model(buffers=[buf]))
+    assert withbuf is not None, why
+    assert withbuf.population == plain.population + 1
+    assert withbuf.unplanned == 1 and plain.unplanned == 0
+    assert withbuf.unplanned_bytes > 0
+    assert withbuf.planned == plain.planned, "a buffer is not transported"
+    line = withbuf.line()
+    for token in ("population=", "planned=", "unplanned=1",
+                  f"unplanned_bytes={withbuf.unplanned_bytes}"):
+        assert token in line, (token, line)
+    # The producer is NAMED on the line, so a reader can grep who answered.
+    assert "walk_live_tensors" in line
+    assert "walk_live_tensors" in sh.PLAN_SOURCE
+
+
+def test_the_unplanned_population_moves_the_card_digest(chunked):
+    """must_fix 5's second half: the digest was over the truncated set too.
+
+    Two co-located ranks with different buffer populations agreed that they
+    held the same bytes on this card, because the fingerprint only ever saw
+    the parameters.
+    """
+    a, _ = _derive()
+    b, why = _derive(model=_sb4_model(buffers=[
+        ("model.layers.0.self_attn.rotary_emb.cos_sin_cache",
+         _FakeParam(64, 64))]))
+    assert b is not None, why
+    assert b.card_digest != a.card_digest
+    # ... and it stays a per-CARD reading: the group digest must not move.
+    assert b.facts.digest == a.facts.digest
+
+
+def test_a_model_the_walk_cannot_enumerate_is_refused_by_name(chunked):
+    """The derivation never raises -- the walk gets the same treatment as ``build_plan``."""
+
+    class _Hostile:
+        def named_parameters(self, *_a, **_k):
+            return iter(())
+
+        def named_buffers(self, *_a, **_k):
+            raise RuntimeError("no buffers on this shape")
+
+        def named_modules(self, *_a, **_k):
+            return iter((("", self),))
+
+    plan, why = _derive(model=_Hostile())
+    assert plan is None
+    assert why.startswith("population-refused:RuntimeError"), why
+
+
+# --- must_fix 6: the derivation is inside the deadline ----------------------
+
+
+def test_the_derivation_prices_itself_and_the_hook_subtracts_it(chunked):
+    """must_fix 6: the walk ran on the flip's critical path, unmeasured.
+
+    ``_weg2_shadow_plan`` walks every named parameter, calls a regex tag
+    function and ``ParamGeom.of`` per tensor, then ``build_plan`` sorts and
+    emits per parameter -- all BEFORE ``run_leg_hook`` starts its clock, so it
+    was outside ``shadow_ms``, outside ``hook_budget_ms`` and outside every
+    ``budget=ok|OVER`` reading, while ``SHADOW_HOOK_BUDGET_S`` claimed to be
+    "the ONE wall a flip leg pays for having an observer".
+    """
+    plan, why = _derive()
+    assert plan is not None, why
+    assert plan.derive_ms > 0.0, "the derivation must price itself"
+    assert f"derive_ms={plan.derive_ms:.3f}" in plan.line()
+    # The hook subtracts it from its own deadline rather than re-timing it.
+    src = inspect.getsource(sh.run_leg_hook)
+    assert 'derive_ms = float(getattr(plan, "derive_ms", 0.0) or 0.0)' in src
+    assert "deadline = started + max(0.0, hook_budget_s - derive_ms / 1e3)" in src
+    # And the verdict grades the SUM, not the half the hook happened to time.
+    result = sh.ShadowResult(leg=0, epoch="e", subset=sh.select_subset((), leg=0),
+                             counters=sh.ShadowCounters(), direction="d2h")
+    result.shadow_ms, result.derive_ms, result.hook_budget_ms = 3.0, 4.0, 5.0
+    assert result.observer_ms == pytest.approx(7.0)
+    assert "budget=OVER" in result.line(), result.line()
+    assert "derive_ms=4.000" in result.line()
+    result.derive_ms = 0.5
+    assert "budget=ok" in result.line(), result.line()
+
+
+# --- finding 8: the wave map is an assumption and says so -------------------
+
+
+def test_the_wave_map_is_printed_as_the_assumption_it_is(chunked):
+    """finding 8: ``derive_waves`` was handed ``{}`` and the line read as a fact.
+
+    For group P the ring's real flip-order map is NOT empty -- ``launcher``
+    builds ``chunk_tag_cards`` and logs it as ``WEG2-FLIP-ORDER MAP group=P``,
+    and the front picks the pause order from it per flip.  This derivation
+    cannot produce that map (a rank holds only its own PP stage's layer count),
+    which is a defensible deviation; printing ``waves=1`` as though it were a
+    reading of the ring's own map is not.  A reader with both lines in one boot
+    log must be able to see which is which from the lines.
+    """
+    plan, why = _derive()
+    assert plan is not None, why
+    assert "wave_map=uniform-assumed" in plan.line(), plan.line()
+    assert f"waves={len(plan.facts.waves)}" in plan.line()
+    src = inspect.getsource(sh.derive_leg_plan)
+    assert "waves_of(family, {}, cards)" in src, "the literal is still the literal"

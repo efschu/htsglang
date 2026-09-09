@@ -151,6 +151,18 @@ SHADOW_TRANSPORT_BUDGET_S = 30.0
 #: spends, the transport cannot spend again, so the two together can never
 #: exceed this number no matter how the sub-budgets are tuned.
 #:
+#: TWICE FALSE WHEN WRITTEN, and both halves are fixed rather than re-worded
+#: (S5c refuter, must_fix 2 and 6):
+#:
+#: * the transport got ONE NUMBER and performs MANY waits, each restarting its
+#:   own clock -- worst case ``(batches + slots + 1) x`` this constant.  It now
+#:   receives the DEADLINE as a callable (``budget_left``) and re-evaluates it
+#:   per wait; see ``weight_exchange_transport._wait_budget``.
+#: * the DERIVATION ran in the adapter before the hook's clock started and was
+#:   outside the number entirely.  It is now subtracted from the deadline and
+#:   printed as ``derive_ms=``, and ``budget=ok|OVER`` grades
+#:   :attr:`ShadowResult.observer_ms`, which is the sum.
+#:
 #: ITS VALUE IS THE GATE BUDGET, DELIBERATELY, and that is the whole rule: the
 #: shadow may cost the flip ONE rendezvous, never a rendezvous plus a transport
 #: plus a compare.  It is a policy number sitting on top of S5's, not a fourth
@@ -361,6 +373,32 @@ def plan_divergence_message(*, scope: str, leg: int, epoch: str,
     )
 
 
+#: THE PLACEMENT REFUSAL, one grep-able line.  Deliberately NOT a W-code: no
+#: rank is wrong, nothing is corrupt, and a W-code in a boot log is a claim
+#: that something went wrong.  What happened is that the observer was asked to
+#: use a lane whose two ends are sequential on this placement, and it declined
+#: before spending the flip's time on it.
+ONCARD_NOT_DRAINABLE_PREFIX = "WEG2-XCHG-SHADOW-ONCARD-REFUSED"
+
+
+def oncard_not_drainable_message(*, rank: int, row: int, peer_row: int,
+                                 leg: int, epoch: str, is_source: bool,
+                                 descs: int) -> str:
+    """Why this leg compared digests and moved no bytes (S5c refuter, must_fix 3)."""
+    return (
+        f"{ONCARD_NOT_DRAINABLE_PREFIX} rank={rank} row={row} "
+        f"peer_row={peer_row} leg={leg} epoch={epoch} "
+        f"hook={'source' if is_source else 'destination'} oncard_descs={descs} "
+        "-- the co-located end of this lane cannot run while this hook holds "
+        "its scheduler thread (the source hook is upstream of the pause loop "
+        "that publishes the C14 credit the co-located destination hook's "
+        "resume is fenced on), so a producer here would fill a bounce, block "
+        "in drain-final and time out at the budget for zero compared bytes; "
+        "the gate rendezvous ran and plan_digest/card_digest WERE compared, "
+        "the ring is and stays the only authority for weight bytes"
+    )
+
+
 def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                 classes_hash: int, need_mib: int,
                 log: Callable[[str], None],
@@ -441,11 +479,15 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                         for i in wanted),
                     monotonic() - started, expected=len(wanted))
             # W64, scope=group.  THE DERIVATION'S OWN AGREEMENT, checked in the
-            # rendezvous that already exists rather than in a second one: the
-            # digest is over facts that are GROUP-UNIFORM BY CONSTRUCTION
-            # (S5c), so any disagreement here is a rank reading a different
-            # boot configuration -- a stale chunk geometry, a wave partition
-            # from another family, a rotation its card cannot offer.
+            # rendezvous that already exists rather than in a second one: every
+            # field of this digest is read from the LAUNCHER's environment or
+            # from a pure function of it (S5c refuter, must_fix 4 took the one
+            # live-tensor field back out), so a disagreement here is a rank
+            # reading a different boot configuration -- a stale chunk geometry,
+            # a wave partition from another family -- and never a property of
+            # which card the rank sits on.  A class-set disagreement is NOT
+            # this check: it is ``classes_hash`` two branches up, which says so
+            # in its own words.
             digests = {i: int(rows[i]["plan_digest"]) for i in wanted}
             if len(set(digests.values())) != 1:
                 message = plan_divergence_message(
@@ -1219,6 +1261,12 @@ class ShadowResult:
     #: ``shadow_ms`` above it is the compare's own work overrunning (work is
     #: measured, waits are bounded) and reads as ``budget=OVER``.
     hook_budget_ms: float = 0.0
+    #: THE DERIVATION'S WALL, which the adapter paid BEFORE this hook's clock
+    #: started (S5c refuter, must_fix 6).  It is on the line and it is inside
+    #: the ``budget=`` verdict below: the bound the user law is read off must
+    #: cover everything the observer costs the leg, not everything the observer
+    #: happened to time.
+    derive_ms: float = 0.0
     #: ``verify_sem_arm``'s census (24) when every count was armed, ``None``
     #: when it refused or could not run.  ``None`` prints ``n/a``: an absent
     #: check and a passed one are different findings (denominator law).
@@ -1246,6 +1294,17 @@ class ShadowResult:
     #: censused for the divergence W64 refuses without re-deriving anything.
     plan_digest: int = 0
 
+    @property
+    def observer_ms(self) -> float:
+        """EVERYTHING THIS OBSERVER COST THE LEG, in one number.
+
+        ``shadow_ms`` plus ``derive_ms``, and the sum is what ``budget=`` is
+        graded against (S5c refuter, must_fix 6).  The derivation runs in the
+        adapter before the hook's own clock exists, so a verdict over
+        ``shadow_ms`` alone graded the observer against a bound that excluded
+        part of the observer.
+        """
+        return float(self.shadow_ms) + float(self.derive_ms)
     def line(self) -> str:
         """THE acceptance line.  One line, both token sets, and here is why.
 
@@ -1293,8 +1352,9 @@ class ShadowResult:
             f"gate_skew_ms={self.gate_skew_ms:.3f} "
             f"lock_wait_ms={ms(self.lock_wait_ms)} "
             f"hook={self.hook} shadow_ms={self.shadow_ms:.3f} "
+            f"derive_ms={self.derive_ms:.3f} "
             f"hook_budget_ms={self.hook_budget_ms:.3f} "
-            f"budget={'OVER' if self.hook_budget_ms and self.shadow_ms > self.hook_budget_ms else 'ok'} "
+            f"budget={'OVER' if self.hook_budget_ms and self.observer_ms > self.hook_budget_ms else 'ok'} "
             f"hop_bound_ms={self.hop_bound_ms:.3f} "
             f"sems_armed={'n/a' if self.sems_armed is None else self.sems_armed} "
             f"resume_reserve_mib={self.resume_reserve_mib} "
@@ -1451,8 +1511,19 @@ def shadow_transport(
     classes: Sequence[str] = (),
     per_leg: int = 1,
     budget_s: float = SHADOW_TRANSPORT_BUDGET_S,
+    #: THE LEG'S REMAINING DEADLINE, as a callable, forwarded verbatim to
+    #: ``tp.run_leg`` (S5c refuter, must_fix 2).  ``budget_s`` bounds ONE wait
+    #: and the transport performs many; only a callable can bound their sum.
+    budget_left: Optional[Callable[[], float]] = None,
     gate_budget_s: float = SHADOW_GATE_BUDGET_S,
     gate_rows: Optional[Sequence[int]] = None,
+    #: S5c refuter, must_fix 3.  ``False`` means "the co-located peer of this
+    #: lane cannot run while this hook holds its thread", which is the truth on
+    #: ``weight_updater``'s placement.  The gate still runs -- the digests are
+    #: compared -- and the TRANSPORT is refused by name afterwards, before a
+    #: bounce is allocated or a handle awaited.  See
+    #: :attr:`ShadowLegInputs.oncard_drainable`.
+    oncard_drainable: bool = True,
     #: S5c.  The two digests this rank votes with, and the peer whose card
     #: geometry it is checked against.  Zero/``None`` keeps S3's and S4's
     #: callers byte-unchanged: a table of zeros is uniform, so the checks are
@@ -1545,6 +1616,20 @@ def shadow_transport(
         if not verdict.run:
             result.reason = verdict.reason.split(":")[0].replace(" ", "-")
             return run
+        if not oncard_drainable and any(_is_on_card(d) for d in subset.descs):
+            # THE LANE HAS NO CONCURRENT PEER ON THIS PLACEMENT, and the gate
+            # has just done the only work that does not need one: the six rows
+            # agreed on ``plan_digest`` and the co-located pair on
+            # ``card_digest``.  Refusing HERE rather than earlier is the whole
+            # value -- an earlier return would skip the rendezvous and the
+            # digests would never be compared at all, which is refuter finding
+            # 9 with the sign flipped.
+            log(oncard_not_drainable_message(
+                rank=rank, row=row, peer_row=peer_row, leg=leg, epoch=epoch,
+                is_source=is_source,
+                descs=sum(1 for d in subset.descs if _is_on_card(d))))
+            result.reason = "oncard-not-drainable"
+            return run
         mine_dst = [d for d in subset.descs if int(d.dst_rank) == int(rank)]
         layout, total = shadow_layout(mine_dst)
         buffers = None
@@ -1587,7 +1672,8 @@ def shadow_transport(
             # A RECORDER, not the group vote.  See the docstring.
             vote_failure=lambda exc: counters.errors.append(
                 f"leg-vote {type(exc).__name__}: {exc}"),
-            budget_s=budget_s, checksum_bytes=sum_bytes,
+            budget_s=budget_s, budget_left=budget_left,
+            checksum_bytes=sum_bytes,
             on_checksum=on_checksum, slot_bytes=slot_bytes,
             # PRICED FROM THIS CARD'S OWN DIAGONAL WITHIN THE SUBSET, by the
             # same :func:`price_leg` call that sized the bounce from it: the
@@ -1797,13 +1883,33 @@ class LegPlanFacts:
     * ``waves`` -- ``weight_exchange.derive_waves`` over those tags;
     * ``cards`` -- ``weight_exchange_region.N_CARDS``, the module that states
       "rank *n* of either group runs on ``cards[n]``";
-    * ``classes`` -- the tensor classes of the CHUNK tags, which is a property
-      of the model architecture and not of a card (see :func:`derive_leg_plan`
-      for why the BASE tag's classes are deliberately not in here).
+    * ``classes`` -- the tensor classes of the CHUNK tags, THE ONE FIELD READ
+      FROM LIVE TENSORS, and therefore the one field deliberately NOT in
+      :attr:`digest`.
 
-    Nothing on this list is read from a card, a rank, a pointer or a live
-    tensor, which is what makes :attr:`digest` comparable across all six rows
-    of the shadow gate.
+    MEASURED-BY-REVIEW DEFECT (S5c refuter, must_fix 4).  This docstring said
+    "nothing on this list is read from a card, a rank, a pointer or a live
+    tensor" while ``classes`` was built from this rank's own
+    ``named_parameters()`` AND filtered by ``ParamGeom.of`` succeeding on this
+    rank's live tensors -- so it was group-uniform only if one ASSERTS that
+    every stage's layer band carries the same module classes.  Under P=PP a
+    rank's inventory is its stage's band alone, and on a hybrid layer stack
+    (GDN + full attention) a band that lacks one layer type yields a different
+    class set.  The code did not check that assertion, it HASHED it, so the
+    divergence would have surfaced as W64 ``scope=group`` under a cause
+    sentence naming a stale chunk geometry -- sending the reader to the wrong
+    place (Instrument-Text-luegt, class A).
+
+    So the class agreement is checked where it already WAS checked, with the
+    right cause sentence: ``classes_hash`` in the same gate row ("the ranks
+    chose different class subsets"), and the CARD digest, which is a per-card
+    reading by construction.  Removing it from here removes a second
+    bookkeeping of one fact, not a check.
+
+    What REMAINS on this list is read from the launcher's environment, from
+    pure functions of it, and from a module constant -- never from a card, a
+    rank, a pointer or a live tensor, which is what makes :attr:`digest`
+    comparable across all six rows of the shadow gate.
     """
 
     chunk_layers: int
@@ -1823,12 +1929,15 @@ class LegPlanFacts:
         one plan and the gate would refuse every leg -- the identical defect
         :func:`classes_hash` names one section up.
         """
+        # ``classes`` IS DELIBERATELY ABSENT -- see the class docstring.  It is
+        # the one field of this dataclass that is read from live tensors, and a
+        # per-rank fact inside a group digest is a gate that refuses for the
+        # wrong reason and names the wrong cause.
         return xr.epoch_hash("|".join((
             f"L={self.chunk_layers}", f"N={self.chunk_count}",
             "family=" + ",".join(self.family_tags),
             "waves=" + ";".join("+".join(w) for w in self.waves),
             "cards=" + ",".join(str(c) for c in self.cards),
-            "classes=" + ",".join(self.classes),
             "source=" + self.source,
         )))
 
@@ -1849,6 +1958,29 @@ class LegPlan:
     tags: Tuple[str, ...]
     card_digest: int
     undescribed: int = 0
+    #: THE POPULATION THIS PLAN WAS DERIVED OVER, from
+    #: ``weight_exchange.walk_live_tensors`` -- the ring's own named producer
+    #: for the question "what live tensors sit under an exchanged tag".
+    population: int = 0
+    #: Of that population, the ones this plan TRANSPORTS (parameters).
+    planned: int = 0
+    #: Of that population, the ones it does NOT: family-tagged buffers and
+    #: plain module attributes.  MEASURED-BY-REVIEW DEFECT (S5c refuter,
+    #: must_fix 5): the derivation walked ``named_parameters()`` alone while
+    #: ``undescribed=`` counted only ``ParamGeom.of`` refusals, so a boot could
+    #: print ``undescribed=0`` with an entire population never enumerated --
+    #: and the largest member of it is the rope ``cos_sin_cache``, measured at
+    #: +300/+181/+210 MiB on D's ``weights_0`` by ``walk_live_tensors``' own
+    #: docstring.  Counted and printed, never silently outside the denominator.
+    unplanned: int = 0
+    unplanned_bytes: int = 0
+    #: THE DERIVATION'S OWN WALL (S5c refuter, must_fix 6).  It runs on the
+    #: flip's critical path before ``run_leg_hook`` starts its clock, so
+    #: without this field it was outside ``shadow_ms``, outside
+    #: ``hook_budget_ms`` and outside every ``budget=ok|OVER`` reading -- while
+    #: ``SHADOW_HOOK_BUDGET_S`` claimed to be "the ONE wall a flip leg pays for
+    #: having an observer".  The hook now subtracts it from its own deadline.
+    derive_ms: float = 0.0
 
     @property
     def classes(self) -> Tuple[str, ...]:
@@ -1882,8 +2014,19 @@ class LegPlan:
             f"tags={','.join(self.tags) or 'none'} "
             f"classes={','.join(self.classes) or 'none'} "
             f"slots={self.slots} bytes={self.nbytes} "
-            f"waves={len(self.facts.waves)} "
+            # THE WAVE MAP IS AN ASSUMPTION AND SAYS SO (S5c refuter, finding
+            # 8).  ``derive_waves`` was handed ``{}`` -- "uniform" -- because a
+            # rank holds only its own PP stage's layer count, so this number is
+            # NOT the per-card order the front reads from
+            # ``WEG2-FLIP-ORDER MAP``, which for group P names several.  A
+            # reader comparing the two lines in one boot log must be able to
+            # see that from the line and not from this source file.
+            f"wave_map=uniform-assumed waves={len(self.facts.waves)} "
+            f"population={self.population} planned={self.planned} "
+            f"unplanned={self.unplanned} "
+            f"unplanned_bytes={self.unplanned_bytes} "
             f"undescribed={self.undescribed} "
+            f"derive_ms={self.derive_ms:.3f} "
             f"plan_digest={self.facts.digest:#x} "
             f"card_digest={self.card_digest:#x} "
             f"source={self.facts.source}"
@@ -1898,8 +2041,8 @@ class LegPlan:
 #: something else.
 PLAN_SOURCE = (
     "weg2_memory_saver.weight_chunk_geometry+weights_family_tags"
-    "+tag_of_parameter_name,weight_exchange.derive_waves+build_plan,"
-    "weight_exchange_region.N_CARDS"
+    "+tag_of_parameter_name,weight_exchange.walk_live_tensors"
+    "+derive_waves+build_plan,weight_exchange_region.N_CARDS"
 )
 
 
@@ -1978,7 +2121,8 @@ def derive_leg_plan(
     ``(None, reason)`` on every refusal, and each reason is its own word so a
     boot log can be censused by cause:
 
-    ``no-model``, ``no-ring-layout`` (this boot has no chunked weights family,
+    ``no-model``, ``population-refused`` (``walk_live_tensors`` could not
+    enumerate this model), ``no-ring-layout`` (this boot has no chunked weights family,
     which is every form without a ring layout -- a P-only boot, a stock boot),
     ``stale-wave-map`` (the wave partition is not a permutation of THIS boot's
     family: the flip order map a rank derived does not belong to the tags it
@@ -1991,6 +2135,7 @@ def derive_leg_plan(
     from sglang.srt.managers import weg2_memory_saver as ms
     from sglang.srt.weg2 import weight_exchange as wx
 
+    _t0 = time.perf_counter()
     chunk_geometry = chunk_geometry or ms.weight_chunk_geometry
     family_tags = family_tags or ms.weights_family_tags
     tag_of = tag_of or wx.tag_of_parameter_name
@@ -2025,6 +2170,30 @@ def derive_leg_plan(
             "stale-wave-map",
             f"waves={waves} family={family}")
 
+    # THE POPULATION COMES FROM THE RING'S OWN PRODUCER (S5c refuter,
+    # must_fix 5).  ``walk_live_tensors`` is the documented three-population
+    # walk -- parameters, buffers, plain module attributes -- and it names, in
+    # its own docstring, exactly the bytes a ``named_parameters()``-only
+    # derivation drops: the rope ``cos_sin_cache`` measured at +300/+181/+210
+    # MiB on D's ``weights_0``.  Those bytes carry CHUNK tags, which is to say
+    # the tags this plan claims to cover, and the ring restores them.  The plan
+    # still TRANSPORTS parameters only -- ``ParamGeom`` needs the live tensor
+    # and this walk hands back records, not tensors -- but the omission is now
+    # ENUMERATED BY THE PRODUCER and counted on the line rather than being
+    # invisible behind ``undescribed=0``.  UPSTREAM-MINIMAL: the population
+    # question has one owner and this is not a second one.
+    try:
+        live = [t for t in wx.walk_live_tensors(model, region_tag=region_tag)
+                if ms.is_weights_family_tag(str(t.tag))]
+    except BaseException as exc:  # noqa: BLE001 -- a derivation never raises
+        return _plan_refusal("population-refused",
+                             f"{type(exc).__name__}: {exc}")
+    for t in live:
+        if str(t.tag) not in family:
+            return _plan_refusal("tag-not-in-family",
+                                 f"{t.name} tag={t.tag} family={family}")
+    unplanned = [t for t in live if str(t.kind) != wx.PARAMETER]
+
     inventory = []
     tensor_of: Dict[str, object] = {}
     carried: set = set()
@@ -2034,6 +2203,11 @@ def derive_leg_plan(
         if not ms.is_weights_family_tag(tag):
             continue
         if tag not in family:
+            # BOTH CHECKS STAY, and they are two questions: the walk above
+            # covers the BUFFER and ATTRIBUTE populations the parameter loop
+            # cannot see, and this one covers an injected ``tag_of`` that
+            # disagrees with the walk's own tagging.  Neither subsumes the
+            # other.
             return _plan_refusal("tag-not-in-family",
                                  f"{name} tag={tag} family={family}")
         try:
@@ -2102,12 +2276,19 @@ def derive_leg_plan(
         source=PLAN_SOURCE)
     return LegPlan(facts=facts, descs=tuple(plan.descs), card=int(rank),
                    tags=tuple(sorted(carried)),
-                   card_digest=card_geometry_digest(inventory, classes),
-                   undescribed=undescribed), ""
+                   card_digest=card_geometry_digest(inventory, classes,
+                                                    unplanned=unplanned),
+                   undescribed=undescribed,
+                   population=len(live),
+                   planned=len(inventory),
+                   unplanned=len(unplanned),
+                   unplanned_bytes=sum(int(t.nbytes) for t in unplanned),
+                   derive_ms=(time.perf_counter() - _t0) * 1e3), ""
 
 
 def card_geometry_digest(inventory: Sequence[object],
-                         classes: Sequence[str]) -> int:
+                         classes: Sequence[str],
+                         unplanned: Sequence[object] = ()) -> int:
     """THIS CARD's storage geometry for the rotation's classes, as one number.
 
     Computed from the INVENTORY and never from the descriptors, and the
@@ -2128,6 +2309,13 @@ def card_geometry_digest(inventory: Sequence[object],
     terms = sorted(
         f"{g.name}:{g.tag}:{g.rows_full}x{g.cols_full}x{g.itemsize}"
         for g in inventory if tensor_class(g.name) in wanted)
+    # THE UNPLANNED POPULATION IS IN HERE TOO (S5c refuter, must_fix 5).  It is
+    # not transported, but it IS bytes this card holds under an exchanged tag,
+    # and a digest computed over the truncated set let two co-located ranks
+    # with different buffer populations agree that they hold the same thing.
+    # Name, tag and size come from ``walk_live_tensors``' own record; there is
+    # no ``ParamGeom`` for these, which is precisely why they are unplanned.
+    terms += sorted(f"{t.name}:{t.tag}:{t.nbytes}:{t.kind}" for t in unplanned)
     return xr.epoch_hash("|".join(terms))
 
 
@@ -2245,6 +2433,32 @@ class ShadowLegInputs:
     #: have printed the sentence naming an absence that no longer exists.  The
     #: adapter derives, and hands the derivation's own reason word down here.
     plan_reason: str = ""
+    #: CAN THE CO-LOCATED PEER DRAIN THIS RANK'S BOUNCE WHILE THIS HOOK HOLDS
+    #: ITS THREAD?  Its producer is the ADAPTER, because the answer is a
+    #: property of WHERE the two hooks are placed, which only the adapter knows.
+    #:
+    #: MEASURED-BY-REVIEW DEFECT (S5c refuter, must_fix 3).  On
+    #: ``weight_updater``'s placement the answer is NO, structurally: the source
+    #: hook runs before the sleep leg's pause loop, ``credit.publish`` runs
+    #: INSIDE that loop, and the co-located waking rank's destination hook runs
+    #: after a ``resume`` that is fenced (C14) on exactly that credit.  So the
+    #: consumer of this bounce cannot exist while the producer blocks on it.
+    #: With a non-empty plan -- which is what S5c added -- every armed source
+    #: leg would therefore fill a bounce, block in ``drain-final``, time out at
+    #: the budget, mark its PROD row FAILED and raise W53; the destination hook
+    #: would then find a FAILED row and raise at once.  Net product effect:
+    #: seconds added to every sleep leg, on the critical path of the C14 credit,
+    #: and ZERO bytes ever compared.
+    #:
+    #: So the lane is refused BY NAME, before a bounce exists, and what the
+    #: shadow still delivers on this placement is the part that needs no lane:
+    #: the derivation, its provenance line, and the gate rendezvous in which
+    #: ``plan_digest`` and ``card_digest`` ARE compared across the rows -- which
+    #: is also the honest answer to refuter finding 9, since no byte now moves
+    #: under a plan its consumer has not seen.  ``True`` is the default because
+    #: it is the truth for every concurrent caller (S6's RPC handler, and every
+    #: hermetic test that drives both ends of the lane at once).
+    oncard_drainable: bool = True
 
 
 class ShadowLeg:
@@ -2606,12 +2820,16 @@ def run_leg_hook(
     nothing else -- it never covered the attach, the gate, the transport or the
     compare, all of which sat on the leg's critical path.  The two things that
     can WAIT (the gate rendezvous and the transport's slot protocol) now draw
-    from one deadline: each is given ``min(its own ceiling, what is left)``, so
-    whatever the gate spends the transport cannot spend again.  Work is not a
-    wait and is not clamped -- the compare's device sums are bounded by the
-    class subset instead -- but the total IS measured (``shadow_ms``) and
-    printed beside the deadline (``hook_budget_ms``, ``budget=ok|OVER``), so an
-    overrun is a reading rather than a hidden cost.
+    from one deadline.  The gate is ONE wait and is given ``min(its ceiling,
+    what is left)``; the TRANSPORT performs many and is given the deadline
+    itself as a callable, so each of its waits is re-clamped (S5c refuter,
+    must_fix 2 -- one number handed down was a per-wait ceiling being read as a
+    total).  Work is not a wait and is not clamped -- the compare's device sums
+    are bounded by the class subset instead -- but the total IS measured
+    (``shadow_ms``), the DERIVATION's wall is subtracted from the deadline and
+    printed (``derive_ms=``, must_fix 6), and ``budget=ok|OVER`` grades their
+    sum against ``hook_budget_ms``, so an overrun is a reading rather than a
+    hidden cost.
     """
     if armed is None:
         armed = shadow_armed()
@@ -2619,7 +2837,18 @@ def run_leg_hook(
         return None
     started = time.perf_counter()
     hook_budget_s = max(0.0, float(hook_budget_s))
-    deadline = started + hook_budget_s
+    # THE DERIVATION IS INSIDE THE DEADLINE (S5c refuter, must_fix 6).  It runs
+    # in the adapter, BEFORE this clock starts, on the flip's critical path: a
+    # walk over every named parameter plus a regex tag call and a ``ParamGeom``
+    # per tensor, then ``build_plan``'s sort and its per-parameter emit.  With
+    # it outside, ``SHADOW_HOOK_BUDGET_S``'s claim to be "the ONE wall a flip
+    # leg pays for having an observer ... the only bound the user law can be
+    # read off in one place" was false by exactly that wall.  It is subtracted
+    # here rather than re-timed, because the adapter already measured it and a
+    # second measurement of one quantity is the defect this round removed from
+    # three other places.
+    derive_ms = float(getattr(plan, "derive_ms", 0.0) or 0.0)
+    deadline = started + max(0.0, hook_budget_s - derive_ms / 1e3)
     left = lambda: max(0.0, deadline - time.perf_counter())  # noqa: E731
     summer_stream = None
     leg = ShadowLeg(inputs, log).adopt()
@@ -2731,9 +2960,14 @@ def run_leg_hook(
             resume_reserve_bytes=inputs.resume_reserve_bytes,
             explicit=explicit, slot_bytes=slot_bytes,
             stripe_bytes=stripe_bytes,
-            # BOTH WAITS OUT OF ONE DEADLINE -- see the docstring.
+            # BOTH WAITS OUT OF ONE DEADLINE -- see the docstring.  The gate
+            # is ONE wait, so clamping it once at entry is exact; the transport
+            # performs MANY, so it gets the deadline itself as a callable
+            # (S5c refuter, must_fix 2) and not just a first slice of it.
             budget_s=min(float(budget_s), left()),
+            budget_left=left,
             gate_budget_s=min(float(gate_budget_s), left()),
+            oncard_drainable=bool(inputs.oncard_drainable),
             gate_rows=inputs.gate_rows,
             plan_digest=plan_digest, card_digest=card_digest,
             # THE CO-LOCATED PAIR IS ONLY VISIBLE TO THE DESTINATION.  The
@@ -2791,4 +3025,5 @@ def run_leg_hook(
         result.resume_reserve_mib = int(
             -(-int(inputs.resume_reserve_bytes) // MIB))
         result.plan_digest = plan.facts.digest if plan is not None else 0
+        result.derive_ms = derive_ms
         log(result.line())

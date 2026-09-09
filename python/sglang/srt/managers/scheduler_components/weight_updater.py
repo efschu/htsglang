@@ -1320,6 +1320,23 @@ class SchedulerWeightUpdaterManager:
                 ring_ms=ring_ms,
                 gate_rows=self._weg2_shadow_gate_rows(str(hook), group),
                 plan_reason=str(plan_reason),
+                # THE ON-CARD LANE HAS NO CONCURRENT PEER ON THIS PLACEMENT.
+                # Same structural fact as ``_weg2_shadow_gate_rows`` above, one
+                # consequence further on (S5c refuter, must_fix 3): the source
+                # hook is UPSTREAM of the pause loop whose ``credit.publish``
+                # the co-located waking rank's ``resume`` is fenced on (C14),
+                # and the destination hook runs after that resume -- so while
+                # either hook holds this scheduler thread, the other end of the
+                # bounce cannot be running.  With a real plan (S5c's whole
+                # addition) an armed source leg would fill a bounce, block in
+                # ``drain-final`` to the budget, vote its PROD row FAILED and
+                # take the destination down with it: seconds on the critical
+                # path of that credit for zero compared bytes.  The gate still
+                # runs and the two digests are still compared; only the lane is
+                # refused, by name, on the log.  It is FALSE HERE and nowhere
+                # else -- S6's RPC handler drives both ends inside one call and
+                # passes the default.
+                oncard_drainable=False,
             )
             try:
                 sh.run_leg_hook(inputs, log=logger.info, plan=plan)
