@@ -2729,6 +2729,37 @@ class ModelRunnerKVCacheMixin:
         has evidence for. The gapped cut is the new path and the one with the
         demonstrated OOM, so it is the only one whose sizing moves.
 
+        THAT GATE HAS NOT FIRED ON ANY BOOT OF RECORD, and the paragraph above
+        no longer describes what runs (#1023 S4, doc repair, no behaviour
+        change). ``rank_user_reserve_mib`` DEFAULTS TO 1024
+        (``server_args.py:2615-2636``), not to ``None``, so ``configured is
+        None`` is False on every configuration and the ``pp_gapped_ownership_
+        active`` half of the gate below is never reached. What actually happens
+        on a plain ``pp_size=1`` boot is the #774 branch: the value is treated
+        as an explicit answer and 1024 MiB per rank is held back. Measured on
+        the Weg-2 D group, boots weg2sb4 / sb5d / sb5e: a
+        ``gapped corridor holdback`` post of exactly 1.000 GiB on all three
+        ranks of a ``pp_size=1`` group with no gapped cut anywhere in it.
+
+        Two consequences a reader needs, because the docstring implied the
+        opposite of both:
+
+        * the holdback is SETTABLE today. ``server_args.py:13012-13019`` refuses
+          the flag only when ``self._user_reserve_was_passed() and not
+          ledger_on``; those Weg-2 boots run ``--enable-vram-ledger``, so
+          ``--rank-user-reserve-mib 0`` reaches ``reserve_mib <= 0`` below and
+          releases the whole 1024 MiB per rank with no code change at all.
+          WEG2_KV1M_SPEC_0908 sec 3.3 rung R3 is exactly that argv, and it is an
+          argv change and an operator decision -- not an engineering slice and
+          not a repair of a defect.
+        * the 1024 MiB is NOT slack this code is holding by accident. With the
+          ledger on it IS the ledger's external-headroom term doing its
+          documented job (``mem_ledger/terms.py:19`` ``card_total =
+          user_reserve + internal_demand + kv_pool``, ``:26`` "NOTHING internal
+          is ever funded from" it, ``DEFAULT_USER_RESERVE_MIB = 1024`` at
+          ``:76``). Setting it to 0 SPENDS the operator's declared free space
+          under Reserve-Semantik; it does not reclaim a defect.
+
         The corridor is a TARGET and not a hard floor (softened 2026-08-16:
         undershoot is allowed with a warning, the hard rule is OOM avoidance),
         so this holds back at most what is actually available and never drives
