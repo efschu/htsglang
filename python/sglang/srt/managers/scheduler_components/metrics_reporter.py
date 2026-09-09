@@ -736,13 +736,21 @@ class SchedulerMetricsReporter:
         # ONE log object per rank, shared with the DRAFT runners as well as the
         # target runner: a speculative round is a draft forward plus a verify
         # forward and they must fold into ONE round line, not two.
+        #
+        # getattr on ``tp_rank`` and ``draft_worker``, for the reason the drain
+        # sites below give: this install path is driven in tests by reporter
+        # STAND-INS (SimpleNamespace) that carry only the fields the PREFILL
+        # install reads (``test_rank_prefill_log_pp_691``), and on the real
+        # reporter both reads are byte-identical. Found by the serve-next5
+        # train's gate, not by #1241's own sweep, which never ran that file.
         self.decode_round_log = DecodeRoundLog(
             clock=self.rank_prefill_log.clock,
-            rank=int(self.tp_rank or 0),
+            rank=int(getattr(self, "tp_rank", 0) or 0),
         )
         self.scheduler.tp_worker.model_runner.decode_round_log = self.decode_round_log
-        if self.scheduler.draft_worker is not None:
-            dw = getattr(self.scheduler.draft_worker, "draft_worker", None)
+        draft_worker = getattr(self.scheduler, "draft_worker", None)
+        if draft_worker is not None:
+            dw = getattr(draft_worker, "draft_worker", None)
             if dw is not None:
                 if hasattr(dw, "draft_runner"):
                     dw.draft_runner.decode_round_log = self.decode_round_log
