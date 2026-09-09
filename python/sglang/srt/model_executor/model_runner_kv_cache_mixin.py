@@ -3421,7 +3421,6 @@ class ModelRunnerKVCacheMixin:
             min_tokens=int(getattr(sa, "kv_tail_min_tokens", 0) or 0),
             max_tokens=int(getattr(sa, "kv_tail_max_tokens", -1)),
             ring_rows=getattr(sa, "kv_tail_ring_rows", None),
-            graph_capacity_tokens=getattr(sa, "kv_tail_graph_capacity_tokens", None),
             host_max_tokens=getattr(sa, "kv_tail_host_max_tokens", None),
             shrink_hysteresis_rounds=getattr(
                 sa, "kv_tail_shrink_hysteresis_rounds", None
@@ -3432,14 +3431,47 @@ class ModelRunnerKVCacheMixin:
         )
         if not knobs.enabled:
             return None
+        # BASIS 7.3 IS DEFERRED TO SLICE 5, SO THE DRAFT IS EXEMPT BY NAME.
+        # This branch is taken by the draft pool worker too, and a draft with a
+        # ring is worse than a draft without one: every draft decode step
+        # carries `spec_info.kv_indptr`, so the weighted-DCP plan branch is
+        # skipped, no tail plan is armed, and the per-layer merge raises W58 on
+        # the first step. The tail is a TARGET-side feature until slice 5 gives
+        # the draft its own tail rule (and its own pressure precedence).
+        if getattr(self, "is_draft_worker", False) or getattr(
+            self, "is_draft_pool_worker", False
+        ):
+            return None
         from sglang.srt.distributed.parallel_state import get_parallel
+        from sglang.srt.distributed.utils import uneven_dcp_active
         from sglang.srt.layers.dcp.owner import dcp_weighted_owner_bounds
 
         dcp_size = int(get_parallel().attn_dcp_size or 1)
+        # TWO INDEX SPACES (see KvTailRing.__init__). Under weighted DCP the
+        # token allocator is sized over the GLOBAL context C while the pool
+        # holds only this rank's compacted rows, so every freed index has to be
+        # translated by the owner rule before it may touch the mapping. Which
+        # space applies is decided HERE, where the allocator is built, and
+        # handed to the ring as a value -- never re-derived inside it.
+        owner_bounds = None
+        index_space = "compact"
         if dcp_size > 1:
-            cp_S, _lo, _hi, cp_ratio = dcp_weighted_owner_bounds(
+            if not uneven_dcp_active(dcp_size):
+                from sglang.srt.mem_cache.kv_tail import Weg2KvTailFormRefused
+
+                raise Weg2KvTailFormRefused(
+                    "W58 Weg2KvTailFormRefused: the precision tail refuses "
+                    f"EVEN modulo DCP (dcp_size={dcp_size}). That lane "
+                    "inflates the allocator index space and the page "
+                    "granularity by the split factor, and its write loc is "
+                    "not the weighted compact slot the ring's mapping is "
+                    "keyed by."
+                )
+            cp_S, cp_lo, cp_hi, cp_ratio = dcp_weighted_owner_bounds(
                 dcp_size, int(get_parallel().attn_dcp_rank or 0)
             )
+            owner_bounds = (cp_S, cp_lo, cp_hi, cp_ratio)
+            index_space = "global"
         else:
             cp_S, cp_ratio = 1, 1
         return install_kv_tail_ring(
@@ -3449,6 +3481,8 @@ class ModelRunnerKVCacheMixin:
             owned_share_num=cp_ratio,
             owned_share_den=cp_S,
             enable_memory_saver=bool(getattr(sa, "enable_memory_saver", False)),
+            owner_bounds=owner_bounds,
+            allocator_index_space=index_space,
         )
 
     def _decoupled_kv_pool_override(

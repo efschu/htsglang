@@ -1664,6 +1664,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # #1243 PRECISION TAIL: DISARM the ring at the top of EVERY forward.
+        # Only the weighted-DCP decode plan below re-arms it, so extend,
+        # target-verify, draft and idle steps claim no ring row at the shared
+        # `_dcp_write_scatter` write site. Without this the ring filled with
+        # the OLDEST prompt tokens of a prefill (the age-out that bounds the
+        # window runs only at decode plan time) and clamped away exactly the
+        # newest ones the tail exists for -- the inverse of the design, and it
+        # made basis 2.5's "extend untouched" false.
+        _tail_ring = getattr(
+            getattr(self, "token_to_kv_pool", None), "kv_tail", None
+        )
+        if _tail_ring is not None:
+            _tail_ring.disarm()
         # Eager path: never use a graph-bucket ragged wrapper. Tree-spec verify
         # (topk > 1) still needs an override: it plans a draft->draft custom
         # mask, and flashinfer's non-graph plan() does NOT reset _custom_mask_buf
@@ -5817,14 +5830,24 @@ class FlashInferAttnBackend(AttentionBackend):
             self._kv_tail_wrapper = w
         return w
 
-    def _kv_tail_plan_decode(self, built, bs):
+    def _kv_tail_plan_decode(self, built, bs, wrapper):
         """Split the owned decode plan and plan the tail wrapper.
 
-        Returns the TRIMMED body `(kv_indptr, kv_indices)`; the tail plan is
-        stashed for `_kv_tail_merge_decode` to run per layer. Called out of
-        graph, once per decode step -- what a capture fixes is the tail's
-        CAPACITY, not its length, so growth, slide and shrink within that
-        capacity need no recapture."""
+        Returns the TRIMMED body ``(kv_indptr, kv_indices)``; the tail plan is
+        stashed for ``_kv_tail_merge_decode`` to run per layer. Called out of
+        graph, once per decode step.
+
+        THE TRIMMED INDPTR IS WRITTEN BACK INTO THE CALLER'S OWN STORAGE, not
+        returned as a fresh tensor. ``fast_decode_plan`` (the post-capture
+        ``begin_forward``) skips every device-to-device copy into the wrapper's
+        frozen buffers and assumes the caller wrote the indptr in place -- the
+        contract the replay block below this call states verbatim, and whose
+        violation is the documented "attention over garbage prompt KV" signature.
+        A freshly allocated ``body_indptr`` would have re-introduced exactly
+        that. Slice 1 additionally refuses graphs outright (see below), so this
+        is belt as well as braces -- and it is the line that must survive when
+        slice 2 lifts the graph refusal.
+        """
         from sglang.srt.mem_cache.kv_tail import Weg2KvTailFormRefused
 
         ring = self.token_to_kv_pool.kv_tail
@@ -5839,10 +5862,45 @@ class FlashInferAttnBackend(AttentionBackend):
                 "tail beside an UNTRIMMED body plan would attend every 16-bit "
                 "token twice."
             )
+        if int(getattr(self, "num_wrappers", 1)) != 1:
+            raise Weg2KvTailFormRefused(
+                "W58 Weg2KvTailFormRefused: the precision tail refuses a "
+                f"multi-wrapper backend (num_wrappers={self.num_wrappers}, "
+                f"dispatch_reason={getattr(self, 'dispatch_reason', None)}). "
+                "The sliding-window and cross-attention lanes enter this "
+                "updater TWICE per step, and the second entry would overwrite "
+                "the first one's tail plan -- every layer would then merge "
+                "against whichever wrapper planned last. That is silent "
+                "wrongness, so it is refused here instead of being left to a "
+                "later plan-missing check that this shape does not trigger. "
+                "It is also why `self.indices_updater_decode` may be read "
+                "below: at num_wrappers == 1 it IS the calling updater."
+            )
+        if (
+            hasattr(wrapper.begin_forward, "func")
+            and wrapper.begin_forward.func == fast_decode_plan
+        ):
+            raise Weg2KvTailFormRefused(
+                "W58 Weg2KvTailFormRefused: the precision tail refuses a "
+                "CAPTURED CUDA-graph decode. The tail wrapper is a plain "
+                "eager BatchDecodeWithPagedKVCacheWrapper -- no "
+                "use_cuda_graph, no frozen paged_kv_indptr/indices buffers -- "
+                "and it is re-planned per step against freshly allocated "
+                "tensors, so a replay would run it against the capture-time "
+                "plan. Basis 2.9 (tail boundary as a TENSOR input to the "
+                "captured graph, no recapture on growth or shrink) is "
+                "DEFERRED TO SLICE 2 and named, not silently assumed: run "
+                "slice 1 with --disable-cuda-graph, which is also the form "
+                "the weg2kvtail1 quality probe already used."
+            )
         kv_indptr, kv_indices, owned_tail_len = built
         body_indptr, body_indices, tail_indptr, tail_ring = ring.plan(
             kv_indptr, kv_indices, owned_tail_len, site="decode"
         )
+        # IN PLACE -- see the docstring. `kv_indptr` is the caller's buffer
+        # slice (`self.kv_indptr[wrapper_id][: bs + 1]`), the same storage the
+        # decode wrapper was created on.
+        kv_indptr.copy_(body_indptr)
         iu = self.indices_updater_decode
         w = self._kv_tail_decode_wrapper()
         w.begin_forward(
@@ -5857,16 +5915,32 @@ class FlashInferAttnBackend(AttentionBackend):
             q_data_type=iu.q_data_type,
         )
         self._kv_tail_planned_rows = int(tail_ring.numel())
+        # Per-request empty masks for the merge's (o=0, lse=-inf) contract.
+        # Device tensors, built from the two indptrs that were just planned;
+        # no sync. The BODY one is not defensive: at the shipped arm
+        # (--kv-tail-min-tokens 16384 over sequences shorter than that) EVERY
+        # owned slot of EVERY request is inside the window, so the body plan is
+        # empty for the whole batch on every step. That is the arm's normal
+        # case, not a corner, and an unsanitised empty body partial would feed
+        # whatever flashinfer returns for a zero-length row straight into the
+        # merge.
+        self._kv_tail_body_empty = body_indptr[1:] == body_indptr[:-1]
+        self._kv_tail_tail_empty = tail_indptr[1:] == tail_indptr[:-1]
         ring.log_counters("decode")
-        return body_indptr, body_indices
+        # ARM the write side for exactly this step (see KvTailRing.disarm).
+        ring.begin_decode_step()
+        return kv_indptr, body_indices
 
     def _kv_tail_merge_decode(self, q_full, layer, o, lse):
-        """Run the tail wrapper for this layer and fold it into `(o, lse)`.
+        """Run the tail wrapper for this layer and fold it into ``(o, lse)``.
 
-        An EMPTY tail contributes the empty-attention identity `(o=0,
-        lse=-inf)` and `_safe_merge_state` folds it in as a no-op -- the same
-        sanitisation contract the graph block loop reproduces, and the reason
-        `--kv-tail-min-tokens 0` is byte-identical rather than merely close.
+        BOTH partials are sanitised to the in-tree empty-attention contract
+        ``(o=0, lse=-inf)`` before the merge, and a request empty on BOTH sides
+        is re-sanitised after it -- the same three lines the graph block loop
+        uses, for the same reason (merging two -inf partials is otherwise a
+        NaN). The BODY half needs it as much as the tail half: at a tail
+        minimum above the sequence length the body plan is empty for the whole
+        batch on every step.
 
         A step that reaches here with NO plan is a refusal, not a skip: the
         body wrapper was then planned by a branch slice 1 does not trim."""
@@ -5887,6 +5961,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 "skipping would make the tail a silent no-op on exactly the "
                 "steps that differ."
             )
+        neg_inf = float("-inf")
+        body_empty = getattr(self, "_kv_tail_body_empty", None)
+        if body_empty is not None and body_empty.numel() == o.shape[0]:
+            lse = torch.where(
+                body_empty.unsqueeze(1), torch.full_like(lse, neg_inf), lse
+            )
+            o = torch.where(body_empty.view(-1, 1, 1), torch.zeros_like(o), o)
         if not planned:
             return o, lse
         o_t, lse_t = self._kv_tail_wrapper.forward_return_lse(
@@ -5895,7 +5976,18 @@ class FlashInferAttnBackend(AttentionBackend):
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
         )
-        return _safe_merge_state(o, lse, o_t, lse_t)
+        tail_empty = getattr(self, "_kv_tail_tail_empty", None)
+        if tail_empty is not None and tail_empty.numel() == o_t.shape[0]:
+            lse_t = torch.where(
+                tail_empty.unsqueeze(1), torch.full_like(lse_t, neg_inf), lse_t
+            )
+            o_t = torch.where(tail_empty.view(-1, 1, 1), torch.zeros_like(o_t), o_t)
+        o, lse = _safe_merge_state(o, lse, o_t, lse_t)
+        if body_empty is not None and tail_empty is not None:
+            both = body_empty & tail_empty
+            lse = torch.where(both.unsqueeze(1), torch.full_like(lse, neg_inf), lse)
+            o = torch.where(both.view(-1, 1, 1), torch.zeros_like(o), o)
+        return o, lse
 
     def forward_decode_weightless_worker(self, layer, forward_batch):
         """Weightless-KV WORKER dispatch for one full-attention layer (Option-B
@@ -6831,7 +6923,7 @@ class FlashInferIndicesUpdaterDecode:
                     # the double write an untrimmed body plan plus a tail pass
                     # attends the same token twice.
                     kv_indptr, kv_indices = self.attn_backend._kv_tail_plan_decode(
-                        _built, bs
+                        _built, bs, wrapper
                     )
             else:
                 dcp_lens = get_dcp_lens(

@@ -42,7 +42,6 @@ from sglang.srt.mem_cache.kv_tail import (
     KvTailKnobs,
     KvTailRing,
     Weg2KvTailFormRefused,
-    Weg2KvTailGraphClamp,
     Weg2KvTailNoOp,
     Weg2KvTailUnfundable,
     auto_ring_rows,
@@ -83,12 +82,18 @@ class _Layer:
         self.v_scale = None
 
 
-def _ring(rows=32, body_rows=64, knobs=None):
-    return KvTailRing(
+def _ring(rows=32, body_rows=64, knobs=None, owner_bounds=None, armed=True):
+    r = KvTailRing(
         _body_pool(body_rows),
         knobs or KvTailKnobs(min_tokens=8, max_tokens=8),
         ring_rows=rows,
+        owner_bounds=owner_bounds,
     )
+    if armed:
+        # An UNARMED ring claims nothing by design (the write site is shared
+        # with extend), so every test that claims is a decode step.
+        r.begin_decode_step()
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +216,7 @@ class TestRingLifecycle(CustomTestCase):
 
         body = _body_pool(64)
         ring = KvTailRing(body, KvTailKnobs(min_tokens=8, max_tokens=8), ring_rows=16)
+        ring.begin_decode_step()
         alloc = TokenToKVPoolAllocator(
             size=64,
             dtype=torch.float8_e4m3fn,
@@ -226,6 +232,7 @@ class TestRingLifecycle(CustomTestCase):
         self.assertEqual(ring.rows_held, 0)
         self.assertEqual(ring.available_size(), 16)
         # And the cutover full reset zeroes the mapping.
+        ring.begin_decode_step()
         slots2 = alloc.alloc(3)
         ring.claim(slots2, torch.ones_like(slots2, dtype=torch.bool))
         self.assertEqual(ring.rows_held, 3)
@@ -460,29 +467,13 @@ class TestCountersAndDueGate(CustomTestCase):
         )
         ring.reset()
         self.assertEqual(ring.counters.resets, 1)
+        self.assertEqual(ring.counters.wiped_rows, 2)
+        self.assertEqual(ring.counters.materialised_total, 0)
         self.assertEqual(ring.counters.released_total, 2)
         kv_indptr = torch.tensor([0, 2], dtype=torch.int32)
         kv_indices = torch.tensor([20, 21], dtype=torch.int32)
         ring.plan(kv_indptr, kv_indices, torch.tensor([2]))
         self.assertEqual(ring.counters.attended_rows, 0)
-
-    def test_graph_capacity_clamp_is_refused_under_an_explicit_larger_max(self):
-        ring = _ring(
-            rows=16,
-            knobs=KvTailKnobs(min_tokens=8, max_tokens=64, graph_capacity_tokens=8),
-        )
-        with self.assertRaises(Weg2KvTailGraphClamp) as cm:
-            ring.check_graph_capacity(40)
-        self.assertIn("W57 Weg2KvTailGraphClamp", str(cm.exception))
-        # With an OPEN max the clamp is counted, not refused.
-        ring2 = _ring(
-            rows=16,
-            knobs=KvTailKnobs(
-                min_tokens=8, max_tokens=KV_TAIL_OPEN, graph_capacity_tokens=8
-            ),
-        )
-        self.assertEqual(ring2.check_graph_capacity(40), 8)
-        self.assertEqual(ring2.counters.clamped, 32)
 
 
 # ---------------------------------------------------------------------------
@@ -510,11 +501,6 @@ class TestKnobValidation(CustomTestCase):
         with self.assertRaises(Weg2KvTailUnfundable):
             KvTailKnobs(min_tokens=16384, max_tokens=0).validate()
         KvTailKnobs(min_tokens=0, max_tokens=0).validate()
-
-    def test_a_guaranteed_tail_with_no_captured_capacity_refuses(self):
-        with self.assertRaises(Weg2KvTailUnfundable) as cm:
-            KvTailKnobs(min_tokens=1024, graph_capacity_tokens=0).validate()
-        self.assertIn("graph-capacity", str(cm.exception))
 
     def test_a_ring_below_the_guaranteed_minimum_refuses(self):
         with self.assertRaises(Weg2KvTailUnfundable) as cm:
@@ -639,6 +625,223 @@ class TestDefaultPathUnchanged(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
+# T6 -- THE TWO INDEX SPACES (F1), THE ARM (F4/F8), AND THE SIZING TERMS
+# (F10/F11).  These are the refuter's must_fixes, each with the assertion that
+# can fail on it.
+# ---------------------------------------------------------------------------
+
+
+class TestAllocatorIndexSpace(CustomTestCase):
+    """Under weighted DCP the body allocator is sized over the GLOBAL context C
+    while the pool holds only this rank's compacted rows, so the two index
+    spaces are NOT the same number.  The previous test used a 64-row pool with
+    a 64-slot allocator -- the degenerate case where they coincide, which
+    cannot fail on the defect."""
+
+    BOUNDS = (32, 0, 17, 17)  # cp_S, cp_lo, cp_hi, cp_ratio
+
+    def _ring_and_locs(self):
+        # 96 global slots at 17/32 = 51 owned rows, so the ring must be able to
+        # hold all of them or the fixture measures the CLAMP instead of the
+        # translation.
+        ring = _ring(rows=64, body_rows=1024, owner_bounds=self.BOUNDS)
+        cache_loc = torch.arange(0, 96, dtype=torch.int64)
+        loc, mask = dcp_weighted_write_slots(cache_loc, *self.BOUNDS)
+        return ring, cache_loc, loc, mask
+
+    def test_the_two_spaces_really_differ_on_this_fixture(self):
+        _r, cache_loc, loc, mask = self._ring_and_locs()
+        owned = cache_loc[mask]
+        self.assertTrue(bool((loc[mask] != owned).any()))
+
+    def test_a_free_in_the_global_space_releases_the_right_ring_row(self):
+        ring, cache_loc, loc, mask = self._ring_and_locs()
+        ring.claim(loc, mask)
+        n = int(mask.sum())
+        self.assertEqual(ring.rows_held, n)
+        # Free ONE owned global slot; exactly its own row must come back.
+        victim = int(cache_loc[mask][3])
+        compact = int(loc[cache_loc == victim][0])
+        row_before = int(ring.mapping[compact])
+        self.assertGreaterEqual(row_before, 0)
+        ring._on_body_free(torch.tensor([victim], dtype=torch.int64))
+        self.assertEqual(ring.rows_held, n - 1)
+        self.assertEqual(int(ring.mapping[compact]), KV_TAIL_NULL)
+        self.assertEqual(ring.counters.materialised_total, 1)
+
+    def test_a_free_of_a_slot_this_rank_does_not_own_touches_nothing(self):
+        ring, cache_loc, loc, mask = self._ring_and_locs()
+        ring.claim(loc, mask)
+        n = int(mask.sum())
+        foreign = int(cache_loc[~mask][0])
+        ring._on_body_free(torch.tensor([foreign], dtype=torch.int64))
+        self.assertEqual(ring.rows_held, n)
+        self.assertEqual(ring.counters.materialised_total, 0)
+
+    def test_every_translated_slot_is_inside_the_mapping(self):
+        """In range BY CONSTRUCTION (dcp_compact_pool_rows ceils to a whole
+        owner block), not by a clamp -- so the top allocator slot C must land
+        inside a pool sized by that rule."""
+        from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
+
+        cp_S, _lo, _hi, cp_ratio = self.BOUNDS
+        C = 4096
+        rows = dcp_compact_pool_rows(C, cp_S, cp_ratio)
+        ring = _ring(rows=8, body_rows=rows, owner_bounds=self.BOUNDS)
+        allocator_space = torch.arange(0, C + 1, dtype=torch.int64)
+        compact = ring.to_compact_slots(allocator_space)
+        self.assertGreater(compact.numel(), 0)
+        self.assertLess(int(compact.max()), ring.mapping.numel())
+
+    def test_the_even_dcp_index_space_is_refused_by_name(self):
+        from sglang.srt.mem_cache.kv_tail import (
+            Weg2KvTailFormRefused,
+            install_kv_tail_ring,
+        )
+
+        with self.assertRaises(Weg2KvTailFormRefused) as cm:
+            install_kv_tail_ring(
+                _body_pool(64),
+                KvTailKnobs(min_tokens=8, ring_rows=16),
+                max_running_requests=1,
+                owned_share_num=1,
+                owned_share_den=1,
+                allocator_index_space="even",
+            )
+        self.assertIn("W58 Weg2KvTailFormRefused", str(cm.exception))
+
+    def test_a_global_index_space_without_bounds_is_refused(self):
+        from sglang.srt.mem_cache.kv_tail import (
+            Weg2KvTailFormRefused,
+            install_kv_tail_ring,
+        )
+
+        with self.assertRaises(Weg2KvTailFormRefused):
+            install_kv_tail_ring(
+                _body_pool(64),
+                KvTailKnobs(min_tokens=8, ring_rows=16),
+                max_running_requests=1,
+                owned_share_num=1,
+                owned_share_den=1,
+                allocator_index_space="global",
+            )
+
+
+class TestTheArm(CustomTestCase):
+    """The write site is SHARED with extend.  An unarmed ring must claim
+    nothing at all -- otherwise a long prefill fills the ring front-to-back
+    with the OLDEST prompt tokens and clamps away the newest ones, which is the
+    inverse of the design and made basis 2.5's 'extend untouched' false."""
+
+    def test_an_unarmed_ring_claims_nothing(self):
+        ring = _ring(rows=16, armed=False)
+        loc = torch.tensor([1, 2, 3], dtype=torch.int64)
+        rl, rm = ring.claim(loc, torch.ones(3, dtype=torch.bool))
+        self.assertIsNone(rl)
+        self.assertIsNone(rm)
+        self.assertEqual(ring.rows_held, 0)
+        self.assertEqual(ring.counters.claimed_total, 0)
+        self.assertTrue(bool((ring.mapping == KV_TAIL_NULL).all()))
+
+    def test_arming_then_disarming_returns_to_claiming_nothing(self):
+        ring = _ring(rows=16, armed=False)
+        ring.begin_decode_step()
+        loc = torch.tensor([1, 2, 3], dtype=torch.int64)
+        self.assertIsNotNone(ring.claim(loc, torch.ones(3, dtype=torch.bool))[0])
+        ring.disarm()
+        loc2 = torch.tensor([4, 5], dtype=torch.int64)
+        self.assertIsNone(ring.claim(loc2, torch.ones(2, dtype=torch.bool))[0])
+        self.assertEqual(ring.rows_held, 3)
+
+    def test_the_claim_is_memoised_for_the_step(self):
+        """One allocation per STEP, not per attention layer: the 16 layers of a
+        decode step all call claim() with the same write."""
+        ring = _ring(rows=16)
+        loc = torch.tensor([1, 2, 3], dtype=torch.int64)
+        mask = torch.ones(3, dtype=torch.bool)
+        a_loc, a_mask = ring.claim(loc, mask)
+        for _layer in range(15):
+            b_loc, b_mask = ring.claim(loc, mask)
+            self.assertIs(b_loc, a_loc)
+            self.assertIs(b_mask, a_mask)
+        self.assertEqual(ring.counters.claimed_total, 3)
+        # A new step re-derives it.
+        ring.begin_decode_step()
+        c_loc, _c_mask = ring.claim(loc, mask)
+        self.assertIsNot(c_loc, a_loc)
+        self.assertEqual(ring.counters.claimed_total, 3)
+
+    def test_a_reset_disarms(self):
+        ring = _ring(rows=16)
+        ring.reset()
+        self.assertIsNone(ring.claim(
+            torch.tensor([1], dtype=torch.int64), torch.ones(1, dtype=torch.bool)
+        )[0])
+
+
+class TestInstrumentPopulations(CustomTestCase):
+    def test_a_wipe_and_a_cast_are_counted_apart(self):
+        ring = _ring(rows=16)
+        ring.claim(
+            torch.tensor([20, 21, 22], dtype=torch.int64),
+            torch.ones(3, dtype=torch.bool),
+        )
+        ring.materialise_body_rows(torch.tensor([20], dtype=torch.int64))
+        ring.reset()
+        c = ring.counters
+        self.assertEqual(c.materialised_total, 1)
+        self.assertEqual(c.wiped_rows, 2)
+        self.assertEqual(c.released_total, 3)
+
+    def test_the_line_carries_no_field_that_can_only_print_zero(self):
+        ring = _ring(rows=16)
+        line = ring.counter_line("decode")
+        self.assertNotIn("suppressed=", line)
+        self.assertIn(" clamped_alloc=", line)
+        self.assertIn(" wiped_rows=", line)
+        self.assertIn(" materialised_rows=", line)
+
+    def test_clamped_alloc_has_exactly_one_producer(self):
+        ring = _ring(rows=2, body_rows=64)
+        ring.claim(
+            torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+            torch.ones(4, dtype=torch.bool),
+        )
+        self.assertEqual(ring.counters.clamped_alloc, 4)
+        self.assertEqual(ring.counters.claimed_total, 0)
+
+    def test_the_graph_capacity_knob_is_gone_with_its_dead_clamp(self):
+        """It had no caller under python/, so --kv-tail-graph-capacity-tokens
+        could not affect a boot; shipping it was desk-written-never-executed."""
+        with self.assertRaises(TypeError):
+            KvTailKnobs(min_tokens=8, graph_capacity_tokens=8)
+        self.assertFalse(hasattr(_ring(rows=8), "check_graph_capacity"))
+
+
+class TestSizingTerms(CustomTestCase):
+    """F10/F11: the ring post is charged off the UN-inflated cell, and the slot
+    mapping is a per-BODY-ROW allocation, charged rather than merely printed."""
+
+    def _cfg(self):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        cfg = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
+        cfg._kv_tail_mr = object()
+        return cfg
+
+    def test_the_mapping_scales_with_pool_rows_not_with_ring_rows(self):
+        cfg = self._cfg()
+        small = cfg._kv_tail_map_bytes(1000, 1)
+        big = cfg._kv_tail_map_bytes(100000, 1)
+        self.assertGreater(big, small * 50)
+        self.assertEqual(small, 4 * (1000 + 1 + 1))
+
+    def test_no_mapping_bytes_without_a_pool(self):
+        cfg = self._cfg()
+        self.assertEqual(cfg._kv_tail_map_bytes(0, 1), 0)
+
+
+# ---------------------------------------------------------------------------
 # MUTANTS.  Each must turn a NAMED assertion above red.
 # ---------------------------------------------------------------------------
 
@@ -666,6 +869,23 @@ _MUTANTS = {
     "M9_no_due_gate": (
         "        self._due_gate(attended, untrimmed, site)\n",
         "",
+    ),
+    # M10 -- index the mapping with the RAW allocator index (the F1 defect):
+    # under weighted DCP that frees a DIFFERENT live token's ring row.
+    "M10_raw_free_index": (
+        "        slots = self.to_compact_slots(free_index)",
+        "        slots = free_index.to(torch.int64)",
+    ),
+    # M11 -- claim regardless of the arm: the ring fills on EXTEND again, with
+    # the oldest prompt tokens, which is the inverse of the design.
+    "M11_ignore_arm": (
+        '        if not getattr(self, "_armed", False):\n            return None, None\n',
+        "",
+    ),
+    # M12 -- report a cutover WIPE as a materialised cast.
+    "M12_wipe_as_cast": (
+        "        self.counters.wiped_rows += self.rows_held",
+        "        self.counters.materialised_total += self.rows_held",
     ),
 }
 
@@ -701,6 +921,53 @@ class TestMutantsKillNamedAssertions(CustomTestCase):
             kv_indptr, kv_indices, torch.tensor([2]), mapping
         )
         self.assertNotEqual(body.numel() + tail.numel(), kv_indices.numel())
+
+    def test_M10_raw_free_index_frees_the_wrong_ring_row(self):
+        """The F1 defect, made a mutant: under weighted DCP the allocator's
+        index space is the GLOBAL context C and the mapping is keyed by the
+        COMPACTED slot, so an untranslated free touches a different token."""
+        m = _load_mutant("M10_raw_free_index")
+        bounds = (32, 0, 17, 17)
+        ring = m.KvTailRing(
+            _body_pool(1024),
+            m.KvTailKnobs(min_tokens=8, max_tokens=8),
+            ring_rows=32,
+            owner_bounds=bounds,
+        )
+        ring.begin_decode_step()
+        cache_loc = torch.tensor([64, 65, 66], dtype=torch.int64)
+        loc, mask = dcp_weighted_write_slots(cache_loc, *bounds)
+        ring.claim(loc, mask)
+        held = ring.rows_held
+        self.assertEqual(held, 3)
+        ring._on_body_free(torch.tensor([64], dtype=torch.int64))
+        # The correct translation frees exactly one row; the mutant frees the
+        # row of whatever token happens to sit at compact slot 64 -- here none,
+        # so nothing is released and the real owner keeps a stale row.
+        self.assertEqual(ring.rows_held, 3)
+
+    def test_M11_ignoring_the_arm_lets_the_extend_write_fill_the_ring(self):
+        m = _load_mutant("M11_ignore_arm")
+        ring = m.KvTailRing(
+            _body_pool(64), m.KvTailKnobs(min_tokens=8, max_tokens=8), ring_rows=16
+        )
+        # NEVER armed: this is an extend step at the shared write site.
+        loc = torch.tensor([1, 2, 3], dtype=torch.int64)
+        ring.claim(loc, torch.ones(3, dtype=torch.bool))
+        self.assertEqual(ring.rows_held, 3)
+
+    def test_M12_reporting_a_wipe_as_a_cast_hides_data_loss(self):
+        m = _load_mutant("M12_wipe_as_cast")
+        ring = m.KvTailRing(
+            _body_pool(64), m.KvTailKnobs(min_tokens=8, max_tokens=8), ring_rows=16
+        )
+        ring.begin_decode_step()
+        ring.claim(
+            torch.tensor([20, 21], dtype=torch.int64), torch.ones(2, dtype=torch.bool)
+        )
+        ring.reset()
+        self.assertEqual(ring.counters.wiped_rows, 0)
+        self.assertEqual(ring.counters.materialised_total, 2)
 
     def test_M3_position_key_breaks_the_compacted_slot_lookup(self):
         m = _load_mutant("M3_position_key")

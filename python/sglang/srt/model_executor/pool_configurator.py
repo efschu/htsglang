@@ -342,6 +342,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self._kv_tail_body_itemsize = int(
             torch._utils._element_size(mr.kv_cache_dtype)
         )
+        # THE UN-INFLATED CELL, deliberately captured BEFORE the EAGLE/draft
+        # and DFLASH rescalings below. The ring is built from the BODY POOL's
+        # geometry alone (kv_tail.py reads head_num / head_dim / layer_num off
+        # it), so charging the ring against a cell that already carries the
+        # draft's extra layers over-charges the post and mis-prints
+        # kv_tail_cell_bytes on the very line declared authoritative for the
+        # ring's cost.
+        self._kv_tail_target_cell_size = int(target_cell_size)
         self._kv_tail_mr = mr
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -531,6 +539,39 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         return cell_size
 
 
+    def _kv_tail_map_bytes(self, max_total_num_tokens: int, page_size: int) -> int:
+        """The dense body-slot -> ring-row mapping, in bytes.
+
+        Its length is a row per BODY POOL ROW (``kv_tail.py``: ``body_rows =
+        body_pool.size + page_size``), NOT a row per ring row -- on the D form
+        that is roughly five times larger. It is a real device allocation made
+        at pool-init time out of the same budget, so it is charged, not merely
+        printed.
+        """
+        mr = getattr(self, "_kv_tail_mr", None)
+        if mr is None or max_total_num_tokens <= 0:
+            return 0
+        rows = int(max_total_num_tokens)
+        try:
+            from sglang.srt.distributed.parallel_state import get_parallel
+            from sglang.srt.distributed.utils import uneven_dcp_active
+            from sglang.srt.layers.dcp.owner import (
+                dcp_compact_pool_rows,
+                dcp_weighted_owner_bounds,
+            )
+
+            dcp_size = int(get_parallel().attn_dcp_size or 1)
+            if dcp_size > 1 and uneven_dcp_active(dcp_size):
+                cp_S, _lo, _hi, cp_ratio = dcp_weighted_owner_bounds(
+                    dcp_size, int(get_parallel().attn_dcp_rank or 0)
+                )
+                rows = dcp_compact_pool_rows(int(max_total_num_tokens), cp_S, cp_ratio)
+        except Exception:
+            # Sizing must not fail on a topology probe; the un-sharded row
+            # count is the CONSERVATIVE (larger) charge.
+            pass
+        return 4 * (int(rows) + int(page_size) + 1)
+
     def _kv_tail_ring_post(self, page_size: int):
         """#1243: this rank's bf16 ring as a BUDGET POST, plus its terms.
 
@@ -557,7 +598,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             min_tokens=int(getattr(sa, "kv_tail_min_tokens", 0) or 0),
             max_tokens=int(getattr(sa, "kv_tail_max_tokens", -1)),
             ring_rows=getattr(sa, "kv_tail_ring_rows", None),
-            graph_capacity_tokens=getattr(sa, "kv_tail_graph_capacity_tokens", None),
             host_max_tokens=getattr(sa, "kv_tail_host_max_tokens", None),
         )
         if not knobs.enabled:
@@ -578,17 +618,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         mrr = int(getattr(sa, "max_running_requests", 0) or 0)
         if rows is None:
             rows = auto_ring_rows(mrr, knobs.min_tokens, cp_ratio, cp_S)
-        ring_cell = self._cell_size // max(self._kv_tail_body_itemsize, 1) * 2
-        map_bytes = 4 * (int(rows) + page_size + 1)
+        base_cell = int(
+            getattr(self, "_kv_tail_target_cell_size", 0) or self._cell_size
+        )
+        ring_cell = base_cell // max(self._kv_tail_body_itemsize, 1) * 2
         return int(rows) * int(ring_cell), {
             "rows": int(rows),
             "cell": int(ring_cell),
-            "map_bytes": int(map_bytes),
             "min_tokens": knobs.min_tokens,
             "max_tokens": (
                 "open" if knobs.max_tokens == -1 else int(knobs.max_tokens)
             ),
-            "graph_capacity": knobs.resolved_graph_capacity(),
             "host_max_tokens": knobs.resolved_host_max(),
             "share": f"{cp_ratio}/{cp_S}",
             "mrr": mrr,
@@ -615,12 +655,36 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     "ring is not clamped, because a silently shorter tail is "
                     "precision the operator asked for and did not get."
                 )
+        _tail_map_bytes = 0
         max_total_num_tokens = (
             self._KVLESS_STAGE_TOKENS
             if self._cell_size == 0
             else available_bytes // self._cell_size
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        if tail_post:
+            # The MAPPING is a second real device allocation (a row per BODY
+            # POOL ROW, ~5x the ring's rows on the D form), so it is charged
+            # too. It depends on max_total_num_tokens, which depends on the
+            # budget -- one conservative correction pass, never a loop: the
+            # bytes computed against the LARGER token count over-charge
+            # slightly and the second pass can only shrink the mapping, never
+            # grow it, so a single pass cannot leave the ring unfunded.
+            _tail_map_bytes = self._kv_tail_map_bytes(max_total_num_tokens, page_size)
+            available_bytes = int(available_bytes) - int(_tail_map_bytes)
+            if available_bytes <= 0:
+                from sglang.srt.mem_cache.kv_tail import Weg2KvTailUnfundable
+
+                raise Weg2KvTailUnfundable(
+                    "W54 Weg2KvTailUnfundable: the precision-tail ring post "
+                    f"({tail_post} B) plus its slot mapping "
+                    f"({_tail_map_bytes} B) leaves {available_bytes} bytes "
+                    "for the KV pool on this rank."
+                )
+            max_total_num_tokens = available_bytes // self._cell_size
+            max_total_num_tokens = max_total_num_tokens // page_size * page_size
+            tail_terms["map_bytes"] = int(_tail_map_bytes)
+            tail_terms["post_bytes"] = int(tail_post) + int(_tail_map_bytes)
         # #704: emit the LAST link of the sizing chain.
         #
         # The chain is: budget - sum(budget_posts) = rest (already emitted at
@@ -659,20 +723,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 else (
                     " | kv_tail_rows=%d kv_tail_cell_bytes=%d "
                     "kv_tail_ring_bytes=%d kv_tail_map_bytes=%d min_tokens=%s "
-                    "max_tokens=%s graph_capacity=%s host_max_tokens=%s "
+                    "max_tokens=%s host_max_tokens=%s "
                     "dcp_share=%s mrr=%s post_bytes=%d"
                     % (
                         tail_terms["rows"],
                         tail_terms["cell"],
                         tail_post,
-                        tail_terms["map_bytes"],
+                        tail_terms.get("map_bytes", 0),
                         tail_terms["min_tokens"],
                         tail_terms["max_tokens"],
-                        tail_terms["graph_capacity"],
                         tail_terms["host_max_tokens"],
                         tail_terms["share"],
                         tail_terms["mrr"],
-                        tail_post,
+                        tail_terms.get("post_bytes", tail_post),
                     )
                 )
             ),

@@ -24,6 +24,25 @@ read side) -- to a ring row.  It never recomputes ownership, never holds a
 position, and never appears in ``req_to_token``.  Everything that decides
 WHICH tokens this rank stores stays where it is.
 
+TWO INDEX SPACES, NOT ONE.  The mapping is keyed by the COMPACTED PHYSICAL
+SLOT.  The BODY ALLOCATOR under weighted DCP is NOT in that space: it is sized
+over the GLOBAL logical context C, and the pool holds only
+``dcp_compact_pool_rows(C, cp_S, cp_ratio)`` rows.  Every index arriving from
+its free path is therefore translated by ``to_compact_slots`` through the SAME
+owner primitive the write used.  Indexing the mapping raw was the first cut's
+worst defect: for a high slot it runs off the end of the mapping, and for a low
+one it silently frees a DIFFERENT live token's ring row while the true owner
+keeps a pointer to a row that is back in the free list.
+
+THE ARM KEEPS THE RING OFF THE EXTEND PATH.  ``_dcp_write_scatter`` is the
+extend write as well as the decode write, and the age-out that bounds the
+window runs only at DECODE plan time.  An always-claiming ring therefore filled
+front-to-back with the OLDEST prompt tokens of a long prefill and clamped away
+exactly the newest ones the tail exists for.  So the ring is ARMED by the
+decode plan and DISARMED at the top of every forward; that also collapses the
+per-LAYER allocator mutation and its host sync into ONE per step, on the decode
+plan path #616c deliberately de-synced.
+
 THE NULL IS -1, NOT 0.  The SWA translation table this is modelled on
 (``mem_cache/allocator/swa.py:82``) can use 0 as its null because SWA slot 0
 is reserved.  Ours is written as -1 and read as ``mapping >= 0`` so that the
@@ -57,7 +76,6 @@ __all__ = [
     "KvTailRing",
     "Weg2KvTailUnfundable",
     "Weg2KvTailNoOp",
-    "Weg2KvTailGraphClamp",
     "Weg2KvTailFormRefused",
     "auto_ring_rows",
     "install_kv_tail_ring",
@@ -109,18 +127,6 @@ class Weg2KvTailNoOp(RuntimeError):
     """
 
 
-class Weg2KvTailGraphClamp(RuntimeError):
-    """W57 Weg2KvTailGraphClamp -- a tail longer than the captured graph
-    capacity was requested while ``--kv-tail-max-tokens`` was set EXPLICITLY
-    above that capacity.
-
-    What a capture fixes is a CAPACITY, not a length: growth, slide and shrink
-    within it are free, and an empty tail is the identity contribution.  Only
-    growth beyond the captured capacity is clamped -- and a clamp that
-    contradicts an explicit operator maximum is refused rather than counted.
-    """
-
-
 class Weg2KvTailFormRefused(RuntimeError):
     """W58 Weg2KvTailFormRefused -- the tail cannot be honoured on this pool
     form, so it is refused by name instead of installed as a no-op.
@@ -147,7 +153,6 @@ class KvTailKnobs:
     ``max_tokens``   -- 7.7, default OPEN (``KV_TAIL_OPEN`` = -1).
     ``ring_rows``    -- the real elasticity bound under the boot-fixed-ring
                         deviation (spec decision D2).  ``None`` = auto.
-    ``graph_capacity_tokens`` -- 2.9 needs a captured capacity to be a number.
     ``host_max_tokens``       -- 7.5 needs a value while 7.7's max is open.
     ``shrink_hysteresis_rounds`` -- 2.2; implemented in slice 2, validated here.
     ``virtual_fp8`` / ``sidecar`` / ``draft`` -- slices 3 / 4 / 5, off here.
@@ -164,7 +169,6 @@ class KvTailKnobs:
     min_tokens: int = 0
     max_tokens: int = KV_TAIL_OPEN
     ring_rows: Optional[int] = None
-    graph_capacity_tokens: Optional[int] = None
     host_max_tokens: Optional[int] = None
     shrink_hysteresis_rounds: Optional[int] = None
     virtual_fp8: bool = False
@@ -180,11 +184,6 @@ class KvTailKnobs:
         if self.ring_rows is not None and self.ring_rows > 0:
             return True
         return self.min_tokens > 0
-
-    def resolved_graph_capacity(self) -> int:
-        if self.graph_capacity_tokens is None:
-            return self.min_tokens
-        return self.graph_capacity_tokens
 
     def resolved_host_max(self) -> int:
         if self.host_max_tokens is None:
@@ -223,21 +222,6 @@ class KvTailKnobs:
                     "floor has no reading. Pass "
                     f"--kv-tail-max-tokens {KV_TAIL_OPEN} for open."
                 )
-        # (3)
-        cap = self.resolved_graph_capacity()
-        if self.min_tokens > 0 and cap <= 0:
-            raise Weg2KvTailUnfundable(
-                "W54 Weg2KvTailUnfundable: --kv-tail-min-tokens "
-                f"{self.min_tokens} demands a captured tail, but "
-                f"--kv-tail-graph-capacity-tokens is {cap}. What a CUDA-graph "
-                "capture fixes is a capacity, not a length (basis 2.9); a "
-                "zero capacity cannot hold the guaranteed minimum."
-            )
-        if cap < 0:
-            raise Weg2KvTailUnfundable(
-                "W54 Weg2KvTailUnfundable: --kv-tail-graph-capacity-tokens "
-                f"{cap} is negative."
-            )
         # (4)
         if self.ring_rows is not None and self.ring_rows < self.min_tokens:
             raise Weg2KvTailUnfundable(
@@ -395,7 +379,9 @@ def split_owned_indices(
     the same order of cost as the plan itself -- but it is an ADDED sync on
     that path and it is UNMEASURED on metal.  If a wedge appears at the decode
     plan under load, this is the first line to suspect, and the fix is a
-    fixed-shape gather against the graph capacity rather than a mask.
+    fixed-shape gather against a fixed capacity rather than a mask.  It is one
+    sync per STEP, not per layer: the per-layer syncs the write side once had
+    are gone (see ``begin_decode_step``).
     """
     bs = int(kv_indptr.numel()) - 1
     device = kv_indices.device
@@ -465,16 +451,31 @@ class KvTailCounters:
     """Every counter names its population; nothing here is a rate."""
 
     claimed_total: int = 0
-    released_total: int = 0
+    #: Rows returned by the ONE cast primitive (age-out / free / pressure).
+    #: This is the population the word "materialised" names, and from slice 3
+    #: it is the count of completed bf16 -> fp8 casts.
+    materialised_total: int = 0
+    #: Rows the CUTOVER wiped. A wipe is data DISCARDED, not data cast, so it
+    #: is counted apart: from slice 3 (virtual fp8) folding it into
+    #: materialised_total would report a loss as a completed cast.
+    wiped_rows: int = 0
     demoted_total: int = 0
     pressure_demotions: int = 0
-    clamped: int = 0
+    #: One population only: rows the allocator could not hand out at claim
+    #: time (basis 7.2's write-side fallback). There is no second producer.
+    clamped_alloc: int = 0
     resets: int = 0
     attended_rows: int = 0
     body_rows: int = 0
     untrimmed_owned: int = 0
     reqs: int = 0
-    suppressed: int = 0
+
+    @property
+    def released_total(self) -> int:
+        """Every row that left the ring, by either path. The DUE gate's
+        clause (b) asks exactly this question and must not be able to miss a
+        wipe."""
+        return self.materialised_total + self.wiped_rows
 
 
 class KvTailRing:
@@ -496,12 +497,31 @@ class KvTailRing:
         ring_rows: int,
         device: Optional[str] = None,
         enable_memory_saver: bool = False,
+        owner_bounds: Optional[Tuple[int, int, int, int]] = None,
         _pool_factory=None,
         _allocator_factory=None,
     ):
         self.knobs = knobs
         self.counters = KvTailCounters()
         self._refuse_unsupported_form(body_pool, knobs)
+        # TWO INDEX SPACES, NAMED (the F1 defect of the first cut).  The
+        # mapping is keyed by the COMPACTED PHYSICAL SLOT
+        # (``dcp_weighted_write_slots``), because that is what the write side
+        # produces and what ``build_dcp_weighted_kv_indices`` emits.  The BODY
+        # ALLOCATOR under weighted DCP does not live in that space: its size is
+        # ``max_total_num_tokens`` = the GLOBAL logical context C
+        # (``model_runner_kv_cache_mixin.py``: "the allocator index space is C
+        # itself"), while the pool holds only ``dcp_compact_pool_rows(C, cp_S,
+        # cp_ratio)`` rows.  So every index arriving from the allocator's free
+        # path must be translated through the SAME owner primitive the write
+        # used -- never indexed raw, which for a low slot silently frees a
+        # DIFFERENT live token's ring row and for a high slot runs off the end
+        # of the mapping.
+        #
+        # ``owner_bounds`` None means the two spaces coincide (no DCP): the
+        # allocator is sized over the same rows the pool holds.
+        self.owner_bounds = owner_bounds
+
         if ring_rows <= 0:
             raise Weg2KvTailUnfundable(
                 "W54 Weg2KvTailUnfundable: the tail ring was asked for with "
@@ -559,6 +579,9 @@ class KvTailRing:
         )
         self.map_bytes = self.mapping.numel() * self.mapping.element_size()
         self.rows_held = 0
+        # Armed only for the duration of one DECODE step; see begin_decode_step.
+        self._armed = False
+        self._claim_cache = None
 
     # -- form gate ---------------------------------------------------------
 
@@ -632,10 +655,36 @@ class KvTailRing:
         body_allocator.register_free_listener(self._on_body_free, on_clear=self.reset)
         self._body_allocator = body_allocator
 
+    def to_compact_slots(self, allocator_index: torch.Tensor) -> torch.Tensor:
+        """Allocator index space -> the mapping's compacted-slot space.
+
+        The ONE translation, through the owner primitive the write side used,
+        so read, write and free cannot drift into three different opinions of
+        which row a token lives in.  Unowned slots drop out here: a free of a
+        token another rank owns must touch nothing on this rank.
+
+        The result is in range BY CONSTRUCTION rather than by a clamp:
+        ``dcp_compact_pool_rows`` ceils to a whole owner block precisely so
+        that the top slot ``C`` compacts inside the pool, and the mapping is
+        sized ``body_pool.size + page_size``.
+        """
+        if self.owner_bounds is None:
+            return allocator_index.to(torch.int64)
+        from sglang.srt.layers.dcp.owner import dcp_weighted_write_slots
+
+        cp_S, cp_lo, cp_hi, cp_ratio = self.owner_bounds
+        loc, mask = dcp_weighted_write_slots(
+            allocator_index.to(torch.int64), cp_S, cp_lo, cp_hi, cp_ratio
+        )
+        return loc[mask]
+
     def _on_body_free(self, free_index) -> None:
         if free_index is None or free_index.numel() == 0:
             return
-        self.materialise_body_rows(free_index)
+        slots = self.to_compact_slots(free_index)
+        if slots.numel() == 0:
+            return
+        self.materialise_body_rows(slots)
 
     def available_size(self) -> int:
         """Free RING rows -- the admission bound of basis 7.10.
@@ -647,6 +696,32 @@ class KvTailRing:
         """
         return int(self.allocator.available_size())
 
+    def begin_decode_step(self) -> None:
+        """ARM the ring for exactly one decode step, and drop the per-step
+        claim cache.
+
+        THE ARM IS WHAT KEEPS THE RING OFF THE EXTEND PATH (the F8 defect of
+        the first cut).  ``_dcp_write_scatter`` is the extend write as well as
+        the decode write, and the age-out that bounds the window runs only at
+        DECODE plan time.  An unarmed ring therefore filled front-to-back with
+        the OLDEST prompt tokens of a long prefill and clamped away exactly the
+        newest ones the tail exists for -- the inverse of the design, and
+        basis 2.5's "extend untouched" was false while it could happen.
+
+        It is also what removes the per-LAYER host syncs (F4): the allocation
+        and its one ``int(...)`` happen on the first write of an ARMED step and
+        are reused by the remaining layers, so a step costs ONE sync on the
+        decode plan path #616c de-synced, not one per attention layer.
+        """
+        self._armed = True
+        self._claim_cache = None
+
+    def disarm(self) -> None:
+        """Every non-decode step: extend, draft, spec, idle.  An unarmed ring
+        claims nothing and touches no device memory at the write site."""
+        self._armed = False
+        self._claim_cache = None
+
     def claim(self, loc: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """Claim ring rows for the owned body slots in ``loc``.
 
@@ -654,24 +729,42 @@ class KvTailRing:
         for the body write -- no second ownership arithmetic, ever.  Slots that
         already hold a ring row keep it (a re-write of the same slot must not
         leak a row).  Returns ``(ring_loc, ring_mask)`` shaped like ``loc``, or
-        ``(None, None)`` when nothing could be claimed.
+        ``(None, None)`` when the ring is not armed for this step.
+
+        Called once per attention LAYER with the same ``loc``; the result is
+        memoised for the step, keyed on the tensor's identity so a caller that
+        ever passes a different write does not silently reuse the wrong rows.
         """
+        if not getattr(self, "_armed", False):
+            return None, None
+        key = (loc.data_ptr(), int(loc.numel()))
+        cached = getattr(self, "_claim_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
         if mask is None:
             mask = torch.ones_like(loc, dtype=torch.bool)
         owned = loc[mask].to(torch.int64)
         if owned.numel() == 0:
+            self._claim_cache = (key, None, None)
             return None, None
         existing = self.mapping[owned].to(torch.int64)
         fresh = existing < 0
+        # The ONE host sync of the step (see begin_decode_step): the allocator
+        # takes a count, not a mask.
         n_fresh = int(fresh.sum())
         if n_fresh:
             rows = self.allocator.alloc(n_fresh)
             if rows is None:
                 # No room: the tokens simply stay body-only.  A short ring is a
                 # smaller tail, never a wrong answer -- basis 7.2's fallback,
-                # here at the write side.
-                self.counters.clamped += n_fresh
-                rows = None
+                # here at the write side.  NOTE (basis 2.6 / F14): WHICH tokens
+                # lose their 16-bit row is a rank-LOCAL outcome, so a request's
+                # realised precision can differ per rank even though the tail
+                # BOUNDARY is rank-uniform.  That is benign for the LSE math --
+                # each token is still attended exactly once, by exactly one
+                # rank -- but it is narrower than "the tail is rank-uniform"
+                # and is counted rather than assumed.
+                self.counters.clamped_alloc += n_fresh
             else:
                 self.mapping[owned[fresh]] = rows.to(torch.int32)
                 self.rows_held += n_fresh
@@ -681,9 +774,12 @@ class KvTailRing:
         full[mask] = self.mapping[owned].to(torch.int64)
         ring_mask = full >= 0
         ring_loc[ring_mask] = full[ring_mask]
-        if not bool(ring_mask.any()):
-            return None, None
-        return ring_loc.to(loc.dtype), ring_mask
+        # NO ``.any()`` HERE.  An all-false mask is a legal no-op for the
+        # masked write kernel, and asking the device whether the mask has any
+        # true entry is a second blocking D2H per layer on the decode path.
+        ring_loc = ring_loc.to(loc.dtype)
+        self._claim_cache = (key, ring_loc, ring_mask)
+        return ring_loc, ring_mask
 
     def write(self, layer, ring_loc, ring_mask, cache_k, cache_v) -> None:
         """The SECOND ``set_kv_buffer``, against the ring, at the SAME masked
@@ -725,7 +821,7 @@ class KvTailRing:
         self.allocator.free(rows[live])
         self.mapping[slots64[live]] = KV_TAIL_NULL
         self.rows_held -= n
-        self.counters.released_total += n
+        self.counters.materialised_total += n
         self.counters.demoted_total += n
         if pressure:
             self.counters.pressure_demotions += n
@@ -743,9 +839,15 @@ class KvTailRing:
         """
         self.mapping.fill_(KV_TAIL_NULL)
         self.allocator.clear()
-        self.counters.released_total += self.rows_held
+        # A WIPE, NOT A CAST.  Counted in its own field: from slice 3 the 8-bit
+        # row of a tail-resident token does not exist yet, so reporting a
+        # cutover wipe as a materialisation would report DATA LOSS as a
+        # completed conversion.
+        self.counters.wiped_rows += self.rows_held
         self.counters.resets += 1
         self.rows_held = 0
+        self._armed = False
+        self._claim_cache = None
 
     # -- planning ----------------------------------------------------------
 
@@ -813,31 +915,14 @@ class KvTailRing:
                 "only reader (the per-LAYER reset that rooted weg2kvtail1)."
             )
 
-    def check_graph_capacity(self, tail_tokens: int) -> int:
-        """Clamp a tail to the captured capacity -- and REFUSE the clamp when an
-        explicit ``--kv-tail-max-tokens`` sits above that capacity."""
-        cap = self.knobs.resolved_graph_capacity()
-        if tail_tokens <= cap:
-            return tail_tokens
-        self.counters.clamped += tail_tokens - cap
-        if self.knobs.max_tokens != KV_TAIL_OPEN and self.knobs.max_tokens > cap:
-            raise Weg2KvTailGraphClamp(
-                "W57 Weg2KvTailGraphClamp: a tail of "
-                f"{tail_tokens} tokens exceeds the captured graph capacity "
-                f"{cap}, while --kv-tail-max-tokens is explicitly "
-                f"{self.knobs.max_tokens}. Clamping here would silently serve "
-                "a shorter tail than the operator asked for. Raise "
-                "--kv-tail-graph-capacity-tokens to at least "
-                f"{self.knobs.max_tokens}, or lower --kv-tail-max-tokens."
-            )
-        return cap
-
     # -- the counter line (L2) ---------------------------------------------
 
     def counter_line(self, site: str = "decode") -> str:
-        """One line per batch.  Not rate-limited; if it ever is, it prints its
-        own suppressed count, because a counter whose denominator is invisible
-        is how a boot reports a no-op as a success."""
+        """One line per decode plan.  NOT rate-limited, and therefore carrying
+        no ``suppressed=`` field: a field that can only ever print 0 cannot do
+        the job the denominator law added it for, and printing one is a claim
+        that a limiter was checked.  If a limiter is ever added here, it prints
+        its own suppressed count and this docstring is the contract."""
         c = self.counters
         mx = "open" if self.knobs.max_tokens == KV_TAIL_OPEN else self.knobs.max_tokens
         return (
@@ -850,9 +935,12 @@ class KvTailRing:
             f"rows_held={self.rows_held}/{self.ring_rows} reqs={c.reqs} "
             f"attended_rows={c.attended_rows} body_rows={c.body_rows} "
             f"untrimmed_owned={c.untrimmed_owned} "
-            f"materialised_rows={c.released_total} "
-            f"ring_free={self.available_size()} clamped={c.clamped} "
-            f"resets={c.resets} suppressed={c.suppressed} "
+            f"claimed_total={c.claimed_total} "
+            f"materialised_rows={c.materialised_total} "
+            f"wiped_rows={c.wiped_rows} "
+            f"ring_free={self.available_size()} "
+            f"clamped_alloc={c.clamped_alloc} "
+            f"resets={c.resets} "
             f"instrument=plan-counts"
         )
 
@@ -867,12 +955,21 @@ def install_kv_tail_ring(
     owned_share_num: int,
     owned_share_den: int,
     enable_memory_saver: bool = False,
+    owner_bounds: Optional[Tuple[int, int, int, int]] = None,
+    allocator_index_space: str = "compact",
 ) -> Optional[KvTailRing]:
     """Attach a ring to the FULL-ATTENTION pool, or return ``None``.
 
     The ring is instantiated only for the pool reached through
     ``HybridLinearKVPool.full_kv_pool`` (basis 2.10): the linear / GDN side
     never sees it, structurally rather than by a flag.
+
+    ``allocator_index_space`` names which space the BODY ALLOCATOR frees in --
+    ``"compact"`` (no DCP: allocator rows are pool rows) or ``"global"``
+    (weighted DCP: the allocator is sized over the global context C and every
+    freed index must be translated by ``owner_bounds``).  Anything else is
+    refused: an untranslatable free path frees a DIFFERENT live token's ring
+    row, which is a wrong 16-bit read rather than a crash.
 
     Returns ``None`` -- byte-identically the pre-slice path -- whenever the tail
     is off.  A tail that is ON and cannot be honoured RAISES; it never installs
@@ -881,6 +978,26 @@ def install_kv_tail_ring(
     if not knobs.enabled:
         return None
     knobs.validate(page_size=int(getattr(token_to_kv_pool, "page_size", 1)))
+    if allocator_index_space not in ("compact", "global"):
+        raise Weg2KvTailFormRefused(
+            "W58 Weg2KvTailFormRefused: the precision tail refuses an "
+            f"allocator index space of {allocator_index_space!r}. Slice 1 can "
+            "translate a freed allocator index into the mapping's compacted "
+            "slot only where the weighted owner rule defines that translation "
+            "(uneven DCP) or where the two spaces coincide (no DCP). Under "
+            "EVEN modulo DCP the allocator index space is inflated by the "
+            "split factor and the write loc is not the weighted compact slot, "
+            "so a free would index the mapping with a number that names a "
+            "different token. Run the tail on the uneven-DCP form."
+        )
+    if allocator_index_space == "global" and owner_bounds is None:
+        raise Weg2KvTailFormRefused(
+            "W58 Weg2KvTailFormRefused: the precision tail was asked for a "
+            "global allocator index space with no owner bounds to translate "
+            "it. The bounds come from dcp_weighted_owner_bounds and are the "
+            "SAME derivation the write side used; without them there is no "
+            "honest mapping from a freed slot to a ring row."
+        )
     body_pool = getattr(token_to_kv_pool, "full_kv_pool", token_to_kv_pool)
     rows = knobs.ring_rows
     if rows is None:
@@ -892,6 +1009,7 @@ def install_kv_tail_ring(
         knobs,
         ring_rows=rows,
         enable_memory_saver=enable_memory_saver,
+        owner_bounds=owner_bounds if allocator_index_space == "global" else None,
     )
     body_pool.kv_tail = ring
     token_to_kv_pool.kv_tail = ring

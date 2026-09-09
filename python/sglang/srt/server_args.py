@@ -1299,8 +1299,7 @@ class ServerArgs:
         Arg(
             help="Precision tail (#1243): elastic ceiling above "
             "--kv-tail-min-tokens. -1 means OPEN upwards, bounded in practice "
-            "by the ring rows and the captured graph capacity, not by the KV "
-            "pool. 0 is a REAL value (a hard zero tail), which is why it is "
+            "by the ring rows, not by the KV pool. 0 is a REAL value (a hard zero tail), which is why it is "
             "not the open sentinel. This is also the only speed lever the "
             "tail has: there is deliberately no automatic speed-driven "
             "shrink.",
@@ -1315,17 +1314,6 @@ class ServerArgs:
             "group's own argv rather than restated. The ring is a separate "
             "boot-sized allocation, so THIS is the knob that trades KV tokens "
             "for precision, and its cost is printed on the pool sizing line.",
-        ),
-    ] = None
-    kv_tail_graph_capacity_tokens: A[
-        Optional[int],
-        Arg(
-            help="Precision tail (#1243): tail tokens per request the captured "
-            "CUDA graph plans room for. Unset = --kv-tail-min-tokens. What a "
-            "capture fixes is a CAPACITY, not a length: growth, slide and "
-            "shrink within it need no recapture, and an empty tail is the "
-            "identity contribution. Growth beyond it is clamped and counted, "
-            "and REFUSED when --kv-tail-max-tokens was set explicitly higher.",
         ),
     ] = None
     kv_tail_host_max_tokens: A[
@@ -8812,7 +8800,6 @@ class ServerArgs:
             min_tokens=self.kv_tail_min_tokens,
             max_tokens=self.kv_tail_max_tokens,
             ring_rows=self.kv_tail_ring_rows,
-            graph_capacity_tokens=self.kv_tail_graph_capacity_tokens,
             host_max_tokens=self.kv_tail_host_max_tokens,
             shrink_hysteresis_rounds=self.kv_tail_shrink_hysteresis_rounds,
             virtual_fp8=self.kv_tail_virtual_fp8,
@@ -8851,6 +8838,38 @@ class ServerArgs:
                 f"--page-size 1, got {self.page_size}. The body-slot -> "
                 "ring-row mapping is indexed per TOKEN by the compacted "
                 "physical slot the weighted DCP owner rule produces."
+            )
+        if not self.disable_cuda_graph:
+            raise ValueError(
+                "W58 Weg2KvTailFormRefused: the precision tail needs "
+                "--disable-cuda-graph on this tree. The tail's second decode "
+                "attention call runs from a PLAIN eager flashinfer wrapper "
+                "(no use_cuda_graph, no frozen paged_kv_indptr/indices "
+                "buffers) that is re-planned per step against freshly "
+                "allocated tensors, so a captured replay would run it against "
+                "the capture-time plan. Basis 2.9 -- the tail boundary as a "
+                "TENSOR input to the captured graph, no recapture on growth "
+                "or shrink -- is DEFERRED TO SLICE 2 and refused here by "
+                "name, because an unproven capture is the one failure this "
+                "feature cannot be allowed to have silently: it reads a "
+                "stale plan and returns a plausible wrong answer. The "
+                "weg2kvtail1 quality probe already ran this exact form."
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "W58 Weg2KvTailFormRefused: the precision tail cannot be "
+                "combined with --speculative-algorithm "
+                f"{self.speculative_algorithm} on this tree. Under EAGLE / "
+                "NEXTN / MTP the TARGET model never runs a plain decode -- it "
+                "runs verify as an EXTEND (ForwardMode.TARGET_VERIFY) -- so "
+                "the decode-only plan slice 1 trims is never reached, while "
+                "the shared write site would still claim ring rows: rows "
+                "held, nothing attended, no counter line, arms bit-identical. "
+                "That is precisely the boot weg2kvtail1 shape, one layer up, "
+                "and refusing at argv costs a launch instead of a boot. The "
+                "extend-side plan trim that lifts this is slice 2 (basis 2.5 "
+                "scopes slice 1 to decode); the draft's own tail is slice 5 "
+                "(basis 7.3)."
             )
 
     def _handle_hicache_host_role(self):
