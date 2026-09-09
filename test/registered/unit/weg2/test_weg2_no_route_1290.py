@@ -86,10 +86,10 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
     nothing else in the front ever returns "no route"."""
 
     def test_red_first_the_sb5f_long_prompt_has_no_route(self):
-        """THE defect, as one call. Over X AND over the carrier."""
+        """THE defect, as one call. Over X AND over the carrier, MEASURED."""
         self.assertEqual(
             serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST,
-                              SB5F_X, SB5F_CARRIER_MAX),
+                              SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True),
             "none")
 
     def test_between_x_and_carrier_the_long_route_fires(self):
@@ -108,6 +108,33 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
         """The route CARRIER-EXCEEDS was built for, and it stays."""
         self.assertEqual(
             serviceable_route(9000, SB5F_CARRIER_EST, SB5F_X, SB5F_CARRIER_MAX),
+            "carrier_single")
+
+    def test_a_terminal_refusal_may_not_rest_on_an_estimate(self):
+        """ROUND 2. `carrier_est` is `len(text)/CARRIER_CHARS_PER_TOKEN`
+        whenever the front holds no EXACT prompt-token count -- which it never
+        does for a first-time prompt, i.e. for every long request. That
+        constant (2.4) deliberately OVER-prices tokens; on the sb5f salad the
+        real ratio was ~3.0, so a 22,169-token prompt priced out above the
+        27,466 carrier on ~25% of estimator conservatism alone. Refusing 413
+        on that number would turn a deliberate over-estimate into a hard
+        rejection of prompts the rig can serve -- a worse failure than the
+        slow one. An estimate may DOWNGRADE the route, never terminate it."""
+        est = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
+                                SB5F_CARRIER_MAX, carrier_exact=False)
+        exact = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
+                                  SB5F_CARRIER_MAX, carrier_exact=True)
+        self.assertEqual(est, "carrier_single",
+                         "an estimated carrier figure must not refuse")
+        self.assertEqual(exact, "none")
+        self.assertNotEqual(est, exact)
+
+    def test_the_default_is_the_safe_one(self):
+        """`carrier_exact` defaults False: a caller that does not know must
+        not accidentally get the terminal verdict."""
+        self.assertEqual(
+            serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
+                              SB5F_CARRIER_MAX),
             "carrier_single")
 
     def test_unset_bounds_disable_themselves_and_never_refuse(self):

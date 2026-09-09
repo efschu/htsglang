@@ -99,8 +99,11 @@ def test_route_floor_carries_its_derivation_and_resolves_its_citations():
     assert "four conjuncts" in why and "conservative refusal" in why
 
     lines = inspect.getsourcelines(front)[0]
-    for anchor in ("and carrier_est > self.carrier_max_tokens:",
-                   "short_ok = remainder <= self.tp_prefill_max_tokens"):
+    # #1290 unpoisoned these two anchors: both bounds moved into
+    # `serviceable_route`, which asks them TOGETHER. The citations must name
+    # the lines that decide today, not the lines that used to.
+    for anchor in ("fits_carrier = carrier_max <= 0 or carrier_est <= carrier_max",
+                   "fits_d_prefill = x_tokens <= 0 or uncached <= x_tokens"):
         cited = cc._front_line(anchor, -1)
         assert cited > 0, f"anchor vanished from front.py: {anchor!r}"
         assert anchor in lines[cited - 1], (
@@ -430,8 +433,10 @@ def test_zero_is_documented_the_same_way_in_the_front_and_in_the_launcher():
     assert "0 is NOT an off switch" in inspect.getsource(launcher)
 
     # the guards those sentences describe are still the guards
-    assert ("if self.carrier_max_tokens > 0 and carrier_est > self.carrier_max_tokens:"
-            in inspect.getsource(front.Front.handle_generate))
+    # #1290: the carrier guard lives in `serviceable_route` now -- one
+    # verdict on both bounds. The sentence it describes is unchanged.
+    assert ("fits_carrier = carrier_max <= 0 or carrier_est <= carrier_max"
+            in inspect.getsource(front.serviceable_route))
     assert ("if self.carrier_max_tokens > 0 and pt > self.carrier_max_tokens"
             in inspect.getsource(front.Front.leg1))
 

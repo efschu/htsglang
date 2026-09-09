@@ -561,7 +561,7 @@ NO_ROUTE_NAME = "W52 " + NO_ROUTE_MARKER
 
 
 def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
-                      carrier_max: int) -> str:
+                      carrier_max: int, carrier_exact: bool = False) -> str:
     """#1290: WHICH ROUTE CAN SERVE THIS REQUEST -- decided ONCE, up front.
 
     Returns one of ``short`` / ``long`` / ``carrier_single`` / ``none``.
@@ -600,7 +600,25 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
     if not fits_carrier:
         # The store cannot be read into D, so the two-leg route is out: only a
         # single prefill on D could serve it -- and only if D can prefill it.
-        return "carrier_single" if fits_d_prefill else "none"
+        if fits_d_prefill:
+            return "carrier_single"
+        # A TERMINAL REFUSAL MAY NOT REST ON AN ESTIMATE (#1290, round 2).
+        # `carrier_est` is `len(text) / CARRIER_CHARS_PER_TOKEN` whenever the
+        # front has no EXACT prompt-token count for this text -- and it never
+        # has one for a first-time prompt, which every long request is. That
+        # constant (2.4) deliberately OVER-prices tokens so the carrier is
+        # never under-estimated; on the sb5f salad the real ratio was ~3.0, so
+        # a 22,169-token prompt priced out at ~27.5k+ against carrier_max
+        # 27,466 -- refused on ~25% of estimator conservatism.
+        #
+        # Refusing a request outright on that number would turn a deliberate
+        # over-estimate into a hard 413 for prompts the rig can actually
+        # serve, which is a worse failure than the slow one. So an estimate
+        # may only DOWNGRADE the route, never terminate it: the request goes
+        # to D as before, and the exact count taken at the response
+        # (`_note_exact`) makes the NEXT decision on this text terminal.
+        # Only a measured `carrier_exact` count refuses.
+        return "none" if carrier_exact else "carrier_single"
     if fits_d_prefill:
         return "short"
     # X < uncached <= carrier: THE P ROUTE. This is the verdict that produced
@@ -1932,14 +1950,29 @@ class Front:
         # which number each bound was compared against.
         route = serviceable_route(remainder, carrier_est,
                                   self.tp_prefill_max_tokens,
-                                  self.carrier_max_tokens)
+                                  self.carrier_max_tokens,
+                                  carrier_exact=exact is not None)
+        # THE COMPARED NUMBER IS PRINTED (#1290 round 2). The CARRIER-EXCEEDS
+        # line below printed `est_prompt=... exact=None > carrier_max=...`,
+        # and NEITHER of those is the value the branch compares -- `est_prompt`
+        # is the /3.0 total, `exact` is a cache miss, and `carrier_est` (the
+        # /2.4 figure actually tested) did not appear at all. On sb5f that
+        # rendered as `est_prompt=22169 exact=None > carrier_max=27466`, a
+        # printed inequality that is FALSE as printed (22169 < 27466), and it
+        # cost a reader a whole wrong causal chain -- "None was read as
+        # exceeds". Nothing read None as a number; the line simply never
+        # showed the number. Instrument-text-lies, class A.
         logger.info(
             "WEG2 ROUTE-VERDICT rid=%s verdict=%s uncached=%d (base for X=%d, "
-            "what D must PREFILL) carrier_est=%d (base for carrier_max=%d, the "
-            "WHOLE prompt's KV through the host staging pool) est_prompt=%d "
-            "exact=%s (#1290)",
-            rid, route, remainder, self.tp_prefill_max_tokens, carrier_est,
-            self.carrier_max_tokens, est_prompt, exact,
+            "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the span-LRU "
+            "prefix) carrier_est=%d src=%s (THE COMPARED VALUE for "
+            "carrier_max=%d: the WHOLE prompt's KV through the host staging "
+            "pool, at CARRIER_CHARS_PER_TOKEN=%.1f) est_prompt=%d chars=%d "
+            "(#1290)",
+            rid, route, remainder, self.tp_prefill_max_tokens, CHARS_PER_TOKEN,
+            carrier_est, "exact" if exact is not None else "estimate",
+            self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
+            len(text),
         )
         if route == "none":
             # TERMINAL AT ADMISSION, and 4xx because it is the request that
@@ -1968,10 +2001,13 @@ class Front:
                 status=413)
         if route == "carrier_single":
             self.counters["route_carrier_exceeds"] += 1
-            logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill est_prompt=%d exact=%s > carrier_max=%d "
+            logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill carrier_est=%d (%s) > carrier_max=%d "
+                           "est_prompt=%d exact=%s "
                            "(group D host staging pool bound: the store cannot be read into D for a prompt this long; "
-                           "ONE prefill on D, no leg 1, no double prefill; uncached=%d fits X=%d, checked #1290)",
-                           rid, est_prompt, exact, self.carrier_max_tokens,
+                           "ONE prefill on D, no leg 1, no double prefill; uncached=%d vs X=%d, checked #1290)",
+                           rid, carrier_est,
+                           "exact" if exact is not None else "ESTIMATE from chars, never terminal",
+                           self.carrier_max_tokens, est_prompt, exact,
                            remainder, self.tp_prefill_max_tokens)
             if self.awake == "D" and self.admit_d and self.state == "serving":
                 seat = await self._acquire_short_seat(rid, carrier_est)
@@ -2011,8 +2047,13 @@ class Front:
         # "batch" before, which is why the sb5f census read LONG 0 and nobody
         # could tell "queued because P is awake" from "queued because it is
         # too long for D". Same queue, two reasons, now two counters.
-        self.counters["route_long" if route == "long" else "route_batch"] += 1
+        # ADDITIVE, not a rename: `route_batch` keeps counting the queue as it
+        # always did (the #1246 carrier-floor census reads it over the whole
+        # length axis), and `route_long` names the SUBSET that is queued
+        # because it is too long for D rather than because P is awake.
+        self.counters["route_batch"] += 1
         if route == "long":
+            self.counters["route_long"] += 1
             logger.info(
                 "WEG2-ROUTE rid=%s LONG -> P leg 1 (uncached=%d > X=%d, so D "
                 "cannot prefill it; carrier_est=%d <= carrier_max=%d, so P's "
@@ -2552,8 +2593,15 @@ class Front:
         # in 503 after a median 22.0 s, every one of them a P prefill spent on
         # a verdict that could not move. So: ask once, up front, whether the
         # retry can change the answer; when it cannot, refuse by name now.
-        carrier_est = len(text) // int(CARRIER_CHARS_PER_TOKEN) + 1
-        if self.carrier_max_tokens > 0 and carrier_est > self.carrier_max_tokens:
+        # SAME RULE AS THE ROUTER: only a MEASURED count may terminate. D has
+        # just answered, so `_note_exact` has this text's real prompt_tokens
+        # -- which is exactly the case the router could not have. An estimate
+        # here would refuse on the same ~25% conservatism.
+        exact = self.exact_tokens.get(
+            hashlib.sha1(text.encode(errors="replace")).hexdigest())
+        carrier_est = exact if exact is not None else None
+        if (self.carrier_max_tokens > 0 and carrier_est is not None
+                and carrier_est > self.carrier_max_tokens):
             self.counters["W52_Weg2NoServiceableRoute"] += 1
             detail = (
                 f"{NO_ROUTE_NAME} rid={rid}: D refused this request with "

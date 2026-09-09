@@ -363,11 +363,11 @@ def route_floor(short_bound: Optional[int] = None) -> Tuple[int, str]:
     floor = carrier_est_at_l_star - 1
 
     ref_chunk = _front_ref("front.Front.handle_generate",
-                           "short_ok = remainder <= self.tp_prefill_max_tokens", -1)
+                           "fits_d_prefill = x_tokens <= 0 or uncached <= x_tokens", -1)
     ref_carrier = _front_ref("front.Front.handle_generate",
-                             "and carrier_est > self.carrier_max_tokens:", 561)
+                             "fits_carrier = carrier_max <= 0 or carrier_est <= carrier_max", 561)
     ref_short = _front_ref("front.Front.handle_generate",
-                           "short_ok = remainder <= self.tp_prefill_max_tokens", -1)
+                           "fits_d_prefill = x_tokens <= 0 or uncached <= x_tokens", -1)
     ref_est = _front_ref("front.Front.handle_generate", "carrier_est = exact if exact else", 560)
     why = (
         f"floor={floor} tokens of CARRIER-EXCEEDS price, NOT the SHORT bound {chunk} itself: the two "
@@ -602,7 +602,7 @@ def decide_bound(
     the W45 it already was.
     """
     ref_carrier = _front_ref("front.Front.handle_generate",
-                             "and carrier_est > self.carrier_max_tokens:", 561)
+                             "fits_carrier = carrier_max <= 0 or carrier_est <= carrier_max", 561)
     ref_leg1 = _front_ref("front.Front.leg1", "and pt > self.carrier_max_tokens", 624)
     provenance = (
         f"Source '{SOURCE_MARKER}' in {log_path}; component={COMPONENT}; "
