@@ -1634,6 +1634,34 @@ class OnCardStats:
     bytes_moved: int = 0
     batches: int = 0
     elapsed_s: float = 0.0
+    #: #1273 S5c.  THE WALL THIS LANE SPENT WAITING FOR ITS PEER, seconds.
+    #:
+    #: The producer blocks in ``_await_oncard`` twice per lane: once per batch
+    #: for the double buffer's drain, and once at the end for the TERMINAL
+    #: drain of the last ``slots`` batches.  Both are bounded by ``budget_s``
+    #: and neither was ever MEASURED, so a lane that spent its whole budget
+    #: waiting and a lane that never waited printed the same ``hop_ms`` split
+    #: -- the wait was inside ``elapsed_s`` with no way to subtract it.
+    #:
+    #: It matters here and not only as hygiene: under the shadow the two ends
+    #: of this lane sit at OPPOSITE ENDS OF ONE FLIP (the source hook before
+    #: the pause, the destination hook after the resume), so the producer's
+    #: terminal drain can legitimately span the flip.  The block is bounded --
+    #: that is ``SHADOW_HOOK_BUDGET_S``, carved down through ``run_leg``'s
+    #: ``budget_s`` -- and this is the number that lets a boot PRICE it
+    #: (``blocked_ms=`` on the shadow's own line) instead of guessing.
+    drain_wait_s: float = 0.0
+    #: THE PART OF :attr:`drain_wait_s` THAT IS **NOT** INSIDE
+    #: :attr:`elapsed_s`, seconds.  The producer stops its own clock before the
+    #: terminal drain -- deliberately, so a slow consumer does not read as a
+    #: slow producer -- so the terminal wait is the one block a caller must
+    #: subtract itself before deriving any "everything else" remainder from
+    #: ``elapsed_s``.  Without the split, ``weight_exchange_shadow``'s
+    #: ``issue_ms`` (a remainder) would have silently absorbed a wait that can
+    #: span a whole flip, and the spec's ``issue_ms <= 5 % of xchg_ms`` would
+    #: have been graded against it.  Zero on the consumer, whose fill waits are
+    #: all inside its own clock.
+    drain_wait_outside_s: float = 0.0
 
     def line(self) -> str:
         """The second acceptance line of spec section 6/S4, plus ``batches``.
@@ -2133,9 +2161,12 @@ def run_oncard_producer(
         # The double buffer's only rule: slot s may be refilled once the
         # consumer has released the batch that used it last, which is
         # `seq - slots`.  Everything else about this lane's safety follows.
+        # MEASURED, not just bounded (#1273 S5c): see OnCardStats.drain_wait_s.
+        _blocked = time.perf_counter()
         _await_oncard(region, DIR_ONCARD_CONS_OFF, peer_row,
                       batch.seq - bounce.slots, budget, what="drain", row=row,
                       slot=slot, wave=wave)
+        stats.drain_wait_s += time.perf_counter() - _blocked
         base = bounce.slot_address(batch.seq)
         for piece in batch.pieces:
             desc = descs[piece.desc_index]
@@ -2162,9 +2193,18 @@ def run_oncard_producer(
     if batches:
         last = batches[-1].seq
         for seq in range(max(0, last - bounce.slots + 1), last + 1):
+            # THE TERMINAL DRAIN IS THE ONE THAT CAN SPAN A FLIP.  Measured for
+            # the same reason and into the same field; it is deliberately NOT
+            # inside ``elapsed_s`` (that clock stopped above, so this rank's
+            # own hop wall does not absorb how long its peer took), so the two
+            # numbers are additive and a reader can see both.
+            _blocked = time.perf_counter()
             _await_oncard(region, DIR_ONCARD_CONS_OFF, peer_row, seq, budget,
                           what="drain-final", row=row,
                           slot=seq % bounce.slots, wave=wave)
+            _waited = time.perf_counter() - _blocked
+            stats.drain_wait_s += _waited
+            stats.drain_wait_outside_s += _waited
     return stats
 
 
@@ -2202,9 +2242,15 @@ def run_oncard_consumer(
         # slot, which needs this consumer's release).  A >= here is what let
         # batch 1's byte count answer batch 0's question and raise W54 against
         # a healthy producer.
+        # MEASURED (#1273 S5c): the consumer's fill wait spans the flip on the
+        # shadow's placement exactly as the producer's drain does, and the same
+        # field carries both -- which of the two a number came from is the
+        # ``hook=`` token on the shadow's own line.
+        _blocked = time.perf_counter()
         got = _await_oncard(region, DIR_ONCARD_PROD_OFF, peer_row, batch.seq,
                             budget, what="fill", row=row, slot=slot,
                             wave=wave, exact=True)
+        stats.drain_wait_s += time.perf_counter() - _blocked
         # The producer's batcher geometry, published rather than assumed.  Two
         # co-located ranks reading the same plan with different slot sizes
         # agree on every payload below the smaller one and diverge silently
