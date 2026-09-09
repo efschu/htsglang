@@ -86,23 +86,32 @@ def _fresh_boot() -> str:
 # The fake device layer.
 # ===========================================================================
 
-FAKE_DEV_BASE = 1 << 46
-FAKE_DEV_SPAN = 1 << 32
-FAKE_IMPORT_BIAS = 1 << 45
+#: A TAG BIT, above the 47-bit x86-64 user address range, not a base address to
+#: compare against.  MEASURED DEFECT, first remote run of this file: with the
+#: tag at ``1 << 46`` and the split written as ``ptr < FAKE_DEV_BASE``, every
+#: REAL host address -- the mapped region's ``0x7f...``, i.e. ~1.4e14 -- sorted
+#: as a DEVICE pointer, was decoded into rank 1 of a file that had never been
+#: sized for it, and the first staging copy segfaulted.  A harness that
+#: mis-sorts pointers cannot prove anything about a transport that moves them,
+#: so the split is a tag test now and is pinned by a test of its own.
+FAKE_DEV_TAG = 1 << 50
+FAKE_RANK_SHIFT = 40
+FAKE_IMPORT_BIAS = 1 << 49
 
 
 def dev_ptr(rank: int, off: int) -> int:
-    return FAKE_DEV_BASE + int(rank) * FAKE_DEV_SPAN + int(off)
+    return FAKE_DEV_TAG | (int(rank) << FAKE_RANK_SHIFT) | int(off)
 
 
 class FakeDeviceOps(tp.DeviceOps):
     """:class:`tp.DeviceOps` over bytes.  Cross-process by construction.
 
     "Device memory" is one file per rank under ``root/dev-<rank>.bin``; a
-    device pointer is ``FAKE_DEV_BASE + rank * SPAN + offset``, so which rank a
+    device pointer is ``FAKE_DEV_TAG | rank << 40 | offset``, so which rank a
     copy landed on is recoverable from the address alone.  Host pointers are
     REAL addresses (the mapped shm region), so the staging layout under test is
-    the product's own and not a model of it.
+    the product's own and not a model of it -- which is exactly why the
+    host/device split must be a TAG test and not a magnitude one.
     """
 
     name = "fake"
@@ -143,13 +152,25 @@ class FakeDeviceOps(tp.DeviceOps):
             self._maps[rank] = (base, mm, fd)
             return base
 
+    @staticmethod
+    def decode(ptr: int) -> tuple:
+        """``(rank, offset)`` of a device pointer, or ``None`` for a host one.
+
+        A TAG TEST, never a magnitude comparison -- see :data:`FAKE_DEV_TAG`.
+        """
+        raw = int(ptr) & ~FAKE_IMPORT_BIAS
+        if not raw & FAKE_DEV_TAG:
+            return None
+        body = raw & ~FAKE_DEV_TAG
+        return (body >> FAKE_RANK_SHIFT, body & ((1 << FAKE_RANK_SHIFT) - 1))
+
     def real(self, ptr: int) -> int:
         """Resolve a fake pointer to a real address.  Host pointers pass through."""
-        raw = int(ptr) & ~FAKE_IMPORT_BIAS
-        if raw < FAKE_DEV_BASE:
+        got = self.decode(ptr)
+        if got is None:
             return int(ptr)
-        rank = (raw - FAKE_DEV_BASE) // FAKE_DEV_SPAN
-        off = (raw - FAKE_DEV_BASE) % FAKE_DEV_SPAN
+        rank, off = got
+        assert off + 0 <= FAKE_DEV_BYTES, (rank, off)
         return self._base_of(rank) + off
 
     # -- streams ----------------------------------------------------------
@@ -219,9 +240,9 @@ class FakeDeviceOps(tp.DeviceOps):
         return None
 
     def ipc_get_handle(self, ptr: int) -> bytes:
-        raw = int(ptr) & ~FAKE_IMPORT_BIAS
-        rank = (raw - FAKE_DEV_BASE) // FAKE_DEV_SPAN
-        off = (raw - FAKE_DEV_BASE) % FAKE_DEV_SPAN
+        got = self.decode(ptr)
+        assert got is not None, "an IPC handle is only ever taken on device memory"
+        rank, off = got
         token = f"{rank}-{off}".encode("ascii")
         with open(os.path.join(self.root, "ipc", f"h{rank}-{off}"), "wb") as fh:
             fh.write(struct.pack("<QQ", rank, off))
@@ -1107,6 +1128,33 @@ def test_the_dir_view_cannot_reach_the_gate_rows_or_a_slot(region):
         assert getattr(region.read_gate_row(0), attr) == getattr(gate_before, attr)
     assert region.read_matrix_row(0).sealed == matrix_before.sealed
     assert region.read_slot(0, 0).state == xr.SLOT_FREE
+
+
+def test_the_fake_never_mistakes_a_host_address_for_a_device_one(region, ops):
+    """A HARNESS test, kept because the harness got this wrong on the metal.
+
+    First remote run of this file: the split was ``ptr < FAKE_DEV_BASE`` with
+    the base at ``1 << 46``, and every real host address -- the mapped
+    region's ``0x7f...`` -- sorted as a DEVICE pointer, was decoded into a rank
+    whose file had never been sized for that offset, and the first staging copy
+    segfaulted.  A harness that mis-sorts pointers cannot prove anything about
+    a transport whose whole job is to move them, so the split is pinned here.
+
+    The tag sits above the 47-bit x86-64 user range, which is what makes the
+    real addresses below it and the assertion meaningful rather than lucky.
+    """
+    for host in (region.base_address(), region.slot_address(0, 0),
+                 region.dir_address(), id(ops)):
+        assert host < (1 << 48), f"{host:#x} is outside the user range"
+        assert FakeDeviceOps.decode(host) is None, f"{host:#x} read as device"
+        assert ops.real(host) == host
+
+    for rank in range(xr.N_RANKS):
+        for off in (0, 1, FAKE_DEV_BYTES - 1):
+            ptr = dev_ptr(rank, off)
+            assert FakeDeviceOps.decode(ptr) == (rank, off)
+            assert FakeDeviceOps.decode(ptr | FAKE_IMPORT_BIAS) == (rank, off)
+            assert ptr | FAKE_IMPORT_BIAS != ptr
 
 
 def test_kind_constants_match_the_plan_builder():
