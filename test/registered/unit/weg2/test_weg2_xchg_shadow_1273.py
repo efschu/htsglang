@@ -2261,14 +2261,16 @@ def test_the_destination_hook_matches_the_ring_and_writes_nothing_into_it(
         thread = threading.Thread(target=lambda: sh.run_leg_hook(
             _inputs(sh.HOOK_SOURCE, row=0, peer_row=3), log=lines.append,
             descs=descs, region=region, sems=sems_s, ops=src_ops, armed=True,
-            slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0))
+            slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0,
+                oncard_slot_bytes=SLOT))
         thread.start()
         try:
             result = sh.run_leg_hook(
                 _inputs(sh.HOOK_DESTINATION, row=3, peer_row=0),
                 log=lines.append, descs=descs, region=region, sems=sems_d,
                 ops=dst_ops, armed=True, sum_bytes=byte_sum(dst_ops),
-                slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0)
+                slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0,
+                oncard_slot_bytes=SLOT)
         finally:
             thread.join(60)
         assert result.ran, result.counters.errors
@@ -2318,14 +2320,16 @@ def test_the_destination_hook_cannot_swallow_a_mismatch(region, tmp_path, boot,
         thread = threading.Thread(target=lambda: sh.run_leg_hook(
             _inputs(sh.HOOK_SOURCE, row=0, peer_row=3), log=lines.append,
             descs=descs, region=region, sems=sems_s, ops=src_ops, armed=True,
-            slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0))
+            slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0,
+                oncard_slot_bytes=SLOT))
         thread.start()
         try:
             result = sh.run_leg_hook(
                 _inputs(sh.HOOK_DESTINATION, row=3, peer_row=0),
                 log=lines.append, descs=descs, region=region, sems=sems_d,
                 ops=dst_ops, armed=True, sum_bytes=byte_sum(dst_ops),
-                slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0)
+                slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0,
+                oncard_slot_bytes=SLOT)
         finally:
             thread.join(60)
         assert result.counters.mismatch == 1
