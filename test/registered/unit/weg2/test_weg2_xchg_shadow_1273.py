@@ -2162,12 +2162,25 @@ def test_the_hook_closes_its_run_on_every_path_including_the_raising_one(
 
 # --- danger 3: a hook whose failure aborts the leg ------------------------
 
+class _NotAnException(BaseException):
+    """A BaseException that is NOT an Exception, and not one pytest acts on.
+
+    ``KeyboardInterrupt`` is the obvious member of this class and it is the
+    WRONG probe: pytest treats it as a session abort, so a hook that stopped
+    catching ``BaseException`` ended the run with ten tests never collected and
+    a junit that said ``failures=0``.  Measured this round -- mutant C read
+    ``VERDICT: OK`` at ``tests=80`` against a ``tests=90`` baseline, i.e. the
+    kill was visible only in the DENOMINATOR.  A gate whose red is a smaller
+    test count is not a gate.
+    """
+
+
 def test_no_hook_failure_can_reach_the_leg(no_active_leg):
     """DANGER 3, enumerated over the failure classes the hook can meet."""
     for provider in (
         lambda _d, _lg, _r: (_ for _ in ()).throw(RuntimeError("plan")),
         lambda _d, _lg, _r: (_ for _ in ()).throw(MemoryError("oom")),
-        lambda _d, _lg, _r: (_ for _ in ()).throw(KeyboardInterrupt()),
+        lambda _d, _lg, _r: (_ for _ in ()).throw(_NotAnException()),
     ):
         previous = sh.set_plan_provider(provider)
         try:
