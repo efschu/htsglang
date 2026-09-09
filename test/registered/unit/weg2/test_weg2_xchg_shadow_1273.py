@@ -1755,7 +1755,7 @@ def _inputs(hook, *, leg=0, rank=0, row=0, peer_row=3, epoch="e.0",
             direction="P->D", **kw):
     return sh.ShadowLegInputs(leg=leg, epoch=epoch, direction=direction,
                               hook=hook, rank=rank, row=row, peer_row=peer_row,
-                              device=0, card_uuid="u0",
+                              device=kw.pop("device", 0), card_uuid="u0",
                               uuid_of_card=("u0", "u1", "u2"),
                               free_mib=kw.pop("free_mib", 8192), **kw)
 
@@ -2231,9 +2231,14 @@ def test_the_two_call_sites_are_where_the_bytes_are(no_active_leg):
                         "scheduler_components", "weight_updater.py")
     with open(path, encoding="utf-8") as fh:
         src = fh.read()
-    assert "self._weg2_shadow_source_leg(recv_req, weights_tags, tag_bytes)" in src
+    assert "self._weg2_shadow_source_leg(recv_req)" in src
     assert "self._weg2_shadow_destination_leg(" in src
     i_src = src.index("self._weg2_shadow_source_leg(recv_req")
+    # S5b FIX, refuter must_fix 4: the leg's own clock starts BEFORE the hook,
+    # or weg2_leg_ms -- the wall the sb5f flip band is read from and the wall
+    # that gates a co-located rank's C14 credit -- excludes the whole observer.
+    assert src.index("weg2_leg_t0 = time.perf_counter()") < i_src, \
+        "the leg's own instrument cannot see what the source hook cost it"
     i_pause = src.index("self.memory_saver_adapter.pause(tag)")
     assert i_src < i_pause, "the source hook reads pages the pause has unmapped"
     i_dst = src.index("self._weg2_shadow_destination_leg(\n")
@@ -2395,7 +2400,13 @@ def test_the_adapter_reads_the_rings_own_numbers_and_estimates_neither():
     with open(path, encoding="utf-8") as fh:
         src = fh.read()
     assert "ring_ms=sum(float(v[1]) for v in weg2_per_tag.values())" in src
-    assert "int(sum(int(v) for v in (tag_bytes or {}).values()))" in src
+    # S5b FIX, refuter must_fix 2: the reserve is the STILL-UNMAPPED tags read
+    # where the term is consumed, not the weights image read before a resume
+    # that has already happened by the time this hook runs.
+    assert "reserve_bytes=sum(self._weg2_tag_bytes(t)" in src
+    assert "for t in pending_tags)" in src
+    assert "int(sum(int(v) for v in (tag_bytes or {}).values()))" not in src, \
+        "the destination still subtracts an image the resume already mapped"
 
 
 def test_the_flip_index_is_read_back_from_the_fronts_own_epoch():
@@ -2438,3 +2449,423 @@ def test_w63_is_the_next_free_code_and_names_one_exception():
     # of self-refusals cannot read low by exactly the time-refused ones.
     assert sh.UNAFFORDABLE_MARKER in sh.hop_refusal_message(
         card="u", priced_ms=1.0, bound_ms=0.5, batches=2, slot_mib=32.0, leg=0)
+
+
+# ===========================================================================
+# S5b FIX -- THE SIX MUST_FIX OF THE S5b REFUTER.
+#
+# DANGER DIRECTION, and it is not the same one as the round above.  The hooks
+# already refuse to raise, refuse to write into the live arena and refuse to
+# outlive their leg.  What the refuter found is the class BELOW that: a hook
+# that is harmless per statement and RUINOUS PER FLIP --
+#
+#   1. a rendezvous the two placements can never satisfy, whose expiry is paid
+#      every flip, on the critical path of the credit a co-located rank waits
+#      on (a deadlock broken only by a budget is still a deadlock);
+#   2. a priced term consumed AFTER the demand it reserves for was paid, which
+#      does not under-price -- it refuses everything, forever, silently;
+#   3. an observer that allocates on another rank's card and leaves the
+#      AUTHORITATIVE thread's CUDA device where it put it;
+#   4. one enforced bound (60 ms) in front of 35 s of unbounded waiting;
+#   5. refusals that publish nothing, so every peer pays a full budget
+#      discovering a row that was decided milliseconds ago;
+#   6. a compare with no summer -- NOT-RUN for two reasons while the record
+#      names one.
+# ===========================================================================
+
+
+def _wu():
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    return wu
+
+
+def _spy_transport(monkeypatch) -> dict:
+    """Capture ``shadow_transport``'s kwargs and stop the hook there."""
+    seen: dict = {}
+
+    def spy(**kw):
+        seen.update(kw)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(sh, "shadow_transport", spy)
+    return seen
+
+
+def _wu_source(name: str) -> str:
+    """The SOURCE of one ``weight_updater`` method.  Wiring is pinned by text
+    here for the reason ``test_the_two_call_sites_are_where_the_bytes_are``
+    states: this class cannot be constructed without a model runner, a torch
+    process group and a device, so its wiring has no runtime object."""
+    return inspect.getsource(
+        getattr(_wu().SchedulerWeightUpdaterManager, name))
+
+
+# --- must_fix 1: the rendezvous the placements can satisfy -----------------
+
+def test_the_source_hook_does_not_wait_for_rows_the_flip_has_not_reached(region):
+    """MUST_FIX 1.  The gate waits for the rows the hook MAY expect.
+
+    The source hook runs on the SLEEPING group before its ``pause``; the
+    destination runs on the WAKING group after its ``resume``.  On a co-located
+    card the waking rank is fenced on the C14 credit the sleeper publishes
+    inside that pause loop -- i.e. AFTER its own hook.  A source that waits for
+    all six rows waits for three that cannot be written until it stops waiting.
+    """
+    _vote_rows(region, [1, 2], leg=1, vote=True, classes_hash=7)
+    started = time.monotonic()
+    verdict = sh.shadow_gate(region, 0, leg=1, vote=True, classes_hash=7,
+                             need_mib=0, log=lambda _s: None,
+                             expect_rows=(0, 1, 2), budget_s=5.0)
+    assert verdict.run is True, verdict.reason
+    assert verdict.joined == 3 and verdict.expected == 3
+    assert time.monotonic() - started < 1.0, \
+        "it waited for a row it was not entitled to expect"
+    assert verdict.waited_s < 1.0
+    assert "joined=3/3" in verdict.line(leg=1, epoch="e.1")
+
+
+def test_the_same_rendezvous_across_all_six_rows_expires_every_time(region):
+    """THE CAN-FAIL CONTROL for the test above, and the defect itself.
+
+    This is what the shipping shape did on every sleeping rank of every flip:
+    the three waking rows are not there, the budget is spent in full, and the
+    shadow never ran.  If this ever passes, the fix above is measuring nothing.
+    """
+    _vote_rows(region, [1, 2], leg=1, vote=True, classes_hash=7)
+    verdict = sh.shadow_gate(region, 0, leg=1, vote=True, classes_hash=7,
+                             need_mib=0, log=lambda _s: None,
+                             expect_rows=None, budget_s=0.05)
+    assert verdict.run is False
+    assert verdict.expected == xr.N_RANKS
+    assert set(verdict.refusers) == {3, 4, 5}
+    assert verdict.waited_s >= 0.05, "the expiry was not actually paid"
+    assert "joined=3/6" in verdict.line(leg=1, epoch="e.1")
+
+
+def test_the_two_hooks_expect_different_rows_and_the_adapter_says_which():
+    """MUST_FIX 1, the producer.  The adapter is the only thing that knows the
+    GROUP, so it is the only thing that can answer this."""
+    rows = _wu().SchedulerWeightUpdaterManager._weg2_shadow_gate_rows
+    assert rows(None, "source", "P") == (0, 1, 2)
+    assert rows(None, "source", "D") == (3, 4, 5)
+    # The destination runs LAST in the flip, so the source rows are already
+    # sealed with this epoch_hash and this leg: all six, for free.
+    assert rows(None, "destination", "P") is None
+    assert rows(None, "destination", "D") is None
+    # MUTANT: an unknown group must not invent a group's rows.
+    assert rows(None, "source", "?") is None
+
+
+def test_the_gate_rows_reach_the_transport_and_are_not_dropped(
+        monkeypatch, region, sems, no_active_leg):
+    """MUTANT: ``ShadowLegInputs.gate_rows`` exists and nothing forwards it."""
+    seen = _spy_transport(monkeypatch)
+    sh.run_leg_hook(_inputs(sh.HOOK_SOURCE, gate_rows=(0, 1, 2)),
+                    log=lambda _s: None, descs=[_diag(0, 4096)],
+                    region=region, sems=sems, ops=object(), armed=True)
+    assert seen.get("gate_rows") == (0, 1, 2)
+
+
+# --- must_fix 2: a term consumed after its demand was paid -----------------
+
+def test_a_demand_the_resume_already_paid_is_not_subtracted_again():
+    """MUST_FIX 2, as arithmetic.  This is the defect, not a style point.
+
+    ``free_mib`` is read at hook time, i.e. AFTER the wake leg's resume mapped
+    the weights image, so the image is already out of the free column.  The
+    shipping shape subtracted it a SECOND time -- a per-rank image of order
+    9-13 GiB against a free column the VRAM corridor law holds at 819-1229 MiB
+    under load.  ``affordable`` was False by construction: every rank voted NO
+    on every leg and no boot could ever have shown otherwise.
+    """
+    image_mib = 11 * 1024
+    priced = sh.price_shadow("u0", 64 * sh.MIB, free_mib=4096,
+                             reserve_bytes=image_mib * sh.MIB)
+    assert priced.affordable is False, "the defect is not reproduced"
+    # The demand that IS still unmapped when the hook runs (the rest of this
+    # rpc's tags) is a far smaller number, and it is the one with a producer.
+    honest = sh.price_shadow("u0", 64 * sh.MIB, free_mib=4096,
+                             reserve_bytes=512 * sh.MIB)
+    assert honest.affordable is True
+    assert "resume_reserve_mib=512" in honest.line()
+
+
+def test_the_reserve_is_read_from_the_tags_the_resume_has_not_reached():
+    """MUST_FIX 2, the producer, pinned by source: the pending tags of THIS
+    rpc, read from the saver at the instant the term is consumed."""
+    src = inspect.getsource(_wu().SchedulerWeightUpdaterManager)
+    assert "pending_tags = [" in src
+    assert "and not is_weights_family_tag(t)" in src
+    i_reserve = src.index("reserve_bytes=sum(self._weg2_tag_bytes(t)")
+    i_pending = src.index("pending_tags = [")
+    assert i_pending < i_reserve
+
+
+# --- must_fix 3: the device -----------------------------------------------
+
+def test_the_hook_runs_on_this_ranks_own_device_and_never_a_hardcoded_zero():
+    """MUST_FIX 3.  The launcher hands every rank ALL THREE cards, so a rank's
+    device is its ordinal; ``device=0`` allocated on another rank's card and
+    priced it against this one's free column and uuid."""
+    src = _wu_source("_weg2_shadow_hook")
+    assert "device=int(device)" in src
+    assert "device=0," not in src, "the hook is back on a hardcoded card"
+    assert "self._weg2_device_index()" in src
+    idx = _wu_source("_weg2_device_index")
+    assert "torch.cuda.current_device()" in idx
+    assert "return -1" in idx
+
+
+def test_a_rank_with_no_readable_device_says_so_and_does_not_guess():
+    """MUTANT: ``return 0`` on the unreadable path.  An observer that guesses a
+    card allocates on somebody else's."""
+    src = _wu_source("_weg2_shadow_hook")
+    assert "if device < 0:" in src
+    assert 'reason="no-device"' in src
+
+
+def test_the_leg_threads_device_is_put_back_after_the_hook():
+    """MUST_FIX 3, second half.  ``CudartDeviceOps.set_device`` is a bare
+    ``cudaSetDevice`` with no save/restore, so without this the OBSERVER
+    decides which device the authoritative leg continues on."""
+    import ast as _ast
+
+    src = _wu_source("_weg2_shadow_hook")
+    fn = _ast.parse(inspect.cleandoc(src)).body[0]
+    finallies = [n for n in _ast.walk(fn) if isinstance(n, _ast.Try) and n.finalbody]
+    assert finallies, "the hook has no finally at all"
+    restored = any(
+        isinstance(c, _ast.Call) and isinstance(c.func, _ast.Attribute)
+        and c.func.attr == "_weg2_restore_device"
+        for t in finallies for n in t.finalbody for c in _ast.walk(n))
+    assert restored, "the device is restored only on the happy path, or not at all"
+    assert "torch.cuda.set_device" in _wu_source("_weg2_restore_device")
+
+
+# --- must_fix 4: one deadline for every wait ------------------------------
+
+def test_every_wait_the_hook_makes_is_carved_out_of_one_deadline(
+        monkeypatch, region, sems, no_active_leg):
+    """MUST_FIX 4.  ``hop_bound_ms`` grades the priced HOP and nothing else.
+
+    The gate (5 s) and the transport (30 s) sat outside it, on the leg's
+    critical path, so the honest bound on the added wall was the sum of three
+    constants in three places and the code enforced one.  Both waits now draw
+    from ONE deadline, so their sum can never be paid.
+    """
+    seen = _spy_transport(monkeypatch)
+    sh.run_leg_hook(_inputs(sh.HOOK_SOURCE), log=lambda _s: None,
+                    descs=[_diag(0, 4096)], region=region, sems=sems,
+                    ops=object(), armed=True, hook_budget_s=0.25,
+                    gate_budget_s=5.0, budget_s=30.0)
+    assert seen["gate_budget_s"] <= 0.25, seen["gate_budget_s"]
+    assert seen["budget_s"] <= 0.25, seen["budget_s"]
+    assert seen["gate_budget_s"] + seen["budget_s"] <= 0.5
+
+
+def test_the_hook_budget_is_one_rendezvous_and_says_so():
+    """The rule, not the number: the observer may cost the flip ONE gate
+    budget, never a gate plus a transport plus a compare."""
+    assert sh.SHADOW_HOOK_BUDGET_S == sh.SHADOW_GATE_BUDGET_S
+    assert sh.SHADOW_HOOK_BUDGET_S < sh.SHADOW_TRANSPORT_BUDGET_S
+
+
+def test_the_line_carries_the_deadline_beside_the_wall(no_active_leg):
+    """A bound nobody can read on the line is a bound nothing is graded
+    against -- the same argument ``hop_bound_ms`` already carries."""
+    result = sh.run_leg_hook(_inputs(sh.HOOK_SOURCE), log=lambda _s: None,
+                             descs=(), armed=True, hook_budget_s=2.0)
+    assert "hook_budget_ms=2000.000" in result.line()
+    assert "budget=ok" in result.line()
+    over = sh.ShadowResult(leg=0, epoch="e.0", subset=sh.select_subset([], leg=0),
+                           counters=sh.ShadowCounters())
+    over.hook_budget_ms, over.shadow_ms = 100.0, 250.0
+    assert "budget=OVER" in over.line()
+
+
+# --- must_fix 5: a refusal that publishes ---------------------------------
+
+def test_a_refusal_after_the_attach_publishes_its_no_so_no_peer_waits(
+        region, boot, no_active_leg):
+    """MUST_FIX 5.  ``hop_ms`` is priced from THIS card's diagonal, so one card
+    can refuse while the other two do not -- exactly the asymmetric case where
+    a silent return costs five peers a full gate budget each, inside their own
+    flip legs.  W63's own docstring names the hazard; the code only logged it.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    try:
+        lines: list = []
+        result = sh.run_leg_hook(
+            _inputs(sh.HOOK_SOURCE, row=0), log=lines.append,
+            descs=[_diag(0, 400 * sh.MIB)], region=region, sems=sems,
+            ops=object(), armed=True, bound_ms=1.0)
+    finally:
+        sems.close()
+        xr.unlink_semaphores(boot)
+    assert result.reason == "hop-over-bound"
+    row = sh.read_shadow_vote(region, 0)
+    assert row["sealed"] == 1, "the NO row is not a signal at all"
+    assert row["vote"] == 0, "the refusing rank published nothing"
+    assert row["leg"] == 0 and row["epoch_hash"] == region.epoch_hash
+    assert any("vote=no" in ln and "reason=hop-over-bound" in ln
+               for ln in lines), lines
+
+
+def test_a_refusal_before_the_attach_has_nowhere_to_publish_and_admits_it(
+        no_active_leg):
+    """The honest half: ``no-region``/``no-sems``/``no-ops``/``no-plan`` happen
+    with no row to write into, and W63 names them instead of the code
+    pretending a vote was cast."""
+    leg = sh.ShadowLeg(_inputs(sh.HOOK_SOURCE), lambda _s: None)
+    assert leg.region is None
+    assert sh.publish_no_vote(leg, reason="no-region") is False
+
+
+# --- must_fix 6: the summer's product producer ----------------------------
+
+def test_the_destination_builds_its_own_summer_when_the_caller_gives_none(
+        region, tmp_path, boot, no_active_leg):
+    """MUST_FIX 6.  The adapter passed no ``sum_bytes``, so ``compare`` took its
+    ``no-summer`` exit and ``run_leg``'s slot checksums were disabled too --
+    ``verdict=NOT-RUN`` for TWO independent reasons while the record named one.
+    ``make_device_scratch`` and ``device_summer`` had no product caller at all.
+    """
+    xr.create_semaphores(boot)
+    sems_s, sems_d = tp.SemSet(boot), tp.SemSet(boot)
+    src_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    dst_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    built: list = []
+
+    def fake_make_summer(ops, device, stripe_bytes, result):
+        built.append((device, stripe_bytes))
+        return byte_sum(dst_ops), None, None
+
+    try:
+        dst_ops.raw_malloc(0, 2 << 20)
+        payload = pattern(47, 1600)
+        src, ring_dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x60000)
+        write(src_ops, src, payload)
+        write(dst_ops, ring_dst, payload)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=ring_dst,
+                           name="model.layers.0.self_attn.qkv_proj.weight")]
+        _vote_rows(region, [1, 2, 4, 5], leg=0, vote=True,
+                   classes_hash=sh.classes_hash(["qkv_proj"]), need_mib=0)
+        previous = sh._make_summer
+        sh._make_summer = fake_make_summer
+        try:
+            thread = threading.Thread(target=lambda: sh.run_leg_hook(
+                _inputs(sh.HOOK_SOURCE, row=0, peer_row=3), log=lambda _s: None,
+                descs=descs, region=region, sems=sems_s, ops=src_ops,
+                armed=True, slot_bytes=SLOT, stripe_bytes=1 << 20,
+                budget_s=10.0, hook_budget_s=60.0, oncard_slot_bytes=SLOT))
+            thread.start()
+            try:
+                # NO sum_bytes -- the product's shape before the fix.
+                result = sh.run_leg_hook(
+                    _inputs(sh.HOOK_DESTINATION, row=3, peer_row=0),
+                    log=lambda _s: None, descs=descs, region=region,
+                    sems=sems_d, ops=dst_ops, armed=True, slot_bytes=SLOT,
+                    stripe_bytes=1 << 20, budget_s=10.0, hook_budget_s=60.0,
+                    oncard_slot_bytes=SLOT)
+            finally:
+                thread.join(60)
+        finally:
+            sh._make_summer = previous
+    finally:
+        src_ops.close()
+        dst_ops.close()
+        sems_s.close()
+        sems_d.close()
+        xr.unlink_semaphores(boot)
+    assert built == [(0, 1 << 20)], built
+    assert result.counters.stripes == 1 and result.counters.match == 1
+    assert "verdict=MATCH" in result.line()
+
+
+def test_the_summer_producer_is_the_modules_own_two_functions():
+    """MUTANT: ``_make_summer`` returns a summer it invented.  The scratch IS
+    the stripe and the sum IS ``uint8_checksum``; a second implementation here
+    would be a second definition of the comparison the slice exists to make."""
+    src = inspect.getsource(sh._make_summer)
+    assert "make_device_scratch(" in src
+    assert "device_summer(" in src
+    assert "ops.create_stream(" in src
+    hook = inspect.getsource(sh.run_leg_hook)
+    assert "_make_summer(" in hook
+    # AFTER the transport, never before: the scratch is 64 MiB of device
+    # memory and the gate is what licenses an allocation.
+    assert hook.index("run = shadow_transport(") < hook.index("_make_summer(")
+
+
+def test_a_summer_that_cannot_be_built_is_not_a_match():
+    """An unavailable summer must read as NOT-RUN, never as a pass."""
+    class _NoStreams:
+        def create_stream(self, _device):
+            raise RuntimeError("no libcudart here")
+
+    result = sh.ShadowResult(leg=0, epoch="e.0",
+                             subset=sh.select_subset([], leg=0),
+                             counters=sh.ShadowCounters())
+    assert sh._make_summer(_NoStreams(), 0, sh.STRIPE_BYTES, result) == (
+        None, None, None)
+    assert any("no-summer-stream" in e for e in result.counters.errors)
+
+
+def test_the_summers_stream_is_destroyed_before_the_leg_drops_its_ops():
+    """``leg.close`` nulls ``ops``; a stream destroyed through a ``None`` is a
+    leaked stream on the card the shadow may not disturb."""
+    hook = inspect.getsource(sh.run_leg_hook)
+    assert hook.index("destroy(summer_stream)") < hook.index(
+        "leg.close(owner=leg.token)")
+
+
+# --- the non-blocking findings the refuter also named ----------------------
+
+def test_the_price_covers_the_buffer_the_transport_actually_allocates():
+    """CARRIED FROM S5: ``price_leg`` filtered ZEROFILL out of ``mine_dst``
+    while ``shadow_transport`` does not -- it must not, because leaving a
+    ZEROFILL descriptor's ORIGINAL ``dst_ptr`` in the leg would have
+    ``run_leg`` memset the RING's live destination.  So the buffer was bigger
+    than the number that was priced: the unpriced-VRAM class again."""
+    zero = wx.XchgDesc(tag="weights_0", src_rank=1, dst_rank=0,
+                       param_name="model.layers.0.mlp.gate_proj.bias",
+                       kind=wx.ZEROFILL, nbytes=8 * sh.MIB, rows=1,
+                       run_bytes=8 * sh.MIB, spitch=0, dpitch=0,
+                       src_ptr=0, dst_ptr=0x5000)
+    price, _slot = sh.price_leg("u0", [zero], rank=0, is_source=False,
+                                oncard_mode=tp.ONCARD_MODE_IPC, free_mib=8192)
+    allocated = sh.shadow_layout([d for d in [zero] if d.dst_rank == 0])[1]
+    assert allocated > 0
+    assert price.dst_mib == -(-allocated // sh.MIB), (
+        "the shadow allocates bytes nobody priced")
+
+
+def test_the_armed_predicate_has_exactly_one_owner(monkeypatch):
+    """Two spellings of one decision is the Zweitbuchhaltung shape
+    UPSTREAM-MINIMAL refuses; this proves the delegation is real."""
+    monkeypatch.setattr(wx, "shadow_armed", lambda: True)
+    assert sh.shadow_armed() is True
+    monkeypatch.setattr(wx, "shadow_armed", lambda: False)
+    assert sh.shadow_armed() is False
+
+
+def test_the_adapter_still_never_raises_and_that_is_why_signals_are_caught():
+    """NAMED REFUSAL, not a fix (S5b refuter, non-blocking finding).
+
+    The adapter catches ``BaseException``, which swallows a ``KeyboardInterrupt``
+    or ``SystemExit`` arriving on the scheduler thread during a hook.  Narrowing
+    it would put a ``raise`` inside an observer, and
+    ``test_the_weight_updater_adapters_catch_everything_and_return`` pins the
+    opposite -- the flip may not be aborted by its instrument.  The two rules
+    conflict and the flip wins; this test states which, so the next reader
+    finds a decision rather than an oversight.
+    """
+    import ast as _ast
+
+    fn = _ast.parse(inspect.cleandoc(_wu_source("_weg2_shadow_hook"))).body[0]
+    assert not any(isinstance(n, _ast.Raise) for n in _ast.walk(fn))
+    assert any(isinstance(h.type, _ast.Name) and h.type.id == "BaseException"
+               for n in _ast.walk(fn) if isinstance(n, _ast.Try)
+               for h in n.handlers)
