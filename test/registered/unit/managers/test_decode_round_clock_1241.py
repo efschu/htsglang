@@ -173,20 +173,27 @@ class DecodeRoundClockTest(unittest.TestCase):
 
     def test_MUTANT_4_a_graph_replayed_round_REFUSES_the_split_never_reports_zero(self):
         """A replayed collective records no span. An empty slot is not a
-        wait of 0.0; it is an unknown wait."""
+        wait of 0.0; it is an unknown wait.
+
+        #1241b: a graph that carries event NODES now yields the split (see
+        test_decode_graph_event_nodes_1241b.py). This harness declares no
+        graph, which is exactly the shape of a graph captured before the
+        nodes existed -- and the reason now NAMES the missing thing instead
+        of naming the mechanism, because "graph-replay" as a reason claims
+        graphs cannot be split, which is false since #1241b."""
         self.h.log.begin_round(round_id=3, bs=6, rows=24)
         self.run_forward(graphed=True, compute_ms=12.9, waits=())
         self.h.ready_now()
         self.h.log.begin_round(round_id=4, bs=6, rows=24)
         line = self.decode_lines()[0]
-        self.assertIn("split unavailable: graph-replay", line)
+        self.assertIn("split unavailable: graph-replay-no-event-nodes", line)
         self.assertIn("graphed-fwd 1/1", line)
         self.assertNotIn("wait 0.0", line)
         self.assertNotIn("compute", line)
         self.assertIsNone(parse_rank_batch_line("[x TP1] " + line))
         un = parse_unsplit_line("[2026-09-09 00:00:00 TP1] " + line)
         self.assertIsNotNone(un)
-        self.assertEqual(un["reason"], "graph-replay")
+        self.assertEqual(un["reason"], "graph-replay-no-event-nodes")
         self.assertFalse(un["split_known"])
         self.assertAlmostEqual(un["gpu_ms"], 12.9, places=1)
 
@@ -464,10 +471,12 @@ class DecodeRoundClockTest(unittest.TestCase):
         summary = summarize(lines)
         self.assertEqual(summary["TP1"]["count"], 1)
         self.assertEqual(summary["TP1"]["withheld"], 1)
-        self.assertEqual(summary["TP1"]["withheld_reasons"], {"graph-replay": 1})
+        self.assertEqual(
+            summary["TP1"]["withheld_reasons"], {"graph-replay-no-event-nodes": 1}
+        )
         text = report(summary)
         self.assertIn("WITHHELD 1/2 rounds", text)
-        self.assertIn("graph-replay x1", text)
+        self.assertIn("graph-replay-no-event-nodes x1", text)
 
     def test_a_window_of_MOSTLY_withheld_rounds_is_named_not_evidence(self):
         from sglang.srt.debug_utils.rank_phase_summary import report, summarize

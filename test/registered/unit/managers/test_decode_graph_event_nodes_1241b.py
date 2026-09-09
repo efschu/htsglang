@@ -125,17 +125,25 @@ class Harness:
 
     def capture(self, key, regions, phase=None):
         """Capture one graph. ``regions`` is a list of family names, in the
-        order the captured forward issues them (repeats are repeats)."""
-        self.state.capturing = True
-        try:
-            with self.clock.capture_scope(key, phase=phase):
+        order the captured forward issues them (repeats are repeats).
+
+        ORDER IS THE REAL RUNNER'S ORDER: ``capture_scope`` is entered while
+        the stream is NOT yet capturing (decode_cuda_graph_runner wraps
+        ``backend.capture_one``, and the stream starts capturing inside it),
+        so the scope's pre-materialization runs outside the capture -- which
+        ``FakeBackend.materialize`` asserts, because materializing a lazy
+        ``torch.cuda.Event`` inside a capture is exactly the allocation the
+        design promises not to make."""
+        with self.clock.capture_scope(key, phase=phase):
+            self.state.capturing = True
+            try:
                 for family in regions:
                     with self.clock.span(family):
                         # Device work inside the region stamps nothing under
                         # capture; the shape is what is being recorded.
                         pass
-        finally:
-            self.state.capturing = False
+            finally:
+                self.state.capturing = False
         return self.clock.captured_graph(key)
 
     def replay(self, key, per_region_ms):
