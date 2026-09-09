@@ -1707,6 +1707,10 @@ class TestRowsBelowTheMinimumAreNeverDemoted(_PolicyBase):
         ring, loc = self._held()
         for _ in range(5):
             self._plan(ring, loc)
+            # A real decode step MERGES what its plan attended; without this
+            # the fact-4 gate rightly refuses the next plan. Modelling the
+            # read half is what makes this a decode-shaped test.
+            ring.note_merge()
         self.assertEqual(ring.rows_held, self.N)
         self.assertEqual(ring.counters.demoted_total, 0)
 
@@ -1801,6 +1805,7 @@ class TestTheLineSeparatesTheTwoWorlds(_PolicyBase):
         self._plan(ring, loc)
         self.assertEqual(ring.counters.rows_held_pre, self.N)
         self.assertEqual(ring.counters.demoted_this_pass, 0)
+        ring.note_merge()          # the read half of that step
         self._plan(ring, loc, tail_len=0)
         self.assertEqual(ring.counters.rows_held_pre, self.N)
         self.assertEqual(ring.counters.demoted_this_pass, self.N)
