@@ -29,9 +29,53 @@ def _install_fake_corridor(band_floor, arming, phase):
     sys.modules["sglang.srt.managers.phase_flip_presence"] = pf
 
 
+#: ``sys.modules`` value meaning "this key was not loaded before the test".
+_ABSENT = object()
+
+#: The keys every test here rebinds: the two stand-ins and the module under
+#: test, which is re-imported bound to them.
+_REBOUND = (
+    "sglang.srt.managers.corridor_guard",
+    "sglang.srt.managers.phase_flip_presence",
+)
+
+
+def _rebound_keys():
+    return [
+        k for k in list(sys.modules)
+        if k in _REBOUND or k.endswith("planner.bench_suite")
+    ]
+
+
 class CeilingMarginLevel(unittest.TestCase):
     BAND_FLOOR = 819
     ARMING = 1331  # 819 band floor + 512 shipped seam-entry reserve
+
+    # RESTORE ``sys.modules`` AFTER EVERY TEST. The stand-ins above are bare
+    # ``types.ModuleType`` objects with no spec, and the fallback test below
+    # stores ``None``; left in ``sys.modules`` they outlive this file on the
+    # xdist worker that ran it, and every later test on that worker that does
+    # ``from sglang.srt.managers.corridor_guard import corridor_law_bytes``
+    # (or ``PhaseFlipPresence``, ``draft_carrier_provider``) fails with
+    # ``ImportError: cannot import name ... (unknown location)``. Measured on
+    # the serve-next5 train gate (cachyllama, 2026-09-09, -n 8): 23 such
+    # failures in ``test_phase_flip_seam_census_631``,
+    # ``test_phase_flip_spill_depth_631`` and ``test_phase_policy``, all
+    # passing solo, and reproduced deterministically by running this file
+    # before ``test_phase_policy`` on ONE worker (18 = 12 + the 6
+    # pre-existing). Same class as the #1047 census pollution the serve-next4
+    # train fixed: a test that only fails because another ran first.
+    def setUp(self):
+        self._saved = {k: sys.modules[k] for k in _rebound_keys()}
+        for k in _REBOUND:
+            self._saved.setdefault(k, _ABSENT)
+
+    def tearDown(self):
+        for k in _rebound_keys():
+            del sys.modules[k]
+        for k, v in self._saved.items():
+            if v is not _ABSENT:
+                sys.modules[k] = v
 
     def _level(self, free, phase="pp", arming=None):
         _install_fake_corridor(self.BAND_FLOOR, arming or self.ARMING, phase)
