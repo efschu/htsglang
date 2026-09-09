@@ -192,6 +192,7 @@ class _Intake:
     _add_request_to_queue = Scheduler._add_request_to_queue
     readmit_seam_residents = Scheduler.readmit_seam_residents
     _apply_prefetch_deferral = _method("_apply_prefetch_deferral")
+    _apply_group_shortfall_deferral = _method("_apply_group_shortfall_deferral")
     _retry_deferred_prefetches = _method("_retry_deferred_prefetches")
     _deferred_prefetch_bound_s = _method("_deferred_prefetch_bound_s")
     _prefetch_capacity_limit_or_none = _method("_prefetch_capacity_limit_or_none")
