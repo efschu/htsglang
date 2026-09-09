@@ -5,6 +5,7 @@ This module is intentionally lightweight (no torch import) so it can be used in 
 
 from __future__ import annotations
 
+import logging
 import secrets
 from dataclasses import dataclass
 from enum import Enum
@@ -92,6 +93,29 @@ def app_has_admin_force_endpoints(app: Any) -> bool:
     return False
 
 
+#: #1288: loopback peers this server trusts without a bearer. Compared against
+#: the TRANSPORT peer address only -- never a header.
+LOOPBACK_PEERS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+
+
+def peer_is_loopback(peer_host: Optional[str]) -> bool:
+    """True iff the TRANSPORT peer is this machine (#1288).
+
+    THE ARGUMENT MUST COME FROM THE ASGI SCOPE'S ``client`` TUPLE, which is
+    the address the kernel accepted the connection from. It is NEVER derived
+    from ``X-Forwarded-For``, ``X-Real-IP`` or ``Host``: those are strings the
+    caller chooses, so honouring them would let any remote request claim
+    loopback and take the admin routes. There is no reverse proxy in front of
+    these ports, so there is also nothing legitimate to learn from them.
+
+    A ``None`` peer (a non-network transport, or a scope without ``client``)
+    is NOT loopback: unknown must not read as trusted.
+    """
+    if not peer_host:
+        return False
+    return peer_host in LOOPBACK_PEERS
+
+
 def decide_request_auth(
     *,
     method: str,
@@ -100,6 +124,7 @@ def decide_request_auth(
     api_key: Optional[str],
     admin_api_key: Optional[str],
     auth_level: AuthLevel,
+    peer_host: Optional[str] = None,
 ) -> AuthDecision:
     """Pure auth decision function (easy to unit test).
 
@@ -119,6 +144,31 @@ def decide_request_auth(
         return AuthDecision(allowed=True)
 
     if path.startswith("/health") or path.startswith("/metrics"):
+        return AuthDecision(allowed=True)
+
+    # #1288: LOOPBACK IS TRUSTED FOR THE ADMIN LEVELS (user decision
+    # 2026-09-09). Every port of this deployment binds 127.0.0.1, and the
+    # processes that drive the admin routes -- the weg2 front's flip legs and
+    # its own `/server_info` reads -- are on this host by construction. Making
+    # each of them carry a bearer is a second copy of the key with a second
+    # way to get it wrong, and it got it wrong: #1275 fix 5 moved
+    # `/server_info` to ADMIN_OPTIONAL and the front's internal read kept
+    # sending nothing, so group D answered 401 to 180 of 181 reads on boot
+    # weg2sb5f and the #915 admission gate priced blind for the whole run.
+    # sb5d's 503s were the same shape with a different producer (a dtype 500
+    # on the same read): a read with no fallback whose consumer turns
+    # "unknown" into a verdict.
+    #
+    # NON-LOOPBACK PEERS ARE UNCHANGED and still need the key -- defence in
+    # depth if anyone ever passes `--host 0.0.0.0`, which nothing does today.
+    #
+    # THE COST, stated rather than waved past: this reopens the browser-CSRF
+    # vector `cors_policy` describes (audit #506/#510, A2-F3) -- a page in a
+    # browser ON THIS HOST could POST to the admin routes with no key. The
+    # assumption that makes it acceptable is that this LXC runs no browser;
+    # if that ever changes, this trust must go with it.
+    if auth_level in (AuthLevel.ADMIN_OPTIONAL, AuthLevel.ADMIN_FORCE) \
+            and peer_is_loopback(peer_host):
         return AuthDecision(allowed=True)
 
     def _check_bearer_token(
@@ -196,6 +246,13 @@ def add_api_key_middleware(
             path = request.url.path
             authz = request.headers.get("Authorization")
             level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
+            # #1288: THE PEER COMES FROM THE SCOPE, NOT FROM A HEADER.
+            # `scope["client"]` is the address the kernel accepted the
+            # connection from; `request.headers` are strings the caller
+            # chooses. Reading X-Forwarded-For / X-Real-IP here would let any
+            # remote caller claim loopback and take the admin routes.
+            client = scope.get("client")
+            peer_host = client[0] if client else None
             decision = decide_request_auth(
                 method=request.method,
                 path=path,
@@ -203,6 +260,7 @@ def add_api_key_middleware(
                 api_key=self.api_key,
                 admin_api_key=self.admin_api_key,
                 auth_level=level,
+                peer_host=peer_host,
             )
 
             if not decision.allowed:
@@ -221,6 +279,15 @@ def add_api_key_middleware(
 
             await self.app(scope, receive, send)
 
+    # #1288: ONE grep-able line per process saying which policy is in force.
+    # A trust decision that is only visible in the source is a trust decision
+    # nobody audits from a boot log.
+    logging.getLogger(__name__).info(
+        "WEG2-AUTH loopback=trusted bearer=required-for-remote "
+        "(peer from the ASGI scope client tuple only, never "
+        "X-Forwarded-For/X-Real-IP/Host; admin_api_key=%s api_key=%s; #1288)",
+        "set" if admin_api_key else "unset", "set" if api_key else "unset",
+    )
     app.add_middleware(
         _ApiKeyASGIMiddleware,
         api_key=api_key,

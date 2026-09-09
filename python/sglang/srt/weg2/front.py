@@ -1434,29 +1434,31 @@ class Front:
         why = "no exception, no 200, no reading"
         try:
             g = self.groups["D"]
-            # #1288: THROUGH THE SEAM, so this read carries the admin bearer.
-            # `/server_info` is ADMIN_OPTIONAL, so on a keyed boot a bare GET
-            # is a 401 and this gate silently prices nothing.
-            # The timeout stays a KEYWORD and stays the derived constant: the
-            # #1275 fix-5 guard (`test_a13`) reads this method's AST for a
-            # `timeout=` argument whose value names `D_POOL_READ_TIMEOUT_S`,
-            # and a guard that no longer matches the code it guards is the
-            # failure mode #1285 was about.
-            status, raw, _ = await self.group_get(
-                g, "/server_info", timeout=D_POOL_READ_TIMEOUT_S)
-            if status == 200:
-                body = json.loads(raw)
-                for st in (body.get("internal_states") or []):
-                    got = st.get("hicache_prefetch")
-                    if got:
-                        break
-                if not got:
-                    why = "200 but no `hicache_prefetch` in internal_states"
-            else:
-                why = f"HTTP {status}" + (
-                    " -- the front's bearer was refused; is this front's "
-                    "--admin-key-file the key group D was started with? (#1288)"
-                    if status in (401, 403) else "")
+            # #1288: NO BEARER, ON PURPOSE. `/server_info` is ADMIN_OPTIONAL
+            # and this read is front->group over loopback, which the auth
+            # decision now trusts by TRANSPORT PEER (utils/auth.py,
+            # `peer_is_loopback`). Adding a header here would be a second
+            # copy of the key with a second way to get it wrong -- and the
+            # first way is what #1288 is: fix 5 moved the route behind the
+            # gate and this caller kept sending nothing.
+            async with self.session.get(
+                    f"{g.url}/server_info",
+                    timeout=ClientTimeout(total=D_POOL_READ_TIMEOUT_S)) as resp:
+                status = resp.status
+                if status == 200:
+                    body = await resp.json()
+                    for st in (body.get("internal_states") or []):
+                        got = st.get("hicache_prefetch")
+                        if got:
+                            break
+                    if not got:
+                        why = "200 but no `hicache_prefetch` in internal_states"
+                else:
+                    why = f"HTTP {status}" + (
+                        " -- group D refused this read; loopback should be "
+                        "trusted (WEG2-AUTH line in D's log), so check that "
+                        "D is running a tree that carries #1288"
+                        if status in (401, 403) else "")
         except Exception as e:  # noqa: BLE001 - an instrument may never break admission
             got = None
             why = f"{type(e).__name__}: {e}"
@@ -1824,8 +1826,8 @@ class Front:
         results = {}
         for g in self.groups.values():
             try:
-                status, _, _ = await self.group_get(g, "/health", 25)
-                results[g.name] = status
+                async with self.session.get(f"{g.url}/health", timeout=ClientTimeout(total=25)) as r:
+                    results[g.name] = r.status
             except Exception as e:  # noqa: BLE001
                 results[g.name] = f"error: {type(e).__name__}"
         ok = all(v == 200 for v in results.values()) and self.state != "STOP"
@@ -1839,8 +1841,9 @@ class Front:
             return web.json_response({"state": self.state, "stop": str(self.stop) if self.stop else None}, status=503)
         g = self.groups[self.awake]
         try:
-            status, body, ctype = await self.group_get(g, "/health_generate", 60)
-            return web.Response(body=body, status=status, content_type=ctype)
+            async with self.session.get(f"{g.url}/health_generate", timeout=ClientTimeout(total=60)) as r:
+                body = await r.read()
+                return web.Response(body=body, status=r.status, content_type=r.content_type)
         except Exception as e:  # noqa: BLE001
             return web.json_response({"error": f"{type(e).__name__}: {e}", "group": g.name}, status=503)
 
@@ -1906,18 +1909,12 @@ class Front:
                 self.queue.remove(p)
                 if not p.fut.done():
                     p.fut.set_exception(web.HTTPRequestTimeout(text="aborted"))
-        # #1288: THROUGH THE POST SEAM.  `/abort_request` is ADMIN_OPTIONAL and
-        # is named in `admin_key.FRONT_ADMIN_ROUTES` -- the front drives it, so
-        # it needs the bearer exactly as the flip legs do.  It never 401'd on
-        # weg2sb5f only because no client aborted; the break was structural,
-        # not latent in a different sense.  `rpc` reports a transport failure
-        # as code 0, which is the 503 this handler used to raise for.
-        code, text = await self.rpc(g, "/abort_request", payload,
-                                    self.drain_deadline_s)
-        if code == 0:
-            return web.json_response({"error": text}, status=503)
-        return web.Response(body=text.encode(), status=code,
-                            content_type="application/json")
+        try:
+            async with self.session.post(f"{g.url}/abort_request", json=payload) as r:
+                body = await r.read()
+                return web.Response(body=body, status=r.status, content_type=r.content_type)
+        except Exception as e:  # noqa: BLE001
+            return web.json_response({"error": str(e)}, status=503)
 
     async def handle_generate(self, request: web.Request) -> web.StreamResponse:
         if self.state == "STOP":
@@ -2702,12 +2699,12 @@ class Front:
             if isinstance(mi, dict) and mi.get("spec_accept_length") is not None:
                 out["accept_len"] = float(mi["spec_accept_length"])
                 out["accept_src"] = "meta"
-            # #1288: THROUGH THE SEAM. `/get_server_info` is ADMIN_OPTIONAL
-            # too, and on weg2sb5f it answered 401 to 507 of 509 of these --
-            # so `accept_len` fell to `accept_src=none` and both draft
-            # counters read 0 for the whole boot, silently.
-            status, raw, _ = await self.group_get(g, "/get_server_info")
-            info = json.loads(raw) if status == 200 else {}
+            # #1288: no bearer here either -- same loopback trust. On boot
+            # weg2sb5f this read answered 401 to 507 of 509, so `accept_len`
+            # fell to `accept_src=none` and both draft counters read 0 for
+            # the whole boot, silently.
+            async with self.session.get(f"{g.url}/get_server_info") as r:
+                info = await r.json() if r.status == 200 else {}
             if isinstance(info, list) and info:
                 info = info[0]
             if not isinstance(info, dict):
@@ -2772,59 +2769,6 @@ class Front:
                     len(names), kv, mamba, draft, sorted(suffixes)[:8], sorted(ids), self.store_dir)
         if len(ids) > 1:
             self.do_stop("W9 Weg2StoreIdentityMismatch", f"identity suffixes on the sole carrier: {sorted(ids)}")
-
-    # ---------------- the two group-facing seams (#1288) ----------------
-    #: The ONLY two methods that may open an HTTP call the FRONT ITSELF asks
-    #: for.  One per verb, both drawing their headers from the single injector
-    #: ``admin_key_mod.auth_headers`` -- so the bearer is attached in exactly
-    #: two places and a new internal caller cannot forget it.
-    #:
-    #: #1288 is what happens without this rule.  #1275 fix 5 put
-    #: ``/server_info`` and ``/get_server_info`` behind ``ADMIN_OPTIONAL``,
-    #: which on a keyed boot means "require the admin key".  ``Front.rpc``
-    #: learned the bearer; the front's OWN reads of those two routes did not,
-    #: because they were plain ``session.get`` calls at their point of use.
-    #: Measured on boot weg2sb5f (`4f762260ba`, D.log): ``/server_info`` 180x
-    #: 401 against 1x 200, ``/get_server_info`` 507x 401 against 2x 200.  The
-    #: D-pool admission gate and the draft-terms instrument both ran blind.
-    #: Same one-job-two-movers shape as the leak fix 5 closed, one layer down.
-    SEAM_METHODS = ("_rpc_attempt", "group_get")
-    #: The client-request proxies -- deliberately OUTSIDE the seam, and this
-    #: is a safety property rather than an omission.  They forward SOMEBODY
-    #: ELSE'S request, and the front listens unauthenticated on the serving
-    #: port; attaching the front's admin bearer here would let any anonymous
-    #: caller reach a group's ADMIN_OPTIONAL routes through us and read back
-    #: the very key those routes are gated on -- credential laundering, and
-    #: exactly the leak #1275 fix 3 closed at ``/server_info``.  A 401 out of a
-    #: PROXIED ``/get_server_info`` is therefore the correct answer, not a
-    #: defect of this ticket.
-    #:
-    #: ``leg1``/``leg2`` also stream and re-shape bodies, which no
-    #: read-the-whole-response seam can carry.
-    PASSTHROUGH_METHODS = ("handle_passthrough_get", "leg1", "leg2")
-
-    async def group_get(self, g: Group, path: str,
-                        timeout: Optional[float] = None,
-                        ) -> Tuple[int, bytes, str]:
-        """THE ONE front-originated GET of a group (#1288).
-
-        Returns ``(status, body, content_type)``.  Raises whatever aiohttp
-        raises -- every caller already has its own failure semantics (a
-        suppressed D-pool read, a 503 health answer, an instrument that
-        returns its default) and this seam must not flatten them into one.
-
-        THE HEADERS ARE THE POINT.  ``auth_headers`` is unconditional on the
-        path on purpose (see its docstring): a per-path allowlist here would
-        be a second copy of ``http_server.py``'s decorators, and the failure
-        mode of that drift is what this ticket is.  Sending a bearer to
-        ``/health`` -- which ``decide_request_auth`` allows by prefix before
-        any key is consulted -- costs nothing and keeps the rule one rule.
-        """
-        kw: Dict[str, Any] = {"headers": admin_key_mod.auth_headers(self.admin_key)}
-        if timeout is not None:
-            kw["timeout"] = ClientTimeout(total=timeout)
-        async with self.session.get(f"{g.url}{path}", **kw) as r:
-            return r.status, await r.read(), r.content_type
 
     # ---------------- flip machinery ----------------
     async def rpc(self, g: Group, path: str, body: Optional[dict], timeout: float) -> Tuple[int, str]:
@@ -3886,8 +3830,8 @@ class Front:
             for g in self.groups.values():
                 ok = False
                 try:
-                    status, _, _ = await self.group_get(g, "/health", 25)
-                    ok = status == 200
+                    async with self.session.get(f"{g.url}/health", timeout=ClientTimeout(total=25)) as r:
+                        ok = r.status == 200
                 except Exception:  # noqa: BLE001
                     ok = False
                 alive = _sid_alive(g.sid)

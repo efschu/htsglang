@@ -175,7 +175,7 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
         old = old_router(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
                          SB5F_CARRIER_MAX)
         new = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
-                                SB5F_CARRIER_MAX)
+                                SB5F_CARRIER_MAX, carrier_exact=True)
         self.assertEqual(old, "carrier_single",
                          "the mutant must reproduce the shipped behaviour")
         self.assertNotEqual(new, old,
@@ -192,7 +192,7 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
         self.assertEqual(x_only(SB5F_UNCACHED, SB5F_X), "long")
         self.assertEqual(
             serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
-                              SB5F_CARRIER_MAX),
+                              SB5F_CARRIER_MAX, carrier_exact=True),
             "none", "with both bounds consulted, neither route is offered")
 
     def test_mutant_swapping_the_two_bases_changes_the_verdict(self):
@@ -200,9 +200,9 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
         base, which is the conflation the router made, and the answer flips
         from a refusal to a D single prefill: the exact 503."""
         swapped = serviceable_route(SB5F_CARRIER_EST, SB5F_UNCACHED,
-                                    SB5F_X, SB5F_CARRIER_MAX)
+                                    SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True)
         correct = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST,
-                                    SB5F_X, SB5F_CARRIER_MAX)
+                                    SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True)
         self.assertNotEqual(swapped, correct,
                             "if the bases were interchangeable this ticket "
                             "would not exist -- they are not")
@@ -216,8 +216,14 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
                          10 ** 6):
             for carrier_est in (1, SB5F_CARRIER_MAX, SB5F_CARRIER_MAX + 1,
                                 SB5F_CARRIER_EST, 10 ** 6):
+                # `carrier_exact=True`: the invariant is asserted where the
+                # verdict is allowed to be terminal. On an ESTIMATE the front
+                # deliberately degrades to `carrier_single` instead of
+                # refusing (see `test_a_terminal_refusal_may_not_rest_on_an_
+                # estimate`), so D may be offered one prefill it declines --
+                # a bounded, measured cost, not a loop.
                 v = serviceable_route(uncached, carrier_est, SB5F_X,
-                                      SB5F_CARRIER_MAX)
+                                      SB5F_CARRIER_MAX, carrier_exact=True)
                 if v in ("short", "carrier_single"):
                     self.assertLessEqual(
                         uncached, SB5F_X,
@@ -352,7 +358,13 @@ class TheRouterEndToEnd(CustomTestCase):
             return None
 
     def test_a_no_route_request_gets_413_and_never_touches_the_queue(self):
+        import hashlib
         f = self._front()
+        # A MEASURED carrier figure: only that may terminate. This is the
+        # state after D has served (or refused) this text once and
+        # `_note_exact` recorded its real prompt_tokens.
+        text = "w" * (SB5F_CARRIER_EST * 3)
+        f.exact_tokens[hashlib.sha1(text.encode()).hexdigest()] = SB5F_CARRIER_EST
         # Long enough to break the carrier too, priced by the front's own
         # estimator rather than by a number typed here.
         resp = self._run(f, {"stream": False},
@@ -375,7 +387,9 @@ class TheRouterEndToEnd(CustomTestCase):
         self.assertEqual(f.counters["route_long"], 1,
                          "the P route was not named LONG -- the sb5f census "
                          "read LONG 0 for exactly this reason")
-        self.assertEqual(f.counters["route_batch"], 0)
+        self.assertEqual(f.counters["route_batch"], 1,
+                         "route_batch is ADDITIVE: the #1246 carrier-floor "
+                         "census reads it over the whole length axis")
         self.assertEqual(len(f.queue), 1)
 
 
