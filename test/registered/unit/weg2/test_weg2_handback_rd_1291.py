@@ -200,8 +200,8 @@ class ACompletedLegOneMakesTheRefusalTerminal(CustomTestCase):
         src = inspect.getsource(Front._requeue_after_x_refusal)
         i = src.find("W53_Weg2StoreHandbackFailed")
         window = src[i:i + 3000]
-        for key in ('"x_tokens"', '"est_uncached"', '"carrier_max"',
-                    '"leg1_done"'):
+        for key in ('"x_tokens"', '"est_uncached"', '"leg1_prompt_tokens"',
+                    '"carrier_max"', '"leg1_done"'):
             self.assertIn(key, window, f"the refusal body omits {key}")
 
     def test_the_refusal_names_the_evidence_to_collect_next(self):
@@ -269,12 +269,26 @@ class OnlyAMeasuredEmptyHandbackTerminates(CustomTestCase):
 
     def test_mutant_a_partial_handback_is_not_terminal(self):
         """THE case f2a/f2b/t9c protect: D priced a SMALLER extent than the
-        front estimated, so the store DID hand something back and a re-offer
-        can still pay. Terminating here would refuse a served band."""
+        whole prompt P MEASURED, so the store DID hand something back and a
+        re-offer can still pay. Terminating here would refuse a served band.
+
+        CORRECTED BY #1296. This assertion used to pin
+        ``d_extent >= pending.est_uncached`` and its docstring used to read
+        "smaller than the front ESTIMATED" -- and boot weg2sb5h refuted the
+        inference: on the natural-prose arm ``d_extent=18,495 < est=20,670``
+        AND the store had handed back nothing (d_extent == P's leg-1
+        ``prompt_tokens``, ``cached_tokens=0``). A char estimate at 3.0
+        chars/token is not evidence of a handback in either direction; only
+        P's measured count is.  The test fossilised the bug it was written to
+        guard, so it moves with the predicate.
+        """
         src = inspect.getsource(Front._requeue_after_x_refusal)
-        self.assertIn("d_extent >= pending.est_uncached", src,
+        self.assertIn("d_extent >= measured_whole", src,
                       "the terminal branch must compare D's measured extent "
-                      "against the front's estimate, not merely exist")
+                      "against P's MEASURED leg-1 count, never against the "
+                      "front's char estimate (#1296)")
+        self.assertNotIn("d_extent >= pending.est_uncached", src,
+                         "the estimate must not be the comparand again")
         self.assertIn("d_extent is not None", src)
 
     def test_the_refusal_prints_the_measured_extent(self):

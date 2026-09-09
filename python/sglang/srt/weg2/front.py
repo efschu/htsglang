@@ -2696,12 +2696,33 @@ class Front:
         # (`scheduler.py::_weg2_answer_x_refusals`: "...extent after prefix
         # matching is {uncached}"); when it cannot be parsed the answer is
         # UNKNOWN and the old re-offer stands, never a refusal on a guess.
+        # #1296: THE COMPARAND IS P'S MEASURED COUNT, NOT THE FRONT'S ESTIMATE.
+        # `est_uncached` is `len(text) / CHARS_PER_TOKEN` (3.0) and its ERROR
+        # CHANGES SIGN WITH THE PROSE. Boot weg2sb5h ran one 62k-char body in
+        # two styles: token salad measured 2.747-2.798 chars/token (13 rids,
+        # estimate too LOW -> `d_extent >= est_uncached` -> W53/413, as
+        # designed) and natural prose 3.355-3.883 (11 rids, estimate too HIGH
+        # -> the same empty handback read as a PARTIAL one -> a second P
+        # prefill and W35/503). Clean 13/11 split with 3.0 sitting in the gap;
+        # the store had handed back NOTHING for all 24 (d_extent == P's leg-1
+        # `prompt_tokens` exactly, `cached_tokens=0`, every one). Cost of the
+        # estimate: 14 second leg-1 prefills, 156.1 s of P wall, 237,983
+        # tokens re-prefilled for 0 cached hits.
+        # P's realised count for THIS request is already on this object
+        # (`Pending.leg1_prompt_tokens`, written in `leg1`), so measuring
+        # against a measurement costs no new bookkeeping and no second store.
         d_extent = _d_refusal_extent(body)
+        measured_whole = int(getattr(pending, "leg1_prompt_tokens", 0) or 0)
         handback_empty = (
             d_extent is not None
             and pending is not None
-            and pending.est_uncached > 0
-            and d_extent >= pending.est_uncached
+            # 0 is UNKNOWN, never "the store returned nothing": route
+            # CARRIER-EXCEEDS sets `leg1_done` WITHOUT running a leg 1
+            # (`p.skip_leg1` in the drain), so this is the only field that
+            # separates "P ran and nothing came back" from "P never ran".
+            # UNKNOWN re-offers -- the same law as an unparsable body.
+            and measured_whole > 0
+            and d_extent >= measured_whole
         )
         if pending is not None and getattr(pending, "leg1_done", False) \
                 and handback_empty:
@@ -2716,8 +2737,11 @@ class Front:
                 f"est_uncached={pending.est_uncached} X="
                 f"{self.tp_prefill_max_tokens} carrier_max="
                 f"{self.carrier_max_tokens} leg1_done=True requeue_n={n} "
-                f"d_extent={d_extent} (>= est_uncached, so the store handed "
-                f"back NOTHING). "
+                f"d_extent={d_extent} leg1_prompt_tokens={measured_whole} "
+                f"(d_extent >= leg1_prompt_tokens, the MEASURED whole prompt, "
+                f"so the store handed back NOTHING; est_uncached is the "
+                f"front's char estimate at CHARS_PER_TOKEN={CHARS_PER_TOKEN} "
+                f"and is printed for the error, not compared -- #1296). "
                 f"If D's `uncached` above is the WHOLE prompt, the store did "
                 f"not hand P's pages back: check D's PHASE-PURITY STORE "
                 f"WITNESS state for this rid (`unprobed` = no read was ever "
@@ -2729,6 +2753,7 @@ class Front:
             return web.json_response(
                 {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
                  "est_uncached": pending.est_uncached,
+                 "leg1_prompt_tokens": measured_whole,
                  "carrier_max": self.carrier_max_tokens,
                  "leg1_done": True},
                 status=413)
