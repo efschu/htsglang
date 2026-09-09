@@ -46,11 +46,12 @@ logger = logging.getLogger(__name__)
 # cap. The denominator is printed with the cap line so a missing rid can never
 # be read as "that station was not reached".
 _924D_SEEN: set = set()
+_924D_SEQ = 0
 _924D_CAP = 8192
 _924D_SUPPRESSED = 0
 
 
-def note_924d(station: str, *, rid=None, slot=None, node_id=None, extra: str = "") -> None:
+def note_924d(station: str, *, rid=None, slot=None, node_id=None, extra: str = "", dedup: bool = True) -> None:
     """One ``#924D`` line per (subject, station). Never raises.
 
     THE SUBJECT IS THE RID WHERE THERE IS ONE AND THE NODE OTHERWISE, and that
@@ -63,7 +64,19 @@ def note_924d(station: str, *, rid=None, slot=None, node_id=None, extra: str = "
     global _924D_SUPPRESSED
     try:
         subject = str(rid)[:12] if rid is not None else f"node{node_id}"
-        key = (subject, station)
+        # #Q0-trail: LIFECYCLE STATIONS MUST NOT DEDUP. The (subject, station)
+        # key prints ONE line per pair, which is right for a census and WRONG
+        # for a trail: a request that allocates a ping-pong buffer TWICE shows
+        # one alloc line, and the second -- the one that strands the first
+        # pair -- is silently dropped. Measured on boot weg2sn5r: the trail
+        # read as complete (alloc [27,28] ... free [9,8]) while the write that
+        # swapped them was suppressed by this very key.
+        global _924D_SEQ
+        if dedup:
+            key = (subject, station)
+        else:
+            _924D_SEQ += 1
+            key = (subject, station, _924D_SEQ)
         if key in _924D_SEEN:
             return
         if len(_924D_SEEN) >= _924D_CAP:

@@ -101,6 +101,13 @@ class SessionSlot:
         req.req_pool_idx = None
         req.req_pool_binding = None
         req.mamba_pool_idx = None
+        try:
+            from sglang.srt.mem_cache.allocator.mamba import note_924d as _n924
+            _b = req.mamba_ping_pong_track_buffer
+            _n924("buffer_write", rid=getattr(req, 'rid', None), dedup=False,
+                  extra="site=session_park buf=" + (str(_b.tolist()) if _b is not None else "None"))
+        except Exception:
+            pass
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
         req.mamba_last_track_seqlen = None
@@ -117,6 +124,13 @@ class SessionSlot:
 
         req.mamba_pool_idx = self.mamba_pool_idx
         req.mamba_ping_pong_track_buffer = self.mamba_ping_pong_track_buffer
+        try:
+            from sglang.srt.mem_cache.allocator.mamba import note_924d as _n924
+            _b = req.mamba_ping_pong_track_buffer
+            _n924("buffer_write", rid=getattr(req, 'rid', None), dedup=False,
+                  extra="site=session_restore buf=" + (str(_b.tolist()) if _b is not None else "None"))
+        except Exception:
+            pass
         req.mamba_next_track_idx = self.mamba_next_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen

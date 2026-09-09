@@ -2662,6 +2662,13 @@ class Req(ReqDllmMixin):
         self.mamba_pool_idx = None
         # #991: the stamp describes the slot, so it dies with the slot.
         self.mamba_slot_acquired_this_admission = False
+        try:
+            from sglang.srt.mem_cache.allocator.mamba import note_924d as _n924
+            _b = self.mamba_ping_pong_track_buffer
+            _n924("buffer_write", rid=getattr(self, "rid", None), dedup=False,
+                  extra="site=reset_for_retract buf=" + (str(_b.tolist()) if _b is not None else "None"))
+        except Exception:
+            pass
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None

@@ -2108,7 +2108,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     return None
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
-                note_924d("alloc", rid=getattr(req, "rid", None), slot=mid)
+                note_924d("alloc", rid=getattr(req, "rid", None), slot=mid, dedup=False)
                 # #991: batch-owned from birth; `_rollback_alloc` is the only
                 # give-back this slot has, and it is this call's own.
                 req.mamba_slot_acquired_this_admission = False
@@ -2318,6 +2318,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # whole boot, slot 13 with no fate line).
         note_924d(
             "alloc_pingpong",
+            dedup=False,
             rid=getattr(req, "rid", None),
             slot=slots,
             extra=f"n={n} buf={buf.tolist()}",
@@ -2365,6 +2366,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # the node and which fresh slot took its place at which index.
         note_924d(
             "donate",
+            dedup=False,
             rid=getattr(req, "rid", None),
             slot=mamba_value_donated,
             node_id=getattr(getattr(req, "last_node", None), "id", None),
@@ -2444,6 +2446,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             # KEPT -- the keep is the half that has never been in any log.
             note_924d(
                 "free_pingpong",
+                dedup=False,
                 rid=getattr(req, "rid", None),
                 slot=mamba_ping_pong_track_buffer_to_free,
                 extra=(
