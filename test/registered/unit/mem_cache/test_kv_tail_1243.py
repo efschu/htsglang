@@ -24,7 +24,9 @@ part of the suite rather than a one-off script.
 import importlib.util
 import os
 import sys
+import types
 import unittest
+import unittest.mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -839,6 +841,429 @@ class TestSizingTerms(CustomTestCase):
     def test_no_mapping_bytes_without_a_pool(self):
         cfg = self._cfg()
         self.assertEqual(cfg._kv_tail_map_bytes(0, 1), 0)
+
+
+# ---------------------------------------------------------------------------
+# T9 -- THE ON-PATH ITSELF RUNS.  Everything below the ``knobs.enabled`` gate
+# was, until this section existed, executed by NOTHING at desk: py_compile, the
+# import smoke and every tail-OFF boot are structurally blind to it, and boot
+# ``weg2kvtail3`` died on all three ranks at the first arm that switched the
+# tail on, on a one-line wrong import module inside that dead region.  These
+# tests take the gate ON as their precondition, so the region is executed here
+# or nowhere.
+# ---------------------------------------------------------------------------
+
+
+class _FakeParallel:
+    """The two ``ParallelContext`` terms the tail's sizing reads."""
+
+    def __init__(self, dcp_size=1, dcp_rank=0):
+        self.attn_dcp_size = dcp_size
+        self.attn_dcp_rank = dcp_rank
+
+
+class _FakeServerArgs:
+    def __init__(self, **kw):
+        self.kv_tail_min_tokens = 0
+        self.kv_tail_max_tokens = KV_TAIL_OPEN
+        self.kv_tail_ring_rows = None
+        self.kv_tail_host_max_tokens = None
+        self.kv_tail_shrink_hysteresis_rounds = None
+        self.kv_tail_virtual_fp8 = False
+        self.kv_tail_sidecar = False
+        self.kv_tail_draft = False
+        self.max_running_requests = 1
+        self.enable_memory_saver = False
+        self.__dict__.update(kw)
+
+
+class _OnPathBase(CustomTestCase):
+    """Every test here installs a DCP topology and removes it again.
+
+    ``set_cp_token_ratios`` is process-global, so a leaked vector would make a
+    later test read a topology it never asked for -- the failure mode is a
+    green suite that proves nothing about the form it claims to cover.
+    """
+
+    RATIOS = (30, 17, 17)  # the rig's measured uneven vector
+
+    def setUp(self):
+        from sglang.srt.distributed.utils import get_cp_token_ratios
+
+        self._saved_ratios = get_cp_token_ratios()
+
+    def tearDown(self):
+        from sglang.srt.distributed.utils import set_cp_token_ratios
+
+        set_cp_token_ratios(self._saved_ratios)
+
+    def _uneven(self, ratios=None):
+        from sglang.srt.distributed.utils import set_cp_token_ratios
+
+        set_cp_token_ratios(list(ratios or self.RATIOS))
+
+    def _parallel(self, dcp_size=1, dcp_rank=0):
+        """Patch ``get_parallel`` WHERE IT IS DEFINED.
+
+        The sizing sites import it lazily inside the function body, so the
+        patch has to land on the owning module's attribute -- and that is
+        exactly what makes this test able to fail on a wrong import MODULE:
+        a site importing it from anywhere else never sees this stub and
+        raises ImportError instead, which is the boot ``weg2kvtail3`` defect.
+        """
+        import sglang.srt.runtime_context as rc
+
+        return unittest.mock.patch.object(
+            rc, "get_parallel", lambda: _FakeParallel(dcp_size, dcp_rank)
+        )
+
+    def _cfg(self, cell_size=1024, itemsize=1, target_cell=None, **sa_kw):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        cfg = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
+        mr = types.SimpleNamespace(server_args=_FakeServerArgs(**sa_kw))
+        cfg._kv_tail_mr = mr
+        cfg._cell_size = cell_size
+        cfg._kv_tail_body_itemsize = itemsize
+        cfg._kv_tail_target_cell_size = (
+            cell_size if target_cell is None else target_cell
+        )
+        return cfg
+
+
+class TestTheRingPostIsComputedAtAll(_OnPathBase):
+    """R1 -- ``_kv_tail_ring_post`` below its ``knobs.enabled`` gate.
+
+    The boot killer of ``weg2kvtail3``: ``get_parallel`` was imported from
+    ``sglang.srt.distributed.parallel_state``, which has never defined it
+    (``grep -c '^def get_parallel(' parallel_state.py`` = 0); it lives in
+    ``sglang.srt.runtime_context``.  NOTHING in the tree referenced
+    ``_kv_tail_ring_post`` before this test.
+    """
+
+    def test_the_post_is_a_positive_charge_with_the_tail_on(self):
+        cfg = self._cfg(kv_tail_min_tokens=16384, max_running_requests=1)
+        with self._parallel(dcp_size=1):
+            post, terms = cfg._kv_tail_ring_post(page_size=1)
+        self.assertGreater(post, 0)
+        self.assertEqual(post, terms["rows"] * terms["cell"])
+        self.assertEqual(terms["min_tokens"], 16384)
+        self.assertEqual(terms["max_tokens"], "open")
+        self.assertEqual(terms["mrr"], 1)
+
+    def test_the_post_reads_this_ranks_dcp_share_off_the_live_topology(self):
+        """The share is READ from ``get_parallel``, never typed: the three
+        ranks of the rig's uneven vector must get three DIFFERENT posts."""
+        self._uneven()
+        posts, shares = [], []
+        for rank in range(3):
+            cfg = self._cfg(kv_tail_min_tokens=16384, max_running_requests=1)
+            with self._parallel(dcp_size=3, dcp_rank=rank):
+                post, terms = cfg._kv_tail_ring_post(page_size=1)
+            posts.append(post)
+            shares.append(terms["share"])
+        self.assertEqual(shares, ["30/64", "17/64", "17/64"])
+        self.assertGreater(posts[0], posts[1])
+        self.assertEqual(posts[1], posts[2])
+
+    def test_the_ring_cell_is_the_body_geometry_at_sixteen_bit(self):
+        """fp8 body -> bf16 ring is exactly a doubling per element."""
+        cfg = self._cfg(cell_size=4096, itemsize=1)
+        cfg._kv_tail_mr.server_args.kv_tail_min_tokens = 16384
+        cfg._kv_tail_mr.server_args.kv_tail_ring_rows = 10
+        with self._parallel(dcp_size=1):
+            post, terms = cfg._kv_tail_ring_post(page_size=1)
+        self.assertEqual(terms["cell"], 8192)
+        self.assertEqual(post, 10 * 8192)
+
+    def test_the_post_is_zero_and_termless_with_the_tail_off(self):
+        """The default path stays byte-identical -- and that is exactly why
+        the region above could not be reached by any tail-off boot."""
+        cfg = self._cfg()
+        with self._parallel(dcp_size=3, dcp_rank=0):
+            self.assertEqual(cfg._kv_tail_ring_post(page_size=1), (0, {}))
+
+
+class TestTheMappingChargeShardsWithTheTopology(_OnPathBase):
+    """R2 -- the SAME wrong import, one function up, but wrapped in a bare
+    ``except Exception: pass``.
+
+    That swallow is why the existing ``TestSizingTerms`` executed this code and
+    still passed: the ImportError was caught and the un-sharded (larger) row
+    count returned.  A test that only asserts "some bytes came back" cannot
+    tell a working topology probe from a dead one, so this one asserts the
+    probe's EFFECT -- the shard.
+    """
+
+    def test_the_weighted_share_really_reduces_the_charge(self):
+        self._uneven()
+        cfg = self._cfg()
+        with self._parallel(dcp_size=3, dcp_rank=1):  # 17/64
+            sharded = cfg._kv_tail_map_bytes(64000, 1)
+        with self._parallel(dcp_size=1):
+            whole = cfg._kv_tail_map_bytes(64000, 1)
+        self.assertLess(sharded, whole)
+        # 17/64 of the context, plus the owner rule's ceil block.
+        self.assertEqual(sharded, 4 * ((64000 // 64 + 1) * 17 + 1 + 1))
+
+    def test_the_three_ranks_charges_follow_the_vector(self):
+        self._uneven()
+        cfg = self._cfg()
+        got = []
+        for rank in range(3):
+            with self._parallel(dcp_size=3, dcp_rank=rank):
+                got.append(cfg._kv_tail_map_bytes(64000, 1))
+        self.assertGreater(got[0], got[1])
+        self.assertEqual(got[1], got[2])
+
+
+class TestTheSizingChainChargesBothPosts(_OnPathBase):
+    """R3 -- ``calculate_pool_sizes`` below ``if tail_post:``."""
+
+    def test_the_pool_shrinks_by_ring_plus_mapping(self):
+        budget = 8 << 30
+        off = self._cfg()
+        with self._parallel(dcp_size=1):
+            base = off.calculate_pool_sizes(budget, 1)
+        on = self._cfg(kv_tail_min_tokens=16384, max_running_requests=1)
+        with self._parallel(dcp_size=1):
+            tail = on.calculate_pool_sizes(budget, 1)
+        self.assertLess(tail.max_total_num_tokens, base.max_total_num_tokens)
+
+    def test_an_unfundable_ring_refuses_by_name_instead_of_oom_at_pool_init(self):
+        from sglang.srt.mem_cache.kv_tail import Weg2KvTailUnfundable
+
+        cfg = self._cfg(
+            kv_tail_min_tokens=16384,
+            kv_tail_ring_rows=1 << 30,
+            max_running_requests=1,
+        )
+        with self._parallel(dcp_size=1):
+            with self.assertRaises(Weg2KvTailUnfundable):
+                cfg.calculate_pool_sizes(1 << 20, 1)
+
+    def test_the_default_path_never_enters_the_charge(self):
+        budget = 8 << 30
+        cfg = self._cfg()
+        with self._parallel(dcp_size=3, dcp_rank=0):
+            cold = cfg.calculate_pool_sizes(budget, 1)
+        self.assertEqual(cold.max_total_num_tokens, budget // 1024)
+
+
+class TestTheMixinRingBuilderRuns(_OnPathBase):
+    """R4 -- ``_install_kv_tail_ring`` below its own ``knobs.enabled`` gate.
+
+    The SAME wrong import a third time.  This is the wall the boot would have
+    hit next, one link past the sizing one, so fixing only the site named in
+    the traceback would have bought exactly one more boot.
+    """
+
+    def _runner(self, rows=256, **sa_kw):
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            ModelRunnerKVCacheMixin,
+        )
+
+        self._fn = ModelRunnerKVCacheMixin._install_kv_tail_ring
+        return types.SimpleNamespace(
+            server_args=_FakeServerArgs(**sa_kw),
+            token_to_kv_pool=_body_pool(rows),
+            is_draft_worker=False,
+            is_draft_pool_worker=False,
+        )
+
+    def test_the_ring_is_installed_on_the_pool_with_the_tail_on(self):
+        self._uneven()
+        mr = self._runner(
+            rows=4096,
+            kv_tail_min_tokens=8,
+            kv_tail_ring_rows=32,
+            max_running_requests=1,
+        )
+        with self._parallel(dcp_size=3, dcp_rank=1):
+            ring = self._fn(mr)
+        self.assertIsNotNone(ring)
+        self.assertIs(mr.token_to_kv_pool.kv_tail, ring)
+        # Weighted DCP -> the allocator hands out GLOBAL indices, so the ring
+        # must have been given the owner rule to translate them with.  The
+        # bounds are the SAME derivation the write side used; a ring that got
+        # None here would free a different live token's row (the F1 defect).
+        self.assertEqual(ring.owner_bounds, (64, 30, 47, 17))
+
+    def test_the_draft_worker_is_exempt_by_name(self):
+        mr = self._runner(kv_tail_min_tokens=8, kv_tail_ring_rows=16)
+        mr.is_draft_worker = True
+        with self._parallel(dcp_size=1):
+            self.assertIsNone(self._fn(mr))
+
+    def test_even_modulo_dcp_is_refused_by_name_not_silently_mis_keyed(self):
+        mr = self._runner(kv_tail_min_tokens=8, kv_tail_ring_rows=16)
+        # No uneven vector installed -> the even modulo lane.
+        with self._parallel(dcp_size=3, dcp_rank=0):
+            with self.assertRaises(Weg2KvTailFormRefused):
+                self._fn(mr)
+
+    def test_the_pool_is_untouched_with_the_tail_off(self):
+        mr = self._runner()
+        with self._parallel(dcp_size=3, dcp_rank=0):
+            self.assertIsNone(self._fn(mr))
+        self.assertIsNone(getattr(mr.token_to_kv_pool, "kv_tail", None))
+
+
+class TestTheLauncherOnPathRefusals(_OnPathBase):
+    """R5 -- ``ServerArgs._handle_kv_tail`` below its ``knobs.enabled`` gate.
+
+    The graph-boundary decision lives here (basis 2.9): slice 1's second decode
+    attention call runs from a PLAIN eager wrapper, so a captured replay would
+    run it against the capture-time plan.  Refused by name at parse time
+    instead of producing wrong numbers at step time.
+    """
+
+    def _sa(self, **kw):
+        from sglang.srt.server_args import ServerArgs
+
+        sa = ServerArgs.__new__(ServerArgs)
+        sa.kv_tail_min_tokens = 0
+        sa.kv_tail_max_tokens = KV_TAIL_OPEN
+        sa.kv_tail_ring_rows = None
+        sa.kv_tail_host_max_tokens = None
+        sa.kv_tail_shrink_hysteresis_rounds = None
+        sa.kv_tail_virtual_fp8 = False
+        sa.kv_tail_sidecar = False
+        sa.kv_tail_draft = False
+        sa.page_size = 1
+        sa.disable_cuda_graph = True
+        for k, v in kw.items():
+            setattr(sa, k, v)
+        return sa
+
+    def test_a_paged_body_is_refused_because_the_mapping_is_per_token(self):
+        sa = self._sa(kv_tail_min_tokens=16384, page_size=16)
+        with self.assertRaises(ValueError) as cm:
+            sa._handle_kv_tail()
+        self.assertIn("--page-size 1", str(cm.exception))
+
+    def test_captured_graphs_are_refused_at_parse_time(self):
+        sa = self._sa(kv_tail_min_tokens=16384, disable_cuda_graph=False)
+        with self.assertRaises(ValueError) as cm:
+            sa._handle_kv_tail()
+        self.assertIn("--disable-cuda-graph", str(cm.exception))
+
+    def test_a_later_slice_flag_is_refused_rather_than_a_parsing_no_op(self):
+        for flag in ("kv_tail_virtual_fp8", "kv_tail_sidecar", "kv_tail_draft"):
+            with self.subTest(flag=flag):
+                sa = self._sa(**{flag: True})
+                with self.assertRaises(ValueError):
+                    sa._handle_kv_tail()
+
+    def test_the_off_path_accepts_the_very_form_the_on_path_refuses(self):
+        """The gate is a real gate: page_size 16 + captured graphs is the
+        DEFAULT serving form and must stay legal while the tail is off."""
+        self._sa(page_size=16, disable_cuda_graph=False)._handle_kv_tail()
+
+
+# ---------------------------------------------------------------------------
+# T10 -- THE RATCHET.  A lazy import under a feature gate is invisible to
+# py_compile, to ruff (which resolves no module contents) and to every boot
+# that leaves the gate off.  This test resolves them instead of trusting them.
+# ---------------------------------------------------------------------------
+
+
+class TestEveryGatedLazyImportResolves(CustomTestCase):
+    """FUTURE CHECK for the ``weg2kvtail3`` class.
+
+    Walks the AST of every file the #1243 slice touches, collects every import
+    written INSIDE a function body -- the ones a module-level import check can
+    never see -- and resolves each name against the module it claims to come
+    from.  A wrong module, a renamed symbol or a symbol that never existed
+    fails HERE, at desk, instead of on three ranks at boot.
+    """
+
+    FILES = (
+        "sglang/srt/mem_cache/kv_tail.py",
+        "sglang/srt/model_executor/pool_configurator.py",
+        "sglang/srt/model_executor/model_runner_kv_cache_mixin.py",
+        "sglang/srt/layers/dcp/owner.py",
+        "sglang/srt/layers/attention/flashinfer_backend.py",
+        "sglang/srt/server_args.py",
+    )
+
+    @staticmethod
+    def _function_scoped_sglang_imports(path):
+        """``(module, [names], lineno)`` for every ``from sglang... import ...``
+        that is NOT at module scope."""
+        import ast
+
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        out = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.ImportFrom):
+                    continue
+                if inner.level or not (inner.module or "").startswith("sglang"):
+                    continue
+                out.append(
+                    (inner.module, [a.name for a in inner.names], inner.lineno)
+                )
+        return out
+
+    def test_every_function_scoped_sglang_import_in_the_slice_resolves(self):
+        import importlib
+        import sglang
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(sglang.__file__)))
+        broken, checked = [], 0
+        for rel in self.FILES:
+            path = os.path.join(root, rel)
+            self.assertTrue(os.path.exists(path), path)
+            for module, names, lineno in self._function_scoped_sglang_imports(path):
+                checked += 1
+                try:
+                    mod = importlib.import_module(module)
+                except Exception as exc:  # noqa: BLE001
+                    broken.append(f"{rel}:{lineno} import {module}: {exc!r}")
+                    continue
+                for name in names:
+                    if not hasattr(mod, name):
+                        broken.append(
+                            f"{rel}:{lineno} {module} has no {name!r} "
+                            f"(defined elsewhere?)"
+                        )
+        # The population is named, per the denominator law: a green here is
+        # only worth the number of imports it actually resolved.
+        self.assertGreater(checked, 40, "the AST walk collected almost nothing")
+        self.assertEqual(broken, [], "\n".join(broken))
+
+    def test_get_parallel_is_not_importable_from_parallel_state(self):
+        """The exact wrong module, pinned so a future edit cannot re-adopt it.
+
+        ``parallel_state`` mentions ``get_parallel`` only in a docstring; the
+        accessor is a ``runtime_context`` symbol that reads THROUGH to
+        parallel_state, which is precisely why the wrong module reads
+        plausible.
+        """
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.runtime_context import get_parallel
+
+        self.assertFalse(hasattr(parallel_state, "get_parallel"))
+        self.assertTrue(callable(get_parallel))
+
+    def test_no_slice_file_imports_get_parallel_from_the_wrong_module(self):
+        import sglang
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(sglang.__file__)))
+        offenders = []
+        for rel in self.FILES:
+            with open(os.path.join(root, rel), encoding="utf-8") as fh:
+                for n, line in enumerate(fh, 1):
+                    if (
+                        "parallel_state import" in line
+                        and "get_parallel" in line
+                    ):
+                        offenders.append(f"{rel}:{n}")
+        self.assertEqual(offenders, [])
 
 
 # ---------------------------------------------------------------------------
