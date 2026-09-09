@@ -21,9 +21,33 @@ the floor the same instant offers 2024 - 819 = 1205 MiB and it funds.
 SCOPE IS THE POINT. This is the STAGING reserve, not the corridor law. Every
 ordinary allocation is still judged against the centre by the guard; only the
 cutover -- bounded, unanimous, over in seconds -- reaches into the tolerance.
+
+#1257c RE-EXPRESSED THE INPUTS OF THIS FILE (2026-09-09); the arithmetic is
+untouched.
+
+When #662 was written, ``--rank-user-reserve-mib`` WAS the corridor law: it
+defaulted to 1024 and ``_seam_staging_reserve_bytes`` read
+``rank_user_reserve_mib or 1024``. The user decision of 2026-09-09 separates
+the two quantities that literal conflated -- "die 1024er grenze ... existiert
+ja nur weil du den wahren vram verbrauch nicht bepreisen konntest UND weil ich
+manchmal noch vram fuer andere prozesse brauche" -- so the law is the awake
+group's measured transient (or the named 1024 fallback) and the reserve is an
+ADDITIONAL per-card term on top of it, defaulting to 0.
+
+GATE C's instant is therefore now stated as "law 1024, user reserve 0", which
+is what it always physically was; ``_args(1024)`` now means law 1024 PLUS a
+1024 MiB reserve, a different scenario. Every number below is the same number
+as before -- only the input that produces it is named correctly.
+
+AND THE STUB NOW EXPOSES WHAT THE CODE READS. ``_args`` supplied a bare
+``rank_user_reserve_mib`` field, which the shipped function stopped reading
+when the reserve became a per-card quantity, so these tests were green without
+the reserve reaching the code at all.
 """
 
 import types
+
+import pytest
 
 from sglang.srt.managers import corridor_guard as cg
 from sglang.srt.managers import phase_flip_runtime as pfr
@@ -31,25 +55,36 @@ from sglang.srt.managers import phase_flip_runtime as pfr
 MIB = 1 << 20
 
 
-def _args(reserve_mib=1024):
-    return types.SimpleNamespace(rank_user_reserve_mib=reserve_mib)
+@pytest.fixture(autouse=True)
+def _no_ambient_corridor_env(monkeypatch):
+    """A leaked law override or per-card reserve would move every number."""
+    monkeypatch.delenv(cg.LAW_ENV, raising=False)
+    monkeypatch.delenv(cg.USER_RESERVE_ENV, raising=False)
+
+
+def _args(reserve_mib=0):
+    """A ServerArgs stub shaped like the one the shipped function reads."""
+    return types.SimpleNamespace(
+        rank_user_reserve_mib=reserve_mib,
+        user_reserve_mib_scalar=lambda: reserve_mib,
+    )
 
 
 def test_the_seam_reserves_the_band_floor_not_the_centre():
-    assert pfr._seam_staging_reserve_bytes(_args(1024)) == 819 * MIB
+    assert pfr._seam_staging_reserve_bytes(_args(0)) == 819 * MIB
 
 
 def test_it_tracks_the_declared_band_rather_than_a_private_constant():
-    reserve = 1024
-    expected = int(round(reserve * (1.0 - cg.CORRIDOR_BAND_FRACTION)))
-    assert pfr._seam_staging_reserve_bytes(_args(reserve)) == expected * MIB
+    law = cg.CORRIDOR_LAW_MIB
+    expected = int(law - law * cg.CORRIDOR_BAND_FRACTION)
+    assert pfr._seam_staging_reserve_bytes(_args(0)) == expected * MIB
 
 
 def test_the_measured_refusal_now_funds():
     """The GATE C instant, replayed as arithmetic."""
     driver_free, staging_needed = 2024 * MIB, 1059 * MIB
     centre_reserve = 1024 * MIB
-    floor_reserve = pfr._seam_staging_reserve_bytes(_args(1024))
+    floor_reserve = pfr._seam_staging_reserve_bytes(_args(0))
 
     assert driver_free - centre_reserve < staging_needed, "what was refused"
     assert driver_free - floor_reserve >= staging_needed, "what now funds"
@@ -58,17 +93,30 @@ def test_the_measured_refusal_now_funds():
 
 
 def test_a_bigger_user_reserve_still_scales_with_the_band():
-    assert pfr._seam_staging_reserve_bytes(_args(2048)) == 1638 * MIB
+    """1024 MiB of ADDITIONAL user reserve on top of the 1024 MiB law."""
+    assert pfr._seam_staging_reserve_bytes(_args(1024)) == 1638 * MIB
 
 
 def test_an_absent_reserve_falls_back_to_the_shipped_default():
     assert pfr._seam_staging_reserve_bytes(types.SimpleNamespace()) == 819 * MIB
 
 
-def test_the_seam_never_reserves_MORE_than_the_user_asked_for():
-    """A tolerance that made the reserve larger would be a refusal machine."""
-    for mib in (256, 1024, 4096):
-        assert pfr._seam_staging_reserve_bytes(_args(mib)) <= mib * MIB
+def test_the_tolerance_never_makes_the_reserve_LARGER():
+    """A tolerance that grew the reserve would be a refusal machine.
+
+    #1257c restates the BOUND because the quantity moved. It used to read
+    "never more than the user asked for", which held only while the user's
+    reserve WAS the whole law; with the default reserve at 0 that bound would
+    now demand a seam reserve of zero -- the ``cuMemCreate failed:
+    CUDA_ERROR_OUT_OF_MEMORY`` this module exists to avoid. The property that
+    carries #662's intent is the one about the BAND: the seam may reach INTO
+    the tolerance and never above the floor it is measured from.
+    """
+    for reserve in (0, 256, 1024, 4096):
+        floor = cg.corridor_floor_mib("", user_reserve_mib=reserve)
+        got = pfr._seam_staging_reserve_bytes(_args(reserve))
+        assert got <= floor.mib * MIB
+        assert got == floor.verdict_floor_mib * MIB
 
 
 def test_the_corridor_law_itself_is_untouched():

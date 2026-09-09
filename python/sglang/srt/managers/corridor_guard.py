@@ -408,6 +408,20 @@ def corridor_ceiling_for_floor_mib(floor_mib: int) -> int:
     return int(round(f + f * CORRIDOR_BAND_FRACTION))
 
 
+def unmobilised_above_ceiling_mib(free_mib: int, ceiling_mib: int) -> int:
+    """MiB resting above a KNOWN ceiling, or 0. Never a failure by itself.
+
+    The ceiling-first form of :func:`unmobilised_free_mib`, for a consumer that
+    already holds the edge (a pre-#1257c log grades against the band's OWN
+    ceiling, which is not derivable from the band floor). It exists so that
+    ``corridor_arm.arm_report`` does not do the subtraction itself: #656's
+    one-converter gate forbids arithmetic there BY NAME, because a second
+    subtraction in that function is exactly how the two readers came to
+    disagree about the unit.
+    """
+    return max(0, int(free_mib) - int(ceiling_mib))
+
+
 def unmobilised_free_mib(free_mib: int, floor_mib: int) -> int:
     """MiB resting ABOVE the finding edge, or 0. Never a failure by itself.
 

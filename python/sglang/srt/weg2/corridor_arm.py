@@ -59,11 +59,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Tuple
 
-# NO ``corridor_guard`` IMPORT HERE ANY MORE. Every rule this module used to
-# call it for -- the verdict threshold and the unmobilised-free edge -- now
-# arrives ON the floor it is grading (``ring_table.FrontFloor``), which
-# derives both through the guard itself. One reader, and no way for the arm
-# to grade a floor by a rule the floor does not agree with.
+# The guard is imported for its ARITHMETIC, never for a rule restated here:
+# the verdict threshold and the finding edge arrive ON the floor being
+# graded (``ring_table.FrontFloor``), and the one subtraction this module
+# needs is delegated because #656's one-converter gate forbids a ``-`` in
+# ``arm_report`` by name.
+from sglang.srt.managers import corridor_guard
 from sglang.srt.weg2 import front, ring_table
 
 #: The DELTAS a pre-fix pairing shows, MiB.  Used ONLY to recognise the pre-fix
@@ -388,7 +389,7 @@ def arm_report(
                 # floor, named as PRE-1257C-BAND. Gating it would have made an
                 # over-filled card invisible on exactly the logs that have
                 # been taken so far.
-                elif mib > ceiling:
+                elif corridor_guard.unmobilised_above_ceiling_mib(mib, ceiling):
                     # DECISION 5, 2026-09-09: the upper edge is a FINDING and
                     # never a FAIL on its own. It says MiB are sitting
                     # unmobilised, which is a capacity question for the
@@ -397,7 +398,7 @@ def arm_report(
                     # ``problems`` and failed acceptances on it.
                     rep.findings.append(
                         f"phase={phase} nvml{idx} unmobilised_free_mib="
-                        f"{mib - ceiling} "
+                        f"{corridor_guard.unmobilised_above_ceiling_mib(mib, ceiling)} "
                         f"(minimum {mib} MiB against a {floor} MiB floor, "
                         f"ceiling {ceiling} MiB, source={source}); a FINDING, "
                         f"not a failure"
