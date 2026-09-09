@@ -310,21 +310,34 @@ class MutantsOnTheDangerDirection(CustomTestCase):
         self.assertEqual(list(solve.budgets), [28800, 18136, 18120])
 
     def test_mutant_2_free_column_read_as_total_minus_used(self):
-        """M2: drop the driver carve-out -- i.e. read the free column as
-        ``total - used`` instead of NVML free v2. +518 MiB on the 5090 turns a
-        474 MiB breach into a 992... still short, so the mutant is sharpened to
-        the exact form the rule forbids: carve-out zeroed on BOTH sides. The
-        prediction then reads 992 and the SHIPPED code must not."""
+        """M2: read the free column as ``total - used`` -- the solver dropping
+        the driver carve-out from its OWN terms while the sample stays as
+        measured. +518 MiB of fiction on the 5090: 474 reads as 992.
+
+        Sharpened by the first remote run (2026-09-09, cachyllama, junit): the
+        naive mutation (carve zeroed on BOTH sides) is SELF-COMPENSATING --
+        ``awake_residue`` is derived from the same sample, absorbs the 518 and
+        the prediction stays 474. That is a calibration property worth its own
+        assertion, and it means the dangerous mutant is precisely the
+        asymmetric one: a live boot whose solver reads total-used against a
+        sample that was measured honestly."""
         cards, budgets, dormant = sb5f_boot()
         s = sb5f_sample()
         sc = s.by_uuid[SB5F_UUID_5090]
-        blind = replace(sc, driver_reserved_mib=0)
-        mutant_free = cb._predicted_free_mib(32607, 29352, 1334, 0, blind)
         honest_free = cb._predicted_free_mib(32607, 29352, 1334, 518, sc)
         self.assertEqual(honest_free, 474)
+        # THE MUTANT: solver-side carve dropped, sample untouched.
+        mutant_free = cb._predicted_free_mib(32607, 29352, 1334, 0, sc)
         self.assertEqual(mutant_free, honest_free + 518)
-        # The carve-out is 518 MiB of pure fiction in the free column; the rule
-        # that forbids it is why the shipped reading stays 474.
+        # THE CALIBRATION PROPERTY (measured on the first remote run): zeroing
+        # the carve on both sides cancels through the derived residue, so a
+        # consistently carve-blind instrument still reproduces the sampler at
+        # the sample's own budget -- the error would only open up as budgets
+        # move. Pinned so nobody reads it as the mutant above being harmless.
+        blind = replace(sc, driver_reserved_mib=0)
+        self.assertEqual(blind.awake_residue_mib, sc.awake_residue_mib + 518)
+        self.assertEqual(cb._predicted_free_mib(32607, 29352, 1334, 0, blind), 474)
+        # The shipped solve carries the measured carve and stays at 474.
         solve = cb.solve_corridor_budgets(cards, budgets, dormant, s)
         self.assertEqual(field(line_for(solve, SB5F_UUID_5090), "predicted_free_mib"),
                          "474")
@@ -393,9 +406,11 @@ class MutantsOnTheDangerDirection(CustomTestCase):
                 fh.write("{not json")
             short = os.path.join(d, "short.json")
             with open(short, "w") as fh:
+                # genuinely incomplete: the card row has no profiled_tokens,
+                # so the world-pool side of the constraint cannot be priced
+                card = dict(SB5F_CARDS[0], free_idle_mib=578, free_load_mib=474)
                 json.dump({"cell_size": 32768, "token_vector": [1],
-                           "cards": [dict(SB5F_CARDS[0], free_idle_mib=1, free_load_mib=1,
-                                          profiled_tokens=1)]}, fh)
+                           "cards": [card]}, fh)
             for path in (missing, bad, short):
                 sample, why = cb.load_sample(path)
                 self.assertIsNone(sample, f"{path} must not load")
