@@ -52,7 +52,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import admin_key as admin_key_mod
@@ -3537,6 +3537,22 @@ class DOperatingPointRow:
     #: and can halve this.
     funded_ctx_tokens: Optional[int] = None
     note: str = ""
+    #: #1293. WHICH AXIS THE ATTENTION FAMILY'S COMPUTE RIDES on this boot's
+    #: geometry -- ``"token"`` under replicated-KV uneven DCP, ``"head"``
+    #: otherwise. It is not decoration: it names the grid the W53 saturation
+    #: verdict below was taken against, and the two grids differ by 16x on this
+    #: rig (4 kv-head units vs 64 token units), which is the difference between
+    #: a position being representable and being refused.
+    attn_axis: str = "head"
+    #: The DCP token partition of ``_CP_TOKEN_UNITS`` units (largest-remainder,
+    #: the same partitioner and the same units the runtime's own "Uneven DCP:
+    #: auto-set dcp_size" install uses). Empty tuple on the head axis, where
+    #: there is no token vector to report.
+    attn_token_units: Tuple[int, ...] = ()
+    #: Floor-aware re-normalisation statement: which family/axis had a rank
+    #: pinned at the partitioner's one-unit floor, and how far the REALISED
+    #: shares then sit from the requested ratio. Empty when no grid binds.
+    axis_note: str = ""
 
 
 def _gcd_reduce(values: Sequence[int]) -> Tuple[int, ...]:
@@ -3578,6 +3594,93 @@ def d_plan_inputs(model: str, tp_size: int, d_bs: int):
     )
 
 
+def _attn_axis_for(weights: Sequence[int], plan_flags) -> str:
+    """Which axis the attention family's COMPUTE rides for one D vector (#1293).
+
+    ``"token"`` exactly when the boot form is replicated-KV uneven DCP -- the
+    serving form: every rank keeps the FULL replicated kv-head set and runs the
+    attention core over its own TOKEN shard, so the compute follows the token
+    vector, which is continuous (#492: "attention grid-PINNED was FALSE").
+    ``"head"`` otherwise (even DCP, no DCP, or a uniform plan), where the
+    kv-head unit grid genuinely carries the family.
+
+    THE PREDICATE IS #503's SHARED ONE, NOT A THIRD SPELLING.
+    ``plan_uneven_dcp_kv_replicated`` (distributed/utils.py, placed next to the
+    runtime's ``uneven_dcp_kv_replicated`` by #503 so the two cannot drift)
+    answers this exact question at plan time from the flags about to be
+    emitted. A ``plan_flags`` with no DCP evidence (``dcp_size`` unset and no
+    KV token vector) answers "head" for ANY weights -- a non-DCP form must
+    never silently take the token axis, because there the token vector does
+    not exist and the head grid is the real carrier.
+    """
+    from sglang.srt.distributed.utils import plan_uneven_dcp_kv_replicated
+
+    return (
+        "token"
+        if plan_uneven_dcp_kv_replicated(plan_flags, list(weights))
+        else "head"
+    )
+
+
+def _axis_floor_ranks(units: int, weights: Sequence[int]) -> Tuple[int, ...]:
+    """Ranks whose proportional share of ``units`` is BELOW one whole unit.
+
+    ``partition_units`` guarantees every rank >= 1 unit, so each of these is
+    pinned at the partitioner's floor and the realised split stops carrying the
+    weight ratio on that axis. This is the one REACHABLE failure of a unit grid
+    -- a rank owning ZERO units cannot happen -- and naming the ranks rather
+    than answering yes/no is what lets the caller re-normalise against the grid
+    that binds and say WHICH rank moved.
+    """
+    total = sum(int(w) for w in weights)
+    if total <= 0 or int(units) <= 0:
+        return tuple()
+    return tuple(
+        r
+        for r, w in enumerate(weights)
+        if float(int(w)) / float(total) * float(int(units)) < 1.0
+    )
+
+
+def _axis_renormalisation(
+    family: str,
+    axis: str,
+    units: int,
+    weights: Sequence[int],
+    realised: Sequence[int],
+) -> str:
+    """Floor-aware re-normalisation, as a printable statement (#1293).
+
+    When a grid binds, ``partition_units`` floors the starved ranks to one unit
+    and takes the shortfall back off the largest shares, so the realised
+    fractions are NOT the requested ratio. Printing the requested ratio there
+    would be the instrument-text-lies shape -- the number reported would not be
+    the number shipped. This prints BOTH plus the drift between them, with the
+    family and the axis named, so a floored grid is READABLE instead of either
+    silently wrong or automatically fatal.
+    """
+    floored = _axis_floor_ranks(units, weights)
+    if not floored or not realised:
+        return ""
+    w_total = float(sum(int(w) for w in weights)) or 1.0
+    r_total = float(sum(int(u) for u in realised)) or 1.0
+    want = [float(int(w)) / w_total for w in weights]
+    got = [float(int(u)) / r_total for u in realised]
+    return (
+        "%s/%s grid BINDS: rank(s) %s below one of %d units, pinned at the "
+        "floor; realised shares %s vs requested %s (max drift %.3f)"
+        % (
+            family,
+            axis,
+            list(floored),
+            int(units),
+            [round(g, 3) for g in got],
+            [round(w, 3) for w in want],
+            max(abs(g - w) for g, w in zip(got, want)),
+        )
+    )
+
+
 def d_operating_point_rows(
     cards: Sequence[Card],
     budgets: Sequence[int],
@@ -3604,11 +3707,13 @@ def d_operating_point_rows(
 
     # -- the geometry and the cost model, both the runtime's own -------------
     pcm = None
+    plan = None
     try:
         from sglang.srt.uneven_perf import PerfCostModel
 
+        plan = d_plan_inputs(model, len(budgets), d_bs)
         pcm = PerfCostModel(
-            d_plan_inputs(model, len(budgets), d_bs),
+            plan,
             list(maxkv_weights),
             list(budgets),
         )
@@ -3685,9 +3790,24 @@ def d_operating_point_rows(
         return ([], refusals)
 
     # -- the three rows ------------------------------------------------------
-    from sglang.srt.distributed.utils import partition_units
+    from sglang.srt.distributed.utils import _CP_TOKEN_UNITS, partition_units
 
     n_ranks = len(budgets)
+
+    # #1293 -- the plan-time flags the attention-axis predicate reads. This
+    # launcher's group D always ships ``--uneven-dcp`` + ``--uneven-dcp-
+    # weighted`` (``early_read_flags("D")``), and the W54 gate immediately
+    # above has just PROVEN both facts present -- under a non-uniform
+    # ``--rank-tp-ratio`` the runtime then auto-sets ``dcp_size = tp_size``
+    # (server_args.py:12112-12128, "Uneven DCP: auto-set dcp_size"). Mirroring
+    # that auto-set here is gated on the SAME fact the W54 check read, so a
+    # future form that stops shipping the env fact falls back to the head
+    # axis instead of silently keeping the token one. The non-uniformity half
+    # of the predicate stays inside ``plan_uneven_dcp_kv_replicated`` itself.
+    uneven_dcp_armed = "SGLANG_UNEVEN_DCP" in have
+    dcp_flags = replace(
+        plan, dcp_size=(n_ranks if uneven_dcp_armed else plan.dcp_size)
+    )
 
     def _fam_partition(units: int, weights: Sequence[int]) -> Tuple[int, ...]:
         """Partition ``units`` over ``weights``, or ``()`` if the runtime
@@ -3726,6 +3846,33 @@ def d_operating_point_rows(
             attn_units = list(partition_units(grid, list(weights)))
             scale = int(pcm.q_heads) // max(1, grid)
             attn = tuple(u * scale for u in attn_units)
+            # #1293 THE AXIS THE ATTENTION COMPUTE RIDES. Under replicated-KV
+            # uneven DCP (the serving form: dcp_size=3, replicated kv heads,
+            # token-sharded, weighted owner rule #173) the attention COMPUTE
+            # follows the TOKEN vector, not the kv-head unit grid -- #492's
+            # correction verbatim: "attention grid-PINNED was FALSE -- kv
+            # heads are replicated, attention compute follows the token
+            # vector (continuous)". The head partition above stays what the
+            # PROJECTIONS really do (that split is real and prices the weight
+            # terms below); the token partition is what the family's per-rank
+            # work follows, on the SAME 64-unit largest-remainder grid the
+            # runtime's own "Uneven DCP ... installed" vector uses
+            # (_CP_TOKEN_UNITS, distributed/utils.py). This is #503's escape
+            # extended to this solve: #503 fixed the phase-prefill enumerator
+            # gridding attention on kv-heads (placement.py:813 models it
+            # right); the same class sat here.
+            axis = _attn_axis_for(weights, dcp_flags)
+            token_units: Tuple[int, ...] = ()
+            if axis == "token" and position != "maxkv":
+                # The position's own intent made concrete: token ownership
+                # proportional to the measured rates, integerised exactly the
+                # way the runtime integerises its token vector. For maxkv
+                # (auto) the runtime DERIVES its capacity-matched vector
+                # instead; that derived vector is read off predict_capacity
+                # below rather than re-spelled here.
+                token_units = tuple(
+                    partition_units(_CP_TOKEN_UNITS, list(weights))
+                )
             # GDN through the cost model's OWN partitioner, so its predicate
             # (and its `[0] * tp_size` answer for a model it will not shard)
             # is inherited rather than re-implemented.
@@ -3748,10 +3895,55 @@ def d_operating_point_rows(
                         world_pool_tokens=None,
                         feasible=None,
                         funded_ctx_tokens=None,
+                        attn_axis=axis,
+                        attn_token_units=token_units,
                     ),
                     None,
                 )
             mlp = list(mlp_part)
+            # #1293 floor-aware re-normalisation, per family, per axis. When a
+            # unit grid floors a rank, the realised shares drift off the
+            # requested ratio; the drift is PRINTED with the family and the
+            # axis instead of either passing silently (instrument-text-lies
+            # shape) or being fatal for a grid that no longer carries the
+            # compute. Families checked on the grid they actually ride: the
+            # attention COMPUTE on its axis (token grid when uneven DCP, the
+            # head grid otherwise), the attention PROJECTIONS always on the
+            # head grid (their split is real either way), GDN and MLP on
+            # their own unit grids.
+            _notes = []
+            if axis == "token":
+                if token_units:
+                    _notes.append(
+                        _axis_renormalisation(
+                            "attention", "token", _CP_TOKEN_UNITS, weights,
+                            token_units,
+                        )
+                    )
+                _notes.append(
+                    _axis_renormalisation(
+                        "attention-projections", "head", grid, weights,
+                        attn_units,
+                    )
+                )
+            else:
+                _notes.append(
+                    _axis_renormalisation(
+                        "attention", "head", grid, weights, attn_units
+                    )
+                )
+            if gdn:
+                _notes.append(
+                    _axis_renormalisation(
+                        "GDN", "head", int(pcm.gdn_units), weights, list(gdn)
+                    )
+                )
+            _notes.append(
+                _axis_renormalisation(
+                    "MLP", "unit", int(pcm.mlp_units), weights, mlp
+                )
+            )
+            axis_note = "; ".join(n for n in _notes if n)
         except Exception as exc:  # pragma: no cover - geometry is diagnostic
             return (
                 DOperatingPointRow(
@@ -3831,12 +4023,28 @@ def d_operating_point_rows(
         feasible: Optional[bool] = None
         funded_ctx: Optional[int] = None
         try:
-            cap = pcm.predict_capacity(mlp, list(attn_units))
+            # #1293: a token-axis POSITION pins its own token vector, so the
+            # funded context priced is the pinned vector's own budget
+            # (predict_capacity's #492 arm: cp_token_context_budget of the pin,
+            # strictly the weaker of the two) -- the price of taking token
+            # ownership proportional to a rate instead of to capacity reaches
+            # the gate rather than being rounded away. maxkv (auto) keeps the
+            # byte-identical derived-matched call, and its token vector is
+            # read BACK off the model's own answer below.
+            cap = (
+                pcm.predict_capacity(
+                    mlp, list(attn_units), token_vector=list(token_units)
+                )
+                if token_units
+                else pcm.predict_capacity(mlp, list(attn_units))
+            )
             pool = int(sum(cap["p"]))
             if "feasible" in cap:
                 feasible = bool(cap["feasible"])
             if cap.get("ctx") is not None:
                 funded_ctx = int(cap["ctx"])
+            if position == "maxkv" and axis == "token" and cap.get("token_vector"):
+                token_units = tuple(int(v) for v in cap["token_vector"])
         except Exception:
             pool = None
         refusal = None
@@ -3865,6 +4073,9 @@ def d_operating_point_rows(
                 feasible=feasible,
                 funded_ctx_tokens=funded_ctx,
                 note=note,
+                attn_axis=axis,
+                attn_token_units=token_units,
+                axis_note=axis_note,
             ),
             refusal,
         )
@@ -3910,9 +4121,27 @@ def d_operating_point_rows(
     for row in rows[1:]:
         sat_family = None
         sat_rank = None
-        for fam_name, fam_units in (
-            ("attention", int(pcm.attn_units)),
-            ("GDN", int(pcm.gdn_units)),
+        sat_units = None
+        sat_axis = None
+        # #1293: THE GRID THE VERDICT IS TAKEN AGAINST IS THE GRID THE COMPUTE
+        # RIDES. Under replicated-KV uneven DCP the attention compute follows
+        # the TOKEN vector (row.attn_axis == "token"), so saturation for that
+        # family is judged on the 64-unit token grid -- the 4-kv-head-unit
+        # grid stopped carrying the family's compute the moment the KV heads
+        # were replicated (#492), and refusing a measured ratio against a grid
+        # it does not ride was this seam's defect (boot weg2dec1 arms 2/3,
+        # BOOT_weg2dec1_0909.md). The refusal itself STAYS for a vector that
+        # genuinely cannot be represented on its riding axis (a rank's token
+        # share below 1/64), and for every head-axis form.
+        for fam_name, fam_units, fam_axis in (
+            (
+                "attention",
+                _CP_TOKEN_UNITS
+                if row.attn_axis == "token"
+                else int(pcm.attn_units),
+                row.attn_axis,
+            ),
+            ("GDN", int(pcm.gdn_units), "head"),
         ):
             # SAME PREDICATE AS THE PARTITION (review R2). A family the
             # runtime does not shard by the vector has no axis to disable, so
@@ -3923,14 +4152,21 @@ def d_operating_point_rows(
                 continue
             r = _saturated(row.weights, fam_units)
             if r is not None:
-                sat_family, sat_rank = fam_name, r
+                sat_family, sat_rank, sat_units, sat_axis = (
+                    fam_name, r, fam_units, fam_axis,
+                )
                 break
         if sat_family is not None:
+            if sat_family == "attention":
+                sat_part = list(row.attn_token_units or row.attn_heads)
+            else:
+                sat_part = list(row.gdn_heads)
             refusals.append(
                 "W53 Weg2TpOperatingPointDisablesUnevenAxis: position %s "
-                "derives weights %s; rank %d's share of the %d %s units is "
-                "below ONE unit, so partition_units floors it to 1 (it "
-                "guarantees >= 1 per rank) and the shipped partition %s no "
+                "derives weights %s; rank %d's share of the %d %s units "
+                "(axis=%s) is below ONE unit, so partition_units floors "
+                "it to 1 (it guarantees >= 1 per rank) and the shipped "
+                "partition %s no "
                 "longer represents the measured ratio -- the axis is pinned at "
                 "its floor, which is the axis disabled in the sense a boot can "
                 "observe. Refused rather than shipped."
@@ -3938,11 +4174,10 @@ def d_operating_point_rows(
                     row.position,
                     list(row.weights),
                     int(sat_rank),
-                    int(pcm.attn_units) if sat_family == "attention"
-                    else int(pcm.gdn_units),
+                    int(sat_units),
                     sat_family,
-                    list(row.attn_heads) if sat_family == "attention"
-                    else list(row.gdn_heads),
+                    sat_axis,
+                    sat_part,
                 )
             )
         elif len(set(row.weights)) == 1 and len(row.weights) > 1:
@@ -3975,8 +4210,19 @@ def d_operating_point_line(
             if row.round_ms is not None
             else row.round_unit
         )
+        # #1293: which axis the attention compute rides, named per row, plus
+        # the token partition when that axis carries it and the floor-binding
+        # statement when any grid binds. `attn_axis=head` is the pre-DCP
+        # reading of the attn heads printed before it; `attn_axis=token`
+        # says the heads are the PROJECTION split and the compute follows
+        # `token_units`.
+        axis_bit = " attn_axis=%s" % row.attn_axis
+        if row.attn_token_units:
+            axis_bit += " token_units %s" % (list(row.attn_token_units),)
+        if row.axis_note:
+            axis_bit += " [%s]" % row.axis_note
         parts.append(
-            "%s%s: weights %s from %s %s -> attn %s GDN %s, round %s, world pool "
+            "%s%s: weights %s from %s %s -> attn %s%s GDN %s, round %s, world pool "
             "%s, funded ctx %s, feasible %s"
             % (
                 row.position,
@@ -3985,6 +4231,7 @@ def d_operating_point_line(
                 row.score_name,
                 [round(x, 1) for x in row.scores],
                 list(row.attn_heads),
+                axis_bit,
                 list(row.gdn_heads),
                 priced,
                 row.world_pool_tokens
