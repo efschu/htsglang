@@ -56,7 +56,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import (
+    ClientConnectionError,
+    ClientSession,
+    ClientTimeout,
+    ServerDisconnectedError,
+    TraceConfig,
+    web,
+)
 
 from sglang.srt.managers.corridor_guard import (
     corridor_band_ceiling_mib,
@@ -120,6 +127,93 @@ D_POOL_MAX_AGE_S = 1.0
 #: decision -- on the critical path, and even with the gate flag off.
 D_POOL_READ_TIMEOUT_S = D_POOL_MAX_AGE_S
 RPC_TIMEOUT_S = 900.0
+
+# ---------------------------------------------------------------------------
+# #1285: WHICH SOCKET DID THIS RPC GO OUT ON, AND WAS IT A FRESH ONE
+#
+# Boot weg2sb5e died with BOTH gathered flip legs returning
+# `ServerDisconnectedError` after ~117 s, while P answered `/health` on new
+# connections in the same seconds and logged NO access line for the resume.
+# RPC_TIMEOUT_S is 900 s, so it was not a timeout; the front's ONE shared
+# `ClientSession` has no `TCPConnector` of its own, i.e. aiohttp's defaults --
+# keepalive on, `force_close=False`, `limit_per_host=0`.  The leading
+# hypothesis is a STALE POOLED KEEPALIVE connection reused after the peer had
+# closed it, but that shape normally raises at once rather than after 117 s,
+# so it stays a HYPOTHESIS.  Nothing in the old logs can decide it, because
+# nothing recorded which socket an RPC used.  These three lines record it.
+#
+# INSTRUMENT LIMITS, stated because a field that silently degrades is worse
+# than an absent one (aiohttp 3.14.1, verified against `__slots__`):
+#   * `conn` comes from the TraceConfig hooks `on_connection_reuseconn` /
+#     `on_connection_create_end`, which fire reliably but carry NO payload in
+#     this aiohttp -- both param classes have only `__weakref__`.  So they can
+#     say WHICH of the two happened and nothing more.
+#   * `sport` therefore comes from the RESPONSE's own connection transport
+#     (`sockname`), which exists only once a response was received.  On the
+#     RAISED path there is no response and `sport=n/a` -- absent, never 0.
+#   * `pool_idle` / `pool_total` read the connector's private `_conns` /
+#     `_acquired`.  Both are best-effort: an aiohttp that renames them yields
+#     `-1`, which is "unreadable", not "empty".
+#: The two flip legs, by path.  Everything else is `other` -- the leg name is
+#: what makes the log greppable per direction, and only these two are the
+#: gathered pair of `interleave`.
+RPC_LEG_BY_PATH = {
+    "/release_memory_occupation": "sleep",
+    "/resume_memory_occupation": "wake",
+}
+#: Connection-level failures that are, by construction, "the request never
+#: reached a handler": both are raised by aiohttp BEFORE any response line.
+#: `ServerDisconnectedError` is a subclass of `ClientConnectionError`; both are
+#: named so the tuple reads as the intent rather than as a class hierarchy.
+RPC_CONN_ERRORS = (ServerDisconnectedError, ClientConnectionError)
+
+
+def rpc_leg_name(path: str) -> str:
+    return RPC_LEG_BY_PATH.get(path, "other")
+
+
+def rpc_pool_counts(session: Optional[ClientSession]) -> Tuple[int, int]:
+    """(idle, total) pooled connections, or (-1, -1) when unreadable."""
+    try:
+        conn = session.connector  # type: ignore[union-attr]
+        idle = sum(len(v) for v in conn._conns.values())  # noqa: SLF001
+        acquired = conn._acquired  # noqa: SLF001
+        return idle, idle + len(acquired)
+    except Exception:  # noqa: BLE001 - an instrument never breaks serving
+        return -1, -1
+
+
+def rpc_response_sport(resp: Any) -> str:
+    """The LOCAL port this response came back on, or `n/a`.
+
+    Read while the response context is still open, which is the only window in
+    which `resp.connection` is still held.
+    """
+    try:
+        name = resp.connection.transport.get_extra_info("sockname")
+        return str(name[1])
+    except Exception:  # noqa: BLE001 - an instrument never breaks serving
+        return "n/a"
+
+
+def make_rpc_trace_config() -> TraceConfig:
+    """Records reused-vs-new into the per-request ctx dict passed by `rpc`."""
+
+    tc = TraceConfig()
+
+    async def on_reuse(_session, ctx, _params):
+        info = getattr(ctx, "trace_request_ctx", None)
+        if isinstance(info, dict):
+            info["conn"] = "reused"
+
+    async def on_create_end(_session, ctx, _params):
+        info = getattr(ctx, "trace_request_ctx", None)
+        if isinstance(info, dict):
+            info["conn"] = "new"
+
+    tc.on_connection_reuseconn.append(on_reuse)
+    tc.on_connection_create_end.append(on_create_end)
+    return tc
 #: #1262 TIER 3.  How many times its OWN measured cost a flip may take before
 #: the front says it is not progressing.  Dimensionless on purpose: the bound
 #: itself is this boot's last measured flip in the same direction, so it is
@@ -1436,7 +1530,14 @@ class Front:
 
     # ---------------- lifecycle ----------------
     async def startup(self, app):
-        self.session = ClientSession(timeout=ClientTimeout(total=3600))
+        # #1285: the trace config is the ONLY way to learn whether a request
+        # went out on a pooled connection or a fresh one; it adds two awaits
+        # per request and no behaviour.  The connector stays aiohttp's default
+        # ON PURPOSE in this commit -- changing pooling and instrumenting it in
+        # the same step would leave the boot unable to say which of the two
+        # moved the symptom.
+        self.session = ClientSession(timeout=ClientTimeout(total=3600),
+                                     trace_configs=[make_rpc_trace_config()])
         app["controller"] = asyncio.create_task(self.controller())
         app["admitter"] = asyncio.create_task(self.d_admitter())
         app["health"] = asyncio.create_task(self.health_poller())
@@ -2408,13 +2509,66 @@ class Front:
         401 on its very next quiesce and the flip dies. So the token goes on
         every RPC, and `admin_key` is None exactly when the groups are unkeyed.
         """
+        code, text, _ = await self._rpc_attempt(self.session, g, path, body, timeout)
+        return code, text
+
+    async def _rpc_attempt(self, session: ClientSession, g: Group, path: str,
+                           body: Optional[dict], timeout: float,
+                           ) -> Tuple[int, str, bool]:
+        """ONE attempt, instrumented (#1285).
+
+        Returns ``(code, text, retryable)``.  ``retryable`` is True for exactly
+        one shape: a connection-level failure raised BEFORE any response line,
+        i.e. the request provably never reached a handler.  A drop DURING the
+        body read is a PARTIAL RESPONSE -- the handler ran, its effect is
+        applied, and re-sending would apply it twice -- so it comes back
+        ``retryable=False`` however connection-shaped its exception is.  The
+        `got_response` flag below is that discriminator, and it is the whole
+        safety argument for the retry in :meth:`leg_rpc`.
+        """
+        leg = rpc_leg_name(path)
+        epoch = (body or {}).get("epoch")
+        info: Dict[str, str] = {"conn": "unknown"}
+        idle, total = rpc_pool_counts(session)
+        logger.info(
+            "WEG2-RPC ISSUED leg=%s group=%s path=%s epoch=%s conn=%s sport=%s "
+            "pool_idle=%d pool_total=%d",
+            leg, g.name, path, epoch, "pending", "pending", idle, total,
+        )
+        t0 = time.perf_counter()
+        got_response = False
         try:
-            async with self.session.post(f"{g.url}{path}", json=body or {},
-                                         headers=admin_key_mod.auth_headers(self.admin_key),
-                                         timeout=ClientTimeout(total=timeout)) as r:
-                return r.status, (await r.read()).decode(errors="replace")
+            async with session.post(f"{g.url}{path}", json=body or {},
+                                    headers=admin_key_mod.auth_headers(self.admin_key),
+                                    timeout=ClientTimeout(total=timeout),
+                                    trace_request_ctx=info) as r:
+                got_response = True
+                sport = rpc_response_sport(r)
+                text = (await r.read()).decode(errors="replace")
+                status = r.status
+            idle, total = rpc_pool_counts(session)
+            logger.info(
+                "WEG2-RPC RETURNED leg=%s group=%s path=%s epoch=%s conn=%s sport=%s "
+                "pool_idle=%d pool_total=%d code=%d ms=%.0f",
+                leg, g.name, path, epoch, info["conn"], sport, idle, total,
+                status, (time.perf_counter() - t0) * 1000,
+            )
+            return status, text, False
         except Exception as e:  # noqa: BLE001
-            return 0, f"{type(e).__name__}: {e}"
+            idle, total = rpc_pool_counts(session)
+            # `sport=n/a` and not a number: there is no response, hence no
+            # connection object to read a sockname off (instrument limits at
+            # RPC_CONN_ERRORS above).  Absent, never 0.
+            retryable = isinstance(e, RPC_CONN_ERRORS) and not got_response
+            logger.info(
+                "WEG2-RPC RAISED leg=%s group=%s path=%s epoch=%s conn=%s sport=n/a "
+                "pool_idle=%d pool_total=%d after_ms=%.0f got_response=%s retryable=%s "
+                "%s: %s",
+                leg, g.name, path, epoch, info["conn"], idle, total,
+                (time.perf_counter() - t0) * 1000, got_response, retryable,
+                type(e).__name__, e,
+            )
+            return 0, f"{type(e).__name__}: {e}", retryable
 
     async def timed_rpc(self, g: Group, path: str, body: Optional[dict],
                         timeout: float) -> Tuple[int, str, float]:
