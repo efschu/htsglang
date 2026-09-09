@@ -267,20 +267,45 @@ class TestOneWCodePerException(CustomTestCase):
         them -- on the real tree, at the real lines, not on a synthetic
         string."""
         c = census()
+        front = "python/sglang/srt/weg2/front.py"
+        text = open(os.path.join(_repo_root(), front), encoding="utf-8").read()
+        lines = text.split("\n")
+
+        def sites(literal):
+            """The 1-based lines of ``front.py`` that carry this exact text.
+
+            THE LINE IS LOOKED UP, NOT TYPED. The pins here were four hard
+            numbers, and one of them (2804) went stale the moment an unrelated
+            front.py change moved the site by a single line in a merge -- a
+            RED that says nothing about the scan. What this test is for is
+            that the census reads the real SITE in all three forms, so the
+            site is named by its own text and the line is derived from it.
+            An empty result fails loudly below: a literal that no longer
+            exists means the form itself is gone, which IS a finding.
+            """
+            found = [i for i, ln in enumerate(lines, 1) if literal in ln]
+            self.assertTrue(found, f"{front} no longer carries {literal!r}")
+            return found
+
         # form 3, concatenated: front.py builds both of these from a bare code
         # plus a marker constant, and the scan must credit the RESOLVED name.
-        front = "python/sglang/srt/weg2/front.py"
-        self.assertIn(f"{front}:558", c["W50"]["Weg2TpPrefillExceeded"],
-                      "the concatenated form must be read AND resolved")
-        self.assertIn(f"{front}:564", c["W52"]["Weg2NoServiceableRoute"],
-                      "#1290's concatenated claim is the one #1257 walked into")
+        for line in sites('X_REFUSAL_NAME = "W50 " + X_REFUSAL_MARKER'):
+            self.assertIn(f"{front}:{line}", c["W50"]["Weg2TpPrefillExceeded"],
+                          "the concatenated form must be read AND resolved")
+        for line in sites('NO_ROUTE_NAME = "W52 " + NO_ROUTE_MARKER'):
+            self.assertIn(f"{front}:{line}", c["W52"]["Weg2NoServiceableRoute"],
+                          "#1290's concatenated claim is the one #1257 "
+                          "walked into")
         # form 2, counter key: an underscore where the plain pattern wants a
-        # space. Both of #1290's counter sites, and the pre-existing W22 one.
-        for line in (2071, 2804):
+        # space. BOTH of #1290's counter sites, and the pre-existing W22 one.
+        w52_counters = sites('"W52_Weg2NoServiceableRoute"')
+        self.assertEqual(len(w52_counters), 2, w52_counters)
+        for line in w52_counters:
             self.assertIn(f"{front}:{line}",
                           c["W52"]["Weg2NoServiceableRoute"])
-        self.assertIn(f"{front}:2028",
-                      c["W22"]["Weg2SpanUnknownPricedFull"])
+        for line in sites('"W22_Weg2SpanUnknownPricedFull"'):
+            self.assertIn(f"{front}:{line}",
+                          c["W22"]["Weg2SpanUnknownPricedFull"])
         # ...and the sub-key suffix is NOT read as a second holder.
         self.assertEqual(set(c["W28"]), {"Weg2Leg2Unpriced"},
                          "W28_Weg2Leg2Unpriced_stream_served is a sub-key of "
