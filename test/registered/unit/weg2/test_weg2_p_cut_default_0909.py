@@ -62,11 +62,8 @@ from sglang.srt.planner.pp_cut_launch import (
     PPCutRefused,
     choose_under_floor,
 )
-from sglang.srt.weg2 import launcher
-from sglang.srt.weg2.launcher import (
-    DEFAULT_PP_SOLVE_POOL_FLOOR,
-    resolve_pool_floor,
-)
+from sglang.srt.weg2 import DEFAULT_PP_SOLVE_POOL_FLOOR, launcher
+from sglang.srt.weg2.launcher import resolve_pool_floor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -462,7 +459,7 @@ class TheNumberIsWrittenExactlyOnce(CustomTestCase):
                 for t in targets:
                     if isinstance(t, ast.Name) and t.id == "DEFAULT_PP_SOLVE_POOL_FLOOR":
                         sites.append(f"{path.name}:{node.lineno}")
-        self.assertEqual(sites, ["launcher.py:%d" % _constant_lineno()], sites)
+        self.assertEqual(sites, ["__init__.py:%d" % _constant_lineno()], sites)
 
     def test_the_literal_appears_nowhere_else_in_either_package(self):
         """448027 as a bare number anywhere but its own assignment is a copy."""
@@ -471,7 +468,7 @@ class TheNumberIsWrittenExactlyOnce(CustomTestCase):
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Constant) and node.value == 448027):
                     continue
-                if path.name == "launcher.py" and node.lineno == _constant_lineno():
+                if path.name == "__init__.py" and node.lineno == _constant_lineno():
                     continue
                 found.append(f"{path.name}:{node.lineno}")
         self.assertEqual(found, [], f"the floor is restated at {found}")
@@ -531,7 +528,7 @@ class TheNumberIsWrittenExactlyOnce(CustomTestCase):
         )
 
     def test_the_order_is_recorded_where_the_number_lives(self):
-        src = (WEG2_DIR / "launcher.py").read_text()
+        src = (WEG2_DIR / "__init__.py").read_text()
         head = src[: src.index("DEFAULT_PP_SOLVE_POOL_FLOOR = ")]
         block = _flat(head[head.rindex("#: THE SHIPPED FLOOR") :])
         self.assertIn(ORDER, block)
@@ -540,7 +537,7 @@ class TheNumberIsWrittenExactlyOnce(CustomTestCase):
 
 
 def _constant_lineno():
-    tree = ast.parse((WEG2_DIR / "launcher.py").read_text())
+    tree = ast.parse((WEG2_DIR / "__init__.py").read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for t in node.targets:

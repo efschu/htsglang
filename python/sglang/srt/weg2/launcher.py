@@ -60,7 +60,7 @@ from sglang.srt.managers import corridor_guard
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import corridor_budget, host_ledger, ring_table
-from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
+from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_SOLVE_POOL_FLOOR
 
 MIB = 1024 * 1024
 PORT_FRONT = 30030
@@ -333,65 +333,6 @@ P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB = 5584.4
 P_CORRIDOR_TOP_MIB = 1229.0
 P_BYTES_PER_TOKEN = 8192 + 2048
 
-#: THE SHIPPED FLOOR UNDER ``--pp-solve-objective``, in WORLD KV TOKENS, and
-#: WRITTEN EXACTLY ONCE (the pin in
-#: ``test/registered/unit/weg2/test_weg2_p_cut_default_0909.py`` keeps it that
-#: way, the same way ``DEFAULT_P_BS`` is pinned on its own branch).
-#:
-#: THE ORDER IN FORCE, user 2026-09-09, verbatim: "39,13,12 mit bs2 im pp
-#: layout soll standard werden vorerst."
-#:
-#: THE CUT IS STILL SOLVED, NOT PINNED, and that distinction is the whole
-#: reason this is a floor and not a ``--pp-stage-ratio``.  A hand pin would
-#: make ``39,13,12`` survive a card change, a checkpoint change or a re-measure
-#: that made it wrong; the solver stays the authority and this number only says
-#: HOW MUCH POOL the boot refuses to go below.  ``--pp-solve-objective``
-#: (makespan, itself a user default since 2026-09-08) then ranks over what is
-#: left, so the shipped rule reads "the FASTEST cut that still holds
-#: 448,027 tokens" -- and on this rig's frontier that is 39,13,12.
-#:
-#: WHY THIS NUMBER -- the rule, so the next re-solve can redo it rather than
-#: copy it.  Read off the ``PP-CUT FRONTIER`` line of #1286b (SECTION 1am-b,
-#: ``/spinning/gpu-arb/weg2/WEG2_BUILD_DECISIONS_0906.md``), the two frontier
-#: points that bracket the order are
-#:
-#:     40,12,12 / 10,3,3   total_ms=417.6   pool=414654   <- next FASTER
-#:     39,13,12 /  9,4,3   total_ms=420.1   pool=481400   <- THE ORDER
-#:
-#: Under "fastest above F" the order is selected for any F in the half-open
-#: interval (414654, 481400].  The floor is the MIDPOINT of that interval,
-#: (414654 + 481400) // 2 = 448027: it sits 33,373 tokens from each boundary,
-#: which is the largest equal headroom the interval allows.
-#:
-#: A floor survives a uniform re-pricing of the frontier by factor s only while
-#: it stays inside (414654*s, 481400*s], so every floor has TWO tolerances --
-#: how far pools may GROW before 40,12,12 clears it too and wins on speed, and
-#: how far they may SHRINK before 39,13,12 stops clearing it -- and the SMALLER
-#: of the two is the one that fails first.  The midpoint tolerates +8.05 %%
-#: growth and -6.93 %% shrink, so 6.93 %% binds.
-#:
-#: THE REJECTED RULE, named because it is the obvious one: "39,13,12's priced
-#: pool minus the priced-vs-realised tolerance" gives 481400 * 0.999 = 480918.
-#: It tolerates +15.98 %% growth -- better than the midpoint -- but only
-#: -0.10 %% shrink, and that is not a coincidence: subtracting a 0.10 %%
-#: tolerance BUILDS a 0.10 %% shrink margin, so the rule's binding margin is
-#: always exactly the measurement error it was derived from (0.10 %% MEASURED,
-#: weg2sb5f priced 304,946 against 304,655 realised).  A margin the size of
-#: one's own error is no margin: the first re-price that shaved a tenth of a
-#: percent off the pool would silently ship 38,13,13 (453.4 ms) or refuse.
-#: Ranked on distance from the LOWER boundary alone the rejected rule looks
-#: like the better one, which is exactly why that is not the comparison -- the
-#: test asserts it on the binding margin, 6.93 %% against 0.10 %%, 69x.
-#:
-#: THE TRADE THE ORDER BOUGHT, so nobody re-derives it as a regression: against
-#: the unfloored makespan winner 44,10,10 (359.0 ms / 304,946 tokens) this is
-#: +17.0 %% ms/chunk for +57.9 %% pool.  The user chose the knee.
-#:
-#: OFF IS STILL REACHABLE AND STILL EXACT: ``--pp-solve-pool-floor 0`` restores
-#: the unfloored makespan byte for byte.  The floor is PROVISIONAL in the same
-#: sense the bs pair is -- "vorerst" is in the order -- so re-measuring it must
-#: stay an edit to THIS ONE LINE.
-DEFAULT_PP_SOLVE_POOL_FLOOR = 448_027
 #: Group P's per-stage CAPABILITY SCORES, in stage order (ordinal 0 = the
 #: 5090) -- what ``--pp-stage-ratio`` takes.  NOT a layer split: fix 5, after
 #: the map below was found to restate this vector as one.  ``server_args``
