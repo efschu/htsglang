@@ -3096,15 +3096,16 @@ class Front:
             await asyncio.sleep(0.5)
         return False, last
 
-    def _store_used_bytes(self) -> Optional[int]:
-        """The store tmpfs's MEASURED content, or None (never 0 on failure)."""
-        if not self.store_dir:
-            return None
-        try:
-            st = os.statvfs(self.store_dir)
-        except OSError:
-            return None
-        return (st.f_blocks - st.f_bfree) * st.f_frsize
+    # #1236: `_store_used_bytes` IS DELETED, not repaired. It read
+    # `statvfs(store_dir)` and returned `(f_blocks - f_bfree) * f_frsize`,
+    # which was the store's own content only because the store WAS a whole
+    # tmpfs. The store is a plain directory on the shared ZFS dataset now, so
+    # that same call answers with the ROOT FILESYSTEM's usage -- 1.7 TB, not a
+    # store -- and its one consumer (`host_ledger.dormant_image_sample`'s run
+    # residual) no longer wants the term at all: those bytes are not in this
+    # cgroup, so subtracting them would credit the residual with memory the
+    # reading never held. A quantity that stopped meaning anything is removed
+    # rather than given a new definition beside its old name.
 
     def sample_dormant_image(self, group: str, shmem_before: Optional[int]) -> Optional[dict]:
         """Measure ``group``'s dormant host image, once, at its first sleep.
@@ -3138,7 +3139,6 @@ class Front:
             commit=self.commit,
             cg_current_bytes=cg.get("current"),
             reclaimable_bytes=cg.get("reclaimable"),
-            store_used_bytes=self._store_used_bytes(),
             arm=self.ledger_arm or None,
         )
         self.dormant_image[group] = rec

@@ -126,7 +126,6 @@ indicator-law violation the record forbids.
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import time
@@ -251,8 +250,11 @@ DK7_PROVENANCE = (
 #: 4.32/5.21/3.81/8.58) -- it is per-flip FIXED.  What DOES creep is the quiet
 #: baseline, 83.72 -> 87.98 GiB over the boot, and that creep is the store tmpfs
 #: filling (quiet Shmem 47.73 -> 52.68 GiB = +4.95, against 5.1 GiB of store
-#: content at the death): a standing cost this ledger already budgets as
-#: ``store_gib``, not a leak.
+#: content at the death): a standing cost the ledger budgeted as ``store_gib``
+#: at the time, not a leak.  #1236 RETIRED that budget line: the store is on
+#: disk now, so this creep is a property of the tmpfs form that no longer runs
+#: -- the reading is kept because the FLIP TRANSIENT it measures is still the
+#: subject of this constant, but the store half of its explanation is history.
 FLIP_HOST_TRANSIENT_GIB = 9.97
 #: ...AND IT IS THE PRE-RING VALUE. With the shared registered host ring the
 #: transient collapses, because the legs copy THROUGH a preallocated region
@@ -1065,8 +1067,18 @@ class Arm:
     def fundable_moments(self) -> bool:
         return self.launch_leftover_gib >= 0.0 and self.run_leftover_gib >= 0.0
 
-    def predicted_run_peak_gib(self, store_gib: float) -> Optional[float]:
+    def predicted_run_peak_gib(self) -> Optional[float]:
         """What ``memory.current`` this arm reaches at the RUN PEAK, or None.
+
+        #1236: THERE IS NO STORE TERM IN THIS SUM ANY MORE, and its absence is
+        the point rather than an omission.  The canonical page store was a
+        tmpfs, so every byte of it was ``shmem`` inside this cgroup -- charged
+        here in full, un-evictable (``SwapTotal`` 0 on this box), and therefore
+        a direct subtrahend of the room the reaper leaves.  It is a plain
+        directory on the ZFS dataset now (``launcher.STORE_ROOT``), so its cost
+        to the host is PAGE CACHE and ARC: reclaimable, outside this cgroup's
+        ``anon``, and not what the reaper kills for.  Charging it here would be
+        a phantom RAM post for bytes that are on a disk.
 
         The sum of everything this arm actually charges to the cgroup -- the
         reserves (``floor``) are deliberately NOT in it, because a reserve is
@@ -1098,108 +1110,20 @@ class Arm:
             float(origin)
             + _boot_charges_gib(t)
             + t["host_ring_gib"]
-            + float(store_gib)
         )
 
 
-@dataclass
-class StoreSizing:
-    """How big the canonical page store may be, and WHICH bound said so."""
-
-    gib: float
-    leftover_gib: float
-    reap_bound_gib: Optional[float]
-    unsampled_gib: Optional[float]
-    bound: str
-    note: str
-
-
-def size_store_gib(
-    run_leftover_gib: float,
-    peak_without_store_gib: Optional[float],
-    unsampled_reclaim_gib: Optional[float],
-    watermark_gib: float = OBSERVED_REAP_NONRECLAIM_BYTES / GIB,
-    margin_gib: float = 0.0,
-) -> StoreSizing:
-    """The store is ``min(run leftover, reap bound)`` -- TRAIN FIX 3.
-
-    THE DEFECT this replaces (measured on train tip a917eb404c, dry-run
-    2026-09-08 10:00Z, rc=2 on BOTH idle layouts): the store was sized as the
-    WHOLE run leftover and :data:`OBSERVED_REAP_NONRECLAIM_BYTES` was applied
-    AFTERWARDS as a gate, so every arm carried its own refusal by construction
-    -- ``leftover run=15.18 -> store=15 -> run_peak 98.66 vs reap 95.90``.  The
-    lever that refusal named, ``--store-min-gib``, is a MINIMUM and therefore
-    inert against a peak that is too HIGH (fix 2's record: 4 and 2 gave
-    identical refusals).  The store is the ONE term of that sum which is a free
-    choice; making it the residual of the constraint instead of an input to it
-    is the whole fix.
-
-    WHY THE PEAK MODEL IS TRUSTED TO BOUND WITH, and the store sizing is what
-    moved: boot weg2rg6 (base 7f88b1c75d) ran S=1 M=1200 with store=10 GiB; the
-    train-tip model prices that same arm at ``21.38 + 17.23 + 4.75 + 7.45 +
-    0.49 + 0.17 + 32.19 + 10 = 93.66`` GiB, and rg6 measured ``memory.current``
-    flat at 91.31-92.89 over 26 load samples with a whole-boot margin of 2.35
-    GiB to the watermark, i.e. a 93.55 GiB peak -- the model is within 0.11 GiB
-    of the metal (`BOOT_weg2rg6_0908.md` lines 330-345).  The train's leftover
-    is larger than rg6's only because fix 6 DELETED the #1232 ``host_headroom``
-    term (16 GiB); the store then swallowed that room.
-
-    ``unsampled_reclaim_gib`` is the ``slab_reclaimable`` the reap row LACKED
-    (that row has no slab column, so the watermark is an UPPER bound on the
-    reap point -- see :data:`OBSERVED_REAP_NONRECLAIM_BYTES`).  It is READ LIVE
-    from ``memory.stat`` by the caller, never a constant, and it is the ONLY
-    term subtracted here: this is not a safety margin, it is the named error of
-    the watermark itself.  ``None`` (unreadable) subtracts NOTHING and says so
-    -- an absent measurement never becomes a quiet cushion, and never a quiet
-    zero either.
-
-    ``--store-min-gib`` stays the FLOOR it always was.  A reap bound below that
-    floor is a REFUSAL (W21, with the bound printed), never a store shrunk past
-    the point where the carrier can hold one agent prefix.
-    """
-    leftover = max(0.0, float(run_leftover_gib))
-    if peak_without_store_gib is None:
-        return StoreSizing(
-            gib=float(math.floor(leftover)),
-            leftover_gib=leftover,
-            reap_bound_gib=None,
-            unsampled_gib=unsampled_reclaim_gib,
-            bound="leftover",
-            note=(
-                "no run-peak prediction (no cgroup sample), so the reap point "
-                "cannot bound this store -- the leftover is unbounded here"
-            ),
-        )
-    if unsampled_reclaim_gib is None:
-        unsampled = 0.0
-        note = (
-            "unsampled unreadable (memory.stat slab_reclaimable absent) -- NOT "
-            "subtracted, so this bound is optimistic by that term"
-        )
-    else:
-        unsampled = float(unsampled_reclaim_gib)
-        note = (
-            f"unsampled {unsampled:.2f} GiB (live memory.stat slab_reclaimable; the "
-            "reap row carries no slab column, so the watermark over-states the reap "
-            "point by it)"
-        )
-    # #1269 / standing order 2026-09-08: the HARD bound is the watermark minus
-    # the NAMED margin, and the store is what is left under it. The store
-    # shrinks; the margin never does. `bound="leftover"` can therefore no
-    # longer exceed watermark - margin either -- that is what `min` below
-    # enforces, and it is the half the pre-order ledger did not have: sb4's
-    # chosen arm reported `bound=leftover` with a 4.46 GiB gap to the raw
-    # watermark and was still 4.6-5.2 GiB over the mark on the metal.
-    reap_bound = watermark_gib - unsampled - float(margin_gib) - float(peak_without_store_gib)
-    allowed = min(leftover, reap_bound)
-    return StoreSizing(
-        gib=float(math.floor(allowed)) if allowed > 0 else 0.0,
-        leftover_gib=leftover,
-        reap_bound_gib=reap_bound,
-        unsampled_gib=unsampled_reclaim_gib,
-        bound="reap" if reap_bound < leftover else "leftover",
-        note=note,
-    )
+#: #1236: ``size_store_gib`` and ``StoreSizing`` ARE DELETED, not shrunk and
+#: not flagged.  They existed to answer "how much of the host RAM leftover may
+#: the store tmpfs take, bounded by the reap point" -- train fix 3's residual.
+#: The store is a directory on the ZFS dataset now and its size is the P KV
+#: pool's own bytes (``launcher.plan_store``), so that question has no subject
+#: left: there is no RAM residual to hand out, and a function that kept
+#: computing one would be a second bookkeeping beside a size the pool already
+#: fixes.  ``--store-min-gib`` went with it: a FLOOR on a RAM residual is
+#: meaningless once the store is not funded from RAM.  What replaced the floor
+#: is a HARD LAW instead of a knob -- ``max_size >= P pool bytes`` by
+#: construction (#1236), checked against the disk and refused by name (W52).
 
 
 def read_meminfo(path: str = "/proc/meminfo") -> Dict[str, int]:
@@ -1720,7 +1644,6 @@ def dormant_image_sample(
     at: Optional[str] = None,
     cg_current_bytes: Optional[int] = None,
     reclaimable_bytes: Optional[int] = None,
-    store_used_bytes: Optional[int] = None,
     arm: Optional[Dict[str, float]] = None,
     ranks_per_group: int = 3,
 ) -> Dict[str, object]:
@@ -1738,10 +1661,21 @@ def dormant_image_sample(
       first sleep of P is un-interleaved (D does not exist yet) and there the
       two instruments are comparable.
 
-    ``run_residual_gib`` is derived only when the caller supplies the full run
-    moment (a cgroup reading, the arm, and the store's measured content):
-    what the box holds that this ledger's term list does not name.  ``None``
-    with a stated reason otherwise -- never 0.
+    ``run_residual_gib`` is derived only when the caller supplies the run
+    moment (a cgroup reading and the arm): what the box holds that this
+    ledger's term list does not name.  ``None`` with a stated reason
+    otherwise -- never 0.
+
+    #1236 REMOVED THE STORE FROM THIS SUBTRACTION, and it is the same finding
+    as in :meth:`Arm.predicted_run_peak_gib`, one layer down.  The store used
+    to be a tmpfs, so its content WAS inside ``cg_current_bytes`` as
+    un-evictable ``shmem`` and subtracting it was correct.  It is a directory
+    on the ZFS dataset now: its bytes are not in this cgroup at all, so
+    subtracting them would credit the residual with memory the reading never
+    contained and make an unexplained term look explained.  The caller's
+    ``store_used_bytes`` argument went with it -- on a shared dataset the
+    ``statvfs`` that produced it reports the WHOLE root filesystem's usage,
+    which is not this store and never was this quantity.
     """
     delta = (
         None
@@ -1752,10 +1686,10 @@ def dormant_image_sample(
     rss_gib = rss / GIB
     residual: Optional[float] = None
     residual_note = ""
-    if cg_current_bytes is None or arm is None or store_used_bytes is None:
+    if cg_current_bytes is None or arm is None:
         residual_note = (
-            "not the run moment (need a cgroup reading, the arm and the store's "
-            "measured content); NOT derived, and not 0"
+            "not the run moment (need a cgroup reading and the arm); NOT derived, "
+            "and not 0"
         )
     else:
         reclaim = 0 if reclaimable_bytes is None else max(
@@ -1773,7 +1707,6 @@ def dormant_image_sample(
             nonreclaim_gib
             - _boot_charges_gib(charges)
             - rss_gib
-            - int(store_used_bytes) / GIB
         )
     return {
         "group": group,
@@ -1790,7 +1723,6 @@ def dormant_image_sample(
         "pids_asked": [int(p) for p in pids],
         "interleaved": bool(interleaved),
         "cg_current_bytes": cg_current_bytes,
-        "store_used_bytes": store_used_bytes,
         "arm": arm,
         "run_residual_gib": residual,
         "run_residual_note": residual_note,
@@ -1922,7 +1854,7 @@ def _gib_or_none(value: Optional[float]) -> str:
     return "unreadable" if value is None else f"{value:.2f} GiB"
 
 
-def _advisory_line(arm: "Arm", store_gib: float, chosen: bool) -> str:
+def _advisory_line(arm: "Arm", chosen: bool) -> str:
     """The RUN-PEAK line, printed for the CHOSEN arm or -- on a total refusal --
     for the most frugal arm on the ladder.
 
@@ -1933,7 +1865,7 @@ def _advisory_line(arm: "Arm", store_gib: float, chosen: bool) -> str:
     success would delete the explanation at the moment it is wanted.
     """
     watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
-    predicted = arm.predicted_run_peak_gib(store_gib)
+    predicted = arm.predicted_run_peak_gib()
     subject = "this arm" if chosen else f"the most frugal arm (S={arm.s_gb} M={arm.m_mib})"
     if predicted is None:
         return (
@@ -1946,8 +1878,10 @@ def _advisory_line(arm: "Arm", store_gib: float, chosen: bool) -> str:
         f"WEG2-HOST-LEDGER RUN-PEAK ADVISORY: {subject} predicts non-reclaimable memory.current="
         f"{predicted:.2f} GiB at the run peak (run origin {_gib_or_none(arm.terms['run_origin_gib'])} "
         f"[{arm.terms['run_origin_source']}] + heaps + anchors + rings + "
-        f"overhead + draft pools + the host ring Sigma H + store {store_gib:.0f} "
-        f"GiB; the {FLOOR_GIB:.0f} GiB floor is a reserve and is NOT in this sum), "
+        f"overhead + draft pools + the host ring Sigma H; the {FLOOR_GIB:.0f} GiB floor "
+        f"is a reserve and is NOT in this sum, and #1236 REMOVED the store term -- the "
+        f"page store is a directory on the ZFS dataset now, page cache and ARC, "
+        f"reclaimable, outside this cgroup's anon), "
         f"which is {verdict} the OBSERVED REAP POINT {watermark_gib:.2f} GiB "
         "(boot weg2dk5 21:15:30Z, memory.current 102,998,904,832 B minus the 28,916 kB "
         "of that row that was still reclaimable, with oom_kill 18 -> 24 in the same row; "
@@ -1973,7 +1907,6 @@ def choose(
     memtotal_bytes: int,
     memavail_bytes: int,
     *,
-    store_min_gib: float,
     arms: Sequence[Tuple[int, int]] = DEFAULT_ARMS,
     ranks_per_group: int = 3,
     ring_bytes: int = 0,
@@ -1987,22 +1920,24 @@ def choose(
     cg_oom_kill: Optional[int] = None,
     measured_record: Optional[Dict[str, dict]] = None,
     margin: Optional[Margin] = None,
-) -> Tuple[Arm, float, List[str]]:
-    """Walk the ladder; return (arm, store_gib, printed lines) or raise W20/W21.
+) -> Tuple[Arm, Optional[float], List[str]]:
+    """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
-    ``store_gib`` is ``min(run leftover, reap bound)`` floored to whole GiB
-    (:func:`size_store_gib`, train fix 3): the tmpfs the canonical page store
-    lives on is the one free term of the run peak, so it is sized AS the room
-    the reap point leaves rather than sized first and gated afterwards.  A
-    store below ``store_min_gib`` on every arm is a refusal -- a carrier that
-    cannot hold one agent prefix is not a carrier, and the boot would pass R1
-    and fail R2/R4 for a reason the ledger already knew.  Which bound won is
-    printed per arm and on the CHOSEN line, so the refusal (or the choice)
-    names the quantity a reader would otherwise have to re-derive.
+    #1236 CHANGED THE MIDDLE OF THAT TUPLE, and the change is the whole point
+    of this pass: it used to be ``store_gib``, the size of the tmpfs the store
+    lived on, computed here as ``min(run leftover, reap bound)``.  The store is
+    a directory on the ZFS dataset now (``launcher.STORE_ROOT``) and is sized
+    from the P KV pool, not from host RAM, so this function no longer sizes it,
+    no longer charges it in :meth:`Arm.predicted_run_peak_gib`, and no longer
+    carries a ``--store-min-gib`` floor.  What comes back instead is the REAP
+    HEADROOM -- ``hard bound - predicted run peak`` for the chosen arm, or
+    ``None`` when no cgroup sample let a peak be predicted at all.  That is a
+    quantity this function actually computes, and it is what the caller needs
+    to price the one host-RAM risk the disk store does carry (the ZFS ARC).
 
     ``slab_reclaimable_bytes`` is the LIVE ``memory.stat slab_reclaimable``
-    reading -- the term the reap watermark's own row lacked.  It is the only
-    quantity subtracted from the watermark when the bound is computed, and an
+    reading -- the term the reap watermark's own row lacked.  It is subtracted
+    from the watermark wherever the watermark is used as a bound, and an
     unreadable one subtracts nothing and says so.
 
     The cgroup arguments are fix 5's denominator (see :func:`price`).
@@ -2099,31 +2034,22 @@ def choose(
     hard_bound_gib = watermark_gib - margin.total_gib
     lines.append(watermark_provenance(margin, watermark_gib))
     chosen: Optional[Arm] = None
-    store_gib = 0.0
     peak_bound_any = False
-    sizing_of: Dict[int, StoreSizing] = {}
+    # #1236: the STORE TERM IS GONE FROM THIS LOOP.  Train fix 3 sized it here
+    # as min(run leftover, reap bound) because it was a tmpfs and therefore
+    # un-evictable shmem inside this cgroup -- the one free term of the run
+    # peak.  It is a directory on the ZFS dataset now, so there is no RAM
+    # residual to hand out and no store floor to bind on: the arm table prices
+    # RAM, the store is priced against the DISK by launcher.plan_store, and the
+    # two no longer share a currency.  What the store USED to cost this sum is
+    # printed on the CHOSEN line as the freed delta, so the change is visible
+    # in the ledger's own output and not only in this comment.
     for arm in priced:
-        # TRAIN FIX 3: the store is the residual of the reap constraint, not an
-        # input to it.  Sizing it as the whole run leftover and checking the
-        # peak afterwards made every arm carry its own refusal (dry-run
-        # a917eb404c: 10.24/15.18/17.65 -> 98.60/98.66/98.19 vs 95.90).
-        sizing = size_store_gib(
-            arm.run_leftover_gib,
-            arm.predicted_run_peak_gib(0.0),
-            unsampled_gib,
-            watermark_gib=watermark_gib,
-            margin_gib=margin.total_gib,
-        )
-        sizing_of[id(arm)] = sizing
-        run_store = sizing.gib
         moments_ok = arm.fundable_moments
-        store_ok = run_store >= store_min_gib
-        predicted = arm.predicted_run_peak_gib(float(run_store))
+        predicted = arm.predicted_run_peak_gib()
         # FIX 8: the run peak REFUSES.  Two boots died and one could not flip
         # while this quantity was printed as an advisory beside the arm it had
-        # already condemned.  It stays as a guard: with the store bounded above
-        # this can only fire when the arm's peak WITHOUT any store is already
-        # over the watermark, which no store size can repair.
+        # already condemned.
         # #1269: against the HARD BOUND (watermark - margin), not the raw mark.
         peak_ok = predicted is None or predicted <= hard_bound_gib
         binding: List[str] = []
@@ -2131,50 +2057,37 @@ def choose(
             binding.append(f"launch moment ({arm.launch_leftover_gib:.2f} GiB)")
         if arm.run_leftover_gib < 0:
             binding.append(f"run moment ({arm.run_leftover_gib:.2f} GiB)")
-        if not store_ok:
-            binding.append(
-                f"store floor ({run_store:.0f} < {store_min_gib:.0f} GiB, "
-                f"bound={sizing.bound})"
-            )
         if not peak_ok:
             binding.append(
                 f"RUN PEAK ({predicted:.2f} > {hard_bound_gib:.2f} GiB hard bound "
                 f"= {watermark_gib:.2f} reap point - {margin.total_gib:.2f} margin "
                 f"[{margin.terms()}])"
             )
-        ok = moments_ok and store_ok and peak_ok
-        # The reap point is the binding quantity BOTH when the predicted peak
-        # exceeds it and when the room it leaves is under the store floor --
-        # same finding, same lever, so both raise W21 rather than W20.
-        if moments_ok and (not peak_ok or (not store_ok and sizing.bound == "reap")):
+        ok = moments_ok and peak_ok
+        if moments_ok and not peak_ok:
             peak_bound_any = True
         lines.append(
             f"WEG2-HOST-LEDGER ARM S={arm.s_gb} M={arm.m_mib}: "
             f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
             f"overhead={arm.terms['overhead_gib']:.2f} -> "
             f"leftover launch={arm.launch_leftover_gib:.2f} GiB "
-            f"run={arm.run_leftover_gib:.2f} GiB store={run_store:.0f} GiB "
-            f"(leftover {sizing.leftover_gib:.2f}, reap-bound "
-            + (
-                "unreadable"
-                if sizing.reap_bound_gib is None
-                else f"{sizing.reap_bound_gib:.2f}"
-            )
-            + f", floor {store_min_gib:.0f}; bound={sizing.bound}; {sizing.note}) "
+            f"run={arm.run_leftover_gib:.2f} GiB "
+            f"store=NOT CHARGED HERE (#1236: on disk under launcher.STORE_ROOT, "
+            f"page_cache=reclaimable, sized from the P KV pool -- see WEG2-STORE) "
+            f"unsampled_slab={_gib_or_none(unsampled_gib)} "
             "run_peak="
             + ("unreadable (no cgroup sample)" if predicted is None else f"{predicted:.2f} GiB")
-            + f" vs reap {watermark_gib:.2f} GiB => "
+            + f" vs hard bound {hard_bound_gib:.2f} GiB (reap {watermark_gib:.2f} - "
+            f"margin {margin.total_gib:.2f}) => "
             + ("FUNDABLE" if ok else "refused (binding: " + ", ".join(binding) + ")")
         )
         if ok and chosen is None:
             chosen = arm
-            store_gib = float(run_store)
     if chosen is None:
         # The advisory's explanatory half belongs in the refusal too -- see
         # :func:`_advisory_line`.  The most frugal arm is the ladder's last.
         frugal = priced[-1]
-        frugal_store = sizing_of[id(frugal)].gib
-        lines.append(_advisory_line(frugal, float(frugal_store), chosen=False))
+        lines.append(_advisory_line(frugal, chosen=False))
         table = "\n".join(lines)
         # THE HONEST OUTCOME (fix 8): on today's box every arm may refuse, and
         # that IS the answer for this tree.  No term is shrunk to get an arm
@@ -2187,34 +2100,34 @@ def choose(
             "transient left to cut"
         )
         levers = (
-            "The levers are NAMED so this refusal is actionable, and TRAIN FIX 3 changed "
-            "which ones bite: the store is no longer the whole run leftover, it is "
-            "min(leftover, reap-bound) with reap-bound = reap point - unsampled slab - "
-            "peak-without-store, so --store-min-gib is a genuine lever again (it binds "
-            "exactly when the reap-bound printed per arm falls BELOW it, and lowering it "
-            "to that bound funds the arm), while shrinking the leftover buys nothing. The "
-            "other lever is the peak itself: cut Sigma H -- the per-card host ring table, "
-            "solved from the previous boot's own measured dormant image "
-            "(ring_table.solve), so a smaller image is a smaller ring -- which raises "
-            "every arm's reap-bound by the same amount.  Shrinking the store tmpfs is NOT "
-            "a lever, its Shmem was flat across the fatal window."
+            "The levers are NAMED so this refusal is actionable, and #1236 changed which "
+            "ones exist: THE STORE IS NOT A LEVER ANY MORE IN EITHER DIRECTION. It is a "
+            "directory on the ZFS dataset, it is not charged to this sum, and "
+            "--store-min-gib is deleted -- a floor on a RAM residual is meaningless once "
+            "the store is not funded from RAM. The one lever left is the peak itself: cut "
+            "Sigma H -- the per-card host ring table, solved from the previous boot's own "
+            "measured dormant image (ring_table.solve), so a smaller image is a smaller "
+            "ring -- or take a lower arm of the ladder. Note the direction #1236 moves "
+            "this refusal: every arm's predicted peak is now LOWER by exactly the store "
+            "term it used to carry (6 GiB on boot weg2sb5g), so an arm that refused for "
+            "the store's sake alone no longer refuses at all."
         )
         if peak_bound_any:
             raise Weg2HostRunPeakRefused(
                 "W21 Weg2HostRunPeakRefused: an arm funds both moments and the HARD BOUND "
                 f"{hard_bound_gib:.2f} GiB (reap point {watermark_gib:.2f} GiB minus margin "
                 f"{margin.total_gib:.2f} GiB = {margin.terms()}) still binds "
-                "it -- either its predicted RUN PEAK is not below the hard bound even with "
-                "NO store, or the store that watermark leaves room for is below the "
-                f"--store-min-gib floor ({store_min_gib:.0f} GiB). {outcome}. The binding "
-                "term and the reap-bound are printed per arm below; the image term is now "
+                "it -- its predicted RUN PEAK is not below the hard bound, and #1236 "
+                "already removed the store term from that peak, so no store size can "
+                f"repair it and none is asked to. {outcome}. The binding "
+                "term is printed per arm below; the image term is now "
                 "MEASURED (boot weg2dk7: 38.63 GiB dormant against the 28.83 GiB the tag "
                 "census priced) and the origin is the RUN moment, not the launch moment. "
                 f"{levers}\n" + table
             )
         raise Weg2HostLedgerRefused(
-            "W20 Weg2HostLedgerRefused: no arm of the ladder funds both moments "
-            f"plus a {store_min_gib:.0f} GiB store floor on this box "
+            "W20 Weg2HostLedgerRefused: no arm of the ladder funds both moments on this "
+            "box (the store is NOT in this test any more -- #1236 put it on disk) "
             f"(host weights term = {priced[0].terms['host_ring_gib']:.2f} GiB at the run "
             f"moment, span 1 = {priced[0].terms['host_ring_span1_gib']:.2f} GiB at the launch "
             f"moment; {ring_provenance or 'no provenance passed'}). "
@@ -2222,32 +2135,33 @@ def choose(
             f"will not shrink another term silently. {outcome}. {levers}\n"
             + table
         )
-    chosen_sizing = sizing_of[id(chosen)]
+    chosen_peak = chosen.predicted_run_peak_gib()
+    headroom = None if chosen_peak is None else hard_bound_gib - chosen_peak
     lines.append(
         f"WEG2-HOST-LEDGER CHOSEN S={chosen.s_gb} GB (--hicache-size, both groups) "
         f"M={chosen.m_mib} MiB (--hicache-mamba-host-mib, both groups) "
-        f"store={store_gib:.0f} GiB tmpfs (leftover {chosen_sizing.leftover_gib:.2f}, "
-        + (
-            "reap-bound unreadable"
-            if chosen_sizing.reap_bound_gib is None
-            else f"reap-bound {chosen_sizing.reap_bound_gib:.2f}"
-        )
-        + f", floor {store_min_gib:.0f}; bound={chosen_sizing.bound}; "
-        f"{chosen_sizing.note}) "
+        f"store=ON DISK, NOT A RAM POST (#1236: launcher.STORE_ROOT on the ZFS dataset; "
+        f"its host cost is page_cache=reclaimable plus the ZFS ARC, neither of which the "
+        f"reaper kills for, and neither of which is in this arm's sum) "
         f"launch_leftover={chosen.launch_leftover_gib:.2f} GiB "
-        f"run_leftover={chosen.run_leftover_gib:.2f} GiB -- provenance: every term "
+        f"run_leftover={chosen.run_leftover_gib:.2f} GiB "
+        f"reap_headroom={_gib_or_none(headroom)} (hard bound {hard_bound_gib:.2f} - "
+        f"predicted run peak {_gib_or_none(chosen_peak)}) -- provenance: every term "
         "above; expectation from the operator (record 1g) was ~20 GiB without the "
-        f"heap term ({chosen.terms['heaps_gib']:.2f} GiB measured)"
+        f"heap term ({chosen.terms['heaps_gib']:.2f} GiB measured). THE #1236 DELTA: this "
+        "headroom is larger than the pre-#1236 form's by exactly the store term that "
+        "form charged -- 6 GiB on boot weg2sb5g, whose store was a 6 GiB tmpfs -- and "
+        "the launcher prints the delta against THIS boot's own store budget on the "
+        "WEG2-STORE line rather than repeating a recalled number here."
     )
-    lines.append(_advisory_line(chosen, store_gib, chosen=True))
-    return chosen, store_gib, lines
+    lines.append(_advisory_line(chosen, chosen=True))
+    return chosen, headroom, lines
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
 
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--store-min-gib", type=float, default=4.0)
     ap.add_argument("--meminfo", default="/proc/meminfo")
     ap.add_argument("--ring-bytes", type=int, default=0, help="Sigma H, from ring_table.solve")
     ap.add_argument("--ring-span1-bytes", type=int, default=0, help="Sigma image_P")
@@ -2260,10 +2174,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cg = read_cgroup(ns.cgroup)
     ceiling, ceiling_source = resolve_cg_ceiling(cg, mi["MemTotal"])
     try:
-        arm, store, lines = choose(
+        arm, headroom, lines = choose(
             mi["MemTotal"],
             mi["MemAvailable"],
-            store_min_gib=ns.store_min_gib,
             ring_bytes=ns.ring_bytes,
             ring_span1_bytes=ns.ring_span1_bytes,
             ring_provenance=ns.ring_provenance,
@@ -2281,7 +2194,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("\n".join(lines))
     print(f"WEG2_S_GB={arm.s_gb}")
     print(f"WEG2_M_MIB={arm.m_mib}")
-    print(f"WEG2_STORE_GIB={store:.0f}")
+    # #1236: WEG2_STORE_GIB is GONE from this output rather than printed as 0.
+    # A key whose value became meaningless is deleted; a 0 would read as "the
+    # ledger sized a zero store", which is a different and false statement.
+    print("WEG2_REAP_HEADROOM_GIB=" + ("unreadable" if headroom is None else f"{headroom:.2f}"))
     return 0
 
 

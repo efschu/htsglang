@@ -64,16 +64,18 @@ CHUNKS = 8
 RING_BYTES = 32964 * 1024 * 1024
 RING_SPAN1_BYTES = 29912 * 1024 * 1024
 RING_KW = dict(ring_bytes=RING_BYTES, ring_span1_bytes=RING_SPAN1_BYTES)
-STORE_MIN_GIB = 8.0
+def _ladder(memtotal, memavail, current, reclaim, *, record=None, ceiling=None,
+            arms=None):
+    """Price the whole ladder at one box's readings.
 
-
-def _ladder(memtotal, memavail, current, reclaim, *, store_min=STORE_MIN_GIB,
-            record=None, ceiling=None):
-    """Price the whole ladder at one box's readings; return (arm, store, lines)."""
+    #1236: returns ``(arm, reap headroom, lines)``. The middle used to be the
+    store size the ledger handed out; the store is on disk now and this
+    function no longer sizes one.
+    """
     return host_ledger.choose(
         memtotal,
         memavail,
-        store_min_gib=store_min,
+        **({} if arms is None else {"arms": arms}),
         **RING_KW,
         cg_current_bytes=current,
         reclaimable_bytes=reclaim,
@@ -97,7 +99,6 @@ def _fundable_ladder():
     return host_ledger.choose(
         DK7_MEMTOTAL_B,
         DK7_MEMAVAIL_B,
-        store_min_gib=4.0,
         arms=((1, 600),),
         ranks_per_group=1,
         **RING_KW,
@@ -107,6 +108,24 @@ def _fundable_ladder():
         cg_ceiling_source="FALLBACK lxcfs MemTotal",
         cg_oom_kill=0,
     )
+
+
+#: #1236: THE LADDER'S OUTCOME ON THESE BOXES MOVED, and it moved because of
+#: this branch and not because a term was trimmed. Fix 8 refused weg2dk6 and
+#: weg2dk7 outright; both boots carried a 9 GiB tmpfs page store, and every
+#: arm's predicted peak carried those 9 GiB with it. The store is a directory
+#: on the ZFS dataset now (#1236), so the same readings predict ~9 GiB lower
+#: and the full ladder FUNDS S=1/M=1200 with 3.64 GiB of reap headroom -- which
+#: is consistent with the metal rather than in spite of it: weg2dk6 died at
+#: memory.current 96.06 GiB WITH its store resident, and 96.06 - 9 = 87.06 sits
+#: at the hard bound.
+#:
+#: The refusal-TEXT assertions below are about the MESSAGE, not about dk7, so
+#: they are pointed at the same box with the ladder restricted to its TOP arm
+#: (M=2400), which still predicts above the hard bound and still raises W21.
+#: The dk6-vs-dk7 SELECTOR claim is restated in the fundable direction in its
+#: own test rather than deleted.
+REFUSING_ARMS = ((1, 2400),)
 
 
 def _refusal(**kw) -> str:
@@ -285,16 +304,18 @@ class TestTheRunPeakRefusesInsteadOfAdvising(CustomTestCase):
     def test_a_box_whose_peak_fits_still_funds_its_arm(self):
         # The control that keeps the refusal from being a tautology: a gate
         # that can only refuse pins nothing.
-        arm, store, lines = _fundable_ladder()
+        arm, headroom, lines = _fundable_ladder()
         self.assertEqual((arm.s_gb, arm.m_mib), (1, 600))
-        self.assertGreaterEqual(store, 4.0)
-        peak = arm.predicted_run_peak_gib(store)
+        # #1236: the middle of the tuple is the REAP HEADROOM, not a store size.
+        self.assertGreater(headroom, 0.0)
+        peak = arm.predicted_run_peak_gib()
         self.assertLess(peak, host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / GIB)
         self.assertTrue(any("FUNDABLE" in ln for ln in lines))
 
     def test_every_arm_line_carries_its_predicted_peak_and_binding_term(self):
         msg = _refusal(memtotal=DK7_MEMTOTAL_B, memavail=DK7_MEMAVAIL_B,
-                       current=DK7_CG_CURRENT_B, reclaim=DK7_CG_RECLAIM_B)
+                       current=DK7_CG_CURRENT_B, reclaim=DK7_CG_RECLAIM_B,
+                       arms=REFUSING_ARMS)
         self.assertIn("run_peak=", msg)
         self.assertIn("binding:", msg)
         self.assertIn("RUN PEAK", msg)
@@ -312,7 +333,7 @@ class TestTheRunPeakRefusesInsteadOfAdvising(CustomTestCase):
             cg_current_bytes=int(2 * GIB), reclaimable_bytes=0,
             cg_ceiling_bytes=int(200 * GIB),
         )
-        peak = arm.predicted_run_peak_gib(0.0)
+        peak = arm.predicted_run_peak_gib()
         origin = arm.terms["run_origin_gib"]
         self.assertAlmostEqual(
             peak,
@@ -343,7 +364,7 @@ class TestTheOriginIsTheRunMomentNotTheLaunchMoment(CustomTestCase):
         )
         self.assertAlmostEqual(a.terms["run_origin_gib"], b.terms["run_origin_gib"], delta=1e-9)
         self.assertAlmostEqual(
-            a.predicted_run_peak_gib(0.0), b.predicted_run_peak_gib(0.0), delta=1e-9
+            a.predicted_run_peak_gib(), b.predicted_run_peak_gib(), delta=1e-9
         )
         self.assertIn("RUN-MOMENT RESIDUAL FLOOR", a.terms["run_origin_source"])
 
@@ -374,19 +395,21 @@ class TestTheOriginIsTheRunMomentNotTheLaunchMoment(CustomTestCase):
         self.assertAlmostEqual(host_ledger.dk7_run_residual_gib(), 21.38, delta=0.01)
 
     def test_dk7s_quiet_launch_no_longer_buys_a_bigger_arm_than_dk6s(self):
-        # THE TWO-POINT DEMONSTRATION, re-run under fix 8.  At fix-7 pricing
+        # THE TWO-POINT DEMONSTRATION, re-run under #1236.  At fix-7 pricing
         # weg2dk7 (launch 15.36 GiB) took S=1 M=1200 with a 9 GiB store while
         # weg2dk6 (launch 46.80 GiB) took M=600 -- the quieter launch bought the
-        # bigger arm and produced the tighter boot.  Under fix 8 both readings
-        # sit BELOW the measured run-moment residual, so both get the same
-        # origin and BOTH REFUSE.  Which of the two it is, is stated rather than
-        # left open: it is REFUSE, on both.
-        dk7 = _refusal(memtotal=DK7_MEMTOTAL_B, memavail=DK7_MEMAVAIL_B,
-                       current=DK7_CG_CURRENT_B, reclaim=DK7_CG_RECLAIM_B)
-        dk6 = _refusal(memtotal=DK6_MEMTOTAL_B, memavail=DK6_MEMAVAIL_B,
-                       current=DK6_CG_CURRENT_B, reclaim=DK6_CG_RECLAIM_B)
-        for msg in (dk7, dk6):
-            self.assertIn("RUN PEAK", msg)
+        # bigger arm and produced the tighter boot.  Fix 8 made both REFUSE.
+        # #1236 makes both FUND THE SAME ARM, which is this test's claim in its
+        # cleanest form yet: the selector cannot reward a quiet launch, because
+        # both readings sit below the measured run-moment residual and get the
+        # SAME origin.  What changed is only that the outcome is now an arm
+        # rather than a refusal -- the 9 GiB store left the peak.
+        dk7_arm, dk7_head, _ = _ladder(
+            DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, DK7_CG_CURRENT_B, DK7_CG_RECLAIM_B)
+        dk6_arm, dk6_head, _ = _ladder(
+            DK6_MEMTOTAL_B, DK6_MEMAVAIL_B, DK6_CG_CURRENT_B, DK6_CG_RECLAIM_B)
+        self.assertEqual((dk7_arm.s_gb, dk7_arm.m_mib), (dk6_arm.s_gb, dk6_arm.m_mib))
+        self.assertAlmostEqual(dk7_head, dk6_head, delta=1e-9)
         # Same origin, so the selector can no longer reward a quiet launch.
         a = host_ledger.price(DK7_MEMTOTAL_B, DK7_MEMAVAIL_B, 1, 600, **RING_KW,
                               cg_current_bytes=DK7_CG_CURRENT_B, reclaimable_bytes=DK7_CG_RECLAIM_B,
@@ -396,7 +419,7 @@ class TestTheOriginIsTheRunMomentNotTheLaunchMoment(CustomTestCase):
                               cg_ceiling_bytes=DK6_MEMTOTAL_B)
         self.assertAlmostEqual(a.terms["run_origin_gib"], b.terms["run_origin_gib"], delta=1e-9)
         self.assertGreaterEqual(
-            b.predicted_run_peak_gib(0.0), a.predicted_run_peak_gib(0.0) - 1e-9
+            b.predicted_run_peak_gib(), a.predicted_run_peak_gib() - 1e-9
         )
 
 
@@ -408,7 +431,8 @@ class TestTheOriginIsTheRunMomentNotTheLaunchMoment(CustomTestCase):
 class TestTheHonestOutcomeIsPrintedInsteadOfShrinkingATerm(CustomTestCase):
     def test_the_refusal_names_the_ring_slice_as_the_term_that_has_to_move(self):
         msg = _refusal(memtotal=DK7_MEMTOTAL_B, memavail=DK7_MEMAVAIL_B,
-                       current=DK7_CG_CURRENT_B, reclaim=DK7_CG_RECLAIM_B)
+                       current=DK7_CG_CURRENT_B, reclaim=DK7_CG_RECLAIM_B,
+                       arms=REFUSING_ARMS)
         # RING REBASE 0908: fix 8 wrote this refusal while the ring was still
         # a FUTURE slice ("the flip transient is removed by the host ring slice
         # (weg2/ring-0907)").  The ring has since landed and is the base of this
@@ -434,7 +458,8 @@ class TestTheHonestOutcomeIsPrintedInsteadOfShrinkingATerm(CustomTestCase):
 
     def test_the_whole_ladder_is_printed_with_the_refusal(self):
         msg = _refusal(memtotal=DK7_MEMTOTAL_B, memavail=DK7_MEMAVAIL_B,
-                       current=DK7_CG_CURRENT_B, reclaim=DK7_CG_RECLAIM_B)
+                       current=DK7_CG_CURRENT_B, reclaim=DK7_CG_RECLAIM_B,
+                       arms=REFUSING_ARMS)
         for m in (2400, 1200, 600):
             self.assertIn(f"M={m}", msg)
 

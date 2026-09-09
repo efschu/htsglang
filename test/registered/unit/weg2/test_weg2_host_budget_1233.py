@@ -55,7 +55,7 @@ DK5_STORE_CHOSEN_GIB = 9
 DK5_STORE_MIN_GIB = 8.0
 
 
-def _choose(store_min_gib, *, with_cgroup=True, **over):
+def _choose(*, with_cgroup=True, **over):
     """One seam both trees answer through, so red/green is BEHAVIOURAL.
 
     The pre-fix ``choose`` has no cgroup parameters at all; calling it with them
@@ -64,7 +64,7 @@ def _choose(store_min_gib, *, with_cgroup=True, **over):
     exercised exactly as it ran on weg2dk5 -- and fails these assertions on the
     numbers, not on a signature.
     """
-    kw = dict(store_min_gib=store_min_gib, **RING_KW)
+    kw = dict(**RING_KW)
     params = inspect.signature(host_ledger.choose).parameters
     if with_cgroup and "cg_current_bytes" in params:
         kw.update(
@@ -232,21 +232,27 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
     #: launch/run leftovers per arm; the first arm fundable at BOTH moments wins.
     DK5_LADDER_ON_THE_RING = {2400: (-5.35, 3.67), 1200: (-0.42, 8.60), 600: (2.05, 11.07)}
 
-    def test_the_arm_that_died_is_still_refused_at_that_boots_own_store_floor(self):
-        # THE RED-FIRST FACT, unchanged: on weg2dk5 this exact call FUNDED
-        # S=1/M=1200 with a 9 GiB store and the box was reaped 9 minutes later.
-        # On the ring the call still does not hand back that arm.
-        # #1269: THE CLASS'S CLAIM SURVIVES AND IS SHARPENED. Under the hard
-        # bound (watermark MINUS the named margin) the ladder no longer falls to
-        # M=600 -- it refuses OUTRIGHT again, as it did under fix 8 before the
-        # ring made every moment 16.41 GiB cheaper. dk5's best arm predicts
-        # 92.19 GiB against a hard bound of 87.30, so nothing on the ladder
-        # fits. "weg2dk5 would have been named before it booted" is now true by
-        # a blanket refusal rather than by a smaller arm, which is the STRONGER
-        # form of this class's sentence, not a weaker one.
-        with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
-            _choose(DK5_STORE_MIN_GIB)
-        lines = str(cm.exception).splitlines()
+    def test_the_arm_that_died_is_still_refused(self):
+        # THE RED-FIRST FACT, unchanged across three reworkings: on weg2dk5 this
+        # exact call FUNDED S=1/M=1200 and the box was reaped 9 minutes later.
+        # It still does not hand back that arm.
+        #
+        # #1236 MOVED THE OUTCOME AGAIN, and the move is the whole point of the
+        # store going to disk. #1269 had the ladder refusing OUTRIGHT, because
+        # every arm's predicted peak carried its own STORE -- 9 GiB of tmpfs on
+        # dk5's chosen arm -- and that store pushed the best arm to 92.19 GiB
+        # against an 87.30 GiB hard bound. The store is a directory on the ZFS
+        # dataset now and is not in the sum at all, so the same box's peaks drop
+        # by exactly that term: M=600 predicts 81.19 GiB and IS fundable, with
+        # 6.11 GiB of reap headroom. dk5 is therefore named before it boots and
+        # given a smaller, survivable arm -- which is this class's sentence in
+        # its strongest form yet, and NOT a weakening: the arm that died is
+        # still refused, by the LAUNCH moment, which no store size ever touched.
+        arm, headroom, lines_l = _choose()
+        self.assertEqual((arm.s_gb, arm.m_mib), (1, 600))
+        self.assertIsNotNone(headroom)
+        self.assertGreater(headroom, 0.0)
+        lines = "\n".join(lines_l).splitlines()
         # and M=1200 -- the arm that died -- is refused by name, at the LAUNCH
         # moment, which is the term the ring does NOT make free (it charges
         # Sigma span1 = 29.21 GiB there plus the 12 GiB load transient).
@@ -278,6 +284,10 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         self.assertAlmostEqual(arm.terms["host_ring_gib"], 32.19, delta=0.01)
 
     def test_the_whole_ladder_of_that_boot_is_now_below_the_observed_reap_point(self):
+        # #1236 NOTE, stated where the assertion changed rather than in a
+        # commit message: this used to raise W21 for the whole ladder. With the
+        # store off the RAM books two arms fit the hard bound, so the ladder
+        # CHOOSES instead of refusing, and the lines come back from the choice.
         # THE INVERTED VERDICT, re-derived rather than flipped.  Under fix 8
         # EVERY arm predicted a peak ABOVE the reap point; on the ring every arm
         # is BELOW it, because the ring took 16.41 GiB out of the run moment and
@@ -289,9 +299,7 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         # every arm is ABOVE the hard bound (watermark - margin), which is why
         # the ladder refuses. Stating both is the re-derivation; asserting only
         # the first would hide the change that matters.
-        with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
-            _choose(DK5_STORE_MIN_GIB)
-        lines = str(cm.exception).splitlines()
+        _arm, _headroom, lines = _choose()
         watermark = host_ledger.OBSERVED_REAP_CURRENT_BYTES / GIB
         hard_bound = (
             host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / GIB
@@ -304,13 +312,20 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
                 cg_current_bytes=DK5_CG_CURRENT_B, cg_ceiling_bytes=DK5_MEMTOTAL_B,
             )
             self.assertAlmostEqual(priced.run_leftover_gib, run, delta=0.05)
-            peak = priced.predicted_run_peak_gib(max(0.0, float(int(run))))
+            # #1236: NO STORE TERM. The peak is the arm's own charges, and the
+            # store that used to sit on top of it is on disk.
+            peak = priced.predicted_run_peak_gib()
             self.assertLess(peak, watermark, f"M={m} predicts {peak:.2f}")
-            self.assertGreater(
-                peak, hard_bound,
-                f"M={m} predicts {peak:.2f}, which must be ABOVE the hard bound "
-                f"{hard_bound:.2f} -- that is why this ladder refuses",
-            )
+            # Only the TOP arm still clears the hard bound from above; the two
+            # below it now fit, which is exactly the term that was removed.
+            if m == 2400:
+                self.assertGreater(peak, hard_bound, f"M={m} predicts {peak:.2f}")
+            else:
+                self.assertLessEqual(
+                    peak, hard_bound,
+                    f"M={m} predicts {peak:.2f}, which must be AT OR BELOW the hard "
+                    f"bound {hard_bound:.2f} once the store leaves the sum (#1236)",
+                )
         self.assertIn("RUN-PEAK ADVISORY", "\n".join(lines))
         for m in (2400, 1200, 600):
             self.assertIn(f"M={m}", "\n".join(lines))
@@ -327,8 +342,12 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
             cg_current_bytes=DK5_CG_CURRENT_B, cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
         watermark = host_ledger.OBSERVED_REAP_CURRENT_BYTES / GIB
-        predicted = arm.predicted_run_peak_gib(DK5_STORE_CHOSEN_GIB)
-        self.assertAlmostEqual(predicted, 92.66, delta=0.05)
+        # #1236: 92.66 was this arm's peak WITH its 9 GiB tmpfs store. The
+        # store is on disk, so the same arm now predicts 92.66 - 9 = 83.66 --
+        # the identity is asserted rather than the new number alone, so a
+        # reader can see it is the same model minus one named term.
+        predicted = arm.predicted_run_peak_gib()
+        self.assertAlmostEqual(predicted, 92.66 - DK5_STORE_CHOSEN_GIB, delta=0.05)
         self.assertLess(predicted, watermark)
         # the margin the ring bought, at that arm and that store, is Sigma H's
         # saving against fix 8's image + transient: 92.66 + 16.41 = 109.07, which
@@ -339,14 +358,15 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         self.assertFalse(arm.fundable_moments)
 
     def test_the_prediction_is_absent_not_green_without_a_cgroup_sample(self):
-        arm, store, lines = _choose(4.0, with_cgroup=False)
-        self.assertIsNone(arm.predicted_run_peak_gib(store))
+        arm, headroom, lines = _choose(with_cgroup=False)
+        self.assertIsNone(arm.predicted_run_peak_gib())
+        self.assertIsNone(headroom)
         advisory = [ln for ln in lines if "RUN-PEAK ADVISORY" in ln][0]
         self.assertIn("not computed", advisory)
 
     def test_the_terms_line_carries_the_cgroup_reading_and_the_oom_baseline(self):
         try:
-            _arm, _store, lines = _choose(4.0)
+            _arm, _headroom, lines = _choose()
         except host_ledger.Weg2HostLedgerRefused as e:
             lines = str(e).splitlines()      # fix 8: the same lines, on refusal
         terms = [ln for ln in lines if "WEG2-HOST-LEDGER TERMS" in ln][0]

@@ -74,10 +74,25 @@ MEMTS = f"{GPU_ARB}/devtools/mem_timeseries.sh"
 HOST_PREFLIGHT = f"{GPU_ARB}/devtools/host_ledger_preflight.sh"
 SHM_DIR = "/dev/shm"
 PRESENCE_DIR = f"{SHM_DIR}/sglang-phase-flip-presence"
-STORE_MOUNT = "/spinning/hicache-weg2-ram"
+#: #1236, USER RULING 2026-09-09: the Weg-2 page store is "normales hicaching
+#: mit lvl2 und lvl3" -- the UPSTREAM HiCache file backend, pointed at a plain
+#: directory on the ZFS dataset under /spinning.  NOT a tmpfs, NOT a new tier,
+#: NOT an overflow mechanism, NOT a second bookkeeping: the ONLY things this
+#: line owns are WHERE the backend's directory is and HOW BIG it is told to be.
+#:
+#: WHAT THIS REPLACES, and why the replacement is the whole fix: the store was
+#: a tmpfs mounted per boot at ``/spinning/hicache-weg2-ram``, sized out of the
+#: HOST RAM ledger's leftover.  Boot weg2sb5g got 6 GiB of it (max_size 5 G,
+#: min_free 1 G) and REFUSED 1,324 group-P writes with "HiCacheFile ... would
+#: fall below min_free" -- 5 GiB of usable store against a P KV pool of 304,950
+#: tokens x 32,768 B = 9.30 GiB, i.e. the "#1236 Store >= P pool" law violated
+#: by 1.86x before the first flip.  RAM was the wrong currency for a carrier
+#: that has to be at least as large as a pool that already lives in RAM.
+STORE_ROOT = "/spinning/hicache-weg2"
 #: C18: where the per-card host-ring files live under the MAP_SHARED form.  A
 #: tmpfs, because the granules must be shared PAGES (both co-located rank
-#: processes map the same file), not a disk-backed file.
+#: processes map the same file), not a disk-backed file.  THIS COMMENT IS THE
+#: HOST RING'S, NOT THE STORE'S -- the store above is disk and shares nothing.
 HOST_RING_DIR = "/dev/shm/weg2-hostring"
 SHM_ARCHIVE_ROOT = f"{GPU_ARB}/shm_residue"
 #: #1233 fix 8, boot weg2dk7: the /dev/shm NAME FAMILIES THIS LINE'S OWN CODE
@@ -947,6 +962,14 @@ class Weg2LaunchRefused(RuntimeError):
     pass
 
 
+class Weg2StoreDiskRefused(Weg2LaunchRefused):
+    """W52: the disk cannot fund ``max_size + min_free`` for this boot's store."""
+
+
+class Weg2StoreArcRefused(Weg2LaunchRefused):
+    """W53: the ZFS ARC is uncapped and the reap margin does not cover the store."""
+
+
 @dataclass
 class Card:
     nvml_index: int
@@ -984,8 +1007,14 @@ class BootState:
     logs: Dict[str, str] = field(default_factory=dict)
     pids: Dict[str, int] = field(default_factory=dict)
     helper_pids: List[int] = field(default_factory=list)
-    store_mount: str = STORE_MOUNT
-    store_gib: float = 0.0
+    #: #1236: WHERE this boot's store directory is, on disk. Replaces
+    #: ``store_mount`` + ``store_gib`` -- there is no mount and no RAM size.
+    store_dir: str = ""
+    store_max_size_bytes: int = 0
+    store_min_free_bytes: int = 0
+    #: What the host ledger reports instead of a store size: hard bound minus
+    #: predicted run peak. ``None`` when no cgroup sample allowed a prediction.
+    reap_headroom_gib: Optional[float] = None
     budgets: Dict[str, List[int]] = field(default_factory=dict)
     dc_measured_p: Dict[str, int] = field(default_factory=dict)
     dc_expect_d: Dict[str, int] = field(default_factory=dict)
@@ -1522,29 +1551,378 @@ def cards_free_check(cards: List[Card], log: Log) -> None:
 # --------------------------------------------------------------------------
 
 
-def mount_store(log: Log, store_gib: float, dry: bool) -> None:
+#: THE MEASURED COMPOSITION OF A REAL WEG-2 STORE, from which the sidecar
+#: headroom factor below is DERIVED rather than picked.  Provenance, both
+#: halves on this rig and both quoted rather than recalled:
+#:
+#: * FILE COUNTS -- boot ``weg2sb5g``'s own ``W9 store census (shard-walked)``
+#:   line, 2026-09-09T07:12:38Z, store dir ``/spinning/hicache-weg2-ram/store``:
+#:   ``files=76733 kv=50651 mamba=42 draft=26040``.
+#: * BYTE WEIGHTS -- ``stat`` on the store residue ``/spinning/hicache-l3``
+#:   (same model, identity ``b023832e91bf5745``), 2026-09-09: a KV page is
+#:   32,768 B (three samples, all exact); the three DCP shards of ONE mamba
+#:   node (``feb21ed4a261...``) are 39,223,296 + 19,611,648 + 19,611,648 B,
+#:   summing to 78,446,592 B = 74.81 MiB of GDN state per radix node -- which
+#:   is what the #706 CANONICAL blob holds in one file, geometry-neutral.
+#:   A draft page is :data:`host_ledger.DRAFT_PAGE_BYTES` = 2,048 B.
+#:
+#: THE HONEST LIMIT OF THIS RATIO, stated because a factor invites being read
+#: as a constant of nature: it is ONE snapshot of ONE boot's mix.  The draft
+#: half is structurally bounded (2,048 B beside every 32,768 B page = 1/16, and
+#: the census sat below that at 0.51 draft pages per KV page).  The MAMBA half
+#: is not: a blob is written per RADIX NODE, so its share moves with chunk
+#: granularity and prefix reuse, and at this census it was the DOMINANT term --
+#: 3.29 GB against 1.66 GB of KV.  That is also the arithmetic that explains
+#: sb5g's 1,324 refusals without any further hypothesis: kv + mamba + draft =
+#: 5.01 GB against 5 GiB of usable tmpfs, i.e. the store was already at its
+#: wall.  The factor is therefore a SIZING INPUT with a flag
+#: (``--store-sidecar-factor``), not a law, and on disk it is cheap to be
+#: generous with -- which is the point of moving off RAM.
+STORE_CENSUS_PROVENANCE = "boot weg2sb5g W9 store census 2026-09-09T07:12:38Z"
+STORE_CENSUS_KV_PAGES = 50651
+STORE_CENSUS_MAMBA_BLOBS = 42
+STORE_CENSUS_DRAFT_PAGES = 26040
+STORE_CENSUS_KV_PAGE_BYTES = 32768
+#: 39,223,296 + 19,611,648 + 19,611,648 measured on /spinning/hicache-l3.
+STORE_MAMBA_BLOB_BYTES = 39_223_296 + 19_611_648 + 19_611_648
+_CENSUS_KV_BYTES = STORE_CENSUS_KV_PAGES * STORE_CENSUS_KV_PAGE_BYTES
+_CENSUS_MAMBA_BYTES = STORE_CENSUS_MAMBA_BLOBS * STORE_MAMBA_BLOB_BYTES
+_CENSUS_DRAFT_BYTES = STORE_CENSUS_DRAFT_PAGES * host_ledger.DRAFT_PAGE_BYTES
+#: (kv + mamba + draft) / kv at that census = 3.02.  Multiply the P group's KV
+#: pool bytes by this to size the WHOLE store, sidecars included.
+STORE_SIDECAR_FACTOR = (
+    _CENSUS_KV_BYTES + _CENSUS_MAMBA_BYTES + _CENSUS_DRAFT_BYTES
+) / float(_CENSUS_KV_BYTES)
+#: ``min_free_space`` FOR THE DISK, and the reason it is not the old 1 GiB:
+#: that 1 GiB was 1/6th of a 6 GiB tmpfs and it latched the write stop after
+#: 5 GiB.  Here the filesystem is the CONTAINER'S ROOT (``/`` is
+#: ``spinning/subvol-999-disk-0``; ``df`` 2026-09-09: 2.3 T, 622 G free), so
+#: the floor protects the whole box, not the store: below it this rig's own
+#: boot logs (a P+D+front triple measured ~2.5 GB on weg2sb4), the evidence
+#: tree and the model cache start failing.  32 GiB is ~13 such boots of
+#: headroom.  It is NOT a ZFS performance-knee margin -- the pool is already
+#: 74 % full, so that knee is behind us and is a different conversation.
+STORE_DISK_MIN_FREE_GIB = 32.0
+#: The measured device figures for this dataset, SECTION 1as sec. 0 of
+#: ``gpu-arb/weg2/WEG2_BUILD_DECISIONS_0906.md`` (2026-09-09 08:41Z, 2 GiB of
+#: /dev/urandom -- ``/dev/zero`` on a COMPRESSED dataset scored 10.5 GB/s and
+#: measured nothing).  Only the two ``oflag/iflag=direct`` rows may be cited:
+#: buffered write 3016.5 MB/s and any log-file read are ARC/compression
+#: artefacts.  Used to PRICE reads, never to gate them.
+STORE_DISK_WRITE_MBPS = 1346.9
+STORE_DISK_READ_MBPS = 2754.9
+
+
+@dataclass
+class StoreDiskPlan:
+    """WHERE the store is, HOW BIG it is told to be, and WHAT SAID SO."""
+
+    directory: str
+    p_pool_tokens: int
+    cell_bytes: int
+    p_pool_bytes: int
+    sidecar_factor: float
+    max_size_bytes: int
+    min_free_bytes: int
+    fs_free_bytes: int
+    fs_total_bytes: int
+
+    @property
+    def needed_bytes(self) -> int:
+        return self.max_size_bytes + self.min_free_bytes
+
+    def extra_config(self) -> str:
+        return store_extra_config(self.max_size_bytes, self.min_free_bytes)
+
+
+def plan_store(
+    tag: str,
+    p_pool_tokens: float,
+    attn_counts: Sequence[int],
+    kv_mib_per_token_per_attn_layer: float,
+    sidecar_factor: float = STORE_SIDECAR_FACTOR,
+    min_free_gib: float = STORE_DISK_MIN_FREE_GIB,
+    root: str = STORE_ROOT,
+) -> StoreDiskPlan:
+    """Size the store from THE P POOL, and check the DISK can fund it.
+
+    ``max_size = P pool bytes x sidecar_factor``.  The P pool bytes come from
+    the SAME source the KV pool sizing itself uses -- the ``PP-POOL-JOIN``
+    line's own ``pool_tokens`` and ``cell_bytes``, i.e. :class:`PCutFacts`
+    straight out of :func:`solve_p_cut` -- never a hand-typed 32 KiB.  That
+    matters for the same reason #1286 F1 gave for the join key: a literal here
+    would keep printing a plausible number on any config with a different KV
+    dtype or head geometry while the pool itself had moved.
+
+    WHY ``>= P pool`` IS THE RIGHT FLOOR (#1236): under the Weg-2 phase law
+    group P prefills the WHOLE backlog into its pool and the store is the
+    carrier every one of those prefixes travels through to reach group D.  A
+    store smaller than the pool cannot hold what one prefill leg produces, so
+    the writes at the end of the leg are refused -- which is exactly the shape
+    boot weg2sb5g logged 1,324 times.
+
+    ``min_free_space`` is checked against the DISK the directory lives on
+    (``statvfs`` of ``root``), which is what
+    ``LRUFileEvictor._enforce_free_space_locked`` will itself read at runtime;
+    there is no second reading and no second bookkeeping.  Raises W52 when the
+    filesystem cannot fund ``max_size + min_free`` -- fail fast at preflight
+    rather than let the evictor latch its write stop mid-flip.
+    """
+    cell_bytes = int(round(sum(int(a) for a in attn_counts)
+                           * float(kv_mib_per_token_per_attn_layer) * MIB))
+    pool_bytes = int(round(float(p_pool_tokens) * cell_bytes))
+    max_size = int(math.ceil(pool_bytes * float(sidecar_factor)))
+    min_free = int(round(float(min_free_gib) * host_ledger.GIB))
+    os.makedirs(root, exist_ok=True)
+    st = os.statvfs(root)
+    free = st.f_bavail * st.f_frsize
+    total = st.f_blocks * st.f_frsize
+    plan = StoreDiskPlan(
+        directory=f"{root}/{tag}",
+        p_pool_tokens=int(p_pool_tokens),
+        cell_bytes=cell_bytes,
+        p_pool_bytes=pool_bytes,
+        sidecar_factor=float(sidecar_factor),
+        max_size_bytes=max_size,
+        min_free_bytes=min_free,
+        fs_free_bytes=free,
+        fs_total_bytes=total,
+    )
+    if plan.needed_bytes > free:
+        raise Weg2StoreDiskRefused(
+            f"W52 Weg2StoreDiskRefused: the filesystem hosting {root} cannot fund this "
+            f"boot's store. NEEDED {plan.needed_bytes / host_ledger.GIB:.2f} GiB = "
+            f"max_size {max_size / host_ledger.GIB:.2f} GiB (P pool "
+            f"{plan.p_pool_tokens} tokens x {cell_bytes} B/token = "
+            f"{pool_bytes / host_ledger.GIB:.2f} GiB x sidecar factor "
+            f"{sidecar_factor:.2f}) + min_free {min_free / host_ledger.GIB:.2f} GiB, "
+            f"AVAILABLE {free / host_ledger.GIB:.2f} GiB of {total / host_ledger.GIB:.2f} "
+            f"GiB. This is the '#1236 Store >= P pool' law meeting a disk that cannot "
+            f"hold it -- refusing at preflight rather than letting HiCacheFile latch its "
+            f"write stop mid-flip the way boot weg2sb5g did 1,324 times. The levers, "
+            f"named: free space on {root}; --store-sidecar-factor (the sidecar headroom, "
+            f"default {STORE_SIDECAR_FACTOR:.2f} from {STORE_CENSUS_PROVENANCE}); "
+            f"--store-disk-min-free-gib (the floor protecting this box's own root "
+            f"filesystem, default {STORE_DISK_MIN_FREE_GIB:.0f} GiB); or a smaller P "
+            f"pool via --pp-solve-objective. NOT a lever: host RAM -- this store is "
+            f"disk, and the host ledger no longer prices it."
+        )
+    return plan
+
+
+def prepare_store(log: Log, plan: StoreDiskPlan, dry: bool) -> str:
+    """Make this boot's store directory -- a PLAIN DIRECTORY, freshly.
+
+    No mount and no umount: the store is the upstream file backend's own
+    directory on the ZFS dataset.  "Fresh per boot" is kept exactly as the
+    tmpfs form had it, but by NAMING the directory after the boot tag instead
+    of by re-mounting: a previous boot's store is a different directory, so it
+    can never be inherited by accident, and sweeping it is an explicit act
+    (:func:`sweep_store_residue`) with its bytes printed.
+    """
     if dry:
-        log(f"DRY-RUN: would mount tmpfs size={store_gib:.0f}G at {STORE_MOUNT}")
-        return
-    os.makedirs(STORE_MOUNT, exist_ok=True)
-    mounts = open("/proc/mounts").read()
-    if f" {STORE_MOUNT} " in mounts:
-        subprocess.run(["umount", STORE_MOUNT], check=False)
-        log(f"store: stale tmpfs at {STORE_MOUNT} unmounted (fresh store per boot)")
-    subprocess.run(["mount", "-t", "tmpfs", "-o", f"size={int(store_gib)}G", "tmpfs", STORE_MOUNT], check=True)
-    st = os.statvfs(STORE_MOUNT)
+        log(
+            f"DRY-RUN: would create store directory {plan.directory} "
+            f"(max_size {plan.max_size_bytes / host_ledger.GIB:.2f} GiB, "
+            f"min_free {plan.min_free_bytes / host_ledger.GIB:.2f} GiB)"
+        )
+        return plan.directory
+    os.makedirs(plan.directory, exist_ok=True)
+    return plan.directory
+
+
+def sweep_store_residue(log: Log, keep: str, dry: bool, root: str = STORE_ROOT) -> int:
+    """Remove PREVIOUS boots' store directories under :data:`STORE_ROOT`.
+
+    The tmpfs form got "fresh store per boot" from the umount+mount pair.  On
+    disk the equivalent act is explicit, and it is deliberately scoped to
+    ``root`` and to directories that are not ``keep``: nothing outside this
+    line's own root is listed, stat'ed or removed -- the same rule
+    :func:`shm_residue_sweep` follows for /dev/shm, for the same reason.
+    Returns the bytes reclaimed (0 in dry-run, which is stated, not implied).
+    """
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        log(f"store residue: {root} unreadable -- NOT swept, and not read as empty")
+        return 0
+    stale = [n for n in names if os.path.join(root, n) != keep
+             and os.path.isdir(os.path.join(root, n))]
+    if not stale:
+        log(f"store residue: none under {root} (fresh store per boot)")
+        return 0
+    freed = 0
+    detail = []
+    for n in stale:
+        p = os.path.join(root, n)
+        alloc, _apparent, count = _tree_bytes(p)
+        freed += alloc
+        detail.append(f"{n}={alloc}B/{count}f")
+    if dry:
+        log(
+            f"DRY-RUN store residue: would remove {len(stale)} previous store dir(s) "
+            f"under {root} freeing {freed / host_ledger.GIB:.2f} GiB ({', '.join(detail)})"
+        )
+        return 0
+    for n in stale:
+        shutil.rmtree(os.path.join(root, n), ignore_errors=True)
     log(
-        f"store: tmpfs mounted at {STORE_MOUNT} size={st.f_blocks * st.f_frsize / host_ledger.GIB:.2f} GiB "
-        f"(RAM-backed canonical page store, user ruling 2026-09-07; NO disk tier in V1 -- the file "
-        f"backend has no second tier, /spinning/hicache-weg2 is not used)"
+        f"store residue: removed {len(stale)} previous store dir(s) under {root}, "
+        f"freed {freed / host_ledger.GIB:.2f} GiB ({', '.join(detail)}) -- DISK, not "
+        f"host RAM; nothing here was ever charged to the reap ledger"
+    )
+    return freed
+
+
+def store_extra_config(max_size_bytes: int, min_free_bytes: int) -> str:
+    """The backend's own knobs, in BYTES, with no unit rounding in between.
+
+    ``max_size_scope: shared`` is kept from the tmpfs form and is what makes
+    this a DIRECTORY cap: every writer rank builds its own evictor over the
+    same directory, and ``LRUFileEvictor._load_config`` divides a shared cap by
+    the writer count so the sum of the ranks' caps is the number passed here.
+    """
+    return json.dumps(
+        {
+            "max_size": str(int(max_size_bytes)),
+            "min_free_space": str(int(min_free_bytes)),
+            "max_size_scope": "shared",
+        },
+        separators=(",", ":"),
     )
 
 
-def store_extra_config(store_gib: float) -> str:
-    # max_size + min_free_space must fit the filesystem (W8): the tmpfs IS
-    # store_gib, so max_size = store_gib - 1 G and min_free_space = 1 G.
-    max_size = max(1, int(store_gib) - 1)
-    return json.dumps({"max_size": f"{max_size}G", "min_free_space": "1G", "max_size_scope": "shared"}, separators=(",", ":"))
+def read_arc_state(
+    param_path: str = "/sys/module/zfs/parameters/zfs_arc_max",
+    kstat_path: str = "/proc/spl/kstat/zfs/arcstats",
+) -> Dict[str, Optional[int]]:
+    """ZFS ARC facts in BYTES: ``arc_max`` (the module parameter), ``c_max``
+    and ``size`` (live, from arcstats).  ``None`` -- never 0 -- for anything
+    unreadable, because 0 is a MEANINGFUL value of ``zfs_arc_max`` (it means
+    "unset, use the built-in default") and must not be forged by an absence.
+    """
+    out: Dict[str, Optional[int]] = {"arc_max": None, "c_max": None, "size": None}
+    try:
+        with open(param_path) as f:
+            out["arc_max"] = int(f.read().strip())
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(kstat_path) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 3 and parts[0] in ("c_max", "size"):
+                    out[parts[0]] = int(parts[2])
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def arc_preflight_line(
+    arc: Dict[str, Optional[int]],
+    plan: StoreDiskPlan,
+    margin_gib: Optional[float],
+) -> str:
+    """ONE line pricing the ZFS ARC beside the reap margin, and W53 if it must.
+
+    THE ASSUMPTION, stated rather than assumed: the ARC is the cache ZFS keeps
+    for this dataset, it is RECLAIMABLE under memory pressure (the kernel
+    shrinks it before the reaper kills), and it is HOST kernel memory -- it is
+    not charged to this container's cgroup at all.
+
+    WHAT WAS CHECKED ON THIS BOX rather than guessed (2026-09-09), because the
+    briefing asked whether ``MemAvailable`` includes the ARC: ``/proc/meminfo``
+    here is ``fuse.lxcfs``, and its numbers are this CGROUP's.  Measured at one
+    reading: meminfo ``Cached`` 31,287,292 kB against cgroup ``memory.stat
+    file`` 32,038,137,856 B -- the same 29.84 GiB -- and meminfo
+    ``SReclaimable`` 792,860 kB against cgroup ``slab_reclaimable``
+    811,390,688 B, the same 0.76 GiB, with ``MemAvailable`` equal to
+    ``MemFree + Cached + SReclaimable`` to within 0.15 GiB.  The ARC's own
+    4.92 GiB (``size`` 5,288,088,320 B) appears in NEITHER.  So: the ARC is
+    invisible to the reap ledger, and invisible in the SAFE direction -- it
+    cannot inflate ``memory.current``, which is the quantity the reaper acts
+    on (#1233 fix 5).  What it can do is compete for host RAM outside our
+    cgroup, which is why the cap is checked at all.
+
+    THE REFUSAL is narrow ON PURPOSE: only an UNBOUNDED ARC (``zfs_arc_max``
+    0 or unreadable) combined with a reap margin thinner than this store's own
+    byte budget.  A capped ARC -- 5 GiB here, already sitting at 4.92 GiB, so
+    at cap and evicting -- can absorb nothing further and is not a hazard.
+    """
+    def _g(v: Optional[int]) -> str:
+        return "unreadable" if v is None else f"{v / host_ledger.GIB:.2f} GiB"
+
+    arc_max = arc.get("arc_max")
+    unbounded = arc_max is None or arc_max == 0
+    store_budget_gib = plan.needed_bytes / host_ledger.GIB
+    head = (
+        f"WEG2-STORE ARC: zfs_arc_max={_g(arc_max)}"
+        + ("" if arc_max else " (0/unreadable = NO EXPLICIT CAP)")
+        + f" arcstats c_max={_g(arc.get('c_max'))} size={_g(arc.get('size'))} "
+        f"vs this boot's store budget {store_budget_gib:.2f} GiB and reap margin "
+        + ("unreadable" if margin_gib is None else f"{margin_gib:.2f} GiB")
+        + ". The ARC is HOST kernel memory and reclaimable under pressure; measured on "
+        "this box 2026-09-09, meminfo here is fuse.lxcfs and its Cached/SReclaimable "
+        "are this CGROUP's own file/slab_reclaimable to the byte, and the ARC is in "
+        "NEITHER -- so it cannot move memory.current, the quantity the reaper acts on."
+    )
+    if unbounded and margin_gib is not None and margin_gib < store_budget_gib:
+        raise Weg2StoreArcRefused(
+            f"W53 Weg2StoreArcRefused: the ZFS ARC has NO explicit cap "
+            f"(zfs_arc_max={_g(arc_max)}) and the reap margin {margin_gib:.2f} GiB is "
+            f"thinner than this store's own byte budget {store_budget_gib:.2f} GiB. An "
+            f"uncapped ARC can grow to hold what this store writes, and this boot has "
+            f"not left room for it. Set /sys/module/zfs/parameters/zfs_arc_max to a "
+            f"finite value, or widen the margin. NOT refused when the ARC is capped: a "
+            f"capped ARC evicts instead of growing. {head}"
+        )
+    return head + (
+        "  VERDICT: capped, no refusal."
+        if not unbounded
+        else "  VERDICT: uncapped, but the reap margin covers this store's budget -- "
+             "stated, not refused."
+    )
+
+
+def store_read_cost_line(plan: StoreDiskPlan, cap_tokens: int) -> str:
+    """PRICE a store read from disk, once, at boot -- the read-side cost line.
+
+    Bandwidth: the measured ``iflag=direct`` read-back of INCOMPRESSIBLE bytes,
+    SECTION 1as sec. 0.  The buffered figure and every log-file read are ARC
+    and compression artefacts and are not cited.
+
+    The bound it is checked against is the one that already exists: #1238 fix 7
+    ``Scheduler._deferred_prefetch_bound_s`` = ``prefetch_timeout_base + pages
+    x prefetch_timeout_per_page``, with the defaults of
+    ``PrefetchTimeoutConfig`` (base 2.0 s, 1.0 s per 1024 tokens) and
+    ``page_size=1`` from :func:`common_flags`.  The backend's configured
+    ``max`` (60 s) is printed beside it because the linear form is not clipped
+    on this path and a reader should see both ceilings.
+    """
+    read_bps = STORE_DISK_READ_MBPS * 1e6
+    cap_bytes = int(cap_tokens) * plan.cell_bytes
+    cap_s = cap_bytes / read_bps
+    pool_s = plan.p_pool_bytes / read_bps
+    bound_cap = 2.0 + int(cap_tokens) / 1024.0
+    bound_pool = 2.0 + plan.p_pool_tokens / 1024.0
+    return (
+        f"WEG2-STORE READ COST: per-request cap {int(cap_tokens)} tokens x "
+        f"{plan.cell_bytes} B = {cap_bytes / host_ledger.GIB:.2f} GiB prices at "
+        f"{cap_s:.2f} s of device time at the MEASURED {STORE_DISK_READ_MBPS:.1f} MB/s "
+        f"direct read (SECTION 1as sec. 0, /dev/urandom, iflag=direct on the ZFS "
+        f"compressed dataset -- the 3016.5 MB/s buffered write and every log-file read "
+        f"are ARC/compression artefacts and are NOT cited). A P-POOL-SIZED PREFIX, the "
+        f"case the flip actually asks for, is {plan.p_pool_tokens} tokens = "
+        f"{plan.p_pool_bytes / host_ledger.GIB:.2f} GiB = {pool_s:.2f} s. Against the "
+        f"#1238 fix 7 deferral bound (_deferred_prefetch_bound_s = base 2.0 s + 1.0 "
+        f"s/KiToken at page_size=1, unclipped on that path): {bound_cap:.1f} s for the "
+        f"cap and {bound_pool:.1f} s for the P pool -- covered "
+        f"{bound_cap / cap_s:.0f}x and {bound_pool / pool_s:.0f}x. Even against the "
+        f"backend's configured PrefetchTimeoutConfig.max of 60.0 s both reads fit "
+        f"({60.0 / cap_s:.0f}x, {60.0 / pool_s:.0f}x). Writes price at "
+        f"{STORE_DISK_WRITE_MBPS:.1f} MB/s and ride the backup thread "
+        f"(cache_controller backup_thread_func), off the scheduler thread."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1556,7 +1934,7 @@ def common_flags(
     model: str,
     s_gb: int,
     m_mib: int,
-    store_gib: float,
+    store_cfg: str,
     max_kv_per_request: int,
     write_policy: str = "write_through",
     group: str = "both",
@@ -1575,7 +1953,16 @@ def common_flags(
     (server_args.py:19507, "Pipeline parallelism is not compatible with
     overlap schedule", plus the same forcing in
     arg_groups/overrides._pipeline_parallel_overlap_disable), and group D runs
-    pp_size=1.  MEASURED consequence of the old placement: D booted with
+    pp_size=1.
+
+    ``store_cfg`` is the RENDERED backend extra-config JSON
+    (:func:`store_extra_config`), not a size.  #1236: it used to be a
+    ``store_gib`` float, because the store was a tmpfs the HOST RAM ledger had
+    sized; the store is a directory on disk now and its size comes from the P
+    KV pool (:func:`plan_store`), so passing a GiB number through here would be
+    carrying the old currency past the point where it stopped meaning anything.
+
+    MEASURED consequence of the old placement: D booted with
     disable_overlap_schedule=True inheriting a PP-only reason (BSSCALE_0907.md
     D4), so CPU scheduling of round n+1 could not hide behind GPU work of
     round n on a group that has no pipeline at all.  See argv_p / argv_d.
@@ -1605,7 +1992,7 @@ def common_flags(
         "--hicache-storage-backend", "file",
         "--hicache-mem-layout", "layer_first",
         "--hicache-io-backend", "direct",
-        "--hicache-storage-backend-extra-config", store_extra_config(store_gib),
+        "--hicache-storage-backend-extra-config", store_cfg,
         "--hicache-canonical-kv-page",
         "--host", "127.0.0.1",
         "--chunked-prefill-size", str(CHUNKED_PREFILL_TOKENS),
@@ -1650,7 +2037,7 @@ def argv_p(
     budgets: List[int],
     s_gb: int,
     m_mib: int,
-    store_gib: float,
+    store_cfg: str,
     extra: List[str],
     p_bs: int = 8,
     max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
@@ -1707,7 +2094,7 @@ def argv_p(
         else []
     )
     return [py, "-m", "sglang.launch_server"] + common_flags(
-        model, s_gb, m_mib, store_gib, max_kv_per_request, write_policy, "P",
+        model, s_gb, m_mib, store_cfg, max_kv_per_request, write_policy, "P",
         random_seed, barlink_cap_cycles, census_interval,
     ) + [
         # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
@@ -1799,7 +2186,7 @@ def argv_d(
     budgets: List[int],
     s_gb: int,
     m_mib: int,
-    store_gib: float,
+    store_cfg: str,
     extra: List[str],
     d_bs: int = 8,
     max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
@@ -1814,7 +2201,7 @@ def argv_d(
     admin_api_key: Optional[str] = None,
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(
-        model, s_gb, m_mib, store_gib, max_kv_per_request, "write_through", "D",
+        model, s_gb, m_mib, store_cfg, max_kv_per_request, "write_through", "D",
         random_seed, barlink_cap_cycles, census_interval,
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
@@ -3090,17 +3477,16 @@ def measured_record_path() -> str:
 
 
 def choose_host_ledger(
-    store_min_gib: float,
     ring_bytes: int,
     ring_span1_bytes: int,
     ring_provenance: str = "",
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
-) -> Tuple[host_ledger.Arm, float, List[str], Dict[str, Optional[int]]]:
+) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
-    Returns ``(arm, store_gib, printed lines, the cgroup reading)`` or raises
+    Returns ``(arm, reap headroom GiB, printed lines, the cgroup reading)`` or raises
     :class:`host_ledger.Weg2HostLedgerRefused` -- ``main`` only logs the lines
     and carries the reading into the boot state.
 
@@ -3110,7 +3496,7 @@ def choose_host_ledger(
 
     #1233 fix 7: this is a FUNCTION and not four lines inside ``main`` because
     it is the only wire that carries fix 6 into a boot, and inside ``main`` --
-    behind NVML, a tmpfs mount and two servers -- nothing could reach it.  The
+    behind NVML, the store preparation and two servers -- nothing could reach it.  The
     fix-6 review measured exactly that: replacing ``cg["reclaimable"]`` below
     with ``None`` reverts the whole boot to fix 5's denominator and 152 tests
     stayed green.  The two paths are the same code from here down, and the
@@ -3134,10 +3520,9 @@ def choose_host_ledger(
     record = host_ledger.read_measured_record(
         measured_record_path() if record_path is None else record_path
     )
-    arm, store_gib, lines = host_ledger.choose(
+    arm, reap_headroom_gib, lines = host_ledger.choose(
         mi["MemTotal"],
         mi["MemAvailable"],
-        store_min_gib=store_min_gib,
         ring_bytes=ring_bytes,
         ring_span1_bytes=ring_span1_bytes,
         ring_provenance=ring_provenance,
@@ -3146,15 +3531,16 @@ def choose_host_ledger(
         # page cache is what the kernel hands back instead of killing for.
         reclaimable_bytes=cg["reclaimable"],
         # train fix 3: the LIVE slab term the reap watermark's own row lacked.
-        # The store's reap bound subtracts it; passing None here reverts the
-        # bound to the optimistic form and says so on every ARM line.
+        # It is subtracted wherever the watermark bounds; passing None here
+        # reverts that bound to the optimistic form and says so on every ARM
+        # line. #1236: it no longer sizes a store -- there is no RAM store.
         slab_reclaimable_bytes=cg["slab_reclaimable"],
         cg_ceiling_bytes=cg_ceiling,
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
         measured_record=record,
     )
-    return arm, store_gib, lines, cg
+    return arm, reap_headroom_gib, lines, cg
 
 
 def count_marker(path: str, marker: str) -> int:
@@ -5452,7 +5838,30 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model", default=MODEL_DEFAULT)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--debug-hold", choices=["none", "P", "D", "both"], default="none")
-    ap.add_argument("--store-min-gib", type=float, default=8.0)
+    # #1236: --store-min-gib IS DELETED. It was a FLOOR on how much of the host
+    # RAM leftover the store tmpfs had to get, and there is no RAM leftover to
+    # floor any more -- the store is a directory on the ZFS dataset sized from
+    # the P KV pool. Its replacement is not another knob but a LAW checked
+    # against the disk (max_size >= P pool bytes, W52). The two knobs below are
+    # the only ones the disk form has, and both have a stated default.
+    ap.add_argument(
+        "--store-sidecar-factor", type=float, default=STORE_SIDECAR_FACTOR,
+        help="#1236: multiply the P KV pool's bytes by this to size the store, "
+             "covering the Mamba blobs and draft pages that ride beside the KV "
+             "pages. Default %(default).2f, DERIVED not picked: "
+             "(kv + mamba + draft) / kv at " + STORE_CENSUS_PROVENANCE + " "
+             f"(kv={STORE_CENSUS_KV_PAGES}x{STORE_CENSUS_KV_PAGE_BYTES} B, "
+             f"mamba={STORE_CENSUS_MAMBA_BLOBS}x{STORE_MAMBA_BLOB_BYTES} B measured on "
+             f"/spinning/hicache-l3, draft={STORE_CENSUS_DRAFT_PAGES}x2048 B). The mamba "
+             "half moves with chunk granularity and prefix reuse, so this is a sizing "
+             "input with provenance, not a constant of the model.")
+    ap.add_argument(
+        "--store-disk-min-free-gib", type=float, default=STORE_DISK_MIN_FREE_GIB,
+        help="#1236: HiCacheFile min_free_space, against the DISK the store lives on "
+             "(default %(default).0f GiB). This filesystem is the container's own root, "
+             "so the floor protects the box -- boot logs, the evidence tree, the model "
+             "cache -- not the store. NOT the old 1 GiB, which was 1/6th of a 6 GiB "
+             "tmpfs and latched the backend's write stop after 5 GiB.")
     ap.add_argument("--weight-chunks", type=int, default=8,
                     help="#1233: number of weights_<k> layer-chunk tags per group (0 = the round-1 single tag / two-backup shape)")
     ap.add_argument("--ready-deadline-s", type=float, default=900.0)
@@ -6301,14 +6710,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
 
     # 2. host ledger
-    arm, store_gib, lines, cg = choose_host_ledger(
-        ns.store_min_gib, ring_plan.host_weights_bytes,
+    arm, reap_headroom_gib, lines, cg = choose_host_ledger(
+        ring_plan.host_weights_bytes,
         ring_plan.host_weights_span1_bytes, ring_plan.provenance)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
     state.ledger_lines = lines
-    state.store_gib = store_gib
+    state.reap_headroom_gib = reap_headroom_gib
 
     # #1269 fix 4 follow-up: KEEP THE PREFLIGHT'S OWN ANON READING. `cg` is the
     # cgroup snapshot the ledger just took, BEFORE any group process exists, so
@@ -6335,11 +6744,65 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         state.helper_pids.append(mpid)
         log(f"mem time series pid {mpid} csv {memts} (started before group P: launch AND run moments sampled)")
 
-    # 3. store
-    mount_store(log, store_gib, dry)
-    store_dir = f"{STORE_MOUNT}/store"
-    if not dry:
-        os.makedirs(store_dir, exist_ok=True)
+    # 3. store -- ON DISK, SIZED FROM THE P KV POOL (#1236).
+    #
+    # ORDERING, and why it is safe: `cut` (solve_p_cut) is already solved above,
+    # before the ring, so the pool this store must cover is known here without
+    # moving anything.  The ledger ran first only because the ARC line prices
+    # itself against the reap headroom the ledger computes.
+    store_plan = plan_store(
+        ns.tag,
+        cut.pool_tokens,
+        cut.attn_counts,
+        cut.kv_mib_per_token_per_attn_layer,
+        sidecar_factor=ns.store_sidecar_factor,
+        min_free_gib=ns.store_disk_min_free_gib,
+    )
+    store_cfg = store_plan.extra_config()
+    log(
+        f"WEG2-STORE: dir={store_plan.directory} ON DISK (ZFS dataset, plain directory "
+        f"-- #1236 user ruling 2026-09-09: 'normales hicaching mit lvl2 und lvl3', the "
+        f"upstream HiCacheFile backend, no new tier and no overflow mechanism; the "
+        f"tmpfs form and its mount/umount are DELETED, not flagged off). "
+        f"max_size={store_plan.max_size_bytes} B "
+        f"({store_plan.max_size_bytes / host_ledger.GIB:.2f} GiB, scope=shared over the "
+        f"writer ranks) = P POOL {store_plan.p_pool_tokens} tokens x "
+        f"{store_plan.cell_bytes} B/token = "
+        f"{store_plan.p_pool_bytes / host_ledger.GIB:.2f} GiB x sidecar factor "
+        f"{store_plan.sidecar_factor:.2f} ({STORE_CENSUS_PROVENANCE}: kv={STORE_CENSUS_KV_PAGES} "
+        f"pages x {STORE_CENSUS_KV_PAGE_BYTES} B, mamba={STORE_CENSUS_MAMBA_BLOBS} blobs x "
+        f"{STORE_MAMBA_BLOB_BYTES} B measured on /spinning/hicache-l3, "
+        f"draft={STORE_CENSUS_DRAFT_PAGES} pages x {host_ledger.DRAFT_PAGE_BYTES} B). "
+        f"min_free={store_plan.min_free_bytes} B "
+        f"({store_plan.min_free_bytes / host_ledger.GIB:.2f} GiB) AGAINST THIS DISK, "
+        f"which has {store_plan.fs_free_bytes / host_ledger.GIB:.2f} GiB free of "
+        f"{store_plan.fs_total_bytes / host_ledger.GIB:.2f} GiB -- not the old 1 GiB on a "
+        f"6 GiB tmpfs that latched HiCacheFile's write stop after 5 GiB and refused 1,324 "
+        f"group-P writes on boot weg2sb5g. "
+        f"#1236 LAW CHECK: max_size >= P pool is "
+        f"{'HELD' if store_plan.max_size_bytes >= store_plan.p_pool_bytes else 'VIOLATED'} "
+        f"({store_plan.max_size_bytes / max(1, store_plan.p_pool_bytes):.2f}x; weg2sb5g ran "
+        f"at 0.54x). extra_config={store_cfg}"
+    )
+    log(
+        f"WEG2-STORE LEDGER DELTA: {store_plan.needed_bytes / host_ledger.GIB:.2f} GiB of "
+        f"store budget left the HOST RAM ledger entirely (max_size + min_free), because "
+        f"this store is a directory on disk and its host cost is page cache plus the ZFS "
+        f"ARC -- both reclaimable, neither in cgroup anon, neither what the reaper kills "
+        f"for. The reap headroom the ledger now reports is "
+        + ("unreadable (no cgroup sample)" if reap_headroom_gib is None
+           else f"{reap_headroom_gib:.2f} GiB")
+        + ", and it is larger than the pre-#1236 form's by exactly the store term that "
+        "form charged (6 GiB on boot weg2sb5g). NOT a claim that the box gained RAM: the "
+        "bytes moved to a device, they did not disappear."
+    )
+    log(arc_preflight_line(read_arc_state(), store_plan, reap_headroom_gib))
+    log(store_read_cost_line(store_plan, max_kv_per_request))
+    sweep_store_residue(log, store_plan.directory, dry)
+    store_dir = prepare_store(log, store_plan, dry)
+    state.store_dir = store_dir
+    state.store_max_size_bytes = store_plan.max_size_bytes
+    state.store_min_free_bytes = store_plan.min_free_bytes
 
     # 4. group P
     # TRAIN FIX 5 moved the dc-reserve / budgets_p / cut solve ahead of the
@@ -6376,7 +6839,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # boot instead of assuming it, and a divergence is named rather than
     # silently shipping a cut solved for a chunk size the argv does not carry.
     chunk_tokens_armed = chunked_prefill_size_of(
-        common_flags(ns.model, arm.s_gb, arm.m_mib, store_gib, max_kv_per_request,
+        common_flags(ns.model, arm.s_gb, arm.m_mib, store_cfg, max_kv_per_request,
                      ns.p_hicache_write_policy, "P", ns.random_seed,
                      ns.barlink_bar1_cap_cycles, ns.collective_census_interval)
     )
@@ -6516,7 +6979,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"Direct call: curl -s -X POST http://127.0.0.1:{PORT_D}/hicache/storage-backend/resize "
         f"-H \"Authorization: Bearer $(cat {admin_key_file})\" "
         f"-H 'Content-Type: application/json' -d '{{\"max_size_gb\": 8, \"min_free_gb\": 20}}'")
-    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, draft_kv_on_p, admin_api_key=admin_api_key)
+    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, draft_kv_on_p, admin_api_key=admin_api_key)
     # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
     # gated the ring table was hashed over an argv built with sentinel ledger
     # terms, which is sound only while every flag those sentinels reach is
@@ -6575,7 +7038,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -6642,7 +7105,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
@@ -6808,7 +7271,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         py, store_dir, spec_p.pid, spec_d.pid, dc_expect_d, cards, ns, chunk_count,
         carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,
         src_chunk_cards=src_chunk_cards, measured_record=measured_record_path(),
-        commit=tip, ledger_arm={"s_gb": arm.s_gb, "m_mib": arm.m_mib, "store_gib": store_gib},
+        commit=tip, ledger_arm={"s_gb": arm.s_gb, "m_mib": arm.m_mib},
         admin_key_file=admin_key_file,
         anon_preboot_bytes=anon_preboot_bytes,
     )
@@ -6970,10 +7433,19 @@ def teardown(path: str) -> int:
             pass
     print(f"KILL leftovers {left}")
     time.sleep(3)
-    mount = st.get("store_mount", STORE_MOUNT)
-    if f" {mount} " in open("/proc/mounts").read():
-        subprocess.run(["umount", mount], check=False)
-        print(f"store tmpfs {mount} unmounted")
+    # #1236: the store is a DIRECTORY ON DISK, so teardown removes it instead
+    # of unmounting a tmpfs. The umount pair is deleted, not kept behind a
+    # flag: there is no tmpfs form left to unmount. Removing it here is the
+    # symmetric act (the umount destroyed the store too); the boot-time
+    # `sweep_store_residue` is the belt-and-braces for a teardown that never
+    # ran, e.g. after a crash. These are DISK bytes -- nothing freed here was
+    # ever charged to the host reap ledger.
+    store_dir = st.get("store_dir", "")
+    if store_dir and os.path.isdir(store_dir):
+        alloc, _apparent, count = _tree_bytes(store_dir)
+        shutil.rmtree(store_dir, ignore_errors=True)
+        print(f"store dir {store_dir} removed ({alloc} B allocated, {count} files; DISK, "
+              f"not host RAM)")
     # C18: the per-card ring files are tmpfs pages charged to this boot's host
     # ledger.  Leaving them behind would carry Sigma H of RAM into the NEXT
     # boot's baseline, where nothing names it.

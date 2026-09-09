@@ -468,8 +468,8 @@ class LedgerRingTermsTest(unittest.TestCase):
 
     def test_choose_prints_the_ring_provenance_it_was_given(self):
         memtotal, memavail = self._common_box()
-        arm, store, lines = host_ledger.choose(
-            memtotal, memavail, store_min_gib=4.0,
+        arm, headroom, lines = host_ledger.choose(
+            memtotal, memavail,
             ring_bytes=self.SIGMA_H, ring_span1_bytes=self.SIGMA_SPAN1,
             ring_provenance="boot weg2zr2, 165 WEG2-CHUNK-BYTES lines",
         )
@@ -478,11 +478,15 @@ class LedgerRingTermsTest(unittest.TestCase):
         self.assertIn("29.21 GiB", terms)
         self.assertIn("boot weg2zr2, 165 WEG2-CHUNK-BYTES lines", terms)
         self.assertEqual((arm.s_gb, arm.m_mib), (1, 1200))
-        self.assertEqual(store, 10.0)
+        # #1236: the middle of the tuple is the REAP HEADROOM (hard bound minus
+        # predicted run peak), not a store size -- the store is on disk and this
+        # ledger no longer sizes one.
+        self.assertIsNotNone(headroom)
+        self.assertGreater(headroom, 0.0)
 
     def test_an_unfundable_ladder_refuses_with_the_ring_arithmetic(self):
         with self.assertRaises(host_ledger.Weg2HostLedgerRefused) as ctx:
-            host_ledger.choose(int(40 * GIB), int(30 * GIB), store_min_gib=8.0,
+            host_ledger.choose(int(40 * GIB), int(30 * GIB),
                                ring_bytes=self.SIGMA_H,
                                ring_span1_bytes=self.SIGMA_SPAN1,
                                ring_provenance="boot fake")
@@ -771,7 +775,7 @@ class LauncherRingPlanTest(unittest.TestCase):
         self.assertEqual(plan.host_weights_bytes, 0)
         self.assertEqual(plan.host_weights_span1_bytes, 0)
         with self.assertRaises(host_ledger.Weg2HostLedgerRefused):
-            host_ledger.choose(int(118 * GIB), int(103 * GIB), store_min_gib=4.0,
+            host_ledger.choose(int(118 * GIB), int(103 * GIB),
                                ring_bytes=plan.host_weights_bytes,
                                ring_span1_bytes=plan.host_weights_span1_bytes,
                                ring_provenance=plan.provenance)
@@ -1562,13 +1566,14 @@ class OldFormPriceTest(unittest.TestCase):
         table, reason = ring_table.solve(REAL_CARDS, EVIDENCE, ZR2)
         self.assertIsNotNone(table, reason)
         old = launcher.HostRingPlan(form="", armed=False, table=table)
-        arm, store, _ = host_ledger.choose(
-            int(118.05 * GIB), int(103.95 * GIB), store_min_gib=8.0,
+        arm, headroom, _ = host_ledger.choose(
+            int(118.05 * GIB), int(103.95 * GIB),
             ring_bytes=old.host_weights_bytes,
             ring_span1_bytes=old.host_weights_span1_bytes,
             ring_provenance=old.provenance)
         self.assertGreaterEqual(arm.launch_leftover_gib, 0.0)
-        self.assertGreaterEqual(store, 8.0)
+        self.assertIsNotNone(headroom)
+        self.assertGreater(headroom, 0.0)
 
 
 class MemfdArmIsDeletedTest(unittest.TestCase):
@@ -1668,7 +1673,7 @@ class NoMeasuredTableRefusesTheBootTest(unittest.TestCase):
         self.assertEqual(plan.host_weights_bytes, 0)
         self.assertEqual(plan.host_weights_span1_bytes, 0)
         with self.assertRaises(host_ledger.Weg2HostLedgerRefused) as cm:
-            host_ledger.choose(int(118 * GIB), int(104 * GIB), store_min_gib=8.0,
+            host_ledger.choose(int(118 * GIB), int(104 * GIB),
                                ring_bytes=plan.host_weights_bytes,
                                ring_span1_bytes=plan.host_weights_span1_bytes,
                                ring_provenance=plan.provenance)

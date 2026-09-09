@@ -71,12 +71,10 @@ DK5_CG_RECLAIMABLE_B = 6_466_440 * 1024
 DK5_RING_BYTES = 32964 * 1024 * 1024
 DK5_RING_SPAN1_BYTES = 29912 * 1024 * 1024
 RING_KW = dict(ring_bytes=DK5_RING_BYTES, ring_span1_bytes=DK5_RING_SPAN1_BYTES)
-DK5_STORE_MIN_GIB = 8.0
 
 
 def _choose(**over):
     kw = dict(
-        store_min_gib=DK5_STORE_MIN_GIB,
         **RING_KW,
         cg_current_bytes=DK5_CG_CURRENT_B,
         reclaimable_bytes=DK5_CG_RECLAIMABLE_B,
@@ -314,13 +312,21 @@ class TestTheRunPeakAdvisory(CustomTestCase):
             self.assertLess(arm.terms["cg_nonreclaim_gib"], arm.terms["run_origin_gib"])
             self.assertIn("RUN-MOMENT RESIDUAL FLOOR", arm.terms["run_origin_source"])
         self.assertAlmostEqual(
-            charged.predicted_run_peak_gib(8.0), cached.predicted_run_peak_gib(8.0),
+            charged.predicted_run_peak_gib(), cached.predicted_run_peak_gib(),
             delta=1e-9,
         )
-        # The store is still a term of the sum, one GiB for one GiB.
-        self.assertAlmostEqual(
-            cached.predicted_run_peak_gib(8.0) - cached.predicted_run_peak_gib(0.0),
-            8.0, delta=1e-6,
+        # #1236: THE STORE IS NO LONGER A TERM OF THIS SUM, and this assertion
+        # is inverted rather than deleted -- the old form pinned "one GiB of
+        # store for one GiB of predicted peak", so its inverse is the exact
+        # statement that the term is gone. `predicted_run_peak_gib` takes no
+        # store argument at all now, which is why the check is on the signature
+        # as well as on the value: a store size cannot be passed in, and could
+        # not move the peak if it were.
+        import inspect
+        self.assertEqual(
+            [n for n in inspect.signature(
+                host_ledger.Arm.predicted_run_peak_gib).parameters if n != "self"],
+            [],
         )
 
     def test_the_watermark_is_stated_in_the_same_currency(self):
@@ -340,7 +346,7 @@ class TestTheRunPeakAdvisory(CustomTestCase):
         arm = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW
         )
-        self.assertIsNone(arm.predicted_run_peak_gib(8.0))
+        self.assertIsNone(arm.predicted_run_peak_gib())
 
     def test_the_v2_semantics_are_written_down_where_the_formula_lives(self):
         proof = host_ledger.CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF

@@ -93,11 +93,15 @@ RING = dict(ring_bytes=RING_BYTES, ring_span1_bytes=RING_SPAN1_BYTES,
             ring_provenance="boot weg2zr2 (spec section 2 table)")
 
 
-def test_w20_refuses_when_no_arm_funds_the_store():
+def test_w20_refuses_when_no_arm_funds_the_moments():
+    # #1236 RENAMED THIS, and the rename is the finding: the store is not in
+    # this refusal any more. It is a directory on the ZFS dataset sized from
+    # the P KV pool, so what W20 tests is the two MOMENTS on the ring. The box
+    # below still refuses, for the ring it cannot fund.
     memtotal = 118 * GIB
     memavail = 60 * GIB  # a box with 60 GiB available cannot fund the ring
     with pytest.raises(host_ledger.Weg2HostLedgerRefused) as ei:
-        host_ledger.choose(memtotal, memavail, store_min_gib=4.0, **RING)
+        host_ledger.choose(memtotal, memavail, **RING)
     assert "W20 Weg2HostLedgerRefused" in str(ei.value)
     assert "ARM S=1 M=600" in str(ei.value)  # the whole ladder is printed
 
@@ -106,7 +110,7 @@ def test_w20_refuses_a_boot_with_no_measured_ring_table_rather_than_guessing():
     """C19/R22: with BACKUP_P_BYTES and BACKUP_D_BYTES deleted there is no
     constant left to price the flip with, and the planner does not invent one."""
     with pytest.raises(host_ledger.Weg2HostLedgerRefused) as ei:
-        host_ledger.choose(160 * GIB, 150 * GIB, store_min_gib=4.0)
+        host_ledger.choose(160 * GIB, 150 * GIB)
     assert "no measured source" in str(ei.value)
 
 
@@ -129,7 +133,7 @@ def test_w20_still_refuses_the_live_box_shape_under_the_DR1_two_image_shape():
     memtotal = 118 * GIB
     memavail = 107 * GIB
     with pytest.raises(host_ledger.Weg2HostLedgerRefused) as ei:
-        host_ledger.choose(memtotal, memavail, store_min_gib=4.0,
+        host_ledger.choose(memtotal, memavail,
                            ring_bytes=DR1_BYTES,
                            ring_span1_bytes=RING_SPAN1_BYTES,
                            ring_provenance="boot weg2zr2, DR-1 two-image shape")
@@ -179,16 +183,20 @@ def test_the_cgroup_denominator_binds_and_names_itself():
 def test_the_ring_is_what_makes_that_same_box_fundable():
     """The whole point of C1-C8, priced: the shared region charges Sigma H once
     (32.19 GiB) where DR-1 charged both images (61.4)."""
-    arm, store, lines = host_ledger.choose(118 * GIB, 107 * GIB, store_min_gib=4.0, **RING)
-    assert arm.launch_leftover_gib >= 0 and arm.run_leftover_gib >= 0 and store >= 4
+    arm, headroom, lines = host_ledger.choose(118 * GIB, 107 * GIB, **RING)
+    assert arm.launch_leftover_gib >= 0 and arm.run_leftover_gib >= 0
+    # #1236: the middle of the tuple is the REAP HEADROOM, not a store size.
+    assert headroom is None or headroom > 0
     assert round(arm.terms["host_ring_gib"], 2) == 32.19
 
 
 def test_w20_funds_a_box_with_enough_ram_and_prints_every_term():
     memtotal = 160 * GIB
     memavail = 150 * GIB
-    arm, store, lines = host_ledger.choose(memtotal, memavail, store_min_gib=4.0, **RING)
-    assert arm.s_gb == 1 and store >= 4
+    arm, headroom, lines = host_ledger.choose(memtotal, memavail, **RING)
+    assert arm.s_gb == 1
+    # #1236: no store term to assert on -- this ledger prices RAM only.
+    assert headroom is None or headroom > 0
     assert arm.launch_leftover_gib >= 0 and arm.run_leftover_gib >= 0
 
 

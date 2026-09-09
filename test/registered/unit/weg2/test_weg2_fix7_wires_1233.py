@@ -111,7 +111,7 @@ def _seam_lines():
         meminfo, cg = _fake_host(tmp)
         try:
             _arm, _store, lines, _r = launcher.choose_host_ledger(
-                DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg,
+                DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg,
                 record_path=os.path.join(tmp, "no-such-record.json"),
             )
             return lines
@@ -145,13 +145,20 @@ class TestTheLedgerWireIsLoadBearing(CustomTestCase):
             #   origin 21.38 (the dk7 run-residual floor, above this box's
             #   14.99 launch reading) + charges 27.62 (heaps 17.23 + anchors
             #   2.37 + rings 7.45 + overhead 0.39 + draft 0.18) + Sigma H 32.19
-            #   + store 17 = 98.19 GiB, against the 95.90 GiB reap point.
-            # That is exactly what fix 8 built W21 for, so the pin follows it.
-            with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
-                launcher.choose_host_ledger(
-                    DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg,
-                    record_path=os.path.join(tmp, "no-such-record.json"),
-                )
+            #   = 81.19 GiB. #1236: the "+ store 17" this sum used to carry is
+            #   GONE -- the page store is a directory on the ZFS dataset, so it
+            #   is not in the run peak at all, and 81.19 sits UNDER the hard
+            #   bound. This box therefore no longer reaches W21 through the run
+            #   peak on the full ladder; the pin below restricts the ladder to
+            #   its top arm, which still predicts above the bound.
+            import unittest.mock as _mock
+            with _mock.patch.object(host_ledger, "DEFAULT_ARMS", ((1, 2400),)):
+                with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
+                    launcher.choose_host_ledger(
+                        DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo,
+                        cgroup_root=cg,
+                        record_path=os.path.join(tmp, "no-such-record.json"),
+                    )
         terms = [ln for ln in str(cm.exception).splitlines()
                  if "WEG2-HOST-LEDGER TERMS" in ln][0]
         # base = 118.05 (ceiling) - 14.99 (non-reclaimable) - 10 (CLI) = 93.05.
@@ -162,14 +169,15 @@ class TestTheLedgerWireIsLoadBearing(CustomTestCase):
         self.assertIn("image_P=38.63 GiB", terms)
 
     def test_the_seam_hands_the_reading_and_the_arm_back_when_the_box_can_fund_one(self):
-        # The control: the same seam, same files, a store floor the box can
-        # meet -- the reading reaches the caller (main stores it in the boot
-        # state) and the reclaimable share is what it was measured to be.
+        # The control: the same seam, same files -- the reading reaches the
+        # caller (main stores it in the boot state) and the reclaimable share is
+        # what it was measured to be. (#1236: there is no store floor argument
+        # to vary any more; the seam takes the ring terms and nothing else.)
         with tempfile.TemporaryDirectory() as tmp:
             meminfo, cg = _fake_host(tmp)
             try:
                 _arm, _store, _lines, reading = launcher.choose_host_ledger(
-                    0.0, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg,
+                    DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo, cgroup_root=cg,
                     record_path=os.path.join(tmp, "no-such-record.json"),
                 )
             except (host_ledger.Weg2HostLedgerRefused,
@@ -207,7 +215,7 @@ class TestTheLedgerWireIsLoadBearing(CustomTestCase):
                     os.remove(os.path.join(cg, "memory.stat"))
                 try:
                     arm, _s, lines, _r = launcher.choose_host_ledger(
-                        DK5_STORE_MIN_GIB, DK5_RING_BYTES, DK5_RING_SPAN1_BYTES,
+                        DK5_RING_BYTES, DK5_RING_SPAN1_BYTES,
                         meminfo_path=meminfo, cgroup_root=cg,
                         record_path=os.path.join(tmp, "no-such-record.json"),
                     )

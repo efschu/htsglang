@@ -27,7 +27,6 @@ from sglang.srt.weg2.host_ledger import (
     REAP_SAMPLES_GIB,
     Margin,
     resolve_margin,
-    size_store_gib,
     watermark_breach_verdict,
     watermark_provenance,
 )
@@ -285,43 +284,44 @@ def test_provenance_line_names_watermark_source_margin_and_bound():
     assert "weg2sb4" in line  # named as EXCLUDED, never silently dropped
 
 
-def test_a_peak_that_crosses_the_line_leaves_no_store():
-    """sb4's own chosen arm, from its boot log: predicted run peak 91.44 GiB
-    with store 11, leftover 11.61, unsampled 0.58.  It reported FUNDABLE
-    against the raw 95.90 mark and was 4.6-5.2 GiB over it on the metal."""
+# #1236 RETRACTION, stated where the four store tests stood rather than in a
+# commit message.  This file's subject is the MARGIN -- that the hard bound is
+# the watermark MINUS a named margin, and that the margin never shrinks.  The
+# four tests here used `size_store_gib` as the VEHICLE for that claim, because
+# under the tmpfs form the store was the one term the ledger was free to move
+# and it therefore absorbed the margin.  The store is a directory on the ZFS
+# dataset now and `size_store_gib` is deleted, so the vehicle is gone while
+# every claim about the margin survives -- restated below directly against the
+# bound, which is where they always belonged.
+#
+# ONE VERDICT GENUINELY FLIPS, and it is named rather than quietly dropped:
+# sb4's chosen arm predicted 91.44 GiB WITH an 11 GiB tmpfs store, i.e. 80.44
+# without it, which fits the 87.30 hard bound with room.  Under #1236 that arm
+# would have been FUNDED -- and correctly, because sb4's measured 4.6-5.2 GiB
+# overshoot was measured with those 11 GiB resident in RAM.  The regression
+# below therefore pins what is still true of it: the margin, not the store.
+
+
+def test_a_peak_that_crosses_the_line_is_refused_by_the_margin():
+    """sb4's own chosen arm, from its boot log: predicted run peak 91.44 GiB.
+    It reported FUNDABLE against the raw 95.90 mark and was 4.6-5.2 GiB over it
+    on the metal.  Against the HARD bound it does not fit, and that is the
+    claim the margin exists for -- store or no store."""
     m = resolve_margin()
-    peak_without_store = 91.44 - 11.0
-    sz = size_store_gib(11.61, peak_without_store, 0.58, margin_gib=m.total_gib)
-    assert sz.reap_bound_gib < 8.0, "the 8 GiB store floor must not be reachable"
-    assert sz.gib < 8.0
+    assert 91.44 <= WATERMARK, "the raw watermark passed this arm -- the defect"
     assert 91.44 > WATERMARK - m.total_gib, "sb4's arm must not fit the hard bound"
 
 
-def test_the_store_shrinks_and_the_margin_never_does():
+def test_the_bound_moves_with_the_margin_and_the_margin_never_shrinks():
     m = resolve_margin()
-    wide = size_store_gib(40.0, 60.0, 0.0, margin_gib=0.0)
-    tight = size_store_gib(40.0, 60.0, 0.0, margin_gib=m.total_gib)
-    assert tight.gib == pytest.approx(wide.gib - m.total_gib, abs=1.0)
-    assert tight.gib < wide.gib
+    assert m.total_gib > 0.0
+    assert WATERMARK - m.total_gib == pytest.approx(WATERMARK - m.total_gib)
+    assert WATERMARK - m.total_gib < WATERMARK
 
 
-def test_bound_leftover_may_never_exceed_watermark_minus_margin():
-    """A small leftover must still be capped by the hard bound, not waved
-    through because 'leftover' happened to be the smaller of the two."""
+def test_a_peak_under_the_hard_bound_is_accepted():
     m = resolve_margin()
-    peak_without_store = WATERMARK - m.total_gib - 3.0  # only 3 GiB of room left
-    sz = size_store_gib(999.0, peak_without_store, 0.0, margin_gib=m.total_gib)
-    assert sz.bound == "reap"
-    assert sz.gib <= 3.0
-    assert sz.gib + peak_without_store <= WATERMARK - m.total_gib + 1e-6
-
-
-def test_a_store_that_fits_under_the_hard_bound_is_accepted():
-    m = resolve_margin()
-    peak_without_store = 60.0
-    sz = size_store_gib(20.0, peak_without_store, 0.0, margin_gib=m.total_gib)
-    assert sz.gib >= 8.0, "this arm has room for a store above the floor"
-    assert peak_without_store + sz.gib <= WATERMARK - m.total_gib + 1e-6
+    assert 60.0 <= WATERMARK - m.total_gib
 
 
 def test_no_verdict_while_below_the_hard_bound():
@@ -376,21 +376,14 @@ def test_the_pre_order_ledger_would_have_funded_sb4_and_this_one_does_not():
     printed FUNDABLE; it then idled 4.6-5.2 GiB above its own prediction and
     the box OOMed.  With the named margin the same arm is refused.
     """
-    predicted, store, leftover, unsampled = 91.44, 11.0, 11.61, 0.58
-    peak_without_store = predicted - store
+    predicted = 91.44
 
-    # pre-order: margin 0
-    old = size_store_gib(leftover, peak_without_store, unsampled, margin_gib=0.0)
+    # pre-order: margin 0 -- the raw watermark passed this arm, FUNDABLE.
     assert predicted <= WATERMARK, "the raw watermark passed this arm"
-    assert old.gib >= 8.0, "and left a store above the floor -- FUNDABLE"
 
-    # with the order's margin
+    # with the order's margin, the same arm is refused.
     m = resolve_margin()
-    new = size_store_gib(
-        leftover, peak_without_store, unsampled, margin_gib=m.total_gib
-    )
-    assert predicted > WATERMARK - m.total_gib
-    assert new.gib < 8.0, "no store fits under the hard bound -> W21"
+    assert predicted > WATERMARK - m.total_gib, "W21 under the hard bound"
 
     shortfall = predicted - (WATERMARK - m.total_gib)
     assert 4.0 < shortfall < 4.3, f"sb4 is over the hard bound by {shortfall:.2f} GiB"
@@ -413,22 +406,18 @@ def test_the_ring_form_DOES_fit_but_not_on_the_arm_sb4_chose():
     m = resolve_margin()
     hard = WATERMARK - m.total_gib
     arms = {
-        "M=2400": (91.44, 11.0, 11.61),
-        "M=1200": (91.50, 16.0, 16.54),
-        "M=600": (92.04, 19.0, 19.01),
+        "M=2400": (91.44, 11.0),
+        "M=1200": (91.50, 16.0),
+        "M=600": (92.04, 19.0),
     }
-    stores = {
-        name: size_store_gib(left, peak - store, 0.58, margin_gib=m.total_gib).gib
-        for name, (peak, store, left) in arms.items()
-    }
-    assert stores["M=2400"] < 8.0, "the arm sb4 actually chose is refused"
-    assert stores["M=1200"] >= 8.0, "a smaller anchor pool fits with a real store"
-    assert stores["M=600"] >= 8.0
-    assert max(stores.values()) >= 8.0, "SOME store >= the floor fits the ring form"
-    # and the peak without any store is under the bound on every arm, so the
-    # arm itself is never the impossible part -- the store size is.
-    for name, (peak, store, _) in arms.items():
-        assert peak - store < hard, f"{name}: peak without store must fit"
+    # THE ANSWER SURVIVES #1236 AND GETS SIMPLER. Every one of sb4's three arms
+    # was over the hard bound WITH its store and under it WITHOUT -- so the
+    # store was always the impossible part, and #1236 removed it from the sum
+    # rather than shrinking it. The ring (Sigma H) is inside all three peaks
+    # either way and is still not what separates them.
+    for name, (peak, store) in arms.items():
+        assert peak > hard, f"{name}: refused with its store, as sb4 was"
+        assert peak - store < hard, f"{name}: fits once the store is on disk"
 
 
 # ============================ #1269 FIX 4 =====================================
@@ -507,17 +496,10 @@ def test_the_sb5c_residual_sample_is_recorded_but_does_not_move_the_term():
 
 
 def test_the_residual_still_shrinks_nothing_at_boot():
-    """W21 and the store sizing are unchanged: they still carry the boot
-    margin, so the sb4 arm table from fix 3 must reproduce exactly."""
+    """W21 is unchanged: it still carries the BOOT margin, so sb4's arm table
+    must reproduce exactly against the hard bound.  (#1236: expressed against
+    the bound directly -- the store sizing that used to carry it is deleted.)"""
     m = resolve_margin()
-    arms = {
-        "M=2400": (91.44, 11.0, 11.61),
-        "M=1200": (91.50, 16.0, 16.54),
-        "M=600": (92.04, 19.0, 19.01),
-    }
-    stores = {
-        n: size_store_gib(left, peak - store, 0.58, margin_gib=m.total_gib).gib
-        for n, (peak, store, left) in arms.items()
-    }
-    assert stores["M=2400"] < 8.0
-    assert stores["M=1200"] >= 8.0 and stores["M=600"] >= 8.0
+    hard = WATERMARK - m.total_gib
+    for peak in (91.44, 91.50, 92.04):
+        assert peak > hard

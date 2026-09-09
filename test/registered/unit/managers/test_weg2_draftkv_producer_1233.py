@@ -420,7 +420,7 @@ class TestHostLedgerDraftTerms(CustomTestCase):
         # below the break-even of the priced form above.
         memavail = int((150 - arm.launch_leftover_gib - draft_terms / 2) * gib)
         chosen, _store, _lines = host_ledger.choose(
-            int(200 * gib), memavail, store_min_gib=0.0, **ring_kw
+            int(200 * gib), memavail, **ring_kw
         )
         self.assertNotEqual((chosen.s_gb, chosen.m_mib), (1, 2400))
 
