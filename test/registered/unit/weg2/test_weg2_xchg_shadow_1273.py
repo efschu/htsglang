@@ -13,7 +13,7 @@ from the metal (SECTION 1ai-S5-pre of WEG2_BUILD_DECISIONS_0906):
 **THE DOUBLE IS S4's FAKE DEVICE LAYER**, imported rather than re-written: a
 second fake would be a second set of assumptions about the same silicon, and
 the S4 round already proved that the fake is weakest exactly where the defects
-are (three of six must_fix lived in its benign spots).  This file re-uses it
+are (three of six must_fix lived in its benign spots).  This file reuses it
 and adds what S5 needs on top -- a byte-summing checksum, poisoned shadow
 destinations and a second destination image to compare against.
 
@@ -664,7 +664,7 @@ def test_a_rank_that_cannot_afford_the_shadow_stops_every_rank_running_it(region
     assert verdict.refusers == (0,)
     assert "a rank refused" in verdict.reason
     assert verdict.joined == xr.N_RANKS
-    assert f"leg=7" in verdict.line(leg=7, epoch="b.7")
+    assert "leg=7" in verdict.line(leg=7, epoch="b.7")
 
 
 def test_ranks_that_chose_different_subsets_do_not_shadow(region):
