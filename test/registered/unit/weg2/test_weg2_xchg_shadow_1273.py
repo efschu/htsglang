@@ -961,7 +961,8 @@ def test_the_shadow_moves_the_bytes_into_its_own_buffer_and_not_the_ring_s(
                       "match=1", "mismatch=0", "oncard_ms=", "cross_ms=",
                       "ring_ms=", "verdict=MATCH", "subset=qkv_proj",
                       "dir=P->D", "pieces=", "xchg_ms=", "issue_ms=",
-                      "slot_wait_ms=", "gate_skew_ms=", "lock_wait_ms="):
+                      "slot_wait_ms=", "gate_skew_ms=", "lock_wait_ms=",
+                      "tag=weights_0", "slot_checksum_not_representable="):
             assert token in line, (token, line)
     finally:
         src_ops.close()
@@ -1327,3 +1328,365 @@ def test_the_armed_counts_are_read_from_one_place(boot):
     finally:
         sems.close()
         xr.unlink_semaphores(boot)
+
+
+# ===========================================================================
+# THE FIX ROUND -- one test per must_fix of the S5 review and the S5 refuter.
+# DANGER DIRECTION of the whole block, and it is one sentence: an instrument
+# that cannot go red, and VRAM this instrument spends without pricing it.
+# ===========================================================================
+
+
+def _report(*, expected, got, nbytes=1024):
+    return tp.ChecksumReport(lane="cross", pair=0, slot=1, seq=4,
+                             nbytes=nbytes, expected=expected, got=got)
+
+
+def test_the_slot_checksum_asks_representability_before_it_says_mismatch():
+    """MUST_FIX (S5 review 1): rule 3 was asked for STRIPES only.
+
+    The slot path -- the transport's producer-vs-consumer comparison, which
+    reaches the same W59 marker -- logged on a bare inequality.  A batch whose
+    two ends framed the field differently was therefore reported as a data
+    corruption, which is #656 register C22 exactly: an instance killed for a
+    corruption that had not happened.
+    """
+    counters = sh.ShadowCounters()
+    lines: list = []
+    # 1024 bytes can sum to at most 261120; this value never was a checksum.
+    verdict = sh.report_slot_checksum(
+        _report(expected=4626949667419791296, got=17), counters,
+        leg=1, epoch="b.1", log=lines.append)
+    assert verdict == sh.NOT_REPRESENTABLE
+    assert counters.checksum_not_representable == 1
+    assert counters.checksum_mismatch == 0, (
+        "a framing error was counted as a corruption of the staged bytes")
+    assert "never a checksum of this batch" in lines[-1]
+    assert sh.MISMATCH_MARKER in lines[-1] and "verdict=NOT-REPRESENTABLE" in lines[-1]
+    # A REAL disagreement, both sides representable, still reports -- the fix
+    # may not have turned the instrument off.
+    assert sh.report_slot_checksum(_report(expected=100, got=101), counters,
+                                   leg=1, epoch="b.1",
+                                   log=lines.append) == sh.MISMATCH
+    assert counters.checksum_mismatch == 1
+    assert "STAGED bytes changed" in lines[-1]
+    # And agreement logs nothing at all.
+    before = len(lines)
+    assert sh.report_slot_checksum(_report(expected=100, got=100), counters,
+                                   leg=1, epoch="b.1",
+                                   log=lines.append) == sh.MATCH
+    assert len(lines) == before and counters.checksum_reports == 3
+
+
+def test_one_representability_question_serves_both_checksums():
+    """Rule 3 says the function is IMPORTED, never re-derived -- once."""
+    assert sh.checksum_representable(255 * 16, 16)
+    assert not sh.checksum_representable(255 * 16 + 1, 16)
+    assert not sh.checksum_representable(-1, 16)
+
+
+def test_a_compare_with_no_summer_may_not_read_as_a_pass(ops):
+    """MUST_FIX (S5 review 2): the ``ran = False`` of the no-summer guard was
+    unpinned -- the refuter's own mutant deleted it and 46 tests stayed green.
+
+    Mutated, a destination whose compare got no summer emitted ``ran=yes``
+    with ``stripes=0``, which is the "unarmed instrument reads as passed" the
+    compare's own docstring claims that line prevents.  Same lesson as this
+    slice's mutants E and K: a line no case exercises is not a property.
+    """
+    result = sh.ShadowResult(leg=0, epoch="b.1",
+                             subset=sh.select_subset([], leg=0),
+                             counters=sh.ShadowCounters(), ran=True)
+    run = sh.ShadowRun(result, sh.ShadowBuffers(ops, 0, 4096), (), {})
+    out = run.compare(None, lambda _s: None)
+    assert out.ran is False, "an unarmed compare reported itself as a run"
+    line = out.line()
+    assert "ran=no" in line and "verdict=NOT-RUN" in line
+    assert "stripes=0" in line
+    assert ops.freed, "the buffers outlived the compare"
+
+
+def test_a_compare_that_compared_nothing_is_not_a_match():
+    """The third verdict, in the CODE and not only in the boot ticket's grep."""
+    counters = sh.ShadowCounters()
+    assert counters.verdict == sh.NO_STRIPES
+    counters.stripes, counters.match = 2, 2
+    assert counters.verdict == sh.MATCH
+    counters.mismatch = 1
+    assert counters.verdict == sh.MISMATCH
+    ran_but_empty = sh.ShadowResult(leg=0, epoch="b.1",
+                                    subset=sh.select_subset([], leg=0),
+                                    counters=sh.ShadowCounters(), ran=True)
+    assert "verdict=NO-STRIPES" in ran_but_empty.line()
+
+
+def _diag(rank, nbytes, cls="qkv_proj"):
+    return wx.XchgDesc(tag="weights_0", src_rank=rank, dst_rank=rank,
+                       param_name=f"model.layers.0.attn.{cls}.weight",
+                       kind=wx.FLAT, nbytes=nbytes, rows=1, run_bytes=nbytes,
+                       spitch=0, dpitch=0, src_ptr=0x1000, dst_ptr=0x2000)
+
+
+def test_the_sources_on_card_bounce_is_priced_and_can_refuse():
+    """MUST_FIX (S5 review 3 / refuter 2): the source priced ZERO and then
+    allocated the bounce anyway.
+
+    ``run_leg``'s diagonal raw-mallocs ``slots x slot_bytes`` on the
+    PRODUCER's card (``OnCardBounce``).  With ``need_bytes=0`` the source voted
+    YES unconditionally and took up to 2 x 128 MiB on exactly the card the boot
+    ticket expects to refuse -- the one failure this module names as forbidden,
+    unpriced, on the leg nobody looked at.
+    """
+    descs = [_diag(0, 4 << 30)]
+    price, slot = sh.price_leg("GPU-5090", descs, rank=0, is_source=True,
+                               oncard_mode=tp.ONCARD_MODE_IPC, free_mib=8192)
+    assert price.bounce_mib == tp.ONCARD_SLOTS * slot // sh.MIB > 0
+    assert price.dst_mib == 0 and price.scratch_mib == 0
+    assert price.need_mib == price.bounce_mib
+    assert "oncard_bounce=" in price.message()
+    assert f"bounce_mib={price.bounce_mib}" in price.line()
+    # sb5f's own reading: the card the ticket expects to refuse now refuses on
+    # the SOURCE leg too, which it could not before.
+    tight, _ = sh.price_leg("GPU-5090", descs, rank=0, is_source=True,
+                            oncard_mode=tp.ONCARD_MODE_IPC, free_mib=474)
+    assert not tight.affordable
+    # The IMPORTING side maps the exporter's allocation; the host degrade's
+    # bounce is a shm file.  Neither is VRAM on this card.
+    imported, _ = sh.price_leg("GPU-5090", descs, rank=0, is_source=False,
+                               oncard_mode=tp.ONCARD_MODE_IPC, free_mib=8192)
+    assert imported.bounce_mib == 0
+    degraded, _ = sh.price_leg("GPU-5090", descs, rank=0, is_source=True,
+                               oncard_mode=tp.ONCARD_MODE_HOST, free_mib=8192)
+    assert degraded.bounce_mib == 0
+
+
+def test_the_diagonal_slot_is_this_cards_lane_and_not_the_sum():
+    """MUST_FIX (refuter 5): the slot was priced from the subset's on-card
+    bytes summed across ALL THREE cards.
+
+    ``run_leg`` selects the diagonal with ``src_rank == rank``: the lane runs
+    once per CARD between two co-located processes.  The sum-as-one-lane
+    reading is the exact error ``XchgPlan.oncard_bytes_by_rank`` was written to
+    stop (S5-pre's own "10.28 GiB = 329 batches"), and it had been re-committed
+    one seam over -- inflating the bounce above by the same factor.
+    """
+    descs = [_diag(0, 4 << 30), _diag(1, 4 << 30)]
+    _, mine = sh.price_leg("GPU-5090", descs, rank=0, is_source=True,
+                           oncard_mode=tp.ONCARD_MODE_IPC, free_mib=8192)
+    assert mine == tp.plan_oncard_slot_bytes(4 << 30).slot_bytes
+    summed = tp.plan_oncard_slot_bytes(8 << 30).slot_bytes
+    assert mine < summed, "the two denominators must be distinguishable here"
+    # Both co-located processes derive it from the same filter over the same
+    # descriptors, which is what keeps the W52 slot_bytes check a cross-check.
+    _, peer = sh.price_leg("GPU-5090", descs, rank=0, is_source=False,
+                           oncard_mode=tp.ONCARD_MODE_IPC, free_mib=8192)
+    assert peer == mine
+
+
+def test_the_resume_reserve_is_subtracted_and_printed():
+    """MUST_FIX (refuter 4), the half of it that is code.
+
+    ``free_mib`` is read at HOOK time; the destination's ring ``resume`` maps
+    its image AFTER that instant, while the shadow's buffers are still alive.
+    A price that ignores the not-yet-resumed demand can pass a subset that then
+    OOMs the authoritative ``cu_mem_create`` mid-flip.  The term is a caller's
+    to supply and the line always prints it, so an unwired boot reads as
+    unwired instead of as priced.
+    """
+    free, need_bytes = 2000, 512 * sh.MIB
+    assert sh.price_shadow("GPU-5090", need_bytes, free).affordable
+    with_reserve = sh.price_shadow("GPU-5090", need_bytes, free,
+                                   reserve_bytes=600 * sh.MIB)
+    assert not with_reserve.affordable
+    assert "resume_reserve_mib=600" in with_reserve.line()
+    assert "resume_reserve_mib=600" in with_reserve.message()
+    params = inspect.signature(sh.shadow_transport).parameters
+    assert params["resume_reserve_bytes"].default == 0
+
+
+def _wide_descs(classes, nbytes):
+    return [wx.XchgDesc(tag=f"weights_{i}", src_rank=1, dst_rank=0,
+                        param_name=f"model.layers.{i}.attn.{cls}.weight",
+                        kind=wx.FLAT, nbytes=nbytes, rows=1, run_bytes=nbytes,
+                        spitch=0, dpitch=0, src_ptr=0x1000, dst_ptr=0x2000)
+            for i, cls in enumerate(classes)]
+
+
+def test_the_full_leg_is_priced_on_every_leg_and_grades_nothing(region):
+    """MUST_FIX (S5 review 4): the automatic path priced only the SUBSET.
+
+    The boot ticket predicts "the 5090 REFUSES at full size, and no refusal
+    there is itself a finding" -- but no full-size budget line could ever
+    appear on a default shadow boot, so that absence was guaranteed by the code
+    and would have been read as a finding.  An absence that cannot occur is not
+    evidence.  The full price is now printed on every leg, marked
+    ``graded=no``, and the VOTE still comes from the subset.
+    """
+    descs = _wide_descs(["qkv_proj", "o_proj", "down_proj"], 900 * sh.MIB)
+    # Every other rank votes NO so the gate returns at once: what is under test
+    # is what was logged BEFORE it, and the ordering price -> gate is the
+    # property that lets a rank vote its own card's arithmetic.
+    _vote_rows(region, [1, 2, 3, 4, 5], leg=0, vote=False)
+    lines: list = []
+    run = sh.shadow_transport(
+        region=region, sems=None, ops=None, row=0, rank=0, device=0,
+        card_uuid="GPU-5090", uuid_of_card=["u0", "u1", "u2"], descs=descs,
+        is_source=False, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3, wave=WAVE,
+        leg=0, direction="P->D", epoch="b.1", free_mib=2100, log=lines.append)
+    budgets = [ln for ln in lines if ln.startswith(sh.SHADOW_BUDGET_LINE_PREFIX)]
+    assert len(budgets) == 2, budgets
+    full = [ln for ln in budgets if "scope=full" in ln][0]
+    subset = [ln for ln in budgets if "scope=subset" in ln][0]
+    assert "graded=no" in full and "verdict=REFUSED" in full
+    assert "graded=yes" in subset and "verdict=AFFORDABLE" in subset
+    # The vote is the SUBSET's: the full price decided nothing.
+    assert sh.read_shadow_vote(region, 0)["vote"] == sh.VOTE_YES
+    assert not run.result.ran
+
+
+class _FakeScratch:
+    """A tensor-shaped scratch over the double's storage.
+
+    ``data_ptr``/``numel``/``element_size``/slicing -- the four things the
+    summer is allowed to know about it, which is what makes the coupling
+    testable without torch.
+    """
+
+    def __init__(self, ops, nbytes: int):
+        self.ops = ops
+        self.nbytes = int(nbytes)
+        self.ptr = ops.raw_malloc(0, self.nbytes) if self.nbytes else 0
+
+    def data_ptr(self) -> int:
+        return self.ptr
+
+    def numel(self) -> int:
+        return self.nbytes
+
+    def element_size(self) -> int:
+        return 1
+
+    def __getitem__(self, sl):
+        return read(self.ops, self.ptr, int(sl.stop))
+
+
+def test_the_device_summer_cannot_be_a_dead_instrument(ops):
+    """MUST_FIX (refuter 1): the scratch was bound AFTER construction, through
+    an attribute with no caller anywhere.
+
+    Unbound it was ``torch.empty(0)``: ``scratch[:n]`` empty, ``uint8_checksum``
+    0 for BOTH sides of every stripe, ``verdict=MATCH`` on a leg that moved
+    nothing -- with the boot's acceptance being ``mismatch=0``.  Nothing
+    coupled the memcpy TARGET to the tensor's storage either.  Now the tensor
+    is the argument, the target is its ``data_ptr()`` and the bound is its own
+    ``numel() * element_size()``.
+    """
+    payload = pattern(11, 300)
+    src = dev_ptr(0, 0x90000)
+    write(ops, src, payload)
+    scratch = _FakeScratch(ops, 512)
+    summer = sh.device_summer(ops, 0, scratch, checksum=lambda b: sum(b))
+    assert summer(src, len(payload)) == sum(payload)
+    assert summer(src, 0) == 0
+    # THE BOUND COMES FROM THE SCRATCH, not from the module constant: a range
+    # one byte over is refused instead of silently truncated to the slice.
+    with pytest.raises(ValueError) as err:
+        summer(src, 513)
+    assert "513" in str(err.value) and "512" in str(err.value)
+    # And a scratch that was never allocated is refused where it is handed
+    # over, not paid for with a run of zeros.
+    with pytest.raises(ValueError) as empty:
+        sh.device_summer(ops, 0, _FakeScratch(ops, 0), checksum=lambda b: sum(b))
+    assert "EMPTY scratch" in str(empty.value)
+
+
+class _Explosive(wx.XchgDesc):
+    """A descriptor whose rewrite raises, to open the window under test."""
+
+    def replace(self, **kw):
+        raise RuntimeError("rewrite exploded")
+
+
+def test_the_shadow_buffer_is_freed_when_the_rewrite_raises(region, ops):
+    """MUST_FIX (refuter 3): the run was built AFTER the descriptor rewrite.
+
+    An exception in that window reached the handler, which called ``close()``
+    on the STALE run (``buffers=None``) -- so the whole destination buffer
+    leaked for the life of the boot, on the tight card, which is the only card
+    where any of this matters.  The priced refusal self-limits FUTURE legs; the
+    leaked VRAM never comes back.
+    """
+    desc = _Explosive(tag="weights_0", src_rank=1, dst_rank=0,
+                      param_name="model.layers.0.attn.qkv_proj.weight",
+                      kind=wx.FLAT, nbytes=8192, rows=1, run_bytes=8192,
+                      spitch=0, dpitch=0, src_ptr=0x1000, dst_ptr=0x2000)
+    _vote_rows(region, [1, 2, 3, 4, 5], leg=0, vote=True,
+               classes_hash=sh.classes_hash(["qkv_proj"]), need_mib=0)
+    run = sh.shadow_transport(
+        region=region, sems=None, ops=ops, row=0, rank=0, device=0,
+        card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=[desc],
+        is_source=False, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3, wave=WAVE,
+        leg=0, direction="P->D", epoch="b.1", free_mib=8192,
+        log=lambda _s: None, stripe_bytes=1 << 20)
+    assert not run.result.ran
+    assert "transport-failed:RuntimeError" in run.result.reason
+    assert [n for _p, n in ops.freed if n == 8192], (
+        f"the shadow buffer leaked: allocated 8192, freed {ops.freed}")
+
+
+def test_the_line_carries_the_tag_the_shadowed_classes_fall_in():
+    """MUST_FIX (S5 review 5): spec 6/S5's line names ``tag=`` and it was not
+    there; the rotation unit of this slice is the CLASS, and that deviation is
+    now stated on the line and in :attr:`ShadowSubset.tags` rather than implied.
+    """
+    descs = _wide_descs(["qkv_proj", "o_proj"], 4096)
+    # ``o_proj`` sorts first, so leg 0 shadows the class carried by tag
+    # ``weights_1`` -- which is the point: the tag on the line is DERIVED from
+    # the chosen classes, never assumed to be the leg's own index.
+    subset = sh.select_subset(descs, leg=0)
+    assert subset.classes == ("o_proj",) and subset.tags == ("weights_1",)
+    result = sh.ShadowResult(leg=0, epoch="b.1", subset=subset,
+                             counters=sh.ShadowCounters())
+    assert "tag=weights_1" in result.line()
+    # A class subset spanning two tags says both, instead of naming one.
+    both = sh.select_subset(descs, leg=0, classes=["qkv_proj", "o_proj"])
+    assert both.tags == ("weights_0", "weights_1")
+    assert "tag=weights_0,weights_1" in sh.ShadowResult(
+        leg=0, epoch="b.1", subset=both, counters=sh.ShadowCounters()).line()
+    assert "tag=none" in sh.ShadowResult(
+        leg=0, epoch="b.1", subset=sh.select_subset([], leg=0),
+        counters=sh.ShadowCounters()).line()
+
+
+def test_the_gate_skew_is_the_six_ranks_spread_not_this_ranks_wait(region):
+    """FINDING (refuter): ``gate_skew_ms`` carried ``waited_s``.
+
+    Grading spec 6/S5's ``gate_skew_ms <= 100`` against a WAIT conflates two
+    numbers: the rank that arrives LAST waits ~0 and would report a skew of
+    zero on the leg with the largest one.  The rows carry ``ts_ns`` already.
+    """
+    for row in range(1, xr.N_RANKS):
+        sh.write_shadow_vote(region, row, leg=0, vote=True, classes_hash=0,
+                             need_mib=0)
+    time.sleep(0.01)
+    verdict = sh.shadow_gate(region, 0, leg=0, vote=True, classes_hash=0,
+                             need_mib=0, log=lambda _s: None)
+    assert verdict.run and verdict.waited_s < 0.005
+    assert verdict.skew_ms >= 10.0, (
+        "the spread of the six stamps was reported as this rank's wait")
+    assert "skew_ms=" in verdict.line(leg=0, epoch="b.1")
+
+
+def test_the_unmeasured_wall_fields_do_not_print_as_measurements():
+    """FINDING (refuter): ``ring_ms=0.000`` and ``lock_wait_ms=0.000`` had no
+    producer anywhere -- zeros that read as measurements of a restore that was
+    never timed.  ``n/a`` until a hook fills them.
+    """
+    result = sh.ShadowResult(leg=0, epoch="b.1",
+                             subset=sh.select_subset([], leg=0),
+                             counters=sh.ShadowCounters())
+    assert "ring_ms=n/a" in result.line()
+    assert "lock_wait_ms=n/a" in result.line()
+    result.ring_ms, result.lock_wait_ms = 12.5, 0.25
+    assert "ring_ms=12.500" in result.line()
+    assert "lock_wait_ms=0.250" in result.line()
