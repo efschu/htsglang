@@ -138,23 +138,39 @@ def test_ingest_folds_dumps_into_a_measured_calibration(tmp_path):
     assert "memory_stats" in got["GPU-a"].source
 
 
-def test_ingest_refuses_mixed_profiles(tmp_path, capsys):
+def test_ingest_groups_mixed_profiles_instead_of_refusing(tmp_path, capsys):
+    """FIX #1292: a directory holding more than one activation profile used
+    to be a blanket refusal ("more than one activation profile"). That was
+    right when it could only mean a bad measurement -- but Weg-2's P and D
+    groups legitimately share one dump directory and always carry two
+    different profiles (different tp_size/pp_size). ``ingest`` now groups
+    by profile digest and folds each group into its own cache entry,
+    printing one verdict block per group; neither group is merged into or
+    refused because of the other.
+    """
     import dataclasses as dc
 
     dumps = tmp_path / "d"
     dumps.mkdir()
+    other_profile = dc.replace(PROFILE, chunked_prefill_size=4096)
     write_dump(dumps, 0, "GPU-a", 900, 730)
-    write_dump(
-        dumps,
-        1,
-        "GPU-b",
-        850,
-        640,
-        profile=dc.replace(PROFILE, chunked_prefill_size=4096),
-    )
+    write_dump(dumps, 1, "GPU-b", 850, 640, profile=other_profile)
     m = load_script()
-    assert m.ingest(str(dumps), str(tmp_path / "c")) == 1
-    assert "more than one activation profile" in capsys.readouterr().out
+    cache = tmp_path / "c"
+    assert m.ingest(str(dumps), str(cache)) == 0
+
+    out = capsys.readouterr().out
+    assert out.count("=== profile ") == 2, out
+    assert out.count("Wrote 1 card footprint(s)") == 2, out
+
+    got_a = load_footprints(hw_fingerprint=FP, profile=PROFILE, cache_dir=str(cache))
+    got_b = load_footprints(
+        hw_fingerprint=FP, profile=other_profile, cache_dir=str(cache)
+    )
+    assert set(got_a) == {"GPU-a"}, "profile A's cache entry must not gain GPU-b"
+    assert set(got_b) == {"GPU-b"}, "profile B's cache entry must not gain GPU-a"
+    assert got_a["GPU-a"].activation_mib == 900
+    assert got_b["GPU-b"].activation_mib == 850
 
 
 def test_ingest_refuses_mixed_fingerprints(tmp_path, capsys):

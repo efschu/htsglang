@@ -71,8 +71,15 @@ if REPO_PYTHON not in sys.path:
 
 
 def load_dumps(dump_dir: str) -> List[dict]:
+    # FIX #1292: the pattern used to be "phase_footprint_rank*.json". It now
+    # also matches the group-qualified shape "phase_footprint_P_rank0.json"
+    # / "phase_footprint_D_rank0.json" that
+    # sglang.srt.mem_ledger.activation_probe.dump_filename() writes, so a
+    # directory holding both Weg-2 groups' dumps is read whole rather than
+    # half-ignored.
     out = []
-    for path in sorted(glob.glob(os.path.join(dump_dir, "phase_footprint_rank*.json"))):
+    pattern = os.path.join(dump_dir, "phase_footprint_*rank*.json")
+    for path in sorted(glob.glob(pattern)):
         try:
             with open(path) as f:
                 out.append(json.load(f))
@@ -81,7 +88,19 @@ def load_dumps(dump_dir: str) -> List[dict]:
     return out
 
 
-def ingest(dump_dir: str, cache_dir: Optional[str] = None) -> int:
+def _ingest_one_group(
+    profile_digest: str, dumps: List[dict], cache_dir: Optional[str]
+) -> int:
+    """One profile's worth of dumps -> one cache entry, one verdict block.
+
+    FIX #1292: this used to be the whole body of ``ingest``. It is now called
+    once per profile-digest GROUP rather than once for the whole directory,
+    so two Weg-2 groups' dumps sitting in one directory each get their own
+    ``save_footprints`` call instead of being merged (silently attributing
+    one group's peak to the other) or refused outright (throwing away both
+    groups' otherwise-valid measurements just because they disagree, which
+    two independently-launched Weg-2 process groups always will).
+    """
     from sglang.srt.mem_ledger.activation import (
         ActivationProfile,
         FootprintProvenance,
@@ -89,34 +108,20 @@ def ingest(dump_dir: str, cache_dir: Optional[str] = None) -> int:
         save_footprints,
     )
 
-    dumps = load_dumps(dump_dir)
-    if not dumps:
-        print(
-            f"No rank dumps in {dump_dir}. Boot the recipe with "
-            "SGLANG_PHASE_FOOTPRINT_DUMP set to that directory, drive a "
-            "representative prefill, then re-run ingest."
-        )
-        return 1
-
-    profiles = {json.dumps(d.get("profile"), sort_keys=True) for d in dumps}
-    if len(profiles) != 1:
-        print(
-            "REFUSING: the dumps describe more than one activation profile. "
-            "Folding measurements from different configs into one calibration "
-            "would attribute one config's peak to another.\n"
-            + "\n".join(f"  {p}" for p in sorted(profiles))
-        )
-        return 1
+    groups_seen = {d.get("group", "") for d in dumps}
+    label = ",".join(sorted(g or "(none)" for g in groups_seen))
+    print(f"\n=== profile {profile_digest}  (group {label}, {len(dumps)} dump(s)) ===")
 
     fingerprints = {d.get("hw_fingerprint") for d in dumps}
     if len(fingerprints) != 1 or not next(iter(fingerprints)):
         print(
-            f"REFUSING: dumps carry inconsistent hardware fingerprints: {fingerprints}"
+            f"REFUSING group {profile_digest}: dumps carry inconsistent "
+            f"hardware fingerprints: {fingerprints}"
         )
         return 1
     hw_fingerprint = next(iter(fingerprints))
 
-    profile = ActivationProfile(*json.loads(next(iter(profiles))))
+    profile = ActivationProfile(*dumps[0]["profile"])
     footprints: Dict[str, PhaseFootprint] = {}
     for d in dumps:
         uuid = str(d["card_uuid"])
@@ -131,23 +136,24 @@ def ingest(dump_dir: str, cache_dir: Optional[str] = None) -> int:
         # repaired here, because the floor it would need was never recorded.
         if delta is None:
             print(
-                f"REFUSING: rank {d.get('rank')} on {uuid} carries no "
-                "activation_delta_bytes, so its activation_peak_bytes "
-                f"({raw_peak} MiB) is the ABSOLUTE resident figure -- weights "
-                "and KV pool included -- not the prefill transient. Ingesting "
-                "it would reserve a whole rank's footprint as its activation "
-                "term. Re-measure with a build that records the peak floor "
-                "(#589)."
+                f"REFUSING group {profile_digest}: rank {d.get('rank')} on "
+                f"{uuid} carries no activation_delta_bytes, so its "
+                f"activation_peak_bytes ({raw_peak} MiB) is the ABSOLUTE "
+                "resident figure -- weights and KV pool included -- not the "
+                "prefill transient. Ingesting it would reserve a whole "
+                "rank's footprint as its activation term. Re-measure with a "
+                "build that records the peak floor (#589)."
             )
             return 1
         activation = int(delta) // (1 << 20)
         capture = int(d["capture_bytes"]) // (1 << 20)
         if activation <= 0:
             print(
-                f"REFUSING: rank {d.get('rank')} on {uuid} reports a "
-                f"non-positive activation delta ({activation} MiB). That is a "
-                "failed measurement, not a small one -- the prefill hook did "
-                "not run, or ran before the workload."
+                f"REFUSING group {profile_digest}: rank {d.get('rank')} on "
+                f"{uuid} reports a non-positive activation delta "
+                f"({activation} MiB). That is a failed measurement, not a "
+                "small one -- the prefill hook did not run, or ran before "
+                "the workload."
             )
             return 1
         footprints[uuid] = PhaseFootprint(
@@ -177,11 +183,45 @@ def ingest(dump_dir: str, cache_dir: Optional[str] = None) -> int:
     print(f"  {'card uuid':<{width}}  {'activation':>12}  {'capture':>10}")
     for uuid, fp in sorted(footprints.items()):
         print(f"  {uuid:<{width}}  {fp.activation_mib:>8} MiB  {fp.capture_mib:>6} MiB")
-    print(
-        "\nThese are MEASURED_PEAK and now take precedence over the shipped "
-        "reference-window upper bounds."
-    )
     return 0
+
+
+def ingest(dump_dir: str, cache_dir: Optional[str] = None) -> int:
+    from sglang.srt.mem_ledger.activation import profile_digest_from_canonical
+
+    dumps = load_dumps(dump_dir)
+    if not dumps:
+        print(
+            f"No rank dumps in {dump_dir}. Boot the recipe with "
+            "SGLANG_PHASE_FOOTPRINT_DUMP set to that directory, drive a "
+            "representative prefill, then re-run ingest."
+        )
+        return 1
+
+    # FIX #1292: group by profile digest instead of refusing the whole
+    # ingest on >1 profile. Two Weg-2 groups (P, D) legitimately share one
+    # dump directory today (the existing recipe arms both with the same
+    # SGLANG_PHASE_FOOTPRINT_DUMP) and always carry two different profiles
+    # (different tp_size/pp_size) -- that is not a bad measurement, it is
+    # two good ones. Each group gets its own cache write and its own
+    # printed verdict block; they are never folded into one.
+    groups: Dict[str, List[dict]] = {}
+    for d in dumps:
+        digest = d.get("profile_digest") or profile_digest_from_canonical(
+            d.get("profile")
+        )
+        groups.setdefault(digest, []).append(d)
+
+    rc = 0
+    for digest in sorted(groups):
+        rc = _ingest_one_group(digest, groups[digest], cache_dir) or rc
+
+    if rc == 0:
+        print(
+            "\nThese are MEASURED_PEAK and now take precedence over the "
+            "shipped reference-window upper bounds."
+        )
+    return rc
 
 
 def show(cache_dir: Optional[str] = None) -> int:
