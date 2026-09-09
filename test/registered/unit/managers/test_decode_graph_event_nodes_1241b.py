@@ -51,6 +51,13 @@ class FakeState:
         self.readable_from = float("inf")
         self.capturing = False
         self.synchronize_calls = 0
+        #: Called on every ``query()``, with the number of queries so far.
+        #: THE FORWARD THREAD, modelled. The read loop is not atomic against
+        #: it on the real device either, and a hook is the only way a
+        #: single-threaded fake can put a replay INSIDE the loop rather than
+        #: politely before or after it.
+        self.on_query = None
+        self.queries = 0
 
     def advance(self, ms: float) -> None:
         self.now += float(ms)
@@ -78,6 +85,10 @@ class FakeEvent:
         self.t = t
 
     def query(self) -> bool:
+        self._state.queries += 1
+        hook = self._state.on_query
+        if hook is not None:
+            hook(self._state.queries)
         return self.t is not None and self.t <= self._state.readable_from
 
     def elapsed_time(self, other: "FakeEvent") -> float:
@@ -85,7 +96,18 @@ class FakeEvent:
             "elapsed_time on an unstamped event: the clock read a node the "
             "device had not executed"
         )
+        if not self._complete() or not other._complete():
+            # CUDA fact 3, the failure half: cudaEventElapsedTime returns
+            # cudaErrorNotReady when either event has not completed, and
+            # torch raises that as RuntimeError. Reachable here only for a
+            # node a replay re-recorded BETWEEN the clock's query and its
+            # read -- which is precisely the window the two-sided generation
+            # check exists for.
+            raise RuntimeError("cudaErrorNotReady")
         return other.t - self.t
+
+    def _complete(self) -> bool:
+        return self.t is not None and self.t <= self._state.readable_from
 
     def synchronize(self) -> None:  # pragma: no cover - must never be called
         self._state.synchronize_calls += 1
@@ -205,7 +227,7 @@ class GraphEventNodeTest(unittest.TestCase):
             self.h.state.advance(max(compute_ms, 0.0))
 
     def lines(self):
-        return [l for l in self.cap.lines if l.startswith("Decode rank batch")]
+        return [ln for ln in self.cap.lines if ln.startswith("Decode rank batch")]
 
     # -- the tests -------------------------------------------------------
 
@@ -378,11 +400,254 @@ class GraphEventNodeTest(unittest.TestCase):
             self.graph_round(i, "k8", [1.0, 1.0])
         self.h.ready_now()
         self.h.log.end_round()
-        over = [l for l in self.cap.lines if l.startswith("Decode rank clock overhead")]
+        over = [ln for ln in self.cap.lines if ln.startswith("Decode rank clock overhead")]
         self.assertEqual(len(over), 1, over)
         self.assertIn("1 graphs carry 4 nodes (4 created inside a capture)", over[0])
         self.assertIn("overwritten by a later replay", over[0])
         self.assertIn("not yet complete", over[0])
+        self.assertIn("rounds that replayed one graph twice", over[0])
+
+
+class ConcurrentReplayTest(unittest.TestCase):
+    """The read is NOT atomic against the forward thread (review finding 2).
+
+    ``harvest_round`` runs on the SCHEDULER thread, out of the metrics
+    flush; ``note_graph_replay`` and the graph launch run on the FORWARD
+    thread. Between the clock's generation check and its last ``query()``
+    lie ~two host calls per pair, and the overlap scheduler routinely has
+    the next replay of the same key already queued. A check taken only
+    BEFORE the read therefore proves nothing about the read.
+
+    Both tests drive that window explicitly, through ``FakeState.on_query``:
+    the replay lands between pair 1 and pair 2, never politely outside the
+    loop. The friendly orders are already pinned by ``GraphEventNodeTest``.
+    """
+
+    def setUp(self) -> None:
+        self.h = Harness()
+        self.cap = _Capture()
+        self.logger = logging.getLogger(
+            "sglang.srt.managers.scheduler_components.decode_round_log"
+        )
+        self.logger.addHandler(self.cap)
+        self.logger.setLevel(logging.INFO)
+        self.addCleanup(self.logger.removeHandler, self.cap)
+
+    def lines(self):
+        return [ln for ln in self.cap.lines if ln.startswith("Decode rank batch")]
+
+    def _pending_round(self, key, per_region_ms):
+        """One graphed round, left unread: the flush happens in the test."""
+        self.h.log.begin_round(round_id=1, bs=6, rows=24)
+        with self.h.log.segment("decode", graphed=True):
+            self.h.clock.note_graph_replay(key)
+            self.h.replay(key, per_region_ms)
+            self.h.state.advance(6.0)
+
+    def test_a_replay_landing_MID_read_is_refused_not_averaged_in(self):
+        """MUTANT-5, and the quietest defect in this file: check the
+        generation ONCE, before the read. The replay that lands inside the
+        loop re-stamps the early nodes; the loop then sums pair 1 from
+        replay N+1 and pair 2 from replay N and prints their mixture as a
+        measurement. Nothing raises, and the stale counter -- which the boot
+        ticket leans on to decide whether the instrument works -- stays 0,
+        so the boot would report the trap as a clean read."""
+        self.h.capture("k8", ["tp.all_reduce", "dcp.all_gather"])
+        self._pending_round("k8", [1.0, 2.0])
+
+        def land_a_replay(n):
+            # query 1 = the round bracket's end, 2 = pair 1's post,
+            # 3 = pair 2's post. Fire on 3: pair 1 has been read, pair 2
+            # has not.
+            if n != 3:
+                return
+            self.h.state.on_query = None
+            self.h.clock.note_graph_replay("k8")
+            self.h.replay("k8", [50.0, 60.0])
+
+        self.h.state.on_query = land_a_replay
+        self.h.log.end_round()
+
+        un = parse_unsplit_line("[2026-09-09 00:00:00 TP1] " + self.lines()[0])
+        self.assertIsNotNone(un, self.lines()[0])
+        self.assertEqual(un["reason"], "graph-replay-nodes-overwritten")
+        self.assertEqual(
+            self.h.clock.graph_node_counts[3], 1, "the mid-read replay was not counted"
+        )
+        self.assertEqual(self.h.state.synchronize_calls, 0)
+
+    def test_a_node_re_recorded_mid_read_is_a_refusal_not_an_exception(self):
+        """MUTANT-6: let ``cudaErrorNotReady`` out. ``elapsed_time`` raises
+        RuntimeError for an event a concurrent replay re-recorded and the
+        device has not reached; uncaught it rides the flush into the
+        scheduler tick, on a form that emits ~5695 graphed rounds per rank
+        per 23 minutes. A crash is not the honest form of 'unknown'."""
+        self.h.capture("k8", ["tp.all_reduce", "dcp.all_gather"])
+        self._pending_round("k8", [1.0, 2.0])
+
+        def re_record_in_flight(n):
+            if n != 3:
+                return
+            self.h.state.on_query = None
+            # The device is executing the next replay: pair 2's PRE node has
+            # been re-recorded and its POST has not been reached yet.
+            nodes = self.h.clock.captured_graph("k8")
+            self.h.state.readable_from = self.h.state.now
+            nodes.pairs[1][0].stamp(self.h.state.now + 1.0)
+
+        self.h.state.on_query = re_record_in_flight
+        self.h.log.end_round()
+
+        un = parse_unsplit_line("[2026-09-09 00:00:00 TP1] " + self.lines()[0])
+        self.assertIsNotNone(un, self.lines()[0])
+        self.assertEqual(un["reason"], "graph-replay-nodes-unread")
+        self.assertEqual(self.h.clock.graph_node_counts[4], 1)
+        self.assertEqual(self.h.state.synchronize_calls, 0)
+
+
+class MultiGraphRoundTest(unittest.TestCase):
+    """More than one declared replay under ONE bracket (review finding 3).
+
+    The shipped form kept a single ``(nodes, generation)`` on the span and
+    OVERWROTE it, which prices the last replay and drops the rest with no
+    refusal and no counter -- an undercounted wait that prints as a
+    measurement. Two different graphs sum; one graph twice cannot, because
+    the second replay overwrites the nodes the first would be read from.
+    """
+
+    def setUp(self) -> None:
+        self.h = Harness()
+        self.cap = _Capture()
+        self.logger = logging.getLogger(
+            "sglang.srt.managers.scheduler_components.decode_round_log"
+        )
+        self.logger.addHandler(self.cap)
+        self.logger.setLevel(logging.INFO)
+        self.addCleanup(self.logger.removeHandler, self.cap)
+
+    def lines(self):
+        return [ln for ln in self.cap.lines if ln.startswith("Decode rank batch")]
+
+    def test_two_different_graphs_in_one_bracket_are_summed_not_dropped(self):
+        """MUTANT-7: keep one entry per span. The draft graph's wait then
+        vanishes from a round that ran it, and the line still prints."""
+        self.h.capture("kdraft", ["tp.all_reduce"])
+        self.h.capture("ktarget", ["dcp.all_gather"])
+        self.h.log.begin_round(round_id=1, bs=6, rows=24)
+        with self.h.log.segment("decode", graphed=True):
+            self.h.clock.note_graph_replay("kdraft")
+            self.h.replay("kdraft", [1.0])
+            self.h.clock.note_graph_replay("ktarget")
+            self.h.replay("ktarget", [2.0])
+            self.h.state.advance(7.0)
+        self.h.ready_now()
+        self.h.log.end_round()
+
+        line = self.lines()[0]
+        self.assertNotIn("split unavailable", line)
+        parsed = parse_rank_batch_line("[x TP1] " + line)
+        self.assertAlmostEqual(parsed["wait_ms"], 3.0, places=1)
+        self.assertIn("tp.all_reduce 1.0/1x", line)
+        self.assertIn("dcp.all_gather 2.0/1x", line)
+
+    def test_one_graph_declared_twice_in_one_bracket_is_refused_by_name(self):
+        """The second replay re-executed the very nodes the first
+        declaration would have been read from. That wait is not smaller, it
+        is destroyed -- and summing the two declarations would count the
+        second replay twice."""
+        self.h.capture("k8", ["tp.all_reduce"])
+        self.h.log.begin_round(round_id=1, bs=6, rows=24)
+        with self.h.log.segment("decode", graphed=True):
+            self.h.clock.note_graph_replay("k8")
+            self.h.replay("k8", [1.0])
+            self.h.clock.note_graph_replay("k8")
+            self.h.replay("k8", [9.0])
+            self.h.state.advance(5.0)
+        self.h.ready_now()
+        self.h.log.end_round()
+
+        un = parse_unsplit_line("[2026-09-09 00:00:00 TP1] " + self.lines()[0])
+        self.assertIsNotNone(un, self.lines()[0])
+        self.assertEqual(un["reason"], "graph-replay-key-replayed-twice")
+        self.assertFalse(un["split_known"])
+        self.assertEqual(self.h.clock.graph_node_counts[5], 1)
+
+
+class RunnerGraphKeyTest(unittest.TestCase):
+    """The clock's registry is process-global; a ShapeKey is not (finding 1).
+
+    ``shape_key.py`` states in its own docstring that a ShapeKey identifies
+    a shape "across all runners" -- correct for a graph backend that one
+    runner owns, wrong for the clock's one dict. A speculative draft runner
+    and the target runner both capture ``bs=8``; under the bare shape the
+    second capture REPLACES the first's node list, the first runner's next
+    replay reads a graph it never ran, and the generation check passes
+    because nobody bumped it in between.
+
+    The runner's own method is borrowed here rather than reimplemented, so
+    this cannot pass against a copy that has drifted from the call sites.
+    """
+
+    @staticmethod
+    def _runner_class():
+        # Imported inside the test: everything above in this file is
+        # torch-free, and the runner module pulls the whole executor chain.
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        class _BareRunner:
+            _clock_graph_key = DecodeCudaGraphRunner._clock_graph_key
+
+        return _BareRunner
+
+    def test_a_runner_s_key_for_one_shape_is_stable_across_calls(self):
+        """A tag re-drawn per call would make the capture and the replay
+        disagree, and every graphed round would refuse for no reason."""
+        runner = self._runner_class()()
+        first = runner._clock_graph_key(("shape", 8))
+        second = runner._clock_graph_key(("shape", 8))
+        self.assertEqual(first, second)
+
+    def _capture_log(self):
+        cap = _Capture()
+        logger = logging.getLogger(
+            "sglang.srt.managers.scheduler_components.decode_round_log"
+        )
+        logger.addHandler(cap)
+        logger.setLevel(logging.INFO)
+        self.addCleanup(logger.removeHandler, cap)
+        return cap
+
+    def test_two_runners_capturing_one_shape_do_not_share_a_node_list(self):
+        """MUTANT-8: pass the bare ShapeKey. Both captures land on one
+        registry entry, and the draft runner's replay is priced with the
+        target runner's nodes -- a fabricated split, with no refusal, in the
+        exact shape of a measurement."""
+        cls = self._runner_class()
+        draft, target = cls(), cls()
+        shape = ("shape", 8)
+        kd, kt = draft._clock_graph_key(shape), target._clock_graph_key(shape)
+        self.assertNotEqual(kd, kt)
+
+        cap = self._capture_log()
+        h = Harness()
+        h.capture(kd, ["tp.all_reduce"])
+        h.capture(kt, ["dcp.all_gather", "dcp.all_gather"])
+        self.assertIsNotNone(h.clock.captured_graph(kd))
+        self.assertEqual(len(h.clock.captured_graph(kd).pairs), 1)
+        self.assertEqual(len(h.clock.captured_graph(kt).pairs), 2)
+
+        h.log.begin_round(round_id=1, bs=6, rows=24)
+        with h.log.segment("decode", graphed=True):
+            h.clock.note_graph_replay(kd)
+            h.replay(kd, [1.0])
+            h.state.advance(4.0)
+        h.ready_now()
+        h.log.end_round()
+        line = [ln for ln in cap.lines if ln.startswith("Decode rank batch")][0]
+        self.assertIn("tp.all_reduce 1.0/1x", line)
+        self.assertNotIn("dcp.all_gather", line)
 
 
 class EagerPathUnchangedTest(unittest.TestCase):
@@ -405,7 +670,7 @@ class EagerPathUnchangedTest(unittest.TestCase):
                 self.h.state.advance(5.0)
             self.h.state.advance(15.0)
         self.h.log.begin_round(round_id=8, bs=1, rows=1)
-        line = [l for l in self.cap.lines if l.startswith("Decode rank batch")][0]
+        line = [ln for ln in self.cap.lines if ln.startswith("Decode rank batch")][0]
         head, _, tail = line.partition(", t: ")
         _, _, rest = tail.partition(", bs: ")
         self.assertEqual(head, "Decode rank batch, rank: 1, #round: 7")
@@ -421,7 +686,7 @@ class EagerPathUnchangedTest(unittest.TestCase):
             with self.h.clock.span("tp.all_reduce"):
                 self.h.state.advance(1.0)
         self.h.log.end_round()
-        self.assertEqual(self.h.clock.graph_node_counts, (0, 0, 0, 0, 0))
+        self.assertEqual(self.h.clock.graph_node_counts, (0, 0, 0, 0, 0, 0))
 
     def test_the_clock_is_armed_by_a_capture_scope_or_no_node_is_ever_laid(self):
         """The dispatch sites gate on `armed`, not on `span`. A capture scope

@@ -95,9 +95,18 @@ each now NAMES THE MISSING THING rather than naming the mechanism:
     key), so there is nothing to read;
 ``graph-replay-nodes-overwritten``
     a later replay of the same key re-executed the nodes before this round
-    was read. The nodes belong to the graph, not to the round;
+    was read, or WHILE it was being read. The nodes belong to the graph, not
+    to the round, and the read is not atomic against the forward thread, so
+    the generation that proves this is checked before AND after the read;
 ``graph-replay-nodes-unread``
-    a node had not completed. Never blocked on, never partially priced.
+    a node had not completed, or a node a concurrent replay re-recorded
+    mid-read returned ``cudaErrorNotReady``. Never blocked on, never
+    partially priced;
+``graph-replay-key-replayed-twice``
+    one bracketed forward declared the SAME graph twice. Two DIFFERENT
+    graphs in one bracket sum, and are reported normally; the same graph
+    twice cannot, because the second replay overwrote the nodes the first
+    would have been read from.
 
 ``gpu-ms`` survives in every case -- the bracket is recorded AROUND the
 replay, on the same stream. The eager arm (``--d-disable-cuda-graph`` on the
@@ -444,10 +453,10 @@ class DecodeRoundLog:
         # `--d-disable-cuda-graph` control arm, or `--d-disable-overlap-
         # schedule`, before reading anything into the round times), unready is
         # the device not having finished. Neither is ever waited on.
-        graphs = nodes = late = stale = unready = 0
+        graphs = nodes = late = stale = unready = reused = 0
         gcounts = getattr(self.clock, "graph_node_counts", None)
         if gcounts is not None:
-            graphs, nodes, late, stale, unready = gcounts
+            graphs, nodes, late, stale, unready, reused = gcounts
         logger.info(
             "Decode rank clock overhead, rank: %d, %.1f us/round host-side over "
             "%d rounds = %.3f %% of the mean round gpu-ms %.2f, emitting about "
@@ -458,7 +467,7 @@ class DecodeRoundLog:
             "%d, decode rounds opened contended %d. Graph event nodes (#1241b): "
             "%d graphs carry %d nodes (%d created inside a capture); reads "
             "skipped without blocking: %d overwritten by a later replay, %d "
-            "not yet complete.",
+            "not yet complete, %d rounds that replayed one graph twice.",
             self.rank,
             us_per_round,
             self._overhead_rounds,
@@ -473,4 +482,5 @@ class DecodeRoundLog:
             late,
             stale,
             unready,
+            reused,
         )

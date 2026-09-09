@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import itertools
 import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -208,6 +209,16 @@ def build_replay_fb_view(
         mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
         spec_info=forward_batch.spec_info,
     )
+
+
+#: #1241b. Serial number handed to each runner INSTANCE the first time it
+#: talks to the collective clock. See ``_clock_graph_key``: the clock's graph
+#: registry is process-global and a ShapeKey is explicitly "one shape across
+#: all runners", so the runner has to supply the identity the shape does not
+#: carry. A counter and not ``id(self)``: an id is reused after a runner is
+#: collected, and the reuse would resurrect exactly the collision this
+#: exists to prevent.
+_CLOCK_RUNNER_SEQ = itertools.count()
 
 
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
@@ -688,6 +699,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64
+
+    def _clock_graph_key(self, shape_key):
+        """#1241b. The collective clock's key for one of THIS runner's graphs.
+
+        NOT the ShapeKey. ``shape_key.py`` says in its own docstring that a
+        ShapeKey "identifies one captured CUDA-graph shape across all
+        runners", and that is exactly right for the graph BACKEND, which one
+        runner owns. It is wrong for the collective clock, whose registry is
+        process-global: a speculative draft runner, the target runner and the
+        weightless-KV worker runner all capture ``bs=8`` in one process, and
+        under a bare ShapeKey the second capture REPLACES the first's node
+        list. The first runner's next replay would then read nodes it never
+        executed, find the generation unmoved (nobody bumped it in between),
+        and print another graph's wait as its own -- a fabricated split with
+        the shape of a measurement, and no refusal to mark it.
+
+        So the key carries a per-instance serial the shape does not have.
+        Assigned lazily rather than in ``__init__`` so that the identity is a
+        property of talking to the clock, not of construction order, and so
+        that a test can exercise it without building a runner.
+        """
+        tag = getattr(self, "_clock_runner_tag", None)
+        if tag is None:
+            tag = next(_CLOCK_RUNNER_SEQ)
+            self._clock_runner_tag = tag
+        return (tag, shape_key)
 
     def _clock_capture_phase(self):
         """#1241b. The family PREFIX this capture's collectives must carry.
@@ -1878,7 +1915,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # wait. The scope wraps the capture only -- the warmups above
                 # are not capturing, so they lay nothing.
                 with collective_clock().capture_scope(
-                    shape_key, phase=self._clock_capture_phase()
+                    self._clock_graph_key(shape_key),
+                    phase=self._clock_capture_phase(),
                 ):
                     self.backend.capture_one(
                         shape_key,
@@ -1984,7 +2022,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # an un-instrumented rank in a three-rank comparison is worse
             # than no comparison.
             with collective_clock().capture_scope(
-                shape_key, phase=self._clock_capture_phase()
+                self._clock_graph_key(shape_key),
+                phase=self._clock_capture_phase(),
             ):
                 self.backend.capture_one(
                     shape_key,
@@ -2241,7 +2280,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # and -- independently of any round -- the key's generation is
             # bumped, because this replay overwrites the timestamps a pending
             # round may still be waiting to read.
-            collective_clock().note_graph_replay(self._replay_graph_key)
+            collective_clock().note_graph_replay(
+                self._clock_graph_key(self._replay_graph_key)
+            )
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             if read_done_post_replay:
                 read_done = self.device_module.Event()

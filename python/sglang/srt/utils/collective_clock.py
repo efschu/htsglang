@@ -88,6 +88,37 @@ SCHEDULER, not of this module: with the overlap scheduler the host runs a
 batch ahead of the device, so a round may not have completed by the time the
 next replay is launched. The refusal counts are printed, so a boot answers
 the question instead of a comment claiming it.
+
+THE GENERATION CHECK IS TWO CHECKS, NOT ONE. ``harvest_round`` runs on the
+SCHEDULER thread; ``note_graph_replay`` and the graph launch run on the
+FORWARD thread. A single check before the read would be a TOCTOU: the read
+loop is ~two host calls per pair, and a replay launched inside that window
+re-stamps the early nodes while the loop is still walking the later ones,
+producing a mixture of two replays that no exception announces. So the
+generation is read again AFTER the read and the split is refused if it
+moved. The bump happens before the launch, which is what makes the second
+check conclusive rather than merely likelier to be right.
+
+THE KEY IS THE RUNNER'S, NOT THE SHAPE'S. ``_graphs`` is a process-global
+dict on a process-global clock, while a capture size (``bs=8``) is a shape
+several runners in one process capture independently -- the target runner,
+a speculative DRAFT runner, the weightless-KV worker runner. Keying by the
+bare shape would let the later capture replace the earlier one's entry, and
+the earlier runner's replay would then read a graph it never ran, pass its
+generation check, and print somebody else's wait as its own. Callers
+therefore namespace the key by runner identity
+(``decode_cuda_graph_runner._clock_graph_key``); this module treats the key
+as opaque and only requires that two distinct graphs never share one.
+
+ALWAYS ON, FOR EVERY GRAPH-CAPTURING FORM, DELIBERATELY. The capture scope
+at the decode runner's two capture sites is not gated on weg-2 or on any
+flag: every form that captures decode graphs (weg-1, default serving)
+carries these nodes, re-executes them on every replay, and holds the events
+for the process lifetime. That follows the full-feature-default rule -- an
+instrument only the measuring form carries cannot compare the forms -- and
+the cost is bounded and printed (two events per wrapped region per graph,
+counted by ``graph_node_counts``). What is NOT gated is stated here so a
+reader of another form's log knows why the nodes are in it.
 """
 
 from __future__ import annotations
@@ -265,14 +296,23 @@ class RoundSpan:
     #: same instrument and is the reason the guard exists rather than an
     #: assertion in a comment.
     contended: bool = False
-    #: #1241b. The captured graph this round replayed, as declared at the
-    #: replay site, or ``None`` when the round replayed a graph that carries
-    #: no event nodes (or declared nothing at all).
-    graph_nodes: Optional["GraphNodes"] = None
-    #: The generation ``graph_nodes`` held when THIS round launched. Read
-    #: back at harvest: a mismatch means a later replay has overwritten the
-    #: timestamps and the split is refused by name.
-    graph_generation: int = 0
+    #: #1241b. ``(nodes, generation-at-declaration)`` for every graph replay
+    #: DECLARED inside this bracket, in declaration order. A LIST and not one
+    #: entry: nothing in the scheduler forbids a bracketed forward from
+    #: replaying two graphs, and the single-entry form silently priced the
+    #: last one and dropped the rest (review finding 3). Empty means the
+    #: round replayed a graph that carries no event nodes, or declared
+    #: nothing at all. The generation is read back at harvest -- a mismatch
+    #: means a later replay has overwritten the timestamps.
+    graph_reads: List[Tuple["GraphNodes", int]] = dataclasses.field(
+        default_factory=list
+    )
+    #: One key declared TWICE inside one bracket. Not the same as two
+    #: different graphs, which sum: the second replay of the SAME graph
+    #: re-executes the very nodes the first declaration was going to be read
+    #: from, so the first replay's wait is not unknown, it is destroyed.
+    #: Refused by name; never summed as if the second replay were the round.
+    graph_key_reused: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -335,6 +375,11 @@ class CollectiveClock:
         #: finding as a split absent for the other.
         self._graph_stale_reads: int = 0
         self._graph_unready_reads: int = 0
+        #: Rounds that declared one graph key twice inside a single bracket.
+        #: A third refusal reason, counted for the same reason as the other
+        #: two: the alternative is an undercounted wait that still prints as
+        #: a measurement.
+        self._graph_key_reuses: int = 0
         #: The round bracket currently open, so the replay site can declare
         #: WHICH graph it is about to replay without threading the span
         #: through four dispatch layers.
@@ -575,17 +620,28 @@ class CollectiveClock:
             return
         nodes.generation += 1
         span = self._open_span
-        if span is not None:
-            span.graph_nodes = nodes
-            span.graph_generation = nodes.generation
+        if span is None:
+            return
+        for have, _gen in span.graph_reads:
+            if have is nodes:
+                # SECOND replay of the SAME graph inside ONE bracket. The
+                # bump above already invalidated the earlier declaration's
+                # reading: these nodes now belong to the replay being
+                # launched. Two different graphs would sum; this cannot, and
+                # overwriting the entry (the shipped form) priced the last
+                # replay and dropped the first without saying so.
+                span.graph_key_reused = True
+                self._graph_key_reuses += 1
+                return
+        span.graph_reads.append((nodes, nodes.generation))
 
     @property
-    def graph_node_counts(self) -> Tuple[int, int, int, int, int]:
-        """``(graphs, event nodes, late-created, stale reads, unready reads)``.
+    def graph_node_counts(self) -> Tuple[int, int, int, int, int, int]:
+        """``(graphs, event nodes, late-created, stale, unready, key reused)``.
 
         The denominator of every graph-replayed split line. ``graphs`` and
         ``event nodes`` say how much of the boot CAN be split at all; the
-        two read counts say how much of what could be, was not -- and why.
+        three read counts say how much of what could be, was not -- and why.
         """
         pairs = sum(len(g.pairs) for g in self._graphs.values())
         late = sum(g.late_created for g in self._graphs.values())
@@ -595,6 +651,7 @@ class CollectiveClock:
             late,
             self._graph_stale_reads,
             self._graph_unready_reads,
+            self._graph_key_reuses,
         )
 
     def _read_graph_nodes(
@@ -605,13 +662,36 @@ class CollectiveClock:
         Query-only, like everything else here. ``None`` means at least one
         node had not completed; the caller refuses the split rather than
         blocking on it or pricing the pairs that did complete.
+
+        THE READ IS NOT ATOMIC WITH RESPECT TO THE DEVICE. This loop runs on
+        the scheduler thread while the forward thread may launch the next
+        replay of this same key; the driver then re-executes these nodes
+        under the host's feet. Two things follow, and both are handled by
+        NAMING rather than by locking (a lock here would put the scheduler
+        thread behind the forward thread on the hot path):
+
+        * a node re-recorded and still in flight makes
+          ``cudaEventElapsedTime`` return ``cudaErrorNotReady``, which torch
+          raises as ``RuntimeError``. That is a refusal, not a crash --
+          uncaught it would ride the flush into the scheduler tick;
+        * a node re-executed and ALREADY complete returns a plausible number
+          from somebody else's replay, and no exception says so. The caller
+          re-reads the generation after this returns; the bump happens
+          before the launch, so an unmoved generation means no newer replay
+          of this key was launched while this loop ran.
         """
         acc: Dict[str, List[float]] = {}
         for pre, post, family in nodes.pairs:
-            if not post.query():
+            try:
+                if not post.query():
+                    self._graph_unready_reads += 1
+                    return None
+                ms = pre.elapsed_time(post)
+            except RuntimeError:
+                # cudaErrorNotReady on a node a concurrent replay re-recorded
+                # mid-read. Same outcome as an incomplete node, same counter.
                 self._graph_unready_reads += 1
                 return None
-            ms = pre.elapsed_time(post)
             cell = acc.get(family)
             if cell is None:
                 acc[family] = [ms, 1.0, ms]
@@ -763,27 +843,58 @@ class CollectiveClock:
         if span.graph_replayed:
             slot = span.slot
             span.slot = None
-            nodes = span.graph_nodes
-            span.graph_nodes = None
+            reads = span.graph_reads
+            span.graph_reads = []
             refused = None
-            graph_families: Optional[Dict[str, FamilyStat]] = None
-            if nodes is None:
+            graph_families: Dict[str, FamilyStat] = {}
+            if span.graph_key_reused:
+                # Two replays of ONE key under one bracket: the second
+                # destroyed the first's timestamps before anything could read
+                # them. Counted in ``note_graph_replay``.
+                refused = "graph-replay-key-replayed-twice"
+            elif not reads:
                 # The graph ran, and it carries no event nodes: captured
                 # before this instrument existed, captured by a runner that
                 # arms no capture scope, or replayed without a declaration.
                 # NAME THE MISSING THING -- the old reason said "graph-replay",
                 # which read as "graphs cannot be split" and is now false.
                 refused = "graph-replay-no-event-nodes"
-            elif nodes.generation != span.graph_generation:
-                # A later replay of the same key has already re-executed the
-                # nodes and overwritten their timestamps. The numbers sitting
-                # in them are somebody else's round.
-                self._graph_stale_reads += 1
-                refused = "graph-replay-nodes-overwritten"
-            else:
-                graph_families = self._read_graph_nodes(nodes)
-                if graph_families is None:
+            for nodes, generation in reads if refused is None else ():
+                if nodes.generation != generation:
+                    # A later replay of the same key has already re-executed
+                    # the nodes and overwritten their timestamps. The numbers
+                    # sitting in them are somebody else's round.
+                    self._graph_stale_reads += 1
+                    refused = "graph-replay-nodes-overwritten"
+                    break
+                fams = self._read_graph_nodes(nodes)
+                if fams is None:
                     refused = "graph-replay-nodes-unread"
+                    break
+                if nodes.generation != generation:
+                    # THE SAME CHECK AGAIN, AND IT IS NOT REDUNDANT. The one
+                    # above proves nothing about the read that follows it:
+                    # the forward thread can launch the next replay of this
+                    # key between the two, and the nodes then hand back a
+                    # mixture of two replays' timestamps with no error. The
+                    # generation is bumped BEFORE the launch, so a generation
+                    # that has not moved by here means no newer replay was
+                    # launched while the loop above ran -- which is the whole
+                    # claim the split rests on.
+                    self._graph_stale_reads += 1
+                    refused = "graph-replay-nodes-overwritten"
+                    break
+                for name, stat in fams.items():
+                    have = graph_families.get(name)
+                    graph_families[name] = (
+                        stat
+                        if have is None
+                        else FamilyStat(
+                            total_ms=have.total_ms + stat.total_ms,
+                            count=have.count + stat.count,
+                            max_ms=max(have.max_ms, stat.max_ms),
+                        )
+                    )
             if refused is not None:
                 # Drain the slot's events back to the pool without pricing
                 # them: a partial wait over a round whose graph part is
