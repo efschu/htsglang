@@ -902,20 +902,42 @@ class _OnPathBase(CustomTestCase):
 
         set_cp_token_ratios(list(ratios or self.RATIOS))
 
+    #: Every module that binds ``get_parallel`` at module level and is read by
+    #: the tail's ON path. The patch lands on the CONSUMER's namespace, not on
+    #: the defining module: after a ``from X import y`` the consumer holds its
+    #: own reference and patching X is invisible to it. The defining module is
+    #: patched too, so a site that (legitimately) imports it lazily also sees
+    #: the stub.
+    _PARALLEL_CONSUMERS = (
+        "sglang.srt.runtime_context",
+        "sglang.srt.model_executor.pool_configurator",
+        "sglang.srt.model_executor.model_runner_kv_cache_mixin",
+    )
+
     def _parallel(self, dcp_size=1, dcp_rank=0):
-        """Patch ``get_parallel`` WHERE IT IS DEFINED.
+        """Install a stub topology in every namespace that reads one.
 
-        The sizing sites import it lazily inside the function body, so the
-        patch has to land on the owning module's attribute -- and that is
-        exactly what makes this test able to fail on a wrong import MODULE:
-        a site importing it from anywhere else never sees this stub and
-        raises ImportError instead, which is the boot ``weg2kvtail3`` defect.
+        This does NOT weaken the wrong-import check that motivated these
+        tests: a site that re-adopts ``from <wrong module> import
+        get_parallel`` shadows the module-level name and raises ImportError
+        before any stub is consulted, so it still fails here -- and
+        ``TestEveryGatedLazyImportResolves`` pins the module name directly.
         """
-        import sglang.srt.runtime_context as rc
+        import contextlib
+        import importlib
 
-        return unittest.mock.patch.object(
-            rc, "get_parallel", lambda: _FakeParallel(dcp_size, dcp_rank)
-        )
+        stack = contextlib.ExitStack()
+        for name in self._PARALLEL_CONSUMERS:
+            mod = importlib.import_module(name)
+            if hasattr(mod, "get_parallel"):
+                stack.enter_context(
+                    unittest.mock.patch.object(
+                        mod,
+                        "get_parallel",
+                        lambda s=dcp_size, r=dcp_rank: _FakeParallel(s, r),
+                    )
+                )
+        return stack
 
     def _cfg(self, cell_size=1024, itemsize=1, target_cell=None, **sa_kw):
         from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
@@ -1226,10 +1248,18 @@ class TestEveryGatedLazyImportResolves(CustomTestCase):
                     broken.append(f"{rel}:{lineno} import {module}: {exc!r}")
                     continue
                 for name in names:
-                    if not hasattr(mod, name):
+                    if hasattr(mod, name):
+                        continue
+                    # `from pkg import submodule` is legal and leaves no
+                    # attribute on the package until the submodule is
+                    # imported, so an attribute miss is only a finding once
+                    # the submodule reading has also failed.
+                    try:
+                        importlib.import_module(f"{module}.{name}")
+                    except Exception:  # noqa: BLE001
                         broken.append(
                             f"{rel}:{lineno} {module} has no {name!r} "
-                            f"(defined elsewhere?)"
+                            f"and no submodule of that name"
                         )
         # The population is named, per the denominator law: a green here is
         # only worth the number of imports it actually resolved.
