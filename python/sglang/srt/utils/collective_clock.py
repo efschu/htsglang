@@ -718,10 +718,22 @@ class CollectiveClock:
         # is what the ring holds once it is full. Caught by
         # ``test_the_replay_path_allocates_no_event``, which is why that
         # mutant test exists rather than a comment promising it.
-        for _ in range(self._graph_ring):
-            ev = self._backend.event()
-            self._backend.materialize(ev)
-            self._fence_pool.append(ev)
+        #
+        # GUARDED ON ``is_capturing``, unlike the pair loop above, and the
+        # asymmetry is deliberate rather than an oversight: the pair loop is
+        # a no-op on the first capture (the hint is 0) and by the second one
+        # the scope is entered before the stream starts capturing, so it
+        # never materializes inside a capture. This loop has no such hint to
+        # hide behind -- it always wants a full ring -- and a scope CAN be
+        # entered on an already-capturing stream. Materializing there is the
+        # one thing ``ClockBackend.materialize`` forbids, so the fences are
+        # simply not pre-created in that case and the replay path
+        # late-creates them, counted and printed.
+        if not self._backend.is_capturing():
+            for _ in range(self._graph_ring):
+                ev = self._backend.event()
+                self._backend.materialize(ev)
+                self._fence_pool.append(ev)
         capture = GraphNodes(key=key, phase=phase)
         self._capture = capture
         try:
