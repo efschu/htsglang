@@ -73,6 +73,7 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.utils.collective_clock import collective_clock
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -687,6 +688,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _cache_loc_dtype(self):
         return torch.int64
+
+    def _clock_capture_phase(self):
+        """#1241b. The family PREFIX this capture's collectives must carry.
+
+        A decode round names its phase with ``phase_scope`` and the mapping
+        in ``DecodeRoundLog.PHASE_OF_CATEGORY``; a CAPTURE runs outside any
+        round, so nothing would prefix its families and a replayed verify
+        would report ``tp.all_reduce`` where the eager verify reports
+        ``spec_verify:tp.all_reduce``. Two spellings of one family is the
+        quiet way a decomposition stops being comparable, so the prefix is
+        read from the ONE mapping rather than spelled again here.
+        """
+        from sglang.srt.managers.scheduler_components.decode_round_log import (
+            DecodeRoundLog,
+        )
+
+        category = (
+            "target_verify"
+            if self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            else "decode"
+        )
+        return DecodeRoundLog.PHASE_OF_CATEGORY.get(category)
 
     def _make_graph_key(self, size, stream_idx=None, variant_label=None):
         return ShapeKey(
@@ -1850,12 +1873,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     skip_logits=False,
                 )
-                self.backend.capture_one(
-                    shape_key,
-                    run_once,
-                    dummies=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                # #1241b. The collectives of this graph get event-record
+                # NODES so a REPLAY of it can still be split into compute and
+                # wait. The scope wraps the capture only -- the warmups above
+                # are not capturing, so they lay nothing.
+                with collective_clock().capture_scope(
+                    shape_key, phase=self._clock_capture_phase()
+                ):
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        dummies=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
 
     def _capture_one_shape_weightless(
         self,
@@ -1948,12 +1978,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 stream_idx,
                 variant_label,
             )
-            self.backend.capture_one(
-                shape_key,
-                run_once,
-                dummies=None,
-                post_warmup_hook=None,
-            )
+            # #1241b: the worker replays its own decode graph and is
+            # bracketed by the same round instrument (model_runner.py, the
+            # `worker_can_run_graph` branch), so it needs the same nodes --
+            # an un-instrumented rank in a three-rank comparison is worse
+            # than no comparison.
+            with collective_clock().capture_scope(
+                shape_key, phase=self._clock_capture_phase()
+            ):
+                self.backend.capture_one(
+                    shape_key,
+                    run_once,
+                    dummies=None,
+                    post_warmup_hook=None,
+                )
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
@@ -2198,6 +2236,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
+            # #1241b. DECLARE the graph, at the launch site, before it runs:
+            # the round about to be timed picks up this graph's event nodes,
+            # and -- independently of any round -- the key's generation is
+            # bumped, because this replay overwrites the timestamps a pending
+            # round may still be waiting to read.
+            collective_clock().note_graph_replay(self._replay_graph_key)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             if read_done_post_replay:
                 read_done = self.device_module.Event()

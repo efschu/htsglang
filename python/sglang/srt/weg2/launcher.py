@@ -1796,6 +1796,7 @@ def argv_d(
     random_seed: int = RANDOM_SEED,
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
+    disable_cuda_graph: bool = False,
     admin_api_key: Optional[str] = None,
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(
@@ -1803,6 +1804,13 @@ def argv_d(
         random_seed, barlink_cap_cycles, census_interval,
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
+    ) + (
+        # #1241b CONTROL ARM, NOT A TUNING KNOB. Default off, and off means
+        # this list is empty -- the shipped argv is byte-identical to the one
+        # before this flag existed. Passing it CHANGES THE MEASURED FORM
+        # (full-perf validation runs with graphs and spec), so a number taken
+        # under it describes the eager form and nothing else.
+        ["--disable-cuda-graph"] if disable_cuda_graph else []
     ) + [
         # C1/K2: D's own bs, independent of P's by construction.
         "--max-running-requests", str(d_bs),
@@ -6126,6 +6134,19 @@ def build_parser() -> argparse.ArgumentParser:
              "in the first place.",
     )
     ap.add_argument(
+        "--d-disable-cuda-graph", action="store_true",
+        help="CONTROL ARM ONLY (#1241b). Put --disable-cuda-graph on group "
+             "D, so every decode round runs eager and the compute/wait split "
+             "is measured the slice-1 way. THIS CHANGES THE MEASURED FORM: "
+             "boot weg2dec1_0909 recorded eager rounds averaging 16.6x the "
+             "graphed ones, so a ms/round or a compute/wait number taken "
+             "under this flag describes the eager form and must never be "
+             "quoted as the form's. The graphed form is split by the event "
+             "nodes #1241b lays at capture -- use this arm to CHECK those "
+             "numbers, or when the overhead line reports the nodes as "
+             "overwritten. Default off, and off is byte-identical argv.",
+    )
+    ap.add_argument(
         "--d-disable-overlap-schedule", action="store_true",
         help="Put --disable-overlap-schedule back on group D. The escape "
              "hatch for a server_args gate that refuses overlap under D's "
@@ -6684,6 +6705,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     log(depth_decision.line())
     state.p_depth = depth_decision.depth
+    if ns.d_disable_cuda_graph:
+        log(
+            "W56 Weg2EagerDecodeArm: --d-disable-cuda-graph was passed, so "
+            "group D runs --disable-cuda-graph. THIS IS A CONTROL ARM: the "
+            "decode form under measurement is now eager, not the graphed "
+            "full-perf form, and boot weg2dec1_0909 measured the eager mean "
+            "round at 16.6x the graphed one. Every ms/round, compute/wait and "
+            "throughput figure from this boot carries that scope; none of "
+            "them is a statement about the shipped form."
+        )
     if ns.d_disable_overlap_schedule:
         log(
             "W41 Weg2OverlapRefused: --d-disable-overlap-schedule was passed, "
@@ -6806,7 +6837,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -6874,7 +6905,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid

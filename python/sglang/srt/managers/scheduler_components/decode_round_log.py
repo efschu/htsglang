@@ -66,22 +66,45 @@ additionally RETIRES the open round -- that is the "idle flush" this
 docstring used to name without anyone having written it, and it is why the
 last round of a decode burst is emitted at all.
 
-GRAPH-REPLAY HONEST, WHICH HERE MEANS MOSTLY REFUSING. Decode is the phase
-that actually runs from captured CUDA graphs, and a collective inside a
-REPLAYED graph never executes the Python body that would record its events.
-Its span is therefore not small, it is ABSENT -- and a slot with no pairs
-reports ``wait 0.0``, which has the exact shape of a measurement and is a
-fabrication. So a round with any graph-replayed forward prints::
+GRAPH-REPLAY HONEST -- WHICH SINCE #1241b MEANS SPLIT, NOT REFUSED. Decode is
+the phase that actually runs from captured CUDA graphs, and a collective
+inside a REPLAYED graph never executes the Python body that would record its
+events. Its span is therefore not small, it is ABSENT -- and a slot with no
+pairs reports ``wait 0.0``, which has the exact shape of a measurement and is
+a fabrication. Slice 1 therefore withheld the split from every graphed round,
+and boot ``weg2dec1_0909`` showed what that costs on the real full-perf form:
+5695 withheld rounds per rank against 11 eager ones whose mean was 16.6x
+longer -- a sample that cannot describe the form, and a denominator trap for
+anyone who averages it anyway.
 
-    ... #fwd: 1, gpu-ms: 12.9 (split unavailable: graph-replay, graphed-fwd 1/1)
+#1241b closes it at the source instead of changing the form. The collectives
+are wrapped at CAPTURE time with event-record NODES that the graph re-executes
+on every replay (``utils/collective_clock.capture_scope``), and the round
+reads them one round late through the same query-only path. A graphed round
+now prints the ordinary split line, with its families spelled exactly as an
+eager round spells them::
 
-``gpu-ms`` survives -- the bracket is recorded AROUND the replay, on the same
-stream, so the round's device time is honest -- and the split is withheld.
-A boot that wants the split for the whole ladder runs the decode arm eager
-(``--disable-cuda-graph``) or reads the split from the rounds that fell out
-of the capture (bs above the captured maximum, or a verify shape the decode
-graph does not cover). WHICH ROUNDS THOSE WERE IS PRINTED, not assumed: the
-``graphed-fwd K/N`` field is the denominator law applied to this line.
+    ... #fwd: 1, gpu-ms: 12.9 (compute 9.4, wait 3.5)
+    (wait by family: tp.all_reduce 3.1/56x, spec_verify:tp.all_reduce 0.4/2x)
+
+``split unavailable`` survives for the cases that genuinely are unknown, and
+each now NAMES THE MISSING THING rather than naming the mechanism:
+
+``graph-replay-no-event-nodes``
+    the graph was captured with no scope armed (or the replay declared no
+    key), so there is nothing to read;
+``graph-replay-nodes-overwritten``
+    a later replay of the same key re-executed the nodes before this round
+    was read. The nodes belong to the graph, not to the round;
+``graph-replay-nodes-unread``
+    a node had not completed. Never blocked on, never partially priced.
+
+``gpu-ms`` survives in every case -- the bracket is recorded AROUND the
+replay, on the same stream. The eager arm (``--d-disable-cuda-graph`` on the
+Weg-2 launcher) stays available as a CONTROL, and only that: it changes the
+measured form, and full-perf validation is done with graphs and spec. WHICH
+ROUNDS WERE GRAPHED IS STILL PRINTED, not assumed: the ``graphed-fwd K/N``
+field is the denominator law applied to this line.
 
 READ ONE ROUND LATE, NEVER A SYNC IN THE ROUND. Every reading is
 ``Event.query()``, never ``synchronize()``. Round N's events are read when
@@ -413,6 +436,18 @@ class DecodeRoundLog:
         counts = getattr(self.clock, "contention_counts", None)
         if counts is not None:
             arm_refusals, round_contentions = counts
+        # #1241b DENOMINATOR OF THE GRAPHED SPLIT. `graphs`/`nodes` say how
+        # much of this boot CAN be split at all -- zero nodes and every
+        # graphed round is refused for a structural reason, not a timing one.
+        # `stale` and `unready` say how much of what could be, was not: stale
+        # is the scheduler running a replay ahead of the read (try the
+        # `--d-disable-cuda-graph` control arm, or `--d-disable-overlap-
+        # schedule`, before reading anything into the round times), unready is
+        # the device not having finished. Neither is ever waited on.
+        graphs = nodes = late = stale = unready = 0
+        gcounts = getattr(self.clock, "graph_node_counts", None)
+        if gcounts is not None:
+            graphs, nodes, late, stale, unready = gcounts
         logger.info(
             "Decode rank clock overhead, rank: %d, %.1f us/round host-side over "
             "%d rounds = %.3f %% of the mean round gpu-ms %.2f, emitting about "
@@ -420,7 +455,10 @@ class DecodeRoundLog:
             "event records per forward and is inside the bracket it measures. "
             "Dropped rounds (events never readable): %d. Slot contention with "
             "the prefill half (#252), both MUST be 0: prefill armings refused "
-            "%d, decode rounds opened contended %d.",
+            "%d, decode rounds opened contended %d. Graph event nodes (#1241b): "
+            "%d graphs carry %d nodes (%d created inside a capture); reads "
+            "skipped without blocking: %d overwritten by a later replay, %d "
+            "not yet complete.",
             self.rank,
             us_per_round,
             self._overhead_rounds,
@@ -430,4 +468,9 @@ class DecodeRoundLog:
             self._dropped_rounds,
             arm_refusals,
             round_contentions,
+            graphs,
+            nodes,
+            late,
+            stale,
+            unready,
         )
