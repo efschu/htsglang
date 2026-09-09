@@ -1444,6 +1444,15 @@ class ShadowResult:
         return (
             f"{SHADOW_LINE_PREFIX} leg={self.leg} epoch={self.epoch} "
             f"dir={self.direction} ran={'yes' if self.ran else 'no'} "
+            # S6 fix F: THE REASON RIDES BESIDE ``ran``, not 400 characters
+            # later.  Boot weg2shadowE read `ran=no pieces=0 stripes=0` off the
+            # head of this line and filed "an affordable class has nothing to
+            # exchange"; the actual cause, `reason=plan-diverged-oncard-peer`,
+            # was already on the same line at the far end and was missed by
+            # every reader including the one who wrote the record.  The trailing
+            # `reason=` stays where it is -- parsers keyed on it do not move --
+            # so this is an addition, not a format change.
+            f"why={self.reason or 'ok'} "
             f"classes={len(self.subset.classes)} "
             f"subset={','.join(self.subset.classes) or 'none'} "
             f"rotation={len(self.subset.rotation)} "
