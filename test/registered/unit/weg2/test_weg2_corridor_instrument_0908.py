@@ -285,7 +285,14 @@ class CorridorLineTest(unittest.TestCase):
     #: card.  On a rig with no measured footprint and no user reserve the
     #: values are the named fallback, so the VERDICTS below are byte-identical
     #: to the pre-#1257c ones -- which is the point of pinning them here.
-    FALLBACK_FIELDS = "floor=1024MiB source=UNMEASURED-FALLBACK reserve=0MiB"
+    # #1257c refuter fix 1: the segment carries BOTH numbers -- the floor
+    # and the number the ``verdict=`` beside it is actually graded
+    # against. Pinning only ``floor=`` is how the front and the arm came
+    # to contradict each other on the same line.
+    FALLBACK_FIELDS = (
+        "floor=1024MiB verdict_floor=819MiB "
+        "source=UNMEASURED-FALLBACK reserve=0MiB"
+    )
 
     def test_verdict_per_card(self):
         _f, line = self._line({0: 1030, 1: 341, 2: 852})
@@ -734,7 +741,8 @@ class BandHasOneDeclarationTest(unittest.TestCase):
         # fallback.
         self.assertIn(
             "nvml0:free=1030MiB reserved=425MiB floor=1536MiB "
-            "source=ENV-OVERRIDE reserve=0MiB verdict=BELOW",
+            "verdict_floor=1228MiB source=ENV-OVERRIDE reserve=0MiB "
+            "verdict=BELOW",
             line,
         )
 

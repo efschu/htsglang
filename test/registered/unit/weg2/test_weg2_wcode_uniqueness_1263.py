@@ -270,7 +270,7 @@ class TestOneWCodePerException(CustomTestCase):
         # form 3, concatenated: front.py builds both of these from a bare code
         # plus a marker constant, and the scan must credit the RESOLVED name.
         front = "python/sglang/srt/weg2/front.py"
-        self.assertIn(f"{front}:557", c["W50"]["Weg2TpPrefillExceeded"],
+        self.assertIn(f"{front}:558", c["W50"]["Weg2TpPrefillExceeded"],
                       "the concatenated form must be read AND resolved")
         self.assertIn(f"{front}:563", c["W52"]["Weg2NoServiceableRoute"],
                       "#1290's concatenated claim is the one #1257 walked into")

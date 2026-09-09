@@ -252,7 +252,16 @@ class CorridorTrace:
         if corridor_mib is None:
             derived = corridor_floor(self.card_uuid)
             if derived is not None:
-                corridor_mib = int(derived.verdict_floor_mib)
+                # THE FLOOR, NOT THE VERDICT FLOOR -- and this is a bug fix,
+                # not a preference (found 2026-09-09 by widening the suite set
+                # past weg2+mem_ledger to the managers tests that pin this).
+                # ``corridor_mib`` is the TARGET here: ``corridor_band_floor_mib``
+                # below DERIVES the verdict threshold from it and ``margin_mib``
+                # is measured to it. Feeding it ``verdict_floor_mib`` applied
+                # the -20 % band TWICE -- an unmeasured card graded its breach
+                # at 655 MiB instead of 819, so the instrument that exists to
+                # audit the gate had a 164 MiB blind spot under it.
+                corridor_mib = int(derived.mib)
                 corridor_source = derived.source
             else:
                 corridor_mib = corridor_law_mib()
@@ -294,18 +303,14 @@ class CorridorTrace:
             # with extra steps. ``corridor_mib`` already IS the guard's
             # ``verdict_floor_mib`` when the floor was derived, so the band is
             # applied only where the source says nothing measured it.
-            "corridor_band_floor_mib": (
-                int(corridor_mib)
-                if corridor_source.startswith("MEASURED-")
-                else _band_floor_mib(corridor_mib)
-            ),
+            # ONE RULE, asked of the guard rather than restated: a MEASURED
+            # floor has no tolerance under it, a stated one keeps the band.
+            # The two-branch expression that used to sit here was a THIRD
+            # copy of that rule (after ``CorridorFloor.verdict_floor_mib`` and
+            # the log-line reader), and it is the copy that double-applied.
+            "corridor_band_floor_mib": _verdict_floor(corridor_mib, corridor_source),
             "breach": bool(
-                floor // MIB
-                < (
-                    int(corridor_mib)
-                    if corridor_source.startswith("MEASURED-")
-                    else _band_floor_mib(corridor_mib)
-                )
+                floor // MIB < _verdict_floor(corridor_mib, corridor_source)
             ),
             "margin_mib": floor // MIB - corridor_mib,
             "arena_backed_min_mib": min(s.kv_arena_backed_bytes for s in samples)
@@ -348,6 +353,25 @@ def _band_floor_mib(corridor_mib: int) -> int:
     from sglang.srt.managers.corridor_guard import CORRIDOR_BAND_FRACTION
 
     return int(corridor_mib - corridor_mib * CORRIDOR_BAND_FRACTION)
+
+
+def _verdict_floor(corridor_mib: int, corridor_source: str) -> int:
+    """The breach threshold, asked of the guard -- never restated here.
+
+    #1257c: a MEASURED floor has NO tolerance under it (a measured transient
+    peak is a physical requirement, and slack below it is a breach with extra
+    steps); a STATED one keeps the band. That rule lives in
+    ``corridor_guard.verdict_floor_for_mib`` and this defers to it, so the
+    instrument and the gate cannot answer the same question differently --
+    which is the whole of #656 and the reason ``_band_floor_mib`` alone is not
+    enough any more.
+    """
+    try:
+        from sglang.srt.managers.corridor_guard import verdict_floor_for_mib
+
+        return int(verdict_floor_for_mib(int(corridor_mib), corridor_source))
+    except Exception:  # pragma: no cover - see corridor_floor's own fallback
+        return _band_floor_mib(int(corridor_mib))
 
 
 def requested_period_ms() -> Optional[int]:
