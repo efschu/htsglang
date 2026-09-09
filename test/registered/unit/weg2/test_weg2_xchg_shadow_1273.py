@@ -30,8 +30,8 @@ from __future__ import annotations
 import ctypes
 import inspect
 import os
-import re
 import threading
+import time
 
 import pytest
 
@@ -344,3 +344,275 @@ def _plan_with_oncard(by_rank) -> wx.XchgPlan:
 
 def _plan_line_for(*, oncard_nbytes: int) -> str:
     return _plan_with_oncard({0: oncard_nbytes}).log_line()
+
+
+# ===========================================================================
+# ITEM 3 -- SlotBatch.checksum, wired.  DANGER DIRECTION: a checksum that is
+# computed and never compared, compared against a number nobody computed,
+# taken over slot padding, taken before the sync -- or one that ABORTS, which
+# is the shadow taking authority it does not have.
+# ===========================================================================
+
+
+@pytest.fixture()
+def sems(boot):
+    xr.create_semaphores(boot)
+    s = tp.SemSet(boot)
+    yield s
+    s.close()
+    xr.unlink_semaphores(boot)
+
+
+def byte_sum(ops: FakeDeviceOps):
+    """A ``uint8_checksum``-shaped summer over the double's storage.
+
+    Same VALUE contract as ``model_executor/weights_arena.uint8_checksum``: the
+    exact integer sum of the unsigned bytes, so
+    ``checksum_is_representable(v, n)`` grades it the same way it grades the
+    metal's.  It is a different IMPLEMENTATION on purpose -- torch on a device
+    tensor there, ctypes over a file mapping here -- because what is under test
+    is the wiring, not torch.
+    """
+
+    def summer(addr: int, nbytes: int) -> int:
+        return sum(ctypes.string_at(ops.real(int(addr)), int(nbytes)))
+
+    return summer
+
+
+def _cross_round_trip(region, sems, ops, descs, *, pair, slot_bytes=SLOT,
+                      budget_s=10.0, checksum_bytes=None, on_checksum=None,
+                      corrupt=None):
+    pstats = tp.PairStats(*xr.CROSS_PAIRS[pair], "us", "ud")
+    cstats = tp.PairStats(*xr.CROSS_PAIRS[pair], "us", "ud")
+    errors: list = []
+
+    def produce():
+        try:
+            tp.run_producer_pair(region, sems, ops, ops.create_stream(0),
+                                 pair=pair, descs=descs, stats=pstats,
+                                 budget_s=budget_s, slot_bytes=slot_bytes,
+                                 checksum_bytes=checksum_bytes)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=produce)
+    thread.start()
+    try:
+        if corrupt is not None:
+            corrupt()
+        tp.run_consumer_pair(region, sems, ops, ops.create_stream(0),
+                             pair=pair, descs=descs, stats=cstats,
+                             budget_s=budget_s, slot_bytes=slot_bytes,
+                             checksum_bytes=checksum_bytes,
+                             on_checksum=on_checksum)
+    finally:
+        thread.join(30)
+    assert not errors, errors
+    return pstats, cstats
+
+
+def test_the_checksum_is_not_computed_when_no_summer_is_supplied():
+    """The authoritative path must stay byte-identical, cost included.
+
+    ``0`` has meant "not computed" since S4 and still does; what changed is
+    that a summer makes it a number.  A batch that computed a sum nobody asked
+    for would put a full read of every byte inside the flip budget -- the
+    reason the field was ``TODO(S5)`` and not simply filled in.
+    """
+    batch = tp.SlotBatch(0, (tp.Piece(0, tp.FLAT, 16, 0, 0, 0),), 16)
+    reads: list = []
+    assert batch.checksum() == tp.CHECKSUM_NOT_COMPUTED
+    assert batch.checksum(None) == 0
+    assert not reads
+
+    def spy(addr, nbytes):
+        reads.append((addr, nbytes))
+        return 7
+
+    assert batch.checksum(spy, 0x1000) == 7
+    assert reads == [(0x1000, 16)]
+
+
+def test_the_checksum_covers_the_payload_and_not_the_slot_padding():
+    """The range is the batch's payload, never the slot.
+
+    A slot is reused; the bytes past ``total_bytes`` are the PREVIOUS batch's.
+    Summing the whole slot would make a correct transport report a mismatch on
+    every short batch, i.e. an instrument that fires on the healthy case --
+    the worst kind, because the first response to it is to disable the check.
+    """
+    batch = tp.SlotBatch(3, (tp.Piece(0, tp.FLAT, 100, 0, 0, 0),), 100)
+    seen: list = []
+
+    def spy(addr, nbytes):
+        seen.append(nbytes)
+        return 0
+
+    batch.checksum(spy, 0)
+    assert seen == [100], "the summer was handed the slot, not the payload"
+
+
+def test_the_producer_publishes_the_checksum_after_the_sync_not_before(
+        region, sems, ops):
+    """A checksum of issued-but-not-landed bytes is the previous batch's.
+
+    The fake defers every copy to ``synchronize``, so a checksum taken one
+    statement earlier sums the poison this test writes into the slot.  That is
+    the same ordering ``bytes_filled`` already has and the same mutant (M4 of
+    the first S4 round) one field over -- and S5-pre named it load-bearing here
+    precisely because the shadow reads this field WITHOUT the semaphore.
+    """
+    payload = pattern(11, 300)
+    src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x20000)
+    write(ops, src, payload)
+    poison(ops, dst, len(payload), seed=0x5A)
+    # Poison the STAGING slot, so "summed before the copy landed" is a
+    # different number and not merely a zero.
+    base = region.slot_address(0, 0)
+    ctypes.memset(base, 0xE7, SLOT)
+    descs = [flat_desc(0, 1, len(payload), src_ptr=src, dst_ptr=dst, name="p")]
+    _cross_round_trip(region, sems, ops, descs, pair=0,
+                      checksum_bytes=byte_sum(ops))
+    assert sum(payload) != 0xE7 * len(payload)
+    assert read(ops, dst, len(payload)) == payload
+
+
+def test_a_corrupted_slot_is_reported_to_the_callback_and_never_raised(
+        region, sems, ops):
+    """THE ZERO-AUTHORITY PROPERTY, on the checksum path.
+
+    The staged bytes are corrupted between the producer's publish and the
+    consumer's read.  The consumer must NOTICE (a report with the two numbers)
+    and must NOT act: no raise, no refusal, the copy still issued.  A shadow
+    that stops a flip on its own finding is not a shadow, and this is the exact
+    seam where it would be easiest to make it one.
+    """
+    payload = pattern(13, 200)
+    src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x20000)
+    write(ops, src, payload)
+    poison(ops, dst, len(payload), seed=0x33)
+    descs = [flat_desc(0, 1, len(payload), src_ptr=src, dst_ptr=dst, name="p")]
+    reports: list = []
+
+    def corrupt():
+        # Wait for the slot to carry this flip's PRODUCED record, then flip a
+        # byte in the staging slot itself.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            rec = region.read_slot(0, 0)
+            if rec.state == xr.SLOT_PRODUCED and rec.checksum:
+                base = region.slot_address(0, 0)
+                ctypes.memset(base, 0xFF, 1)
+                return
+            time.sleep(0.001)
+        raise AssertionError("the producer never published a checksum")
+
+    _cross_round_trip(region, sems, ops, descs, pair=0,
+                      checksum_bytes=byte_sum(ops), on_checksum=reports.append,
+                      corrupt=corrupt)
+    assert len(reports) == 1, reports
+    report = reports[0]
+    assert not report.match
+    assert report.lane == "cross" and report.nbytes == len(payload)
+    assert report.expected != report.got
+
+
+def test_a_producer_that_computed_nothing_is_not_compared_against(
+        region, sems, ops):
+    """An unarmed instrument must not read as a passed one (spec 4.2).
+
+    The consumer has a summer; the producer did not.  Comparing this rank's
+    real sum against the other's ``0`` would report a mismatch on every batch
+    of an entirely healthy flip.
+    """
+    payload = pattern(17, 180)
+    src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x20000)
+    write(ops, src, payload)
+    descs = [flat_desc(0, 1, len(payload), src_ptr=src, dst_ptr=dst, name="p")]
+    reports: list = []
+    _cross_round_trip(region, sems, ops, descs, pair=0,
+                      checksum_bytes=None, on_checksum=reports.append)
+    assert reports == []
+    # And with BOTH halves armed the same payload does produce a report.
+    region.release_slot(0, 0)
+    reports2: list = []
+    _cross_round_trip(region, sems, ops, descs, pair=0,
+                      checksum_bytes=byte_sum(ops), on_checksum=reports2.append)
+    assert len(reports2) == 1 and reports2[0].match
+
+
+def test_the_oncard_row_carries_the_checksum_and_the_consumer_verifies_it(
+        region, tmp_path):
+    """The diagonal has no slot RECORD, so the row is the only channel.
+
+    ``xr.CROSS_PAIRS`` has no diagonal by construction, so the on-card lane
+    cannot borrow ``XchgSlot.checksum``.  The row grew the field; this proves
+    it survives the seal, reaches the consumer, and is compared.
+    """
+    prod = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    cons = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        payload = pattern(23, 900)
+        src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x30000)
+        write(prod, src, payload)
+        poison(cons, dst, len(payload), seed=0xB1)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=dst,
+                           name="oncard")]
+        bounce = tp.OnCardBounce(prod, 0, slots=tp.ONCARD_SLOTS, slot_bytes=SLOT)
+        tp.publish_ipc_handle(region, 0, bounce.handle)
+        tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, seq=-1, nbytes=0,
+                            slot_bytes=SLOT, wave=WAVE,
+                            state=tp.ONCARD_STATE_ARMED)
+        peer = cons.ipc_open_handle(tp.read_ipc_handle(region, 0))
+        pstats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_IPC)
+        cstats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_IPC)
+        reports: list = []
+        errors: list = []
+
+        def produce():
+            try:
+                tp.run_oncard_producer(region, prod, prod.create_stream(0),
+                                       bounce, row=0, peer_row=3, wave=WAVE,
+                                       descs=descs, stats=pstats, budget_s=10.0,
+                                       checksum_bytes=byte_sum(prod))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        thread = threading.Thread(target=produce)
+        thread.start()
+        tp.run_oncard_consumer(region, cons, cons.create_stream(0), peer,
+                               row=3, peer_row=0, wave=WAVE, descs=descs,
+                               stats=cstats, slots=tp.ONCARD_SLOTS,
+                               slot_bytes=SLOT, budget_s=10.0,
+                               checksum_bytes=byte_sum(cons),
+                               on_checksum=reports.append)
+        thread.join(30)
+        assert not errors, errors
+        assert read(cons, dst, len(payload)) == payload
+        assert reports and all(r.lane == "oncard" for r in reports)
+        assert all(r.match for r in reports), reports
+        row = tp.read_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, 0)
+        assert row["sealed"] and row["checksum"] != 0
+        bounce.close()
+    finally:
+        prod.close()
+        cons.close()
+
+
+def test_the_checksum_seam_is_opt_in_at_every_entry_point():
+    """Nothing pays for the shadow's instrument unless it asks for it.
+
+    Four functions grew the pair of arguments; all four default to ``None``, so
+    a caller that does not know about them -- which is every caller S6 will
+    write for the authoritative path -- gets today's behaviour exactly.
+    """
+    for fn in (tp.run_producer_pair, tp.run_consumer_pair,
+               tp.run_oncard_producer, tp.run_oncard_consumer, tp.run_leg):
+        params = inspect.signature(fn).parameters
+        if "checksum_bytes" in params:
+            assert params["checksum_bytes"].default is None, fn.__name__
+        if "on_checksum" in params:
+            assert params["on_checksum"].default is None, fn.__name__
+    assert "checksum_bytes" in inspect.signature(tp.run_leg).parameters
+    assert "on_checksum" in inspect.signature(tp.run_leg).parameters
