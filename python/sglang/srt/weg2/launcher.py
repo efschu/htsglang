@@ -74,6 +74,7 @@ from sglang.srt.weg2 import (
     ring_table,
     weight_exchange_region,
     weight_exchange_shadow,
+    weight_exchange_transport,
     xchg_residency,
 )
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_ORDERED_CUT
@@ -986,6 +987,18 @@ P_MAMBA_SLOTS_PER_RUNNING_REQUEST = 2
 #: without the exchange being able to break a flip.
 WEIGHT_SOURCE_CHOICES = ("ring", "exchange", "shadow")
 WEIGHT_SOURCE_DEFAULT = "ring"
+
+#: #1273 S6: THE ON-CARD LANE'S ARM, spec section 3.7 degrade 3's own flag
+#: (``--weg2-xchg-oncard {ipc|host}``).  It had no producer at all: the ranks
+#: read ``SGLANG_WEG2_XCHG_ONCARD`` from their inherited environment and the
+#: launcher never wrote it, so the ``host`` arm -- the only arm on which a
+#: store-and-forward deposit can exist -- was reachable only by an operator
+#: exporting a variable by hand, while the #1269 ledger charged its bytes on
+#: every ``shadow`` boot (S6 refuter, must_fix 4).  One name, one producer, and
+#: the SAME value decides the charge and the allocation.
+ONCARD_MODE_CHOICES = (weight_exchange_transport.ONCARD_MODE_IPC,
+                       weight_exchange_transport.ONCARD_MODE_HOST)
+ONCARD_MODE_DEFAULT = weight_exchange_transport.ONCARD_MODE_IPC
 
 #: The /dev/shm staging region's layout terms, spec section 6/S3: 2 slots per
 #: DIRECTED cross-card pair (double buffering), 32 MiB per slot (evidence E2
@@ -3275,7 +3288,8 @@ def prepare_xchg_region(log: Log, boot_nonce: str, hook_mode: int,
 
 def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
                        hook_mode: int = 0, dry: bool = False,
-                       hop_bound_ms: Optional[float] = None) -> Dict[str, str]:
+                       hop_bound_ms: Optional[float] = None,
+                       oncard_mode: str = ONCARD_MODE_DEFAULT) -> Dict[str, str]:
     """#1273 S5: arm the region for the SHADOW arm, and publish it to both groups.
 
     ``{}`` on every other arm, and that empty dict is what keeps the default
@@ -3308,6 +3322,12 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
     # would have to invent.
     env[weight_exchange_shadow.ENV_HOP_BOUND_MS] = repr(
         float(weight_exchange_shadow.hop_bound_ms(hop_bound_ms)))
+    # S6: the on-card arm, published by the same mechanism and for the same
+    # reason.  It is what decides whether a deposit is possible at all, and it
+    # is the same string ``choose_host_ledger`` charges the deposit's host
+    # bytes on -- so the arm a rank enforces and the arm the ledger paid for
+    # cannot be two different readings.
+    env[weight_exchange_transport.ENV_ONCARD_MODE] = str(oncard_mode)
     log(f"WEG2-XCHG-SHADOW ARMED epoch={boot_nonce} path={got.get('path', '')} "
         f"sems={got.get('sems', 0)} ring=AUTHORITATIVE exchange=OBSERVER "
         f"-- the ring refills every weight byte as it does today; the exchange "
@@ -3826,7 +3846,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
                 # S5b: the shadow's hop bound is launcher OUTPUT too, so an
                 # operator's inherited shell value may not silently regrade a
                 # boot that arms no shadow at all.
-                weight_exchange_shadow.ENV_HOP_BOUND_MS):
+                weight_exchange_shadow.ENV_HOP_BOUND_MS,
+                # S6: the on-card arm is launcher OUTPUT for the same reason --
+                # an inherited ``SGLANG_WEG2_XCHG_ONCARD=host`` would put ranks
+                # on an arm this boot's ledger charged nothing for.
+                weight_exchange_transport.ENV_ONCARD_MODE):
         env.pop(key, None)
     for key, value in (xchg_env or {}).items():
         env[str(key)] = str(value)
@@ -4135,6 +4159,29 @@ def measured_record_path() -> str:
     return f"{EVIDENCE_DIR}/{host_ledger.MEASURED_RECORD_NAME}"
 
 
+def xchg_bounce_charge_bytes(weight_source: str, oncard_mode: str) -> int:
+    """The #1269 host term for the exchange's own pinned carrier, in bytes.
+
+    ONE PRODUCER OF THE PREDICATE (S6 refuter, must_fix 4), and it is a
+    function rather than an expression inside :func:`choose_host_ledger`
+    because the property under test -- "the charge fires on exactly the arm
+    that can allocate" -- must be provable without a host to read.
+
+    BOTH ARMS DECIDE IT.  ``--weg2-weight-source ring`` creates no region at
+    all; ``--weg2-xchg-oncard ipc`` creates one but exports a VRAM bounce that
+    is freed with its own leg, so no bounce FILE exists and no host byte is
+    pinned.  The bytes exist on ``shadow``/``exchange`` + ``host`` and nowhere
+    else, and this is the same value :func:`prepare_shadow_env` publishes to
+    the ranks -- so the arm a rank enforces and the arm that was paid for
+    cannot be two readings.
+    """
+    if str(weight_source) == WEIGHT_SOURCE_DEFAULT:
+        return 0
+    if str(oncard_mode) != weight_exchange_transport.ONCARD_MODE_HOST:
+        return 0
+    return int(host_ledger.xchg_bounce_bytes())
+
+
 def choose_host_ledger(
     ring_bytes: int,
     ring_span1_bytes: int,
@@ -4143,6 +4190,7 @@ def choose_host_ledger(
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
     weight_source: str = WEIGHT_SOURCE_DEFAULT,
+    oncard_mode: str = ONCARD_MODE_DEFAULT,
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -4199,16 +4247,26 @@ def choose_host_ledger(
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
         measured_record=record,
-        # #1273 S6: the exchange's own pinned host carrier.  The ARM STRING
-        # decides it here, at the one ledger call site, and not inside the
+        # #1273 S6: the exchange's own pinned host carrier.  The ARM STRINGS
+        # decide it here, at the one ledger call site, and not inside the
         # ledger -- `WEIGHT_SOURCE_CHOICES` is this module's, and a ledger that
         # knew about arm names would be a second reader of a decision that
         # already has one.  `ring` charges 0 and every existing boot number is
         # unchanged.
-        xchg_bounce_host_bytes=(
-            0 if str(weight_source) == WEIGHT_SOURCE_DEFAULT
-            else host_ledger.xchg_bounce_bytes()
-        ),
+        #
+        # BOTH ARMS, NOT ONE (S6 refuter, must_fix 4).  This charged on every
+        # non-ring boot, but the bounce FILE exists only on the `host` on-card
+        # arm -- on `ipc` the verdict is `DEPOSIT_REASON_IPC`, the lane logs
+        # the blameless not-drainable line and no host byte moves.  So a
+        # `shadow` + `ipc` boot (the default, and the only one the launcher
+        # could produce before the flag above existed) shrank the store and the
+        # run-peak headroom by 0.75 GiB for bytes that arm cannot allocate: a
+        # charge for a thing that does not happen is the mirror of the omission
+        # this term was added to close.  The predicate is now the SAME one the
+        # deposit allocates under, and it is the launcher's own published
+        # value rather than a second reading of the environment.
+        xchg_bounce_host_bytes=xchg_bounce_charge_bytes(weight_source,
+                                                        oncard_mode),
     )
     return arm, reap_headroom_gib, lines, cg
 
@@ -7677,6 +7735,24 @@ def build_parser() -> argparse.ArgumentParser:
              "can refuse NOTHING ELSE.",
     )
     ap.add_argument(
+        "--weg2-xchg-oncard", choices=ONCARD_MODE_CHOICES,
+        default=ONCARD_MODE_DEFAULT,
+        help="#1273 S6 (spec 3.7 degrade 3): how the CO-LOCATED pair of ranks "
+             "on one card moves its diagonal. 'ipc' (the default) exports the "
+             "producer's VRAM bounce to the consumer's process; 'host' routes "
+             "it through a per-card pinned shm file instead, which is the only "
+             "arm on which a STORE-AND-FORWARD deposit exists -- an exported "
+             "VRAM bounce is freed with the exporting leg and cannot outlive "
+             "it, so the source could not deposit and return. The value is "
+             "published to both groups as SGLANG_WEG2_XCHG_ONCARD and it is "
+             "the SAME value the host ledger charges the deposit's pinned "
+             "bytes on, so the arm a rank enforces and the arm that was paid "
+             "for cannot diverge. On 'host' the ledger charges "
+             f"{host_ledger.xchg_bounce_bytes() / (1024 ** 3):.2f} GiB at both "
+             "moments and the store shrinks by it. Ignored on "
+             "--weg2-weight-source ring",
+    )
+    ap.add_argument(
         "--weg2-shadow-hop-bound-ms", type=float,
         default=weight_exchange_shadow.SHADOW_HOP_BOUND_MS_DEFAULT,
         help="#1273 S5b: the wall the SHADOW is allowed to price its on-card "
@@ -8662,13 +8738,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # groups by build_env below.  Empty on every other arm.
     xchg_env = prepare_shadow_env(log, str(ring_plan.epoch),
                                   ns.weg2_weight_source, dry=dry,
-                                  hop_bound_ms=ns.weg2_shadow_hop_bound_ms)
+                                  hop_bound_ms=ns.weg2_shadow_hop_bound_ms,
+                                  oncard_mode=ns.weg2_xchg_oncard)
 
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
         ring_plan.host_weights_bytes,
         ring_plan.host_weights_span1_bytes, ring_plan.provenance,
-        weight_source=ns.weg2_weight_source)
+        weight_source=ns.weg2_weight_source,
+        oncard_mode=ns.weg2_xchg_oncard)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
