@@ -270,16 +270,16 @@ class TestOneWCodePerException(CustomTestCase):
         # form 3, concatenated: front.py builds both of these from a bare code
         # plus a marker constant, and the scan must credit the RESOLVED name.
         front = "python/sglang/srt/weg2/front.py"
-        self.assertIn(f"{front}:554", c["W50"]["Weg2TpPrefillExceeded"],
+        self.assertIn(f"{front}:557", c["W50"]["Weg2TpPrefillExceeded"],
                       "the concatenated form must be read AND resolved")
-        self.assertIn(f"{front}:560", c["W52"]["Weg2NoServiceableRoute"],
+        self.assertIn(f"{front}:563", c["W52"]["Weg2NoServiceableRoute"],
                       "#1290's concatenated claim is the one #1257 walked into")
         # form 2, counter key: an underscore where the plain pattern wants a
         # space. Both of #1290's counter sites, and the pre-existing W22 one.
-        for line in (1980, 2602):
+        for line in (2070, 2803):
             self.assertIn(f"{front}:{line}",
                           c["W52"]["Weg2NoServiceableRoute"])
-        self.assertIn(f"{front}:1937",
+        self.assertIn(f"{front}:2027",
                       c["W22"]["Weg2SpanUnknownPricedFull"])
         # ...and the sub-key suffix is NOT read as a second holder.
         self.assertEqual(set(c["W28"]), {"Weg2Leg2Unpriced"},

@@ -100,8 +100,11 @@ def _write_footprints(cache_dir: str, digest: str, peaks) -> str:
 
 
 def _publish(cache_dir: str, groups) -> str:
-    path = os.path.join(cache_dir, cg.FLOOR_DIGEST_FILE_DEFAULT)
-    os.makedirs(cache_dir, exist_ok=True)
+    # THE PATH THE GUARD ACTUALLY READS, asked of the guard rather than
+    # rebuilt here: a test that writes its fixture to a path the code under
+    # test does not read is a test that proves nothing and says PASS.
+    path = cg._floor_digest_path()
+    os.makedirs(os.path.dirname(path) or cache_dir, exist_ok=True)
     with open(path, "w") as f:
         json.dump({"hw_fingerprint": HW, "groups": dict(groups)}, f)
     return path
@@ -172,7 +175,7 @@ class CorridorFloorDerivation(unittest.TestCase):
         self.assertTrue(f.actuates, "an explicit reserve IS a priced floor")
         self.assertEqual(f.reason, "user-reserve")
 
-    def test_the_real_rig_case_p_measured_d_unmeasured(self):
+    def test_the_real_rig_case_p_measured_d_unmeasured(self):  # noqa: D401
         """The mixed case, which is what the next boot on this rig looks like."""
         _write_footprints(self.cache, "pdigest", P_PEAKS)
         _publish(self.cache, {"P": "pdigest"})
@@ -428,7 +431,9 @@ class TheReserveDefault(unittest.TestCase):
 
         from sglang.srt.model_executor import model_runner_kv_cache_mixin as m
 
-        src = inspect.getsource(m.KvCacheMixin._gapped_corridor_holdback)
+        src = inspect.getsource(
+            m.ModelRunnerKVCacheMixin._gapped_corridor_holdback
+        )
         self.assertNotIn("reserve_mib = 1024", src)
         self.assertIn("DEFAULT_USER_RESERVE_MIB", src)
         self.assertIn("USER_RESERVE_UNSET", src)
