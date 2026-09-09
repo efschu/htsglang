@@ -1167,6 +1167,7 @@ class HiCacheFile(HiCacheStorage):
             writer_count=writer_count,
             path_for_stem=self._existing_path,
             iter_existing=self._iter_existing_files,
+            iter_staging=self._iter_staging_files,
             pins=self.pins,
             # #810: under `--hicache-host-role staging` this store IS the
             # retention tier, so it may not run unbounded. Decided from the
@@ -1585,6 +1586,55 @@ class HiCacheFile(HiCacheStorage):
                 except OSError:
                     continue
 
+    def _iter_staging_files(self):
+        """``stat`` for every non-``.bin`` regular file under the store.
+
+        #1295 SHOULD_FIX 8 -- THE COMPONENT THE CAP COULD NOT SEE AT ALL.
+        ``_iter_existing_files`` yields ``.bin`` only, so the evictor's
+        ``seen_bytes`` -- and therefore the operator's ``max_size`` -- excluded
+        the ``<final>.tmp.<uuid>`` staging files every write passes through and
+        the orphaned canonical partials, both of which sit on the same
+        filesystem under the same cap. Those are reaped BY AGE AT ATTACH ONLY
+        (``_partial_ttl_s`` / ``sweep_partials``), and under Weg 2 the process
+        attaches once and runs for hours, so between attaches the component is
+        unbounded.
+
+        BY MEASUREMENT, NOT BY NAME: anything under this directory that is not
+        a ``.bin`` occupies the cap's filesystem, whatever the writer called
+        it. Naming ``.tmp.`` explicitly would bound only the class we happened
+        to think of, which is the population bug this ticket IS.
+
+        A SECOND ``scandir`` PASS, PRICED: the shard directories are read
+        twice, but ``os.stat`` -- the expensive half -- runs only on the
+        non-``.bin`` entries, which are few. Folding it into the ``.bin`` walk
+        would change ``iter_existing``'s contract, which three other callers
+        share.
+        """
+        try:
+            with os.scandir(self.file_path) as it:
+                top = list(it)
+        except FileNotFoundError:
+            return
+        for entry in top:
+            if entry.is_dir():
+                try:
+                    with os.scandir(entry.path) as shard_it:
+                        shard_entries = list(shard_it)
+                except OSError:
+                    continue
+                for sub in shard_entries:
+                    if sub.name.endswith(".bin") or sub.is_dir():
+                        continue
+                    try:
+                        yield sub.stat()
+                    except OSError:
+                        continue
+            elif not entry.name.endswith(".bin"):
+                try:
+                    yield entry.stat()
+                except OSError:
+                    continue
+
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
     ) -> str:
@@ -1757,8 +1807,17 @@ class HiCacheFile(HiCacheStorage):
         wake would buy nothing but the walk. So a rank that dies HERE alone
         while its siblings wake on is still the disagreement §0 forbids
         ("STOP, never compensation"), and the escalation above is what closes
-        it. Wiring that escalation is S1/S3's obligation, recorded as such in
-        WEG2_BUILD_DECISIONS_0906.md; S5 owns only the one definition.
+        it.
+
+        WIRED (#1295 fix 2 round 2), and NOT as a ``raise`` on the caller's
+        line -- that was fix 2's first cut and it performed exactly the
+        rank-local death this paragraph forbids, under a docstring claiming
+        otherwise. ``SchedulerWeightUpdaterManager._weg2_rescan_store_index``
+        RECORDS the refusal in ``weg2_store_rescan_failure``, and
+        ``resume_memory_occupation`` votes it through the C15 ok-bit of the
+        group fence that already closes the resume leg: every rank joins,
+        the verdict is all-gathered, any False raises ``Weg2FlipRankDisagree``
+        on all of them. No new collective and no rank left running.
         """
         return self._evictor.rescan()
 
