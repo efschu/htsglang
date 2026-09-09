@@ -10079,8 +10079,9 @@ class Scheduler(
             # `leaked_mamba_pages` wall (boot weg2sn5s: one station line for
             # the whole request, zero #991 lines in the log). Same helper and
             # same guards as the two sibling exits; no second ledger.
-            if release_admission_acquired_mamba_slot(
-                req, self.tree_cache, site="weg2_x_refusal"
+            _tc = getattr(self, "tree_cache", None)
+            if _tc is not None and release_admission_acquired_mamba_slot(
+                req, _tc, site="weg2_x_refusal"
             ):
                 self.counters_991_x_refusal = getattr(self, "counters_991_x_refusal", 0) + 1
                 logger.info(
