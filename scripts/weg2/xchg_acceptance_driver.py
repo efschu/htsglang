@@ -303,20 +303,31 @@ def test_s4_pair_and_oncard_lines(tmp_path) -> None:
 
     pairs = [l for l in lines if l.startswith(tp.PAIR_LINE_PREFIX)]
     oncard = [l for l in lines if l.startswith(tp.ONCARD_LINE_PREFIX)]
-    assert len(pairs) == 2 * xr.N_PAIRS and len(oncard) == 2 * xr.N_CARDS
+    waves = _S4.DOUBLE_WAVES
+    assert len(pairs) == waves * 2 * xr.N_PAIRS, len(pairs)
+    assert len(oncard) == waves * 2 * xr.N_CARDS, len(oncard)
     _say("S4", pairs[0])
     _say("S4", oncard[0])
     for token in ("src=", "dst=", "bytes_mib=", "pieces=", "strided_mib=",
                   "ms=", "gbs=", "slot_waits=", "slot_wait_ms="):
         assert token in pairs[0], f"{token!r} missing from {pairs[0]!r}"
-    for token in ("card=", "mode=", "bytes_mib=", "hops=", "hop_ms="):
+    for token in ("card=", "mode=", "bytes_mib=", "batches=", "hop_ms="):
         assert token in oncard[0], f"{token!r} missing from {oncard[0]!r}"
+    # The count is of BATCHES and says so: the lane has exactly two hops by
+    # construction, so a `hops=` printing ~329 on the real flip would be a
+    # field whose name states what the number is not.
+    assert "hops=" not in oncard[0], oncard[0]
 
     degraded = []
     tp.arm_oncard_lane(card_uuid="GPU-probe", probe=lambda: (False, "smoke"),
                        log=degraded.append)
     _say("S4", degraded[0])
     assert tp.ONCARD_UNAVAILABLE_MARKER in degraded[0]
+    # The degrade line must name the target it really uses -- a per-card bounce
+    # file, NOT the staging region the spec prose names (CROSS_PAIRS has no
+    # diagonal to borrow), and the host term that goes with it.
+    assert "bounce=oncard-<card>.bin" in degraded[0], degraded[0]
+    assert f"host_add_mib={tp.ONCARD_HOST_DEGRADE_MIB}" in degraded[0]
 
 
 def tp_marker() -> str:

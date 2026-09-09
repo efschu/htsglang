@@ -11,7 +11,7 @@ wrong place, or do not land at all, with no error anywhere.
 arrays and a file-mediated IPC handle table.  Everything above the adapter is
 the product code, unmodified: the batcher, the slot state machine, the real
 POSIX semaphores, the real ``/dev/shm`` region, the short-piece refusal, the
-two on-card hops, the five threads.  Six real processes run it.  What the fake
+two on-card hops, the real per-rank thread set.  Six real processes run it.  What the fake
 replaces is exactly the set of calls that need silicon, and that set contains
 no branch.
 
@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import ast
 import ctypes
+import errno
 import inspect
 import itertools
 import mmap
@@ -65,6 +66,13 @@ from sglang.srt.weg2 import weight_exchange_transport as tp
 #: exercised by a few kilobytes of payload.
 SLOT = 4096
 FAKE_DEV_BYTES = 8 << 20
+
+#: The wave index every single-wave test runs in.  Named rather than literal
+#: because ``wave`` is a STAMP the two sides compare, and a test that passed 0
+#: by accident on one side and 0 by accident on the other would prove nothing
+#: about the comparison.  ``test_a_previous_waves_oncard_row_is_not_this_waves_
+#: signal`` is the one that moves it.
+WAVE = 0
 
 _COUNTER = itertools.count()
 
@@ -118,12 +126,14 @@ class FakeDeviceOps(tp.DeviceOps):
 
     def __init__(self, root: str, rank: int, *, fail_ipc_open: bool = False,
                  fail_host_register: bool = False, drop_last_copy: bool = False,
-                 stream_flags: int = tp.CUDA_STREAM_DEFAULT):
+                 stream_flags: int = tp.CUDA_STREAM_DEFAULT,
+                 on_free=None):
         self.root = root
         self.rank = int(rank)
         self.fail_ipc_open = fail_ipc_open
         self.fail_host_register = fail_host_register
         self.drop_last_copy = drop_last_copy
+        self.on_free = on_free
         self._stream_flags = int(stream_flags)
         self._maps: dict = {}
         self._bump = 0
@@ -132,6 +142,9 @@ class FakeDeviceOps(tp.DeviceOps):
         self._lock = threading.Lock()
         self.registered: list = []
         self.issued = 0
+        self.freed: list = []
+        self.closed_handles: list = []
+        self._allocs: dict = {}
         os.makedirs(os.path.join(root, "ipc"), exist_ok=True)
 
     # -- storage ----------------------------------------------------------
@@ -244,10 +257,28 @@ class FakeDeviceOps(tp.DeviceOps):
             self._bump += int(nbytes)
         assert self._bump <= FAKE_DEV_BYTES, "fake device out of memory"
         self._base_of(self.rank)
-        return dev_ptr(self.rank, off)
+        ptr = dev_ptr(self.rank, off)
+        self._allocs[ptr] = int(nbytes)
+        return ptr
 
     def raw_free(self, ptr: int) -> None:
-        return None
+        """A FREE THAT POISONS, because a free that does nothing cannot be
+        used to prove anything about a lifetime.
+
+        ``cudaFree`` returns the pages to the driver, which may hand them to
+        anyone; a peer still copying out of an imported mapping then reads
+        whatever is there.  The first version of this fake returned ``None``,
+        which is exactly why 36 green tests and six mutants could not see the
+        producer freeing its exported bounce while its co-located consumer was
+        still reading it (S4 review + refuter, must_fix).  Poisoning makes that
+        window a byte mismatch instead of a shrug.
+        """
+        nbytes = self._allocs.pop(int(ptr), 0)
+        self.freed.append((int(ptr), nbytes))
+        if nbytes:
+            ctypes.memset(self.real(int(ptr)), 0x6B, nbytes)
+        if self.on_free is not None:
+            self.on_free(int(ptr), nbytes)
 
     def ipc_get_handle(self, ptr: int) -> bytes:
         got = self.decode(ptr)
@@ -279,7 +310,7 @@ class FakeDeviceOps(tp.DeviceOps):
         return dev_ptr(rank, off) | FAKE_IMPORT_BIAS
 
     def ipc_close_handle(self, ptr: int) -> None:
-        return None
+        self.closed_handles.append(int(ptr))
 
     def close(self) -> None:
         for _base, mm, fd in self._maps.values():
@@ -607,13 +638,25 @@ def test_stream_is_not_nonblocking():
 
 def test_oncard_lane_falls_back_by_name(tmp_path):
     """A failing ``cudaIpcOpenMemHandle`` arms **W56** at LAUNCH and the lane
-    degrades to the staging region with a named line.
+    degrades with a named line that says WHERE TO.
 
-    Four things are asserted, and the third and fourth are the ones that
-    matter: the code and the degrade target; that the decision is taken at the
-    ARM (``probe`` runs exactly once, so nothing per-flip and nothing per-lane
-    can change it later -- R2-1); and that an explicit request for the degrade
-    is not overridden by a green probe.
+    MEASURED-BY-REVIEW DEFECT (S4 review, 2026-09-09, must_fix): the line said
+    "the on-card share routes through the staging region", which is what spec
+    3.7 degrade 3 and spec 6/S4 both say and is NOT what the code does -- the
+    degrade uses a per-card bounce FILE (``oncard_host_path``), because
+    ``CROSS_PAIRS`` has no diagonal to borrow.  The old assertions checked the
+    code, the cost and the arming discipline and never the TARGET, so they
+    passed straight over it; a reader of the line would have concluded the
+    degrade was ledger-neutral when it adds host bytes spec 0.2 does not
+    carry.  The target is asserted here against the function that actually
+    builds the path, so the two cannot drift apart again.
+
+    Five things now: the code; the degrade TARGET and its host term; that the
+    decision is taken at the ARM (``probe`` runs exactly once, so nothing
+    per-flip and nothing per-lane can change it later -- R2-1); that an
+    explicit request for the degrade is not overridden by a green probe; and
+    that an explicit request for ``ipc`` is REFUSED rather than silently
+    degraded.
     """
     calls: list = []
     lines: list = []
@@ -639,6 +682,19 @@ def test_oncard_lane_falls_back_by_name(tmp_path):
     assert "cudaIpcOpenMemHandle" in lines[0]
     assert "0.2" in lines[0] and "host saving" in lines[0], (
         "the degrade must state its cost and what it does NOT cost")
+    # THE TARGET, tied to the function that builds it rather than to prose.
+    bounce_name = os.path.basename(tp.oncard_host_path("bootx", 7))
+    assert bounce_name == "oncard-7.bin", bounce_name
+    assert f"bounce={bounce_name.replace('7', '<card>')}" in lines[0], lines[0]
+    assert "NOT" in lines[0] and "staging region" in lines[0], (
+        "the line must say which target it does NOT use, or the spec wording "
+        "keeps reading as the behaviour")
+    assert f"host_add_mib={tp.ONCARD_HOST_DEGRADE_MIB}" in lines[0]
+    # ...and the term is the real geometry: one bounce per card of the three,
+    # ONCARD_SLOTS slots each.  Computed here from the same two constants the
+    # HostBounce is built from, never from the message.
+    assert tp.ONCARD_HOST_DEGRADE_MIB == \
+        3 * tp.ONCARD_SLOTS * tp.ONCARD_SLOT_BYTES // xr.MIB
 
     ok_lines: list = []
     assert tp.arm_oncard_lane(card_uuid="GPU-abc", probe=lambda: (True, ""),
@@ -663,6 +719,23 @@ def test_oncard_lane_falls_back_by_name(tmp_path):
         log=raised.append) == tp.ONCARD_MODE_HOST
     assert "OSError" in raised[0]
 
+    # AN EXPLICIT `ipc` WHOSE PROBE FAILS IS A REFUSAL, and it is the only
+    # runtime use the W56 CLASS has.  Degrading here would run a boot whose
+    # operator believes the lane is on, and every wall claim that followed
+    # would be about a lane that is not there.  A refusal that is only ever a
+    # string is a refusal nobody can catch.
+    asked: list = []
+    with pytest.raises(tp.Weg2XchgOnCardUnavailable) as excinfo:
+        tp.arm_oncard_lane(card_uuid="GPU-abc",
+                           probe=lambda: (False, "cudaIpc rc=1"),
+                           requested=tp.ONCARD_MODE_IPC, log=asked.append)
+    assert tp.ONCARD_UNAVAILABLE_MARKER in str(excinfo.value)
+    assert "degrade_to=none" in str(excinfo.value)
+    assert f"requested={tp.ONCARD_MODE_IPC}" in str(excinfo.value)
+    assert asked and tp.ONCARD_UNAVAILABLE_MARKER in asked[0], (
+        "a refusal must also reach the log: the raise unwinds into the "
+        "launcher, and the boot log is where the reason has to survive")
+
 
 def test_the_degraded_lane_really_moves_the_bytes(tmp_path, region):
     """W56 names a degrade; the degrade has to work.
@@ -685,17 +758,25 @@ def test_the_degraded_lane_really_moves_the_bytes(tmp_path, region):
                                  slot_bytes=SLOT, shm_root=os.path.dirname(
                                      os.path.dirname(region.path)))
         tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, seq=-1, nbytes=0,
+                            slot_bytes=SLOT, wave=WAVE,
                             state=tp.ONCARD_STATE_ARMED)
         c_bounce = tp.HostBounce(cons, region.boot_nonce, 0, create=False,
                                  slot_bytes=SLOT, shm_root=os.path.dirname(
                                      os.path.dirname(region.path)))
         assert c_bounce.ptr != p_bounce.ptr, "two mappings, two addresses"
+        # The degrade's host cost is a REAL file of a size this test can read,
+        # and it scales exactly as the W56 line's `host_add_mib` claims.
+        assert os.path.getsize(p_bounce.path) == tp.ONCARD_SLOTS * SLOT
+        assert p_bounce.path.endswith("oncard-0.bin"), p_bounce.path
+        assert tp.ONCARD_HOST_DEGRADE_MIB * xr.MIB == \
+            3 * tp.ONCARD_SLOTS * tp.ONCARD_SLOT_BYTES
         errors: list = []
 
         def produce():
             try:
                 tp.run_oncard_producer(region, prod, prod.create_stream(0),
-                                       p_bounce, row=0, peer_row=3, descs=descs,
+                                       p_bounce, row=0, peer_row=3, wave=WAVE,
+                                       descs=descs,
                                        stats=tp.OnCardStats(0, "u0", "host"),
                                        budget_s=10.0)
             except BaseException as exc:  # noqa: BLE001
@@ -705,8 +786,8 @@ def test_the_degraded_lane_really_moves_the_bytes(tmp_path, region):
         thread.start()
         stats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_HOST)
         tp.run_oncard_consumer(region, cons, cons.create_stream(0), c_bounce.ptr,
-                               row=3, peer_row=0, descs=descs, stats=stats,
-                               slot_bytes=SLOT, budget_s=10.0)
+                               row=3, peer_row=0, wave=WAVE, descs=descs,
+                               stats=stats, slot_bytes=SLOT, budget_s=10.0)
         thread.join(30)
         assert not errors, errors
         assert read(cons, dst, len(payload)) == payload
@@ -988,6 +1069,7 @@ def test_oncard_two_hops_land_the_bytes_and_the_handle_survives(region, tmp_path
         assert tp.read_ipc_handle(region, 0) == bounce.handle
         assert tp.read_ipc_handle(region, 0)[-1] == 0xA5, "c_char would truncate"
         tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, seq=-1, nbytes=0,
+                            slot_bytes=SLOT, wave=WAVE,
                             state=tp.ONCARD_STATE_ARMED)
 
         peer = cons.ipc_open_handle(tp.read_ipc_handle(region, 0))
@@ -1000,21 +1082,23 @@ def test_oncard_two_hops_land_the_bytes_and_the_handle_survives(region, tmp_path
         def produce():
             try:
                 tp.run_oncard_producer(region, prod, prod.create_stream(0),
-                                       bounce, row=0, peer_row=3, descs=descs,
-                                       stats=pstats, budget_s=10.0)
+                                       bounce, row=0, peer_row=3, wave=WAVE,
+                                       descs=descs, stats=pstats,
+                                       budget_s=10.0)
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
 
         thread = threading.Thread(target=produce)
         thread.start()
         tp.run_oncard_consumer(region, cons, cons.create_stream(0), peer,
-                               row=3, peer_row=0, descs=descs, stats=cstats,
-                               slots=tp.ONCARD_SLOTS, slot_bytes=SLOT,
-                               budget_s=10.0)
+                               row=3, peer_row=0, wave=WAVE, descs=descs,
+                               stats=cstats, slots=tp.ONCARD_SLOTS,
+                               slot_bytes=SLOT, budget_s=10.0)
         thread.join(30)
         assert not errors, errors
         assert read(cons, dst, len(payload)) == payload
-        assert pstats.hops == cstats.hops > 1, "the double buffer really cycled"
+        assert pstats.batches == cstats.batches > 1, \
+            "the double buffer really cycled"
         bounce.close()
     finally:
         prod.close()
@@ -1040,11 +1124,12 @@ def test_oncard_consumer_refuses_a_short_hop(region, tmp_path):
         bounce = tp.OnCardBounce(ops, 0, slots=tp.ONCARD_SLOTS, slot_bytes=SLOT)
         tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, seq=batch.seq,
                             nbytes=batch.total_bytes - 8,
+                            slot_bytes=SLOT, wave=WAVE,
                             state=tp.ONCARD_STATE_READY)
         before = ops.issued
         with pytest.raises(tp.Weg2XchgShortPiece) as excinfo:
             tp.run_oncard_consumer(region, ops, ops.create_stream(0), bounce.ptr,
-                                   row=3, peer_row=0, descs=descs,
+                                   row=3, peer_row=0, wave=WAVE, descs=descs,
                                    stats=tp.OnCardStats(0, "u0", "ipc"),
                                    slots=tp.ONCARD_SLOTS, slot_bytes=SLOT,
                                    budget_s=2.0)
@@ -1065,13 +1150,14 @@ def test_a_previous_flips_oncard_row_is_not_this_flips_signal(region, boot):
     is what stops it, so the epoch hash is what this test moves.
     """
     tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, seq=5, nbytes=99,
+                        slot_bytes=SLOT, wave=WAVE,
                         state=tp.ONCARD_STATE_READY)
     assert tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 5, 1.0,
-                            what="fill", row=3)["bytes"] == 99
+                            what="fill", row=3, wave=WAVE)["bytes"] == 99
     region.begin_flip(f"{boot}.2")
     with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
         tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 5, 0.2,
-                         what="fill", row=3)
+                         what="fill", row=3, wave=WAVE)
     assert "denominator" in str(excinfo.value)
     assert "epoch_hash" in str(excinfo.value)
     assert "alive_in_proc" in str(excinfo.value)
@@ -1093,26 +1179,28 @@ def test_a_second_batch_does_not_overwrite_the_first_batchs_row(region):
       earlier one even if the layout changed again.
     """
     tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, slot=0, seq=0,
-                        nbytes=4096, state=tp.ONCARD_STATE_READY)
+                        nbytes=4096, slot_bytes=SLOT, wave=WAVE,
+                        state=tp.ONCARD_STATE_READY)
     tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, slot=1, seq=1,
-                        nbytes=1904, state=tp.ONCARD_STATE_READY)
+                        nbytes=1904, slot_bytes=SLOT, wave=WAVE,
+                        state=tp.ONCARD_STATE_READY)
     assert tp.read_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, 0)["bytes"] == 4096
     assert tp.read_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, 1)["bytes"] == 1904
 
     got = tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 0, 1.0,
-                           what="fill", row=3, slot=0, exact=True)
+                           what="fill", row=3, slot=0, wave=WAVE, exact=True)
     assert got["bytes"] == 4096, "batch 0's row must still describe batch 0"
 
     # And exactness: slot 1 carries batch 1, so asking it about batch 0 is a
     # timeout, never batch 1's byte count.
     with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
         tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 0, 0.2,
-                         what="fill", row=3, slot=1, exact=True)
+                         what="fill", row=3, slot=1, wave=WAVE, exact=True)
     assert "exact=yes" in str(excinfo.value)
     assert "peer_seq=1" in str(excinfo.value)
     # The DRAIN direction is monotone and must stay >=.
     assert tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 0, 1.0,
-                            what="drain", row=3, slot=1)["seq"] == 1
+                            what="drain", row=3, slot=1, wave=WAVE)["seq"] == 1
 
 
 def test_run_leg_applies_its_slot_size_to_both_lanes():
@@ -1127,7 +1215,8 @@ def test_run_leg_applies_its_slot_size_to_both_lanes():
     sig = inspect.signature(tp.run_leg)
     assert sig.parameters["oncard_slot_bytes"].default is None
     source = inspect.getsource(tp.run_leg)
-    assert "diag_bytes = int(slot_bytes if oncard_slot_bytes is None" in source
+    assert "slot_bytes if oncard_slot_bytes is None else oncard_slot_bytes" \
+        in source
     # EVERY diagonal site, found by an AST walk rather than counted by
     # hand: a literal count is a test that has to be edited whenever a
     # site is added, which is precisely when it should fail instead.
@@ -1151,6 +1240,7 @@ def test_a_torn_oncard_row_is_not_a_signal(region):
     """Half a row must not read as a whole one -- the same seal law as S3's
     gate rows, in the area S4 owns."""
     tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 1, seq=2, nbytes=64,
+                        slot_bytes=SLOT, wave=WAVE,
                         state=tp.ONCARD_STATE_READY)
     assert tp.read_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 1)["sealed"] == 1
     view = region.dir_view()
@@ -1159,7 +1249,7 @@ def test_a_torn_oncard_row_is_not_a_signal(region):
     assert tp.read_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 1)["sealed"] == 0
     with pytest.raises(xr.Weg2XchgGateTimeout):
         tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 1, 2, 0.2,
-                         what="fill", row=4)
+                         what="fill", row=4, wave=WAVE)
 
 
 def test_an_armed_row_is_the_handle_signal_and_not_a_batch(region):
@@ -1171,20 +1261,513 @@ def test_an_armed_row_is_the_handle_signal_and_not_a_batch(region):
     W54 against a producer that had done nothing wrong.
     """
     tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, seq=-1, nbytes=0,
+                        slot_bytes=SLOT, wave=WAVE,
                         state=tp.ONCARD_STATE_ARMED)
-    tp._await_handle(region, 0, 1.0, row=3)          # returns at once
-    with pytest.raises(xr.Weg2XchgGateTimeout):      # but is not batch 0
+    tp._await_handle(region, 0, 1.0, row=3, wave=WAVE)   # returns at once
+    with pytest.raises(xr.Weg2XchgGateTimeout):          # but is not batch 0
         tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 0, 0.2,
-                         what="fill", row=3)
+                         what="fill", row=3, wave=WAVE)
 
 
 def test_await_handle_names_a_source_that_never_armed(region):
     with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
-        tp._await_handle(region, 2, 0.2, row=5)
+        tp._await_handle(region, 2, 0.2, row=5, wave=WAVE)
     message = str(excinfo.value)
     assert "what=handle" in message
     assert "peer_row=2" in message
     assert "never published a bounce handle" in message
+
+
+def test_the_oncard_producer_may_not_run_ahead_of_the_double_buffer(region, tmp_path):
+    """The diagonal's ONLY back-pressure, proven by making it bite.
+
+    MEASURED-BY-REVIEW GAP (S4 review, 2026-09-09, must_fix, a SURVIVING
+    MUTANT): deleting the whole in-loop ``_await_oncard(..., what="drain")``
+    call left 36/36 green, because no on-card payload in the suite exceeded two
+    slots -- ``batch.seq - bounce.slots`` was negative on every path and the
+    call returned at its base case without ever reading a row.  The lane is
+    double-buffered precisely so the producer can be held; nothing proved it
+    ever was.
+
+    The kill is a COUNT, not a timeout: with a consumer that drains nothing,
+    a producer that respects the double buffer fills exactly
+    ``ONCARD_SLOTS`` batches and then blocks.  Without the wait it fills all
+    four, overwriting slot 0's row while batch 0 is undrained -- the same
+    overwrite class that was already fixed once, one wait over.
+    """
+    ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        payload = pattern(29, 4 * SLOT - 100)
+        src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x30000)
+        write(ops, src, payload)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=dst,
+                           name="oncard")]
+        assert len(tp.batch_descs(descs, SLOT)) == 4, "not deep enough to block"
+        bounce = tp.OnCardBounce(ops, 0, slots=tp.ONCARD_SLOTS, slot_bytes=SLOT)
+        stats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_IPC)
+        with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
+            tp.run_oncard_producer(region, ops, ops.create_stream(0), bounce,
+                                   row=0, peer_row=3, wave=WAVE, descs=descs,
+                                   stats=stats, budget_s=0.3)
+        assert "what=drain " in str(excinfo.value), str(excinfo.value)
+        assert stats.batches == tp.ONCARD_SLOTS, (
+            f"the producer filled {stats.batches} slots into a "
+            f"{tp.ONCARD_SLOTS}-slot bounce with nobody draining -- batch "
+            f"{tp.ONCARD_SLOTS}'s row overwrote batch 0's while batch 0 was "
+            f"still undrained")
+        bounce.close()
+    finally:
+        ops.close()
+
+
+def test_the_oncard_producer_does_not_return_before_the_last_batch_is_drained(
+        region, tmp_path):
+    """The TERMINAL half of the lifetime handshake, on its own.
+
+    The in-loop drain wait stops the producer refilling a slot; it says nothing
+    about the LAST ``ONCARD_SLOTS`` batches, which no later batch ever waits
+    for.  Those are exactly the ones still in flight when the caller frees the
+    bounce, so ``run_oncard_producer`` may not return while any of them is
+    undrained.  A consumer that stops one batch short must therefore hold the
+    producer to its budget, not let it through.
+    """
+    ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        payload = pattern(53, 3 * SLOT - 30)
+        src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x30000)
+        write(ops, src, payload)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=dst,
+                           name="oncard")]
+        batches = tp.batch_descs(descs, SLOT)
+        assert len(batches) == 3
+        # The consumer drained everything EXCEPT the last batch.
+        for batch in batches[:-1]:
+            tp.write_oncard_row(region, tp.DIR_ONCARD_CONS_OFF, 3,
+                                slot=batch.seq % tp.ONCARD_SLOTS, seq=batch.seq,
+                                nbytes=batch.total_bytes, slot_bytes=SLOT,
+                                wave=WAVE, state=tp.ONCARD_STATE_DONE)
+        bounce = tp.OnCardBounce(ops, 0, slots=tp.ONCARD_SLOTS, slot_bytes=SLOT)
+        stats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_IPC)
+        with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
+            tp.run_oncard_producer(region, ops, ops.create_stream(0), bounce,
+                                   row=0, peer_row=3, wave=WAVE, descs=descs,
+                                   stats=stats, budget_s=0.3)
+        assert "what=drain-final" in str(excinfo.value), str(excinfo.value)
+        assert f"seq={batches[-1].seq}" in str(excinfo.value)
+        assert stats.batches == len(batches), (
+            "it must fail at the END, having filled every batch -- a failure "
+            "earlier than that is the in-loop wait, not this one")
+        bounce.close()
+    finally:
+        ops.close()
+
+
+def test_the_exported_bounce_is_not_freed_until_the_peer_has_released_it(
+        tmp_path, boot, sems):
+    """A ``cudaFree`` under a peer's open IPC mapping is the silent-wrongness
+    class at its worst, and the fake could not see it.
+
+    MEASURED-BY-REVIEW DEFECT (S4 review + refuter, 2026-09-09, must_fix):
+    ``run_oncard_producer`` returned as soon as its last row was written and
+    ``run_leg``'s ``finally`` freed the bounce, while the co-located consumer
+    could still be issuing D2D out of the imported pointer for up to
+    ``ONCARD_SLOTS`` batches -- 64 MiB per card per wave at the shipping
+    default, wrong bytes, no rc, nothing raised.  CUDA also forbids the
+    EXPORTER freeing an allocation an importer still has mapped, which the
+    terminal drain alone does not cover: "your last copy landed" and "your
+    mapping is gone" are two different facts.
+
+    Six green tests, thirty-six green assertions and six mutants missed it
+    because the fake's ``raw_free`` was ``return None`` -- the double DID
+    execute the racing free and could not perceive it.  ``raw_free`` poisons
+    now, and this test pins the ORDER against a consumer that deliberately
+    holds its mapping open after its last byte has landed.
+    """
+    events: list = []
+    lock = threading.Lock()
+
+    def note(what: str) -> None:
+        with lock:
+            events.append((what, time.perf_counter()))
+
+    region = xr.XchgRegion.create(boot, shm_root=str(tmp_path))
+    prod = FakeDeviceOps(str(tmp_path / "d"), rank=0,
+                         on_free=lambda _p, _n: note("free"))
+    cons = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        region.begin_flip(f"{boot}.1")
+        payload = pattern(37, 3 * SLOT - 50)
+        src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x30000)
+        write(prod, src, payload)
+        poison(cons, dst, len(payload), seed=0x4D)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=dst,
+                           name="oncard")]
+        errors: list = []
+
+        def consume() -> None:
+            try:
+                tp._await_handle(region, 0, 20.0, row=3, wave=WAVE)
+                peer = cons.ipc_open_handle(tp.read_ipc_handle(region, 0))
+                tp.run_oncard_consumer(
+                    region, cons, cons.create_stream(0), peer, row=3,
+                    peer_row=0, wave=WAVE, descs=descs,
+                    stats=tp.OnCardStats(0, "u0", tp.ONCARD_MODE_IPC),
+                    slots=tp.ONCARD_SLOTS, slot_bytes=SLOT, budget_s=20.0)
+                # Every byte has landed and every CONS row is written, so the
+                # producer's terminal DRAIN is satisfied here -- and the
+                # mapping is still open.  This window is the defect.
+                time.sleep(0.3)
+                cons.ipc_close_handle(peer)
+                note("release")
+                tp.write_oncard_release(region, 3, wave=WAVE)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+                tp.write_oncard_release(region, 3, wave=WAVE)
+
+        thread = threading.Thread(target=consume)
+        thread.start()
+        try:
+            tp.run_leg(region, sems, prod, row=0, rank=0, device=0,
+                       card_uuid="GPU-0",
+                       uuid_of_card=[f"GPU-{c}" for c in range(xr.N_CARDS)],
+                       descs=descs, is_source=True,
+                       oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3, wave=WAVE,
+                       log=lambda _ln: None,
+                       vote_failure=lambda exc: None,
+                       budget_s=20.0, slot_bytes=SLOT)
+        finally:
+            thread.join(60)
+        assert not errors, errors
+        assert read(cons, dst, len(payload)) == payload
+
+        order = [what for what, _t in sorted(events, key=lambda e: e[1])]
+        assert order.count("free") == 1, (
+            f"the bounce must be freed exactly once, got {events}")
+        assert order == ["release", "free"], (
+            f"the exporter freed its bounce while the importer still had it "
+            f"mapped: {events}")
+        assert prod.freed and prod.freed[0][1] == tp.ONCARD_SLOTS * SLOT
+    finally:
+        prod.close()
+        cons.close()
+        region.close()
+
+
+def test_a_previous_waves_oncard_row_is_not_this_waves_signal(region):
+    """The epoch hash is per FLIP; ``run_leg`` is per WAVE.
+
+    MEASURED-BY-REVIEW DEFECT (S4 refuter, 2026-09-09, must_fix): every wave
+    restarts ``seq`` at 0 with a new bounce and a new handle, and the row
+    carried no wave stamp -- so at the SAME epoch hash, wave 1's leftover rows
+    answered wave 2's questions.  All three waits were affected and they fail
+    differently, so all three are asserted:
+
+    * DRAIN, always reachable: wave 1's consumer row sits at a large sequence,
+      so wave 2's ``>=`` returns instantly and the producer refills a slot
+      nobody has drained -- a silent overwrite on every multi-wave flip.
+    * FILL, reachable whenever a wave's on-card share is two batches or fewer:
+      the stale row matches EXACTLY and either raises W54 against a healthy
+      producer or copies out of an unfilled bounce.
+    * HANDLE: waves 2 and 3 never wait for the new handle at all and read
+      wave 1's 64 bytes -- of a buffer the previous wave has already freed.
+
+    The only staleness test this file had moved ``begin_flip``, which is the
+    coarser stamp; nothing here ever called ``run_leg`` twice.
+    """
+    # -- DRAIN ------------------------------------------------------------
+    tp.write_oncard_row(region, tp.DIR_ONCARD_CONS_OFF, 3, slot=0, seq=110,
+                        nbytes=SLOT, slot_bytes=SLOT, wave=0,
+                        state=tp.ONCARD_STATE_DONE)
+    assert tp._await_oncard(region, tp.DIR_ONCARD_CONS_OFF, 3, 0, 1.0,
+                            what="drain", row=0, slot=0, wave=0)["seq"] == 110
+    with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
+        tp._await_oncard(region, tp.DIR_ONCARD_CONS_OFF, 3, 0, 0.2,
+                         what="drain", row=0, slot=0, wave=1)
+    assert "peer_wave=0" in str(excinfo.value)
+    assert "wave=1" in str(excinfo.value)
+    assert "and wave=1)" in str(excinfo.value), "the denominator names the wave"
+
+    # -- FILL -------------------------------------------------------------
+    tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, slot=0, seq=0,
+                        nbytes=SLOT, slot_bytes=SLOT, wave=0,
+                        state=tp.ONCARD_STATE_READY)
+    assert tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 0, 1.0,
+                            what="fill", row=3, slot=0, wave=0,
+                            exact=True)["bytes"] == SLOT
+    with pytest.raises(xr.Weg2XchgGateTimeout):
+        tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 0, 0.2,
+                         what="fill", row=3, slot=0, wave=1, exact=True)
+
+    # -- HANDLE -----------------------------------------------------------
+    tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, slot=0, seq=-1,
+                        nbytes=0, slot_bytes=SLOT, wave=0,
+                        state=tp.ONCARD_STATE_ARMED)
+    tp._await_handle(region, 0, 1.0, row=3, wave=0)
+    with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
+        tp._await_handle(region, 0, 0.2, row=3, wave=1)
+    assert "peer_wave=0" in str(excinfo.value)
+    assert "what=handle" in str(excinfo.value)
+
+
+def test_the_two_sides_must_agree_on_the_oncard_slot_size(region, tmp_path):
+    """``slot_bytes`` decides byte placement and was agreed by nothing.
+
+    Two co-located ranks entering with different batcher slot sizes produce
+    identical batches for every payload below the smaller of the two and
+    diverge silently above it -- and on this lane there is no ``bytes_filled``
+    record to catch it, only the row.  So the row carries the producer's
+    geometry and the consumer refuses the disagreement by name, before the
+    first copy (#802 rule 4: a number two ranks derive independently must be
+    handshaken, not assumed).
+    """
+    ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        payload = pattern(43, 3000)
+        src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x30000)
+        write(ops, src, payload)
+        poison(ops, dst, len(payload), seed=0x5E)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=dst)]
+        batch = tp.batch_descs(descs, SLOT)[0]
+        # A payload this size batches identically at either slot size, so the
+        # byte count agrees and ONLY the geometry stamp can refuse it.
+        assert tp.batch_descs(descs, 2 * SLOT)[0].total_bytes == batch.total_bytes
+        bounce = tp.OnCardBounce(ops, 0, slots=tp.ONCARD_SLOTS, slot_bytes=SLOT)
+        tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, slot=0,
+                            seq=batch.seq, nbytes=batch.total_bytes,
+                            slot_bytes=2 * SLOT, wave=WAVE,
+                            state=tp.ONCARD_STATE_READY)
+        before = ops.issued
+        with pytest.raises(xr.Weg2XchgPlanDisagree) as excinfo:
+            tp.run_oncard_consumer(region, ops, ops.create_stream(0), bounce.ptr,
+                                   row=3, peer_row=0, wave=WAVE, descs=descs,
+                                   stats=tp.OnCardStats(0, "u0", "ipc"),
+                                   slots=tp.ONCARD_SLOTS, slot_bytes=SLOT,
+                                   budget_s=2.0)
+        assert f"slot_bytes={2 * SLOT}" in str(excinfo.value)
+        assert ops.issued == before, "the refusal must precede the first copy"
+        assert read(ops, dst, len(payload)) != payload
+        bounce.close()
+    finally:
+        ops.close()
+
+
+def test_a_slot_size_the_region_cannot_hold_is_refused_before_any_copy(
+        region, sems, ops):
+    """The one arithmetic bound that was stated and never enforced.
+
+    MEASURED-BY-REVIEW DEFECT (S4 review + refuter, 2026-09-09, must_fix):
+    ``batch_descs`` refused only ``slot_bytes <= 0`` and both pair runners
+    accepted whatever they were handed, while the staging slots are exactly
+    ``xr.SLOT_BYTES`` apart.  A larger value issues copies past the end of the
+    slot into the NEXT directed pair's live payload; ``publish``'s
+    ``bytes_filled > SLOT_BYTES`` refusal is the only guard and it fires after
+    the bytes have landed.  ``test_a_batch_never_exceeds_the_slot_it_will_be_
+    written_into`` names this exact hazard in its docstring and proves only
+    that the batcher respects the number it was given -- the half that was
+    never in doubt.
+    """
+    over = xr.SLOT_BYTES + 1
+    src, dst = dev_ptr(0, 0), dev_ptr(1, 0)
+    descs = [flat_desc(0, 1, 512, src_ptr=src, dst_ptr=dst)]
+    before = ops.issued
+    for runner in (tp.run_producer_pair, tp.run_consumer_pair):
+        with pytest.raises(xr.Weg2XchgPlanDisagree) as excinfo:
+            runner(region, sems, ops, ops.create_stream(0),
+                   pair=xr.pair_id(0, 1), descs=descs,
+                   stats=tp.PairStats(0, 1, "a", "b"), budget_s=1.0,
+                   slot_bytes=over)
+        assert "W52 Weg2XchgPlanDisagree" in str(excinfo.value)
+        assert f"slot_bytes={over}" in str(excinfo.value), runner.__name__
+        assert "next pair's live payload" in str(excinfo.value)
+    assert ops.issued == before, "the refusal must precede the first copy"
+
+    # Both of run_leg's knobs, at the door, before a thread exists.
+    votes: list = []
+
+    def leg(**over_kw):
+        return tp.run_leg(region, sems, ops, row=0, rank=0, device=0,
+                          card_uuid="GPU-0",
+                          uuid_of_card=[f"GPU-{c}" for c in range(xr.N_CARDS)],
+                          descs=descs, is_source=True,
+                          oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3, wave=WAVE,
+                          log=lambda _ln: None, vote_failure=votes.append,
+                          budget_s=1.0, **over_kw)
+
+    with pytest.raises(xr.Weg2XchgPlanDisagree):
+        leg(slot_bytes=over)
+    with pytest.raises(xr.Weg2XchgPlanDisagree):
+        leg(slot_bytes=SLOT, oncard_slot_bytes=tp.ONCARD_SLOT_BYTES + 1)
+    assert votes == [], (
+        "a knob refused at the door is not a leg that failed mid-flight; "
+        "voting ok=False here would take the whole group down for a caller's "
+        "argument error")
+    assert ops.issued == before
+
+    # The ceiling is the region's OWN header value, not a module constant this
+    # function happens to agree with.
+    assert region.header()["slot_bytes"] == xr.SLOT_BYTES
+    assert tp.require_slot_bytes(xr.SLOT_BYTES, xr.SLOT_BYTES,
+                                 what="t") == xr.SLOT_BYTES
+    for bad in (0, -1):
+        with pytest.raises(xr.Weg2XchgPlanDisagree):
+            tp.require_slot_bytes(xr.SLOT_BYTES, bad, what="t")
+
+
+def test_the_sequence_half_of_the_short_piece_check_fires_on_its_own(
+        region, sems, ops):
+    """W54's ``rec.seq != batch.seq`` half, alone.
+
+    MEASURED-BY-REVIEW GAP (S4 review, 2026-09-09, a SURVIVING MUTANT):
+    reducing the check to its byte-count half left 36/36 green.  On the real
+    flip that is the half that never fires -- nearly every batch is a full
+    32 MiB slot, so ``bytes_filled == total_bytes`` by construction -- and
+    ``claim_produced`` checks the epoch and never the sequence, which makes
+    this the ONLY sequence discriminator in the design.  A slot carrying a
+    different batch of the same size would be copied without a word.
+    """
+    pair = xr.pair_id(0, 1)
+    payload = pattern(47, 700)
+    src, dst = dev_ptr(0, 0), dev_ptr(1, 0)
+    write(ops, src, payload)
+    poison(ops, dst, len(payload), seed=0x6F)
+    descs = [flat_desc(0, 1, len(payload), src_ptr=src, dst_ptr=dst)]
+    batch = tp.batch_descs(descs, SLOT)[0]
+
+    # The producer publishes the RIGHT byte count under the WRONG sequence.
+    assert sems.trywait(pair, batch.slot, "empty")
+    region.begin_fill(pair, batch.slot, batch.seq + 4)
+    stream = ops.create_stream(0)
+    ops.memcpy_async(region.slot_address(pair, batch.slot), src, len(payload),
+                     stream)
+    ops.synchronize(stream)
+    region.publish(pair, batch.slot, batch.total_bytes)
+    sems.post(pair, batch.slot, "full")
+
+    before = ops.issued
+    with pytest.raises(tp.Weg2XchgShortPiece) as excinfo:
+        tp.run_consumer_pair(region, sems, ops, ops.create_stream(0),
+                             pair=pair, descs=descs,
+                             stats=tp.PairStats(0, 1, "u0", "u1"),
+                             budget_s=2.0, slot_bytes=SLOT)
+    message = str(excinfo.value)
+    assert tp.SHORT_PIECE_MARKER in message
+    assert "short_by=0" in message, "the byte counts AGREE -- that is the point"
+    assert f"seq_filled={batch.seq + 4}" in message
+    assert f"seq={batch.seq} " in message
+    assert "seq_ok=no" in message, (
+        "a W54 that printed only byte counts would read as a contradiction of "
+        "itself here")
+    assert ops.issued == before
+    assert read(ops, dst, len(payload)) != payload
+
+
+class _ScriptedSems(tp.SemSet):
+    """A :class:`tp.SemSet` whose two RAW syscalls are scripted.
+
+    Nothing else is replaced: the retry logic, the deadline arithmetic and the
+    errno classification under test are the product's own.  ``handle`` is
+    overridden so no named semaphore is opened -- the scripted calls never
+    dereference it.  The script is POPPED, so a runaway retry loop raises
+    ``IndexError`` instead of hanging the suite.
+    """
+
+    def __init__(self, boot_nonce: str, script):
+        super().__init__(boot_nonce)
+        self.script = list(script)
+        self.calls = 0
+        self.deadlines: list = []
+
+    def handle(self, pair, slot, kind):
+        return 0xDEAD
+
+    def _timedwait_once(self, handle, ts):
+        self.calls += 1
+        self.deadlines.append((ts.tv_sec, ts.tv_nsec))
+        return self.script.pop(0)
+
+    def _trywait_once(self, handle):
+        self.calls += 1
+        return self.script.pop(0)
+
+
+def test_a_signal_during_a_slot_wait_is_not_a_timeout(boot):
+    """EINTR read as a timeout is a group-fatal refusal on a healthy peer.
+
+    MEASURED-BY-REVIEW DEFECT (S4 refuter, 2026-09-09, must_fix):
+    ``sem_timedwait``'s return code was compared against 0 and errno was never
+    read, although the CDLL was opened with ``use_errno=True``.  POSIX permits
+    ``EINTR``, and these waits run inside a live ``launch_server`` beside
+    torch's watchdogs and child reaping -- so a signal produced
+    ``W53 ... no producer posted this slot within the fence budget`` naming a
+    rank that was perfectly healthy, and ``run_leg`` then voted the group down
+    (W29 -> front W4 -> do_stop).  A guard that cries wolf on the healthy path
+    is the failure mode this file names in
+    ``test_batches_are_the_same_whether_the_side_coalesced_or_not``.
+
+    Three classifications and one arithmetic property: EINTR retries,
+    ETIMEDOUT is the only false, any other errno raises rather than being
+    silently swallowed -- and the retry uses the SAME ABSOLUTE DEADLINE, so a
+    storm of signals cannot extend the fence budget.
+    """
+    interrupted = _ScriptedSems(boot, [errno.EINTR, errno.EINTR, errno.EINTR, 0])
+    assert interrupted.timedwait(0, 0, "full", 5.0) is True
+    assert interrupted.calls == 4
+    assert len(set(interrupted.deadlines)) == 1, (
+        f"the deadline was rebuilt inside the retry loop, so every signal "
+        f"extends the fence budget: {interrupted.deadlines}")
+
+    timed_out = _ScriptedSems(boot, [errno.ETIMEDOUT])
+    assert timed_out.timedwait(0, 0, "full", 0.01) is False
+
+    broken = _ScriptedSems(boot, [errno.EINVAL])
+    with pytest.raises(OSError) as excinfo:
+        broken.timedwait(0, 0, "full", 0.01)
+    assert excinfo.value.errno == errno.EINVAL
+
+    # The non-blocking probe classifies the same way: EAGAIN is "not available"
+    # (which is what makes slot_waits exact), EINTR is not.
+    poll = _ScriptedSems(boot, [errno.EINTR, errno.EAGAIN])
+    assert poll.trywait(0, 0, "empty") is False
+    assert poll.calls == 2
+    ready = _ScriptedSems(boot, [0])
+    assert ready.trywait(0, 0, "empty") is True
+
+
+def test_every_thread_that_failed_is_reported_not_only_the_first(
+        region, sems, ops):
+    """Two threads die; the one that is raised must not erase the other.
+
+    ``run_leg`` used to call ``vote_failure(errors[0])`` and raise it, dropping
+    the rest.  When a pair thread and the diagonal fail together the survivor
+    may name the consequence rather than the cause, and the other error would
+    then exist nowhere -- not in the log, not on the exception.
+    """
+    src = dev_ptr(0, 0)
+    descs = []
+    for dst_card in (1, 2):
+        descs.append(flat_desc(0, dst_card, 3 * SLOT - 40,
+                               src_off=dst_card * 0x40000,
+                               dst_off=dst_card * 0x40000,
+                               src_ptr=src, dst_ptr=dev_ptr(dst_card, 0),
+                               name=f"p{dst_card}"))
+    lines: list = []
+    votes: list = []
+    with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
+        tp.run_leg(region, sems, ops, row=0, rank=0, device=0,
+                   card_uuid="GPU-0",
+                   uuid_of_card=[f"GPU-{c}" for c in range(xr.N_CARDS)],
+                   descs=descs, is_source=True,
+                   oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3, wave=WAVE,
+                   log=lines.append, vote_failure=votes.append,
+                   budget_s=0.3, slot_bytes=SLOT)
+    assert len(votes) == 1, "exactly one vote, whatever the thread count"
+    assert votes[0] is excinfo.value
+    extra = [ln for ln in lines if "also failed" in ln]
+    assert len(extra) == 1, lines
+    assert "thread 2 of 2" in extra[0], extra[0]
+    assert "W53 Weg2XchgGateTimeout" in extra[0]
+    notes = getattr(excinfo.value, "__notes__", [])
+    assert any("also failed" in n for n in notes), notes
 
 
 # ===========================================================================
@@ -1236,6 +1819,7 @@ def test_the_dir_sub_layout_is_disjoint_and_inside_the_region():
         ("handles", tp.DIR_HANDLE_OFF, tp.DIR_HANDLE_BYTES),
         ("oncard_prod", tp.DIR_ONCARD_PROD_OFF, tp.DIR_ONCARD_PROD_BYTES),
         ("oncard_cons", tp.DIR_ONCARD_CONS_OFF, tp.DIR_ONCARD_CONS_BYTES),
+        ("oncard_rel", tp.DIR_ONCARD_REL_OFF, tp.DIR_ONCARD_REL_BYTES),
     ]
     cursor = 0
     for name, off, size in areas:
@@ -1247,6 +1831,11 @@ def test_the_dir_sub_layout_is_disjoint_and_inside_the_region():
     # ONE ROW PER RANK PER SLOT -- see the measured overwrite defect.
     assert tp.DIR_ONCARD_ROWS == xr.N_RANKS * tp.ONCARD_SLOTS
     assert tp.DIR_ONCARD_PROD_BYTES == tp.DIR_ONCARD_ROWS * tp.DIR_ONCARD_ROW_BYTES
+    # The row carries seq, bytes, slot_bytes, wave, epoch_hash, pid, state --
+    # and its seal still fits inside the row with room left over, so the next
+    # field to be added does not silently overwrite the seal.
+    assert tp.ONCARD_ROW_STRUCT.size == 8 + 6 * 8
+    assert tp.ONCARD_SEAL_OFF + 8 < tp.DIR_ONCARD_ROW_BYTES
     with pytest.raises(ValueError):
         tp._oncard_row_off(tp.DIR_ONCARD_PROD_OFF, 0, tp.ONCARD_SLOTS)
     # ~1608 x 48 B is what spec 2.2 says the S6 pointer table needs.
@@ -1328,7 +1917,8 @@ def test_no_byte_moves_before_the_flip_is_bound(tmp_path, boot, sems):
 
         with pytest.raises(xr.Weg2XchgPlanDisagree):
             tp.write_oncard_row(unbound, tp.DIR_ONCARD_PROD_OFF, 0, slot=0,
-                                seq=0, nbytes=1, state=tp.ONCARD_STATE_READY)
+                                seq=0, nbytes=1, slot_bytes=SLOT, wave=WAVE,
+                                state=tp.ONCARD_STATE_READY)
     finally:
         ops_.close()
         unbound.close()
@@ -1365,6 +1955,11 @@ def test_run_leg_interface_is_what_s6_must_call():
     and an unwired function is exactly the kind that drifts.  Every argument
     here is one S6 must supply, and ``vote_failure`` is REQUIRED rather than
     defaulted because an opt-in unwind is the weg2rg2 hold-and-wait.
+
+    ``wave`` is REQUIRED for the same class of reason: this function is called
+    once per wave, every on-card handshake row carries the wave, and a default
+    would let wave 2 silently inherit wave 1's rows and wave 1's IPC handle at
+    the same epoch hash.
     """
     sig = inspect.signature(tp.run_leg)
     required = {n for n, p in sig.parameters.items()
@@ -1372,7 +1967,7 @@ def test_run_leg_interface_is_what_s6_must_call():
     assert required == {
         "region", "sems", "ops", "row", "rank", "device", "card_uuid",
         "uuid_of_card", "descs", "is_source", "oncard_mode", "peer_row",
-        "log", "vote_failure",
+        "wave", "log", "vote_failure",
     }
     assert "TODO(S6)" in inspect.getdoc(tp.run_leg)
     assert "TODO(S5)" in inspect.getdoc(tp.SlotBatch.checksum)
@@ -1412,18 +2007,24 @@ def test_the_acceptance_lines_carry_every_token_the_spec_names():
     assert "gbs=0.000" in zero.line() and "bytes_mib=0.00" in zero.line()
 
     oncard = tp.OnCardStats(1, "GPU-card", tp.ONCARD_MODE_IPC,
-                            bytes_moved=2 * xr.MIB, hops=4, elapsed_s=0.013)
+                            bytes_moved=2 * xr.MIB, batches=4, elapsed_s=0.013)
     for token in ("WEG2-XCHG-ONCARD", "card=GPU-card", "mode=ipc",
-                  "bytes_mib=2.00", "hops=4", "hop_ms=13.000"):
+                  "bytes_mib=2.00", "batches=4", "hop_ms=13.000"):
         assert token in oncard.line(), token
+    # The field counts BATCHES and says so.  It was added as `hops`, which the
+    # lane has exactly two of by construction, so on the real flip it would
+    # have printed ~329 for a two-hop lane -- a name stating something the
+    # number is not, in the very field added to fix a blindness.
+    assert "hops=" not in oncard.line(), oncard.line()
 
     # A kilobyte lane prints bytes_mib=0.00 and MUST still be distinguishable
-    # from one that moved nothing -- the measured reason `hops` is on the line.
+    # from one that moved nothing -- the measured reason the count is on the
+    # line at all.
     small = tp.OnCardStats(1, "GPU-card", tp.ONCARD_MODE_IPC,
-                           bytes_moved=5000, hops=2, elapsed_s=0.001)
-    assert "bytes_mib=0.00" in small.line() and "hops=2" in small.line()
+                           bytes_moved=5000, batches=2, elapsed_s=0.001)
+    assert "bytes_mib=0.00" in small.line() and "batches=2" in small.line()
     nothing = tp.OnCardStats(1, "GPU-card", tp.ONCARD_MODE_IPC)
-    assert "bytes_mib=0.00" in nothing.line() and "hops=0" in nothing.line()
+    assert "bytes_mib=0.00" in nothing.line() and "batches=0" in nothing.line()
 
 
 def test_every_w_code_this_slice_raises_is_free_and_named_once():
@@ -1478,6 +2079,16 @@ CROSS_BASE = 0x40000
 CROSS_STRIDE = 0x8000
 ZEROFILL_AT = 0x100000
 
+#: THE DOUBLE RUNS ``run_leg`` TWICE, and that is a defect-driven number.
+#: ``run_leg``'s contract is per WAVE while the epoch hash is per FLIP, so
+#: every on-card handshake row of wave 2 sits beside a leftover row of wave 1
+#: at the same epoch -- and nothing in this file called ``run_leg`` twice, so
+#: the whole class was invisible (S4 refuter, must_fix).  Two waves with the
+#: destination re-poisoned in between is the end-to-end half of that fix; the
+#: row-level half is
+#: ``test_a_previous_waves_oncard_row_is_not_this_waves_signal``.
+DOUBLE_WAVES = 2
+
 
 def _cross_off(src: int, dst: int) -> int:
     return CROSS_BASE + (src * xr.N_CARDS + dst) * CROSS_STRIDE
@@ -1489,13 +2100,22 @@ def _plan_for_double():
     Deliberately mixed -- FLAT and STRIDED2D on every cross pair, an on-card
     share on every card, one ZEROFILL -- because the failure this double exists
     to catch is a lane that works alone and deadlocks beside the others.
+
+    THE ON-CARD SHARE IS DELIBERATELY DEEPER THAN THE DOUBLE BUFFER.  It was
+    5000 B against a 4096 B slot -- two batches -- so ``batch.seq -
+    bounce.slots`` was negative on every path of every run and the producer's
+    drain wait, the diagonal's only back-pressure, returned at its base case
+    without ever reading a row.  Deleting that wait outright left the whole
+    suite green (S4 review, a surviving mutant).  Four batches make the double
+    buffer actually cycle and actually block.
     """
     descs = []
     for src in range(xr.N_CARDS):
         for dst in range(xr.N_CARDS):
             if src == dst:
                 descs.append(flat_desc(
-                    src, dst, 5000, src_off=ONCARD_SRC, dst_off=ONCARD_DST,
+                    src, dst, 4 * SLOT - 100,
+                    src_off=ONCARD_SRC, dst_off=ONCARD_DST,
                     src_ptr=dev_ptr(src, 0), dst_ptr=dev_ptr(dst, 0),
                     name=f"oncard.{src}"))
                 continue
@@ -1537,7 +2157,7 @@ def _rank_child(root: str, region_path: str, boot: str, group: str, rank: int,
     peer_row = xr.rank_row("D" if is_source else "P", rank)
     ops = FakeDeviceOps(root, rank=rank)
     verdict = {"row": row, "ok": False, "error": "", "lines": [],
-               "mismatch": [], "zerofill": 0, "bump": 0}
+               "mismatch": [], "zerofill": 0, "bump": 0, "waves": 0}
     sems = None
     try:
         with xr.XchgRegion.open(region_path, expect_boot=boot) as region:
@@ -1546,32 +2166,42 @@ def _rank_child(root: str, region_path: str, boot: str, group: str, rank: int,
             sems = tp.SemSet(boot)
             descs = _plan_for_double()
             for desc in descs:
-                if is_source:
-                    if desc.kind == tp.ZEROFILL or int(desc.src_rank) != rank:
-                        continue
-                    write(ops, int(desc.src_ptr) + int(desc.src_off),
-                          pattern(_seed_of(desc.param_name), _span(desc, "src")))
-                else:
-                    if int(desc.dst_rank) != rank:
-                        continue
-                    poison(ops, int(desc.dst_ptr) + int(desc.dst_off),
-                           _span(desc, "dst"), seed=0x3C)
+                if not is_source:
+                    continue
+                if desc.kind == tp.ZEROFILL or int(desc.src_rank) != rank:
+                    continue
+                write(ops, int(desc.src_ptr) + int(desc.src_off),
+                      pattern(_seed_of(desc.param_name), _span(desc, "src")))
             tp.register_region(region, ops, row, log=lambda _ln: None)
             ready.wait(30)
-            result = tp.run_leg(
-                region, sems, ops, row=row, rank=rank, device=0,
-                card_uuid=f"GPU-{rank}",
-                uuid_of_card=[f"GPU-{c}" for c in range(xr.N_CARDS)],
-                descs=descs, is_source=is_source,
-                oncard_mode=tp.ONCARD_MODE_IPC, peer_row=peer_row,
-                log=lambda _ln: None,
-                vote_failure=lambda exc: region.write_gate_row(row, 0, False),
-                budget_s=40.0, slot_bytes=SLOT,
-            )
-            verdict["lines"] = list(result.lines)
-            verdict["zerofill"] = result.zerofill_bytes
-            if not is_source:
-                verdict["mismatch"] = _verify(ops, root, descs, rank)
+            for wave in range(DOUBLE_WAVES):
+                if not is_source:
+                    # RE-POISONED BEFORE EVERY WAVE, so wave 1's bytes can
+                    # never be what makes wave 2's verification pass.  Safe
+                    # without a barrier: a rank's device memory is written by
+                    # that rank alone.
+                    for desc in descs:
+                        if int(desc.dst_rank) != rank:
+                            continue
+                        poison(ops, int(desc.dst_ptr) + int(desc.dst_off),
+                               _span(desc, "dst"), seed=0x3C + wave)
+                result = tp.run_leg(
+                    region, sems, ops, row=row, rank=rank, device=0,
+                    card_uuid=f"GPU-{rank}",
+                    uuid_of_card=[f"GPU-{c}" for c in range(xr.N_CARDS)],
+                    descs=descs, is_source=is_source,
+                    oncard_mode=tp.ONCARD_MODE_IPC, peer_row=peer_row,
+                    wave=wave,
+                    log=lambda _ln: None,
+                    vote_failure=lambda exc: region.write_gate_row(row, 0, False),
+                    budget_s=40.0, slot_bytes=SLOT,
+                )
+                verdict["lines"] += list(result.lines)
+                verdict["zerofill"] += result.zerofill_bytes
+                verdict["waves"] += 1
+                if not is_source:
+                    verdict["mismatch"] += [f"w{wave}.{name}" for name in
+                                            _verify(ops, root, descs, rank)]
             verdict["bump"] = ops._bump
             verdict["ok"] = not verdict["mismatch"]
     except BaseException as exc:  # noqa: BLE001 -- reported through the file
@@ -1620,8 +2250,9 @@ def test_six_ranks_move_a_wave_and_every_byte_lands(tmp_path):
 
     Six ``multiprocessing`` children under ``CUDA_VISIBLE_DEVICES=""``, a real
     ``/dev/shm`` region, 24 real POSIX semaphores, the real batcher, the real
-    slot state machine, the real five-thread leg.  The only substitution is the
-    device adapter.
+    slot state machine, the real leg -- TWICE, once per wave, with every
+    destination re-poisoned in between.  The only substitution is the device
+    adapter.
 
     The assertion is BYTE IDENTITY against the source's own bytes, and every
     destination was poisoned first.  The acceptance lines are counted by NAMED
@@ -1669,23 +2300,31 @@ def test_six_ranks_move_a_wave_and_every_byte_lands(tmp_path):
     assert len(consumers) == xr.N_CARDS
     for verdict in consumers:
         assert verdict["mismatch"] == [], verdict["mismatch"]
-    assert sum(v["zerofill"] for v in consumers) == 256
+    assert all(v["waves"] == DOUBLE_WAVES for v in verdicts), \
+        [v["waves"] for v in verdicts]
+    assert sum(v["zerofill"] for v in consumers) == 256 * DOUBLE_WAVES
+    # The on-card share is deeper than the bounce, so the producer's drain wait
+    # is on the executed path rather than at its base case -- the gap that let
+    # a deleted drain wait leave this file green.
+    oncard_desc = [d for d in _plan_for_double()
+                   if d.kind != tp.ZEROFILL and int(d.src_rank) == int(d.dst_rank)][0]
+    assert len(tp.batch_descs([oncard_desc], SLOT)) > tp.ONCARD_SLOTS
     # The bounce is sized from run_leg's OWN slot size, not the module
     # default: a 4 KiB leg that allocated a 64 MiB bounce is exactly how
     # the half-applied knob was caught.
     sources = [v for v in verdicts if v["row"] < xr.N_CARDS]
-    assert all(v["bump"] == tp.ONCARD_SLOTS * SLOT for v in sources), \
-        [v["bump"] for v in sources]
+    assert all(v["bump"] == DOUBLE_WAVES * tp.ONCARD_SLOTS * SLOT
+               for v in sources), [v["bump"] for v in sources]
     assert all(v["bump"] == 0 for v in consumers), [v["bump"] for v in consumers]
 
     lines = [ln for v in verdicts for ln in v["lines"]]
     pairs = [ln for ln in lines if ln.startswith(tp.PAIR_LINE_PREFIX)]
     oncard = [ln for ln in lines if ln.startswith(tp.ONCARD_LINE_PREFIX)]
-    assert len(pairs) == 2 * xr.N_PAIRS, pairs
-    assert len(oncard) == 2 * xr.N_CARDS, oncard
+    assert len(pairs) == DOUBLE_WAVES * 2 * xr.N_PAIRS, pairs
+    assert len(oncard) == DOUBLE_WAVES * 2 * xr.N_CARDS, oncard
     for src, dst in xr.CROSS_PAIRS:
         named = [ln for ln in pairs if f"src=GPU-{src} dst=GPU-{dst} " in ln]
-        assert len(named) == 2, (src, dst, named)
+        assert len(named) == DOUBLE_WAVES * 2, (src, dst, named)
         # NOT "bytes_mib != 0.00": these payloads are kilobytes and two
         # decimals of MiB cannot tell SMALL from NOTHING -- the double
         # printed exactly that for a lane that had just moved every byte
@@ -1694,4 +2333,4 @@ def test_six_ranks_move_a_wave_and_every_byte_lands(tmp_path):
         assert all(" pieces=0 " not in ln for ln in named), named
     for line in oncard:
         assert "mode=ipc" in line, line
-        assert " hops=0 " not in line, line
+        assert " batches=0 " not in line, line
