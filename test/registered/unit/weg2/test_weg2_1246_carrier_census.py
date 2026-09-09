@@ -859,13 +859,20 @@ def _decision_region() -> str:
     return textwrap.dedent("\n".join(body))
 
 
-def _launcher_decision(cen, override, *, floor_why="the floor, derived"):
+def _launcher_decision(cen, override, *, floor_why="the floor, derived",
+                       x_measured=True):
     """Run that region.  Returns ``(shipped_bound, log_lines)`` or raises
-    ``Weg2LaunchRefused`` exactly as the launcher would."""
+    ``Weg2LaunchRefused`` exactly as the launcher would.
+
+    ``x_measured`` is the region's #1299 input: the floor is 1.25x X, so the
+    region has to know whether that X was measured on this rig or came from
+    the recorded fallback pair.  Default True = the pre-#1299 behaviour, so
+    every expectation below is unchanged.
+    """
     from types import SimpleNamespace
 
     from sglang.srt.weg2 import carrier_census as _cc_mod
-    from sglang.srt.weg2.launcher import Weg2LaunchRefused
+    from sglang.srt.weg2.launcher import Weg2LaunchRefused, XSeed
 
     logged = []
     g = {
@@ -877,6 +884,7 @@ def _launcher_decision(cen, override, *, floor_why="the floor, derived"):
         "_floor": cen.floor,
         "_floor_why": floor_why,
         "spec_d": SimpleNamespace(log="<group D log>"),
+        "x_seed": XSeed(8742, "X=8742 source=<test>", x_measured),
     }
     exec(compile(_decision_region(), "<launcher decision region>", "exec"), g)
     return g["carrier_max_tokens"], logged
@@ -894,6 +902,35 @@ def test_the_launcher_region_refuses_an_override_above_the_measured_bound(tmp_pa
             _launcher_decision(cen, n)
         assert "operator_above_measured" in str(e.value), n
         assert "27466" in str(e.value)
+
+
+def test_the_launcher_region_does_not_refuse_a_below_floor_on_an_unmeasured_x(tmp_path):
+    """#1299, AT THE SEAM THAT SHIPS IT: the region must pass x_seed.measured
+    into decide_bound, not merely have it in scope.
+
+    The measured shape of boots dec2b (f929987a9c) and shadow B (edbf7007c8):
+    a real carrier bound of 27,466 against a floor of 28,195 = 1.25 x an X of
+    22,556 that came from the recorded fallback pair, not from this rig. Both
+    were refused pre-READY on that comparison.
+    """
+    cen = _census_of(tmp_path, [27466] * 3, name="belowfloor.log", floor=28195)
+    assert cen.verdict == "below_floor"
+
+    bound, logged = _launcher_decision(cen, None, x_measured=False)
+    assert bound == 27466, "the MEASURED bound still ships"
+    assert any("UNGRADED" in ln for ln in logged)
+    assert any("did NOT measure" in ln for ln in logged)
+
+
+def test_the_launcher_region_still_refuses_a_below_floor_on_a_measured_x(tmp_path):
+    """The exemption must not become an off switch: with both terms measured
+    the W45 is a real finding and the region must still raise."""
+    from sglang.srt.weg2.launcher import Weg2LaunchRefused
+
+    cen = _census_of(tmp_path, [27466] * 3, name="belowfloor2.log", floor=28195)
+    with pytest.raises(Weg2LaunchRefused) as e:
+        _launcher_decision(cen, None, x_measured=True)
+    assert "below_floor" in str(e.value)
 
 
 def test_the_launcher_region_ships_the_interval_and_logs_all_three_numbers(tmp_path):
