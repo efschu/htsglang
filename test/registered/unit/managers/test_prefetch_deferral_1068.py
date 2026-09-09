@@ -1167,7 +1167,14 @@ class TestTheGroupShortfallDeferral(_Clean):
         s.waiting_queue = [r]
         s._verdict = lambda req: "issued"
         s._retry_deferred_prefetches()
-        _assert_unmarked(self, r)
+        # The LANDED contract, and it is #1068's, not this arm's: the MARK is
+        # cleared and the landed-hold is armed for one more pass. The timing
+        # fields are deliberately left standing as history -- only the full
+        # clearer (`_clear_prefetch_deferral_fields`, i.e. the cutover
+        # re-issue) zeroes those, which is why `_assert_unmarked` is the wrong
+        # assertion here and the right one for the readmit tests above.
+        self.assertIsNone(getattr(r, "prefetch_deferred", None))
+        self.assertTrue(getattr(r, "_prefetch_landed_hold_once", False))
         self.assertEqual(PREFETCH_GATE_COUNTS.get("landed", 0), 1)
 
     def test_the_retry_set_is_identical_on_every_rank(self):

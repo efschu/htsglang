@@ -661,29 +661,72 @@ def test_f3_the_fixture_is_actually_in_the_tree():
     )
 
 
-def test_f3_every_truncated_read_reaches_a_terminal_line():
-    """F3 -- THE ACCEPTANCE FOR PART (C), AND IT IS EXPECTED RED HERE.
+def test_f3_the_walk_reproduces_the_recorded_defect_exactly():
+    """F3, THE CHARACTERISATION HALF -- and why it is not the acceptance.
 
-    A read the pool cut must end somewhere a reader can see: a completion, a
-    reap, a refusal, or a defer.  On sb5h, 34 of 37 ``over_bound=true``
-    truncated rids have NONE of the five -- issued, cut, and gone without a
-    word ~1 s later, which is why ``WEG2 X-DEFER`` is 0 in 109,471 lines while
-    24 requests were priced at their whole prompt.  Neither the trim deletion
-    nor anything else on this branch closes this; part (C) does, and this test
-    is how the next boot says so.
+    THE FIXTURE IS A RECORDING OF A BOOT THAT RAN WITHOUT THE FIX.  No code
+    change on this branch can make it greener, and a test that can only ever
+    be red is not an acceptance -- it is a permanent red that people learn to
+    scroll past.  So the frozen subject gets the assertion it can actually
+    carry: the walk reproduces the recorded defect EXACTLY, 34 orphans out of
+    37 ``over_bound=true`` truncated rids.
 
-    RUNS EVERYWHERE (part C round 1).  Fix 2 wrote this test against the
-    evidence tree alone, so it skipped on the remote and was never executed as
-    a pytest node at all.  It now reads the shipped fixture -- the same lines,
-    proven identical by :func:`test_f3_fixture_is_faithful` wherever the full
-    log exists -- so the acceptance is a test that RAN and is red, not a
-    computation somebody did by hand and wrote down.
+    That pins two things that do matter here: the walk itself works (it is the
+    same function the acceptance runs), and the pre-fix number is on the
+    record in executable form, so nobody has to trust the prose.
+
+    THE ACCEPTANCE IS
+    :func:`test_f3_invariant_holds_on_a_post_fix_log`, which runs the SAME
+    walk against a NEW boot's D log.  That is gate 4 of the #1298 boot ticket
+    and it is the only place the invariant can honestly go green.
     """
     trunc, terminal = _f3_walk(SB5H_D_FIXTURE)
+    assert len(trunc) == 37, (
+        f"{len(trunc)} truncated rids in the recording, expected 37 -- the "
+        "fixture or the instrument's line format moved"
+    )
+    orphans = sorted(r for r in trunc if not terminal.get(r))
+    assert len(orphans) == 34, (
+        f"the recorded defect is 34 orphans of 37; this walk found "
+        f"{len(orphans)}. The recording cannot change, so the walk did."
+    )
+
+
+def test_f3_invariant_holds_on_a_post_fix_log():
+    """F3, THE ACCEPTANCE -- gate 4 of the #1298 boot ticket.
+
+    Every ``over_bound=true`` truncated rid must reach exactly one terminal
+    line: a completion, a reap, a refusal, or a defer.  ``WEG2 X-DEFER`` counts
+    as terminal, because a deferred read is one the X gate has accounted for,
+    which is the whole of part (C).
+
+    On boot weg2sb5h, 34 of 37 had none of the five -- issued, cut, and gone
+    without a word about a second later, which is why ``WEG2 X-DEFER`` is 0 in
+    109,471 lines while 24 requests were priced at their whole prompt.
+
+    Point it at the next boot's D log::
+
+        WEG2_F3_LOG=/spinning/evidence-665-f1/boot_..._D.log \
+          pytest test/registered/unit/weg2/test_weg2_store_grid_claim_1298.py \
+          -k test_f3_invariant
+
+    It SKIPS without that variable rather than silently passing on an empty
+    walk, and it asserts its own population floor for the same reason.
+    """
+    path = os.environ.get("WEG2_F3_LOG")
+    if not path:
+        pytest.skip(
+            "set WEG2_F3_LOG to a post-fix boot's D log -- the shipped fixture "
+            "is a PRE-fix recording and is pinned by "
+            "test_f3_the_walk_reproduces_the_recorded_defect_exactly instead"
+        )
+    trunc, terminal = _f3_walk(path)
     assert len(trunc) >= F3_MIN_TRUNCATED_RIDS, (
-        f"only {len(trunc)} truncated rids in the subject -- below the "
+        f"only {len(trunc)} truncated rids in {path} -- below the "
         f"{F3_MIN_TRUNCATED_RIDS} floor. A green from an empty walk is not a "
-        "green; the fixture or the instrument's line format moved."
+        "green: either the boot never filled the staging pool (in which case "
+        "this gate has no population and must not be reported as passed) or "
+        "the instrument's line format moved."
     )
     orphans = sorted(r for r in trunc if not terminal.get(r))
     assert not orphans, (
