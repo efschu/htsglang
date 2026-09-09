@@ -681,12 +681,43 @@ P_CORRIDOR_HOLDBACK_MIB = 1024.0
 #: against the boot's own `per_req=51.43 MiB` at 33 linear layers.
 P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT = 1.5588
 
-#: Slots the demand-driven pool allocates per unit of --p-bs: mamba_ratio 2 x
-#: safety 1.25 (model_runner_kv_cache_mixin.py:2088). The boot prints the
-#: product: `target_concurrency=8 ratio=2 safety=1.25 ->
-#: max_mamba_cache_size=20 slots`. The pool model charged --p-bs itself
-#: before #1286, i.e. 8 slots where the allocator took 20.
-P_MAMBA_SLOT_FACTOR = 2.5
+#: The runtime's OWN safety margin on the demand-driven mamba pool
+#: (model_runner_kv_cache_mixin.py:177 ``MAMBA_AUTO_SAFETY_MARGIN``). Restated
+#: here rather than imported because importing that module drags torch into a
+#: launcher that has no business loading it; the restatement is not free-hand
+#: -- ``test_pp_cut_boot_sizing_1286`` reads the constant out of the runtime's
+#: source and fails when the two drift.
+P_MAMBA_AUTO_SAFETY_MARGIN = 1.25
+
+#: Mamba state SLOTS one running request can hold at once -- the runtime's
+#: ``mamba_slots_per_running_req`` (mem_cache/mamba_pool_floor.py), which is
+#: also the ceiling on ``_calculate_mamba_ratio`` (:2684 takes the ``min`` of
+#: the two). Boot weg2sb5f emits both: ``[auto-mamba] target_concurrency=8
+#: ratio=2 safety=1.25 -> max_mamba_cache_size=20 slots``.
+#:
+#: WHY THIS REPLACED A `2.5` FUDGE FACTOR (#1286 F4). The old constant folded
+#: "ratio 2" and "safety 1.25" into one number and multiplied ``--p-bs`` by it,
+#: which reproduced weg2sb5f and nothing else: ``_auto_mamba_demand_size``
+#: (:2085-2106) is ``max(ceil(target * ratio * safety), ratio,
+#: mamba_hard_floor(sa, target))`` and the third term -- ``target *
+#: slots_per_running_req`` -- was simply not in the model. A boot whose ratio
+#: branch differs (no overlap schedule, no ack-release, radix cache off) or
+#: whose hard floor binds takes MORE slots than 2.5x, the model then charges
+#: LESS mamba than the boot, and the pool is OVER-priced: #1286's own defect
+#: recurring on a different term.
+#:
+#: The expression below is a PROVEN upper bound on the runtime's slot count
+#: rather than a re-derivation of its branches, which is why it needs one
+#: number and not the whole ServerArgs surface. With ``p = slots per running
+#: request`` and ``t = target``: ``ratio = min(base, p) <= p``, so
+#: ``ceil(t*ratio*1.25) <= ceil(t*p*1.25)``; the hard floor is exactly ``t*p``,
+#: and ``t*p <= ceil(t*p*1.25)``; ``ratio <= t*p`` likewise. Hence
+#: ``_auto_mamba_demand_size <= ceil(t * p * MAMBA_AUTO_SAFETY_MARGIN)``. An
+#: upper bound on SLOTS is an over-charge of mamba MiB, i.e. an UNDER-price of
+#: the pool -- the conservative direction, and the opposite of the one that
+#: cost weg2sb5f its floor. At p=2, t=8 it is ceil(20.0) = 20, the boot's own
+#: number, so the bound is TIGHT on the shipping form and not merely safe.
+P_MAMBA_SLOTS_PER_RUNNING_REQUEST = 2
 
 #: #1240 -- the DEPTH axis of the cost model, and the two records that pin it.
 #:
@@ -3392,6 +3423,93 @@ def _max_running_requests(model: str, group: str = "D", bs: int = 8) -> int:
     return int(flags[flags.index("--max-running-requests") + 1])
 
 
+def _p_page_size(model: str, p_bs: int = 8) -> int:
+    """``--page-size`` as this launcher actually passes it to group P.
+
+    #1286 F7. The pool model floors twice, as the sizer does
+    (``pool_configurator.calculate_pool_sizes``), and the page is the second
+    floor. Read off the argv for the same reason ``_max_running_requests`` is:
+    the flag lives in ``common_flags`` today and the model must follow it if it
+    moves, rather than carrying a second copy of the value.
+    """
+    flags = argv_p("py", model, [1, 1, 1], 1, 1, 1.0, [], p_bs=int(p_bs))
+    try:
+        return int(flags[flags.index("--page-size") + 1])
+    except ValueError:
+        # Absent means the runtime's own default, which is 1. Not an error:
+        # the launcher is allowed to stop stating a flag whose default it wants.
+        return 1
+
+
+def p_activation_reserve_provenance(model: str, p_bs: int = 8) -> Tuple[float, str]:
+    """What group P's boot would charge for the prefill activation reserve if
+    NOTHING on this rig were calibrated -- and the line that tells you which
+    branch it actually took.
+
+    #1286 F2. ``--pp-cut-activation-reserve-mib`` defaults to the 1024 MiB both
+    reference boots emitted, and that number is NOT a runtime constant: the
+    boot resolves it per card through ``ServerArgs.activation_reserve_mb``
+    (server_args.py:14176), which asks ``mem_ledger.resolve_phase_footprint``
+    for a MEASURED footprint keyed by (card UUID, hardware fingerprint,
+    activation profile) and falls back to the inherited
+    ``mamba_pre_capture_reserve_mb`` heuristic (:14150) when nothing matches.
+    On this rig the calibrated branch was taken -- the sb5f P log carries no
+    ``Using the INHERITED activation heuristic`` line -- but nothing in the
+    pool model depends on that having been true, and the fallback is several
+    times larger. Unpriced, it is the #1286 defect recurring by a different
+    road, so the launcher prices the RISK explicitly even though it does not
+    charge it.
+
+    WHY THE LAUNCHER DOES NOT SIMPLY RESOLVE THE FOOTPRINT ITSELF (a named
+    refusal, not an oversight). ``resolve_phase_footprint`` needs the
+    ``ActivationProfile`` the BOOT will build, and building it here means
+    restating ``profile_from_server_args`` -- seven fields, including
+    ``cuda_graph_config.decode.max_bs`` -- against a ServerArgs this process
+    never constructs. A restatement that is wrong by one field does not fail
+    loudly: it returns ``None``, which reads as "uncalibrated", which would
+    refuse a launch that is perfectly fine. A second set of books whose error
+    mode is a false refusal is worse than the risk it removes, and the risk it
+    removes is DETECTABLE in one grep of the boot's own log. So: measure the
+    exposure, print it, name the grep.
+
+    Returns ``(heuristic_mib, one-line provenance)``. The heuristic comes from
+    the runtime's own method against a view carrying exactly the attributes it
+    reads -- never a typed number.
+    """
+    from sglang.srt.server_args import ServerArgs
+
+    flags = argv_p("py", model, [1, 1, 1], 1, 1, 1.0, [], p_bs=int(p_bs))
+
+    def _flag(name: str, default):
+        try:
+            return type(default)(flags[flags.index(name) + 1])
+        except (ValueError, IndexError):
+            return default
+
+    class _ReserveView:
+        """Exactly the ServerArgs surface ``mamba_pre_capture_reserve_mb``
+        reads, filled from the argv this launcher builds for group P."""
+
+        disaggregation_mode = "null"
+        max_running_requests = _flag("--max-running-requests", 8)
+        chunked_prefill_size = _flag("--chunked-prefill-size", 0)
+        max_prefill_tokens = _flag("--max-prefill-tokens", 0)
+        speculative_num_draft_tokens = _flag("--speculative-num-draft-tokens", 0)
+        tp_size = _flag("--tp-size", 1)
+        pp_size = _flag("--pp-size", 1)
+
+    heuristic = float(
+        ServerArgs.mamba_pre_capture_reserve_mb(_ReserveView(), None)
+    )
+    return heuristic, (
+        "resolved per card by ServerArgs.activation_reserve_mb "
+        "(server_args.py:14176) from a MEASURED phase footprint; its fallback "
+        "when no footprint matches this rig's (hardware fingerprint, "
+        "activation profile) is the inherited heuristic "
+        "mamba_pre_capture_reserve_mb = %.0f MiB/rank"
+    ) % heuristic
+
+
 def d_mamba_ping_pong_cost(model: str, disable_overlap: bool, d_bs: int = 8) -> Tuple[str, int, int, int]:
     """What D's overlap choice costs in DEVICE mamba state slots (FIX 1r/1).
 
@@ -4844,20 +4962,62 @@ def solve_p_cut(
         #
         # #1286: --max-running-requests is the CONCURRENCY TARGET, not the slot
         # count. The demand-driven pool allocates
-        # `ceil(target * mamba_ratio * safety)` slots
-        # (model_runner_kv_cache_mixin.py:2088, and the boot prints the result:
-        # `[auto-mamba] ... target_concurrency=8 ratio=2 safety=1.25 ->
+        # `max(ceil(target * ratio * safety), ratio, mamba_hard_floor)` slots
+        # (model_runner_kv_cache_mixin.py:2085-2106, and the boot prints the
+        # result: `[auto-mamba] ... target_concurrency=8 ratio=2 safety=1.25 ->
         # max_mamba_cache_size=20 slots`). Charging 8 where the allocator takes
         # 20 under-charged the mamba post by 2.5x on every rank.
+        #
+        # F4: and charging `--p-bs x 2.5` reproduced THAT boot and no other,
+        # because the hard-floor term was absent and the `2` was one branch of
+        # `_calculate_mamba_ratio`. The bound below dominates all three terms
+        # of the max for any branch (see P_MAMBA_SLOTS_PER_RUNNING_REQUEST),
+        # so the model can no longer charge LESS mamba than the boot -- and an
+        # over-charge here under-prices the pool, which is the safe way to be
+        # wrong.
+        #
+        # The target is READ OFF P's OWN ARGV, and the branch that would clamp
+        # it (`_auto_mamba_target_concurrency` caps an AUTO-DEFAULTED
+        # --max-running-requests at MAMBA_AUTO_TARGET_CONCURRENCY = 16) is
+        # unreachable here: `_max_running_requests` raises unless the flag is
+        # literally on the argv this launcher builds, so P's value is always
+        # the user-set branch.
         mamba_slots=math.ceil(
             _max_running_requests(model, "P", int(getattr(ns, "p_bs", 8) or 8))
-            * float(ns.pp_cut_mamba_slot_factor)
+            * int(ns.pp_cut_mamba_slots_per_running_request)
+            * P_MAMBA_AUTO_SAFETY_MARGIN
+        ),
+        # #1286 F7: the sizer's second floor. Read off P's argv for the same
+        # reason as the target above -- a second copy would drift the day
+        # --page-size moves.
+        page_size=_p_page_size(model, int(getattr(ns, "p_bs", 8) or 8)),
+        # #1286 F3: the two runtime posts that had no field, funded at zero
+        # WITH the claim stated. Both are absent from the emitted post list of
+        # weg2sb5f AND weg2rg6:
+        #   * `mamba pre-capture reserve` is charged only when
+        #     `post_capture_kv_active` (model_runner_kv_cache_mixin.py:864), and
+        #     group P sizes its pool BEFORE capture on this form;
+        #   * `speculative intermediate state` is the `admitted * D * per_req`
+        #     half of `_mamba_pool_budget_cost_gb` (:2107) and is zero at D=0 --
+        #     which is also why 1.5588 MiB/linear-layer/slot recovers from
+        #     `size * per_req` alone.
+        # A form that changes either of those must re-measure the post; the
+        # acknowledgement is what makes that a decision rather than a silence.
+        zero_posts_acknowledged=(
+            "mamba pre-capture reserve",
+            "speculative intermediate state",
+            "GGUF dequant scratch",
         ),
     )
     # #1286: a LAUNCH may not price with an unfunded post. The desk paths keep
     # their upper bound; this seam publishes a number that is compared against
     # --max-kv-per-request and read as the boot's pool, so it refuses instead.
     _cut.refuse_unfunded_posts(model_pool)
+    # #1286 F5: and a per-stage vector of the wrong LENGTH is a launch input
+    # error, not an unpriceable layout. Checked here, before the candidate
+    # loop, because the loop's own ValueError catch turns it into "not one cut
+    # is priceable" -- true of every candidate, and about the wrong thing.
+    _cut.refuse_pool_model_geometry(model_pool, len(budgets_p))
     families = tuple(
         _pp_cut.LAYER_FAMILY_ATTENTION
         if str(k) == "full_attention"
@@ -5008,14 +5168,21 @@ def solve_p_cut(
     # #1286: the posts, on their own line, in the runtime's own order and with
     # the runtime's own names, so this line and the boot's `KV budget posts`
     # line can be read side by side without a translation step.
+    _act_heuristic_mib, _act_provenance = p_activation_reserve_provenance(
+        model, int(getattr(ns, "p_bs", 8) or 8)
+    )
     log(
         "PP-CUT budget posts (the boot's own list, MiB/rank): "
         "weights+runtime = %.1f/layer x n + stage_fixed %s; corridor holdback "
-        "%.1f; mamba %.4f/linear-layer/slot x %d slots (--p-bs %d x factor "
-        "%.2f, the runtime's ratio 2 x safety 1.25); prefill activation "
-        "reserve %.1f. Every one of these was UNFUNDED or wrong before #1286 "
-        "and each omission over-prices; measured on weg2sb5f, the same cut "
-        "published 499967 tokens and group P sized 304655 (+64.1%%)."
+        "%.1f; mamba %.4f/linear-layer/slot x %d slots (ceil(--p-bs %d x %d "
+        "slots/running-request x safety %.2f), an UPPER BOUND on "
+        "_auto_mamba_demand_size incl. its hard floor); speculative "
+        "intermediate %.1f; prefill activation reserve %.1f; mamba pre-capture "
+        "reserve %.1f; page_size %d. Zero posts ACKNOWLEDGED (absent from both "
+        "reference boots' emitted lists, not merely unmeasured): %s. Every one "
+        "of these was UNFUNDED or wrong before #1286 and each omission "
+        "over-prices; measured on weg2sb5f, the same cut published 499967 "
+        "tokens and group P sized 304655 (+64.1%%)."
         % (
             mean_layer_mib,
             ",".join("%.1f" % v for v in model_pool.stage_fixed_mib),
@@ -5023,8 +5190,37 @@ def solve_p_cut(
             float(model_pool.mamba_mib_per_linear_layer_per_slot),
             int(model_pool.mamba_slots),
             int(getattr(ns, "p_bs", 8) or 8),
-            float(ns.pp_cut_mamba_slot_factor),
+            int(ns.pp_cut_mamba_slots_per_running_request),
+            P_MAMBA_AUTO_SAFETY_MARGIN,
+            float(model_pool.speculative_intermediate_mib),
             float(model_pool.activation_reserve_mib),
+            float(model_pool.mamba_precapture_reserve_mib),
+            int(model_pool.page_size),
+            ", ".join(model_pool.zero_posts_acknowledged) or "none",
+        )
+    )
+    # #1286 F2: the ONE post in that list whose value is not a runtime
+    # constant. Named with its exposure and its detection line, because an
+    # unpriced risk reads as no risk -- the same lesson one level up.
+    log(
+        "PP-CUT activation reserve RISK: charging %.0f MiB/rank, %s. The gap "
+        "is %+.0f MiB/rank, i.e. %.0f tokens per ATTENTION LAYER on whichever "
+        "stage binds -- OVER-pricing, silently, in the direction that clears a "
+        "pool floor the boot cannot hold. NOT PRICED IN, and NOT auto-resolved "
+        "here on purpose: building the boot's ActivationProfile in this "
+        "process would restate profile_from_server_args, and a restatement "
+        "wrong by one field returns None = 'uncalibrated' = a false refusal of "
+        "a healthy launch. DETECTION, one grep of group P's log: "
+        "`grep -c 'Using the INHERITED activation heuristic' P.log` -- 0 means "
+        "the calibrated branch was taken and the prices above stand; >=1 means "
+        "every price above is stale by the gap and only the boot's own sizing "
+        "line counts."
+        % (
+            float(model_pool.activation_reserve_mib),
+            _act_provenance,
+            _act_heuristic_mib - float(model_pool.activation_reserve_mib),
+            (_act_heuristic_mib - float(model_pool.activation_reserve_mib))
+            / max(1e-9, kv_mib),
         )
     )
     log(decision.provenance_line())
@@ -5097,22 +5293,42 @@ def solve_p_cut(
     per_rank_priced = _pp_cut.stage_pp_capacities(
         chosen.layers, chosen.attn, model_pool
     ) if chosen.kind == "contiguous" else ()
+    # #1286 F1: the join KEY comes from the pool model's own cell, never from a
+    # typed 2048. The price above already uses
+    # `kv_mib_per_token_per_attn_layer` (consumed from config by
+    # kv_mib_per_token_per_attn_layer_from_config), and the inputs line one
+    # screen up already prints it correctly -- so a hardcoded 2048 here would
+    # publish a cell_bytes that does not equal P's own `cell_size=` on ANY
+    # config with a different KV dtype or head geometry, while the price
+    # itself stayed right. That is the one failure this line exists to
+    # prevent: a join key that silently stops joining.
+    _cell_bytes_per_attn_layer = int(round(kv_mib * _pp_cut.MIB))
     log(
         "PP-POOL-JOIN: objective=%s layers=%s attn=%s PRICED pool_tokens=%d "
-        "priced_per_rank=%s cell_bytes=%s -- REALISED is group P's own sizing: "
+        "priced_per_rank=%s cell_bytes=%s page_size=%d mamba_slots=%d -- "
+        "REALISED is group P's own sizing: "
         "join on cell_bytes against 'KV pool sizing: available_bytes=... "
         "cell_size=...' per rank, and compare the world against 'KV token "
         "sizing: ... min-reduced across ranks to N'. PRICED minus REALISED is "
         "this pool model's error FOR THIS CUT and belongs in the boot record; "
         "it was +64.1%% before #1286 and the residual the posts carry now is "
-        "the two-boot spread of --pp-cut-stage-fixed-mib (<=12.7 MiB/rank)."
+        "the two-boot spread of --pp-cut-stage-fixed-mib (<=12.7 MiB/rank). "
+        "SECOND JOIN, same discipline: mamba_slots is an UPPER BOUND on the "
+        "boot's '[auto-mamba] ... -> max_mamba_cache_size=N slots', so N <= "
+        "%d must hold; N above it means the mamba post is under-charged and "
+        "the pool over-priced (#1286 F4)."
         % (
             str(ns.pp_solve_objective),
             ",".join(str(n) for n in chosen.layers),
             ",".join(str(a) for a in chosen.attn),
             int(chosen.pool_tokens),
             ",".join("%d" % int(c) for c in per_rank_priced) or "n/a (gapped)",
-            ",".join(str(int(a) * 2048) for a in chosen.attn),
+            ",".join(
+                str(int(a) * _cell_bytes_per_attn_layer) for a in chosen.attn
+            ),
+            int(model_pool.page_size),
+            int(model_pool.mamba_slots),
+            int(model_pool.mamba_slots),
         )
     )
     if chosen.kind == "gapped":
@@ -5549,15 +5765,23 @@ def build_parser() -> argparse.ArgumentParser:
              f"upper bound and is REFUSED at the launch seam.",
     )
     ap.add_argument(
-        "--pp-cut-mamba-slot-factor", type=float,
-        default=P_MAMBA_SLOT_FACTOR,
-        help=f"Slots the demand-driven mamba pool allocates per unit of "
-             f"--p-bs. Default {P_MAMBA_SLOT_FACTOR} = mamba_ratio 2 x safety "
-             f"1.25, the runtime's own derivation "
-             f"(model_runner_kv_cache_mixin.py:2088; the boot prints the "
-             f"result as '[auto-mamba] ... target_concurrency=8 ratio=2 "
-             f"safety=1.25 -> max_mamba_cache_size=20 slots'). Before #1286 "
-             f"the pool model charged --p-bs itself, i.e. 2.5x too few slots.",
+        "--pp-cut-mamba-slots-per-running-request", type=int,
+        default=P_MAMBA_SLOTS_PER_RUNNING_REQUEST,
+        help=f"Mamba state slots ONE running request holds at once -- the "
+             f"runtime's mamba_pool_floor.mamba_slots_per_running_req, which "
+             f"is also the ceiling on _calculate_mamba_ratio "
+             f"(model_runner_kv_cache_mixin.py:2684 takes the min of the two). "
+             f"Default {P_MAMBA_SLOTS_PER_RUNNING_REQUEST}, the value boot "
+             f"weg2sb5f emits as '[auto-mamba] ... ratio=2 ... -> "
+             f"max_mamba_cache_size=20 slots'. The pool model charges "
+             f"ceil(--p-bs x this x {P_MAMBA_AUTO_SAFETY_MARGIN}), which is a "
+             f"PROVEN UPPER BOUND on _auto_mamba_demand_size (:2085-2106) "
+             f"including its mamba_hard_floor term -- an upper bound on slots "
+             f"over-charges mamba and therefore UNDER-prices the pool, the "
+             f"conservative direction. It replaces a 2.5 fudge factor that "
+             f"omitted the hard floor entirely (#1286 F4). VERIFY PER BOOT: "
+             f"the '[auto-mamba]' line's slot count must be <= the "
+             f"'PP-POOL-JOIN: ... mamba_slots=' this launcher publishes.",
     )
     ap.add_argument(
         "--pp-cut-stage-fixed-mib", default=P_PP_STAGE_FIXED_MIB,

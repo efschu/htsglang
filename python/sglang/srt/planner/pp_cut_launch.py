@@ -129,8 +129,59 @@ def refuse_unfunded_posts(pool_model: PhasePoolModel) -> None:
         "reserve' is --pp-cut-activation-reserve-mib, 'gapped corridor "
         "holdback' is --pp-cut-corridor-holdback-mib, 'mamba state pool' "
         "divided by (linear layers x slots) is "
-        "--pp-cut-mamba-mib-per-linear-layer-per-slot." % (len(missing), ", ".join(missing))
+        "--pp-cut-mamba-mib-per-linear-layer-per-slot. A post the boot does "
+        "NOT charge on this form is funded by NAMING it in "
+        "PhasePoolModel.zero_posts_acknowledged, which states the claim "
+        "instead of leaving the field silently at zero."
+        % (len(missing), ", ".join(missing))
     )
+
+
+def refuse_pool_model_geometry(pool_model: PhasePoolModel, stages: int) -> None:
+    """W40 when the pool model's PER-STAGE vectors are not this launch's shape.
+
+    #1286 F5, and it is a SWALLOW, not a typo. ``_stage_free_after_residency``
+    raises a bare ``ValueError`` for a ``stage_fixed_mib`` whose length is not
+    the stage count -- and ``solve_launch_cut``'s ``resolve()`` catches bare
+    ``ValueError`` and turns it into ``pool = None``, which is its way of
+    saying "this CUT does not fit". So a configuration error came out the far
+    side as ``not one cut of %d layers over %d stages is priceable``: a
+    sentence about geometry, for a fault that has nothing to do with geometry,
+    with the actual cause nowhere in it. EVERY candidate fails identically,
+    which is exactly what makes the wrong sentence convincing.
+
+    ``budgets_p`` is ``len(cards)``, so any rig or card selection that is not
+    exactly three meets a three-entry default and lands here.
+
+    Checked HERE rather than by narrowing the catch: the catch is RIGHT --
+    ``stage_pp_capacities`` legitimately raises ``ValueError`` for an
+    infeasible cut, and that genuinely is "unpriceable". What was wrong was
+    asking a per-candidate loop to diagnose a per-LAUNCH input. One check,
+    before the loop, with its own sentence.
+    """
+    for name, vec in (
+        ("--pp-cut-stage-fixed-mib", pool_model.stage_fixed_mib),
+        ("the per-rank budgets (free_mib)", pool_model.free_mib),
+        ("--pp-cut-arming-floor-mib", pool_model.arming_floor_mib),
+    ):
+        if not vec:
+            continue
+        if len(tuple(vec)) != int(stages):
+            raise PPCutRefused(
+                "W40 Weg2PPCutRefused: %s has %d entries for a %d-stage "
+                "launch. These are PER-STAGE posts -- the embedding sits on "
+                "stage 0, lm_head and the draft head on the last -- so they "
+                "cannot be broadcast, and a length mismatch is a launch INPUT "
+                "error, not an unpriceable layout. Left to the solver it "
+                "surfaces as 'not one cut ... is priceable', which names the "
+                "wrong thing entirely (#1286). Values: %s"
+                % (
+                    name,
+                    len(tuple(vec)),
+                    int(stages),
+                    ", ".join("%.1f" % float(x) for x in vec),
+                )
+            )
 
 
 def _refuse_below_pool_floor(
@@ -694,6 +745,18 @@ def solve_launch_cut(
     # when any do, because an alternative a boot could not run is not an
     # alternative; when none do, the whole field is the honest set to name and
     # the refusal below is what the operator actually sees.
+    #
+    # WHY #1286 DID NOT MOVE THIS ROW, ARGUED RATHER THAN OBSERVED. Funding the
+    # four missing posts changes every candidate's price by the SAME per-rank
+    # amount -- `-stage_fixed[r] - activation_reserve - mamba + (arming_floor -
+    # corridor_holdback)` -- which is negative on every stage of this rig
+    # (stage_fixed alone is >= 1105 MiB against a +205 MiB holdback
+    # correction), and none of it depends on the cut. So every price falls,
+    # `_floor_ok` can only SHRINK, and `total_ms` is untouched: a winner that
+    # still clears the floor is still the winner. The kv-floor row has no such
+    # protection -- it ranks BY the number that moved, and there the correction
+    # inverted the order (#1286: 31,17,16 fell from pool-maximal to below the
+    # incumbent). Two objectives, two different exposures to the same repair.
     _floor_ok = [c for c in choosable if c.pool_tokens >= float(cap_tokens)]
     makespan_row = min(
         _floor_ok or choosable, key=lambda c: (c.total_ms, -c.pool_tokens)

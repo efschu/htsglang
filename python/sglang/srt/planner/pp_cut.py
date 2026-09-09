@@ -89,7 +89,7 @@ import json
 import math
 import os
 import re
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "LAYER_FAMILY_ATTENTION",
@@ -2697,6 +2697,17 @@ class PhasePoolModel:
     mamba_mib_per_linear_layer_per_slot: float = 0.0
     mamba_slots: int = 0
 
+    #: The sizer's SECOND floor, and it is not the cell (#1286 F7). The runtime
+    #: does ``available_bytes // cell_size`` and then
+    #: ``// page_size * page_size`` (model_executor/pool_configurator.py:527-531
+    #: ``calculate_pool_sizes``), so a pool is a whole number of PAGES. Both
+    #: reference boots ran ``--page-size 1``, where the second floor is the
+    #: identity and no error was observable; at ``--page-size > 1`` a model that
+    #: floors only by the cell OVER-prices by up to ``page_size - 1`` tokens per
+    #: rank. Mirrored rather than left out because "unobservable on the two
+    #: boots we have" is not "absent from the runtime".
+    page_size: int = 1
+
     # -- #1286: THE POSTS THE BOOT CHARGES AND THIS MODEL DID NOT ----------
     #
     # Measured on boot weg2sb5f (2026-09-09), where the shipped cut was priced
@@ -2735,6 +2746,62 @@ class PhasePoolModel:
     #: safe way, named here so it is not read as agreement.
     corridor_holdback_mib: Optional[float] = None
 
+    #: The runtime's `mamba pre-capture reserve` post, MiB per rank (#1286 F3a).
+    #: Charged by ``model_runner_kv_cache_mixin.py:864-871`` whenever
+    #: ``mambaish_config is not None and post_capture_kv_active`` -- a SECOND
+    #: ``ServerArgs.activation_reserve_mb`` on top of the prefill one. It is
+    #: absent from both reference boots' emitted post lists, i.e.
+    #: ``post_capture_kv_active`` was False on both, which is why this model
+    #: reproduced them at zero. That is a property of those two boots and not of
+    #: the runtime: a post-capture-sizing boot charges it and a model that has
+    #: no field for it cannot even say so. Zero is legal ONLY when the caller
+    #: names it in :attr:`zero_posts_acknowledged`.
+    mamba_precapture_reserve_mib: float = 0.0
+
+    #: The runtime's `speculative intermediate state` post, MiB per rank
+    #: (#1286 F3b). The ``admitted * D * per_req`` half of
+    #: ``_mamba_pool_budget_cost_gb`` (model_runner_kv_cache_mixin.py:2107),
+    #: booked at :2259/:2333/:2399/:2440. Zero on both reference boots -- which
+    #: is exactly why ``mamba_mib_per_linear_layer_per_slot`` recovers cleanly
+    #: from ``size * per_req`` alone (33 linear x 20 slots x 1.5588 = 1028.8 MiB
+    #: against the emitted 1.005 GiB). So that constant silently ASSUMES D = 0,
+    #: and this field is where a boot with D > 0 says otherwise. Zero is legal
+    #: ONLY when the caller names it in :attr:`zero_posts_acknowledged`.
+    speculative_intermediate_mib: float = 0.0
+
+    #: Runtime post names the CALLER has shown are zero for the form it is
+    #: about to price, each acknowledged deliberately (#1286 F3).
+    #:
+    #: WHY AN ACKNOWLEDGEMENT AND NOT A DEFAULT. #1009's lesson is that an
+    #: unpriced term reads as "free", and the repair #1286 shipped was to give
+    #: every runtime post a field. That repair is only half done if a field can
+    #: sit at zero and :attr:`unfunded_posts` returns ``()`` anyway -- the guard
+    #: would then catch a post nobody funded and miss a post nobody could have
+    #: funded, which is the same silence by a different road. Naming the post
+    #: here costs one string and puts the claim, and whoever made it, in the
+    #: launch line.
+    zero_posts_acknowledged: Tuple[str, ...] = ()
+
+    #: The runtime's post NAMES, in the runtime's own order, mapped to the field
+    #: that funds each (#1286 F2/F3). This is the model's statement of WHICH
+    #: list it mirrors, and ``test_pp_cut_boot_sizing_1286`` scans
+    #: ``model_runner_kv_cache_mixin.py`` for ``budget_posts.append`` sites and
+    #: fails when the runtime grows a post that is not in here -- so the mirror
+    #: cannot silently fall behind the thing it mirrors. A guard that only tests
+    #: its own fields for zero can never notice a post it does not know about.
+    RUNTIME_BUDGET_POSTS: ClassVar[Tuple[Tuple[str, str], ...]] = (
+        ("weights + runtime state", "weight_mib_per_layer + stage_fixed_mib"),
+        ("gapped corridor holdback", "corridor_holdback_mib"),
+        ("mamba state pool", "mamba_mib_per_linear_layer_per_slot"),
+        ("speculative intermediate state", "speculative_intermediate_mib"),
+        ("prefill activation reserve", "activation_reserve_mib"),
+        ("mamba pre-capture reserve", "mamba_precapture_reserve_mib"),
+        # Emitted only by the GGUF path, which this launcher never takes: group
+        # P boots a safetensors checkpoint. Funded at zero and acknowledged by
+        # the seam like the other two, rather than omitted from the census.
+        ("GGUF dequant scratch", "gguf_scratch_mib (not modelled -- acknowledge)"),
+    )
+
     @property
     def unfunded_posts(self) -> Tuple[str, ...]:
         """Which of the boot's budget posts this model is not charging.
@@ -2748,6 +2815,16 @@ class PhasePoolModel:
         though zero is a legal value for a non-hybrid checkpoint: the caller
         knows which it has, and a hybrid model priced at zero mamba is exactly
         the weg2sb5f defect (1.005 GiB unbooked on the binding stage).
+
+        THE TWO POSTS THAT WERE ZERO WITHOUT BEING ASKED (#1286 F3). Before
+        this, ``mamba pre-capture reserve`` and ``speculative intermediate
+        state`` had no field at all, so this property returned ``()`` for a
+        model that could not have charged them -- a guard blind to exactly the
+        posts nobody had thought about, which is the population the guard
+        exists for. They are fields now, and their zero has to be SAID
+        (:attr:`zero_posts_acknowledged`) rather than assumed. Every other post
+        keeps its old rule; nothing that funded a model before funds it less
+        now.
         """
         missing: List[str] = []
         if not self.stage_fixed_mib:
@@ -2761,6 +2838,16 @@ class PhasePoolModel:
             or int(self.mamba_slots) <= 0
         ):
             missing.append("mamba_mib_per_linear_layer_per_slot")
+        acknowledged = {str(x) for x in self.zero_posts_acknowledged}
+        for post, field in (
+            ("mamba pre-capture reserve", "mamba_precapture_reserve_mib"),
+            ("speculative intermediate state", "speculative_intermediate_mib"),
+            ("GGUF dequant scratch", "gguf_scratch_mib"),
+        ):
+            if post in acknowledged:
+                continue
+            if field == "gguf_scratch_mib" or float(getattr(self, field)) <= 0.0:
+                missing.append(f"{field} (runtime post {post!r})")
         return tuple(missing)
 
 
@@ -2775,9 +2862,12 @@ def stage_pp_capacities(
     ``available_bytes`` is what is left after every post the boot charges (see
     :func:`_stage_free_after_residency`). This is the same expression the
     runtime prints as ``"KV pool sizing: available_bytes=%d, cell_size=%d ->
-    max_total_num_tokens=%d"``, and the FLOOR is part of it: the sizer does
-    integer division, so a model that returned the real quotient would differ
-    from the boot by up to one token per rank for no reason.
+    max_total_num_tokens=%d"``, and BOTH of its floors are part of it -- the
+    cell division and the page rounding underneath it. See
+    :func:`stage_capacity_tokens`: the sizer does integer division and then
+    rounds down to a whole number of pages, so a model that returned the real
+    quotient would differ from the boot by up to one token per rank, and one
+    that skipped the page floor by up to ``page_size - 1`` (#1286 F7/F8).
 
     #1255: a rank with no full-attention layer is REFUSED, never priced. Its
     cell is zero, and the runtime's own artifact at ``cell_size=0`` is
@@ -2806,11 +2896,7 @@ def stage_pp_capacities(
                 "modelling artifact, not a real configuration: refusing to price "
                 f"cut {tuple(counts)} with attention counts {tuple(attn_counts)}."
             )
-        caps.append(
-            float(
-                math.floor(free / (a * float(model.kv_mib_per_token_per_attn_layer)))
-            )
-        )
+        caps.append(float(stage_capacity_tokens(free, a, model)))
     return tuple(caps)
 
 
@@ -3473,8 +3559,15 @@ def _stage_free_after_residency(
           - weights + runtime state      (weight_mib_per_layer * n  +  stage_fixed_mib[r])
           - gapped corridor holdback     (corridor_holdback_mib, else the arming floor)
           - mamba state pool             (rate * linear_layers * slots)
+          - speculative intermediate st. (speculative_intermediate_mib)
           - prefill activation reserve   (activation_reserve_mib)
+          - mamba pre-capture reserve    (mamba_precapture_reserve_mib)
           = rest, which the sizer then divides by the cell.
+
+    The last three are ZERO on both reference boots and are subtracted anyway,
+    because a term with no field cannot be reported as zero -- it is simply
+    absent, and absent reads as free (#1286 F3). ``unfunded_posts`` makes the
+    caller SAY that it means zero.
 
     Before #1286 the first line charged only the per-LAYER half and the second
     charged the arming floor, while the third and fourth were absent entirely.
@@ -3505,9 +3598,38 @@ def _stage_free_after_residency(
             - float(model.mamba_mib_per_linear_layer_per_slot)
             * linear
             * int(model.mamba_slots)
+            - float(model.speculative_intermediate_mib)
             - float(model.activation_reserve_mib)
+            - float(model.mamba_precapture_reserve_mib)
         )
     return tuple(out)
+
+
+def stage_capacity_tokens(free_mib: float, attn_layers: int, model: PhasePoolModel) -> int:
+    """``floor(available_bytes / cell) // page_size * page_size`` -- INTEGER.
+
+    The runtime's own two floors, in the runtime's own arithmetic
+    (``pool_configurator.calculate_pool_sizes``: ``available_bytes //
+    self._cell_size``, then ``// page_size * page_size``), both on INTEGER
+    bytes.
+
+    WHY INTEGER AND NOT ``math.floor`` ON A FLOAT QUOTIENT (#1286 F8). The
+    model's free memory is carried in MiB as a float and the boot's is an
+    integer byte count, so a float division puts a 1-ULP knife edge under an
+    assertion that is deliberately an EQUALITY -- the equality is what kills
+    the ``floor -> ceil`` mutant, which moves the answer by exactly one token
+    per rank and is invisible to any percentage tolerance. Here the cell is
+    ``2048 = 2**11`` and every quotient is exactly representable, so the two
+    forms agree; that is a property of this checkpoint's KV geometry and not of
+    the code, and the code should not depend on it.
+    """
+    cell_bytes_per_attn_layer = int(round(float(model.kv_mib_per_token_per_attn_layer) * MIB))
+    cell = int(attn_layers) * cell_bytes_per_attn_layer
+    if cell <= 0:
+        raise ValueError("a KV cell of zero bytes cannot bound a token count.")
+    available_bytes = int(float(free_mib) * MIB)
+    page = max(1, int(model.page_size))
+    return (available_bytes // cell) // page * page
 
 
 def gapped_phase_pool(
@@ -3551,11 +3673,7 @@ def gapped_phase_pool(
             # cell_size=0 artifact, 1048576 -- large enough to be invisible in
             # a MIN and to look like a capacity win in any other reduction.
             continue
-        caps.append(
-            float(
-                math.floor(f / (int(a) * float(model.kv_mib_per_token_per_attn_layer)))
-            )
-        )
+        caps.append(float(stage_capacity_tokens(f, int(a), model)))
     if not caps:
         raise ValueError(
             f"gapped map {tuple(counts)} with attention counts "

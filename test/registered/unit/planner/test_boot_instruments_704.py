@@ -36,6 +36,14 @@ from sglang.srt.planner.boot_instruments import (
 
 MiB = 1024.0 * 1024.0
 
+#: K+V bytes per token per full-attention layer on THIS checkpoint: fp8_e4m3 at
+#: 2 x 4 kv-heads x 256 head_dim. It used to be a literal inside
+#: ``predict_tokens_for_cut``; #1286 F1 made it a required argument, because a
+#: cell that belongs to the checkpoint must not have a default in the code that
+#: divides by it. The boots' own ``cell_size=`` lines are this times the
+#: stage's attention count.
+CELL_BYTES_PER_ATTN_LAYER = 2048
+
 # Live [28,20,16] boot. Budget from rank_gpu_memory_mib; posts and rest from
 # DATA_704_budget_posts.txt; mamba allocated from the Mamba Cache lines;
 # arming floors measured. available_bytes is what the sizing line will publish;
@@ -149,7 +157,12 @@ def test_predicting_an_unbooted_cut_without_its_reserve_is_refused():
     from sglang.srt.planner.boot_instruments import predict_tokens_for_cut
 
     with pytest.raises(ValueError, match="reserve"):
-        predict_tokens_for_cut(attn_layers=8, rest_mib=14000.0, reserve_mib=None)
+        predict_tokens_for_cut(
+            attn_layers=8,
+            rest_mib=14000.0,
+            reserve_mib=None,
+            cell_bytes_per_attn_layer=CELL_BYTES_PER_ATTN_LAYER,
+        )
 
 
 def test_predicting_with_a_supplied_reserve_is_arithmetic_only():
@@ -157,7 +170,10 @@ def test_predicting_with_a_supplied_reserve_is_arithmetic_only():
 
     # The measured PP2 stage, so it must land back on the boot.
     tokens = predict_tokens_for_cut(
-        attn_layers=4, rest_mib=8.375 * 1024, reserve_mib=5.045 * 1024
+        attn_layers=4,
+        rest_mib=8.375 * 1024,
+        reserve_mib=5.045 * 1024,
+        cell_bytes_per_attn_layer=CELL_BYTES_PER_ATTN_LAYER,
     )
     assert tokens == pytest.approx(436446, rel=5e-3)
 
@@ -176,6 +192,9 @@ def test_the_arming_floor_is_inside_the_reserve_not_a_second_subtraction():
     reserve = recover_reserve_mib(pp2)
     assert reserve > pp2.arming_floor_mib  # the floor fits inside it
     tokens = predict_tokens_for_cut(
-        attn_layers=pp2.attn_layers, rest_mib=pp2.rest_mib, reserve_mib=reserve
+        attn_layers=pp2.attn_layers,
+        rest_mib=pp2.rest_mib,
+        reserve_mib=reserve,
+        cell_bytes_per_attn_layer=CELL_BYTES_PER_ATTN_LAYER,
     )
     assert tokens == pytest.approx(pp2.max_total_num_tokens, rel=5e-3)
