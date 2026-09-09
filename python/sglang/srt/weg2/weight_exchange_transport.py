@@ -169,15 +169,27 @@ DIR_HANDLE_OFF = DIR_PTRTABLE_OFF + DIR_PTRTABLE_BYTES
 DIR_HANDLE_BYTES = xr.N_RANKS * CUDA_IPC_HANDLE_SIZE
 
 #: The on-card handshake.  TWO row arrays, not one shared record: the producer
-#: writes only its own row and the consumer only its own, which is the law the
+#: writes only its own rows and the consumer only its own, which is the law the
 #: gate rows and matrix rows already obey.  A single record with two writers and
 #: no atomic is a lost update, and this region has MEASURED one
 #: (:meth:`xr.XchgRegion.mark_registered`, ``registered=5/6``).
+#:
+#: **ONE ROW PER RANK PER SLOT, not one per rank.**  MEASURED DEFECT, first
+#: green remote run of S4's suite: with one row per rank the producer's batch 1
+#: overwrote batch 0's ``bytes`` before the consumer had read it, and the
+#: consumer -- which waits for a sequence and then compares byte counts --
+#: raised W54 against a producer that had done nothing wrong
+#: (``expected_bytes=4096 bytes_filled=1904``, i.e. batch 1's number answering
+#: batch 0's question).  A per-slot row cannot be overwritten while the batch
+#: it describes is undrained, because the producer may not reuse a slot until
+#: its consumer has released it; the double buffer that makes the LANE safe is
+#: what makes the SIGNAL safe, and it only works if the signal is per slot too.
 DIR_ONCARD_PROD_OFF = DIR_HANDLE_OFF + DIR_HANDLE_BYTES
 DIR_ONCARD_ROW_BYTES = 64
-DIR_ONCARD_PROD_BYTES = xr.N_RANKS * DIR_ONCARD_ROW_BYTES
+DIR_ONCARD_ROWS = xr.N_RANKS * ONCARD_SLOTS
+DIR_ONCARD_PROD_BYTES = DIR_ONCARD_ROWS * DIR_ONCARD_ROW_BYTES
 DIR_ONCARD_CONS_OFF = DIR_ONCARD_PROD_OFF + DIR_ONCARD_PROD_BYTES
-DIR_ONCARD_CONS_BYTES = xr.N_RANKS * DIR_ONCARD_ROW_BYTES
+DIR_ONCARD_CONS_BYTES = DIR_ONCARD_ROWS * DIR_ONCARD_ROW_BYTES
 DIR_USED_BYTES = DIR_ONCARD_CONS_OFF + DIR_ONCARD_CONS_BYTES
 DIR_CAPACITY = xr.DATA_OFF - xr.DIR_OFF
 
@@ -1159,14 +1171,17 @@ class OnCardStats:
         )
 
 
-def _oncard_row_off(area_off: int, row: int) -> int:
+def _oncard_row_off(area_off: int, row: int, slot: int = 0) -> int:
     if not 0 <= int(row) < xr.N_RANKS:
         raise ValueError(f"row must be 0..{xr.N_RANKS - 1}, not {row!r}")
-    return area_off + int(row) * DIR_ONCARD_ROW_BYTES
+    if not 0 <= int(slot) < ONCARD_SLOTS:
+        raise ValueError(f"slot must be 0..{ONCARD_SLOTS - 1}, not {slot!r}")
+    index = int(row) * ONCARD_SLOTS + int(slot)
+    return area_off + index * DIR_ONCARD_ROW_BYTES
 
 
 def write_oncard_row(region: xr.XchgRegion, area_off: int, row: int, *,
-                     seq: int, nbytes: int, state: int) -> None:
+                     seq: int, nbytes: int, state: int, slot: int = 0) -> None:
     """Publish one side's on-card handshake row.  ONE WRITER PER ADDRESS.
 
     Producer rows and consumer rows are separate arrays, so no word here has two
@@ -1174,10 +1189,15 @@ def write_oncard_row(region: xr.XchgRegion, area_off: int, row: int, *,
     not a signal: a reader that accepted an unsealed row would take a stale
     ``nbytes`` beside a fresh ``seq``, which is the torn-row defect S3 already
     pinned with a test one area over.
+
+    ``slot`` is not decoration: a row is per rank PER SLOT (see
+    :data:`DIR_ONCARD_ROWS`), so batch k's description survives until the
+    producer is allowed to reuse slot ``k % ONCARD_SLOTS`` -- which the double
+    buffer forbids until the consumer has drained it.
     """
-    region._require_flip(f"write_oncard_row row={row}")
+    region._require_flip(f"write_oncard_row row={row} slot={slot}")
     view = region.dir_view()
-    off = _oncard_row_off(area_off, row)
+    off = _oncard_row_off(area_off, row, slot)
     payload = ONCARD_ROW_STRUCT.pack(int(seq), int(nbytes), region.epoch_hash,
                                      os.getpid(), int(state))
     addr = ctypes.addressof(view)
@@ -1185,9 +1205,10 @@ def write_oncard_row(region: xr.XchgRegion, area_off: int, row: int, *,
     ctypes.memmove(addr + off + ONCARD_SEAL_OFF, struct.pack("<Q", _seal(payload)), 8)
 
 
-def read_oncard_row(region: xr.XchgRegion, area_off: int, row: int) -> Dict[str, int]:
+def read_oncard_row(region: xr.XchgRegion, area_off: int, row: int,
+                    slot: int = 0) -> Dict[str, int]:
     view = region.dir_view()
-    off = _oncard_row_off(area_off, row)
+    off = _oncard_row_off(area_off, row, slot)
     addr = ctypes.addressof(view)
     payload = ctypes.string_at(addr + off, ONCARD_ROW_STRUCT.size)
     seal = struct.unpack("<Q", ctypes.string_at(addr + off + ONCARD_SEAL_OFF, 8))[0]
@@ -1387,8 +1408,13 @@ def run_oncard_producer(
     batches = batch_descs(descs, bounce.slot_bytes)
     started = time.perf_counter()
     for batch in batches:
+        slot = batch.seq % bounce.slots
+        # The double buffer's only rule: slot s may be refilled once the
+        # consumer has released the batch that used it last, which is
+        # `seq - slots`.  Everything else about this lane's safety follows.
         _await_oncard(region, DIR_ONCARD_CONS_OFF, peer_row,
-                      batch.seq - bounce.slots, budget, what="drain", row=row)
+                      batch.seq - bounce.slots, budget, what="drain", row=row,
+                      slot=slot)
         base = bounce.slot_address(batch.seq)
         for piece in batch.pieces:
             desc = descs[piece.desc_index]
@@ -1401,8 +1427,9 @@ def run_oncard_producer(
                                    src_ptr, piece.spitch,
                                    piece.run_bytes, piece.rows, stream)
         ops.synchronize(stream)
-        write_oncard_row(region, DIR_ONCARD_PROD_OFF, row, seq=batch.seq,
-                         nbytes=batch.total_bytes, state=ONCARD_STATE_READY)
+        write_oncard_row(region, DIR_ONCARD_PROD_OFF, row, slot=slot,
+                         seq=batch.seq, nbytes=batch.total_bytes,
+                         state=ONCARD_STATE_READY)
         stats.bytes_moved += batch.total_bytes
         stats.hops += 1
     stats.elapsed_s = time.perf_counter() - started
@@ -1435,8 +1462,13 @@ def run_oncard_consumer(
     started = time.perf_counter()
     for batch in batches:
         slot = batch.seq % int(slots)
+        # EXACT, not >=: this row describes slot ``slot``'s current batch, and
+        # the producer cannot have moved past it (it would have to reuse the
+        # slot, which needs this consumer's release).  A >= here is what let
+        # batch 1's byte count answer batch 0's question and raise W54 against
+        # a healthy producer.
         got = _await_oncard(region, DIR_ONCARD_PROD_OFF, peer_row, batch.seq,
-                            budget, what="fill", row=row)
+                            budget, what="fill", row=row, slot=slot, exact=True)
         if got["bytes"] != batch.total_bytes:
             raise Weg2XchgShortPiece(short_piece_message(
                 lane="oncard", pair=-1, slot=slot, seq=batch.seq,
@@ -1456,8 +1488,9 @@ def run_oncard_consumer(
                                    base + piece.slot_off, piece.run_bytes,
                                    piece.run_bytes, piece.rows, stream)
         ops.synchronize(stream)
-        write_oncard_row(region, DIR_ONCARD_CONS_OFF, row, seq=batch.seq,
-                         nbytes=batch.total_bytes, state=ONCARD_STATE_DONE)
+        write_oncard_row(region, DIR_ONCARD_CONS_OFF, row, slot=slot,
+                         seq=batch.seq, nbytes=batch.total_bytes,
+                         state=ONCARD_STATE_DONE)
         stats.bytes_moved += batch.total_bytes
         stats.hops += 1
     stats.elapsed_s = time.perf_counter() - started
@@ -1465,7 +1498,8 @@ def run_oncard_consumer(
 
 
 def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
-                  budget_s: float, *, what: str, row: int) -> Dict[str, int]:
+                  budget_s: float, *, what: str, row: int, slot: int = 0,
+                  exact: bool = False) -> Dict[str, int]:
     """Bounded poll for a peer's on-card row to reach ``seq``.
 
     Bounded by ``WEG2_GROUP_FENCE_BUDGET_S`` like every other wait in this
@@ -1476,6 +1510,13 @@ def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
     poll of the next flip would return immediately with nobody having filled
     anything -- the wave gate's own stop-loss, one lane over.
 
+    ``exact`` distinguishes the two questions this poll answers.  The FILL
+    direction asks "is slot s carrying batch k", and must be exact: a ``>=``
+    accepts a later batch's byte count as an answer about this one, which is
+    how a healthy producer earned a W54 on the first green run of this suite.
+    The DRAIN direction asks "has the consumer got at least as far as k", and
+    ``>=`` is the honest reading there.
+
     A negative ``seq`` is the base case of the double buffer -- there is no
     batch ``-1`` to wait for -- and returns without reading anything.
     """
@@ -1484,26 +1525,27 @@ def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
                 "epoch_hash": region.epoch_hash, "sealed": 1}
     started = time.monotonic()
     while True:
-        got = read_oncard_row(region, area_off, peer_row)
+        got = read_oncard_row(region, area_off, peer_row, slot)
         fresh = (got["sealed"] and got["epoch_hash"] == region.epoch_hash
                  and got["state"] not in (ONCARD_STATE_IDLE, ONCARD_STATE_ARMED))
         if fresh and got["state"] == ONCARD_STATE_FAILED:
             raise Weg2XchgGateTimeout(
                 f"W53 Weg2XchgGateTimeout oncard row={row} peer_row={peer_row} "
-                f"epoch={region.epoch} seq={seq} what={what} -- the peer voted "
-                f"FAILED on this lane"
+                f"slot={slot} epoch={region.epoch} seq={seq} what={what} -- the "
+                f"peer voted FAILED on this lane"
             )
-        if fresh and got["seq"] >= seq:
+        if fresh and (got["seq"] == seq if exact else got["seq"] >= seq):
             return got
         if time.monotonic() - started >= budget_s:
             raise Weg2XchgGateTimeout(
                 f"W53 Weg2XchgGateTimeout oncard row={row} peer_row={peer_row} "
-                f"epoch={region.epoch} seq={seq} what={what} "
+                f"slot={slot} epoch={region.epoch} seq={seq} what={what} "
+                f"exact={'yes' if exact else 'no'} "
                 f"budget_s={budget_s} waited_s={time.monotonic() - started:.3f} "
                 f"peer_seq={got['seq']} peer_state={got['state']} "
                 f"peer_sealed={got['sealed']} peer_pid={got['pid']} "
                 f"alive_in_proc={'yes' if _pid_alive(got['pid'], '/proc') else 'no'} "
-                f"(denominator: the peer's single on-card row carrying "
+                f"(denominator: the peer's on-card row for THIS slot carrying "
                 f"epoch_hash={region.epoch_hash:#x})"
             )
         time.sleep(ONCARD_POLL_S)
@@ -1514,14 +1556,15 @@ def _await_handle(region: xr.XchgRegion, peer_row: int, budget_s: float,
     """Wait for the co-located producer to publish its bounce IPC handle.
 
     Separate from :func:`_await_oncard` because it waits on a DIFFERENT event:
-    the producer arms (``ONCARD_STATE_ARMED``, ``seq = -1``) once, before batch
-    0, and the consumer must import the handle before the first batch exists.
-    Folding the two would make batch 0's wait also the handle's wait, and the
-    consumer would then open a handle it had never been told was there.
+    the producer arms (``ONCARD_STATE_ARMED``, ``seq = -1``, slot 0) once,
+    before batch 0, and the consumer must import the handle before the first
+    batch exists.  Folding the two would make batch 0's wait also the handle's
+    wait, and the consumer would then open a handle it had never been told was
+    there.
     """
     started = time.monotonic()
     while True:
-        got = read_oncard_row(region, DIR_ONCARD_PROD_OFF, peer_row)
+        got = read_oncard_row(region, DIR_ONCARD_PROD_OFF, peer_row, 0)
         if (got["sealed"] and got["epoch_hash"] == region.epoch_hash
                 and got["state"] != ONCARD_STATE_IDLE):
             return
@@ -1569,6 +1612,7 @@ def run_leg(
     vote_failure: Callable[[BaseException], None],
     budget_s: Optional[float] = None,
     slot_bytes: int = xr.SLOT_BYTES,
+    oncard_slot_bytes: Optional[int] = None,
 ) -> LegResult:
     """Move this rank's whole share of one wave, on five threads.
 
@@ -1593,12 +1637,20 @@ def run_leg(
     because they are three numbers, and the boot forms in this tree have made
     every pair of them differ at least once.
 
+    ``oncard_slot_bytes`` DEFAULTS TO ``slot_bytes``, and that default is a
+    measured correction rather than a convenience: the first version took
+    ``slot_bytes`` for the cross lane and left the on-card bounce on the module
+    default, so a caller that set one knob got two different batch sizes and no
+    line said so.  A knob that applies to half of what its name covers is worse
+    than no knob.
+
     TODO(S6): nothing calls this yet.  S6 owns the RPC handler that binds the
     flip, runs Gate 0, resumes the destination's tags, calls this per wave and
     then closes ``wave_gate``.  ``test_run_leg_interface_is_what_s6_must_call``
     pins the signature so the seam cannot drift while it is unwired.
     """
     budget = xr.fence_budget_s() if budget_s is None else float(budget_s)
+    diag_bytes = int(slot_bytes if oncard_slot_bytes is None else oncard_slot_bytes)
     result = LegResult()
     errors: List[BaseException] = []
     lock = threading.Lock()
@@ -1649,15 +1701,16 @@ def run_leg(
         peer_ptr = 0
         try:
             if is_source:
-                bounce = (OnCardBounce(ops, device) if ipc
-                          else HostBounce(ops, region.boot_nonce, rank, create=True))
+                bounce = (OnCardBounce(ops, device, slot_bytes=diag_bytes) if ipc
+                          else HostBounce(ops, region.boot_nonce, rank,
+                                          create=True, slot_bytes=diag_bytes))
                 if ipc:
                     publish_ipc_handle(region, row, bounce.handle)
-                # ARMED, seq -1: "the bounce is there, no batch yet".  A
-                # consumer that waited on batch 0 for the handle would open a
+                # ARMED, seq -1, slot 0: "the bounce is there, no batch yet".
+                # A consumer that waited on batch 0 for the handle would open a
                 # buffer it had never been told existed.
-                write_oncard_row(region, DIR_ONCARD_PROD_OFF, row, seq=-1,
-                                 nbytes=0, state=ONCARD_STATE_ARMED)
+                write_oncard_row(region, DIR_ONCARD_PROD_OFF, row, slot=0,
+                                 seq=-1, nbytes=0, state=ONCARD_STATE_ARMED)
                 run_oncard_producer(region, ops, stream, bounce, row=row,
                                     peer_row=peer_row, descs=on_card,
                                     stats=oncard_stats, budget_s=budget)
@@ -1666,11 +1719,13 @@ def run_leg(
                 if ipc:
                     peer_ptr = ops.ipc_open_handle(read_ipc_handle(region, peer_row))
                 else:
-                    bounce = HostBounce(ops, region.boot_nonce, rank, create=False)
+                    bounce = HostBounce(ops, region.boot_nonce, rank,
+                                        create=False, slot_bytes=diag_bytes)
                     peer_ptr = bounce.ptr
                 run_oncard_consumer(region, ops, stream, peer_ptr, row=row,
                                     peer_row=peer_row, descs=on_card,
-                                    stats=oncard_stats, budget_s=budget)
+                                    stats=oncard_stats, budget_s=budget,
+                                    slot_bytes=diag_bytes)
         finally:
             if ipc and peer_ptr:
                 ops.ipc_close_handle(peer_ptr)
