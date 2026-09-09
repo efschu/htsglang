@@ -2622,6 +2622,33 @@ class FlashInferAttnBackend(AttentionBackend):
             layer.v_scale,
             dcp_kv_mask=dcp_kv_mask,
         )
+        #
+        # #1243 PRECISION TAIL, write half. SAME `loc`, SAME `dcp_kv_mask` --
+        # the ring inherits the weighted owner rule verbatim and no ownership
+        # arithmetic is recomputed. Slice 1 is a DOUBLE write: the body row
+        # above is unchanged, so a token in the ring exists in both pools and
+        # the read side must (and does) trim the body plan to match.
+        # `cache_k` arrives bf16 and the ring is bf16, so the cast inside
+        # `set_kv_buffer` is a structural no-op on this call and the masked
+        # write kernel is reused unchanged.
+        #
+        # PROBED WITH A DOUBLE getattr, NOT A METHOD AND NOT A BARE ATTRIBUTE.
+        # This function is also entered with a duck-typed `self` -- it IS
+        # `_dcp_owner_write` under another name, and the #472 pad-positions
+        # tests bind it to a SimpleNamespace carrying only the fields the owner
+        # rule needs. Either shorter form turns every such caller into an
+        # AttributeError, which is exactly what the set-diff against 57fef0ce6e
+        # caught. `None` is then the pre-#1243 path byte-for-byte.
+        #
+        # The ring hangs off the POOL rather than off the backend so the ONE
+        # object the write side and the read side consult is the same object;
+        # a writer and a reader disagreeing about which rows are 16-bit is the
+        # defect class this whole slice is shaped against.
+        ring = getattr(getattr(self, "token_to_kv_pool", None), "kv_tail", None)
+        if ring is not None:
+            ring_loc, ring_mask = ring.claim(loc, dcp_kv_mask)
+            if ring_loc is not None:
+                ring.write(layer, ring_loc, ring_mask, k_full, v_full)
 
     # Historical name used by the weightless KV-worker (head-rank broadcast)
     # call sites -- same function, single source of truth.
@@ -5751,10 +5778,124 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            # #1243 PRECISION TAIL: one extra PAGED call from the SAME
+            # flashinfer wrapper family as the body, over the bf16 ring, merged
+            # by `_safe_merge_state` BEFORE the untouched cross-rank combine.
+            # The merge primitive is NOT interchangeable with the uneven-DCP
+            # LSE path: `_dcp_extend_final_merge` states in-tree that
+            # flashinfer's `merge_state` "uses a different internal convention
+            # and must NOT be used across these two sources". So tail<->body is
+            # intra-family `_safe_merge_state`; cross-rank stays `cp_lse_*`.
+            # The per-layer collective count is UNCHANGED -- the extra call
+            # takes no collective at all.
+            o, lse = self._kv_tail_merge_decode(q_full, layer, o, lse)
         # o: [tokens, 24, D], lse: [tokens, 24]; combine across the DCP token
         # shards and slice back to this rank's [12/6/6] head shard.
         o = cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
         return o.reshape(-1, layer.tp_q_head_num * layer.head_dim).to(q.dtype)
+
+    # ---------------------------------------------------------------- #1243
+    # PRECISION TAIL -- the D-side read half. Both methods return the
+    # pre-#1243 value byte-for-byte when no ring is installed.
+
+    def _kv_tail_decode_wrapper(self):
+        """Persistent decode wrapper for the bf16 ring, lazily created and
+        re-planned ONCE PER STEP out of graph.
+
+        Shares the backend workspace, exactly like the Stage-B0 block wrapper
+        (`_wl_block_decode_wrapper`) and the spill wrappers: all `.run()` calls
+        are stream-ordered, and this wrapper only ever runs after the body
+        wrapper for the same layer."""
+        w = getattr(self, "_kv_tail_wrapper", None)
+        if w is None:
+            w = BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.decode_backend,
+                use_tensor_cores=self.decode_use_tensor_cores,
+            )
+            self._kv_tail_wrapper = w
+        return w
+
+    def _kv_tail_plan_decode(self, built, bs):
+        """Split the owned decode plan and plan the tail wrapper.
+
+        Returns the TRIMMED body `(kv_indptr, kv_indices)`; the tail plan is
+        stashed for `_kv_tail_merge_decode` to run per layer. Called out of
+        graph, once per decode step -- what a capture fixes is the tail's
+        CAPACITY, not its length, so growth, slide and shrink within that
+        capacity need no recapture."""
+        from sglang.srt.mem_cache.kv_tail import Weg2KvTailFormRefused
+
+        ring = self.token_to_kv_pool.kv_tail
+        if getattr(self, "_sess_spill", None) is not None or getattr(
+            self, "_wl_chunk_block_size", 0
+        ):
+            raise Weg2KvTailFormRefused(
+                "W58 Weg2KvTailFormRefused: the precision tail refuses the "
+                "kv-session-offload spill lane and the weightless block-decode "
+                "lane. Both replace the monolithic paged read with their own "
+                "index plumbing, which slice 1 does not trim -- running the "
+                "tail beside an UNTRIMMED body plan would attend every 16-bit "
+                "token twice."
+            )
+        kv_indptr, kv_indices, owned_tail_len = built
+        body_indptr, body_indices, tail_indptr, tail_ring = ring.plan(
+            kv_indptr, kv_indices, owned_tail_len, site="decode"
+        )
+        iu = self.indices_updater_decode
+        w = self._kv_tail_decode_wrapper()
+        w.begin_forward(
+            tail_indptr,
+            tail_ring,
+            iu.kv_last_page_len[:bs],
+            iu.num_qo_heads,
+            iu.num_kv_heads,
+            iu.head_dim,
+            1,
+            data_type=torch.bfloat16,
+            q_data_type=iu.q_data_type,
+        )
+        self._kv_tail_planned_rows = int(tail_ring.numel())
+        ring.log_counters("decode")
+        return body_indptr, body_indices
+
+    def _kv_tail_merge_decode(self, q_full, layer, o, lse):
+        """Run the tail wrapper for this layer and fold it into `(o, lse)`.
+
+        An EMPTY tail contributes the empty-attention identity `(o=0,
+        lse=-inf)` and `_safe_merge_state` folds it in as a no-op -- the same
+        sanitisation contract the graph block loop reproduces, and the reason
+        `--kv-tail-min-tokens 0` is byte-identical rather than merely close.
+
+        A step that reaches here with NO plan is a refusal, not a skip: the
+        body wrapper was then planned by a branch slice 1 does not trim."""
+        ring = getattr(self.token_to_kv_pool, "kv_tail", None)
+        if ring is None:
+            return o, lse
+        planned = getattr(self, "_kv_tail_planned_rows", None)
+        if planned is None:
+            from sglang.srt.mem_cache.kv_tail import Weg2KvTailFormRefused
+
+            raise Weg2KvTailFormRefused(
+                "W58 Weg2KvTailFormRefused: a decode step reached the tail "
+                "merge without a tail plan. The body indices for this step "
+                "were built by a branch slice 1 does not trim (a spec_info "
+                "kv_indptr, the even-DCP rule, or the non-DCP path), so the "
+                "body wrapper is UNTRIMMED and folding a tail into it would "
+                "attend every 16-bit token twice. Refused rather than skipped: "
+                "skipping would make the tail a silent no-op on exactly the "
+                "steps that differ."
+            )
+        if not planned:
+            return o, lse
+        o_t, lse_t = self._kv_tail_wrapper.forward_return_lse(
+            q_full,
+            ring.pool.get_kv_buffer(layer.layer_id),
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+        )
+        return _safe_merge_state(o, lse, o_t, lse_t)
 
     def forward_decode_weightless_worker(self, layer, forward_batch):
         """Weightless-KV WORKER dispatch for one full-attention layer (Option-B
@@ -6351,6 +6492,15 @@ def _build_dcp_ragged_tree_mask(
 _build_dcp_weighted_kv_indices = build_dcp_weighted_kv_indices
 
 
+def _kv_tail_position_lengths(paged_kernel_lens, min_tokens):
+    """#1243: the tail boundary in GLOBAL POSITIONS, rank-uniform by
+    construction (basis 2.6) -- `seq_lens` is the same vector on every rank, so
+    no reduce and no PP0 verdict is minted for it."""
+    from sglang.srt.mem_cache.kv_tail import position_tail_lengths
+
+    return position_tail_lengths(paged_kernel_lens, min_tokens)
+
+
 def _dcp_host_total_tokens(
     extend_prefix_lens_cpu: Optional[Union[List[int], torch.Tensor]],
     expected_sum: Optional[int] = None,
@@ -6613,6 +6763,14 @@ class FlashInferIndicesUpdaterDecode:
         # Host-side kv indptr for the DCP cuda-graph replay plan (see below);
         # None on every non-DCP / non-graph path.
         dcp_graph_indptr_host: Optional[torch.Tensor] = None
+        # #1243: INVALIDATE the tail plan before this step decides which branch
+        # builds the indices. A stale row count from the previous step would let
+        # the per-layer merge run the tail wrapper against a plan that no longer
+        # describes this batch -- silently wrong output, the #345
+        # right-token/wrong-slot class. Only the weighted-DCP branch below
+        # re-arms it; every other branch leaves it None and the merge refuses.
+        if getattr(self.attn_backend, "token_to_kv_pool", None) is not None:
+            self.attn_backend._kv_tail_planned_rows = None
         if self.attn_backend.uneven_dcp and (
             spec_info is None or getattr(spec_info, "kv_indptr", None) is None
         ):
@@ -6635,7 +6793,19 @@ class FlashInferIndicesUpdaterDecode:
                 # WEIGHTED owner rule: owned slots + compact indices from the
                 # out_cache_loc (loc % cp_S in [cp_lo, cp_hi)); see
                 # _build_dcp_weighted_kv_indices / _dcp_masked_write.
-                kv_indptr, kv_indices = _build_dcp_weighted_kv_indices(
+                _tail_ring = getattr(
+                    getattr(self.attn_backend, "token_to_kv_pool", None),
+                    "kv_tail",
+                    None,
+                )
+                _tail_lens = (
+                    None
+                    if _tail_ring is None
+                    else _kv_tail_position_lengths(
+                        paged_kernel_lens, _tail_ring.knobs.min_tokens
+                    )
+                )
+                _built = _build_dcp_weighted_kv_indices(
                     self.req_to_token,
                     req_pool_indices,
                     paged_kernel_lens,
@@ -6648,7 +6818,21 @@ class FlashInferIndicesUpdaterDecode:
                     # #623: same unbounded-D2H removal as the extend site.
                     # None when no usable mirror -> the old device read.
                     total_tokens=dcp_host_total_tokens(host_lens),
+                    tail_lens=_tail_lens,
                 )
+                if _tail_ring is None:
+                    kv_indptr, kv_indices = _built
+                else:
+                    # #1243 PRECISION TAIL, read half. Out of graph, once per
+                    # step: split this rank's owned plan into a body PREFIX and
+                    # a tail SUFFIX, age out whatever left the window, and plan
+                    # the tail wrapper. `kv_indptr`/`kv_indices` are then the
+                    # TRIMMED body plan -- required from slice 1, because under
+                    # the double write an untrimmed body plan plus a tail pass
+                    # attends the same token twice.
+                    kv_indptr, kv_indices = self.attn_backend._kv_tail_plan_decode(
+                        _built, bs
+                    )
             else:
                 dcp_lens = get_dcp_lens(
                     paged_kernel_lens, dcp_size, dcp_rank, kv_start_idx

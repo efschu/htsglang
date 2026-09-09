@@ -3405,6 +3405,52 @@ class ModelRunnerKVCacheMixin:
         )
         return rows
 
+    def _install_kv_tail_ring(self):
+        """Install the #1243 precision-tail ring, or leave the pool untouched.
+
+        The ring is sized from THIS rank's live DCP share and from
+        ``max_running_requests`` READ off the server args -- never a typed
+        constant and never a hardcoded token vector. Both numbers are printed
+        on the KV pool sizing line beside the ring bytes, so the ring post is
+        recoverable from the boot log instead of being re-derived externally.
+        """
+        from sglang.srt.mem_cache.kv_tail import KvTailKnobs, install_kv_tail_ring
+
+        sa = self.server_args
+        knobs = KvTailKnobs(
+            min_tokens=int(getattr(sa, "kv_tail_min_tokens", 0) or 0),
+            max_tokens=int(getattr(sa, "kv_tail_max_tokens", -1)),
+            ring_rows=getattr(sa, "kv_tail_ring_rows", None),
+            graph_capacity_tokens=getattr(sa, "kv_tail_graph_capacity_tokens", None),
+            host_max_tokens=getattr(sa, "kv_tail_host_max_tokens", None),
+            shrink_hysteresis_rounds=getattr(
+                sa, "kv_tail_shrink_hysteresis_rounds", None
+            ),
+            virtual_fp8=bool(getattr(sa, "kv_tail_virtual_fp8", False)),
+            sidecar=bool(getattr(sa, "kv_tail_sidecar", False)),
+            draft=bool(getattr(sa, "kv_tail_draft", False)),
+        )
+        if not knobs.enabled:
+            return None
+        from sglang.srt.distributed.parallel_state import get_parallel
+        from sglang.srt.layers.dcp.owner import dcp_weighted_owner_bounds
+
+        dcp_size = int(get_parallel().attn_dcp_size or 1)
+        if dcp_size > 1:
+            cp_S, _lo, _hi, cp_ratio = dcp_weighted_owner_bounds(
+                dcp_size, int(get_parallel().attn_dcp_rank or 0)
+            )
+        else:
+            cp_S, cp_ratio = 1, 1
+        return install_kv_tail_ring(
+            self.token_to_kv_pool,
+            knobs,
+            max_running_requests=int(getattr(sa, "max_running_requests", 0) or 0),
+            owned_share_num=cp_ratio,
+            owned_share_den=cp_S,
+            enable_memory_saver=bool(getattr(sa, "enable_memory_saver", False)),
+        )
+
     def _decoupled_kv_pool_override(
         self: ModelRunner, all_attn_layer_ids, default_size: int
     ):
@@ -4507,6 +4553,13 @@ class ModelRunnerKVCacheMixin:
                     swappable_backing=False,
                     **extra_args,
                 )
+                # #1243 PRECISION TAIL: attach the bf16 ring to the
+                # FULL-ATTENTION pool only (basis 2.10 -- the linear/GDN side
+                # never sees it, structurally rather than by a flag). Returns
+                # None and leaves this path byte-identical whenever the tail is
+                # off; a tail that is ON and cannot be honoured on this form
+                # RAISES by name rather than installing itself as a no-op.
+                self._install_kv_tail_ring()
                 if _dial_initial_rows is not None:
                     from sglang.srt.managers.vram_dial import (
                         register_dial_participant,
@@ -4812,6 +4865,17 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.register_mapping(
                     swa_allocator.full_to_swa_index_mapping
                 )
+
+        # #1243 PRECISION TAIL: bind the ring's lifetime to the BODY SLOT's.
+        # Subscribing to the body allocator's free/clear events makes the ring
+        # a strict SUB-lifecycle of the slot it shadows -- retract, abort,
+        # request finish and the cutover full reset all pass through here, so
+        # there is no second place that has to remember to release a ring row
+        # and no deleter sitting between the writer and its reader. That
+        # separation is the shape that made boot weg2kvtail1 a silent no-op.
+        _ring = getattr(self.token_to_kv_pool, "kv_tail", None)
+        if _ring is not None:
+            _ring.attach_to_allocator(self.token_to_kv_pool_allocator)
 
         # Defensive check: the explicit validation above should reject known
         # unsupported pool families before allocation. Keep this guard here so

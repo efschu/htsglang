@@ -1277,6 +1277,104 @@ class ServerArgs:
             ">= 1. Only in effect with --max-running-requests-ceiling.",
         ),
     ] = 8
+    # --- PRECISION TAIL (#1243) ------------------------------------------
+    # The newest N tokens of every sequence additionally in bf16, older tokens
+    # in the existing fp8 pool, one LSE merge per attention layer.  The tail is
+    # the LESS lossy direction, so it is not a quality trade -- it is a VRAM
+    # trade, and every knob below is the operator's half of it.
+    kv_tail_min_tokens: A[
+        int,
+        Arg(
+            help="Precision tail (#1243): guaranteed newest tokens per request "
+            "kept in bf16 beside the fp8 KV pool, read by a second attention "
+            "call per layer and merged by LSE. This portion is ledger-priced "
+            "per rank -- it is a budget post, so it always fits for an "
+            "admitted request. 0 disables the guarantee (everything elastic) "
+            "and, with --kv-tail-ring-rows unset, disables the tail entirely, "
+            "which is the byte-identical default path.",
+        ),
+    ] = 0
+    kv_tail_max_tokens: A[
+        int,
+        Arg(
+            help="Precision tail (#1243): elastic ceiling above "
+            "--kv-tail-min-tokens. -1 means OPEN upwards, bounded in practice "
+            "by the ring rows and the captured graph capacity, not by the KV "
+            "pool. 0 is a REAL value (a hard zero tail), which is why it is "
+            "not the open sentinel. This is also the only speed lever the "
+            "tail has: there is deliberately no automatic speed-driven "
+            "shrink.",
+        ),
+    ] = -1
+    kv_tail_ring_rows: A[
+        Optional[int],
+        Arg(
+            help="Precision tail (#1243): rows of this rank's bf16 ring. "
+            "Unset = auto = max_running_requests * --kv-tail-min-tokens * this "
+            "rank's live DCP share, with max_running_requests READ off the "
+            "group's own argv rather than restated. The ring is a separate "
+            "boot-sized allocation, so THIS is the knob that trades KV tokens "
+            "for precision, and its cost is printed on the pool sizing line.",
+        ),
+    ] = None
+    kv_tail_graph_capacity_tokens: A[
+        Optional[int],
+        Arg(
+            help="Precision tail (#1243): tail tokens per request the captured "
+            "CUDA graph plans room for. Unset = --kv-tail-min-tokens. What a "
+            "capture fixes is a CAPACITY, not a length: growth, slide and "
+            "shrink within it need no recapture, and an empty tail is the "
+            "identity contribution. Growth beyond it is clamped and counted, "
+            "and REFUSED when --kv-tail-max-tokens was set explicitly higher.",
+        ),
+    ] = None
+    kv_tail_host_max_tokens: A[
+        Optional[int],
+        Arg(
+            help="Precision tail (#1243): tail tokens per request the HiCache "
+            "host tier reserves for the 16-bit sidecar that carries the tail "
+            "across the flip. Unset = --kv-tail-min-tokens. It exists as its "
+            "own knob because --kv-tail-max-tokens defaults to open, and an "
+            "open maximum gives the host ledger no number to post. Beyond it "
+            "a reader falls back to the 8-bit page. Slice 4.",
+        ),
+    ] = None
+    kv_tail_shrink_hysteresis_rounds: A[
+        Optional[int],
+        Arg(
+            help="Precision tail (#1243): consecutive rounds with free ring "
+            "rows required before a shrunken tail may grow again. Unset = "
+            "--admission-release-hysteresis, whose semantics this copies "
+            "verbatim and for its stated reason: shrinking is immediate, "
+            "regrowth needs proof, or a momentary dip becomes a shrink/grow "
+            "thrash loop. Must be >= 1. Slice 2.",
+        ),
+    ] = None
+    kv_tail_virtual_fp8: A[
+        bool,
+        Arg(
+            help="Precision tail (#1243): suppress the fp8 body write while a "
+            "token is tail-resident (its row stays allocated and is written by "
+            "the one cast primitive when the token ages out). Slice 3; "
+            "refused until then.",
+        ),
+    ] = False
+    kv_tail_sidecar: A[
+        bool,
+        Arg(
+            help="Precision tail (#1243): carry the tail across the flip as a "
+            "16-bit sidecar component beside the fp8 page in the canonical "
+            "store. Needs --page-size 1. Slice 4; refused until then.",
+        ),
+    ] = False
+    kv_tail_draft: A[
+        bool,
+        Arg(
+            help="Precision tail (#1243): give the draft/MTP KV the same tail "
+            "rule. Under pressure the draft's 16-bit tails are the FIRST thing "
+            "given up. Slice 5; refused until then.",
+        ),
+    ] = False
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
@@ -6963,6 +7061,10 @@ class ServerArgs:
         # value and the user's figure becomes the float's start.
         self._handle_max_running_requests_ceiling()
 
+        # #1243: the precision tail's knobs are validated here, before any
+        # handler reads them, and REFUSED rather than clamped.
+        self._handle_kv_tail()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -8685,6 +8787,71 @@ class ServerArgs:
                 f"{self.admission_release_hysteresis}."
             )
 
+
+    def _handle_kv_tail(self):
+        """Validate the precision tail's knobs (#1243), or refuse by name.
+
+        REFUSED, NEVER CLAMPED, for the reason the mamba-floor validators state:
+        silently lowering a tail gives back precision the operator asked for and
+        silently raising one takes KV bytes the operator did not offer. Both
+        choices belong to the operator and both are named in the message.
+
+        The sentinel is resolved BEFORE any comparison. ``--kv-tail-max-tokens
+        -1`` is "open upwards"; ``0`` is a real value (a hard zero tail, which
+        basis 7.4 makes meaningful), so ``0`` may not double as the sentinel --
+        and if it did it would be caught by the ``max < min`` rule at the very
+        defaults it is supposed to express.
+
+        The three later-slice flags are refused here rather than accepted as
+        no-ops: a flag that parses and does nothing is how a boot reports an
+        unbuilt feature as a working one.
+        """
+        from sglang.srt.mem_cache.kv_tail import KvTailKnobs
+
+        knobs = KvTailKnobs(
+            min_tokens=self.kv_tail_min_tokens,
+            max_tokens=self.kv_tail_max_tokens,
+            ring_rows=self.kv_tail_ring_rows,
+            graph_capacity_tokens=self.kv_tail_graph_capacity_tokens,
+            host_max_tokens=self.kv_tail_host_max_tokens,
+            shrink_hysteresis_rounds=self.kv_tail_shrink_hysteresis_rounds,
+            virtual_fp8=self.kv_tail_virtual_fp8,
+            sidecar=self.kv_tail_sidecar,
+            draft=self.kv_tail_draft,
+        )
+        knobs.validate(page_size=self.page_size)
+        if self.kv_tail_shrink_hysteresis_rounds is not None:
+            if self.kv_tail_shrink_hysteresis_rounds < 1:
+                raise ValueError(
+                    "W54 Weg2KvTailUnfundable: "
+                    "--kv-tail-shrink-hysteresis-rounds must be >= 1, got "
+                    f"{self.kv_tail_shrink_hysteresis_rounds}. Shrinking is "
+                    "immediate; regrowth needs proof, and zero rounds of proof "
+                    "is a thrash loop."
+                )
+        for flag, value, slice_no in (
+            ("--kv-tail-virtual-fp8", self.kv_tail_virtual_fp8, 3),
+            ("--kv-tail-sidecar", self.kv_tail_sidecar, 4),
+            ("--kv-tail-draft", self.kv_tail_draft, 5),
+        ):
+            if value:
+                raise ValueError(
+                    f"W54 Weg2KvTailUnfundable: {flag} is not implemented on "
+                    f"this tree (precision tail slice {slice_no}; slice 1 "
+                    "ships the bf16 ring, the second decode attention call and "
+                    "the trimmed body plan only). Refused rather than accepted "
+                    "as a no-op: a flag that parses and does nothing reports an "
+                    "unbuilt feature as a working one."
+                )
+        if not knobs.enabled:
+            return
+        if self.page_size != 1:
+            raise ValueError(
+                "W58 Weg2KvTailFormRefused: the precision tail needs "
+                f"--page-size 1, got {self.page_size}. The body-slot -> "
+                "ring-row mapping is indexed per TOKEN by the compacted "
+                "physical slot the weighted DCP owner rule produces."
+            )
 
     def _handle_hicache_host_role(self):
         """#810: fail fast when the host tier is declared staging but sized
