@@ -1595,8 +1595,15 @@ def test_a_slot_size_the_region_cannot_hold_is_refused_before_any_copy(
 
     with pytest.raises(xr.Weg2XchgPlanDisagree):
         leg(slot_bytes=over)
+    # S5 MOVED THIS CEILING, and the property is unchanged: each knob is
+    # bounded by the storage it writes into.  The cross knob writes into the
+    # region's slots (xr.SLOT_BYTES); the diagonal writes into a bounce this
+    # module allocates itself, whose ceiling became ONCARD_SLOT_BYTES_MAX when
+    # the slot size started being PRICED from the plan's batch count (S5-pre
+    # measured the lane per-batch-bound, so the slot is a decision, not a
+    # constant).
     with pytest.raises(xr.Weg2XchgPlanDisagree):
-        leg(slot_bytes=SLOT, oncard_slot_bytes=tp.ONCARD_SLOT_BYTES + 1)
+        leg(slot_bytes=SLOT, oncard_slot_bytes=tp.ONCARD_SLOT_BYTES_MAX + 1)
     assert votes == [], (
         "a knob refused at the door is not a leg that failed mid-flight; "
         "voting ok=False here would take the whole group down for a caller's "
@@ -1827,17 +1834,28 @@ def test_the_dir_sub_layout_is_disjoint_and_inside_the_region():
         cursor = off + size
     assert cursor == tp.DIR_USED_BYTES <= tp.DIR_CAPACITY
     assert tp.DIR_CAPACITY == xr.DATA_OFF - xr.DIR_OFF
+    # S5 appended `checksum` to the row: the diagonal has no slot RECORD to
+    # carry it (xr.CROSS_PAIRS has no diagonal), so the row is the only channel
+    # a co-located producer has.  The row still fits its 128-byte cell with the
+    # seal.
     assert tp.ONCARD_ROW_STRUCT.size + 8 <= tp.DIR_ONCARD_ROW_BYTES
     # ONE ROW PER RANK PER SLOT -- see the measured overwrite defect.
-    assert tp.DIR_ONCARD_ROWS == xr.N_RANKS * tp.ONCARD_SLOTS
+    # S5: sized from ONCARD_SLOTS_MAX, not from the shipping default, because
+    # the pipeline depth became a per-plan knob and two processes compute these
+    # offsets independently -- a row area that followed an argument would put
+    # rank r's slot k on rank r+1's slot 0, identically on both sides.
+    assert tp.DIR_ONCARD_ROWS == xr.N_RANKS * tp.ONCARD_SLOTS_MAX
+    assert tp.ONCARD_SLOTS <= tp.ONCARD_SLOTS_MAX
     assert tp.DIR_ONCARD_PROD_BYTES == tp.DIR_ONCARD_ROWS * tp.DIR_ONCARD_ROW_BYTES
-    # The row carries seq, bytes, slot_bytes, wave, epoch_hash, pid, state --
-    # and its seal still fits inside the row with room left over, so the next
-    # field to be added does not silently overwrite the seal.
-    assert tp.ONCARD_ROW_STRUCT.size == 8 + 6 * 8
+    # The row carries seq, bytes, slot_bytes, wave, epoch_hash, pid, state and
+    # (S5) checksum -- and its seal still fits inside the row with room left
+    # over, so the next field to be added does not silently overwrite the seal.
+    # That headroom is what let S5 add one without moving the row size, which
+    # is the property this line grades rather than the count itself.
+    assert tp.ONCARD_ROW_STRUCT.size == 8 + 7 * 8
     assert tp.ONCARD_SEAL_OFF + 8 < tp.DIR_ONCARD_ROW_BYTES
     with pytest.raises(ValueError):
-        tp._oncard_row_off(tp.DIR_ONCARD_PROD_OFF, 0, tp.ONCARD_SLOTS)
+        tp._oncard_row_off(tp.DIR_ONCARD_PROD_OFF, 0, tp.ONCARD_SLOTS_MAX)
     # ~1608 x 48 B is what spec 2.2 says the S6 pointer table needs.
     assert tp.DIR_PTRTABLE_BYTES >= 1608 * 48
 
@@ -2045,6 +2063,11 @@ def test_every_w_code_this_slice_raises_is_free_and_named_once():
         ("W53", "Weg2XchgGateTimeout"),
         ("W54", "Weg2XchgShortPiece"),
         ("W56", "Weg2XchgOnCardUnavailable"),
+        # S5 (S4-fix refusal C, an S6 must_fix carried forward): the per-leg
+        # semaphore re-arm check lives in this module because SemSet does.
+        # W62 is free in the branch census -- W60 was the highest assigned and
+        # W61 is the shadow's.
+        ("W62", "Weg2XchgSemaphoreNotRearmed"),
     }, found
 
 
