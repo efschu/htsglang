@@ -39,6 +39,7 @@ __all__ = [
     "is_armed",
     "reset_peaks",
     "read_peaks",
+    "dump_filename",
     "write_footprint_dump",
     "note_capture_begin",
     "note_capture_end",
@@ -96,6 +97,27 @@ def read_peaks(device_index: int = 0) -> dict:
         return {}
 
 
+def dump_filename(rank: int, group: str = "") -> str:
+    """The dump filename for this rank, qualified by Weg-2 group if any.
+
+    FIX #1292: P and D are two independently-launched process groups that
+    can share one dump directory (the existing recipe arms both with the
+    identical ``SGLANG_PHASE_FOOTPRINT_DUMP``). ``rank`` alone is only
+    unique WITHIN one group's ``torch.distributed`` job -- see
+    :func:`_global_rank` -- so P's rank 0 and D's rank 0 collided on the
+    same filename and P, booted second, silently overwrote D's dump.
+
+    The group tag is not a new identity: it is ``SGLANG_WEG2_GROUP``, the
+    one thing in the tree that already tells a rank which Weg-2 group it is
+    in (``weg2/launcher.py``'s ``build_env(group=...)``, read back via
+    ``weg2_memory_saver.weg2_group_name()``). Outside Weg-2 that group is
+    ``""`` and the filename is byte-identical to the pre-fix shape, so a
+    single-regime boot is unaffected.
+    """
+    tag = f"{group}_" if group else ""
+    return f"phase_footprint_{tag}rank{rank}.json"
+
+
 def write_footprint_dump(
     *,
     rank: int,
@@ -108,6 +130,7 @@ def write_footprint_dump(
     prefill_tokens: Optional[int] = None,
     dump_dir: Optional[str] = None,
     peak_floor_bytes: Optional[int] = None,
+    group: str = "",
 ) -> Optional[str]:
     """Write this rank's dump. One file per rank, so no collective is needed
     and a rank that dies mid-run simply contributes nothing.
@@ -125,6 +148,14 @@ def write_footprint_dump(
                                 an honest absence, never a silent fallback to
                                 the raw peak, which would re-introduce the
                                 exact over-charge this field exists to fix.
+
+    ``group`` is this rank's Weg-2 group ("P", "D", or "" outside Weg-2);
+    see :func:`dump_filename`. FIX #1292 also refuses to overwrite an
+    existing dump under this filename when its profile digest differs from
+    this write's: same filename, different profile is exactly the P-over-D
+    collision, and a same-group, same-profile rewrite (the normal
+    keep-the-running-peak path in :func:`record_prefill_peak`) is
+    unaffected because the digest then matches.
     """
     directory = dump_dir or os.environ.get(DUMP_ENV)
     if not directory:
@@ -132,14 +163,44 @@ def write_footprint_dump(
     delta: Optional[int] = None
     if peak_floor_bytes is not None:
         delta = max(0, int(activation_peak_bytes) - int(peak_floor_bytes))
+    from sglang.srt.mem_ledger.activation import profile_digest_from_canonical
+
+    digest = profile_digest_from_canonical(profile_canonical)
     try:
         os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, f"phase_footprint_rank{rank}.json")
+        path = os.path.join(directory, dump_filename(rank, group))
+        if os.path.exists(path):
+            existing_digest = None
+            try:
+                with open(path) as f:
+                    existing = json.load(f)
+                existing_digest = existing.get("profile_digest") or (
+                    profile_digest_from_canonical(existing.get("profile") or [])
+                )
+            except (OSError, ValueError) as e:
+                logger.warning(
+                    "phase footprint %s unreadable while checking for a "
+                    "collision (%s); refusing rather than guessing.", path, e,
+                )
+                return None
+            if existing_digest != digest:
+                logger.warning(
+                    "W18 Weg2PhaseFootprintCollision PHASE-FOOTPRINT REFUSED "
+                    "to overwrite %s (group=%r rank=%d): existing profile "
+                    "digest %s does not match this write's %s. Two Weg-2 "
+                    "groups collided on one filename instead of writing "
+                    "distinct dumps -- fix the group tag, do not force the "
+                    "write.",
+                    path, group, rank, existing_digest, digest,
+                )
+                return None
         payload = {
             "rank": rank,
+            "group": group,
             "card_uuid": card_uuid,
             "hw_fingerprint": hw_fingerprint,
             "profile": profile_canonical,
+            "profile_digest": digest,
             "activation_peak_bytes": int(activation_peak_bytes),
             "peak_floor_bytes": (
                 None if peak_floor_bytes is None else int(peak_floor_bytes)
@@ -231,6 +292,7 @@ def _resolve_identity(model_runner) -> Optional[dict]:
     if _identity is not None:
         return _identity or None
     try:
+        from sglang.srt.managers.weg2_memory_saver import weg2_group_name
         from sglang.srt.mem_ledger.activation import profile_from_server_args
         from sglang.srt.mem_ledger.calibration import rig_fingerprint
         from sglang.srt.mem_ledger.engine import _model_architectures
@@ -250,6 +312,12 @@ def _resolve_identity(model_runner) -> Optional[dict]:
             "hw_fingerprint": live[0] if live else "",
             "profile_canonical": profile.canonical(),
             "rank": _global_rank(model_runner),
+            # FIX #1292: the Weg-2 group this rank belongs to ("P", "D", or
+            # "" outside Weg-2) -- see dump_filename(). weg2_group_name()
+            # reads SGLANG_WEG2_GROUP, set only by weg2/launcher.py's
+            # build_env(); it never raises, so this import cannot turn a
+            # non-Weg2 boot into a probe failure.
+            "group": weg2_group_name(),
         }
     except Exception as e:  # pragma: no cover - NVML/config availability
         logger.warning("phase footprint probe cannot identify this rank: %s", e)
@@ -311,4 +379,5 @@ def record_prefill_peak(model_runner, num_tokens: int) -> None:
         reserved_peak_bytes=int(peaks.get("reserved_peak_bytes", 0)),
         prefill_tokens=int(num_tokens),
         peak_floor_bytes=_peak_floor_bytes,
+        group=identity.get("group", ""),
     )

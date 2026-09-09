@@ -82,6 +82,7 @@ __all__ = [
     "PhaseFootprint",
     "ActivationProfile",
     "profile_key",
+    "profile_digest_from_canonical",
     "footprint_cache_path",
     "load_footprints",
     "save_footprints",
@@ -134,10 +135,22 @@ class ActivationProfile:
         ]
 
 
+def profile_digest_from_canonical(canonical: list) -> str:
+    """Stable digest of an already-canonicalised profile.
+
+    FIX #1292: split out of :func:`profile_key` so a caller holding the raw
+    ``profile`` list from a phase-footprint dump (``activation_probe.py``'s
+    on-disk payload, or ``probe_activation.py``'s ingest) can compute the
+    identical digest without reconstructing an :class:`ActivationProfile`
+    first. One digest recipe, not a second one kept in sync by hand.
+    """
+    blob = json.dumps(canonical, sort_keys=True)
+    return hashlib.sha1(blob.encode()).hexdigest()[:12]
+
+
 def profile_key(profile: ActivationProfile) -> str:
     """Stable digest of the profile. Same discipline as the card probe key."""
-    blob = json.dumps(profile.canonical(), sort_keys=True)
-    return hashlib.sha1(blob.encode()).hexdigest()[:12]
+    return profile_digest_from_canonical(profile.canonical())
 
 
 @dataclasses.dataclass(frozen=True)
