@@ -39,6 +39,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from sglang.srt.weg2 import weight_exchange as wx
 from sglang.srt.weg2 import weight_exchange_region as xr
+from sglang.srt.weg2 import weight_exchange_shadow as sh
 from sglang.srt.weg2 import weight_exchange_transport as tp
 
 from .test_weg2_xchg_transport_1273 import (  # noqa: E402 -- after the env guard
@@ -616,3 +617,497 @@ def test_the_checksum_seam_is_opt_in_at_every_entry_point():
             assert params["on_checksum"].default is None, fn.__name__
     assert "checksum_bytes" in inspect.signature(tp.run_leg).parameters
     assert "on_checksum" in inspect.signature(tp.run_leg).parameters
+
+
+# ===========================================================================
+# ITEM 1 -- THE SHADOW.  DANGER DIRECTION: an observer that acquires
+# authority -- refusing a flip, holding a leg for the fence budget, OOMing the
+# card it is watching, or reporting a framing error as a data corruption.
+# ===========================================================================
+
+
+def _vote_rows(region, rows, *, leg, vote=True, classes_hash=0, need_mib=0):
+    for row in rows:
+        sh.write_shadow_vote(region, row, leg=leg, vote=vote,
+                             classes_hash=classes_hash, need_mib=need_mib)
+
+
+def test_the_shadow_area_is_disjoint_from_s4s_and_inside_the_region():
+    """Three owners now write the dir area; none may overlap another.
+
+    S3 owns the region, S4 owns ``[DIR_OFF, DATA_OFF)`` and states its own
+    sub-layout, and S5 appends its vote rows after S4's last byte.  An overlap
+    here is not a crash -- it is two mechanisms silently editing each other's
+    single-writer rows, which is the lost-update this region has already
+    MEASURED once (``registered=5/6``).
+    """
+    assert sh.SHADOW_AREA_OFF == tp.DIR_USED_BYTES
+    assert sh.SHADOW_AREA_OFF >= tp.DIR_ONCARD_REL_OFF + tp.DIR_ONCARD_REL_BYTES
+    assert sh.SHADOW_AREA_END <= tp.DIR_CAPACITY, (
+        sh.SHADOW_AREA_END, tp.DIR_CAPACITY)
+    assert sh.SHADOW_SEAL_OFF + 8 <= sh.SHADOW_ROW_BYTES
+    offs = {sh._row_off(r) for r in range(xr.N_RANKS)}
+    assert len(offs) == xr.N_RANKS
+
+
+def test_a_rank_that_cannot_afford_the_shadow_stops_every_rank_running_it(region):
+    """THE #802 RULE, applied to an observer: rank-uniform or not at all.
+
+    A subset of ranks running the exchange is not a smaller experiment -- it is
+    a producer with no consumer, blocking on a slot until a budget expires
+    inside somebody's authoritative leg.  So one refusal is six.
+    """
+    _vote_rows(region, [1, 2, 3, 4, 5], leg=7, vote=True)
+    verdict = sh.shadow_gate(region, 0, leg=7, vote=False, classes_hash=0,
+                             need_mib=900, log=lambda _s: None)
+    assert not verdict.run
+    assert verdict.refusers == (0,)
+    assert "a rank refused" in verdict.reason
+    assert verdict.joined == xr.N_RANKS
+    assert f"leg=7" in verdict.line(leg=7, epoch="b.7")
+
+
+def test_ranks_that_chose_different_subsets_do_not_shadow(region):
+    """Six ranks shadowing different classes is six half-experiments.
+
+    The subset is derived from the leg index and a sorted class list, so the
+    six agree without a message; publishing the hash makes that a CHECK instead
+    of an assumption -- and it costs one word in a row that is already there.
+    """
+    _vote_rows(region, [1, 2, 3, 4, 5], leg=2, vote=True, classes_hash=0xAAAA)
+    verdict = sh.shadow_gate(region, 0, leg=2, vote=True, classes_hash=0xBBBB,
+                             need_mib=10, log=lambda _s: None)
+    assert not verdict.run
+    assert "different class subsets" in verdict.reason
+
+
+def test_the_gate_expiry_switches_the_shadow_off_and_never_raises(region):
+    """DEVIATION 6, made falsifiable.
+
+    Five of six ranks vote.  The authoritative wave gate would wait
+    ``WEG2_GROUP_FENCE_BUDGET_S`` and then raise W53 -- correct there, fatal
+    here: it would put 120 s of an observer's wait inside a flip leg.  The
+    shadow waits its own small budget and switches itself off.
+    """
+    _vote_rows(region, [1, 2, 3, 4], leg=1, vote=True)
+    started = time.monotonic()
+    verdict = sh.shadow_gate(region, 0, leg=1, vote=True, classes_hash=0,
+                             need_mib=0, log=lambda _s: None, budget_s=0.05)
+    assert not verdict.run
+    assert time.monotonic() - started < 5.0
+    assert 5 in verdict.refusers
+    assert "switches itself off" in verdict.reason
+    assert verdict.joined == 5
+
+
+def test_the_subset_rotates_and_every_rank_derives_the_same_one():
+    """A bounded subset per leg, rotating, identical on all six ranks.
+
+    Derived from the LEG INDEX and a sorted class list -- never from anything a
+    rank measures -- so two ranks holding different directed slices of the plan
+    still choose the same classes.
+    """
+    descs = _class_descs(["qkv_proj", "o_proj", "in_proj_qkvz"])
+    seen = []
+    for leg in range(6):
+        subset = sh.select_subset(descs, leg=leg)
+        assert len(subset.classes) == 1
+        seen.append(subset.classes[0])
+    assert set(seen) == {"qkv_proj", "o_proj", "in_proj_qkvz"}
+    assert seen[:3] != seen[1:4] or len(set(seen[:3])) == 3
+    # The same leg, from a DIFFERENT directed slice of the same plan, picks
+    # the same class.
+    half = [d for d in descs if d.dst_rank == 0]
+    assert sh.select_subset(half, leg=4).classes == \
+        sh.select_subset(descs, leg=4).classes
+
+
+def test_the_classes_hash_is_stable_across_processes():
+    """``hash()`` is salted per process; six ranks would publish six numbers.
+
+    The same defect class as a plan id built from pointers, and it would make
+    the gate refuse every leg for a reason that reads like a real disagreement.
+    """
+    assert sh.classes_hash(["b", "a"]) == sh.classes_hash(["a", "b"])
+    assert sh.classes_hash(["a", "b"]) == xr.epoch_hash("a|b")
+
+
+def test_the_5090_free_column_refuses_the_full_leg_by_name():
+    """The rig's own reading, priced.
+
+    sb5f measured the 5090 at **474 MiB** free under load -- already below the
+    1024 MiB corridor floor before the shadow asks for anything.  The refusal
+    names the card, both halves of the need, the free column and the floor, so
+    a reader can see WHICH term made it impossible instead of being told it was.
+    """
+    price = sh.price_shadow("GPU-5090", 8 * (1 << 30), 474)
+    assert not price.affordable
+    msg = price.message()
+    assert sh.UNAFFORDABLE_MARKER in msg
+    for token in ("card=GPU-5090", "need_mib=", "free_mib=474", "floor_mib=1024",
+                  "scratch="):
+        assert token in msg, (token, msg)
+    assert "REFUSED" in price.line()
+
+
+def test_a_bounded_subset_fits_where_the_full_leg_does_not():
+    """Which is the whole reason the subset is bounded and rotating."""
+    free = 4096
+    assert not sh.price_shadow("GPU-5090", 8 * (1 << 30), free).affordable
+    small = sh.price_shadow("GPU-5090", 512 * (1 << 20), free)
+    assert small.affordable
+    # The scratch is charged, always: it is 64 MiB of real VRAM and the spec
+    # budgets it by name.
+    assert small.need_mib == 512 + sh.STRIPE_BYTES // sh.MIB
+
+
+def test_shadow_mismatch_names_the_parameter():
+    """Spec 6/S5's first red-first test, verbatim in intent.
+
+    "checksum mismatch" is not a finding a reader can act on.  The line names
+    the CLASS, the parameter, the stripe, the destination offset, the byte
+    count and BOTH checksums.
+    """
+    stripe = sh.Stripe(index=3, tensor_class="in_proj_qkvz",
+                       param_name="model.layers.7.linear_attn.in_proj_qkvz.weight",
+                       nbytes=1024, shadow_sum=500, ring_sum=501,
+                       first_run_dst=0xDEAD000)
+    assert sh.classify(stripe) == sh.MISMATCH
+    msg = sh.mismatch_message(stripe, verdict=sh.MISMATCH, leg=2, epoch="b.2")
+    for token in ("W59 Weg2XchgShadowMismatch", "class=in_proj_qkvz",
+                  "param=model.layers.7.linear_attn.in_proj_qkvz.weight",
+                  "stripe=3", "dst_off=0xdead000", "nbytes=1024",
+                  "shadow_checksum=500", "ring_checksum=501"):
+        assert token in msg, (token, msg)
+    assert "RING's bytes are authoritative" in msg
+
+
+def test_shadow_asks_representability_before_reporting():
+    """Spec 6/S5's second red-first test, and #656 register C22's lesson.
+
+    A value outside ``[0, 255 * nbytes]`` was never a checksum of this payload:
+    the two ends framed it differently.  Reporting that as a data corruption is
+    what killed an instance for a corruption that had not happened.
+    """
+    unwritten = sh.Stripe(index=0, tensor_class="o_proj", param_name="p",
+                          nbytes=16, shadow_sum=4626949667419791296, ring_sum=0)
+    assert sh.classify(unwritten) == sh.NOT_REPRESENTABLE
+    msg = sh.mismatch_message(unwritten, verdict=sh.NOT_REPRESENTABLE, leg=1,
+                              epoch="b.1")
+    assert "never a checksum of this payload" in msg
+    assert "the DATA is not what is wrong" in msg
+    negative = sh.Stripe(index=0, tensor_class="o_proj", param_name="p",
+                         nbytes=16, shadow_sum=-4450328002521349435, ring_sum=0)
+    assert sh.classify(negative) == sh.NOT_REPRESENTABLE
+
+
+def test_the_comparison_walks_payload_runs_and_never_2d_padding(ops):
+    """A 2-D destination's padding belongs to OTHER tensors.
+
+    Between two runs of a row-parallel class sit bytes this rank's own
+    exchange never wrote.  A span compare would report them as mismatches on a
+    perfectly correct flip -- an instrument that fires on the healthy case,
+    which is the worst kind because the first response to it is to switch it
+    off.
+    """
+    rows, run, dpitch = 4, 64, 256
+    ring = dev_ptr(0, 0x10000)
+    shadow = dev_ptr(0, 0x40000)
+    payload = pattern(7, rows * run)
+    # Both sides get the SAME payload in their runs and DIFFERENT padding.
+    for r in range(rows):
+        write(ops, ring + r * dpitch, payload[r * run:(r + 1) * run])
+        write(ops, shadow + r * dpitch, payload[r * run:(r + 1) * run])
+        write(ops, ring + r * dpitch + run, b"\xAA" * (dpitch - run))
+        write(ops, shadow + r * dpitch + run, b"\x55" * (dpitch - run))
+    desc = _strided(rows=rows, run_bytes=run, dpitch=dpitch, dst_ptr=ring)
+    layout = {id(desc): 0}
+    stripes = sh.compare_stripes([desc], layout, shadow, byte_sum(ops))
+    assert len(stripes) == 1
+    assert stripes[0].nbytes == rows * run
+    assert sh.classify(stripes[0]) == sh.MATCH, "the padding was compared"
+
+
+def test_a_stripe_is_the_sum_of_its_runs_and_64_mib_wide(ops):
+    """Stripes are built out of runs because the sum is EXACT and additive.
+
+    ``weights_arena.uint8_checksum`` says so where it explains why chunking
+    cannot change the value; that is what lets a 6 KiB run of a 2-D class
+    contribute to a 64 MiB stripe instead of becoming a stripe of its own.
+    """
+    desc = _flat(nbytes=3000, dst_ptr=dev_ptr(0, 0x10000))
+    write(ops, desc.dst_ptr, pattern(3, 3000))
+    write(ops, dev_ptr(0, 0x40000), pattern(3, 3000))
+    stripes = sh.compare_stripes([desc], {id(desc): 0}, dev_ptr(0, 0x40000),
+                                 byte_sum(ops), stripe_bytes=1000)
+    assert [s.nbytes for s in stripes] == [1000, 1000, 1000]
+    assert all(s.match for s in stripes)
+    assert sum(s.shadow_sum for s in stripes) == sum(pattern(3, 3000))
+
+
+def test_the_shadow_moves_the_bytes_into_its_own_buffer_and_not_the_ring_s(
+        region, tmp_path, boot):
+    """END TO END on the fake: the diagonal, into a shadow buffer.
+
+    The ring's destination is poisoned before and asserted UNCHANGED after --
+    the shadow may read the source's still-mapped VRAM and may write only its
+    own raw buffer.  A shadow that touched the destination would be the
+    exchange with the ring's authority and none of its proof.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    src_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    dst_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        payload = pattern(31, 2000)
+        src, ring_dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x60000)
+        write(src_ops, src, payload)
+        poison(dst_ops, ring_dst, len(payload), seed=0x77)
+        before = read(dst_ops, ring_dst, len(payload))
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=ring_dst,
+                           name="model.layers.0.self_attn.qkv_proj.weight")]
+        _vote_rows(region, [1, 2, 4, 5], leg=0, vote=True,
+                   classes_hash=sh.classes_hash(["qkv_proj"]), need_mib=0)
+        out: list = []
+
+        def source():
+            out.append(sh.shadow_transport(
+                region=region, sems=sems, ops=src_ops, row=0, rank=0, device=0,
+                card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=descs,
+                is_source=True, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3,
+                wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
+                free_mib=8192, log=lambda _s: None, budget_s=10.0))
+
+        thread = threading.Thread(target=source)
+        thread.start()
+        run = sh.shadow_transport(
+            region=region, sems=sems, ops=dst_ops, row=3, rank=0, device=0,
+            card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=descs,
+            is_source=False, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=0,
+            wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
+            free_mib=8192, log=lambda _s: None, budget_s=10.0,
+            sum_bytes=byte_sum(dst_ops))
+        thread.join(60)
+        assert run.result.ran, run.result.counters.errors
+        assert run.buffers is not None
+        assert read(dst_ops, run.buffers.ptr, len(payload)) == payload
+        assert read(dst_ops, ring_dst, len(payload)) == before, \
+            "the shadow wrote into the RING's destination"
+        # Now the ring 'restores' the same bytes and the compare must MATCH.
+        write(dst_ops, ring_dst, payload)
+        result = run.compare(byte_sum(dst_ops), lambda _s: None)
+        assert result.counters.stripes == 1
+        assert result.counters.match == 1 and result.counters.mismatch == 0
+        line = result.line()
+        for token in ("WEG2-XCHG-SHADOW ", "leg=0", "classes=1", "stripes=1",
+                      "match=1", "mismatch=0", "oncard_ms=", "cross_ms=",
+                      "ring_ms=", "verdict=MATCH", "subset=qkv_proj",
+                      "dir=P->D", "pieces=", "xchg_ms=", "issue_ms=",
+                      "slot_wait_ms=", "gate_skew_ms=", "lock_wait_ms="):
+            assert token in line, (token, line)
+    finally:
+        src_ops.close()
+        dst_ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+
+
+def test_a_mismatch_is_counted_and_the_flip_is_never_told(region, tmp_path, boot):
+    """The can-fail control for the acceptance line, and the authority rule.
+
+    The 'ring' restores DIFFERENT bytes than the shadow pulled.  The line must
+    go red (``verdict=MISMATCH``, ``mismatch=1``) and nothing may be raised:
+    the ring's bytes were served, and this is a finding about the EXCHANGE.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    src_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    dst_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        payload = pattern(37, 1500)
+        src, ring_dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x60000)
+        write(src_ops, src, payload)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=ring_dst,
+                           name="model.layers.0.mlp.down_proj.weight")]
+        _vote_rows(region, [1, 2, 4, 5], leg=0, vote=True,
+                   classes_hash=sh.classes_hash(["down_proj"]), need_mib=0)
+        thread = threading.Thread(target=lambda: sh.shadow_transport(
+            region=region, sems=sems, ops=src_ops, row=0, rank=0, device=0,
+            card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=descs,
+            is_source=True, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3,
+            wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
+            free_mib=8192, log=lambda _s: None, budget_s=10.0))
+        thread.start()
+        run = sh.shadow_transport(
+            region=region, sems=sems, ops=dst_ops, row=3, rank=0, device=0,
+            card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=descs,
+            is_source=False, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=0,
+            wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
+            free_mib=8192, log=lambda _s: None, budget_s=10.0,
+            sum_bytes=byte_sum(dst_ops))
+        thread.join(60)
+        assert run.result.ran
+        write(dst_ops, ring_dst, pattern(38, 1500))  # a DIFFERENT restore
+        lines: list = []
+        result = run.compare(byte_sum(dst_ops), lines.append)
+        assert result.counters.mismatch == 1
+        assert "verdict=MISMATCH" in result.line()
+        assert any(sh.MISMATCH_MARKER in ln for ln in lines)
+        assert any("class=down_proj" in ln for ln in lines)
+    finally:
+        src_ops.close()
+        dst_ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+
+
+def test_a_transport_failure_is_logged_and_never_raised(region, tmp_path, boot):
+    """Zero authority under FAILURE, which is the case that matters.
+
+    W52/W53/W54 stop a flip on the authoritative path.  Here the same events
+    mean only "the shadow got no measurement": they are recorded, the line says
+    ``ran=no`` with the reason, and the leg continues.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    dst_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0, fail_ipc_open=True)
+    try:
+        descs = [flat_desc(0, 0, 512, src_ptr=dev_ptr(0, 0x10000),
+                           dst_ptr=dev_ptr(0, 0x60000),
+                           name="model.layers.0.self_attn.o_proj.weight")]
+        _vote_rows(region, [1, 2, 4, 5], leg=0, vote=True,
+                   classes_hash=sh.classes_hash(["o_proj"]), need_mib=0)
+        lines: list = []
+        run = sh.shadow_transport(
+            region=region, sems=sems, ops=dst_ops, row=3, rank=0, device=0,
+            card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=descs,
+            is_source=False, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=0,
+            wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
+            free_mib=8192, log=lines.append, budget_s=0.4,
+            sum_bytes=byte_sum(dst_ops))
+        assert not run.result.ran
+        assert run.result.counters.errors, "the failure was not even recorded"
+        assert "ran=no" in run.result.line()
+        assert "verdict=NOT-RUN" in run.result.line()
+        # And the compare afterwards is a no-op that still refuses to say MATCH.
+        result = run.compare(byte_sum(dst_ops), lines.append)
+        assert result.counters.match == 0
+    finally:
+        dst_ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+
+
+def test_the_shadow_hands_the_transport_a_recorder_not_the_group_vote():
+    """``vote_failure`` is how one rank takes six down.  The shadow may not.
+
+    An AST check, because the property is about what is PASSED and a runtime
+    assertion would only prove it for the paths a test happens to drive.
+    """
+    import ast
+
+    src = inspect.getsource(sh.shadow_transport)
+    tree = ast.parse(src.lstrip())
+    votes = [kw for node in ast.walk(tree)
+             if isinstance(node, ast.Call)
+             for kw in node.keywords if kw.arg == "vote_failure"]
+    assert votes, "the transport call lost its vote_failure argument"
+    for kw in votes:
+        assert isinstance(kw.value, ast.Lambda), ast.dump(kw.value)
+        body = ast.dump(kw.value.body)
+        assert "counters" in body and "errors" in body, body
+
+
+def test_the_shadow_mode_does_not_arm_the_exchange():
+    """``shadow`` is RING-AUTHORITATIVE, and one predicate says so.
+
+    ``exchange_armed()`` gates ``enable_cpu_backup`` and therefore whether
+    ``pause`` is a pure unmap.  True under ``shadow`` would delete the ring
+    restore the shadow compares against -- the ground truth removed by the
+    instrument that needs it.
+    """
+    with wx.weight_source_for_test(sh.WEIGHT_SOURCE_SHADOW):
+        assert wx.weight_source() == "shadow"
+        assert wx.shadow_armed()
+        assert not wx.exchange_armed()
+    with wx.weight_source_for_test(wx.WEIGHT_SOURCE_EXCHANGE):
+        assert wx.exchange_armed() and not wx.shadow_armed()
+    with wx.weight_source_for_test("nonsense"):
+        assert wx.weight_source() == wx.WEIGHT_SOURCE_RING, \
+            "an unrecognised env value armed something"
+
+
+def test_the_default_boot_publishes_no_region_env_and_pops_an_inherited_one():
+    """The default arm stays byte-identical, INCLUDING what it inherits.
+
+    Launcher OUTPUT is popped when this boot arms nothing -- the same rule the
+    ring family and the duplex table already follow, and for the measured
+    reason: a stale region path in the operator's shell is a rank mapping
+    another boot's shared memory.
+    """
+    from sglang.srt.weg2 import launcher
+
+    keys = ("SGLANG_WEG2_XCHG_REGION", "SGLANG_WEG2_XCHG_BOOT",
+            "SGLANG_WEG2_WEIGHT_SOURCE")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ[k] = "inherited"
+        env = launcher.build_env(tree="/t", venv="/v", cvd="GPU-a",
+                                 store_dir="/s", debug_hold=False, tag="t")
+        for k in keys:
+            assert k not in env, k
+        armed = launcher.build_env(
+            tree="/t", venv="/v", cvd="GPU-a", store_dir="/s",
+            debug_hold=False, tag="t",
+            xchg_env={"SGLANG_WEG2_XCHG_REGION": "/dev/shm/weg2-xchg-b/xchg.bin",
+                      "SGLANG_WEG2_XCHG_BOOT": "b",
+                      "SGLANG_WEG2_WEIGHT_SOURCE": "shadow"})
+        assert armed["SGLANG_WEG2_WEIGHT_SOURCE"] == "shadow"
+        assert armed["SGLANG_WEG2_XCHG_BOOT"] == "b"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_the_shadow_arm_is_a_launcher_choice_and_arms_nothing_on_the_others():
+    """``--weg2-weight-source shadow`` exists, and the other arms are untouched."""
+    from sglang.srt.weg2 import launcher
+
+    assert launcher.WEIGHT_SOURCE_CHOICES == ("ring", "exchange", "shadow")
+    assert launcher.WEIGHT_SOURCE_DEFAULT == "ring"
+    for arm in ("ring", "exchange"):
+        assert launcher.prepare_shadow_env(lambda *_a: None, "b", arm) == {}
+
+
+def _flat(*, nbytes, dst_ptr, name="model.layers.0.self_attn.qkv_proj.weight"):
+    return wx.XchgDesc(tag="weights_0", src_rank=0, dst_rank=0,
+                       param_name=name, kind=wx.FLAT, nbytes=nbytes, rows=1,
+                       run_bytes=nbytes, spitch=0, dpitch=0, src_off=0,
+                       dst_off=0, src_ptr=0x1000, dst_ptr=dst_ptr)
+
+
+def _strided(*, rows, run_bytes, dpitch, dst_ptr,
+             name="model.layers.0.self_attn.o_proj.weight"):
+    return wx.XchgDesc(tag="weights_0", src_rank=0, dst_rank=0,
+                       param_name=name, kind=wx.STRIDED2D,
+                       nbytes=rows * run_bytes, rows=rows, run_bytes=run_bytes,
+                       spitch=run_bytes, dpitch=dpitch, src_off=0, dst_off=0,
+                       src_ptr=0x1000, dst_ptr=dst_ptr)
+
+
+def _class_descs(classes):
+    out = []
+    for i, cls in enumerate(classes):
+        for rank in (0, 1):
+            out.append(wx.XchgDesc(
+                tag="weights_0", src_rank=rank, dst_rank=rank,
+                param_name=f"model.layers.{i}.attn.{cls}.weight",
+                kind=wx.FLAT, nbytes=4096, rows=1, run_bytes=4096, spitch=0,
+                dpitch=0, src_off=0, dst_off=0, src_ptr=0x1000,
+                dst_ptr=0x2000))
+    return out
+
