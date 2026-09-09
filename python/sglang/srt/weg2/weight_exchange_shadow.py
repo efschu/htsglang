@@ -1581,6 +1581,16 @@ class ShadowLeg:
         self.sems: Optional[tp.SemSet] = None
         self.ops: Optional[tp.DeviceOps] = None
         self.run: Optional[ShadowRun] = None
+        #: WHICH OF THE THREE THIS LEG OPENED ITSELF.  MEASURED DEFECT, found
+        #: by this round's own end-to-end test as a SIGSEGV and a junit.xml
+        #: that was never written: :meth:`close` used to close all three
+        #: unconditionally, so a leg handed a region and a device layer by its
+        #: CALLER unmapped them out from under that caller -- and in the
+        #: product's own shape (two co-located ranks, one region) the source
+        #: leg's close would land while the destination leg is still reading.
+        #: "The handler cannot close a run it does not own" is the rule; a run
+        #: does not own what it was handed either.
+        self._opened: set = set()
         self.sems_armed: Optional[int] = None
         self.sems_reason: str = ""
         self.closed = False
@@ -1610,13 +1620,17 @@ class ShadowLeg:
         self.closed = True
         for name in ("run", "ops", "sems", "region"):
             obj = getattr(self, name, None)
-            if obj is None:
+            setattr(self, name, None)
+            # ``run`` is always this leg's own -- :func:`shadow_transport`
+            # builds it here and its buffer is the one raw cudaMalloc that must
+            # not survive the leg.  The other three are closed ONLY if this leg
+            # opened them; see :attr:`_opened`.
+            if obj is None or (name != "run" and name not in self._opened):
                 continue
             try:
                 obj.close()
             except BaseException:  # noqa: BLE001 -- an observer's unwind
                 pass
-            setattr(self, name, None)
         if _ACTIVE_LEG is self:
             _ACTIVE_LEG = None
         return True
@@ -1641,6 +1655,7 @@ class ShadowLeg:
                 return "no-region"
             try:
                 self.region = xr.XchgRegion.open(path, expect_boot=boot)
+                self._opened.add("region")
             except BaseException as exc:  # noqa: BLE001
                 self.sems_reason = f"{type(exc).__name__}: {exc}"
                 return "no-region"
@@ -1664,6 +1679,7 @@ class ShadowLeg:
         else:
             try:
                 self.sems = tp.SemSet(self.region.boot_nonce)
+                self._opened.add("sems")
             except BaseException as exc:  # noqa: BLE001
                 self.sems_reason = f"{type(exc).__name__}: {exc}"
                 return "no-sems"
@@ -1672,6 +1688,7 @@ class ShadowLeg:
         else:
             try:
                 self.ops = tp.CudartDeviceOps()
+                self._opened.add("ops")
             except BaseException as exc:  # noqa: BLE001
                 self.sems_reason = f"{type(exc).__name__}: {exc}"
                 return "no-ops"
