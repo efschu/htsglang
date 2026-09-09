@@ -699,7 +699,14 @@ class TestTheLauncherSeam(CustomTestCase):
                 why,
                 incumbent_candidate(d, INCUMBENT, PRICED_ATTN[RG6]),
                 d.makespan or d.chosen,
+                # PASSED IN, never read from P_PP_STAGE_RATIO_SCORES inside the
+                # formatter: #1233 pins the census of that vector's readers.
+                # An obviously fake value, asserted ABSENT below, because the
+                # incumbent IS ranked in this field and the fallback must not
+                # fire.
+                incumbent_fallback="FALLBACK-MUST-NOT-APPEAR",
             )
+            self.assertNotIn("FALLBACK-MUST-NOT-APPEAR", line)
             print("\nRECORD %s" % line)
             self.assertTrue(line.startswith("PP-CUT SHIPPED: "))
             self.assertIn(shown, line)
