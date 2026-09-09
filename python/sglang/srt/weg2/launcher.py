@@ -405,6 +405,237 @@ CONTEXT_LENGTH_TOKENS = 262144
 #: D's prefill chunk width.  Named once because it is X's FLOOR (K5): a bound
 #: below one chunk would refuse work D must be able to do to make progress.
 CHUNKED_PREFILL_TOKENS = 4096
+
+# ---------------------------------------------------------------------------
+# #1023 S1 -- GROUP D'S KV FORM.  The cap seam, behind the objective knob.
+# ---------------------------------------------------------------------------
+#: The 1M operating point, and the ONLY place it is written.  WEG2_KV1M_SPEC
+#: 0908 sec 2.1: at ``--max-running-requests 1`` the mamba sizer gives 5 state
+#: slots, so ``_hybrid_kv_token_cap``'s concurrency term collapses to
+#: ``max(1, 5 // 4) = 1`` and the cap becomes ``1 x (context_len + extra)``.
+#: With today's context that is 262,151 tokens -- a SILENT -61 % against the
+#: 671,680-token pool of boot weg2sb5e -- so raising the per-request ceiling is
+#: the PRECONDITION of a bs1 form, never its consequence.
+CONTEXT_LENGTH_TOKENS_1M = 1048576
+#: The mamba state pool the ``bs1-slots`` position asks for.  Spec sec 2.1's
+#: second route: keep the 262,144 context and buy the cap through the pool's
+#: own capacity term, ``max_mamba_cache_size // mamba_ratio = 16 // 4 = 4``.
+#: It also restores ``retention_pin_budget`` from 1 to 12 slots
+#: (mem_cache/mamba_pool_floor.py), which is the prefix-cache collapse a bare
+#: bs1 causes; and it clears ``_validate_max_mamba_cache_size``'s hard demand
+#: floor for one running request (server_args.py:15074-15111).
+D_KV_FORM_SLOTS_MAMBA_CACHE = 16
+#: D's mamba ratio on this model, and it is READ, not assumed: the engine's
+#: ``_calculate_mamba_ratio`` resolves 4 for Qwen3_5 (48 GDN layers over 16
+#: full-attention layers).  Named here only so the cap arithmetic this module
+#: PRINTS can be checked against the engine's own; the engine never reads it.
+D_MAMBA_RATIO = 4
+#: The form positions.  ``bs8`` is TODAY, byte-for-byte: no flag of this knob
+#: reaches either group's argv in that position.
+D_KV_FORM_CHOICES = ("bs8", "bs1-ctx1m", "bs1-slots")
+D_KV_FORM_DEFAULT = "bs8"
+#: ``--d-bs`` when nobody passed it.  The flag's argparse default is ``None``
+#: -- a SENTINEL, so ``--d-kv-form`` can tell "the operator asked for 8" from
+#: "nobody said" without comparing against a default, which is the trap that
+#: makes an owned quantity silently win.  The resolved value is unchanged.
+D_BS_DEFAULT = 8
+
+
+@dataclass(frozen=True)
+class DKvForm:
+    """Group D's KV form: the argv it derives, and the ceiling it buys.
+
+    A KV-vs-Perf objective position (memory ``kv-vs-perf-waehlbar``), not a
+    default and not a hand pin.  Every field below is DERIVED from the position
+    name; ``line`` states the form, its price and the pool ceiling it buys, so
+    no boot can take a bs1 form without the log saying which one and what it
+    cost.
+    """
+
+    name: str
+    d_bs: int
+    context_length: int
+    max_kv_per_request: int
+    max_mamba_cache_size: Optional[int]
+    #: The concurrency term ``_hybrid_kv_token_cap`` will compute for this form.
+    cap_concurrency: int
+    #: ``cap_concurrency * (context_length + extra)`` -- the per-request KV cap
+    #: that must clear the projected pool, or the pool is silently clamped.
+    cap_tokens: int
+    line: str
+
+    @property
+    def is_default(self) -> bool:
+        return self.name == D_KV_FORM_DEFAULT
+
+
+def d_kv_form_cap_tokens(concurrency: int, context_len: int, extra: int) -> int:
+    """``_hybrid_kv_token_cap``'s own arithmetic, so the launcher can print it.
+
+    ONE formula, stated in one place:
+    ``model_runner_kv_cache_mixin.py:4864-4877`` --
+    ``concurrency = max(max_running_requests, max_mamba_cache_size // ratio)``
+    then ``concurrency * (context_len + get_req_to_token_extra_context_len())``.
+    This is a MIRROR and is pinned as one: the S1 test drives the engine's real
+    method on a double and asserts it returns exactly this number, so the two
+    cannot drift apart without a red test.
+    """
+    return int(concurrency) * (int(context_len) + int(extra))
+
+
+def d_kv_form_extra_tokens(argv_of_d: Sequence[str]) -> int:
+    """``get_req_to_token_extra_context_len`` READ OFF D'S OWN ARGV.
+
+    ``mem_cache/common.py:383-397``: ``extra = 4 + max_speculative_num_draft_tokens``
+    (the page>1/topk>1 branch needs both, and D runs ``--page-size 1``, so it
+    cannot be reached from this argv).  Read rather than restated for the same
+    reason ``_max_running_requests`` reads its flag off the argv: a launcher
+    that changes ``--speculative-num-draft-tokens`` must move this number with
+    it or the printed ceiling becomes a claim about a boot that did not happen.
+
+    The USER LAW of 2026-09-09 ("mtp bleibt dabei") is what makes the term
+    non-zero and permanent: D keeps its NEXTN head in every form here, so no
+    position of this knob may drop a ``--speculative-*`` flag.
+    """
+    draft_tokens = 0
+    for i, a in enumerate(argv_of_d):
+        if a == "--speculative-num-draft-tokens" and i + 1 < len(argv_of_d):
+            draft_tokens = int(argv_of_d[i + 1])
+    return 4 + draft_tokens
+
+
+def resolve_d_kv_form(
+    form: str,
+    d_bs_default: int,
+    max_kv_per_request: int,
+    extra_tokens: int,
+    d_bs_was_passed: bool = False,
+    max_kv_per_request_was_passed: bool = False,
+) -> DKvForm:
+    """Turn the objective position into group D's argv, and price it.
+
+    Refuses (W52) rather than resolving when the operator states the same
+    quantity twice: a bs1 form OWNS ``--max-running-requests`` and the per-
+    request KV ceiling, so an explicit ``--d-bs``/``--max-kv-per-request``
+    beside it is two statements of one number and the launcher would have to
+    pick one silently -- the class this rig has paid for repeatedly.
+    """
+    if form not in D_KV_FORM_CHOICES:
+        raise Weg2LaunchRefused(
+            "W52 Weg2KvFormRefused: --d-kv-form %r is not one of %s."
+            % (form, "|".join(D_KV_FORM_CHOICES))
+        )
+    if form == D_KV_FORM_DEFAULT:
+        return DKvForm(
+            name=form,
+            d_bs=int(d_bs_default),
+            context_length=CONTEXT_LENGTH_TOKENS,
+            max_kv_per_request=int(max_kv_per_request),
+            max_mamba_cache_size=None,
+            cap_concurrency=int(d_bs_default),
+            cap_tokens=d_kv_form_cap_tokens(
+                int(d_bs_default), CONTEXT_LENGTH_TOKENS, extra_tokens
+            ),
+            line=(
+                "WEG2 D-KV-FORM objective=%s (the default, unchanged): group D runs "
+                "--max-running-requests %d at --context-length %d, so "
+                "_hybrid_kv_token_cap = max(%d, mamba_slots // %d) x (%d + %d) = %d "
+                "tokens and does not bind the profiled pool (boot weg2sb5e:380 "
+                "printed 2,621,510 against a 671,680-token pool). The bs1 "
+                "positions of WEG2_KV1M_SPEC_0908 sec 2.1 (%s) are SELECTABLE and "
+                "never silent; this boot did not take one."
+                % (
+                    form,
+                    int(d_bs_default),
+                    CONTEXT_LENGTH_TOKENS,
+                    int(d_bs_default),
+                    D_MAMBA_RATIO,
+                    CONTEXT_LENGTH_TOKENS,
+                    extra_tokens,
+                    d_kv_form_cap_tokens(
+                        int(d_bs_default), CONTEXT_LENGTH_TOKENS, extra_tokens
+                    ),
+                    ", ".join(c for c in D_KV_FORM_CHOICES if c != D_KV_FORM_DEFAULT),
+                )
+            ),
+        )
+    if d_bs_was_passed:
+        raise Weg2LaunchRefused(
+            "W52 Weg2KvFormRefused: --d-kv-form %s OWNS group D's concurrency "
+            "(--max-running-requests 1 is what collapses the mamba sizer to 5 "
+            "slots and frees 7/8 of both mamba posts), so --d-bs must not be "
+            "passed beside it. Drop --d-bs, or take --d-kv-form %s."
+            % (form, D_KV_FORM_DEFAULT)
+        )
+    if max_kv_per_request_was_passed:
+        raise Weg2LaunchRefused(
+            "W52 Weg2KvFormRefused: --d-kv-form %s OWNS group D's per-request KV "
+            "ceiling -- the whole point of the position is that the ceiling is "
+            "raised in step with the concurrency collapse. An operator value "
+            "beside it is the second statement that would silently win or lose. "
+            "Drop --max-kv-per-request, or take --d-kv-form %s."
+            % (form, D_KV_FORM_DEFAULT)
+        )
+    if form == "bs1-ctx1m":
+        ctx = CONTEXT_LENGTH_TOKENS_1M
+        slots = None
+        concurrency = 1
+        price = (
+            "concurrency 8 -> 1; retention_pin_budget 8 -> 1 slot, so D's prefix "
+            "cache collapses and D prefills more (spec R-5); every prompt above "
+            "D's 27,466-token carrier takes ONE D-side prefill (spec R-4); and "
+            "the RoPE growth at a 1,048,576 context is charged to Account A on "
+            "an UNPROVEN account (spec sec 7.1 / R-11) -- if it lands in Account "
+            "B instead, this position is dead and bs1-slots is the survivor"
+        )
+    else:
+        ctx = CONTEXT_LENGTH_TOKENS
+        slots = D_KV_FORM_SLOTS_MAMBA_CACHE
+        concurrency = D_KV_FORM_SLOTS_MAMBA_CACHE // D_MAMBA_RATIO
+        price = (
+            "concurrency 8 -> 1 for admission while the CAP is bought from the "
+            "state pool instead of the context: +%d mamba slots over the bs1 "
+            "sizer's 5, which also restores retention_pin_budget to 12 slots "
+            "(no prefix-cache collapse) and carries NO RoPE growth. No single "
+            "request may exceed %d tokens in this position"
+            % (D_KV_FORM_SLOTS_MAMBA_CACHE - 5, CONTEXT_LENGTH_TOKENS)
+        )
+    cap = d_kv_form_cap_tokens(concurrency, ctx, extra_tokens)
+    return DKvForm(
+        name=form,
+        d_bs=1,
+        context_length=ctx,
+        max_kv_per_request=ctx,
+        max_mamba_cache_size=slots,
+        cap_concurrency=concurrency,
+        cap_tokens=cap,
+        line=(
+            "WEG2 D-KV-FORM objective=%s (SELECTED, not the default %r): group D "
+            "runs --max-running-requests 1 --context-length %d "
+            "--max-kv-per-request %d%s, so _hybrid_kv_token_cap = max(1, %s // %d) "
+            "= %d x (%d + %d) = %d tokens. THE CEILING THIS BUYS: the cap no "
+            "longer binds a pool up to %d tokens, against the %d the bare bs1 "
+            "form would have clamped it to (WEG2_KV1M_SPEC_0908 sec 2.1, the "
+            "-61%% trap). WHAT IT COSTS: %s. Nothing here is lossy and the MTP "
+            "drafter stays on (user law 2026-09-09)."
+            % (
+                form,
+                D_KV_FORM_DEFAULT,
+                ctx,
+                ctx,
+                "" if slots is None else " --max-mamba-cache-size %d" % slots,
+                "5 (bs1 sizer)" if slots is None else str(slots),
+                D_MAMBA_RATIO,
+                concurrency,
+                ctx,
+                extra_tokens,
+                cap,
+                cap,
+                d_kv_form_cap_tokens(1, CONTEXT_LENGTH_TOKENS, extra_tokens),
+                price,
+            )
+        ),
+    )
 #: WEG2_SCHEDULING_SPEC_0907 C10/K5 -- the RECORDED break-even inputs, used
 #: only when this rig's own logs carry none.  Measured pair from record
 #: 1l/1o (boot weg2zr2, tip 7e3a9150b4): D's realised single-prefill rate at
@@ -1480,6 +1711,7 @@ def common_flags(
     random_seed: int = RANDOM_SEED,
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
+    context_length: int = CONTEXT_LENGTH_TOKENS,
 ) -> List[str]:
     """Flags BOTH groups share.
 
@@ -1496,6 +1728,12 @@ def common_flags(
     disable_overlap_schedule=True inheriting a PP-only reason (BSSCALE_0907.md
     D4), so CPU scheduling of round n+1 could not hide behind GPU work of
     round n on a group that has no pipeline at all.  See argv_p / argv_d.
+
+    ``context_length`` IS still shared in every shipped position (#1023 S1):
+    it is a parameter only so group D's ``bs1-ctx1m`` form can raise its own
+    ceiling without moving group P's, and the default reproduces today's argv
+    byte-for-byte.  A boot where the two differ says so on the D-KV-FORM line
+    -- it is not something a reader has to diff two argvs to discover.
     """
     return [
         "--model-path", model,
@@ -1504,7 +1742,7 @@ def common_flags(
         "--rank-gpu-id", "0,1,2",
         "--skip-server-warmup",
         "--kv-cache-dtype", "fp8_e4m3",
-        "--context-length", str(CONTEXT_LENGTH_TOKENS),
+        "--context-length", str(context_length),
         # C14/K9: the per-request KV ceiling, decoupled from the model
         # context. A CEILING, not the pressure relief: on D the device pool
         # is far below d_bs x 262,144, so this never binds first.
@@ -1729,12 +1967,23 @@ def argv_d(
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
     admin_api_key: Optional[str] = None,
+    context_length: int = CONTEXT_LENGTH_TOKENS,
+    max_mamba_cache_size: Optional[int] = None,
 ) -> List[str]:
+    # #1023 S1: the last two parameters are group D's KV FORM, and their
+    # defaults ARE today's boot -- an unset form emits neither flag and the
+    # shared --context-length, so this argv is byte-identical to the one every
+    # weg2sb5* boot ran. They are never passed by hand: main derives them from
+    # --d-kv-form through resolve_d_kv_form, which also prints the ceiling the
+    # position buys and the price it charges.
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_gib, max_kv_per_request, "write_through", "D",
-        random_seed, barlink_cap_cycles, census_interval,
+        random_seed, barlink_cap_cycles, census_interval, context_length,
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
+    ) + (
+        [] if max_mamba_cache_size is None
+        else ["--max-mamba-cache-size", str(int(max_mamba_cache_size))]
     ) + [
         # C1/K2: D's own bs, independent of P's by construction.
         "--max-running-requests", str(d_bs),
@@ -5117,9 +5366,27 @@ def build_parser() -> argparse.ArgumentParser:
                     help="K1: group P's --max-running-requests AND the front's leg-1 concurrency. "
                          "Independent of --d-bs (law 2). Default 8 = today's shipped value. Also "
                          "sizes P's req_to_token_pool, so it is resolved before the budget solve.")
-    ap.add_argument("--d-bs", type=int, default=8,
-                    help="K2: group D's --max-running-requests AND the number of front seats, so "
-                         "the front never hands D more concurrent requests than D can run.")
+    ap.add_argument("--d-bs", type=int, default=None,
+                    help=f"K2: group D's --max-running-requests AND the number of front seats, so "
+                         f"the front never hands D more concurrent requests than D can run. Unset = "
+                         f"{D_BS_DEFAULT} (unchanged); the default is a sentinel only so --d-kv-form "
+                         f"can tell 'the operator asked for 8' from 'nobody said'.")
+    ap.add_argument("--d-kv-form", choices=list(D_KV_FORM_CHOICES),
+                    default=D_KV_FORM_DEFAULT,
+                    help=f"#1023 S1. Group D's KV FORM -- a KV-vs-Perf objective position, never a "
+                         f"default and never a hand pin. {D_KV_FORM_DEFAULT!r} (default) is today's "
+                         f"boot byte-for-byte. 'bs1-ctx1m' runs D at --max-running-requests 1 and "
+                         f"raises BOTH --context-length and --max-kv-per-request to "
+                         f"{CONTEXT_LENGTH_TOKENS_1M}, so the per-request cap "
+                         f"(_hybrid_kv_token_cap) stops clamping the pool to {CONTEXT_LENGTH_TOKENS + 7} "
+                         f"tokens; it costs the prefix-cache retention pin and carries the UNPROVEN "
+                         f"RoPE account of WEG2_KV1M_SPEC_0908 sec 7.1. 'bs1-slots' buys the same cap "
+                         f"from the state pool instead (--max-mamba-cache-size "
+                         f"{D_KV_FORM_SLOTS_MAMBA_CACHE}, concurrency term "
+                         f"{D_KV_FORM_SLOTS_MAMBA_CACHE // D_MAMBA_RATIO}), keeps the "
+                         f"{CONTEXT_LENGTH_TOKENS} context and the retention pin, and has no RoPE "
+                         f"growth. A bs1 position OWNS --d-bs and --max-kv-per-request: passing "
+                         f"either beside it is W52 Weg2KvFormRefused.")
     ap.add_argument("--tp-prefill-max-tokens", type=int, default=None,
                     help="K5 (X): uncached tokens D may prefill itself. Unset = DERIVED as "
                          "2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip "
@@ -5655,8 +5922,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # reason -- one number, printed with its inputs, then TOLD to both the
     # front and group D (C2/R-6: no HTTP round trip to a sleeping group).
     p_bs = max(1, int(ns.p_bs))
-    d_bs = max(1, int(ns.d_bs))
+    d_bs = max(1, D_BS_DEFAULT if ns.d_bs is None else int(ns.d_bs))
     max_kv_per_request = int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS)
+    # #1023 S1 -- THE CAP SEAM, RESOLVED HERE AND DERIVED, never pinned. The
+    # form owns group D's concurrency and per-request ceiling in every position
+    # but the default; ``extra`` is read off D's own argv (the drafter's
+    # --speculative-num-draft-tokens, which the user law of 2026-09-09 keeps
+    # on), so the printed ceiling cannot drift from the boot that runs.
+    d_kv_form = resolve_d_kv_form(
+        ns.d_kv_form,
+        d_bs_default=d_bs,
+        max_kv_per_request=max_kv_per_request,
+        extra_tokens=d_kv_form_extra_tokens(
+            argv_d("py", ns.model, [1, 1, 1], 1, 1, 1.0, [], d_bs=d_bs)
+        ),
+        d_bs_was_passed=ns.d_bs is not None,
+        max_kv_per_request_was_passed=ns.max_kv_per_request is not None,
+    )
+    d_bs = d_kv_form.d_bs
+    log(d_kv_form.line)
     x_tokens, x_provenance = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
@@ -5675,7 +5959,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"SCHEDULING FLAGS AS EMITTED -- group P: --max-running-requests {p_bs} "
         f"--max-kv-per-request {max_kv_per_request} (no --tp-prefill-max-tokens: the PP prefill "
         f"group is not the one law 4 bounds); group D: --max-running-requests {d_bs} "
-        f"--max-kv-per-request {max_kv_per_request} --tp-prefill-max-tokens {x_tokens}; "
+        f"--max-kv-per-request {d_kv_form.max_kv_per_request} "
+        f"--context-length {d_kv_form.context_length} "
+        + ("" if d_kv_form.max_mamba_cache_size is None
+           else f"--max-mamba-cache-size {d_kv_form.max_mamba_cache_size} ")
+        + f"(--d-kv-form {d_kv_form.name}) --tp-prefill-max-tokens {x_tokens}; "
         f"front: --p-concurrency {p_bs} --d-bs {d_bs} --tp-prefill-max-tokens {x_tokens} "
         f"--flip-min-work-tokens {flip_min_work_tokens} --idle-layout {idle_layout_front} "
         f"--drain-deadline-s {ns.drain_deadline_s} --fairness-w-s {ns.fairness_w_s}"
@@ -6170,7 +6458,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, d_kv_form.max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key, context_length=d_kv_form.context_length, max_mamba_cache_size=d_kv_form.max_mamba_cache_size), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -6237,7 +6525,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, d_kv_form.max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key, context_length=d_kv_form.context_length, max_mamba_cache_size=d_kv_form.max_mamba_cache_size), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
