@@ -514,6 +514,18 @@ def price_shadow(card: str, need_bytes: int, free_mib: int, *,
                        up(reserve_bytes), str(scope), bool(graded))
 
 
+def oncard_lane_bytes(descs: Sequence[object], rank: int) -> int:
+    """THIS CARD's diagonal inside ``descs`` -- ``run_leg``'s own filter.
+
+    ONE DEFINITION, because the number is used twice (the bounce is priced from
+    it, and the hop is priced from it) and two copies of a filter is how the
+    sum-across-cards denominator got in.
+    """
+    return sum(int(d.nbytes) for d in descs
+               if d.kind != tp.ZEROFILL and _is_on_card(d)
+               and int(d.src_rank) == int(rank))
+
+
 def price_leg(card_uuid: str, descs: Sequence[object], *, rank: int,
               is_source: bool, oncard_mode: str, free_mib: int,
               oncard_slots: int = tp.ONCARD_SLOTS,
@@ -545,8 +557,7 @@ def price_leg(card_uuid: str, descs: Sequence[object], *, rank: int,
     """
     moved = [d for d in descs if d.kind != tp.ZEROFILL]
     mine_dst = [d for d in moved if int(d.dst_rank) == int(rank)]
-    oncard_bytes = sum(int(d.nbytes) for d in moved
-                       if _is_on_card(d) and int(d.src_rank) == int(rank))
+    oncard_bytes = oncard_lane_bytes(descs, rank)
     diag_slot = (int(tp.plan_oncard_slot_bytes(oncard_bytes).slot_bytes)
                  if oncard_slot_bytes is None else int(oncard_slot_bytes))
     # The IMPORTING side maps the exporter's allocation and allocates none of
@@ -947,6 +958,15 @@ class ShadowResult:
     gate_skew_ms: float = 0.0
     lock_wait_ms: Optional[float] = None
     pieces: int = 0
+    #: THE SHADOW'S OWN PRICED HOP, so the boot ticket can put a measurement
+    #: beside a prediction.  The PLAN line's ``oncard_hop_ms_priced`` prices the
+    #: FULL diagonal; a shadow leg moves a class SUBSET, so grading its
+    #: ``oncard_ms`` against the plan's number compares two different lanes.
+    #: ``ONCARD_PER_BATCH_MS`` carries its own measured arm (S5-pre, 32 MiB
+    #: slot, 16 batches, consumer side, RTX 5090).
+    oncard_slot_mib: float = 0.0
+    oncard_batches: int = 0
+    oncard_hop_ms_priced: Optional[float] = None
     direction: str = "?"
     ran: bool = False
     reason: str = ""
@@ -988,6 +1008,9 @@ class ShadowResult:
             f"slot_checksum_mismatch={counters.checksum_mismatch} "
             f"slot_checksum_not_representable="
             f"{counters.checksum_not_representable} "
+            f"oncard_slot_mib={self.oncard_slot_mib:g} "
+            f"oncard_batches={self.oncard_batches} "
+            f"oncard_hop_ms_priced={ms(self.oncard_hop_ms_priced)} "
             f"oncard_ms={self.oncard_ms:.3f} cross_ms={self.cross_ms:.3f} "
             f"ring_ms={ms(self.ring_ms)} compare_ms={self.compare_ms:.3f} "
             f"xchg_ms={self.oncard_ms + self.cross_ms:.3f} "
@@ -1186,6 +1209,16 @@ def shadow_transport(
             floor_mib=floor_mib, stripe_bytes=stripe_bytes,
             reserve_bytes=resume_reserve_bytes, scope=SCOPE_SUBSET)
         log(price.line())
+        # The lane's own geometry, on the line, from the same two numbers that
+        # sized the bounce -- a prediction the boot can be graded against.
+        # BEFORE THE GATE, because it is a property of the PLAN and not of the
+        # run: a leg the gate switches off still prints what it would have
+        # cost, which is the number a refused boot needs most.
+        diag_bytes = oncard_lane_bytes(subset.descs, rank)
+        result.oncard_slot_mib = diag_slot / MIB
+        result.oncard_batches = -(-diag_bytes // diag_slot) if diag_bytes else 0
+        result.oncard_hop_ms_priced = (result.oncard_batches
+                                       * tp.ONCARD_PER_BATCH_MS)
         if not price.affordable:
             log(price.message())
             if explicit:
