@@ -7112,6 +7112,46 @@ class Weg2RingFormUnproven(ring_table.Weg2RingRefused):
     """
 
 
+class Weg2ChunkCardMismatch(Weg2LaunchRefused, ValueError):
+    """W52: ``chunk_tag_cards()``'s ``card_of_stage`` length does not match
+    the PP stage count (#1294).
+
+    Before this class existed the site raised a bare ``ValueError``, which is
+    reachable from ``main()`` after the dry-return (``launcher.py`` calls
+    ``chunk_tag_cards`` while building the flip's chunk-tag-to-card map) and
+    left the sglang groups alive on the cards as an uncaught traceback --
+    both funnels (this one and the pre-#1248 one) missed it because it was
+    neither in ``REFUSALS`` nor named ``Weg2*``.  Subclasses BOTH
+    ``Weg2LaunchRefused`` (so ``cli()``'s ``except REFUSALS`` catches it, the
+    same as every other launch refusal) AND ``ValueError`` (so the
+    pre-existing ``test_weg2_flip_order_1233.py::test_card_list_that_does_not_match_the_stages_is_refused``
+    -- which asserts ``ValueError`` and is not itself in scope here -- keeps
+    passing unmodified: the exception TYPE this call raises is intentionally
+    made richer, not swapped for an unrelated one, so no consumer of the old
+    type loses its match).
+    """
+
+
+class Weg2CarrierFloorUnreachable(Weg2LaunchRefused):
+    """W54: ``carrier_census.route_floor()``'s bisection could not bracket a
+    prompt length that exceeds the SHORT bound (#1294).
+
+    Before this class existed the site raised a bare ``RuntimeError`` for
+    what its own comment calls unreachable "for any sane divisor" --
+    reachable from ``main()`` after the dry-return via
+    ``_cc.route_floor(x_tokens)`` -- and left the sglang groups alive on the
+    cards as an uncaught traceback, missed by both funnels for the same
+    reason as ``Weg2ChunkCardMismatch`` above.  No pre-existing test asserts
+    on the specific ``RuntimeError`` this branch used to raise (checked:
+    every ``route_floor`` call site in
+    ``test_weg2_1246_carrier_census.py`` exercises the normal
+    ``(floor, why)`` return, none the unreachable branch), so no
+    multiple-inheritance is needed here -- ``Weg2LaunchRefused`` already
+    subclasses ``RuntimeError``, so any hypothetical ``except RuntimeError``
+    elsewhere still matches.
+    """
+
+
 #: Every refusal class that must leave this launcher as the ONE named line and
 #: exit 2, never as a traceback.  ``Weg2RingRefused`` is a BASE class on purpose
 #: (FIX 2): the previous list enumerated its members, ``Weg2RingNeedsInterleave``
