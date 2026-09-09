@@ -203,7 +203,7 @@ class CorridorSolve:
     @property
     def changed(self) -> bool:
         return self.unpriced_reason is None and any(
-            l.count("->") and " verdict=APPLIED" in l for l in self.lines
+            ln.count("->") and " verdict=APPLIED" in ln for ln in self.lines
         )
 
 
@@ -417,8 +417,10 @@ def floors_for_cards(
     scalar 1024 that every card was graded against and that no caller ever
     passed.  It is now a required per-card input with provenance, because the
     two halves of the old number are per-card quantities: the awake group's
-    measured transient peak differs by card (1055/1097/858 MiB on this rig at
-    the S3 P ingest) and so does the user reserve.
+    measured transient peak differs by card (1055/1095/858 MiB on this rig at
+    the S3 P ingest, re-read from the dumps by the serve-next4 train -- the
+    earlier 1097 was a stale quote of the same file) and so does the user
+    reserve.
     """
     return {
         c.uuid: corridor_floor_mib(

@@ -78,7 +78,7 @@ def corridor_law_floor_bytes(card_uuid: str = "", group: Optional[str] = None) -
     #1257c / REFUTER FINDING 6 (2026-09-09): THE FLOOR IS NO LONGER A RIG-WIDE
     CONSTANT, so importing the constant became exactly the second-floor defect
     this function's own docstring forbids. On this rig the guard says 858 on
-    one card and 1097 on another while the flat import kept saying 1024 --
+    one card and 1095 on another while the flat import kept saying 1024 --
     short on one card and over-reserving on the other, both silently. Given a
     ``card_uuid`` this now takes the SAME derivation every other consumer takes
     (``corridor_floor_mib``): the awake group's measured transient plus the

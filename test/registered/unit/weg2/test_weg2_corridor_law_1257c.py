@@ -26,12 +26,18 @@ Five consequences follow, and each has a test below:
    requires it, and it prints its provenance;
 5. the upper band edge is a FINDING (``unmobilised_free_mib=``), never a FAIL.
 
-THE REAL CASE ON THIS RIG IS MIXED, and it is tested as such: group P's
-transient IS measured (S3 ingest 2026-09-09,
+BOTH THE MIXED AND THE ALL-MEASURED CASE ARE TESTED, because the rig moved
+under this file. When it was written, group P's transient was measured (S3
+ingest 2026-09-09,
 ``/root/.cache/sglang/phase_footprint-a191a0712717-055c2e4b0867.json``, 1055 /
-1097 / 858 MiB per card) and group D's is NOT (no boot has yet written
-``phase_footprint_D_rank*.json``). A test that only exercised "all measured"
-or "none measured" would miss exactly the boot this tree is about to take.
+1095 / 858 MiB per card) and group D's was not. The serve-next4 train then
+ingested boot weg2sb5h's OWN D dumps
+(``phase_footprint-a191a0712717-cc0ac5caf91e.json``, 767 / 700 / 701 MiB) and
+published both groups into the pointer, so on this rig BOTH groups now read
+MEASURED. The mixed case below is kept deliberately: it is the state of any
+other box, of a cleared cache, and of the first boot of any new recipe.
+(The P numbers here were 1055/1097/858 until 2026-09-09; 1097 was a stale
+quote of the same file, which says 1095 on ``GPU-5c648f96``.)
 
 HERMETIC: no NVML, no torch, no GPU, no boot. Every footprint is written into
 a tmp cache dir and read back through the shipped store.
@@ -58,7 +64,7 @@ HW = "a191a0712717"
 C5090 = "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
 C3080A = "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7"
 C3080B = "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"
-P_PEAKS = {C5090: 1055, C3080A: 1097, C3080B: 858}
+P_PEAKS = {C5090: 1055, C3080A: 1095, C3080B: 858}
 
 
 @dataclass
@@ -153,7 +159,7 @@ class CorridorFloorDerivation(unittest.TestCase):
     def test_the_floor_is_per_card_and_not_rig_uniform(self):
         _write_footprints(self.cache, "pdigest", P_PEAKS)
         got = {u: self._floor(u, "P").mib for u in P_PEAKS}
-        self.assertEqual(got, {C5090: 1055, C3080A: 1097, C3080B: 858})
+        self.assertEqual(got, {C5090: 1055, C3080A: 1095, C3080B: 858})
         # And two of the three are TIGHTER than the 1024 they replace, which is
         # the finding that makes "dropping the reserve is a relaxation" false.
         self.assertGreater(got[C5090], cg.CORRIDOR_LAW_MIB)
@@ -194,7 +200,8 @@ class CorridorFloorDerivation(unittest.TestCase):
         """MUTANT DIRECTION: a reader that only ever looks up group P.
 
         The moment a boot writes ``phase_footprint_D_rank*.json`` and it is
-        ingested, D's floor must MOVE. A derivation that hard-codes the P
+        ingested, D's floor must MOVE -- which is exactly what happened on
+        this rig on 2026-09-09 (weg2sb5h's D dumps, digest cc0ac5caf91e). A derivation that hard-codes the P
         digest, or that keys on a filename instead of the (fingerprint,
         profile digest, card) triple, passes every other test in this file and
         fails this one.
@@ -214,13 +221,13 @@ class CorridorFloorDerivation(unittest.TestCase):
         path = _write_footprints(self.cache, "pdigest", P_PEAKS)
         f = self._floor(C3080A, "P")
         self.assertIn(path, f.provenance)
-        self.assertIn("1097", f.provenance)
+        self.assertIn("1095", f.provenance)
         line = f.line
         for token in (
             "CORRIDOR-FLOOR",
             f"card={C3080A}",
             "group=P",
-            "floor=1097",
+            "floor=1095",
             "source=MEASURED-P",
             "reserve=0",
             "actuates=yes",
@@ -486,8 +493,8 @@ class TheSharedSurfaces(unittest.TestCase):
         line = (
             "WEG2-CORRIDOR phase=D(awake) epoch=3 "
             "instrument=nvml_v2_free,allocatable band=819-1266MiB "
-            "nvml0:free=1095MiB reserved=425MiB floor=1097MiB "
-            "verdict_floor=1097MiB source=MEASURED-P "
+            "nvml0:free=1095MiB reserved=425MiB floor=1095MiB "
+            "verdict_floor=1095MiB source=MEASURED-P "
             "reserve=0MiB verdict=BELOW "
             "nvml1:free=474MiB reserved=518MiB floor=1055MiB "
             "verdict_floor=1055MiB source=MEASURED-P "
@@ -501,7 +508,7 @@ class TheSharedSurfaces(unittest.TestCase):
         self.assertEqual(
             got,
             {
-                0: ring_table.FrontFloor(1097, "MEASURED-P", 1097),
+                0: ring_table.FrontFloor(1095, "MEASURED-P", 1095),
                 1: ring_table.FrontFloor(1055, "MEASURED-P", 1055),
             },
         )
@@ -959,10 +966,13 @@ class RefuterFixThreeOneDigestOneGroup(unittest.TestCase):
     def test_the_first_boot_fallback_says_why_and_who_fixes_it(self):
         """The launcher reads the floor before the process that publishes it.
 
-        VERIFIED ON THIS RIG 2026-09-09: the phase footprints exist
-        (1055/1097/858 MiB) and the pointer file does NOT, so every card reads
-        the fallback until a boot of that group publishes which digest it
-        used. An operator reading the line should not have to derive that.
+        The state this test pins is the state of a cache that has footprints
+        but no pointer: every card reads the fallback until a boot of that
+        group publishes WHICH digest it used, and an operator reading the line
+        should not have to derive that. (On this rig the pointer has since
+        been seeded from weg2sb5h's dumps, so the rig itself is no longer in
+        this state -- the cache dir here is a tmp one, which is why the test
+        still exercises it.)
         """
         got = cg.corridor_floor_mib(
             C5090, group="P", hw_fingerprint=HW, cache_dir=self.cache

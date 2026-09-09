@@ -169,8 +169,8 @@ def line_for(solve, uuid):
     written to catch.
     """
     hits = [
-        l for l in solve.lines
-        if f"card={uuid} " in l and " verdict=" in l
+        ln for ln in solve.lines
+        if f"card={uuid} " in ln and " verdict=" in ln
     ]
     assert len(hits) == 1, (
         f"expected exactly one verdict line for {uuid}, got {len(hits)}"
@@ -181,8 +181,8 @@ def line_for(solve, uuid):
 def installed_line_for(solve, uuid):
     """The ``INSTALLED`` provenance line for one card, or ``None`` (#1257c)."""
     hits = [
-        l for l in solve.lines
-        if f"card={uuid} INSTALLED " in l
+        ln for ln in solve.lines
+        if f"card={uuid} INSTALLED " in ln
     ]
     return hits[0] if hits else None
 
@@ -234,7 +234,7 @@ class TheInstrumentReproducesTheMetal(CustomTestCase):
     def test_predicted_world_pool_equals_the_pool_D_actually_served(self):
         """D.log:380 EFFECTIVE max_total_num_tokens 674080, reproduced from the
         three profiled capacities and the installed vector."""
-        s = sb5f_sample()
+        sb5f_sample()
         caps = [SB5F_PROFILED[c["card_uuid"]] for c in SB5F_CARDS]
         pool, binder = cb._world_pool(caps, SB5F_VECTOR)
         self.assertEqual(pool, SB5F_WORLD_POOL)

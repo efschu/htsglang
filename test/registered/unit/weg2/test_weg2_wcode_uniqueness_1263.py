@@ -74,6 +74,15 @@ ROOTS = (
     "python/sglang/srt/weg2",
     "python/sglang/srt/managers",
     "python/sglang/srt/mem_cache",
+    # serve-next4 train (2026-09-09), refuter A finding 7 / refuter B R7: these
+    # two were OUTSIDE the walk, so a collision confined to them was invisible
+    # and the tree's answer for ``W18 Weg2PhaseFootprintCollision``
+    # (``mem_ledger/activation_probe.py``) and ``W40 Weg2PPCutRefused``
+    # (``planner/pp_cut_launch.py``) rested on a manual grep. Adding them
+    # changes no verdict at this tip -- the collision set is byte-identical --
+    # which is the point: the guard now DEFENDS what the grep asserted.
+    "python/sglang/srt/mem_ledger",
+    "python/sglang/srt/planner",
     "scripts/weg2",
 )
 FILES = ("python/sglang/srt/server_args.py",)
@@ -186,6 +195,10 @@ class TestOneWCodePerException(CustomTestCase):
         self.assertGreater(len(c), 20, "the W-code scan found almost nothing")
         self.assertIn("W50", c, "the renumbered prefill refusal must be found")
         self.assertIn("W47", c, "the objective refusal must still be found")
+        # THE TWO ROOTS ADDED BY THE serve-next4 TRAIN, named so that dropping
+        # one from ROOTS fails here instead of silently shrinking the surface.
+        self.assertIn("W18", c, "mem_ledger must be in the walk (W18)")
+        self.assertIn("W40", c, "planner must be in the walk (W40)")
 
     def test_no_new_collision(self):
         """RED-FIRST: this failed at the parent 64a2829afd with W47 in the

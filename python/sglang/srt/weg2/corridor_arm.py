@@ -202,7 +202,7 @@ class ArmReport:
     band_mib: Tuple[int, int] = (0, 0)
     #: #1257c: ``{nvml index: (floor MiB, source)}`` read back off the front's
     #: own CORRIDOR line. Empty on a pre-#1257c log.
-    floors: Dict[int, "ring_table.FrontFloor"] = field(default_factory=dict)
+    floors: Dict[int, ring_table.FrontFloor] = field(default_factory=dict)
     problems: List[str] = field(default_factory=list)
     #: #1257c: things worth saying that are NOT failures. The upper band edge
     #: lives here by user decision (2026-09-09, consequence 5).
