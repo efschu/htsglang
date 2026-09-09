@@ -923,11 +923,17 @@ def shadow_transport(
                                     scratch_bytes=stripe_bytes)
             mine_dst = [d for d in subset.descs if int(d.dst_rank) == int(rank)]
             shadowed = to_shadow(mine_dst, layout, buffers.ptr)
-            layout = {id(new): layout[id(old)]
-                      for old, new in zip(mine_dst, shadowed)}
             keep = {id(d) for d in mine_dst}
             leg_descs = [d for d in subset.descs if id(d) not in keep] + shadowed
-            run = ShadowRun(result, buffers, shadowed, layout,
+            # THE COMPARE KEEPS THE ORIGINAL DESCRIPTORS, and this is the one
+            # place the two address spaces must not be confused.  MEASURED
+            # DEFECT, caught by this slice's own can-fail control: handing the
+            # SHADOWED descriptors to the comparison made both of its sides the
+            # shadow buffer, so every stripe matched itself and the instrument
+            # could not go red.  A comparison whose two sides are the same
+            # pointer is the "gate that cannot fail" this campaign keeps
+            # naming, and it was one line.
+            run = ShadowRun(result, buffers, mine_dst, layout,
                             stripe_bytes=stripe_bytes)
         counters = result.counters
 
