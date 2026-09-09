@@ -1157,16 +1157,26 @@ class OnCardStats:
     elapsed_s: float = 0.0
 
     def line(self) -> str:
-        """The second acceptance line of spec section 6/S4.
+        """The second acceptance line of spec section 6/S4, plus ``hops``.
 
         ``hop_ms`` is THIS rank's half of the two hops, not the pair's total:
         the source's compaction and the destination's scatter run in two
         processes and neither can time the other without a clock they do not
         share.  E1 arm d predicts 11-18 ms for the whole diagonal.
+
+        ``hops`` is NOT in the spec's token list and is added deliberately.
+        ``bytes_mib`` is printed to two decimals, so anything under ~5 KiB
+        prints ``0.00`` -- indistinguishable from a lane that moved NOTHING.
+        On the real flip the diagonal is 10.28 GiB and the distinction never
+        arises, which is exactly why it would never have been noticed: the
+        six-process double, whose payloads are kilobytes, printed
+        ``bytes_mib=0.00`` for a lane that had just moved every byte correctly.
+        A line that cannot tell zero from small is not an acceptance, so the
+        batch count sits beside the size and is a hard zero when nothing moved.
         """
         return (
             f"{ONCARD_LINE_PREFIX} card={self.card_uuid} mode={self.mode} "
-            f"bytes_mib={self.bytes_moved / xr.MIB:.2f} "
+            f"bytes_mib={self.bytes_moved / xr.MIB:.2f} hops={self.hops} "
             f"hop_ms={self.elapsed_s * 1e3:.3f}"
         )
 
