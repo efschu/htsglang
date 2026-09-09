@@ -1001,11 +1001,21 @@ class Weg2LaunchRefused(RuntimeError):
 
 
 class Weg2StoreDiskRefused(Weg2LaunchRefused):
-    """W52: the disk cannot fund ``max_size + min_free`` for this boot's store."""
+    """W57: the disk cannot fund ``max_size + min_free`` for this boot's store.
+
+    RENUMBERED W52 -> W57 by the serve-next4 train (2026-09-09): W52 was
+    already ``Weg2NoServiceableRoute`` (``front.py``, #1290) at the base this
+    branch merges into.  The number is a label, the NAME is the identity
+    (``front.py``'s ``X_REFUSAL_MARKER`` note); grep the name.
+    """
 
 
 class Weg2StoreArcRefused(Weg2LaunchRefused):
-    """W53: the ZFS ARC is uncapped and the reap margin does not cover the store."""
+    """W58: the ZFS ARC is uncapped and the reap margin does not cover the store.
+
+    RENUMBERED W53 -> W58 by the serve-next4 train (2026-09-09): W53 was
+    already ``Weg2StoreHandbackFailed`` (``front.py``, #1291) at the base.
+    """
 
 
 @dataclass
@@ -1714,7 +1724,7 @@ def plan_store(
     ``min_free_space`` is checked against the DISK the directory lives on
     (``statvfs`` of ``root``), which is what
     ``LRUFileEvictor._enforce_free_space_locked`` will itself read at runtime;
-    there is no second reading and no second bookkeeping.  Raises W52 when the
+    there is no second reading and no second bookkeeping.  Raises W57 when the
     filesystem cannot fund ``max_size + min_free`` -- fail fast at preflight
     rather than let the evictor latch its write stop mid-flip.
     """
@@ -1873,7 +1883,7 @@ def arc_preflight_line(
     plan: StoreDiskPlan,
     margin_gib: Optional[float],
 ) -> str:
-    """ONE line pricing the ZFS ARC beside the reap margin, and W53 if it must.
+    """ONE line pricing the ZFS ARC beside the reap margin, and W58 if it must.
 
     THE ASSUMPTION, stated rather than assumed: the ARC is the cache ZFS keeps
     for this dataset, it is RECLAIMABLE under memory pressure (the kernel
@@ -5992,7 +6002,7 @@ def build_parser() -> argparse.ArgumentParser:
     # RAM leftover the store tmpfs had to get, and there is no RAM leftover to
     # floor any more -- the store is a directory on the ZFS dataset sized from
     # the P KV pool. Its replacement is not another knob but a LAW checked
-    # against the disk (max_size >= P pool bytes, W52). The two knobs below are
+    # against the disk (max_size >= P pool bytes, W57). The two knobs below are
     # the only ones the disk form has, and both have a stated default.
     ap.add_argument(
         "--store-sidecar-factor", type=float, default=STORE_SIDECAR_FACTOR,
@@ -6432,7 +6442,7 @@ def build_parser() -> argparse.ArgumentParser:
              f"({corridor_budget.UNPRICED_NAME}), not a default: the budgets "
              "then ship byte-identical and the log says so. The code is "
              "interpolated from the module constant on purpose; a hand-typed "
-             "one here is exactly how front.py:556's 'W52 is free' comment "
+             "one here is exactly how front.py's 'W52 is free' comment "
              "outlived the number it described.",
     )
     ap.add_argument(
@@ -7802,8 +7812,9 @@ class Weg2RingFormUnproven(ring_table.Weg2RingRefused):
 
 
 class Weg2ChunkCardMismatch(Weg2LaunchRefused, ValueError):
-    """W52: ``chunk_tag_cards()``'s ``card_of_stage`` length does not match
-    the PP stage count (#1294).
+    """W59: ``chunk_tag_cards()``'s ``card_of_stage`` length does not match
+    the PP stage count (#1294).  RENUMBERED W52 -> W59 (serve-next4 train,
+    2026-09-09); the emitter is ``weg2_memory_saver.py``.
 
     Before this class existed the site raised a bare ``ValueError``, which is
     reachable from ``main()`` after the dry-return (``launcher.py`` calls
@@ -7822,8 +7833,9 @@ class Weg2ChunkCardMismatch(Weg2LaunchRefused, ValueError):
 
 
 class Weg2CarrierFloorUnreachable(Weg2LaunchRefused):
-    """W54: ``carrier_census.route_floor()``'s bisection could not bracket a
-    prompt length that exceeds the SHORT bound (#1294).
+    """W60: ``carrier_census.route_floor()``'s bisection could not bracket a
+    prompt length that exceeds the SHORT bound (#1294).  RENUMBERED W54 -> W60
+    (serve-next4 train, 2026-09-09): W54 is ``Weg2CorridorBudgetUnpriced``.
 
     Before this class existed the site raised a bare ``RuntimeError`` for
     what its own comment calls unreachable "for any sane divisor" --

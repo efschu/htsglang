@@ -546,12 +546,17 @@ class TestPostSpawnRefusalRunsTeardown(CustomTestCase):
                      "total_mib": 32607, "reserved_mib": 0},
                 ],
             )
-            raise L.Weg2LaunchRefused("W53 fake post-spawn refusal")
+            # W45 (``Weg2CarrierCensusRefused``) is a REAL post-spawn refusal
+            # of this tree -- the docstring above enumerates it. A synthetic
+            # number, or a real number paired with an exception that does not
+            # hold it, is a live grep hit that outlives the fake (serve-next4
+            # refuter A, 2026-09-09).
+            raise L.Weg2LaunchRefused("W45 fake post-spawn refusal")
 
         rc, out = self._run_with(fake_main, _fake_snapshot({0: 0, 1: 0}))
         self.assertEqual(rc, 2)
         self.assertIn(
-            "WEG2-LAUNCH REFUSED W53 teardown=done groups=2 pids=2 cards_empty=True",
+            "WEG2-LAUNCH REFUSED W45 teardown=done groups=2 pids=2 cards_empty=True",
             out,
         )
 
@@ -564,12 +569,12 @@ class TestPostSpawnRefusalRunsTeardown(CustomTestCase):
                 cards=[{"nvml_index": 1, "uuid": "GPU-1", "name": "5090",
                         "total_mib": 32607, "reserved_mib": 0}],
             )
-            raise L.Weg2LaunchRefused("W53 Weg2TpOperatingPointDisablesUnevenAxis: fake")
+            raise L.Weg2LaunchRefused("W45 Weg2CarrierCensusRefused: fake")
 
         rc, out = self._run_with(fake_main, _fake_snapshot({1: 1434}))
         self.assertEqual(rc, 2)
         self.assertIn(
-            "WEG2-LAUNCH REFUSED W53 teardown=done groups=1 pids=1 cards_empty=False",
+            "WEG2-LAUNCH REFUSED W45 teardown=done groups=1 pids=1 cards_empty=False",
             out,
         )
 
