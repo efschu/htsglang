@@ -1364,21 +1364,88 @@ class SchedulerWeightUpdaterManager:
                     epoch=str(getattr(recv_req, "epoch", "") or ""),
                     detail="torch reports no CUDA device on this rank"))
                 return
+            # ------------------------------------------------------------
+            # #1273 S6 fix D -- THE IDENTITY SWEEP, not one more instance.
+            #
+            # Boot weg2shadowD found the SAME SHAPE one level up: the flip
+            # index degraded to -1, was COMPOSED INTO A STAMP
+            # (``weight_exchange_shadow.py:2753``,
+            # ``f"{boot_nonce}.{int(i.leg)}"``) and handed to
+            # ``XchgRegion.begin_flip``, which refused it as **W52
+            # Weg2XchgPlanDisagree** -- a name that says "the plan disagrees"
+            # about a leg whose actual condition is "this is not a flip".
+            #
+            # The three legs that produced it were group P's BOOT-TIME initial
+            # sleep at its own READY (14:33:55Z), 73 s BEFORE the first flip
+            # began (14:35:08Z).  That leg carries no epoch because no flip
+            # exists yet -- the W63 printed ``epoch=`` EMPTY, not malformed --
+            # so the -1 was honest and only its downstream use was not.
+            #
+            # UPSTREAM-MINIMAL, and it is why no counter is added here: the
+            # FRONT owns the flip counter and publishes it on the request
+            # (``front.py:2667`` composes ``credit_epoch(boot, self.epoch)``
+            # and sends it on BOTH gathered legs, ``:2676-2680``); every real
+            # flip leg of shadowD carried ``epoch=1788964408.0`` / ``.1``
+            # correctly.  ``credit_epoch``'s own docstring records what a
+            # rank-local counter costs -- a cross-boot collision that fed C14
+            # a previous boot's credit.  So the authority is the request, and
+            # the right behaviour when it is absent is to REFUSE BY NAME, never
+            # to invent an index and never to let the sentinel travel.
+            #
+            # THE CLASS, swept here in one place: every identity this hook
+            # reads is resolved BEFORE the inputs are built, and any one that
+            # is missing becomes a NAMED W63 refusal instead of a sentinel that
+            # downstream code has to recognise.  The sentinels that used to
+            # travel were: leg=-1 / epoch="" (W52, above), card_uuid="unknown"
+            # (an unnamed card priced and charged as if it were a real one),
+            # and free_mib=0 (an UNREADABLE NVML free column priced as a FULL
+            # card -- ``price_shadow`` would then refuse UNAFFORDABLE giving
+            # the wrong reason, which is worse than not pricing).
+            # ------------------------------------------------------------
+            leg = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
+            epoch_token = str(getattr(recv_req, "epoch", "") or "")
+            if leg < 0:
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-flip-epoch", rank=rank, leg=leg,
+                    epoch=epoch_token,
+                    detail=f"hook={hook} -- this leg carries no flip epoch, so "
+                           f"it is not a flip: the front publishes the index on "
+                           f"the request (front.py:2667) and the boot-time "
+                           f"initial sleep runs before any flip exists.  A leg "
+                           f"with no flip identity may not stamp a region"))
+                return
+            card_uuid = self._weg2_card_uuid()
+            if not card_uuid:
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-card", rank=rank, leg=leg, epoch=epoch_token,
+                    detail=f"hook={hook} -- NVML could not name this rank's "
+                           f"card, and every shadow term (the price, the "
+                           f"deposit charge, the W61 line) is keyed by it"))
+                return
             peer = "D" if group == "P" else "P"
             free_bytes = self._weg2_free_bytes()
+            if free_bytes is None:
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-free-column", rank=rank, leg=leg,
+                    epoch=epoch_token,
+                    detail=f"hook={hook} card={card_uuid} -- the LIVE NVML free "
+                           f"column is what price_shadow grades against and it "
+                           f"could not be read; pricing against 0 would refuse "
+                           f"UNAFFORDABLE naming a full card that is not full"))
+                return
             plan, plan_reason = self._weg2_shadow_plan(str(hook), group,
                                                        int(rank))
             inputs = sh.ShadowLegInputs(
-                leg=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
-                epoch=str(getattr(recv_req, "epoch", "") or ""),
+                leg=leg,
+                epoch=epoch_token,
                 direction="d2h" if hook == sh.HOOK_SOURCE else "h2d",
                 hook=str(hook),
                 rank=int(rank),
                 row=xr.rank_row(group, int(rank)),
                 peer_row=xr.rank_row(peer, int(rank)),
                 device=int(device),
-                card_uuid=self._weg2_card_uuid() or "unknown",
-                free_mib=0 if free_bytes is None else int(free_bytes // MIB_),
+                card_uuid=card_uuid,
+                free_mib=int(free_bytes // MIB_),
                 resume_reserve_bytes=int(reserve_bytes),
                 ring_ms=ring_ms,
                 gate_rows=self._weg2_shadow_gate_rows(str(hook), group),
