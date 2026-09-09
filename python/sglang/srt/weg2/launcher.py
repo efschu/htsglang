@@ -5282,7 +5282,9 @@ def incumbent_candidate(decision, incumbent_layers, incumbent_attn):
     return None
 
 
-def shipped_line(decision, chosen, ship_why, incumbent_row, makespan_row) -> str:
+def shipped_line(
+    decision, chosen, ship_why, incumbent_row, makespan_row, *, incumbent_fallback: str
+) -> str:
     """THE ``PP-CUT SHIPPED`` line. Pure, so it can be RENDERED by a test.
 
     Split out for the same reason :func:`incumbent_candidate` was: this line is
@@ -5292,6 +5294,13 @@ def shipped_line(decision, chosen, ship_why, incumbent_row, makespan_row) -> str
     to it produces -- a wrong arity raises TypeError at emit time, i.e. after
     the weights are loaded, i.e. a spent window. Now a desk test builds a
     decision and renders it.
+
+    ``incumbent_fallback`` is passed IN rather than built from
+    ``P_PP_STAGE_RATIO_SCORES`` here, and that is not style. #1233 pins the
+    census of functions that read the incumbent score vector, precisely because
+    an extra reader is how a constant drifts back into the argv path; this
+    formatter has no business joining that list, so the one string it would
+    need is handed to it by the caller that legitimately holds the vector.
 
     #1286b renamed ``pool_tokens=`` to ``chosen_pool=`` and added
     ``pool_floor=``: a pool figure whose constraint is not printed beside it is
@@ -5314,9 +5323,7 @@ def shipped_line(decision, chosen, ship_why, incumbent_row, makespan_row) -> str
             "none" if decision.pool_floor is None else str(int(decision.pool_floor)),
             chosen.makespan_ms,
             ship_why,
-            incumbent_row.fmt() if incumbent_row is not None else "%s / %s" % (
-                _csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)
-            ),
+            incumbent_row.fmt() if incumbent_row is not None else incumbent_fallback,
             "%d" % int(incumbent_row.pool_tokens) if incumbent_row is not None
             else "n/a (NOT RANKED by this solve)",
             "%.1f" % incumbent_row.makespan_ms if incumbent_row is not None
@@ -5714,7 +5721,17 @@ def solve_p_cut(
     decision.refuse_shipped_below_floors(
         chosen, "the SHIPPED cut (%s)" % (ship_why.split(" (")[0],)
     )
-    log(shipped_line(decision, chosen, ship_why, incumbent_row, makespan_row))
+    log(
+        shipped_line(
+            decision,
+            chosen,
+            ship_why,
+            incumbent_row,
+            makespan_row,
+            incumbent_fallback="%s / %s"
+            % (_csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)),
+        )
+    )
     # #1286 -- THE JOIN LINE. `PP-CUT SHIPPED` prices the three objectives, but
     # nothing on it could be JOINED against what group P then sized: the two
     # halves are emitted by different processes, in different units, with no

@@ -119,14 +119,30 @@ class TheConsumersReadTheOneSeam(CustomTestCase):
 
 class ThePriceOfBothAlternativesIsPrintedEveryBoot(CustomTestCase):
     def test_the_shipped_line_prices_all_three_arms(self):
+        """#1286b MOVED THE LINE AND RENAMED ONE FIELD; this guard follows it.
+
+        The line was extracted from ``solve_p_cut`` into the pure
+        ``launcher.shipped_line`` so a desk test can RENDER it -- twelve
+        substitutions across one %-format whose only proof of rendering used
+        to be a boot -- and ``pool_tokens=`` became ``chosen_pool=`` beside a
+        new ``pool_floor=``.  This guard is about the INTENT (all three arms
+        priced on the shipped line, every boot) and not about the address, so
+        it moves with the line rather than being deleted; a guard left pointing
+        at the old location is how a suite starts lying about what it pins,
+        which is the same reason the makespan-default test above was renamed
+        with its value.
+        """
         import inspect
 
-        src = inspect.getsource(launcher.solve_p_cut)
+        src = inspect.getsource(launcher.shipped_line)
         i = src.index("PP-CUT SHIPPED")
         window = src[i:i + 900]
         for token in ("incumbent %s pool %s", "pool-maximal (kv-floor)",
-                      "makespan-optimal", "pool_tokens=%d", "makespan_ms=%.1f"):
+                      "makespan-optimal", "chosen_pool=%d", "pool_floor=%s",
+                      "makespan_ms=%.1f"):
             self.assertIn(token, window)
+        # and it is still the line the boot emits, not an orphaned formatter
+        self.assertIn("shipped_line(", inspect.getsource(launcher.solve_p_cut))
 
 
 if __name__ == "__main__":
