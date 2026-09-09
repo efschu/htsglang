@@ -2079,6 +2079,10 @@ def test_every_w_code_this_slice_raises_is_free_and_named_once():
         # matches every grep of every old boot log, and this file's own
         # history is two collisions bought by picking a number.
         ("W65", "Weg2XchgDepositUnfundable"),
+        # S6 fix E (#1273): the on-card slot CEILING flag's refusal.  W65 was
+        # the census maximum when the comment above was written, so W66 is the
+        # next free code -- enumerated, not picked, and no retired gap reused.
+        ("W66", "Weg2XchgOncardSlotRefused"),
     }, found
 
 
