@@ -90,6 +90,39 @@ Environment contract
   N = 0     -> every token is fp8 (emulates today's fp8 body).
   N = all   -> no token is ever rounded (emulates full bf16; the identity).
   N = k     -> tokens older than the youngest k positions are fp8.
+
+THE 2026-09-09 NO-OP, ITS ROOT, AND THE TWO GUARDS THAT NOW MAKE IT LOUD
+-----------------------------------------------------------------------
+Boot ``weg2kvtail1`` ran four arms and every one came back BIT-IDENTICAL at all
+53,047 scored positions, ``N0`` included -- an fp8 round trip of every KV byte
+cannot do that.  The banner printed; the rounding never happened.
+
+ROOT, one line: ``begin_attention`` runs ONCE PER LAYER, and every layer of one
+forward pass carries the SAME ``forward_batch.seq_lens``.  The stale-sequence
+test was ``seq_len <= prev``, which is therefore TRUE at every layer boundary
+inside a single pass -- so ``reset_all()`` wiped every ring 60-odd times per
+forward, no ring ever held the PREVIOUS chunk's record, the eviction loop found
+``take <= 0`` on every call, and ``rounded_rows_total`` stayed 0 for the whole
+boot.  This is the lifecycle-table class: a DELETER (``reset_all``) sat between
+the WRITER (``after_write`` appending a record) and the READER (the eviction
+loop), separated by the LAYER event.
+
+The fix is ``<`` instead of ``<=`` plus a per-ring continuity guard, and it is
+deliberately not trusted on its own.  Two refusals make a repeat impossible to
+mistake for a null result:
+
+  * COVERAGE (``after_write``): after the eviction loop the ring must have
+    advanced ``evicted_upto`` all the way to the boundary the tail rule
+    demands.  The 2026-09-09 defect fails this on the FIRST write of the second
+    chunk.
+  * NO-OP (``begin_attention``, once per prefill batch): if the rule was DUE --
+    the sequence has grown past ``tail_n`` by at least one full write -- and not
+    one row has been round-tripped, the boot dies instead of producing a
+    perfect, meaningless A/A.
+
+Plus one log line per prefill batch (``KV-TAIL-PROBE roundtrips=...``) so a run
+carries its own engagement evidence and no future reader has to infer it from a
+banner.
 """
 
 from __future__ import annotations
@@ -119,6 +152,21 @@ FP8_DTYPE = torch.float8_e4m3fn
 #: Only these pool dtypes can carry the emulation: the pool must be WIDER than
 #: fp8, otherwise there is nothing to round down from.
 SUPPORTED_POOL_DTYPES = (torch.bfloat16, torch.float16)
+
+#: Printed for ``site=`` before any KV write has reached the probe.  It says
+#: "nothing arrived", never a plausible-looking class name -- a guessed site is
+#: exactly the fiction that cost boot weg2kvtail1.
+SITE_UNKNOWN = "NONE-REACHED-THE-PROBE"
+
+#: The one-line engagement report, one per prefill batch.  Kept as a constant
+#: so the runner and the tests grep the SAME literal the boot emits.
+REPORT_PREFIX = "KV-TAIL-PROBE"
+
+#: The boot-level no-op refusal.  W51 was picked by ENUMERATING the used set
+#: with the census in ``test/registered/unit/weg2/test_weg2_wcode_uniqueness_1263.py``
+#: (37 codes assigned, highest W50; 51 is the first free number above it, and
+#: it is not one of the {15, 18, 23, 39} that file pins as free).
+WCODE_NOOP = "W51 Weg2KvTailProbeNoOp"
 
 
 class KvTailProbeRefused(RuntimeError):
@@ -207,7 +255,9 @@ class _State:
     """Per-process probe state.  One ring per (pool identity, layer)."""
 
     __slots__ = ("rings", "ctx_seq_len", "ctx_scale", "ctx_layer_id", "residual_max",
-                 "banner_done", "writes", "reset_count")
+                 "banner_done", "writes", "reset_count", "tokens_seen",
+                 "rounded_total", "roundtrips", "site", "pool_dtype",
+                 "max_write_rows", "max_seq_len")
 
     def __init__(self) -> None:
         self.rings: Dict[Tuple[int, int], _LayerRing] = {}
@@ -218,6 +268,23 @@ class _State:
         self.banner_done: bool = False
         self.writes: int = 0
         self.reset_count: int = 0
+        #: Rows OFFERED to the probe: one row per token per layer, so this is
+        #: tokens x layers and never a token count.  Named, not inferred.
+        self.tokens_seen: int = 0
+        #: Rows actually fp8-round-tripped.  Under DCP this is only the subset
+        #: THIS rank owns, which is why it is reported beside ``tokens_seen``
+        #: and never as a fraction of it.
+        self.rounded_total: int = 0
+        #: ``fp8_round_trip_`` invocations that touched at least one row; k and
+        #: v are counted separately, so a demoted block scores 2.
+        self.roundtrips: int = 0
+        #: The pool class the bytes ACTUALLY took, recorded from the live call
+        #: rather than assumed from a docstring -- the exact question the
+        #: 2026-09-09 no-op had to be rooted by reading code.
+        self.site: Optional[str] = None
+        self.pool_dtype: Optional[str] = None
+        self.max_write_rows: int = 0
+        self.max_seq_len: int = 0
 
     def reset_all(self) -> None:
         for ring in self.rings.values():
@@ -248,6 +315,13 @@ def configure_for_test(tail_n: Optional[int], acked: bool = True) -> None:
     _STATE.ctx_seq_len = None
     _STATE.residual_max = 0
     _STATE.writes = 0
+    _STATE.tokens_seen = 0
+    _STATE.rounded_total = 0
+    _STATE.roundtrips = 0
+    _STATE.site = None
+    _STATE.pool_dtype = None
+    _STATE.max_write_rows = 0
+    _STATE.max_seq_len = 0
 
 
 def probe_stats() -> Dict[str, object]:
@@ -257,6 +331,11 @@ def probe_stats() -> Dict[str, object]:
     in the pass that wrote them while the tail rule said fp8 (see the module
     docstring).  A run with ``--chunked-prefill-size <= N`` must report 0; any
     other value has to be quoted beside the quality numbers.
+
+    DENOMINATORS, because two of these counters look like token counts and are
+    not: ``tokens_seen`` is rows OFFERED (tokens x layers), ``tokens_rounded``
+    is rows DEMOTED and under DCP covers only this rank's owned subset.  They
+    are never divided by one another here.
     """
     return {
         "active": ACTIVE,
@@ -265,8 +344,14 @@ def probe_stats() -> Dict[str, object]:
         "writes": _STATE.writes,
         "rings": len(_STATE.rings),
         "sequence_resets": _STATE.reset_count,
-        "rounded_rows_total": sum(r.rounded_rows for r in _STATE.rings.values()),
+        "rounded_rows_total": _STATE.rounded_total,
         "residual_rows_max": _STATE.residual_max,
+        "roundtrips": _STATE.roundtrips,
+        "tokens_seen": _STATE.tokens_seen,
+        "site": _STATE.site or SITE_UNKNOWN,
+        "pool_dtype": _STATE.pool_dtype or "unknown",
+        "max_write_rows": _STATE.max_write_rows,
+        "max_seq_len": _STATE.max_seq_len,
     }
 
 
@@ -305,6 +390,65 @@ def _resolve_mha_pool(pool):
     """Unwrap to the object that actually owns ``k_buffer`` / ``v_buffer``."""
     inner = getattr(pool, "full_kv_pool", None)
     return inner if inner is not None else pool
+
+
+def _is_extend_batch(forward_batch) -> bool:
+    """True for a prefill/extend pass.  Unknown shape counts as extend.
+
+    An unknown batch shape REPORTS rather than hides: a missing
+    ``forward_mode`` must not be able to silence the engagement line, because
+    silence is what the 2026-09-09 no-op looked like.
+    """
+    mode = getattr(forward_batch, "forward_mode", None)
+    is_extend = getattr(mode, "is_extend", None)
+    return True if is_extend is None else bool(is_extend())
+
+
+def _report_pass(prev_seq_len: Optional[int]) -> None:
+    """One engagement line per prefill batch, plus the boot-level no-op refusal.
+
+    DENOMINATOR AND TIMING, both stated because both can be misread: the
+    counters are CUMULATIVE over the process, and the line is emitted at the
+    START of a pass, so it covers everything up to and including the PREVIOUS
+    pass.  ``tokens_seen`` is rows offered (tokens x layers); ``tokens_rounded``
+    is rows demoted, which under DCP is only this rank's owned subset.
+
+    The refusal fires only once the rule was DUE -- the sequence has grown past
+    ``tail_n`` by at least one full write, evaluated on the PREVIOUS pass's
+    ``seq_len`` so that the writes which would do the rounding have already
+    had their chance.  The identity arm (``N=all``) rounds nothing by design
+    and is excluded by name, not by threshold.
+    """
+    logger.warning(
+        "%s roundtrips=%d tokens_seen=%d tokens_rounded=%d layers=%d site=%s "
+        "dtype=%s",
+        REPORT_PREFIX,
+        _STATE.roundtrips,
+        _STATE.tokens_seen,
+        _STATE.rounded_total,
+        len(_STATE.rings),
+        _STATE.site or SITE_UNKNOWN,
+        _STATE.pool_dtype or "unknown",
+    )
+    tail_n = _CFG.tail_n
+    if tail_n is None:
+        return
+    if _STATE.rounded_total > 0 or _STATE.tokens_seen == 0:
+        return
+    if prev_seq_len is None or prev_seq_len <= tail_n + _STATE.max_write_rows:
+        return
+    raise KvTailProbeRefused(
+        f"{WCODE_NOOP}: {REPORT_PREFIX} REFUSED: 0 round-trips after "
+        f"{_STATE.tokens_seen} tokens (rows offered across {len(_STATE.rings)} "
+        f"layer rings; tail_n={tail_n}, largest write {_STATE.max_write_rows} "
+        f"rows, previous pass seq_len={prev_seq_len}, so the tail rule was DUE "
+        f"and demanded demotions).  Writes reached "
+        f"{_STATE.site or SITE_UNKNOWN} at dtype "
+        f"{_STATE.pool_dtype or 'unknown'}.  This is the boot weg2kvtail1 "
+        "failure: the banner prints, nothing is rounded, and every arm comes "
+        "back bit-identical -- a PERFECT A/A that means nothing.  The arm dies "
+        "here instead."
+    )
 
 
 def begin_attention(layer, forward_batch) -> None:
@@ -347,11 +491,24 @@ def begin_attention(layer, forward_batch) -> None:
 
     seq_len = int(seq_lens[0].item())
     prev = _STATE.ctx_seq_len
-    # A shorter (or equal) sequence than the previous pass means a NEW request
+    # A STRICTLY shorter sequence than the previous pass means a NEW request
     # took the slot: positions restart at 0 and every ring is stale.
-    if prev is not None and seq_len <= prev:
+    #
+    # STRICTLY -- and that single character is the whole 2026-09-09 no-op.
+    # This hook runs ONCE PER LAYER and every layer of one forward pass carries
+    # the SAME seq_lens, so the old ``<=`` wiped every ring at every layer
+    # boundary; no ring survived to hold the previous chunk, the eviction loop
+    # always found take<=0, and four arms came back bit-identical at 53,047
+    # positions with the ACTIVE banner printed.  An EQUAL seq_len is the normal
+    # within-pass case here, not a new request.  A new request that is LONGER
+    # than the last is caught per-ring in ``after_write`` instead, because the
+    # global seq_len cannot see it.
+    if prev is not None and seq_len < prev:
         _STATE.reset_all()
+    new_pass = prev is None or seq_len != prev
     _STATE.ctx_seq_len = seq_len
+    if seq_len > _STATE.max_seq_len:
+        _STATE.max_seq_len = seq_len
     _STATE.ctx_scale = None if k_scale is None else float(k_scale)
     _STATE.ctx_layer_id = getattr(layer, "layer_id", None)
 
@@ -367,6 +524,12 @@ def begin_attention(layer, forward_batch) -> None:
             "ALL (identity, nothing rounded)" if _CFG.tail_n is None else _CFG.tail_n,
             ENV_N,
         )
+
+    # One engagement line per prefill batch (and the no-op refusal).  Emitted
+    # on the FIRST layer of a new pass, because that is the only point at which
+    # a per-layer hook can see a batch boundary at all.
+    if new_pass and _is_extend_batch(forward_batch):
+        _report_pass(prev)
 
 
 def after_write(pool, layer_id: int, loc, dcp_kv_mask=None) -> None:
@@ -418,6 +581,48 @@ def after_write(pool, layer_id: int, loc, dcp_kv_mask=None) -> None:
             "longer than the sequence, so row->position pairing is impossible"
         )
 
+    # CONTINUITY, per ring.  For one sequence the writes of a layer are
+    # contiguous: chunk c must start exactly where chunk c-1 ended.  A gap or a
+    # rewind means a DIFFERENT request took the slot -- including the case the
+    # global seq_len test structurally cannot see, a new request LONGER than
+    # the last one, whose stale ring would otherwise round slots that now
+    # belong to someone else.
+    if not ring.records and ring.seq_len == 0:
+        # An EMPTY ring and a write that does not start at position 0.  An
+        # empty ring is only legitimate at the start of a sequence, and the
+        # probe's position axis assumes a sequence starts at 0 (the arms run
+        # --disable-radix-cache and verify cached_tokens == 0 per passage).
+        # So this is either a prefix-cached start the emulation cannot place,
+        # or history that was WIPED between the write and the read -- which is
+        # exactly the 2026-09-09 no-op.  Refusing here is what makes the two
+        # indistinguishable states both loud instead of both silent.
+        if first_pos != 0:
+            raise KvTailProbeRefused(
+                f"{WCODE_NOOP}: {REPORT_PREFIX} REFUSED: layer {layer_id} holds "
+                f"no write history, yet this write starts at position "
+                f"{first_pos} (seq_len={seq_len}, {n_rows} rows).  Either the "
+                "sequence did not start at 0 for this rank (prefix cache -- "
+                "run with --disable-radix-cache and cached_tokens == 0), or "
+                "the ring was wiped between the write and the eviction read, "
+                "which is the boot weg2kvtail1 no-op: nothing gets demoted and "
+                "every arm comes back bit-identical."
+            )
+        ring.evicted_upto = 0
+    elif first_pos != ring.seq_len:
+        ring.reset()
+        ring.evicted_upto = first_pos
+        _STATE.reset_count += 1
+
+    _STATE.tokens_seen += n_rows
+    if n_rows > _STATE.max_write_rows:
+        _STATE.max_write_rows = n_rows
+    _STATE.pool_dtype = str(dtype)
+    _STATE.site = (
+        f"{type(pool).__name__}.set_kv_buffer"
+        if inner is pool
+        else f"{type(pool).__name__}->{type(inner).__name__}.set_kv_buffer"
+    )
+
     tail_n = _CFG.tail_n
     if tail_n is None:
         # N = all: the identity arm.  Record nothing, round nothing.
@@ -463,9 +668,30 @@ def after_write(pool, layer_id: int, loc, dcp_kv_mask=None) -> None:
         slots = slots.to(dtype=torch.long)
         fp8_round_trip_(k_buf, slots, scale)
         fp8_round_trip_(v_buf, slots, scale)
-        ring.rounded_rows += int(slots.numel())
+        n_slots = int(slots.numel())
+        ring.rounded_rows += n_slots
+        _STATE.rounded_total += n_slots
+        if n_slots:
+            _STATE.roundtrips += 2  # k and v are two round trips, counted apart
         ring.evicted_upto = max(rec_first, ring.evicted_upto) + take
         if ring.evicted_upto >= rec_end:
             ring.records.popleft()
         else:
             break
+
+    # COVERAGE INVARIANT -- the guard that would have killed boot weg2kvtail1
+    # on its second chunk instead of after four arms.  The records of one ring
+    # are contiguous from its eviction cursor, so the loop above can only stop
+    # short if history was LOST between the write and the read.  Positions are
+    # compared, never owned rows: a DCP mask changes how many slots are
+    # demoted, never how far the cursor may advance.
+    if ring.evicted_upto < boundary:
+        raise KvTailProbeRefused(
+            f"{WCODE_NOOP}: {REPORT_PREFIX} REFUSED: layer {layer_id} demoted "
+            f"only up to position {ring.evicted_upto} of the {boundary} the "
+            f"tail rule demands (tail_n={tail_n}, seq_len={seq_len}, this "
+            f"write {n_rows} rows at {first_pos}, {len(ring.records)} records "
+            "held).  The ring lost the history it needs, so tokens older than "
+            "the tail are still 16-bit and every arm would come back "
+            "bit-identical."
+        )

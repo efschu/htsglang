@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import types
 
@@ -673,3 +674,286 @@ def test_harness_provenance_reports_this_worktrees_commit():
     prov = mod.harness_provenance()
     assert prov["commit"] is None or len(prov["commit"]) == 40
     assert "dirty" in prov
+
+
+# ============ 9. THE MULTI-LAYER LIFECYCLE -- the boot weg2kvtail1 no-op =====
+# Every test above drives ONE layer per pass, and that is exactly why the
+# no-op survived to metal: a real forward calls ``begin_attention`` ONCE PER
+# LAYER with the SAME seq_lens, and the old ``seq_len <= prev`` stale test
+# therefore wiped every ring at every layer boundary.  Four arms came back
+# bit-identical at 53,047 positions with the ACTIVE banner printed.
+#
+# RED AT THE PARENT 49f79b89fd (== fdbf4add84 for all three patched modules):
+# ``test_a_multi_layer_pass_still_demotes`` reports rounded_rows_total == 0.
+
+
+class FakeMHAPool(FakePool):
+    """Stands in for ``MHATokenToKVPool`` -- the class that owns the buffers."""
+
+
+class FakeHybridPool:
+    """Stands in for ``HybridLinearKVPool``: a wrapper that delegates.
+
+    This is the shape on the Qwen3.8 GDN form -- the attention backend holds
+    the hybrid wrapper and the bytes land in ``full_kv_pool``.  The fake mirrors
+    the real hierarchy rather than inventing one, and
+    ``test_the_real_hybrid_pool_really_delegates_to_full_kv_pool`` reads the
+    tree to prove the mirror still holds.
+    """
+
+    def __init__(self, inner):
+        self.full_kv_pool = inner
+
+
+def _drive_multilayer(pool, tail_n, chunks, n_layers, layer_ids=None):
+    """Exactly the real call order: begin_attention PER LAYER, same seq_lens."""
+    ktp.configure_for_test(tail_n)
+    ids = list(range(n_layers)) if layer_ids is None else layer_ids
+    pos = 0
+    for n in chunks:
+        pos += n
+        slots = torch.arange(pos - n, pos)
+        for lid in ids:
+            ktp.begin_attention(fake_layer(layer_id=lid), fake_batch(pos))
+            ktp.after_write(pool, lid, slots, None)
+    return pos
+
+
+def test_a_multi_layer_pass_still_demotes():
+    """THE red-first test for the 2026-09-09 no-op.
+
+    Four layers, two chunks, N=0: chunk 1's rows must be fp8 once chunk 2 is
+    written, on EVERY layer.  At the parent this returns 0 rounded rows.
+    """
+    torch.manual_seed(21)
+    pool = FakeMHAPool(n_slots=64, layers=(0, 1, 2, 3))
+    before = {lid: pool.k[lid].clone() for lid in range(4)}
+    _drive_multilayer(pool, 0, [8, 8], n_layers=4)
+
+    st = ktp.probe_stats()
+    assert st["rounded_rows_total"] == 32, (
+        "a multi-layer forward pass rounded "
+        f"{st['rounded_rows_total']} rows instead of 4 layers x 8: the "
+        "per-layer begin_attention wiped the rings before the eviction loop "
+        "could read them -- this is the boot weg2kvtail1 no-op"
+    )
+    assert st["roundtrips"] == 8, "k and v of four layers is eight round trips"
+    for lid in range(4):
+        for s in range(8):
+            assert torch.equal(
+                pool.k[lid][s],
+                real_fp8_store(before[lid][s], None).to(torch.bfloat16),
+            ), f"layer {lid} slot {s} was never demoted"
+        assert torch.equal(pool.k[lid][8:16], before[lid][8:16]), (
+            "the CURRENT chunk must not be demoted early"
+        )
+
+
+def test_an_equal_seq_len_across_layers_is_not_a_new_sequence():
+    """The one-character root, asserted directly on the reset counter."""
+    ktp.configure_for_test(4)
+    for lid in range(6):
+        ktp.begin_attention(fake_layer(layer_id=lid), fake_batch(1024))
+    assert ktp.probe_stats()["sequence_resets"] == 0, (
+        "the layers of ONE forward pass were read as six new sequences"
+    )
+    ktp.begin_attention(fake_layer(layer_id=0), fake_batch(512))
+    assert ktp.probe_stats()["sequence_resets"] == 1, (
+        "a strictly shorter sequence IS a new request and must still reset"
+    )
+
+
+def test_a_long_chunked_prefill_demotes_every_chunk_but_the_current_one():
+    torch.manual_seed(22)
+    pool = FakeMHAPool(n_slots=128, layers=(0, 1))
+    before = pool.k[0].clone()
+    _drive_multilayer(pool, 0, [16] * 8, n_layers=2)
+    for s in range(112):
+        assert torch.equal(
+            pool.k[0][s], real_fp8_store(before[s], None).to(torch.bfloat16)
+        ), f"slot {s} of an 8-chunk prefill was not demoted"
+    assert torch.equal(pool.k[0][112:128], before[112:128])
+    assert ktp.probe_stats()["rounded_rows_total"] == 224  # 112 rows x 2 layers
+
+
+# ----------------------------------- the engagement line -------------------
+
+
+def test_one_engagement_line_per_prefill_batch_naming_site_and_dtype(caplog):
+    """A run must carry its own proof of engagement, not a banner.
+
+    ONE line per pass, not per layer, and it names the pool class the bytes
+    ACTUALLY took plus the pool dtype -- the two facts whose absence made the
+    weg2kvtail1 log unreadable after the fact.
+    """
+    pool = FakeMHAPool(n_slots=64, layers=(0, 1, 2, 3))
+    with caplog.at_level(logging.WARNING, logger=ktp.__name__):
+        _drive_multilayer(pool, 0, [8, 8, 8], n_layers=4)
+
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith(ktp.REPORT_PREFIX + " ")]
+    assert len(lines) == 3, f"expected one line per prefill batch, got {lines}"
+    for line in lines:
+        fields = dict(kv.split("=", 1) for kv in line.split()[1:])
+        assert list(fields) == [
+            "roundtrips", "tokens_seen", "tokens_rounded", "layers", "site",
+            "dtype",
+        ], line
+    last = dict(kv.split("=", 1) for kv in lines[-1].split()[1:])
+    # emitted at the START of a pass, so it carries the first two passes
+    assert last["tokens_rounded"] == "32"
+    assert last["tokens_seen"] == "64"
+    assert last["layers"] == "4"
+    assert last["site"] == "FakeMHAPool.set_kv_buffer"
+    assert last["dtype"] == "torch.bfloat16"
+
+
+def test_the_line_names_BOTH_classes_when_the_pool_is_a_wrapper():
+    """On the GDN form the backend holds the hybrid wrapper; the line has to
+    say so, or the next reader repeats the class hunt this fix started with."""
+    inner = FakeMHAPool(n_slots=64, layers=(0,))
+    _drive_multilayer(FakeHybridPool(inner), 0, [8, 8], n_layers=1)
+    assert ktp.probe_stats()["site"] == (
+        "FakeHybridPool->FakeMHAPool.set_kv_buffer"
+    )
+    assert ktp.probe_stats()["rounded_rows_total"] == 8
+
+
+def test_site_before_any_write_says_nothing_reached_the_probe():
+    ktp.configure_for_test(0)
+    assert ktp.probe_stats()["site"] == ktp.SITE_UNKNOWN
+    assert ktp.probe_stats()["pool_dtype"] == "unknown"
+
+
+# ------------------------------------------ the two no-op refusals ----------
+
+
+def _wipe_then_write_again(pool):
+    """Reproduce the parent's behaviour exactly: a wipe between the write and
+    the eviction read, which is what ``seq_len <= prev`` did at every layer."""
+    ktp.configure_for_test(0)
+    ktp.begin_attention(fake_layer(), fake_batch(8))
+    ktp.after_write(pool, 0, torch.arange(0, 8), None)
+    ktp._STATE.reset_all()
+    ktp.begin_attention(fake_layer(), fake_batch(16))
+    ktp.after_write(pool, 0, torch.arange(8, 16), None)
+
+
+def test_a_wiped_ring_refuses_instead_of_silently_demoting_nothing():
+    pool = FakeMHAPool(n_slots=64, layers=(0,))
+    with pytest.raises(KvTailProbeRefused, match="W51 Weg2KvTailProbeNoOp"):
+        _wipe_then_write_again(pool)
+
+
+def test_the_wiped_ring_refusal_names_what_it_lost_and_both_causes():
+    pool = FakeMHAPool(n_slots=64, layers=(0,))
+    with pytest.raises(KvTailProbeRefused) as exc:
+        _wipe_then_write_again(pool)
+    msg = str(exc.value)
+    assert "layer 0 holds no write history" in msg
+    assert "starts at position 8" in msg and "seq_len=16" in msg
+    assert "prefix cache" in msg and "wiped" in msg
+
+
+def test_the_coverage_invariant_fires_when_a_ring_loses_a_MIDDLE_record():
+    """The second net, reached by removing history the ring still believes it
+    has: the cursor cannot advance to the boundary, and stopping short is not
+    allowed to pass as 'nothing was due'."""
+    pool = FakeMHAPool(n_slots=64, layers=(0,))
+    ktp.configure_for_test(0)
+    ktp.begin_attention(fake_layer(), fake_batch(8))
+    ktp.after_write(pool, 0, torch.arange(0, 8), None)
+    key = next(iter(ktp._STATE.rings))
+    ktp._STATE.rings[key].records.clear()  # history gone, cursor left behind
+    ktp.begin_attention(fake_layer(), fake_batch(16))
+    with pytest.raises(KvTailProbeRefused) as exc:
+        ktp.after_write(pool, 0, torch.arange(8, 16), None)
+    msg = str(exc.value)
+    assert "W51 Weg2KvTailProbeNoOp" in msg
+    assert "demoted only up to position 0 of the 8" in msg
+    assert "tail_n=0" in msg and "seq_len=16" in msg
+
+
+def test_the_boot_refuses_on_zero_round_trips_once_the_rule_was_due():
+    """The second guard, stated in the words the record has to quote."""
+    ktp.configure_for_test(0)
+    ktp._STATE.tokens_seen = 126976
+    ktp._STATE.max_write_rows = 1024
+    ktp._STATE.ctx_seq_len = 4096  # the PREVIOUS pass
+    with pytest.raises(KvTailProbeRefused) as exc:
+        ktp.begin_attention(fake_layer(), fake_batch(5120))
+    msg = str(exc.value)
+    assert "KV-TAIL-PROBE REFUSED: 0 round-trips after 126976 tokens" in msg
+    assert "W51 Weg2KvTailProbeNoOp" in msg
+
+
+def test_the_no_op_refusal_does_not_fire_before_the_rule_is_due():
+    """A tail of 16k has rounded nothing at position 4k, and that is CORRECT.
+    A guard that cannot tell those apart would kill every large-N arm."""
+    ktp.configure_for_test(16384)
+    ktp._STATE.tokens_seen = 126976
+    ktp._STATE.max_write_rows = 1024
+    ktp._STATE.ctx_seq_len = 4096
+    ktp.begin_attention(fake_layer(), fake_batch(5120))  # must not raise
+
+
+def test_the_identity_arm_never_refuses_for_rounding_nothing():
+    """N=all rounds nothing BY DESIGN; excluded by name, not by threshold."""
+    ktp.configure_for_test(None)
+    ktp._STATE.tokens_seen = 999999
+    ktp._STATE.max_write_rows = 1024
+    ktp._STATE.ctx_seq_len = 100000
+    ktp.begin_attention(fake_layer(), fake_batch(200000))  # must not raise
+    assert ktp.probe_stats()["rounded_rows_total"] == 0
+
+
+def test_a_new_LONGER_request_resets_the_ring_instead_of_rounding_its_slots():
+    """The case the global seq_len test structurally cannot see: request B is
+    longer than A, so no reset fires there -- the per-ring continuity guard is
+    what stops A's stale slots being rounded under B's positions."""
+    torch.manual_seed(23)
+    pool = FakeMHAPool(n_slots=64, layers=(0,))
+    ktp.configure_for_test(0)
+    ktp.begin_attention(fake_layer(), fake_batch(4))
+    ktp.after_write(pool, 0, torch.arange(0, 4), None)
+    resets = ktp.probe_stats()["sequence_resets"]
+
+    before = pool.k[0].clone()
+    # request B, LONGER: its first chunk starts at position 0 again
+    ktp.begin_attention(fake_layer(), fake_batch(32))
+    ktp.after_write(pool, 0, torch.arange(32, 64), None)
+    assert ktp.probe_stats()["sequence_resets"] == resets + 1
+    assert torch.equal(pool.k[0], before), (
+        "a stale ring from the previous request rounded slots under the new "
+        "request's position axis"
+    )
+
+
+# --------------------------- the fake mirrors the REAL hierarchy ------------
+
+
+def test_the_real_hybrid_pool_really_delegates_to_full_kv_pool():
+    """``FakeHybridPool`` is only a valid stand-in while this holds."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    src = inspect.getsource(HybridLinearKVPool.set_kv_buffer)
+    assert "self.full_kv_pool.set_kv_buffer" in src, (
+        "HybridLinearKVPool no longer delegates to full_kv_pool -- the probe "
+        "unwraps that attribute and the fake in this file mirrors it"
+    )
+
+
+def test_the_dcp_write_really_lands_on_set_kv_buffer():
+    """The ROOT of the 2026-09-09 investigation, pinned as a test.
+
+    The uneven-DCP write site was the first suspect and it is INNOCENT: it
+    calls the hooked method.  Recording that here stops the next reader
+    re-hunting the write path when the symptom returns.
+    """
+    from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+
+    src = inspect.getsource(FlashInferAttnBackend._dcp_write_scatter)
+    assert "self.token_to_kv_pool.set_kv_buffer" in src, (
+        "the uneven-DCP scatter no longer writes through set_kv_buffer; the "
+        "probe hook is now beside the real write site, not on it"
+    )
