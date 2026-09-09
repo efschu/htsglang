@@ -2068,6 +2068,15 @@ def test_every_w_code_this_slice_raises_is_free_and_named_once():
         # W62 is free in the branch census -- W60 was the highest assigned and
         # W61 is the shadow's.
         ("W62", "Weg2XchgSemaphoreNotRearmed"),
+        # S6 (#1273): the store-and-forward deposit's refusal.  ENUMERATED,
+        # not picked -- the census over the four roots of
+        # ``test_weg2_wcode_uniqueness_1263`` at ``edbf7007c8`` returns 54
+        # assigned codes with a maximum of W64, so the next free code is W65.
+        # The gaps below that maximum (W5, W6, W13-15, W18, W19, W23, W24,
+        # W27, W39, W57) are deliberately NOT reused: a retired number still
+        # matches every grep of every old boot log, and this file's own
+        # history is two collisions bought by picking a number.
+        ("W65", "Weg2XchgDepositUnfundable"),
     }, found
 
 
@@ -2357,3 +2366,229 @@ def test_six_ranks_move_a_wave_and_every_byte_lands(tmp_path):
     for line in oncard:
         assert "mode=ipc" in line, line
         assert " batches=0 " not in line, line
+
+
+# --- S6: the store-and-forward deposit -------------------------------------
+#
+# THE ORDERING THESE TESTS DRIVE is the one SECTION 1ai-S5c-fix documented and
+# no test in this file had: the source hook runs, RETURNS, and only afterwards
+# does the peer's leg exist (its resume is C14-fenced on a credit published
+# inside the pause loop the source hook is upstream of).  The existing
+# `test_the_degraded_lane_really_moves_the_bytes` runs both ends CONCURRENTLY
+# in two threads, which is the shape that placement can never produce.
+
+
+def _deposit_descs(prod, cons, *, batches: int, slot: int):
+    """One on-card descriptor per slot, written and poisoned.  Returns descs."""
+    descs = []
+    for i in range(batches):
+        payload = pattern(0x40 + i, slot)
+        src, dst = dev_ptr(0, 0x10000 + i * slot), dev_ptr(0, 0x80000 + i * slot)
+        write(prod, src, payload)
+        poison(cons, dst, len(payload), seed=0xEE)
+        descs.append(flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=dst,
+                               name=f"oncard{i}"))
+    return descs
+
+
+def test_a_deposit_outlives_its_leg_and_is_read_after_the_source_is_gone(
+        tmp_path, region):
+    """S6: the source deposits and RETURNS; the destination reads afterwards.
+
+    THE CAN-FAIL THIS SLICE EXISTS FOR.  Nothing is concurrent here: the
+    producer runs to completion on this thread, closes its own mapping (the
+    leg's ``finally``) and only THEN is a consumer created.  On the shipping
+    lane that sequence cannot work -- the producer's terminal drain waits for a
+    consumer that does not exist yet and dies at the budget -- which is exactly
+    what ``WEG2-XCHG-SHADOW-ONCARD-REFUSED`` six-per-flip was reporting.
+    """
+    prod = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    cons = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    root = os.path.dirname(os.path.dirname(region.path))
+    try:
+        batches = 5
+        descs = _deposit_descs(prod, cons, batches=batches, slot=SLOT)
+        assert len(tp.batch_descs(descs, SLOT)) == batches
+        bounce = tp.HostBounce(prod, region.boot_nonce, 0, create=True,
+                               slots=batches, slot_bytes=SLOT, shm_root=root)
+        tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, seq=-1, nbytes=0,
+                            slot_bytes=SLOT, wave=WAVE,
+                            state=tp.ONCARD_STATE_ARMED)
+        p_stats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_HOST)
+        tp.run_oncard_producer(region, prod, prod.create_stream(0), bounce,
+                               row=0, peer_row=3, wave=WAVE, descs=descs,
+                               stats=p_stats, budget_s=2.0, store_forward=True)
+        # THE SOURCE LEG IS OVER.  It waited for nothing -- no per-batch drain
+        # (every `seq - slots` is negative) and no terminal drain (skipped by
+        # construction) -- and its mapping is gone.
+        assert p_stats.batches == batches
+        assert p_stats.drain_wait_outside_s == 0.0, p_stats.drain_wait_outside_s
+        assert p_stats.drain_wait_s < 0.05, p_stats.drain_wait_s
+        bounce.close()
+        # ... and the bytes are still there, because `close` does not unlink.
+        assert os.path.exists(bounce.path), bounce.path
+        assert os.path.getsize(bounce.path) == batches * SLOT
+
+        collected = tp.HostBounce(cons, region.boot_nonce, 0, create=False,
+                                  slots=batches, slot_bytes=SLOT, shm_root=root)
+        c_stats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_HOST)
+        tp.run_oncard_consumer(region, cons, cons.create_stream(0),
+                               collected.ptr, row=3, peer_row=0, wave=WAVE,
+                               descs=descs, stats=c_stats, slots=batches,
+                               slot_bytes=SLOT, budget_s=2.0)
+        collected.close()
+        assert c_stats.batches == batches
+        for i, desc in enumerate(descs):
+            assert read(cons, desc.dst_ptr, desc.nbytes) == pattern(0x40 + i, SLOT)
+    finally:
+        prod.close()
+        cons.close()
+
+
+def test_a_deposit_with_fewer_slots_than_batches_is_refused_before_a_copy(
+        tmp_path, region):
+    """S6 W65: the danger direction, refused where it cannot be compensated.
+
+    ``slots < batches`` under store-and-forward is SILENT: batch ``k`` and
+    batch ``k + slots`` share a slot, the producer overwrites without waiting
+    (that is what the deposit removed), and the destination -- reading in a
+    later leg -- takes the later batch's bytes under the earlier batch's row
+    with nothing disagreeing.  So the refusal is in the producer, before the
+    first ``memcpy`` is issued, and not only in the planner.
+    """
+    prod = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    root = os.path.dirname(os.path.dirname(region.path))
+    try:
+        descs = _deposit_descs(prod, prod, batches=4, slot=SLOT)
+        bounce = tp.HostBounce(prod, region.boot_nonce, 0, create=True,
+                               slots=2, slot_bytes=SLOT, shm_root=root)
+        issued = prod.issued
+        with pytest.raises(tp.Weg2XchgDepositUnfundable) as caught:
+            tp.run_oncard_producer(region, prod, prod.create_stream(0), bounce,
+                                   row=0, peer_row=3, wave=WAVE, descs=descs,
+                                   stats=tp.OnCardStats(0, "u0", "host"),
+                                   budget_s=2.0, store_forward=True)
+        bounce.close()
+        assert "W65 Weg2XchgDepositUnfundable" in str(caught.value)
+        assert "slots=2" in str(caught.value) and "batches=4" in str(caught.value)
+        assert prod.issued == issued, "NO copy may be issued before the refusal"
+    finally:
+        prod.close()
+
+
+def test_the_deposit_skips_the_terminal_drain_that_the_shipping_lane_needs(
+        tmp_path, region):
+    """S6: the same descriptors, with and without the deposit, one budget.
+
+    The control is the point: without ``store_forward`` this producer blocks in
+    ``drain-final`` for a consumer that will never come and dies at the budget
+    naming that wait; with it, it returns.  A test that only ran the deposit
+    would prove the new path works and nothing about what it removed.
+    """
+    prod = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    root = os.path.dirname(os.path.dirname(region.path))
+    try:
+        descs = _deposit_descs(prod, prod, batches=3, slot=SLOT)
+        deposit = tp.HostBounce(prod, region.boot_nonce, 0, create=True,
+                                slots=3, slot_bytes=SLOT, shm_root=root)
+        stats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_HOST)
+        tp.run_oncard_producer(region, prod, prod.create_stream(0), deposit,
+                               row=0, peer_row=3, wave=WAVE, descs=descs,
+                               stats=stats, budget_s=0.2, store_forward=True)
+        deposit.close()
+        assert stats.batches == 3
+
+        # THE CONTROL, same rows, same wave, same absent consumer.
+        pipeline = tp.HostBounce(prod, region.boot_nonce, 1, create=True,
+                                 slots=3, slot_bytes=SLOT, shm_root=root)
+        with pytest.raises(tp.Weg2XchgGateTimeout) as caught:
+            tp.run_oncard_producer(region, prod, prod.create_stream(0),
+                                   pipeline, row=0, peer_row=3, wave=WAVE,
+                                   descs=descs,
+                                   stats=tp.OnCardStats(0, "u0", "host"),
+                                   budget_s=0.2, store_forward=False)
+        pipeline.close()
+        assert "what=drain-final" in str(caught.value), caught.value
+    finally:
+        prod.close()
+
+
+def test_the_slot_count_is_derived_from_the_batches_and_prints_its_provenance():
+    """S6: ``slots`` stops being an echoed constant and says where it came from.
+
+    Every product path ran the lane at ``tp.ONCARD_SLOTS = 2`` because
+    ``run_leg_hook`` had no way to pass anything else -- a hand number one seam
+    below a planner that already knew the batch count.  Under the deposit the
+    count IS the batch count, and the plan is its one producer, so the W52
+    cross-check between the two co-located processes still compares two
+    readings of one derivation.
+    """
+    default = tp.plan_oncard_slot_bytes(200 * xr.MIB)
+    assert default.slots == tp.ONCARD_SLOTS and default.slots_source == "caller"
+
+    plan = tp.plan_oncard_slot_bytes(200 * xr.MIB, store_forward=True)
+    assert plan.slots == plan.batches, (plan.slots, plan.batches)
+    assert plan.slots_source == "store-forward-batches"
+    assert plan.deposit_bytes == plan.slots * plan.slot_bytes
+    for token in ("oncard_slots_source=store-forward-batches",
+                  f"oncard_slots={plan.slots}",
+                  f"oncard_deposit_mib={plan.deposit_bytes / xr.MIB:.0f}"):
+        assert token in plan.tokens(), (token, plan.tokens())
+    # THE SIZE IS RAISED UNTIL THE COUNT FITS THE ROW AREA, never clamped: a
+    # clamp would be the `slots < batches` overwrite arrived at by arithmetic.
+    big = tp.plan_oncard_slot_bytes(tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES,
+                                    store_forward=True)
+    assert big.slots == big.batches <= tp.ONCARD_SLOTS_MAX
+    over = tp.plan_oncard_slot_bytes(
+        4 * tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES_MAX, store_forward=True)
+    assert over.slots == over.batches > tp.ONCARD_SLOTS_MAX
+
+
+def test_the_three_deposit_refusals_are_named_apart():
+    """S6: three causes, three levers, three words -- never one 'refused'."""
+    budget = tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES
+    ok = dict(batches=2, slots=2, slot_bytes=tp.ONCARD_SLOT_BYTES,
+              budget_bytes=budget, mode=tp.ONCARD_MODE_HOST)
+    assert tp.deposit_refusal_reason(**ok) == ""
+    assert tp.deposit_refusal_reason(**{**ok, "mode": tp.ONCARD_MODE_IPC}) == \
+        tp.DEPOSIT_REASON_IPC
+    assert tp.deposit_refusal_reason(
+        **{**ok, "batches": tp.ONCARD_SLOTS_MAX + 1,
+           "slots": tp.ONCARD_SLOTS_MAX + 1}) == tp.DEPOSIT_REASON_BATCHES
+    assert tp.deposit_refusal_reason(**{**ok, "slots": 1}) == \
+        tp.DEPOSIT_REASON_BATCHES
+    # An unfunded deposit and an UNREAD budget refuse the same way: an absent
+    # measurement never becomes a quiet zero.
+    assert tp.deposit_refusal_reason(**{**ok, "budget_bytes": 0}) == \
+        tp.DEPOSIT_REASON_UNFUNDED
+    assert tp.deposit_refusal_reason(
+        **{**ok, "slot_bytes": budget}) == tp.DEPOSIT_REASON_UNFUNDED
+
+
+def test_run_leg_refuses_a_deposit_on_the_exported_arm(tmp_path, region, boot):
+    """S6: an exported VRAM bounce cannot outlive the leg that exported it.
+
+    Refused BEFORE a thread exists, like the two slot knobs beside it: the
+    exporter's ``cudaFree`` runs in this leg's own unwind, so a destination
+    reading in a later leg would map freed VRAM -- and half-honouring the ask
+    (deposit, then free with the leg) is the use-after-free the S4 review
+    already found once.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        with pytest.raises(tp.Weg2XchgDepositUnfundable) as caught:
+            tp.run_leg(region, sems, ops, row=0, rank=0, device=0,
+                       card_uuid="u0", uuid_of_card=("u0", "u1", "u2"),
+                       descs=[], is_source=True,
+                       oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3, wave=WAVE,
+                       log=lambda _s: None, vote_failure=lambda _e: None,
+                       slot_bytes=SLOT, oncard_slot_bytes=SLOT,
+                       oncard_store_forward=True)
+        assert tp.DEPOSIT_REASON_IPC in str(caught.value)
+        assert "W65 Weg2XchgDepositUnfundable" in str(caught.value)
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
