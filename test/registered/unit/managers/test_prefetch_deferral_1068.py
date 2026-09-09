@@ -1204,6 +1204,42 @@ class TestTheGroupShortfallDeferral(_Clean):
         self.assertEqual(sets[0], sets[1])
         self.assertEqual(sets[1], sets[2])
 
+    def test_the_tp_admission_hold_is_uniform_for_this_mark(self):
+        """#1203 family A3, newly REACHABLE and therefore newly checked.
+
+        `_admission_held_for_deferred_prefetch` withholds admission on a mark,
+        and its own docstring records that in the TP phase the PP0 exemption is
+        inert -- every rank reaches `return True` and holds on ITS OWN mark. It
+        names that an open hazard because #1068's mark is rank-local at both
+        ends (this rank's budget, this rank's clock).
+
+        Before #1298 that path was UNREACHABLE on group D: no mark could exist
+        there at all (`symmetric_vote`). This arm makes it reachable, so the
+        hazard's precondition has to be checked rather than inherited -- and it
+        is not met: the shortfall mark is written from MIN-reduced values, so
+        all three ranks hold or release the same request on the same pass. The
+        hold is the DESIRED behaviour here (do not admit while a re-issue is
+        owed); what would be wrong is an asymmetric one.
+        """
+        ranks = []
+        for _ in range(3):
+            s = _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True, tp_size=3)
+            r = _Req("h", seq=1)
+            s._add_request_to_queue(r)
+            ranks.append((s, r))
+        holds = [s._admission_held_for_deferred_prefetch(r) for s, r in ranks]
+        self.assertEqual(
+            holds, [True, True, True],
+            "the ranks must hold this request together or not at all -- an "
+            "asymmetric hold builds different batches per rank (#1203 A3)",
+        )
+        for s, r in ranks:
+            s._clear_prefetch_deferral_fields(r)
+        self.assertEqual(
+            [s._admission_held_for_deferred_prefetch(r) for s, r in ranks],
+            [False, False, False],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
