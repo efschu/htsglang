@@ -553,6 +553,61 @@ def d_seat_need(est_tokens: int, realised_tokens: int = 0):
 X_REFUSAL_MARKER = "Weg2TpPrefillExceeded"
 X_REFUSAL_NAME = "W50 " + X_REFUSAL_MARKER
 
+#: #1290. W52 is free: the used set at this tip is W50 (Weg2TpPrefillExceeded)
+#: and W51 (Weg2HostRingUnfunded), enumerated before choosing rather than
+#: guessed -- the renumbering note above W50 is about exactly that mistake.
+NO_ROUTE_MARKER = "Weg2NoServiceableRoute"
+NO_ROUTE_NAME = "W52 " + NO_ROUTE_MARKER
+
+
+def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
+                      carrier_max: int) -> str:
+    """#1290: WHICH ROUTE CAN SERVE THIS REQUEST -- decided ONCE, up front.
+
+    Returns one of ``short`` / ``long`` / ``carrier_single`` / ``none``.
+
+    THE TWO BOUNDS ASK DIFFERENT QUESTIONS OF DIFFERENT TOKEN BASES, and
+    conflating them is the defect this function exists to end:
+
+    * ``x_tokens`` (``--tp-prefill-max-tokens``) bounds what group D can
+      PREFILL. D re-derives the extent after ``match_prefix``, so the base is
+      the UNCACHED remainder -- the tokens D would actually have to compute.
+    * ``carrier_max`` bounds what can move through the host staging pool as
+      KV. That is the WHOLE prompt's KV, cached prefix included, so its base
+      is the total estimate ``carrier_est``.
+
+    Both bases are correct FOR THEIR OWN QUESTION. What was missing is that
+    nobody asked them TOGETHER before committing to a route:
+
+    MEASURED, boot weg2sb5f long-prompt arm (2026-09-09, 3 workers x 12.45
+    min): every request carried ~22,200 UNCACHED tokens against X=12,944 and
+    carrier_max=27,466, with a total estimate above the carrier. The router's
+    first branch saw only the carrier, printed ``CARRIER-EXCEEDS -> D single
+    prefill``, and handed D a prefill 1.7x its own cap. D refused all 93 by
+    name (W50 x159 including the re-offers), the front re-queued in band, and
+    93 of 93 ended in HTTP 503 after a median 22.0 s with ZERO tokens
+    streamed. Route census for the whole boot: SHORT 487, CARRIER-EXCEEDS 97,
+    BATCH 7, LONG 0 -- the P route was never chosen for a long prompt at all.
+
+    THE INVARIANT: a request whose uncached extent exceeds D's prefill cap is
+    NEVER routed to a D single prefill, because D refuses it BY CONSTRUCTION
+    and no amount of retrying changes a static cap. If the carrier also
+    refuses it, no route exists and the honest answer is ONE named refusal at
+    admission, not a requeue loop that spends 22 s to reach a 503.
+    """
+    fits_d_prefill = x_tokens <= 0 or uncached <= x_tokens
+    fits_carrier = carrier_max <= 0 or carrier_est <= carrier_max
+    if not fits_carrier:
+        # The store cannot be read into D, so the two-leg route is out: only a
+        # single prefill on D could serve it -- and only if D can prefill it.
+        return "carrier_single" if fits_d_prefill else "none"
+    if fits_d_prefill:
+        return "short"
+    # X < uncached <= carrier: THE P ROUTE. This is the verdict that produced
+    # 0 of 591 on sb5f; P prefills leg 1 and the KV comes back to D through
+    # the carrier, which by this branch it fits.
+    return "long"
+
 
 def x_refusal_marker_in(body_text: str) -> bool:
     """True iff this text carries D's named Weg2TpPrefillExceeded refusal.
@@ -1869,11 +1924,55 @@ class Front:
         stream = bool(payload.get("stream"))
         exact = self.exact_tokens.get(hashlib.sha1(text.encode(errors="replace")).hexdigest())
         carrier_est = exact if exact else int(len(text) / CARRIER_CHARS_PER_TOKEN) + 1
-        if self.carrier_max_tokens > 0 and carrier_est > self.carrier_max_tokens:
+        # #1290: ONE ROUTE VERDICT, TAKEN ONCE, ON BOTH BOUNDS TOGETHER.  The
+        # branch below used to test the carrier ALONE and send anything over
+        # it to a D single prefill -- including requests whose uncached extent
+        # was 1.7x D's own prefill cap, which D then refused by construction.
+        # The verdict names the two bases so a reader never has to work out
+        # which number each bound was compared against.
+        route = serviceable_route(remainder, carrier_est,
+                                  self.tp_prefill_max_tokens,
+                                  self.carrier_max_tokens)
+        logger.info(
+            "WEG2 ROUTE-VERDICT rid=%s verdict=%s uncached=%d (base for X=%d, "
+            "what D must PREFILL) carrier_est=%d (base for carrier_max=%d, the "
+            "WHOLE prompt's KV through the host staging pool) est_prompt=%d "
+            "exact=%s (#1290)",
+            rid, route, remainder, self.tp_prefill_max_tokens, carrier_est,
+            self.carrier_max_tokens, est_prompt, exact,
+        )
+        if route == "none":
+            # TERMINAL AT ADMISSION, and 4xx because it is the request that
+            # does not fit this server, not the server that failed.  sb5f
+            # spent a median 22.0 s per request discovering this by round trip
+            # and answered 503, which reads as "try again" for a condition
+            # that cannot change.
+            self.counters["W52_Weg2NoServiceableRoute"] += 1
+            detail = (
+                f"{NO_ROUTE_NAME} rid={rid}: no route can serve this request. "
+                f"uncached={remainder} exceeds D's prefill cap X="
+                f"{self.tp_prefill_max_tokens} (--tp-prefill-max-tokens), so D "
+                f"cannot single-prefill it; carrier_est={carrier_est} exceeds "
+                f"carrier_max={self.carrier_max_tokens}, so P cannot hand its "
+                f"KV back to D either. Refused at admission rather than "
+                f"re-offered: D's cap is static, so no retry can change this "
+                f"answer. Send at most {min(self.tp_prefill_max_tokens, self.carrier_max_tokens)} "
+                f"tokens, or raise --tp-prefill-max-tokens / the carrier bound."
+            )
+            logger.error("%s", detail)
+            return web.json_response(
+                {"error": detail, "uncached": remainder,
+                 "x_tokens": self.tp_prefill_max_tokens,
+                 "carrier_est": carrier_est,
+                 "carrier_max": self.carrier_max_tokens},
+                status=413)
+        if route == "carrier_single":
             self.counters["route_carrier_exceeds"] += 1
             logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill est_prompt=%d exact=%s > carrier_max=%d "
                            "(group D host staging pool bound: the store cannot be read into D for a prompt this long; "
-                           "ONE prefill on D, no leg 1, no double prefill)", rid, est_prompt, exact, self.carrier_max_tokens)
+                           "ONE prefill on D, no leg 1, no double prefill; uncached=%d fits X=%d, checked #1290)",
+                           rid, est_prompt, exact, self.carrier_max_tokens,
+                           remainder, self.tp_prefill_max_tokens)
             if self.awake == "D" and self.admit_d and self.state == "serving":
                 seat = await self._acquire_short_seat(rid, carrier_est)
                 if seat is not None:
@@ -1893,7 +1992,7 @@ class Front:
                 return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=503)
             self._mark_posted(p)
             return await self.leg2(request, rid, payload, text, stream, pending=p, seat=p.seat)
-        short_ok = remainder <= self.tp_prefill_max_tokens
+        short_ok = route == "short"
         # L10 (C9): the front's X verdict, LABELLED as the estimate it is --
         # price_remainder is len(text)/3.0 minus an LRU prefix guess, with no
         # tokenizer at the front.  D re-derives the real extent after
@@ -1907,7 +2006,19 @@ class Front:
                 logger.info("WEG2-ROUTE rid=%s SHORT -> D est_prompt=%d remainder=%d span_known=%s", rid, est_prompt, remainder, known)
                 self._log_admit(rid, source="short", t_arrive=time.time())
                 return await self.leg2(request, rid, payload, text, stream, pending=None, seat=seat)
-        self.counters["route_batch"] += 1
+        # #1290: NAME THE P ROUTE. `route == "long"` is X < uncached <=
+        # carrier -- the case P exists for -- and it was counted only as
+        # "batch" before, which is why the sb5f census read LONG 0 and nobody
+        # could tell "queued because P is awake" from "queued because it is
+        # too long for D". Same queue, two reasons, now two counters.
+        self.counters["route_long" if route == "long" else "route_batch"] += 1
+        if route == "long":
+            logger.info(
+                "WEG2-ROUTE rid=%s LONG -> P leg 1 (uncached=%d > X=%d, so D "
+                "cannot prefill it; carrier_est=%d <= carrier_max=%d, so P's "
+                "KV can come back to D) est_prompt=%d queue=%d",
+                rid, remainder, self.tp_prefill_max_tokens, carrier_est,
+                self.carrier_max_tokens, est_prompt, len(self.queue))
         if self.awake != "D" and short_ok:
             # L4/R-10: law 1 read literally means every arrival during a P
             # drain is queued BATCH, SHORT ones included.  Counted here,
@@ -2431,6 +2542,37 @@ class Front:
         if pending is not None:
             pending.x_requeues = n
         self.counters["W50_Weg2TpPrefillExceeded"] += 1
+        # #1290: TERMINAL ON THE FIRST REFUSAL WHEN THE REASON CANNOT CHANGE.
+        # The requeue is a bet that a full P prefill puts the prefix in the
+        # store, so D's `match_prefix` shrinks the extent below X on the second
+        # offer. That bet is only payable if the KV can come BACK to D, i.e.
+        # if the prompt fits the carrier. Over the carrier it cannot, D sees
+        # the same whole prompt again and refuses again -- which is exactly
+        # what sb5f measured: 159 in-band re-offers, 78 W35s, 93 of 93 ending
+        # in 503 after a median 22.0 s, every one of them a P prefill spent on
+        # a verdict that could not move. So: ask once, up front, whether the
+        # retry can change the answer; when it cannot, refuse by name now.
+        carrier_est = len(text) // int(CARRIER_CHARS_PER_TOKEN) + 1
+        if self.carrier_max_tokens > 0 and carrier_est > self.carrier_max_tokens:
+            self.counters["W52_Weg2NoServiceableRoute"] += 1
+            detail = (
+                f"{NO_ROUTE_NAME} rid={rid}: D refused this request with "
+                f"{X_REFUSAL_NAME} and a re-offer cannot change that answer -- "
+                f"carrier_est={carrier_est} exceeds carrier_max="
+                f"{self.carrier_max_tokens}, so a P prefill's KV cannot be read "
+                f"back into D and D would see the same extent again. Refused on "
+                f"the FIRST refusal (n={n}) instead of spending a full P prefill "
+                f"to reach the same verdict (#1290). D said: "
+                f"{body.decode(errors='replace')[:300]}"
+            )
+            logger.error("%s", detail)
+            if seat is not None:
+                seat.release(NO_ROUTE_NAME)
+            return web.json_response(
+                {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
+                 "carrier_est": carrier_est,
+                 "carrier_max": self.carrier_max_tokens},
+                status=413)
         logger.warning("WEG2 X-REQUEUE rid=%s n=%d verdict=%s", rid, n,
                        "requeue" if n <= 1 else "W35")
         if n > 1:

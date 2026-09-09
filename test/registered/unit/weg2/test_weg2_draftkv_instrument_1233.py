@@ -42,6 +42,21 @@ class _Resp:
         return False
 
 
+def _front_stub(session):
+    """A `self` for the unbound `Front._draft_terms` call below.
+
+    #1288: `_draft_terms` no longer touches `self.session` directly -- it goes
+    through the ONE bearer-carrying GET seam `Front.group_get`. A data-only
+    namespace therefore stops modelling `self`, and because `_draft_terms`
+    swallows every exception into its defaults, the AttributeError read as
+    "the instrument returned 0" rather than as a broken harness. So the stub
+    carries the seam, bound to itself.
+    """
+    me = types.SimpleNamespace(session=session, admin_key=None)
+    me.group_get = Front.group_get.__get__(me)
+    return me
+
+
 class _Session:
     def __init__(self, payloads):
         self.payloads = list(payloads)
@@ -75,7 +90,7 @@ def _server_info(hits, misses, accept=2.4):
 class TestFrontDraftTerms(CustomTestCase):
     def test_fix2_terms_are_read_from_internal_states(self):
         session = _Session([_server_info(12, 3), _server_info(20, 3)])
-        me = types.SimpleNamespace(session=session, admin_key=None)
+        me = _front_stub(session)
         g = types.SimpleNamespace(url="http://127.0.0.1:30032")
         out = asyncio.run(Front._draft_terms(me, g, None))
         self.assertEqual((out["draft_pages"], out["draft_miss"]), (12, 3), out)
@@ -87,7 +102,7 @@ class TestFrontDraftTerms(CustomTestCase):
 
     def test_fix2_a_body_without_the_counters_reads_none_not_zero(self):
         session = _Session([{"model_path": "/m", "internal_states": [{"memory_usage": {}}]}])
-        me = types.SimpleNamespace(session=session, admin_key=None)
+        me = _front_stub(session)
         out = asyncio.run(Front._draft_terms(me, types.SimpleNamespace(url="u"), None))
         self.assertEqual(out["accept_src"], "none")
 
