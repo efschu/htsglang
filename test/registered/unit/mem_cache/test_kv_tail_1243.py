@@ -1321,6 +1321,311 @@ class TestEveryGatedLazyImportResolves(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
+# T11 -- THE LAYER-ID SPACE AT EVERY RING <-> POOL CROSSING.  Boot weg2kvtail4
+# died in the tail's FIRST ring write:
+#
+#   flashinfer_backend.py:5765 _forward_decode_dcp -> :2557 _dcp_masked_write
+#     -> :2664 _dcp_write_scatter -> ring.write(...)
+#     -> kv_tail.py:792 write -> memory_pool.py:4074 set_kv_buffer
+#        k_buf = self.k_buffer[self.local_slot(layer_id)]
+#   IndexError: list index out of range
+#
+# THREE SPACES, and slice 1 crossed between them without translating:
+#
+#   GLOBAL          `layer.layer_id`, what the model and the attention backend
+#                   carry.  0..num_hidden_layers-1.
+#   DENSE FULL-ATTN what `HybridLinearKVPool.full_kv_pool` is addressed in.
+#                   The wrapper converts with `_transfer_full_attention_id`
+#                   BEFORE calling the sub-pool, and passes the result as
+#                   `layer_id_override`.  0..full_layer_nums-1.
+#   POOL-LOCAL SLOT what `k_buffer` is indexed by: `KVCache.local_slot`.
+#
+# `install_kv_tail_ring` unwraps `full_kv_pool` and builds the ring's pool with
+# its DENSE geometry -- correctly -- but `ring.write` was then handed the
+# GLOBAL id and never translated it.  On a hybrid model most layers are linear
+# /GDN, so a global id far above `full_layer_nums` indexes off the end of a
+# correctly sized list.  The IndexError (rather than the KeyError `local_slot`
+# raises for an unowned layer) is itself the proof that this is the contiguous
+# subtraction running in the wrong frame, not an ownership question.
+#
+# NOT the root, recorded because it was the leading hypothesis: uneven DCP
+# splits TOKENS, not LAYERS.  All three ranks own the same layer set here, and
+# the rank-uniformity pin below asserts exactly that.
+# ---------------------------------------------------------------------------
+
+
+#: A hybrid layout of the shape this rig actually runs: a few full-attention
+#: layers scattered among many linear/GDN ones. The gap between 27 and 4 is
+#: the whole defect.
+_FULL_ATTN_GLOBAL_IDS = (3, 11, 19, 27)
+_TOTAL_MODEL_LAYERS = 32
+
+
+class _HybridPoolDouble:
+    """The two members of ``HybridLinearKVPool`` that the tail's seam touches.
+
+    Deliberately NOT a mock of the whole pool: the sub-pool underneath is a
+    REAL ``MHATokenToKVPool``, so ``local_slot``, the buffer list and its
+    length are the shipped objects. What is doubled is only the wrapper's
+    translation, which is the thing under test.
+    """
+
+    def __init__(self, full_pool, global_ids=_FULL_ATTN_GLOBAL_IDS):
+        self.full_kv_pool = full_pool
+        self.full_attention_layer_id_mapping = {
+            gid: dense for dense, gid in enumerate(sorted(global_ids))
+        }
+
+    def _transfer_full_attention_id(self, layer_id: int) -> int:
+        if layer_id not in self.full_attention_layer_id_mapping:
+            raise ValueError(
+                f"{layer_id=} not in full attention layers: "
+                f"{self.full_attention_layer_id_mapping.keys()}"
+            )
+        return self.full_attention_layer_id_mapping[layer_id]
+
+
+class _KernelRecorder:
+    """Intercepts the Triton masked-write at its call boundary.
+
+    The IndexError under test is raised BEFORE the kernel is reached
+    (``memory_pool.py:4074`` sits above the launch), so intercepting the kernel
+    does not hide it -- it only lets the assertion continue on to WHICH buffer
+    was selected, which is the half that can be silently wrong.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def __getitem__(self, grid):
+        def _call(*args, **kwargs):
+            self.calls.append(args)
+
+        return _call
+
+
+class _HybridSeamBase(CustomTestCase):
+    FULL = len(_FULL_ATTN_GLOBAL_IDS)
+
+    def _hybrid_ring(self, rows=16, body_rows=64, min_tokens=8):
+        """A ring installed the way the boot installs it: through the WRAPPER."""
+        from sglang.srt.mem_cache.kv_tail import install_kv_tail_ring
+
+        # The sub-pool carries the DENSE full-attention layer count, exactly as
+        # HybridLinearKVPool builds it (`layer_num=self.full_layer_nums`).
+        full_pool = _body_pool(body_rows)
+        self.assertEqual(len(full_pool.k_buffer), LAYERS)
+        wrapper = _HybridPoolDouble(full_pool)
+        ring = install_kv_tail_ring(
+            wrapper,
+            KvTailKnobs(
+                min_tokens=min_tokens, max_tokens=min_tokens, ring_rows=rows
+            ),
+            max_running_requests=1,
+            owned_share_num=1,
+            owned_share_den=1,
+        )
+        self.assertIsNotNone(ring)
+        return wrapper, full_pool, ring
+
+    def _armed(self, ring, loc=(3, 4, 5, 6), mask=(True, True, False, True)):
+        ring.begin_decode_step()
+        return ring.claim(
+            torch.tensor(loc, dtype=torch.int64), torch.tensor(mask)
+        )
+
+
+class TestTheRingWriteTranslatesTheLayerId(_HybridSeamBase):
+    """R6-WRITE -- ``kv_tail.py:792``, the weg2kvtail4 boot killer."""
+
+    def test_a_global_layer_id_above_the_dense_count_does_not_run_off_the_list(self):
+        """The exact boot failure: global 27 into a 4-slot buffer list."""
+        from sglang.srt.mem_cache import memory_pool
+
+        _w, _p, ring = self._hybrid_ring()
+        ring_loc, ring_mask = self._armed(ring)
+        rec = _KernelRecorder()
+        real = memory_pool.masked_set_kv_buffer_kernel
+        memory_pool.masked_set_kv_buffer_kernel = rec
+        try:
+            k = torch.zeros((4, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+            v = torch.zeros((4, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+            # 27 is a REAL full-attention layer of this model and the last one;
+            # its dense slot is 3, which the 4-slot ring pool has.
+            ring.write(_Layer(27), ring_loc, ring_mask, k, v)
+        finally:
+            memory_pool.masked_set_kv_buffer_kernel = real
+        self.assertEqual(len(rec.calls), 1)
+
+    def test_the_write_lands_in_the_slot_the_pools_own_mapping_names(self):
+        """Not merely 'it did not crash': the buffer selected must be the one
+        the WRAPPER's translation names, object for object. A write that lands
+        in a plausible wrong slot is the failure mode ``local_slot``'s own
+        docstring was written against."""
+        from sglang.srt.mem_cache import memory_pool
+
+        wrapper, full_pool, ring = self._hybrid_ring()
+        ring_loc, ring_mask = self._armed(ring)
+        real = memory_pool.masked_set_kv_buffer_kernel
+        for gid in _FULL_ATTN_GLOBAL_IDS:
+            with self.subTest(global_layer=gid):
+                rec = _KernelRecorder()
+                memory_pool.masked_set_kv_buffer_kernel = rec
+                try:
+                    k = torch.zeros((4, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+                    v = torch.zeros((4, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+                    ring.write(_Layer(gid), ring_loc, ring_mask, k, v)
+                finally:
+                    memory_pool.masked_set_kv_buffer_kernel = real
+                dense = wrapper._transfer_full_attention_id(gid)
+                self.assertEqual(len(rec.calls), 1)
+                k_buf, v_buf = rec.calls[0][2], rec.calls[0][3]
+                self.assertIs(k_buf, ring.pool.k_buffer[dense])
+                self.assertIs(v_buf, ring.pool.v_buffer[dense])
+
+    def test_the_ring_write_uses_the_same_translation_as_the_body_write(self):
+        """ONE authority. The body write reaches the sub-pool as
+        ``layer_id_override=_transfer_full_attention_id(layer.layer_id)``; the
+        ring must resolve the identical id, not a second table of its own."""
+        wrapper, _p, ring = self._hybrid_ring()
+        for gid in _FULL_ATTN_GLOBAL_IDS:
+            self.assertEqual(
+                ring.local_layer_id(gid),
+                wrapper._transfer_full_attention_id(gid),
+            )
+
+    def test_a_layer_the_tail_does_not_hold_is_refused_not_translated(self):
+        """A linear/GDN layer has no full-attention slot at all. It must be
+        REFUSED by the wrapper's own rule rather than silently folded onto
+        some other layer's ring rows."""
+        _w, _p, ring = self._hybrid_ring()
+        with self.assertRaises(ValueError):
+            ring.local_layer_id(4)  # a GDN layer: not in the mapping
+
+
+class TestTheRingReadTranslatesTheLayerId(_HybridSeamBase):
+    """R6-READ -- ``flashinfer_backend.py:5975``,
+    ``ring.pool.get_kv_buffer(layer.layer_id)``.
+
+    The SAME defect on the second decode attention call: it would have been the
+    next wall the moment the write was fixed, because it hands the ring pool a
+    GLOBAL id in exactly the same way.
+    """
+
+    def test_the_read_of_a_high_global_layer_resolves_to_its_dense_buffer(self):
+        wrapper, _p, ring = self._hybrid_ring()
+        for gid in _FULL_ATTN_GLOBAL_IDS:
+            with self.subTest(global_layer=gid):
+                dense = wrapper._transfer_full_attention_id(gid)
+                k, v = ring.pool.get_kv_buffer(ring.local_layer_id(gid))
+                self.assertIs(k, ring.pool.k_buffer[dense])
+                self.assertIs(v, ring.pool.v_buffer[dense])
+
+    def test_the_raw_global_id_really_is_out_of_range_on_this_fixture(self):
+        """The fixture must be able to expose the bug, or the tests above are
+        theatre: the un-translated id has to be a genuine over-run."""
+        _w, _p, ring = self._hybrid_ring()
+        self.assertGreater(max(_FULL_ATTN_GLOBAL_IDS), len(ring.pool.k_buffer))
+        with self.assertRaises(IndexError):
+            ring.pool.k_buffer[max(_FULL_ATTN_GLOBAL_IDS)]
+
+    def test_the_read_site_asks_the_ring_for_the_translation(self):
+        """Source pin for the seam this suite cannot drive end to end.
+
+        `_kv_tail_merge_decode` needs a planned flashinfer wrapper and a
+        device, so its RUNTIME stays unproven at desk. What is pinned here is
+        the id space it uses: the read must go through the ring's authority,
+        never straight off `layer.layer_id`.
+        """
+        import sglang
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(sglang.__file__)))
+        path = os.path.join(root, "sglang/srt/layers/attention/flashinfer_backend.py")
+        offenders = []
+        with open(path, encoding="utf-8") as fh:
+            for n, line in enumerate(fh, 1):
+                if "ring.pool.get_kv_buffer" not in line:
+                    continue
+                if "local_layer_id" not in line:
+                    offenders.append(f"{n}: {line.strip()}")
+        self.assertEqual(
+            offenders,
+            [],
+            "a ring-pool read is taking a raw layer id:\n" + "\n".join(offenders),
+        )
+
+
+class TestTheLayerFrameIsRankUniform(_HybridSeamBase):
+    """Uneven DCP splits TOKENS, not LAYERS.
+
+    The leading hypothesis for the weg2kvtail4 death was that the three ranks
+    own different layer subsets. They do not -- the token vector 30/17/17 is a
+    token-axis split and every rank holds every full-attention layer. This is
+    pinned so a future reader does not re-adopt the wrong root, and so a real
+    per-rank layer split (PP layer sets) cannot arrive unnoticed.
+    """
+
+    def test_the_same_global_layer_resolves_identically_on_every_rank(self):
+        rings = [self._hybrid_ring()[2] for _ in range(3)]
+        for gid in _FULL_ATTN_GLOBAL_IDS:
+            slots = [r.local_layer_id(gid) for r in rings]
+            self.assertEqual(len(set(slots)), 1, f"rank-split layer frame at {gid}")
+
+    def test_each_rank_resolves_into_its_OWN_buffers_never_a_shared_one(self):
+        """Same slot NUMBER, different buffer OBJECT: the ranks agree on the
+        frame and share no storage."""
+        rings = [self._hybrid_ring()[2] for _ in range(3)]
+        for gid in _FULL_ATTN_GLOBAL_IDS:
+            bufs = [r.pool.k_buffer[r.local_layer_id(gid)] for r in rings]
+            for i in range(len(bufs)):
+                for j in range(i + 1, len(bufs)):
+                    self.assertIsNot(bufs[i], bufs[j])
+
+    def test_the_ring_inherits_the_body_pools_own_slot_map(self):
+        """The ring's pool is a SECOND ALLOCATION OF THE SAME FRAME, so its
+        ``local_slot`` must agree with the body pool's by construction rather
+        than by re-deriving ownership from the process-global parser -- which
+        under a PP layer set would attach a GLOBAL-keyed map to a pool that is
+        addressed with DENSE ids."""
+        _w, full_pool, ring = self._hybrid_ring()
+        self.assertEqual(
+            getattr(ring.pool, "_local_slot_of", None),
+            getattr(full_pool, "_local_slot_of", None),
+        )
+
+
+class TestTheNonHybridPathIsUnchanged(_HybridSeamBase):
+    """No wrapper -> the global id IS the pool frame, and the translation must
+    be the identity. This is the path every existing test drove, which is why
+    none of them could see the defect."""
+
+    def test_the_identity_translation_when_there_is_no_wrapper(self):
+        ring = _ring(rows=16)
+        for lid in range(LAYERS):
+            self.assertEqual(ring.local_layer_id(lid), lid)
+
+    def test_the_write_still_reaches_the_kernel_on_the_plain_pool(self):
+        from sglang.srt.mem_cache import memory_pool
+
+        ring = _ring(rows=16)
+        loc = torch.tensor([3, 4, 5, 6], dtype=torch.int64)
+        ring_loc, ring_mask = ring.claim(loc, torch.tensor([1, 1, 0, 1], dtype=torch.bool))
+        rec = _KernelRecorder()
+        real = memory_pool.masked_set_kv_buffer_kernel
+        memory_pool.masked_set_kv_buffer_kernel = rec
+        try:
+            for lid in range(LAYERS):
+                k = torch.zeros((4, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+                v = torch.zeros((4, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+                ring.write(_Layer(lid), ring_loc, ring_mask, k, v)
+        finally:
+            memory_pool.masked_set_kv_buffer_kernel = real
+        self.assertEqual(len(rec.calls), LAYERS)
+        for lid, args in enumerate(rec.calls):
+            self.assertIs(args[2], ring.pool.k_buffer[lid])
+
+
+# ---------------------------------------------------------------------------
 # MUTANTS.  Each must turn a NAMED assertion above red.
 # ---------------------------------------------------------------------------
 
