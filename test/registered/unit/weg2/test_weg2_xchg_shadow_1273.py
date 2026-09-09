@@ -4179,7 +4179,12 @@ def test_the_deposit_is_a_term_of_the_1269_host_ledger_and_the_arm_line_says_so(
     from sglang.srt.weg2 import host_ledger as hl
 
     per_card = hl.xchg_bounce_bytes_per_card()
-    assert per_card == tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES
+    # S6 refuter, must_fix 3: the geometry's CEILING, read from its owner's own
+    # name for it.  This asserted the slot FLOOR beside the slot count's
+    # ceiling -- a quarter of what the planner may derive -- which made the
+    # charge understate and `deposit_refusal_reason` falsely refuse.
+    assert per_card == tp.ONCARD_DEPOSIT_BYTES_MAX
+    assert per_card == tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES_MAX
     assert hl.xchg_bounce_bytes(3) == 3 * per_card
     ring = hl.price(120 << 30, 60 << 30, 1, 1200,
                     ring_bytes=30 << 30, ring_span1_bytes=10 << 30)
@@ -4235,10 +4240,14 @@ def test_the_launcher_charges_the_deposit_only_on_an_armed_boot():
     """
     from sglang.srt.weg2 import launcher as lc
 
+    # S6-fix must_fix 4: the predicate is its own named producer now, so it
+    # is provable without a host to read -- see
+    # `test_the_deposit_is_charged_only_on_the_arm_that_can_allocate_it`.
     src = inspect.getsource(lc.choose_host_ledger)
-    assert "xchg_bounce_host_bytes=(" in src, src
-    assert "host_ledger.xchg_bounce_bytes()" in src, src
-    assert "WEIGHT_SOURCE_DEFAULT" in src, src
+    assert "xchg_bounce_host_bytes=xchg_bounce_charge_bytes(" in src, src
+    predicate = inspect.getsource(lc.xchg_bounce_charge_bytes)
+    assert "host_ledger.xchg_bounce_bytes()" in predicate, predicate
+    assert "WEIGHT_SOURCE_DEFAULT" in predicate, predicate
     main_src = inspect.getsource(lc.main)
     assert "weight_source=ns.weg2_weight_source" in main_src, \
         "the arm must reach the ledger call site"
@@ -4393,3 +4402,153 @@ def test_a_deposit_with_more_batches_than_slots_is_refused_by_name(
     # which is what makes this a refusal about the shape and not about the lane.
     assert sh.oncard_lane_batches(subset.descs, 0, DEPOSIT_SLOT) \
         <= tp.ONCARD_SLOTS_MAX
+
+
+# ===========================================================================
+# S6 FIX -- must_fix 4 (the charge and the allocation share one predicate),
+# finding 6 (the rank's budget asks the arm) and finding 8 (the deposit field).
+# ===========================================================================
+
+
+def test_the_deposit_is_charged_only_on_the_arm_that_can_allocate_it():
+    """S6 refuter must_fix 4: 0.75 GiB charged on a boot that moves no byte.
+
+    The charge fired on every non-``ring`` boot, but the bounce FILE exists
+    only on the ``host`` on-card arm -- on ``ipc`` the verdict is
+    ``DEPOSIT_REASON_IPC``, the lane logs the blameless not-drainable line and
+    nothing is pinned.  ``SGLANG_WEG2_XCHG_ONCARD`` had NO producer in the
+    launcher, so ``ipc`` was the only arm a launched boot could be on: every
+    shadow boot shrank the store and the run-peak headroom for bytes that arm
+    cannot allocate.  A charge for a thing that does not happen is the mirror
+    of the omission the term was added to close.
+    """
+    from sglang.srt.weg2 import host_ledger as hl
+    from sglang.srt.weg2 import launcher as lc
+
+    assert "oncard_mode" in inspect.signature(lc.choose_host_ledger).parameters
+    assert "xchg_bounce_charge_bytes(weight_source" in \
+        inspect.getsource(lc.choose_host_ledger)
+    main_src = inspect.getsource(lc.main)
+    assert "oncard_mode=ns.weg2_xchg_oncard" in main_src, \
+        "the arm must reach BOTH the ledger call site and the shadow env"
+    assert main_src.count("oncard_mode=ns.weg2_xchg_oncard") == 2, main_src
+
+    charge = lc.xchg_bounce_charge_bytes
+    # THE ONLY ARM THAT PINS A BYTE IS THE ONLY ARM THAT IS CHARGED.
+    assert charge("shadow", tp.ONCARD_MODE_HOST) == hl.xchg_bounce_bytes()
+    assert charge("exchange", tp.ONCARD_MODE_HOST) == hl.xchg_bounce_bytes()
+    assert charge("shadow", tp.ONCARD_MODE_IPC) == 0
+    assert charge("ring", tp.ONCARD_MODE_HOST) == 0
+    assert charge("ring", tp.ONCARD_MODE_IPC) == 0
+    assert hl.xchg_bounce_bytes() > 0, "this test proves nothing at a zero term"
+
+    # ... and the term reaches the ARM LINE with exactly that value.
+    def _arms(term):
+        _a, _s, lines = hl.choose(200 << 30, 150 << 30, store_min_gib=1.0,
+                                  ring_bytes=20 << 30, ring_span1_bytes=8 << 30,
+                                  xchg_bounce_host_bytes=term)
+        return [ln for ln in lines if ln.startswith("WEG2-HOST-LEDGER ARM ")]
+
+    ipc = _arms(charge("shadow", tp.ONCARD_MODE_IPC))
+    host = _arms(charge("shadow", tp.ONCARD_MODE_HOST))
+    assert ipc and host
+    assert all("xchg_bounce=0.00" in ln for ln in ipc), ipc
+    expect = f"xchg_bounce={hl.xchg_bounce_bytes() / hl.GIB:.2f}"
+    assert expect != "xchg_bounce=0.00"
+    assert all(expect in ln for ln in host), (expect, host)
+
+
+def test_the_launcher_publishes_the_on_card_arm_it_charged_for(tmp_path):
+    """S6 refuter must_fix 4, the producer half: the flag spec 3.7 named.
+
+    ``--weg2-xchg-oncard {ipc|host}`` is the spec's own flag and had no
+    producer at all -- the ranks read the environment and the launcher never
+    wrote it.  It is published like the hop bound and POPPED like it, because
+    an inherited ``host`` from an operator's shell would put ranks on an arm
+    this boot's ledger charged nothing for.
+    """
+    from sglang.srt.weg2 import launcher as lc
+
+    assert lc.ONCARD_MODE_DEFAULT == tp.ONCARD_MODE_IPC
+    assert set(lc.ONCARD_MODE_CHOICES) == {tp.ONCARD_MODE_IPC,
+                                           tp.ONCARD_MODE_HOST}
+    ns = lc.build_parser().parse_args(["--tree", "/t", "--tag", "x"])
+    assert ns.weg2_xchg_oncard == tp.ONCARD_MODE_IPC
+    with pytest.raises(SystemExit):
+        lc.build_parser().parse_args(["--tree", "/t", "--tag", "x",
+                                      "--weg2-xchg-oncard", "staging"])
+    env_src = inspect.getsource(lc.prepare_shadow_env)
+    assert "weight_exchange_transport.ENV_ONCARD_MODE" in env_src, env_src
+    build_src = inspect.getsource(lc.build_env)
+    assert "weight_exchange_transport.ENV_ONCARD_MODE" in build_src, \
+        "an inherited on-card arm must be popped like the hop bound"
+    # The ring arm publishes NOTHING, which is what keeps it byte-identical.
+    assert lc.prepare_shadow_env(lambda _s: None, "b1", "ring",
+                                 oncard_mode="host") == {}
+
+
+def test_the_rank_budget_is_zero_on_the_arm_the_ledger_charged_nothing_for(
+        monkeypatch):
+    """S6 refuter finding 6: the 'ledger answer' was two module constants.
+
+    ``_weg2_shadow_host_budget`` returned the full per-card charge on EVERY
+    arm, while the launcher charges it on ``host`` only.  A rank that
+    authorised a deposit against a term nobody carried would pin host bytes
+    above the reap mark by exactly the amount that was never paid --
+    ``host-schwelle-nie-uebertreten``.  It now asks the arm the launcher
+    published, which is the same string that decided the charge.
+    """
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+    from sglang.srt.weg2 import host_ledger as hl
+
+    budget = wu.SchedulerWeightUpdaterManager._weg2_shadow_host_budget
+
+    monkeypatch.setenv(tp.ENV_ONCARD_MODE, tp.ONCARD_MODE_IPC)
+    assert budget(object()) == 0
+    monkeypatch.delenv(tp.ENV_ONCARD_MODE, raising=False)
+    assert budget(object()) == 0, "the default arm is ipc and funds nothing"
+    monkeypatch.setenv(tp.ENV_ONCARD_MODE, tp.ONCARD_MODE_HOST)
+    assert budget(object()) == hl.xchg_bounce_bytes_per_card()
+    assert budget(object()) == tp.ONCARD_DEPOSIT_BYTES_MAX
+
+
+def test_the_shadow_line_prices_the_copy_on_the_host_arm_and_not_on_ipc(
+        region, ops):
+    """S6 refuter must_fix 1, at the seam that PRINTS the number.
+
+    ``shadow_transport`` multiplied the batch count by ``ONCARD_PER_BATCH_MS``
+    BY HAND -- a second copy of a formula that already had an owner, and one
+    with no bytes term at all.  Both readings now come out of
+    ``plan_oncard_slot_bytes``, so the hop the hook grades and the hop the line
+    prints cannot be two different models.
+    """
+    desc = _diag(0, 3 << 20, cls="qkv_proj")
+    _vote_rows(region, [1, 2, 3, 4, 5], leg=0, vote=False,
+               classes_hash=sh.classes_hash(["qkv_proj"]), need_mib=0)
+
+    def _run(mode):
+        run = sh.shadow_transport(
+            region=region, sems=None, ops=ops, row=0, rank=0, device=0,
+            card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=[desc],
+            is_source=True, oncard_mode=mode, peer_row=3, wave=WAVE,
+            leg=0, direction="P->D", epoch="b.1", free_mib=8192,
+            log=lambda _s: None, oncard_slot_bytes=1 << 20)
+        return run.result
+
+    ipc = _run(tp.ONCARD_MODE_IPC)
+    host = _run(tp.ONCARD_MODE_HOST)
+    assert ipc.oncard_batches == host.oncard_batches == 3
+    # The ipc arm is byte-identical to the pre-S6 reading ...
+    assert ipc.oncard_hop_ms_priced == 3 * tp.ONCARD_PER_BATCH_MS
+    # ... and the host arm carries the bytes the old model dropped.
+    expect = 3 * tp.ONCARD_PER_BATCH_MS + \
+        ((3 << 20) / (tp.ONCARD_HOST_COPY_GBPS * 1e9)) * 1e3
+    assert host.oncard_hop_ms_priced == pytest.approx(expect)
+    # The bytes term is the LARGER of the two on a 3 MiB diagonal already,
+    # and it grows with the bytes while the batch term does not.
+    assert host.oncard_hop_ms_priced - ipc.oncard_hop_ms_priced == \
+        pytest.approx(((3 << 20) / (tp.ONCARD_HOST_COPY_GBPS * 1e9)) * 1e3)
+    assert host.oncard_hop_ms_priced > 2 * ipc.oncard_hop_ms_priced
+    # Finding 8: neither lane deposits, so neither prints a deposit.
+    assert ipc.oncard_deposit_mib == 0.0 and host.oncard_deposit_mib == 0.0
+    assert "oncard_deposit_mib=0" in host.line(), host.line()

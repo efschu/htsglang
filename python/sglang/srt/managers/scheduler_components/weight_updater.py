@@ -1384,10 +1384,25 @@ class SchedulerWeightUpdaterManager:
         arithmetic rather than two copies of it.  Zero on any failure, and zero
         REFUSES the deposit downstream: an observer that could not read its own
         budget must not pin host memory on a guess.
+
+        IT ASKS THE ARM FIRST, AND THAT IS THE HALF THAT WAS MISSING (S6
+        refuter, finding 6 + must_fix 4).  The launcher charges the deposit
+        ONLY on the ``host`` on-card arm; a rank that returned the full budget
+        on every arm would authorise a deposit against a term the ledger did
+        not carry -- host bytes above the reap mark by exactly the amount
+        nobody paid for, which ``host-schwelle-nie-uebertreten`` forbids.  The
+        arm is read from the value the launcher PUBLISHED
+        (``resolve_shadow_oncard_mode``), i.e. the same string that decided the
+        charge, so the two cannot disagree.  With that, the ``except`` arm
+        below is no longer the only path to 0: ``ipc`` reaches it by design.
         """
         try:
             from sglang.srt.weg2 import host_ledger as hl
+            from sglang.srt.weg2 import weight_exchange_shadow as wxs
+            from sglang.srt.weg2 import weight_exchange_transport as tp
 
+            if wxs.resolve_shadow_oncard_mode() != tp.ONCARD_MODE_HOST:
+                return 0
             return int(hl.xchg_bounce_bytes_per_card())
         except Exception:  # noqa: BLE001 -- an observer never raises
             return 0
