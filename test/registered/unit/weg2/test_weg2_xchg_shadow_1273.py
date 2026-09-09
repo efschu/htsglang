@@ -859,6 +859,13 @@ def test_the_shadow_moves_the_bytes_into_its_own_buffer_and_not_the_ring_s(
     src_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
     dst_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
     try:
+        # A HARNESS PROPERTY, not a product one: the two FakeDeviceOps share
+        # one card's storage (that is what makes the on-card lane real here)
+        # but each has its OWN bump allocator starting at 0, so the source's
+        # bounce and the destination's shadow buffer would alias at offset 0.
+        # The spacer moves the destination's allocations clear of it.  On the
+        # metal two processes' cudaMalloc cannot alias.
+        dst_ops.raw_malloc(0, 2 << 20)
         payload = pattern(31, 2000)
         src, ring_dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x60000)
         write(src_ops, src, payload)
@@ -926,6 +933,7 @@ def test_a_mismatch_is_counted_and_the_flip_is_never_told(region, tmp_path, boot
     src_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
     dst_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
     try:
+        dst_ops.raw_malloc(0, 2 << 20)  # see the spacer note above
         payload = pattern(37, 1500)
         src, ring_dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x60000)
         write(src_ops, src, payload)
