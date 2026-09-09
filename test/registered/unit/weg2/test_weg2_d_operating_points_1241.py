@@ -510,7 +510,16 @@ class OperatingPointVectorTest(unittest.TestCase):
     def test_the_bs6_regime_premise_is_marked_UNPROVEN_on_the_row_and_in_help(self):
         """"a bs=6 round is compute-bound" is the very quantity slice (1)
         measures, and slice (1) has produced no measurement. An argv-affecting
-        arm may not present a hypothesis as a finding."""
+        arm may not present a hypothesis as a finding.
+
+        SINCE THE USER ORDER OF 2026-09-09 THIS ARM IS THE DEFAULT, which
+        makes the marking matter more, not less: the premise behind the arm a
+        boot gets by saying nothing must be the loudest of the three. The
+        assertion is therefore on the PROPERTY ("regime premises", "UNPROVEN"
+        and the fact that it is now the default) rather than on one exact
+        sentence -- a pin on the sentence goes red for a wording change that
+        strengthens the warning, which is the wrong direction to defend.
+        """
         import argparse
         import inspect
 
@@ -522,7 +531,12 @@ class OperatingPointVectorTest(unittest.TestCase):
         src = inspect.getsource(lz)
         i = src.index('"--d-tp-objective"')
         help_text = src[i : i + 4000]
-        self.assertIn("BOTH REGIME PREMISES ARE UNPROVEN", help_text)
+        self.assertIn("REGIME PREMISES ARE", help_text)
+        self.assertIn("UNPROVEN", help_text)
+        # And the reader is told that one of these unproven premises is what
+        # they get by default -- the half that only became true with the
+        # 2026-09-09 order, and the half a reader most needs.
+        self.assertIn("IS NOW THE DEFAULT", help_text)
         del argparse
 
     def test_the_help_no_longer_promises_the_ZERO_HEADS_refusal(self):
