@@ -5995,6 +5995,9 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             o_t = torch.where(tail_empty.view(-1, 1, 1), torch.zeros_like(o_t), o_t)
         o, lse = _kv_tail_lse_merge(o, lse, o_t, lse_t)
+        # FACT 3: the read half reports itself. `attended_rows` says a PLAN
+        # named rows; this says a kernel read them.
+        ring.note_merge()
         if body_empty is not None and tail_empty is not None:
             both = body_empty & tail_empty
             lse = torch.where(both.unsqueeze(1), torch.full_like(lse, neg_inf), lse)

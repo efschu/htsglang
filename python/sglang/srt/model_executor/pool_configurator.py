@@ -649,6 +649,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             "host_max_tokens": knobs.resolved_host_max(),
             "share": f"{cp_ratio}/{cp_S}",
             "mrr": mrr,
+            # FACT 1: name BOTH dtypes. The ring is bf16 by construction
+            # (KvTailRing builds its pool with torch.bfloat16); the BODY's is
+            # read off the flag. Boot weg2kvtail6 hard-wired
+            # --kv-cache-dtype bfloat16 for every arm, so there was no fp8
+            # body anywhere and the whole quality conclusion was void -- and
+            # nothing in the log said so. kv_tail_cell_bytes alone is a proxy
+            # and it was not read correctly.
+            "tail_dtype": "bf16",
+            "body_dtype": str(getattr(sa, "kv_cache_dtype", None) or "auto"),
         }
 
     def calculate_pool_sizes(
@@ -741,7 +750,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     " | kv_tail_rows=%d kv_tail_cell_bytes=%d "
                     "kv_tail_ring_bytes=%d kv_tail_map_bytes=%d min_tokens=%s "
                     "max_tokens=%s host_max_tokens=%s "
-                    "dcp_share=%s mrr=%s post_bytes=%d"
+                    "dcp_share=%s mrr=%s post_bytes=%d "
+                    "tail_dtype=%s body_dtype=%s"
                     % (
                         tail_terms["rows"],
                         tail_terms["cell"],
@@ -753,6 +763,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         tail_terms["share"],
                         tail_terms["mrr"],
                         tail_terms.get("post_bytes", tail_post),
+                        tail_terms["tail_dtype"],
+                        tail_terms["body_dtype"],
                     )
                 )
             ),

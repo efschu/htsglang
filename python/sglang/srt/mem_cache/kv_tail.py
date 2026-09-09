@@ -488,6 +488,12 @@ class KvTailCounters:
     #: cannot distinguish "the demoter is too eager" from "the ring was never
     #: armed", and the first reading costs a boot.
     decode_steps: int = 0
+    #: READ-PATH PROOF (#1243 fact 3). `attended_rows` is a PLAN fact -- it
+    #: says a plan NAMED rows. Only this says a kernel actually read them.
+    #: The gap between the two is the kvtail1 "probe did not bite" class:
+    #: banner printed, counter moving, nothing rounded.
+    tail_merges: int = 0
+    tail_merges_this_step: int = 0
     attended_rows: int = 0
     body_rows: int = 0
     untrimmed_owned: int = 0
@@ -637,6 +643,8 @@ class KvTailRing:
         # Armed only for the duration of one DECODE step; see begin_decode_step.
         self._armed = False
         self._claim_cache = None
+        #: attended_rows of the PREVIOUS plan, for the fact-4 gate below.
+        self._last_plan_attended = 0
 
     # -- form gate ---------------------------------------------------------
 
@@ -837,6 +845,14 @@ class KvTailRing:
         self._claim_cache = (key, ring_loc, ring_mask)
         return ring_loc, ring_mask
 
+    def note_merge(self) -> None:
+        """The READ half reports itself. Called once per LAYER from
+        ``_kv_tail_merge_decode``, after the tail wrapper has actually run.
+
+        This is the only fact in the instrument that a PLAN cannot fake."""
+        self.counters.tail_merges += 1
+        self.counters.tail_merges_this_step += 1
+
     def local_layer_id(self, layer_id: int) -> int:
         """GLOBAL layer id -> the frame the ring's pool is addressed in.
 
@@ -959,6 +975,20 @@ class KvTailRing:
         # emission time, i.e. AFTER any age-out below; reporting only that is
         # what made weg2kvtail5's line unable to say whether a row was ever
         # resident. Reset per pass so the term is a PASS quantity, not a total.
+        # FACT 4, the kvtail1 gate: the PREVIOUS step planned a tail and no
+        # kernel ever read it. Checked HERE because a plan runs once per step
+        # and the merges of the step before it are complete by now.
+        if self._last_plan_attended > 0 and self.counters.tail_merges_this_step == 0:
+            raise Weg2KvTailNoOp(
+                "W56 Weg2KvTailNoOp: the previous decode step planned "
+                f"{self._last_plan_attended} attended tail rows and the tail "
+                "merge ran 0 times, so no kernel read a single 16-bit row. "
+                "attended_rows is a PLAN fact; tail_merges is the READ fact. "
+                "A tail that is planned and never read is the shape boot "
+                "weg2kvtail1 shipped: banner printed, counters moving, four "
+                "arms bit-identical."
+            )
+        self.counters.tail_merges_this_step = 0
         self.counters.rows_held_pre = self.rows_held
         self.counters.demoted_this_pass = 0
         pre = split_owned_indices(kv_indptr, kv_indices, owned_tail_len, self.mapping)
@@ -988,6 +1018,7 @@ class KvTailRing:
                 "the only falsifier either has."
             )
         self._due_gate(attended, untrimmed, site)
+        self._last_plan_attended = attended
         return body_indptr, body_indices, tail_indptr, tail_ring
 
     def _due_gate(self, attended: int, untrimmed: int, site: str) -> None:
@@ -1051,6 +1082,7 @@ class KvTailRing:
             f"demoted_by_free={c.demoted_by_free} "
             f"demoted_by_pressure={c.demoted_by_pressure} "
             f"decode_steps={c.decode_steps} "
+            f"tail_merges={c.tail_merges} "
             f"instrument=plan-counts"
         )
 
