@@ -79,7 +79,17 @@ BUDGETS_MIB = (27960.0, 17064.0, 16552.0)
 #: ``weights attn 355.1 / linear 366.2 MiB per layer -> mean 363.4 used``
 #: (same line).  The mean is the model's own deliberate choice; keeping it
 #: makes this test about the POSTS and not about the weight split.
+#:
+#: THE LOG ROUNDS IT TO ONE DECIMAL and the launcher does not, so reproducing
+#: the shipped pool from this fixture is exact to about 5 tokens on the binding
+#: stage (0.086 MiB of weight over 44 layers, 4 tokens at an 11-layer cell) --
+#: which is why the two "reproduce the shipped number" assertions below carry
+#: ``REPRO_TOKENS`` and not ``assertEqual``.  Asserting the last digit here
+#: would be asserting precision the printed input does not have.
 MEAN_LAYER_MIB = 363.4
+
+#: Slack for reproducing a SHIPPED pool figure from the rounded log inputs.
+REPRO_TOKENS = 25
 
 #: ``kv=2048 B/token/attn-layer (from config, fp8_e4m3)`` -> MiB.
 KV_MIB_PER_TOKEN_PER_ATTN_LAYER = 2048.0 / (1024.0 * 1024.0)
@@ -288,23 +298,33 @@ class TestBootSizingFormula(CustomTestCase):
     def test_per_rank_capacities_match_the_boots_per_rank_capacities(self):
         """Not only the min: every rank, so a right answer for a wrong reason
         (two errors cancelling on the binder) cannot pass."""
-        caps = stage_pp_capacities(SB5F_COUNTS, SB5F_ATTN, funded_model())
+        model = funded_model()
+        caps = stage_pp_capacities(SB5F_COUNTS, SB5F_ATTN, model)
         for r, (got, metal) in enumerate(zip(caps, SB5F_LOCAL_TOKENS)):
             rel = abs(got - metal) / float(metal)
             self.assertLess(
                 rel, self.TOLERANCE,
                 msg=f"rank{r}: priced {got:.0f} vs metal {metal}",
             )
+            # EXACT against the second source, so a rounding that goes the
+            # wrong way (ceil, round-half-up) cannot hide inside the 0.5 %
+            # band the fixed post's own spread earns.
+            self.assertEqual(
+                got, _hand_capacity(model, SB5F_COUNTS, SB5F_ATTN, r),
+                msg=f"rank{r}: the model and the transcribed post list differ",
+            )
 
     def test_the_unfunded_model_is_the_measured_over_pricing(self):
         """THE RED HALF: reproduce the defect exactly as it shipped."""
-        self.assertEqual(
-            int(pp_phase_pool(SB5F_COUNTS, SB5F_ATTN, unfunded_model())),
+        self.assertAlmostEqual(
+            pp_phase_pool(SB5F_COUNTS, SB5F_ATTN, unfunded_model()),
             SB5F_PRICED_BEFORE_THE_FIX,
+            delta=REPRO_TOKENS,
         )
-        self.assertEqual(
-            int(pp_phase_pool(RG6_COUNTS, RG6_ATTN, unfunded_model())),
+        self.assertAlmostEqual(
+            pp_phase_pool(RG6_COUNTS, RG6_ATTN, unfunded_model()),
             RG6_PRICED_BEFORE_THE_FIX,
+            delta=REPRO_TOKENS,
         )
         # ... and it is over-pricing, the dangerous direction, on both cuts.
         self.assertGreater(SB5F_PRICED_BEFORE_THE_FIX, 1.6 * SB5F_WORLD_TOKENS)
@@ -363,7 +383,7 @@ class TestEveryPostIsLoadBearing(CustomTestCase):
             mamba_mib_per_linear_layer_per_slot=0.0,
             corridor_holdback_mib=None,
         )
-        self.assertEqual(int(got), SB5F_PRICED_BEFORE_THE_FIX)
+        self.assertAlmostEqual(got, SB5F_PRICED_BEFORE_THE_FIX, delta=REPRO_TOKENS)
 
 
 class TestUnfundedPostsAreNamedNotSilent(CustomTestCase):
