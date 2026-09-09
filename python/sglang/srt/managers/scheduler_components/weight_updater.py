@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import functools
 import logging
+import os
 import time
 import traceback
 from collections import OrderedDict
@@ -1520,7 +1521,99 @@ class SchedulerWeightUpdaterManager:
         except BaseException:  # noqa: BLE001 -- an observer never raises
             pass
 
-    def _weg2_shadow_plan(self, hook: str, group: str, rank: int):
+    def _weg2_shadow_region(self):
+        """This process's shadow region, opened once and kept.  ``None`` if absent.
+
+        #1311 S6b.  The card manifest has to be published and read BEFORE the
+        plan is derived (the plan is narrowed by the agreement), and the plan is
+        derived before ``run_leg_hook`` opens its own region for the transport.
+        So this adapter opens one itself, from the SAME two env vars
+        ``ShadowLeg.attach`` reads -- no second channel is invented.
+
+        CACHED PER PROCESS, and that is correct rather than convenient: the
+        region file is per BOOT (its ``boot_hash`` names the boot nonce) and is
+        merely re-STAMPED per flip, while what this adapter reads and writes --
+        the manifest rows -- are keyed on ``boot_hash`` and are boot constants.
+        The transport's own region handle stays :class:`ShadowLeg`'s; this one
+        is never handed to a leg and never begins a flip.
+
+        Never raises: an observer that took a flip down over its own bookkeeping
+        would be the thing this whole slice exists not to be.
+        """
+        cached = getattr(self, "_weg2_shadow_region_cache", "unset")
+        if cached != "unset":
+            return cached
+        region = None
+        try:
+            from sglang.srt.weg2 import weight_exchange_region as xr
+
+            path = (os.environ.get(xr.ENV_REGION_PATH, "") or "").strip()
+            boot = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
+            if path and boot:
+                region = xr.XchgRegion.open(path, expect_boot=boot)
+        except BaseException:  # noqa: BLE001 -- an observer never raises
+            region = None
+        self._weg2_shadow_region_cache = region
+        return region
+
+    def _weg2_shadow_manifest(self, group: str, peer: str, rank: int, *,
+                              leg: int, epoch: str):
+        """Publish this rank's card manifest and agree with the co-located peer.
+
+        ``(AgreedPieces | None, state)``.  THE FIX FOR BOOT weg2xsn5's W82.
+
+        The manifest itself is a BOOT constant and is derived once per process;
+        the reconciliation runs per leg because the PEER's row appears at the
+        peer's own first hook, which is a different instant of a different flip
+        half.  Reconciling is one shared-memory read plus a set intersection --
+        microseconds against a derivation that walks every parameter.
+
+        Never raises.  A ``None`` agreement is a NAMED state on the log, never a
+        quiet fall-back to this rank's own view: the fall-back IS the defect
+        this closes.
+        """
+        try:
+            from sglang.srt.weg2 import weight_exchange as wx
+            from sglang.srt.weg2 import weight_exchange_region as xr
+            from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+            region = self._weg2_shadow_region()
+            if region is None:
+                return None, "no-region"
+            entries = getattr(self, "_weg2_shadow_manifest_cache", None)
+            if entries is None:
+                runner = getattr(self.tp_worker, "model_runner", None)
+                model = getattr(runner, "model", None)
+                region_tag = ""
+                if runner is not None:
+                    try:
+                        region_tag = wx.weights_region_tag_for(
+                            wx.RunnerShape.of(runner))
+                    except BaseException:  # noqa: BLE001
+                        region_tag = ""
+                entries, reason = sh.derive_card_manifest(
+                    rank=int(rank), model=model, region_tag=region_tag)
+                if entries is None:
+                    return None, f"no-manifest:{reason}"
+                self._weg2_shadow_manifest_cache = entries
+            row = xr.rank_row(group, int(rank))
+            peer_row = xr.rank_row(peer, int(rank))
+            agreed, state = sh.reconcile_card_manifest(
+                region, row=row, peer_row=peer_row, entries=entries)
+            # ONE LINE PER LEG, AND IT NAMES BOTH CARDINALITIES.  The states
+            # that are not ``agreed`` are the ones a boot record has to be able
+            # to count, and two of them are ordinary startup rather than a
+            # fault -- which is why only the overflow carries a W-code.
+            logger.info(sh.manifest_state_message(
+                state=state, rank=int(rank), row=row, peer_row=peer_row,
+                leg=int(leg), epoch=str(epoch), mine=len(entries),
+                theirs=(agreed.theirs if agreed is not None else -1)))
+            return agreed, state
+        except BaseException as exc:  # noqa: BLE001 -- an observer never raises
+            return None, f"manifest-failed:{type(exc).__name__}"
+
+    def _weg2_shadow_plan(self, hook: str, group: str, rank: int, *,
+                          agreed=None):
         """THE PRODUCT CALL SITE OF ``weight_exchange.build_plan``.
 
         SECTION 1ai-S5b-fix's UNPROVEN 2 in its own words -- *"``build_plan``
@@ -1558,7 +1651,13 @@ class SchedulerWeightUpdaterManager:
             return sh.derive_leg_plan(
                 hook=str(hook), group=str(group),
                 peer=("D" if group == "P" else "P"), rank=int(rank),
-                model=model, region_tag=region_tag)
+                model=model, region_tag=region_tag,
+                # #1311 S6b.  ``require_agreement`` is the half that must not be
+                # forgotten: without it a leg whose peer has not published would
+                # silently fall back to this rank's own inventory, which is
+                # exactly the rank-local derivation boot weg2xsn5 refused 7 of 8
+                # legs on.  The product refuses by name instead.
+                agreed=agreed, require_agreement=True)
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
             return None, f"derivation-failed:{type(exc).__name__}"
 
@@ -1688,8 +1787,18 @@ class SchedulerWeightUpdaterManager:
                            f"UNAFFORDABLE naming a full card that is not full"))
                 return
             self._weg2_shadow_param_census(group, rank)
+            # #1311 S6b -- THE CARD MANIFEST, BEFORE THE PLAN AND NOT AFTER.
+            # The plan is narrowed to the pair's agreed piece set, and
+            # ``coalesce`` merges descriptors across parameter names, so the
+            # narrowing has to happen on the INVENTORY inside the derivation.
+            # That is why the agreement is reconciled here, one call earlier,
+            # rather than inside ``run_leg_hook`` where the region is opened
+            # for the transport.
+            agreed, manifest_state = self._weg2_shadow_manifest(
+                group, peer, int(rank), leg=leg, epoch=epoch_token)
             plan, plan_reason = self._weg2_shadow_plan(str(hook), group,
-                                                       int(rank))
+                                                       int(rank),
+                                                       agreed=agreed)
             inputs = sh.ShadowLegInputs(
                 leg=leg,
                 epoch=epoch_token,
@@ -1704,7 +1813,11 @@ class SchedulerWeightUpdaterManager:
                 resume_reserve_bytes=int(reserve_bytes),
                 ring_ms=ring_ms,
                 gate_rows=self._weg2_shadow_gate_rows(str(hook), group),
-                plan_reason=str(plan_reason),
+                # THE MANIFEST STATE RIDES THE PLAN REASON, so the one line a
+                # refused leg prints (W81 ``no-plan``) says WHY the pair could
+                # not agree and not merely that it did not.
+                plan_reason=(f"{plan_reason} manifest={manifest_state}"
+                             if plan_reason else str(plan_reason)),
                 # THE ON-CARD LANE HAS NO CONCURRENT PEER ON THIS PLACEMENT.
                 # Same structural fact as ``_weg2_shadow_gate_rows`` above, one
                 # consequence further on (S5c refuter, must_fix 3): the source
@@ -1727,9 +1840,49 @@ class SchedulerWeightUpdaterManager:
                 # ``seq - slots`` is negative) rather than by a branch, so
                 # ``blocked_ms`` stays 0.000 and the destination now has bytes
                 # to COMPARE.  A shape that does not fit is still refused by
-                # name, and the refusal is now W83 (the deposit) instead of the
+                # name, and the refusal is now W85 (the deposit) instead of the
                 # blameless placement line.
                 oncard_drainable=False,
+                # #1311 S6b -- THE LANE S6 BUILT AND NOBODY ASKED FOR.
+                #
+                # BOOT weg2xsn5 MEASURED IT: ``WEG2-XCHG-SHADOW-ONCARD-REFUSED``
+                # 24 times, every one ``hook=source``, on every leg, INDEPENDENT
+                # of the W82 plan divergence.  The root is one missing argument.
+                # ``run_leg_hook``'s refusal reads
+                #     if not oncard_store_forward or reason == DEPOSIT_REASON_IPC
+                # and ``ShadowLegInputs.oncard_store_forward`` defaults to
+                # ``False``.  This construction never passed it, and a grep of
+                # the tree found the field's only non-default producers in TWO
+                # TEST FILES -- so the store-and-forward deposit was priced, its
+                # slot arithmetic guarded (``require_store_forward_slots``), its
+                # refusal reasons enumerated, and it could not be reached from a
+                # boot.  Same class as "``build_plan`` has no product caller"
+                # (S5b UNPROVEN 2): a lane written, tested and never wired.
+                #
+                # IT IS THE UPSTREAM-MINIMAL SHAPE OF THE THREE THE TICKET
+                # OFFERS.  Running the lane from the DESTINATION hook does not
+                # help -- the source rank is then inside its pause loop and its
+                # end still cannot drain.  Splitting the source hook so the C14
+                # credit publishes first would move the flip's own ordering to
+                # suit an observer, which is deviation 6 of this module's
+                # docstring inverted.  A side thread with a bounded join is
+                # measured-bad: the leg is owned by the thread that runs it
+                # (``weight_exchange_shadow._ACTIVE``), and a second leg sharing
+                # the interpreter adopted the slot and closed the first out from
+                # under itself, presenting as a gate expiry five seconds inside
+                # a flip.  The deposit needs NO concurrent peer at all, which is
+                # the property the placement actually lacks.
+                #
+                # ASKING IS NOT GETTING, and that is deliberate: with a shape
+                # that does not fit, ``deposit_refusal_reason`` still refuses BY
+                # NAME -- W85 on the ``host`` arm when the slots or the #1269
+                # charge do not carry it, and the blameless placement line on
+                # the ``ipc`` arm, where an exported bounce cannot outlive its
+                # leg by construction.  A boot on ``--weg2-xchg-oncard ipc``
+                # (which is what weg2xsn5 ran) therefore still refuses; the
+                # difference is that the refusal now names the ARM, and the
+                # ``host`` arm now has a path.
+                oncard_store_forward=True,
                 # WHAT THE #1269 LEDGER CHARGED FOR ONE CARD'S DEPOSIT.  The
                 # adapter is the producer because the budget is a property of
                 # the BOOT's arm and a rank hook cannot read the launcher's
