@@ -1877,12 +1877,22 @@ class TestTheMergeSeamRuns(CustomTestCase):
         from sglang.srt.layers.attention import flashinfer_backend as fb
 
         layer = types.SimpleNamespace(layer_id=0, scaling=1.0, logit_cap=0.0)
-        real = fb._safe_merge_state
+        # `_safe_merge_state` is defined INSIDE a flashinfer-availability
+        # block, so on a CPU-only desk the module global does not exist at
+        # all -- `getattr` would raise and the substitution has to create it.
+        # (On the rig flashinfer is present, so this is a desk fact, not a
+        # boot risk; it is why the seam could look "not hermetically
+        # executable" at first glance.)
+        sentinel = object()
+        real = getattr(fb, "_safe_merge_state", sentinel)
         fb._safe_merge_state = _reference_merge
         try:
             return self._fn(be, torch.zeros(o.shape[0], self.HEADS_Q, HEAD_DIM), layer, o, lse)
         finally:
-            fb._safe_merge_state = real
+            if real is sentinel:
+                del fb._safe_merge_state
+            else:
+                fb._safe_merge_state = real
 
     def _ring1(self):
         r = _ring(rows=16)
